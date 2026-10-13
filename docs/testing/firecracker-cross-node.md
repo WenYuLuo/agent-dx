@@ -98,6 +98,8 @@ OBS 配置文件必须是权限 `0600` 的普通文件，包含 `bucket`、`regi
 
 OBS suite 关闭后台 checkpoint GC，避免它与上传阻断竞争；显式删除仍须释放已登记制品。驱动记录实际 package、SDK、Firecracker、sandboxd、kernel、initrd、runtime EROFS 与驱动文件摘要。首次或失败运行应保留错误证据，最终结果以严格验收器、空 VM 清单、空 OBS prefix 和清理记录为准。
 
+Coordinator 重启后，仍存活的 adxlet 清理未提交执行并重新采用权威暂停点时，环境 revision 必须继续递增。Relay 在全量路由替换后仍保留已见版本；回退到旧暂停 revision 会导致后续路由发布冲突。该路径的组件回归使用真实 UDS Relay 的版本检查，同时由上述真实 VM 重启用例验证。
+
 低带宽部署可延长测试 pause 调用预算；OBS fixture 将对象存储请求超时设置为 `AWS_TIMEOUT=240s`。demand 负载使用 128 MiB guest 内存和 32 MiB writable layer。Ingress 的单次唤醒等待仍有 300 秒上限；HTTP 驱动只对 503 用同一个业务 nonce 重试，并在响应证据的 `transient_statuses` 中保留所有失败状态和时间。成功结果代表该业务 nonce 恢复后执行一次；出现 503 时，不能宣称第一次 HTTP 请求被透明保留到恢复完成。
 
 失败运行的测试资源停止后，可使用 `s3_probe.py RUN --cleanup` 删除该运行 prefix 下的对象并中止 multipart uploads。此操作单独记录为 `obs-fixture-cleanup.json`，不会将失败运行改为通过。正常通过仍须先证明实例删除后的 OBS 清单为空。

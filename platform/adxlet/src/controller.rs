@@ -446,7 +446,7 @@ struct Controller {
 }
 
 impl Controller {
-    async fn align_authority(&mut self, record: EnvironmentRecord) -> Result<()> {
+    async fn align_authority(&mut self, mut record: EnvironmentRecord) -> Result<()> {
         if self.retired
             || record.spec != self.record.spec
             || record.assignment != self.record.assignment
@@ -462,8 +462,15 @@ impl Controller {
                 return Err(Error::Conflict);
             }
             self.cleanup().await?;
+            // Cleanup retires the uncommitted execution at its local revision.
+            // A live Relay retains that version across full catalog replacement;
+            // publishing the older paused revision would prevent reconciliation
+            // and the next restore from advancing its binding.
+            record.revision = record
+                .revision
+                .max(self.record.revision.checked_add(1).ok_or(Error::Conflict)?);
             self.record = record;
-            self.durability = Some(Durability::Published);
+            self.durability = None;
             self.idle = None;
         }
         Ok(())

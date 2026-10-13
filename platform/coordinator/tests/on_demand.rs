@@ -63,6 +63,7 @@ fn caller() -> Option<pb::CallerContext> {
 #[derive(Default)]
 struct Backend {
     relay: Mutex<Option<Arc<data_plane_gateway::node::Relay>>>,
+    versioned_routes: Mutex<Option<Arc<adxlet::routes::UdsRoutes>>>,
     running: Mutex<BTreeMap<String, adxlet::RuntimeObservation>>,
     restored: AtomicUsize,
     restore_gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
@@ -143,7 +144,25 @@ impl Readiness for Backend {
 }
 #[async_trait]
 impl Routes for Backend {
+    async fn begin_reconcile(&self) -> Result<()> {
+        let routes = self.versioned_routes.lock().unwrap().clone();
+        if let Some(routes) = routes {
+            routes.begin_reconcile().await?;
+        }
+        Ok(())
+    }
+    async fn finish_reconcile(&self) -> Result<()> {
+        let routes = self.versioned_routes.lock().unwrap().clone();
+        if let Some(routes) = routes {
+            routes.finish_reconcile().await?;
+        }
+        Ok(())
+    }
     async fn activate(&self, record: &EnvironmentRecord) -> Result<()> {
+        let routes = self.versioned_routes.lock().unwrap().clone();
+        if let Some(routes) = routes {
+            return routes.activate(record).await;
+        }
         let relay = self.relay.lock().unwrap().clone();
         if let Some(relay) = relay {
             relay
@@ -157,6 +176,10 @@ impl Routes for Backend {
         Ok(())
     }
     async fn retire(&self, record: &EnvironmentRecord) -> Result<()> {
+        let routes = self.versioned_routes.lock().unwrap().clone();
+        if let Some(routes) = routes {
+            return routes.retire(record).await;
+        }
         let relay = self.relay.lock().unwrap().clone();
         if let Some(relay) = relay {
             relay
@@ -734,7 +757,69 @@ async fn coordinator_restart_reconciles_the_durable_wake_without_new_identity() 
 #[tokio::test]
 #[ignore = "requires dedicated real Redis"]
 async fn coordinator_restart_during_uncommitted_restore_cleans_then_retries() {
+    coordinator_restart_uncommitted_restore(false).await;
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis"]
+async fn coordinator_restart_reconciles_uncommitted_restore_with_real_versioned_relay() {
+    coordinator_restart_uncommitted_restore(true).await;
+}
+
+struct VersionedRelay {
+    routes: Arc<adxlet::routes::UdsRoutes>,
+    task: tokio::task::JoinHandle<()>,
+    _directory: tempfile::TempDir,
+}
+impl Drop for VersionedRelay {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+impl VersionedRelay {
+    async fn start() -> Self {
+        use data_plane_gateway::node::route_control::proto::relay_service_server::RelayServiceServer;
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("relay.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let relay = Arc::new(
+            data_plane_gateway::node::Relay::new(
+                data_plane_gateway::common::protocol::GatewayPolicy::for_local_mock(vec![
+                    "127.0.0.0/8".parse().unwrap(),
+                ]),
+            )
+            .with_route_enforcement(),
+        );
+        let service = data_plane_gateway::node::route_control::BindingService::new(relay);
+        let task = tokio::spawn(async move {
+            Server::builder()
+                .add_service(RelayServiceServer::new(service))
+                .serve_with_incoming(tokio_stream::wrappers::UnixListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        let routes =
+            Arc::new(adxlet::routes::UdsRoutes::new(socket, Duration::from_secs(2)).unwrap());
+        routes.begin_reconcile().await.unwrap();
+        routes.finish_reconcile().await.unwrap();
+        Self {
+            routes,
+            task,
+            _directory: directory,
+        }
+    }
+}
+
+async fn coordinator_restart_uncommitted_restore(versioned_routes: bool) {
     let mut rig = Rig::new(Duration::from_millis(150)).await;
+    let relay = if versioned_routes {
+        Some(VersionedRelay::start().await)
+    } else {
+        None
+    };
+    if let Some(relay) = &relay {
+        *rig.source.backend.versioned_routes.lock().unwrap() = Some(relay.routes.clone());
+    }
     let gate = Arc::new(tokio::sync::Notify::new());
     *rig.source.backend.restore_gate.lock().unwrap() = Some(gate.clone());
     assert!(rig.resume(true).await.is_err());
