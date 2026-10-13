@@ -278,7 +278,9 @@ add(
         'metrics_listen': '127.0.0.1:17003',
         'checkpoint_dir': str(P / 'checkpoints'),
         'report_interval_seconds': 2,
-        'rpc_timeout_seconds': 20,
+        # Demand holds readiness across a 45-second checkpoint TTL. The ready
+        # deadline must outlast that hold so this case measures TTL admission.
+        'rpc_timeout_seconds': 120 if os.getenv('ADX_FC_SUITE') == 'demand' else 20,
         'execd_port': 50090,
         'execd_command': ['/usr/local/bin/adx-execd'],
         'execd_env': {},
