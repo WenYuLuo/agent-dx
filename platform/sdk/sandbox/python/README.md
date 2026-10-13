@@ -206,8 +206,40 @@ Ingress waits for the committed Running route before sending application bytes;
 passive route subscriptions and health/metrics do not wake a paused sandbox.
 Requests already sent upstream are not replayed. Transient owner RPC failures
 retry on the same owner within the resume budget. A temporary wake failure before
-forwarding returns HTTP 503. Resume waits up to 300 seconds;
-a timeout may leave the durable operation pending. If every node rejects admission,
+forwarding returns HTTP 503. A finite SDK HTTP request sends
+`X-ADX-Processing-Timeout-Ms`: authentication, route lookup, wake, route delivery,
+connection admission, forwarding and response streaming share one Ingress deadline.
+The SDK defaults to 300 seconds for a data request and adds a configurable
+communication margin (30 seconds by default) to its HTTP timeout. Without the
+header, wake and route delivery share a 300-second default; existing forwarding
+and streaming lifetimes remain unchanged. Negative invoke timeouts omit the
+header and retain unbounded application HTTP waits.
+
+If readiness is still pending when the deadline expires before application
+forwarding, Ingress returns HTTP 503 with `X-ADX-Error-Code: ENV_RESUMING`,
+`Retry-After: 1`, and a JSON `error` containing `code: ENV_RESUMING`,
+`retry: same_operation`, `outcome: not_started`, `requestForwarded: false`,
+`requestId`, and `instanceId`. The durable restore continues independently.
+SDK retries retain the request ID and body; **each allowed retry gets the same
+configured timeout plus communication margin**. Retry count is configurable via
+`ConnectionConfig.request_max_attempts` / `ADX_REQUEST_MAX_ATTEMPTS` (default 3,
+including the first data-path attempt). Known-unsent connection failures and absent
+direct routes retain their existing single control-plane fallback; `ENV_RESUMING`
+never takes that fallback. Retry-After and jitter apply between demand retries.
+Exhaustion raises `SandboxHTTPError` with the same `ENV_RESUMING` contract; callers
+can choose to try again. No sticky Ingress routing is required: replicas share the
+Coordinator intent and independently subscribe to the committed route.
+
+HTTP 504 after forwarding carries `PROCESSING_DEADLINE_EXCEEDED`, `outcome: unknown`,
+`requestForwarded: true`, and `retry: never`; it is not a safe demand retry. If
+response headers have already been delivered, deadline expiry ends the body stream
+instead. Existing idempotent invoke transport retries keep the same EXECD operation
+ID and never cross into a control-plane fallback after an unknown outcome.
+File bytes and seekable file bodies support safe demand retry. Consumed iterators
+are not replayed automatically and surface the structured error instead.
+Expired or unavailable checkpoints return HTTP 409 `ENV_UNAVAILABLE`, `retry: never`.
+
+A timeout may leave the durable operation pending. If every node rejects admission,
 rejected nodes are excluded for a 30-second capacity round before reevaluation.
 
 ## Recovery methods
@@ -362,6 +394,8 @@ connection = ConnectionConfig(
     use_tls=True,
     gateway_address="gateway.example.com:443",
     gateway_use_tls=True,
+    communication_margin_seconds=30,
+    request_max_attempts=3,
 )
 
 with Sandbox(image="python:3.12-slim", connection=connection) as sandbox:
@@ -378,7 +412,10 @@ Existing allocations remain held; this view does not report actual utilization
 or the rated capacity of admission-disabled nodes.
 
 Without a `ConnectionConfig`, the SDK reads `ADX_SERVER_ADDRESS`, `ADX_TOKEN`,
-`ADX_TLS`, `ADX_GATEWAY_ADDRESS`, and `ADX_GATEWAY_TLS`. The gateway address
+`ADX_TLS`, `ADX_GATEWAY_ADDRESS`, `ADX_GATEWAY_TLS`,
+`ADX_COMMUNICATION_MARGIN_SECONDS`, and `ADX_REQUEST_MAX_ATTEMPTS`.
+The communication margin must be finite and between 0 and 3600 seconds;
+request_max_attempts must be a positive integer. The gateway address
 defaults to the frontend address for reverse-tunnel and user-port routes. PTY
 uses the Ingress data-plane route when a gateway address is configured, and falls
 back to the server address for combined deployments.

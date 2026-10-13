@@ -1,3 +1,4 @@
+use super::processing::ProcessingDeadline;
 use crate::common::protocol::ConnectTarget;
 use crate::common::route::{
     DataPlaneAuthMode, DataPlaneSecurityMode, EnvironmentStatus, RouteInfo,
@@ -66,6 +67,10 @@ pub enum ResolveError {
     MissingEndpoint,
     #[error("route point-get is temporarily unavailable: {0}")]
     Unavailable(String),
+    #[error("environment readiness remains pending; business request was not forwarded")]
+    Resuming,
+    #[error("environment cannot resume: {0}")]
+    ResumeRejected(String),
 }
 
 #[derive(Clone)]
@@ -81,6 +86,7 @@ pub struct IngressRouteResolver {
 pub struct RouteHandle {
     /// Metadata-only handle: authenticate before asking the lifecycle owner to wake.
     pub needs_resume: bool,
+    pub processing: Option<ProcessingDeadline>,
     pub access_kind: AccessKind,
     pub relay_address: String,
     pub tenant_id: String,
@@ -133,38 +139,54 @@ impl IngressRouteResolver {
         self
     }
     pub async fn wake(&self, route: &RouteHandle) -> Result<RouteHandle, ResolveError> {
+        let deadline = route.processing.clone().unwrap_or_default();
+        deadline.waiting_resume();
         let _permit = self
             .resume_admission
             .try_acquire()
             .map_err(|_| ResolveError::Unavailable("resume wait queue is full".into()))?;
-        let runtime = self
-            .demand
-            .as_ref()
-            .ok_or(ResolveError::NotFound)?
-            .ensure_running(route)
-            .await?;
-        let mut changes = self.store.subscribe();
-        tokio::time::timeout(Duration::from_secs(300), async {
+        let ready = tokio::time::timeout_at(deadline.at, async {
+            let mut wake_route = route.clone();
+            wake_route.processing = Some(deadline.clone());
+            let runtime = self
+                .demand
+                .as_ref()
+                .ok_or(ResolveError::NotFound)?
+                .ensure_running(&wake_route)
+                .await?;
+            let mut changes = self.store.subscribe();
             loop {
+                if !self.store.ready() {
+                    return Err(ResolveError::NotReady);
+                }
                 if let Some(info) = self.store.get(&route.target.instance_id) {
                     if is_connectable(&info.environment_status) && info.sandbox_id == runtime {
-                        return self
+                        let mut ready = self
                             .resolve(
                                 &route.target.instance_id,
                                 route.target.target_port,
                                 route.access_kind,
                                 route.target.request_id.clone(),
                             )
-                            .await;
+                            .await?;
+                        ready.processing = Some(deadline.clone());
+                        return Ok(ready);
                     }
                 }
-                changes.recv().await.map_err(|_| {
-                    ResolveError::Unavailable("route subscription interrupted during resume".into())
-                })?;
+                match changes.recv().await {
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        return Err(ResolveError::Unavailable(
+                            "route subscription interrupted during resume".into(),
+                        ))
+                    }
+                }
             }
         })
         .await
-        .map_err(|_| ResolveError::Unavailable("resumed route did not arrive".into()))?
+        .map_err(|_| ResolveError::Resuming)??;
+        deadline.prepared();
+        Ok(ready)
     }
 
     pub fn with_point_getter(mut self, point_getter: Arc<dyn RoutePointGetter>) -> Self {
@@ -236,9 +258,19 @@ impl IngressRouteResolver {
                 }
             }
         };
-        tokio::time::timeout(ROUTE_ARRIVAL_WAIT, replacement)
+        let deadline = old.processing.as_ref().map_or_else(
+            || tokio::time::Instant::now() + ROUTE_ARRIVAL_WAIT,
+            |processing| {
+                processing
+                    .at
+                    .min(tokio::time::Instant::now() + ROUTE_ARRIVAL_WAIT)
+            },
+        );
+        let mut route = tokio::time::timeout_at(deadline, replacement)
             .await
-            .map_err(|_| ResolveError::Unavailable("replacement route did not arrive".into()))?
+            .map_err(|_| ResolveError::Unavailable("replacement route did not arrive".into()))??;
+        route.processing = old.processing.clone();
+        Ok(route)
     }
 
     async fn subscribed_route(&self, instance_id: &str) -> Result<RouteInfo, ResolveError> {
@@ -322,6 +354,7 @@ impl IngressRouteResolver {
         let port_forward_auth_mode = route.port_forward_auth_mode(target_port);
         Ok(RouteHandle {
             needs_resume: false,
+            processing: None,
             access_kind,
             relay_address: route.relay_address,
             tenant_id: route.tenant_id,

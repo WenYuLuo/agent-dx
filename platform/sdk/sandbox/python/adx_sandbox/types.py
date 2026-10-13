@@ -1,4 +1,5 @@
 import ipaddress
+import math
 import os
 import re
 from dataclasses import dataclass, field
@@ -144,8 +145,15 @@ class ConnectionConfig:
     gateway_use_tls: bool = False
     verify_tls: bool = False
     token_provider: Optional[Callable[[], str]] = field(default=None, repr=False)
+    communication_margin_seconds: float = ADX_GET_TIMEOUT_BUFFER
+    request_max_attempts: int = 3
 
     def __post_init__(self) -> None:
+        if isinstance(self.request_max_attempts, bool) or not isinstance(self.request_max_attempts, int) or self.request_max_attempts < 1:
+            raise ValueError("request_max_attempts must be a positive integer")
+        margin = self.communication_margin_seconds
+        if isinstance(margin, bool) or not isinstance(margin, (int, float)) or not math.isfinite(margin) or not 0 <= margin <= 3600:
+            raise ValueError("communication_margin_seconds must be finite and between 0 and 3600")
         for field_name in ("server_address", "token"):
             value = getattr(self, field_name)
             if not isinstance(value, str) or not value.strip():
@@ -199,6 +207,8 @@ class ConnectionConfig:
             gateway_address=gateway_address or None,
             gateway_use_tls=_connection_env_flag("ADX_GATEWAY_TLS", False),
             verify_tls=verify_tls,
+            communication_margin_seconds=float(os.environ.get("ADX_COMMUNICATION_MARGIN_SECONDS", str(ADX_GET_TIMEOUT_BUFFER))),
+            request_max_attempts=int(os.environ.get("ADX_REQUEST_MAX_ATTEMPTS", "3")),
         )
 
 

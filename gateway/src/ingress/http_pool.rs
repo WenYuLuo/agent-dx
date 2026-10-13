@@ -226,6 +226,12 @@ impl BackendHttpPool {
             Err(error) => return Err((error, Some(request))),
         };
         let request_allows_reuse = !has_connection_close(request.headers());
+        if let Some(processing) = request
+            .extensions()
+            .get::<super::processing::ProcessingDeadline>()
+        {
+            processing.forwarded();
+        }
         let response = sender
             .send_request(request)
             .await

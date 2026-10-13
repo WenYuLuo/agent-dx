@@ -5,6 +5,7 @@ pub mod coordinator_routes;
 pub mod http_pool;
 pub mod path;
 pub mod pool;
+pub mod processing;
 pub mod resolver;
 pub mod reverse_proxy;
 pub mod route_store;

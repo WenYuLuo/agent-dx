@@ -157,6 +157,7 @@ impl crate::ingress::resolver::DemandResolver for ProbeDemand {
     ) -> Result<RouteHandle, ResolveError> {
         Ok(RouteHandle {
             needs_resume: self.paused,
+            processing: None,
             access_kind: kind,
             relay_address: self.relay.clone(),
             tenant_id: "tenant".into(),

@@ -1028,6 +1028,16 @@ async fn adxlet_restart_cleans_an_uncommitted_restore_before_retrying() {
 #[tokio::test]
 #[ignore = "requires dedicated real Redis"]
 async fn first_traffic_through_multiple_real_ingress_instances_wakes_and_forwards() {
+    multiple_ingress_traffic(false).await;
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis"]
+async fn timed_out_http_requests_retry_through_other_ingress_replicas_and_restore_once() {
+    multiple_ingress_traffic(true).await;
+}
+
+async fn multiple_ingress_traffic(timeout_retry: bool) {
     use data_plane_gateway::{
         common::protocol::GatewayPolicy,
         ingress::{
@@ -1051,10 +1061,43 @@ async fn first_traffic_through_multiple_real_ingress_instances_wakes_and_forward
         .unwrap();
     let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = backend.local_addr().unwrap().port();
+    let executions = Arc::new(Mutex::new(BTreeMap::<String, usize>::new()));
+    let counted = executions.clone();
     let echo = tokio::spawn(async move {
         loop {
             let (mut socket, _) = backend.accept().await.unwrap();
+            let counted = counted.clone();
             tokio::spawn(async move {
+                if timeout_retry {
+                    let mut request = Vec::new();
+                    let mut byte = [0; 1];
+                    while !request.ends_with(b"\r\n\r\n") {
+                        if socket.read_exact(&mut byte).await.is_err() {
+                            return;
+                        }
+                        request.extend_from_slice(&byte);
+                    }
+                    let request = String::from_utf8(request).unwrap();
+                    assert!(!request
+                        .to_ascii_lowercase()
+                        .contains("x-adx-processing-timeout-ms"));
+                    let id = request
+                        .lines()
+                        .find_map(|line| {
+                            line.split_once(':')
+                                .filter(|(key, _)| key.eq_ignore_ascii_case("x-adx-request-id"))
+                                .map(|(_, value)| value.trim())
+                        })
+                        .unwrap()
+                        .to_owned();
+                    *counted.lock().unwrap().entry(id.clone()).or_default() += 1;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{id}",
+                        id.len()
+                    );
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                    return;
+                }
                 let (mut read, mut write) = socket.split();
                 let _ = tokio::io::copy(&mut read, &mut write).await;
             });
@@ -1121,20 +1164,23 @@ async fn first_traffic_through_multiple_real_ingress_instances_wakes_and_forward
                 .stream_only()
                 .with_demand_resolver(connection.clone()),
         );
-        ingresses.push(Arc::new(Ingress::new(
-            resolver,
-            DataPlaneL4Connector::new(H2PoolConfig {
-                tls_config: None,
-                connections_per_node: 1,
-                max_connections_per_node: 1,
-                ..Default::default()
-            }),
-            IngressAuthenticator::with_verifier(connection),
-            port,
-            8765,
-            "127.0.0.1:1",
-            vec![],
-        )));
+        ingresses.push(Arc::new(
+            Ingress::new(
+                resolver,
+                DataPlaneL4Connector::new(H2PoolConfig {
+                    tls_config: None,
+                    connections_per_node: 1,
+                    max_connections_per_node: 1,
+                    ..Default::default()
+                }),
+                IngressAuthenticator::with_verifier(connection),
+                port,
+                8765,
+                "127.0.0.1:1",
+                vec![],
+            )
+            .with_client_acl(vec!["127.0.0.0/8".parse().unwrap()], false),
+        ));
     }
     let mut requests = Vec::new();
     assert!(ingresses[0]
@@ -1147,30 +1193,92 @@ async fn first_traffic_through_multiple_real_ingress_instances_wakes_and_forward
         )
         .await
         .is_err());
-    assert_eq!(rig.source.backend.restored.load(Ordering::SeqCst), 0);
-    for ingress in ingresses {
-        requests.push(tokio::spawn(async move {
-            let mut stream = ingress
-                .open_l4_stream(
-                    "sleep",
-                    port,
-                    AccessKind::Direct,
-                    KEY,
-                    "first-business-request".into(),
-                )
+    assert!(rig.source.backend.restored.load(Ordering::SeqCst) <= 1);
+    if timeout_retry {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        *rig.source.backend.restore_gate.lock().unwrap() = Some(gate.clone());
+        for i in 0..12 {
+            let ingress = ingresses[i % 3].clone();
+            requests.push(tokio::spawn(async move {
+                let response =
+                    ingress_http_attempt(ingress, port, KEY, &format!("logical-{i}"), 1000).await;
+                assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+                assert!(response.contains("ENV_RESUMING"), "{response}");
+                assert!(
+                    response.contains("\"requestForwarded\":false"),
+                    "{response}"
+                );
+            }));
+        }
+        for request in requests.drain(..) {
+            request.await.unwrap();
+        }
+        assert!(
+            executions.lock().unwrap().is_empty(),
+            "timed-out requests must not reach the backend"
+        );
+        let intent = rig.session.get("sleep").await.unwrap().resume.unwrap();
+        assert!(!intent.local_rejected);
+        assert_eq!(rig.source.backend.restored.load(Ordering::SeqCst), 1);
+        for i in 0..12 {
+            // Every retry uses a different replica and the same timeout configured
+            // for both HTTP attempts; each gateway has its own route store and pool.
+            let ingress = ingresses[(i + 1) % 3].clone();
+            requests.push(tokio::spawn(async move {
+                let response =
+                    ingress_http_attempt(ingress, port, KEY, &format!("logical-{i}"), 1000).await;
+                assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+                assert!(response.ends_with(&format!("logical-{i}")), "{response}");
+            }));
+        }
+        // Retries are already waiting on other replicas while the original
+        // physical restore is still gated. They must join its durable intent.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(executions.lock().unwrap().is_empty());
+        assert_eq!(
+            rig.session
+                .get("sleep")
                 .await
+                .unwrap()
+                .resume
+                .unwrap()
+                .operation_id,
+            intent.operation_id
+        );
+        assert_eq!(rig.source.backend.restored.load(Ordering::SeqCst), 1);
+        gate.notify_one();
+        for request in requests.drain(..) {
+            request.await.unwrap();
+        }
+        assert!(rig.session.get("sleep").await.unwrap().resume.is_none());
+        let counts = executions.lock().unwrap();
+        assert_eq!(counts.len(), 12);
+        assert!(counts.values().all(|count| *count == 1));
+    } else {
+        for ingress in ingresses {
+            requests.push(tokio::spawn(async move {
+                let mut stream = ingress
+                    .open_l4_stream(
+                        "sleep",
+                        port,
+                        AccessKind::Direct,
+                        KEY,
+                        "first-business-request".into(),
+                    )
+                    .await
+                    .unwrap();
+                stream.write_all(b"resume-then-forward").await.unwrap();
+                let mut response = [0u8; 19];
+                stream.read_exact(&mut response).await.unwrap();
+                assert_eq!(&response, b"resume-then-forward");
+            }));
+        }
+        for request in requests {
+            tokio::time::timeout(Duration::from_secs(5), request)
+                .await
+                .unwrap()
                 .unwrap();
-            stream.write_all(b"resume-then-forward").await.unwrap();
-            let mut response = [0u8; 19];
-            stream.read_exact(&mut response).await.unwrap();
-            assert_eq!(&response, b"resume-then-forward");
-        }));
-    }
-    for request in requests {
-        tokio::time::timeout(Duration::from_secs(5), request)
-            .await
-            .unwrap()
-            .unwrap();
+        }
     }
     assert_eq!(rig.source.backend.restored.load(Ordering::SeqCst), 1);
     assert_eq!(rig.target.backend.restored.load(Ordering::SeqCst), 0);
@@ -1180,6 +1288,60 @@ async fn first_traffic_through_multiple_real_ingress_instances_wakes_and_forward
     publisher.abort();
     relay_task.abort();
     echo.abort();
+}
+
+async fn ingress_http_attempt(
+    ingress: Arc<data_plane_gateway::ingress::Ingress>,
+    port: u16,
+    key: &str,
+    request_id: &str,
+    timeout_ms: u64,
+) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let cert = include_bytes!("../../../gateway/tests/fixtures/ingress-cert.pem");
+    let key_pem = include_bytes!("../../../gateway/tests/fixtures/ingress-key.pem");
+    let certificates = rustls_pemfile::certs(&mut &cert[..])
+        .collect::<std::io::Result<Vec<_>>>()
+        .unwrap();
+    let private_key = rustls_pemfile::private_key(&mut &key_pem[..])
+        .unwrap()
+        .unwrap();
+    let server = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certificates.clone(), private_key)
+        .unwrap();
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in certificates {
+        roots.add(cert).unwrap();
+    }
+    let client = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (shutdown, stopped) = tokio::sync::watch::channel(false);
+    let service = tokio::spawn(ingress.serve_http_tls(
+        listener,
+        tokio_rustls::TlsAcceptor::from(Arc::new(server)),
+        stopped,
+    ));
+    let socket = tokio::net::TcpStream::connect(address).await.unwrap();
+    let mut socket = tokio_rustls::TlsConnector::from(Arc::new(client))
+        .connect(
+            rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+            socket,
+        )
+        .await
+        .unwrap();
+    socket.write_all(format!("POST /sleep/{port}/invoke HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {key}\r\nX-ADX-Request-ID: {request_id}\r\nX-ADX-Processing-Timeout-Ms: {timeout_ms}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), socket.read_to_end(&mut response))
+        .await
+        .unwrap()
+        .unwrap();
+    shutdown.send(true).unwrap();
+    service.await.unwrap().unwrap();
+    String::from_utf8(response).unwrap()
 }
 
 #[tokio::test]

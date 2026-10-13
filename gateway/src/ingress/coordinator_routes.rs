@@ -374,6 +374,7 @@ impl super::resolver::DemandResolver for CoordinatorConnection {
             .is_some_and(|s| s.ports.contains(&u32::from(port)));
         Ok(RouteHandle {
             needs_resume: true,
+            processing: None,
             access_kind: kind,
             relay_address: owner.relay_address,
             tenant_id: spec.tenant_id.clone(),
@@ -406,23 +407,36 @@ impl super::resolver::DemandResolver for CoordinatorConnection {
             .map_err(|_| ResolveError::NotReady)?
             .clone()
             .ok_or(ResolveError::NotReady)?;
-        let owner = tokio::time::timeout(
-            Duration::from_secs(300),
-            pb::coordinator_service_client::CoordinatorServiceClient::new(channel).ensure_running(
-                pb::EnsureRunningRequest {
-                    expected_runtime_id: route.target.workload_id.clone(),
-                    environment_id: route.target.instance_id.clone(),
-                    caller: Some(pb::CallerContext {
-                        tenant_id: route.tenant_id.clone(),
-                        administrator: false,
-                    }),
-                    timeout_seconds: 300,
-                },
-            ),
+        let deadline = route.processing.clone().unwrap_or_default();
+        let mut request = tonic::Request::new(pb::EnsureRunningRequest {
+            expected_runtime_id: route.target.workload_id.clone(),
+            environment_id: route.target.instance_id.clone(),
+            caller: Some(pb::CallerContext {
+                tenant_id: route.tenant_id.clone(),
+                administrator: false,
+            }),
+            timeout_seconds: deadline.remaining().as_secs().saturating_add(1).min(3600),
+        });
+        request.set_timeout(deadline.remaining());
+        let owner = tokio::time::timeout_at(
+            deadline.at,
+            pb::coordinator_service_client::CoordinatorServiceClient::new(channel)
+                .ensure_running(request),
         )
         .await
-        .map_err(|_| ResolveError::Unavailable("traffic resume timed out".into()))?
-        .map_err(|e| ResolveError::Unavailable(e.to_string()))?
+        .map_err(|_| ResolveError::Resuming)?
+        .map_err(|e| match e.code() {
+            // Tonic may report its grpc-timeout expiry as Cancelled. This RPC
+            // carries wake demand only; neither status means business bytes were sent.
+            tonic::Code::DeadlineExceeded | tonic::Code::Cancelled => ResolveError::Resuming,
+            tonic::Code::InvalidArgument | tonic::Code::FailedPrecondition => {
+                ResolveError::ResumeRejected(e.message().to_owned())
+            }
+            tonic::Code::NotFound
+            | tonic::Code::PermissionDenied
+            | tonic::Code::Unauthenticated => ResolveError::NotFound,
+            _ => ResolveError::Unavailable(e.to_string()),
+        })?
         .into_inner();
         let record = owner
             .record
