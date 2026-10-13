@@ -51,7 +51,7 @@ impl Controller {
             .checkpoint
             .as_ref()
             .ok_or_else(|| Error::Unavailable("reload recovery point is unavailable".into()))?;
-        if checkpoint.expires_at_unix_seconds <= now()? {
+        if checkpoint.expired(now()?) {
             return Err(Error::Invalid("reload recovery point expired".into()));
         }
         self.services
@@ -102,12 +102,7 @@ impl Controller {
     }
 
     pub(super) async fn expire_checkpoint(&mut self, now: u64) -> Result<Option<OperationResult>> {
-        let Some(cp) = self
-            .record
-            .checkpoint
-            .clone()
-            .filter(|cp| cp.expires_at_unix_seconds <= now)
-        else {
+        let Some(cp) = self.record.checkpoint.clone().filter(|cp| cp.expired(now)) else {
             return Ok(None);
         };
         if self.record.state == EnvironmentState::Paused {
@@ -170,17 +165,13 @@ impl Controller {
         if self.record.state != EnvironmentState::Running {
             return Err(Error::Conflict);
         }
-        if request.ttl_seconds == 0
-            || request.timeout_seconds == 0
-            || request.timeout_seconds > 3600
-        {
+        request.retention.validate()?;
+        if request.timeout_seconds == 0 || request.timeout_seconds > 3600 {
             return Err(Error::Invalid(
                 "positive checkpoint TTL and timeout (at most 3600 seconds) required".into(),
             ));
         }
-        let expires_at = now()?
-            .checked_add(request.ttl_seconds)
-            .ok_or_else(|| Error::Invalid("checkpoint TTL overflow".into()))?;
+        let expires_at = request.retention.expires_at(now()?)?;
         let services = self
             .services
             .checkpoint
@@ -370,9 +361,7 @@ impl Controller {
             id: request.operation_id.clone(),
             artifact,
             // Retention starts after the storage publication, including remote upload.
-            expires_at_unix_seconds: now()?
-                .checked_add(request.ttl_seconds)
-                .ok_or_else(|| Error::Invalid("checkpoint TTL overflow".into()))?,
+            expires_at_unix_seconds: request.retention.expires_at(now()?)?,
             source_runtime_id: self.record.runtime.id.clone(),
         });
         self.transition(Event::Checkpointed)?;
@@ -476,7 +465,7 @@ impl Controller {
             return Err(Error::Conflict);
         }
         let cp = self.record.checkpoint.clone().ok_or(Error::Conflict)?;
-        if cp.expires_at_unix_seconds <= now()? {
+        if cp.expired(now()?) {
             return Err(Error::Invalid("checkpoint expired".into()));
         }
         let services = self.services.checkpoint.clone().ok_or(Error::Conflict)?;

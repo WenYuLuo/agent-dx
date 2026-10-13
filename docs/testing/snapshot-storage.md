@@ -35,8 +35,11 @@ adxlet 可使用原来的 `checkpoint_dir`，或显式选择 `checkpoint_storage
 | shared | 必须上传到配置的对象存储，否则拒绝 | 支持同别名的兼容节点 |
 
 该策略用于手动/自动 pause 和 workload checkpoint；它不替代可复用 Snapshot 目录。
+`pauseOptions.retention` 接受有限 TTL 或显式永久保留；永久暂停点在 Redis/RPC 中的
+过期时间为空，经过期扫描、对账或节点失效仍保持休眠。显式删除或替换时释放引用，
+实际制品清理继续遵守存储引用及孤儿回收契约。
 OBS 使用既有 S3 兼容适配器和标准凭据配置，上面的 endpoint 是配置示例。
-本次新增按流量恢复未运行真实 OBS/Firecracker 验收。节点注册自动携带
+真实 OBS/Firecracker 验证入口和运行边界见[跨节点验收说明](firecracker-cross-node.md)。节点注册自动携带
 `ADX_CHECKPOINT_STORAGE=<alias>`，shared 创建过滤掉 local 节点，恢复目标必须匹配
 制品存储别名及原有运行时/放置约束；别名相同须由部署保证指向同一 bucket/prefix。
 

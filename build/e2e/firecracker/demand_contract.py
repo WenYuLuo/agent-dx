@@ -11,6 +11,7 @@ CASES = (
     'expired checkpoint rejects traffic without execution',
     'restore admitted before TTL completes after TTL',
     'committed resume response lost and retry reuses execution',
+    'permanent pause survives restarts and traffic restores across nodes',
 )
 
 
@@ -39,3 +40,10 @@ def verify(result):
     cut = by_name[CASES[9]]
     if cut.get('same_execution') is not True or cut.get('attempts', 0) < 2 or cut.get('commit_before_cut') is not True:
         raise ValueError('missing committed response-loss retry evidence')
+    permanent = by_name[CASES[10]]
+    if (permanent.get('automatic_expiry', 0) is not None or permanent.get('manual_expiry', 0) is not None
+            or permanent.get('dormant_after_coordinator_restart') is not True
+            or permanent.get('traffic_after_manual_pause') is not True or permanent.get('continuity') is not True
+            or permanent.get('target') != 'node2' or permanent.get('epoch_after', 0) <= permanent.get('epoch_before', 0)
+            or not permanent.get('session_after') or permanent.get('session_after') == permanent.get('session_before')):
+        raise ValueError('missing permanent retention restart and traffic evidence')

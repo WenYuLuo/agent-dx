@@ -26,7 +26,7 @@ image = sys.argv[2]
 base = Path(os.environ['ADX_FC_BASE'])
 evidence = root / 'evidence'
 os.environ['SSL_CERT_FILE'] = str(root / 'secrets/tls/ca.pem')
-from adx_sandbox import ConnectionConfig, PausePolicy, Sandbox
+from adx_sandbox import RetentionPolicy, IdleAction, CheckpointStorage, ConnectionConfig, PausePolicy, Sandbox
 from adx_sandbox._transport import SandboxClient
 
 connection = ConnectionConfig(server_address='127.0.0.1:8443', token=(root / 'secrets/api-key').read_text().strip(), use_tls=True, verify_tls=True)
@@ -115,11 +115,11 @@ def command(sandbox, text):
     return output.stdout.strip()
 
 
-def create(idle=0, ttl=900):
+def create(idle=0, ttl=900, retention=None):
     sandbox = Sandbox(image=image, runtime='firecracker', cpu=1000, memory=128, storage_mb=32,
                       env={'PYTHONDONTWRITEBYTECODE': '1'}, idle_timeout=idle,
-                      idle_action='pause' if idle else 'delete', pause_policy=PausePolicy(ttl_seconds=ttl, timeout_seconds=1800, storage='shared'),
-                      auto_resume=True, port_forwardings=[8088], connection=connection, create_timeout=180,
+                      idle_action=IdleAction.PAUSE if idle else IdleAction.DELETE, pause_policy=PausePolicy(retention=retention or RetentionPolicy.for_seconds(ttl), timeout_seconds=1800, storage=CheckpointStorage.SHARED),
+                      port_forwardings=[8088], connection=connection, create_timeout=180,
                       schedule_affinities=[{'kind': 0, 'affinity': 0, 'weight': 1000,
                                             'labelOps': [{'type': 0, 'labelKey': 'NODE_ID', 'labelValues': ['node1']}]}])
     sandboxes.append(sandbox)
@@ -219,7 +219,7 @@ def return_source(source, manager):
 def restart_case(index, role):
     sandbox = create()
     baseline = request(sandbox)
-    sandbox.pause(ttl_seconds=900, timeout_seconds=1800)
+    sandbox.pause(retention=RetentionPolicy.for_seconds(900), timeout_seconds=1800)
     paused(sandbox)
     source, manager = stop_source(sandbox)
     target = 'node2'
@@ -351,7 +351,7 @@ try:
 
     sandbox = create()
     baseline = request(sandbox)
-    sandbox.pause(ttl_seconds=900, timeout_seconds=1800)
+    sandbox.pause(retention=RetentionPolicy.for_seconds(900), timeout_seconds=1800)
     old = paused(sandbox)
     futures = [executor.submit(request, sandbox, 'concurrent-' + str(i)) for i in range(12)]
     responses = [future.result(2100) for future in futures]
@@ -365,7 +365,7 @@ try:
 
     sandbox = create()
     baseline = request(sandbox)
-    sandbox.pause(ttl_seconds=900, timeout_seconds=1800)
+    sandbox.pause(retention=RetentionPolicy.for_seconds(900), timeout_seconds=1800)
     old = paused(sandbox)
     source, manager = stop_source(sandbox)
     time.sleep(4)
@@ -386,7 +386,7 @@ try:
 
     sandbox = create()
     request(sandbox)
-    pause = sandbox.pause(ttl_seconds=20, timeout_seconds=1800)
+    pause = sandbox.pause(retention=RetentionPolicy.for_seconds(20), timeout_seconds=1800)
     paused(sandbox)
     source, manager = stop_source(sandbox)
     wait(lambda: time.time() >= pause.expires_at + 1)
@@ -404,7 +404,7 @@ try:
 
     sandbox = create()
     baseline = request(sandbox)
-    pause = sandbox.pause(ttl_seconds=15, timeout_seconds=1800)
+    pause = sandbox.pause(retention=RetentionPolicy.for_seconds(15), timeout_seconds=1800)
     paused(sandbox)
     blocked = block('node1', 50090)
     try:
@@ -431,7 +431,7 @@ try:
 
     sandbox = create()
     baseline = request(sandbox)
-    sandbox.pause(ttl_seconds=900, timeout_seconds=1800)
+    sandbox.pause(retention=RetentionPolicy.for_seconds(900), timeout_seconds=1800)
     paused(sandbox)
 
     def committed():
@@ -458,6 +458,42 @@ try:
         after = request(sandbox)
         continuity(baseline, after)
         pass_case(9, instance_id=sandbox.id, attempts=len(proxy.attempts), same_execution=same, commit_before_cut=proxy.commit['committed_at'] <= proxy.commit['reply_cut_at'], cut=proxy.commit, after_retry=after_commit)
+    delete(sandbox)
+    sandbox = create(idle=5, retention=RetentionPolicy.forever())
+    baseline = request(sandbox)
+    permanent = paused(sandbox)
+    if permanent['result']['checkpoint']['expires_at_unix_seconds'] is not None:
+        raise AssertionError('automatic permanent pause has an expiry')
+    source, manager = stop_source(sandbox)
+    epoch = catalog()['header']['epoch']
+    os.kill(pid(root, 'coordinator'), signal.SIGKILL)
+    wait(lambda: catalog()['header']['epoch'] > epoch)
+    dormant = record(sandbox)
+    if dormant['result']['state'] != 'Paused' or dormant.get('resume') or inventory('node2'):
+        raise AssertionError('permanent pause woke during Coordinator restart')
+    after = request(sandbox)
+    continuity(baseline, after)
+    return_source(source, manager)
+    target = record(sandbox)['assignment']['node_id']
+    if target != 'node2':
+        raise AssertionError('permanent snapshot did not restore across nodes')
+    manual = sandbox.pause(retention=RetentionPolicy.forever(), timeout_seconds=1800)
+    if manual.expires_at is not None:
+        raise AssertionError('manual permanent pause has an expiry')
+    kept = paused(sandbox)
+    session = catalog()['node:' + target]['session']['id']
+    os.kill(pid(root / target, 'adxlet'), signal.SIGKILL)
+    wait(lambda: catalog()['node:' + target]['session']['id'] != session)
+    wait(lambda: catalog()['node:' + target]['session']['routable'])
+    current = record(sandbox)
+    if current['result']['state'] != 'Paused' or current['result']['checkpoint'] != kept['result']['checkpoint'] or inventory(target):
+        raise AssertionError('permanent pause changed during adxlet restart')
+    after_restart = request(sandbox)
+    continuity(baseline, after_restart)
+    pass_case(10, instance_id=sandbox.id, automatic_expiry=None, manual_expiry=manual.expires_at,
+              dormant_after_coordinator_restart=True, epoch_before=epoch, epoch_after=catalog()['header']['epoch'],
+              session_before=session, session_after=catalog()['node:' + target]['session']['id'],
+              target=target, traffic_after_manual_pause=True, continuity=True)
     delete(sandbox)
     result['status'] = 'passed'
 except BaseException as error:

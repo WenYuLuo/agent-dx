@@ -493,7 +493,7 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
         caller: caller(),
         operation_id: "pause-auth".into(),
         expected_revision: 2,
-        ttl_seconds: 600,
+        retention: Some(adx_core::lifecycle::RetentionPolicy::Ttl { ttl_seconds: 600 }.into()),
         timeout_seconds: 60,
     };
     assert_eq!(
@@ -2729,7 +2729,7 @@ async fn shared_checkpoint_moves_to_new_node_and_old_node_cleans_without_deletin
         checkpoint: Some(RestorePoint {
             id: "pause".into(),
             artifact: artifact.clone(),
-            expires_at_unix_seconds: u64::MAX,
+            expires_at_unix_seconds: None,
             source_runtime_id: "held-1".into(),
             origin: None,
         }),

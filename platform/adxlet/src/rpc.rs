@@ -319,7 +319,13 @@ impl pb::node_service_server::NodeService for NodeRpc {
                         .pause(crate::checkpoint::PauseRequest {
                             operation_id: r.operation_id,
                             expected_revision: r.expected_revision,
-                            ttl_seconds: r.ttl_seconds,
+                            retention: r
+                                .retention
+                                .ok_or_else(|| {
+                                    Status::invalid_argument("pause retention required")
+                                })?
+                                .try_into()
+                                .map_err(status)?,
                             timeout_seconds: r.timeout_seconds,
                         })
                         .await

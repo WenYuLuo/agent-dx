@@ -30,8 +30,6 @@ struct Create {
     idle_action: adx_core::lifecycle::IdleAction,
     #[serde(rename = "pauseOptions")]
     pause: Option<Pause>,
-    #[serde(rename = "autoResume")]
-    auto_resume: bool,
     #[serde(rename = "restartPolicy")]
     restart: Option<Restart>,
     #[serde(rename = "scheduleAffinities")]
@@ -70,7 +68,7 @@ struct Restart {
 #[derive(Deserialize)]
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 struct Pause {
-    ttl_seconds: u64,
+    retention: Retention,
     timeout_seconds: u64,
     storage: adx_core::lifecycle::CheckpointStorage,
 }
@@ -78,11 +76,59 @@ impl Default for Pause {
     fn default() -> Self {
         let p = adx_core::lifecycle::PausePolicy::default();
         Self {
-            ttl_seconds: p.ttl_seconds,
+            retention: p.retention.into(),
             timeout_seconds: p.timeout_seconds,
             storage: p.storage,
         }
     }
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum Retention {
+    Ttl {
+        #[serde(rename = "ttlSeconds")]
+        ttl_seconds: u64,
+    },
+    Forever,
+}
+impl From<adx_core::lifecycle::RetentionPolicy> for Retention {
+    fn from(value: adx_core::lifecycle::RetentionPolicy) -> Self {
+        match value {
+            adx_core::lifecycle::RetentionPolicy::Ttl { ttl_seconds } => Self::Ttl { ttl_seconds },
+            adx_core::lifecycle::RetentionPolicy::Forever => Self::Forever,
+        }
+    }
+}
+impl From<Retention> for adx_core::lifecycle::RetentionPolicy {
+    fn from(value: Retention) -> Self {
+        match value {
+            Retention::Ttl { ttl_seconds } => Self::Ttl { ttl_seconds },
+            Retention::Forever => Self::Forever,
+        }
+    }
+}
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+struct PauseRequest {
+    retention: Option<Retention>,
+    timeout_seconds: Option<u64>,
+}
+pub fn pause_retention(
+    body: &Value,
+    default: adx_core::lifecycle::RetentionPolicy,
+) -> Result<adx_core::lifecycle::RetentionPolicy, Status> {
+    let request: PauseRequest =
+        serde_json::from_value(body.clone()).map_err(|_| invalid("invalid pause request"))?;
+    if request
+        .timeout_seconds
+        .is_some_and(|seconds| seconds == 0 || seconds > 3600)
+    {
+        return Err(invalid("pause timeout must be from 1 through 3600 seconds"));
+    }
+    let retention = request.retention.map_or(default, Into::into);
+    retention.validate().map_err(|e| invalid(&e.to_string()))?;
+    Ok(retention)
 }
 #[derive(Default, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -535,9 +581,8 @@ pub fn create_spec_with_environment(
     let lifecycle = adx_core::lifecycle::LifecyclePolicy {
         idle_timeout_seconds: r.idle as u64,
         idle_action: r.idle_action,
-        auto_resume: r.auto_resume,
         pause: r.pause.as_ref().map(|p| adx_core::lifecycle::PausePolicy {
-            ttl_seconds: p.ttl_seconds,
+            retention: p.retention.into(),
             timeout_seconds: p.timeout_seconds,
             storage: p.storage,
         }),
@@ -793,9 +838,8 @@ pub fn create_spec_with_environment(
                 adx_core::lifecycle::IdleAction::Delete => 0,
                 adx_core::lifecycle::IdleAction::Pause => 1,
             },
-            auto_resume: r.auto_resume,
             pause: r.pause.map(|p| pb::PausePolicy {
-                ttl_seconds: p.ttl_seconds,
+                retention: Some(adx_core::lifecycle::RetentionPolicy::from(p.retention).into()),
                 timeout_seconds: p.timeout_seconds,
                 storage: match p.storage {
                     adx_core::lifecycle::CheckpointStorage::Configured => 0,

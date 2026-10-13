@@ -14,7 +14,7 @@ impl StoredEnvironment {
         record
             .checkpoint
             .as_ref()
-            .filter(|cp| cp.artifact.storage != "local" && cp.expires_at_unix_seconds > now)
+            .filter(|cp| cp.artifact.storage != "local" && !cp.expired(now))
     }
     pub fn recovery_point(&self, now: u64) -> Option<&adx_core::RestorePoint> {
         if !self.invalidated {
@@ -27,7 +27,7 @@ impl StoredEnvironment {
         record
             .checkpoint
             .as_ref()
-            .filter(|cp| cp.artifact.storage != "local" && cp.expires_at_unix_seconds > now)
+            .filter(|cp| cp.artifact.storage != "local" && !cp.expired(now))
     }
 }
 impl Session {

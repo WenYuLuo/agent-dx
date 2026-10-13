@@ -15,7 +15,7 @@ use std::{
 pub struct PauseRequest {
     pub operation_id: String,
     pub expected_revision: u64,
-    pub ttl_seconds: u64,
+    pub retention: adx_core::lifecycle::RetentionPolicy,
     pub timeout_seconds: u64,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -53,7 +53,7 @@ service_impl!(pb::coordinator_service_server::CoordinatorService, {
     async fn ensure_running(&self, request: Request<pb::EnsureRunningRequest>) -> Result<Response<pb::GetEnvironmentResponse>, Status> {
         assert_eq!(request.get_ref().environment_id, "environment");
         assert_eq!(request.get_ref().caller.as_ref().unwrap().tenant_id, "tenant");
-        assert!(!request.get_ref().traffic);
+        assert_eq!(request.get_ref().timeout_seconds, 300);
         let mut state = self.0.lock().unwrap();
         state.resumes += 1;
         if state.lookup_unavailable { return Err(Status::unavailable("coordinator unavailable")); }

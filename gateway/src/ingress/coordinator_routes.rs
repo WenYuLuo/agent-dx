@@ -344,7 +344,6 @@ impl super::resolver::DemandResolver for CoordinatorConnection {
         let record = owner.record.ok_or(ResolveError::NotFound)?;
         let spec = record.spec.as_ref().ok_or(ResolveError::NotFound)?;
         if !matches!(record.state, s if s == pb::EnvironmentState::Paused as i32 || s == pb::EnvironmentState::Running as i32)
-            || !spec.lifecycle.as_ref().is_some_and(|p| p.auto_resume)
         {
             return Err(ResolveError::NotFound);
         }
@@ -417,7 +416,6 @@ impl super::resolver::DemandResolver for CoordinatorConnection {
                         tenant_id: route.tenant_id.clone(),
                         administrator: false,
                     }),
-                    traffic: true,
                     timeout_seconds: 300,
                 },
             ),

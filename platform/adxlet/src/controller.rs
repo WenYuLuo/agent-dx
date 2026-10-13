@@ -513,7 +513,7 @@ impl Controller {
             let cp = self.record.checkpoint.clone().ok_or(Error::Conflict)?;
             let services = self.services.checkpoint.clone().ok_or(Error::Conflict)?;
             self.cleanup().await?;
-            if cp.expires_at_unix_seconds <= super::checkpoint::now()? {
+            if cp.expired(super::checkpoint::now()?) {
                 return self.delete().await;
             }
             match services.store.validate_artifact(&cp.artifact).await {

@@ -299,7 +299,7 @@ impl TryFrom<control::RestorePoint> for adx_core::RestorePoint {
             .ok_or_else(|| Error::Invalid("checkpoint artifact required".into()))?;
         if v.id.is_empty()
             || v.source_runtime_id.is_empty()
-            || v.expires_at_unix_seconds == 0
+            || v.expires_at_unix_seconds == Some(0)
             || a.storage.is_empty()
             || a.location.is_empty()
             || a.size_bytes == 0
@@ -365,12 +365,14 @@ impl TryFrom<control::LifecyclePolicy> for adx_core::lifecycle::LifecyclePolicy 
                 1 => IdleAction::Pause,
                 _ => return Err(Error::Invalid("invalid idle action".into())),
             },
-            auto_resume: v.auto_resume,
             pause: v
                 .pause
                 .map(|p| {
                     Ok(PausePolicy {
-                        ttl_seconds: p.ttl_seconds,
+                        retention: p
+                            .retention
+                            .ok_or_else(|| Error::Invalid("pause retention required".into()))?
+                            .try_into()?,
                         timeout_seconds: p.timeout_seconds,
                         storage: match p.storage {
                             0 => CheckpointStorage::Configured,
@@ -399,9 +401,8 @@ impl From<adx_core::lifecycle::LifecyclePolicy> for control::LifecyclePolicy {
                 adx_core::lifecycle::IdleAction::Delete => 0,
                 adx_core::lifecycle::IdleAction::Pause => 1,
             },
-            auto_resume: v.auto_resume,
             pause: v.pause.map(|p| control::PausePolicy {
-                ttl_seconds: p.ttl_seconds,
+                retention: Some(p.retention.into()),
                 timeout_seconds: p.timeout_seconds,
                 storage: match p.storage {
                     adx_core::lifecycle::CheckpointStorage::Configured => 0,
@@ -446,3 +447,30 @@ pub mod runtime {
     tonic::include_proto!("adx.runtime.v1");
 }
 pub mod runtime_stream;
+
+impl TryFrom<control::RetentionPolicy> for adx_core::lifecycle::RetentionPolicy {
+    type Error = Error;
+    fn try_from(value: control::RetentionPolicy) -> Result<Self> {
+        use control::retention_policy::Policy;
+        let retention = match value.policy {
+            Some(Policy::TtlSeconds(ttl_seconds)) => Self::Ttl { ttl_seconds },
+            Some(Policy::Forever(true)) => Self::Forever,
+            _ => return Err(Error::Invalid("explicit retention policy required".into())),
+        };
+        retention.validate()?;
+        Ok(retention)
+    }
+}
+impl From<adx_core::lifecycle::RetentionPolicy> for control::RetentionPolicy {
+    fn from(value: adx_core::lifecycle::RetentionPolicy) -> Self {
+        use control::retention_policy::Policy;
+        Self {
+            policy: Some(match value {
+                adx_core::lifecycle::RetentionPolicy::Ttl { ttl_seconds } => {
+                    Policy::TtlSeconds(ttl_seconds)
+                }
+                adx_core::lifecycle::RetentionPolicy::Forever => Policy::Forever(true),
+            }),
+        }
+    }
+}

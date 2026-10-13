@@ -40,7 +40,7 @@ p.add_argument('--output', type=Path, required=True)
 p.add_argument('--restart-command', nargs='+')
 a = p.parse_args()
 os.environ['SSL_CERT_FILE'] = str(a.ca.resolve())
-from adx_sandbox import ConnectionConfig, Mount, NetworkPolicy, S3Config, Sandbox
+from adx_sandbox import RetentionPolicy, ConnectionConfig, Mount, NetworkPolicy, S3Config, Sandbox
 from s3_client import Client as S3Client
 
 out = a.output.resolve()
@@ -245,7 +245,7 @@ try:
     pid = command('cat /tmp/counter.pid')
     payload = b'checkpoint-preserved\x00\xff' * 4096
     sandbox.files.write('/tmp/checkpoint.bin', payload)
-    paused = sandbox.pause(ttl_seconds=600, timeout_seconds=120)
+    paused = sandbox.pause(retention=RetentionPolicy.for_seconds(600), timeout_seconds=120)
     if not (paused.sandbox_id == sandbox.id and paused.size > 0):
         raise AssertionError()
     passed(
@@ -395,7 +395,7 @@ try:
     for clone in clones:
         sandbox = clone
         count = int(command('cat /tmp/counter'))
-        checkpoint = clone.pause(ttl_seconds=600, timeout_seconds=120)
+        checkpoint = clone.pause(retention=RetentionPolicy.for_seconds(600), timeout_seconds=120)
         if not (checkpoint.size > 0):
             raise AssertionError()
         clone.resume()

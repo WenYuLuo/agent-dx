@@ -80,7 +80,7 @@ impl Controller {
             .pause(PauseRequest {
                 operation_id: format!("{id}-pause"),
                 expected_revision: request.expected_revision,
-                ttl_seconds: 86400,
+                retention: adx_core::lifecycle::RetentionPolicy::Ttl { ttl_seconds: 86400 },
                 timeout_seconds: request.timeout_seconds,
             })
             .await;
@@ -209,7 +209,7 @@ impl super::Controller {
         self.record.checkpoint = Some(adx_core::RestorePoint {
             id: format!("clone-{}", self.record.spec.id),
             artifact,
-            expires_at_unix_seconds: u64::MAX,
+            expires_at_unix_seconds: None,
             source_runtime_id: origin.runtime_id.clone(),
             origin: Some(origin),
         });

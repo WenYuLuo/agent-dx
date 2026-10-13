@@ -80,7 +80,6 @@ impl Operations {
                         expected_runtime_id,
                         environment_id: id.into(),
                         caller: Some(caller.clone()),
-                        traffic: false,
                         timeout_seconds: 300,
                     })),
                 )
@@ -172,13 +171,25 @@ impl Operations {
             .record
             .as_ref()
             .ok_or_else(|| Status::unavailable("environment directory returned no record"))?;
-        let default_ttl = record
+        let default_retention = record
             .spec
             .as_ref()
             .and_then(|s| s.lifecycle.as_ref())
             .and_then(|l| l.pause.as_ref())
-            .map_or(90_000, |p| p.ttl_seconds);
-        let ttl = number(&body, "ttlSeconds", default_ttl, u64::MAX)?;
+            .map(|p| {
+                p.retention
+                    .ok_or_else(|| Status::data_loss("pause retention missing"))
+            })
+            .transpose()?
+            .map(TryInto::try_into)
+            .transpose()
+            .map_err(adx_protocol::status)?
+            .unwrap_or_default();
+        let retention = if kind == Kind::Pause {
+            crate::contract::pause_retention(&body, default_retention)?
+        } else {
+            default_retention
+        };
         if kind == Kind::Delete
             && record.state == pb::EnvironmentState::Deleted as i32
             && !record.resources_held
@@ -254,7 +265,7 @@ impl Operations {
                                 caller: caller_context,
                                 operation_id: request_id.into(),
                                 expected_revision: operation.expected,
-                                ttl_seconds: ttl,
+                                retention: Some(retention.into()),
                                 timeout_seconds: seconds,
                             })),
                         )
@@ -354,7 +365,7 @@ impl Operations {
                                 .as_ref()
                                 .filter(|checkpoint| {
                                     checkpoint.id == request_id
-                                        && checkpoint.expires_at_unix_seconds > 0
+                                        && checkpoint.expires_at_unix_seconds != Some(0)
                                 })
                                 .ok_or_else(|| Status::data_loss("invalid recovery point"))?;
                             let size = checkpoint

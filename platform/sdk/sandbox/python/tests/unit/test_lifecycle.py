@@ -136,12 +136,26 @@ class LifecycleTests(unittest.TestCase):
         self.assertTrue(callable(resume), "Sandbox.resume must exist")
         self.assertEqual(
             list(inspect.signature(pause).parameters),
-            ["self", "ttl_seconds", "timeout_seconds"],
+            ["self", "retention", "timeout_seconds"],
         )
         self.assertEqual(
             list(inspect.signature(resume).parameters),
             ["self"],
         )
+
+    def test_permanent_pause_returns_no_expiry_and_sends_explicit_retention(self):
+        class Client(_CloseTracker):
+            def pause(self, sandbox_id, retention, timeout_seconds=300):
+                self.retention = retention
+                return {"sandboxId": sandbox_id, "snapshotId": "pause-forever", "size": 8192,
+                        "state": "paused", "expiresAt": None}
+        sandbox = object.__new__(Sandbox)
+        sandbox._client = Client()
+        sandbox._sid = "default-sandbox-1"
+        sandbox._closed = False
+        result = sandbox.pause(adx_sandbox.RetentionPolicy.forever())
+        self.assertIsNone(result.expires_at)
+        self.assertEqual(sandbox._client.retention, {"kind": "forever"})
 
     def test_reload_returns_bool_without_replacing_facades(self):
         class Client(_CloseTracker):
@@ -185,8 +199,8 @@ class LifecycleTests(unittest.TestCase):
         self.assertIsNotNone(resume_result_type, "ResumeResult must be public")
 
         class Client(_CloseTracker):
-            def pause(self, sandbox_id, ttl_seconds, timeout_seconds=300):
-                self.pause_args = (sandbox_id, ttl_seconds, timeout_seconds)
+            def pause(self, sandbox_id, retention, timeout_seconds=300):
+                self.pause_args = (sandbox_id, retention, timeout_seconds)
                 return {
                     "sandboxId": sandbox_id,
                     "snapshotId": "pause-123",
@@ -249,7 +263,7 @@ class LifecycleTests(unittest.TestCase):
 
         for value in (True, 0, -1):
             with self.subTest(value=value):
-                with self.assertRaisesRegex(ValueError, "ttl_seconds"):
+                with self.assertRaisesRegex(TypeError, "retention"):
                     sandbox.pause(value)
 
     def test_delete_uses_sandbox_id_without_name_namespace_variant(self):

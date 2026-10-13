@@ -33,7 +33,7 @@ config = json.loads((root / 'deployment.yaml').read_text())
 if not (Path(config['package_dir']).resolve() == a.package.resolve()):
     raise AssertionError()
 os.environ['SSL_CERT_FILE'] = str(root / 'secrets/tls/ca.pem')
-from adx_sandbox import ConnectionConfig, RestartPolicy, Sandbox
+from adx_sandbox import RetentionPolicy, ConnectionConfig, RestartPolicy, Sandbox
 
 connection = ConnectionConfig(
     server_address=a.endpoint, token=(root / 'secrets/api-key').read_text().strip(), use_tls=True, verify_tls=True
@@ -146,7 +146,7 @@ try:
 
     recovered_from_checkpoint = create(idle_timeout=0, failover=True)
     recovered_from_checkpoint.files.write('/tmp/failover-state', 'checkpoint-state')
-    checkpoint = recovered_from_checkpoint.pause(ttl_seconds=600, timeout_seconds=120)
+    checkpoint = recovered_from_checkpoint.pause(retention=RetentionPolicy.for_seconds(600), timeout_seconds=120)
     if not (checkpoint.size > 0):
         raise AssertionError()
     recovered_from_checkpoint.resume()

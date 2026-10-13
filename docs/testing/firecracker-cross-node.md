@@ -80,6 +80,8 @@ sudo env ADX_FC_BASE=/opt/adx ADX_FC_SUITE=demand \
 
 OBS 配置文件必须是权限 `0600` 的普通文件，包含 `bucket`、`region`、`endpoint`、专用 `prefix`、`access_key`、`secret_key`。endpoint 使用区域 HTTPS 地址，例如 `https://obs.cn-north-4.myhuaweicloud.com`。驱动使用虚拟主机寻址，将运行目录名称附加到 prefix，先验证该范围为空，再做真实 SigV4 PUT/GET/DELETE。凭据只写入私有配置与服务环境；导出记录仅含公共存储配置与请求 ID。
 
+demand 严格集合为 11 项；创建和手动 pause 使用显式 RetentionPolicy，业务流量唤醒无需开关。
+
 业务负载是 VM 内的 Python HTTP 服务，通过公共 Ingress 的声明端口接受带唯一 nonce 的请求。响应包含 guest PID、内存中的 nonce 计数和持久文件内容；恢复前后的响应必须对应同一 guest 进程状态，每个请求只执行一次。
 
 初始创建使用 `schedule_affinities` 的软节点亲和（`kind=0, affinity=0`）优先选择 node1，并确认实际归属；这样原节点失效时仍允许 node2 接管。SDK 的 `node_id` 是硬放置约束，不适用于该跨节点故障场景。
@@ -94,6 +96,7 @@ OBS 配置文件必须是权限 `0600` 的普通文件，包含 `bucket`、`regi
 | 恢复中重启 | 阻断目标 Execd readiness；等实际 backend 为 Running、Redis 仍为 Paused 且 recovery.pending，再 SIGKILL Coordinator 或目标 adxlet。检查意图、归属、session/epoch 和 VM 清理。 |
 | TTL 已过期 | 到期后真实 HTTP 必须失败，两节点都不能启动执行。 |
 | 恢复跨越 TTL | 到期前接纳请求，真实 VM 恢复后用 readiness 阻断将提交延至到期之后；放行后按既定接纳契约完成。 |
+| 永久保留 | 自动永久暂停后让原节点失效并重启 Coordinator；休眠期间不创建 VM。流量跨节点恢复后手动永久暂停，再重启目标 adxlet 并由流量唤醒。两个暂停点都必须没有过期时间，PID、内存和文件保持。 |
 | 成功后应答丢失 | HTTPS 代理消费成功的 resume 应答并确认 Redis Running 与物理 VM，再关闭客户端连接。公共 SDK 用同一请求 ID 重试，归属、runtime 和 backend 必须一致。 |
 
 OBS suite 关闭后台 checkpoint GC，避免它与上传阻断竞争；显式删除仍须释放已登记制品。驱动记录实际 package、SDK、Firecracker、sandboxd、kernel、initrd、runtime EROFS 与驱动文件摘要。首次或失败运行应保留错误证据，最终结果以严格验收器、空 VM 清单、空 OBS prefix 和清理记录为准。

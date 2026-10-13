@@ -8,8 +8,6 @@ pub struct LifecyclePolicy {
     pub idle_timeout_seconds: u64,
     pub idle_action: IdleAction,
     pub pause: Option<PausePolicy>,
-    /// Authorized business traffic may wake a paused Environment.
-    pub auto_resume: bool,
     pub restart: Option<RestartPolicy>,
 }
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -32,14 +30,14 @@ pub enum CheckpointStorage {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PausePolicy {
-    pub ttl_seconds: u64,
+    pub retention: RetentionPolicy,
     pub timeout_seconds: u64,
     pub storage: CheckpointStorage,
 }
 impl Default for PausePolicy {
     fn default() -> Self {
         Self {
-            ttl_seconds: 90_000,
+            retention: RetentionPolicy::default(),
             timeout_seconds: 300,
             storage: CheckpointStorage::Configured,
         }
@@ -47,12 +45,44 @@ impl Default for PausePolicy {
 }
 impl PausePolicy {
     pub fn validate(&self) -> Result<()> {
-        if self.ttl_seconds == 0 || self.timeout_seconds == 0 || self.timeout_seconds > 3600 {
+        self.retention.validate()?;
+        if self.timeout_seconds == 0 || self.timeout_seconds > 3600 {
             return Err(Error::Invalid(
                 "pause requires positive retention and timeout at most 3600 seconds".into(),
             ));
         }
         Ok(())
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RetentionPolicy {
+    Ttl { ttl_seconds: u64 },
+    Forever,
+}
+impl Default for RetentionPolicy {
+    fn default() -> Self {
+        Self::Ttl {
+            ttl_seconds: 90_000,
+        }
+    }
+}
+impl RetentionPolicy {
+    pub fn validate(self) -> Result<()> {
+        if matches!(self, Self::Ttl { ttl_seconds: 0 }) {
+            return Err(Error::Invalid("retention TTL must be positive".into()));
+        }
+        Ok(())
+    }
+    pub fn expires_at(self, now: u64) -> Result<Option<u64>> {
+        self.validate()?;
+        match self {
+            Self::Forever => Ok(None),
+            Self::Ttl { ttl_seconds } => now
+                .checked_add(ttl_seconds)
+                .map(Some)
+                .ok_or_else(|| Error::Invalid("checkpoint TTL overflow".into())),
+        }
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -102,8 +132,7 @@ mod tests {
         let policy: LifecyclePolicy = serde_json::from_value(serde_json::json!({
             "idle_timeout_seconds": 30,
             "idle_action": "pause",
-            "pause": {"ttl_seconds": 3600, "timeout_seconds": 120, "storage": "shared"},
-            "auto_resume": true
+            "pause": {"retention": {"kind":"ttl", "ttl_seconds":3600}, "timeout_seconds": 120, "storage": "shared"}
         }))
         .expect("typed idle-pause policy must be accepted");
         policy.validate().unwrap();

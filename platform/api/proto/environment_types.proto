@@ -96,10 +96,13 @@ message SandboxOptions {
 
 enum IdleAction { IDLE_ACTION_DELETE = 0; IDLE_ACTION_PAUSE = 1; }
 enum CheckpointStorage { CHECKPOINT_STORAGE_CONFIGURED = 0; CHECKPOINT_STORAGE_LOCAL = 1; CHECKPOINT_STORAGE_SHARED = 2; }
-message PausePolicy { uint64 ttl_seconds = 1; uint64 timeout_seconds = 2; CheckpointStorage storage = 3; }
+message RetentionPolicy {
+  oneof policy { uint64 ttl_seconds = 1; bool forever = 2; }
+}
+message PausePolicy { reserved 1; RetentionPolicy retention = 4; uint64 timeout_seconds = 2; CheckpointStorage storage = 3; }
 message LifecyclePolicy {
   uint64 idle_timeout_seconds = 1; RestartPolicy restart = 2;
-  IdleAction idle_action = 3; PausePolicy pause = 4; bool auto_resume = 5;
+  IdleAction idle_action = 3; PausePolicy pause = 4; reserved 5;
 }
 
 message RestartPolicy { uint32 max_attempts = 1; uint64 initial_backoff_seconds = 2; uint64 max_backoff_seconds = 3; }
@@ -208,7 +211,7 @@ message CheckpointArtifact { string storage = 1; string location = 2; uint64 siz
 
 message RuntimeIdentity { string environment_id = 1; string runtime_id = 2; uint64 ownership_generation = 3; }
 
-message RestorePoint { RuntimeIdentity origin = 5; string id = 1; CheckpointArtifact artifact = 2; uint64 expires_at_unix_seconds = 3; string source_runtime_id = 4; }
+message RestorePoint { RuntimeIdentity origin = 5; string id = 1; CheckpointArtifact artifact = 2; optional uint64 expires_at_unix_seconds = 3; string source_runtime_id = 4; }
 
 enum LifecycleKind { LIFECYCLE_KIND_UNSPECIFIED = 0; LIFECYCLE_KIND_PAUSE = 1; LIFECYCLE_KIND_RESUME = 2; LIFECYCLE_KIND_SNAPSHOT = 3; LIFECYCLE_KIND_NETWORK = 4; LIFECYCLE_KIND_RELOAD = 5; }
 

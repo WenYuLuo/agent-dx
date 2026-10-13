@@ -111,7 +111,7 @@ impl Controller {
                                                     self.record.revision
                                                 ),
                                                 expected_revision: self.record.revision,
-                                                ttl_seconds: policy.ttl_seconds,
+                                                retention: policy.retention,
                                                 timeout_seconds: policy.timeout_seconds,
                                             },
                                             stamp.clone(),
@@ -187,7 +187,7 @@ impl Controller {
                 .record
                 .checkpoint
                 .as_ref()
-                .is_none_or(|checkpoint| checkpoint.expires_at_unix_seconds <= now)
+                .is_none_or(|checkpoint| checkpoint.expired(now))
             {
                 self.sync().await?;
                 return Err(Error::Unavailable(

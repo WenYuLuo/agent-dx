@@ -31,6 +31,7 @@ p.add_argument('--image', required=True)
 a = p.parse_args()
 os.environ['SSL_CERT_FILE'] = str(a.run / 'secrets/tls/ca.pem')
 from adx_sandbox import (
+    RetentionPolicy,
     ConnectionConfig,
     DNSPolicy,
     NetworkPolicy,
@@ -204,7 +205,7 @@ try:
     if not (egress_probe() != 0):
         raise AssertionError('reload lost deny-all policy')
     passed('reload refreshes execution identity and reconnects', runtime_id=restored['runtime']['id'])
-    paused = s.pause(ttl_seconds=600, timeout_seconds=120)
+    paused = s.pause(retention=RetentionPolicy.for_seconds(600), timeout_seconds=120)
     if not (paused.size > 0):
         raise AssertionError()
     # Restart only adxlet while paused; preserve Coordinator/Redis/sandboxd.

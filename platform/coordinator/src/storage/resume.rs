@@ -21,21 +21,13 @@ impl Session {
         deleted.last_operation = None;
         self.commit(deleted).await
     }
-    pub async fn request_resume(
-        &self,
-        id: &str,
-        traffic: bool,
-        now: u64,
-    ) -> Result<StoredEnvironment> {
+    pub async fn request_resume(&self, id: &str, now: u64) -> Result<StoredEnvironment> {
         let field = format!("environment:{id}");
         for _ in 0..ATTEMPTS {
             let [header_value, value] = self.store.fields([HEADER.into(), field.clone()]).await?;
             let mut header = self.header(&header_value)?;
             let mut stored: StoredEnvironment = decode(value.as_deref().ok_or(Error::NotFound)?)?;
             stored.validate()?;
-            if traffic && !stored.spec.lifecycle.auto_resume {
-                return Err(Error::Invalid("traffic resume is disabled".into()));
-            }
             let record = stored.result.as_ref().ok_or(Error::Conflict)?;
             if !matches!(
                 record.state,
@@ -44,10 +36,7 @@ impl Session {
                 return Err(Error::Conflict);
             }
             if record.state == EnvironmentState::Paused
-                && record
-                    .checkpoint
-                    .as_ref()
-                    .is_none_or(|cp| cp.expires_at_unix_seconds <= now)
+                && record.checkpoint.as_ref().is_none_or(|cp| cp.expired(now))
             {
                 return Err(Error::Invalid("checkpoint expired or missing".into()));
             }

@@ -16,8 +16,8 @@ async fn paused_fixture() -> (
         generation: 1,
         devices: vec![],
     };
-    let mut specification = spec("sleep");
-    specification.lifecycle.auto_resume = true;
+    let specification = spec("sleep");
+
     session
         .reserve(specification.clone(), assignment.clone())
         .await
@@ -29,7 +29,7 @@ async fn paused_fixture() -> (
     record.checkpoint = Some(adx_core::RestorePoint {
         id: "pause".into(),
         origin: None,
-        expires_at_unix_seconds: u64::MAX,
+        expires_at_unix_seconds: None,
         source_runtime_id: "sleep-1".into(),
         artifact: adx_core::CheckpointArtifact {
             storage: "obs".into(),
@@ -43,13 +43,61 @@ async fn paused_fixture() -> (
 
 #[tokio::test]
 #[ignore = "requires dedicated real Redis"]
+async fn traffic_wakes_manually_paused_environment_without_opt_in() {
+    let (_rig, session, _) = paused_fixture().await;
+    assert!(session.request_resume("sleep", 1).await.is_ok());
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis"]
+async fn permanent_pause_survives_coordinator_epoch_and_can_transfer_after_node_loss() {
+    let (rig, session, record) = paused_fixture().await;
+    session
+        .register_session(
+            node("source"),
+            "source:1".into(),
+            "source:2".into(),
+            Some(adx_coordinator::storage::NodeSession {
+                id: "boot".into(),
+                sequence: 1,
+                routable: true,
+            }),
+        )
+        .await
+        .unwrap();
+    session.invalidate_node("source", "boot").await.unwrap();
+    let replacement = rig.store().await.begin(1).await.unwrap();
+    let dormant = replacement.get("sleep").await.unwrap();
+    assert_eq!(
+        dormant.result.as_ref().unwrap().state,
+        EnvironmentState::Paused
+    );
+    assert!(dormant.resume.is_none());
+    replacement.request_resume("sleep", u64::MAX).await.unwrap();
+    let moved = replacement
+        .reserve_recovery(
+            &record.assignment,
+            Assignment {
+                node_id: "target".into(),
+                generation: 2,
+                ..record.assignment.clone()
+            },
+            u64::MAX,
+        )
+        .await
+        .unwrap();
+    assert_eq!(moved.assignment.node_id, "target");
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis"]
 async fn concurrent_traffic_and_manual_resume_share_durable_intent() {
     let (_rig, session, _) = paused_fixture().await;
     let mut work = Vec::new();
-    for i in 0..16 {
+    for _ in 0..16 {
         let s = session.clone();
         work.push(tokio::spawn(async move {
-            s.request_resume("sleep", i % 2 == 0, 1).await.unwrap()
+            s.request_resume("sleep", 1).await.unwrap()
         }));
     }
     let first = work.remove(0).await.unwrap();
@@ -63,7 +111,7 @@ async fn concurrent_traffic_and_manual_resume_share_durable_intent() {
 #[ignore = "requires dedicated real Redis"]
 async fn shared_storage_alone_does_not_permit_transfer_before_local_rejection() {
     let (_rig, session, record) = paused_fixture().await;
-    let demanded = session.request_resume("sleep", true, 1).await.unwrap();
+    let demanded = session.request_resume("sleep", 1).await.unwrap();
     let replacement = Assignment {
         node_id: "target".into(),
         generation: 2,
@@ -105,11 +153,11 @@ async fn shared_storage_alone_does_not_permit_transfer_before_local_rejection() 
 #[ignore = "requires dedicated real Redis"]
 async fn deletion_and_expiry_fence_pending_resume() {
     let (_rig, session, mut record) = paused_fixture().await;
-    session.request_resume("sleep", true, 1).await.unwrap();
+    session.request_resume("sleep", 1).await.unwrap();
     record.revision += 1;
-    record.checkpoint.as_mut().unwrap().expires_at_unix_seconds = 2;
+    record.checkpoint.as_mut().unwrap().expires_at_unix_seconds = Some(2);
     session.commit(record.clone()).await.unwrap();
-    assert!(session.request_resume("sleep", true, 2).await.is_err());
+    assert!(session.request_resume("sleep", 2).await.is_err());
     let replacement = Assignment {
         node_id: "target".into(),
         generation: 2,
@@ -140,7 +188,7 @@ async fn deletion_and_expiry_fence_pending_resume() {
     record.checkpoint = None;
     session.commit(record).await.unwrap();
     assert_eq!(
-        session.request_resume("sleep", false, 1).await,
+        session.request_resume("sleep", 1).await,
         Err(Error::NotFound)
     );
 }
@@ -182,7 +230,7 @@ async fn node_loss_preserves_dormancy_and_does_not_enqueue_restore() {
     paused.checkpoint = Some(adx_core::RestorePoint {
         id: "pause".into(),
         origin: None,
-        expires_at_unix_seconds: u64::MAX,
+        expires_at_unix_seconds: None,
         source_runtime_id: "sleeper-1".into(),
         artifact: adx_core::CheckpointArtifact {
             storage: "obs".into(),
@@ -231,7 +279,7 @@ async fn node_loss_preserves_dormancy_and_does_not_enqueue_restore() {
 async fn capacity_retry_round_keeps_intent_identity_and_reconsiders_nodes() {
     let (_rig, session, record) = paused_fixture().await;
     let intent = session
-        .request_resume("sleep", true, 1)
+        .request_resume("sleep", 1)
         .await
         .unwrap()
         .resume
@@ -241,7 +289,7 @@ async fn capacity_retry_round_keeps_intent_identity_and_reconsiders_nodes() {
         .await
         .unwrap();
     let before = session
-        .request_resume("sleep", true, 30)
+        .request_resume("sleep", 30)
         .await
         .unwrap()
         .resume
@@ -249,7 +297,7 @@ async fn capacity_retry_round_keeps_intent_identity_and_reconsiders_nodes() {
     assert!(before.local_rejected);
     assert!(before.rejected_nodes.contains("source"));
     let retry = session
-        .request_resume("sleep", true, 31)
+        .request_resume("sleep", 31)
         .await
         .unwrap()
         .resume

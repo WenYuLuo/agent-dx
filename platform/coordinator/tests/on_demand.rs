@@ -38,7 +38,6 @@ fn spec() -> EnvironmentSpec {
             disk_bytes: 0,
         },
         lifecycle: adx_core::lifecycle::LifecyclePolicy {
-            auto_resume: true,
             pause: Some(adx_core::lifecycle::PausePolicy {
                 storage: adx_core::lifecycle::CheckpointStorage::Shared,
                 ..Default::default()
@@ -412,7 +411,7 @@ impl Rig {
             caller: caller(),
             operation_id: "pause-original".into(),
             expected_revision: record.revision,
-            ttl_seconds,
+            retention: Some(adx_core::lifecycle::RetentionPolicy::Ttl { ttl_seconds }.into()),
             timeout_seconds: 10,
         })
         .await
@@ -446,7 +445,7 @@ impl Rig {
             expected_runtime_id: "sleep-1".into(),
             environment_id: "sleep".into(),
             caller: caller(),
-            traffic,
+
             timeout_seconds: 3,
         })
         .await
@@ -477,7 +476,7 @@ async fn multiple_ingress_and_manual_resume_restore_once_on_original_node() {
                 expected_runtime_id: "sleep-1".into(),
                 environment_id: "sleep".into(),
                 caller: caller(),
-                traffic: i % 2 == 0,
+
                 timeout_seconds: 3,
             })
             .await
@@ -690,7 +689,7 @@ async fn sleeping_node_loss_only_restores_after_demand() {
 #[ignore = "requires dedicated real Redis"]
 async fn redis_restart_preserves_pending_wake_and_restore_point() {
     let mut rig = Rig::new(Duration::from_secs(2)).await;
-    let pending = rig.session.request_resume("sleep", true, 1).await.unwrap();
+    let pending = rig.session.request_resume("sleep", 1).await.unwrap();
     rig._redis.crash();
     rig._redis.start().await;
     let after = tokio::time::timeout(Duration::from_secs(2), async {
@@ -715,7 +714,7 @@ async fn redis_restart_preserves_pending_wake_and_restore_point() {
 #[ignore = "requires dedicated real Redis"]
 async fn coordinator_restart_reconciles_the_durable_wake_without_new_identity() {
     let mut rig = Rig::new(Duration::from_secs(2)).await;
-    let pending = rig.session.request_resume("sleep", true, 1).await.unwrap();
+    let pending = rig.session.request_resume("sleep", 1).await.unwrap();
     rig.server.abort();
     let _ = (&mut rig.server).await;
     rig.session = rig._redis.store().await.begin(1).await.unwrap();
@@ -1121,7 +1120,7 @@ async fn delete_serializes_with_restore_and_fences_its_late_result() {
             .ensure_running(pb::EnsureRunningRequest {
                 environment_id: "sleep".into(),
                 caller: caller(),
-                traffic: true,
+
                 timeout_seconds: 3,
                 expected_runtime_id: "sleep-1".into(),
             })
@@ -1241,9 +1240,9 @@ async fn background_resume_round_does_not_starve_later_intents() {
             .await
             .unwrap();
         rig.session.commit(record).await.unwrap();
-        rig.session.request_resume(&id, true, 1).await.unwrap();
+        rig.session.request_resume(&id, 1).await.unwrap();
     }
-    rig.session.request_resume("sleep", true, 1).await.unwrap();
+    rig.session.request_resume("sleep", 1).await.unwrap();
     rig.rpc.resume_pending().await.unwrap();
     assert_eq!(rig.source.backend.restored.load(Ordering::SeqCst), 0);
     rig.rpc.resume_pending().await.unwrap();

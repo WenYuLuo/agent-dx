@@ -645,7 +645,7 @@ def test_pause_and_resume_retry_with_one_internal_request_id_per_call():
     client = _make_client(handler)
     _check(callable(getattr(client, "pause", None)), "SandboxClient.pause must exist")
     _check(callable(getattr(client, "resume", None)), "SandboxClient.resume must exist")
-    pause = client.pause("default-sandbox-1", 90_000)
+    pause = client.pause("default-sandbox-1", {"kind": "ttl", "ttlSeconds": 90_000})
     resume = client.resume("default-sandbox-1")
 
     _check(len(pause_attempts) == 3, f"pause attempts: {pause_attempts}")
@@ -658,7 +658,7 @@ def test_pause_and_resume_retry_with_one_internal_request_id_per_call():
         f"pause request id: {pause_attempts}",
     )
     _check(
-        {attempt[1]["ttlSeconds"] for attempt in pause_attempts} == {90_000},
+        {attempt[1]["retention"]["ttlSeconds"] for attempt in pause_attempts} == {90_000},
         f"pause ttl changed: {pause_attempts}",
     )
     _check(
@@ -702,7 +702,7 @@ def test_pause_rejects_snapshot_identity_not_owned_by_internal_request():
 
     client = _make_client(handler)
     try:
-        client.pause("default-sandbox-1", 90_000)
+        client.pause("default-sandbox-1", {"kind": "ttl", "ttlSeconds": 90_000})
         raise AssertionError("mismatched pause snapshot identity unexpectedly succeeded")
     except SandboxError as exc:
         _check("does not match" in str(exc), f"unexpected pause identity error: {exc}")

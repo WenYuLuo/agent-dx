@@ -32,7 +32,7 @@ image = sys.argv[2]
 base = pathlib.Path(os.environ['ADX_FC_BASE'])
 output = root / 'evidence/sdk-transfer.json'
 os.environ['SSL_CERT_FILE'] = str(root / 'secrets/tls/ca.pem')
-from adx_sandbox import ConnectionConfig, Sandbox
+from adx_sandbox import RetentionPolicy, ConnectionConfig, Sandbox
 
 connection = ConnectionConfig(
     server_address='127.0.0.1:8443', token=(root / 'secrets/api-key').read_text().strip(), use_tls=True, verify_tls=True
@@ -121,7 +121,7 @@ try:
     saved_pid = command('cat /tmp/counter.pid')
     payload = b'cross-node-checkpoint\x00\xff' * 4096
     sandbox.files.write('/tmp/transfer.bin', payload)
-    paused = sandbox.pause(ttl_seconds=900, timeout_seconds=120)
+    paused = sandbox.pause(retention=RetentionPolicy.for_seconds(900), timeout_seconds=120)
     if not (paused.size > 0):
         raise AssertionError()
     sandbox.resume()

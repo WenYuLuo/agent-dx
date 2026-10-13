@@ -320,7 +320,7 @@ fn validate_result(r: &EnvironmentRecord) -> Result<()> {
             || cp.artifact.storage.is_empty()
             || cp.artifact.location.is_empty()
             || cp.artifact.size_bytes == 0
-            || cp.expires_at_unix_seconds == 0
+            || cp.expires_at_unix_seconds == Some(0)
             || match &cp.origin {
                 None => !adx_core::valid_runtime_id(
                     &r.spec.id,

@@ -120,12 +120,15 @@ class DemandFixtureTests(unittest.TestCase):
         cases[6].update(old_backend_removed=True, state_at_crash='Paused')
         cases[8].update(admitted_at=10, expires_at=12, completed_at=13)
         cases[9].update(same_execution=True, attempts=2, commit_before_cut=True)
+        cases[10].update(automatic_expiry=None, manual_expiry=None, dormant_after_coordinator_restart=True,
+                         traffic_after_manual_pause=True, continuity=True, target='node2',
+                         epoch_before=1, epoch_after=2, session_before='before', session_after='after')
         return {'status': 'passed', 'cases': cases, 'storage': {'kind': 'real_obs'}, 'obs_empty': True, 'cleanup_errors': [], 'inventories': {'node1': 0, 'node2': 0}}
 
     def test_missing_real_fault_boundary_cannot_pass(self):
         complete = self.complete()
         verify(complete)
-        mutations = [(1, 'same_backend', False), (1, 'checkpoint_created', True), (2, 'captured_before_request', False), (6, 'old_backend_removed', False), (8, 'completed_at', 11), (9, 'attempts', 1), (9, 'commit_before_cut', False)]
+        mutations = [(1, 'same_backend', False), (1, 'checkpoint_created', True), (2, 'captured_before_request', False), (6, 'old_backend_removed', False), (8, 'completed_at', 11), (9, 'attempts', 1), (9, 'commit_before_cut', False), (10, 'automatic_expiry', 10), (10, 'traffic_after_manual_pause', False), (10, 'session_after', 'before')]
         for index, key, value in mutations:
             with self.subTest(key=key):
                 bad = copy.deepcopy(complete)

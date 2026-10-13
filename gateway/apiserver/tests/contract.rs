@@ -8,19 +8,27 @@ fn caller() -> pb::CallerContext {
     }
 }
 #[test]
+fn explicit_forever_pause_retention_is_accepted() {
+    let result = create_spec(
+        json!({"image":"image","idleTimeoutSeconds":30,"idleAction":"pause",
+        "pauseOptions":{"retention":{"kind":"forever"},"storage":"shared"}}),
+        &caller(),
+    );
+    assert!(result.is_ok(), "forever retention rejected: {result:?}");
+}
+#[test]
 fn idle_pause_options_are_typed_and_validated() {
     let spec = create_spec(json!({"image":"image", "idleTimeoutSeconds":30,"idleAction":"pause",
-        "autoResume":true, "pauseOptions":{"ttlSeconds":3600,"timeoutSeconds":120,"storage":"shared"}}), &caller()).unwrap();
+        "pauseOptions":{"retention":{"kind":"ttl","ttlSeconds":3600},"timeoutSeconds":120,"storage":"shared"}}), &caller()).unwrap();
     let policy = spec.lifecycle.unwrap();
     assert_eq!(policy.idle_action, pb::IdleAction::Pause as i32);
-    assert!(policy.auto_resume);
     assert_eq!(
         policy.pause.unwrap().storage,
         pb::CheckpointStorage::Shared as i32
     );
     for value in [
         json!({"image":"image","idleAction":"pause"}),
-        json!({"image":"image","pauseOptions":{"ttlSeconds":0}}),
+        json!({"image":"image","pauseOptions":{"retention":{"kind":"ttl","ttlSeconds":0}}}),
         json!({"image":"image","pauseOptions":{"storage":"missing"}}),
     ] {
         assert!(create_spec(value.clone(), &caller()).is_err(), "{value}");

@@ -16,27 +16,60 @@ ADX_GET_DEFAULT_TIMEOUT = 300
 ADX_GET_TIMEOUT_BUFFER = 30
 
 
+class IdleAction(str, Enum):
+    DELETE = "delete"
+    PAUSE = "pause"
+
+
+class CheckpointStorage(str, Enum):
+    CONFIGURED = "configured"
+    LOCAL = "local"
+    SHARED = "shared"
+
+
 @dataclass(frozen=True)
-class PausePolicy:
-    """Anonymous recovery-point retention and publication policy.
+class RetentionPolicy:
+    """An explicit finite TTL or retention until the Sandbox is deleted."""
 
-    shared requires the node's object store (including an OBS endpoint).
-    """
-
-    ttl_seconds: int = 90_000
-    timeout_seconds: int = 300
-    storage: str = "configured"
+    ttl_seconds: Optional[int]
 
     def __post_init__(self):
-        for name, maximum in (("ttl_seconds", (1 << 64) - 1), ("timeout_seconds", 3600)):
-            value = getattr(self, name)
-            if isinstance(value, bool) or not isinstance(value, int) or not 0 < value <= maximum:
-                raise ValueError(f"{name} must be a positive integer at most {maximum}")
-        if self.storage not in ("configured", "local", "shared"):
-            raise ValueError("storage must be configured, local, or shared")
+        value = self.ttl_seconds
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int) or not 0 < value < (1 << 64)):
+            raise ValueError("retention TTL must be a positive uint64 integer")
+
+    @classmethod
+    def forever(cls) -> "RetentionPolicy":
+        return cls(None)
+
+    @classmethod
+    def for_seconds(cls, seconds: int) -> "RetentionPolicy":
+        if seconds is None:
+            raise ValueError("use RetentionPolicy.forever() for permanent retention")
+        return cls(seconds)
 
     def to_dict(self) -> Dict[str, Any]:
-        return {"ttlSeconds": self.ttl_seconds, "timeoutSeconds": self.timeout_seconds, "storage": self.storage}
+        return {"kind": "forever"} if self.ttl_seconds is None else {"kind": "ttl", "ttlSeconds": self.ttl_seconds}
+
+
+@dataclass(frozen=True)
+class PausePolicy:
+    """Anonymous recovery-point retention and publication policy."""
+
+    retention: RetentionPolicy = field(default_factory=lambda: RetentionPolicy.for_seconds(90_000))
+    timeout_seconds: int = 300
+    storage: CheckpointStorage = CheckpointStorage.CONFIGURED
+
+    def __post_init__(self):
+        if not isinstance(self.retention, RetentionPolicy):
+            raise TypeError("retention must be a RetentionPolicy")
+        if isinstance(self.timeout_seconds, bool) or not isinstance(self.timeout_seconds, int) or not 0 < self.timeout_seconds <= 3600:
+            raise ValueError("timeout_seconds must be an integer from 1 through 3600")
+        if not isinstance(self.storage, CheckpointStorage):
+            raise TypeError("storage must be a CheckpointStorage")
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"retention": self.retention.to_dict(), "timeoutSeconds": self.timeout_seconds, "storage": self.storage.value}
 
 
 @dataclass(frozen=True)
@@ -602,7 +635,7 @@ class PauseResult:
     snapshot_id: str
     size: int
     state: str
-    expires_at: int
+    expires_at: Optional[int]
 
 
 @dataclass(frozen=True)

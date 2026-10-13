@@ -62,9 +62,7 @@ impl CoordinatorRpc {
                 s.invalidated
                     && s.result.as_ref().is_some_and(|r| {
                         r.state == EnvironmentState::Paused
-                            && r.checkpoint
-                                .as_ref()
-                                .is_some_and(|cp| cp.expires_at_unix_seconds <= now)
+                            && r.checkpoint.as_ref().is_some_and(|cp| cp.expired(now))
                     })
             })
             .take(16)
@@ -166,11 +164,7 @@ impl CoordinatorRpc {
                 }
                 let demanded = state
                     .session
-                    .request_resume(
-                        &request.environment_id,
-                        request.traffic,
-                        recovery::now().map_err(status)?,
-                    )
+                    .request_resume(&request.environment_id, recovery::now().map_err(status)?)
                     .await
                     .map_err(status)?;
                 state.remember_environment(demanded);
@@ -196,7 +190,7 @@ impl CoordinatorRpc {
                     let was_rejected = stored.resume.as_ref().is_some_and(|r| r.local_rejected);
                     stored = state
                         .session
-                        .request_resume(id, false, recovery::now().map_err(status)?)
+                        .request_resume(id, recovery::now().map_err(status)?)
                         .await
                         .map_err(status)?;
                     if was_rejected && !stored.resume.as_ref().is_some_and(|r| r.local_rejected) {
@@ -437,7 +431,6 @@ impl CoordinatorRpc {
                     tenant_id: stored.spec.tenant_id,
                     administrator: false,
                 }),
-                traffic: false,
                 timeout_seconds: 1,
             };
             if self.ensure_running(request).await.is_ok() {

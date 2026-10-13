@@ -133,9 +133,11 @@ Later dual-clone FC runs exposed a network failure, tracked in the [investigatio
 Pause one open sandbox and later resume the same logical sandbox:
 
 ```python
+from adx_sandbox import RetentionPolicy, Sandbox
+
 sandbox = Sandbox(image="python:3.12-slim")
 
-paused = sandbox.pause(ttl_seconds=90_000, timeout_seconds=300)
+paused = sandbox.pause(retention=RetentionPolicy.for_seconds(90_000), timeout_seconds=300)
 print(paused.snapshot_id, paused.expires_at)
 
 running = sandbox.resume()
@@ -145,17 +147,24 @@ print(running.route_address, running.port_mappings)
 The public signatures are:
 
 ```python
-Sandbox.pause(ttl_seconds=None, *, timeout_seconds=300) -> PauseResult
+Sandbox.pause(retention=None, *, timeout_seconds=300) -> PauseResult
 Sandbox.resume() -> ResumeResult
 ```
 
-The SDK accepts `None` or a positive integral, non-boolean `ttl_seconds`.
-`None` inherits `pause_policy.ttl_seconds`; without a policy the server uses 90,000 seconds. `timeout_seconds` is keyword-only and must be an
-integral, non-boolean value from 1 through 3600. A successful pause returns a
-frozen `PauseResult` with `sandbox_id`, `snapshot_id`, byte `size`, `state`,
-and `expires_at`. The SDK rejects a response unless it describes this sandbox,
-has state `"paused"`, and includes a nonempty snapshot ID, positive size, and
-positive expiry.
+`retention=None` inherits `pause_policy.retention`; the default policy retains the
+restore point for 90,000 seconds. Use `RetentionPolicy.for_seconds(seconds)` for
+a positive integer TTL or `RetentionPolicy.forever()` to retain the point until
+explicit deletion or replacement. Finite retention begins after publication.
+Permanent pause returns `expires_at=None`; the stored record and RPC use an absent
+expiry, rather than a large timestamp. `PauseResult` also contains `sandbox_id`,
+`snapshot_id`, byte `size`, and `state="paused"`.
+
+`timeout_seconds` is keyword-only, integral and non-boolean, from 1 through 3600.
+It bounds the sandboxd capture RPC and sets the SDK's per-attempt HTTP wait with
+an extra 30-second transport allowance. It is not a total pause deadline: OBS
+publication follows capture and uses its own storage request timeout. Losing the
+HTTP reply does not cancel an accepted lifecycle operation; its outcome can remain
+unknown and the SDK retries the same operation identity.
 
 `resume()` returns a frozen `ResumeResult` with `sandbox_id`, `state`,
 `route_address`, `function_proxy_id`, `node_id`, and `port_mappings`. The SDK
@@ -168,20 +177,19 @@ Pausing validates the configured store's artifact and commits Paused after remov
 ### Idle pause and traffic resume
 
 ```python
-from adx_sandbox import PausePolicy, Sandbox
+from adx_sandbox import CheckpointStorage, IdleAction, PausePolicy, RetentionPolicy, Sandbox
 
 sandbox = Sandbox(
     image="example/execd:latest",
     idle_timeout=60,
-    idle_action="pause",
-    pause_policy=PausePolicy(ttl_seconds=3600, timeout_seconds=300, storage="shared"),
-    auto_resume=True,
+    idle_action=IdleAction.PAUSE,
+    pause_policy=PausePolicy(retention=RetentionPolicy.forever(), timeout_seconds=300, storage=CheckpointStorage.SHARED),
 )
 ```
 
-`idle_action` defaults to `"delete"`; `"pause"` requires a positive idle timeout
-and a checkpoint-capable runtime. `storage="configured"` uses the node backend,
-`"local"` retains files on that node, and `"shared"` requires complete publication
+`idle_action` is an `IdleAction` enum and defaults to `IdleAction.DELETE`; `IdleAction.PAUSE` requires a positive idle timeout
+and a checkpoint-capable runtime. `CheckpointStorage.CONFIGURED` uses the node backend,
+`CheckpointStorage.LOCAL` retains files on that node, and `CheckpointStorage.SHARED` requires complete publication
 to its configured object store. Configure an OBS S3-compatible endpoint on every
 eligible node, with the same alias/bucket/prefix. The shared setting also limits
 creation placement to nodes advertising shared checkpoint storage.
@@ -192,8 +200,8 @@ background command can be checkpointed. Automatic pause atomically closes new
 admission and rechecks activity. New demand before capture cancels pause; demand
 once capture starts waits for publication and restores afterward.
 
-With `auto_resume=True`, authorized business traffic through Ingress shares the
-manual resume entry. Concurrent first requests coalesce into one durable intent.
+Authorized business traffic through Ingress shares the manual resume entry for
+both automatic and manual pauses; no auto-resume opt-in is required. Concurrent first requests coalesce into one durable intent.
 Ingress waits for the committed Running route before sending application bytes;
 passive route subscriptions and health/metrics do not wake a paused sandbox.
 Requests already sent upstream are not replayed. Transient owner RPC failures
@@ -272,10 +280,9 @@ Raw HTTP has intentionally different validation in a few places. A raw
 Snapshot request has `name` as its handler field: an omitted or empty name is
 accepted, while a supplied whitespace-only name is rejected. Its
 `timeoutSeconds` defaults to 300, is validated in the range 1 through 3600,
-converted to milliseconds, and forwarded as the checkpoint RPC logical timeout. Raw Pause applies the same `timeoutSeconds` contract, while
-treating omitted or zero `ttlSeconds` as 90,000 seconds and rejecting negative,
-malformed, or non-numeric JSON values; the SDK is deliberately stricter about
-TTL. Only Snapshot and Pause currently accept this caller-provided logical
+converted to milliseconds, and forwarded as the checkpoint RPC logical timeout. Raw Pause accepts optional `retention` as `{"kind":"forever"}` or
+`{"kind":"ttl","ttlSeconds":3600}`; omission inherits the creation policy.
+Its `timeoutSeconds` is validated from 1 through 3600 and defaults to 300. Only Snapshot and Pause currently accept this caller-provided logical
 timeout body field. The SDK sends `{}` for resume and reload, and their
 handlers define no body fields. Raw HTTP requires a pattern-valid
 `X-ADX-Request-ID` header;

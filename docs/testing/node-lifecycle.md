@@ -4,7 +4,7 @@ adxlet 拥有实例串行状态机。Coordinator 提供归属校验、Redis 持�
 
 ## 运行策略
 
-`EnvironmentSpec.lifecycle` 包含 `idle_timeout_seconds`、`idle_action`（默认 delete）、可选 `pause`、`auto_resume`（默认 false）和可选 `restart`。HTTP 对应 `idleTimeoutSeconds`、`idleAction`、`pauseOptions`、`autoResume`、`restartPolicy`；Python SDK 对应 `idle_timeout_seconds`、`idle_action`、`PausePolicy`、`auto_resume`、`RestartPolicy`。
+`EnvironmentSpec.lifecycle` 包含 `idle_timeout_seconds`、`idle_action`（默认 delete）、可选 `pause` 和可选 `restart`。HTTP 对应 `idleTimeoutSeconds`、`idleAction`、`pauseOptions`、`restartPolicy`；Python SDK 对应 `idle_timeout`、`IdleAction`、`PausePolicy`、`RestartPolicy`。自动和手动暂停后的鉴权业务流量均可唤醒，无需额外开关。
 
 - 空闲超时为 0 时不回收。启用后，运行实例的 Execd 活跃客户端请求数与 Relay 流计数必须同时为 0，且活动版本在整个空闲窗口内未改变。后台命令仍计入 Execd 状态与活动版本，但客户端退出后不会仅因命令仍运行而阻止回收。采样失败或活动版本改变会重置窗口。adxlet 默认执行删除；`idle_action=pause` 在同一窗口结束后进入自动暂停，要求正数空闲超时和可用的 checkpoint 能力。
 - RuntimeDriver 确认执行退出后，节点先退役路由、确认旧执行清理，再标记 Failed。启用重启时，按照指数退避和累计重试上限重新申请本机资源，并分配新的执行 ID，Environment ID 与归属代次保持。
@@ -14,9 +14,11 @@ adxlet 拥有实例串行状态机。Coordinator 提供归属校验、Redis 持�
 
 ## 休眠与按需恢复
 
-`pauseOptions` 的 `ttlSeconds` 默认 90000、`timeoutSeconds` 默认 300（1–3600），
-`storage` 为 configured（默认）、local 或 shared。TTL 从制品发布完成开始计算，
-与空闲窗口分别计时。shared 要求节点已配置共享对象存储，发布失败不能返回暂停成功。
+`pauseOptions.retention` 为 `{"kind":"ttl","ttlSeconds":90000}`（默认）或 `{"kind":"forever"}`。
+有限 TTL 从制品发布完成开始计算，与空闲窗口分别计时；永久恢复点的过期时间为空，
+保留至显式删除或替换。`timeoutSeconds` 默认 300（1–3600），约束后端捕获 RPC，
+不覆盖 OBS 上传等后续步骤的整体耗时。`storage` 为 configured（默认）、local 或 shared；
+SDK 使用 `CheckpointStorage` 枚举。shared 要求节点已配置共享对象存储，发布失败不能返回暂停成功。
 
 自动暂停先通过 Relay 的活动版本原子关闭新流准入，再通过 Execd 的活动版本关闭
 客户端操作准入并复核需求。已接纳请求不会被当成空闲；捕获前的新需求取消本次暂停，

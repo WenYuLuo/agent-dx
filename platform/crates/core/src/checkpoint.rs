@@ -13,8 +13,15 @@ pub struct RestorePoint {
     pub origin: Option<crate::runtime::RuntimeIdentity>,
     pub id: String,
     pub artifact: CheckpointArtifact,
-    pub expires_at_unix_seconds: u64,
+    /// None retains the restore point until explicit deletion or replacement.
+    pub expires_at_unix_seconds: Option<u64>,
     pub source_runtime_id: String,
+}
+impl RestorePoint {
+    pub fn expired(&self, now: u64) -> bool {
+        self.expires_at_unix_seconds
+            .is_some_and(|expiry| expiry <= now)
+    }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LifecycleKind {

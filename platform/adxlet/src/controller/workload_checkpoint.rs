@@ -248,7 +248,7 @@ impl Controller {
             origin: None,
             source_runtime_id: self.record.runtime.id.clone(),
             // Anonymous recovery points follow their Environment's lifecycle.
-            expires_at_unix_seconds: u64::MAX,
+            expires_at_unix_seconds: None,
         });
         self.record.revision = self.record.revision.checked_add(1).ok_or(Error::Conflict)?;
         self.record.last_operation = None;

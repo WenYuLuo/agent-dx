@@ -578,14 +578,14 @@ class SandboxClient:
     def pause(
         self,
         sandbox_id: str,
-        ttl_seconds: Optional[int] = None,
+        retention: Optional[Dict[str, Any]] = None,
         timeout_seconds: int = ADX_GET_DEFAULT_TIMEOUT,
     ) -> Dict[str, Any]:
         """Synchronously pause one sandbox using one internal request identity."""
         return self._lifecycle_request(
             sandbox_id,
             operation="pause",
-            body={"timeoutSeconds": timeout_seconds, **({"ttlSeconds": ttl_seconds} if ttl_seconds is not None else {})},
+            body={"timeoutSeconds": timeout_seconds, **({"retention": retention} if retention is not None else {})},
             timeout_seconds=timeout_seconds,
         )
 

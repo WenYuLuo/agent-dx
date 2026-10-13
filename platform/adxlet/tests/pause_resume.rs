@@ -315,7 +315,7 @@ fn pause(revision: u64) -> PauseRequest {
     PauseRequest {
         operation_id: "pause-a".into(),
         expected_revision: revision,
-        ttl_seconds: 600,
+        retention: adx_core::lifecycle::RetentionPolicy::Ttl { ttl_seconds: 600 },
         timeout_seconds: 60,
     }
 }
@@ -499,7 +499,7 @@ async fn expiry_cleans_paused_environment_but_never_deletes_resumed_execution() 
     let paused = h.pause(pause(created.record.revision)).await.unwrap();
     let cp = paused.record.checkpoint.clone().unwrap();
     let running = h.resume(resume(paused.record.revision)).await.unwrap();
-    h.expire_checkpoint(cp.expires_at_unix_seconds)
+    h.expire_checkpoint(cp.expires_at_unix_seconds.unwrap())
         .await
         .unwrap();
     assert!(backend
@@ -514,14 +514,46 @@ async fn expiry_cleans_paused_environment_but_never_deletes_resumed_execution() 
     let mut request = pause(r.record.revision);
     request.operation_id = "pause-c".into();
     let paused = h.pause(request).await.unwrap();
-    h.expire_checkpoint(paused.record.checkpoint.unwrap().expires_at_unix_seconds)
-        .await
-        .unwrap();
+    h.expire_checkpoint(
+        paused
+            .record
+            .checkpoint
+            .unwrap()
+            .expires_at_unix_seconds
+            .unwrap(),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         h.sync().await.unwrap().record.state,
         EnvironmentState::Deleted
     );
     assert_eq!(node.used(), Resources::default());
+}
+
+#[tokio::test]
+async fn permanent_pause_survives_expiry_and_reconcile_then_resumes_and_deletes() {
+    let (_temp, backend, node, spec, assignment) = fixture();
+    let h = node.environment(spec, assignment).unwrap();
+    let created = h.create().await.unwrap();
+    let mut request = pause(created.record.revision);
+    request.retention = adx_core::lifecycle::RetentionPolicy::Forever;
+    let paused = h.pause(request).await.unwrap();
+    let cp = paused.record.checkpoint.clone().unwrap();
+    assert_eq!(cp.expires_at_unix_seconds, None);
+    assert_eq!(h.expire_checkpoint(u64::MAX).await.unwrap(), None);
+    node.reconcile(vec![paused.record]).await.unwrap();
+    let current = h.sync().await.unwrap();
+    assert_eq!(current.record.state, EnvironmentState::Paused);
+    assert!(Path::new(&cp.artifact.location).exists());
+    let running = h.resume(resume(current.record.revision)).await.unwrap();
+    assert!(backend
+        .running
+        .lock()
+        .unwrap()
+        .contains(&running.record.runtime.id));
+    h.delete().await.unwrap();
+    assert!(!Path::new(&cp.artifact.location).exists());
 }
 
 #[tokio::test]
@@ -1269,7 +1301,7 @@ async fn recovery_with_unusable_checkpoint_settles_failed_without_image_start() 
         checkpoint: Some(adx_core::RestorePoint {
             id: "recovery".into(),
             source_runtime_id: "environment-1".into(),
-            expires_at_unix_seconds: u64::MAX,
+            expires_at_unix_seconds: None,
             origin: Some(adx_core::runtime::RuntimeIdentity {
                 environment_id: "environment".into(),
                 runtime_id: "environment-1".into(),
@@ -1346,7 +1378,7 @@ async fn recovery_retries_publication_without_repeating_backend_restore() {
         checkpoint: Some(adx_core::RestorePoint {
             id: "recovery".into(),
             source_runtime_id: "environment-1".into(),
-            expires_at_unix_seconds: u64::MAX,
+            expires_at_unix_seconds: None,
             origin: Some(adx_core::runtime::RuntimeIdentity {
                 environment_id: "environment".into(),
                 runtime_id: "environment-1".into(),
@@ -1658,7 +1690,7 @@ async fn idle_pause_releases_resources_and_concurrent_demand_restores_once() {
     let (_temp, backend, node, mut spec, assignment) = fixture();
     spec.lifecycle.idle_timeout_seconds = 10;
     spec.lifecycle.idle_action = adx_core::lifecycle::IdleAction::Pause;
-    spec.lifecycle.auto_resume = true;
+
     let h = node.environment(spec.clone(), assignment).unwrap();
     let initial = h.create().await.unwrap();
     *backend.activity.lock().unwrap() = Some((1, 0));

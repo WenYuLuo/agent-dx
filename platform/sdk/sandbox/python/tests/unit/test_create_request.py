@@ -19,6 +19,18 @@ from adx_sandbox import (
 
 
 class CreateRequestTests(unittest.TestCase):
+    def test_explicit_forever_retention_and_typed_actions(self):
+        import adx_sandbox as sdk
+        for name in ("RetentionPolicy", "IdleAction", "CheckpointStorage"):
+            self.assertTrue(hasattr(sdk, name), name)
+        body = self.capture_create(
+            idle_timeout=30,
+            idle_action=sdk.IdleAction.PAUSE,
+            pause_policy=sdk.PausePolicy(retention=sdk.RetentionPolicy.forever(), storage=sdk.CheckpointStorage.SHARED),
+        )
+        self.assertNotIn("autoResume", body)
+        self.assertEqual(body["pauseOptions"]["retention"], {"kind": "forever"})
+
     def setUp(self):
         self.exchanges = []
         self.http_clients = []
@@ -255,20 +267,20 @@ class CreateRequestTests(unittest.TestCase):
         self.assert_no_transport_setup()
 
     def test_idle_pause_with_shared_storage_is_preserved(self):
-        from adx_sandbox import PausePolicy
-        body = self.capture_create(idle_timeout=30, idle_action="pause", auto_resume=True,
-                                   pause_policy=PausePolicy(ttl_seconds=3600, timeout_seconds=120, storage="shared"))
+        from adx_sandbox import PausePolicy, RetentionPolicy, IdleAction, CheckpointStorage
+        body = self.capture_create(idle_timeout=30, idle_action=IdleAction.PAUSE,
+                                   pause_policy=PausePolicy(retention=RetentionPolicy.for_seconds(3600), timeout_seconds=120, storage=CheckpointStorage.SHARED))
         self.assertEqual(body["idleAction"], "pause")
-        self.assertTrue(body["autoResume"])
-        self.assertEqual(body["pauseOptions"], {"ttlSeconds": 3600, "timeoutSeconds": 120, "storage": "shared"})
+        self.assertNotIn("autoResume", body)
+        self.assertEqual(body["pauseOptions"], {"retention": {"kind": "ttl", "ttlSeconds": 3600}, "timeoutSeconds": 120, "storage": "shared"})
 
     def test_invalid_idle_pause_options_do_not_open_transport(self):
-        from adx_sandbox import PausePolicy
-        for options in ({"idle_action": "missing"}, {"idle_action": "pause", "idle_timeout": 0},
+        from adx_sandbox import PausePolicy, RetentionPolicy, IdleAction, CheckpointStorage
+        for options in ({"idle_action": "missing"}, {"idle_action": IdleAction.PAUSE, "idle_timeout": 0},
                         {"auto_resume": 1}, {"pause_policy": {"storage": "shared"}}):
             with self.subTest(options=options), self.assertRaises((ValueError, TypeError)):
                 Sandbox(image="fixture", connection=self.connection, **options)
         self.assert_no_transport_setup()
-        for options in ({"ttl_seconds": 0}, {"timeout_seconds": 3601}, {"storage": "missing"}):
-            with self.subTest(options=options), self.assertRaises(ValueError):
+        for options in ({"retention": 0}, {"timeout_seconds": 3601}, {"storage": "missing"}):
+            with self.subTest(options=options), self.assertRaises((ValueError, TypeError)):
                 PausePolicy(**options)
