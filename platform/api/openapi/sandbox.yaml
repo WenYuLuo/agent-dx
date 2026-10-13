@@ -288,6 +288,7 @@ paths:
       tags: [Sandboxes]
       operationId: resumeSandbox
       summary: Resume a paused Sandbox
+      description: Authorized business traffic also resumes both manually and automatically paused Sandboxes through the same Coordinator entry.
       parameters:
         - $ref: "#/components/parameters/SandboxId"
         - $ref: "#/components/parameters/ResumeOperationId"
@@ -717,7 +718,18 @@ components:
         snapshotId:
           type: string
           description: Tenant-scoped reusable snapshot used to create a new Sandbox.
-        idleTimeoutSeconds: {type: integer, format: int64, minimum: 0}
+        idleTimeoutSeconds:
+          type: integer
+          format: int64
+          minimum: 0
+          default: 0
+          description: Idle observation window; zero disables the action. Not a maximum lifetime.
+        idleAction:
+          type: string
+          enum: [delete, pause]
+          default: delete
+          description: Pause requires positive idleTimeoutSeconds and checkpoint capability.
+        pauseOptions: {$ref: "#/components/schemas/PausePolicy"}
         restartPolicy: {$ref: "#/components/schemas/RestartPolicy"}
         failover:
           type: boolean
@@ -991,21 +1003,62 @@ components:
         exit_code: {type: [integer, "null"], format: int32}
         message: {type: string}
         probe_failure: {$ref: "#/components/schemas/ProbeFailure"}
+    RetentionPolicy:
+      description: Finite retention starts after publication; forever retains the point until deletion or replacement.
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required: [kind, ttlSeconds]
+          properties:
+            kind: {type: string, const: ttl}
+            ttlSeconds: {type: integer, format: int64, minimum: 1}
+        - type: object
+          additionalProperties: false
+          required: [kind]
+          properties:
+            kind: {type: string, const: forever}
+    PausePolicy:
+      type: object
+      additionalProperties: false
+      properties:
+        retention:
+          allOf: [{$ref: "#/components/schemas/RetentionPolicy"}]
+          default: {kind: ttl, ttlSeconds: 90000}
+        timeoutSeconds:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 3600
+          default: 300
+          description: Sandboxd checkpoint capture budget; does not bound OBS publication or the whole pause operation.
+        storage:
+          type: string
+          enum: [configured, local, shared]
+          default: configured
+          description: Anonymous checkpoint publication policy. Shared requires complete object-store publication and supports compatible cross-node resume.
     PauseRequest:
       type: object
       additionalProperties: false
       properties:
-        ttlSeconds: {type: integer, format: int64, minimum: 0, default: 90000}
-        timeoutSeconds: {type: integer, format: int64, minimum: 1, maximum: 3600, default: 300}
+        retention:
+          allOf: [{$ref: "#/components/schemas/RetentionPolicy"}]
+          description: Omission inherits pauseOptions.retention, otherwise defaults to a 90000-second TTL.
+        timeoutSeconds:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 3600
+          default: 300
+          description: Capture RPC budget and per-attempt caller wait with transport allowance; not a total pause deadline.
     PauseResult:
       type: object
-      required: [sandboxId, snapshotId, size, state]
+      required: [sandboxId, snapshotId, size, state, expiresAt]
       properties:
         sandboxId: {type: string}
         snapshotId: {type: string}
         size: {type: integer, format: int64, minimum: 1}
         state: {type: string, const: paused}
-        expiresAt: {type: [integer, "null"], format: int64}
+        expiresAt: {type: [integer, "null"], format: int64, description: "Null for permanent retention; otherwise a Unix timestamp in seconds."}
     ResumeResult:
       type: object
       required: [sandboxId, state, routeAddress, functionProxyId, nodeId, portMappings]

@@ -19,6 +19,9 @@ service CoordinatorService {
   rpc InspectNode(InspectNodeRequest) returns (InspectNodeResponse);
   rpc CreateEnvironment(CreateEnvironmentRequest) returns (EnvironmentResult);
   rpc GetEnvironment(GetEnvironmentRequest) returns (GetEnvironmentResponse);
+  rpc EnsureRunning(EnsureRunningRequest) returns (GetEnvironmentResponse);
+  // Retire a dormant Environment whose original execution ownership is invalidated.
+  rpc RetireDormant(GetEnvironmentRequest) returns (EnvironmentResult);
   // Node-owned state decisions are persisted by Coordinator. This does not transfer
   // ownership of the Environment lifecycle to Coordinator.
   rpc CommitEnvironment(CommitEnvironmentRequest) returns (CommitEnvironmentResponse);
@@ -34,6 +37,7 @@ service NodeService {
   rpc DeleteEnvironment(DeleteEnvironmentRequest) returns (EnvironmentResult);
   rpc PauseEnvironment(PauseEnvironmentRequest) returns (EnvironmentResult);
   rpc ResumeEnvironment(ResumeEnvironmentRequest) returns (EnvironmentResult);
+  rpc EnsureEnvironmentRunning(EnsureEnvironmentRunningRequest) returns (EnvironmentResult);
   rpc UpdateNetworkPolicy(UpdateNetworkPolicyRequest) returns (EnvironmentResult);
   rpc ReloadEnvironment(ReloadEnvironmentRequest) returns (EnvironmentResult);
   rpc CreateSnapshot(CreateSnapshotRequest) returns (CreateSnapshotResponse);
@@ -41,6 +45,15 @@ service NodeService {
 }
 
 message RecoverEnvironmentRequest { EnvironmentRecord record = 1; string node_session_id = 2; }
+message EnsureRunningRequest {
+  string environment_id = 1; CallerContext caller = 2; reserved 3;
+  uint64 timeout_seconds = 4;
+  // Observed execution before demand; callers coalesce onto a later Running result.
+  string expected_runtime_id = 5;
+}
+message EnsureEnvironmentRunningRequest {
+  Assignment assignment = 1; string operation_id = 2; string node_session_id = 3;
+}
 
 message GetNodeSessionRequest {}
 
@@ -99,7 +112,7 @@ message InspectNodeRequest { string node_id = 1; string session_id = 2; }
 
 message InspectNodeResponse { repeated EnvironmentRecord records = 1; uint64 coordinator_epoch = 2; repeated ReusableSnapshot snapshots = 3; repeated RestorePoint retained_checkpoints = 4; }
 
-message PauseEnvironmentRequest { Assignment assignment = 1; CallerContext caller = 2; string operation_id = 3; uint64 expected_revision = 4; uint64 ttl_seconds = 5; uint64 timeout_seconds = 6; }
+message PauseEnvironmentRequest { Assignment assignment = 1; CallerContext caller = 2; string operation_id = 3; uint64 expected_revision = 4; reserved 5; uint64 timeout_seconds = 6; RetentionPolicy retention = 7; }
 
 message ResumeEnvironmentRequest { Assignment assignment = 1; CallerContext caller = 2; string operation_id = 3; uint64 expected_revision = 4; }
 

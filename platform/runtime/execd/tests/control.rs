@@ -42,6 +42,7 @@ async fn prepare_ack_requires_reader_and_abort_reuses_it() {
     });
     let control = Controller::new(identity(), hooks.clone()).unwrap();
     let request = PrepareCheckpoint {
+        idle_revision: None,
         identity: identity(),
         operation_id: "a".into(),
         expected_revision: 1,
@@ -57,6 +58,7 @@ async fn prepare_ack_requires_reader_and_abort_reuses_it() {
         .unwrap();
     let second = control
         .prepare(PrepareCheckpoint {
+            idle_revision: None,
             identity: identity(),
             operation_id: "b".into(),
             expected_revision: control.status().revision,
@@ -89,6 +91,7 @@ async fn restore_refreshes_identity_and_rejects_old_owner() {
     .unwrap();
     control
         .prepare(PrepareCheckpoint {
+            idle_revision: None,
             identity: identity(),
             operation_id: "a".into(),
             expected_revision: 1,
@@ -107,6 +110,7 @@ async fn restore_refreshes_identity_and_rejects_old_owner() {
     assert_eq!(control.status().identity.runtime_id, "i-2");
     assert!(control
         .prepare(PrepareCheckpoint {
+            idle_revision: None,
             identity: identity(),
             operation_id: "b".into(),
             expected_revision: control.status().revision
@@ -128,6 +132,7 @@ impl CheckpointHooks for MissingHandoff {
 async fn missing_handoff_never_acknowledges_prepared() {
     let control = Controller::new(identity(), Arc::new(MissingHandoff)).unwrap();
     let request = PrepareCheckpoint {
+        idle_revision: None,
         identity: identity(),
         operation_id: "a".into(),
         expected_revision: 1,
@@ -179,6 +184,7 @@ async fn disconnected_prepare_keeps_operation_and_stale_revision_is_rejected() {
     )
     .unwrap();
     let request = PrepareCheckpoint {
+        idle_revision: None,
         identity: identity(),
         operation_id: "a".into(),
         expected_revision: 1,
@@ -204,6 +210,7 @@ async fn disconnected_prepare_keeps_operation_and_stale_revision_is_rejected() {
     );
     assert!(control
         .prepare(PrepareCheckpoint {
+            idle_revision: None,
             identity: identity(),
             operation_id: "b".into(),
             expected_revision: 1
@@ -240,6 +247,7 @@ async fn clone_handoff_rebinds_identity_and_rejects_source_requests() {
     let control = Controller::new(identity(), Arc::new(CloneHooks)).unwrap();
     control
         .prepare(PrepareCheckpoint {
+            idle_revision: None,
             identity: identity(),
             operation_id: "clone-source".into(),
             expected_revision: 1,
@@ -257,6 +265,7 @@ async fn clone_handoff_rebinds_identity_and_rejects_source_requests() {
     assert_eq!(control.status().phase, RuntimePhase::Running);
     assert!(control
         .prepare(PrepareCheckpoint {
+            idle_revision: None,
             identity: identity(),
             operation_id: "old-source-request".into(),
             expected_revision: control.status().revision
@@ -306,6 +315,7 @@ async fn workload_checkpoint_waits_for_handoff_and_durable_completion() {
     assert!(control.finish_checkpoint(finish.clone()).is_err());
     control
         .prepare(PrepareCheckpoint {
+            idle_revision: None,
             identity: identity(),
             operation_id: "local-a".into(),
             expected_revision: control.status().revision,
@@ -349,6 +359,7 @@ async fn restored_runtime_discards_workload_request() {
     tokio::task::yield_now().await;
     control
         .prepare(PrepareCheckpoint {
+            idle_revision: None,
             identity: identity(),
             operation_id: "source".into(),
             expected_revision: control.status().revision,

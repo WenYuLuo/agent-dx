@@ -244,6 +244,15 @@ pub enum DataPlaneSecurityMode {
     Tls,
     TlsToken,
 }
+impl DataPlaneSecurityMode {
+    /// Resolve the deployment's default before publishing routing or wake policy.
+    pub fn effective(self) -> Self {
+        match self {
+            Self::Inherit => Self::TlsToken,
+            mode => mode,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DataPlanePolicy {

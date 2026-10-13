@@ -323,6 +323,11 @@ impl Files {
                 self.ingress
                     .authorize(&route, &self.tenant)
                     .map_err(|_| ReadError::NotFound)?;
+                let route = self
+                    .ingress
+                    .prepare_route(route, &self.tenant)
+                    .await
+                    .map_err(|_| ReadError::Route)?;
                 let admission = Admission {
                     route,
                     changes: Mutex::new(self.ingress.subscribe_route_changes()),

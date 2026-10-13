@@ -3,7 +3,7 @@ use adx_core::{
     Assignment, EnvironmentRecord, EnvironmentSpec, EnvironmentState, Error, Event, LifecycleKind,
     Result,
 };
-use std::{sync::Arc, time::Instant};
+use std::{collections::BTreeSet, sync::Arc, time::Instant};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 
@@ -13,6 +13,8 @@ mod snapshots;
 mod workload_checkpoint;
 use super::checkpoint::{PauseRequest, ResumeRequest};
 
+pub(super) type CheckpointReferences = BTreeSet<(String, String)>;
+
 enum Command {
     Snapshot(
         super::checkpoint::SnapshotRequest,
@@ -20,6 +22,7 @@ enum Command {
     ),
     Pause(PauseRequest),
     Resume(ResumeRequest),
+    EnsureRunning(String),
     Network {
         policy: Option<adx_core::sandbox::NetworkPolicy>,
         operation_id: String,
@@ -36,7 +39,11 @@ enum Command {
     CollectFailed(u64),
     Sync,
     Reconcile,
-    Discard(oneshot::Sender<Result<()>>),
+    AlignAuthority(Box<EnvironmentRecord>, oneshot::Sender<Result<()>>),
+    Discard(
+        Option<Arc<CheckpointReferences>>,
+        oneshot::Sender<Result<()>>,
+    ),
     Expire(u64, oneshot::Sender<Result<Option<OperationResult>>>),
     Tick(oneshot::Sender<Result<Option<OperationResult>>>),
     RuntimeEvent(
@@ -63,6 +70,7 @@ impl Envelope {
 #[derive(Clone)]
 pub struct EnvironmentHandle {
     tx: mpsc::Sender<Envelope>,
+    demand: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl EnvironmentHandle {
@@ -94,6 +102,11 @@ impl EnvironmentHandle {
     }
     pub async fn resume(&self, request: ResumeRequest) -> Result<OperationResult> {
         self.send(Command::Resume(request)).await
+    }
+    pub async fn ensure_running(&self, operation_id: String) -> Result<OperationResult> {
+        self.demand
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        self.send(Command::EnsureRunning(operation_id)).await
     }
     pub async fn update_network_policy(
         &self,
@@ -141,11 +154,27 @@ impl EnvironmentHandle {
     pub(crate) async fn reconcile(&self) -> Result<OperationResult> {
         self.send(Command::Reconcile).await
     }
-    pub(crate) async fn discard(&self) -> Result<()> {
+    pub(crate) async fn align_authority(&self, record: EnvironmentRecord) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         let (unused, _) = oneshot::channel();
         self.tx
-            .send(Envelope::new(Command::Discard(tx), unused))
+            .send(Envelope::new(
+                Command::AlignAuthority(Box::new(record), tx),
+                unused,
+            ))
+            .await
+            .map_err(|_| Error::Unavailable("environment controller stopped".into()))?;
+        rx.await
+            .map_err(|_| Error::Unavailable("environment controller stopped".into()))?
+    }
+    pub(crate) async fn discard(
+        &self,
+        references: Option<Arc<CheckpointReferences>>,
+    ) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        let (unused, _) = oneshot::channel();
+        self.tx
+            .send(Envelope::new(Command::Discard(references, tx), unused))
             .await
             .map_err(|_| Error::Unavailable("environment controller stopped".into()))?;
         rx.await
@@ -223,6 +252,7 @@ pub(crate) fn spawn_restored(
     services: Arc<Services>,
 ) -> EnvironmentHandle {
     let (tx, mut rx) = mpsc::channel::<Envelope>(32);
+    let demand = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let mut controller = Controller {
         recovery_files: None,
         held: record.resources_held,
@@ -234,6 +264,9 @@ pub(crate) fn spawn_restored(
         idle: None,
         restart_after: None,
         health_failures: 0,
+        demand: demand.clone(),
+        observed_demand: 0,
+        auto_pause_guard: None,
     };
     tokio::spawn(async move {
         while let Some(Envelope {
@@ -252,12 +285,17 @@ pub(crate) fn spawn_restored(
                 .await;
         }
     });
-    EnvironmentHandle { tx }
+    EnvironmentHandle { tx, demand }
 }
 
 impl Controller {
     async fn dispatch(&mut self, command: Command, reply: Reply) {
         let command = match command {
+            Command::AlignAuthority(record, ack) => {
+                let result = self.align_authority(*record).await;
+                let _ = ack.send(result);
+                return;
+            }
             Command::Snapshot(request, ack) => {
                 let result = if self.retired {
                     Err(Error::Conflict)
@@ -304,15 +342,8 @@ impl Controller {
                 let _ = ack.send(result);
                 return;
             }
-            Command::Discard(ack) => {
-                let result = if self.retired {
-                    Ok(())
-                } else {
-                    self.cleanup().await
-                };
-                if result.is_ok() {
-                    self.retired = true;
-                }
+            Command::Discard(references, ack) => {
+                let result = self.discard_execution(references.as_deref()).await;
                 let _ = ack.send(result);
                 return;
             }
@@ -325,6 +356,7 @@ impl Controller {
         let operation = match &command {
             Command::Pause(_) => "pause",
             Command::Resume(_) => "resume",
+            Command::EnsureRunning(_) => "ensure_running",
             Command::Network { .. } => "network",
             Command::Reload { .. } => "reload",
             Command::Recover(_) => "recover",
@@ -337,12 +369,25 @@ impl Controller {
         };
         let result = match command {
             Command::Snapshot(_, _)
-            | Command::Discard(_)
+            | Command::AlignAuthority(_, _)
+            | Command::Discard(_, _)
             | Command::Expire(_, _)
             | Command::Tick(_)
             | Command::RuntimeEvent(_, _) => unreachable!(),
             Command::Pause(request) => self.pause(request).await,
             Command::Resume(request) => self.resume(request).await,
+            Command::EnsureRunning(operation_id) => {
+                self.idle = None;
+                if self.record.state == EnvironmentState::Running {
+                    self.sync().await
+                } else {
+                    self.resume(ResumeRequest {
+                        operation_id,
+                        expected_revision: self.record.revision,
+                    })
+                    .await
+                }
+            }
             Command::Network {
                 policy,
                 operation_id,
@@ -393,6 +438,9 @@ impl Controller {
 }
 
 struct Controller {
+    auto_pause_guard: Option<((String, u64, u64), u64)>,
+    demand: Arc<std::sync::atomic::AtomicU64>,
+    observed_demand: u64,
     recovery_files: Option<crate::checkpoint::MaterializedCheckpoint>,
     record: EnvironmentRecord,
     services: Arc<Services>,
@@ -406,6 +454,66 @@ struct Controller {
 }
 
 impl Controller {
+    async fn discard_execution(&mut self, references: Option<&CheckpointReferences>) -> Result<()> {
+        if !self.retired {
+            self.cleanup().await?;
+            // Stop accepting serial operations before deleting retired artifacts.
+            // A failed object deletion is retried without republishing old state.
+            self.retired = true;
+        }
+        let Some(references) = references else {
+            return Ok(());
+        };
+        let Some(checkpoint) = &self.services.checkpoint else {
+            return Ok(());
+        };
+        if let Some(cp) = self.record.checkpoint.as_ref() {
+            let key = (cp.artifact.storage.clone(), cp.artifact.location.clone());
+            if !references.contains(&key) {
+                checkpoint.store.remove(&cp.artifact).await?;
+                self.record.checkpoint = None;
+            }
+        }
+        while let Some(artifact) = self.obsolete_checkpoints.last() {
+            let key = (artifact.storage.clone(), artifact.location.clone());
+            if !references.contains(&key) {
+                checkpoint.store.remove(artifact).await?;
+            }
+            self.obsolete_checkpoints.pop();
+        }
+        Ok(())
+    }
+
+    async fn align_authority(&mut self, mut record: EnvironmentRecord) -> Result<()> {
+        if self.retired
+            || record.spec != self.record.spec
+            || record.assignment != self.record.assignment
+        {
+            return Err(Error::Conflict);
+        }
+        if record.state == EnvironmentState::Paused && record.runtime.id != self.record.runtime.id {
+            // A current controller may have finished restore while its commit
+            // was fenced by a Coordinator restart. Clean that execution and
+            // re-adopt the durable paused point instead of publishing Failed.
+            // A known published result requires a fresh catalog; do not delete it.
+            if self.durability == Some(Durability::Published) {
+                return Err(Error::Conflict);
+            }
+            self.cleanup().await?;
+            // Cleanup retires the uncommitted execution at its local revision.
+            // A live Relay retains that version across full catalog replacement;
+            // publishing the older paused revision would prevent reconciliation
+            // and the next restore from advancing its binding.
+            record.revision = record
+                .revision
+                .max(self.record.revision.checked_add(1).ok_or(Error::Conflict)?);
+            self.record = record;
+            self.durability = None;
+            self.idle = None;
+        }
+        Ok(())
+    }
+
     async fn reconcile(&mut self) -> Result<OperationResult> {
         let observation = if self.record.state == EnvironmentState::Running {
             Some(
@@ -450,7 +558,7 @@ impl Controller {
             let cp = self.record.checkpoint.clone().ok_or(Error::Conflict)?;
             let services = self.services.checkpoint.clone().ok_or(Error::Conflict)?;
             self.cleanup().await?;
-            if cp.expires_at_unix_seconds <= super::checkpoint::now()? {
+            if cp.expired(super::checkpoint::now()?) {
                 return self.delete().await;
             }
             match services.store.validate_artifact(&cp.artifact).await {
@@ -619,6 +727,12 @@ impl Controller {
         let mut awaiting_readiness = false;
         let operation_started = Instant::now();
         let attempt = timeout(initialization_timeout, async {
+            if self.record.spec.lifecycle.idle_action == adx_core::lifecycle::IdleAction::Pause {
+                self.services
+                    .runtime
+                    .checkpoint_supported(&self.record.spec.runtime_class)
+                    .await?;
+            }
             self.services.readiness.expect_runtime(&self.record)?;
             let runtime_start_started = Instant::now();
             self.record.runtime.ip = Some(

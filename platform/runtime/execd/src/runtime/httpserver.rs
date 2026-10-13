@@ -372,7 +372,9 @@ async fn handle_one_request(
 
     // Ordinary atomic operations are data activity. The long-lived command
     // watch above is deliberately a passive observer and must not prevent idle.
-    let _active = super::activity::enter(super::activity::ActivitySource::DirectHttp);
+    let _active = match super::activity::try_enter(super::activity::ActivitySource::DirectHttp) {
+        Ok(active) => active, Err(_) => return write_resp(sock, 503, "{\"error\":\"runtime is quiescing\"}").await,
+    };
 
     if method == "GET" && route == "/upload/status" {
         return handle_upload_status(sock, &path).await;
@@ -618,7 +620,10 @@ async fn handle_pty(
     head: &str,
     raw_path: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let _active = super::activity::enter(super::activity::ActivitySource::DirectHttp);
+    let _active = match super::activity::try_enter(super::activity::ActivitySource::DirectHttp) {
+        Ok(active) => active,
+        Err(_) => return write_resp(sock, 503, "{\"error\":\"runtime is quiescing\"}").await,
+    };
     let command: Vec<String> = query_params(raw_path, "command")
         .into_iter()
         .filter_map(|value| percent_decode(&value))

@@ -1,6 +1,6 @@
 # 管控面当前实现
 
-核对日期：2026-09-21。内部以 Environment 为核心，公开接口保持 Sandbox HTTP/SDK 形态。本文描述当前源码；当次测试数据保留在带日期的验收报告中。
+核对日期：2026-10-13。内部以 Environment 为核心，公开接口保持 Sandbox HTTP/SDK 形态。本文描述当前源码；当次测试数据保留在带日期的验收报告中。
 
 ## 模块与职责
 
@@ -13,38 +13,39 @@
 | `crates/transport` | mTLS/HTTP TLS、请求上下文和剩余 deadline | 不承载路由、调度或生命周期规则 |
 | `platform/crates/scheduling` | 静态 Filter/Score、Pack/Spread、整卡、节点/实例亲和与反亲和、增量快照与索引 | 拓扑规则存在于内部类型和库；不是公开 HTTP 已验收能力 |
 | `platform/coordinator` | Global 轮转、同进程 Shard 队列与选点、自动分片、Redis、认证、路由/快照目录、节点失效与跨节点恢复协调 | 单 Coordinator；无 scaler、抢占或租户配额；未分配队列仅在内存 |
-| `platform/adxlet` | 每 Environment 串行任务、准入、暂停/恢复/删除、空闲删除、可配置重启、资源采集、对账 | 普通生命周期由节点决定；SQLite 是提交故障降级日志 |
+| `platform/adxlet` | 每 Environment 串行任务、准入、暂停/恢复/删除、空闲删除/暂停、可配置重启、资源采集、对账 | 普通生命周期由节点决定；SQLite 是提交故障降级日志 |
 | 同上 `sandboxd.rs` / `runtime_control.rs` | RuntimeDriver、Start/Stats/checkpoint/restore、Execd 双向控制流／HTTP 准备与身份校验 | sandboxd 自行生成物理 ID；平台 Environment ID 与后端 ID 分开 |
 | 同上 `checkpoint.rs` / `checkpoint/` | 本地/S3 存储抽象、下载缓存、引用保护、过期和孤儿制品回收 | local-only 制品只在源节点可用；模板预热后置 |
 | 同上 `routes.rs` / `proxy.rs` | 本机绑定、全量同步、代理重启重放、活动接收；默认嵌入 RelayService | 省略 `proxy_mode` 即 `embedded`；显式 `standalone` 保留分进程；两种模式使用同一 UDS 控制契约 |
 | `gateway/apiserver` | Rust HTTPS 服务、API Key 缓存、版本化实例目录订阅、生命周期和快照适配、管理员密钥接口；默认托管 Ingress 服务 | [支持范围](apiserver.md)；Agent 路由需要另配业务服务 |
-| `gateway` | 可复用 Ingress 服务、Redis 发现与 gRPC 路由订阅、认证、转发；Relay 绑定复核与数据转发 | 数据请求不进入生命周期队列；Ingress 路由仅内存缓存；显式分进程复用同一实现 |
+| `gateway` | 可复用 Ingress 服务、Redis 发现与 gRPC 路由订阅、认证、转发；Relay 绑定复核与数据转发 | 休眠首请求经 EnsureRunning 唤醒后转发；Ingress 路由仅内存缓存；显式分进程复用同一实现 |
 | `platform/runtime/execd` | 命令、文件、Shell/PTY、命令观察、HTTP 运行时协作 | 恢复时更新身份/认证、退役旧连接并重建监听 |
 | `platform/deployment` | Rust `adxctl`、统一 YAML 配置、supervisor、清理后停止 | API Server 默认内嵌 Ingress，adxlet 默认内嵌 Relay；显式分进程仍使用同一发布包；sandboxd 由部署环境托管 |
 | `crates/observability` 与各组件埋点 | Trace 上下文/采样/OTLP、Metrics、结构化日志；组件和 supervisor 的滚动压缩实现 | Collector 是外部采集组件；实时队列丢弃指标后置 |
 
 ## 生命周期与提交
 
-创建：Coordinator 先持久化 Assignment，再由 adxlet 本机准入、启动 sandboxd、确认 Execd 就绪和本机绑定，最后提交 Running。Coordinator 向 API Server 首次全量、后续增量发布活跃实例目录；删除后撤销目录项并从 Redis 主目录移除，短期最小回执只用于相同删除结果重试。普通已有实例操作命中本地目录后直达节点，无需预先向 Coordinator 登记每次操作意图。
+创建：Coordinator 先持久化 Assignment，再由 adxlet 本机准入、启动 sandboxd、确认 Execd 就绪和本机绑定，最后提交 Running。Coordinator 向 API Server 首次全量、后续增量发布活跃实例目录；删除后撤销目录项并从 Redis 主目录移除，短期最小回执只用于相同删除结果重试。暂停等已有实例操作命中本地目录后直达节点；手动恢复和 Ingress 需求统一由 Coordinator 持久化唤醒意图。
 
 可配置 `create_mode: "local_first"`：API Server 订阅可用节点并轮转入口，adxlet 用同一 Admission 暂留标量资源和整卡，再由 Coordinator 验证硬约束、CAS 确认归属并同步内存账本后启动。本地不满足时由入口节点保留同 ID 回退 ShardScheduler；API Server 不在连接失败或结果未知时二次发起中心创建。`createTimeoutSeconds` 约束完整创建，`scheduleTimeoutSeconds` 仅从请求进入 Coordinator 中心队列后计时，本地准入不预切或消耗中心排队预算。Pack/Spread、软评分和队列公平性仅适用于中心路径；默认仍为 `central`。并发、暂留释放和结果未知契约见 [本地优先与原子归属](atomic-environment-claim.md)。
 
-暂停：节点完成 checkpoint、确认旧执行删除、保存制品，再经 Coordinator 提交 Paused 和恢复点。对象存储成功要求上传完成。恢复：公开 resume 直达所属节点重新准入和恢复，完成 Execd/绑定后提交 Running；共享 checkpoint 的故障跨节点恢复由 Coordinator 协调新归属。删除先退役本机绑定、确认后端删除，再释放资源和提交结果。
+暂停：节点完成 checkpoint、确认旧执行删除、保存制品，再经 Coordinator 提交 Paused 和恢复点。对象存储成功要求上传完成。恢复：公开 resume 与流量 autoResume 共用 Coordinator EnsureRunning，先原节点准入，明确 NoCapacity 或归属失效后使用共享 checkpoint 调度兼容目标；RPC 不确定时保留当前归属。完成 Execd/绑定后提交 Running，Ingress 等待对应路由再转发。删除先退役本机绑定、确认后端删除，再释放资源和提交结果。
 
 adxlet 调用 sandboxd Start 时，RPC 失败、超时、应答丢失或成功载荷无效均判定创建 Failed，不以同一执行身份重复 Start。创建进入 Failed 即释放本机标量资源和 GPU/NPU 预留，并在清理之前提交 `resources_held=false`。资源释放不依赖后端查询、删除成功或清理超时。清理与本机尚在等待的 Start 客户端任务串行，失败则继续重试；提交不可用时按既有降级／重试契约补写集群账本。Failed 实例即使已释放资源仍会在生命周期巡检中检查并删除迟到的后端，不能转成 Running；节点重启时通过权威目录对账清理。这里的 Failed 是创建结果，不是物理后端从未启动的证明。公开 API 应答丢失仍按同一 Environment 身份查询或重试，不能另建实例；checkpoint 结果未知的保护独立保留。
 
 `StateSink` 返回 Published 表示 Coordinator 已提交 Redis；Journaled 表示结果只进入 SQLite 降级日志。后者不发布集群路由，API Server 不返回集群生命周期成功。Coordinator 恢复后去重补写；adxlet 重启而 Coordinator 不可用时只观察，等待权威对账。详见 [节点生命周期](node-lifecycle.md)、[暂停恢复](environment-checkpoint.md) 和 [存储](snapshot-storage.md)。
 
-节点心跳超时后，Coordinator 持久化失效、撤销路由并协调有效共享 checkpoint 的恢复。local-only、缺失或过期 checkpoint 直接失败。原节点返回先清理失效执行，再开放准入。心跳失效是控制面判定，不是物理进程已停止的证据；当前没有跨宿主网络分区的强隔离验收，见 [失效契约](node-failure-takeover.md)。
+节点心跳超时后，Coordinator 持久化失效、撤销路由并协调有效共享 checkpoint 的恢复。Running/Failed 对象的 local-only、缺失或过期 checkpoint 明确恢复失败；用户休眠的 Paused 保持休眠，首次需求才选择共享 checkpoint 目标，TTL/删除仍可退役它。原节点返回先清理失效执行，再开放准入。心跳失效是控制面判定，不是物理进程已停止的证据；当前没有跨宿主网络分区的强隔离验收，见 [失效契约](node-failure-takeover.md)。
 
 ## 公开能力与 Agent 边界
 
-新平台已接通创建、查询、删除、同节点暂停/恢复、reload、可复用快照目录和克隆、空闲删除、重启策略、`failover=true`、HTTP/SDK 放置约束、S3 rootfs／mount、镜像入口继承、创建及运行期网络策略、独立执行 limit、extra_config、每实例数据面安全策略、鉴权端口转发、`upstream` reverse tunnel 及命令/文件数据链路。公开请求中的本机 rootfs 和 host mount 会被拒绝；节点本地 Execd 运行环境仍由部署配置拥有。旧 `/invoke` 兼容传输不属于新数据链路。
+新平台已接通创建、查询、删除、按需暂停/恢复、reload、可复用快照目录和克隆、空闲删除/暂停、流量唤醒、重启策略、`failover=true`、HTTP/SDK 放置约束、S3 rootfs／mount、镜像入口继承、创建及运行期网络策略、独立执行 limit、extra_config、每实例数据面安全策略、鉴权端口转发、`upstream` reverse tunnel 及命令/文件数据链路。公开请求中的本机 rootfs 和 host mount 会被拒绝；节点本地 Execd 运行环境仍由部署配置拥有。旧 `/invoke` 兼容传输不属于新数据链路。
 
 `agent/` 已实现 Rust Template/AgentBinding 管理和无状态 Activator；Gateway Ingress 装配 Agent API，Activator 的 Sandbox 管理经 API Server。AgentBinding 首次访问按稳定身份激活，用户 Harness 通过 HTTP/WS/SSH 访问。具体部署及已验证范围见 [Agent 使用说明](../../agent/README.md)；平台基础 E2E 与 Agent 端到端验收分开记录。 API Server 原有 `agent_address` 兼容转发入口继续保留，与 Ingress 内的 Agent API 分开。
 
 ## 验收与剩余范围
 
+- 自动暂停/流量恢复有 API/SDK、实际 Execd、真实 Redis/gRPC、多 Ingress 及上传失败夹具回归；此次未运行真实 Firecracker/OBS 或 K8s 验收。配置与行为见 [节点生命周期](node-lifecycle.md)。
 - 本地优先创建链路已通过真实 Redis/mTLS/HTTPS 与新制品本地双节点8组验收，见 [本地报告](2026-09-17-local-first-e2e.md)；提交 `363e44f` 的 [Buildkite #30](2026-09-18-runtime-environment-k8s.md) 已用正式发布包完成同一八组 K8s 验收。
 - 最新正式基础 K8s 为 Buildkite #30：OCI default/runtime-only/custom 三种运行环境、资源 Metrics、日志滚动/采集和跨组件 Trace 均通过，清理无残留。两个 Pod 位于同一宿主。历史 [Buildkite #24](2026-09-17-rust-apiserver-k8s.md) 保留为 Rust API Server 七组迁移记录。
 - 本地 FC：暂停/恢复、S3、SQLite 降级、快照与跨节点恢复分别有真实验收，见 [路线图](control-plane-roadmap.md)。后续双克隆运行暴露网络问题，不能只引用较早成功批次宣称已解决。

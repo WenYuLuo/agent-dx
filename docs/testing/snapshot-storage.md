@@ -10,10 +10,10 @@ adxlet 可使用原来的 `checkpoint_dir`，或显式选择 `checkpoint_storage
 {
   "checkpoint_storage": {
     "kind": "s3",
-    "alias": "shared",
+    "alias": "obs",
     "bucket": "adx-checkpoints",
-    "region": "us-east-1",
-    "endpoint": "https://objects.example.internal",
+    "region": "cn-north-4",
+    "endpoint": "https://obs.cn-north-4.myhuaweicloud.com",
     "allow_http": false,
     "prefix": "production/checkpoints",
     "root": "/opt/adx/data/checkpoints",
@@ -24,6 +24,25 @@ adxlet 可使用原来的 `checkpoint_dir`，或显式选择 `checkpoint_storage
 
 部署环境通过标准 AWS 凭证环境变量或环境提供的身份机制配置 S3 访问。实例记录只保存存储别名、制品 ID 与字节数，不保存端点和密钥。每个集群使用独立的 bucket/prefix；共享该存储的节点必须为同一别名配置相同 bucket/prefix，并保持节点 ID 和存储别名稳定；本地目录是节点私有的暂存与下载缓存。
 
+### Environment 匿名恢复点策略
+
+创建 HTTP 的 `pauseOptions.storage` / SDK `PausePolicy.storage` 配置匿名恢复点：
+
+| 值 | 发布行为 | 跨节点恢复 |
+| --- | --- | --- |
+| configured（默认） | 使用节点配置的本地/S3 后端 | 后端为共享对象存储时支持 |
+| local | 即使节点配置 S3 也保留本地制品 | 不支持 |
+| shared | 必须上传到配置的对象存储，否则拒绝 | 支持同别名的兼容节点 |
+
+该策略用于手动/自动 pause 和 workload checkpoint；它不替代可复用 Snapshot 目录。
+`pauseOptions.retention` 接受有限 TTL 或显式永久保留；永久暂停点在 Redis/RPC 中的
+过期时间为空，经过期扫描、对账或节点失效仍保持休眠。显式删除或替换时释放引用，
+实际制品清理继续遵守存储引用及孤儿回收契约。
+OBS 使用既有 S3 兼容适配器和标准凭据配置，上面的 endpoint 是配置示例。
+真实 OBS/Firecracker 验证入口和运行边界见[跨节点验收说明](firecracker-cross-node.md)。节点注册自动携带
+`ADX_CHECKPOINT_STORAGE=<alias>`，shared 创建过滤掉 local 节点，恢复目标必须匹配
+制品存储别名及原有运行时/放置约束；别名相同须由部署保证指向同一 bucket/prefix。
+
 ## 制品提交与恢复
 
 - 本地目录发布检查制品路径、文件类型和总长度，成功时文件已生成且可在本机读取；adxlet 不对制品和目录执行 `fsync`，由操作系统及执行后端异步写回。local-only 不承诺返回前已稳定落盘，也不支持丢失节点后的跨节点恢复。恢复点元数据仍按生命周期契约提交给 Coordinator。暂停、workload checkpoint、上传失败后的本地保留和本地快照复制共用该语义。
@@ -31,12 +50,12 @@ adxlet 可使用原来的 `checkpoint_dir`，或显式选择 `checkpoint_storage
 - 后端先生成完整本地 checkpoint。对象适配器按文件流式上传，记录每个文件的长度、SHA256 和权限；所有文件完成后才写入版本化格式的 manifest，作为发布完成标记。
 - 下载按 manifest 限制路径、长度和校验和，不接受符号链接及特殊文件。完整下载后以 rename 暴露缓存目录，避免恢复读取半成品。
 - 上传失败保留本地制品，adxlet 尝试回滚恢复。回滚使用的本地恢复点写入实例结果，保持 local-only 语义；成功上传后的暂存目录在结果全局提交后清理。
-- 运行中的 Execd 通过 Unix Socket 发起 workload checkpoint 时，同样使用节点配置的存储后端。S3 上传及实例结果提交完成后才回复成功；上传失败向 Execd 返回错误，运行中的源实例保持运行，不把本地暂存误报为共享恢复点。
+- 运行中的 Execd 通过 Unix Socket 发起 workload checkpoint 时，按 Environment 的 `pause.storage` 策略使用节点配置的存储后端或保留本地制品。S3 上传及实例结果提交完成后才回复成功；上传失败向 Execd 返回错误，运行中的源实例保持运行，不把本地暂存误报为共享恢复点。
 - 制品清理与快照复制保留接口边界。复制产生独立制品 ID；源暂停恢复点删除不影响可复用副本。远端文件支持服务端复制，大文件使用有界流式复制。
 
 ## 缓存与实际执行引用
 
-缓存按字节预算和最近使用时间淘汰未引用下载。预算被已有引用占满时，新恢复返回暂不可用。暂停实例对账仅验证远端 manifest，不因扫描目录而下载全部暂停实例。
+缓存按字节预算和最近使用时间淘汰未引用下载。预算被已有引用占满或制品超过本机缓存预算时，恢复在执行前明确返回 NoCapacity；统一恢复入口可排除该节点，选择共享存储的兼容目标。暂停实例对账仅验证远端 manifest，不因扫描目录而下载全部暂停实例。
 
 sandboxd 的 Firecracker v2 恢复会直接读取调用方制品中的 state/memory 文件。因此引用要保持到执行停止，不能在 Restore RPC 返回后立即释放。adxlet 重启后从权威记录重建运行实例的引用；过期恢复点立即失去再次恢复资格，但物理文件和对应记录延迟到运行引用释放后清理。上传失败回滚同样遵守这一规则。
 

@@ -294,6 +294,9 @@ impl Controller {
                 {
                     return Err(Error::Conflict);
                 }
+                if let Some(revision) = request.idle_revision {
+                    super::activity::quiesce(revision)?;
+                }
                 let prepared = state.reader_running;
                 state.status.phase = if prepared {
                     RuntimePhase::Prepared
@@ -348,6 +351,7 @@ impl Controller {
                 let mut state = self.state.lock().unwrap();
                 state.reader_running = false;
                 state.status.phase = RuntimePhase::Running;
+                super::activity::reopen();
                 if let Some(checkpoint) = &mut state.status.checkpoint {
                     checkpoint.phase = CheckpointPhase::Failed;
                     checkpoint.error = Some(match error {
@@ -407,6 +411,7 @@ impl Controller {
         let mut state = self.state.lock().unwrap();
         state.status.phase = self.handoff_probe_phase();
         state.status.failure = None;
+        super::activity::reopen();
         let (phase, error) = match (outcome, restored) {
             (Ok(HandoffOutcome::Restore), Some(Ok(identity))) => {
                 state.status.identity = identity;
@@ -460,6 +465,7 @@ impl Controller {
             return Err(Error::Conflict);
         }
         state.status.phase = RuntimePhase::Running;
+        super::activity::reopen();
         state.status.checkpoint.as_mut().unwrap().phase = CheckpointPhase::Aborted;
         self.publish(&mut state);
         Ok(state.status.clone())

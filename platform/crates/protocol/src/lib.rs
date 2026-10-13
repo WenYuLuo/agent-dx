@@ -30,7 +30,11 @@ impl TryFrom<control::EnvironmentSpec> for adx_core::EnvironmentSpec {
         let spec = Self {
             runtime_profile: value.runtime_profile.map(TryInto::try_into).transpose()?,
             snapshot_id: value.snapshot_id,
-            lifecycle: value.lifecycle.map(Into::into).unwrap_or_default(),
+            lifecycle: value
+                .lifecycle
+                .map(TryInto::try_into)
+                .transpose()?
+                .unwrap_or_default(),
             env: value.env.into_iter().collect(),
             id: value.id,
             tenant_id: value.tenant_id,
@@ -309,7 +313,7 @@ impl TryFrom<control::RestorePoint> for adx_core::RestorePoint {
             .ok_or_else(|| Error::Invalid("checkpoint artifact required".into()))?;
         if v.id.is_empty()
             || v.source_runtime_id.is_empty()
-            || v.expires_at_unix_seconds == 0
+            || v.expires_at_unix_seconds == Some(0)
             || a.storage.is_empty()
             || a.location.is_empty()
             || a.size_bytes == 0
@@ -365,21 +369,61 @@ impl TryFrom<control::CompletedOperation> for adx_core::CompletedOperation {
     }
 }
 
-impl From<control::LifecyclePolicy> for adx_core::lifecycle::LifecyclePolicy {
-    fn from(v: control::LifecyclePolicy) -> Self {
-        Self {
+impl TryFrom<control::LifecyclePolicy> for adx_core::lifecycle::LifecyclePolicy {
+    type Error = Error;
+    fn try_from(v: control::LifecyclePolicy) -> Result<Self> {
+        use adx_core::lifecycle::{CheckpointStorage, IdleAction, PausePolicy};
+        let policy = Self {
+            idle_action: match v.idle_action {
+                0 => IdleAction::Delete,
+                1 => IdleAction::Pause,
+                _ => return Err(Error::Invalid("invalid idle action".into())),
+            },
+            pause: v
+                .pause
+                .map(|p| {
+                    Ok(PausePolicy {
+                        retention: p
+                            .retention
+                            .ok_or_else(|| Error::Invalid("pause retention required".into()))?
+                            .try_into()?,
+                        timeout_seconds: p.timeout_seconds,
+                        storage: match p.storage {
+                            0 => CheckpointStorage::Configured,
+                            1 => CheckpointStorage::Local,
+                            2 => CheckpointStorage::Shared,
+                            _ => return Err(Error::Invalid("invalid checkpoint storage".into())),
+                        },
+                    })
+                })
+                .transpose()?,
             idle_timeout_seconds: v.idle_timeout_seconds,
             restart: v.restart.map(|r| adx_core::lifecycle::RestartPolicy {
                 max_attempts: r.max_attempts,
                 initial_backoff_seconds: r.initial_backoff_seconds,
                 max_backoff_seconds: r.max_backoff_seconds,
             }),
-        }
+        };
+        policy.validate()?;
+        Ok(policy)
     }
 }
 impl From<adx_core::lifecycle::LifecyclePolicy> for control::LifecyclePolicy {
     fn from(v: adx_core::lifecycle::LifecyclePolicy) -> Self {
         Self {
+            idle_action: match v.idle_action {
+                adx_core::lifecycle::IdleAction::Delete => 0,
+                adx_core::lifecycle::IdleAction::Pause => 1,
+            },
+            pause: v.pause.map(|p| control::PausePolicy {
+                retention: Some(p.retention.into()),
+                timeout_seconds: p.timeout_seconds,
+                storage: match p.storage {
+                    adx_core::lifecycle::CheckpointStorage::Configured => 0,
+                    adx_core::lifecycle::CheckpointStorage::Local => 1,
+                    adx_core::lifecycle::CheckpointStorage::Shared => 2,
+                },
+            }),
             idle_timeout_seconds: v.idle_timeout_seconds,
             restart: v.restart.map(|r| control::RestartPolicy {
                 max_attempts: r.max_attempts,
@@ -417,6 +461,33 @@ pub mod runtime {
     tonic::include_proto!("adx.runtime.v1");
 }
 pub mod runtime_stream;
+
+impl TryFrom<control::RetentionPolicy> for adx_core::lifecycle::RetentionPolicy {
+    type Error = Error;
+    fn try_from(value: control::RetentionPolicy) -> Result<Self> {
+        use control::retention_policy::Policy;
+        let retention = match value.policy {
+            Some(Policy::TtlSeconds(ttl_seconds)) => Self::Ttl { ttl_seconds },
+            Some(Policy::Forever(true)) => Self::Forever,
+            _ => return Err(Error::Invalid("explicit retention policy required".into())),
+        };
+        retention.validate()?;
+        Ok(retention)
+    }
+}
+impl From<adx_core::lifecycle::RetentionPolicy> for control::RetentionPolicy {
+    fn from(value: adx_core::lifecycle::RetentionPolicy) -> Self {
+        use control::retention_policy::Policy;
+        Self {
+            policy: Some(match value {
+                adx_core::lifecycle::RetentionPolicy::Ttl { ttl_seconds } => {
+                    Policy::TtlSeconds(ttl_seconds)
+                }
+                adx_core::lifecycle::RetentionPolicy::Forever => Policy::Forever(true),
+            }),
+        }
+    }
+}
 
 impl TryFrom<control::RuntimeFailure> for adx_core::RuntimeFailure {
     type Error = Error;

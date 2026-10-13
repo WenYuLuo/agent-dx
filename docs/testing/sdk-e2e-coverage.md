@@ -1,7 +1,7 @@
 # Sandbox SDK 公开能力与端到端覆盖
 
-本清单从 `adx_sandbox` 的公开导出反向检查端到端用例。当前 `__all__` 有 44 个名字：6 个
-操作入口类、12 个错误类型、24 个数据／策略类型，以及 `resources()` 和
+本清单从 `adx_sandbox` 的公开导出反向检查端到端用例。当前 `__all__` 有 48 个名字：6 个
+操作入口类、12 个错误类型、28 个数据／策略类型，以及 `resources()` 和
 `SDK_CAPABILITIES`。`Commands` 与 `Filesystem` 不单独顶层导出，但由 `Sandbox` 属性返回，
 也是用户接口。`SandboxFailure` 是 `SandboxInfo.failure` 使用的结构化失败数据，
 不新增独立操作；公开操作仍为 66 个。

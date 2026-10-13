@@ -15,7 +15,7 @@ use std::{
 pub struct PauseRequest {
     pub operation_id: String,
     pub expected_revision: u64,
-    pub ttl_seconds: u64,
+    pub retention: adx_core::lifecycle::RetentionPolicy,
     pub timeout_seconds: u64,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,11 +83,30 @@ pub trait CheckpointCooperation: Send + Sync {
         ))
     }
     async fn prepare(&self, record: &EnvironmentRecord, operation_id: &str) -> Result<()>;
+    async fn prepare_idle(
+        &self,
+        record: &EnvironmentRecord,
+        operation_id: &str,
+        _revision: u64,
+    ) -> Result<()> {
+        self.prepare(record, operation_id).await
+    }
     /// Caller guarantees backend checkpoint has not been invoked.
     async fn abort_unstarted(&self, record: &EnvironmentRecord, operation_id: &str) -> Result<()>;
 }
 #[async_trait]
 impl CheckpointCooperation for crate::runtime_control::RuntimeControlClient {
+    async fn prepare_idle(
+        &self,
+        record: &EnvironmentRecord,
+        id: &str,
+        revision: u64,
+    ) -> Result<()> {
+        let status = self.status(record).await?;
+        self.prepare_with_idle(record, id, status.revision, Some(revision))
+            .await
+            .map(|_| ())
+    }
     async fn workload_status(
         &self,
         record: &EnvironmentRecord,
@@ -146,6 +165,31 @@ impl CheckpointCooperation for crate::runtime_control::RuntimeControlClient {
 }
 #[async_trait]
 pub trait CheckpointStore: Send + Sync {
+    fn storage_alias(&self) -> &str {
+        "local"
+    }
+    fn validate_policy(&self, policy: adx_core::lifecycle::CheckpointStorage) -> Result<()> {
+        if policy == adx_core::lifecycle::CheckpointStorage::Shared
+            && self.storage_alias() == "local"
+        {
+            return Err(Error::Invalid(
+                "shared checkpoint storage is not configured on this node".into(),
+            ));
+        }
+        Ok(())
+    }
+    async fn publish_with_policy(
+        &self,
+        staged: &Path,
+        policy: adx_core::lifecycle::CheckpointStorage,
+    ) -> Result<CheckpointArtifact> {
+        self.validate_policy(policy)?;
+        if policy == adx_core::lifecycle::CheckpointStorage::Local {
+            self.retain_staged(staged).await
+        } else {
+            self.publish(staged).await
+        }
+    }
     /// Private local staging, visible to the execution backend on this node.
     async fn allocate(&self) -> Result<PathBuf>;
     /// Discard a local staging directory after its execution has stopped.

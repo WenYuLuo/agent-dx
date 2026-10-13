@@ -28,6 +28,9 @@ from .types import (
     PauseResult,
     PortForwarding,
     RestartPolicy,
+    PausePolicy,
+    RetentionPolicy,
+    IdleAction,
     ResumeResult,
     S3Config,
     SandboxInfo,
@@ -316,6 +319,8 @@ class Sandbox:
         schedule_affinities: Optional[List[Dict[str, Any]]] = None,
         snapshot_id: Optional[str] = None,
         restart_policy: Optional[RestartPolicy] = None,
+        idle_action: IdleAction = IdleAction.DELETE,
+        pause_policy: Optional[PausePolicy] = None,
         failover: bool = False,
         inherit_entrypoint: bool = False,
         readiness_probe: Optional[ReadinessProbe] = None,
@@ -346,7 +351,9 @@ class Sandbox:
             memory: Memory scheduling request in MB (default 4096).
             cpu_limit: CPU cgroup limit in milli-cores (0 = same as *cpu*).
             mem_limit: Memory cgroup limit in MB (0 = same as *memory*).
-            idle_timeout: Seconds before idle sandbox is reclaimed (default 300).
+            idle_timeout: Continuous client-idle window in seconds (default 300).
+            idle_action: delete (default) or pause at the end of the idle window.
+            pause_policy: Anonymous checkpoint retention and local/shared storage.
             restart_policy: Optional bounded node-local restart after an unexpected exit.
             create_timeout: Logical create budget in seconds. By default it is
                 derived as ``schedule_timeout + 60``. An
@@ -399,6 +406,12 @@ class Sandbox:
                 server defaults.
             extra_config: Extra sandbox-side configuration forwarded to sandboxd.
         """
+        if not isinstance(idle_action, IdleAction):
+            raise TypeError("idle_action must be an IdleAction")
+        if idle_action == IdleAction.PAUSE and (isinstance(idle_timeout, bool) or not isinstance(idle_timeout, int) or idle_timeout <= 0):
+            raise ValueError("idle pause requires a positive idle_timeout")
+        if pause_policy is not None and not isinstance(pause_policy, PausePolicy):
+            raise TypeError("pause_policy must be a PausePolicy")
         if image is not None and (not isinstance(image, str) or not image.strip()):
             raise ValueError("image must be a non-empty string")
         if rootfs is not None and not isinstance(rootfs, S3Config):
@@ -517,6 +530,7 @@ class Sandbox:
             "snapshotId": snapshot_id.strip() if snapshot_id is not None else None,
             "failover": failover,
             "idleTimeoutSeconds": idle_timeout,
+            "idleAction": idle_action.value,
             "createTimeoutSeconds": resolved_create_timeout,
             "scheduleTimeoutSeconds": resolved_schedule_timeout,
             "initCallTimeoutSeconds": init_timeout,
@@ -524,6 +538,8 @@ class Sandbox:
         }
         if body["snapshotId"] is None:
             del body["snapshotId"]
+        if pause_policy is not None:
+            body["pauseOptions"] = pause_policy.to_dict()
         if restart_policy is not None:
             if not isinstance(restart_policy, RestartPolicy):
                 raise TypeError("restart_policy must be a RestartPolicy")
@@ -939,7 +955,7 @@ class Sandbox:
 
     def pause(
         self,
-        ttl_seconds: int = 90_000,
+        retention: Optional[RetentionPolicy] = None,
         *,
         timeout_seconds: int = ADX_GET_DEFAULT_TIMEOUT,
     ) -> PauseResult:
@@ -948,30 +964,29 @@ class Sandbox:
         Local-only files are immediately readable on the owning node, without
         forced filesystem writeback. Remote storage completes its upload.
         """
-        if isinstance(ttl_seconds, bool) or not isinstance(ttl_seconds, int):
-            raise ValueError("ttl_seconds must be a positive integer")
-        if ttl_seconds <= 0:
-            raise ValueError("ttl_seconds must be a positive integer")
+        if retention is not None and not isinstance(retention, RetentionPolicy):
+            raise TypeError("retention must be a RetentionPolicy")
         if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, int):
             raise ValueError("timeout_seconds must be a positive integer")
         if timeout_seconds <= 0 or timeout_seconds > 3600:
             raise ValueError("timeout_seconds must be between 1 and 3600")
         if self._closed:
             raise RuntimeError("sandbox is closed")
-        result = self._client.pause(self._sid, ttl_seconds, timeout_seconds=timeout_seconds)
+        result = self._client.pause(self._sid, retention.to_dict() if retention is not None else None, timeout_seconds=timeout_seconds)
         pause = PauseResult(
             sandbox_id=str(result.get("sandboxId") or ""),
             snapshot_id=str(result.get("snapshotId") or ""),
             size=int(result.get("size") or 0),
             state=str(result.get("state") or ""),
-            expires_at=int(result.get("expiresAt") or 0),
+            expires_at=int(result["expiresAt"]) if result.get("expiresAt") is not None else None,
         )
         pause_result_invalid = (
             pause.sandbox_id != self._sid
             or pause.state != "paused"
             or not pause.snapshot_id
             or pause.size <= 0
-            or pause.expires_at <= 0
+            or "expiresAt" not in result
+            or (pause.expires_at is not None and pause.expires_at <= 0)
         )
         if pause_result_invalid:
             raise SandboxError("pause response is not an authoritative PAUSED result")

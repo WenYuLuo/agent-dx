@@ -5,7 +5,10 @@ use adx_core::{
     snapshots::{Snapshot, SnapshotState},
     EnvironmentRecord, EnvironmentState, Error, ResourceLedger, Resources, Result,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 impl Adxlet {
     /// Collection is permitted only after complete authoritative recovery.
     pub async fn collect_remote_orphans(&self) -> Result<usize> {
@@ -47,13 +50,25 @@ impl Adxlet {
         records: Vec<EnvironmentRecord>,
         snapshots: Vec<Snapshot>,
     ) -> Result<()> {
-        self.reconcile_retained(records, snapshots, vec![]).await
+        self.reconcile_authority(records, snapshots, None).await
     }
+    /// `retained_checkpoints` must include all globally referenced artifacts,
+    /// including other nodes and pending restores. Only this complete catalog
+    /// permits reclaiming checkpoints owned by retired local controllers.
     pub async fn reconcile_retained(
         &self,
         records: Vec<EnvironmentRecord>,
         snapshots: Vec<Snapshot>,
         retained_checkpoints: Vec<adx_core::CheckpointArtifact>,
+    ) -> Result<()> {
+        self.reconcile_authority(records, snapshots, Some(retained_checkpoints))
+            .await
+    }
+    async fn reconcile_authority(
+        &self,
+        records: Vec<EnvironmentRecord>,
+        snapshots: Vec<Snapshot>,
+        retained_checkpoints: Option<Vec<adx_core::CheckpointArtifact>>,
     ) -> Result<()> {
         let mut ready = self.lifecycle_ready.write().await;
         if self.is_draining() {
@@ -61,7 +76,8 @@ impl Adxlet {
         }
         *ready = false;
         let mut snapshot_ids = BTreeSet::new();
-        let mut retained = retained_checkpoints;
+        let complete_references = retained_checkpoints.is_some();
+        let mut retained = retained_checkpoints.unwrap_or_default();
         for snapshot in snapshots {
             snapshot.validate()?;
             if snapshot.source_node_id != self.node_id
@@ -95,6 +111,21 @@ impl Adxlet {
             }
             catalog.insert(r.spec.id.clone(), r);
         }
+        // Only a complete global reference catalog proves that a shared point
+        // is no longer needed by a different node or a recovery in progress.
+        let references = complete_references.then(|| {
+            Arc::new(
+                retained
+                    .iter()
+                    .chain(
+                        catalog
+                            .values()
+                            .filter_map(|record| record.checkpoint.as_ref().map(|cp| &cp.artifact)),
+                    )
+                    .map(|artifact| (artifact.storage.clone(), artifact.location.clone()))
+                    .collect(),
+            )
+        });
         let controllers = self
             .environments
             .lock()
@@ -107,6 +138,15 @@ impl Adxlet {
                 {
                     return Err(Error::Conflict);
                 }
+            }
+        }
+        // Drain each accepted serial operation before scanning/destructive cleanup.
+        // Restore can finish after its RPC caller timed out. Align only an
+        // uncommitted execution with the durable pause point; a newer published
+        // result rejects this stale catalog so the heartbeat fetches it again.
+        for (id, (_, assignment, handle)) in &controllers {
+            if let Some(record) = catalog.get(id).filter(|r| r.assignment == *assignment) {
+                handle.align_authority(record.clone()).await?;
             }
         }
         let actual = tokio::time::timeout(
@@ -148,7 +188,7 @@ impl Adxlet {
             }) {
                 // Drain accepted operations, then clean locally without inventing a
                 // cluster record for an identity the authority does not own.
-                handle.discard().await?;
+                handle.discard(references.clone()).await?;
                 self.remember_retired(&assignment, None);
                 self.environments
                     .lock()

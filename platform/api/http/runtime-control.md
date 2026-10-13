@@ -55,9 +55,11 @@ healthcheck 连续失败计数；相同身份恢复也有内部阶段代次隔�
 ## Checkpoint 顺序
 
 1. Adxlet 读取运行时身份和 revision。
-2. `POST /control/v1/checkpoint/prepare`，正文为 `identity`、`operation_id`、`expected_revision`。
+2. `POST /control/v1/checkpoint/prepare`，正文为 `identity`、`operation_id`、`expected_revision`，以及可选 `idle_revision`。
 3. EXECD 进入 Preparing，先成功打开后端 handoff 文件，随后返回 Prepared。接受后的任务独立于 HTTP 连接，断线不会取消它。Adxlet 必须同时验证返回的身份、operation_id、运行阶段和 checkpoint 阶段都是预期值，再允许调用 sandboxd Checkpoint。
 4. sandboxd 负责实际 checkpoint。EXECD 根据 handoff 的 `resume`、`restore` 或 `error` 处理后续运行。Adxlet 负责等待后端结果、制品上传、元数据持久化以及路由更新。
+
+自动暂停携带观测到的 `activity_revision` 作为 `idle_revision`。Execd 在同一准入锁下确认无活跃客户端操作且活动版本未变，再关闭新操作准入；不满足返回 Conflict，保持 Running。abort 或成功恢复后重新开放准入。后台命令不改变原有空闲判定语义。
 
 Prepared 仅证明实例内的 handoff 准备完成，不代表 checkpoint 制品已生成或暂停成功，也不承诺应用事务静止。Preparing/Prepared/Restoring/Failed 期间拒绝新的数据操作和隧道连接；已有工作由后端冻结语义约束。
 
@@ -96,10 +98,12 @@ curl --fail-with-body --unix-socket /run/adx/execd.sock \
 `CheckpointRequest.timeout_seconds` 接收剩余预算，gRPC deadline 不额外延长。
 对于升级前缺少 deadline 的在途请求，Adxlet 使用同样的 600 秒兜底值。
 
-This creates an anonymous **local recovery point**, retaining the same running
+This creates an anonymous **recovery point**, retaining the same running
 runtime, allocation and route. It does not create a reusable snapshot catalog
 entry. The point replaces the previous point, follows Environment cleanup, and is
-consumed by reload or same-node failover. It cannot recover a lost node.
+consumed by reload or failover. Its local/configured/shared policy is inherited
+from Environment lifecycle; shared points can recover a lost node through
+Coordinator, while local points remain bound to the original node.
 
 EXECD serializes local requests and exposes the pending operation ID in
 `GET /control/v1/status` as `requested_checkpoint`. Adxlet reads it during

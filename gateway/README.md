@@ -115,6 +115,26 @@ ADX_DATA_PLANE_INGRESS_BACKEND_HTTP_IDLE_TIMEOUT_SEC=5
 ADX_DATA_PLANE_INGRESS_BACKEND_HTTP_ACQUIRE_TIMEOUT_MS=3000
 ```
 
+For an HTTP request carrying `X-ADX-Processing-Timeout-Ms` (one positive integer,
+1–86400000 milliseconds), Ingress creates one deadline after receiving its headers.
+Authentication, route lookup, resume, committed-route delivery, pool/CONNECT
+admission, upstream processing and response streaming consume that same deadline.
+The header is removed before forwarding. A cancelled or expired wake RPC returns
+HTTP 503 `ENV_RESUMING` only while application bytes have not been sent, with
+`Retry-After: 1`, a reserved `X-ADX-Error-Code` marker, and a structured error
+containing `retry: same_operation`, `outcome: not_started`, `requestForwarded: false`
+and the request/Environment IDs. Ingress strips that reserved response marker
+from upstream replies. HTTP 504 after forwarding instead reports an unknown
+outcome and `retry: never`; an expired stream with already-sent response headers
+is closed. Rejected checkpoint restoration reports HTTP 409 `ENV_UNAVAILABLE`.
+
+A request's timeout or disconnection does not cancel a durable wake intent.
+Independent Ingress replicas coalesce through Coordinator and can deliver retries
+using their own route cache and connection pool. Without the HTTP deadline header,
+wake plus committed-route delivery share one default 300-second deadline;
+forwarding and upgraded-connection lifetimes otherwise retain their existing policy.
+See the [SDK timeout and demand retry contract](../platform/sdk/sandbox/python/README.md).
+
 Pool admission timeout returns HTTP 429. Metrics expose current idle
 connections plus opened, reused, discarded, and acquire-timeout totals. The L4
 connector presents the H2 CONNECT stream directly as `AsyncRead + AsyncWrite`;

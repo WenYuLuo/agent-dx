@@ -75,6 +75,45 @@ fn response(result: crate::OperationResult) -> Result<Response<pb::EnvironmentRe
 }
 #[tonic::async_trait]
 impl pb::node_service_server::NodeService for NodeRpc {
+    async fn ensure_environment_running(
+        &self,
+        request: Request<pb::EnsureEnvironmentRunningRequest>,
+    ) -> std::result::Result<Response<pb::EnvironmentResult>, Status> {
+        if self.peers.authenticate(&request)? != Principal::Coordinator {
+            return Err(Status::permission_denied("Coordinator identity required"));
+        }
+        let r = request.into_inner();
+        if r.node_session_id != self.session_id || self.session_id.is_empty() {
+            return Err(Status::failed_precondition("node process session changed"));
+        }
+        let assignment: adx_core::Assignment = r
+            .assignment
+            .ok_or_else(|| Status::invalid_argument("assignment required"))?
+            .try_into()
+            .map_err(status)?;
+        let (_, owner, handle) = self
+            .manager
+            .environments
+            .lock()
+            .map_err(|_| Status::internal("environment registry unavailable"))?
+            .get(&assignment.environment_id)
+            .cloned()
+            .ok_or_else(|| Status::not_found("environment not managed"))?;
+        if owner != assignment {
+            return Err(Status::failed_precondition("assignment changed"));
+        }
+        let gate = self.manager.lifecycle_ready.read().await;
+        if !*gate || self.manager.is_draining() {
+            return Err(Status::unavailable("node is reconciling or draining"));
+        }
+        response(
+            handle
+                .ensure_running(r.operation_id)
+                .await
+                .map_err(status)?,
+        )
+        .map_err(status)
+    }
     async fn create_local_environment(
         &self,
         request: Request<pb::LocalEnvironmentCreateRequest>,
@@ -280,7 +319,13 @@ impl pb::node_service_server::NodeService for NodeRpc {
                         .pause(crate::checkpoint::PauseRequest {
                             operation_id: r.operation_id,
                             expected_revision: r.expected_revision,
-                            ttl_seconds: r.ttl_seconds,
+                            retention: r
+                                .retention
+                                .ok_or_else(|| {
+                                    Status::invalid_argument("pause retention required")
+                                })?
+                                .try_into()
+                                .map_err(status)?,
                             timeout_seconds: r.timeout_seconds,
                         })
                         .await

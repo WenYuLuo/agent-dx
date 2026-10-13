@@ -3,6 +3,7 @@
 import copy
 import json
 from pathlib import Path
+from storage_fixture import public as public_storage
 
 HOST = '10.240.0.1'
 ADDRESSES = {'node1': '10.240.0.11', 'node2': '10.240.0.12'}
@@ -34,7 +35,8 @@ def configure(root):
         cert = 'node' if name == 'node1' else 'node2'
         for key, suffix in [('certificate', 'pem'), ('private_key', 'key')]:
             c['tls'][key] = str(root / 'secrets/tls' / f'{cert}.{suffix}')
-        c['checkpoint_storage']['endpoint'] = f'http://{HOST}:19090'
+        if public_storage(root)['kind'] == 'minio':
+            c['checkpoint_storage']['endpoint'] = f'http://{HOST}:19090'
         c['checkpoint_gc']['min_age_seconds'] = 3600
         env = service['env']
         env['ADX_DATA_PLANE_RELAY_TLS_CERT'] = c['tls']['certificate']
@@ -56,7 +58,7 @@ def configure(root):
             (backend / filename).write_bytes((root / 'sandboxd' / filename).read_bytes())
         text = (root / 'sandboxd/config.toml').read_text().replace(str(root), str(folder))
         if name == 'node2':
-            text = text.replace('10.231.16.0/20', '10.231.32.0/20')
+            text = text.replace('ip_range = "10.231.16.1/20"', 'ip_range = "10.231.32.1/20"')
         text = text.replace('cgroup_root_name = "/adx-fc-', f'cgroup_root_name = "/{name}-adx-fc-')
         (backend / 'config.toml').write_text(text)
     control = copy.deepcopy(original)

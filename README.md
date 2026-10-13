@@ -166,7 +166,7 @@ Local-only checkpoint success confirms readable files on the owning node and com
 - Central and local-first creation with CPU, memory, disk, GPU/NPU device, label, affinity, and preference constraints.
 - API Key administrator and tenant identities plus configurable internal mTLS.
 - Versioned route publication and synchronized local binding checks.
-- Node reconciliation, restart policy, idle deletion, checkpoint recovery, local/S3-compatible storage, and reference-aware artifact cleanup.
+- Node reconciliation, restart policy, idle deletion/pause, traffic-triggered resume, checkpoint recovery, local/S3-compatible storage, and reference-aware artifact cleanup.
 - Prometheus metrics, OpenTelemetry traces, structured component logs, and external Collector integration. Node runtime stdout/stderr is redirected to per-runtime files with terminated-log compression and GC.
 - Process deployment with managed or external Redis and Kubernetes end-to-end deployment profiles.
 

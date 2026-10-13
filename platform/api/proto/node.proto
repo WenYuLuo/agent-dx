@@ -9,7 +9,13 @@ service RelayService {
   rpc ReplaceBindings(BindingSnapshot) returns (BindingState);
   rpc UpdateBinding(UpdateBindingRequest) returns (UpdateBindingResponse);
   rpc GetEnvironmentActivity(GetEnvironmentActivityRequest) returns (EnvironmentActivityState);
+  rpc SetEnvironmentAdmission(EnvironmentAdmissionRequest) returns (EnvironmentAdmissionResponse);
 }
+message EnvironmentAdmissionRequest {
+  string environment_id = 1; string runtime_id = 2; string proxy_session_id = 3;
+  uint64 activity_revision = 4; bool close = 5;
+}
+message EnvironmentAdmissionResponse { bool closed = 1; }
 message GetEnvironmentActivityRequest { string environment_id = 1; string runtime_id = 2; }
 message EnvironmentActivityState { string proxy_session_id = 1; uint64 activity_revision = 2; uint64 active_streams = 3; }
 message RuntimeTarget {

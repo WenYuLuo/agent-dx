@@ -5,6 +5,7 @@ mod cloning;
 mod collection;
 mod metrics;
 mod recovery;
+mod resume;
 mod snapshots;
 use crate::{
     storage::{ClaimOutcome, LocalClaim, NodeSession, Session, StoredEnvironment, StoredNode},
@@ -41,6 +42,7 @@ struct State {
     needs_recovery: bool,
     placement: Placement,
     recovery_cursor: Option<String>,
+    resume_cursor: Option<String>,
     collection_cursor: Option<String>,
     live: BTreeMap<String, LiveNode>,
     recovering: BTreeMap<String, tokio::time::Instant>,
@@ -144,10 +146,11 @@ impl State {
                 .get(&assignment.environment_id)
                 .ok_or(Error::Conflict)?
                 .clone();
+            let recovery_now = recovery::now()?;
             let recovery = self
                 .environments
                 .get(&spec.id)
-                .filter(|i| i.invalidated)
+                .filter(|i| i.invalidated || i.resume_point(recovery_now).is_some())
                 .cloned();
             let saved = if let Some(old) = recovery {
                 self.session
@@ -158,6 +161,17 @@ impl State {
             };
             match saved {
                 Ok(record) => {
+                    if let Some(source) = record
+                        .recovery
+                        .as_ref()
+                        .filter(|recovery| recovery.source.node_id != record.assignment.node_id)
+                        .and_then(|recovery| self.live.get_mut(&recovery.source.node_id))
+                    {
+                        // A live former owner still has a paused controller.
+                        // Require the existing closed-admission handshake to
+                        // retire it against the complete global reference catalog.
+                        source.inspected = false;
+                    }
                     self.remember_environment(record);
                 }
                 Err(Error::Conflict)
@@ -191,6 +205,8 @@ impl State {
     }
 }
 struct Inner {
+    resume_admission: Arc<tokio::sync::Semaphore>,
+    resume_locks: std::sync::Mutex<BTreeMap<String, std::sync::Weak<Mutex<()>>>>,
     state: Mutex<State>,
     claim_sender: mpsc::Sender<PendingClaim>,
     changed: Notify,
@@ -348,6 +364,8 @@ impl CoordinatorRpc {
         let (claim_sender, claim_requests) = mpsc::channel(CLAIM_BATCH_CAPACITY);
         tokio::spawn(run_claim_batches(session.clone(), claim_requests));
         Ok(Self(Arc::new(Inner {
+            resume_admission: Arc::new(tokio::sync::Semaphore::new(1024)),
+            resume_locks: std::sync::Mutex::new(BTreeMap::new()),
             state: Mutex::new(State {
                 session,
                 scheduler,
@@ -367,6 +385,7 @@ impl CoordinatorRpc {
                 needs_recovery: false,
                 placement,
                 recovery_cursor: None,
+                resume_cursor: None,
                 collection_cursor: None,
                 live: BTreeMap::new(),
                 recovering,
@@ -780,6 +799,42 @@ impl CoordinatorRpc {
 }
 #[tonic::async_trait]
 impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
+    async fn retire_dormant(
+        &self,
+        request: Request<pb::GetEnvironmentRequest>,
+    ) -> std::result::Result<Response<pb::EnvironmentResult>, Status> {
+        if self.0.peers.authenticate(&request)? != Principal::ApiServer {
+            return Err(Status::permission_denied("API Server required"));
+        }
+        self.retire_dormant(request.into_inner())
+            .await
+            .map(Response::new)
+    }
+    async fn ensure_running(
+        &self,
+        request: Request<pb::EnsureRunningRequest>,
+    ) -> std::result::Result<Response<pb::GetEnvironmentResponse>, Status> {
+        if !matches!(
+            self.0.peers.authenticate(&request)?,
+            Principal::ApiServer | Principal::Ingress
+        ) {
+            return Err(Status::permission_denied("API Server or Ingress required"));
+        }
+        let service = self.clone();
+        let request = request.into_inner();
+        let permit = self
+            .0
+            .resume_admission
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Status::resource_exhausted("resume wait queue is full"))?;
+        tokio::spawn(async move {
+            let _permit = permit;
+            service.ensure_running(request).await.map(Response::new)
+        })
+        .await
+        .map_err(|_| Status::internal("resume task failed"))?
+    }
     type WatchNodesStream =
         tokio_stream::wrappers::ReceiverStream<std::result::Result<pb::NodeDirectory, Status>>;
     async fn watch_nodes(
@@ -1261,6 +1316,9 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                 let stored = state.session.get(&r.environment_id).await.map_err(status)?;
                 match principal {
                     Principal::ApiServer => tenant(r.caller.as_ref(), &stored.spec.tenant_id)?,
+                    // Trusted Ingress reads policy metadata before applying the
+                    // public endpoint's configured authentication mode.
+                    Principal::Ingress => (),
                     Principal::Node(ref id) if id == &stored.assignment.node_id => (),
                     _ => {
                         return Err(Status::permission_denied(
@@ -1372,6 +1430,7 @@ mod reconciliation_tests {
             devices: vec![],
         };
         let mut environment = StoredEnvironment {
+            resume: None,
             failed_since_unix_seconds: None,
             recovery: None,
             invalidated: false,

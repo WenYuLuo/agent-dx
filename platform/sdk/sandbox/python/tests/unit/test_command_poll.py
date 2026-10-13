@@ -360,13 +360,12 @@ def test_close_during_poll_stops_wait_thread_and_preserves_other_lease(monkeypat
     client = SandboxClient(server="poll.example", token="first")
     other = SandboxClient(server="poll.example", token="second")
     client._direct_enabled = direct
-    client._connection = None
     invoke = Mock(wraps=client.invoke)
     monkeypatch.setattr(client, "invoke", invoke)
 
     def wait():
         try:
-            CommandHandle("cmd-42", client, "sandbox", 42).wait(timeout=3)
+            CommandHandle("cmd-42", SimpleNamespace(_connection=None, invoke=invoke), "sandbox", 42).wait(timeout=3)
         except Exception as exc:
             errors.append(exc)
 

@@ -1,6 +1,8 @@
 #[path = "storage/claims.rs"]
 mod claims;
 mod common;
+#[path = "storage/dormancy.rs"]
+mod dormancy;
 use adx_coordinator::{storage::StoredNode, Coordinator, Node, Placement};
 use adx_core::{
     Assignment, EnvironmentRecord, EnvironmentSpec, EnvironmentState, Error, Resources,
@@ -863,7 +865,7 @@ async fn pause_resume_persists_recovery_point_fences_old_results_and_restores_ca
         origin: None,
         id: "pause".into(),
         source_runtime_id: initial.runtime.id.clone(),
-        expires_at_unix_seconds: u64::MAX,
+        expires_at_unix_seconds: None,
         artifact: CheckpointArtifact {
             storage: "local".into(),
             location: "/checkpoints/cp".into(),
@@ -955,7 +957,7 @@ async fn sqlite_replays_pause_and_resume_after_redis_and_node_sink_restart() {
         origin: None,
         id: "cp".into(),
         source_runtime_id: initial.runtime.id.clone(),
-        expires_at_unix_seconds: u64::MAX,
+        expires_at_unix_seconds: None,
         artifact: CheckpointArtifact {
             storage: "local".into(),
             location: "/tmp/checkpoint".into(),
@@ -1208,7 +1210,7 @@ async fn recovery_assignment_is_durable_and_old_generation_cannot_publish() {
     r.checkpoint = Some(adx_core::RestorePoint {
         id: "pause".into(),
         origin: None,
-        expires_at_unix_seconds: u64::MAX,
+        expires_at_unix_seconds: None,
         source_runtime_id: "held-1".into(),
         artifact: adx_core::CheckpointArtifact {
             storage: "shared".into(),
@@ -1309,7 +1311,7 @@ async fn recovery_never_uses_missing_local_or_expired_checkpoint() {
             r.checkpoint = Some(adx_core::RestorePoint {
                 id: "pause".into(),
                 origin: None,
-                expires_at_unix_seconds: if kind == "expired" { 1 } else { u64::MAX },
+                expires_at_unix_seconds: Some(if kind == "expired" { 1 } else { u64::MAX }),
                 source_runtime_id: "held-1".into(),
                 artifact: adx_core::CheckpointArtifact {
                     storage: if kind == "local" { "local" } else { "shared" }.into(),

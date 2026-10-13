@@ -211,10 +211,17 @@ impl ReverseProxy {
             Ok(uri) => uri,
             Err(error) => return bad_gateway(error),
         };
+        if let Some(processing) = request
+            .extensions()
+            .get::<super::processing::ProcessingDeadline>()
+        {
+            processing.forwarded();
+        }
         let mut response = match self.client.request(request).await {
             Ok(response) => response,
             Err(error) => return bad_gateway(error),
         };
+        response.headers_mut().remove("x-adx-error-code");
         let response_upgrade = requested_upgrade(response.headers());
         if response.status() == StatusCode::SWITCHING_PROTOCOLS {
             let Some(downstream_upgrade) = downstream_upgrade else {

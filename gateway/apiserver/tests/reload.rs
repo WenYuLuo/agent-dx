@@ -16,6 +16,7 @@ struct State {
     owner: pb::GetEnvironmentResponse,
     lookups: usize,
     reloads: usize,
+    resumes: usize,
     executions: usize,
     lookup_unavailable: bool,
     reload_unavailable: bool,
@@ -49,6 +50,15 @@ service_impl!(pb::coordinator_service_server::CoordinatorService, {
         assert_eq!(request.get_ref().caller.as_ref().unwrap().tenant_id, "tenant");
         Ok(Response::new(state.owner.clone()))
     }
+    async fn ensure_running(&self, request: Request<pb::EnsureRunningRequest>) -> Result<Response<pb::GetEnvironmentResponse>, Status> {
+        assert_eq!(request.get_ref().environment_id, "environment");
+        assert_eq!(request.get_ref().caller.as_ref().unwrap().tenant_id, "tenant");
+        assert_eq!(request.get_ref().timeout_seconds, 300);
+        let mut state = self.0.lock().unwrap();
+        state.resumes += 1;
+        if state.lookup_unavailable { return Err(Status::unavailable("coordinator unavailable")); }
+        Ok(Response::new(state.owner.clone()))
+    }
 }, [
     get_scheduling_queue(GetSchedulingQueueRequest) -> GetSchedulingQueueResponse,
     set_node_scheduling(SetNodeSchedulingRequest) -> NodeSchedulingState,
@@ -59,6 +69,7 @@ service_impl!(pb::coordinator_service_server::CoordinatorService, {
     inspect_node(InspectNodeRequest) -> InspectNodeResponse,
     create_environment(CreateEnvironmentRequest) -> EnvironmentResult,
     commit_environment(CommitEnvironmentRequest) -> CommitEnvironmentResponse,
+    retire_dormant(GetEnvironmentRequest) -> EnvironmentResult,
 ]);
 
 service_impl!(pb::node_service_server::NodeService, {
@@ -113,6 +124,7 @@ service_impl!(pb::node_service_server::NodeService, {
     create_environment(StartAssignedEnvironmentRequest) -> EnvironmentResult,
     pause_environment(PauseEnvironmentRequest) -> EnvironmentResult,
     resume_environment(ResumeEnvironmentRequest) -> EnvironmentResult,
+    ensure_environment_running(EnsureEnvironmentRunningRequest) -> EnvironmentResult,
     update_network_policy(UpdateNetworkPolicyRequest) -> EnvironmentResult,
     create_snapshot(CreateSnapshotRequest) -> CreateSnapshotResponse,
     collect_snapshot(CollectSnapshotRequest) -> CollectSnapshotResponse,
@@ -159,6 +171,7 @@ impl Fixture {
             owner: owner.clone(),
             lookups: 0,
             reloads: 0,
+            resumes: 0,
             executions: 0,
             lookup_unavailable: false,
             reload_unavailable: false,
@@ -303,4 +316,53 @@ async fn unknown_reload_cannot_exhaust_cache_or_block_delete() {
         .await
         .unwrap();
     assert_eq!(deleted, serde_json::Value::Null);
+}
+
+#[tokio::test]
+async fn manual_resume_uses_coordinator_and_returns_new_owner_from_stale_cache() {
+    let fixture = Fixture::new().await;
+    fixture
+        .state
+        .lock()
+        .unwrap()
+        .owner
+        .record
+        .as_mut()
+        .unwrap()
+        .assignment
+        .as_mut()
+        .unwrap()
+        .node_id = "new-node".into();
+    let result = fixture.execute(Kind::Resume).await.unwrap();
+    assert_eq!(result["nodeId"], "new-node");
+    assert_eq!(result["state"], "running");
+    assert_eq!(fixture.state.lock().unwrap().resumes, 1);
+    assert_eq!(fixture.state.lock().unwrap().lookups, 0);
+    let owner = fixture
+        .clients
+        .owner(
+            "environment",
+            &pb::CallerContext {
+                tenant_id: "tenant".into(),
+                administrator: false,
+            },
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        owner.record.unwrap().assignment.unwrap().node_id,
+        "new-node"
+    );
+}
+
+#[tokio::test]
+async fn coordinator_resume_failure_does_not_fall_back_to_direct_node_resume() {
+    let fixture = Fixture::new().await;
+    fixture.state.lock().unwrap().lookup_unavailable = true;
+    assert_eq!(
+        fixture.execute(Kind::Resume).await.unwrap_err().code(),
+        tonic::Code::Unavailable
+    );
+    assert_eq!(fixture.state.lock().unwrap().resumes, 1);
 }

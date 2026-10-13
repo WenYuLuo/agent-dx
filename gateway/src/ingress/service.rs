@@ -82,7 +82,11 @@ impl IngressService {
         let store = Arc::new(RouteStore::new());
         let route_changes = store.subscribe();
         let watcher = Arc::new(CoordinatorConnection::new(control).map_err(send_error)?);
-        let resolver = Arc::new(IngressRouteResolver::new(store.clone()).stream_only());
+        let resolver = Arc::new(
+            IngressRouteResolver::new(store.clone())
+                .stream_only()
+                .with_demand_resolver(watcher.clone()),
+        );
         let connector = DataPlaneL4Connector::new(config.h2_pool_config()?);
         let authenticator = IngressAuthenticator::with_verifier(watcher.clone());
         #[cfg(feature = "agent-api")]

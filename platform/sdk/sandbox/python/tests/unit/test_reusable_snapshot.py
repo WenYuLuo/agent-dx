@@ -245,6 +245,7 @@ class ReusableSnapshotTests(unittest.TestCase):
                 return Response({"status": "deleted"})
 
         client = object.__new__(SandboxClient)
+        client._connection = adx_sandbox.ConnectionConfig(server_address="frontend", token="test-token")
         client._base = "https://frontend/api/sandbox/v1"
         client._http = HTTP()
 
@@ -291,6 +292,7 @@ class ReusableSnapshotTests(unittest.TestCase):
                 return Response()
 
         client = object.__new__(SandboxClient)
+        client._connection = adx_sandbox.ConnectionConfig(server_address="frontend", token="test-token")
         client._base = "https://frontend/api/sandbox/v1"
         client._http = HTTP()
 
@@ -313,6 +315,7 @@ class ReusableSnapshotTests(unittest.TestCase):
                 return Response()
 
         client = object.__new__(SandboxClient)
+        client._connection = adx_sandbox.ConnectionConfig(server_address="frontend", token="test-token")
         client._base = "https://frontend/api/sandbox/v1"
         client._http = HTTP()
 

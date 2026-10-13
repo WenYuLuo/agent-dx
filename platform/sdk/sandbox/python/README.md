@@ -21,7 +21,7 @@ remains visible even when cleanup also fails.
 
 ## Server compatibility
 
-The new Environment backend supports basic lifecycle, same-node pause/resume, reusable snapshots, grouped placement, idle deletion and restart policy. It requires an image containing the release EXECD at the configured command path; generic `python:3.12-slim` below is only an illustrative image name.
+The new Environment backend supports basic lifecycle, on-demand pause/resume, reusable snapshots, grouped placement, idle deletion/pause and restart policy. It requires an image containing the release EXECD at the configured command path; generic `python:3.12-slim` below is only an illustrative image name.
 
 The Environment backend supports S3 rootfs, S3/image mounts, entrypoint inheritance,
 creation and runtime network policy, `extra_config`, `failover=True`, independent
@@ -124,7 +124,7 @@ There are three deliberately different checkpoint paths:
 | Path | Public SDK API | Artifact and placement | When to use it |
 | --- | --- | --- | --- |
 | Reusable Snapshot | `create_snapshot()` then `Sandbox.create()` | New Environment identity; shared storage allows fresh placement, local-only pins the source node. | Independent clones from a prepared source. |
-| Pause / resume | `pause()` then `resume()` | Same Environment ID; public resume calls its owning Adxlet. | Stop and resume one logical sandbox. |
+| Pause / resume | `pause()` then `resume()` | Same Environment ID; Coordinator first tries the owner, then schedules a compatible node after definitive resource rejection or owner loss. | Stop and resume one logical sandbox. |
 | Failure recovery | `failover=True` | Same Environment and node; restores the latest unexpired checkpoint after unexpected backend exit. | Workloads that must recover execution state rather than cold-start. |
 | Explicit reload | `reload()` | Same Environment; replaces a Running backend from its latest unexpired checkpoint. | Operator-requested reset to a known recovery point. |
 
@@ -203,9 +203,11 @@ Later dual-clone FC runs exposed a network failure, tracked in the [investigatio
 Pause one open sandbox and later resume the same logical sandbox:
 
 ```python
+from adx_sandbox import RetentionPolicy, Sandbox
+
 sandbox = Sandbox(image="python:3.12-slim")
 
-paused = sandbox.pause(ttl_seconds=90_000, timeout_seconds=300)
+paused = sandbox.pause(retention=RetentionPolicy.for_seconds(90_000), timeout_seconds=300)
 print(paused.snapshot_id, paused.expires_at)
 
 running = sandbox.resume()
@@ -215,25 +217,100 @@ print(running.route_address, running.port_mappings)
 The public signatures are:
 
 ```python
-Sandbox.pause(ttl_seconds=90_000, *, timeout_seconds=300) -> PauseResult
+Sandbox.pause(retention=None, *, timeout_seconds=300) -> PauseResult
 Sandbox.resume() -> ResumeResult
 ```
 
-The SDK accepts only a positive integral, non-boolean `ttl_seconds`; its
-default is 90,000 seconds. `timeout_seconds` is keyword-only and must be an
-integral, non-boolean value from 1 through 3600. A successful pause returns a
-frozen `PauseResult` with `sandbox_id`, `snapshot_id`, byte `size`, `state`,
-and `expires_at`. The SDK rejects a response unless it describes this sandbox,
-has state `"paused"`, and includes a nonempty snapshot ID, positive size, and
-positive expiry.
+`retention=None` inherits `pause_policy.retention`; the default policy retains the
+restore point for 90,000 seconds. Use `RetentionPolicy.for_seconds(seconds)` for
+a positive integer TTL or `RetentionPolicy.forever()` to retain the point until
+explicit deletion or replacement. Finite retention begins after publication.
+Permanent pause returns `expires_at=None`; the stored record and RPC use an absent
+expiry, rather than a large timestamp. `PauseResult` also contains `sandbox_id`,
+`snapshot_id`, byte `size`, and `state="paused"`.
+
+`timeout_seconds` is keyword-only, integral and non-boolean, from 1 through 3600.
+It bounds the sandboxd capture RPC and sets the SDK's per-attempt HTTP wait with
+an extra 30-second transport allowance. It is not a total pause deadline: OBS
+publication follows capture and uses its own storage request timeout. Losing the
+HTTP reply does not cancel an accepted lifecycle operation; its outcome can remain
+unknown and the SDK retries the same operation identity.
 
 `resume()` returns a frozen `ResumeResult` with `sandbox_id`, `state`,
 `route_address`, `function_proxy_id`, `node_id`, and `port_mappings`. The SDK
 requires the response to identify this sandbox, report `"running"`, and
-include a route address and function-proxy ID. Resume performs local admission on the owning node, restores the checkpoint, rearms the runtime listener and commits Running. Route-cache convergence after
+include a route address and function-proxy ID. Resume uses Coordinator EnsureRunning, first admitting on the owning node. A shared checkpoint allows another compatible node after definitive NoCapacity or owner invalidation; an uncertain RPC result retains ownership and retries there. The selected node restores the checkpoint, rearms the runtime listener and commits Running. Route-cache convergence after
 that result is outside the resume success boundary.
 
-Pausing validates the configured store's artifact and commits Paused after removing the old execution. Local-only files are immediately readable on the owning node; adxlet does not force filesystem writeback, so publication does not guarantee survival of a host crash or power loss. S3 publication waits for upload completion. A SQLite-only result is not cluster success. Public resume requires the authoritative Paused identity and a valid checkpoint. Failed-node cross-node recovery with a shared checkpoint is a separate Coordinator path; it is not selected by the public resume call.
+Pausing validates the configured store's artifact and commits Paused after removing the old execution. Local-only files are immediately readable on the owning node; adxlet does not force filesystem writeback, so publication does not guarantee survival of a host crash or power loss. S3 publication waits for upload completion. A SQLite-only result is not cluster success. Public resume uses authoritative ownership and a valid checkpoint. Local-only points remain tied to the original node; shared points preserve the Environment ID across a new ownership generation. Node loss preserves Paused until demand, expiry or deletion.
+
+### Idle pause and traffic resume
+
+```python
+from adx_sandbox import CheckpointStorage, IdleAction, PausePolicy, RetentionPolicy, Sandbox
+
+sandbox = Sandbox(
+    image="example/execd:latest",
+    idle_timeout=60,
+    idle_action=IdleAction.PAUSE,
+    pause_policy=PausePolicy(retention=RetentionPolicy.forever(), timeout_seconds=300, storage=CheckpointStorage.SHARED),
+)
+```
+
+`idle_action` is an `IdleAction` enum and defaults to `IdleAction.DELETE`; `IdleAction.PAUSE` requires a positive idle timeout
+and a checkpoint-capable runtime. `CheckpointStorage.CONFIGURED` uses the node backend,
+`CheckpointStorage.LOCAL` retains files on that node, and `CheckpointStorage.SHARED` requires complete publication
+to its configured object store. Configure an OBS S3-compatible endpoint on every
+eligible node, with the same alias/bucket/prefix. The shared setting also limits
+creation placement to nodes advertising shared checkpoint storage.
+
+The existing idle window observes Execd client operations and Relay streams;
+health, metrics and command observation do not keep the sandbox busy. A detached
+background command can be checkpointed. Automatic pause atomically closes new
+admission and rechecks activity. New demand before capture cancels pause; demand
+once capture starts waits for publication and restores afterward.
+
+Authorized business traffic through Ingress shares the manual resume entry for
+both automatic and manual pauses; no auto-resume opt-in is required. Concurrent first requests coalesce into one durable intent.
+Ingress waits for the committed Running route before sending application bytes;
+passive route subscriptions and health/metrics do not wake a paused sandbox.
+Requests already sent upstream are not replayed. Transient owner RPC failures
+retry on the same owner within the resume budget. A temporary wake failure before
+forwarding returns HTTP 503. A finite SDK HTTP request sends
+`X-ADX-Processing-Timeout-Ms`: authentication, route lookup, wake, route delivery,
+connection admission, forwarding and response streaming share one Ingress deadline.
+The SDK defaults to 300 seconds for a data request and adds a configurable
+communication margin (30 seconds by default) to its HTTP timeout. Without the
+header, wake and route delivery share a 300-second default; existing forwarding
+and streaming lifetimes remain unchanged. Negative invoke timeouts omit the
+header and retain unbounded application HTTP waits.
+
+If readiness is still pending when the deadline expires before application
+forwarding, Ingress returns HTTP 503 with `X-ADX-Error-Code: ENV_RESUMING`,
+`Retry-After: 1`, and a JSON `error` containing `code: ENV_RESUMING`,
+`retry: same_operation`, `outcome: not_started`, `requestForwarded: false`,
+`requestId`, and `instanceId`. The durable restore continues independently.
+SDK retries retain the request ID and body; **each allowed retry gets the same
+configured timeout plus communication margin**. Retry count is configurable via
+`ConnectionConfig.request_max_attempts` / `ADX_REQUEST_MAX_ATTEMPTS` (default 3,
+including the first data-path attempt). Known-unsent connection failures and absent
+direct routes retain their existing single control-plane fallback; `ENV_RESUMING`
+never takes that fallback. Retry-After and jitter apply between demand retries.
+Exhaustion raises `SandboxHTTPError` with the same `ENV_RESUMING` contract; callers
+can choose to try again. No sticky Ingress routing is required: replicas share the
+Coordinator intent and independently subscribe to the committed route.
+
+HTTP 504 after forwarding carries `PROCESSING_DEADLINE_EXCEEDED`, `outcome: unknown`,
+`requestForwarded: true`, and `retry: never`; it is not a safe demand retry. If
+response headers have already been delivered, deadline expiry ends the body stream
+instead. Existing idempotent invoke transport retries keep the same EXECD operation
+ID and never cross into a control-plane fallback after an unknown outcome.
+File bytes and seekable file bodies support safe demand retry. Consumed iterators
+are not replayed automatically and surface the structured error instead.
+Expired or unavailable checkpoints return HTTP 409 `ENV_UNAVAILABLE`, `retry: never`.
+
+A timeout may leave the durable operation pending. If every node rejects admission,
+rejected nodes are excluded for a 30-second capacity round before reevaluation.
 
 ## Recovery methods
 
@@ -305,10 +382,9 @@ Raw HTTP has intentionally different validation in a few places. A raw
 Snapshot request has `name` as its handler field: an omitted or empty name is
 accepted, while a supplied whitespace-only name is rejected. Its
 `timeoutSeconds` defaults to 300, is validated in the range 1 through 3600,
-converted to milliseconds, and forwarded as the checkpoint RPC logical timeout. Raw Pause applies the same `timeoutSeconds` contract, while
-treating omitted or zero `ttlSeconds` as 90,000 seconds and rejecting negative,
-malformed, or non-numeric JSON values; the SDK is deliberately stricter about
-TTL. Only Snapshot and Pause currently accept this caller-provided logical
+converted to milliseconds, and forwarded as the checkpoint RPC logical timeout. Raw Pause accepts optional `retention` as `{"kind":"forever"}` or
+`{"kind":"ttl","ttlSeconds":3600}`; omission inherits the creation policy.
+Its `timeoutSeconds` is validated from 1 through 3600 and defaults to 300. Only Snapshot and Pause currently accept this caller-provided logical
 timeout body field. The SDK sends `{}` for resume and reload, and their
 handlers define no body fields. Raw HTTP requires a pattern-valid
 `X-ADX-Request-ID` header;
@@ -388,6 +464,8 @@ connection = ConnectionConfig(
     use_tls=True,
     gateway_address="gateway.example.com:443",
     gateway_use_tls=True,
+    communication_margin_seconds=30,
+    request_max_attempts=3,
 )
 
 with Sandbox(image="python:3.12-slim", connection=connection) as sandbox:
@@ -404,7 +482,10 @@ Existing allocations remain held; this view does not report actual utilization
 or the rated capacity of admission-disabled nodes.
 
 Without a `ConnectionConfig`, the SDK reads `ADX_SERVER_ADDRESS`, `ADX_TOKEN`,
-`ADX_TLS`, `ADX_GATEWAY_ADDRESS`, and `ADX_GATEWAY_TLS`. The gateway address
+`ADX_TLS`, `ADX_GATEWAY_ADDRESS`, `ADX_GATEWAY_TLS`,
+`ADX_COMMUNICATION_MARGIN_SECONDS`, and `ADX_REQUEST_MAX_ATTEMPTS`.
+The communication margin must be finite and between 0 and 3600 seconds;
+request_max_attempts must be a positive integer. The gateway address
 defaults to the frontend address for reverse-tunnel and user-port routes. PTY
 uses the Ingress data-plane route when a gateway address is configured, and falls
 back to the server address for combined deployments.

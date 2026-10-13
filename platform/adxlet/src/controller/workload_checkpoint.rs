@@ -58,9 +58,24 @@ impl Controller {
         let Some(status) = status else {
             return Ok(false);
         };
+        let storage = self
+            .record
+            .spec
+            .lifecycle
+            .pause
+            .clone()
+            .unwrap_or_default()
+            .storage;
         let Some(id) = status.requested_checkpoint else {
             return Ok(false);
         };
+        if let Err(error) = services.store.validate_policy(storage) {
+            services
+                .cooperation
+                .finish_workload(&self.record, &id, Some(error.to_string()))
+                .await?;
+            return Err(error);
+        }
         self.idle = None;
         if status.identity != crate::runtime_control::RuntimeControlClient::identity(&self.record) {
             return Err(Error::Conflict);
@@ -213,7 +228,7 @@ impl Controller {
         let artifact = match before_deadline(
             deadline,
             "checkpoint publication",
-            services.store.publish(&staged),
+            services.store.publish_with_policy(&staged, storage),
         )
         .await
         {
@@ -236,7 +251,7 @@ impl Controller {
             origin: None,
             source_runtime_id: self.record.runtime.id.clone(),
             // Anonymous recovery points follow their Environment's lifecycle.
-            expires_at_unix_seconds: u64::MAX,
+            expires_at_unix_seconds: None,
         });
         self.record.revision = self.record.revision.checked_add(1).ok_or(Error::Conflict)?;
         self.record.last_operation = None;

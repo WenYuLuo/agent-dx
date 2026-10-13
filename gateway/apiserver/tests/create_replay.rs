@@ -85,6 +85,8 @@ assignment: Some(pb::Assignment { environment_id: spec.id.clone(), node_id: "nod
     register_node(RegisterNodeRequest) -> RegisterNodeResponse,
     inspect_node(InspectNodeRequest) -> InspectNodeResponse,
     commit_environment(CommitEnvironmentRequest) -> CommitEnvironmentResponse,
+    ensure_running(EnsureRunningRequest) -> GetEnvironmentResponse,
+    retire_dormant(GetEnvironmentRequest) -> EnvironmentResult,
 ]);
 #[tonic::async_trait]
 impl pb::environment_directory_service_server::EnvironmentDirectoryService for Service {

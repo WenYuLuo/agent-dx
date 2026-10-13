@@ -1,4 +1,5 @@
 import ipaddress
+import math
 import os
 import re
 from dataclasses import dataclass, field
@@ -14,6 +15,62 @@ ADX_GET_DEFAULT_TIMEOUT = 300
 # Extra seconds added to the user-specified timeout for the RPC call,
 # to account for network overhead and serialization.
 ADX_GET_TIMEOUT_BUFFER = 30
+
+
+class IdleAction(str, Enum):
+    DELETE = "delete"
+    PAUSE = "pause"
+
+
+class CheckpointStorage(str, Enum):
+    CONFIGURED = "configured"
+    LOCAL = "local"
+    SHARED = "shared"
+
+
+@dataclass(frozen=True)
+class RetentionPolicy:
+    """An explicit finite TTL or retention until the Sandbox is deleted."""
+
+    ttl_seconds: Optional[int]
+
+    def __post_init__(self):
+        value = self.ttl_seconds
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int) or not 0 < value < (1 << 64)):
+            raise ValueError("retention TTL must be a positive uint64 integer")
+
+    @classmethod
+    def forever(cls) -> "RetentionPolicy":
+        return cls(None)
+
+    @classmethod
+    def for_seconds(cls, seconds: int) -> "RetentionPolicy":
+        if seconds is None:
+            raise ValueError("use RetentionPolicy.forever() for permanent retention")
+        return cls(seconds)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"kind": "forever"} if self.ttl_seconds is None else {"kind": "ttl", "ttlSeconds": self.ttl_seconds}
+
+
+@dataclass(frozen=True)
+class PausePolicy:
+    """Anonymous recovery-point retention and publication policy."""
+
+    retention: RetentionPolicy = field(default_factory=lambda: RetentionPolicy.for_seconds(90_000))
+    timeout_seconds: int = 300
+    storage: CheckpointStorage = CheckpointStorage.CONFIGURED
+
+    def __post_init__(self):
+        if not isinstance(self.retention, RetentionPolicy):
+            raise TypeError("retention must be a RetentionPolicy")
+        if isinstance(self.timeout_seconds, bool) or not isinstance(self.timeout_seconds, int) or not 0 < self.timeout_seconds <= 3600:
+            raise ValueError("timeout_seconds must be an integer from 1 through 3600")
+        if not isinstance(self.storage, CheckpointStorage):
+            raise TypeError("storage must be a CheckpointStorage")
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"retention": self.retention.to_dict(), "timeoutSeconds": self.timeout_seconds, "storage": self.storage.value}
 
 
 @dataclass(frozen=True)
@@ -88,8 +145,15 @@ class ConnectionConfig:
     gateway_use_tls: bool = False
     verify_tls: bool = False
     token_provider: Optional[Callable[[], str]] = field(default=None, repr=False)
+    communication_margin_seconds: float = ADX_GET_TIMEOUT_BUFFER
+    request_max_attempts: int = 3
 
     def __post_init__(self) -> None:
+        if isinstance(self.request_max_attempts, bool) or not isinstance(self.request_max_attempts, int) or self.request_max_attempts < 1:
+            raise ValueError("request_max_attempts must be a positive integer")
+        margin = self.communication_margin_seconds
+        if isinstance(margin, bool) or not isinstance(margin, (int, float)) or not math.isfinite(margin) or not 0 <= margin <= 3600:
+            raise ValueError("communication_margin_seconds must be finite and between 0 and 3600")
         for field_name in ("server_address", "token"):
             value = getattr(self, field_name)
             if not isinstance(value, str) or not value.strip():
@@ -143,6 +207,8 @@ class ConnectionConfig:
             gateway_address=gateway_address or None,
             gateway_use_tls=_connection_env_flag("ADX_GATEWAY_TLS", False),
             verify_tls=verify_tls,
+            communication_margin_seconds=float(os.environ.get("ADX_COMMUNICATION_MARGIN_SECONDS", str(ADX_GET_TIMEOUT_BUFFER))),
+            request_max_attempts=int(os.environ.get("ADX_REQUEST_MAX_ATTEMPTS", "3")),
         )
 
 
@@ -590,7 +656,7 @@ class PauseResult:
     snapshot_id: str
     size: int
     state: str
-    expires_at: int
+    expires_at: Optional[int]
 
 
 @dataclass(frozen=True)

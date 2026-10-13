@@ -307,6 +307,156 @@ impl CoordinatorConnection {
     }
 }
 #[async_trait::async_trait]
+impl super::resolver::DemandResolver for CoordinatorConnection {
+    async fn describe(
+        &self,
+        id: &str,
+        port: u16,
+        kind: super::resolver::AccessKind,
+        request_id: String,
+    ) -> Result<super::resolver::RouteHandle, super::resolver::ResolveError> {
+        use super::resolver::{ResolveError, RouteHandle};
+        let channel = self
+            .channel
+            .read()
+            .map_err(|_| ResolveError::NotReady)?
+            .clone()
+            .ok_or(ResolveError::NotReady)?;
+        let owner = tokio::time::timeout(
+            self.timeout,
+            pb::coordinator_service_client::CoordinatorServiceClient::new(channel).get_environment(
+                pb::GetEnvironmentRequest {
+                    environment_id: id.into(),
+                    caller: None,
+                },
+            ),
+        )
+        .await
+        .map_err(|_| ResolveError::Unavailable("environment lookup timed out".into()))?
+        .map_err(|e| {
+            if e.code() == tonic::Code::NotFound {
+                ResolveError::NotFound
+            } else {
+                ResolveError::Unavailable(e.to_string())
+            }
+        })?
+        .into_inner();
+        let record = owner.record.ok_or(ResolveError::NotFound)?;
+        let spec = record.spec.as_ref().ok_or(ResolveError::NotFound)?;
+        if !matches!(record.state, s if s == pb::EnvironmentState::Paused as i32 || s == pb::EnvironmentState::Running as i32)
+        {
+            return Err(ResolveError::NotFound);
+        }
+        let runtime = record.runtime.as_ref().ok_or(ResolveError::NotFound)?;
+        let data_plane = spec.sandbox.as_ref().and_then(|s| s.data_plane.as_ref());
+        let tunnel_security_mode =
+            security_mode(data_plane.map_or(0, |d| d.tunnel)).map_err(ResolveError::Unavailable)?;
+        let forwarding = security_mode(data_plane.map_or(0, |d| d.port_forward))
+            .map_err(ResolveError::Unavailable)?;
+        let effective = |mode| match mode {
+            DataPlaneSecurityMode::Inherit => {
+                match adx_core::sandbox::DataPlaneSecurityMode::Inherit.effective() {
+                    adx_core::sandbox::DataPlaneSecurityMode::TlsToken => {
+                        DataPlaneSecurityMode::TlsToken
+                    }
+                    adx_core::sandbox::DataPlaneSecurityMode::Tls => DataPlaneSecurityMode::Tls,
+                    adx_core::sandbox::DataPlaneSecurityMode::Inherit => {
+                        DataPlaneSecurityMode::Inherit
+                    }
+                }
+            }
+            mode => mode,
+        };
+        let tunnel_security_mode = effective(tunnel_security_mode);
+        let declared_port = spec
+            .sandbox
+            .as_ref()
+            .is_some_and(|s| s.ports.contains(&u32::from(port)));
+        Ok(RouteHandle {
+            needs_resume: true,
+            processing: None,
+            access_kind: kind,
+            relay_address: owner.relay_address,
+            tenant_id: spec.tenant_id.clone(),
+            tunnel_security_mode,
+            port_forward_auth_mode: if declared_port
+                && effective(forwarding) == DataPlaneSecurityMode::TlsToken
+            {
+                DataPlaneAuthMode::Token
+            } else {
+                DataPlaneAuthMode::None
+            },
+            target: crate::common::protocol::ConnectTarget {
+                instance_id: id.into(),
+                workload_id: runtime.id.clone(),
+                // A dormant handle contains policy metadata only. It is never opened.
+                target_ip: std::net::Ipv4Addr::UNSPECIFIED.into(),
+                target_port: port,
+                request_id,
+            },
+        })
+    }
+    async fn ensure_running(
+        &self,
+        route: &super::resolver::RouteHandle,
+    ) -> Result<String, super::resolver::ResolveError> {
+        use super::resolver::ResolveError;
+        let channel = self
+            .channel
+            .read()
+            .map_err(|_| ResolveError::NotReady)?
+            .clone()
+            .ok_or(ResolveError::NotReady)?;
+        let deadline = route.processing.clone().unwrap_or_default();
+        let mut request = tonic::Request::new(pb::EnsureRunningRequest {
+            expected_runtime_id: route.target.workload_id.clone(),
+            environment_id: route.target.instance_id.clone(),
+            caller: Some(pb::CallerContext {
+                tenant_id: route.tenant_id.clone(),
+                administrator: false,
+            }),
+            timeout_seconds: deadline.remaining().as_secs().saturating_add(1).min(3600),
+        });
+        request.set_timeout(deadline.remaining());
+        let owner = tokio::time::timeout_at(
+            deadline.at,
+            pb::coordinator_service_client::CoordinatorServiceClient::new(channel)
+                .ensure_running(request),
+        )
+        .await
+        .map_err(|_| ResolveError::Resuming)?
+        .map_err(|e| match e.code() {
+            // Tonic may report its grpc-timeout expiry as Cancelled. This RPC
+            // carries wake demand only; neither status means business bytes were sent.
+            tonic::Code::DeadlineExceeded | tonic::Code::Cancelled => ResolveError::Resuming,
+            tonic::Code::InvalidArgument | tonic::Code::FailedPrecondition => {
+                ResolveError::ResumeRejected(e.message().to_owned())
+            }
+            tonic::Code::NotFound
+            | tonic::Code::PermissionDenied
+            | tonic::Code::Unauthenticated => ResolveError::NotFound,
+            _ => ResolveError::Unavailable(e.to_string()),
+        })?
+        .into_inner();
+        let record = owner
+            .record
+            .filter(|r| r.state == pb::EnvironmentState::Running as i32)
+            .ok_or_else(|| ResolveError::Unavailable("resume not published".into()))?;
+        if record
+            .spec
+            .as_ref()
+            .is_none_or(|s| s.tenant_id != route.tenant_id)
+        {
+            return Err(ResolveError::NotFound);
+        }
+        record
+            .runtime
+            .map(|r| r.id)
+            .ok_or(ResolveError::MissingEndpoint)
+    }
+}
+
+#[async_trait::async_trait]
 impl CredentialVerifier for CoordinatorConnection {
     async fn verify(&self, key: &str) -> Result<AuthenticatedIdentity, AuthError> {
         if !(32..=512).contains(&key.len()) {

@@ -6,6 +6,7 @@ mod collection;
 mod credentials;
 mod failure;
 mod recovery;
+mod resume;
 mod snapshots;
 use crate::Node;
 use adx_core::{
@@ -105,7 +106,20 @@ pub struct Recovery {
     pub pending: bool,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResumeIntent {
+    pub operation_id: String,
+    /// A definitive local admission rejection permits a different placement.
+    pub local_rejected: bool,
+    /// Admission failures are excluded for one bounded placement round.
+    #[serde(default)]
+    pub rejected_nodes: std::collections::BTreeSet<String>,
+    #[serde(default)]
+    pub retry_after_unix_seconds: u64,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredEnvironment {
+    #[serde(default)]
+    pub resume: Option<ResumeIntent>,
     /// Durable age of a terminal failure; retries and Coordinator restarts do not reset it.
     #[serde(default)]
     pub failed_since_unix_seconds: Option<u64>,
@@ -307,7 +321,7 @@ fn validate_result(r: &EnvironmentRecord) -> Result<()> {
             || cp.artifact.storage.is_empty()
             || cp.artifact.location.is_empty()
             || cp.artifact.size_bytes == 0
-            || cp.expires_at_unix_seconds == 0
+            || cp.expires_at_unix_seconds == Some(0)
             || match &cp.origin {
                 None => !adx_core::valid_runtime_id(
                     &r.spec.id,
@@ -360,10 +374,15 @@ fn next_result(old: &StoredEnvironment, r: &EnvironmentRecord) -> Result<bool> {
     if old.invalidated
         && (!matches!(
             r.state,
-            EnvironmentState::Failed | EnvironmentState::Deleted
+            EnvironmentState::Failed | EnvironmentState::Deleted | EnvironmentState::Paused
         ) || r.resources_held
             || r.restart_pending
             || r.runtime.ip.is_some()
+            || (r.state == EnvironmentState::Paused
+                && old
+                    .result
+                    .as_ref()
+                    .is_none_or(|previous| previous.state != EnvironmentState::Paused))
             || (r.state != EnvironmentState::Deleted
                 && old
                     .result
@@ -1033,6 +1052,7 @@ impl Session {
             }
         }
         let record = StoredEnvironment {
+            resume: None,
             failed_since_unix_seconds: None,
             recovery: None,
             invalidated: false,
@@ -1188,10 +1208,13 @@ impl Session {
                 return Err(Error::NotFound);
             };
             let mut stored_environment: StoredEnvironment = decode(environment_value)?;
-            if !next_result(&stored_environment, &result)? {
+            if !(next_result(&stored_environment, &result)?
+                || result.state == EnvironmentState::Running && stored_environment.resume.is_some())
+            {
                 return Ok(result);
             }
             if result.state != EnvironmentState::Paused {
+                stored_environment.resume = None;
                 if let Some(recovery) = &mut stored_environment.recovery {
                     recovery.pending = false;
                 }

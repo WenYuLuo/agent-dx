@@ -24,16 +24,18 @@ Response format:
 import base64
 import json
 import logging
+import math
 import os
+import random
 import time
 import uuid
+from contextlib import contextmanager, nullcontext
 from typing import Any, Dict, Iterable, Optional
 
 import httpx
 
-# Default per-call timeout buffer, mirroring types.ADX_GET_TIMEOUT_BUFFER.
 from ._http_pool import acquire_shared_http_client
-from .types import ADX_GET_DEFAULT_TIMEOUT, ADX_GET_TIMEOUT_BUFFER, ConnectionConfig
+from .types import ADX_GET_DEFAULT_TIMEOUT, ConnectionConfig
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +53,7 @@ class SandboxError(RuntimeError):
         outcome: Optional[str] = None,
         operation_id: Optional[str] = None,
         instance_id: Optional[str] = None,
+        request_forwarded: Optional[bool] = None,
         failure: Optional[Dict[str, Any]] = None,
         probe_failure: Optional[Dict[str, Any]] = None,
     ):
@@ -61,6 +64,7 @@ class SandboxError(RuntimeError):
         self.outcome = outcome
         self.operation_id = operation_id
         self.instance_id = instance_id
+        self.request_forwarded = request_forwarded
         self.failure = failure
         self.probe_failure = probe_failure
 
@@ -110,6 +114,7 @@ class SandboxHTTPError(SandboxError):
         operation_id: Optional[str] = None,
         instance_id: Optional[str] = None,
         probe_failure: Optional[Dict[str, Any]] = None,
+        request_forwarded: Optional[bool] = None,
     ):
         super().__init__(
             message,
@@ -120,6 +125,7 @@ class SandboxHTTPError(SandboxError):
             operation_id=operation_id,
             instance_id=instance_id,
             probe_failure=probe_failure,
+            request_forwarded=request_forwarded,
         )
         self.status_code = status_code
         self.payload = payload
@@ -147,6 +153,7 @@ class _RetryableHTTPStatus(SandboxHTTPError):
             outcome=error.outcome,
             operation_id=error.operation_id,
             instance_id=error.instance_id,
+            request_forwarded=error.request_forwarded,
         )
 
 
@@ -166,7 +173,6 @@ _DIRECT_UNKNOWN_OUTCOME_ERRORS = (
     httpx.WriteError,
     httpx.WriteTimeout,
 )
-_DIRECT_MAX_ATTEMPTS = 3
 _DIRECT_RETRY_BACKOFF_SECONDS = 0.1
 _DIRECT_POOL_TIMEOUT_SECONDS = 2.0
 # A single missing route is commonly a transient publication race. Keep trying
@@ -300,7 +306,7 @@ class SandboxClient:
     def create_info(self, body: Dict[str, Any]) -> Dict[str, Any]:
         """POST /sandboxes and return the confirmed-running final SSE result."""
         logical_timeout = int(body.get("createTimeoutSeconds") or _DEFAULT_CREATE_LOGICAL_TIMEOUT)
-        request_timeout = logical_timeout + ADX_GET_TIMEOUT_BUFFER
+        request_timeout = logical_timeout + self._connection.communication_margin_seconds
         # A UUIDv4 identifies this logical create across transport retries.
         operation_id = str(uuid.uuid4())
         request_id = f"create-{operation_id}"
@@ -543,7 +549,7 @@ class SandboxClient:
                 f"{self._base}/sandboxes/{sandbox_id}/snapshots",
                 json=body,
                 headers={"X-ADX-Request-ID": request_id},
-                timeout=timeout_seconds + ADX_GET_TIMEOUT_BUFFER,
+                timeout=timeout_seconds + self._connection.communication_margin_seconds,
             )
         except _CREATE_RETRYABLE_ERRORS as exc:
             raise SandboxError(
@@ -562,7 +568,7 @@ class SandboxClient:
     def get_snapshot(self, snapshot_id: str) -> Dict[str, Any]:
         resp = self._http.get(
             f"{self._base}/snapshots/{snapshot_id}",
-            timeout=ADX_GET_DEFAULT_TIMEOUT + ADX_GET_TIMEOUT_BUFFER,
+            timeout=ADX_GET_DEFAULT_TIMEOUT + self._connection.communication_margin_seconds,
         )
         return self._json(resp)
 
@@ -583,7 +589,7 @@ class SandboxClient:
         resp = self._http.get(
             f"{self._base}/snapshots",
             params=params,
-            timeout=ADX_GET_DEFAULT_TIMEOUT + ADX_GET_TIMEOUT_BUFFER,
+            timeout=ADX_GET_DEFAULT_TIMEOUT + self._connection.communication_margin_seconds,
         )
         return self._json(resp)
 
@@ -592,21 +598,21 @@ class SandboxClient:
         resp = self._http.delete(
             f"{self._base}/snapshots/{snapshot_id}",
             headers={"X-ADX-Request-ID": request_id},
-            timeout=ADX_GET_DEFAULT_TIMEOUT + ADX_GET_TIMEOUT_BUFFER,
+            timeout=ADX_GET_DEFAULT_TIMEOUT + self._connection.communication_margin_seconds,
         )
         self._json(resp)
 
     def pause(
         self,
         sandbox_id: str,
-        ttl_seconds: int = 90_000,
+        retention: Optional[Dict[str, Any]] = None,
         timeout_seconds: int = ADX_GET_DEFAULT_TIMEOUT,
     ) -> Dict[str, Any]:
         """Synchronously pause one sandbox using one internal request identity."""
         return self._lifecycle_request(
             sandbox_id,
             operation="pause",
-            body={"ttlSeconds": ttl_seconds, "timeoutSeconds": timeout_seconds},
+            body={"timeoutSeconds": timeout_seconds, **({"retention": retention} if retention is not None else {})},
             timeout_seconds=timeout_seconds,
         )
 
@@ -653,7 +659,7 @@ class SandboxClient:
                     f"{self._base}/sandboxes/{sandbox_id}/{operation}",
                     json=body,
                     headers={"X-ADX-Request-ID": request_id},
-                    timeout=timeout_seconds + ADX_GET_TIMEOUT_BUFFER,
+                    timeout=timeout_seconds + self._connection.communication_margin_seconds,
                 )
             except _CREATE_RETRYABLE_ERRORS as exc:
                 last_error = exc
@@ -738,16 +744,14 @@ class SandboxClient:
         derived from the logical *timeout* with a small network buffer, so a slow
         primitive does not trip the client first.
         """
-        rpc_timeout: Optional[float]
-        if timeout is None:
-            rpc_timeout = ADX_GET_DEFAULT_TIMEOUT
-        elif timeout < 0:
-            rpc_timeout = None  # unbounded
-        else:
-            rpc_timeout = max(timeout + ADX_GET_TIMEOUT_BUFFER, ADX_GET_DEFAULT_TIMEOUT)
-
+        logical_timeout = ADX_GET_DEFAULT_TIMEOUT if timeout is None else timeout
+        if isinstance(logical_timeout, bool) or not isinstance(logical_timeout, (int, float)) or not math.isfinite(logical_timeout):
+            raise ValueError("timeout must be finite")
+        if logical_timeout == 0 or logical_timeout > 86400:
+            raise ValueError("timeout must be positive and at most 86400 seconds, or negative for unbounded calls")
         request_id = self._new_request_id("invoke")
-        deadline = None if rpc_timeout is None else time.monotonic() + rpc_timeout
+        processing_deadline = None if logical_timeout < 0 else time.monotonic() + logical_timeout
+        deadline = None if processing_deadline is None else processing_deadline + self._connection.communication_margin_seconds
 
         # Prefer the /direct path; fall back to the control-plane invoke path.
         if self._direct_enabled and not self._direct_disabled:
@@ -757,9 +761,14 @@ class SandboxClient:
                 args or {},
                 request_id,
                 deadline,
+                processing_deadline,
+                None if logical_timeout < 0 else logical_timeout,
             )
             if not fell_back:
                 return _InvokeResult(result, request_id)
+            if logical_timeout >= 0:
+                processing_deadline = time.monotonic() + logical_timeout
+                deadline = processing_deadline + self._connection.communication_margin_seconds
 
         fallback_timeout = self._remaining_timeout(deadline)
         if fallback_timeout is not None and fallback_timeout <= 0:
@@ -776,7 +785,7 @@ class SandboxClient:
                     "requestId": request_id,
                 },
                 timeout=fallback_timeout,
-                headers={"X-ADX-Request-ID": request_id},
+                headers={"X-ADX-Request-ID": request_id, **self._processing_headers(processing_deadline)},
             )
         except httpx.RequestError as error:
             raise SandboxError(
@@ -792,6 +801,8 @@ class SandboxClient:
         args: Dict[str, Any],
         request_id: str,
         deadline: Optional[float],
+        processing_deadline: Optional[float] = None,
+        processing_timeout: Optional[float] = None,
     ) -> "tuple[Dict[str, Any], bool]":
         """Try the /direct path. Returns ``(result, fell_back)``.
 
@@ -813,11 +824,17 @@ class SandboxClient:
         outcome_unknown = False
         attempts = 0
 
-        for attempt in range(1, _DIRECT_MAX_ATTEMPTS + 1):
+        pending_resume: Optional[SandboxHTTPError] = None
+        attempt_limit = self._connection.request_max_attempts
+        for attempt in range(1, attempt_limit + 1):
             remaining = self._remaining_timeout(deadline)
             if remaining is not None and remaining <= 0:
                 break
+            processing_remaining = self._remaining_timeout(processing_deadline)
+            if processing_remaining is not None and processing_remaining <= 0:
+                break
             attempts = attempt
+            retry_after = 0.0
             pool_timeout = (
                 _DIRECT_POOL_TIMEOUT_SECONDS if remaining is None else min(_DIRECT_POOL_TIMEOUT_SECONDS, remaining)
             )
@@ -834,7 +851,7 @@ class SandboxClient:
                         "requestId": request_id,
                     },
                     timeout=request_timeout,
-                    headers={"X-ADX-Request-ID": request_id},
+                    headers={"X-ADX-Request-ID": request_id, **self._processing_headers(processing_deadline)},
                 )
             except _DIRECT_SAFE_FALLBACK_ERRORS as exc:
                 self._direct_route_misses = 0
@@ -890,7 +907,15 @@ class SandboxClient:
                         )
                     return {}, True
                 self._direct_route_misses = 0
-                if resp.status_code in _RETRYABLE_GATEWAY_STATUS_CODES:
+                error = self._http_error(resp, request_id=request_id) if resp.status_code >= 400 else None
+                if error is not None and error.retry == "never":
+                    raise error
+                if error is not None and self._is_resuming(resp, error, request_id):
+                    pending_resume = error
+                    last_error = error
+                    last_failure_safe = True
+                    retry_after = self._resume_retry_delay(resp)
+                elif resp.status_code in _RETRYABLE_GATEWAY_STATUS_CODES:
                     last_error = _RetryableHTTPStatus(self._http_error(resp, request_id=request_id))
                     last_failure_safe = False
                     outcome_unknown = True
@@ -911,12 +936,11 @@ class SandboxClient:
                             parsed = {"value": parsed}
                         return parsed, False
 
-            if attempt >= _DIRECT_MAX_ATTEMPTS:
+            if attempt >= attempt_limit:
                 break
-            remaining = self._remaining_timeout(deadline)
-            backoff = _DIRECT_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1))
-            if remaining is not None:
-                backoff = min(backoff, max(0.0, remaining))
+            backoff = max(retry_after, _DIRECT_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1)))
+            if retry_after:
+                backoff += random.uniform(0, 0.1)
             if backoff <= 0:
                 break
             logger.warning(
@@ -924,11 +948,20 @@ class SandboxClient:
                 request_id,
                 action,
                 attempt,
-                _DIRECT_MAX_ATTEMPTS,
+                attempt_limit,
                 last_error,
             )
             time.sleep(backoff)
+            if processing_timeout is not None:
+                # Every permitted retry is a new HTTP attempt with the same
+                # configured timeout, margin and operation identity.
+                processing_deadline = time.monotonic() + processing_timeout
+                deadline = processing_deadline + self._connection.communication_margin_seconds
 
+        if pending_resume is not None and not outcome_unknown:
+            # No attempt reached the application. Keep this authoritative outcome;
+            # never turn demand waiting into a control-plane invocation fallback.
+            raise pending_resume
         if last_failure_safe and not outcome_unknown and last_error is not None:
             # Every attempt failed before request bytes could reach EXECD.
             self._direct_disabled = True
@@ -959,6 +992,77 @@ class SandboxClient:
             operation_id=request_id,
             instance_id=sandbox_id,
         ) from last_error
+
+    @staticmethod
+    def _is_resuming(response: httpx.Response, error: SandboxHTTPError, request_id: str) -> bool:
+        detail = error.payload.get("error", {})
+        return (response.status_code == 503 and response.headers.get("X-ADX-Error-Code") == "ENV_RESUMING"
+                and error.code == "ENV_RESUMING" and error.outcome == "not_started"
+                and error.retry == "same_operation" and isinstance(detail, dict)
+                and detail.get("requestForwarded") is False and detail.get("requestId") == request_id)
+
+    @staticmethod
+    def _resume_retry_delay(response: httpx.Response) -> float:
+        try:
+            seconds = float(response.headers.get("Retry-After", "1"))
+        except ValueError:
+            seconds = 1.0
+        if not math.isfinite(seconds) or seconds < 0:
+            seconds = 1.0
+        return min(seconds, 30.0)
+
+    @contextmanager
+    def _data_response(self, method: str, url: str, timeout: Optional[float], *, stream=False, **kwargs):
+        """Retry only an authoritative not-forwarded reply, with a replayable body.
+
+        Generic file transport failures keep the file API's existing recovery
+        behavior. An iterator cannot be replayed after HTTPX has consumed it.
+        """
+        logical = ADX_GET_DEFAULT_TIMEOUT if timeout is None else timeout
+        if isinstance(logical, bool) or not isinstance(logical, (int, float)) or not math.isfinite(logical):
+            raise ValueError("timeout must be finite")
+        if logical == 0 or logical > 86400:
+            raise ValueError("timeout must be positive and at most 86400 seconds, or negative")
+        headers = dict(kwargs.pop("headers", None) or {})
+        request_id = headers.setdefault("X-ADX-Request-ID", self._new_request_id("data"))
+        content = kwargs.get("content")
+        rewind = None
+        replayable = content is None or isinstance(content, (bytes, bytearray, str))
+        if hasattr(content, "seek") and hasattr(content, "tell"):
+            try:
+                rewind = content.tell()
+                replayable = True
+            except (OSError, ValueError):
+                pass
+        attempt_limit = self._connection.request_max_attempts
+        for attempt in range(attempt_limit):
+            if rewind is not None:
+                content.seek(rewind)
+            processing_deadline = None if logical < 0 else time.monotonic() + logical
+            attempt_headers = {**headers, **self._processing_headers(processing_deadline)}
+            transport_timeout = None if logical < 0 else logical + self._connection.communication_margin_seconds
+            context = (self._http.stream(method, url, timeout=transport_timeout, headers=attempt_headers, **kwargs)
+                       if stream else nullcontext(getattr(self._http, method.lower())(
+                           url, timeout=transport_timeout, headers=attempt_headers, **kwargs)))
+            with context as response:
+                if response.status_code < 400:
+                    yield response
+                    return
+                if stream:
+                    response.read()
+                error = self._http_error(response, request_id=request_id)
+                if not self._is_resuming(response, error, request_id) or not replayable or attempt + 1 == attempt_limit:
+                    raise error
+                delay = self._resume_retry_delay(response) + random.uniform(0, 0.1)
+            response.close()
+            time.sleep(delay)
+
+    @staticmethod
+    def _processing_headers(deadline: Optional[float]) -> Dict[str, str]:
+        if deadline is None:
+            return {}
+        milliseconds = max(1, math.ceil(max(0.0, deadline - time.monotonic()) * 1000))
+        return {"X-ADX-Processing-Timeout-Ms": str(milliseconds)}
 
     @staticmethod
     def _remaining_timeout(deadline: Optional[float]) -> Optional[float]:
@@ -1040,15 +1144,13 @@ class SandboxClient:
     ) -> int:
         url = f"{self._direct_base}/{self._safe_id(sandbox_id)}/upload/status"
         try:
-            resp = self._http.get(
-                url,
+            with self._data_response("GET", url, rpc_timeout,
                 params={"path": remote_path, "uploadId": upload_id},
-                timeout=rpc_timeout,
-            )
+
+            ) as resp:
+                pass
         except httpx.RequestError as e:
             raise SandboxError(f"direct upload status {sandbox_id} failed: {e}") from e
-        if resp.status_code >= 400:
-            raise SandboxError(f"direct upload status {sandbox_id} failed: HTTP {resp.status_code} {resp.text}")
         try:
             parsed = resp.json()
         except ValueError as e:
@@ -1066,20 +1168,17 @@ class SandboxClient:
         url = f"{self._direct_base}/{self._safe_id(sandbox_id)}/upload/commit"
         request_id = self._new_request_id("upload-commit")
         try:
-            resp = self._http.post(
-                url,
+            with self._data_response("POST", url, rpc_timeout,
                 params={
                     "path": remote_path,
                     "uploadId": upload_id,
                     "totalSize": str(total),
                 },
-                timeout=rpc_timeout,
                 headers={"X-ADX-Request-ID": request_id},
-            )
+            ) as resp:
+                pass
         except httpx.RequestError as e:
             raise SandboxError(f"direct upload commit {sandbox_id} failed: {e}") from e
-        if resp.status_code >= 400:
-            raise SandboxError(f"direct upload commit {sandbox_id} failed: HTTP {resp.status_code} {resp.text}")
         try:
             parsed = resp.json()
         except ValueError as e:
@@ -1136,17 +1235,14 @@ class SandboxClient:
             params = {"path": remote_path, "type": upload_type}
             if extra_params:
                 params.update(extra_params)
-            resp = self._http.post(
-                url,
+            with self._data_response("POST", url, rpc_timeout,
                 params=params,
                 content=content,
-                timeout=rpc_timeout,
                 headers=headers,
-            )
+            ) as resp:
+                pass
         except httpx.RequestError as e:
             raise SandboxError(f"direct upload {sandbox_id} failed: {e}") from e
-        if resp.status_code >= 400:
-            raise SandboxError(f"direct upload {sandbox_id} failed: HTTP {resp.status_code} {resp.text}")
         try:
             parsed = resp.json()
         except ValueError as e:
@@ -1170,15 +1266,10 @@ class SandboxClient:
             return
         url = f"{self._direct_base}/{self._safe_id(sandbox_id)}/download"
         try:
-            with self._http.stream(
-                "GET",
-                url,
+            with self._data_response(
+                "GET", url, rpc_timeout, stream=True,
                 params={"path": remote_path, "type": download_type},
-                timeout=rpc_timeout,
             ) as resp:
-                if resp.status_code >= 400:
-                    body = resp.read().decode("utf-8", errors="replace")
-                    raise SandboxError(f"direct download {sandbox_id} failed: HTTP {resp.status_code} {body}")
                 self._write_stream_to_file(resp, local_path, append=False)
         except httpx.RequestError as e:
             raise SandboxError(f"direct download {sandbox_id} failed: {e}") from e
@@ -1200,16 +1291,11 @@ class SandboxClient:
             offset = os.path.getsize(part_path) if os.path.exists(part_path) else 0
             headers = {"Range": f"bytes={offset}-"} if offset > 0 else None
             try:
-                with self._http.stream(
-                    "GET",
-                    url,
+                with self._data_response(
+                    "GET", url, rpc_timeout, stream=True,
                     params={"path": remote_path, "type": "file"},
-                    timeout=rpc_timeout,
-                    headers=headers,
+                        headers=headers,
                 ) as resp:
-                    if resp.status_code >= 400:
-                        body = resp.read().decode("utf-8", errors="replace")
-                        raise SandboxError(f"direct download {sandbox_id} failed: HTTP {resp.status_code} {body}")
                     append = offset > 0 and resp.status_code == 206
                     if offset > 0 and resp.status_code != 206:
                         append = False
@@ -1238,15 +1324,13 @@ class SandboxClient:
         """Download bytes over the required /direct binary data path."""
         url = f"{self._direct_base}/{self._safe_id(sandbox_id)}/download"
         try:
-            resp = self._http.get(
-                url,
+            with self._data_response("GET", url, rpc_timeout,
                 params={"path": remote_path, "type": "file"},
-                timeout=rpc_timeout,
-            )
+
+            ) as resp:
+                pass
         except httpx.RequestError as e:
             raise SandboxError(f"direct download {sandbox_id} failed: {e}") from e
-        if resp.status_code >= 400:
-            raise SandboxError(f"direct download {sandbox_id} failed: HTTP {resp.status_code} {resp.text}")
         return resp.content
 
     @property
@@ -1320,6 +1404,7 @@ class SandboxClient:
             operation_id=detail.get("operationId"),
             instance_id=detail.get("instanceId"),
             probe_failure=detail.get("probeFailure"),
+            request_forwarded=detail.get("requestForwarded") if isinstance(detail.get("requestForwarded"), bool) else None,
         )
 
     @staticmethod

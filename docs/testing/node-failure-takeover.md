@@ -6,7 +6,7 @@
 
 1. 心跳超时后关闭该节点的调度资格，持久化节点会话及旧执行的失效状态，撤销旧路由。仅设置节点 unavailable 不足以完成此流程。
 2. 失效后的旧会话、旧归属代次及旧执行不能通过迟到心跳、结果提交或 SQLite 补写重新变为有效。
-3. 需要恢复的 Environment 使用新的执行代次重新调度，保持 Environment ID；恢复所需 checkpoint 必须已登记、未过期、可跨节点读取且兼容目标后端。
+3. 用户休眠的 Paused 保留失效归属和恢复点，不主动恢复；手动/流量需求通过 EnsureRunning 触发恢复。自动故障恢复中的中间 Paused/recovery.pending 仍代表恢复运行意图。需要恢复的 Environment 使用新的执行代次重新调度，保持 Environment ID；恢复所需 checkpoint 必须已登记、未过期、可跨节点读取且兼容目标后端。
 4. checkpoint 缺失或 local-only 时明确恢复失败，不从原始镜像重新创建。节点不可调度期间不把它的容量重新投入分配。
 5. Coordinator 重启后，已有节点先关闭路由和准入，并从恢复完成时开始等待一个心跳超时周期。期限内重新报到可正常对账；期限届满仍未报到则失效旧执行。迟到注册和结果提交同样先检查这段期限，不能绕过定时器。
 
@@ -19,7 +19,7 @@
 ## adxlet 的职责
 
 1. 恢复连接时，旧进程会话被判失效也必须触发完整对账，不仅进程重启才对账。
-2. 对账完成前关闭生命周期入口与新准入；获取 Coordinator 完整目录后，将实际 backend 执行与 Environment ID、归属节点及执行代次逐一比较。
+2. 对账完成前关闭生命周期入口与新准入；获取 Coordinator 完整目录后先排空各 Environment 已接纳的串行操作。未提交恢复执行清理后重新接纳权威 Paused 恢复点；已知发布的新执行若与目录不同，拒绝该旧目录并重取，不能当成孤儿删除。随后将实际 backend 执行与 Environment ID、归属节点及执行代次逐一比较。
 3. 已失效、已转移或代次落后的执行：退役本机绑定/会话，调用 RuntimeDriver 删除旧执行，清理本机占用。不能复用旧执行重新发布 Running，也不能把自动重启策略用于重新拉起它。
 4. SQLite 日志不能覆盖 Coordinator 的失效或转移决定；丢弃退役归属的补写记录。有效归属的日志继续遵守已有降级契约。
 5. 清理失败时保持对账未完成和准入关闭，重试清理。受有效快照引用保护的制品不随旧执行无条件删除。
@@ -36,4 +36,4 @@ Coordinator 暂时不可用时的 SQLite 降级行为，与 Coordinator 已经�
 - 无 checkpoint、local-only、过期或不兼容 checkpoint：明确恢复失败。
 - 恢复过程被 Coordinator 重启或请求重试打断：不重复创建，不接受旧代结果；原节点之后恢复仍清理旧执行。
 
-当前 `CoordinatorRpc::expire_nodes` 调用 `Session::invalidate_node`，原子更新节点和旧执行结果，并保存 invalidated 标记；迟到注册/提交路径也会先检查超时。adxlet 对账会废弃与权威终态冲突的已有控制器，SQLite 不补写到权威终态之上。`Session::reserve_recovery` 与 `CoordinatorRpc::recover_instances` 已接通共享 checkpoint 的新代次分配/恢复；持久化计划、重复请求和源节点制品保护有组件测试。真实FC双节点六项及计划落盘后Coordinator重启已通过，r5目标adxlet执行中重启及未提交backend清理也已通过，见 [跨节点恢复](2026-09-16-cross-node-recovery.md)。
+当前 `CoordinatorRpc::expire_nodes` 调用 `Session::invalidate_node`，原子更新节点和旧执行结果，并保存 invalidated 标记；迟到注册/提交路径也会先检查超时。adxlet 对账会废弃与权威终态冲突的已有控制器，SQLite 不补写到权威终态之上。`Session::reserve_recovery` 与 `CoordinatorRpc::recover_environments` 已接通共享 checkpoint 的新代次分配/恢复；持久化计划、重复请求和源节点制品保护有组件测试。真实FC双节点六项及计划落盘后Coordinator重启已通过，r5目标adxlet执行中重启及未提交backend清理也已通过，见 [跨节点恢复](2026-09-16-cross-node-recovery.md)。

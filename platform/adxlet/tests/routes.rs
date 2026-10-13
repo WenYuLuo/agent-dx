@@ -117,11 +117,17 @@ async fn start<T: RelayService>(service: T) -> (Server, UdsRoutes) {
 struct Handler(Arc<BindingService>);
 #[tonic::async_trait]
 impl RelayService for Handler {
+    async fn set_environment_admission(
+        &self,
+        request: Request<pb::EnvironmentAdmissionRequest>,
+    ) -> Result<Response<pb::EnvironmentAdmissionResponse>, Status> {
+        self.0.set_environment_admission(request).await
+    }
     async fn get_environment_activity(
         &self,
-        _: Request<pb::GetEnvironmentActivityRequest>,
+        request: Request<pb::GetEnvironmentActivityRequest>,
     ) -> Result<Response<pb::EnvironmentActivityState>, Status> {
-        Err(Status::unimplemented("fixture has no activity"))
+        self.0.get_environment_activity(request).await
     }
 
     async fn get_binding_state(
@@ -217,6 +223,12 @@ struct ConcurrentUpdates {
 
 #[tonic::async_trait]
 impl RelayService for ConcurrentUpdates {
+    async fn set_environment_admission(
+        &self,
+        _: Request<pb::EnvironmentAdmissionRequest>,
+    ) -> Result<Response<pb::EnvironmentAdmissionResponse>, Status> {
+        Err(Status::unimplemented("fixture admission"))
+    }
     async fn get_environment_activity(
         &self,
         _: Request<pb::GetEnvironmentActivityRequest>,
@@ -288,6 +300,12 @@ async fn independent_binding_updates_do_not_wait_for_each_other() {
 }
 #[tonic::async_trait]
 impl RelayService for Delayed {
+    async fn set_environment_admission(
+        &self,
+        _: Request<pb::EnvironmentAdmissionRequest>,
+    ) -> Result<Response<pb::EnvironmentAdmissionResponse>, Status> {
+        Err(Status::unimplemented("fixture admission"))
+    }
     async fn get_environment_activity(
         &self,
         _: Request<pb::GetEnvironmentActivityRequest>,
@@ -454,4 +472,32 @@ async fn full_snapshot_retries_and_invalid_snapshot_never_open_admission() {
         .await
         .unwrap();
     assert!(proxy.ready());
+}
+
+#[tokio::test]
+async fn idle_admission_barrier_requires_current_idle_activity_and_can_reopen() {
+    let tracker = Arc::new(data_plane_gateway::node::ActivityTracker::new(
+        "activity-session",
+    ));
+    let relay = Arc::new(
+        Relay::new(GatewayPolicy::new(vec![]))
+            .with_route_enforcement()
+            .with_activity_tracker(tracker.clone()),
+    );
+    let binding = Arc::new(BindingService::new(relay));
+    let (_server, routes) = start(Handler(binding)).await;
+    routes.activate(&record()).await.unwrap();
+    let (session, revision, active) = routes.activity(&record()).await.unwrap();
+    assert_eq!(active, 0);
+    tracker.activate("i");
+    assert!(!routes.quiesce(&record(), &session, revision).await.unwrap());
+    tracker.deactivate("i");
+    assert!(
+        !routes.quiesce(&record(), &session, revision).await.unwrap(),
+        "a complete intervening request resets idle"
+    );
+    let (session, revision, _) = routes.activity(&record()).await.unwrap();
+    assert!(routes.quiesce(&record(), &session, revision).await.unwrap());
+    routes.reopen(&record()).await.unwrap();
+    assert!(routes.quiesce(&record(), &session, revision).await.unwrap());
 }

@@ -53,7 +53,7 @@ instead of inferring retry safety from HTTP status or message text. See the
 | Get reusable snapshot | `GET /api/sandbox/v1/snapshots/{snapshotID}` | none | tenant-scoped catalog JSON returned by the Rust Coordinator SnapshotService |
 | List reusable snapshots | `GET /api/sandbox/v1/snapshots?name=&pageToken=&pageSize=` | none | tenant-scoped catalog JSON returned by the Rust Coordinator SnapshotService |
 | Delete reusable snapshot | `DELETE /api/sandbox/v1/snapshots/{snapshotID}` | none | tenant-scoped catalog JSON returned by the Rust Coordinator SnapshotService |
-| Pause | `POST /api/sandbox/v1/sandboxes/{sandboxID}/pause` | `{"ttlSeconds":90000,"timeoutSeconds":300}` | `{"sandboxId":"...","snapshotId":"...","size":8192,"state":"paused","expiresAt":...}` |
+| Pause | `POST /api/sandbox/v1/sandboxes/{sandboxID}/pause` | `{"retention":{"kind":"ttl","ttlSeconds":90000},"timeoutSeconds":300}` | `{"sandboxId":"...","snapshotId":"...","size":8192,"state":"paused","expiresAt":...}` |
 | Resume | `POST /api/sandbox/v1/sandboxes/{sandboxID}/resume` | none | `{"sandboxId":"...","state":"running","routeAddress":"host:port","functionProxyId":"...","nodeId":"...","portMappings":{}}` |
 | Reload latest recovery point | `POST /api/sandbox/v1/sandboxes/{sandboxID}/reload` | none | `{"success":true}` after a new backend execution reaches Running and is published |
 | Replace network policy | `PUT /api/sandbox/v1/sandboxes/{sandboxID}/network` | complete network policy, or `{}` to clear it | `{"success":true}` after sandboxd accepts the replacement and the operation is published |
@@ -148,7 +148,27 @@ central scheduling. User commands use the separate EXECD HTTP data path.
 
 For snapshot creation, omitted/zero resource values inherit the source. Positive CPU/memory/disk values must equal its resource geometry; restoring with larger limits or resizing is rejected. This applies to the new Rust resolver even though the HTTP handler can encode positive overrides.
 
-Public resume uses the owner cache and calls the owning Adxlet; it performs same-node admission. Cross-node recovery of the same ID is the Coordinator's failed-node recovery flow using a valid shared checkpoint, not a promise made by an ordinary resume request. `failover=true` enables same-node recovery from the latest unexpired checkpoint after an unexpected backend exit; no checkpoint means Failed and no cold start. Reload explicitly replaces a Running backend from that same latest recovery point.
+Public resume and authenticated Ingress demand call Coordinator EnsureRunning. It persists one intent, prefers original-node admission, and transfers a shared checkpoint only after definitive NoCapacity or owner invalidation. An ambiguous RPC retains the owner. Paused objects stay dormant on node loss. `failover=true` enables same-node recovery from the latest unexpired checkpoint after an unexpected backend exit; no checkpoint means Failed and no cold start. Reload explicitly replaces a Running backend from that same latest recovery point.
+
+## Idle pause and auto resume
+
+Create accepts `idleTimeoutSeconds` (0 disables), `idleAction` (`delete` default,
+`pause` requires a positive idle window) and `pauseOptions`.
+`pauseOptions.retention` is `{"kind":"ttl","ttlSeconds":90000}` by default, or
+`{"kind":"forever"}`. Permanent pause returns `expiresAt=null` and remains retained
+until deletion or replacement. The other options are `timeoutSeconds`
+(300 default, 1–3600), and `storage` (`configured` default, `local`, `shared`).
+Shared requires a configured object backend, e.g. OBS via S3 compatibility;
+nodes automatically advertise `ADX_CHECKPOINT_STORAGE`. Anonymous pause/workload
+checkpoints follow this policy. Omitted/zero pause request TTL inherits the
+Environment policy, otherwise 90000. The retention clock starts after publication.
+
+Only authorized business traffic can demand resume. Concurrent requests share
+the same durable operation; Ingress waits for the committed Running route before
+sending bytes. Passive subscriptions, health and metrics do not wake a sandbox.
+Admission rejection across all nodes retains a pending intent with a 30-second
+capacity retry round. EnsureRunning waits at most 300 seconds at these callers;
+timeout does not prove restore failed or permit another node to run concurrently.
 
 ## Reusable snapshots
 
@@ -158,9 +178,8 @@ empty string, but a supplied whitespace-only name is rejected. The resulting
 snapshot belongs to the verified API Key identity. The service replaces incoming tenant headers; a caller cannot claim another tenant via a header or body.
 
 Raw `timeoutSeconds` is honored for reusable snapshots and pause: it defaults
-to 300 and must be from 1 through 3600 when supplied. API Server encodes it into the Node checkpoint RPC timeout. The RPC context additionally includes the configured transport timeout. Pause also
-accepts `ttlSeconds`; omitted or zero becomes 90000 and only a negative value
-is rejected. Snapshot and Pause are currently the only lifecycle bodies with a
+to 300 and must be from 1 through 3600 when supplied. API Server encodes it into the Node checkpoint RPC timeout. The RPC context additionally includes the configured transport timeout. Pause accepts optional `retention`; omission inherits the creation policy.
+The capture budget does not bound subsequent OBS publication or the entire pause. Snapshot and Pause are currently the only lifecycle bodies with a
 caller-provided logical timeout; SDK HTTP transport waits use that logical
 value plus a 30-second buffer. Reusable Snapshot uses one SDK transport
 attempt, while Pause uses the lifecycle retry policy.
@@ -215,12 +234,11 @@ SDK behavior is deliberately not identical to raw HTTP behavior:
   a 30-second buffer; raw HTTP forwards that field to the checkpoint RPC timeout. The SDK treats gateway/connection failure
   while creating a reusable snapshot as uncertain and does not silently retry
   it.
-- `Sandbox.pause(ttl_seconds=90000, *, timeout_seconds=300)` rejects zero,
-  negative, and boolean TTLs and validates its keyword-only timeout from 1
-  through 3600. Raw HTTP treats an omitted or zero `ttlSeconds` as `90000`,
-  rejects only a negative value, and forwards `timeoutSeconds` as the
-  checkpoint RPC timeout. The SDK request timeout is the
-  configured timeout plus 30 seconds.
+- `Sandbox.pause(retention=None, *, timeout_seconds=300)` inherits the creation
+  policy by default. `RetentionPolicy.for_seconds(seconds)` requires a positive
+  integer TTL; `RetentionPolicy.forever()` explicitly disables expiry. The
+  keyword-only timeout is from 1 through 3600. SDK request wait per attempt is
+  that timeout plus 30 seconds; OBS upload uses its own timeout.
 - Pause, resume, and reload use up to three SDK HTTP attempts for retryable
   transport/gateway failures, retaining one `pause-`, `resume-`, or `reload-`
   identity across those attempts. Reusable snapshot creation is the single,

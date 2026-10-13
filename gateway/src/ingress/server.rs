@@ -4,6 +4,7 @@ use super::http_pool::{
     BackendHttpPool, BackendHttpPoolConfig, BackendHttpPoolError, BackendHttpPoolKey,
 };
 use super::path::{parse_direct_path, parse_port_host_route, ParsedDirectPath};
+use super::processing::{ProcessingDeadline, TIMEOUT_HEADER};
 use super::resolver::{AccessKind, IngressRouteResolver, ResolveError, RouteHandle};
 use super::reverse_proxy::{ProxyRoute, ReverseProxy, ReverseProxyConfig};
 use crate::common::listener::accept_with_backoff;
@@ -37,6 +38,95 @@ use uuid::Uuid;
 
 type BoxError = Box<dyn Error + Send + Sync>;
 pub(super) type ProxyBody = UnsyncBoxBody<Bytes, BoxError>;
+
+struct DeadlineBody {
+    body: ProxyBody,
+    timer: Pin<Box<tokio::time::Sleep>>,
+    finished: bool,
+}
+impl DeadlineBody {
+    fn new(body: ProxyBody, deadline: tokio::time::Instant) -> Self {
+        Self {
+            body,
+            timer: Box::pin(tokio::time::sleep_until(deadline)),
+            finished: false,
+        }
+    }
+}
+impl hyper::body::Body for DeadlineBody {
+    type Data = Bytes;
+    type Error = BoxError;
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<hyper::body::Frame<Bytes>, BoxError>>> {
+        use std::future::Future;
+        if self.finished {
+            return Poll::Ready(None);
+        }
+        if self.timer.as_mut().poll(cx).is_ready() {
+            self.finished = true;
+            return Poll::Ready(Some(Err(Box::new(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "processing deadline exceeded after forwarding",
+            )))));
+        }
+        let result = Pin::new(&mut self.body).poll_frame(cx);
+        if matches!(result, Poll::Ready(None | Some(Err(_)))) {
+            self.finished = true;
+        }
+        result
+    }
+    fn is_end_stream(&self) -> bool {
+        self.finished || self.body.is_end_stream()
+    }
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.body.size_hint()
+    }
+}
+
+fn resuming_response(request_id: &str, instance_id: &str) -> Response<ProxyBody> {
+    let body = serde_json::json!({"error": {
+        "code": "ENV_RESUMING", "message": "Environment readiness is pending; retry the same request",
+        "retry": "same_operation", "outcome": "not_started", "requestForwarded": false,
+        "requestId": request_id, "instanceId": instance_id,
+    }});
+    let mut response = plain(StatusCode::SERVICE_UNAVAILABLE, &body.to_string());
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, http::HeaderValue::from_static("1"));
+    response.headers_mut().insert(
+        "x-adx-error-code",
+        http::HeaderValue::from_static("ENV_RESUMING"),
+    );
+    response
+}
+
+fn processing_timeout_response(
+    deadline: &ProcessingDeadline,
+    request_id: &str,
+    instance_id: &str,
+) -> Response<ProxyBody> {
+    if deadline.is_waiting_resume() && !deadline.is_forwarded() {
+        return resuming_response(request_id, instance_id);
+    }
+    let body = serde_json::json!({"error": {
+        "code": "PROCESSING_DEADLINE_EXCEEDED", "message": "Request processing deadline exceeded",
+        "retry": if deadline.is_forwarded() { "never" } else { "same_operation" },
+        "outcome": if deadline.is_forwarded() { "unknown" } else { "not_started" },
+        "requestForwarded": deadline.is_forwarded(), "requestId": request_id, "instanceId": instance_id,
+    }});
+    let mut response = plain(StatusCode::GATEWAY_TIMEOUT, &body.to_string());
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+    response
+}
 const L4_COPY_BUFFER_SIZE: usize = 64 * 1024;
 const COMMAND_WATCH_PATH: &str = "/api/sandbox/v1/commands/watch";
 const EXECD_COMMAND_PORT: u16 = 50090;
@@ -419,9 +509,28 @@ impl Ingress {
         tenant_id: &str,
     ) -> Result<IngressStream, IngressOpenError> {
         self.authorize(&route, tenant_id)?;
+        let route = self.prepare_route(route, tenant_id).await?;
         self.open_authorized_stream(route)
             .await
             .map_err(IngressOpenError::Connect)
+    }
+    pub(super) async fn prepare_route(
+        &self,
+        route: RouteHandle,
+        tenant_id: &str,
+    ) -> Result<RouteHandle, IngressOpenError> {
+        self.authorize(&route, tenant_id)?;
+        if !route.needs_resume {
+            return Ok(route);
+        }
+        let ready = self.resolver.wake(&route).await?;
+        self.authorize(&ready, tenant_id)?;
+        if ready.tunnel_security_mode != route.tunnel_security_mode
+            || ready.port_forward_auth_mode != route.port_forward_auth_mode
+        {
+            return Err(IngressOpenError::Forbidden);
+        }
+        Ok(ready)
     }
 
     pub(super) async fn open_authorized_stream(
@@ -437,6 +546,12 @@ impl Ingress {
         route: RouteHandle,
         passive: bool,
     ) -> io::Result<IngressStream> {
+        if passive && route.needs_resume {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "passive watch cannot wake a sandbox",
+            ));
+        }
         let error = match self.open_current_stream(route.clone(), passive).await {
             Ok(stream) => return Ok(stream),
             Err(error) => error,
@@ -453,6 +568,22 @@ impl Ingress {
         // only for a replacement binding, then open once against that execution.
         let replacement = match self.resolver.replacement(&route).await {
             Ok(replacement) => replacement,
+            Err(_) if !passive => match self.resolver.wake(&route).await {
+                Ok(route) => route,
+                Err(error @ (ResolveError::Resuming | ResolveError::ResumeRejected(_))) => {
+                    return Err(io::Error::other(error));
+                }
+                Err(ResolveError::Unavailable(message)) => {
+                    return Err(io::Error::new(io::ErrorKind::NotConnected, message));
+                }
+                Err(ResolveError::NotReady) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotConnected,
+                        "resume service is not ready",
+                    ));
+                }
+                Err(_) => return Err(error),
+            },
             Err(_) => return Err(error),
         };
         if replacement.tenant_id != route.tenant_id
@@ -752,6 +883,15 @@ impl Ingress {
         ingress_security: IngressSecurity,
         peer: std::net::SocketAddr,
     ) -> Result<Response<ProxyBody>, Infallible> {
+        let processing = match ProcessingDeadline::from_headers(request.headers()) {
+            Ok(deadline) => deadline,
+            Err(message) => return Ok(plain(StatusCode::BAD_REQUEST, message)),
+        };
+        let budgeted = request.headers().contains_key(TIMEOUT_HEADER);
+        request.headers_mut().remove(TIMEOUT_HEADER);
+        request.extensions_mut().insert(processing.clone());
+        let request_id = ensure_request_id(&mut request);
+        let instance_id = self.access_fields(&request).1;
         let route = match self.access_fields(&request).0 {
             "port-forwarding" => "/{sandbox}/{port}/*",
             "tunnel" => "/tunnel/*",
@@ -777,9 +917,36 @@ impl Ingress {
         trace
             .run(async {
                 adx_observability::trace::inject_headers(request.headers_mut());
-                let response = self
-                    .handle_http_inner(request, ingress_security, peer)
-                    .await?;
+                let handled = self.handle_http_inner(request, ingress_security, peer);
+                let (mut response, deadline_exceeded) = if budgeted {
+                    match tokio::time::timeout_at(processing.at, handled).await {
+                        Ok(response) => (response?, false),
+                        Err(_) => (
+                            processing_timeout_response(&processing, &request_id, &instance_id),
+                            true,
+                        ),
+                    }
+                } else {
+                    (handled.await?, false)
+                };
+                if response
+                    .headers()
+                    .get("x-adx-error-code")
+                    .is_some_and(|v| v == "ENV_RESUMING")
+                {
+                    response = resuming_response(&request_id, &instance_id);
+                }
+                if budgeted
+                    && processing.is_forwarded()
+                    && !deadline_exceeded
+                    && response.status() != StatusCode::SWITCHING_PROTOCOLS
+                {
+                    let (parts, body) = response.into_parts();
+                    response = Response::from_parts(
+                        parts,
+                        DeadlineBody::new(body, processing.at).boxed_unsync(),
+                    );
+                }
                 adx_observability::trace::attribute(
                     "http.response.status_code",
                     response.status().as_u16().to_string(),
@@ -1397,13 +1564,14 @@ impl Ingress {
             );
         }
         let request_id = header_string(request, "x-request-id");
-        let route = match self
+        let mut route = match self
             .resolve_route(&instance_id, target_port, access_kind, request_id.clone())
             .await
         {
             Ok(route) => route,
             Err(error) => return error_response(error),
         };
+        route.processing = request.extensions().get::<ProcessingDeadline>().cloned();
         let auth_required = self.auth_required(access_kind, &route);
         if ingress_security == IngressSecurity::Plaintext && auth_required {
             return tls_required();
@@ -1586,7 +1754,7 @@ impl Ingress {
             }
         }
         let request_id = header_string(&request, "x-request-id");
-        let route = match self
+        let mut route = match self
             .resolve_route(
                 &parsed.instance_id,
                 parsed.target_port,
@@ -1600,6 +1768,7 @@ impl Ingress {
                 return Err((error_response(error), request));
             }
         };
+        route.processing = request.extensions().get::<ProcessingDeadline>().cloned();
         let auth_required = self.auth_required(parsed.access_kind, &route);
         if ingress_security == IngressSecurity::Plaintext && auth_required {
             return Ok(tls_required());
@@ -1655,6 +1824,23 @@ impl Ingress {
                 }
             }
         }
+        if matches!(request.uri().path(), "/healthz" | "/metrics") {
+            if let Err(error) = self.authorize(&route, &tenant_id) {
+                return Ok(error_response(error));
+            }
+            if route.needs_resume {
+                return Ok(plain(StatusCode::SERVICE_UNAVAILABLE, "Sandbox is paused"));
+            }
+            // Probe connections stay passive even when Relay rejects a stale
+            // binding. Do not pool them with business connections or demand wake.
+            let stream = match self.open_authorized_stream_with_activity(route, true).await {
+                Ok(stream) => stream,
+                Err(error) => return Ok(error_response(IngressOpenError::Connect(error))),
+            };
+            let cancelled = stream.cancelled.clone();
+            return Ok(proxy_http(request, stream, "sandbox", Some(cancelled)).await);
+        }
+
         let upgrade_requested = request.headers().contains_key(header::UPGRADE);
         if upgrade_requested {
             let stream = match self.open_resolved_stream(route, &tenant_id).await {
@@ -1670,6 +1856,10 @@ impl Ingress {
         if let Err(error) = self.authorize(&route, &tenant_id) {
             return Ok(error_response(error));
         }
+        let route = match self.prepare_route(route, &tenant_id).await {
+            Ok(route) => route,
+            Err(error) => return Err((error_response(error), request)),
+        };
         if !self.resolver.route_is_current(&route) {
             return Err((error_response(IngressOpenError::RouteChanged), request));
         }
@@ -1687,6 +1877,7 @@ impl Ingress {
             .await
         {
             Ok(mut response) => {
+                response.headers_mut().remove("x-adx-error-code");
                 strip_hop_by_hop_headers(response.headers_mut());
                 Ok(response.map(|body| {
                     body.map_err(|error| -> BoxError { Box::new(error) })
@@ -1739,7 +1930,9 @@ impl WatchState {
         // The command already exists. A temporary downstream failure should
         // reconnect its subscription, never reject it or start another command.
         let retryable = match &error {
-            IngressOpenError::Resolve(ResolveError::NotReady | ResolveError::Unavailable(_))
+            IngressOpenError::Resolve(
+                ResolveError::NotReady | ResolveError::Unavailable(_) | ResolveError::Resuming,
+            )
             | IngressOpenError::Draining
             | IngressOpenError::RouteChanged => true,
             IngressOpenError::Connect(error) => !matches!(
@@ -2069,10 +2262,14 @@ where
             }
         }
     });
+    if let Some(processing) = request.extensions().get::<ProcessingDeadline>() {
+        processing.forwarded();
+    }
     let mut response = match sender.send_request(request).await {
         Ok(response) => response,
         Err(error) => return plain(StatusCode::BAD_GATEWAY, &error.to_string()),
     };
+    response.headers_mut().remove("x-adx-error-code");
     if response.status() == StatusCode::SWITCHING_PROTOCOLS {
         if let Some(downstream_upgrade) = downstream_upgrade {
             let upstream_upgrade = hyper::upgrade::on(&mut response);
@@ -2277,8 +2474,16 @@ fn header_string(request: &Request<Incoming>, name: &str) -> String {
 }
 
 fn ensure_request_id(request: &mut Request<Incoming>) -> String {
-    let current = header_string(request, "x-request-id");
+    let current = header_string(request, "x-adx-request-id");
+    let current = if current.is_empty() {
+        header_string(request, "x-request-id")
+    } else {
+        current
+    };
     if !current.is_empty() {
+        if let Ok(value) = http::HeaderValue::from_str(&current) {
+            request.headers_mut().insert("x-request-id", value);
+        }
         return current;
     }
     let generated = Uuid::new_v4().to_string();
@@ -2350,9 +2555,38 @@ fn strip_token_query(query: &str) -> String {
 }
 
 fn error_response(error: IngressOpenError) -> Response<ProxyBody> {
+    if matches!(&error, IngressOpenError::Resolve(ResolveError::Resuming))
+        || matches!(&error, IngressOpenError::Connect(e) if e.get_ref().and_then(|e| e.downcast_ref::<ResolveError>()) == Some(&ResolveError::Resuming))
+    {
+        return resuming_response("", "");
+    }
+    let rejected = match &error {
+        IngressOpenError::Resolve(ResolveError::ResumeRejected(message)) => Some(message.as_str()),
+        IngressOpenError::Connect(error) => match error
+            .get_ref()
+            .and_then(|e| e.downcast_ref::<ResolveError>())
+        {
+            Some(ResolveError::ResumeRejected(message)) => Some(message.as_str()),
+            _ => None,
+        },
+        _ => None,
+    };
+    if let Some(message) = rejected {
+        let body = serde_json::json!({"error": {"code": "ENV_UNAVAILABLE", "message": message,
+            "retry": "never", "outcome": "not_started", "requestForwarded": false}});
+        let mut response = plain(StatusCode::CONFLICT, &body.to_string());
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            http::HeaderValue::from_static("application/json"),
+        );
+        return response;
+    }
     let status = match &error {
+        IngressOpenError::Resolve(ResolveError::ResumeRejected(_)) => StatusCode::CONFLICT,
         IngressOpenError::Resolve(ResolveError::NotFound) => StatusCode::NOT_FOUND,
-        IngressOpenError::Resolve(ResolveError::NotReady | ResolveError::Unavailable(_))
+        IngressOpenError::Resolve(
+            ResolveError::NotReady | ResolveError::Unavailable(_) | ResolveError::Resuming,
+        )
         | IngressOpenError::Draining
         | IngressOpenError::RouteChanged => StatusCode::SERVICE_UNAVAILABLE,
         IngressOpenError::Resolve(ResolveError::EnvironmentStatus { .. }) => StatusCode::CONFLICT,
@@ -2680,6 +2914,8 @@ mod tests {
 
     fn route(tunnel: DataPlaneSecurityMode, port_forward: DataPlaneAuthMode) -> RouteHandle {
         RouteHandle {
+            needs_resume: false,
+            processing: None,
             access_kind: AccessKind::Direct,
             relay_address: "node:8443".into(),
             tenant_id: "tenant-a".into(),
@@ -2948,3 +3184,6 @@ fn response_text(status: StatusCode, message: &str) -> Response<ProxyBody> {
 #[cfg(all(test, feature = "agent-api"))]
 #[path = "agent_api_tests.rs"]
 mod agent_api_tests;
+
+#[cfg(test)]
+mod processing_tests;

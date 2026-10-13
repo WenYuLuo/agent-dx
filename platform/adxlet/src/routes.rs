@@ -225,6 +225,49 @@ fn rpc_error(s: tonic::Status) -> Error {
 }
 #[async_trait]
 impl Routes for UdsRoutes {
+    async fn quiesce(
+        &self,
+        record: &EnvironmentRecord,
+        session: &str,
+        revision: u64,
+    ) -> Result<bool> {
+        let response = self
+            .connect()
+            .await?
+            .set_environment_admission(self.request(pb::EnvironmentAdmissionRequest {
+                environment_id: record.spec.id.clone(),
+                runtime_id: record.runtime.id.clone(),
+                proxy_session_id: session.into(),
+                activity_revision: revision,
+                close: true,
+            }))
+            .await
+            .map_err(rpc_error)?
+            .into_inner();
+        Ok(response.closed)
+    }
+    async fn reopen(&self, record: &EnvironmentRecord) -> Result<()> {
+        let session = self
+            .connect()
+            .await?
+            .get_binding_state(self.request(pb::GetBindingStateRequest {}))
+            .await
+            .map_err(rpc_error)?
+            .into_inner()
+            .proxy_session_id;
+        self.connect()
+            .await?
+            .set_environment_admission(self.request(pb::EnvironmentAdmissionRequest {
+                environment_id: record.spec.id.clone(),
+                runtime_id: record.runtime.id.clone(),
+                proxy_session_id: session,
+                activity_revision: 0,
+                close: false,
+            }))
+            .await
+            .map_err(rpc_error)?;
+        Ok(())
+    }
     async fn activity(&self, record: &EnvironmentRecord) -> Result<(String, u64, u64)> {
         let mut client = self.connect().await?;
         let result = client

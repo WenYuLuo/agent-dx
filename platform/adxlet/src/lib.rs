@@ -184,6 +184,19 @@ pub trait Readiness: Send + Sync {
 
 #[async_trait]
 pub trait Routes: Send + Sync {
+    /// Close new business stream admission only if the observed idle version still matches.
+    async fn quiesce(
+        &self,
+        record: &EnvironmentRecord,
+        session: &str,
+        revision: u64,
+    ) -> Result<bool> {
+        let (current_session, current_revision, active) = self.activity(record).await?;
+        Ok(current_session == session && current_revision == revision && active == 0)
+    }
+    async fn reopen(&self, record: &EnvironmentRecord) -> Result<()> {
+        self.activate(record).await
+    }
     /// (process session, cumulative activity revision, active streams).
     async fn activity(&self, _record: &EnvironmentRecord) -> Result<(String, u64, u64)> {
         Err(Error::Unavailable("proxy activity is unavailable".into()))
@@ -287,6 +300,12 @@ pub struct Adxlet {
 }
 
 impl Adxlet {
+    pub fn checkpoint_storage_alias(&self) -> Option<&str> {
+        self.services
+            .checkpoint
+            .as_ref()
+            .map(|c| c.store.storage_alias())
+    }
     pub fn new(
         node_id: String,
         runtime: Arc<dyn RuntimeDriver>,
@@ -561,6 +580,17 @@ impl Adxlet {
             return Err(Error::Unavailable("node is draining".into()));
         }
         spec.validate()?;
+        if spec.lifecycle.idle_action == adx_core::lifecycle::IdleAction::Pause
+            || spec.lifecycle.pause.is_some()
+        {
+            let checkpoint =
+                self.services.checkpoint.as_ref().ok_or_else(|| {
+                    Error::Invalid("pause policy requires checkpoint storage".into())
+                })?;
+            checkpoint
+                .store
+                .validate_policy(spec.lifecycle.pause.clone().unwrap_or_default().storage)?;
+        }
         validate_device_assignment(&spec.scheduling.devices, &assignment.devices)?;
         if assignment.node_id != self.node_id
             || assignment.environment_id != spec.id
