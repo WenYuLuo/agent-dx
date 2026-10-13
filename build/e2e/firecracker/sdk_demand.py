@@ -119,8 +119,12 @@ def create(idle=0, ttl=900):
     sandbox = Sandbox(image=image, runtime='firecracker', cpu=1000, memory=128, storage_mb=32,
                       env={'PYTHONDONTWRITEBYTECODE': '1'}, idle_timeout=idle,
                       idle_action='pause' if idle else 'delete', pause_policy=PausePolicy(ttl_seconds=ttl, timeout_seconds=1800, storage='shared'),
-                      auto_resume=True, port_forwardings=[8088], node_id='node1', connection=connection, create_timeout=180)
+                      auto_resume=True, port_forwardings=[8088], connection=connection, create_timeout=180,
+                      schedule_affinities=[{'kind': 0, 'affinity': 0, 'weight': 1000,
+                                            'labelOps': [{'type': 0, 'labelKey': 'NODE_ID', 'labelValues': ['node1']}]}])
     sandboxes.append(sandbox)
+    if record(sandbox)['assignment']['node_id'] != 'node1':
+        raise AssertionError('initial node preference did not select node1')
     sandbox.files.write('/tmp/demand-server.py', GUEST)
     sandbox.files.write('/tmp/demand-file', 'durable-' + sandbox.id)
     command(sandbox, 'nohup python3 /tmp/demand-server.py >/tmp/demand-server.log 2>&1 </dev/null &')

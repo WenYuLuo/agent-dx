@@ -82,6 +82,8 @@ OBS 配置文件必须是权限 `0600` 的普通文件，包含 `bucket`、`regi
 
 业务负载是 VM 内的 Python HTTP 服务，通过公共 Ingress 的声明端口接受带唯一 nonce 的请求。响应包含 guest PID、内存中的 nonce 计数和持久文件内容；恢复前后的响应必须对应同一 guest 进程状态，每个请求只执行一次。
 
+初始创建使用 `schedule_affinities` 的软节点亲和（`kind=0, affinity=0`）优先选择 node1，并确认实际归属；这样原节点失效时仍允许 node2 接管。SDK 的 `node_id` 是硬放置约束，不适用于该跨节点故障场景。
+
 | 验证点 | 真实触发与判定 |
 | --- | --- |
 | 活跃请求与空闲检测 | HTTP 响应延迟超过 idle window；期间连续读取 Redis 和实际 VM 清单，必须保持 Running。 |
