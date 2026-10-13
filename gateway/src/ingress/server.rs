@@ -480,6 +480,15 @@ impl Ingress {
             Ok(replacement) => replacement,
             Err(_) if !passive => match self.resolver.wake(&route).await {
                 Ok(route) => route,
+                Err(ResolveError::Unavailable(message)) => {
+                    return Err(io::Error::new(io::ErrorKind::NotConnected, message));
+                }
+                Err(ResolveError::NotReady) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotConnected,
+                        "resume service is not ready",
+                    ));
+                }
                 Err(_) => return Err(error),
             },
             Err(_) => return Err(error),

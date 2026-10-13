@@ -333,9 +333,13 @@ impl CoordinatorRpc {
                 .map_err(|_| Status::unavailable("invalid resume owner endpoint"))?
                 .connect_timeout(self.0.timeout)
                 .timeout(self.0.timeout);
-            let channel = endpoint.connect().await.map_err(|_| {
-                Status::unavailable("resume owner connection failed; ownership retained")
-            })?;
+            let channel = match endpoint.connect().await {
+                Ok(channel) => channel,
+                Err(_) => {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue;
+                }
+            };
             let mut client =
                 pb::node_service_client::NodeServiceClient::new(self.0.node_tls.wrap(channel));
             let transferred = stored.recovery.as_ref().is_some_and(|r| r.pending);
@@ -389,8 +393,20 @@ impl CoordinatorRpc {
                     }
                     state.remember_environment(rejected);
                 }
-                // Retain the durable target and operation after timeout, lost
-                // acknowledgement or publication failure. Retry on that owner.
+                // An owner RPC has a shorter budget than the whole restore.
+                // Keep waiting on that owner after an ambiguous transport or
+                // publication result; the caller's outer deadline bounds this loop.
+                Err(error)
+                    if matches!(
+                        error.code(),
+                        tonic::Code::Unavailable
+                            | tonic::Code::DeadlineExceeded
+                            | tonic::Code::Cancelled
+                            | tonic::Code::Unknown
+                    ) =>
+                {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
                 Err(error) => return Err(error),
             }
         }

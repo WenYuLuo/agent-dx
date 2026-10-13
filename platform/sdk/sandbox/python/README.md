@@ -172,7 +172,7 @@ from adx_sandbox import PausePolicy, Sandbox
 
 sandbox = Sandbox(
     image="example/execd:latest",
-    idle_timeout_seconds=60,
+    idle_timeout=60,
     idle_action="pause",
     pause_policy=PausePolicy(ttl_seconds=3600, timeout_seconds=300, storage="shared"),
     auto_resume=True,
@@ -196,7 +196,9 @@ With `auto_resume=True`, authorized business traffic through Ingress shares the
 manual resume entry. Concurrent first requests coalesce into one durable intent.
 Ingress waits for the committed Running route before sending application bytes;
 passive route subscriptions and health/metrics do not wake a paused sandbox.
-Requests already sent upstream are not replayed. Resume waits up to 300 seconds;
+Requests already sent upstream are not replayed. Transient owner RPC failures
+retry on the same owner within the resume budget. A temporary wake failure before
+forwarding returns HTTP 503. Resume waits up to 300 seconds;
 a timeout may leave the durable operation pending. If every node rejects admission,
 rejected nodes are excluded for a 30-second capacity round before reevaluation.
 

@@ -67,3 +67,35 @@ Lima r1未进入用例：sandboxd在 `ip netns exec` 环境下报告 `cgroup v1 
 证据位于 `out/ci/stage-4/fc-transfer/r5/evidence/`，重点为 `result.json`、`node-recovery-before-crash.json`、`node-recovery-restart.json`；完整日志为 `r5.log`，驱动回归为 `node-driver-regression.log`。
 
 r4与r5共同完成阶段4的本地故障恢复验收。此结果仍限定于同一KVM宿主上的隔离节点；正式Kubernetes门禁属于阶段7。
+
+## 真实 OBS 与按流量唤醒
+
+`ADX_FC_SUITE=demand` 选择独立的 `sdk_demand.py` / `demand_contract.py`。验收要求真实 OBS；MinIO 或只完成旧的六项 transfer 用例不能通过该门禁。
+
+```sh
+sudo env ADX_FC_BASE=/opt/adx ADX_FC_SUITE=demand \
+  ADX_FC_OBS_CONFIG=/run/obs-private/config.json \
+  python3 -u /opt/adx/e2e/firecracker/transfer.py /runs/demand-new-run
+```
+
+OBS 配置文件必须是权限 `0600` 的普通文件，包含 `bucket`、`region`、`endpoint`、专用 `prefix`、`access_key`、`secret_key`。endpoint 使用区域 HTTPS 地址，例如 `https://obs.cn-north-4.myhuaweicloud.com`。驱动使用虚拟主机寻址，将运行目录名称附加到 prefix，先验证该范围为空，再做真实 SigV4 PUT/GET/DELETE。凭据只写入私有配置与服务环境；导出记录仅含公共存储配置与请求 ID。
+
+业务负载是 VM 内的 Python HTTP 服务，通过公共 Ingress 的声明端口接受带唯一 nonce 的请求。响应包含 guest PID、内存中的 nonce 计数和持久文件内容；恢复前后的响应必须对应同一 guest 进程状态，每个请求只执行一次。
+
+| 验证点 | 真实触发与判定 |
+| --- | --- |
+| 活跃请求与空闲检测 | HTTP 响应延迟超过 idle window；期间连续读取 Redis 和实际 VM 清单，必须保持 Running。 |
+| 捕获前新请求 | 非 root 透明代理暂缓实际 Execd 的 idle Prepared 应答；Ingress 请求先形成持久唤醒意图，再放行。必须保留原 backend，不能生成 checkpoint。 |
+| 捕获后新请求 | 仅阻断源节点到 OBS 的 HTTPS；确认实际 VM 已停止，再发 HTTP。请求等待实际上传完成并恢复，PID、内存和文件保持。 |
+| 并发唤醒 | 12 个真实 HTTP 请求同时唤醒 Paused；原节点仍可用时应保持原归属，最终只有一个 VM，每个 nonce 一次。 |
+| 节点失效 | SIGSTOP 源 adxlet，等待心跳失效；Paused 保持休眠且目标 VM 数量为零。随后 HTTP 才触发另一节点从 OBS 恢复。 |
+| 恢复中重启 | 阻断目标 Execd readiness；等实际 backend 为 Running、Redis 仍为 Paused 且 recovery.pending，再 SIGKILL Coordinator 或目标 adxlet。检查意图、归属、session/epoch 和 VM 清理。 |
+| TTL 已过期 | 到期后真实 HTTP 必须失败，两节点都不能启动执行。 |
+| 恢复跨越 TTL | 到期前接纳请求，真实 VM 恢复后用 readiness 阻断将提交延至到期之后；放行后按既定接纳契约完成。 |
+| 成功后应答丢失 | HTTPS 代理消费成功的 resume 应答并确认 Redis Running 与物理 VM，再关闭客户端连接。公共 SDK 用同一请求 ID 重试，归属、runtime 和 backend 必须一致。 |
+
+OBS suite 关闭后台 checkpoint GC，避免它与上传阻断竞争；显式删除仍须释放已登记制品。驱动记录实际 package、SDK、Firecracker、sandboxd、kernel、initrd、runtime EROFS 与驱动文件摘要。首次或失败运行应保留错误证据，最终结果以严格验收器、空 VM 清单、空 OBS prefix 和清理记录为准。
+
+低带宽部署可延长测试 pause 调用预算；OBS fixture 将对象存储请求超时设置为 `AWS_TIMEOUT=240s`。demand 负载使用 128 MiB guest 内存和 32 MiB writable layer。Ingress 的单次唤醒等待仍有 300 秒上限；HTTP 驱动只对 503 用同一个业务 nonce 重试，并在响应证据的 `transient_statuses` 中保留所有失败状态和时间。成功结果代表该业务 nonce 恢复后执行一次；出现 503 时，不能宣称第一次 HTTP 请求被透明保留到恢复完成。
+
+失败运行的测试资源停止后，可使用 `s3_probe.py RUN --cleanup` 删除该运行 prefix 下的对象并中止 multipart uploads。此操作单独记录为 `obs-fixture-cleanup.json`，不会将失败运行改为通过。正常通过仍须先证明实例删除后的 OBS 清单为空。

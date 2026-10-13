@@ -545,6 +545,37 @@ async fn all_nodes_reject_capacity_without_repeated_assignment_churn() {
 
 #[tokio::test]
 #[ignore = "requires dedicated real Redis"]
+async fn transient_owner_rpc_deadline_waits_within_the_resume_budget() {
+    let rig = Arc::new(Rig::new(Duration::from_millis(150)).await);
+    let gate = Arc::new(tokio::sync::Notify::new());
+    *rig.source.backend.restore_gate.lock().unwrap() = Some(gate.clone());
+    let wake = {
+        let rig = rig.clone();
+        tokio::spawn(async move { rig.resume(true).await })
+    };
+    rig.source.backend.restore_entered.notified().await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(
+        !wake.is_finished(),
+        "a node RPC deadline must not end the longer caller resume budget"
+    );
+    let pending = rig.session.get("sleep").await.unwrap();
+    assert_eq!(pending.assignment.node_id, "a");
+    assert!(pending.resume.is_some());
+    assert_eq!(rig.target.backend.restored.load(Ordering::SeqCst), 0);
+    gate.notify_one();
+    let restored = wake.await.unwrap().unwrap().record.unwrap();
+    assert_eq!(
+        restored.state,
+        adx_protocol::control::EnvironmentState::Running as i32
+    );
+    assert_eq!(restored.assignment.unwrap().node_id, "a");
+    assert_eq!(rig.source.backend.restored.load(Ordering::SeqCst), 1);
+    assert_eq!(rig.source.backend.running.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis"]
 async fn ambiguous_resume_deadline_retains_owner_and_never_starts_another_node() {
     let rig = Rig::new(Duration::from_millis(150)).await;
     let gate = Arc::new(tokio::sync::Notify::new());
@@ -745,9 +776,31 @@ async fn coordinator_restart_during_uncommitted_restore_cleans_then_retries() {
     });
     rig.source
         .sink
-        .reconnect(channel(&rig.address, Principal::Node("a".into())).await);
+        // Keep publication rejected while every accepted retry drains. Otherwise
+        // a queued sync can legitimately publish Running during re-registration,
+        // and this fixture no longer tests an uncommitted execution.
+        .reconnect(channel(&rig.address, Principal::Node("b".into())).await);
     gate.notify_one();
     rig.source.manager.pause_lifecycle().await;
+    let handle = rig
+        .source
+        .manager
+        .environment(pending.spec.clone(), pending.assignment.clone())
+        .unwrap();
+    assert!(handle.sync().await.is_err());
+    assert_eq!(
+        rig.session
+            .get("sleep")
+            .await
+            .unwrap()
+            .result
+            .unwrap()
+            .state,
+        adx_core::EnvironmentState::Paused
+    );
+    rig.source
+        .sink
+        .reconnect(channel(&rig.address, Principal::Node("a".into())).await);
     *rig.source.backend.restore_gate.lock().unwrap() = None;
     for worker in [&mut rig.source, &mut rig.target] {
         worker.report.heartbeat_sequence += 1;

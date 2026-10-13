@@ -17,7 +17,9 @@ import urllib.request
 from pathlib import Path
 
 from transfer_config import ADDRESSES, HOST, configure
-from transfer_contract import verify
+from transfer_contract import verify as verify_transfer
+from demand_contract import verify as verify_demand
+from storage_fixture import public as public_storage
 
 
 def _executable(name, environment=None, cwd=None):
@@ -34,6 +36,9 @@ def _executable(name, environment=None, cwd=None):
 
 def main():
     root = Path(sys.argv[1]).resolve()
+    demand_suite = os.getenv('ADX_FC_SUITE') == 'demand'
+    verify = verify_demand if demand_suite else verify_transfer
+    sdk_result_name = 'sdk-demand.json' if demand_suite else 'sdk-transfer.json'
     base = Path(os.environ.get('ADX_FC_BASE', '/opt/adx'))
     if root.exists():
         raise ValueError('run directory must be new')
@@ -74,6 +79,7 @@ def main():
     )
     configure(root)
     evidence = root / 'evidence'
+    (evidence / 'kvm.json').write_text(json.dumps({'api': 12, 'create_vm': True, 'create_vcpu': True}))
 
     def call(args, **kw):
         return subprocess.run(list(map(str, args)), env=env, check=True, **kw)
@@ -85,6 +91,11 @@ def main():
         Path('/opt/adx-fc/bin/sandboxd'),
         Path('/opt/adx-fc/bin/firecracker'),
         base / 'package/runtime/adx-execd',
+        base / 'package/runtime/adx-runtime-rootfs.img',
+        Path('/opt/adx-fc/artifacts/Image'),
+        Path('/opt/adx-fc/artifacts/initrd.img'),
+        *sorted((base / 'sdk').glob('adx_sandbox-*.whl')),
+        *sorted((base / 'e2e/firecracker').glob('*.py')),
     ):
         with binary.open('rb') as stream:
             runtime_hashes[str(binary)] = hashlib.file_digest(stream, 'sha256').hexdigest()
@@ -97,6 +108,7 @@ def main():
     started_nodes = []
     created_namespaces = []
     bridge_created = False
+    nat_rule = None
     result = {'status': 'failed', 'cases': [], 'cleanup_errors': [], 'inventories': {}}
     env.update(
         MINIO_ROOT_USER=(root / 'secrets/s3-user').read_text().strip(),
@@ -146,7 +158,7 @@ def main():
             hostdev = f'ax{tag}{i}'
             peer = f'ay{tag}{i}'
             call(['ip', 'link', 'add', hostdev, 'type', 'veth', 'peer', 'name', peer])
-            call(['ip', 'link', 'set', hostdev, 'coordinator', bridge])
+            call(['ip', 'link', 'set', hostdev, 'master', bridge])
             call(['ip', 'link', 'set', hostdev, 'up'])
             call(['ip', 'link', 'set', peer, 'netns', ns])
             for args in (
@@ -184,19 +196,24 @@ def main():
                 indent=2,
             )
         )
-        spawn(
-            'minio',
-            [
-                base / 'tools/minio',
-                'server',
-                root / 'objects',
-                '--address',
-                '0.0.0.0:19090',
-                '--console-address',
-                '127.0.0.1:19091',
-            ],
-        )
-        wait(lambda: urllib.request.urlopen('http://127.0.0.1:19090/minio/health/ready', timeout=2).status == 200)
+        if public_storage(root)['kind'] == 'real_obs':
+            call(['sysctl', '-qw', 'net.ipv4.ip_forward=1'])
+            nat_rule = ['POSTROUTING', '-s', '10.240.0.0/24', '!', '-d', '10.240.0.0/24', '-m', 'comment', '--comment', root.name, '-j', 'MASQUERADE']
+            call(['iptables', '-t', 'nat', '-A', *nat_rule])
+        if public_storage(root)['kind'] == 'minio':
+            spawn(
+                'minio',
+                [
+                    base / 'tools/minio',
+                    'server',
+                    root / 'objects',
+                    '--address',
+                    '0.0.0.0:19090',
+                    '--console-address',
+                    '127.0.0.1:19091',
+                ],
+            )
+            wait(lambda: urllib.request.urlopen('http://127.0.0.1:19090/minio/health/ready', timeout=2).status == 200)
         call(['python3', base / 'e2e/firecracker/s3_probe.py', root, '--create'])
         spawn('registry', ['docker-registry', 'serve', root / 'registry.yaml'])
         sys.path.insert(0, str(base / 'e2e'))
@@ -273,13 +290,15 @@ def main():
         wait(ready)
         (root / 'backend-pids.json').write_text(json.dumps(backend_pids))
         print('TWO FIRECRACKER NODES READY', flush=True)
-        call([base / 'client/bin/python', '-u', base / 'e2e/firecracker/sdk_transfer.py', root, image], timeout=900)
-        result.update(json.loads((evidence / 'sdk-transfer.json').read_text()))
+        driver = 'sdk_demand.py' if demand_suite else 'sdk_transfer.py'
+        call([base / 'client/bin/python', '-u', base / 'e2e/firecracker' / driver, root, image], timeout=14400 if demand_suite else 900)
+        result.update(json.loads((evidence / sdk_result_name).read_text()))
         for name in namespaces:
             result['inventories'][name] = inventory(name)
         call(['python3', base / 'e2e/firecracker/s3_probe.py', root])
+        result['obs_empty'] = public_storage(root)['kind'] == 'real_obs'
     except BaseException as error:
-        sdk_result = evidence / 'sdk-transfer.json'
+        sdk_result = evidence / sdk_result_name
         if sdk_result.exists():
             result.update(json.loads(sdk_result.read_text()))
         result['error'] = repr(error)
@@ -347,6 +366,8 @@ def main():
             call(['ip', 'netns', 'del', ns])
         if bridge_created:
             call(['ip', 'link', 'del', bridge])
+        if nat_rule:
+            call(['iptables', '-t', 'nat', '-D', *nat_rule])
         if result['cleanup_errors']:
             result['status'] = 'failed'
         try:

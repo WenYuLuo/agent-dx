@@ -9,6 +9,7 @@ import subprocess
 import time
 
 from fc_runtime_profile import resolve as resolve_runtime_profile
+from storage_fixture import external as external_storage, public as public_storage
 
 
 def _executable(command_name, environment=None, cwd=None):
@@ -43,6 +44,8 @@ for name in ('s3-user', 's3-key'):
     path = PRIVATE / name
     path.write_text(secrets.token_hex(32))
     path.chmod(0o600)
+if os.getenv('ADX_FC_OBS_CONFIG'):
+    external_storage(RUN, os.environ['ADX_FC_OBS_CONFIG'])
 if not T.exists():
     subprocess.run([_executable('python3'), str(BASE / 'e2e/rpc_certificates.py'), str(T)], check=True)
     subprocess.run(
@@ -363,7 +366,7 @@ kernel_args = "console=ttyS0 reboot=k panic=1 pci=off init=/init random.trust_cp
 kvm_device = "/dev/kvm"
 default_vcpu_count = 1
 default_memory_mib = 512
-default_overlay_size_bytes = 536870912
+default_overlay_size_bytes = {32 * 1024**2 if os.getenv('ADX_FC_SUITE') == 'demand' else 536870912}
 checkpoint_mode = "full"
 virtiofs_enabled = true
 virtiofsd_path = "{BASE}/tools/virtiofsd"
@@ -407,7 +410,15 @@ for service in deployment['services']:
             'root': str(RUN / 'checkpoints'),
             'cache_budget_bytes': 4 * 1024**3,
         }
-        c['checkpoint_gc'] = {'enabled': True, 'min_age_seconds': 0, 'interval_seconds': 1, 'max_artifacts': 100}
+        selected = public_storage(RUN)
+        if selected['kind'] == 'real_obs':
+            c['checkpoint_storage'].update({key: selected[key] for key in ('alias', 'bucket', 'region', 'endpoint', 'prefix')})
+            c['checkpoint_storage']['allow_http'] = False
+            c['checkpoint_gc'] = {'enabled': False}
+            service['env']['AWS_VIRTUAL_HOSTED_STYLE_REQUEST'] = 'true'
+            service['env']['AWS_TIMEOUT'] = '240s'
+        if selected['kind'] != 'real_obs':
+            c['checkpoint_gc'] = {'enabled': True, 'min_age_seconds': 0, 'interval_seconds': 1, 'max_artifacts': 100}
         service['env'].update(
             {
                 'AWS_ACCESS_KEY_ID': (PRIVATE / 's3-user').read_text().strip(),

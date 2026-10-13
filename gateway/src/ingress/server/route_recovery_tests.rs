@@ -263,3 +263,71 @@ async fn health_and_metrics_never_wake_paused_or_rejected_old_routes() {
     }
     relay_task.abort();
 }
+
+#[tokio::test]
+async fn rejected_binding_preserves_temporary_wake_failure_as_retryable() {
+    let relay = Arc::new(
+        Relay::new(GatewayPolicy::for_local_mock(vec!["127.0.0.0/8"
+            .parse()
+            .unwrap()]))
+        .with_route_enforcement(),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let relay_address = listener.local_addr().unwrap().to_string();
+    let relay_task = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let _ = relay.serve_h2(socket).await;
+    });
+    let store = Arc::new(RouteStore::new());
+    store.set_ready(true);
+    store.put(RouteInfo {
+        instance_id: "environment".into(),
+        tenant_id: "tenant".into(),
+        sandbox_id: "old-runtime".into(),
+        sandbox_ip: "127.0.0.1".into(),
+        relay_address: relay_address.clone(),
+        environment_status: EnvironmentStatus {
+            code: 3,
+            ..Default::default()
+        },
+        tunnel_security_mode: DataPlaneSecurityMode::Tls,
+        port_forward_security_mode: DataPlaneSecurityMode::Tls,
+        port_forward_routes: vec![],
+    });
+    let demand = Arc::new(ProbeDemand {
+        paused: false,
+        wakes: std::sync::atomic::AtomicUsize::new(0),
+        relay: relay_address,
+    });
+    let resolver = Arc::new(
+        IngressRouteResolver::new(store)
+            .stream_only()
+            .with_demand_resolver(demand.clone()),
+    );
+    let route = resolver
+        .resolve("environment", 8088, AccessKind::Direct, "request")
+        .await
+        .unwrap();
+    let ingress = Ingress::new(
+        resolver,
+        DataPlaneL4Connector::new(H2PoolConfig {
+            tls_config: None,
+            connections_per_node: 1,
+            max_connections_per_node: 1,
+            ..Default::default()
+        }),
+        IngressAuthenticator::disabled(),
+        50090,
+        8765,
+        "127.0.0.1:1",
+        vec![],
+    );
+    let error = ingress.open_authorized_stream(route).await.err().unwrap();
+    assert_eq!(error.kind(), io::ErrorKind::NotConnected);
+    assert_eq!(
+        error_response(IngressOpenError::Connect(error)).status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(demand.wakes.load(std::sync::atomic::Ordering::SeqCst), 1);
+    relay_task.abort();
+}
