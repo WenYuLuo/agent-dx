@@ -285,3 +285,18 @@ execution from the cached record. Existing assignment, generation and operation
 ID checks still apply; other lifecycle operations continue to use the local
 directory. This read does not lock the revision against subsequent concurrent
 operations, which may still produce a conflict.
+
+## Constructor working directory
+
+The create request accepts an optional `cwd` absolute path without control
+characters. Coordinator persists this constructor option and Adxlet passes it to
+Execd using the platform-owned `ADX_SANDBOX_CWD` environment value. Execd creates
+the directory and missing parents before runtime Ready, including when runtime
+identity is refreshed after checkpoint restoration. An existing directory is
+accepted. A file conflict, inaccessible or read-only path fails initialization;
+the normal failed-creation path releases admission and cleans up the backend.
+
+This option initializes the default directory used by SDK commands. It does not
+change Execd's process cwd or the inherited OCI entrypoint's WORKDIR. Per-command
+cwd overrides remain strict and never create directories implicitly; spawn errors
+use `SPAWN_FAILED` and `error_message`.

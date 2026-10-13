@@ -300,6 +300,7 @@ fn security_pb(value: core::DataPlaneSecurityMode) -> i32 {
 impl From<core::SandboxOptions> for pb::SandboxOptions {
     fn from(value: core::SandboxOptions) -> Self {
         Self {
+            cwd: value.cwd,
             rootfs: value.rootfs.map(Into::into),
             mounts: value.mounts.into_iter().map(Into::into).collect(),
             network: value.network.map(Into::into),
@@ -328,6 +329,7 @@ impl TryFrom<pb::SandboxOptions> for core::SandboxOptions {
         let data_plane = value.data_plane.unwrap_or_default();
         let limits = value.limits.unwrap_or_default();
         Ok(Self {
+            cwd: value.cwd,
             rootfs: value.rootfs.map(TryInto::try_into).transpose()?,
             mounts: value
                 .mounts

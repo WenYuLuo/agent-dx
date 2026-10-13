@@ -237,8 +237,10 @@ async fn real_http_client_prepares_retries_aborts_and_refreshes_restored_identit
         .prepare(&record(1), "a", initial.revision)
         .await
         .is_err());
+    let restored_cwd = runtime.temp.path().join("restored/workspace");
+    assert!(!restored_cwd.exists());
     runtime.handoff(
-        "ADX_ENVIRONMENT_ID=i\nADX_RUNTIME_ID=i-2\nADX_OWNERSHIP_GENERATION=2\nEXECD_HTTP_TOKEN=after\n",
+        &format!("ADX_ENVIRONMENT_ID=i\nADX_RUNTIME_ID=i-2\nADX_OWNERSHIP_GENERATION=2\nEXECD_HTTP_TOKEN=after\nADX_SANDBOX_CWD={}\n", restored_cwd.display()),
         "restore",
     );
     let restored_client = runtime.client("after");
@@ -253,6 +255,10 @@ async fn real_http_client_prepares_retries_aborts_and_refreshes_restored_identit
     .await
     .unwrap();
     assert_eq!(restored.phase, RuntimePhase::Running);
+    assert!(
+        restored_cwd.is_dir(),
+        "restored runtime reported Ready before cwd initialization"
+    );
     tokio::time::timeout(Duration::from_secs(2), async {
         while let Some(Ok(message)) = old_tunnel.next().await {
             if message.is_close() {

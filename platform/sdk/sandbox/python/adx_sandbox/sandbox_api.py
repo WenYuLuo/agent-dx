@@ -364,7 +364,8 @@ class Sandbox:
             schedule_timeout: Scheduling budget in seconds (default 30).
             env: Environment variables to set in the sandbox.
             name: Logical name for the sandbox instance.
-            cwd: Working directory inside the sandbox.
+            cwd: Default command directory inside the sandbox. Execd creates
+                it and missing parents before reporting the sandbox ready.
             port_forwardings: Ports to forward from the sandbox. Each entry is
                 a port number (defaults to TCP) or a ``PortForwarding`` object.
             mounts: Custom mount specifications for the sandbox.
@@ -544,6 +545,8 @@ class Sandbox:
             if not isinstance(restart_policy, RestartPolicy):
                 raise TypeError("restart_policy must be a RestartPolicy")
             body["restartPolicy"] = restart_policy.to_dict()
+        if cwd is not None:
+            body["cwd"] = cwd
         if inherit_entrypoint:
             body["inheritEntrypoint"] = True
         if readiness_probe is not None:

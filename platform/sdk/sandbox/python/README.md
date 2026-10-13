@@ -46,6 +46,20 @@ and `failure` details. Before publication, the caller may receive
 `OUTCOME_UNKNOWN`; query `get_info()` instead of interpreting route errors as
 OOM. Successful calls do not perform an additional catalog query.
 
+## Working directory
+
+`Sandbox(cwd="/workspace/task")` sends the constructor directory to the server.
+Execd creates the directory and any missing parents before reporting Ready;
+the SDK does not issue a separate filesystem initialization call. An existing
+directory and its contents are preserved. Initialization failure makes creation
+fail through the normal lifecycle cleanup path.
+
+Commands without an explicit `cwd` use the constructor directory. A per-command
+`commands.run(..., cwd="/other")` override must already exist; create it explicitly
+with `files.make_dir()` when needed. A failed command does not stop Execd. The
+constructor setting does not change Execd's own working directory or an inherited
+OCI entrypoint's `WORKDIR`.
+
 ## Image startup process
 
 Set `inherit_entrypoint=True` on a fresh image-backed sandbox to start the

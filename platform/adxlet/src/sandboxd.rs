@@ -553,6 +553,12 @@ pub fn start_request(
         xpu.entry(kind.into()).or_default().push(d.id);
     }
     let options = &spec.sandbox;
+    // Only the typed constructor option may configure runtime initialization.
+    envs.remove("ADX_SANDBOX_CWD");
+    if let Some(cwd) = &options.cwd {
+        adx_core::sandbox::validate_cwd(cwd)?;
+        envs.insert("ADX_SANDBOX_CWD".into(), cwd.clone());
+    }
     let mut mounts = options
         .mounts
         .iter()

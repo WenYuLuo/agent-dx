@@ -96,17 +96,19 @@ try:
         details["expected_node_id"] = expected_node
 
     unique_name = f"akernel-e2e-{int(time.time())}"
+    cwd = f"/tmp/{unique_name}/workspace/nested"
     sandbox = Sandbox(
         image=image,
         runtime="runsc",
         name=unique_name,
-        cwd="/tmp",
+        cwd=cwd,
         node_id=expected_node or None,
         memory=memory,
         create_timeout=180,
         schedule_timeout=120,
     )
     check("create", bool(sandbox.id), sandbox.id)
+    check("constructor cwd initialized before ready", sandbox.files.exists(cwd), cwd)
 
     summary = sandbox._client.instance_info(sandbox.id)
     details["instance_summary"] = summary
@@ -140,7 +142,7 @@ try:
     command = sandbox.commands.run("pwd && printf command-ok", timeout=30)
     check(
         "command cwd inheritance",
-        command.exit_code == 0 and command.stdout.startswith("/tmp") and "command-ok" in command.stdout,
+        command.exit_code == 0 and command.stdout.startswith(cwd + "\n") and "command-ok" in command.stdout,
         {"exit_code": command.exit_code, "stdout": command.stdout},
     )
 

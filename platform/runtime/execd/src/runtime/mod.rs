@@ -28,6 +28,7 @@ mod checkpoint_socket;
 pub(crate) mod child_env;
 mod cmd;
 mod codec;
+mod constructor_cwd;
 pub mod control;
 pub mod control_stream;
 mod dispatch;
@@ -155,6 +156,7 @@ impl control::CheckpointHooks for RuntimeHooks {
         if let Some(tunnel) = &self.tunnel {
             tunnel.validate_restored_ports(&environment)?;
         }
+        constructor_cwd::initialize(environment.get(constructor_cwd::ENV).map(String::as_str))?;
         child_env::refresh_from_map(&environment);
         for (key, value) in &environment {
             std::env::set_var(key, value);
@@ -177,6 +179,7 @@ async fn boot(
     token: Option<String>,
     tunnel_ports: Option<(u16, u16)>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    constructor_cwd::initialize_from_environment()?;
     child_env::initialize();
     let probe_config = probes::configuration()?;
     entrypoint::initialize();

@@ -273,6 +273,9 @@ pub struct SandboxOptions {
     pub healthcheck_probe: Option<crate::probes::ProbeSpec>,
     #[serde(default = "crate::probes::default_init_timeout")]
     pub init_timeout_seconds: u64,
+    /// Constructor directory initialized by Execd before runtime readiness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
     pub rootfs: Option<Rootfs>,
     #[serde(default)]
     pub mounts: Vec<Mount>,
@@ -314,6 +317,9 @@ impl SandboxOptions {
             }
             self.probe_config().validate()?;
         }
+        if let Some(cwd) = &self.cwd {
+            validate_cwd(cwd)?;
+        }
         if let Some(rootfs) = &self.rootfs {
             rootfs.validate()?;
         }
@@ -347,4 +353,14 @@ impl SandboxOptions {
         }
         Ok(())
     }
+}
+
+/// Validate a constructor cwd without accessing the coordinator host filesystem.
+pub fn validate_cwd(cwd: &str) -> Result<()> {
+    if !cwd.starts_with('/') || cwd.chars().any(char::is_control) {
+        return Err(Error::Invalid(
+            "sandbox cwd must be an absolute path without control characters".into(),
+        ));
+    }
+    Ok(())
 }

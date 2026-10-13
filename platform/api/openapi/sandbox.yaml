@@ -667,6 +667,14 @@ components:
           type: string
           description: Required unless snapshotId or the deployment Runtime Environment supplies the rootfs.
         runtime: {type: string}
+        cwd:
+          type: string
+          pattern: "^/"
+          description: |
+            Constructor command directory. Execd creates it and any missing
+            parents before runtime Ready; failure prevents a successful create.
+            It does not change Execd or the inherited image entrypoint cwd.
+            A commands.run cwd override still requires an existing directory.
         rootfs:
           oneOf:
             - type: string

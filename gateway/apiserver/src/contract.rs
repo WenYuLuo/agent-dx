@@ -12,6 +12,7 @@ struct Create {
     namespace: String,
     image: String,
     runtime: String,
+    cwd: Option<String>,
     rootfs: Value,
     cpu: i64,
     memory: i64,
@@ -763,6 +764,7 @@ pub fn create_spec_with_environment(
             .map_err(|_| invalid("invalid sandbox extra_config"))?
     };
     let sandbox = adx_core::sandbox::SandboxOptions {
+        cwd: r.cwd,
         rootfs,
         mounts,
         network,

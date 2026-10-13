@@ -1351,3 +1351,19 @@ async fn exited_backend_uses_wait_reason_before_deletion_and_not_exit_code_alone
             .any(|v| v == "wait:generated-backend-id"));
     }
 }
+
+#[test]
+fn constructor_cwd_is_owned_by_spec_and_does_not_change_execd_process_cwd() {
+    let mut spec = spec();
+    spec.env.insert("ADX_SANDBOX_CWD".into(), "/spoofed".into());
+    let mut config = Config::default();
+    config
+        .env
+        .insert("ADX_SANDBOX_CWD".into(), "/deployment".into());
+    let omitted = start_request(&spec, "i-1", 1, &[], &config).unwrap();
+    assert!(!omitted.envs.contains_key("ADX_SANDBOX_CWD"));
+    spec.sandbox.cwd = Some("/workspace/nested".into());
+    let request = start_request(&spec, "i-1", 1, &[], &config).unwrap();
+    assert_eq!(request.envs["ADX_SANDBOX_CWD"], "/workspace/nested");
+    assert_eq!(request.cwd, "/");
+}

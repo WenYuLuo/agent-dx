@@ -382,3 +382,29 @@ fn malformed_or_inapplicable_probes_are_rejected_before_assignment() {
         );
     }
 }
+
+#[test]
+fn constructor_cwd_is_preserved_and_invalid_paths_are_rejected() {
+    let spec = create_spec(
+        json!({"name":"cwd", "image":"image", "cwd":"/workspace/nested"}),
+        &caller(),
+    )
+    .unwrap();
+    let model: adx_core::EnvironmentSpec = spec.try_into().unwrap();
+    assert_eq!(model.sandbox.cwd.as_deref(), Some("/workspace/nested"));
+    for cwd in [
+        "",
+        "relative/path",
+        "/workspace\ninvalid",
+        "/workspace\0invalid",
+    ] {
+        let error = create_spec(json!({"image":"image", "cwd":cwd}), &caller()).unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    }
+    assert!(create_spec(json!({"image":"image"}), &caller())
+        .unwrap()
+        .sandbox
+        .unwrap()
+        .cwd
+        .is_none());
+}

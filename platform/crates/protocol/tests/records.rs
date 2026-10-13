@@ -8,6 +8,7 @@ fn sandbox_options_roundtrip_preserves_backend_contract() {
     use adx_core::sandbox as model;
 
     let options = model::SandboxOptions {
+        cwd: Some("/workspace/task".into()),
         rootfs: Some(model::Rootfs {
             readonly: true,
             source: model::StorageSource::S3(model::S3Source {

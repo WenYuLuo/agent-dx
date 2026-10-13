@@ -186,7 +186,7 @@ class SDKContractTests(unittest.TestCase):
         with self.assertRaisesRegex(Exception, "cannot assign"):
             resume.state = "paused"
 
-    def test_sandbox_runtime_and_default_cwd_are_applied_without_frontend_cwd_field(self):
+    def test_sandbox_runtime_and_constructor_cwd_are_sent_for_runtime_initialization(self):
         with patch("adx_sandbox.sandbox_api.SandboxClient", _FakeClient):
             sandbox = Sandbox(
                 image="ubuntu:22.04",
@@ -202,7 +202,7 @@ class SDKContractTests(unittest.TestCase):
         self.assertEqual(body["rootfs"]["imageurl"], "ubuntu:22.04")
         self.assertNotIn("readonly", body["rootfs"])
         self.assertNotIn("image", body)
-        self.assertNotIn("cwd", body)
+        self.assertEqual(body["cwd"], "/workspace")
         self.assertNotIn("cwdMode", body)
         self.assertEqual(
             sandbox._client.calls[-1][2]["cwd"],
