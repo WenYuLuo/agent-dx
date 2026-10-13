@@ -3,7 +3,9 @@
 `POST /checkpoint` on the Execd Unix socket creates a recovery point while
 keeping the original runtime alive. It uses the adxlet checkpoint store: local
 configuration produces a local-only point, while S3 configuration publishes a
-shared point before acknowledging the request. An upload failure is reported to
+shared point before acknowledging the request. Environment `pauseOptions.storage`
+can override this with `local` or require `shared`; the default `configured`
+uses the node backend. An upload failure is reported to
 the runtime without advertising a local-only point as a successful shared
 checkpoint. The operation is independent of the reusable Snapshot API and the
 stopping pause operation.

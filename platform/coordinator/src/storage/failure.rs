@@ -42,7 +42,13 @@ impl Session {
                         restart_attempts: 0,
                         restart_pending: false,
                     });
-                result.state = EnvironmentState::Failed;
+                // Losing a node retires execution ownership, not the user's
+                // dormancy intent. A paused restore point is awakened on demand.
+                let autonomous_recovery = environment.resume.is_none()
+                    && environment.recovery.as_ref().is_some_and(|r| r.pending);
+                if result.state != EnvironmentState::Paused || autonomous_recovery {
+                    result.state = EnvironmentState::Failed;
+                }
                 result.revision = result.revision.checked_add(1).ok_or(Error::Conflict)?;
                 result.resources_held = false;
                 result.runtime.ip = None;

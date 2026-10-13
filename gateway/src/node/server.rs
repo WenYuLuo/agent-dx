@@ -69,11 +69,44 @@ struct RouteKey {
 }
 
 struct RouteBinding {
+    quiescing: bool,
     sandbox_ip: IpAddr,
     revision_tx: watch::Sender<u64>,
 }
 
 impl Relay {
+    /// Serialize the idle check and admission closure with stream registration.
+    pub fn set_environment_admission(
+        &self,
+        instance: &str,
+        runtime: &str,
+        revision: u64,
+        close: bool,
+    ) -> io::Result<bool> {
+        let key = RouteKey {
+            instance_id: instance.into(),
+            workload_id: runtime.into(),
+        };
+        let mut routes = self
+            .route_shard(&key)
+            .write()
+            .map_err(|_| io::Error::other("route registry unavailable"))?;
+        let binding = routes
+            .get_mut(&key)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "binding missing"))?;
+        if !close {
+            binding.quiescing = false;
+            return Ok(false);
+        }
+        let (current, active) = self
+            .instance_activity(instance)
+            .ok_or_else(|| io::Error::other("activity unavailable"))?;
+        if current != revision || active != 0 {
+            return Ok(false);
+        }
+        binding.quiescing = true;
+        Ok(true)
+    }
     pub fn new(policy: GatewayPolicy) -> Self {
         Self {
             policy,
@@ -128,6 +161,19 @@ impl Relay {
     pub fn with_max_active_streams(mut self, max: usize) -> Self {
         self.max_active_streams = max;
         self
+    }
+
+    fn track_stream(&self, instance_id: &str, passive: bool) -> Option<ActivityStreamGuard> {
+        if passive {
+            return None;
+        }
+        self.activity.as_ref().map(|tracker| {
+            tracker.activate(instance_id);
+            ActivityStreamGuard {
+                tracker: tracker.clone(),
+                instance_id: instance_id.into(),
+            }
+        })
     }
 
     pub fn instance_activity(&self, instance_id: &str) -> Option<(u64, u64)> {
@@ -195,6 +241,7 @@ impl Relay {
         routes.insert(
             key,
             RouteBinding {
+                quiescing: false,
                 sandbox_ip,
                 revision_tx,
             },
@@ -368,7 +415,7 @@ impl Relay {
             return;
         }
         let _active = ActiveStreamGuard(self.active_streams.clone());
-        let route_rx = if self.route_enforcement {
+        let (route_rx, _activity) = if self.route_enforcement {
             let key = RouteKey {
                 instance_id: target.instance_id.clone(),
                 workload_id: target.workload_id.clone(),
@@ -376,20 +423,28 @@ impl Relay {
             let routes = self
                 .route_shard(&key)
                 .read()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                .unwrap_or_else(|p| p.into_inner());
             let Some(binding) = routes.get(&key) else {
                 self.metrics.route_mismatch.fetch_add(1, Ordering::Relaxed);
                 send_error(&mut respond, StatusCode::CONFLICT);
                 return;
             };
-            if binding.sandbox_ip != target.target_ip {
-                self.metrics.route_mismatch.fetch_add(1, Ordering::Relaxed);
+            if binding.sandbox_ip != target.target_ip || binding.quiescing {
+                if binding.quiescing && !passive {
+                    if let Some(tracker) = &self.activity {
+                        tracker.activate(&target.instance_id);
+                        tracker.deactivate(&target.instance_id);
+                    }
+                }
                 send_error(&mut respond, StatusCode::CONFLICT);
                 return;
             }
-            Some(binding.revision_tx.subscribe())
+            // Count before releasing the binding lock and before TCP connect:
+            // quiesce must observe accepted connections still opening upstream.
+            let activity = self.track_stream(&target.instance_id, passive);
+            (Some(binding.revision_tx.subscribe()), activity)
         } else {
-            None
+            (None, self.track_stream(&target.instance_id, passive))
         };
         let connect = tokio::select! {
             result = connect_within_budget(target.socket_addr(), self.connect_timeout) => result,
@@ -415,16 +470,6 @@ impl Relay {
             Err(_) => return,
         };
         self.metrics.connect_total.fetch_add(1, Ordering::Relaxed);
-        let _activity = (!passive)
-            .then_some(self.activity.as_ref())
-            .flatten()
-            .map(|tracker| {
-                tracker.activate(&target.instance_id);
-                ActivityStreamGuard {
-                    tracker: tracker.clone(),
-                    instance_id: target.instance_id.clone(),
-                }
-            });
         let mut route_rx = route_rx;
         let relay_stats = RelayStats::default();
         let result = tokio::select! {

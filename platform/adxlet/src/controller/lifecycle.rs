@@ -4,6 +4,37 @@ use adx_core::{CompletedOperation, LifecycleKind, RestorePoint};
 use std::{path::Path, time::Duration};
 
 impl Controller {
+    pub(super) async fn auto_pause(
+        &mut self,
+        request: PauseRequest,
+        stamp: (String, u64, u64),
+        demand: u64,
+    ) -> Result<()> {
+        if !self
+            .services
+            .routes
+            .quiesce(&self.record, &stamp.0, stamp.1)
+            .await?
+        {
+            return Ok(());
+        }
+        let result = async {
+            let activity = self.services.readiness.activity(&self.record).await?;
+            if activity != (stamp.2, 0)
+                || self.demand.load(std::sync::atomic::Ordering::Acquire) != demand
+            {
+                return Ok(());
+            }
+            self.auto_pause_guard = Some((stamp, demand));
+            self.pause(request).await.map(|_| ())
+        }
+        .await;
+        self.auto_pause_guard = None;
+        if self.record.state == EnvironmentState::Running {
+            self.services.routes.reopen(&self.record).await?;
+        }
+        result
+    }
     pub(super) async fn reload(
         &mut self,
         operation_id: String,
@@ -155,17 +186,42 @@ impl Controller {
             .checkpoint
             .clone()
             .ok_or_else(|| Error::Invalid("checkpoint storage is not configured".into()))?;
+        let storage = self
+            .record
+            .spec
+            .lifecycle
+            .pause
+            .clone()
+            .unwrap_or_default()
+            .storage;
+        services.store.validate_policy(storage)?;
         self.services
             .runtime
             .checkpoint_supported(&self.record.spec.runtime_class)
             .await?;
         let staged = services.store.allocate().await?;
         // Preparation errors can be ambiguous: abort is valid only before the backend call.
-        if let Err(error) = services
-            .cooperation
-            .prepare(&self.record, &request.operation_id)
-            .await
-        {
+        let preparation = match &self.auto_pause_guard {
+            Some((stamp, _)) => {
+                services
+                    .cooperation
+                    .prepare_idle(&self.record, &request.operation_id, stamp.2)
+                    .await
+            }
+            None => {
+                services
+                    .cooperation
+                    .prepare(&self.record, &request.operation_id)
+                    .await
+            }
+        };
+        if let Err(error) = preparation {
+            if self.auto_pause_guard.is_some() && error == Error::Conflict {
+                // A definitive idle-barrier rejection has not changed runtime
+                // state. In particular, do not abort another workload checkpoint.
+                services.store.discard_staged(&staged).await?;
+                return self.sync().await;
+            }
             let abort = services
                 .cooperation
                 .abort_unstarted(&self.record, &request.operation_id)
@@ -186,6 +242,25 @@ impl Controller {
                 )));
             }
             return Err(error);
+        }
+        if let Some((stamp, demand)) = &self.auto_pause_guard {
+            let proxy = self.services.routes.activity(&self.record).await;
+            if self.demand.load(std::sync::atomic::Ordering::Acquire) != *demand
+                || !matches!(proxy, Ok((ref session, revision, 0)) if session == &stamp.0 && revision == stamp.1)
+            {
+                let abort = services
+                    .cooperation
+                    .abort_unstarted(&self.record, &request.operation_id)
+                    .await;
+                services.store.discard_staged(&staged).await?;
+                if let Err(error) = abort {
+                    self.transition(Event::Fail)?;
+                    self.services.routes.retire(&self.record).await?;
+                    self.sync().await?;
+                    return Err(error);
+                }
+                return self.sync().await;
+            }
         }
         self.transition(Event::Pause)?;
         if let Err(error) = self.services.routes.retire(&self.record).await {
@@ -244,7 +319,7 @@ impl Controller {
         self.recovery_files = None;
         self.release_capacity()?;
         self.record.runtime.ip = None;
-        let artifact = match services.store.publish(&staged).await {
+        let artifact = match services.store.publish_with_policy(&staged, storage).await {
             Ok(artifact) => artifact,
             Err(error) => {
                 // Staging contains the complete local recovery point, even if upload
@@ -294,7 +369,10 @@ impl Controller {
             origin: None,
             id: request.operation_id.clone(),
             artifact,
-            expires_at_unix_seconds: expires_at,
+            // Retention starts after the storage publication, including remote upload.
+            expires_at_unix_seconds: now()?
+                .checked_add(request.ttl_seconds)
+                .ok_or_else(|| Error::Invalid("checkpoint TTL overflow".into()))?,
             source_runtime_id: self.record.runtime.id.clone(),
         });
         self.transition(Event::Checkpointed)?;
@@ -368,6 +446,9 @@ impl Controller {
             return self.replay_or_sync().await;
         }
         let result = self.resume(request).await;
+        if matches!(result, Err(Error::NoCapacity)) {
+            return result;
+        }
         if let Err(error) = &result {
             // Paused plus no local reservation proves this attempt did not leave
             // an execution. A Running result whose publication failed is retried

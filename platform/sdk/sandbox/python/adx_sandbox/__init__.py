@@ -19,6 +19,7 @@ from .types import (
     SnapshotInfo,
     ResumeResult,
     RestartPolicy,
+    PausePolicy,
     TrafficPolicy,
 )
 
@@ -64,6 +65,7 @@ __all__ = [
     "PauseResult",
     "ResumeResult",
     "RestartPolicy",
+    "PausePolicy",
     "Mount",
     "NetworkPolicy",
     "NetworkRule",

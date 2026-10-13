@@ -92,7 +92,25 @@ central scheduling. User commands use the separate EXECD HTTP data path.
 
 For snapshot creation, omitted/zero resource values inherit the source. Positive CPU/memory/disk values must equal its resource geometry; restoring with larger limits or resizing is rejected. This applies to the new Rust resolver even though the HTTP handler can encode positive overrides.
 
-Public resume uses the owner cache and calls the owning Adxlet; it performs same-node admission. Cross-node recovery of the same ID is the Coordinator's failed-node recovery flow using a valid shared checkpoint, not a promise made by an ordinary resume request. `failover=true` enables same-node recovery from the latest unexpired checkpoint after an unexpected backend exit; no checkpoint means Failed and no cold start. Reload explicitly replaces a Running backend from that same latest recovery point.
+Public resume and authenticated Ingress demand call Coordinator EnsureRunning. It persists one intent, prefers original-node admission, and transfers a shared checkpoint only after definitive NoCapacity or owner invalidation. An ambiguous RPC retains the owner. Paused objects stay dormant on node loss. `failover=true` enables same-node recovery from the latest unexpired checkpoint after an unexpected backend exit; no checkpoint means Failed and no cold start. Reload explicitly replaces a Running backend from that same latest recovery point.
+
+## Idle pause and auto resume
+
+Create accepts `idleTimeoutSeconds` (0 disables), `idleAction` (`delete` default,
+`pause` requires positive timeout), `pauseOptions` and `autoResume` (false default).
+`pauseOptions` has `ttlSeconds` (90000 default, positive), `timeoutSeconds`
+(300 default, 1–3600), and `storage` (`configured` default, `local`, `shared`).
+Shared requires a configured object backend, e.g. OBS via S3 compatibility;
+nodes automatically advertise `ADX_CHECKPOINT_STORAGE`. Anonymous pause/workload
+checkpoints follow this policy. Omitted/zero pause request TTL inherits the
+Environment policy, otherwise 90000. The retention clock starts after publication.
+
+Only authorized business traffic can demand resume. Concurrent requests share
+the same durable operation; Ingress waits for the committed Running route before
+sending bytes. Passive subscriptions, health and metrics do not wake a sandbox.
+Admission rejection across all nodes retains a pending intent with a 30-second
+capacity retry round. EnsureRunning waits at most 300 seconds at these callers;
+timeout does not prove restore failed or permit another node to run concurrently.
 
 ## Reusable snapshots
 

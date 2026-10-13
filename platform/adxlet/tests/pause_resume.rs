@@ -15,6 +15,10 @@ use std::{
 
 #[derive(Default)]
 struct Backend {
+    prepare_gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
+    prepare_entered: tokio::sync::Notify,
+    checkpoint_gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
+    checkpoint_entered: tokio::sync::Notify,
     snapshots: Mutex<BTreeMap<String, adx_core::snapshots::Snapshot>>,
     fail_snapshot_publish: Mutex<bool>,
     running: Mutex<BTreeSet<String>>,
@@ -85,6 +89,11 @@ impl RuntimeDriver for Backend {
     }
     async fn checkpoint(&self, id: &str, path: &Path, _: Duration) -> Result<()> {
         self.event("checkpoint");
+        self.checkpoint_entered.notify_one();
+        let gate = self.checkpoint_gate.lock().unwrap().clone();
+        if let Some(gate) = gate {
+            gate.notified().await;
+        }
         std::fs::write(path.join("memory"), b"actual saved memory").unwrap();
         if !*self.checkpoint_leaves_running.lock().unwrap() {
             self.running.lock().unwrap().remove(id);
@@ -192,6 +201,11 @@ impl CheckpointCooperation for Backend {
     }
     async fn prepare(&self, _: &EnvironmentRecord, _: &str) -> Result<()> {
         self.event("prepare");
+        self.prepare_entered.notify_one();
+        let gate = self.prepare_gate.lock().unwrap().clone();
+        if let Some(gate) = gate {
+            gate.notified().await;
+        }
         if *self.fail_prepare.lock().unwrap() {
             return Err(Error::Unavailable("prepare reply lost".into()));
         }
@@ -546,6 +560,9 @@ async fn restore_cleanup_failure_keeps_resources_and_invalidates_previous_operat
 struct UnavailablePublication(LocalCheckpointStore);
 #[async_trait]
 impl adxlet::checkpoint::CheckpointStore for UnavailablePublication {
+    fn storage_alias(&self) -> &str {
+        "obs"
+    }
     async fn allocate(&self) -> Result<std::path::PathBuf> {
         self.0.allocate().await
     }
@@ -575,6 +592,9 @@ struct SharedPublication {
 }
 #[async_trait]
 impl adxlet::checkpoint::CheckpointStore for SharedPublication {
+    fn storage_alias(&self) -> &str {
+        "shared"
+    }
     async fn allocate(&self) -> Result<std::path::PathBuf> {
         self.local.allocate().await
     }
@@ -610,7 +630,11 @@ impl adxlet::checkpoint::CheckpointStore for SharedPublication {
 }
 #[tokio::test]
 async fn failed_publication_restores_local_staging_and_reports_pause_failure() {
-    let (temp, backend, _node, spec, assignment) = fixture();
+    let (temp, backend, _node, mut spec, assignment) = fixture();
+    spec.lifecycle.pause = Some(adx_core::lifecycle::PausePolicy {
+        storage: adx_core::lifecycle::CheckpointStorage::Shared,
+        ..Default::default()
+    });
     let node = Adxlet::new(
         "node".into(),
         backend.clone(),
@@ -1627,4 +1651,109 @@ async fn pause_retires_control_state_only_after_the_backend_stop_barrier() {
     *backend.fail_remove.lock().unwrap() = false;
     handle.delete().await.unwrap();
     assert!(hub.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn idle_pause_releases_resources_and_concurrent_demand_restores_once() {
+    let (_temp, backend, node, mut spec, assignment) = fixture();
+    spec.lifecycle.idle_timeout_seconds = 10;
+    spec.lifecycle.idle_action = adx_core::lifecycle::IdleAction::Pause;
+    spec.lifecycle.auto_resume = true;
+    let h = node.environment(spec.clone(), assignment).unwrap();
+    let initial = h.create().await.unwrap();
+    *backend.activity.lock().unwrap() = Some((1, 0));
+    h.tick().await.unwrap();
+    tokio::time::advance(Duration::from_secs(10)).await;
+    h.tick().await.unwrap();
+    let paused = h.sync().await.unwrap();
+    assert_eq!(paused.record.state, EnvironmentState::Paused);
+    assert_eq!(node.used(), Resources::default());
+    assert!(backend.running.lock().unwrap().is_empty());
+    let mut wakes = Vec::new();
+    for _ in 0..16 {
+        let h = h.clone();
+        wakes.push(tokio::spawn(async move {
+            h.ensure_running("shared-wake".into()).await.unwrap()
+        }));
+    }
+    for wake in wakes {
+        assert_eq!(wake.await.unwrap().record.state, EnvironmentState::Running);
+    }
+    assert_eq!(
+        backend
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.as_str() == "restore")
+            .count(),
+        1
+    );
+    assert_eq!(backend.running.lock().unwrap().len(), 1);
+    assert_ne!(
+        h.sync().await.unwrap().record.runtime.id,
+        initial.record.runtime.id
+    );
+    assert_eq!(node.used(), spec.resources);
+}
+
+#[tokio::test(start_paused = true)]
+async fn traffic_before_capture_cancels_idle_pause() {
+    let (_temp, backend, node, mut spec, assignment) = fixture();
+    spec.lifecycle.idle_timeout_seconds = 10;
+    spec.lifecycle.idle_action = adx_core::lifecycle::IdleAction::Pause;
+    let h = node.environment(spec, assignment).unwrap();
+    h.create().await.unwrap();
+    *backend.activity.lock().unwrap() = Some((1, 0));
+    h.tick().await.unwrap();
+    tokio::time::advance(Duration::from_secs(10)).await;
+    let gate = Arc::new(tokio::sync::Notify::new());
+    *backend.prepare_gate.lock().unwrap() = Some(gate.clone());
+    let monitor = {
+        let h = h.clone();
+        tokio::spawn(async move { h.tick().await })
+    };
+    backend.prepare_entered.notified().await;
+    let mut wake = Box::pin(h.ensure_running("arriving-demand".into()));
+    assert!(futures_util::poll!(wake.as_mut()).is_pending());
+    gate.notify_one();
+    monitor.await.unwrap().unwrap();
+    assert_eq!(wake.await.unwrap().record.state, EnvironmentState::Running);
+    assert!(!backend
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|e| e == "checkpoint"));
+    assert!(backend.events.lock().unwrap().iter().any(|e| e == "abort"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn traffic_during_capture_waits_then_resumes_without_replaying_capture() {
+    let (_temp, backend, node, mut spec, assignment) = fixture();
+    spec.lifecycle.idle_timeout_seconds = 10;
+    spec.lifecycle.idle_action = adx_core::lifecycle::IdleAction::Pause;
+    let h = node.environment(spec, assignment).unwrap();
+    h.create().await.unwrap();
+    *backend.activity.lock().unwrap() = Some((1, 0));
+    h.tick().await.unwrap();
+    tokio::time::advance(Duration::from_secs(10)).await;
+    let gate = Arc::new(tokio::sync::Notify::new());
+    *backend.checkpoint_gate.lock().unwrap() = Some(gate.clone());
+    let monitor = {
+        let h = h.clone();
+        tokio::spawn(async move { h.tick().await })
+    };
+    backend.checkpoint_entered.notified().await;
+    let mut wake = Box::pin(h.ensure_running("arriving-demand".into()));
+    assert!(futures_util::poll!(wake.as_mut()).is_pending());
+    gate.notify_one();
+    monitor.await.unwrap().unwrap();
+    assert_eq!(wake.await.unwrap().record.state, EnvironmentState::Running);
+    let events = backend.events.lock().unwrap();
+    assert_eq!(
+        events.iter().filter(|e| e.as_str() == "checkpoint").count(),
+        1
+    );
+    assert_eq!(events.iter().filter(|e| e.as_str() == "restore").count(), 1);
 }

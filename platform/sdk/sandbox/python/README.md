@@ -21,7 +21,7 @@ remains visible even when cleanup also fails.
 
 ## Server compatibility
 
-The new Environment backend supports basic lifecycle, same-node pause/resume, reusable snapshots, grouped placement, idle deletion and restart policy. It requires an image containing the release EXECD at the configured command path; generic `python:3.12-slim` below is only an illustrative image name.
+The new Environment backend supports basic lifecycle, on-demand pause/resume, reusable snapshots, grouped placement, idle deletion/pause and restart policy. It requires an image containing the release EXECD at the configured command path; generic `python:3.12-slim` below is only an illustrative image name.
 
 The Environment backend supports S3 rootfs, S3/image mounts, entrypoint inheritance,
 creation and runtime network policy, `extra_config`, `failover=True`, independent
@@ -54,7 +54,7 @@ There are three deliberately different checkpoint paths:
 | Path | Public SDK API | Artifact and placement | When to use it |
 | --- | --- | --- | --- |
 | Reusable Snapshot | `create_snapshot()` then `Sandbox.create()` | New Environment identity; shared storage allows fresh placement, local-only pins the source node. | Independent clones from a prepared source. |
-| Pause / resume | `pause()` then `resume()` | Same Environment ID; public resume calls its owning Adxlet. | Stop and resume one logical sandbox. |
+| Pause / resume | `pause()` then `resume()` | Same Environment ID; Coordinator first tries the owner, then schedules a compatible node after definitive resource rejection or owner loss. | Stop and resume one logical sandbox. |
 | Failure recovery | `failover=True` | Same Environment and node; restores the latest unexpired checkpoint after unexpected backend exit. | Workloads that must recover execution state rather than cold-start. |
 | Explicit reload | `reload()` | Same Environment; replaces a Running backend from its latest unexpired checkpoint. | Operator-requested reset to a known recovery point. |
 
@@ -145,12 +145,12 @@ print(running.route_address, running.port_mappings)
 The public signatures are:
 
 ```python
-Sandbox.pause(ttl_seconds=90_000, *, timeout_seconds=300) -> PauseResult
+Sandbox.pause(ttl_seconds=None, *, timeout_seconds=300) -> PauseResult
 Sandbox.resume() -> ResumeResult
 ```
 
-The SDK accepts only a positive integral, non-boolean `ttl_seconds`; its
-default is 90,000 seconds. `timeout_seconds` is keyword-only and must be an
+The SDK accepts `None` or a positive integral, non-boolean `ttl_seconds`.
+`None` inherits `pause_policy.ttl_seconds`; without a policy the server uses 90,000 seconds. `timeout_seconds` is keyword-only and must be an
 integral, non-boolean value from 1 through 3600. A successful pause returns a
 frozen `PauseResult` with `sandbox_id`, `snapshot_id`, byte `size`, `state`,
 and `expires_at`. The SDK rejects a response unless it describes this sandbox,
@@ -160,10 +160,45 @@ positive expiry.
 `resume()` returns a frozen `ResumeResult` with `sandbox_id`, `state`,
 `route_address`, `function_proxy_id`, `node_id`, and `port_mappings`. The SDK
 requires the response to identify this sandbox, report `"running"`, and
-include a route address and function-proxy ID. Resume performs local admission on the owning node, restores the checkpoint, rearms the runtime listener and commits Running. Route-cache convergence after
+include a route address and function-proxy ID. Resume uses Coordinator EnsureRunning, first admitting on the owning node. A shared checkpoint allows another compatible node after definitive NoCapacity or owner invalidation; an uncertain RPC result retains ownership and retries there. The selected node restores the checkpoint, rearms the runtime listener and commits Running. Route-cache convergence after
 that result is outside the resume success boundary.
 
-Pausing validates the configured store's artifact and commits Paused after removing the old execution. Local-only files are immediately readable on the owning node; adxlet does not force filesystem writeback, so publication does not guarantee survival of a host crash or power loss. S3 publication waits for upload completion. A SQLite-only result is not cluster success. Public resume requires the authoritative Paused identity and a valid checkpoint. Failed-node cross-node recovery with a shared checkpoint is a separate Coordinator path; it is not selected by the public resume call.
+Pausing validates the configured store's artifact and commits Paused after removing the old execution. Local-only files are immediately readable on the owning node; adxlet does not force filesystem writeback, so publication does not guarantee survival of a host crash or power loss. S3 publication waits for upload completion. A SQLite-only result is not cluster success. Public resume uses authoritative ownership and a valid checkpoint. Local-only points remain tied to the original node; shared points preserve the Environment ID across a new ownership generation. Node loss preserves Paused until demand, expiry or deletion.
+
+### Idle pause and traffic resume
+
+```python
+from adx_sandbox import PausePolicy, Sandbox
+
+sandbox = Sandbox(
+    image="example/execd:latest",
+    idle_timeout_seconds=60,
+    idle_action="pause",
+    pause_policy=PausePolicy(ttl_seconds=3600, timeout_seconds=300, storage="shared"),
+    auto_resume=True,
+)
+```
+
+`idle_action` defaults to `"delete"`; `"pause"` requires a positive idle timeout
+and a checkpoint-capable runtime. `storage="configured"` uses the node backend,
+`"local"` retains files on that node, and `"shared"` requires complete publication
+to its configured object store. Configure an OBS S3-compatible endpoint on every
+eligible node, with the same alias/bucket/prefix. The shared setting also limits
+creation placement to nodes advertising shared checkpoint storage.
+
+The existing idle window observes Execd client operations and Relay streams;
+health, metrics and command observation do not keep the sandbox busy. A detached
+background command can be checkpointed. Automatic pause atomically closes new
+admission and rechecks activity. New demand before capture cancels pause; demand
+once capture starts waits for publication and restores afterward.
+
+With `auto_resume=True`, authorized business traffic through Ingress shares the
+manual resume entry. Concurrent first requests coalesce into one durable intent.
+Ingress waits for the committed Running route before sending application bytes;
+passive route subscriptions and health/metrics do not wake a paused sandbox.
+Requests already sent upstream are not replayed. Resume waits up to 300 seconds;
+a timeout may leave the durable operation pending. If every node rejects admission,
+rejected nodes are excluded for a 30-second capacity round before reevaluation.
 
 ## Recovery methods
 

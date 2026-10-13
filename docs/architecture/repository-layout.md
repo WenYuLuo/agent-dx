@@ -1,6 +1,6 @@
 # Agent DX 当前目录与组件边界
 
-核对日期：2026-09-24。此页描述当前源码布局；首次导入记录保留在 [迁移报告](../migration/2026-09-14-import.md)。[HTML 阅读版](repository-layout.html) 从本文件生成，架构图为仓库内 SVG。
+核对日期：2026-10-13。此页描述当前源码布局；首次导入记录保留在 [迁移报告](../migration/2026-09-14-import.md)。[HTML 阅读版](repository-layout.html) 从本文件生成，架构图为仓库内 SVG。
 
 ![当前组件与调用方向](../../assets/architecture/current-architecture.svg)
 
@@ -20,6 +20,8 @@ Agent API 在 Gateway Ingress 内处理产品请求。独立模式通过 Activat
 API Server 仍保留原有九条 `/api/agent` 兼容转发路由，由 `agent_address` 指向外部 Agent 服务；这是平台侧既有入口，不属于当前 Ingress Agent API／Activator 链路，本轮保持不变。
 
 平台内部以 **Environment + Runtime** 建模。Environment 是跨节点、暂停恢复和故障接管期间保持不变的逻辑身份，持有期望规格、生命周期、归属和 checkpoint 引用；Runtime 是 sandboxd 在某个节点创建的一次物理执行，具有独立 `runtime_id`，重启、恢复或接管时可以替换。二者通过 `RuntimeIdentity { environment_id, runtime_id, ownership_generation }` 绑定，adxlet 只允许当前 generation 的 Runtime 对外提供服务。
+
+Environment 自动暂停复用 idle timeout，策略为 delete/pause；匿名恢复点可按配置发布到共享对象存储。Ingress 认证首请求后与 API Server 手动 resume 共用 Coordinator `EnsureRunning`。Coordinator 持久化恢复意图、优先原节点准入，仅在明确资源不足或执行已失效时调度兼容目标；adxlet 执行恢复并提交 Running。节点失效保留 Paused，等待需求或到期/删除。Ingress 获得该执行的已发布路由后才转发业务字节。详见 [节点生命周期](../testing/node-lifecycle.md)。
 
 公开 Sandbox HTTP/SDK 契约继续使用 `/api/instances`、`instanceId` 和 `instance_id`；API Server 在边界将这些兼容字段映射为 `environment_id`。内部 Rust 类型、gRPC、持久化字段与 Metrics 统一使用 Environment/Runtime。详见 [命名与抽象](naming.md)。
 

@@ -1763,7 +1763,8 @@ async fn handle_client(stream: TcpStream, state: Arc<State>) -> Result<(), Strin
     .await
     .map_err(|e| format!("ws accept: {e}"))?;
     let (mut sink, mut rx_ws) = ws.split();
-    let _active = super::activity::enter(super::activity::ActivitySource::Tunnel);
+    let _active = super::activity::try_enter(super::activity::ActivitySource::Tunnel)
+        .map_err(|_| "runtime is quiescing")?;
     let (tx, mut rx) = mpsc::channel::<OutboundMessage>(OUTBOUND_QUEUE_FRAMES);
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
     let generation = state.active_generation.fetch_add(1, Ordering::AcqRel) + 1;

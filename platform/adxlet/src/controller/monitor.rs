@@ -10,6 +10,11 @@ impl Controller {
     }
 
     async fn tick_inner(&mut self) -> Result<()> {
+        let demand = self.demand.load(std::sync::atomic::Ordering::Acquire);
+        if demand != self.observed_demand {
+            self.idle = None;
+            self.observed_demand = demand;
+        }
         let failed_cleanup =
             self.record.state == EnvironmentState::Failed && !self.record.restart_pending;
         if self.durability == Some(crate::Durability::Journaled) && !failed_cleanup {
@@ -86,7 +91,36 @@ impl Controller {
                                     self.record.spec.lifecycle.idle_timeout_seconds,
                                 )
                             {
-                                self.delete().await?;
+                                match self.record.spec.lifecycle.idle_action {
+                                    adx_core::lifecycle::IdleAction::Delete => {
+                                        self.delete().await?;
+                                    }
+                                    adx_core::lifecycle::IdleAction::Pause => {
+                                        let policy = self
+                                            .record
+                                            .spec
+                                            .lifecycle
+                                            .pause
+                                            .clone()
+                                            .unwrap_or_default();
+                                        self.auto_pause(
+                                            crate::checkpoint::PauseRequest {
+                                                operation_id: format!(
+                                                    "idle-{}-{}",
+                                                    self.record.assignment.generation,
+                                                    self.record.revision
+                                                ),
+                                                expected_revision: self.record.revision,
+                                                ttl_seconds: policy.ttl_seconds,
+                                                timeout_seconds: policy.timeout_seconds,
+                                            },
+                                            stamp.clone(),
+                                            demand,
+                                        )
+                                        .await?;
+                                        self.idle = None;
+                                    }
+                                }
                             }
                         }
                         _ => self.idle = Some((stamp, Instant::now())),

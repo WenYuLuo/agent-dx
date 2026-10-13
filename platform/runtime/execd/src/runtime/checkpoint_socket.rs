@@ -146,18 +146,20 @@ async fn handle(mut stream: UnixStream) -> io::Result<()> {
             .map_err(io::Error::other)?
             .as_nanos();
         let id = format!("execd-{time}-{}", SEQUENCE.fetch_add(1, Ordering::Relaxed));
-        let _activity = super::activity::enter(super::activity::ActivitySource::Checkpoint);
-        match controller.request_checkpoint(id, timeout.unwrap()).await {
-            Ok(()) => (200, serde_json::json!({"status":"completed"})),
-            Err(Error::Invalid(error)) => (400, serde_json::json!({"error":error})),
-            Err(Error::Conflict) => (
-                409,
-                serde_json::json!({"error":"checkpoint already in progress"}),
-            ),
-            Err(Error::Unavailable(error)) if error == "checkpoint request timed out" => {
-                (504, serde_json::json!({"error":error}))
-            }
-            Err(error) => (503, serde_json::json!({"error":error.to_string()})),
+        match super::activity::try_enter(super::activity::ActivitySource::Checkpoint) {
+            Err(_) => (409, serde_json::json!({"error":"runtime is quiescing"})),
+            Ok(_activity) => match controller.request_checkpoint(id, timeout.unwrap()).await {
+                Ok(()) => (200, serde_json::json!({"status":"completed"})),
+                Err(Error::Invalid(error)) => (400, serde_json::json!({"error":error})),
+                Err(Error::Conflict) => (
+                    409,
+                    serde_json::json!({"error":"checkpoint already in progress"}),
+                ),
+                Err(Error::Unavailable(error)) if error == "checkpoint request timed out" => {
+                    (504, serde_json::json!({"error":error}))
+                }
+                Err(error) => (503, serde_json::json!({"error":error.to_string()})),
+            },
         }
     } else {
         (

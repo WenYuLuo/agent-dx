@@ -61,7 +61,61 @@ impl Operations {
         body: Value,
         caller: &pb::CallerContext,
     ) -> Result<Value, Status> {
-        let ttl = number(&body, "ttlSeconds", 90000, u64::MAX)?;
+        if kind == Kind::Resume {
+            let observed = self.clients.owner(id, caller, false).await?;
+            let expected_runtime_id = observed
+                .record
+                .as_ref()
+                .and_then(|r| r.runtime.as_ref())
+                .map_or_else(String::new, |r| r.id.clone());
+            let mut coordinator = pb::coordinator_service_client::CoordinatorServiceClient::new(
+                self.clients.coordinator().await?,
+            );
+            let owner = self
+                .clients
+                .rpc_with_timeout(
+                    "apiserver.ensure_running",
+                    Duration::from_secs(300),
+                    coordinator.ensure_running(trace::inject(pb::EnsureRunningRequest {
+                        expected_runtime_id,
+                        environment_id: id.into(),
+                        caller: Some(caller.clone()),
+                        traffic: false,
+                        timeout_seconds: 300,
+                    })),
+                )
+                .await?;
+            authorize(caller, owner.record.as_ref())?;
+            if owner
+                .record
+                .as_ref()
+                .is_none_or(|r| r.state != pb::EnvironmentState::Running as i32)
+            {
+                return Err(Status::unavailable("resume has not committed Running"));
+            }
+            if owner.relay_address.is_empty()
+                || owner
+                    .record
+                    .as_ref()
+                    .and_then(|r| r.spec.as_ref())
+                    .is_none_or(|s| s.id != id)
+            {
+                return Err(Status::data_loss(
+                    "invalid resume route or Environment identity",
+                ));
+            }
+            let node = owner
+                .record
+                .as_ref()
+                .and_then(|r| r.assignment.as_ref())
+                .ok_or_else(|| Status::data_loss("resume assignment missing"))?
+                .node_id
+                .clone();
+            let value = json!({"sandboxId": id, "state": "running", "routeAddress": owner.relay_address,
+                "functionProxyId": node, "nodeId": node, "portMappings": {}});
+            self.clients.put_owner(owner).await?;
+            return Ok(value);
+        }
         let seconds = number(&body, "timeoutSeconds", 300, 3600)?;
         let name = body
             .get("name")
@@ -83,10 +137,48 @@ impl Operations {
         // Workload checkpoint acknowledges publication before the directory watch
         // necessarily catches up. Reload must start from the committed revision.
         let mut owner = clients.owner(id, caller, kind == Kind::Reload).await?;
+        if kind == Kind::Delete
+            && owner
+                .record
+                .as_ref()
+                .is_some_and(|r| r.state == pb::EnvironmentState::Paused as i32)
+        {
+            let mut coordinator = pb::coordinator_service_client::CoordinatorServiceClient::new(
+                clients.coordinator().await?,
+            );
+            match clients
+                .rpc(
+                    "apiserver.retire_dormant",
+                    coordinator.retire_dormant(trace::inject(pb::GetEnvironmentRequest {
+                        environment_id: id.into(),
+                        caller: Some(caller.clone()),
+                    })),
+                )
+                .await
+            {
+                Ok(deleted) => {
+                    owner.record = deleted.record;
+                    clients.put_owner(owner).await?;
+                    return Ok(Value::Null);
+                }
+                Err(error) if error.code() == Code::NotFound => return Ok(Value::Null),
+                Err(error) if error.code() == Code::FailedPrecondition => {
+                    owner = clients.owner(id, caller, true).await?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
         let record = owner
             .record
             .as_ref()
             .ok_or_else(|| Status::unavailable("environment directory returned no record"))?;
+        let default_ttl = record
+            .spec
+            .as_ref()
+            .and_then(|s| s.lifecycle.as_ref())
+            .and_then(|l| l.pause.as_ref())
+            .map_or(90_000, |p| p.ttl_seconds);
+        let ttl = number(&body, "ttlSeconds", default_ttl, u64::MAX)?;
         if kind == Kind::Delete
             && record.state == pb::EnvironmentState::Deleted as i32
             && !record.resources_held
@@ -168,19 +260,7 @@ impl Operations {
                         )
                         .await
                 }
-                Kind::Resume => {
-                    clients
-                        .rpc(
-                            "apiserver.resume",
-                            node.resume_environment(trace::inject(pb::ResumeEnvironmentRequest {
-                                assignment,
-                                caller: caller_context,
-                                operation_id: request_id.into(),
-                                expected_revision: operation.expected,
-                            })),
-                        )
-                        .await
-                }
+                Kind::Resume => Err(Status::internal("resume requires the Coordinator entry")),
                 Kind::Snapshot => match clients
                     .rpc_with_timeout(
                         "apiserver.snapshot",
@@ -295,17 +375,7 @@ impl Operations {
                             })
                         }
                         Kind::Resume => {
-                            if owner.relay_address.is_empty() {
-                                return Err(Status::data_loss("missing node route"));
-                            }
-                            json!({
-                                "sandboxId": id,
-                                "state": "running",
-                                "routeAddress": owner.relay_address,
-                                "functionProxyId": operation.assignment.node_id,
-                                "nodeId": operation.assignment.node_id,
-                                "portMappings": {},
-                            })
+                            return Err(Status::internal("resume requires the Coordinator entry"))
                         }
                         Kind::Snapshot => {
                             let snapshot = snapshot

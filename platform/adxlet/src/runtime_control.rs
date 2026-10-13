@@ -442,7 +442,18 @@ impl RuntimeControlClient {
         operation_id: &str,
         expected_revision: u64,
     ) -> Result<RuntimeStatus> {
+        self.prepare_with_idle(record, operation_id, expected_revision, None)
+            .await
+    }
+    pub async fn prepare_with_idle(
+        &self,
+        record: &EnvironmentRecord,
+        operation_id: &str,
+        expected_revision: u64,
+        idle_revision: Option<u64>,
+    ) -> Result<RuntimeStatus> {
         let request = PrepareCheckpoint {
+            idle_revision,
             identity: Self::identity(record),
             operation_id: operation_id.into(),
             expected_revision,

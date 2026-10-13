@@ -1,16 +1,44 @@
 # adxlet 生命周期与降级
 
-adxlet 拥有实例串行状态机。Coordinator 提供归属校验、Redis 持久化和路由发布；现存实例的生命周期请求由 API Server 缓存命中后直达节点。
+adxlet 拥有实例串行状态机。Coordinator 提供归属校验、Redis 持久化和路由发布；暂停等节点操作由 API Server 缓存命中后直达节点；手动恢复与 Ingress 流量唤醒统一调用 Coordinator `EnsureRunning`。
 
 ## 运行策略
 
-`EnvironmentSpec.lifecycle` 包含 `idle_timeout_seconds` 和可选 `restart`。HTTP 保留 `idleTimeoutSeconds`，新增 `restartPolicy`；Python SDK 支持 `RestartPolicy(max_attempts=3, initial_backoff_seconds=1, max_backoff_seconds=30)`。
+`EnvironmentSpec.lifecycle` 包含 `idle_timeout_seconds`、`idle_action`（默认 delete）、可选 `pause`、`auto_resume`（默认 false）和可选 `restart`。HTTP 对应 `idleTimeoutSeconds`、`idleAction`、`pauseOptions`、`autoResume`、`restartPolicy`；Python SDK 对应 `idle_timeout_seconds`、`idle_action`、`PausePolicy`、`auto_resume`、`RestartPolicy`。
 
-- 空闲超时为 0 时不回收。启用后，运行实例的 Execd 活跃客户端请求数与 Relay 流计数必须同时为 0，且活动版本在整个空闲窗口内未改变。后台命令仍计入 Execd 状态与活动版本，但客户端退出后不会仅因命令仍运行而阻止回收。采样失败或活动版本改变会重置窗口。adxlet 执行删除。
+- 空闲超时为 0 时不回收。启用后，运行实例的 Execd 活跃客户端请求数与 Relay 流计数必须同时为 0，且活动版本在整个空闲窗口内未改变。后台命令仍计入 Execd 状态与活动版本，但客户端退出后不会仅因命令仍运行而阻止回收。采样失败或活动版本改变会重置窗口。adxlet 默认执行删除；`idle_action=pause` 在同一窗口结束后进入自动暂停，要求正数空闲超时和可用的 checkpoint 能力。
 - RuntimeDriver 确认执行退出后，节点先退役路由、确认旧执行清理，再标记 Failed。启用重启时，按照指数退避和累计重试上限重新申请本机资源，并分配新的执行 ID，Environment ID 与归属代次保持。
 - `restart_attempts` 和 `restart_pending` 随实例结果写入 Redis／降级日志。进程重启不重置次数。显式删除取消重启。清理未确认时保留资源，禁止启动替代执行。
 - 可配置 `execd_health_failure_threshold`；省略时不以健康探测失败触发重启。连续失败达到阈值后，仍须先确认旧执行清理。健康检查只覆盖 Execd。
 - 初次 Start 失败、超时或应答丢失均判定创建 Failed；不会触发运行中退出的自动重启策略。创建进入 Failed 即释放资源预留并提交结果；清理失败或超时不阻止释放。Failed 控制器继续清理残留及迟到执行，不转成 Running。节点重启按权威目录对账。
+
+## 休眠与按需恢复
+
+`pauseOptions` 的 `ttlSeconds` 默认 90000、`timeoutSeconds` 默认 300（1–3600），
+`storage` 为 configured（默认）、local 或 shared。TTL 从制品发布完成开始计算，
+与空闲窗口分别计时。shared 要求节点已配置共享对象存储，发布失败不能返回暂停成功。
+
+自动暂停先通过 Relay 的活动版本原子关闭新流准入，再通过 Execd 的活动版本关闭
+客户端操作准入并复核需求。已接纳请求不会被当成空闲；捕获前的新需求取消本次暂停，
+捕获开始后只排队等待，不取消不确定的 checkpoint，随后由同一恢复入口恢复。
+后台命令仍沿用原先的空闲检测语义，可由后端冻结保存。
+
+Ingress 先完成租户和数据面策略校验，再发出 `EnsureRunning`；被动订阅、health/metrics
+不产生唤醒需求。Coordinator 在 Redis CAS 中记录恢复意图和固定 operation ID，并按
+Environment 串行驱动；多个 Ingress、手动恢复和后台重试共用它。先尝试原节点的本机
+资源准入；只有明确 NoCapacity 或旧执行已失效且有共享恢复点，才选择兼容节点。
+RPC 超时、应答丢失和发布失败保留当前归属，避免启动第二份执行。全部节点拒绝时，
+一个容量轮次排除已经拒绝的节点，30 秒后重试资源，不在节点间持续改写归属。
+
+节点失效将 Paused 标记为归属失效并释放资源，仍保留 Paused；不进入 Running/Failed
+对象的主动故障恢复。自动故障恢复过程中的中间 Paused/recovery.pending 并非用户休眠，目标再次失效仍续走原有故障恢复。首次需求再触发休眠对象跨节点恢复。Coordinator/adxlet 重启按 Redis
+意图、generation 和节点进程会话对账，清理未提交执行后才能恢复。TTL 到期或显式
+删除与恢复提交通过串行节点任务及 Redis 版本校验竞争；失联休眠对象由 Coordinator
+退役，迟到结果不能复活它。远端物理制品仍遵守既有引用及孤儿回收契约。
+
+组件测试 `on_demand.rs` 使用真实 Redis、Coordinator/Node gRPC 和多个真实 Ingress；
+执行内存与对象存储为可控夹具。Execd idle admission 测试启动生产二进制，用 FIFO
+模拟 checkpoint handoff。它们不构成此次真实 Firecracker/OBS 部署验收。
 
 ## 资源与指标
 

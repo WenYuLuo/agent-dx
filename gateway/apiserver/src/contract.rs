@@ -26,6 +26,12 @@ struct Create {
     snapshot_id: String,
     #[serde(rename = "idleTimeoutSeconds")]
     idle: i64,
+    #[serde(rename = "idleAction")]
+    idle_action: adx_core::lifecycle::IdleAction,
+    #[serde(rename = "pauseOptions")]
+    pause: Option<Pause>,
+    #[serde(rename = "autoResume")]
+    auto_resume: bool,
     #[serde(rename = "restartPolicy")]
     restart: Option<Restart>,
     #[serde(rename = "scheduleAffinities")]
@@ -60,6 +66,23 @@ struct Restart {
     max_attempts: u32,
     initial_backoff_seconds: u64,
     max_backoff_seconds: u64,
+}
+#[derive(Deserialize)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+struct Pause {
+    ttl_seconds: u64,
+    timeout_seconds: u64,
+    storage: adx_core::lifecycle::CheckpointStorage,
+}
+impl Default for Pause {
+    fn default() -> Self {
+        let p = adx_core::lifecycle::PausePolicy::default();
+        Self {
+            ttl_seconds: p.ttl_seconds,
+            timeout_seconds: p.timeout_seconds,
+            storage: p.storage,
+        }
+    }
 }
 #[derive(Default, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -509,6 +532,18 @@ pub fn create_spec_with_environment(
     if r.create_timeout < 0 || r.schedule_timeout < 0 || r.init_timeout < 0 || r.idle < 0 {
         return Err(invalid("timeouts cannot be negative"));
     }
+    let lifecycle = adx_core::lifecycle::LifecyclePolicy {
+        idle_timeout_seconds: r.idle as u64,
+        idle_action: r.idle_action,
+        auto_resume: r.auto_resume,
+        pause: r.pause.as_ref().map(|p| adx_core::lifecycle::PausePolicy {
+            ttl_seconds: p.ttl_seconds,
+            timeout_seconds: p.timeout_seconds,
+            storage: p.storage,
+        }),
+        restart: None,
+    };
+    lifecycle.validate().map_err(|e| invalid(&e.to_string()))?;
     if r.storage.is_some_and(|v| v <= 0) || r.storage_limit_mb < 0 {
         return Err(invalid("storageMb must be positive"));
     }
@@ -629,6 +664,26 @@ pub fn create_spec_with_environment(
         })
         .map_err(|error| invalid(&error.to_string()))?;
     let mut policy = policy;
+    if r.pause
+        .as_ref()
+        .is_some_and(|p| p.storage == adx_core::lifecycle::CheckpointStorage::Shared)
+    {
+        if policy.required_node.is_empty() {
+            policy.required_node.push(pb::LabelSelector::default());
+        }
+        for selector in &mut policy.required_node {
+            selector.expressions.push(pb::LabelRequirement {
+                key: "ADX_CHECKPOINT_STORAGE".into(),
+                op: pb::SelectorOp::Exists as i32,
+                values: vec![],
+            });
+            selector.expressions.push(pb::LabelRequirement {
+                key: "ADX_CHECKPOINT_STORAGE".into(),
+                op: pb::SelectorOp::NotIn as i32,
+                values: vec!["local".into()],
+            });
+        }
+    }
     if !r.xpu.is_empty() {
         let parts: Vec<_> = r.xpu.split(':').collect();
         if parts.len() != 3 {
@@ -734,6 +789,20 @@ pub fn create_spec_with_environment(
         lifecycle: Some(pb::LifecyclePolicy {
             idle_timeout_seconds: r.idle as u64,
             restart,
+            idle_action: match r.idle_action {
+                adx_core::lifecycle::IdleAction::Delete => 0,
+                adx_core::lifecycle::IdleAction::Pause => 1,
+            },
+            auto_resume: r.auto_resume,
+            pause: r.pause.map(|p| pb::PausePolicy {
+                ttl_seconds: p.ttl_seconds,
+                timeout_seconds: p.timeout_seconds,
+                storage: match p.storage {
+                    adx_core::lifecycle::CheckpointStorage::Configured => 0,
+                    adx_core::lifecycle::CheckpointStorage::Local => 1,
+                    adx_core::lifecycle::CheckpointStorage::Shared => 2,
+                },
+            }),
         }),
         snapshot_id: snapshot,
         sandbox: Some(sandbox.into()),

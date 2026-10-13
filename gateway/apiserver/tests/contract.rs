@@ -8,6 +8,25 @@ fn caller() -> pb::CallerContext {
     }
 }
 #[test]
+fn idle_pause_options_are_typed_and_validated() {
+    let spec = create_spec(json!({"image":"image", "idleTimeoutSeconds":30,"idleAction":"pause",
+        "autoResume":true, "pauseOptions":{"ttlSeconds":3600,"timeoutSeconds":120,"storage":"shared"}}), &caller()).unwrap();
+    let policy = spec.lifecycle.unwrap();
+    assert_eq!(policy.idle_action, pb::IdleAction::Pause as i32);
+    assert!(policy.auto_resume);
+    assert_eq!(
+        policy.pause.unwrap().storage,
+        pb::CheckpointStorage::Shared as i32
+    );
+    for value in [
+        json!({"image":"image","idleAction":"pause"}),
+        json!({"image":"image","pauseOptions":{"ttlSeconds":0}}),
+        json!({"image":"image","pauseOptions":{"storage":"missing"}}),
+    ] {
+        assert!(create_spec(value.clone(), &caller()).is_err(), "{value}");
+    }
+}
+#[test]
 fn public_create_maps_directly_to_instance_and_uses_verified_identity() {
     let spec=create_spec(json!({"name":"case","namespace":"ns","tenant":"spoofed","image":"image","cpu":125,"memory":32,"storageMb":4,"env":{"USER_VALUE":"ok"},"idleTimeoutSeconds":15}), &caller()).unwrap();
     assert_eq!(spec.id, "ns-case");

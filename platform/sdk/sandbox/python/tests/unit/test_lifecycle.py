@@ -226,7 +226,7 @@ class LifecycleTests(unittest.TestCase):
         )
         self.assertEqual(
             sandbox._client.pause_args,
-            ("default-sandbox-1", 90_000, 300),
+            ("default-sandbox-1", None, 300),
         )
         self.assertEqual(
             resume_result,

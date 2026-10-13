@@ -109,6 +109,15 @@ impl Adxlet {
                 }
             }
         }
+        // Drain each accepted serial operation before scanning/destructive cleanup.
+        // Restore can finish after its RPC caller timed out. Align only an
+        // uncommitted execution with the durable pause point; a newer published
+        // result rejects this stale catalog so the heartbeat fetches it again.
+        for (id, (_, assignment, handle)) in &controllers {
+            if let Some(record) = catalog.get(id).filter(|r| r.assignment == *assignment) {
+                handle.align_authority(record.clone()).await?;
+            }
+        }
         let actual = tokio::time::timeout(
             self.services.operation_timeout,
             self.services.runtime.inventory(),

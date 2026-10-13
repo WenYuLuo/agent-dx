@@ -70,6 +70,8 @@ pub enum ResolveError {
 
 #[derive(Clone)]
 pub struct IngressRouteResolver {
+    resume_admission: Arc<tokio::sync::Semaphore>,
+    demand: Option<Arc<dyn DemandResolver>>,
     store: Arc<RouteStore>,
     stream_only: bool,
     point_getter: Option<Arc<dyn RoutePointGetter>>,
@@ -77,6 +79,8 @@ pub struct IngressRouteResolver {
 
 #[derive(Debug, Clone)]
 pub struct RouteHandle {
+    /// Metadata-only handle: authenticate before asking the lifecycle owner to wake.
+    pub needs_resume: bool,
     pub access_kind: AccessKind,
     pub relay_address: String,
     pub tenant_id: String,
@@ -97,10 +101,23 @@ pub enum PointGetError {
 pub trait RoutePointGetter: Send + Sync {
     async fn point_get(&self, instance_id: &str) -> Result<Option<RouteInfo>, PointGetError>;
 }
+#[async_trait]
+pub trait DemandResolver: Send + Sync {
+    async fn describe(
+        &self,
+        instance_id: &str,
+        target_port: u16,
+        access_kind: AccessKind,
+        request_id: String,
+    ) -> Result<RouteHandle, ResolveError>;
+    async fn ensure_running(&self, route: &RouteHandle) -> Result<String, ResolveError>;
+}
 
 impl IngressRouteResolver {
     pub fn new(store: Arc<RouteStore>) -> Self {
         Self {
+            resume_admission: Arc::new(tokio::sync::Semaphore::new(1024)),
+            demand: None,
             store,
             stream_only: false,
             point_getter: None,
@@ -110,6 +127,44 @@ impl IngressRouteResolver {
     pub fn stream_only(mut self) -> Self {
         self.stream_only = true;
         self
+    }
+    pub fn with_demand_resolver(mut self, demand: Arc<dyn DemandResolver>) -> Self {
+        self.demand = Some(demand);
+        self
+    }
+    pub async fn wake(&self, route: &RouteHandle) -> Result<RouteHandle, ResolveError> {
+        let _permit = self
+            .resume_admission
+            .try_acquire()
+            .map_err(|_| ResolveError::Unavailable("resume wait queue is full".into()))?;
+        let runtime = self
+            .demand
+            .as_ref()
+            .ok_or(ResolveError::NotFound)?
+            .ensure_running(route)
+            .await?;
+        let mut changes = self.store.subscribe();
+        tokio::time::timeout(Duration::from_secs(300), async {
+            loop {
+                if let Some(info) = self.store.get(&route.target.instance_id) {
+                    if is_connectable(&info.environment_status) && info.sandbox_id == runtime {
+                        return self
+                            .resolve(
+                                &route.target.instance_id,
+                                route.target.target_port,
+                                route.access_kind,
+                                route.target.request_id.clone(),
+                            )
+                            .await;
+                    }
+                }
+                changes.recv().await.map_err(|_| {
+                    ResolveError::Unavailable("route subscription interrupted during resume".into())
+                })?;
+            }
+        })
+        .await
+        .map_err(|_| ResolveError::Unavailable("resumed route did not arrive".into()))?
     }
 
     pub fn with_point_getter(mut self, point_getter: Arc<dyn RoutePointGetter>) -> Self {
@@ -223,6 +278,7 @@ impl IngressRouteResolver {
         access_kind: AccessKind,
         request_id: impl Into<String>,
     ) -> Result<RouteHandle, ResolveError> {
+        let request_id = request_id.into();
         if !self.store.ready() {
             return Err(ResolveError::NotReady);
         }
@@ -234,7 +290,17 @@ impl IngressRouteResolver {
                     .await
                     .map_err(|error| ResolveError::Unavailable(error.to_string()))?
                     .ok_or(ResolveError::NotFound)?,
-                None if self.stream_only => self.subscribed_route(instance_id).await?,
+                None if self.stream_only => match self.subscribed_route(instance_id).await {
+                    Ok(route) => route,
+                    Err(error) => match &self.demand {
+                        Some(demand) => {
+                            return demand
+                                .describe(instance_id, target_port, access_kind, request_id)
+                                .await
+                        }
+                        None => return Err(error),
+                    },
+                },
                 None => return Err(ResolveError::NotFound),
             },
         };
@@ -255,6 +321,7 @@ impl IngressRouteResolver {
             .ok_or(ResolveError::MissingEndpoint)?;
         let port_forward_auth_mode = route.port_forward_auth_mode(target_port);
         Ok(RouteHandle {
+            needs_resume: false,
             access_kind,
             relay_address: route.relay_address,
             tenant_id: route.tenant_id,

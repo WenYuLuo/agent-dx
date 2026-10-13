@@ -253,3 +253,22 @@ class CreateRequestTests(unittest.TestCase):
             with self.subTest(options=options), self.assertRaises(error_type):
                 self.capture_create(**options)
         self.assert_no_transport_setup()
+
+    def test_idle_pause_with_shared_storage_is_preserved(self):
+        from adx_sandbox import PausePolicy
+        body = self.capture_create(idle_timeout=30, idle_action="pause", auto_resume=True,
+                                   pause_policy=PausePolicy(ttl_seconds=3600, timeout_seconds=120, storage="shared"))
+        self.assertEqual(body["idleAction"], "pause")
+        self.assertTrue(body["autoResume"])
+        self.assertEqual(body["pauseOptions"], {"ttlSeconds": 3600, "timeoutSeconds": 120, "storage": "shared"})
+
+    def test_invalid_idle_pause_options_do_not_open_transport(self):
+        from adx_sandbox import PausePolicy
+        for options in ({"idle_action": "missing"}, {"idle_action": "pause", "idle_timeout": 0},
+                        {"auto_resume": 1}, {"pause_policy": {"storage": "shared"}}):
+            with self.subTest(options=options), self.assertRaises((ValueError, TypeError)):
+                Sandbox(image="fixture", connection=self.connection, **options)
+        self.assert_no_transport_setup()
+        for options in ({"ttl_seconds": 0}, {"timeout_seconds": 3601}, {"storage": "missing"}):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                PausePolicy(**options)

@@ -84,6 +84,8 @@ service_impl!(pb::coordinator_service_server::CoordinatorService, {
     register_node(RegisterNodeRequest) -> RegisterNodeResponse,
     inspect_node(InspectNodeRequest) -> InspectNodeResponse,
     commit_environment(CommitEnvironmentRequest) -> CommitEnvironmentResponse,
+    ensure_running(EnsureRunningRequest) -> GetEnvironmentResponse,
+    retire_dormant(GetEnvironmentRequest) -> EnvironmentResult,
 ]);
 #[tonic::async_trait]
 impl pb::environment_directory_service_server::EnvironmentDirectoryService for Service {

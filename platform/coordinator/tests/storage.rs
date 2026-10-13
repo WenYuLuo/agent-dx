@@ -1,6 +1,8 @@
 #[path = "storage/claims.rs"]
 mod claims;
 mod common;
+#[path = "storage/dormancy.rs"]
+mod dormancy;
 use adx_coordinator::{storage::StoredNode, Coordinator, Node, Placement};
 use adx_core::{
     Assignment, EnvironmentRecord, EnvironmentSpec, EnvironmentState, Error, Resources,

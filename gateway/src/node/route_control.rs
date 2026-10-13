@@ -217,6 +217,35 @@ fn ack(request: &UpdateBindingRequest) -> UpdateBindingResponse {
 }
 #[tonic::async_trait]
 impl RelayService for BindingService {
+    async fn set_environment_admission(
+        &self,
+        request: Request<proto::EnvironmentAdmissionRequest>,
+    ) -> Result<Response<proto::EnvironmentAdmissionResponse>, Status> {
+        let r = request.into_inner();
+        let state = self.state.lock().await;
+        if !state.ready
+            || r.proxy_session_id != self.session
+            || !matches!(
+            state.versions.get(&r.environment_id).and_then(|v| v.binding.as_ref()),
+            Some(Binding::Active(t)) if t.runtime_id == r.runtime_id)
+        {
+            return Err(Status::failed_precondition(
+                "current binding and session required",
+            ));
+        }
+        let closed = self
+            .proxy
+            .set_environment_admission(
+                &r.environment_id,
+                &r.runtime_id,
+                r.activity_revision,
+                r.close,
+            )
+            .map_err(|e| Status::unavailable(e.to_string()))?;
+        Ok(Response::new(proto::EnvironmentAdmissionResponse {
+            closed,
+        }))
+    }
     async fn get_environment_activity(
         &self,
         request: Request<proto::GetEnvironmentActivityRequest>,

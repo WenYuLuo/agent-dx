@@ -28,6 +28,7 @@ from .types import (
     PauseResult,
     PortForwarding,
     RestartPolicy,
+    PausePolicy,
     ResumeResult,
     S3Config,
     SandboxInfo,
@@ -310,6 +311,9 @@ class Sandbox:
         schedule_affinities: Optional[List[Dict[str, Any]]] = None,
         snapshot_id: Optional[str] = None,
         restart_policy: Optional[RestartPolicy] = None,
+        idle_action: str = "delete",
+        pause_policy: Optional[PausePolicy] = None,
+        auto_resume: bool = False,
         failover: bool = False,
         inherit_entrypoint: bool = False,
         xpu: Optional[str] = None,
@@ -337,7 +341,10 @@ class Sandbox:
             memory: Memory scheduling request in MB (default 4096).
             cpu_limit: CPU cgroup limit in milli-cores (0 = same as *cpu*).
             mem_limit: Memory cgroup limit in MB (0 = same as *memory*).
-            idle_timeout: Seconds before idle sandbox is reclaimed (default 300).
+            idle_timeout: Continuous client-idle window in seconds (default 300).
+            idle_action: delete (default) or pause at the end of the idle window.
+            pause_policy: Anonymous checkpoint retention and local/shared storage.
+            auto_resume: Allow authorized business traffic to wake this Sandbox.
             restart_policy: Optional bounded node-local restart after an unexpected exit.
             create_timeout: Logical create budget in seconds. By default it is
                 derived as ``schedule_timeout + 60``. An
@@ -381,6 +388,14 @@ class Sandbox:
                 server defaults.
             extra_config: Extra sandbox-side configuration forwarded to sandboxd.
         """
+        if idle_action not in ("delete", "pause"):
+            raise ValueError("idle_action must be delete or pause")
+        if idle_action == "pause" and (isinstance(idle_timeout, bool) or not isinstance(idle_timeout, int) or idle_timeout <= 0):
+            raise ValueError("idle pause requires a positive idle_timeout")
+        if not isinstance(auto_resume, bool):
+            raise TypeError("auto_resume must be a bool")
+        if pause_policy is not None and not isinstance(pause_policy, PausePolicy):
+            raise TypeError("pause_policy must be a PausePolicy")
         if image is not None and (not isinstance(image, str) or not image.strip()):
             raise ValueError("image must be a non-empty string")
         if rootfs is not None and not isinstance(rootfs, S3Config):
@@ -493,6 +508,8 @@ class Sandbox:
             "snapshotId": snapshot_id.strip() if snapshot_id is not None else None,
             "failover": failover,
             "idleTimeoutSeconds": idle_timeout,
+            "idleAction": idle_action,
+            "autoResume": auto_resume,
             "createTimeoutSeconds": resolved_create_timeout,
             "scheduleTimeoutSeconds": resolved_schedule_timeout,
             "initCallTimeoutSeconds": _INIT_CALL_TIMEOUT,
@@ -500,6 +517,8 @@ class Sandbox:
         }
         if body["snapshotId"] is None:
             del body["snapshotId"]
+        if pause_policy is not None:
+            body["pauseOptions"] = pause_policy.to_dict()
         if restart_policy is not None:
             if not isinstance(restart_policy, RestartPolicy):
                 raise TypeError("restart_policy must be a RestartPolicy")
@@ -908,7 +927,7 @@ class Sandbox:
 
     def pause(
         self,
-        ttl_seconds: int = 90_000,
+        ttl_seconds: Optional[int] = None,
         *,
         timeout_seconds: int = ADX_GET_DEFAULT_TIMEOUT,
     ) -> PauseResult:
@@ -917,9 +936,9 @@ class Sandbox:
         Local-only files are immediately readable on the owning node, without
         forced filesystem writeback. Remote storage completes its upload.
         """
-        if isinstance(ttl_seconds, bool) or not isinstance(ttl_seconds, int):
+        if ttl_seconds is not None and (isinstance(ttl_seconds, bool) or not isinstance(ttl_seconds, int)):
             raise ValueError("ttl_seconds must be a positive integer")
-        if ttl_seconds <= 0:
+        if ttl_seconds is not None and ttl_seconds <= 0:
             raise ValueError("ttl_seconds must be a positive integer")
         if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, int):
             raise ValueError("timeout_seconds must be a positive integer")

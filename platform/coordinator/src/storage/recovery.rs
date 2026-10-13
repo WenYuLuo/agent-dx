@@ -2,6 +2,20 @@
 use super::*;
 
 impl StoredEnvironment {
+    pub fn resume_point(&self, now: u64) -> Option<&adx_core::RestorePoint> {
+        let record = self.result.as_ref()?;
+        if record.state != EnvironmentState::Paused
+            || record.resources_held
+            || self.resume.is_none()
+            || (!self.invalidated && !self.resume.as_ref()?.local_rejected)
+        {
+            return None;
+        }
+        record
+            .checkpoint
+            .as_ref()
+            .filter(|cp| cp.artifact.storage != "local" && cp.expires_at_unix_seconds > now)
+    }
     pub fn recovery_point(&self, now: u64) -> Option<&adx_core::RestorePoint> {
         if !self.invalidated {
             return None;
@@ -58,6 +72,7 @@ impl Session {
             }
             let mut checkpoint = stored_environment
                 .recovery_point(now)
+                .or_else(|| stored_environment.resume_point(now))
                 .ok_or(Error::Conflict)?
                 .clone();
             let target: StoredNode = decode(node_value.as_deref().ok_or(Error::NotFound)?)?;
@@ -91,6 +106,9 @@ impl Session {
             });
             stored_environment.assignment = replacement.clone();
             stored_environment.invalidated = false;
+            if let Some(intent) = &mut stored_environment.resume {
+                intent.local_rejected = false;
+            }
             stored_environment.failed_since_unix_seconds = None;
             stored_environment.recovery = Some(Recovery {
                 source: previous.clone(),

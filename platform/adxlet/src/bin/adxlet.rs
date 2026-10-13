@@ -361,13 +361,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
+    let mut labels = config.labels;
+    if let Some(alias) = manager.checkpoint_storage_alias() {
+        labels.insert("ADX_CHECKPOINT_STORAGE".into(), alias.into());
+    }
     let registration = pb::RegisterNodeRequest {
         node_id: config.node_id.clone(),
         node_address: config.advertised_address,
         proxy_address: config.proxy_address,
         capacity: Some(o.capacity.into()),
         devices: o.devices.into_iter().map(Into::into).collect(),
-        labels: config.labels,
+        labels,
         accepting_allocations: false,
         session_id: session_id.clone(),
         heartbeat_sequence: 0,

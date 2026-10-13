@@ -29,7 +29,11 @@ impl TryFrom<control::EnvironmentSpec> for adx_core::EnvironmentSpec {
         let spec = Self {
             runtime_profile: value.runtime_profile.map(TryInto::try_into).transpose()?,
             snapshot_id: value.snapshot_id,
-            lifecycle: value.lifecycle.map(Into::into).unwrap_or_default(),
+            lifecycle: value
+                .lifecycle
+                .map(TryInto::try_into)
+                .transpose()?
+                .unwrap_or_default(),
             env: value.env.into_iter().collect(),
             id: value.id,
             tenant_id: value.tenant_id,
@@ -351,21 +355,60 @@ impl TryFrom<control::CompletedOperation> for adx_core::CompletedOperation {
     }
 }
 
-impl From<control::LifecyclePolicy> for adx_core::lifecycle::LifecyclePolicy {
-    fn from(v: control::LifecyclePolicy) -> Self {
-        Self {
+impl TryFrom<control::LifecyclePolicy> for adx_core::lifecycle::LifecyclePolicy {
+    type Error = Error;
+    fn try_from(v: control::LifecyclePolicy) -> Result<Self> {
+        use adx_core::lifecycle::{CheckpointStorage, IdleAction, PausePolicy};
+        let policy = Self {
+            idle_action: match v.idle_action {
+                0 => IdleAction::Delete,
+                1 => IdleAction::Pause,
+                _ => return Err(Error::Invalid("invalid idle action".into())),
+            },
+            auto_resume: v.auto_resume,
+            pause: v
+                .pause
+                .map(|p| {
+                    Ok(PausePolicy {
+                        ttl_seconds: p.ttl_seconds,
+                        timeout_seconds: p.timeout_seconds,
+                        storage: match p.storage {
+                            0 => CheckpointStorage::Configured,
+                            1 => CheckpointStorage::Local,
+                            2 => CheckpointStorage::Shared,
+                            _ => return Err(Error::Invalid("invalid checkpoint storage".into())),
+                        },
+                    })
+                })
+                .transpose()?,
             idle_timeout_seconds: v.idle_timeout_seconds,
             restart: v.restart.map(|r| adx_core::lifecycle::RestartPolicy {
                 max_attempts: r.max_attempts,
                 initial_backoff_seconds: r.initial_backoff_seconds,
                 max_backoff_seconds: r.max_backoff_seconds,
             }),
-        }
+        };
+        policy.validate()?;
+        Ok(policy)
     }
 }
 impl From<adx_core::lifecycle::LifecyclePolicy> for control::LifecyclePolicy {
     fn from(v: adx_core::lifecycle::LifecyclePolicy) -> Self {
         Self {
+            idle_action: match v.idle_action {
+                adx_core::lifecycle::IdleAction::Delete => 0,
+                adx_core::lifecycle::IdleAction::Pause => 1,
+            },
+            auto_resume: v.auto_resume,
+            pause: v.pause.map(|p| control::PausePolicy {
+                ttl_seconds: p.ttl_seconds,
+                timeout_seconds: p.timeout_seconds,
+                storage: match p.storage {
+                    adx_core::lifecycle::CheckpointStorage::Configured => 0,
+                    adx_core::lifecycle::CheckpointStorage::Local => 1,
+                    adx_core::lifecycle::CheckpointStorage::Shared => 2,
+                },
+            }),
             idle_timeout_seconds: v.idle_timeout_seconds,
             restart: v.restart.map(|r| control::RestartPolicy {
                 max_attempts: r.max_attempts,

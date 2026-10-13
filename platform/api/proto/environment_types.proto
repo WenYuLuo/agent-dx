@@ -94,7 +94,13 @@ message SandboxOptions {
   string extra_config = 9;
 }
 
-message LifecyclePolicy { uint64 idle_timeout_seconds = 1; RestartPolicy restart = 2; }
+enum IdleAction { IDLE_ACTION_DELETE = 0; IDLE_ACTION_PAUSE = 1; }
+enum CheckpointStorage { CHECKPOINT_STORAGE_CONFIGURED = 0; CHECKPOINT_STORAGE_LOCAL = 1; CHECKPOINT_STORAGE_SHARED = 2; }
+message PausePolicy { uint64 ttl_seconds = 1; uint64 timeout_seconds = 2; CheckpointStorage storage = 3; }
+message LifecyclePolicy {
+  uint64 idle_timeout_seconds = 1; RestartPolicy restart = 2;
+  IdleAction idle_action = 3; PausePolicy pause = 4; bool auto_resume = 5;
+}
 
 message RestartPolicy { uint32 max_attempts = 1; uint64 initial_backoff_seconds = 2; uint64 max_backoff_seconds = 3; }
 

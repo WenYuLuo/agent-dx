@@ -17,6 +17,8 @@
 | 11. 节点本地优先创建 | API 节点轮转、共用 Admission 暂留、Coordinator 原子 claim 与中心账本同步、同 ID 收敛 | 本地 Redis/mTLS/HTTPS、真实 sandboxd/runc/Execd 和正式 K8s 八组 |
 | 12. 内置运行环境 | 本地 EROFS 与不可变 OCI 双路径、静态 Execd、PID 1 回收、自定义镜像 bootstrap | standalone EROFS、OCI K8s 三模式；Firecracker 新入口单列验证 |
 
+自动暂停/按流量恢复扩展已实现：复用 idle timeout，匿名恢复点可配置共享存储，手动和流量恢复统一入口、优先原节点及明确拒绝后的跨节点恢复、节点失效保持休眠。新增组件测试覆盖并发唤醒、上传失败、暂停准入及恢复中重启；真实 OBS/Firecracker 与 K8s 验收待运行，不能沿用下述历史验收替代。见 [契约](node-lifecycle.md)。
+
 阶段 1 已完成本地验收：2026-09-15，独立 Lima ARM64 KVM 节点使用真实 OCI 镜像，通过公共 SDK 完成创建、执行、暂停、adxlet 重启、恢复和删除。恢复后内存计数器继续增加、PID 不变、二进制文件一致；Redis 记录为 Deleted 且资源释放，sandboxd 清单与 checkpoint 目录为空。122 项定向 Rust/Redis 测试、Clippy、真实 RPC 与 API Server HTTP 集成通过。详细证据见 [本地验收记录](2026-09-15-checkpoint-acceptance.md)。
 
 阶段 2 已完成本地验收：Lima r7 的 checkpoint 与节点生命周期共 10 项真实 Firecracker 用例通过，141 项 Rust/Redis/HTTP 定向测试、138 项 SDK 单测和 Go 检查通过。契约及证据见 [节点生命周期与降级](node-lifecycle.md)。阶段 3 已完成本地快照与存储验收；阶段4已完成本地故障恢复验收，阶段6已完成本地部署收口验收，阶段7按本轮基础K8s范围完成正式验收，阶段5尚未全部验收完成。本地验收与 Kubernetes Buildkite 分开记录。

@@ -161,6 +161,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Err(error) = recovery_rpc.recover_environments().await {
                 adx_observability::warn!("environment recovery incomplete: {error}");
             }
+            if let Err(error) = recovery_rpc.resume_pending().await {
+                adx_observability::warn!("pending resume reconciliation unavailable: {error}");
+            }
         }
     };
     let collection_rpc = rpc.clone();
@@ -170,6 +173,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tick.tick().await;
             if let Err(error) = collection_rpc.collect_snapshots().await {
                 adx_observability::warn!("snapshot collection incomplete: {error}");
+            }
+            if let Err(error) = collection_rpc.expire_dormant().await {
+                adx_observability::warn!("dormant expiration incomplete: {error}");
             }
             if let Err(error) = collection_rpc
                 .collect_failed(Duration::from_secs(config.failed_retention_seconds))

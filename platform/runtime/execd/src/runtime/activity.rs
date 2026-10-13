@@ -7,6 +7,7 @@ pub fn revision() -> u64 {
 }
 static ACTIVE: AtomicI64 = AtomicI64::new(0);
 static COMMANDS: AtomicI64 = AtomicI64::new(0);
+static ADMISSION: std::sync::Mutex<bool> = std::sync::Mutex::new(true);
 #[derive(Clone, Copy)]
 pub(crate) enum ActivitySource {
     DirectHttp,
@@ -21,6 +22,24 @@ pub(crate) fn enter(_: ActivitySource) -> ActiveGuard {
     ACTIVE.fetch_add(1, Ordering::SeqCst);
     REVISION.fetch_add(1, Ordering::SeqCst);
     ActiveGuard
+}
+pub(crate) fn try_enter(source: ActivitySource) -> adx_core::Result<ActiveGuard> {
+    let admission = ADMISSION.lock().unwrap_or_else(|p| p.into_inner());
+    if !*admission {
+        return Err(adx_core::Error::Conflict);
+    }
+    Ok(enter(source))
+}
+pub(crate) fn quiesce(expected_revision: u64) -> adx_core::Result<()> {
+    let mut admission = ADMISSION.lock().unwrap_or_else(|p| p.into_inner());
+    if active_count() != 0 || revision() != expected_revision {
+        return Err(adx_core::Error::Conflict);
+    }
+    *admission = false;
+    Ok(())
+}
+pub(crate) fn reopen() {
+    *ADMISSION.lock().unwrap_or_else(|p| p.into_inner()) = true;
 }
 impl Drop for ActiveGuard {
     fn drop(&mut self) {

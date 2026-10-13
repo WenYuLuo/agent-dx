@@ -698,7 +698,22 @@ components:
         snapshotId:
           type: string
           description: Tenant-scoped reusable snapshot used to create a new Sandbox.
-        idleTimeoutSeconds: {type: integer, format: int64, minimum: 0}
+        idleTimeoutSeconds:
+          type: integer
+          format: int64
+          minimum: 0
+          default: 0
+          description: Idle observation window; zero disables the action. Not a maximum lifetime.
+        idleAction:
+          type: string
+          enum: [delete, pause]
+          default: delete
+          description: Pause requires positive idleTimeoutSeconds and checkpoint capability.
+        pauseOptions: {$ref: "#/components/schemas/PausePolicy"}
+        autoResume:
+          type: boolean
+          default: false
+          description: Authorized Ingress business traffic shares the manual resume entry; passive subscriptions and probes do not wake paused Sandboxes.
         restartPolicy: {$ref: "#/components/schemas/RestartPolicy"}
         failover:
           type: boolean
@@ -891,11 +906,26 @@ components:
         required_cpu: {type: integer, format: int64, description: CPU millicores}
         required_mem: {type: integer, format: int64, description: Memory MiB}
         image: {type: string}
+    PausePolicy:
+      type: object
+      additionalProperties: false
+      properties:
+        ttlSeconds: {type: integer, format: int64, minimum: 1, default: 90000}
+        timeoutSeconds: {type: integer, format: int64, minimum: 1, maximum: 3600, default: 300}
+        storage:
+          type: string
+          enum: [configured, local, shared]
+          default: configured
+          description: Anonymous pause/workload checkpoint policy. Shared requires complete object-store publication and supports compatible cross-node resume.
     PauseRequest:
       type: object
       additionalProperties: false
       properties:
-        ttlSeconds: {type: integer, format: int64, minimum: 0, default: 90000}
+        ttlSeconds:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Omitted/zero inherits pauseOptions.ttlSeconds, otherwise 90000 seconds; retention begins after publication.
         timeoutSeconds: {type: integer, format: int64, minimum: 1, maximum: 3600, default: 300}
     PauseResult:
       type: object

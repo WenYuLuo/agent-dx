@@ -16,6 +16,7 @@ use tokio::{
     net::UnixStream,
 };
 struct Process {
+    port: u16,
     child: Child,
     temp: tempfile::TempDir,
     writer: Option<std::fs::File>,
@@ -70,6 +71,7 @@ fn start(address: &str) -> Process {
         .spawn()
         .unwrap();
     Process {
+        port,
         child,
         temp,
         writer: Some(writer),
@@ -437,4 +439,92 @@ async fn restored_binary_reconnects_with_target_identity_and_scoped_credential()
         CheckpointPhase::Restored
     );
     assert!(control.status(&original).await.is_err());
+}
+
+#[tokio::test]
+async fn idle_barrier_rejects_inflight_and_stale_activity_and_abort_reopens_http() {
+    let test = setup(None, true).await;
+    test.client.abort();
+    test.hub.disconnect(&identity()).unwrap();
+    let process = start(&test.address);
+    let control = RuntimeControlClient::new(1, Duration::from_secs(2))
+        .unwrap()
+        .with_stream(test.hub.clone());
+    test.hub.wait_ready(&identity()).await.unwrap();
+    let record = record();
+    let idle = control.status(&record).await.unwrap();
+    let mut upload = tokio::net::TcpStream::connect(("127.0.0.1", process.port))
+        .await
+        .unwrap();
+    upload.write_all(format!("POST /upload?path={} HTTP/1.1\r\nHost: localhost\r\nX-Auth: test-http-token\r\nContent-Length: 5\r\nConnection: close\r\n\r\n", process.temp.path().join("payload").display()).as_bytes()).await.unwrap();
+    let active = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let status = control.status(&record).await.unwrap();
+            if status.active_requests != 0 {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(control
+        .prepare_with_idle(
+            &record,
+            "busy",
+            active.revision,
+            Some(active.activity_revision)
+        )
+        .await
+        .is_err());
+    assert_eq!(
+        control.status(&record).await.unwrap().phase,
+        RuntimePhase::Running
+    );
+    upload.write_all(b"hello").await.unwrap();
+    upload.shutdown().await.unwrap();
+    let mut response = Vec::new();
+    upload.read_to_end(&mut response).await.unwrap();
+    let current = control.status(&record).await.unwrap();
+    assert_eq!(current.active_requests, 0);
+    assert!(current.activity_revision > idle.activity_revision);
+    assert!(control
+        .prepare_with_idle(
+            &record,
+            "stale",
+            current.revision,
+            Some(idle.activity_revision)
+        )
+        .await
+        .is_err());
+    let prepared = control
+        .prepare_with_idle(
+            &record,
+            "idle",
+            current.revision,
+            Some(current.activity_revision),
+        )
+        .await
+        .unwrap();
+    let mut blocked = tokio::net::TcpStream::connect(("127.0.0.1", process.port))
+        .await
+        .unwrap();
+    blocked.write_all(b"GET /download?path=/missing HTTP/1.1\r\nHost: localhost\r\nX-Auth: test-http-token\r\nConnection: close\r\n\r\n").await.unwrap();
+    blocked.shutdown().await.unwrap();
+    let mut response = Vec::new();
+    blocked.read_to_end(&mut response).await.unwrap();
+    assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 503"));
+    control
+        .abort_unstarted(&record, "idle", prepared.revision)
+        .await
+        .unwrap();
+    let mut reopened = tokio::net::TcpStream::connect(("127.0.0.1", process.port))
+        .await
+        .unwrap();
+    reopened.write_all(b"GET /download?path=/missing HTTP/1.1\r\nHost: localhost\r\nX-Auth: test-http-token\r\nConnection: close\r\n\r\n").await.unwrap();
+    reopened.shutdown().await.unwrap();
+    let mut response = Vec::new();
+    reopened.read_to_end(&mut response).await.unwrap();
+    assert!(!String::from_utf8_lossy(&response).starts_with("HTTP/1.1 503"));
+    assert!(control.status(&record).await.unwrap().activity_revision > current.activity_revision);
 }

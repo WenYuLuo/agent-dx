@@ -194,9 +194,7 @@ impl ObjectCheckpointStore {
                 .min_by_key(|(_, e)| e.used)
                 .map(|(id, _)| id.clone());
             let Some(id) = candidate else {
-                return Err(Error::Unavailable(
-                    "checkpoint cache budget occupied by active references".into(),
-                ));
+                return Err(Error::NoCapacity);
             };
             let entry = &cache.entries[&id];
             tokio::fs::remove_dir_all(&entry.path)
@@ -343,6 +341,9 @@ fn inventory(root: &Path) -> Result<FileInventory> {
 }
 #[async_trait]
 impl CheckpointStore for ObjectCheckpointStore {
+    fn storage_alias(&self) -> &str {
+        &self.alias
+    }
     async fn allocate(&self) -> Result<PathBuf> {
         self.staging.allocate().await
     }
@@ -525,7 +526,7 @@ impl CheckpointStore for ObjectCheckpointStore {
             ));
         }
         if artifact.size_bytes > self.budget {
-            return Err(Error::Unavailable("checkpoint exceeds cache budget".into()));
+            return Err(Error::NoCapacity);
         }
         let manifest = self.manifest(artifact).await?;
         Self::trim(&mut cache, self.budget - artifact.size_bytes).await?;

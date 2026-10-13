@@ -168,6 +168,7 @@ async fn prepare_and_completion_use_the_stream_and_reconnect_preserves_pending_r
         .request(
             &identity(),
             ControlOperation::Prepare(PrepareCheckpoint {
+                idle_revision: None,
                 identity: identity(),
                 operation_id: "save".into(),
                 expected_revision: status.revision,

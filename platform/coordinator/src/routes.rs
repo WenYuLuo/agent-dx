@@ -14,7 +14,7 @@ use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 fn security(value: adx_core::sandbox::DataPlaneSecurityMode) -> i32 {
-    match value {
+    match value.effective() {
         // The current deployment default is tls-token. Resolve inheritance at
         // publication so every Ingress sees one authoritative per-environment mode.
         adx_core::sandbox::DataPlaneSecurityMode::Inherit => {

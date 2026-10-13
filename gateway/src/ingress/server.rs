@@ -419,9 +419,28 @@ impl Ingress {
         tenant_id: &str,
     ) -> Result<IngressStream, IngressOpenError> {
         self.authorize(&route, tenant_id)?;
+        let route = self.prepare_route(route, tenant_id).await?;
         self.open_authorized_stream(route)
             .await
             .map_err(IngressOpenError::Connect)
+    }
+    pub(super) async fn prepare_route(
+        &self,
+        route: RouteHandle,
+        tenant_id: &str,
+    ) -> Result<RouteHandle, IngressOpenError> {
+        self.authorize(&route, tenant_id)?;
+        if !route.needs_resume {
+            return Ok(route);
+        }
+        let ready = self.resolver.wake(&route).await?;
+        self.authorize(&ready, tenant_id)?;
+        if ready.tunnel_security_mode != route.tunnel_security_mode
+            || ready.port_forward_auth_mode != route.port_forward_auth_mode
+        {
+            return Err(IngressOpenError::Forbidden);
+        }
+        Ok(ready)
     }
 
     pub(super) async fn open_authorized_stream(
@@ -437,6 +456,12 @@ impl Ingress {
         route: RouteHandle,
         passive: bool,
     ) -> io::Result<IngressStream> {
+        if passive && route.needs_resume {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "passive watch cannot wake a sandbox",
+            ));
+        }
         let error = match self.open_current_stream(route.clone(), passive).await {
             Ok(stream) => return Ok(stream),
             Err(error) => error,
@@ -453,6 +478,10 @@ impl Ingress {
         // only for a replacement binding, then open once against that execution.
         let replacement = match self.resolver.replacement(&route).await {
             Ok(replacement) => replacement,
+            Err(_) if !passive => match self.resolver.wake(&route).await {
+                Ok(route) => route,
+                Err(_) => return Err(error),
+            },
             Err(_) => return Err(error),
         };
         if replacement.tenant_id != route.tenant_id
@@ -1655,6 +1684,23 @@ impl Ingress {
                 }
             }
         }
+        if matches!(request.uri().path(), "/healthz" | "/metrics") {
+            if let Err(error) = self.authorize(&route, &tenant_id) {
+                return Ok(error_response(error));
+            }
+            if route.needs_resume {
+                return Ok(plain(StatusCode::SERVICE_UNAVAILABLE, "Sandbox is paused"));
+            }
+            // Probe connections stay passive even when Relay rejects a stale
+            // binding. Do not pool them with business connections or demand wake.
+            let stream = match self.open_authorized_stream_with_activity(route, true).await {
+                Ok(stream) => stream,
+                Err(error) => return Ok(error_response(IngressOpenError::Connect(error))),
+            };
+            let cancelled = stream.cancelled.clone();
+            return Ok(proxy_http(request, stream, "sandbox", Some(cancelled)).await);
+        }
+
         let upgrade_requested = request.headers().contains_key(header::UPGRADE);
         if upgrade_requested {
             let stream = match self.open_resolved_stream(route, &tenant_id).await {
@@ -1670,6 +1716,10 @@ impl Ingress {
         if let Err(error) = self.authorize(&route, &tenant_id) {
             return Ok(error_response(error));
         }
+        let route = match self.prepare_route(route, &tenant_id).await {
+            Ok(route) => route,
+            Err(error) => return Err((error_response(error), request)),
+        };
         if !self.resolver.route_is_current(&route) {
             return Err((error_response(IngressOpenError::RouteChanged), request));
         }
@@ -2680,6 +2730,7 @@ mod tests {
 
     fn route(tunnel: DataPlaneSecurityMode, port_forward: DataPlaneAuthMode) -> RouteHandle {
         RouteHandle {
+            needs_resume: false,
             access_kind: AccessKind::Direct,
             relay_address: "node:8443".into(),
             tenant_id: "tenant-a".into(),

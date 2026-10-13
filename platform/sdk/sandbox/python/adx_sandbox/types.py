@@ -17,6 +17,29 @@ ADX_GET_TIMEOUT_BUFFER = 30
 
 
 @dataclass(frozen=True)
+class PausePolicy:
+    """Anonymous recovery-point retention and publication policy.
+
+    shared requires the node's object store (including an OBS endpoint).
+    """
+
+    ttl_seconds: int = 90_000
+    timeout_seconds: int = 300
+    storage: str = "configured"
+
+    def __post_init__(self):
+        for name, maximum in (("ttl_seconds", (1 << 64) - 1), ("timeout_seconds", 3600)):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or not 0 < value <= maximum:
+                raise ValueError(f"{name} must be a positive integer at most {maximum}")
+        if self.storage not in ("configured", "local", "shared"):
+            raise ValueError("storage must be configured, local, or shared")
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"ttlSeconds": self.ttl_seconds, "timeoutSeconds": self.timeout_seconds, "storage": self.storage}
+
+
+@dataclass(frozen=True)
 class RestartPolicy:
     """Bounded node-local restart after an unexpected runtime exit."""
 

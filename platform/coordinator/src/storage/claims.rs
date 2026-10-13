@@ -153,6 +153,7 @@ impl Session {
             };
             let generation = header.generation.checked_add(1).ok_or(Error::Conflict)?;
             let record = StoredEnvironment {
+                resume: None,
                 failed_since_unix_seconds: None,
                 recovery: None,
                 invalidated: false,
@@ -299,6 +300,7 @@ impl Session {
                     header.generation = generation;
                     header.advance()?;
                     let record = StoredEnvironment {
+                        resume: None,
                         failed_since_unix_seconds: None,
                         recovery: None,
                         invalidated: false,
