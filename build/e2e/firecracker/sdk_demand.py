@@ -404,7 +404,7 @@ try:
 
     sandbox = create()
     baseline = request(sandbox)
-    pause = sandbox.pause(retention=RetentionPolicy.for_seconds(15), timeout_seconds=1800)
+    pause = sandbox.pause(retention=RetentionPolicy.for_seconds(45), timeout_seconds=1800)
     paused(sandbox)
     blocked = block('node1', 50090)
     try:
