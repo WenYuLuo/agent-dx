@@ -1789,3 +1789,69 @@ async fn traffic_during_capture_waits_then_resumes_without_replaying_capture() {
     );
     assert_eq!(events.iter().filter(|e| e.as_str() == "restore").count(), 1);
 }
+
+#[tokio::test]
+async fn retired_controller_reclaims_unreferenced_shared_checkpoint() {
+    retired_shared_checkpoint(Some(false)).await;
+}
+#[tokio::test]
+async fn retired_controller_preserves_shared_checkpoint_used_by_another_node() {
+    retired_shared_checkpoint(Some(true)).await;
+}
+#[tokio::test]
+async fn retired_controller_preserves_shared_checkpoint_without_global_catalog() {
+    retired_shared_checkpoint(None).await;
+}
+async fn retired_shared_checkpoint(retained: Option<bool>) {
+    use adxlet::checkpoint::{CheckpointStore, ObjectCheckpointStore};
+    let (temp, backend, _, mut spec, assignment) = fixture();
+    let store = Arc::new(
+        ObjectCheckpointStore::new(
+            "shared".into(),
+            Arc::new(object_store::memory::InMemory::new()),
+            "test".into(),
+            temp.path().into(),
+            1024,
+        )
+        .unwrap(),
+    );
+    spec.lifecycle.pause = Some(adx_core::lifecycle::PausePolicy {
+        storage: adx_core::lifecycle::CheckpointStorage::Shared,
+        ..Default::default()
+    });
+    let node = Adxlet::new(
+        "node".into(),
+        backend.clone(),
+        backend.clone(),
+        backend.clone(),
+        backend.clone(),
+    )
+    .with_checkpointing(store.clone(), backend)
+    .unwrap();
+    node.update_capacity(spec.resources, Duration::from_secs(60))
+        .unwrap();
+    let handle = node.environment(spec, assignment).unwrap();
+    let created = handle.create().await.unwrap();
+    let paused = handle.pause(pause(created.record.revision)).await.unwrap();
+    let artifact = paused.record.checkpoint.unwrap().artifact;
+    store.validate_artifact(&artifact).await.unwrap();
+    if let Some(retained) = retained {
+        node.reconcile_retained(
+            vec![],
+            vec![],
+            if retained {
+                vec![artifact.clone()]
+            } else {
+                vec![]
+            },
+        )
+        .await
+        .unwrap();
+    } else {
+        node.reconcile_catalog(vec![], vec![]).await.unwrap();
+    }
+    assert_eq!(
+        store.validate_artifact(&artifact).await.is_ok(),
+        retained != Some(false)
+    );
+}

@@ -3,7 +3,7 @@ use adx_core::{
     Assignment, EnvironmentRecord, EnvironmentSpec, EnvironmentState, Error, Event, LifecycleKind,
     Result,
 };
-use std::{sync::Arc, time::Instant};
+use std::{collections::BTreeSet, sync::Arc, time::Instant};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 
@@ -12,6 +12,8 @@ mod monitor;
 mod snapshots;
 mod workload_checkpoint;
 use super::checkpoint::{PauseRequest, ResumeRequest};
+
+pub(super) type CheckpointReferences = BTreeSet<(String, String)>;
 
 enum Command {
     Snapshot(
@@ -38,7 +40,10 @@ enum Command {
     Sync,
     Reconcile,
     AlignAuthority(Box<EnvironmentRecord>, oneshot::Sender<Result<()>>),
-    Discard(oneshot::Sender<Result<()>>),
+    Discard(
+        Option<Arc<CheckpointReferences>>,
+        oneshot::Sender<Result<()>>,
+    ),
     Expire(u64, oneshot::Sender<Result<Option<OperationResult>>>),
     Tick(oneshot::Sender<Result<Option<OperationResult>>>),
     RuntimeEvent(
@@ -162,11 +167,14 @@ impl EnvironmentHandle {
         rx.await
             .map_err(|_| Error::Unavailable("environment controller stopped".into()))?
     }
-    pub(crate) async fn discard(&self) -> Result<()> {
+    pub(crate) async fn discard(
+        &self,
+        references: Option<Arc<CheckpointReferences>>,
+    ) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         let (unused, _) = oneshot::channel();
         self.tx
-            .send(Envelope::new(Command::Discard(tx), unused))
+            .send(Envelope::new(Command::Discard(references, tx), unused))
             .await
             .map_err(|_| Error::Unavailable("environment controller stopped".into()))?;
         rx.await
@@ -327,15 +335,8 @@ impl Controller {
                 let _ = ack.send(result);
                 return;
             }
-            Command::Discard(ack) => {
-                let result = if self.retired {
-                    Ok(())
-                } else {
-                    self.cleanup().await
-                };
-                if result.is_ok() {
-                    self.retired = true;
-                }
+            Command::Discard(references, ack) => {
+                let result = self.discard_execution(references.as_deref()).await;
                 let _ = ack.send(result);
                 return;
             }
@@ -362,7 +363,7 @@ impl Controller {
         let result = match command {
             Command::Snapshot(_, _)
             | Command::AlignAuthority(_, _)
-            | Command::Discard(_)
+            | Command::Discard(_, _)
             | Command::Expire(_, _)
             | Command::Tick(_)
             | Command::RuntimeEvent(_, _) => unreachable!(),
@@ -446,6 +447,36 @@ struct Controller {
 }
 
 impl Controller {
+    async fn discard_execution(&mut self, references: Option<&CheckpointReferences>) -> Result<()> {
+        if !self.retired {
+            self.cleanup().await?;
+            // Stop accepting serial operations before deleting retired artifacts.
+            // A failed object deletion is retried without republishing old state.
+            self.retired = true;
+        }
+        let Some(references) = references else {
+            return Ok(());
+        };
+        let Some(checkpoint) = &self.services.checkpoint else {
+            return Ok(());
+        };
+        if let Some(cp) = self.record.checkpoint.as_ref() {
+            let key = (cp.artifact.storage.clone(), cp.artifact.location.clone());
+            if !references.contains(&key) {
+                checkpoint.store.remove(&cp.artifact).await?;
+                self.record.checkpoint = None;
+            }
+        }
+        while let Some(artifact) = self.obsolete_checkpoints.last() {
+            let key = (artifact.storage.clone(), artifact.location.clone());
+            if !references.contains(&key) {
+                checkpoint.store.remove(artifact).await?;
+            }
+            self.obsolete_checkpoints.pop();
+        }
+        Ok(())
+    }
+
     async fn align_authority(&mut self, mut record: EnvironmentRecord) -> Result<()> {
         if self.retired
             || record.spec != self.record.spec
