@@ -21,23 +21,23 @@ use afs_protocol::meta::{
     DfsSetXattrReply, DfsSetXattrRequest, DfsSpecialNode as PbDfsSpecialNode,
     DfsSpecialNodeKind as PbDfsSpecialNodeKind, DfsSymlinkReply, DfsSymlinkRequest, DfsUnlinkReply,
     DfsUnlinkRequest, DfsWriteLeaseReply, DfsXattrRecord as PbDfsXattrRecord,
-    DfsXattrSetMode as PbDfsXattrSetMode, GetDfsChunkSourcesReply, GetDfsChunkSourcesRequest,
-    GetDfsInodeReply, GetDfsInodeRequest, GetDfsPlacementSnapshotReply,
-    GetDfsPlacementSnapshotRequest, GetFileVersionReply, GetFileVersionRequest,
-    ListOwnerRootsReply, ListOwnerRootsRequest, LookupNodeReply, LookupNodeRequest,
-    LookupRootReply, LookupRootRequest, MetaBackendPersistence, NodeDescriptor, NodeEndpoint,
-    OpenDfsWriteReply, OpenDfsWriteRequest, PingReply, PingRequest, PollRootCommandBatchRequest,
-    PresentedRootAccess, RecoverRootReply, RecoverRootRequest, RegisterNodeReply,
-    RegisterNodeRequest, RenewDfsWriteLeaseRequest, ReserveRootReply, ReserveRootRequest,
-    ResolveDfsLockAuthorityReply, ResolveDfsLockAuthorityRequest, ResolveDfsWriteAuthorityReply,
-    ResolveDfsWriteAuthorityRequest, RootCommand, RootCommandBatchCompacted,
-    RootCommandBatchEvents, RootCommandBatchReply, RootCommandBatchUnsupported,
-    RootCommandRecoveryCursor, RootCommandRecoveryReason, RootCommandType, RootLocation,
-    RootReservation, RootRight as PbRootRight, SyncDfsInodeMetadataReply,
-    SyncDfsInodeMetadataRequest, ValidateDfsReplicaWriteReply, ValidateDfsReplicaWriteRequest,
-    ValidateRootAccessReply, ValidateRootAccessRequest, WatchRootCommandsRequest,
-    dfs_meta_server::DfsMeta as DfsMetaService, meta_server::Meta as MetaService,
-    owner_roots_server::OwnerRoots as OwnerRootsService,
+    DfsXattrSetMode as PbDfsXattrSetMode, DeactivateRootReply, DeactivateRootRequest,
+    GetDfsChunkSourcesReply, GetDfsChunkSourcesRequest, GetDfsInodeReply, GetDfsInodeRequest,
+    GetDfsPlacementSnapshotReply, GetDfsPlacementSnapshotRequest, GetFileVersionReply,
+    GetFileVersionRequest, ListOwnerRootsReply, ListOwnerRootsRequest, LookupNodeReply,
+    LookupNodeRequest, LookupRootReply, LookupRootRequest, MetaBackendPersistence, NodeDescriptor,
+    NodeEndpoint, OpenDfsWriteReply, OpenDfsWriteRequest, PingReply, PingRequest,
+    PollRootCommandBatchRequest, PresentedRootAccess, RecoverRootReply, RecoverRootRequest,
+    RegisterNodeReply, RegisterNodeRequest, RenewDfsWriteLeaseRequest, ReserveRootReply,
+    ReserveRootRequest, ResolveDfsLockAuthorityReply, ResolveDfsLockAuthorityRequest,
+    ResolveDfsWriteAuthorityReply, ResolveDfsWriteAuthorityRequest, RootCommand,
+    RootCommandBatchCompacted, RootCommandBatchEvents, RootCommandBatchReply,
+    RootCommandBatchUnsupported, RootCommandRecoveryCursor, RootCommandRecoveryReason,
+    RootCommandType, RootLocation, RootReservation, RootRight as PbRootRight,
+    SyncDfsInodeMetadataReply, SyncDfsInodeMetadataRequest, ValidateDfsReplicaWriteReply,
+    ValidateDfsReplicaWriteRequest, ValidateRootAccessReply, ValidateRootAccessRequest,
+    WatchRootCommandsRequest, dfs_meta_server::DfsMeta as DfsMetaService,
+    meta_server::Meta as MetaService, owner_roots_server::OwnerRoots as OwnerRootsService,
 };
 use std::{pin::Pin, sync::Arc, time::Duration};
 use tokio_stream::Stream;
@@ -557,6 +557,32 @@ impl OwnerRootsService for OwnerRootsRpc {
             .await
             .map_err(afs_transport::grpc::error_status::error_to_status)?;
         Ok(Response::new(AbortRootReply {}))
+    }
+
+    async fn deactivate_root(
+        &self,
+        request: Request<DeactivateRootRequest>,
+    ) -> Result<Response<DeactivateRootReply>, Status> {
+        let authenticated = authenticated_node_id(&self.0, &request)?;
+        let request = request.into_inner();
+        require_text(&request.request_id, "request_id")?;
+        require_text(&request.root_id, "root_id")?;
+        require_text(&request.home_node_id, "home_node_id")?;
+        require_text(&request.home_session_id, "home_session_id")?;
+        self.0
+            .owner_roots
+            .deactivate_root(super::owner_roots::DeactivateRootInput {
+                request_id: request.request_id,
+                root_id: request.root_id,
+                root_epoch: request.root_epoch,
+                home_node_id: request.home_node_id,
+                home_session_id: request.home_session_id,
+                reason: request.reason,
+                authenticated_home_node_id: authenticated,
+            })
+            .await
+            .map_err(afs_transport::grpc::error_status::error_to_status)?;
+        Ok(Response::new(DeactivateRootReply {}))
     }
 
     async fn lookup_root(

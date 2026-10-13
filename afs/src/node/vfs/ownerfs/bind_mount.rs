@@ -126,6 +126,15 @@ mod linux {
         pub(in crate::node) fn detach(&mut self) -> io::Result<()> {
             self.export.detach()
         }
+
+        /// D4 方案 B: 以显式 flags 分离 bind mount。
+        ///
+        /// `MNT_DETACH` 立即把挂载从 namespace 分离，不等待已打开的 fd；
+        /// 底层的实际释放延后到最后一个 fd 关闭。调用方负责在独立线程中
+        /// 执行，避免在 FUSE 回调内做可能重入的 syscall。
+        pub(in crate::node) fn detach_with_flags(&mut self, flags: i32) -> io::Result<()> {
+            self.export.detach_with_flags(flags)
+        }
     }
 
     fn is_fuse_mount(file: &File) -> io::Result<bool> {
@@ -304,6 +313,27 @@ mod linux {
             if self.inspect()?.is_some() {
                 return Err(errno(libc::ESTALE));
             }
+            self.activated = false;
+            Ok(())
+        }
+
+        /// D4 方案 B: 与 [`Self::detach`] 相同的所有权校验，但以显式 flags
+        /// 卸载。`MNT_DETACH` 立即从 namespace 移除挂载，不等待已打开的 fd。
+        pub(in crate::node) fn detach_with_flags(&mut self, flags: i32) -> io::Result<()> {
+            if !self.activated {
+                if self.inspect()?.is_none() {
+                    return Ok(());
+                }
+                return Err(errno(libc::ESTALE));
+            }
+            let mount = self.mount_identity()?;
+            if directory_identity(&self.source)? != self.source_identity {
+                return Err(errno(libc::ESTALE));
+            }
+            if self.inspect()?.as_ref() != Some(&mount) {
+                return Err(errno(libc::ESTALE));
+            }
+            unmount_with_flags(&self.target_proc_path()?, flags)?;
             self.activated = false;
             Ok(())
         }
@@ -773,6 +803,18 @@ mod linux {
     fn normal_unmount(path: &std::ffi::CStr) -> io::Result<()> {
         // SAFETY: path is NUL-terminated and live. Flags 0 request normal unmount.
         let result = unsafe { libc::umount2(path.as_ptr(), 0) };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    #[allow(unsafe_code)]
+    fn unmount_with_flags(path: &std::ffi::CStr, flags: i32) -> io::Result<()> {
+        // SAFETY: path is NUL-terminated and live. Flags select the unmount
+        // mode; MNT_DETACH separates the mount without waiting for open FDs.
+        let result = unsafe { libc::umount2(path.as_ptr(), flags) };
         if result == 0 {
             Ok(())
         } else {

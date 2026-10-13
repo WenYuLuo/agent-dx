@@ -19,6 +19,7 @@ pub trait OwnerRootAuthority: Send + Sync {
     fn reserve_root(&self, input: ReserveRootInput) -> MetaFuture<'_, ReserveRootOutput>;
     fn activate_root(&self, input: ActivateRootInput) -> MetaFuture<'_, RootAccessGrant>;
     fn abort_root(&self, input: AbortRootInput) -> MetaFuture<'_, ()>;
+    fn deactivate_root(&self, input: DeactivateRootInput) -> MetaFuture<'_, ()>;
     fn lookup_root(&self, input: LookupRootInput) -> MetaFuture<'_, Option<RootRecord>>;
     fn list_owner_roots(&self, input: ListOwnerRootsInput) -> MetaFuture<'_, ListOwnerRootsOutput>;
     fn acquire_root(&self, input: AcquireRootInput) -> MetaFuture<'_, RootAccessGrant>;
@@ -50,6 +51,10 @@ impl OwnerRootAuthority for MissingOwnerRootAuthority {
     }
 
     fn abort_root(&self, _input: AbortRootInput) -> MetaFuture<'_, ()> {
+        Box::pin(async { Err(unavailable_meta_store()) })
+    }
+
+    fn deactivate_root(&self, _input: DeactivateRootInput) -> MetaFuture<'_, ()> {
         Box::pin(async { Err(unavailable_meta_store()) })
     }
 
@@ -296,6 +301,105 @@ impl OwnerRootAuthority for StoreOwnerRootAuthority {
                     result: OperationResult::Empty,
                 }),
             ]);
+            let _ = commit_or_replay(self.store.as_ref(), txn).await?;
+            Ok(())
+        })
+    }
+
+    fn deactivate_root(&self, input: DeactivateRootInput) -> MetaFuture<'_, ()> {
+        Box::pin(async move {
+            let snapshot = self
+                .store
+                .read(MetaRead::Root {
+                    root_id: input.root_id.clone(),
+                })
+                .await?;
+            let Some(MetaEntity::Root(root)) = snapshot.entity else {
+                // 幂等：root 已不在 Meta active 列表。
+                return Ok(());
+            };
+            if root.root_epoch != input.root_epoch {
+                return Err(invalid("deactivate root epoch does not match durable root"));
+            }
+            if root.home_node_id != input.home_node_id
+                || root.home_session_id != input.home_session_id
+            {
+                return Err(invalid("deactivate caller does not match durable root"));
+            }
+            if let Some(authenticated) = &input.authenticated_home_node_id
+                && authenticated != &root.home_node_id
+            {
+                return Err(permission_denied(format!(
+                    "authenticated node {authenticated} does not match root home {}",
+                    root.home_node_id
+                )));
+            }
+            let grants = self
+                .store
+                .read(MetaRead::RootGrants {
+                    root_id: root.root_id.clone(),
+                })
+                .await?;
+            let home_generation = grants.entities.iter().find_map(|entity| match entity {
+                MetaEntity::RootGrant(grant)
+                    if grant.holder_node_id == root.home_node_id
+                        && grant.root_epoch == root.root_epoch =>
+                {
+                    Some(grant.access_generation)
+                }
+                _ => None,
+            });
+            let key = request_key(
+                format!("{}/{}", root.home_node_id, root.home_session_id),
+                input.request_id.clone(),
+            );
+            let mut txn = MetaTxn::new(key.clone(), StoreOperation::DeactivateRoot);
+            txn.conditions.extend([
+                TxnCondition::RequestAbsent(key),
+                TxnCondition::NodeSessionCurrent {
+                    node_id: root.home_node_id.clone(),
+                    session_id: root.home_session_id.clone(),
+                },
+                TxnCondition::EntityEquals(MetaEntity::Root(root.clone())),
+            ]);
+            txn.mutations
+                .push(TxnMutation::Delete(MetaKey::Root {
+                    root_id: root.root_id.clone(),
+                }));
+            for entity in &grants.entities {
+                if let MetaEntity::RootGrant(grant) = entity {
+                    txn.mutations.push(TxnMutation::Delete(MetaKey::RootGrant {
+                        root_id: grant.root_id.clone(),
+                        holder_node_id: grant.holder_node_id.clone(),
+                        holder_session_id: grant.holder_session_id.clone(),
+                    }));
+                }
+            }
+            if let Some(access_generation) = home_generation {
+                // 写 REVOKE_ACCESS 命令，让各 holder 的 watch/poll 收到撤权事实；
+                // Home 对未知/已删 root 的 revoke 匹配返回 Ok(false)，不会卡住 poll。
+                txn.mutations.push(TxnMutation::Put(MetaEntity::RootCommand(
+                    RootCommandRecord {
+                        command_id: format!(
+                            "deactivate:{}:{}:{}",
+                            root.root_id, root.root_epoch, input.request_id
+                        ),
+                        home_node_id: root.home_node_id.clone(),
+                        home_session_id: root.home_session_id.clone(),
+                        root_id: root.root_id.clone(),
+                        root_epoch: root.root_epoch,
+                        old_access_generation: access_generation,
+                        command_type: RootCommandType::RevokeAccess,
+                    },
+                )));
+            }
+            txn.mutations.push(TxnMutation::RecordRequestOutcome(
+                super::store::RequestOutcome {
+                    request: txn.request.clone(),
+                    operation: txn.operation,
+                    result: OperationResult::Empty,
+                },
+            ));
             let _ = commit_or_replay(self.store.as_ref(), txn).await?;
             Ok(())
         })
@@ -730,6 +834,16 @@ pub struct AbortRootInput {
     pub session_id: String,
     pub create_intent_id: String,
     pub prepare_token: String,
+    pub authenticated_home_node_id: Option<String>,
+}
+
+pub struct DeactivateRootInput {
+    pub request_id: String,
+    pub root_id: String,
+    pub root_epoch: u64,
+    pub home_node_id: String,
+    pub home_session_id: String,
+    pub reason: String,
     pub authenticated_home_node_id: Option<String>,
 }
 

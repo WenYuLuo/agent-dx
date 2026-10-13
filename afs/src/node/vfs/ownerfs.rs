@@ -106,6 +106,13 @@ impl PrivateFuseCache {
             native_home_roots: HashMap::new(),
         }
     }
+
+    /// D4: root 删除后移除共享缓存策略与 native home 索引。幂等：root 不在
+    /// 任一集合中时无操作。
+    fn remove_root(&mut self, root_id: &RootId) {
+        self.shared_roots.remove(root_id);
+        self.native_home_roots.remove(root_id);
+    }
 }
 
 impl Default for OwnerFs {
@@ -316,6 +323,22 @@ impl OwnerFs {
                 "OwnerFs local file operations are not wired in this VFS instance",
             )
         })
+    }
+
+    /// D4 方案 A: 管理 API 显式删除 root，不经过 FUSE/VFS 路径。
+    ///
+    /// 执行与 FUSE root rmdir 相同的完整删除流程（§2.1 公共部分），
+    /// 不受 bind mount EBUSY 限制。
+    pub(in crate::node) fn delete_root(&self, name: &OsStr) -> Result<()> {
+        afs_logging::info!("ownerfs.delete_root.start"; "name" => ?name);
+        let result = self.require_local().and_then(|local| local.rmdir_root(name));
+        match &result {
+            Ok(()) => afs_logging::info!("ownerfs.delete_root.completed"; "name" => ?name),
+            Err(error) => {
+                afs_logging::info!("ownerfs.delete_root.failed"; "name" => ?name, "error" => ?error)
+            }
+        }
+        result
     }
 
     /// Build a Home-side file executor for the P2P OwnerFiles service.
@@ -4752,10 +4775,17 @@ impl LocalOwnerFs {
                 &replacement,
             )?;
         }
+        // D4 方案 B: root 直接子项删除后若 root 已空，异步 lazy unmount bind，
+        // 让随后的 root rmdir 能到达 FUSE。
+        self.maybe_lazy_unmount_empty_root(&parent_record, &root_use)?;
         Ok(())
     }
 
     fn rmdir(&self, ctx: &RequestContext, parent: BackendInode, name: &OsStr) -> Result<()> {
+        // D4: root 级别 rmdir 触发完整 root 删除流程。
+        if parent.value == OWNERFS_ROOT_INODE {
+            return self.rmdir_root(name);
+        }
         let parent_record = self.directory_record(parent)?;
         let child = parent_record
             .relative
@@ -4794,6 +4824,88 @@ impl LocalOwnerFs {
         self.disk.remove_dir(&physical).map_err(Error::from)?;
         let mut state = self.state.lock().map_err(|_| poisoned())?;
         state.remove_path(&parent_record.root_id, child);
+        drop(state);
+        // D4 方案 B: root 直接子项删除后若 root 已空，异步 lazy unmount bind，
+        // 让随后的 root rmdir 能到达 FUSE。
+        self.maybe_lazy_unmount_empty_root(&parent_record, &root_use)?;
+        Ok(())
+    }
+
+    /// D4: 删除整个 root 目录（spec §5.4）。
+    ///
+    /// 顺序：解析 root_id → 卸载 bind mount → RootManager::delete_root
+    /// （revoke → 缓存移除 → Meta deactivate → catalog → 物理目录）→
+    /// OwnerState 索引清理 → PrivateFuseCache 清理。任一步失败时后续步骤
+    /// 不再执行，残留记录由 reconcile_on_startup 的 zombie 检测在下一次
+    /// 启动时清理。
+    fn rmdir_root(&self, name: &OsStr) -> Result<()> {
+        // 1. 解析 root_id。并发 rmdir 的第二个调用在这里已找不到 name
+        //    条目（第一个调用完成 state.remove_root 后），返回 ENOENT，
+        //    与 delete_root 的缓存移除线性化点一致。
+        let root_id = {
+            let state = self.state.lock().map_err(|_| poisoned())?;
+            let inode = state
+                .root_names
+                .get(name)
+                .ok_or_else(|| Error::coded(afs_error::NODE_VFS_NOT_FOUND, "root name not found"))?;
+            state
+                .inodes
+                .get(inode)
+                .ok_or_else(|| stale("root inode not found"))?
+                .root_id
+                .clone()
+        };
+        afs_logging::info!("ownerfs.rmdir_root.resolved"; "name" => ?name, "root_id" => ?root_id);
+
+        // 2. 卸载活跃 bind mount。EBUSY（仍有活跃 fd）只记录日志，
+        //    不阻塞删除；物理目录删除失败时由下次启动的 reconcile 重试。
+        if let Some(mm) = &self.mount_manager {
+            mm.request_unmount(&root_id)?;
+        }
+        afs_logging::info!("ownerfs.rmdir_root.unmounted"; "root_id" => ?root_id);
+
+        // 3. RootManager::delete_root（revoke → 缓存移除 → Meta deactivate
+        //    → catalog 条目 → 物理目录）。
+        self.roots.delete_root(&root_id)?;
+        afs_logging::info!("ownerfs.rmdir_root.root_deleted"; "root_id" => ?root_id);
+
+        // 4. 清除 OwnerState 中的 FUSE 索引。
+        {
+            let mut state = self.state.lock().map_err(|_| poisoned())?;
+            state.remove_root(&root_id);
+        }
+        afs_logging::info!("ownerfs.rmdir_root.state_cleaned"; "root_id" => ?root_id);
+
+        // 5. 清除 PrivateFuseCache 中的共享缓存与 native home 索引。
+        {
+            let mut cache = self
+                .private_cache
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            cache.remove_root(&root_id);
+        }
+        afs_logging::info!("ownerfs.rmdir_root.cache_cleaned"; "root_id" => ?root_id);
+
+        Ok(())
+    }
+
+    /// D4 方案 B: root 的直接子项被删除后，若 root 物理目录已空，异步触发
+    /// bind mount 的 lazy unmount（MNT_DETACH），使随后的 root rmdir 能到达
+    /// FUSE 并触发完整删除流程（spec §3 B.2）。
+    fn maybe_lazy_unmount_empty_root(
+        &self,
+        parent_record: &NodeRecord,
+        root_use: &root::RootUse,
+    ) -> Result<()> {
+        if !parent_record.relative.is_root() {
+            return Ok(());
+        }
+        let remaining = self.disk.read_dir(root_use.data_dir()).map_err(Error::from)?;
+        if remaining.is_empty()
+            && let Some(mm) = &self.mount_manager
+        {
+            mm.request_lazy_unmount(&parent_record.root_id)?;
+        }
         Ok(())
     }
 
@@ -5534,6 +5646,31 @@ impl OwnerState {
         );
         self.attach_path(&root_id, relative, inode);
         inode
+    }
+
+    /// D4: 清除与 root 关联的全部 FUSE 索引。
+    ///
+    /// 已打开的 file/dir handle 不强制关闭；FUSE release/releasedir 在 fd
+    /// 关闭时正常走完。root_id 不在 state 中时是无操作。
+    fn remove_root(&mut self, root_id: &RootId) {
+        let root_inodes: Vec<u64> = self
+            .inodes
+            .iter()
+            .filter(|(_, record)| &record.root_id == root_id)
+            .map(|(&inode, _)| inode)
+            .collect();
+        if root_inodes.is_empty() {
+            return;
+        }
+        for inode in &root_inodes {
+            self.inodes.remove(inode);
+            self.aliases.remove(inode);
+        }
+        self.root_names.retain(|_, inode| !root_inodes.contains(inode));
+        self.paths.retain(|(rid, _), _| rid != root_id);
+        self.subtrees.remove(root_id);
+        self.identity_members.retain(|(rid, _), _| rid != root_id);
+        self.identities.retain(|(rid, _), _| rid != root_id);
     }
 
     fn inode_for_path(
@@ -7280,6 +7417,17 @@ mod tests {
             Ok(())
         }
 
+        fn deactivate_root(
+            &self,
+            root_id: &RootId,
+            _: u64,
+            _: &str,
+            _: &str,
+        ) -> Result<()> {
+            self.active.lock().unwrap().remove(root_id);
+            Ok(())
+        }
+
         fn lookup_root(&self, _: &RootId) -> Result<Option<root::RootLocation>> {
             Ok(None)
         }
@@ -7385,6 +7533,16 @@ mod tests {
 
         fn abort_root(&self, _: &RootReservation) -> Result<()> {
             Ok(())
+        }
+
+        fn deactivate_root(
+            &self,
+            _: &RootId,
+            _: u64,
+            _: &str,
+            _: &str,
+        ) -> Result<()> {
+            Err(Error::coded(afs_error::NODE_VFS_UNIMPLEMENTED, "test"))
         }
 
         fn lookup_root(&self, id: &RootId) -> Result<Option<root::RootLocation>> {

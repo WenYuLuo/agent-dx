@@ -75,6 +75,17 @@ impl RootMeta for NativeHomeMeta {
         Ok(())
     }
 
+    fn deactivate_root(
+        &self,
+        root_id: &RootId,
+        _: u64,
+        _: &str,
+        _: &str,
+    ) -> Result<()> {
+        self.active.lock().unwrap().remove(root_id);
+        Ok(())
+    }
+
     fn lookup_root(&self, id: &RootId) -> Result<Option<RootLocation>> {
         Ok(self.active.lock().unwrap().get(id).cloned())
     }

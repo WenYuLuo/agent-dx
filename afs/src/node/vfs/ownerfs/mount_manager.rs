@@ -8,6 +8,7 @@
 use std::{
     collections::HashMap,
     ffi::OsString,
+    io,
     path::PathBuf,
     sync::{Arc, Mutex, Weak},
     thread,
@@ -126,6 +127,49 @@ impl MountManager {
         for entry in entries {
             Self::detach_entry(&entry);
         }
+    }
+
+    /// D4: 删除流程的卸载步骤——从 entries 移除该 root 并 detach 活跃 bind。
+    ///
+    /// 幂等：root_id 不在 entries 中时返回 Ok(())。detach 失败（如 EBUSY，
+    /// 仍有活跃 fd 引用 bind mount）只记录日志，不阻塞删除流程；物理目录
+    /// 删除可能随后失败，由 reconcile_on_startup 在下次启动时重试。
+    pub(in crate::node) fn request_unmount(&self, root_id: &RootId) -> Result<()> {
+        let entry = {
+            let mut entries = self.entries.lock().map_err(|_| poisoned())?;
+            entries.remove(root_id)
+        };
+        if let Some(entry) = entry {
+            Self::detach_entry(&entry);
+        }
+        Ok(())
+    }
+
+    /// D4 方案 B: root 变空时异步 lazy unmount 活跃 bind。
+    ///
+    /// 非阻塞：在独立线程中执行 `MNT_DETACH`，避免在 FUSE 回调内做可能
+    /// 重入的 syscall（umount2 需要解析 `/ownerfs/<root>`，会触发 LOOKUP）。
+    /// 幂等：root 不在 entries 中或不在 NativeActive 状态时无操作。失败只
+    /// 记录日志；随后的 root rmdir 若因 EBUSY 失败，由管理 API（方案 A）
+    /// 兜底或下一次 rmdir 重试。
+    pub(in crate::node) fn request_lazy_unmount(&self, root_id: &RootId) -> Result<()> {
+        let entry = {
+            let entries = self.entries.lock().map_err(|_| poisoned())?;
+            entries.get(root_id).cloned()
+        };
+        if let Some(entry) = entry {
+            let root_id = root_id.clone();
+            std::thread::spawn(move || {
+                if let Err(error) = entry.lazy_detach() {
+                    afs_logging::warn!(
+                        "mount_manager.lazy_unmount.failed";
+                        "root_id" => ?root_id,
+                        "error" => error.to_string(),
+                    );
+                }
+            });
+        }
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]
@@ -258,6 +302,30 @@ impl MountManager {
             }
         }
         *state = MountState::FuseOnly { reason };
+    }
+}
+
+impl MountEntry {
+    /// D4 方案 B: 用 `MNT_DETACH` lazy 分离活跃 bind，并把条目降级为
+    /// FuseOnly。幂等：非 NativeActive 状态时无操作。
+    #[cfg(target_os = "linux")]
+    fn lazy_detach(&self) -> io::Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("mount entry state poisoned"))?;
+        if let MountState::NativeActive { bind } = &mut *state {
+            bind.detach_with_flags(libc::MNT_DETACH)?;
+            *state = MountState::FuseOnly {
+                reason: "lazy unmount triggered by empty root".into(),
+            };
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn lazy_detach(&self) -> io::Result<()> {
+        Ok(())
     }
 }
 
