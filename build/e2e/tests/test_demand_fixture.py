@@ -1,7 +1,9 @@
 import copy
 import http.client
+import ipaddress
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -149,6 +151,7 @@ class DemandFixtureTests(unittest.TestCase):
             env = {**os.environ, 'ADX_FC_BASE': str(base), 'ADX_FC_RUN_ROOT': str(run), 'ADX_FC_OBS_CONFIG': str(self.config(base)), 'ADX_FC_SUITE': 'demand'}
             subprocess.run([sys.executable, str(ROOT / 'firecracker/configure.py'), 'node1'], env=env, check=True, capture_output=True)
             configure(run)
+            guest_networks = []
             for node in ('node1', 'node2'):
                 service = json.loads((run / node / 'deployment.yaml').read_text())['services'][0]
                 self.assertFalse(service['config']['checkpoint_gc']['enabled'])
@@ -157,3 +160,9 @@ class DemandFixtureTests(unittest.TestCase):
                 self.assertEqual(service['config']['checkpoint_storage']['alias'], 'obs')
                 self.assertTrue(service['config']['checkpoint_storage']['endpoint'].startswith('https://test-bucket.'))
                 self.assertIn('default_overlay_size_bytes = 33554432', (run / node / 'sandboxd/config.toml').read_text())
+                text = (run / node / 'sandboxd/config.toml').read_text()
+                guest_network = ipaddress.ip_interface(re.search(r'ip_range = "([^"]+)"', text)[1]).network
+                allowed = [ipaddress.ip_network(cidr) for cidr in service['env']['ADX_DATA_PLANE_ALLOWED_TARGET_CIDRS'].split(',')]
+                self.assertIn(guest_network, allowed, 'the actual guest subnet must match Relay admission')
+                guest_networks.append(guest_network)
+            self.assertEqual(len(set(guest_networks)), 2, 'execution nodes require distinct guest pools')

@@ -58,7 +58,7 @@ def configure(root):
             (backend / filename).write_bytes((root / 'sandboxd' / filename).read_bytes())
         text = (root / 'sandboxd/config.toml').read_text().replace(str(root), str(folder))
         if name == 'node2':
-            text = text.replace('10.231.16.0/20', '10.231.32.0/20')
+            text = text.replace('ip_range = "10.231.16.1/20"', 'ip_range = "10.231.32.1/20"')
         text = text.replace('cgroup_root_name = "/adx-fc-', f'cgroup_root_name = "/{name}-adx-fc-')
         (backend / 'config.toml').write_text(text)
     control = copy.deepcopy(original)
