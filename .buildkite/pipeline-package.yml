@@ -406,7 +406,6 @@ steps:
     RUSTUP_AUTO_INSTALL: '0'
     GOCACHE: /mnt/paas/build-cache/adx/go-build/amd64
     GOMODCACHE: /mnt/paas/build-cache/adx/go-mod
-    ADX_BACKEND_ARTIFACT_BUILD: 01a0ad6d-9629-4da8-903b-3f8bd1ddc992
     ADX_DEFER_PUBLICATION: '1'
   plugins: *id001
 - label: Release · Assemble · Linux ARM64

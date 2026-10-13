@@ -330,9 +330,10 @@ intermediate component archives use OBS by default. `build-manifest.json` binds
 the commit, component manifests, base archive, backend bundle and tested SDK
 copy. `admin-candidate.json` independently binds the same commit/build and Python artifacts.
 
-The assembly step downloads the pinned external sandboxd backend artifact selected by
-`ADX_BACKEND_ARTIFACT_BUILD` and verifies its revision, target and complete file
-digests. `sdk-package` independently tests the public SDK on Python 3.12, creates
+The assembly step downloads the checksum-pinned OBS sandboxd bundle recorded in
+[`third_party/sandboxd/artifacts.json`](../third_party/sandboxd/artifacts.json).
+It verifies archive size/SHA256, sandboxd revision, target, the complete file set,
+every file digest and actual ELF architecture before publishing the backend directory. `sdk-package` independently tests the public SDK on Python 3.12, creates
 one wheel and one sdist, installs the wheel in a source-free virtual environment,
 and publishes `sdk-candidate.json` with commit, version and SHA256 values.
 
@@ -438,7 +439,7 @@ available separately for development reproduction in [build/e2e](../build/e2e/RE
 Buildkite syntax follows the official [Agent Stack execution](https://buildkite.com/docs/agent/self-hosted/agent-stack-k8s/running-builds)
 and [PodSpec configuration](https://buildkite.com/docs/agent/self-hosted/agent-stack-k8s/podspec).
 
-构建会在复用的 worker 中按版本和 SHA256 准备 Go 1.25.5、Redis 7.2.5。基础流水线直接下载并校验固定的 sandboxd 后端产物，不访问 GitHub 重建；只有显式取消 `ADX_BACKEND_ARTIFACT_BUILD` 时才进入源码构建维护路径。未指定基础镜像时，打包步骤按仓库 Dockerfile 构建并发布测试基础镜像，再用 registry digest 构建节点与 EXECD 镜像。`ADX_REDIS_SERVER` / `ADX_REDIS_CLI` 和 `ADX_E2E_RUNTIME_BASE` / `ADX_E2E_EXECD_BASE` 可显式覆盖。
+构建会在复用的 worker 中按版本和 SHA256 准备 Go 1.25.5、Redis 7.2.5。基础流水线通过 OBS 下载 `third_party/sandboxd/artifacts.json` 固定的 sandboxd 后端归档，校验完整包、提交、文件摘要和实际 ELF 架构。源码重建维护入口为 `build/e2e/build_backend.py`，不作为常规出包的自动回退。未指定基础镜像时，打包步骤按仓库 Dockerfile 构建并发布测试基础镜像，再用 registry digest 构建节点与 EXECD 镜像。`ADX_REDIS_SERVER` / `ADX_REDIS_CLI` 和 `ADX_E2E_RUNTIME_BASE` / `ADX_E2E_EXECD_BASE` 可显式覆盖。
 
 ## ADX build image and Cargo cache
 
@@ -473,12 +474,14 @@ compiler job's Cargo target directory.
 An existing sccache from the shared worker cache is reused when available, and
 Cargo cache locations/source selection are recorded in `bootstrap.log`.
 
-`ADX_BACKEND_ARTIFACT_BUILD` selects the Buildkite build UUID containing the
-`platform-build` backend artifacts. The default gate uses the verified artifacts
-from build `01a0ad6d-9629-4da8-903b-3f8bd1ddc992` (Buildkite #21). Revision,
-target, complete file set and every file checksum must pass validation. ADX
-product binaries and SDK are still built from the current commit. Unset the
-variable only for an explicit external-runtime rebuild from its pinned source.
+The external backend is selected by the target-specific OBS archive pin in
+`third_party/sandboxd/artifacts.json`. `build/e2e/download_backend.py` downloads
+one archive with bounded HTTPS retries and installs it only after all integrity
+and architecture checks pass. Updating the dependency requires updating the
+source revision, archive URL, byte count and SHA256 together. ADX product binaries
+and SDK are built from the current commit. The current backend bundle is x86_64;
+ARM package jobs keep external-runtime acceptance disabled. Explicit maintenance
+rebuilds use `build/e2e/build_backend.py`.
 
 The image stage caches the pinned Ubuntu amd64 base in SWR. On a cache miss it
 pulls the identical manifest from a configurable regional mirror and checks its
@@ -561,7 +564,7 @@ The existing basic E2E result alone does not count as this profile passing.
 
 正式镜像构建默认使用 `source.json` 中的 `ci_image`，即西南二区 SWR 的 Linux AMD64 固定摘要，已通过 [Buildkite #20](https://buildkite.com/agent-dx/agent-dx/builds/20) 推送及回拉验证。`ADX_COLLECTOR_IMAGE` 可覆盖完整引用；`ADX_COLLECTOR_MIRROR` 继续用于选择承载上游多架构索引的镜像站。本地构建默认仍使用上游多架构镜像。
 
-`ADX_BACKEND_ARTIFACT_BUILD` 接受 Buildkite build UUID（API 返回的 `id`），不是页面上的递增构建编号。复用制品仍需匹配 sandboxd 提交、目标架构与完整文件摘要；ADX 产品每次从当前提交构建。
+OBS 后端 pin 按目标架构选择归档。归档无法下载或校验失败时，本轮装配失败；CI 不切换源、不重新编译 sandboxd。ADX 产品每次从当前提交构建。
 
 The basic acceptance driver also runs an independent `local-first` case: restart API Server with `create_mode=local_first`, verify concurrent public SDK creation, real commands and deletion, require confirmed-claim evidence, then restore central mode. The default `k8s-basic` profile contains five bounded cases. The eleven-case `full` and local `standalone` profiles carry installed-SDK `data-plane`, `lifecycle` and fault/restart/stop coverage. [Buildkite #30](https://buildkite.com/agent-dx/agent-dx/builds/30) passed the previous eight-case OCI profile; the current profile split requires fresh formal evidence.
 

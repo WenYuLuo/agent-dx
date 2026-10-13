@@ -125,21 +125,10 @@ cp "$ADX_RELEASE_OUTPUT/manifest.json" out/buildkite/release-manifest.json
 backend_args=()
 if [[ ${ADX_EXTERNAL_BACKEND:-1} == 1 ]]; then
   echo "--- :package: Verify pinned sandboxd backend artifacts"
-  if [[ -n ${ADX_BACKEND_ARTIFACT_BUILD:-} ]]; then
-    buildkite-agent artifact download 'out/buildkite/backend/*' . \
-      --step platform-build --build "$ADX_BACKEND_ARTIFACT_BUILD" \
-      2>&1 | tee out/buildkite/logs/backend.log
-    python3 build/e2e/verify_backend.py \
-      --directory out/buildkite/backend \
-      --target "$ADX_RELEASE_TARGET" \
-      2>&1 | tee -a out/buildkite/logs/backend.log
-  else
-    python3 build/e2e/build_backend.py \
-      --output out/buildkite/backend \
-      --redis-cli "$ADX_REDIS_CLI" \
-      --jobs "${JOBS:-2}" \
-      2>&1 | tee out/buildkite/logs/backend.log
-  fi
+  python3 build/e2e/download_backend.py \
+    --directory out/buildkite/backend \
+    --target "$ADX_RELEASE_TARGET" \
+    2>&1 | tee out/buildkite/logs/backend.log
   tar -czf out/buildkite/backend.tar.gz -C out/buildkite/backend .
   backend_args=(--backend-manifest out/buildkite/backend/manifest.json --backend-archive out/buildkite/backend.tar.gz)
 fi
