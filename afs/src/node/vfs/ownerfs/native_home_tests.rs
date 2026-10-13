@@ -158,6 +158,39 @@ pub(crate) fn fixture(
     (temp, fs, ctx, disk)
 }
 
+/// Build a native-Home-eligible OwnerFs with a MountManager attached, ready
+/// for mkdir-triggered bind mount integration tests. `fuse_mount_path` is
+/// passed through to the MountManager; the caller must call
+/// `attach_owner` after wrapping the result in an `Arc`.
+pub(crate) fn fixture_with_mount_manager(
+    fuse_mount_path: PathBuf,
+) -> (tempfile::TempDir, OwnerFs, RequestContext) {
+    let temp = tempfile::tempdir().unwrap();
+    let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
+    let meta = Arc::new(NativeHomeMeta::new());
+    let roots = Arc::new(RootManager::new(
+        "node-a".into(),
+        "session-a".into(),
+        meta,
+        disk.clone(),
+    ));
+    let metadata = fs::metadata(temp.path()).unwrap();
+    let ctx = RequestContext {
+        uid: metadata.uid(),
+        gid: metadata.gid(),
+        pid: 42,
+        umask: 0,
+        supplementary_gids: Vec::new(),
+    };
+    let fs = OwnerFs::new_local_with_mount_manager(
+        roots,
+        disk,
+        Arc::new(RejectRemoteFactory),
+        fuse_mount_path,
+    );
+    (temp, fs, ctx)
+}
+
 fn fixture_native_home_eligible_with_remote() -> (tempfile::TempDir, OwnerFs, RequestContext) {
     let temp = tempfile::tempdir().unwrap();
     let disk = Arc::new(LocalFs::open(temp.path()).unwrap());

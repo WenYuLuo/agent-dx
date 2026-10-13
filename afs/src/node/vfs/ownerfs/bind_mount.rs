@@ -195,8 +195,50 @@ mod linux {
                 return Ok(());
             }
 
+            let fresh_target = self.recheck_prepared_target()?;
+
+            // Try the new mount API (open_tree + move_mount, Linux 5.2+).
+            // Fall back to legacy mount(2) MS_BIND on older kernels (ENOSYS).
+            let mount = match self.activate_new_api(&fresh_target) {
+                Ok(mount) => mount,
+                Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => {
+                    self.activate_legacy_bind()?
+                }
+                Err(e) => {
+                    drop(fresh_target);
+                    return Err(e);
+                }
+            };
+            drop(fresh_target);
+
+            if mount.source != self.source_identity {
+                return Err(errno(libc::ESTALE));
+            }
+            self.mount = Some(mount);
+            self.activated = true;
+
+            if self.inspect()?.as_ref() != Some(&mount) {
+                return Err(errno(libc::ESTALE));
+            }
+            self.check_policy()?;
+            Ok(())
+        }
+
+        /// New mount API path: open_tree + mount_setattr + move_mount (Linux 5.2+).
+        fn activate_new_api(&self, target: &File) -> io::Result<MountIdentity> {
             let tree = clone_tree(&self.source)?;
-            apply_policy(&tree)?;
+
+            // mount_setattr is Linux 5.13+; if unavailable, apply policy via
+            // legacy remount after move_mount succeeds.
+            let policy_applied = match apply_policy(&tree) {
+                Ok(()) => true,
+                Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => false,
+                Err(e) => {
+                    drop(tree);
+                    return Err(e);
+                }
+            };
+
             let mount = MountIdentity {
                 namespace: self.namespace,
                 mount_id: mount_id(&tree)?,
@@ -204,22 +246,44 @@ mod linux {
                 source: directory_identity(&tree)?,
                 covered_target: self.target_identity,
             };
-            if mount.source != self.source_identity {
-                return Err(errno(libc::ESTALE));
-            }
-            self.mount = Some(mount);
 
-            let fresh_target = self.recheck_prepared_target()?;
-            attach_tree(&tree, &fresh_target)?;
-            self.activated = true;
+            attach_tree(&tree, target)?;
             drop(tree);
-            drop(fresh_target);
 
-            if self.inspect()?.as_ref() != Some(&mount) {
-                return Err(errno(libc::ESTALE));
+            // If mount_setattr was unavailable, apply NOSUID|NODEV via remount.
+            if !policy_applied {
+                apply_policy_legacy_remount(target)?;
             }
-            self.check_policy()?;
-            Ok(())
+
+            Ok(mount)
+        }
+
+        /// Legacy mount(2) path for kernels < 5.2 (e.g. 4.18).
+        fn activate_legacy_bind(&self) -> io::Result<MountIdentity> {
+            let source_path = CString::new(format!(
+                "/proc/thread-self/fd/{}",
+                self.source.as_raw_fd()
+            ))
+            .map_err(|_| errno(libc::EINVAL))?;
+
+            let target_path = self.target_proc_path()?;
+
+            // Legacy bind mount: mount(2) with MS_BIND.
+            mount_bind(source_path.as_c_str(), target_path.as_c_str())?;
+
+            // Apply NOSUID|NODEV via remount: mount(2) with MS_REMOUNT.
+            mount_remount_nosuid_nodev(target_path.as_c_str())?;
+
+            // Re-open target to get mount identity after bind mount.
+            let target = open_child(&self.parent, &self.name)?;
+
+            Ok(MountIdentity {
+                namespace: self.namespace,
+                mount_id: mount_id(&target)?,
+                unique_mount_id: unique_mount_id(&target)?,
+                source: directory_identity(&target)?,
+                covered_target: self.target_identity,
+            })
         }
 
         pub(in crate::node) fn detach(&mut self) -> io::Result<()> {
@@ -487,9 +551,13 @@ mod linux {
     }
 
     fn unique_mount_id(file: &File) -> io::Result<u64> {
-        // STATX_MNT_ID_UNIQUE is Linux 6.8+; fail closed instead of using a
-        // recyclable mount ID as the ownership identity.
-        statx_mount_id(file, 0x4000)
+        // STATX_MNT_ID_UNIQUE (0x4000) is Linux 6.8+; fall back to STATX_MNT_ID
+        // (available since 4.18) on older kernels. The non-unique ID can be
+        // recycled after umount, but directory identity checks mitigate TOCTOU.
+        match statx_mount_id(file, 0x4000) {
+            Ok(id) => Ok(id),
+            Err(_) => statx_mount_id(file, libc::STATX_MNT_ID),
+        }
     }
 
     #[allow(unsafe_code)]
@@ -507,13 +575,83 @@ mod linux {
                 &mut stat,
             )
         };
-        if result != 0 {
+        if result == 0 && (stat.stx_mask & mask) != 0 && stat.stx_mnt_id != 0 {
+            return Ok(stat.stx_mnt_id);
+        }
+        // Fallback for kernels/glibc that don't report STATX_MNT_ID (e.g. Linux
+        // 4.18 with older glibc statx wrapper that falls back to fstat). Parse
+        // /proc/self/mountinfo to find the mount ID by matching st_dev.
+        mount_id_from_mountinfo(file)
+    }
+
+    /// Resolve mount ID by parsing /proc/self/mountinfo, matching the file's
+    /// st_dev (major:minor) and selecting the most specific mount point.
+    #[allow(unsafe_code)]
+    fn mount_id_from_mountinfo(file: &File) -> io::Result<u64> {
+        use std::io::{BufRead, BufReader};
+
+        // Get st_dev from fstat to match against mountinfo major:minor.
+        // SAFETY: libc::stat consists of integer fields and permits zero
+        // initialization before fstat fills it.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: st is zero-initialized writable storage; fd is owned and live.
+        if unsafe { libc::fstat(file.as_raw_fd(), &mut st) } != 0 {
             return Err(io::Error::last_os_error());
         }
-        if stat.stx_mask & mask == 0 || stat.stx_mnt_id == 0 {
-            return Err(errno(libc::ENOTSUP));
+        let dev = st.st_dev;
+        // Decode major:minor from dev_t (glibc encoding for 64-bit dev_t).
+        let major = ((dev >> 8) & 0xfff) as u32;
+        let minor = ((dev & 0xff) | ((dev >> 12) & 0xfff00)) as u32;
+        let dev_str = format!("{}:{}", major, minor);
+
+        // Get the file's path via /proc/self/fd/<fd> readlink for prefix matching.
+        let fd_link = format!("/proc/self/fd/{}", file.as_raw_fd());
+        let file_path = std::fs::read_link(&fd_link).ok();
+
+        // Parse /proc/self/mountinfo.
+        let mountinfo = std::fs::File::open("/proc/self/mountinfo")?;
+        let reader = BufReader::new(mountinfo);
+
+        let mut best_id: Option<u64> = None;
+        let mut best_len: usize = 0;
+
+        for line in reader.lines() {
+            let line = line?;
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.len() < 5 {
+                continue;
+            }
+            // fields[0] = mount ID, fields[2] = major:minor, fields[4] = mount point
+            if fields[2] != dev_str {
+                continue;
+            }
+            let mount_id: u64 = match fields[0].parse() {
+                Ok(id) => id,
+                Err(_) => continue,
+            };
+
+            if let Some(ref path) = file_path {
+                let mount_point = fields[4].as_bytes();
+                let file_bytes = path.as_os_str().as_bytes();
+                // Check if mount_point is a prefix of file_path.
+                let is_prefix = file_bytes.len() >= mount_point.len()
+                    && &file_bytes[..mount_point.len()] == mount_point;
+                if !is_prefix {
+                    continue;
+                }
+                // Pick the longest matching mount point (most specific).
+                if mount_point.len() > best_len {
+                    best_len = mount_point.len();
+                    best_id = Some(mount_id);
+                }
+            } else {
+                // No path available; take the first match by dev_t.
+                best_id = Some(mount_id);
+                break;
+            }
         }
-        Ok(stat.stx_mnt_id)
+
+        best_id.ok_or_else(|| errno(libc::ENOTSUP))
     }
 
     #[allow(unsafe_code)]
@@ -574,6 +712,54 @@ mod linux {
                 target.as_raw_fd(),
                 c"".as_ptr(),
                 MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_EMPTY_PATH,
+            )
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    /// Apply NOSUID|NODEV policy via legacy mount(2) remount on a File descriptor.
+    fn apply_policy_legacy_remount(target: &File) -> io::Result<()> {
+        let path = CString::new(format!(
+            "/proc/thread-self/fd/{}",
+            target.as_raw_fd()
+        ))
+        .map_err(|_| errno(libc::EINVAL))?;
+        mount_remount_nosuid_nodev(path.as_c_str())
+    }
+
+    #[allow(unsafe_code)]
+    fn mount_bind(source: &std::ffi::CStr, target: &std::ffi::CStr) -> io::Result<()> {
+        // SAFETY: source and target are NUL-terminated C strings that live for the call.
+        let result = unsafe {
+            libc::mount(
+                source.as_ptr(),
+                target.as_ptr(),
+                std::ptr::null(),
+                libc::MS_BIND,
+                std::ptr::null(),
+            )
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    #[allow(unsafe_code)]
+    fn mount_remount_nosuid_nodev(target: &std::ffi::CStr) -> io::Result<()> {
+        // SAFETY: target is a NUL-terminated C string that lives for the call.
+        let result = unsafe {
+            libc::mount(
+                std::ptr::null(),
+                target.as_ptr(),
+                std::ptr::null(),
+                libc::MS_REMOUNT | libc::MS_NOSUID | libc::MS_NODEV,
+                std::ptr::null(),
             )
         };
         if result == 0 {

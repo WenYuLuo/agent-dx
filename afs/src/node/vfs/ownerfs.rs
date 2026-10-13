@@ -46,6 +46,7 @@ pub(in crate::node) mod bind_mount;
 pub mod catalog;
 pub mod files;
 mod native_home;
+mod mount_manager;
 pub mod remote;
 pub mod root;
 
@@ -76,6 +77,7 @@ const OWNERFS_ROOT_INODE: u64 = 1;
 pub struct OwnerFs {
     local: Option<Arc<LocalOwnerFs>>,
     private_cache: Arc<Mutex<PrivateFuseCache>>,
+    mount_manager: Option<Arc<mount_manager::MountManager>>,
 }
 
 // Kernel page/attribute cache is profitable only while this node is the sole
@@ -118,6 +120,7 @@ impl OwnerFs {
         Self {
             local: None,
             private_cache: Arc::new(Mutex::new(PrivateFuseCache::new())),
+            mount_manager: None,
         }
     }
 
@@ -154,6 +157,36 @@ impl OwnerFs {
         Self::new_local_with_native_home_eligibility(roots, disk, Some(remote_factory), true)
     }
 
+    /// Construct an OwnerFs with a MountManager for multi-workspace bind mount.
+    ///
+    /// The `fuse_mount_path` is the FUSE mount point under which workspace
+    /// roots are created. After wrapping the result in `Arc`, call
+    /// `mount_manager().attach_owner(&arc)` to complete wiring.
+    #[must_use]
+    pub(crate) fn new_local_with_mount_manager(
+        roots: Arc<RootManager>,
+        disk: Arc<LocalFs>,
+        remote_factory: Arc<dyn RemoteFilesFactory>,
+        fuse_mount_path: PathBuf,
+    ) -> Self {
+        let private_cache = Arc::new(Mutex::new(
+            PrivateFuseCache::with_native_home_eligibility(true),
+        ));
+        let mount_manager =
+            Arc::new(mount_manager::MountManager::new(Some(fuse_mount_path)));
+        Self {
+            local: Some(Arc::new(LocalOwnerFs::new(
+                roots,
+                disk,
+                Some(remote_factory),
+                private_cache.clone(),
+                Some(mount_manager.clone()),
+            ))),
+            private_cache,
+            mount_manager: Some(mount_manager),
+        }
+    }
+
     fn new_local_with_native_home_eligibility(
         roots: Arc<RootManager>,
         disk: Arc<LocalFs>,
@@ -169,8 +202,22 @@ impl OwnerFs {
                 disk,
                 remote_factory,
                 private_cache.clone(),
+                None,
             ))),
             private_cache,
+            mount_manager: None,
+        }
+    }
+
+    /// Returns the MountManager if multi-workspace bind mount is enabled.
+    pub(in crate::node) fn mount_manager(&self) -> Option<&Arc<mount_manager::MountManager>> {
+        self.mount_manager.as_ref()
+    }
+
+    /// Shut down all active bind mounts. Called from Node shutdown.
+    pub(crate) fn mount_manager_shutdown(&self) {
+        if let Some(mm) = &self.mount_manager {
+            mm.shutdown();
         }
     }
 
@@ -1185,6 +1232,7 @@ struct LocalOwnerFs {
     state: Mutex<OwnerState>,
     locks: Mutex<OwnerLockRegistry>,
     private_cache: Arc<Mutex<PrivateFuseCache>>,
+    mount_manager: Option<Arc<mount_manager::MountManager>>,
 }
 
 #[derive(Clone)]
@@ -2036,6 +2084,7 @@ impl LocalOwnerFs {
         disk: Arc<LocalFs>,
         remote_factory: Option<Arc<dyn RemoteFilesFactory>>,
         private_cache: Arc<Mutex<PrivateFuseCache>>,
+        mount_manager: Option<Arc<mount_manager::MountManager>>,
     ) -> Self {
         let mut state = OwnerState::new();
         for root in roots.cached_local_roots().unwrap_or_default() {
@@ -2062,6 +2111,7 @@ impl LocalOwnerFs {
             state: Mutex::new(state),
             locks: Mutex::new(OwnerLockRegistry::default()),
             private_cache,
+            mount_manager,
         }
     }
 
@@ -4482,6 +4532,14 @@ impl LocalOwnerFs {
                 identity,
                 attributes.clone(),
             );
+            // Trigger async native bind mount for multi-workspace support.
+            // Non-blocking: failures fall back to FUSE-only (D2) and only log.
+            if let Some(mm) = &self.mount_manager {
+                let _ = mm.request_mount(
+                    root_use.root_id().clone(),
+                    name.to_os_string(),
+                );
+            }
             return Ok(Entry {
                 inode: backend_inode(inode),
                 attributes,

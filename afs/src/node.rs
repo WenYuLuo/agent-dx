@@ -1362,8 +1362,18 @@ async fn run_node(
         ) {
             workspace_bind_root_control = Some((root_meta, roots.clone()));
         }
-        let owner = if cfg.experimental_native_workspace || cfg.experimental_ownerfs_workspace_bind
-        {
+        let owner = if cfg.experimental_ownerfs_workspace_bind {
+            let mount_path = cfg
+                .ownerfs_mount
+                .clone()
+                .expect("workspace bind requires mount");
+            vfs::ownerfs::OwnerFs::new_local_with_mount_manager(
+                roots,
+                disk,
+                remote_factory,
+                mount_path,
+            )
+        } else if cfg.experimental_native_workspace {
             vfs::ownerfs::OwnerFs::new_local_native_eligible_with_remote(
                 roots,
                 disk,
@@ -1372,7 +1382,11 @@ async fn run_node(
         } else {
             vfs::ownerfs::OwnerFs::new_local_with_remote(roots, disk, remote_factory)
         };
-        Some(Arc::new(owner))
+        let owner = Arc::new(owner);
+        if let Some(mm) = owner.mount_manager() {
+            mm.attach_owner(&owner);
+        }
+        Some(owner)
     } else {
         None
     };
@@ -2000,41 +2014,8 @@ async fn run_node(
         (native_workspace_worker, native_workspace_startup_error) =
             register_native_workspace_startup(&mut services, startup);
     }
-    #[cfg(feature = "ownerfs")]
-    let mut workspace_bind_worker = None;
-    #[cfg(feature = "ownerfs")]
-    if cfg.experimental_ownerfs_workspace_bind {
-        let owner = state
-            .ownerfs
-            .clone()
-            .expect("workspace bind requires OwnerFs");
-        let mount = cfg
-            .ownerfs_mount
-            .clone()
-            .expect("workspace bind requires mount");
-        let workspace = cfg
-            .ownerfs_workspace_bind
-            .as_ref()
-            .expect("workspace bind requires settings")
-            .workspace
-            .clone();
-        let startup = tokio::task::spawn_blocking(move || {
-            WorkspaceBindWorker::start(owner, mount, workspace)
-        })
-        .await;
-        match startup {
-            Ok(Ok((worker, ready))) => {
-                let monitor = worker.monitor(services.stop.subscribe());
-                services.spawn(async move { monitor.await.map_err(Into::into) });
-                workspace_bind_worker = Some(worker);
-                if let Err(error) = ready {
-                    native_workspace_startup_error = Some(error.into());
-                }
-            }
-            Ok(Err(error)) => native_workspace_startup_error = Some(error.into()),
-            Err(error) => native_workspace_startup_error = Some(error.into()),
-        }
-    }
+    // Multi-workspace bind mount is handled by MountManager via mkdir triggers.
+    // No single-workspace startup worker is needed.
     #[cfg(feature = "ownerfs")]
     if native_workspace_startup_error.is_none()
         && let Some((meta, roots)) = workspace_bind_root_control
@@ -2074,18 +2055,8 @@ async fn run_node(
         }
     }
     #[cfg(feature = "ownerfs")]
-    if let Some(worker) = workspace_bind_worker {
-        let closure = tokio::task::spawn_blocking(move || worker.shutdown()).await;
-        let error: Option<BoxError> = match closure {
-            Ok(Ok(())) => None,
-            Ok(Err(error)) => Some(error.into()),
-            Err(error) => Some(error.into()),
-        };
-        if let Some(error) = error {
-            afs_logging::error!("ownerfs.workspace_bind_closure_failed"; "error" => error.to_string());
-            remember_shutdown_error(&mut shutdown_error, error);
-            std::future::pending::<()>().await;
-        }
+    if let Some(owner) = state.ownerfs.as_ref() {
+        owner.mount_manager_shutdown();
     }
     // Stop FUSE admission and observe its thread cleanup before the final dirty drain.
     // Dropping BackgroundSession alone detaches the thread and cannot prove this boundary.
@@ -2313,6 +2284,7 @@ async fn run_workspace_bind_root_commands(
 }
 
 #[cfg(feature = "ownerfs")]
+#[allow(dead_code)]
 struct WorkspaceBindWorker {
     stop: Arc<AtomicBool>,
     worker: Option<std::thread::JoinHandle<std::io::Result<()>>>,
@@ -2320,6 +2292,7 @@ struct WorkspaceBindWorker {
 }
 
 #[cfg(feature = "ownerfs")]
+#[allow(dead_code)]
 impl WorkspaceBindWorker {
     // Even a failed activation returns the original worker to Node: attachment
     // may have succeeded before its postcondition failed. Never drop its claim.

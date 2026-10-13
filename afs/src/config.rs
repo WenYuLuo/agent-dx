@@ -475,12 +475,12 @@ impl Config {
                     "experimental_ownerfs_workspace_bind cannot be enabled with experimental_native_workspace",
                 ));
             }
-            let bind = cfg.ownerfs_workspace_bind.as_ref().ok_or_else(|| {
-                invalid(
-                    "experimental_ownerfs_workspace_bind requires administrator ownerfs_workspace_bind settings",
-                )
-            })?;
-            validate_ownerfs_workspace_name(&bind.workspace)?;
+            // Multi-workspace bindmount is triggered dynamically by mkdir.
+            // The legacy [ownerfs_workspace_bind] section is optional and only
+            // used for pre-declared workspace names if present.
+            if let Some(bind) = cfg.ownerfs_workspace_bind.as_ref() {
+                validate_ownerfs_workspace_name(&bind.workspace)?;
+            }
         }
         if cfg.experimental_native_workspace {
             if role != Role::Node || !cfg.ownerfs || cfg.ownerfs_mount.is_none() {

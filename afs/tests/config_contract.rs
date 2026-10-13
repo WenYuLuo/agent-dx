@@ -260,22 +260,11 @@ fn ownerfs_workspace_bind_is_default_off_and_refuses_incomplete_or_wrong_backend
     assert!(!cfg.experimental_ownerfs_workspace_bind);
     assert!(cfg.ownerfs_workspace_bind.is_none());
 
-    for (role, argv) in [
-        (
-            Role::Node,
-            vec![
-                "afs-node",
-                "--fs",
-                "ownerfs",
-                "--ownerfs-mount",
-                "/tmp/owner",
-                "--experimental-ownerfs-workspace-bind",
-                "true",
-            ],
-        ),
-        (
+    // Non-Node role should still be rejected.
+    assert!(
+        Config::resolve(
             Role::Meta,
-            vec![
+            Cli::parse_from([
                 "afs-meta",
                 "--fs",
                 "ownerfs",
@@ -283,11 +272,28 @@ fn ownerfs_workspace_bind_is_default_off_and_refuses_incomplete_or_wrong_backend
                 "/tmp/owner",
                 "--experimental-ownerfs-workspace-bind",
                 "true",
-            ],
-        ),
-    ] {
-        assert!(Config::resolve(role, Cli::parse_from(argv)).is_err());
-    }
+            ])
+        )
+        .is_err()
+    );
+
+    // Node role without [ownerfs_workspace_bind] should now succeed — the section
+    // is optional; bindmount is triggered dynamically by mkdir.
+    assert!(
+        Config::resolve(
+            Role::Node,
+            Cli::parse_from([
+                "afs-node",
+                "--fs",
+                "ownerfs",
+                "--ownerfs-mount",
+                "/tmp/owner",
+                "--experimental-ownerfs-workspace-bind",
+                "true",
+            ])
+        )
+        .is_ok()
+    );
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("node.toml");
