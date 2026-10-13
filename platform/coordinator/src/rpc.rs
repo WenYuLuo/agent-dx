@@ -161,6 +161,17 @@ impl State {
             };
             match saved {
                 Ok(record) => {
+                    if let Some(source) = record
+                        .recovery
+                        .as_ref()
+                        .filter(|recovery| recovery.source.node_id != record.assignment.node_id)
+                        .and_then(|recovery| self.live.get_mut(&recovery.source.node_id))
+                    {
+                        // A live former owner still has a paused controller.
+                        // Require the existing closed-admission handshake to
+                        // retire it against the complete global reference catalog.
+                        source.inspected = false;
+                    }
                     self.remember_environment(record);
                 }
                 Err(Error::Conflict)

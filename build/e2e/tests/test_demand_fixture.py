@@ -147,6 +147,19 @@ class DemandFixtureTests(unittest.TestCase):
                 bad['cases'][11][key] = value
                 with self.assertRaises(ValueError): verify(bad)
 
+    def test_wake_identity_is_preserved_across_distinct_node_execution_id(self):
+        from demand_contract import same_wake
+        rejected = {'resume': {'operation_id': 'wake-one'}}
+        transferred = {'resume': {'operation_id': 'wake-one'}}
+        completed = {'resume': None, 'result': {'state': 'Running',
+                     'last_operation': {'kind': 'Resume', 'id': 'recover-2'}}}
+        self.assertTrue(same_wake(rejected, transferred, completed))
+        transferred['resume']['operation_id'] = 'wake-two'
+        self.assertFalse(same_wake(rejected, transferred, completed))
+        transferred['resume']['operation_id'] = 'wake-one'
+        completed['resume'] = {'operation_id': 'wake-one'}
+        self.assertFalse(same_wake(rejected, transferred, completed))
+
     def test_physical_audit_rejects_extra_capacity_restore(self):
         from demand_physical import audit
         result = self.complete()

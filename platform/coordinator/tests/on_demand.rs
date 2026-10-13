@@ -506,7 +506,8 @@ async fn multiple_ingress_and_manual_resume_restore_once_on_original_node() {
 #[tokio::test]
 #[ignore = "requires dedicated real Redis"]
 async fn definite_local_capacity_rejection_restores_same_state_on_another_node() {
-    let rig = Rig::new(Duration::from_secs(2)).await;
+    use adxlet::checkpoint::CheckpointStore;
+    let mut rig = Rig::new(Duration::from_secs(2)).await;
     rig.source
         .manager
         .update_capacity(
@@ -525,6 +526,82 @@ async fn definite_local_capacity_rejection_restores_same_state_on_another_node()
     assert_eq!(rig.source.backend.restored.load(Ordering::SeqCst), 0);
     assert_eq!(rig.target.backend.restored.load(Ordering::SeqCst), 1);
     assert!(rig.source.backend.running.lock().unwrap().is_empty());
+    assert_eq!(rig.target.backend.running.lock().unwrap().len(), 1);
+    let checkpoint = rig
+        .session
+        .get("sleep")
+        .await
+        .unwrap()
+        .result
+        .unwrap()
+        .checkpoint
+        .unwrap()
+        .artifact;
+    let mut client = pb::coordinator_service_client::CoordinatorServiceClient::new(
+        channel(&rig.address, Principal::Node("a".into())).await,
+    );
+    rig.source.report.heartbeat_sequence += 1;
+    assert_eq!(
+        client
+            .register_node(rig.source.report.clone())
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
+    rig.source.manager.pause_lifecycle().await;
+    rig.source.report.heartbeat_sequence += 1;
+    rig.source.report.reconciling = true;
+    rig.source.report.accepting_allocations = false;
+    client
+        .register_node(rig.source.report.clone())
+        .await
+        .unwrap();
+    let catalog = client
+        .inspect_node(pb::InspectNodeRequest {
+            node_id: "a".into(),
+            session_id: rig.source.report.session_id.clone(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    rig.source
+        .manager
+        .reconcile_retained(
+            catalog
+                .records
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<Vec<_>>>()
+                .unwrap(),
+            catalog
+                .snapshots
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<Vec<_>>>()
+                .unwrap(),
+            catalog
+                .retained_checkpoints
+                .into_iter()
+                .map(|cp| adx_core::RestorePoint::try_from(cp).map(|cp| cp.artifact))
+                .collect::<Result<Vec<_>>>()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    rig.source.report.heartbeat_sequence += 1;
+    rig.source.report.reconciling = false;
+    rig.source.report.accepting_allocations = true;
+    client
+        .register_node(rig.source.report.clone())
+        .await
+        .unwrap();
+    assert_eq!(rig.source.manager.drain().await.unwrap(), 0);
+    rig.target
+        .store
+        .validate_artifact(&checkpoint)
+        .await
+        .unwrap();
     assert_eq!(rig.target.backend.running.lock().unwrap().len(), 1);
 }
 

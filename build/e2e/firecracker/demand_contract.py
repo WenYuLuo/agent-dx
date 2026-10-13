@@ -16,6 +16,17 @@ CASES = (
 )
 
 
+def same_wake(rejected, transferred, completed):
+    """The durable wake ID survives transfer; the node owns a separate execution ID."""
+    try:
+        operation = rejected['resume']['operation_id']
+        return (bool(operation) and transferred['resume']['operation_id'] == operation
+                and completed['resume'] is None and completed['result']['state'] == 'Running'
+                and completed['result']['last_operation']['kind'] == 'Resume')
+    except (KeyError, TypeError):
+        return False
+
+
 def verify(result):
     cases = result.get('cases', [])
     if (result.get('status') != 'passed' or result.get('cleanup_errors') != []

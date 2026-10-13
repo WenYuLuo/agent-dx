@@ -17,7 +17,7 @@ from concurrent.futures import ThreadPoolExecutor
 from urllib.error import HTTPError
 from urllib.request import HTTPSHandler, ProxyHandler, Request, build_opener
 
-from demand_contract import CASES
+from demand_contract import CASES, same_wake
 from demand_faults import ResumeResponseCut
 from s3_client import Client
 from storage_fixture import public as public_storage
@@ -250,16 +250,22 @@ def capacity_case():
     for response in responses: continuity(baseline, response)
     after = record(sandbox)
     operation = rejected['resume']['operation_id']
-    if (after['assignment']['node_id'] != 'node2' or after['result']['last_operation']['id'] != operation
-            or physical('node1') != owner_backend or len(inventory('node2')) != 1
-            or catalog()['node:node1']['session']['id'] != source_session):
-        raise AssertionError('capacity transfer changed wake identity or source execution')
+    (evidence / 'capacity-completed.json').write_text(json.dumps({'at': time.time(), 'record': after,
+        'source_node': catalog()['node:node1'], 'inventories': {node: inventory(node) for node in capacities},
+        'responses': responses}, indent=2))
+    if not same_wake(rejected, transferred, after):
+        raise AssertionError('Coordinator wake identity changed or did not settle')
+    if after['assignment']['node_id'] != 'node2' or len(inventory('node2')) != 1:
+        raise AssertionError('capacity transfer did not produce one peer execution')
+    if physical('node1') != owner_backend or catalog()['node:node1']['session']['id'] != source_session:
+        raise AssertionError('capacity transfer changed the healthy source session or execution')
     pass_case(11, instance_id=sandbox.id, source='node1', target='node2', source_healthy=True,
               source_cpu_capacity=capacities['node1'], source_cpu_reserved=reserved['node1'], local_rejected=True,
               local_error=local['error'], local_attempt_at=local['unix_seconds'], local_rejected_at=rejected_at,
               peer_release_at=peer_release_at, transferred_at=transferred_at,
               generation_before=before['assignment']['generation'], generation_after=after['assignment']['generation'],
               wake_operation_preserved=True, wake_operation_id=operation, request_count=12,
+              node_execution_operation_id=after['result']['last_operation']['id'],
               unique_nonces=len({response['nonce'] for response in responses}), responses=responses,
               source_session=source_session, backend=physical('node2'), owner_load_backend=owner_backend)
     kill(sandbox)

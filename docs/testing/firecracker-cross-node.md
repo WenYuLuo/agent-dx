@@ -80,7 +80,7 @@ sudo env ADX_FC_BASE=/opt/adx ADX_FC_SUITE=demand \
 
 OBS 配置文件必须是权限 `0600` 的普通文件，包含 `bucket`、`region`、`endpoint`、专用 `prefix`、`access_key`、`secret_key`。endpoint 使用区域 HTTPS 地址，例如 `https://obs.cn-north-4.myhuaweicloud.com`。驱动使用虚拟主机寻址，将运行目录名称附加到 prefix，先验证该范围为空，再做真实 SigV4 PUT/GET/DELETE。凭据只写入私有配置与服务环境；导出记录仅含公共存储配置与请求 ID。
 
-demand 严格集合为 12 项；创建和手动 pause 使用显式 RetentionPolicy，业务流量唤醒无需开关。
+demand 严格集合为 12 项；创建和手动 pause 使用显式 RetentionPolicy，业务流量唤醒无需开关。容量回退完成归属转移后，Coordinator 要求存活的原节点重新对账；原节点保持同一 session，退役旧控制器，保留仍属本机的运行实例和目标引用的共享快照。Coordinator 的持久 wake ID 与 adxlet 的执行操作 ID 分层记录。
 
 业务负载是 VM 内的 Python HTTP 服务，通过公共 Ingress 的声明端口接受带唯一 nonce 的请求。响应包含 guest PID、内存中的 nonce 计数和持久文件内容；恢复前后的响应必须对应同一 guest 进程状态，每个请求只执行一次。
 
