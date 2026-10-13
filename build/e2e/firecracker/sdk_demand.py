@@ -118,7 +118,7 @@ def command(sandbox, text):
 def create(idle=0, ttl=900):
     sandbox = Sandbox(image=image, runtime='firecracker', cpu=1000, memory=128, storage_mb=32,
                       env={'PYTHONDONTWRITEBYTECODE': '1'}, idle_timeout=idle,
-                      idle_action='pause', pause_policy=PausePolicy(ttl_seconds=ttl, timeout_seconds=1800, storage='shared'),
+                      idle_action='pause' if idle else 'delete', pause_policy=PausePolicy(ttl_seconds=ttl, timeout_seconds=1800, storage='shared'),
                       auto_resume=True, port_forwardings=[8088], node_id='node1', connection=connection, create_timeout=180)
     sandboxes.append(sandbox)
     sandbox.files.write('/tmp/demand-server.py', GUEST)
