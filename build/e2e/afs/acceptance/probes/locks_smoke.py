@@ -78,7 +78,8 @@ def _parse_start_ticks(stat_text: str) -> int:
     close = stat_text.rfind(")")
     if close == -1:
         raise RuntimeError("/proc stat is malformed: missing comm terminator")
-    tail = stat_text[close + 2 :].split()
+    tail_start = close + 2
+    tail = stat_text[tail_start:].split()
     if len(tail) <= 19:
         raise RuntimeError("/proc stat is malformed: missing starttime")
     return int(tail[19])
@@ -408,7 +409,7 @@ class Child:
     def release(self) -> int:
         if self.proc.poll() is None:
             try:
-                if not self.proc.stdin is not None:
+                if self.proc.stdin is None:
                     raise AssertionError("self.proc.stdin is not None")
                 self.proc.stdin.write("release\n")
                 self.proc.stdin.flush()

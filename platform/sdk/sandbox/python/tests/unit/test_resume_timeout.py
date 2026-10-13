@@ -110,6 +110,8 @@ class ResumeTimeoutTests(unittest.TestCase):
         calls = []
         def handler(request):
             calls.append(request)
+            if request.method == "GET":
+                return httpx.Response(200, json={"status": "running", "failure": None})
             if len(calls) == 1:
                 raise httpx.ReadTimeout("response lost", request=request)
             return httpx.Response(503, headers={"X-ADX-Error-Code": "ENV_RESUMING"}, json={"error": {
@@ -120,7 +122,9 @@ class ResumeTimeoutTests(unittest.TestCase):
             with self.assertRaises(SandboxError) as raised:
                 self.client(handler).invoke("env", "side_effect", timeout=10)
         self.assertEqual(raised.exception.code, "OUTCOME_UNKNOWN")
-        self.assertTrue(all(r.url.path.startswith("/direct/") for r in calls))
+        self.assertTrue(all(r.url.path.startswith("/direct/") for r in calls if r.method == "POST"))
+        self.assertEqual(sum(r.method == "POST" for r in calls), 3)
+        self.assertEqual(sum(r.method == "GET" for r in calls), 1)
 
     def test_concurrent_resuming_retries_preserve_each_logical_identity(self):
         barrier, lock = threading.Barrier(12), threading.Lock()
