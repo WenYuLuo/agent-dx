@@ -12,6 +12,7 @@ CASES = (
     'restore admitted before TTL completes after TTL',
     'committed resume response lost and retry reuses execution',
     'permanent pause survives restarts and traffic restores across nodes',
+    'healthy owner rejects capacity before concurrent traffic restores on peer',
 )
 
 
@@ -47,3 +48,17 @@ def verify(result):
             or permanent.get('target') != 'node2' or permanent.get('epoch_after', 0) <= permanent.get('epoch_before', 0)
             or not permanent.get('session_after') or permanent.get('session_after') == permanent.get('session_before')):
         raise ValueError('missing permanent retention restart and traffic evidence')
+    capacity = by_name[CASES[11]]
+    if (capacity.get('source_healthy') is not True or capacity.get('local_rejected') is not True
+            or capacity.get('local_error') != 'insufficient resources or node admission closed'
+            or capacity.get('source_cpu_capacity', 0) <= 0
+            or capacity.get('source_cpu_reserved') != capacity.get('source_cpu_capacity')
+            or capacity.get('source') != 'node1' or capacity.get('target') != 'node2'
+            or capacity.get('generation_after', 0) <= capacity.get('generation_before', 0)
+            or capacity.get('wake_operation_preserved') is not True
+            or capacity.get('request_count') != 12 or capacity.get('unique_nonces') != 12
+            or capacity.get('source_restore_count') != 0 or capacity.get('peer_restore_count') != 1):
+        raise ValueError('missing healthy-owner capacity transfer or single restore evidence')
+    if not (capacity['local_attempt_at'] <= capacity['local_rejected_at']
+            < capacity['peer_release_at'] < capacity['transferred_at']):
+        raise ValueError('transfer preceded definitive owner rejection')

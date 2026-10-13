@@ -19,6 +19,7 @@ from pathlib import Path
 from transfer_config import ADDRESSES, HOST, configure
 from transfer_contract import verify as verify_transfer
 from demand_contract import verify as verify_demand
+from demand_physical import audit as audit_demand
 from storage_fixture import public as public_storage
 
 
@@ -370,16 +371,20 @@ def main():
             call(['iptables', '-t', 'nat', '-D', *nat_rule])
         if result['cleanup_errors']:
             result['status'] = 'failed'
-        try:
-            verify(result)
-        except ValueError:
-            result['status'] = 'failed'
-        (evidence / 'result.json').write_text(json.dumps(result, indent=2))
         # Export only logs and public evidence, with credentials redacted.
         for node in ADDRESSES:
             logs = root / node / 'state/logs'
             if logs.exists():
                 shutil.copytree(logs, evidence / (node + '-logs'), dirs_exist_ok=True)
+        try:
+            if demand_suite and result['status'] == 'passed':
+                proof = audit_demand(evidence, result)
+                (evidence / 'physical-restore-audit.json').write_text(json.dumps(proof, indent=2))
+            verify(result)
+        except (ValueError, KeyError, OSError) as error:
+            result['status'] = 'failed'
+            result['validation_error'] = str(error)
+        (evidence / 'result.json').write_text(json.dumps(result, indent=2))
         call(['python3', base / 'e2e/firecracker/collect.py', root])
     return 0 if result['status'] == 'passed' else 1
 

@@ -10,6 +10,7 @@ import ssl
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -115,16 +116,16 @@ def command(sandbox, text):
     return output.stdout.strip()
 
 
-def create(idle=0, ttl=900, retention=None):
-    sandbox = Sandbox(image=image, runtime='firecracker', cpu=1000, memory=128, storage_mb=32,
+def create(idle=0, ttl=900, retention=None, node='node1', cpu=1000):
+    sandbox = Sandbox(image=image, runtime='firecracker', cpu=cpu, memory=128, storage_mb=32,
                       env={'PYTHONDONTWRITEBYTECODE': '1'}, idle_timeout=idle,
                       idle_action=IdleAction.PAUSE if idle else IdleAction.DELETE, pause_policy=PausePolicy(retention=retention or RetentionPolicy.for_seconds(ttl), timeout_seconds=1800, storage=CheckpointStorage.SHARED),
                       port_forwardings=[8088], connection=connection, create_timeout=180,
                       schedule_affinities=[{'kind': 0, 'affinity': 0, 'weight': 1000,
-                                            'labelOps': [{'type': 0, 'labelKey': 'NODE_ID', 'labelValues': ['node1']}]}])
+                                            'labelOps': [{'type': 0, 'labelKey': 'NODE_ID', 'labelValues': [node]}]}])
     sandboxes.append(sandbox)
-    if record(sandbox)['assignment']['node_id'] != 'node1':
-        raise AssertionError('initial node preference did not select node1')
+    if record(sandbox)['assignment']['node_id'] != node:
+        raise AssertionError(('initial node preference did not select requested node', node))
     sandbox.files.write('/tmp/demand-server.py', GUEST)
     sandbox.files.write('/tmp/demand-file', 'durable-' + sandbox.id)
     command(sandbox, 'nohup python3 /tmp/demand-server.py >/tmp/demand-server.log 2>&1 </dev/null &')
@@ -176,11 +177,93 @@ def paused(sandbox):
     return value
 
 
-def delete(sandbox):
+def kill(sandbox):
     sandbox.kill()
     wait(lambda: record(sandbox) is None)
-    wait(lambda: not inventory('node1') and not inventory('node2'))
     sandboxes.remove(sandbox)
+
+
+def delete(sandbox):
+    kill(sandbox)
+    wait(lambda: not inventory('node1') and not inventory('node2'))
+
+
+def capacity_case():
+    sandbox = create()
+    baseline = request(sandbox)
+    sandbox.pause(retention=RetentionPolicy.for_seconds(900), timeout_seconds=1800)
+    before = paused(sandbox)
+    initial = catalog()
+    source_session = initial['node:node1']['session']['id']
+    source_pid = pid(root / 'node1', 'adxlet')
+    capacities = {node: initial['node:' + node]['node']['capacity']['cpu_millis'] for node in ('node1', 'node2')}
+    if any(cpu != 4000 for cpu in capacities.values()):
+        raise AssertionError(('capacity suite requires an actual 4-core cgroup quota', capacities))
+    owner_load = create(cpu=capacities['node1'])
+    peer_load = create(node='node2', cpu=capacities['node2'])
+    owner_backend, peer_backend = physical('node1'), physical('node2')
+    saturated = catalog()
+    reserved = {node: sum(value['spec']['resources']['cpu_millis'] for key, value in saturated.items()
+                          if key.startswith('environment:') and value['assignment']['node_id'] == node
+                          and value.get('result', {}).get('resources_held')) for node in capacities}
+    if reserved != capacities:
+        raise AssertionError(('real running loads did not fill CPU reservations', reserved, capacities))
+    (evidence / 'capacity-saturated.json').write_text(json.dumps({'at': time.time(), 'nodes': {
+        node: saturated['node:' + node] for node in capacities}, 'reserved': reserved,
+        'loads': {node: record(load) for node, load in [('node1', owner_load), ('node2', peer_load)]}}, indent=2))
+    barrier = threading.Barrier(13)
+    def demand(index):
+        barrier.wait(10)
+        return request(sandbox, 'capacity-' + str(index))
+    futures = [executor.submit(demand, index) for index in range(12)]
+    barrier.wait(10)
+    rejected = wait(lambda: (lambda r: r if r and (r.get('resume') or {}).get('local_rejected') else None)(record(sandbox)))
+    rejected_at = time.time()
+    if rejected['assignment'] != before['assignment'] or rejected['invalidated'] or rejected['result']['state'] != 'Paused':
+        raise AssertionError('ownership moved before observing owner admission rejection')
+    if rejected['result']['checkpoint'] != before['result']['checkpoint'] or any(future.done() for future in futures):
+        raise AssertionError('capacity rejection changed checkpoint or completed demand early')
+    errors = []
+    for line in (root/'node1/state/logs/node1.log').read_text().splitlines():
+        try: event = json.loads(line)
+        except ValueError: continue
+        if event.get('environment_id') == sandbox.id and event.get('operation') == 'ensure_running':
+            errors.append(event)
+    local = next((event for event in errors if event.get('error') == 'insufficient resources or node admission closed'), None)
+    if local is None:
+        raise AssertionError(('no actual owner NoCapacity operation result', errors))
+    if physical('node1') != owner_backend or physical('node2') != peer_backend:
+        raise AssertionError('a target VM appeared before peer capacity was freed')
+    healthy = catalog()['node:node1']
+    os.kill(source_pid, 0)
+    if healthy['session']['id'] != source_session or not healthy['session']['routable'] or not healthy['node']['available']:
+        raise AssertionError('source was invalidated or unhealthy during capacity rejection')
+    (evidence / 'capacity-owner-rejected.json').write_text(json.dumps({'at': rejected_at, 'record': rejected,
+        'node': healthy, 'local_operation_result': local, 'inventories': {node: inventory(node) for node in capacities}}, indent=2))
+    peer_release_at = time.time()
+    kill(peer_load)
+    wait(lambda: not inventory('node2'))
+    transferred = wait(lambda: (lambda r: r if r and r['assignment']['node_id'] == 'node2' else None)(record(sandbox)))
+    transferred_at = time.time()
+    (evidence / 'capacity-transfer.json').write_text(json.dumps({'at': transferred_at, 'record': transferred}, indent=2))
+    responses = [future.result(2100) for future in futures]
+    for response in responses: continuity(baseline, response)
+    after = record(sandbox)
+    operation = rejected['resume']['operation_id']
+    if (after['assignment']['node_id'] != 'node2' or after['result']['last_operation']['id'] != operation
+            or physical('node1') != owner_backend or len(inventory('node2')) != 1
+            or catalog()['node:node1']['session']['id'] != source_session):
+        raise AssertionError('capacity transfer changed wake identity or source execution')
+    pass_case(11, instance_id=sandbox.id, source='node1', target='node2', source_healthy=True,
+              source_cpu_capacity=capacities['node1'], source_cpu_reserved=reserved['node1'], local_rejected=True,
+              local_error=local['error'], local_attempt_at=local['unix_seconds'], local_rejected_at=rejected_at,
+              peer_release_at=peer_release_at, transferred_at=transferred_at,
+              generation_before=before['assignment']['generation'], generation_after=after['assignment']['generation'],
+              wake_operation_preserved=True, wake_operation_id=operation, request_count=12,
+              unique_nonces=len({response['nonce'] for response in responses}), responses=responses,
+              source_session=source_session, backend=physical('node2'), owner_load_backend=owner_backend)
+    kill(sandbox)
+    delete(owner_load)
 
 
 def block(node, port, action='DROP', redirect=None):
@@ -495,6 +578,7 @@ try:
               session_before=session, session_after=catalog()['node:' + target]['session']['id'],
               target=target, traffic_after_manual_pause=True, continuity=True)
     delete(sandbox)
+    capacity_case()
     result['status'] = 'passed'
 except BaseException as error:
     result['error'] = repr(error)
@@ -516,9 +600,13 @@ finally:
             pass
     for sandbox in list(sandboxes):
         try:
-            delete(sandbox)
+            kill(sandbox)
         except Exception as error:
             result['cleanup_errors'].append(repr(error))
+    try:
+        wait(lambda: not inventory('node1') and not inventory('node2'))
+    except Exception as error:
+        result['cleanup_errors'].append(repr(error))
     executor.shutdown(wait=False, cancel_futures=True)
     if result['cleanup_errors']:
         result['status'] = 'failed'

@@ -123,7 +123,53 @@ class DemandFixtureTests(unittest.TestCase):
         cases[10].update(automatic_expiry=None, manual_expiry=None, dormant_after_coordinator_restart=True,
                          traffic_after_manual_pause=True, continuity=True, target='node2',
                          epoch_before=1, epoch_after=2, session_before='before', session_after='after')
+        if len(cases) > 11:
+            cases[11].update(source_healthy=True, local_rejected=True,
+                             local_error='insufficient resources or node admission closed',
+                             source_cpu_capacity=4000, source_cpu_reserved=4000,
+                             local_attempt_at=10, local_rejected_at=11, peer_release_at=12, transferred_at=13,
+                             source='node1', target='node2', generation_before=1, generation_after=2,
+                             wake_operation_preserved=True, request_count=12, unique_nonces=12,
+                             source_restore_count=0, peer_restore_count=1)
         return {'status': 'passed', 'cases': cases, 'storage': {'kind': 'real_obs'}, 'obs_empty': True, 'cleanup_errors': [], 'inventories': {'node1': 0, 'node2': 0}}
+
+    def test_capacity_transfer_requires_owner_rejection_before_transfer(self):
+        self.assertEqual(len(CASES), 12)
+        complete = self.complete()
+        verify(complete)
+        for key, value in [('source_healthy', False), ('local_rejected', False),
+                           ('local_error', 'timeout'), ('source_cpu_reserved', 3000),
+                           ('transferred_at', 10), ('wake_operation_preserved', False),
+                           ('request_count', 1), ('unique_nonces', 11),
+                           ('source_restore_count', 1), ('peer_restore_count', 2)]:
+            with self.subTest(key=key):
+                bad = copy.deepcopy(complete)
+                bad['cases'][11][key] = value
+                with self.assertRaises(ValueError): verify(bad)
+
+    def test_physical_audit_rejects_extra_capacity_restore(self):
+        from demand_physical import audit
+        result = self.complete()
+        self.assertEqual(len(result['cases']), 12)
+        expected = [0, 0, 1, 1, 1, 1, 1, 0, 1, 1, 2, 1]
+        result['cases'][5]['old_backend_removed'] = False
+        result['cases'][6]['old_backend_removed'] = False
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            logs = {'node1': [], 'node2': []}
+            for index, count in enumerate(expected):
+                case = result['cases'][index]
+                case['instance_id'] = f'env-{index}'
+                node = 'node2' if index == 11 else 'node1'
+                for attempt in range(count):
+                    backend = f'sbox-{index}-{attempt}'
+                    logs[node].extend([f'firecracker: restored sandbox {backend} pid=123',
+                                       f'Type:create SandboxID:{backend} adx.environment_id {case["instance_id"]}'])
+            for node, lines in logs.items(): (root/f'{node}-sandboxd-service.log').write_text('\n'.join(lines)+'\n')
+            self.assertEqual(len(audit(root, result)), 12)
+            with (root/'node2-sandboxd-service.log').open('a') as log:
+                log.write('firecracker: restored sandbox sbox-extra pid=124\nType:create SandboxID:sbox-extra adx.environment_id env-11\n')
+            with self.assertRaises(ValueError): audit(root, result)
 
     def test_missing_real_fault_boundary_cannot_pass(self):
         complete = self.complete()
