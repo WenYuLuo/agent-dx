@@ -255,3 +255,118 @@ async fn invalid_hello_does_not_replace_a_healthy_control_connection() {
         .await
         .unwrap();
 }
+
+#[tokio::test]
+async fn initializing_waits_for_execd_and_terminal_failure_wakes_waiter() {
+    let test = setup(None, true).await;
+    test.hub.wait_ready(&identity()).await.unwrap();
+    test.controller.begin_probe_initialization().unwrap();
+    test.hub
+        .request(&identity(), ControlOperation::Status)
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), test.hub.wait_ready(&identity()))
+            .await
+            .is_err()
+    );
+    let failure = adx_core::probes::ProbeFailure::timeout("readiness HTTP 503");
+    test.controller
+        .probe_failed(
+            &identity(),
+            test.controller.probe_status().unwrap().1,
+            failure.clone(),
+        )
+        .unwrap();
+    let error = tokio::time::timeout(Duration::from_secs(1), test.hub.wait_ready(&identity()))
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(error, adx_core::Error::ProbeFailed(failure));
+}
+#[tokio::test]
+async fn healthcheck_failure_wakes_controller_and_survives_reconnect() {
+    let test = setup(None, true).await;
+    let mut events = test.hub.take_events().unwrap();
+    test.hub.wait_ready(&identity()).await.unwrap();
+    let failure = adx_core::probes::ProbeFailure {
+        kind: adx_core::probes::ProbeFailureKind::HealthcheckFailed,
+        message: "exec exit 7".into(),
+        consecutive_failures: 3,
+        exit_code: Some(7),
+        http_status: None,
+    };
+    test.controller
+        .probe_failed(
+            &identity(),
+            test.controller.probe_status().unwrap().1,
+            failure.clone(),
+        )
+        .unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), events.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        identity()
+    );
+    assert_eq!(
+        test.hub.observed(&identity()).unwrap().unwrap().failure,
+        Some(failure.clone())
+    );
+    test.hub.disconnect(&identity()).unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), test.hub.wait_ready(&identity()))
+            .await
+            .unwrap()
+            .unwrap_err(),
+        adx_core::Error::ProbeFailed(failure)
+    );
+}
+#[tokio::test]
+async fn probe_enabled_resume_rearms_initialization_before_ready() {
+    let mut test = setup(None, true).await;
+    test.hub.wait_ready(&identity()).await.unwrap();
+    test.controller.begin_probe_initialization().unwrap();
+    test.controller
+        .probe_ready(&identity(), test.controller.probe_status().unwrap().1)
+        .unwrap();
+    let stale_epoch = test.controller.probe_status().unwrap().1;
+    let status = test.controller.status();
+    test.hub
+        .request(
+            &identity(),
+            ControlOperation::Prepare(PrepareCheckpoint {
+                identity: identity(),
+                operation_id: "probe-resume".into(),
+                expected_revision: status.revision,
+            }),
+        )
+        .await
+        .unwrap();
+    test.resume
+        .take()
+        .unwrap()
+        .send(HandoffOutcome::Resume)
+        .unwrap();
+    let mut changes = test.controller.subscribe();
+    while test.controller.status().phase != RuntimePhase::Initializing {
+        changes.changed().await.unwrap();
+    }
+    assert_eq!(
+        test.controller.status().checkpoint.unwrap().phase,
+        CheckpointPhase::Resumed
+    );
+    assert_eq!(
+        test.controller.probe_failed(
+            &identity(),
+            stale_epoch,
+            adx_core::probes::ProbeFailure::timeout("stale")
+        ),
+        Err(adx_core::Error::Conflict)
+    );
+    test.controller
+        .probe_ready(&identity(), test.controller.probe_status().unwrap().1)
+        .unwrap();
+    test.hub.wait_ready(&identity()).await.unwrap();
+}

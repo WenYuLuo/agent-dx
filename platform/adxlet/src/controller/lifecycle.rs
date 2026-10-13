@@ -320,7 +320,13 @@ impl Controller {
         self.held = true;
         self.record.resources_held = true;
         self.transition(Event::Resume)?;
-        let attempt = async {
+        self.record.failure = None;
+        let initialization_timeout = if self.record.spec.sandbox.init_timeout_seconds > 0 {
+            Duration::from_secs(self.record.spec.sandbox.init_timeout_seconds)
+        } else {
+            self.services.operation_timeout
+        };
+        let attempt = tokio::time::timeout(initialization_timeout, async {
             self.services.readiness.expect_runtime(&self.record)?;
             self.record.runtime.ip = Some(
                 self.services
@@ -340,9 +346,17 @@ impl Controller {
             );
             self.services.readiness.wait_ready(&self.record).await?;
             self.services.routes.activate(&self.record).await
-        }
-        .await;
+        })
+        .await
+        .unwrap_or_else(|_| {
+            Err(Error::Unavailable(
+                "restore initialization timed out".into(),
+            ))
+        });
         if let Err(error) = attempt {
+            if let Error::ProbeFailed(failure) = &error {
+                self.record.failure = Some(failure.clone().into());
+            }
             match self.cleanup().await {
                 Ok(()) => {
                     self.record.runtime.ip = None;

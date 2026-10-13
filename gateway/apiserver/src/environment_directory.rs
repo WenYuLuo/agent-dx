@@ -226,6 +226,7 @@ mod tests {
     fn entry(id: &str, generation: u64, revision: u64) -> pb::PublishedEnvironment {
         pb::PublishedEnvironment {
             record: Some(pb::EnvironmentRecord {
+                failure: None,
                 spec: Some(pb::EnvironmentSpec {
                     id: id.into(),
                     tenant_id: "tenant".into(),

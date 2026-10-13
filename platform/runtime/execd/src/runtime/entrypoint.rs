@@ -17,7 +17,7 @@ const CONFIG_VERSION: u32 = 1;
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 const STDERR_TAIL_BYTES: usize = 64 * 1024;
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProcessSpec {
     version: u32,
@@ -79,6 +79,8 @@ struct Manager {
     inner: Mutex<Inner>,
     changed: Condvar,
 }
+
+static PROCESS_SPEC: OnceLock<ProcessSpec> = OnceLock::new();
 
 static MANAGER: OnceLock<Arc<Manager>> = OnceLock::new();
 static INITIALIZED: OnceLock<()> = OnceLock::new();
@@ -198,6 +200,7 @@ fn start_from_environment(manager: Arc<Manager>) {
             return;
         }
     };
+    let _ = PROCESS_SPEC.set(spec.clone());
     let stderr_tail = Arc::new(Mutex::new(Vec::new()));
     let mut command = Command::new(&spec.args[0]);
     command
@@ -207,30 +210,7 @@ fn start_from_environment(manager: Arc<Manager>) {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     child_env::apply(&mut command);
-    if let Some(identity) = identity {
-        // SAFETY: the closure runs in the child immediately before exec, captures owned identity
-        // data whose pointers stay valid for the call, performs no access to parent-only state,
-        // and converts every syscall failure into an aborted exec.
-        unsafe {
-            command.pre_exec(move || {
-                let group_result = if let Some(user_name) = &identity.user_name {
-                    libc::initgroups(user_name.as_ptr(), identity.gid as _)
-                } else {
-                    libc::setgroups(0, std::ptr::null())
-                };
-                if group_result != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                if libc::setgid(identity.gid) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                if libc::setuid(identity.uid) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-    }
+    apply_identity(&mut command, identity);
 
     let mut child = match command.spawn() {
         Ok(child) => child,
@@ -312,6 +292,44 @@ fn start_from_environment(manager: Arc<Manager>) {
             .state = State::Exited(info);
         manager.changed.notify_all();
     });
+}
+
+fn apply_identity(command: &mut Command, identity: Option<Identity>) {
+    if let Some(identity) = identity {
+        // SAFETY: the closure runs in the child immediately before exec, captures owned identity
+        // data whose pointers stay valid for the call, performs no access to parent-only state,
+        // and converts every syscall failure into an aborted exec.
+        unsafe {
+            command.pre_exec(move || {
+                let group_result = if let Some(user_name) = &identity.user_name {
+                    libc::initgroups(user_name.as_ptr(), identity.gid as _)
+                } else {
+                    libc::setgroups(0, std::ptr::null())
+                };
+                if group_result != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::setgid(identity.gid) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::setuid(identity.uid) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+}
+
+pub(crate) fn probe_command(argv: &[String]) -> Result<tokio::process::Command, String> {
+    let spec = PROCESS_SPEC
+        .get()
+        .ok_or("managed workload configuration is unavailable")?;
+    let mut command = tokio::process::Command::new(&argv[0]);
+    command.args(&argv[1..]).current_dir(&spec.cwd);
+    child_env::apply_tokio(&mut command);
+    apply_identity(command.as_std_mut(), resolve_identity(&spec.user)?);
+    Ok(command)
 }
 
 fn read_spec(path: &Path) -> Result<ProcessSpec, String> {

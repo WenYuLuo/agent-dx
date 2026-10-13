@@ -75,6 +75,7 @@ impl Session {
                 });
             }
             stored_environment.result = Some(EnvironmentRecord {
+                failure: None,
                 spec: stored_environment.spec.clone(),
                 assignment: replacement.clone(),
                 state: EnvironmentState::Paused,
@@ -85,7 +86,6 @@ impl Session {
                 },
                 resources_held: false,
                 checkpoint: Some(checkpoint),
-                failure: None,
                 last_operation: None,
                 restart_attempts: 0,
                 restart_pending: false,

@@ -56,6 +56,7 @@ impl RuntimeIdentity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimePhase {
+    Initializing,
     Running,
     Preparing,
     Prepared,
@@ -80,6 +81,8 @@ pub struct CheckpointStatus {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeStatus {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<crate::probes::ProbeFailure>,
     pub identity: RuntimeIdentity,
     pub revision: u64,
     pub phase: RuntimePhase,

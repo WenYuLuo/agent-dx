@@ -347,6 +347,15 @@ impl RuntimeControlClient {
             }
             return Err(unavailable("runtime control unavailable"));
         }
+        self.http_request(record, path, body).await
+    }
+    async fn http_request(
+        &self,
+        record: &EnvironmentRecord,
+        path: &str,
+        body: Option<Vec<u8>>,
+    ) -> Result<RuntimeStatus> {
+        let expected = Self::identity(record);
         let key = self.key(record)?;
         let connection = self.connection(&key);
         let method = if body.is_some() {
@@ -412,6 +421,17 @@ impl RuntimeControlClient {
         .map_err(|_| unavailable("deadline exceeded"))?;
         connection.set_idle(true);
         result
+    }
+    /// Probe observations use the last full stream snapshot, with authenticated
+    /// HTTP status polling while that stream has no observation. Mutations remain
+    /// on their configured transport and retain their existing fencing.
+    pub async fn probe_status(&self, record: &EnvironmentRecord) -> Result<RuntimeStatus> {
+        if let Some(stream) = &self.stream {
+            if let Some(status) = stream.observed(&Self::identity(record))? {
+                return Ok(status);
+            }
+        }
+        self.http_request(record, "status", None).await
     }
     pub async fn status(&self, record: &EnvironmentRecord) -> Result<RuntimeStatus> {
         self.request(record, "status", None).await
@@ -518,6 +538,7 @@ mod tests {
 
     fn record(port: u16) -> (EnvironmentRecord, RuntimeControlClient) {
         let record = EnvironmentRecord {
+            failure: None,
             spec: EnvironmentSpec {
                 runtime_profile: None,
                 snapshot_id: None,
@@ -551,7 +572,6 @@ mod tests {
             },
             resources_held: true,
             checkpoint: None,
-            failure: None,
             last_operation: None,
             restart_attempts: 0,
             restart_pending: false,
@@ -606,6 +626,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let (record, client) = record(port);
         let expected = RuntimeStatus {
+            failure: None,
             requested_checkpoint: None,
             requested_checkpoint_deadline_unix_millis: None,
             identity: RuntimeControlClient::identity(&record),
@@ -694,6 +715,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let (record, client) = record(port);
         let expected = RuntimeStatus {
+            failure: None,
             requested_checkpoint: None,
             requested_checkpoint_deadline_unix_millis: None,
             identity: RuntimeControlClient::identity(&record),
@@ -750,6 +772,7 @@ mod tests {
             .iter()
             .map(|record| {
                 serde_json::to_vec(&RuntimeStatus {
+                    failure: None,
                     requested_checkpoint: None,
                     requested_checkpoint_deadline_unix_millis: None,
                     identity: RuntimeControlClient::identity(record),

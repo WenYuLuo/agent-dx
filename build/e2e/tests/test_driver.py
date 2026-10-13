@@ -972,6 +972,14 @@ class AcceptanceGateTests(unittest.TestCase):
             }
             (p / 'bundle.json').write_text(json.dumps(manifest))
             self.assertEqual(driver.verify_bundle(p), manifest)
+            (p / 'workload-probes.tar').write_bytes(b'probes')
+            manifest['workload_probes_archive_sha256'] = driver.sha(p / 'workload-probes.tar')
+            (p / 'bundle.json').write_text(json.dumps(manifest))
+            self.assertEqual(driver.verify_bundle(p), manifest)
+            (p / 'workload-probes.tar').write_bytes(b'replaced')
+            with self.assertRaisesRegex(ValueError, 'workload probe'):
+                driver.verify_bundle(p)
+            (p / 'workload-probes.tar').write_bytes(b'probes')
             (p / 'entrypoint.tar').write_bytes(b'replaced')
             with self.assertRaisesRegex(ValueError, 'entrypoint'):
                 driver.verify_bundle(p)

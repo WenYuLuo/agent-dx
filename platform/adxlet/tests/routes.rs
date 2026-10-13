@@ -25,6 +25,7 @@ use tonic::{Request, Response, Status};
 
 fn record() -> EnvironmentRecord {
     EnvironmentRecord {
+        failure: None,
         restart_attempts: 0,
         restart_pending: false,
         spec: EnvironmentSpec {
@@ -57,7 +58,6 @@ fn record() -> EnvironmentRecord {
             ip: Some("10.0.0.2".parse().unwrap()),
         },
         checkpoint: None,
-        failure: None,
         last_operation: None,
         state: EnvironmentState::Starting,
         revision: 1,

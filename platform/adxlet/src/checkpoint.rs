@@ -117,6 +117,9 @@ impl CheckpointCooperation for crate::runtime_control::RuntimeControlClient {
         }
         loop {
             let status = self.status(record).await?;
+            if let Some(failure) = status.failure {
+                return Err(Error::ProbeFailed(failure));
+            }
             let cp = status.checkpoint.as_ref().ok_or(Error::Conflict)?;
             if cp.operation_id != id {
                 return Err(Error::Conflict);

@@ -52,6 +52,18 @@ subcases, and JUnit reports those subcases individually. Both profiles write
 reached is visible as skipped and prevents the JSON result from passing. The
 public API inventory and uncovered conditional features are tracked in
 [SDK E2E coverage](../../docs/testing/sdk-e2e-coverage.md).
+For workload probes, add `--workload-probes` to `prepare.py`, then run
+`run.py --profile standalone --case workload-probes` against that bundle.
+Run it again with `ADX_E2E_RUNTIME_CONTROL=1` to exercise the Execd control
+stream; the default exercises HTTP status polling. The managed Python workload
+checks delayed HTTP readiness, TCP readiness, exec environment/working directory,
+terminal readiness errors with resource cleanup, health failure thresholds,
+bounded cold restart with a new backend, and idle deletion while probes run.
+Stream mode also requires and saves Execd's successful control registration
+from the host runtime log for each returned sandbox.
+The result is a targeted case with seven functional subcases; it does not
+replace the complete standalone profile. The fixture archive is hash-verified
+with the release bundle, and business requests use its installed SDK wheel.
 For a focused diagnostic, add `--case stop` (or another case from the selected
 profile). The result is labeled `profile: targeted`, records `source_profile`
 and `selected_case`, and cannot be cited as a complete profile pass.

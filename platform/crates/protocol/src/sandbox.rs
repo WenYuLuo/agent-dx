@@ -310,6 +310,9 @@ impl From<core::SandboxOptions> for pb::SandboxOptions {
             ports: value.ports.into_iter().map(u32::from).collect(),
             failover: value.failover,
             inherit_entrypoint: value.inherit_entrypoint,
+            readiness_probe: value.readiness_probe.map(|probe| Box::new(probe.into())),
+            healthcheck_probe: value.healthcheck_probe.map(|probe| Box::new(probe.into())),
+            init_timeout_seconds: value.init_timeout_seconds,
             limits: Some(pb::ResourceLimits {
                 cpu_millis: value.limits.cpu_millis,
                 memory_bytes: value.limits.memory_bytes,
@@ -343,6 +346,9 @@ impl TryFrom<pb::SandboxOptions> for core::SandboxOptions {
                 .collect::<Result<_>>()?,
             failover: value.failover,
             inherit_entrypoint: value.inherit_entrypoint,
+            readiness_probe: value.readiness_probe.map(TryInto::try_into).transpose()?,
+            healthcheck_probe: value.healthcheck_probe.map(TryInto::try_into).transpose()?,
+            init_timeout_seconds: value.init_timeout_seconds,
             limits: core::ResourceLimits {
                 cpu_millis: limits.cpu_millis,
                 memory_bytes: limits.memory_bytes,

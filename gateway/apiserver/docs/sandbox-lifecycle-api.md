@@ -47,6 +47,7 @@ instead of inferring retry safety from HTTP status or message text. See the
 
 | Operation | Method and path | Request body | Decoded successful `data` |
 | --- | --- | --- | --- |
+| Probe capability | `GET /api/sandbox/v1/capabilities` | none | plain JSON `{"capabilities":["workload-probes-v1"]}` (authenticated; no envelope) |
 | Create sandbox | `POST /api/sandbox/v1/sandboxes` | create fields, including optional `snapshotId` and `failover` | `{"sandboxId":"default-name","instanceId":"default-name","status":"running","requestId":"..."}`; `tunnel` is included when requested |
 | Create reusable snapshot | `POST /api/sandbox/v1/sandboxes/{sandboxID}/snapshots` | `{"name":"optional","timeoutSeconds":300}` | `{"snapshotId":"...","names":["optional"]}` |
 | Get reusable snapshot | `GET /api/sandbox/v1/snapshots/{snapshotID}` | none | tenant-scoped catalog JSON returned by the Rust Coordinator SnapshotService |
@@ -65,6 +66,61 @@ Create uses the ordinary `X-Request-Id` header. It is optional: when absent,
 API Server derives the request ID from the trace ID, echoes it as `X-Request-Id`,
 and includes it in the create result. This is distinct from the required
 `X-ADX-Request-ID` header used by the lifecycle routes below.
+
+## Workload probes on image startup
+
+An image create with `inheritEntrypoint=true` accepts `readinessProbe` and
+`healthcheckProbe`. Each contains exactly one action (`httpGet`, `tcpSocket`,
+or `exec`) and integral timing values:
+
+```json
+{
+  "name": "server",
+  "rootfs": {"type": "image", "imageurl": "example/server:latest"},
+  "inheritEntrypoint": true,
+  "initCallTimeoutSeconds": 120,
+  "createTimeoutSeconds": 180,
+  "scheduleTimeoutSeconds": 30,
+  "readinessProbe": {
+    "httpGet": {"port": 8080, "path": "/ready"},
+    "initialDelaySeconds": 0,
+    "periodSeconds": 2,
+    "timeoutSeconds": 1
+  },
+  "healthcheckProbe": {
+    "exec": {"command": ["/app/check"]},
+    "periodSeconds": 10,
+    "timeoutSeconds": 2,
+    "failureThreshold": 3
+  }
+}
+```
+
+`tcpSocket` takes `{"port":8080}`. HTTP/TCP target sandbox loopback; HTTP
+requires 2xx and does not follow redirects. Exec is argv (no implicit shell),
+with the managed entrypoint's effective user, cwd and environment; exit zero
+succeeds. Ports must be 1–65535. Delay defaults to 0 (range 0–86400), period
+is 1–86400, and attempt timeout is 1–3600 seconds. Readiness defaults to
+period 2 / timeout 1; healthcheck defaults to period 10 / timeout 2 /
+`failureThreshold=3`. Readiness does not accept `failureThreshold`.
+
+`initCallTimeoutSeconds` defaults to 30 when omitted or zero; positive values
+must be 1–86400. Adxlet bounds runtime startup plus readiness with this budget,
+within the remaining end-to-end create deadline. Execd retries readiness until
+first success or the deadline. Its transient `Initializing` report stays in
+runtime/control-stream memory. Adxlet publishes Running and activates routes
+only after readiness succeeds; final failure uses normal Failed publication
+and runtime cleanup. Ordinary and SSE errors include `error.probeFailure`,
+with `retry=never` and `outcome=terminal`.
+
+Healthcheck is armed after readiness (or runtime startup when readiness is
+absent). Success resets consecutive failures. Reaching the threshold reports
+final failure through RuntimeStatus; Adxlet processes it through its serialized
+controller and existing restart/failover policy. HTTP status polling backs up
+control-stream delivery. The committed instance view exposes `failure.reason=ProbeFailed` and
+`failure.probe_failure` with `kind`, `message`, `consecutive_failures`, and optional `exit_code` /
+`http_status`. Pause/resume/restore cancel checks, recheck readiness and reset
+healthcheck counts. Probes do not count as user activity.
 
 ## Create from a reusable snapshot
 

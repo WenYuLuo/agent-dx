@@ -79,9 +79,22 @@ adxlet 未获得有效 Start 成功结果（失败、超时、应答丢失或无
 
 这与公开创建 HTTP 应答丢失的 `OUTCOME_UNKNOWN` 分开：客户端不知道服务端结果时，仍须查询或以相同身份重试。查得 Failed 后不能据此再次启动原执行；相同 Environment 的 create 会报状态冲突。checkpoint 的未知结果保护不受该 Start 契约影响。
 
+## 工作负载 probe 失败
+
+Readiness 的初始化预算耗尽，或恢复后的 readiness 失败，使用带
+`ProbeFailure` JSON details 的 gRPC `FailedPrecondition`。API Server 将其映射为
+HTTP 409、`code=UNAVAILABLE`、`retry=never`、`outcome=terminal`，并在
+`error.probeFailure` 中保留 `kind`、`message`、`consecutive_failures` 和可选的
+`exit_code` / `http_status`。SSE final 使用同一结构。该分类优先于普通
+`FailedPrecondition → CONFLICT`；调用方不将已确认的 probe 失败当作结果未知重试。
+
+Healthcheck 达到连续失败阈值后，由 adxlet 清理并按既有策略处理执行；查询的
+`failure.reason=ProbeFailed` 和 `failure.probe_failure` 保存已提交的原因，
+复用现有 OOM/退出失败模型。自动重启成功后该字段清空。
+
 ## SDK 契约
 
-Python SDK 对结构化错误抛出 `SandboxHTTPError`，并公开 `status_code`、`code`、`retry`、`outcome`、`request_id`、`operation_id` 和 `instance_id`。自动重试只能发生在 `same_operation` 或 `after_backoff`，且复用原身份；`never` 立即返回调用方。旧服务没有 `error` 对象时，SDK 保留原有 HTTP 状态兼容路径，但无法给出稳定码。
+Python SDK 对结构化错误抛出 `SandboxHTTPError`，并公开 `status_code`、`code`、`retry`、`outcome`、`request_id`、`operation_id` 、`instance_id` 和可选的 `probe_failure`。自动重试只能发生在 `same_operation` 或 `after_backoff`，且复用原身份；`never` 立即返回调用方。旧服务没有 `error` 对象时，SDK 保留原有 HTTP 状态兼容路径，但无法给出稳定码。
 
 创建请求未显式提供名称时，SDK 使用 `create-*` Request ID 中的 UUID 生成稳定名称。跨 API Server 重试因此仍得到相同 Environment ID；查询暂时返回 404 不能触发换名称或创建第二个实例。
 

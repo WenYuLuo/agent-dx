@@ -7,6 +7,7 @@ fn environment_identity_survives_runtime_replacement() {
     }
 
     let mut record = EnvironmentRecord {
+        failure: None,
         spec: EnvironmentSpec {
             id: "environment-a".into(),
             tenant_id: "tenant-a".into(),
@@ -40,7 +41,6 @@ fn environment_identity_survives_runtime_replacement() {
         },
         resources_held: true,
         checkpoint: None,
-        failure: None,
         last_operation: None,
         restart_attempts: 0,
         restart_pending: false,

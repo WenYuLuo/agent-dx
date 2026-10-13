@@ -135,6 +135,7 @@ impl Fixture {
         let address = listener.local_addr().unwrap().to_string();
         let owner = pb::GetEnvironmentResponse {
             record: Some(pb::EnvironmentRecord {
+                failure: None,
                 spec: Some(pb::EnvironmentSpec {
                     id: "environment".into(),
                     tenant_id: "tenant".into(),

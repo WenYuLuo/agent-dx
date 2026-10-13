@@ -7,6 +7,7 @@ pub mod control {
 
 pub use adx_core::valid_runtime_id;
 use adx_core::{Error, Result};
+mod probes;
 mod sandbox;
 mod scheduling;
 
@@ -244,6 +245,7 @@ impl TryFrom<adx_core::EnvironmentRecord> for control::EnvironmentRecord {
             revision: v.revision,
             restart_attempts: v.restart_attempts,
             restart_pending: v.restart_pending,
+            failure: v.failure.map(|failure| Box::new(failure.into())),
             runtime: Some(control::Runtime {
                 id: v.runtime.id,
                 ip: v.runtime.ip.map(|ip| ip.to_string()).unwrap_or_default(),
@@ -251,7 +253,6 @@ impl TryFrom<adx_core::EnvironmentRecord> for control::EnvironmentRecord {
             resources_held: v.resources_held,
             checkpoint: v.checkpoint.map(Into::into),
             last_operation: v.last_operation.map(Into::into),
-            failure: v.failure.map(Into::into),
         })
     }
 }
@@ -262,9 +263,20 @@ pub fn status(error: adx_core::Error) -> tonic::Status {
         Error::NotFound => tonic::Status::not_found("environment or node not found"),
         Error::NoCapacity => tonic::Status::resource_exhausted("capacity unavailable"),
         Error::Unavailable(message) => tonic::Status::unavailable(message),
+        Error::ProbeFailed(failure) => match serde_json::to_vec(&failure) {
+            Ok(details) => tonic::Status::with_details(
+                tonic::Code::FailedPrecondition,
+                failure.message.clone(),
+                details.into(),
+            ),
+            Err(_) => tonic::Status::internal("probe failure encoding failed"),
+        },
     }
 }
 pub fn dependency_status(status: tonic::Status) -> Error {
+    if let Ok(failure) = serde_json::from_slice(status.details()) {
+        return Error::ProbeFailed(failure);
+    }
     match status.code() {
         tonic::Code::FailedPrecondition => Error::Conflict,
         tonic::Code::NotFound => Error::NotFound,
@@ -415,12 +427,20 @@ impl TryFrom<control::RuntimeFailure> for adx_core::RuntimeFailure {
             Ok(Wire::OomKilled) => Reason::OomKilled,
             Ok(Wire::Exited) => Reason::Exited,
             Ok(Wire::Missing) => Reason::Missing,
+            Ok(Wire::ProbeFailed) => Reason::ProbeFailed,
             _ => return Err(Error::Invalid("invalid runtime failure reason".into())),
         };
+        let probe_failure = value.probe_failure.map(TryInto::try_into).transpose()?;
+        if (reason == Reason::ProbeFailed) != probe_failure.is_some() {
+            return Err(Error::Invalid(
+                "runtime probe failure metadata does not match reason".into(),
+            ));
+        }
         Ok(Self {
             reason,
             exit_code: value.exit_code,
             message: value.message,
+            probe_failure,
         })
     }
 }
@@ -432,11 +452,20 @@ impl From<adx_core::RuntimeFailure> for control::RuntimeFailure {
             Reason::OomKilled => Wire::OomKilled,
             Reason::Exited => Wire::Exited,
             Reason::Missing => Wire::Missing,
+            Reason::ProbeFailed => Wire::ProbeFailed,
         };
         Self {
             reason: reason as i32,
             exit_code: value.exit_code,
             message: value.message,
+            probe_failure: value.probe_failure.map(Into::into),
         }
+    }
+}
+
+impl TryFrom<Box<control::RuntimeFailure>> for adx_core::RuntimeFailure {
+    type Error = Error;
+    fn try_from(value: Box<control::RuntimeFailure>) -> Result<Self> {
+        (*value).try_into()
     }
 }

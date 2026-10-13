@@ -54,6 +54,9 @@ fn sandbox_options_roundtrip_preserves_backend_contract() {
         ports: vec![8080],
         failover: true,
         inherit_entrypoint: false,
+        readiness_probe: None,
+        healthcheck_probe: None,
+        init_timeout_seconds: 0,
         limits: model::ResourceLimits {
             cpu_millis: 1500,
             memory_bytes: 2 << 30,
@@ -125,6 +128,7 @@ fn record_roundtrip_preserves_identity_state_and_ownership() {
         resources_held: true,
         checkpoint: None,
         failure: Some(adx_core::RuntimeFailure {
+            probe_failure: None,
             reason: adx_core::RuntimeFailureReason::OomKilled,
             exit_code: Some(137),
             message: "sandbox backend was OOM-killed".into(),

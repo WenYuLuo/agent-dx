@@ -58,7 +58,8 @@ service_impl!(pb::coordinator_service_server::CoordinatorService, {
             } else {
                 self.0.starts.fetch_add(1, Ordering::SeqCst);
                 let record = pb::EnvironmentRecord {
-                    assignment: Some(pb::Assignment { environment_id: spec.id.clone(), node_id: "node".into(), generation: 1, ..Default::default() }),
+                    failure: None,
+assignment: Some(pb::Assignment { environment_id: spec.id.clone(), node_id: "node".into(), generation: 1, ..Default::default() }),
                     spec: Some(spec.clone()), state: pb::EnvironmentState::Running as i32, revision: 1,
                     resources_held: true, ..Default::default()
                 };

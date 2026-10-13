@@ -183,6 +183,9 @@ impl Api {
                 Err(error) => error_response(error, &request_id, None, None, method != "GET"),
             };
         }
+        if method == "GET" && path == "/api/sandbox/v1/capabilities" {
+            return plain(200, json!({"capabilities": ["workload-probes-v1"]}));
+        }
         if method == "GET" && path == "/api/sandbox/v1/resources" {
             return match self.clients.nodes().await {
                 Ok(nodes) => plain(StatusCode::OK.as_u16(), resource_view(nodes)),

@@ -28,6 +28,7 @@ impl Session {
                     .result
                     .clone()
                     .unwrap_or_else(|| EnvironmentRecord {
+                        failure: None,
                         spec: environment.spec.clone(),
                         assignment: environment.assignment.clone(),
                         runtime: adx_core::Runtime {
@@ -38,7 +39,6 @@ impl Session {
                         state: EnvironmentState::Pending,
                         resources_held: true,
                         checkpoint: None,
-                        failure: None,
                         last_operation: None,
                         restart_attempts: 0,
                         restart_pending: false,

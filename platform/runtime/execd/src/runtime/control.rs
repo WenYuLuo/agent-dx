@@ -30,6 +30,8 @@ pub trait CheckpointHooks: Send + Sync + 'static {
 }
 struct State {
     status: RuntimeStatus,
+    probe_epoch: u64,
+    probe_phase: RuntimePhase,
     prepare: Option<PrepareCheckpoint>,
     reader_running: bool,
     workload_reply: Option<watch::Sender<Option<std::result::Result<(), String>>>>,
@@ -39,6 +41,7 @@ pub struct Controller {
     state: Mutex<State>,
     hooks: Arc<dyn CheckpointHooks>,
     changed: watch::Sender<u64>,
+    probe_readiness: std::sync::atomic::AtomicBool,
 }
 static CURRENT: OnceLock<Arc<Controller>> = OnceLock::new();
 pub(crate) fn install(controller: Arc<Controller>) -> Result<()> {
@@ -55,6 +58,7 @@ impl Controller {
         Ok(Arc::new(Self {
             state: Mutex::new(State {
                 status: RuntimeStatus {
+                    failure: None,
                     identity,
                     revision: 1,
                     phase: RuntimePhase::Running,
@@ -65,6 +69,8 @@ impl Controller {
                     active_commands: 0,
                     activity_revision: 1,
                 },
+                probe_epoch: 1,
+                probe_phase: RuntimePhase::Running,
                 prepare: None,
                 reader_running: false,
                 workload_reply: None,
@@ -72,7 +78,69 @@ impl Controller {
             }),
             hooks,
             changed,
+            probe_readiness: std::sync::atomic::AtomicBool::new(false),
         }))
+    }
+    pub fn begin_probe_initialization(&self) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| Error::Unavailable("runtime state lock poisoned".into()))?;
+        self.probe_readiness
+            .store(true, std::sync::atomic::Ordering::Release);
+        state.status.phase = RuntimePhase::Initializing;
+        state.status.failure = None;
+        self.publish(&mut state);
+        Ok(())
+    }
+    pub fn probe_ready(&self, identity: &RuntimeIdentity, epoch: u64) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| Error::Unavailable("runtime state lock poisoned".into()))?;
+        if state.status.identity != *identity
+            || state.probe_epoch != epoch
+            || state.status.phase != RuntimePhase::Initializing
+        {
+            return Err(Error::Conflict);
+        }
+        state.status.phase = RuntimePhase::Running;
+        self.publish(&mut state);
+        Ok(())
+    }
+    pub fn probe_failed(
+        &self,
+        identity: &RuntimeIdentity,
+        epoch: u64,
+        failure: adx_core::probes::ProbeFailure,
+    ) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| Error::Unavailable("runtime state lock poisoned".into()))?;
+        if state.status.identity != *identity
+            || state.probe_epoch != epoch
+            || !matches!(
+                state.status.phase,
+                RuntimePhase::Initializing | RuntimePhase::Running
+            )
+        {
+            return Err(Error::Conflict);
+        }
+        state.status.phase = RuntimePhase::Failed;
+        state.status.failure = Some(failure);
+        self.publish(&mut state);
+        Ok(())
+    }
+    fn handoff_probe_phase(&self) -> RuntimePhase {
+        if self
+            .probe_readiness
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            RuntimePhase::Initializing
+        } else {
+            RuntimePhase::Running
+        }
     }
     /// Only the local Unix listener calls this. A disconnected caller does not cancel it.
     /// Concurrent workload requests or an active checkpoint return Conflict.
@@ -175,10 +243,21 @@ impl Controller {
         status.activity_revision = super::activity::revision();
         status
     }
+    pub fn probe_status(&self) -> Result<(RuntimeStatus, u64)> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| Error::Unavailable("runtime state lock poisoned".into()))?;
+        Ok((state.status.clone(), state.probe_epoch))
+    }
     pub fn subscribe(&self) -> watch::Receiver<u64> {
         self.changed.subscribe()
     }
     fn publish(&self, state: &mut State) {
+        if state.probe_phase != state.status.phase {
+            state.probe_epoch += 1;
+            state.probe_phase = state.status.phase;
+        }
         state.status.revision += 1;
         self.changed.send_replace(state.status.revision);
     }
@@ -326,7 +405,8 @@ impl Controller {
             None
         };
         let mut state = self.state.lock().unwrap();
-        state.status.phase = RuntimePhase::Running;
+        state.status.phase = self.handoff_probe_phase();
+        state.status.failure = None;
         let (phase, error) = match (outcome, restored) {
             (Ok(HandoffOutcome::Restore), Some(Ok(identity))) => {
                 state.status.identity = identity;

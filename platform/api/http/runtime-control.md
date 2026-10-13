@@ -2,7 +2,7 @@
 
 EXECD 使用同一个 HTTP 监听端口提供用户操作与运行时协作。Adxlet 决定 Environment 生命周期并调用 sandboxd，EXECD 负责实例内的准备、观测和恢复后初始化。共享 JSON 类型定义在 `platform/crates/core/src/runtime.rs`；服务实现为 `runtime/control.rs`，调用端为 Adxlet `runtime_control.rs`。
 
-配置 `adxlet.runtime_control` 时，运行时协作改走 [Execd 主动连接的双向 gRPC 控制流](../proto/runtime-control.md)，用户数据操作继续使用 HTTP。未配置时使用本文 HTTP 控制接口；两种传输复用同一组类型与状态机。
+配置 `adxlet.runtime_control` 时，运行时协作改走 [Execd 主动连接的双向 gRPC 控制流](../proto/runtime-control.md)，用户数据操作继续使用 HTTP。未配置时使用本文 HTTP 控制接口；两种传输复用同一组类型与状态机。Probe 状态观察在控制流尚无快照或断线时使用带凭据的 HTTP status 兜底；控制变更继续使用配置的传输。
 
 ## 身份与就绪
 
@@ -29,6 +29,29 @@ Adxlet 核对完整身份和 `running`，状态确认后再检查 sandboxd 实�
 
 状态查询、health/metrics、命令观察连接不作为忙碌操作。状态返回 HTTP/隧道活动连接与活动命令计数；Adxlet 应结合 Relay 的观测判断空闲。采集失败表示未知，不能视作零。
 
+## 工作负载 probes
+
+Execd 执行用户 readiness / healthcheck，公开配置见
+[Sandbox API](../../../gateway/apiserver/docs/sandbox-lifecycle-api.md#workload-probes-on-image-startup)。
+Readiness 等待期间 `phase=initializing`，首次成功才进入 `running`。
+初始化截止或 healthcheck 达到阈值时 `phase=failed`，增加 `failure`：
+
+```json
+{
+  "kind": "healthcheck_failed",
+  "message": "HTTP probe returned 503",
+  "consecutive_failures": 3,
+  "http_status": 503
+}
+```
+
+最终失败保留在控制状态中，断线重连返回完整快照。Adxlet 直接等待 readiness
+状态，成功后绑定路由和发布 Running；healthcheck 失败经现有 Environment
+串行控制器处理，并由周期 Tick 补偿遗漏通知。Initializing 只属于运行时内存，
+不写入 Redis。持久化仍使用现有 Environment 状态和最终 `failure` 元数据。
+探测不增加用户活动计数。暂停/恢复取消在途检查，重新执行 readiness 并重置
+healthcheck 连续失败计数；相同身份恢复也有内部阶段代次隔离迟到结果。
+
 ## Checkpoint 顺序
 
 1. Adxlet 读取运行时身份和 revision。
@@ -46,7 +69,7 @@ Prepared 仅证明实例内的 handoff 准备完成，不代表 checkpoint 制�
 
 ## 恢复
 
-`restore` handoff 后，EXECD 重新读取完整执行身份。同实例恢复允许归属代次增加，或在同归属代次下推进 execution runtime ID；跨 Environment 克隆另校验 checkpoint 源身份与受控的 `ADX_RESTORE_ORIGIN`。恢复端不能改变已继承监听 socket 的端口。身份校验通过后刷新子进程环境、可选 HTTP token，关闭继承的 HTTP/tunnel 会话，重新注册监听器，再进入 Running/Restored。源端 `resume` 保留原身份。
+`restore` handoff 后，EXECD 重新读取完整执行身份。同实例恢复允许归属代次增加，或在同归属代次下推进 execution runtime ID；跨 Environment 克隆另校验 checkpoint 源身份与受控的 `ADX_RESTORE_ORIGIN`。恢复端不能改变已继承监听 socket 的端口。身份校验通过后刷新子进程环境、可选 HTTP token，关闭继承的 HTTP/tunnel 会话，重新注册监听器，标记 Restored；配置 readiness 时进入 Initializing，探测成功后才进入 Running。源端 `resume` 保留原身份。
 
 节点需使用目标执行记录查询状态，只有身份和阶段匹配后才能绑定目标路由。EXECD 不向 Coordinator 注册，不负责迁移归属，也不直接发布 Ingress 路由。
 

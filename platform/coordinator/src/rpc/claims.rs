@@ -98,6 +98,7 @@ impl State {
             .get(&stored.assignment.node_id)
             .ok_or(Error::NotFound)?;
         let record = stored.result.clone().unwrap_or_else(|| EnvironmentRecord {
+            failure: None,
             spec: stored.spec.clone(),
             assignment: stored.assignment.clone(),
             runtime: adx_core::Runtime {
@@ -108,7 +109,6 @@ impl State {
             revision: 0,
             resources_held: true,
             checkpoint: None,
-            failure: None,
             last_operation: None,
             restart_attempts: 0,
             restart_pending: false,

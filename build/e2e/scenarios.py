@@ -130,6 +130,16 @@ elif sys.argv[1] == 'runtime-exit':
     result = E / 'runtime-exit-result.json'
     run(connection, image, result)
     print(json.dumps(json.loads(result.read_text())), flush=True)
+elif sys.argv[1] == 'workload-probes':
+    from publish import publish
+    from workload_probes import run
+
+    digest = publish('/workload-probes.tar', 'adx-probes')
+    probe_image = '127.0.0.1:5000/adx-probes@' + digest
+    (E / 'workload-probe-image.json').write_text(json.dumps({'image': probe_image}))
+    result = E / 'workload-probes-result.json'
+    run(connection, probe_image, result)
+    print(json.dumps(json.loads(result.read_text())), flush=True)
 elif sys.argv[1].startswith('loss-create-'):
     from sandboxd_runtime_loss import create
 

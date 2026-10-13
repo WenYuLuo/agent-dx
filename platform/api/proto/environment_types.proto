@@ -82,6 +82,21 @@ message DataPlanePolicy {
   DataPlaneSecurityMode port_forward = 2;
 }
 message ResourceLimits { uint64 cpu_millis = 1; uint64 memory_bytes = 2; uint64 disk_bytes = 3; }
+message HttpGetProbe { uint32 port = 1; string path = 2; }
+message TcpSocketProbe { uint32 port = 1; }
+message ExecProbe { repeated string command = 1; }
+message ProbeSpec {
+  oneof action { HttpGetProbe http_get = 1; TcpSocketProbe tcp_socket = 2; ExecProbe exec = 3; }
+  uint64 initial_delay_seconds = 4;
+  uint64 period_seconds = 5;
+  uint64 timeout_seconds = 6;
+  uint32 failure_threshold = 7;
+}
+message ProbeFailure {
+  string kind = 1; string message = 2; uint32 consecutive_failures = 3;
+  optional int32 exit_code = 4; optional uint32 http_status = 5;
+}
+
 message SandboxOptions {
   RootfsSpec rootfs = 1;
   repeated MountSpec mounts = 2;
@@ -92,6 +107,9 @@ message SandboxOptions {
   bool inherit_entrypoint = 7;
   ResourceLimits limits = 8;
   string extra_config = 9;
+  ProbeSpec readiness_probe = 10;
+  ProbeSpec healthcheck_probe = 11;
+  uint64 init_timeout_seconds = 12;
 }
 
 message LifecyclePolicy { uint64 idle_timeout_seconds = 1; RestartPolicy restart = 2; }
@@ -138,7 +156,8 @@ message EnvironmentRecord {
 }
 
 message RuntimeFailure {
-  enum Reason { REASON_UNSPECIFIED = 0; REASON_OOM_KILLED = 1; REASON_EXITED = 2; REASON_MISSING = 3; }
+  ProbeFailure probe_failure = 4;
+  enum Reason { REASON_UNSPECIFIED = 0; REASON_OOM_KILLED = 1; REASON_EXITED = 2; REASON_MISSING = 3; REASON_PROBE_FAILED = 4; }
   Reason reason = 1;
   optional int32 exit_code = 2;
   string message = 3;

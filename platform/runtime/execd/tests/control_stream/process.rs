@@ -77,6 +77,7 @@ fn start(address: &str) -> Process {
 }
 fn record() -> EnvironmentRecord {
     EnvironmentRecord {
+        failure: None,
         spec: EnvironmentSpec {
             id: "i".into(),
             tenant_id: "t".into(),
@@ -106,7 +107,6 @@ fn record() -> EnvironmentRecord {
         },
         resources_held: true,
         checkpoint: None,
-        failure: None,
         last_operation: None,
         restart_attempts: 0,
         restart_pending: false,

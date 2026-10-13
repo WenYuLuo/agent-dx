@@ -34,6 +34,7 @@ mod dispatch;
 mod entrypoint;
 mod fs;
 mod httpserver;
+mod probes;
 mod tunnel;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -177,6 +178,7 @@ async fn boot(
     tunnel_ports: Option<(u16, u16)>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     child_env::initialize();
+    let probe_config = probes::configuration()?;
     entrypoint::initialize();
     let identity = identity_from(&std::env::vars().collect())?;
     let (http_ready, http) = start_http_server_with_control(port, token).await?;
@@ -214,14 +216,22 @@ async fn boot(
     });
     if let Some(identity) = identity {
         let controller = control::Controller::new(identity, hooks.clone())?;
+        if probe_config.as_ref().is_some_and(|c| c.readiness.is_some()) {
+            controller.begin_probe_initialization()?;
+        }
         control::install(controller.clone())?;
         if control_stream::ControlStreamConfig::from_environment()?.is_some() {
-            tokio::spawn(control_stream::run(controller, || {
+            tokio::spawn(control_stream::run(controller.clone(), || {
                 control_stream::ControlStreamConfig::from_environment()?.ok_or_else(|| {
                     adx_core::Error::Unavailable("runtime control configuration missing".into())
                 })
             }));
         }
+        if let Some(config) = probe_config {
+            probes::spawn(controller, config);
+        }
+    } else if probe_config.is_some() {
+        return Err("workload probes require runtime identity".into());
     }
     let _keep_listeners_alive = hooks;
     let mut watchers = tokio::task::JoinSet::new();

@@ -81,6 +81,7 @@ def main():
         p.add_argument('--' + name, type=Path, required=True)
     p.add_argument('--runtime-base', required=True)
     p.add_argument('--execd-base', required=True)
+    p.add_argument('--workload-probes', action='store_true', help='include the managed probe workload fixture')
     p.add_argument('--firecracker-kit', type=Path)
     p.add_argument('--runsc-bin', type=Path, help='optional verified native runsc for the heterogeneous runtime E2E')
     a = p.parse_args()
@@ -117,6 +118,8 @@ def main():
         'execd': f'adx-e2e-execd:{uid}',
         'entrypoint': f'adx-e2e-entrypoint:{uid}',
     }
+    if a.workload_probes:
+        tags['probes'] = f'adx-e2e-probes:{uid}'
     with tempfile.TemporaryDirectory(prefix='adx-e2e-image-') as d:
         context = Path(d)
         shutil.copytree(a.package, context / 'package')
@@ -178,7 +181,15 @@ def main():
             # correctly treated as a failed Environment start.
             'ENTRYPOINT ["/bin/sh", "-c", "sleep 30; echo adx-entrypoint-stderr >&2; exit 7"]\n'
         )
-        for role, base in [('node', a.runtime_base), ('execd', a.execd_base), ('entrypoint', a.execd_base)]:
+        roles = [('node', a.runtime_base), ('execd', a.execd_base), ('entrypoint', a.execd_base)]
+        if a.workload_probes:
+            (context / 'Dockerfile.probes').write_text(
+                'ARG BASE\nFROM ${BASE}\n'
+                'COPY e2e/probe_workload.py /opt/adx/probe-workload.py\n'
+                'WORKDIR /workload\nENTRYPOINT ["python3", "/opt/adx/probe-workload.py"]\n'
+            )
+            roles.append(('probes', a.runtime_base))
+        for role, base in roles:
             subprocess.run(
                 [
                     _executable('docker'),
@@ -221,6 +232,11 @@ def main():
             check=True,
             timeout=300,
         )
+        if a.workload_probes:
+            subprocess.run(
+                [_executable('docker'), 'save', '-o', str(a.output / 'workload-probes.tar'), tags['probes']],
+                stderr=subprocess.STDOUT, check=True, timeout=300,
+            )
     result = {
         'schema_version': 1,
         'package': manifest,
@@ -234,6 +250,8 @@ def main():
         'base_images': {'node': a.runtime_base, 'execd': a.execd_base},
     }
     result['collector'] = {**collector, 'image': collector_image}
+    if a.workload_probes:
+        result['workload_probes_archive_sha256'] = sha(a.output / 'workload-probes.tar')
     if runsc_sha256:
         result['runsc'] = {'sha256': runsc_sha256, 'target': manifest['target']}
     if fc_kit:

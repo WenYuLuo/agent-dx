@@ -33,6 +33,9 @@ impl Controller {
                 }
                 Ok(_) => (),
             }
+            if self.runtime_probe_failure().await? {
+                return Ok(());
+            }
             if let Ok(Ok(usage)) = tokio::time::timeout(
                 self.services.operation_timeout,
                 self.services.runtime.stats(&self.record.runtime.id),
@@ -137,6 +140,25 @@ impl Controller {
             record: self.record.clone(),
             durability: crate::Durability::Published,
         })
+    }
+    pub(super) async fn runtime_probe_failure(&mut self) -> Result<bool> {
+        if self.record.state != EnvironmentState::Running
+            || (self.record.spec.sandbox.healthcheck_probe.is_none()
+                && self.record.spec.sandbox.readiness_probe.is_none())
+        {
+            return Ok(false);
+        }
+        let observation = tokio::time::timeout(
+            self.services.operation_timeout,
+            self.services.readiness.probe_failure(&self.record),
+        )
+        .await;
+        let Ok(Ok(Some(failure))) = observation else {
+            return Ok(false);
+        };
+        self.record.failure = Some(failure.into());
+        self.unexpected_exit().await?;
+        Ok(true)
     }
     async fn unexpected_exit(&mut self) -> Result<()> {
         self.idle = None;

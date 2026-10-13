@@ -57,10 +57,65 @@ exit_code = sandbox.wait_entrypoint()
 print(exit_code, sandbox.entrypoint_exit_info)
 ```
 
-Creation fails when the image has no effective startup command or when that
-process exits before sandbox initialization completes. After a successful
-create, its terminal status remains available through bounded polling while
-the sandbox and its other APIs remain usable.
+Creation fails when the image has no effective startup command or cannot start
+it. A managed process may exit successfully; its terminal status remains
+available through bounded polling while the sandbox and its other APIs remain
+usable. Configure workload probes when creation must wait for a service.
+
+## Workload probes
+
+```python
+from adx_sandbox import Sandbox, ReadinessProbe, HealthcheckProbe, SandboxError
+
+try:
+    sandbox = Sandbox(
+        image="example/server:latest",
+        inherit_entrypoint=True,
+        init_timeout=120,
+        readiness_probe=ReadinessProbe.http_get(port=8080, path="/ready"),
+        healthcheck_probe=HealthcheckProbe.http_get(
+            port=8080, path="/health", failure_threshold=3,
+        ),
+    )
+except SandboxError as error:
+    print(error.probe_failure)
+    raise
+```
+
+Both probe types provide `http_get(port=..., path="/")`,
+`tcp_socket(port=...)`, and `exec(command=[...])` factories. HTTP and TCP check
+sandbox loopback; the port need not be publicly exposed. HTTP requires a 2xx
+response and does not follow redirects. Exec uses argv, the image workload's
+user, working directory and effective environment; exit code zero succeeds.
+Use an explicit shell argv when shell syntax is needed.
+
+| Setting | ReadinessProbe | HealthcheckProbe |
+| --- | --- | --- |
+| `initial_delay_seconds` | 0 | 0, measured after readiness |
+| `period_seconds` | 2 | 10 |
+| `timeout_seconds` | 1 | 2 |
+| `failure_threshold` | retries until initialization deadline | 3 consecutive failures |
+
+Execd runs readiness once per startup/resume/restore and only then reports
+Running. Adxlet activates routes and publishes Running after that report.
+`init_timeout` bounds runtime startup plus readiness; by default the SDK's total
+create budget is scheduling plus initialization plus a 30-second buffer.
+Readiness failure raises `SandboxError` with `probe_failure` and is terminal
+for that create attempt. Initialization is transient runtime state, not a
+separate persisted Environment lifecycle state.
+
+Healthcheck starts after readiness (or immediately after runtime startup when
+readiness is absent). A success resets the failure count. At the threshold,
+Execd reports a sticky failure; Adxlet retires the execution and applies the
+existing restart/failover policy. `sandbox.get_info().failure` is a
+`SandboxFailure(reason="ProbeFailed", ...)`; its `probe_failure` dictionary
+contains the probe kind, message, consecutive failures and available exit/HTTP
+status. Backend OOM and exit failures retain their existing reason values.
+Internal probes do not extend the sandbox's user-activity idle window.
+Pause/resume and restore cancel in-flight checks and reset healthcheck counts.
+The SDK checks server capability before a probe-dependent create; unsupported
+API servers return an error before submission. Use the matching release of
+API Server, Adxlet and Execd.
 
 ## Lifecycle overview
 

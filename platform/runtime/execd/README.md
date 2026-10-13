@@ -28,7 +28,7 @@ is retained. Tombstones are bounded by `EXECD_COMMAND_EXPIRED_MAX_RECORDS`
 (default 4096) and `EXECD_COMMAND_EXPIRED_TTL_SECS` (default 3600); after that
 window, EXECD can no longer distinguish the ID from one never submitted.
 
-Adxlet supplies `ADX_ENVIRONMENT_ID`, `ADX_RUNTIME_ID` and `ADX_OWNERSHIP_GENERATION` through sandboxd. When the node configures `runtime_control`, Execd initiates a bidirectional gRPC stream using the node-injected `ADX_RUNTIME_CONTROL_ADDRESS` and execution-scoped `ADX_RUNTIME_CONTROL_TOKEN`. It sends Ready and checkpoint state, and receives Status/Prepare/Abort/Finish commands. Otherwise runtime cooperation uses the HTTP listener. Both transports share the same control state machine. See the [stream contract](../../api/proto/runtime-control.md), [HTTP contract](../../api/http/runtime-control.md), and [node configuration](../../../docs/deployment/runtime-control-stream.md).
+Adxlet supplies `ADX_ENVIRONMENT_ID`, `ADX_RUNTIME_ID` and `ADX_OWNERSHIP_GENERATION` through sandboxd. When the node configures `runtime_control`, Execd initiates a bidirectional gRPC stream using the node-injected `ADX_RUNTIME_CONTROL_ADDRESS` and execution-scoped `ADX_RUNTIME_CONTROL_TOKEN`. It sends readiness, probe failure and checkpoint state, and receives Status/Prepare/Abort/Finish commands. Otherwise runtime cooperation uses the HTTP listener. Both transports share the same control state machine. See the [stream contract](../../api/proto/runtime-control.md), [HTTP contract](../../api/http/runtime-control.md), and [node configuration](../../../docs/deployment/runtime-control-stream.md).
 
 Checkpoint restore validates the new execution identity, refreshes child environment and HTTP credentials, retires inherited connections, and rearms HTTP/tunnel listeners before reporting Running. Missing or stale restored identity leaves the runtime unavailable. Backend handoff uses `/proc/gvisor/checkpoint` or `ADX_CHECKPOINT_HANDOFF_FILE`; the restored environment comes from `/proc/gvisor/spec_environ` or `ADX_ENV_FILE`.
 
@@ -44,3 +44,23 @@ reload/failover. A success response requires backend handoff and Adxlet's
 persistent result acknowledgement. The optional JSON body
 `{"timeoutSeconds": 120}` bounds the complete operation. An empty body or `{}`
 uses the 600-second default. See the [runtime control contract](../../api/http/runtime-control.md#workload-local-checkpoint).
+
+## Workload probes
+
+Adxlet injects validated `ADX_WORKLOAD_PROBES` configuration for image creates
+with `inherit_entrypoint`. Execd keeps a one-time readiness gate in transient
+RuntimeStatus `initializing`; first success reports `running`, and budget expiry
+reports `failed` with a structured `failure`. Healthcheck starts after readiness
+and reports a sticky failure at its consecutive-failure threshold. Execd does
+not choose restart policy; Adxlet owns cleanup, routes and committed lifecycle.
+See the [public probe contract](../../../gateway/apiserver/docs/sandbox-lifecycle-api.md#workload-probes-on-image-startup).
+
+Probe execution bypasses user activity/command accounting. Exec checks use the
+managed workload's effective identity, cwd and environment, bounded stdout/stderr,
+and a private process group killed on completion, cancellation or timeout.
+HTTP/TCP use loopback; HTTP accepts only 2xx without redirect handling.
+Pause/restore cancels in-flight checks and rearms readiness and healthcheck.
+An internal phase epoch fences checks across same-identity pause/resume.
+`workload_probes.rs` verifies the production Execd process with Adxlet HTTP
+readiness and health-failure reporting; it does not run sandboxd or a kernel
+checkpoint.

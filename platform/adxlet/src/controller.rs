@@ -199,6 +199,7 @@ pub(crate) fn spawn(
     let runtime_id = format!("{}-{}", spec.id, assignment.generation);
     spawn_restored(
         EnvironmentRecord {
+            failure: None,
             restart_attempts: 0,
             restart_pending: false,
             spec,
@@ -211,7 +212,6 @@ pub(crate) fn spawn(
             revision: 0,
             resources_held: held,
             checkpoint: None,
-            failure: None,
             last_operation: None,
         },
         services,
@@ -275,7 +275,13 @@ impl Controller {
                 {
                     Ok(())
                 } else {
-                    self.workload_checkpoint().await.map(|_| ())
+                    async {
+                        if !self.runtime_probe_failure().await? {
+                            self.workload_checkpoint().await?;
+                        }
+                        Ok(())
+                    }
+                    .await
                 };
                 let _ = ack.send(result);
                 return;
@@ -419,6 +425,9 @@ impl Controller {
                 if control.uses_stream() {
                     control.status(&self.record).await?;
                 }
+            }
+            if self.runtime_probe_failure().await? {
+                return self.sync().await;
             }
             self.reconcile_workload_checkpoint().await?;
             if self.record.state == EnvironmentState::Failed {
@@ -601,8 +610,15 @@ impl Controller {
         self.held = true;
         self.record.resources_held = true;
         self.transition(Event::Start)?;
+        self.record.failure = None;
+        let initialization_timeout = if self.record.spec.sandbox.init_timeout_seconds > 0 {
+            std::time::Duration::from_secs(self.record.spec.sandbox.init_timeout_seconds)
+        } else {
+            self.services.operation_timeout
+        };
+        let mut awaiting_readiness = false;
         let operation_started = Instant::now();
-        let attempt = timeout(self.services.operation_timeout, async {
+        let attempt = timeout(initialization_timeout, async {
             self.services.readiness.expect_runtime(&self.record)?;
             let runtime_start_started = Instant::now();
             self.record.runtime.ip = Some(
@@ -647,11 +663,13 @@ impl Controller {
                     .await?,
             );
             let runtime_start_ms = runtime_start_started.elapsed().as_secs_f64() * 1_000.0;
+            awaiting_readiness = true;
             let runtime_ready_started = Instant::now();
             adx_observability::trace::Trace::child("environment.runtime.ready")
                 .run_result(self.services.readiness.wait_ready(&self.record))
                 .await?;
             let runtime_ready_ms = runtime_ready_started.elapsed().as_secs_f64() * 1_000.0;
+            awaiting_readiness = false;
             let route_started = Instant::now();
             adx_observability::trace::Trace::child("environment.route.activate")
                 .run_result(self.services.routes.activate(&self.record))
@@ -667,6 +685,20 @@ impl Controller {
         let (runtime_start_ms, runtime_ready_ms, route_activate_ms) = match attempt {
             Ok(stages) => stages,
             Err(start_error) => {
+                let start_error =
+                    if awaiting_readiness && self.record.spec.sandbox.readiness_probe.is_some() {
+                        match start_error {
+                            Error::ProbeFailed(_) => start_error,
+                            other => Error::ProbeFailed(adx_core::probes::ProbeFailure::timeout(
+                                other.to_string(),
+                            )),
+                        }
+                    } else {
+                        start_error
+                    };
+                if let Error::ProbeFailed(failure) = &start_error {
+                    self.record.failure = Some(failure.clone().into());
+                }
                 self.transition(Event::Fail)?;
                 self.release_capacity()?;
                 self.record.restart_pending = restart

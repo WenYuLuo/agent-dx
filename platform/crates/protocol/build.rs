@@ -12,6 +12,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("cargo:rerun-if-changed=../../api/proto/{file}");
     }
     tonic_build::configure()
+        // Optional workload metadata must not inflate every nested RPC future.
+        .boxed(".adx.control.v1.SandboxOptions.readiness_probe")
+        .boxed(".adx.control.v1.SandboxOptions.healthcheck_probe")
+        .boxed(".adx.control.v1.EnvironmentRecord.failure")
         .boxed(".adx.control.v1.ClaimEnvironmentResponse.outcome.owned")
         .boxed(".adx.control.v1.ClaimEnvironmentResponse.outcome.existing")
         .compile_protos(&["../../api/proto/environment.proto"], &["../../api/proto"])?;

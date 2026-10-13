@@ -5,6 +5,8 @@ use tonic::{Code, Status};
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ErrorDetail<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub probe_failure: Option<adx_core::probes::ProbeFailure>,
     pub code: ErrorCode,
     pub retry: RetryDirective,
     pub outcome: OperationOutcome,
@@ -23,77 +25,88 @@ impl<'a> ErrorDetail<'a> {
         instance_id: Option<&'a str>,
         execution_may_have_started: bool,
     ) -> Self {
-        let (code, retry, outcome) = match status.code() {
-            Code::InvalidArgument | Code::OutOfRange => (
-                ErrorCode::InvalidArgument,
-                RetryDirective::Never,
-                OperationOutcome::NotStarted,
-            ),
-            Code::Unauthenticated => (
-                ErrorCode::Unauthenticated,
-                RetryDirective::Never,
-                OperationOutcome::NotStarted,
-            ),
-            Code::PermissionDenied => (
-                ErrorCode::PermissionDenied,
-                RetryDirective::Never,
-                OperationOutcome::NotStarted,
-            ),
-            Code::NotFound => (
-                ErrorCode::NotFound,
-                RetryDirective::Never,
-                OperationOutcome::Terminal,
-            ),
-            Code::AlreadyExists | Code::FailedPrecondition | Code::Aborted => (
-                ErrorCode::Conflict,
-                RetryDirective::Never,
-                OperationOutcome::NotStarted,
-            ),
-            Code::ResourceExhausted => (
-                ErrorCode::ResourceExhausted,
-                RetryDirective::AfterBackoff,
-                OperationOutcome::NotStarted,
-            ),
-            Code::Unimplemented => (
-                ErrorCode::Unsupported,
-                RetryDirective::Never,
-                OperationOutcome::NotStarted,
-            ),
-            Code::DeadlineExceeded if !execution_may_have_started => (
-                ErrorCode::DeadlineExceeded,
-                RetryDirective::SameOperation,
-                OperationOutcome::NotStarted,
-            ),
-            Code::Unavailable if !execution_may_have_started => (
+        let probe_failure =
+            serde_json::from_slice::<adx_core::probes::ProbeFailure>(status.details()).ok();
+        let (code, retry, outcome) = if probe_failure.is_some() {
+            (
                 ErrorCode::Unavailable,
-                RetryDirective::AfterBackoff,
-                OperationOutcome::NotStarted,
-            ),
-            Code::DataLoss => (
-                ErrorCode::DataLoss,
                 RetryDirective::Never,
                 OperationOutcome::Terminal,
-            ),
-            Code::Cancelled
-            | Code::Unknown
-            | Code::DeadlineExceeded
-            | Code::Unavailable
-            | Code::Internal
-                if execution_may_have_started =>
-            {
-                (
-                    ErrorCode::OutcomeUnknown,
+            )
+        } else {
+            match status.code() {
+                Code::InvalidArgument | Code::OutOfRange => (
+                    ErrorCode::InvalidArgument,
+                    RetryDirective::Never,
+                    OperationOutcome::NotStarted,
+                ),
+                Code::Unauthenticated => (
+                    ErrorCode::Unauthenticated,
+                    RetryDirective::Never,
+                    OperationOutcome::NotStarted,
+                ),
+                Code::PermissionDenied => (
+                    ErrorCode::PermissionDenied,
+                    RetryDirective::Never,
+                    OperationOutcome::NotStarted,
+                ),
+                Code::NotFound => (
+                    ErrorCode::NotFound,
+                    RetryDirective::Never,
+                    OperationOutcome::Terminal,
+                ),
+                Code::AlreadyExists | Code::FailedPrecondition | Code::Aborted => (
+                    ErrorCode::Conflict,
+                    RetryDirective::Never,
+                    OperationOutcome::NotStarted,
+                ),
+                Code::ResourceExhausted => (
+                    ErrorCode::ResourceExhausted,
+                    RetryDirective::AfterBackoff,
+                    OperationOutcome::NotStarted,
+                ),
+                Code::Unimplemented => (
+                    ErrorCode::Unsupported,
+                    RetryDirective::Never,
+                    OperationOutcome::NotStarted,
+                ),
+                Code::DeadlineExceeded if !execution_may_have_started => (
+                    ErrorCode::DeadlineExceeded,
                     RetryDirective::SameOperation,
-                    OperationOutcome::Unknown,
-                )
+                    OperationOutcome::NotStarted,
+                ),
+                Code::Unavailable if !execution_may_have_started => (
+                    ErrorCode::Unavailable,
+                    RetryDirective::AfterBackoff,
+                    OperationOutcome::NotStarted,
+                ),
+                Code::DataLoss => (
+                    ErrorCode::DataLoss,
+                    RetryDirective::Never,
+                    OperationOutcome::Terminal,
+                ),
+                Code::Cancelled
+                | Code::Unknown
+                | Code::DeadlineExceeded
+                | Code::Unavailable
+                | Code::Internal
+                    if execution_may_have_started =>
+                {
+                    (
+                        ErrorCode::OutcomeUnknown,
+                        RetryDirective::SameOperation,
+                        OperationOutcome::Unknown,
+                    )
+                }
+                _ => (
+                    ErrorCode::Internal,
+                    RetryDirective::AfterBackoff,
+                    OperationOutcome::NotStarted,
+                ),
             }
-            _ => (
-                ErrorCode::Internal,
-                RetryDirective::AfterBackoff,
-                OperationOutcome::NotStarted,
-            ),
         };
         Self {
+            probe_failure,
             code,
             retry,
             outcome,
@@ -107,6 +120,16 @@ impl<'a> ErrorDetail<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn final_probe_failure_retains_metadata_and_terminal_retry_contract() {
+        let failure = adx_core::probes::ProbeFailure::timeout("readiness deadline exceeded");
+        let status = adx_protocol::status(adx_core::Error::ProbeFailed(failure.clone()));
+        let detail = ErrorDetail::from_status(&status, "create-a", None, Some("env-a"), true);
+        assert_eq!(detail.retry, RetryDirective::Never);
+        assert_eq!(detail.outcome, OperationOutcome::Terminal);
+        assert_eq!(detail.probe_failure, Some(failure));
+    }
 
     #[test]
     fn stable_failures_are_not_retryable() {

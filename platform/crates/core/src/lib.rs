@@ -7,6 +7,7 @@ pub mod snapshots;
 pub use checkpoint::{
     valid_runtime_id, CheckpointArtifact, CompletedOperation, LifecycleKind, RestorePoint,
 };
+pub mod probes;
 pub mod runtime;
 pub mod sandbox;
 pub mod scheduling;
@@ -26,6 +27,8 @@ pub enum Error {
     NotFound,
     #[error("dependency unavailable: {0}")]
     Unavailable(String),
+    #[error("workload probe failed: {0:?}")]
+    ProbeFailed(probes::ProbeFailure),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -251,6 +254,8 @@ pub struct Runtime {
 /// The backend's terminal observation for one execution, retained before cleanup.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeFailure {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_failure: Option<probes::ProbeFailure>,
     pub reason: RuntimeFailureReason,
     pub exit_code: Option<i32>,
     pub message: String,
@@ -261,6 +266,7 @@ pub enum RuntimeFailureReason {
     OomKilled,
     Exited,
     Missing,
+    ProbeFailed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

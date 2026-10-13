@@ -61,7 +61,11 @@ impl ExecdReadiness {
         Ok(self)
     }
     async fn probe(&self, record: &EnvironmentRecord) -> Result<()> {
-        if self.client.status(record).await?.phase != RuntimePhase::Running {
+        let status = self.client.probe_status(record).await?;
+        if let Some(failure) = status.failure {
+            return Err(Error::ProbeFailed(failure));
+        }
+        if status.phase != RuntimePhase::Running {
             return Err(unavailable("runtime control is not running"));
         }
         Ok(())
@@ -73,6 +77,12 @@ fn unavailable(error: impl std::fmt::Display) -> Error {
 
 #[async_trait]
 impl Readiness for ExecdReadiness {
+    async fn probe_failure(
+        &self,
+        record: &EnvironmentRecord,
+    ) -> Result<Option<adx_core::probes::ProbeFailure>> {
+        Ok(self.client.probe_status(record).await?.failure)
+    }
     fn expect_runtime(&self, record: &EnvironmentRecord) -> Result<()> {
         self.client.expect_runtime(record)
     }
@@ -87,18 +97,12 @@ impl Readiness for ExecdReadiness {
         Ok((status.activity_revision, status.active_requests))
     }
     async fn wait_ready(&self, record: &EnvironmentRecord) -> Result<()> {
-        if self.client.uses_stream() {
-            return tokio::time::timeout(self.ready_timeout, async {
-                self.client.wait_ready_notification(record).await?;
-                if !self.runtime.is_running(&record.runtime.id).await? {
-                    return Err(unavailable("runtime exited before Ready"));
-                }
-                Ok(())
-            })
-            .await
-            .map_err(|_| unavailable("Ready notification deadline exceeded"))?;
-        }
-        tokio::time::timeout(self.ready_timeout, async {
+        let ready_timeout = if record.spec.sandbox.init_timeout_seconds > 0 {
+            Duration::from_secs(record.spec.sandbox.init_timeout_seconds)
+        } else {
+            self.ready_timeout
+        };
+        let polling = async {
             loop {
                 let probe = tokio::time::timeout(self.probe_timeout, async {
                     self.probe(record).await?;
@@ -108,10 +112,30 @@ impl Readiness for ExecdReadiness {
                     Ok(())
                 })
                 .await;
+                if let Ok(Err(error @ Error::ProbeFailed(_))) = &probe {
+                    return Err(error.clone());
+                }
                 if matches!(probe, Ok(Ok(()))) {
                     return Ok(());
                 }
                 tokio::time::sleep(self.poll_interval).await;
+            }
+        };
+        tokio::time::timeout(ready_timeout, async {
+            if self.client.uses_stream() {
+                tokio::select! {
+                    result = self.client.wait_ready_notification(record) => {
+                        result?;
+                        self.probe(record).await?;
+                        if !self.runtime.is_running(&record.runtime.id).await? {
+                            return Err(unavailable("runtime exited before Ready"));
+                        }
+                        Ok(())
+                    }
+                    result = polling => result,
+                }
+            } else {
+                polling.await
             }
         })
         .await

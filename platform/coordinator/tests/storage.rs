@@ -44,6 +44,7 @@ fn node(id: &str) -> Node {
 }
 fn running(spec: EnvironmentSpec, assignment: Assignment) -> EnvironmentRecord {
     EnvironmentRecord {
+        failure: None,
         restart_attempts: 0,
         restart_pending: false,
         runtime: adx_core::Runtime {
@@ -56,7 +57,6 @@ fn running(spec: EnvironmentSpec, assignment: Assignment) -> EnvironmentRecord {
         revision: 2,
         resources_held: true,
         checkpoint: None,
-        failure: None,
         last_operation: None,
     }
 }

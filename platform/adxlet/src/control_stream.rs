@@ -142,26 +142,26 @@ impl RuntimeControlHub {
     pub async fn wait_ready(&self, identity: &RuntimeIdentity) -> Result<()> {
         let slot = self.slot(identity)?;
         let mut changes = slot.status.subscribe();
-        tokio::time::timeout(self.0.timeout, async {
-            loop {
-                if slot.retired.load(Ordering::Acquire) {
-                    return Err(Error::Conflict);
+        loop {
+            if slot.retired.load(Ordering::Acquire) {
+                return Err(Error::Conflict);
+            }
+            if let Some(status) = changes.borrow_and_update().as_ref() {
+                if let Some(failure) = &status.failure {
+                    return Err(Error::ProbeFailed(failure.clone()));
                 }
-                if changes
-                    .borrow_and_update()
-                    .as_ref()
-                    .is_some_and(|s| s.phase == RuntimePhase::Running)
-                {
+                if status.phase == RuntimePhase::Failed {
+                    return Err(unavailable("runtime initialization failed"));
+                }
+                if status.phase == RuntimePhase::Running {
                     return Ok(());
                 }
-                changes
-                    .changed()
-                    .await
-                    .map_err(|_| unavailable("control stream closed"))?;
             }
-        })
-        .await
-        .map_err(|_| unavailable("runtime Ready notification timed out"))?
+            changes
+                .changed()
+                .await
+                .map_err(|_| unavailable("control stream closed"))?;
+        }
     }
     pub fn disconnect(&self, identity: &RuntimeIdentity) -> Result<()> {
         let slot = self.slot(identity)?;
@@ -200,6 +200,9 @@ impl RuntimeControlHub {
                     return Err(Error::Conflict);
                 }
                 if let Some(status) = changes.borrow_and_update().as_ref() {
+                    if let Some(failure) = &status.failure {
+                        return Err(Error::ProbeFailed(failure.clone()));
+                    }
                     if status.phase == RuntimePhase::Failed {
                         return Err(unavailable("checkpoint handoff failed"));
                     }
@@ -293,7 +296,7 @@ impl RuntimeControlHub {
         {
             return Err(Error::Conflict);
         }
-        let pending = status.requested_checkpoint.is_some();
+        let pending = status.requested_checkpoint.is_some() || status.failure.is_some();
         slot.status.send_replace(Some(status));
         drop(session);
         if pending {
@@ -468,6 +471,7 @@ mod tests {
     }
     fn status() -> RuntimeStatus {
         RuntimeStatus {
+            failure: None,
             identity: identity(),
             revision: 1,
             phase: RuntimePhase::Running,

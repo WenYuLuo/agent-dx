@@ -35,6 +35,8 @@ from .types import (
     SnapshotInfo,
 )
 
+from .probes import ReadinessProbe, HealthcheckProbe
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_SCHEDULE_TIMEOUT = 30
@@ -60,7 +62,10 @@ def _get_create_timeout(timeout: Optional[int]) -> int:
     return value
 
 
-def _resolve_create_timeouts(create_timeout: Optional[int], schedule_timeout: Optional[int]) -> tuple[int, int]:
+def _resolve_create_timeouts(create_timeout: Optional[int], schedule_timeout: Optional[int], init_timeout: int = _INIT_CALL_TIMEOUT) -> tuple[int, int]:
+    if isinstance(init_timeout, bool) or not isinstance(init_timeout, int) or not 1 <= init_timeout <= 86400:
+        raise ValueError("init_timeout must be an integer between 1 and 86400")
+    reserve = init_timeout + CREATE_TIMEOUT_BUFFER
     schedule_timeout_invalid = schedule_timeout is not None and (
         isinstance(schedule_timeout, bool) or not isinstance(schedule_timeout, int) or schedule_timeout <= 0
     )
@@ -69,7 +74,7 @@ def _resolve_create_timeouts(create_timeout: Optional[int], schedule_timeout: Op
 
     resolved_schedule = DEFAULT_SCHEDULE_TIMEOUT if schedule_timeout is None else schedule_timeout
     if create_timeout is None and "ADX_SANDBOX_CREATE_TIMEOUT" not in os.environ:
-        resolved_create = resolved_schedule + _CREATE_TIMEOUT_RESERVE
+        resolved_create = resolved_schedule + reserve
     else:
         resolved_create = _get_create_timeout(create_timeout)
 
@@ -78,8 +83,8 @@ def _resolve_create_timeouts(create_timeout: Optional[int], schedule_timeout: Op
     remaining_create_budget = resolved_create - resolved_schedule
     if remaining_create_budget < CREATE_TIMEOUT_BUFFER:
         raise ValueError(f"create_timeout - schedule_timeout must be at least {CREATE_TIMEOUT_BUFFER}")
-    if remaining_create_budget < _CREATE_TIMEOUT_RESERVE:
-        resolved_create = resolved_schedule + _CREATE_TIMEOUT_RESERVE
+    if remaining_create_budget < reserve:
+        resolved_create = resolved_schedule + reserve
     return resolved_create, resolved_schedule
 
 
@@ -313,6 +318,9 @@ class Sandbox:
         restart_policy: Optional[RestartPolicy] = None,
         failover: bool = False,
         inherit_entrypoint: bool = False,
+        readiness_probe: Optional[ReadinessProbe] = None,
+        healthcheck_probe: Optional[HealthcheckProbe] = None,
+        init_timeout: int = 30,
         xpu: Optional[str] = None,
         storage_mb: Optional[int] = None,
         storage_limit_mb: int = 0,
@@ -373,6 +381,15 @@ class Sandbox:
             inherit_entrypoint: Start the effective ``Entrypoint`` and ``Cmd``
                 configured by an image and manage it as the sandbox workload.
                 This option is valid only for image-backed fresh creates.
+            readiness_probe: One-time Execd startup check. Requires
+                ``inherit_entrypoint=True``; retries until first success or
+                ``init_timeout``. Failure raises ``SandboxError`` with
+                ``probe_failure`` metadata.
+            healthcheck_probe: Periodic Execd check after readiness. Consecutive
+                failures reaching its threshold use the existing server
+                restart/failover policy. Inspect ``get_info().failure``.
+            init_timeout: Runtime startup and readiness budget in seconds,
+                from 1 through 86400. Defaults to 30.
             network: Optional creation-time network policy. Omitting it allows
                 unrestricted network access.
             connection: Explicit frontend and gateway connection settings.
@@ -400,6 +417,12 @@ class Sandbox:
             raise ValueError("inherit_entrypoint requires an image rootfs")
         if inherit_entrypoint and snapshot_id is not None:
             raise ValueError("inherit_entrypoint cannot be combined with snapshot_id")
+        for value, expected, label in ((readiness_probe, ReadinessProbe, "readiness_probe"), (healthcheck_probe, HealthcheckProbe, "healthcheck_probe")):
+            if value is not None and type(value) is not expected:
+                raise TypeError(f"{label} must be a {expected.__name__} or None")
+        if (readiness_probe is not None or healthcheck_probe is not None) and not inherit_entrypoint:
+            raise ValueError("workload probes require inherit_entrypoint=True")
+        _resolve_create_timeouts(create_timeout, schedule_timeout, init_timeout)
         if snapshot_id is not None and rootfs_readonly is not None:
             raise ValueError("rootfs_readonly cannot be combined with snapshot_id")
         if env is not None and (
@@ -488,7 +511,7 @@ class Sandbox:
         self._upstream = upstream
 
         # ── build create body ─────────────────────────────────────────────
-        resolved_create_timeout, resolved_schedule_timeout = _resolve_create_timeouts(create_timeout, schedule_timeout)
+        resolved_create_timeout, resolved_schedule_timeout = _resolve_create_timeouts(create_timeout, schedule_timeout, init_timeout)
         body: Dict[str, Any] = {
             "namespace": "default",
             "snapshotId": snapshot_id.strip() if snapshot_id is not None else None,
@@ -496,7 +519,7 @@ class Sandbox:
             "idleTimeoutSeconds": idle_timeout,
             "createTimeoutSeconds": resolved_create_timeout,
             "scheduleTimeoutSeconds": resolved_schedule_timeout,
-            "initCallTimeoutSeconds": _INIT_CALL_TIMEOUT,
+            "initCallTimeoutSeconds": init_timeout,
             "rootfs": ({"runtime": runtime} if runtime is not None else {}),
         }
         if body["snapshotId"] is None:
@@ -507,6 +530,10 @@ class Sandbox:
             body["restartPolicy"] = restart_policy.to_dict()
         if inherit_entrypoint:
             body["inheritEntrypoint"] = True
+        if readiness_probe is not None:
+            body["readinessProbe"] = readiness_probe.to_dict()
+        if healthcheck_probe is not None:
+            body["healthcheckProbe"] = healthcheck_probe.to_dict()
         if image:
             body["rootfs"].update(
                 {
@@ -588,6 +615,8 @@ class Sandbox:
 
         self._sid = ""
         try:
+            if readiness_probe is not None or healthcheck_probe is not None:
+                self._client.require_workload_probes()
             create_info = self._create(body)
             sandbox_id = create_info.get("sandboxId") or create_info.get("instanceId")
             if not isinstance(sandbox_id, str) or not sandbox_id:

@@ -42,6 +42,7 @@ impl RuntimeDriver for Runtime {
 }
 fn record() -> EnvironmentRecord {
     EnvironmentRecord {
+        failure: None,
         restart_attempts: 0,
         restart_pending: false,
         spec: EnvironmentSpec {
@@ -77,7 +78,6 @@ fn record() -> EnvironmentRecord {
         },
         resources_held: true,
         checkpoint: None,
-        failure: None,
         last_operation: None,
     }
 }
@@ -210,4 +210,45 @@ async fn active_client_request_still_blocks_idle_activity() {
             .unwrap(),
         (8, 1)
     );
+}
+
+#[tokio::test]
+async fn terminal_readiness_failure_is_not_retried_as_transport_error() {
+    let (port, _server, requests) = serve(r#"{"identity":{"environment_id":"i","runtime_id":"i-1","ownership_generation":1},"revision":2,"phase":"failed","failure":{"kind":"readiness_timeout","message":"HTTP 503","consecutive_failures":3},"checkpoint":null,"active_requests":0,"active_commands":0}"#, None).await;
+    let result = checker(runtime(true), port)
+        .wait_ready(&record())
+        .await
+        .unwrap_err();
+    assert!(matches!(result, adx_core::Error::ProbeFailed(_)));
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn probe_observation_uses_http_when_control_stream_is_disconnected() {
+    let (port, _server, requests) = serve(r#"{"identity":{"environment_id":"i","runtime_id":"i-1","ownership_generation":1},"revision":2,"phase":"failed","failure":{"kind":"healthcheck_failed","message":"HTTP 503","consecutive_failures":3,"http_status":503},"checkpoint":null,"active_requests":0,"active_commands":0}"#, None).await;
+    let hub =
+        adxlet::control_stream::RuntimeControlHub::new(vec![7; 32], Duration::from_millis(100))
+            .unwrap();
+    let record = record();
+    let client =
+        adxlet::runtime_control::RuntimeControlClient::new(port, Duration::from_millis(100))
+            .unwrap()
+            .with_stream(hub);
+    let checker = ExecdReadiness::with_client(
+        runtime(true),
+        client,
+        Duration::from_millis(10),
+        Duration::from_millis(100),
+        Duration::from_millis(500),
+    )
+    .unwrap();
+    checker.expect_runtime(&record).unwrap();
+    let failure = checker.probe_failure(&record).await.unwrap().unwrap();
+    assert_eq!(failure.http_status, Some(503));
+    assert_eq!(failure.consecutive_failures, 3);
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+    assert!(matches!(
+        checker.wait_ready(&record).await,
+        Err(adx_core::Error::ProbeFailed(_))
+    ));
 }

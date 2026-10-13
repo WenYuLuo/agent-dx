@@ -238,9 +238,16 @@ impl SandboxService {
                 .await;
             return result;
         }
-        let result = self
-            .perform_create(&operation.spec, &input, request_id, caller, retry_pending)
-            .await;
+        // The typed Environment payload includes workload probe configuration.
+        // Keep the RPC orchestration future off callers' stack frames.
+        let result = Box::pin(self.perform_create(
+            &operation.spec,
+            &input,
+            request_id,
+            caller,
+            retry_pending,
+        ))
+        .await;
         self.names.lock().await.remove(&operation.spec.id);
         self.finish_create(&create_key, &mut operation, &result)
             .await;
@@ -382,6 +389,17 @@ fn existing_running_response(
         return Err(Status::already_exists(
             "environment already exists with different arguments",
         ));
+    }
+    if record.state == pb::EnvironmentState::Failed as i32 {
+        if let Some(failure) = &record.failure {
+            let failure: adx_core::RuntimeFailure =
+                failure.clone().try_into().map_err(adx_protocol::status)?;
+            if let Some(probe_failure) = failure.probe_failure {
+                return Err(adx_protocol::status(adx_core::Error::ProbeFailed(
+                    probe_failure,
+                )));
+            }
+        }
     }
     if record.state != pb::EnvironmentState::Running as i32 {
         return Err(Status::unavailable("environment create is not yet running"));
@@ -587,6 +605,7 @@ mod tests {
             ..Default::default()
         };
         let record = pb::EnvironmentRecord {
+            failure: None,
             spec: Some(spec.clone()),
             state: pb::EnvironmentState::Running as i32,
             ..Default::default()
@@ -623,6 +642,7 @@ mod tests {
         spec.env
             .insert("EXECD_TUNNEL_HTTP_PORT".into(), "18766".into());
         let record = pb::EnvironmentRecord {
+            failure: None,
             spec: Some(spec.clone()),
             state: pb::EnvironmentState::Running as i32,
             ..Default::default()
@@ -640,6 +660,7 @@ mod tests {
     #[test]
     fn create_owner_cache_must_cover_the_published_running_revision() {
         let record = pb::EnvironmentRecord {
+            failure: None,
             spec: Some(pb::EnvironmentSpec {
                 id: "tenant-worker".into(),
                 tenant_id: "tenant".into(),
@@ -657,6 +678,7 @@ mod tests {
         };
         let owner = |state, generation, revision, node_id: &str| pb::GetEnvironmentResponse {
             record: Some(pb::EnvironmentRecord {
+                failure: None,
                 spec: record.spec.clone(),
                 assignment: Some(pb::Assignment {
                     environment_id: "tenant-worker".into(),

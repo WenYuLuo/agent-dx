@@ -151,6 +151,7 @@ impl CheckpointCooperation for Backend {
     ) -> Result<Option<adx_core::runtime::RuntimeStatus>> {
         Ok(self.workload_request.lock().unwrap().clone().map(|id| {
             adx_core::runtime::RuntimeStatus {
+                failure: None,
                 identity: adxlet::runtime_control::RuntimeControlClient::identity(record),
                 revision: 1,
                 phase: adx_core::runtime::RuntimePhase::Running,
@@ -1233,6 +1234,7 @@ async fn recovery_with_unusable_checkpoint_settles_failed_without_image_start() 
     let (_temp, backend, node, spec, mut assignment) = fixture();
     assignment.generation = 2;
     let record = EnvironmentRecord {
+        failure: None,
         spec,
         assignment,
         runtime: adx_core::Runtime {
@@ -1257,7 +1259,6 @@ async fn recovery_with_unusable_checkpoint_settles_failed_without_image_start() 
                 size_bytes: 8,
             },
         }),
-        failure: None,
         last_operation: None,
         restart_attempts: 0,
         restart_pending: false,
@@ -1311,6 +1312,7 @@ async fn recovery_retries_publication_without_repeating_backend_restore() {
         .unwrap();
     assignment.generation = 2;
     let seed = EnvironmentRecord {
+        failure: None,
         spec,
         assignment,
         runtime: adx_core::Runtime {
@@ -1331,7 +1333,6 @@ async fn recovery_retries_publication_without_repeating_backend_restore() {
             }),
             artifact,
         }),
-        failure: None,
         last_operation: None,
         restart_attempts: 0,
         restart_pending: false,

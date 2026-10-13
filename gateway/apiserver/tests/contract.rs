@@ -297,3 +297,61 @@ fn rootfs_source_replacement_inherits_default_readonly_unless_explicitly_overrid
     }));
     assert!(!writable.sandbox.unwrap().rootfs.unwrap().readonly);
 }
+
+#[test]
+fn workload_probes_preserve_actions_defaults_and_initialization_budget() {
+    let spec = create_spec(
+        json!({"image":"server", "inheritEntrypoint":true,
+            "initCallTimeoutSeconds":120,
+            "readinessProbe":{"httpGet":{"port":8080,"path":"/ready"}},
+            "healthcheckProbe":{"exec":{"command":["/app/check"]},"failureThreshold":4}
+        }),
+        &caller(),
+    )
+    .unwrap();
+    let options: adx_core::sandbox::SandboxOptions = spec.sandbox.unwrap().try_into().unwrap();
+    assert_eq!(options.init_timeout_seconds, 120);
+    let readiness = options.readiness_probe.unwrap();
+    assert_eq!(
+        readiness.action,
+        adx_core::probes::ProbeAction::HttpGet {
+            port: 8080,
+            path: "/ready".into()
+        }
+    );
+    assert_eq!(
+        (
+            readiness.period_seconds,
+            readiness.timeout_seconds,
+            readiness.failure_threshold
+        ),
+        (2, 1, 1)
+    );
+    let healthcheck = options.healthcheck_probe.unwrap();
+    assert_eq!(
+        (
+            healthcheck.period_seconds,
+            healthcheck.timeout_seconds,
+            healthcheck.failure_threshold
+        ),
+        (10, 2, 4)
+    );
+}
+
+#[test]
+fn malformed_or_inapplicable_probes_are_rejected_before_assignment() {
+    for body in [
+        json!({"image":"server","readinessProbe":{"tcpSocket":{"port":80}}}),
+        json!({"image":"server","inheritEntrypoint":true,"readinessProbe":{"tcpSocket":{"port":80},"failureThreshold":1}}),
+        json!({"image":"server","inheritEntrypoint":true,"healthcheckProbe":{"tcpSocket":{"port":80},"exec":{"command":["true"]}}}),
+        json!({"image":"server","inheritEntrypoint":true,"readinessProbe":{"httpGet":{"port":80,"path":"/ready\r\nX: injected"}}}),
+        json!({"image":"server","inheritEntrypoint":true,"healthcheckProbe":{"exec":{"command":[]}}}),
+        json!({"image":"server","inheritEntrypoint":true,"healthcheckProbe":{"tcpSocket":{"port":65536}}}),
+        json!({"image":"server","initCallTimeoutSeconds":86401}),
+    ] {
+        assert_eq!(
+            create_spec(body, &caller()).unwrap_err().code(),
+            tonic::Code::InvalidArgument
+        );
+    }
+}

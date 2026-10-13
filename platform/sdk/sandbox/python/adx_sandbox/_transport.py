@@ -52,6 +52,7 @@ class SandboxError(RuntimeError):
         operation_id: Optional[str] = None,
         instance_id: Optional[str] = None,
         failure: Optional[Dict[str, Any]] = None,
+        probe_failure: Optional[Dict[str, Any]] = None,
     ):
         super().__init__(message)
         self.request_id = request_id
@@ -61,6 +62,7 @@ class SandboxError(RuntimeError):
         self.operation_id = operation_id
         self.instance_id = instance_id
         self.failure = failure
+        self.probe_failure = probe_failure
 
 
 class SandboxNotFound(SandboxError):
@@ -107,6 +109,7 @@ class SandboxHTTPError(SandboxError):
         outcome: Optional[str] = None,
         operation_id: Optional[str] = None,
         instance_id: Optional[str] = None,
+        probe_failure: Optional[Dict[str, Any]] = None,
     ):
         super().__init__(
             message,
@@ -116,6 +119,7 @@ class SandboxHTTPError(SandboxError):
             outcome=outcome,
             operation_id=operation_id,
             instance_id=instance_id,
+            probe_failure=probe_failure,
         )
         self.status_code = status_code
         self.payload = payload
@@ -253,6 +257,20 @@ class SandboxClient:
         self._resume_min_size = int(os.environ.get("ADX_RESUME_MIN_SIZE", str(64 * 1024 * 1024)))
 
     # ── lifecycle ──────────────────────────────────────────────────────
+
+    def require_workload_probes(self) -> None:
+        """Reject unsupported servers before accepting a probe-dependent create."""
+        response = self._http.get(f"{self._base}/capabilities", headers={"X-Auth": self._token}, timeout=10)
+        if response.status_code in (404, 405, 501):
+            raise SandboxError("server does not support workload probes", code="UNSUPPORTED", retry="never", outcome="not_started")
+        if response.status_code >= 400:
+            raise self._http_error(response)
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise SandboxError("invalid server capabilities response", code="UNSUPPORTED", retry="never", outcome="not_started") from exc
+        if not isinstance(payload, dict) or not isinstance(payload.get("capabilities"), list) or "workload-probes-v1" not in payload["capabilities"]:
+            raise SandboxError("server does not support workload probes", code="UNSUPPORTED", retry="never", outcome="not_started")
 
     def create(self, body: Dict[str, Any]) -> str:
         """POST /sandboxes — returns the new sandboxID."""
@@ -426,6 +444,7 @@ class SandboxClient:
                     outcome=detail.get("outcome"),
                     operation_id=detail.get("operationId"),
                     instance_id=detail.get("instanceId") or sandbox_id,
+                    probe_failure=detail.get("probeFailure"),
                 )
                 if error.retry == "same_operation" and error.outcome == "unknown":
                     raise _RetryableHTTPStatus(error)
@@ -1300,6 +1319,7 @@ class SandboxClient:
             outcome=detail.get("outcome"),
             operation_id=detail.get("operationId"),
             instance_id=detail.get("instanceId"),
+            probe_failure=detail.get("probeFailure"),
         )
 
     @staticmethod

@@ -426,6 +426,7 @@ impl Sandboxd {
             return Ok(crate::RuntimeStatus {
                 running: false,
                 failure: Some(RuntimeFailure {
+                    probe_failure: None,
                     reason: RuntimeFailureReason::Missing,
                     exit_code: None,
                     message: "backend execution is absent".into(),
@@ -604,6 +605,14 @@ pub fn start_request(
         adx_core::runtime_profile::DEFAULT_IMAGE_PROCESS_CONFIG,
         |value| value.bootstrap.image_process_config.as_str(),
     );
+    envs.remove(adx_core::probes::CONFIG_ENV);
+    if options.readiness_probe.is_some() || options.healthcheck_probe.is_some() {
+        envs.insert(
+            adx_core::probes::CONFIG_ENV.into(),
+            serde_json::to_string(&options.probe_config())
+                .map_err(|e| Error::Invalid(e.to_string()))?,
+        );
+    }
     if options.inherit_entrypoint {
         envs.insert(
             "ADX_IMAGE_PROCESS_CONFIG".into(),
@@ -1195,6 +1204,7 @@ fn runtime_failure(result: proto::WaitResponse) -> adx_core::RuntimeFailure {
         .message
         .contains("sandbox was oom-killed by the kernel");
     adx_core::RuntimeFailure {
+        probe_failure: None,
         reason: if oom {
             adx_core::RuntimeFailureReason::OomKilled
         } else {
@@ -1342,5 +1352,56 @@ mod tests {
         )
         .unwrap();
         assert!(!request.envs.contains_key("ADX_RUNTIME_CONTROL_SECRET"));
+    }
+    #[test]
+    fn workload_probe_configuration_is_node_owned_and_preserves_init_budget() {
+        let workload = EnvironmentSpec {
+            sandbox: adx_core::sandbox::SandboxOptions {
+                inherit_entrypoint: true,
+                rootfs: Some(adx_core::sandbox::Rootfs {
+                    readonly: false,
+                    source: adx_core::sandbox::StorageSource::Image("server".into()),
+                }),
+                init_timeout_seconds: 120,
+                readiness_probe: Some(adx_core::probes::ProbeSpec {
+                    action: adx_core::probes::ProbeAction::TcpSocket { port: 8080 },
+                    initial_delay_seconds: 0,
+                    period_seconds: 2,
+                    timeout_seconds: 1,
+                    failure_threshold: 1,
+                }),
+                ..Default::default()
+            },
+            id: "i".into(),
+            tenant_id: "t".into(),
+            image: "image".into(),
+            runtime_class: "runsc".into(),
+            resources: adx_core::Resources {
+                cpu_millis: 100,
+                memory_bytes: 1024,
+                disk_bytes: 1024,
+            },
+            runtime_profile: None,
+            snapshot_id: None,
+            lifecycle: Default::default(),
+            env: Default::default(),
+            scheduling: Default::default(),
+            priority: 0,
+        };
+        let mut config = Config::default();
+        config
+            .env
+            .insert(adx_core::probes::CONFIG_ENV.into(), "spoofed".into());
+        let request = start_request(&workload, "i-7", 7, &[], &config).unwrap();
+        let probes: adx_core::probes::ProbeConfig =
+            serde_json::from_str(&request.envs[adx_core::probes::CONFIG_ENV]).unwrap();
+        assert_eq!(probes.init_timeout_seconds, 120);
+        assert_eq!(probes.readiness, workload.sandbox.readiness_probe);
+        let mut plain = workload;
+        plain.sandbox.readiness_probe = None;
+        let without_probes = start_request(&plain, "i-8", 8, &[], &config).unwrap();
+        assert!(!without_probes
+            .envs
+            .contains_key(adx_core::probes::CONFIG_ENV));
     }
 }

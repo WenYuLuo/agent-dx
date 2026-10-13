@@ -1,3 +1,4 @@
+from .probes import ReadinessProbe, HealthcheckProbe
 from .types import (
     CommandInfo,
     CommandResult,
@@ -36,6 +37,8 @@ SDK_CAPABILITIES = frozenset(
 __all__ = [
     # current API
     "Sandbox",
+    "ReadinessProbe",
+    "HealthcheckProbe",
     "Shell",
     "Shells",
     "CommandHandle",

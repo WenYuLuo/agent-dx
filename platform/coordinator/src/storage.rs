@@ -166,6 +166,7 @@ impl StoredEnvironment {
     }
     pub(crate) fn effective_record(&self) -> EnvironmentRecord {
         self.result.clone().unwrap_or_else(|| EnvironmentRecord {
+            failure: None,
             restart_attempts: 0,
             restart_pending: false,
             runtime: adx_core::Runtime {
@@ -178,7 +179,6 @@ impl StoredEnvironment {
             revision: 0,
             resources_held: true,
             checkpoint: None,
-            failure: None,
             last_operation: None,
         })
     }

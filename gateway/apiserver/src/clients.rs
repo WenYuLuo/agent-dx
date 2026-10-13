@@ -556,6 +556,7 @@ mod tests {
     fn owned(id: &str, tenant: &str) -> pb::GetEnvironmentResponse {
         pb::GetEnvironmentResponse {
             record: Some(pb::EnvironmentRecord {
+                failure: None,
                 spec: Some(pb::EnvironmentSpec {
                     id: id.into(),
                     tenant_id: tenant.into(),

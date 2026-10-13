@@ -9,6 +9,8 @@ use tokio::sync::Semaphore;
 
 struct Dependencies {
     events: Mutex<Vec<String>>,
+    probe_failure: Mutex<Option<adx_core::probes::ProbeFailure>>,
+    records: Mutex<Vec<EnvironmentRecord>>,
     traces: Mutex<Vec<(String, Option<String>)>>,
     fail_at: Mutex<Option<String>>,
     durability: Mutex<Durability>,
@@ -24,6 +26,8 @@ impl Dependencies {
     fn new(block_start: bool) -> Arc<Self> {
         Arc::new(Self {
             events: Mutex::default(),
+            probe_failure: Mutex::default(),
+            records: Mutex::default(),
             traces: Mutex::default(),
             fail_at: Mutex::default(),
             durability: Mutex::new(Durability::Published),
@@ -100,8 +104,24 @@ impl RuntimeDriver for Dependencies {
 }
 #[async_trait]
 impl Readiness for Dependencies {
+    async fn probe_failure(
+        &self,
+        _: &EnvironmentRecord,
+    ) -> Result<Option<adx_core::probes::ProbeFailure>> {
+        Ok(self.probe_failure.lock().unwrap().clone())
+    }
     async fn wait_ready(&self, _record: &EnvironmentRecord) -> Result<()> {
-        self.event("ready")
+        self.event("ready")?;
+        if let Some(failure) = self
+            .probe_failure
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|f| f.kind == adx_core::probes::ProbeFailureKind::ReadinessTimeout)
+        {
+            return Err(Error::ProbeFailed(failure.clone()));
+        }
+        Ok(())
     }
 }
 #[async_trait]
@@ -117,6 +137,7 @@ impl Routes for Dependencies {
 impl StateSink for Dependencies {
     async fn commit(&self, record: &EnvironmentRecord) -> Result<Durability> {
         self.event(&format!("commit:{:?}", record.state))?;
+        self.records.lock().unwrap().push(record.clone());
         Ok(*self.durability.lock().unwrap())
     }
 }
@@ -996,6 +1017,7 @@ async fn backend_oom_is_committed_before_cleanup_and_retained_on_retry() {
     let environment = node.environment(spec("oom"), assignment("oom")).unwrap();
     environment.create().await.unwrap();
     let failure = adx_core::RuntimeFailure {
+        probe_failure: None,
         reason: adx_core::RuntimeFailureReason::OomKilled,
         exit_code: Some(137),
         message: "sandbox backend was OOM-killed".into(),
@@ -1021,4 +1043,147 @@ async fn backend_oom_is_committed_before_cleanup_and_retained_on_retry() {
         Some(failure)
     );
     environment.delete().await.unwrap();
+}
+
+fn workload_spec(id: &str, healthcheck: bool) -> EnvironmentSpec {
+    use adx_core::{probes::*, sandbox::*};
+    let mut spec = spec(id);
+    spec.sandbox.inherit_entrypoint = true;
+    spec.sandbox.rootfs = Some(Rootfs {
+        readonly: false,
+        source: StorageSource::Image("image".into()),
+    });
+    let probe = ProbeSpec {
+        action: ProbeAction::TcpSocket { port: 8080 },
+        initial_delay_seconds: 0,
+        period_seconds: 1,
+        timeout_seconds: 1,
+        failure_threshold: 1,
+    };
+    if healthcheck {
+        spec.sandbox.healthcheck_probe = Some(probe);
+    } else {
+        spec.sandbox.readiness_probe = Some(probe);
+    }
+    spec
+}
+#[tokio::test]
+async fn readiness_final_failure_commits_reason_without_activating_route() {
+    let deps = Dependencies::new(false);
+    let failure = adx_core::probes::ProbeFailure::timeout("HTTP 503");
+    *deps.probe_failure.lock().unwrap() = Some(failure.clone());
+    let manager = node(&deps);
+    let environment = manager
+        .environment(workload_spec("probe", false), assignment("probe"))
+        .unwrap();
+    assert_eq!(
+        environment.create().await.unwrap_err(),
+        Error::ProbeFailed(failure.clone())
+    );
+    let result = environment.sync().await.unwrap();
+    assert_eq!(result.record.state, EnvironmentState::Failed);
+    assert_eq!(result.record.failure, Some(failure.into()));
+    assert!(!deps.events.lock().unwrap().contains(&"activate".into()));
+    assert!(!deps.actual.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(manager.used(), Resources::default());
+}
+#[tokio::test]
+async fn healthcheck_event_cleans_once_and_rejects_old_execution() {
+    let deps = Dependencies::new(false);
+    let manager = node(&deps);
+    let environment = manager
+        .environment(workload_spec("probe", true), assignment("probe"))
+        .unwrap();
+    let created = environment.create().await.unwrap();
+    let identity = adxlet::runtime_control::RuntimeControlClient::identity(&created.record);
+    let failure = adx_core::probes::ProbeFailure {
+        kind: adx_core::probes::ProbeFailureKind::HealthcheckFailed,
+        message: "unhealthy".into(),
+        consecutive_failures: 3,
+        exit_code: Some(7),
+        http_status: None,
+    };
+    *deps.probe_failure.lock().unwrap() = Some(failure.clone());
+    let mut stale = identity.clone();
+    stale.runtime_id = "probe-1-r999".into();
+    manager.observe_runtime_event(&stale).await.unwrap();
+    assert!(deps.actual.load(std::sync::atomic::Ordering::SeqCst));
+    manager.observe_runtime_event(&identity).await.unwrap();
+    manager.observe_runtime_event(&identity).await.unwrap();
+    let record = environment.sync().await.unwrap().record;
+    assert_eq!(record.state, EnvironmentState::Failed);
+    assert_eq!(record.failure, Some(failure.into()));
+    assert_eq!(
+        deps.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|s| *s == "remove")
+            .count(),
+        1
+    );
+    assert_eq!(manager.used(), Resources::default());
+}
+#[tokio::test]
+async fn tick_recovers_healthcheck_failure_without_event() {
+    let deps = Dependencies::new(false);
+    let manager = node(&deps);
+    let environment = manager
+        .environment(workload_spec("probe", true), assignment("probe"))
+        .unwrap();
+    environment.create().await.unwrap();
+    *deps.probe_failure.lock().unwrap() = Some(adx_core::probes::ProbeFailure {
+        kind: adx_core::probes::ProbeFailureKind::HealthcheckFailed,
+        message: "unhealthy".into(),
+        consecutive_failures: 3,
+        exit_code: None,
+        http_status: None,
+    });
+    environment.tick().await.unwrap();
+    assert_eq!(
+        environment.sync().await.unwrap().record.state,
+        EnvironmentState::Failed
+    );
+}
+
+#[tokio::test]
+async fn healthcheck_failure_uses_existing_cold_restart_policy() {
+    let deps = Dependencies::new(false);
+    let manager = node(&deps);
+    let mut spec = workload_spec("probe-restart", true);
+    spec.lifecycle.restart = Some(adx_core::lifecycle::RestartPolicy {
+        max_attempts: 2,
+        initial_backoff_seconds: 1,
+        max_backoff_seconds: 1,
+    });
+    let environment = manager
+        .environment(spec, assignment("probe-restart"))
+        .unwrap();
+    let created = environment.create().await.unwrap();
+    *deps.probe_failure.lock().unwrap() = Some(adx_core::probes::ProbeFailure {
+        kind: adx_core::probes::ProbeFailureKind::HealthcheckFailed,
+        message: "unhealthy".into(),
+        consecutive_failures: 1,
+        exit_code: None,
+        http_status: None,
+    });
+    manager
+        .observe_runtime_event(&adxlet::runtime_control::RuntimeControlClient::identity(
+            &created.record,
+        ))
+        .await
+        .unwrap();
+    let failed = environment.sync().await.unwrap().record;
+    assert_eq!(failed.state, EnvironmentState::Failed);
+    assert!(failed.restart_pending);
+    assert_eq!(failed.restart_attempts, 0);
+    assert!(failed.failure.is_some());
+    *deps.probe_failure.lock().unwrap() = None;
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    environment.tick().await.unwrap();
+    let restarted = environment.sync().await.unwrap().record;
+    assert_eq!(restarted.state, EnvironmentState::Running);
+    assert_eq!(restarted.restart_attempts, 1);
+    assert_ne!(restarted.runtime.id, created.record.runtime.id);
+    assert!(restarted.failure.is_none());
 }

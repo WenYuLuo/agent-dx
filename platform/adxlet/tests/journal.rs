@@ -22,6 +22,7 @@ impl StateSink for Coordinator {
 }
 fn record(revision: u64) -> EnvironmentRecord {
     EnvironmentRecord {
+        failure: None,
         restart_attempts: 0,
         restart_pending: false,
         spec: EnvironmentSpec {
@@ -57,7 +58,6 @@ fn record(revision: u64) -> EnvironmentRecord {
         revision,
         resources_held: true,
         checkpoint: None,
-        failure: None,
         last_operation: None,
     }
 }

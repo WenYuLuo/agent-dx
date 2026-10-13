@@ -260,6 +260,10 @@ pub struct ResourceLimits {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SandboxOptions {
+    pub readiness_probe: Option<crate::probes::ProbeSpec>,
+    pub healthcheck_probe: Option<crate::probes::ProbeSpec>,
+    #[serde(default = "crate::probes::default_init_timeout")]
+    pub init_timeout_seconds: u64,
     pub rootfs: Option<Rootfs>,
     #[serde(default)]
     pub mounts: Vec<Mount>,
@@ -277,7 +281,30 @@ pub struct SandboxOptions {
 }
 
 impl SandboxOptions {
+    pub fn probe_config(&self) -> crate::probes::ProbeConfig {
+        crate::probes::ProbeConfig {
+            readiness: self.readiness_probe.clone(),
+            healthcheck: self.healthcheck_probe.clone(),
+            init_timeout_seconds: self.effective_init_timeout(),
+        }
+    }
+    pub fn effective_init_timeout(&self) -> u64 {
+        if self.init_timeout_seconds == 0 {
+            crate::probes::default_init_timeout()
+        } else {
+            self.init_timeout_seconds
+        }
+    }
     pub fn validate(&self, requests: &crate::Resources) -> Result<()> {
+        self.probe_config().validate()?;
+        if self.readiness_probe.is_some() || self.healthcheck_probe.is_some() {
+            if !self.inherit_entrypoint {
+                return Err(Error::Invalid(
+                    "workload probes require inherit_entrypoint".into(),
+                ));
+            }
+            self.probe_config().validate()?;
+        }
         if let Some(rootfs) = &self.rootfs {
             rootfs.validate()?;
         }

@@ -38,6 +38,10 @@ struct Create {
     init_timeout: i64,
     #[serde(rename = "inheritEntrypoint")]
     inherit: bool,
+    #[serde(rename = "readinessProbe")]
+    readiness: Option<RawProbe>,
+    #[serde(rename = "healthcheckProbe")]
+    healthcheck: Option<RawProbe>,
     failover: bool,
     xpu: String,
     ports: Vec<String>,
@@ -47,6 +51,78 @@ struct Create {
     #[serde(rename = "dataPlane")]
     data_plane: Value,
     tunnel: Tunnel,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RawProbe {
+    http_get: Option<HttpProbe>,
+    tcp_socket: Option<TcpProbe>,
+    exec: Option<ExecProbe>,
+    #[serde(default)]
+    initial_delay_seconds: u64,
+    period_seconds: Option<u64>,
+    timeout_seconds: Option<u64>,
+    failure_threshold: Option<u32>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HttpProbe {
+    port: u16,
+    #[serde(default = "probe_path")]
+    path: String,
+}
+fn probe_path() -> String {
+    "/".into()
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TcpProbe {
+    port: u16,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExecProbe {
+    command: Vec<String>,
+}
+impl RawProbe {
+    fn encode(self, readiness: bool) -> Result<adx_core::probes::ProbeSpec, Status> {
+        use adx_core::probes::{ProbeAction, ProbeSpec};
+        let mut actions = Vec::new();
+        if let Some(p) = self.http_get {
+            actions.push(ProbeAction::HttpGet {
+                port: p.port,
+                path: p.path,
+            });
+        }
+        if let Some(p) = self.tcp_socket {
+            actions.push(ProbeAction::TcpSocket { port: p.port });
+        }
+        if let Some(p) = self.exec {
+            actions.push(ProbeAction::Exec { command: p.command });
+        }
+        if actions.len() != 1 || (readiness && self.failure_threshold.is_some()) {
+            return Err(invalid(
+                "probe requires exactly one action; readiness uses the initialization deadline",
+            ));
+        }
+        let value = ProbeSpec {
+            action: actions.remove(0),
+            initial_delay_seconds: self.initial_delay_seconds,
+            period_seconds: self
+                .period_seconds
+                .unwrap_or(if readiness { 2 } else { 10 }),
+            timeout_seconds: self
+                .timeout_seconds
+                .unwrap_or(if readiness { 1 } else { 2 }),
+            failure_threshold: if readiness {
+                1
+            } else {
+                self.failure_threshold.unwrap_or(3)
+            },
+        };
+        value.validate().map_err(|e| invalid(&e.to_string()))?;
+        Ok(value)
+    }
 }
 #[derive(Default, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -614,6 +690,13 @@ pub fn create_spec_with_environment(
         ports,
         failover: r.failover,
         inherit_entrypoint: r.inherit,
+        readiness_probe: r.readiness.map(|p| p.encode(true)).transpose()?,
+        healthcheck_probe: r.healthcheck.map(|p| p.encode(false)).transpose()?,
+        init_timeout_seconds: if r.init_timeout == 0 {
+            30
+        } else {
+            r.init_timeout as u64
+        },
         limits: adx_core::sandbox::ResourceLimits {
             cpu_millis: cpu_limit,
             memory_bytes: memory_limit,

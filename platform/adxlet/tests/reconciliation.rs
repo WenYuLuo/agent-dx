@@ -100,6 +100,7 @@ impl StateSink for Backend {
 }
 fn record(id: &str, state: EnvironmentState) -> EnvironmentRecord {
     EnvironmentRecord {
+        failure: None,
         restart_attempts: 0,
         restart_pending: false,
         spec: EnvironmentSpec {
@@ -138,7 +139,6 @@ fn record(id: &str, state: EnvironmentState) -> EnvironmentRecord {
             ip: Some("10.0.0.2".parse().unwrap()),
         },
         checkpoint: None,
-        failure: None,
         last_operation: None,
         resources_held: true,
     }

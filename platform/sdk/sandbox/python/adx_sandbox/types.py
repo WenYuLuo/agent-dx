@@ -561,6 +561,7 @@ class SandboxFailure:
     reason: str
     exit_code: Optional[int] = None
     message: str = ""
+    probe_failure: Optional[Dict[str, Any]] = None
 
 
 @dataclass(frozen=True)

@@ -1021,6 +1021,7 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                     .map(|i| {
                         i.result
                             .unwrap_or_else(|| EnvironmentRecord {
+                                failure: None,
                                 restart_attempts: 0,
                                 restart_pending: false,
                                 runtime: adx_core::Runtime {
@@ -1033,7 +1034,6 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                                 revision: 0,
                                 resources_held: true,
                                 checkpoint: None,
-                                failure: None,
                                 last_operation: None,
                             })
                             .try_into()
@@ -1378,6 +1378,7 @@ mod reconciliation_tests {
             spec: spec.clone(),
             assignment: assignment.clone(),
             result: Some(EnvironmentRecord {
+                failure: None,
                 spec,
                 assignment,
                 state: EnvironmentState::Failed,
@@ -1388,7 +1389,6 @@ mod reconciliation_tests {
                 },
                 resources_held: false,
                 checkpoint: None,
-                failure: None,
                 last_operation: None,
                 restart_attempts: 0,
                 restart_pending: false,

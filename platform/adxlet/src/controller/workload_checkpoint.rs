@@ -196,6 +196,9 @@ impl Controller {
             Err(error) => Err(error),
         };
         if let Err(error) = capture {
+            if let Error::ProbeFailed(failure) = &error {
+                self.record.failure = Some(failure.clone().into());
+            }
             // Unknown backend outcomes do not authorize re-execution or a success ACK.
             let _ = services
                 .cooperation

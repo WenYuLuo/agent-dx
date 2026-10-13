@@ -140,6 +140,8 @@ Proxy 首次启动关闭 Environment 准入，adxlet 完成权威对账与全量
 
 内部 gRPC 按 Environment、快照、凭证、路由及节点本地控制拆分，详见 [协议目录](../../platform/api/proto/README.md)。Execd 用户操作使用 HTTP。配置 `adxlet.runtime_control` 后，Execd 主动建立到节点的双向 gRPC 控制流，上报 Ready／checkpoint 状态并接收准备与完成命令；未配置时使用 HTTP 控制。共享类型在 `core/src/runtime.rs`，见 [运行时控制契约](../../platform/api/proto/runtime-control.md) 与 [部署配置](../deployment/runtime-control-stream.md)。
 
+镜像继承入口可配置 readiness 与 healthcheck。Execd 在实例内执行探测，readiness 首次成功后才报告 Running；adxlet 直接等待该状态再绑定路由。Healthcheck 达到失败阈值后，通过现有串行控制器清理并应用既有恢复策略。Initializing 仅保留在运行时内存；最终 failure 元数据随现有 Environment 状态提交。暂停/恢复重新探测，内部探测不增加用户活动。详见 [SDK](../../platform/sdk/sandbox/python/README.md#workload-probes) 与 [Probe 契约](../../gateway/apiserver/docs/sandbox-lifecycle-api.md#workload-probes-on-image-startup)。
+
 正常结果经 Coordinator 写 Redis；SQLite 只在提交不可用时保存待补交结果。Journaled 不发布 Ingress 路由。节点重启而 Coordinator 不可用时等待对账，不从不完整日志重建目录。快照制品走独立的本地/S3 存储抽象。Redis 使用 `environment:<environment_id>`，SQLite journal 使用 `environment` 字段；Coordinator 启动时仅将已删除且不占资源的旧 `capsule:*` 记录原子迁移为 `environment:*`。其他旧控制状态和节点 SQLite journal 不能据此视为兼容，升级前需要单独评估和迁移。详见 [持久化契约](../testing/coordinator-storage.md)和[节点契约](../testing/node-lifecycle.md)。
 
 ## 构建、部署和验收

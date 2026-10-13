@@ -8,19 +8,31 @@
 
 凭证是节点主密钥对 `{environment_id, runtime_id, ownership_generation}` 的 HMAC-SHA256。主密钥持久化在节点 `key_file`，不会注入实例；每个执行只获得自己的派生凭证。普通用户规格不能覆盖控制地址或凭证。主密钥丢失后已有执行不能使用原凭证重连，因此不得作为临时配置目录清理。
 
-Hello 验证成功后的 Running 状态就是 Ready 通知。adxlet 等待通知并确认 sandboxd 执行仍在运行，随后应用 Relay 绑定和提交创建结果。配置开启时不进行 10ms HTTP 就绪轮询。同一身份的新连接替代旧连接；旧连接的迟到状态、结果和断线清理不能修改新连接。删除/失效清理及暂停确认后端停止后撤销预期身份，迟到重连被拒绝。恢复使用新 Runtime 身份登记，旧执行槽位不会跨恢复累积。
+Hello 验证成功后的 Running 状态就是 Ready 通知。adxlet 等待通知并确认 sandboxd 执行仍在运行，随后应用 Relay 绑定和提交创建结果。Readiness 优先等状态通知；周期观察读取流快照，控制流尚无快照或断线时使用带凭据的 HTTP status 兜底。同一身份的新连接替代旧连接；旧连接的迟到状态、结果和断线清理不能修改新连接。删除/失效清理及暂停确认后端停止后撤销预期身份，迟到重连被拒绝。恢复使用新 Runtime 身份登记，旧执行槽位不会跨恢复累积。
 
 此端点独立于节点组件 RPC 的 mTLS 监听，当前使用节点私有网络内的 HTTP/2 和执行凭证，不读取组件证书。它不应暴露在公网；凭证不提供传输加密。部署需允许 Runtime 到本节点端点的网络访问。
 
 ## 双向消息
 
-- Execd → adxlet：完整控制状态变化，包括 Ready、checkpoint 请求/绝对截止时间、Prepared、Resumed、Restored、Failed；重连始终发送完整快照。
+- Execd → adxlet：完整控制状态变化，包括 Initializing、Ready、probe 最终 failure、checkpoint 请求/绝对截止时间、Prepared、Resumed、Restored、Failed；重连始终发送完整快照。
 - adxlet → Execd：Status、Prepare、Abort、Finish。消息复用现有控制状态机，携带原有 identity、operation_id、expected_revision。
 - Execd → adxlet：按 request_id 返回控制结果或稳定错误类别 INVALID / CONFLICT / UNAVAILABLE。
 
 状态采集需要最新活动计数时，adxlet 可在流上发送 Status；不为每次用户命令额外推送活动事件。消息上限 64KiB，每连接最多 16 个待应答请求与 16 个待发送消息；调用取消、超时、断线均释放待应答条目。连接断开本身不证明 runtime 退出，不授权冷启动或改变归属；仍由既有后端对账及可选健康策略决定生命周期。
 
 每个活跃 Runtime 维持一条到所属 adxlet 的 TCP/HTTP2 控制连接，两端各占一个连接 FD；不会向 Coordinator 增加逐 Runtime 的控制连接。该成本需要与数据面的 tunnel/长连接分开计量。
+
+## 工作负载 probes
+
+Readiness 由 Execd 执行，Waiting 阶段报告 `initializing`，只在首次成功后报告
+`running`。Adxlet 的创建流程直接等待执行槽位上的状态 watch，readiness
+通知不经过正在执行 Create 的串行命令队列。最终失败携带共享 `ProbeFailure`
+类型，通过 watch 唤醒创建并走原启动失败清理/发布路径。
+
+Healthcheck 达到阈值后报告 `failed` 和结构化 `failure`；状态保留至执行退休，
+重连携带完整快照。该报告通过有界通知唤醒现有 Environment 控制器，由
+控制器确认当前执行身份、清理并应用既有 restart/failover 策略。Tick 读取
+状态补偿遗漏通知。Execd 不自行重启，Initializing 不作为 Redis 生命周期状态。
 
 ## 实例内 checkpoint
 

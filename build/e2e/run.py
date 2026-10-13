@@ -43,6 +43,7 @@ OPTIONAL_CASES = (
     'idle-active',
     'relay-standalone',
     'runtime-exit',
+    'workload-probes',
     'sandboxd-runtime-loss',
     'sqlite-fallback',
     'sqlite-node-restart',
@@ -131,6 +132,9 @@ def verify_bundle(directory):
         raise ValueError('EXECD archive integrity check failed')
     if sha(directory / 'entrypoint.tar') != m.get('entrypoint_archive_sha256'):
         raise ValueError('entrypoint image archive integrity check failed')
+    if 'workload_probes_archive_sha256' in m:
+        if sha(directory / 'workload-probes.tar') != m['workload_probes_archive_sha256']:
+            raise ValueError('workload probe image archive integrity check failed')
     return m
 
 
@@ -388,6 +392,8 @@ class Run:
                 f'{self.output}:/evidence',
             ]
             args += ['-v', f'{bundle / "execd.tar"}:/execd.tar:ro']
+            if 'workload_probes_archive_sha256' in m:
+                args += ['-v', f'{bundle / "workload-probes.tar"}:/workload-probes.tar:ro']
             if os.getenv('ADX_E2E_RUNTIME_CONTROL') == '1':
                 args += ['-e', 'ADX_E2E_RUNTIME_CONTROL=1']
             self.docker(*args, m['image_ids']['node'])
@@ -535,14 +541,16 @@ class Run:
                 record['subcases'] = sdk_subcases_from_output(output)
                 for node in self.nodes:
                     self.helper(node, 'empty', node)
-        if 'runtime-exit' in selected:
-            with self.case('runtime-exit', checks) as record:
+        for scenario in ('runtime-exit', 'workload-probes'):
+            if scenario not in selected:
+                continue
+            with self.case(scenario, checks) as record:
                 output = self.execute(
                     'node1',
                     '/opt/adx/client/bin/python',
                     '-u',
                     '/opt/adx/e2e/scenarios.py',
-                    'runtime-exit',
+                    scenario,
                     timeout=360,
                 )
                 record['subcases'] = sdk_subcases_from_output(output)

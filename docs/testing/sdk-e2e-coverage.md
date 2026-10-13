@@ -1,7 +1,7 @@
 # Sandbox SDK 公开能力与端到端覆盖
 
-本清单从 `adx_sandbox` 的公开导出反向检查端到端用例。当前 `__all__` 有 42 个名字：6 个
-操作入口类、12 个错误类型、22 个数据／策略类型，以及 `resources()` 和
+本清单从 `adx_sandbox` 的公开导出反向检查端到端用例。当前 `__all__` 有 44 个名字：6 个
+操作入口类、12 个错误类型、24 个数据／策略类型，以及 `resources()` 和
 `SDK_CAPABILITIES`。`Commands` 与 `Filesystem` 不单独顶层导出，但由 `Sandbox` 属性返回，
 也是用户接口。`SandboxFailure` 是 `SandboxInfo.failure` 使用的结构化失败数据，
 不新增独立操作；公开操作仍为 66 个。
@@ -64,6 +64,7 @@ upstream，并校验响应体和路径。该项不是客户端序列化单测。
 | data_plane_security | Standalone r4 已通过每实例纯 TLS 与默认 TLS+Token 对照 | 增加非法安全模式和证书轮换场景 |
 | extra_config | API→Environment→sandboxd 请求契约测试已覆盖 | 具体键的含义由 sandboxd/runtime 定义；按实际 runtime 增加语义 E2E |
 | upstream | Standalone r11 实跑通过 | 增加断线期间在途请求续传和大响应的部署形态 E2E |
+| readiness_probe、healthcheck_probe、init_timeout | `workload-probes` 定向用例覆盖 HTTP/TCP/Exec、启动等待/超时、健康失败/重启和 idle 清理；以同一版本的实跑结果为准 | checkpoint 恢复后重新探测需独立 KVM 验证 |
 
 ## 错误类型
 

@@ -165,6 +165,12 @@ pub trait RuntimeDriver: Send + Sync {
 
 #[async_trait]
 pub trait Readiness: Send + Sync {
+    async fn probe_failure(
+        &self,
+        _record: &EnvironmentRecord,
+    ) -> Result<Option<adx_core::probes::ProbeFailure>> {
+        Ok(None)
+    }
     /// Register the expected execution before Start or restore can report Ready.
     fn expect_runtime(&self, _record: &EnvironmentRecord) -> Result<()> {
         Ok(())
@@ -634,7 +640,7 @@ impl Adxlet {
 }
 
 impl Adxlet {
-    /// Wake checkpoint cooperation in the serial controller. The controller
+    /// Wake runtime failure or checkpoint cooperation in the serial controller. The controller
     /// fences execution identity before acting on a queued notification.
     pub async fn observe_runtime_event(
         &self,
