@@ -34,8 +34,17 @@ wrapper=$(command -v sccache || true)
 if [[ -z "$wrapper" && -x /mnt/paas/build-cache/bin/sccache ]]; then
   wrapper=/mnt/paas/build-cache/bin/sccache
 fi
+unset RUSTC_WRAPPER
 if [[ -n "$wrapper" ]]; then
   mkdir -p "$SCCACHE_DIR"
-  export RUSTC_WRAPPER="$wrapper"
+  # Reuse an existing daemon, or start one before enabling the compiler wrapper.
+  # Optional cache availability must not turn an ordinary Rust build into a failure.
+  if "$wrapper" --show-stats >/dev/null 2>&1 || {
+    "$wrapper" --start-server && "$wrapper" --show-stats >/dev/null 2>&1
+  }; then
+    export RUSTC_WRAPPER="$wrapper"
+  else
+    printf 'sccache server unavailable; compiling without sccache\n' >&2
+  fi
 fi
 printf 'Rust=%s Cargo source=rsproxy-sparse\nCARGO_HOME=%s\nCARGO_TARGET_DIR=%s\nRUSTC_WRAPPER=%s\n' "$actual" "$CARGO_HOME" "$CARGO_TARGET_DIR" "${RUSTC_WRAPPER:-none}"

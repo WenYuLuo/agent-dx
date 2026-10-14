@@ -31,6 +31,16 @@ def _without_afs_environment():
 ROOT = Path(__file__).resolve().parents[3]
 
 
+def _api_gate_stub(repo):
+    (repo / '.buildkite/api-contract-gate.sh').write_text(
+        '#!/usr/bin/env bash\n'
+        'echo api > api-contract-ran\n'
+        'exit "${FAKE_API_CONTRACT_EXIT:-0}"\n'
+    )
+    ignore = repo / '.gitignore'
+    ignore.write_text(ignore.read_text() + 'api-contract-ran\n')
+
+
 class PipelineContracts(unittest.TestCase):
     def test_publication_is_disabled_without_explicit_flag(self):
         for script, flag in [
@@ -215,6 +225,7 @@ class PipelineContracts(unittest.TestCase):
                 '\t@if [ "$${ADX_WITH_AFS}" = "1" ]; then '
                 'echo "afs:$${ADX_WITH_AFS}:$${ADX_AFS_ALL_FEATURES}" >> gate-ran; fi\n'
             )
+            _api_gate_stub(repo)
             subprocess.run(["git", "init"], cwd=repo, capture_output=True, text=True, check=True)
             subprocess.run(["git", "config", "user.email", "ci@example.invalid"], cwd=repo, check=True)
             subprocess.run(["git", "config", "user.name", "CI"], cwd=repo, check=True)
@@ -244,6 +255,14 @@ class PipelineContracts(unittest.TestCase):
                         check=True,
                     )
                     self.assertEqual((repo / "gate-ran").read_text().strip(), expected)
+                    self.assertEqual((repo / 'api-contract-ran').read_text().strip(), 'api')
+            (repo / 'gate-ran').unlink()
+            result = subprocess.run(
+                ['bash', '.buildkite/source-gate.sh'], cwd=repo,
+                env=dict(base_env, FAKE_API_CONTRACT_EXIT='7'), capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 7, result.stderr)
+            self.assertFalse((repo / 'gate-ran').exists())
 
     def test_source_gate_rejects_invalid_afs_switches_before_bootstrap(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -294,6 +313,7 @@ class PipelineContracts(unittest.TestCase):
             (repo / "Makefile").write_text(
                 'rust-check:\n\t@echo rust >> gate-ran\n\t@if [ "$${ADX_WITH_AFS}" = "1" ]; then exit 7; fi\n'
             )
+            _api_gate_stub(repo)
             subprocess.run(["git", "init"], cwd=repo, capture_output=True, text=True, check=True)
             subprocess.run(["git", "config", "user.email", "ci@example.invalid"], cwd=repo, check=True)
             subprocess.run(["git", "config", "user.name", "CI"], cwd=repo, check=True)

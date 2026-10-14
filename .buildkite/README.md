@@ -477,6 +477,9 @@ Package assembly consumes only uploaded component archives; it does not read a
 compiler job's Cargo target directory.
 An existing sccache from the shared worker cache is reused when available, and
 Cargo cache locations/source selection are recorded in `bootstrap.log`.
+Bootstrap checks the cache daemon before enabling `RUSTC_WRAPPER`, starting it
+when needed. If startup or the health check fails, the job logs the failure and
+compiles directly with the same Cargo target/registry caches.
 
 The external backend is selected by the target-specific OBS archive pin in
 `third_party/sandboxd/artifacts.json`. `build/e2e/download_backend.py` downloads

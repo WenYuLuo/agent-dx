@@ -78,6 +78,52 @@ class BuildImageContractTests(unittest.TestCase):
         self.assertEqual(self.config["go"], "1.25.5")
         self.assertEqual(self.config["erofs_utils"], "1.8.10")
 
+    def test_cargo_only_uses_a_reachable_sccache_server(self):
+        for mode, available, starts in (
+            ('ready', True, 0),
+            ('start', True, 1),
+            ('start-fails', False, 1),
+            ('unreachable-after-start', False, 1),
+        ):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / 'rust-toolchain.toml').write_text('[toolchain]\nchannel = "1.95.0"\n')
+                (root / 'rustc').write_text('#!/bin/sh\necho "rustc 1.95.0 (fixture)"\n')
+                (root / 'rustup').write_text('#!/bin/sh\nprintf "rustfmt-x86_64-unknown-linux-gnu\\nclippy-x86_64-unknown-linux-gnu\\n"\n')
+                (root / 'sccache').write_text(
+                    '#!/bin/sh\n'
+                    'printf "%s\\n" "$1" >> "$SCCACHE_TEST_CALLS"\n'
+                    'case "$1" in\n'
+                    ' --show-stats) [ "$SCCACHE_TEST_MODE" = ready ] || { [ "$SCCACHE_TEST_MODE" = start ] && [ -f "$SCCACHE_TEST_STARTED" ]; } ;;\n'
+                    ' --start-server) [ "$SCCACHE_TEST_MODE" != start-fails ] || { echo "server unavailable" >&2; exit 1; }; touch "$SCCACHE_TEST_STARTED" ;;\n'
+                    ' *) exit 9 ;;\n'
+                    'esac\n'
+                )
+                for name in ('rustc', 'rustup', 'sccache'):
+                    (root / name).chmod(0o755)
+                environment = {
+                    **os.environ,
+                    'PATH': str(root) + os.pathsep + os.environ['PATH'],
+                    'ADX_CARGO_HOME': str(root / 'cargo'),
+                    'CARGO_TARGET_DIR': str(root / 'target'),
+                    'RUSTUP_TOOLCHAIN': '1.95.0',
+                    'RUSTC_WRAPPER': str(root / 'stale-wrapper'),
+                    'SCCACHE_DIR': str(root / 'cache'),
+                    'SCCACHE_TEST_MODE': mode,
+                    'SCCACHE_TEST_CALLS': str(root / 'calls'),
+                    'SCCACHE_TEST_STARTED': str(root / 'started'),
+                }
+                result = subprocess.run(
+                    ['bash', '-c', 'source "$1"', 'test', str(ROOT / '.buildkite/setup-cargo.sh')],
+                    cwd=root, env=environment, capture_output=True, text=True, timeout=15,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                expected = str(root / 'sccache') if available else 'none'
+                self.assertIn(f'RUSTC_WRAPPER={expected}', result.stdout)
+                self.assertEqual((root / 'calls').read_text().splitlines().count('--start-server'), starts)
+                if not available:
+                    self.assertIn('compiling without sccache', result.stderr)
+
     def test_recipe_contains_every_offline_build_prerequisite(self):
         for package in (
             "autoconf",
