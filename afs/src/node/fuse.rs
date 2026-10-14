@@ -1713,16 +1713,17 @@ impl Filesystem for AfsFuse {
         let backend = self.backend.clone();
         let context = Self::metadata_context(req, 0);
         let name = name.to_os_string();
-        self.dispatch.submit(move || match backend.getxattr(&context, inode, &name) {
-            Ok(data) => reply_xattr(reply, size, Ok(data)),
-            Err(error) => reply.error(fuse_errno(errno_xattr(
-                error,
-                "getxattr",
-                inode.value,
-                &name,
-                &context,
-            ))),
-        });
+        self.dispatch
+            .submit(move || match backend.getxattr(&context, inode, &name) {
+                Ok(data) => reply_xattr(reply, size, Ok(data)),
+                Err(error) => reply.error(fuse_errno(errno_xattr(
+                    error,
+                    "getxattr",
+                    inode.value,
+                    &name,
+                    &context,
+                ))),
+            });
     }
 
     fn listxattr(&self, req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
@@ -1785,7 +1786,9 @@ impl Filesystem for AfsFuse {
                 reply,
                 backend
                     .removexattr(&context, inode, &name)
-                    .map_err(|error| errno_xattr(error, "removexattr", inode.value, &name, &context)),
+                    .map_err(|error| {
+                        errno_xattr(error, "removexattr", inode.value, &name, &context)
+                    }),
             );
         });
     }

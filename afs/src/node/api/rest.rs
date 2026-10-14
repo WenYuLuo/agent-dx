@@ -15,8 +15,6 @@ use afs_error::{
     CLIENT_ARGUMENT_INVALID, CLIENT_CONNECTION_UNAVAILABLE, DIAGNOSTICS_NOT_CONFIGURED, Error,
     METRICS_FAILED, NODE_TRANSFER_CORRUPT_DATA,
 };
-#[cfg(feature = "ownerfs")]
-use afs_error::NODE_VFS_UNAVAILABLE;
 use afs_protocol::node_control::{PingRequest, node_control_client::NodeControlClient};
 use afs_tracing::{Instrument, tracing};
 use axum::{
@@ -25,25 +23,16 @@ use axum::{
     http::StatusCode,
     routing::{get, post},
 };
-#[cfg(feature = "ownerfs")]
-use axum::extract::Query;
 use serde_json::{Value, json};
-#[cfg(feature = "ownerfs")]
-use std::ffi::OsStr;
 use std::{sync::Arc, time::Duration};
 
 pub fn router(node: Arc<Node>) -> Router {
-    let mut router = Router::new()
+    Router::new()
         .route("/health", get(health))
         .route("/v1/ping", get(ping))
         .route("/v1/diagnostics", post(diagnostics))
-        .route("/metrics", get(metrics));
-    #[cfg(feature = "ownerfs")]
-    {
-        // D4 方案 A：管理 API 显式删除 root，不经过 FUSE/VFS 路径。
-        router = router.route("/debug/root/delete", post(delete_root));
-    }
-    router.with_state(node)
+        .route("/metrics", get(metrics))
+        .with_state(node)
 }
 async fn health(State(node): State<Arc<Node>>) -> (StatusCode, Json<Value>) {
     let report = node_health_report(&node);
@@ -61,27 +50,6 @@ async fn ping(State(node): State<Arc<Node>>) -> Json<Value> {
 async fn metrics(State(node): State<Arc<Node>>) -> Result<String, RestError> {
     afs_metrics::encode_text(&node.observability.registry)
         .map_err(|e| RestError(Error::coded(METRICS_FAILED, e.to_string())))
-}
-/// D4 方案 A：管理 API 显式删除 root（root 级别 rmdir 的兜底路径）。
-#[derive(serde::Deserialize)]
-struct RootDeleteParams {
-    name: String,
-}
-#[cfg(feature = "ownerfs")]
-async fn delete_root(
-    State(node): State<Arc<Node>>,
-    Query(params): Query<RootDeleteParams>,
-) -> Result<Json<Value>, RestError> {
-    let ownerfs = node.ownerfs.as_ref().ok_or_else(|| {
-        RestError(Error::coded(
-            NODE_VFS_UNAVAILABLE,
-            "ownerfs backend not compiled into this artifact",
-        ))
-    })?;
-    ownerfs.delete_root(OsStr::new(&params.name)).map_err(RestError)?;
-    node.observability
-        .record("node", "rest_root_delete", true);
-    Ok(Json(json!({"deleted": params.name})))
 }
 async fn diagnostics(State(node): State<Arc<Node>>) -> Result<Json<Value>, RestError> {
     let result = diagnose(node.clone())

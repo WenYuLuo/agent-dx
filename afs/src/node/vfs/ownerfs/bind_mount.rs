@@ -32,7 +32,7 @@ mod linux {
     use super::{DirectoryIdentity, MountIdentity, NamespaceIdentity};
     use crate::node::vfs::ownerfs::{HomeExportAuthority, OwnerFs};
     use std::{
-        ffi::{CString, OsStr},
+        ffi::{CString, OsStr, OsString},
         fs::File,
         io,
         os::{
@@ -63,9 +63,17 @@ mod linux {
     }
 
     impl AuthorizedWorkspaceBind {
-        pub(in crate::node) fn prepare(
+        /// Prepare an egress bind claim against a native `<egress_root>/<name>`
+        /// target (D1: bind target decoupled from the FUSE tree).
+        ///
+        /// The parent is the administrator-configured native egress root, never
+        /// the FUSE mount point; the target directory is created empty and
+        /// idempotently (a leftover from a previous run is re-verified below).
+        /// The Home source must be a physical backing directory, and the egress
+        /// root must itself be native so a bind target can never cover FUSE.
+        pub(in crate::node) fn prepare_egress(
             owner: Arc<OwnerFs>,
-            mount: &Path,
+            egress_root: &Path,
             workspace: &OsStr,
         ) -> io::Result<Self> {
             validate_component(workspace)?;
@@ -78,15 +86,21 @@ mod linux {
             let source = authority
                 .source_descriptor()
                 .map_err(|error| io::Error::other(error.to_string()))?;
+            if is_fuse_mount(&source)? {
+                return Err(io::Error::other(
+                    "workspace egress bind requires a physical Home source",
+                ));
+            }
             let parent = File::options()
                 .read(true)
                 .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW)
-                .open(mount)?;
-            if !is_fuse_mount(&parent)? || is_fuse_mount(&source)? {
+                .open(egress_root)?;
+            if is_fuse_mount(&parent)? {
                 return Err(io::Error::other(
-                    "workspace bind requires a physical Home source and a FUSE parent",
+                    "workspace egress bind requires a native egress root",
                 ));
             }
+            ensure_egress_target(&parent, workspace)?;
             let export = WorkspaceBindMount::prepare(source, parent, workspace)?;
             let expected = authority.source_identity();
             if export.source_identity()
@@ -126,15 +140,6 @@ mod linux {
         pub(in crate::node) fn detach(&mut self) -> io::Result<()> {
             self.export.detach()
         }
-
-        /// D4 方案 B: 以显式 flags 分离 bind mount。
-        ///
-        /// `MNT_DETACH` 立即把挂载从 namespace 分离，不等待已打开的 fd；
-        /// 底层的实际释放延后到最后一个 fd 关闭。调用方负责在独立线程中
-        /// 执行，避免在 FUSE 回调内做可能重入的 syscall。
-        pub(in crate::node) fn detach_with_flags(&mut self, flags: i32) -> io::Result<()> {
-            self.export.detach_with_flags(flags)
-        }
     }
 
     fn is_fuse_mount(file: &File) -> io::Result<bool> {
@@ -152,6 +157,82 @@ mod linux {
             })
             .ok_or_else(|| errno(libc::ESTALE))?;
         Ok(filesystem == "fuse" || filesystem.starts_with("fuse."))
+    }
+
+    /// Create the empty egress target directory `<egress_root>/<name>` as the
+    /// bind destination. Idempotent: EEXIST (a leftover from a previous run or
+    /// a concurrent creator) is accepted and re-verified by prepare below.
+    #[allow(unsafe_code)]
+    fn ensure_egress_target(parent: &File, name: &OsStr) -> io::Result<()> {
+        let name = validate_component(name)?;
+        // SAFETY: parent and name are live for this synchronous syscall; mode
+        // is masked by the caller's umask.
+        let result = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) };
+        if result == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EEXIST) {
+            return Ok(());
+        }
+        Err(error)
+    }
+
+    /// Scan `/proc/self/mountinfo` for residual workspace egress binds mounted
+    /// directly under `egress_root`. Returns the child names whose mount
+    /// carries the managed NOSUID|NODEV signature (D4 §4.4 startup reconcile).
+    pub(in crate::node) fn scan_egress_binds(egress_root: &Path) -> io::Result<Vec<OsString>> {
+        use std::io::{BufRead, BufReader};
+
+        let root = egress_root.as_os_str().as_bytes();
+        let mut names = Vec::new();
+        let mountinfo = std::fs::File::open("/proc/self/mountinfo")?;
+        for line in BufReader::new(mountinfo).lines() {
+            let line = line?;
+            let Some((identity, detail)) = line.split_once(" - ") else {
+                continue;
+            };
+            let mount_point = match identity.split_whitespace().nth(4) {
+                Some(point) => point,
+                None => continue,
+            };
+            let point = mount_point.as_bytes();
+            if !point.starts_with(root) || point.len() <= root.len() {
+                continue;
+            }
+            let Some(tail) = point.get(root.len()..) else {
+                continue;
+            };
+            if !tail.starts_with(b"/") || tail.len() == 1 || tail[1..].contains(&b'/') {
+                continue;
+            }
+            // Managed signature: the super options carry NOSUID|NODEV. Bind
+            // mounts report source paths from the activating fd, so the target
+            // location plus policy options identify our own exports.
+            let options = detail.split_whitespace().nth(2).unwrap_or("");
+            if !options.contains("nosuid") || !options.contains("nodev") {
+                continue;
+            }
+            names.push(OsString::from(OsStr::from_bytes(&tail[1..])));
+        }
+        Ok(names)
+    }
+
+    /// Detach a residual workspace egress bind by path (D4 §4.4).
+    ///
+    /// Re-verifies that the target is a direct child of `egress_root` and still
+    /// carries the managed NOSUID|NODEV signature before detaching with
+    /// MNT_DETACH, so a busy tree can never strand the cleanup.
+    pub(in crate::node) fn detach_egress_bind(egress_root: &Path, name: &OsStr) -> io::Result<()> {
+        validate_component(name)?;
+        let target = egress_root.join(name);
+        let file = File::options()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(&target)?;
+        check_mount_policy(&file)?;
+        let bytes = CString::new(target.as_os_str().as_bytes()).map_err(|_| errno(libc::EINVAL))?;
+        lazy_unmount(&bytes)
     }
 
     #[derive(Debug)]
@@ -210,9 +291,7 @@ mod linux {
             // Fall back to legacy mount(2) MS_BIND on older kernels (ENOSYS).
             let mount = match self.activate_new_api(&fresh_target) {
                 Ok(mount) => mount,
-                Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => {
-                    self.activate_legacy_bind()?
-                }
+                Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => self.activate_legacy_bind()?,
                 Err(e) => {
                     drop(fresh_target);
                     return Err(e);
@@ -269,16 +348,17 @@ mod linux {
 
         /// Legacy mount(2) path for kernels < 5.2 (e.g. 4.18).
         fn activate_legacy_bind(&self) -> io::Result<MountIdentity> {
-            let source_path = CString::new(format!(
-                "/proc/thread-self/fd/{}",
-                self.source.as_raw_fd()
-            ))
-            .map_err(|_| errno(libc::EINVAL))?;
+            let source_path =
+                CString::new(format!("/proc/thread-self/fd/{}", self.source.as_raw_fd()))
+                    .map_err(|_| errno(libc::EINVAL))?;
 
             let target_path = self.target_proc_path()?;
 
             // Legacy bind mount: mount(2) with MS_BIND.
             mount_bind(source_path.as_c_str(), target_path.as_c_str())?;
+
+            // Make the bind private so detach cannot fail on shared peer busy (D4).
+            make_private(target_path.as_c_str())?;
 
             // Apply NOSUID|NODEV via remount: mount(2) with MS_REMOUNT.
             mount_remount_nosuid_nodev(target_path.as_c_str())?;
@@ -309,31 +389,13 @@ mod linux {
             if self.inspect()?.as_ref() != Some(&mount) {
                 return Err(errno(libc::ESTALE));
             }
-            normal_unmount(&self.target_proc_path()?)?;
+            // MNT_DETACH: detach immediately without failing on a busy tree
+            // (active container fds); the covered target reappears once the
+            // last reference closes (D4 §3.2).
+            lazy_unmount(&self.target_proc_path()?)?;
             if self.inspect()?.is_some() {
                 return Err(errno(libc::ESTALE));
             }
-            self.activated = false;
-            Ok(())
-        }
-
-        /// D4 方案 B: 与 [`Self::detach`] 相同的所有权校验，但以显式 flags
-        /// 卸载。`MNT_DETACH` 立即从 namespace 移除挂载，不等待已打开的 fd。
-        pub(in crate::node) fn detach_with_flags(&mut self, flags: i32) -> io::Result<()> {
-            if !self.activated {
-                if self.inspect()?.is_none() {
-                    return Ok(());
-                }
-                return Err(errno(libc::ESTALE));
-            }
-            let mount = self.mount_identity()?;
-            if directory_identity(&self.source)? != self.source_identity {
-                return Err(errno(libc::ESTALE));
-            }
-            if self.inspect()?.as_ref() != Some(&mount) {
-                return Err(errno(libc::ESTALE));
-            }
-            unmount_with_flags(&self.target_proc_path()?, flags)?;
             self.activated = false;
             Ok(())
         }
@@ -581,13 +643,17 @@ mod linux {
     }
 
     fn unique_mount_id(file: &File) -> io::Result<u64> {
-        // STATX_MNT_ID_UNIQUE (0x4000) is Linux 6.8+; fall back to STATX_MNT_ID
-        // (available since 4.18) on older kernels. The non-unique ID can be
-        // recycled after umount, but directory identity checks mitigate TOCTOU.
-        match statx_mount_id(file, 0x4000) {
-            Ok(id) => Ok(id),
-            Err(_) => statx_mount_id(file, libc::STATX_MNT_ID),
-        }
+        // STATX_MNT_ID_UNIQUE (0x4000) is Linux 6.8+; older kernels report only
+        // STATX_MNT_ID (4.18+). Request both bits in one statx: on 6.8+ the
+        // kernel sets the UNIQUE bit (sharing the stx_mnt_id field), while older
+        // kernels set only the MNT_ID bit and ignore the unknown 0x4000 bit.
+        //
+        // Requesting both bits in a single call avoids the readlink-based
+        // mountinfo fallback, which cannot resolve detached mount fds (their
+        // /proc/self/fd readlink reports "/") and can mis-resolve O_PATH fds
+        // whose readlink is unavailable in restricted environments, wrongly
+        // attributing the root mount id to the file.
+        statx_mount_id(file, 0x4000 | libc::STATX_MNT_ID)
     }
 
     #[allow(unsafe_code)]
@@ -710,7 +776,10 @@ mod linux {
         let attr = MountAttr {
             attr_set: MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV,
             attr_clr: 0,
-            propagation: 0,
+            // 独立传播：bind 挂载点必须脱离 source 的 shared peer group，
+            // 否则 detach（正常 umount 和 MNT_DETACH 均如此）会因任一 peer
+            // busy 而整体失败（EBUSY），留下无法清理的孤儿挂载（D4）。
+            propagation: libc::MS_PRIVATE,
             userns_fd: 0,
         };
         // SAFETY: mount_attr has the Linux UAPI layout and lives for the syscall.
@@ -753,11 +822,8 @@ mod linux {
 
     /// Apply NOSUID|NODEV policy via legacy mount(2) remount on a File descriptor.
     fn apply_policy_legacy_remount(target: &File) -> io::Result<()> {
-        let path = CString::new(format!(
-            "/proc/thread-self/fd/{}",
-            target.as_raw_fd()
-        ))
-        .map_err(|_| errno(libc::EINVAL))?;
+        let path = CString::new(format!("/proc/thread-self/fd/{}", target.as_raw_fd()))
+            .map_err(|_| errno(libc::EINVAL))?;
         mount_remount_nosuid_nodev(path.as_c_str())
     }
 
@@ -770,6 +836,30 @@ mod linux {
                 target.as_ptr(),
                 std::ptr::null(),
                 libc::MS_BIND,
+                std::ptr::null(),
+            )
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    /// Change the mount point's propagation type to private (`mount --make-private`).
+    ///
+    /// With source and filesystemtype both NULL, mount(2) only changes the
+    /// propagation type of target. Private mounts are not part of any shared
+    /// peer group, so detach never fails on a busy peer (D4).
+    #[allow(unsafe_code)]
+    fn make_private(target: &std::ffi::CStr) -> io::Result<()> {
+        // SAFETY: target is a NUL-terminated C string that lives for the call.
+        let result = unsafe {
+            libc::mount(
+                std::ptr::null(),
+                target.as_ptr(),
+                std::ptr::null(),
+                libc::MS_PRIVATE,
                 std::ptr::null(),
             )
         };
@@ -811,10 +901,11 @@ mod linux {
     }
 
     #[allow(unsafe_code)]
-    fn unmount_with_flags(path: &std::ffi::CStr, flags: i32) -> io::Result<()> {
-        // SAFETY: path is NUL-terminated and live. Flags select the unmount
-        // mode; MNT_DETACH separates the mount without waiting for open FDs.
-        let result = unsafe { libc::umount2(path.as_ptr(), flags) };
+    fn lazy_unmount(path: &std::ffi::CStr) -> io::Result<()> {
+        // SAFETY: path is NUL-terminated and live. MNT_DETACH (2) detaches the
+        // mount from the namespace immediately; it never fails on a busy tree,
+        // and the covered target reappears once the last reference closes.
+        let result = unsafe { libc::umount2(path.as_ptr(), libc::MNT_DETACH) };
         if result == 0 {
             Ok(())
         } else {
@@ -832,44 +923,78 @@ mod linux {
         }
 
         #[test]
-        fn authorized_workspace_rejects_ordinary_owner_and_non_fuse_parent() {
+        fn authorized_workspace_egress_rejects_ordinary_owner_and_prepares_native_target() {
             use crate::node::vfs::ownerfs::native_home_tests::{fixture, mkdir_root};
             for eligible in [false, true] {
-                let (temp, owner, ctx, _disk) = fixture(eligible);
+                let (_temp, owner, ctx, _disk) = fixture(eligible);
                 mkdir_root(&owner, &ctx, "workspace");
-                let error = AuthorizedWorkspaceBind::prepare(
+                let egress = tempfile::tempdir().unwrap();
+                let result = AuthorizedWorkspaceBind::prepare_egress(
                     Arc::new(owner),
-                    temp.path(),
+                    egress.path(),
                     OsStr::new("workspace"),
-                )
-                .err()
-                .expect("an unmounted parent must fail");
+                );
                 if eligible {
-                    assert!(error.to_string().contains("FUSE parent"));
+                    // A native egress root yields a claim without mounting; the
+                    // empty target directory is created for the bind.
+                    result.expect("native-eligible owner must prepare an egress claim");
+                    assert!(egress.path().join("workspace").is_dir());
                 } else {
+                    let error = result.err().expect("ordinary owner must fail");
                     assert!(error.to_string().contains("native"));
                 }
             }
         }
 
         #[test]
-        #[ignore = "requires root Linux private mount namespace and /dev/fuse; run explicitly"]
-        fn authorized_workspace_binds_real_fuse_root_and_detaches_after_revocation() {
+        fn prepare_egress_rejects_non_directory_target_and_re_adopts_empty_dir() {
+            use crate::node::vfs::ownerfs::native_home_tests::{fixture, mkdir_root};
+            let (_temp, owner, ctx, _disk) = fixture(true);
+            mkdir_root(&owner, &ctx, "workspace");
+            let owner = Arc::new(owner);
+            let egress = tempfile::tempdir().unwrap();
+
+            // A non-directory target must be rejected rather than bound over.
+            std::fs::write(egress.path().join("workspace"), b"plain file").unwrap();
+            let error = AuthorizedWorkspaceBind::prepare_egress(
+                owner.clone(),
+                egress.path(),
+                OsStr::new("workspace"),
+            )
+            .err()
+            .expect("a file target must fail");
+            assert!(matches!(
+                error.raw_os_error(),
+                Some(libc::ENOTDIR | libc::ELOOP)
+            ));
+            std::fs::remove_file(egress.path().join("workspace")).unwrap();
+
+            // An existing empty directory from a previous run is re-adopted.
+            fs::create_dir(egress.path().join("workspace")).unwrap();
+            AuthorizedWorkspaceBind::prepare_egress(owner, egress.path(), OsStr::new("workspace"))
+                .expect("an existing empty target is idempotent");
+        }
+
+        #[test]
+        #[ignore = "requires root Linux private mount namespace; run explicitly"]
+        fn authorized_workspace_egress_binds_and_detaches_after_revocation() {
             use crate::node::vfs::ownerfs::native_home_tests::{fixture, mkdir_root};
             assert!(can_create_private_mount_namespace());
             let (temp, owner, ctx, _disk) = fixture(true);
             mkdir_root(&owner, &ctx, "workspace");
             let owner = Arc::new(owner);
             let retained = temp.keep();
-            let mount = retained.join("fuse");
-            fs::create_dir(&mount).unwrap();
-            let session = crate::node::fuse::mount_ownerfs(owner.clone(), &mount).unwrap();
-            let mut bind =
-                AuthorizedWorkspaceBind::prepare(owner.clone(), &mount, OsStr::new("workspace"))
-                    .unwrap();
+            let egress = retained.join("egress");
+            fs::create_dir(&egress).unwrap();
+            let mut bind = AuthorizedWorkspaceBind::prepare_egress(
+                owner.clone(),
+                &egress,
+                OsStr::new("workspace"),
+            )
+            .unwrap();
             bind.activate().unwrap();
             bind.verify_current().unwrap();
-            let host_target = mount.join("workspace");
+            let host_target = egress.join("workspace");
             std::thread::spawn(move || {
                 fs::write(host_target.join("proof"), b"physical Home").unwrap();
                 File::open(host_target.join("proof"))
@@ -893,7 +1018,6 @@ mod linux {
             assert!(bind.verify_current().is_err());
             bind.detach().unwrap();
             drop(bind);
-            session.join().unwrap();
             fs::remove_dir_all(retained).unwrap();
         }
 
@@ -1311,5 +1435,6 @@ mod linux {
 
 #[cfg(target_os = "linux")]
 pub(in crate::node) use linux::{
-    AuthorizedWorkspaceBind, WorkspaceBindMount, detach_secondary_clone, inspect_secondary_clone,
+    AuthorizedWorkspaceBind, WorkspaceBindMount, detach_egress_bind, detach_secondary_clone,
+    inspect_secondary_clone, scan_egress_binds,
 };

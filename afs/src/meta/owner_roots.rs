@@ -362,10 +362,9 @@ impl OwnerRootAuthority for StoreOwnerRootAuthority {
                 },
                 TxnCondition::EntityEquals(MetaEntity::Root(root.clone())),
             ]);
-            txn.mutations
-                .push(TxnMutation::Delete(MetaKey::Root {
-                    root_id: root.root_id.clone(),
-                }));
+            txn.mutations.push(TxnMutation::Delete(MetaKey::Root {
+                root_id: root.root_id.clone(),
+            }));
             for entity in &grants.entities {
                 if let MetaEntity::RootGrant(grant) = entity {
                     txn.mutations.push(TxnMutation::Delete(MetaKey::RootGrant {

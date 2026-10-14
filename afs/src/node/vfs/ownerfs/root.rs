@@ -1077,12 +1077,8 @@ impl RootManager {
             .into_iter()
             .find(|record| &record.id == id)
             .ok_or_else(|| invalid_grant("root catalog record not found"))?;
-        self.meta.deactivate_root(
-            id,
-            record.epoch,
-            &self.local_node_id,
-            &self.session_id,
-        )?;
+        self.meta
+            .deactivate_root(id, record.epoch, &self.local_node_id, &self.session_id)?;
         afs_logging::info!("root.delete_root.meta_deactivated"; "root_id" => ?id, "epoch" => record.epoch);
 
         // 4. 清除 catalog 条目。
@@ -1284,6 +1280,23 @@ impl RootManager {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(Error::from(error)),
         }
+    }
+
+    /// The active roots recovered by `reconcile_on_startup`, as `(id, name)`.
+    ///
+    /// Node startup calls this after wiring the MountManager to reconcile
+    /// residual egress binds (D4 §4.4) and to re-trigger mounts for recovered
+    /// roots whose claims were lost with the previous process (v3 §5.6).
+    pub(crate) fn recovered_roots(&self) -> Vec<(RootId, OsString)> {
+        self.roots
+            .read()
+            .map(|roots| {
+                roots
+                    .iter()
+                    .map(|(id, root)| (id.clone(), root.name.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -1557,13 +1570,7 @@ mod tests {
             unreachable!("not used by activation test")
         }
 
-        fn deactivate_root(
-            &self,
-            _: &RootId,
-            _: u64,
-            _: &str,
-            _: &str,
-        ) -> Result<()> {
+        fn deactivate_root(&self, _: &RootId, _: u64, _: &str, _: &str) -> Result<()> {
             unreachable!("not used by activation test")
         }
 
@@ -2310,13 +2317,7 @@ mod tests {
             Ok(())
         }
 
-        fn deactivate_root(
-            &self,
-            root_id: &RootId,
-            _: u64,
-            _: &str,
-            _: &str,
-        ) -> Result<()> {
+        fn deactivate_root(&self, root_id: &RootId, _: u64, _: &str, _: &str) -> Result<()> {
             let mut state = self.0.lock().unwrap();
             if state
                 .active
@@ -2593,7 +2594,9 @@ mod tests {
 
         // 5. catalog 无记录（manager 持有独占锁，先释放再验证）。
         drop(manager);
-        let locked = LocalFsRootCatalog::new(disk.clone()).lock_and_open().unwrap();
+        let locked = LocalFsRootCatalog::new(disk.clone())
+            .lock_and_open()
+            .unwrap();
         assert!(locked.scan_roots().unwrap().is_empty());
     }
 
@@ -2642,7 +2645,9 @@ mod tests {
         assert!(meta.0.lock().unwrap().active.is_none());
         // catalog 无记录（manager 持有独占锁，先释放再验证）。
         drop(manager);
-        let locked = LocalFsRootCatalog::new(disk.clone()).lock_and_open().unwrap();
+        let locked = LocalFsRootCatalog::new(disk.clone())
+            .lock_and_open()
+            .unwrap();
         assert!(locked.scan_roots().unwrap().is_empty());
     }
 }

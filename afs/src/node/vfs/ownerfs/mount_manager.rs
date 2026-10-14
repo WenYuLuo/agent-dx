@@ -6,7 +6,7 @@
 //! the entry state mutex. `request_mount` is non-blocking (RFC 0001 §2).
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     ffi::OsString,
     io,
     path::PathBuf,
@@ -16,7 +16,7 @@ use std::{
 
 use afs_error::Result;
 
-use super::{bind_mount, root::RootId, OwnerFs};
+use super::{OwnerFs, bind_mount, root, root::RootId};
 
 /// Manages per-root native bind mounts triggered by mkdir.
 ///
@@ -25,7 +25,7 @@ use super::{bind_mount, root::RootId, OwnerFs};
 /// state mutex, preventing stacked mounts from repeated requests.
 pub(in crate::node) struct MountManager {
     entries: Mutex<HashMap<RootId, Arc<MountEntry>>>,
-    fuse_mount_path: Option<PathBuf>,
+    egress_root: Option<PathBuf>,
     owner: Mutex<Weak<OwnerFs>>,
 }
 
@@ -55,13 +55,13 @@ fn poisoned() -> afs_error::Error {
 }
 
 impl MountManager {
-    /// Create a new MountManager. `fuse_mount_path` is the FUSE mount point
-    /// under which workspace roots are created (D5). When `None`, all
-    /// requests fall back to FUSE_ONLY.
-    pub(in crate::node) fn new(fuse_mount_path: Option<PathBuf>) -> Self {
+    /// Create a new MountManager. `egress_root` is the administrator-configured
+    /// native path whose children receive workspace bind targets (D1/D6). When
+    /// `None`, all requests fall back to FUSE_ONLY.
+    pub(in crate::node) fn new(egress_root: Option<PathBuf>) -> Self {
         Self {
             entries: Mutex::new(HashMap::new()),
-            fuse_mount_path,
+            egress_root,
             owner: Mutex::new(Weak::new()),
         }
     }
@@ -78,11 +78,7 @@ impl MountManager {
     /// Non-blocking: spawns a worker thread that prepares and activates the
     /// bind. Idempotent: repeated requests for an already-mounted or
     /// mounting root are no-ops. Failures only log (D2 fallback to FUSE).
-    pub(in crate::node) fn request_mount(
-        &self,
-        root_id: RootId,
-        name: OsString,
-    ) -> Result<()> {
+    pub(in crate::node) fn request_mount(&self, root_id: RootId, name: OsString) -> Result<()> {
         let entry = {
             let mut entries = self.entries.lock().map_err(|_| poisoned())?;
             entries
@@ -114,93 +110,134 @@ impl MountManager {
         Ok(())
     }
 
-    /// Shut down all active mounts: detach every live bind and clear entries.
+    /// Shut down all active mounts: detach every live bind, clean up each
+    /// egress target directory, and clear entries.
     ///
     /// Called from the Node shutdown path after the FUSE session ends.
     /// Without this call, active binds keep a strong OwnerFs reference and
-    /// prevent clean drop.
+    /// prevent clean drop. Detach uses MNT_DETACH so a busy tree (active
+    /// container fds) cannot strand the shutdown.
     pub(in crate::node) fn shutdown(&self) {
         let entries: Vec<Arc<MountEntry>> = {
             let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
             entries.drain().map(|(_, v)| v).collect()
         };
         for entry in entries {
-            Self::detach_entry(&entry);
+            // 关闭阶段 detach 失败只记录日志（已在 detach_entry 内 warn）。
+            let _ = Self::detach_entry(&entry);
+            self.cleanup_egress_target(&entry);
         }
     }
 
-    /// D4: 删除流程的卸载步骤——从 entries 移除该 root 并 detach 活跃 bind。
+    /// D4: 删除流程的卸载步骤——从 entries 移除该 root，detach 活跃 bind
+    /// （MNT_DETACH，不因活跃 fd 失败），再清理出口目标空目录。
     ///
-    /// 幂等：root_id 不在 entries 中时返回 Ok(())。detach 失败（如 EBUSY，
-    /// 仍有活跃 fd 引用 bind mount）只记录日志，不阻塞删除流程；物理目录
-    /// 删除可能随后失败，由 reconcile_on_startup 在下次启动时重试。
+    /// 幂等：root_id 不在 entries 中时返回 Ok(())。detach 失败时把 entry 放回
+    /// entries 保留后续重试能力并记录日志，不阻塞删除流程；物理目录删除可能
+    /// 随后失败，由 reconcile_on_startup 在下次启动时重试。
     pub(in crate::node) fn request_unmount(&self, root_id: &RootId) -> Result<()> {
         let entry = {
             let mut entries = self.entries.lock().map_err(|_| poisoned())?;
             entries.remove(root_id)
         };
         if let Some(entry) = entry {
-            Self::detach_entry(&entry);
+            if let Err(error) = Self::detach_entry(&entry) {
+                afs_logging::warn!(
+                    "ownerfs.mount_manager.detach_failed_retained";
+                    "root_id" => ?root_id, "error" => error.to_string()
+                );
+                let mut entries = self.entries.lock().map_err(|_| poisoned())?;
+                entries.insert(root_id.clone(), entry);
+            } else {
+                self.cleanup_egress_target(&entry);
+            }
         }
         Ok(())
     }
 
-    /// D4 方案 B: root 变空时异步 lazy unmount 活跃 bind。
+    /// Startup reconciliation of residual egress bind mounts (D4 §4.4 / v3 §7.5).
     ///
-    /// 非阻塞：在独立线程中执行 `MNT_DETACH`，避免在 FUSE 回调内做可能
-    /// 重入的 syscall（umount2 需要解析 `/ownerfs/<root>`，会触发 LOOKUP）。
-    /// 幂等：root 不在 entries 中或不在 NativeActive 状态时无操作。失败只
-    /// 记录日志；随后的 root rmdir 若因 EBUSY 失败，由管理 API（方案 A）
-    /// 兜底或下一次 rmdir 重试。
-    pub(in crate::node) fn request_lazy_unmount(&self, root_id: &RootId) -> Result<()> {
-        let entry = {
-            let entries = self.entries.lock().map_err(|_| poisoned())?;
-            entries.get(root_id).cloned()
+    /// Scans mountinfo for leftover `<egress_root>/<name>` binds from a previous
+    /// run. Every residual bind is detached with MNT_DETACH (never stranded by a
+    /// busy tree):
+    /// - names with a live recovered root are left as empty target directories,
+    ///   so the normal recovery path re-mounts a fresh claim without stacking;
+    /// - orphan names (no recovered root) also have their empty target directory
+    ///   removed.
+    pub(in crate::node) fn reconcile_egress(&self, known_root_ids: &HashSet<RootId>) -> Result<()> {
+        let Some(egress_root) = self.egress_root.clone() else {
+            return Ok(());
         };
-        if let Some(entry) = entry {
-            let root_id = root_id.clone();
-            std::thread::spawn(move || {
-                if let Err(error) = entry.lazy_detach() {
+        let names = bind_mount::scan_egress_binds(&egress_root).map_err(afs_error::Error::from)?;
+        for name in names {
+            if let Err(error) = bind_mount::detach_egress_bind(&egress_root, &name) {
+                afs_logging::warn!(
+                    "ownerfs.mount_manager.reconcile.detach_failed";
+                    "workspace" => ?name, "error" => error.to_string()
+                );
+                continue;
+            }
+            let known = root::root_id_from_name(&name)
+                .map(|id| known_root_ids.contains(&id))
+                .unwrap_or(false);
+            if !known {
+                let target = egress_root.join(&name);
+                if let Err(error) = std::fs::remove_dir(&target)
+                    && error.kind() != std::io::ErrorKind::NotFound
+                {
                     afs_logging::warn!(
-                        "mount_manager.lazy_unmount.failed";
-                        "root_id" => ?root_id,
-                        "error" => error.to_string(),
+                        "ownerfs.mount_manager.reconcile.target_cleanup_failed";
+                        "workspace" => ?name, "target" => ?target,
+                        "error" => error.to_string()
                     );
                 }
-            });
+            }
         }
         Ok(())
+    }
+
+    /// Best-effort removal of the egress target directory `<egress_root>/<name>`.
+    /// Absence is idempotent; other failures only log (the reconcile or the next
+    /// unmount retries the cleanup).
+    fn cleanup_egress_target(&self, entry: &MountEntry) {
+        let Some(egress_root) = &self.egress_root else {
+            return;
+        };
+        let target = egress_root.join(&entry.name);
+        if let Err(error) = std::fs::remove_dir(&target)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            afs_logging::warn!(
+                "ownerfs.mount_manager.egress_cleanup_failed";
+                "root_id" => ?entry.root_id, "target" => ?target,
+                "error" => error.to_string()
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]
-    fn detach_entry(entry: &MountEntry) {
-        let mut state = match entry.state.lock() {
-            Ok(s) => s,
-            Err(e) => e.into_inner(),
-        };
-        let taken = std::mem::replace(
-            &mut *state,
-            MountState::FuseOnly {
-                reason: "shutdown".to_string(),
-            },
-        );
-        match taken {
-            MountState::NativeActive { mut bind } => {
-                if let Err(error) = bind.detach() {
-                    afs_logging::warn!(
-                        "ownerfs.mount_manager.detach_failed";
-                        "root_id" => ?entry.root_id, "error" => error.to_string()
-                    );
-                }
+    fn detach_entry(entry: &MountEntry) -> io::Result<()> {
+        let mut state = entry
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("mount entry state poisoned"))?;
+        if let MountState::NativeActive { bind } = &mut *state {
+            let result = bind.detach();
+            if result.is_ok() {
+                *state = MountState::FuseOnly {
+                    reason: "detached for teardown".to_string(),
+                };
             }
-            other => {
-                *state = other;
-            }
+            result
+        } else {
+            Ok(())
         }
     }
 
     #[cfg(not(target_os = "linux"))]
-    fn detach_entry(_entry: &MountEntry) {}
+    fn detach_entry(_entry: &MountEntry) -> io::Result<()> {
+        Ok(())
+    }
 
     fn spawn_mount_worker(&self, entry: Arc<MountEntry>) {
         let owner = match self
@@ -215,10 +252,10 @@ impl MountManager {
                 return;
             }
         };
-        let mount_path = match &self.fuse_mount_path {
+        let egress_root = match &self.egress_root {
             Some(p) => p.clone(),
             None => {
-                Self::set_fuse_only(&entry, "no FUSE mount path configured");
+                Self::set_fuse_only(&entry, "no egress root configured");
                 return;
             }
         };
@@ -226,7 +263,7 @@ impl MountManager {
         if let Err(error) = thread::Builder::new()
             .name(format!("afs-mount-{}", entry.root_id.0))
             .spawn(move || {
-                Self::mount_worker_loop(owner, mount_path, entry);
+                Self::mount_worker_loop(owner, egress_root, entry);
             })
         {
             afs_logging::warn!(
@@ -237,11 +274,11 @@ impl MountManager {
     }
 
     #[cfg(target_os = "linux")]
-    fn mount_worker_loop(owner: Arc<OwnerFs>, mount_path: PathBuf, entry: Arc<MountEntry>) {
+    fn mount_worker_loop(owner: Arc<OwnerFs>, egress_root: PathBuf, entry: Arc<MountEntry>) {
         let workspace = entry.name.clone();
-        let mut bind = match bind_mount::AuthorizedWorkspaceBind::prepare(
+        let mut bind = match bind_mount::AuthorizedWorkspaceBind::prepare_egress(
             owner,
-            &mount_path,
+            &egress_root,
             &workspace,
         ) {
             Ok(bind) => bind,
@@ -266,7 +303,9 @@ impl MountManager {
         };
         match &*state {
             MountState::Mounting => {
-                *state = MountState::NativeActive { bind: Box::new(bind) };
+                *state = MountState::NativeActive {
+                    bind: Box::new(bind),
+                };
             }
             MountState::FuseOnly { .. } => {
                 // Shutdown raced ahead; detach the bind we just activated.
@@ -274,13 +313,15 @@ impl MountManager {
                 let _ = bind.detach();
             }
             _ => {
-                *state = MountState::NativeActive { bind: Box::new(bind) };
+                *state = MountState::NativeActive {
+                    bind: Box::new(bind),
+                };
             }
         }
     }
 
     #[cfg(not(target_os = "linux"))]
-    fn mount_worker_loop(_owner: Arc<OwnerFs>, _mount_path: PathBuf, entry: Arc<MountEntry>) {
+    fn mount_worker_loop(_owner: Arc<OwnerFs>, _egress_root: PathBuf, entry: Arc<MountEntry>) {
         Self::set_fuse_only(&entry, "bind mount is only supported on Linux");
     }
 
@@ -302,30 +343,6 @@ impl MountManager {
             }
         }
         *state = MountState::FuseOnly { reason };
-    }
-}
-
-impl MountEntry {
-    /// D4 方案 B: 用 `MNT_DETACH` lazy 分离活跃 bind，并把条目降级为
-    /// FuseOnly。幂等：非 NativeActive 状态时无操作。
-    #[cfg(target_os = "linux")]
-    fn lazy_detach(&self) -> io::Result<()> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| io::Error::other("mount entry state poisoned"))?;
-        if let MountState::NativeActive { bind } = &mut *state {
-            bind.detach_with_flags(libc::MNT_DETACH)?;
-            *state = MountState::FuseOnly {
-                reason: "lazy unmount triggered by empty root".into(),
-            };
-        }
-        Ok(())
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    fn lazy_detach(&self) -> io::Result<()> {
-        Ok(())
     }
 }
 
@@ -378,7 +395,7 @@ mod tests {
     }
 
     #[test]
-    fn request_mount_without_mount_path_falls_back_to_fuse_only() {
+    fn request_mount_without_egress_root_falls_back_to_fuse_only() {
         let (_temp, owner, _ctx, _disk) =
             crate::node::vfs::ownerfs::native_home_tests::fixture(true);
         let owner = Arc::new(owner);
@@ -393,10 +410,10 @@ mod tests {
         let entry = entries.get(&root_id("agent1")).unwrap();
         match &*entry.state.lock().unwrap() {
             MountState::FuseOnly { reason } => assert!(
-                reason.contains("no FUSE mount path configured"),
+                reason.contains("no egress root configured"),
                 "unexpected reason: {reason}"
             ),
-            _ => panic!("expected FuseOnly fallback without a FUSE mount path"),
+            _ => panic!("expected FuseOnly fallback without an egress root"),
         }
     }
 
@@ -486,21 +503,36 @@ mod tests {
         assert!(manager.entries.lock().unwrap().is_empty());
     }
 
+    #[test]
+    fn reconcile_egress_without_egress_root_is_a_no_op() {
+        let manager = MountManager::new(None);
+        manager.reconcile_egress(&HashSet::new()).unwrap();
+        assert!(manager.entries.lock().unwrap().is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reconcile_egress_scans_empty_egress_root_without_error() {
+        let egress = tempfile::tempdir().unwrap();
+        let manager = MountManager::new(Some(egress.path().to_path_buf()));
+        manager.reconcile_egress(&HashSet::new()).unwrap();
+    }
+
     /// mkdir must return before the bind completes (RFC 0001 §2) and must not
     /// fail when the bind falls back to FUSE_ONLY (D2). The MountManager worker
-    /// runs in the background and settles the entry to FuseOnly when the FUSE
-    /// mount path is unusable.
+    /// runs in the background and settles the entry to FuseOnly when the egress
+    /// root is unusable.
     #[cfg(target_os = "linux")]
     #[test]
     fn mkdir_triggers_request_mount_and_bind_failure_does_not_fail_mkdir() {
         use super::super::{
-            native_home_tests::fixture_with_mount_manager, root::root_id_from_name, Backend,
+            Backend, native_home_tests::fixture_with_mount_manager, root::root_id_from_name,
         };
 
-        // A FUSE mount point that will never exist, so bind prepare must fail.
-        let fuse_mount = tempfile::tempdir().unwrap();
-        let fuse_mount_path = fuse_mount.path().join("fuse");
-        let (_temp, owner, ctx) = fixture_with_mount_manager(fuse_mount_path);
+        // An egress root that will never exist, so bind prepare must fail.
+        let egress = tempfile::tempdir().unwrap();
+        let egress_root = egress.path().join("egress");
+        let (_temp, owner, ctx) = fixture_with_mount_manager(egress_root);
         let owner = Arc::new(owner);
         owner.mount_manager().unwrap().attach_owner(&owner);
         let manager = owner.mount_manager().unwrap().clone();

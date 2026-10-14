@@ -272,13 +272,35 @@ fn ownerfs_workspace_bind_is_default_off_and_refuses_incomplete_or_wrong_backend
                 "/tmp/owner",
                 "--experimental-ownerfs-workspace-bind",
                 "true",
+                "--ownerfs-workspace-egress-root",
+                "/tmp/egress",
             ])
         )
         .is_err()
     );
 
     // Node role without [ownerfs_workspace_bind] should now succeed — the section
-    // is optional; bindmount is triggered dynamically by mkdir.
+    // is optional; bindmount is triggered dynamically by mkdir. The egress root
+    // is required.
+    assert!(
+        Config::resolve(
+            Role::Node,
+            Cli::parse_from([
+                "afs-node",
+                "--fs",
+                "ownerfs",
+                "--ownerfs-mount",
+                "/tmp/owner",
+                "--experimental-ownerfs-workspace-bind",
+                "true",
+                "--ownerfs-workspace-egress-root",
+                "/tmp/egress",
+            ])
+        )
+        .is_ok()
+    );
+
+    // Node role with bind enabled but no egress root must fail.
     assert!(
         Config::resolve(
             Role::Node,
@@ -292,7 +314,7 @@ fn ownerfs_workspace_bind_is_default_off_and_refuses_incomplete_or_wrong_backend
                 "true",
             ])
         )
-        .is_ok()
+        .is_err()
     );
 
     let dir = tempfile::tempdir().unwrap();
@@ -316,7 +338,7 @@ fn ownerfs_workspace_bind_is_default_off_and_refuses_incomplete_or_wrong_backend
 fn ownerfs_workspace_bind_validates_workspace_name_and_explicit_off_override() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("node.toml");
-    let base = "fs='ownerfs'\nownerfs_mount='/tmp/owner'\nexperimental_ownerfs_workspace_bind=true\n[ownerfs_workspace_bind]\nworkspace='ws'\n";
+    let base = "fs='ownerfs'\nownerfs_mount='/tmp/owner'\nownerfs_workspace_egress_root='/tmp/egress'\nexperimental_ownerfs_workspace_bind=true\n[ownerfs_workspace_bind]\nworkspace='ws'\n";
     std::fs::write(&path, base).unwrap();
     let cfg = Config::resolve(
         Role::Node,
@@ -330,12 +352,16 @@ fn ownerfs_workspace_bind_validates_workspace_name_and_explicit_off_override() {
             .map(|bind| bind.workspace.as_str()),
         Some("ws")
     );
+    assert_eq!(
+        cfg.ownerfs_workspace_egress_root.as_deref(),
+        Some(std::path::Path::new("/tmp/egress"))
+    );
 
     for invalid in ["", ".", "..", "nested/ws", "ws/leaf", "ws\u{0}leaf"] {
         std::fs::write(
             &path,
             format!(
-                "fs='ownerfs'\nownerfs_mount='/tmp/owner'\nexperimental_ownerfs_workspace_bind=true\n[ownerfs_workspace_bind]\nworkspace={invalid:?}\n"
+                "fs='ownerfs'\nownerfs_mount='/tmp/owner'\nownerfs_workspace_egress_root='/tmp/egress'\nexperimental_ownerfs_workspace_bind=true\n[ownerfs_workspace_bind]\nworkspace={invalid:?}\n"
             ),
         )
         .unwrap();
@@ -372,7 +398,7 @@ fn ownerfs_workspace_bind_rejects_simultaneous_native_workspace_mode() {
     let path = dir.path().join("node.toml");
     std::fs::write(
         &path,
-        "fs='ownerfs'\nownerfs_mount='/tmp/owner'\nexperimental_native_workspace=true\nexperimental_ownerfs_workspace_bind=true\n[native_workspace]\ncontrol_dir='/tmp/native-control'\nruntime='/usr/bin/runc'\nrootfs='/tmp/native-rootfs'\nidle_command=['/bin/view-observer','idle']\nidentity_command=['/bin/view-observer','identity']\nworkload_uid=501\nworkload_gid=501\n[ownerfs_workspace_bind]\nworkspace='ws'\n",
+        "fs='ownerfs'\nownerfs_mount='/tmp/owner'\nownerfs_workspace_egress_root='/tmp/egress'\nexperimental_native_workspace=true\nexperimental_ownerfs_workspace_bind=true\n[native_workspace]\ncontrol_dir='/tmp/native-control'\nruntime='/usr/bin/runc'\nrootfs='/tmp/native-rootfs'\nidle_command=['/bin/view-observer','idle']\nidentity_command=['/bin/view-observer','identity']\nworkload_uid=501\nworkload_gid=501\n[ownerfs_workspace_bind]\nworkspace='ws'\n",
     )
     .unwrap();
     assert!(
@@ -381,5 +407,52 @@ fn ownerfs_workspace_bind_rejects_simultaneous_native_workspace_mode() {
             Cli::parse_from(["afs-node", "--config", path.to_str().unwrap()])
         )
         .is_err()
+    );
+}
+
+#[cfg(feature = "ownerfs")]
+#[test]
+fn ownerfs_workspace_bind_requires_isolated_egress_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("node.toml");
+
+    // Missing egress root already covered above; now exercise path shape.
+    for (name, egress) in [
+        ("relative", "relative/egress"),
+        ("parent traversal", "/tmp/../owner-egress"),
+        ("under mount", "/tmp/owner/egress"),
+        ("under data dir", "/tmp/afs-x/data/egress"),
+    ] {
+        std::fs::write(
+            &path,
+            format!(
+                "fs='ownerfs'\ndata_dir='/tmp/afs-x/data'\nownerfs_mount='/tmp/owner'\nownerfs_workspace_egress_root={egress:?}\nexperimental_ownerfs_workspace_bind=true\n[ownerfs_workspace_bind]\nworkspace='ws'\n"
+            ),
+        )
+        .unwrap();
+        let resolved = Config::resolve(
+            Role::Node,
+            Cli::parse_from(["afs-node", "--config", path.to_str().unwrap()]),
+        );
+        assert!(
+            resolved.is_err(),
+            "egress root {name:?} ({egress:?}) should be rejected"
+        );
+    }
+
+    // An isolated absolute egress root is accepted.
+    std::fs::write(
+        &path,
+        "fs='ownerfs'\ndata_dir='/tmp/afs-x/data'\nownerfs_mount='/tmp/owner'\nownerfs_workspace_egress_root='/srv/egress'\nexperimental_ownerfs_workspace_bind=true\n[ownerfs_workspace_bind]\nworkspace='ws'\n",
+    )
+    .unwrap();
+    let cfg = Config::resolve(
+        Role::Node,
+        Cli::parse_from(["afs-node", "--config", path.to_str().unwrap()]),
+    )
+    .unwrap();
+    assert_eq!(
+        cfg.ownerfs_workspace_egress_root.as_deref(),
+        Some(std::path::Path::new("/srv/egress"))
     );
 }

@@ -1477,9 +1477,12 @@ impl MetaStore for StoreState {
                         .entities
                         .iter()
                         .filter_map(|(key, versioned)| match (key, &versioned.entity) {
-                            (MetaKey::RootGrant { root_id: key_root, .. }, MetaEntity::RootGrant(grant))
-                                if key_root == root_id =>
-                            {
+                            (
+                                MetaKey::RootGrant {
+                                    root_id: key_root, ..
+                                },
+                                MetaEntity::RootGrant(grant),
+                            ) if key_root == root_id => {
                                 Some((grant.holder_node_id.clone(), versioned.clone()))
                             }
                             _ => None,
