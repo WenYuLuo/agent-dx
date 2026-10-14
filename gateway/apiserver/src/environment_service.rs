@@ -6,6 +6,7 @@ use crate::{
     ownership::Cache,
 };
 use adx_protocol::control as pb;
+use adx_transport::deadline::Deadline;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
@@ -23,6 +24,8 @@ struct CreateOperation {
     spec: pb::EnvironmentSpec,
     result: Option<Result<Value, Status>>,
     created_at: Instant,
+    deadline: Deadline,
+    assignment: Option<pb::Assignment>,
     unknown_since: Option<Instant>,
 }
 
@@ -181,7 +184,11 @@ impl EnvironmentService {
                     spec,
                     result: None,
                     created_at: Instant::now(),
+                    deadline: Deadline::after(Duration::from_secs(contract::create_timeout(
+                        &input,
+                    )?))?,
                     unknown_since: None,
+                    assignment: None,
                 }));
                 creates
                     .pending
@@ -240,14 +247,22 @@ impl EnvironmentService {
         }
         // The typed Environment payload includes workload probe configuration.
         // Keep the RPC orchestration future off callers' stack frames.
-        let result = Box::pin(self.perform_create(
-            &operation.spec,
-            &input,
-            request_id,
-            caller,
-            retry_pending,
-        ))
-        .await;
+        let result = tokio::time::timeout_at(
+            operation.deadline.instant(),
+            Box::pin(self.perform_create(
+                &mut operation,
+                &input,
+                request_id,
+                caller,
+                retry_pending,
+            )),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(Status::deadline_exceeded(
+                "create deadline exceeded; query the environment result",
+            ))
+        });
         self.names.lock().await.remove(&operation.spec.id);
         self.finish_create(&create_key, &mut operation, &result)
             .await;
@@ -286,12 +301,15 @@ impl EnvironmentService {
 
     async fn perform_create(
         &self,
-        spec: &pb::EnvironmentSpec,
+        operation: &mut CreateOperation,
         input: &Value,
         request_id: &str,
         caller: &pb::CallerContext,
         retry_pending: bool,
     ) -> Result<Value, Status> {
+        let spec = &operation.spec;
+        let deadline = operation.deadline;
+        let expected_assignment = &mut operation.assignment;
         // A pending retry bypasses a potentially stale subscription. Absence
         // still retries the same identity through atomic ownership, never a new ID.
         match self.clients.owner(&spec.id, caller, retry_pending).await {
@@ -299,14 +317,42 @@ impl EnvironmentService {
                 let record = owner
                     .record
                     .ok_or_else(|| Status::data_loss("environment directory returned no record"))?;
-                return existing_running_response(spec, input, request_id, &record);
+                if !matches_spec(
+                    spec,
+                    record
+                        .spec
+                        .as_ref()
+                        .ok_or_else(|| Status::data_loss("owner specification missing"))?,
+                ) {
+                    return Err(Status::already_exists(
+                        "environment already exists with different arguments",
+                    ));
+                }
+                let assignment = record
+                    .assignment
+                    .as_ref()
+                    .ok_or_else(|| Status::data_loss("owner assignment missing"))?;
+                if expected_assignment
+                    .as_ref()
+                    .is_some_and(|expected| expected != assignment)
+                {
+                    return Err(Status::failed_precondition(
+                        "create ownership generation changed",
+                    ));
+                }
+                *expected_assignment = Some(assignment.clone());
+                if record.state != pb::EnvironmentState::Pending as i32
+                    && record.state != pb::EnvironmentState::Starting as i32
+                {
+                    return existing_running_response(spec, input, request_id, &record);
+                }
             }
             Err(error) if error.code() == Code::NotFound => {}
             Err(error) => return Err(map_create_owner_error(error)),
-        }
+        };
 
         let timeouts = contract::create_timeouts(input)?;
-        let budget = Duration::from_secs(timeouts.create_seconds);
+        let budget = deadline.remaining()?;
         // The RPC future is large in debug builds; keep it off the nested
         // embedded HTTP/Activator polling stack while preserving cancellation.
         let result = Box::pin(self.clients.create_environment(
@@ -315,6 +361,8 @@ impl EnvironmentService {
                 caller: Some(caller.clone()),
                 schedule_timeout_seconds: timeouts.schedule_seconds,
                 create_timeout_seconds: timeouts.create_seconds,
+                create_deadline_unix_millis: deadline.unix_millis(),
+                expected_assignment: expected_assignment.clone(),
             },
             budget,
         ))
@@ -323,6 +371,14 @@ impl EnvironmentService {
         let record = result
             .record
             .ok_or_else(|| Status::unavailable("create returned no environment record"))?;
+        if expected_assignment
+            .as_ref()
+            .is_some_and(|expected| record.assignment.as_ref() != Some(expected))
+        {
+            return Err(Status::failed_precondition(
+                "create ownership generation changed",
+            ));
+        }
         if result.durability != pb::Durability::Published as i32 {
             return Err(Status::unavailable("create is not durably confirmed"));
         }
@@ -402,6 +458,14 @@ fn existing_running_response(
         }
     }
     if record.state != pb::EnvironmentState::Running as i32 {
+        if !record.restart_pending
+            && (record.state == pb::EnvironmentState::Failed as i32
+                || record.state == pb::EnvironmentState::Deleted as i32)
+        {
+            return Err(Status::failed_precondition(
+                "environment create has a terminal result; query its failure",
+            ));
+        }
         return Err(Status::unavailable("environment create is not yet running"));
     }
     let mut response = json!({
@@ -548,6 +612,8 @@ mod tests {
             },
             result: None,
             created_at: old,
+            deadline: Deadline::after(Duration::from_secs(90)).unwrap(),
+            assignment: None,
             unknown_since: None,
         }));
         let mut replays = CreateReplays {
@@ -581,6 +647,8 @@ mod tests {
                     },
                     result: None,
                     created_at: now - Duration::from_secs(30),
+                    deadline: Deadline::after(Duration::from_secs(90)).unwrap(),
+                    assignment: None,
                     unknown_since: Some(now),
                 })),
             )]),

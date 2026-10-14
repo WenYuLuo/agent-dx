@@ -177,3 +177,191 @@ async fn network_create_preserves_tenant_session_and_api_key_checks() {
         tonic::Code::Unauthenticated
     );
 }
+
+struct SlowBackend(Backend, AtomicUsize);
+#[async_trait::async_trait]
+impl RuntimeDriver for SlowBackend {
+    async fn start(
+        &self,
+        spec: &EnvironmentSpec,
+        id: &str,
+        generation: u64,
+        devices: &[DeviceAllocation],
+    ) -> Result<std::net::IpAddr> {
+        self.1.fetch_add(1, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(3200)).await;
+        self.0.start(spec, id, generation, devices).await
+    }
+    async fn is_running(&self, id: &str) -> Result<bool> {
+        self.0.is_running(id).await
+    }
+    async fn remove(&self, id: &str) -> Result<()> {
+        self.0.remove(id).await
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Redis server"]
+async fn create_retries_delivery_and_lost_response_on_the_same_assignment() {
+    let redis = common::Redis::new().await;
+    let session = redis.store().await.begin(1).await.unwrap();
+    let rpc = CoordinatorRpc::new(
+        session.clone(),
+        Placement::Pack,
+        Peers::network(),
+        RpcClient::network(Principal::Coordinator),
+        Duration::from_secs(3),
+    )
+    .await
+    .unwrap();
+    let ml = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ma = ml.local_addr().unwrap();
+    let mut servers = Servers(vec![tokio::spawn(async move {
+        Server::builder()
+            .add_service(pb::coordinator_service_server::CoordinatorServiceServer::new(rpc))
+            .serve_with_incoming(TcpListenerStream::new(ml))
+            .await
+            .unwrap();
+    })]);
+    let sink = Arc::new(
+        CoordinatorStateSink::with_rpc_channel(
+            connect(ma, Principal::Node("node".into())).await,
+            Duration::from_secs(2),
+        )
+        .unwrap()
+        .with_session("boot-1".into()),
+    );
+    let backend = Arc::new(SlowBackend(
+        Backend {
+            session: session.clone(),
+            started: AtomicUsize::new(0),
+            removed: AtomicUsize::new(0),
+            running: Mutex::default(),
+        },
+        AtomicUsize::new(0),
+    ));
+    let manager = Arc::new(Adxlet::new(
+        "node".into(),
+        backend.clone(),
+        Arc::new(LocalChecks),
+        Arc::new(LocalChecks),
+        sink,
+    ));
+    manager
+        .update_capacity(spec("test").resources, Duration::from_secs(60))
+        .unwrap();
+    let node = NodeRpc::new(manager, Peers::network(), "boot-1".into());
+    // The registered owner is initially unreachable: persist ownership before delivery.
+    let nl = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let na = nl.local_addr().unwrap();
+    drop(nl);
+    let mut worker = pb::coordinator_service_client::CoordinatorServiceClient::new(
+        connect(ma, Principal::Node("node".into())).await,
+    );
+    let mut register = pb::RegisterNodeRequest {
+        runtime_classes: vec!["runc".into()],
+        session_id: "boot-1".into(),
+        heartbeat_sequence: 1,
+        reconciling: true,
+        node_id: "node".into(),
+        node_address: na.to_string(),
+        proxy_address: "127.0.0.1:9999".into(),
+        capacity: Some(spec("test").resources.into()),
+        accepting_allocations: false,
+        labels: Default::default(),
+        devices: vec![],
+    };
+    worker.register_node(register.clone()).await.unwrap();
+    worker
+        .inspect_node(pb::InspectNodeRequest {
+            node_id: "node".into(),
+            session_id: "boot-1".into(),
+        })
+        .await
+        .unwrap();
+    register.heartbeat_sequence = 2;
+    register.reconciling = false;
+    register.accepting_allocations = true;
+    worker.register_node(register).await.unwrap();
+    let mut api = pb::coordinator_service_client::CoordinatorServiceClient::new(
+        connect(ma, Principal::ApiServer).await,
+    );
+    let mut request = create("retry-cold");
+    request
+        .spec
+        .as_mut()
+        .unwrap()
+        .execution
+        .as_mut()
+        .unwrap()
+        .init_timeout_seconds = 1;
+    request.create_deadline_unix_millis =
+        adx_transport::deadline::Deadline::after(Duration::from_secs(10))
+            .unwrap()
+            .unix_millis();
+    assert_eq!(
+        api.create_environment(request.clone())
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::Unavailable
+    );
+    let allocation = session.get("retry-cold").await.unwrap();
+    assert!(allocation.result.is_none());
+    assert_eq!(backend.1.load(Ordering::SeqCst), 0);
+    request.expected_assignment = Some(allocation.assignment.clone().try_into().unwrap());
+    let nl = TcpListener::bind(na).await.unwrap();
+    servers.0.push(tokio::spawn(async move {
+        Server::builder()
+            .add_service(pb::node_service_server::NodeServiceServer::new(node))
+            .serve_with_incoming(TcpListenerStream::new(nl))
+            .await
+            .unwrap();
+    }));
+    // Lose the reply after delivery. The serialized controller retains its in-flight start.
+    let pending_reply = tokio::spawn({
+        let mut api = api.clone();
+        let request = request.clone();
+        async move { api.create_environment(request).await }
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while backend.1.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    pending_reply.abort();
+    assert!(pending_reply.await.unwrap_err().is_cancelled());
+    let result = api
+        .create_environment(request.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    let record = result.record.unwrap();
+    assert_eq!(record.state, pb::EnvironmentState::Running as i32);
+    assert_eq!(record.assignment, request.expected_assignment);
+    assert_eq!(backend.1.load(Ordering::SeqCst), 1);
+    assert_eq!(backend.0.started.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        session.get("retry-cold").await.unwrap().assignment,
+        allocation.assignment
+    );
+    // A stale owner generation cannot replay or create another execution.
+    request.expected_assignment.as_mut().unwrap().generation += 1;
+    assert_eq!(
+        api.create_environment(request).await.unwrap_err().code(),
+        tonic::Code::FailedPrecondition
+    );
+    let mut expired = create("expired");
+    expired.create_deadline_unix_millis = 1;
+    assert_eq!(
+        api.create_environment(expired).await.unwrap_err().code(),
+        tonic::Code::DeadlineExceeded
+    );
+    assert!(matches!(
+        session.get("expired").await,
+        Err(adx_core::Error::NotFound)
+    ));
+    assert_eq!(backend.1.load(Ordering::SeqCst), 1);
+}

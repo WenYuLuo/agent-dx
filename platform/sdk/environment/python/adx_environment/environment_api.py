@@ -396,7 +396,8 @@ class Environment:
             healthcheck_probe: Periodic Execd check after readiness. Consecutive
                 failures reaching its threshold use the existing server
                 restart/failover policy. Inspect ``get_info().failure``.
-            init_timeout: Runtime startup and readiness budget in seconds,
+            init_timeout: Execd initialization and readiness budget after backend
+                preparation, in seconds,
                 from 1 through 86400. Defaults to 30.
             network: Optional creation-time network policy. Omitting it allows
                 unrestricted network access.

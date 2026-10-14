@@ -127,6 +127,8 @@ fn create(id: &str) -> pb::CreateEnvironmentRequest {
         caller: caller(),
         schedule_timeout_seconds: 30,
         create_timeout_seconds: 90,
+        create_deadline_unix_millis: 0,
+        expected_assignment: None,
     }
 }
 struct Backend {
@@ -425,6 +427,7 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
     assert_eq!(
         stale_coordinator
             .create_environment(pb::StartAssignedEnvironmentRequest {
+                create_deadline_unix_millis: 0,
                 snapshot: None,
                 spec: Some(spec("late").into()),
                 assignment: first_record.assignment.clone(),
@@ -478,6 +481,7 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
     assert_eq!(
         node_frontend
             .create_environment(pb::StartAssignedEnvironmentRequest {
+                create_deadline_unix_millis: 0,
                 snapshot: None,
                 node_session_id: "boot-1".into(),
                 spec: Some(spec("first").into()),

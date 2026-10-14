@@ -269,6 +269,7 @@ impl CoordinatorRpc {
         let outcome = match outcome {
             ClaimOutcome::Owned(_) => {
                 Outcome::Owned(Box::new(pb::StartAssignedEnvironmentRequest {
+                    create_deadline_unix_millis: 0,
                     spec: Some(record.spec.into()),
                     assignment: Some(record.assignment.try_into().map_err(status)?),
                     node_session_id: candidate.node_session_id,

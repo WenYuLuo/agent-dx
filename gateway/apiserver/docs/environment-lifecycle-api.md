@@ -105,8 +105,8 @@ period 2 / timeout 1; healthcheck defaults to period 10 / timeout 2 /
 `failureThreshold=3`. Readiness does not accept `failureThreshold`.
 
 `initCallTimeoutSeconds` defaults to 30 when omitted or zero; positive values
-must be 1–86400. Adxlet bounds runtime startup plus readiness with this budget,
-within the remaining end-to-end create deadline. Execd retries readiness until
+must be 1–86400. This budget bounds Execd initialization and readiness after
+backend preparation, within the remaining end-to-end create deadline. Execd retries readiness until
 first success or the deadline. Its transient `Initializing` report stays in
 runtime/control-stream memory. Adxlet publishes Running and activates routes
 only after readiness succeeds; final failure uses normal Failed publication
@@ -143,8 +143,18 @@ only after a request enters the Coordinator central queue and applies only until
 Assignment is formed. Queue expiry atomically removes an unassigned request and
 releases its restore reference; an existing Assignment is never cancelled by the
 queue timer. Downstream calls inherit the remaining create deadline and cannot
-start a longer one. The default remains 90 seconds for create and 30 seconds for
-central scheduling. User commands use the separate EXECD HTTP data path.
+start a longer one. The API Server fixes one absolute create deadline, including
+cold image preparation, backend Start, Execd readiness and Running publication.
+Coordinator and Adxlet pass the remaining budget through their create RPCs and
+sandboxd Start; the ordinary short control-RPC timeout does not cap image preparation.
+A same-request retry within that deadline can drive a Pending assignment again,
+using the observed node/generation as a fence. The serialized Adxlet controller
+replays or waits for the same execution. Transport failure remains an unknown
+result; an existing terminal Failed result is not restarted by create replay.
+Clock synchronization is required across processes. Deploy API Server, Coordinator
+and Adxlet together for this internal protocol change. Cleanup and late-runtime
+reconciliation may continue after caller deadline expiry. The default remains
+90 seconds for create and 30 seconds for central scheduling. User commands use the separate EXECD HTTP data path.
 
 For snapshot creation, omitted/zero resource values inherit the source. Positive CPU/memory/disk values must equal its resource geometry; restoring with larger limits or resizing is rejected. This applies to the new Rust resolver even though the HTTP handler can encode positive overrides.
 

@@ -288,6 +288,23 @@ fn scheduling_timeout(seconds: u64) -> Option<Duration> {
     Some(Duration::from_secs(seconds))
 }
 
+fn create_deadline(
+    request: &pb::CreateEnvironmentRequest,
+) -> std::result::Result<adx_transport::deadline::Deadline, adx_transport::deadline::DeadlineError>
+{
+    if request.create_deadline_unix_millis != 0 {
+        adx_transport::deadline::Deadline::from_unix_millis(request.create_deadline_unix_millis)
+    } else {
+        adx_transport::deadline::Deadline::after(Duration::from_secs(
+            if request.create_timeout_seconds == 0 {
+                90
+            } else {
+                request.create_timeout_seconds
+            },
+        ))
+    }
+}
+
 #[derive(Clone)]
 pub struct CoordinatorRpc(Arc<Inner>);
 impl CoordinatorRpc {
@@ -460,15 +477,28 @@ impl CoordinatorRpc {
         &self,
         spec: EnvironmentSpec,
         schedule_timeout: Duration,
+        create_deadline: adx_transport::deadline::Deadline,
+        expected_assignment: Option<adx_core::Assignment>,
     ) -> std::result::Result<pb::EnvironmentResult, Status> {
         let mut schedule_deadline = None;
         loop {
+            create_deadline.remaining()?;
             let changed = self.0.changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
             let mut state = self.0.state.lock().await;
             state.recover_authoritative_state().await.map_err(status)?;
             state.healthy().map_err(status)?;
+            if expected_assignment.as_ref().is_some_and(|expected| {
+                state
+                    .environments
+                    .get(&spec.id)
+                    .is_none_or(|stored| &stored.assignment != expected)
+            }) {
+                return Err(Status::failed_precondition(
+                    "create ownership generation changed",
+                ));
+            }
             if schedule_deadline.is_some_and(|deadline| {
                 tokio::time::Instant::now() >= deadline && !state.specs.contains_key(&spec.id)
             }) {
@@ -486,7 +516,10 @@ impl CoordinatorRpc {
                     *state
                         .scheduling_deadlines
                         .entry(spec.id.clone())
-                        .or_insert_with(|| tokio::time::Instant::now() + schedule_timeout)
+                        .or_insert_with(|| {
+                            (tokio::time::Instant::now() + schedule_timeout)
+                                .min(create_deadline.instant())
+                        })
                 });
             } else {
                 if let Some(id) = &spec.snapshot_id {
@@ -518,7 +551,8 @@ impl CoordinatorRpc {
                     return Err(status(error));
                 }
                 state.specs.insert(spec.id.clone(), spec.clone());
-                let deadline = tokio::time::Instant::now() + schedule_timeout;
+                let deadline =
+                    (tokio::time::Instant::now() + schedule_timeout).min(create_deadline.instant());
                 state.scheduling_deadlines.insert(spec.id.clone(), deadline);
                 schedule_deadline.get_or_insert(deadline);
             }
@@ -580,13 +614,14 @@ impl CoordinatorRpc {
                     .node_tls
                     .endpoint(&node.address)
                     .map_err(|_| Status::invalid_argument("invalid node address"))?
-                    .connect_timeout(self.0.timeout)
-                    .timeout(self.0.timeout);
+                    .connect_timeout(self.0.timeout.min(create_deadline.remaining()?))
+                    .timeout(create_deadline.remaining()?);
                 let channel = endpoint
                     .connect()
                     .await
                     .map_err(|_| Status::unavailable("node connection unavailable"))?;
                 let request = pb::StartAssignedEnvironmentRequest {
+                    create_deadline_unix_millis: create_deadline.unix_millis(),
                     snapshot,
                     node_session_id: node
                         .session
@@ -597,10 +632,12 @@ impl CoordinatorRpc {
                     spec: Some(spec.clone().into()),
                     assignment: Some(stored.assignment.clone().try_into().map_err(status)?),
                 };
+                let mut request = adx_observability::trace::inject(request);
+                request.set_timeout(create_deadline.remaining()?);
                 let result = match pb::node_service_client::NodeServiceClient::new(
                     self.0.node_tls.wrap(channel),
                 )
-                .create_environment(adx_observability::trace::inject(request))
+                .create_environment(request)
                 .await
                 {
                     Ok(result) => result.into_inner(),
@@ -650,7 +687,10 @@ impl CoordinatorRpc {
             if progress {
                 tokio::task::yield_now().await;
             } else {
-                if tokio::time::timeout_at(deadline, changed).await.is_ok() {
+                if tokio::time::timeout_at(deadline.min(create_deadline.instant()), changed)
+                    .await
+                    .is_ok()
+                {
                     continue;
                 }
                 if self.expire_pending(&spec, deadline).await? {
@@ -1019,6 +1059,17 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                 .map_or(0, |create| create.schedule_timeout_seconds),
         )
         .ok_or_else(|| Status::invalid_argument("schedule timeout must not exceed 24 hours"))?;
+        let create = request
+            .create
+            .as_ref()
+            .ok_or_else(|| Status::invalid_argument("create required"))?;
+        let deadline = create_deadline(create)?;
+        let expected_assignment = create
+            .expected_assignment
+            .clone()
+            .map(TryInto::try_into)
+            .transpose()
+            .map_err(status)?;
         let prepared = self.prepare_local(&node, request).await?;
         let spec = prepared
             .spec
@@ -1028,7 +1079,7 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
         let service = self.clone();
         tokio::spawn(trace.run(async move {
             service
-                .create(spec, schedule_timeout)
+                .create(spec, schedule_timeout, deadline, expected_assignment)
                 .await
                 .map(Response::new)
         }))
@@ -1278,6 +1329,13 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                     scheduling_timeout(r.schedule_timeout_seconds).ok_or_else(|| {
                         Status::invalid_argument("schedule timeout must not exceed 24 hours")
                     })?;
+                let deadline = create_deadline(&r)?;
+                let expected_assignment = r
+                    .expected_assignment
+                    .clone()
+                    .map(TryInto::try_into)
+                    .transpose()
+                    .map_err(status)?;
                 let raw = r
                     .spec
                     .ok_or_else(|| Status::invalid_argument("spec required"))?;
@@ -1294,7 +1352,7 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                 tokio::spawn(
                     adx_observability::trace::Trace::child("coordinator.create").run(async move {
                         service
-                            .create(spec, schedule_timeout)
+                            .create(spec, schedule_timeout, deadline, expected_assignment)
                             .await
                             .map(Response::new)
                     }),

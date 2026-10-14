@@ -190,12 +190,14 @@ impl super::Controller {
             .ok_or_else(|| Error::Unavailable("checkpoint storage unavailable".into()))?
             .store
             .clone();
-        let copied = tokio::time::timeout(
-            self.services.operation_timeout,
-            store.duplicate(&snapshot.artifact),
-        )
-        .await
-        .unwrap_or_else(|_| Err(Error::Unavailable("snapshot copy timed out".into())));
+        let copy_budget = self
+            .create_deadline
+            .map_or(self.services.operation_timeout, |deadline| {
+                deadline.saturating_duration_since(tokio::time::Instant::now())
+            });
+        let copied = tokio::time::timeout(copy_budget, store.duplicate(&snapshot.artifact))
+            .await
+            .unwrap_or_else(|_| Err(Error::Unavailable("snapshot copy timed out".into())));
         let artifact = match copied {
             Ok(artifact) => artifact,
             Err(error) => {

@@ -68,6 +68,42 @@ pub struct RuntimeStatus {
 
 #[async_trait]
 pub trait RuntimeDriver: Send + Sync {
+    /// Prepare and start within the create deadline rather than the node RPC cap.
+    async fn start_with_deadline(
+        &self,
+        spec: &EnvironmentSpec,
+        runtime_id: &str,
+        generation: u64,
+        devices: &[DeviceAllocation],
+        deadline: tokio::time::Instant,
+    ) -> Result<std::net::IpAddr> {
+        tokio::time::timeout_at(deadline, self.start(spec, runtime_id, generation, devices))
+            .await
+            .map_err(|_| Error::Unavailable("runtime start deadline exceeded".into()))?
+    }
+    async fn restore_from_with_deadline(
+        &self,
+        spec: &EnvironmentSpec,
+        runtime_id: &str,
+        generation: u64,
+        devices: &[DeviceAllocation],
+        source: RestoreSource<'_>,
+        deadline: tokio::time::Instant,
+    ) -> Result<std::net::IpAddr> {
+        tokio::time::timeout_at(
+            deadline,
+            self.restore_from(
+                spec,
+                runtime_id,
+                generation,
+                devices,
+                source.path,
+                source.origin,
+            ),
+        )
+        .await
+        .map_err(|_| Error::Unavailable("runtime restore deadline exceeded".into()))?
+    }
     async fn stats(&self, _runtime_id: &str) -> Result<metrics::RuntimeUsage> {
         Err(Error::Unavailable("runtime usage is unavailable".into()))
     }
@@ -161,6 +197,11 @@ pub trait RuntimeDriver: Send + Sync {
     /// Idempotent. Success means this runtime is confirmed absent and an older
     /// in-flight start cannot materialize it later. Uncertain cleanup is an error.
     async fn remove(&self, runtime_id: &str) -> Result<()>;
+}
+
+pub struct RestoreSource<'a> {
+    pub path: &'a std::path::Path,
+    pub origin: Option<&'a adx_core::runtime::RuntimeIdentity>,
 }
 
 #[async_trait]

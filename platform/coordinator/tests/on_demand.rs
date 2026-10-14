@@ -398,6 +398,8 @@ impl Rig {
                 caller: caller(),
                 schedule_timeout_seconds: 3,
                 create_timeout_seconds: 10,
+                create_deadline_unix_millis: 0,
+                expected_assignment: None,
             })
             .await
             .unwrap()
@@ -600,6 +602,8 @@ async fn coordinator_autoscaling_http_queries_authoritative_node_ownership_witho
                     caller: caller(),
                     schedule_timeout_seconds: 1,
                     create_timeout_seconds: 10,
+                    create_deadline_unix_millis: 0,
+                    expected_assignment: None,
                 })
                 .await
             });

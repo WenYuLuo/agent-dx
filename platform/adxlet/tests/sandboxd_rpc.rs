@@ -1368,3 +1368,90 @@ fn constructor_cwd_is_owned_by_spec_and_does_not_change_execd_process_cwd() {
     assert_eq!(request.envs["ADX_ENVIRONMENT_CWD"], "/workspace/nested");
     assert_eq!(request.cwd, "/");
 }
+
+#[tokio::test]
+async fn cold_start_uses_create_deadline_beyond_the_node_rpc_cap() {
+    let server = Server {
+        release: Arc::new(Semaphore::new(0)),
+        ..Default::default()
+    };
+    let (adapter, _server) = connect(server.clone()).await;
+    let task = {
+        let adapter = adapter.clone();
+        tokio::spawn(async move {
+            adapter
+                .start_with_deadline(
+                    &spec(),
+                    "i-1",
+                    1,
+                    &[],
+                    tokio::time::Instant::now() + Duration::from_secs(5),
+                )
+                .await
+        })
+    };
+    server.entered.acquire().await.unwrap().forget();
+    // The fixture's node RPC cap is two seconds; cold import takes longer.
+    tokio::time::sleep(Duration::from_millis(2200)).await;
+    server.release.add_permits(1);
+    assert_eq!(task.await.unwrap().unwrap().to_string(), "10.0.0.2");
+    assert_eq!(server.starts.lock().unwrap().len(), 1);
+    adapter.remove("i-1").await.unwrap();
+}
+
+#[tokio::test]
+async fn expired_create_deadline_never_issues_start() {
+    let server = Server::default();
+    let (adapter, _server) = connect(server.clone()).await;
+    assert!(adapter
+        .start_with_deadline(
+            &spec(),
+            "i-1",
+            1,
+            &[],
+            tokio::time::Instant::now() - Duration::from_millis(1)
+        )
+        .await
+        .is_err());
+    assert!(server.starts.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn controller_cold_preparation_uses_total_create_budget_then_readiness_budget() {
+    let server = Server {
+        release: Arc::new(Semaphore::new(0)),
+        ..Default::default()
+    };
+    let (adapter, _server) = connect(server.clone()).await;
+    let hooks = Arc::new(LifecycleHooks::default());
+    let node = lifecycle_node(adapter, &hooks)
+        .with_operation_timeout(Duration::from_millis(100))
+        .unwrap();
+    let environment = node.environment(spec(), lifecycle_assignment()).unwrap();
+    let task = {
+        let environment = environment.clone();
+        tokio::spawn(async move {
+            environment
+                .create_with_deadline(tokio::time::Instant::now() + Duration::from_secs(3))
+                .await
+        })
+    };
+    server.entered.acquire().await.unwrap().forget();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    server.release.add_permits(1);
+    assert_eq!(
+        task.await.unwrap().unwrap().record.state,
+        EnvironmentState::Running
+    );
+    assert_eq!(
+        environment
+            .create_with_deadline(tokio::time::Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap()
+            .record
+            .state,
+        EnvironmentState::Running
+    );
+    assert_eq!(server.starts.lock().unwrap().len(), 1);
+    environment.delete().await.unwrap();
+}

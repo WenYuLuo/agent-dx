@@ -21,6 +21,8 @@ struct State {
     lookups: AtomicUsize,
     response_error: AtomicUsize,
     block_response: AtomicBool,
+    pending_response: AtomicBool,
+    deadlines: Mutex<Vec<u64>>,
     release: Notify,
 }
 #[derive(Clone)]
@@ -48,19 +50,27 @@ service_impl!(pb::coordinator_service_server::CoordinatorService, {
         Ok(Response::new(owner))
     }
     async fn create_environment(&self, request: Request<pb::CreateEnvironmentRequest>) -> Result<Response<pb::EnvironmentResult>, Status> {
+        self.0.deadlines.lock().unwrap().push(request.get_ref().create_deadline_unix_millis);
         self.0.create_calls.fetch_add(1, Ordering::SeqCst);
         let spec = request.into_inner().spec.unwrap();
         let record = {
             let mut owners = self.0.owners.lock().unwrap();
-            if let Some(owner) = owners.get(&spec.id) {
+            if let Some(owner) = owners.get_mut(&spec.id) {
                 assert_eq!(owner.record.as_ref().unwrap().spec.as_ref(), Some(&spec));
+                if !self.0.pending_response.load(Ordering::SeqCst) {
+                    let record = owner.record.as_mut().unwrap();
+                    if record.state == pb::EnvironmentState::Pending as i32 {
+                        record.state = pb::EnvironmentState::Running as i32;
+                        record.revision = 1;
+                    }
+                }
                 owner.record.clone().unwrap()
             } else {
                 self.0.starts.fetch_add(1, Ordering::SeqCst);
                 let record = pb::EnvironmentRecord {
                     failure: None,
 assignment: Some(pb::Assignment { environment_id: spec.id.clone(), node_id: "node".into(), generation: 1, ..Default::default() }),
-                    spec: Some(spec.clone()), state: pb::EnvironmentState::Running as i32, revision: 1,
+                    spec: Some(spec.clone()), state: if self.0.pending_response.load(Ordering::SeqCst) { pb::EnvironmentState::Pending as i32 } else { pb::EnvironmentState::Running as i32 }, revision: 1,
                     resources_held: true, ..Default::default()
                 };
                 owners.insert(spec.id, pb::GetEnvironmentResponse { record: Some(record.clone()), node_address: "127.0.0.1:9000".into(), relay_address: "127.0.0.1:9443".into() });
@@ -319,4 +329,112 @@ async fn expired_unknown_request_is_collected_without_querying_or_changing_envir
         "old"
     );
     assert_eq!(fixture.state.starts.load(Ordering::SeqCst), starts);
+}
+
+#[tokio::test]
+async fn pending_owner_retry_drives_the_original_assignment() {
+    let fixture = Fixture::new().await;
+    fixture.state.pending_response.store(true, Ordering::SeqCst);
+    fixture
+        .state
+        .response_error
+        .store(tonic::Code::Unavailable as usize, Ordering::SeqCst);
+    assert_eq!(
+        fixture
+            .create("pending", "request")
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::Unavailable
+    );
+    let assignment = fixture.state.owners.lock().unwrap()["pending"]
+        .record
+        .as_ref()
+        .unwrap()
+        .assignment
+        .clone();
+    fixture
+        .state
+        .pending_response
+        .store(false, Ordering::SeqCst);
+    fixture.state.response_error.store(0, Ordering::SeqCst);
+    assert_eq!(
+        fixture.create("pending", "request").await.unwrap()["environmentId"],
+        "pending"
+    );
+    assert_eq!(fixture.state.create_calls.load(Ordering::SeqCst), 2);
+    let deadlines = fixture.state.deadlines.lock().unwrap();
+    assert!(deadlines[0] > 0);
+    assert_eq!(deadlines[0], deadlines[1]);
+    assert_eq!(fixture.state.starts.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        fixture.state.owners.lock().unwrap()["pending"]
+            .record
+            .as_ref()
+            .unwrap()
+            .assignment,
+        assignment
+    );
+}
+
+#[tokio::test]
+async fn failed_owner_retry_is_terminal_and_does_not_repeat_start() {
+    let fixture = Fixture::new().await;
+    fixture
+        .state
+        .response_error
+        .store(tonic::Code::Unavailable as usize, Ordering::SeqCst);
+    assert!(fixture.create("failed", "request").await.is_err());
+    {
+        let mut owners = fixture.state.owners.lock().unwrap();
+        let record = owners.get_mut("failed").unwrap().record.as_mut().unwrap();
+        record.state = pb::EnvironmentState::Failed as i32;
+        record.resources_held = false;
+    }
+    fixture.state.response_error.store(0, Ordering::SeqCst);
+    assert_eq!(
+        fixture
+            .create("failed", "request")
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
+    assert_eq!(fixture.state.create_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn pending_retry_rejects_a_changed_generation() {
+    let fixture = Fixture::new().await;
+    fixture.state.pending_response.store(true, Ordering::SeqCst);
+    fixture
+        .state
+        .response_error
+        .store(tonic::Code::Unavailable as usize, Ordering::SeqCst);
+    assert!(fixture.create("pending-fenced", "request").await.is_err());
+    // First retry observes and binds the Pending assignment, then loses its response.
+    assert!(fixture.create("pending-fenced", "request").await.is_err());
+    fixture
+        .state
+        .owners
+        .lock()
+        .unwrap()
+        .get_mut("pending-fenced")
+        .unwrap()
+        .record
+        .as_mut()
+        .unwrap()
+        .assignment
+        .as_mut()
+        .unwrap()
+        .generation = 2;
+    assert_eq!(
+        fixture
+            .create("pending-fenced", "request")
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
+    assert_eq!(fixture.state.create_calls.load(Ordering::SeqCst), 2);
 }

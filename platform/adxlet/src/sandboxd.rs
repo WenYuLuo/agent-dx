@@ -244,10 +244,52 @@ impl Sandboxd {
             spec, runtime_id, generation, devices, &config,
         )?))
     }
+
+    async fn restore_request(
+        &self,
+        spec: &EnvironmentSpec,
+        runtime_id: &str,
+        generation: u64,
+        devices: &[adx_core::scheduling::DeviceAllocation],
+        source: crate::RestoreSource<'_>,
+    ) -> Result<Request<proto::StartRequest>> {
+        let path = source.path;
+        let origin = source.origin;
+        self.checkpoint_supported(&spec.runtime_class).await?;
+        if !path.is_absolute() {
+            return Err(Error::Invalid("absolute checkpoint path required".into()));
+        }
+        let mut request = self
+            .execution_request(spec, runtime_id, generation, devices)
+            .await?;
+        if let Some(origin) = origin {
+            let context = adx_core::runtime::RuntimeRestore {
+                target: adx_core::runtime::RuntimeIdentity {
+                    environment_id: spec.id.clone(),
+                    runtime_id: runtime_id.into(),
+                    ownership_generation: generation,
+                },
+                origin: Some(origin.clone()),
+            };
+            context.validate(origin)?;
+            request.get_mut().envs.insert(
+                "ADX_RESTORE_ORIGIN".into(),
+                serde_json::to_string(origin).map_err(unavailable)?,
+            );
+        }
+        request.get_mut().checkpoint_info = Some(proto::CheckpointInfo {
+            checkpoint_dir: path
+                .to_str()
+                .ok_or_else(|| Error::Invalid("checkpoint path is not UTF-8".into()))?
+                .into(),
+        });
+        Ok(request)
+    }
     async fn execute_start(
         &self,
         runtime_id: &str,
-        request: Request<proto::StartRequest>,
+        mut request: Request<proto::StartRequest>,
+        deadline: Option<tokio::time::Instant>,
     ) -> Result<IpAddr> {
         let mut state = self.cell(runtime_id).lock_owned().await;
         if let StartState::Started(ip) = *state {
@@ -258,6 +300,12 @@ impl Sandboxd {
         }
         if matches!(*state, StartState::Uncertain) {
             return Err(unavailable("start outcome requires reconciliation"));
+        }
+        if let Some(deadline) = deadline {
+            request.set_timeout(
+                adx_transport::deadline::remaining(deadline, Duration::MAX)
+                    .ok_or_else(|| unavailable("runtime start deadline exceeded"))?,
+            );
         }
         *state = StartState::Failed;
         let mut client = self.client.clone();
@@ -991,35 +1039,31 @@ impl RuntimeDriver for Sandboxd {
         path: &Path,
         origin: Option<&adx_core::runtime::RuntimeIdentity>,
     ) -> Result<IpAddr> {
-        self.checkpoint_supported(&spec.runtime_class).await?;
-        if !path.is_absolute() {
-            return Err(Error::Invalid("absolute checkpoint path required".into()));
-        }
-        let mut request = self
-            .execution_request(spec, runtime_id, generation, devices)
+        let request = self
+            .restore_request(
+                spec,
+                runtime_id,
+                generation,
+                devices,
+                crate::RestoreSource { path, origin },
+            )
             .await?;
-        if let Some(origin) = origin {
-            let context = adx_core::runtime::RuntimeRestore {
-                target: adx_core::runtime::RuntimeIdentity {
-                    environment_id: spec.id.clone(),
-                    runtime_id: runtime_id.into(),
-                    ownership_generation: generation,
-                },
-                origin: Some(origin.clone()),
-            };
-            context.validate(origin)?;
-            request.get_mut().envs.insert(
-                "ADX_RESTORE_ORIGIN".into(),
-                serde_json::to_string(origin).map_err(unavailable)?,
-            );
-        }
-        request.get_mut().checkpoint_info = Some(proto::CheckpointInfo {
-            checkpoint_dir: path
-                .to_str()
-                .ok_or_else(|| Error::Invalid("checkpoint path is not UTF-8".into()))?
-                .into(),
-        });
-        self.execute_start(runtime_id, request).await
+        self.execute_start(runtime_id, request, None).await
+    }
+    async fn restore_from_with_deadline(
+        &self,
+        spec: &EnvironmentSpec,
+        runtime_id: &str,
+        generation: u64,
+        devices: &[adx_core::scheduling::DeviceAllocation],
+        source: crate::RestoreSource<'_>,
+        deadline: tokio::time::Instant,
+    ) -> Result<IpAddr> {
+        let request = self
+            .restore_request(spec, runtime_id, generation, devices, source)
+            .await?;
+        self.execute_start(runtime_id, request, Some(deadline))
+            .await
     }
     async fn inventory(&self) -> Result<Vec<crate::RuntimeObservation>> {
         self.list_id("")
@@ -1087,7 +1131,22 @@ impl RuntimeDriver for Sandboxd {
         let request = self
             .execution_request(spec, runtime_id, ownership_generation, devices)
             .await?;
-        self.execute_start(runtime_id, request).await
+        self.execute_start(runtime_id, request, None).await
+    }
+
+    async fn start_with_deadline(
+        &self,
+        spec: &EnvironmentSpec,
+        runtime_id: &str,
+        generation: u64,
+        devices: &[adx_core::scheduling::DeviceAllocation],
+        deadline: tokio::time::Instant,
+    ) -> Result<IpAddr> {
+        let request = self
+            .execution_request(spec, runtime_id, generation, devices)
+            .await?;
+        self.execute_start(runtime_id, request, Some(deadline))
+            .await
     }
 
     async fn remove(&self, runtime_id: &str) -> Result<()> {

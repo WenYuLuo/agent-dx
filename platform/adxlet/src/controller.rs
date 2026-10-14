@@ -33,8 +33,11 @@ enum Command {
         expected_revision: u64,
     },
     Recover(ResumeRequest),
-    Create,
-    Clone(Box<adx_core::snapshots::Snapshot>),
+    Create(Option<tokio::time::Instant>),
+    Clone(
+        Box<adx_core::snapshots::Snapshot>,
+        Option<tokio::time::Instant>,
+    ),
     Delete,
     CollectFailed(u64),
     Sync,
@@ -139,10 +142,24 @@ impl EnvironmentHandle {
         &self,
         snapshot: adx_core::snapshots::Snapshot,
     ) -> Result<OperationResult> {
-        self.send(Command::Clone(Box::new(snapshot))).await
+        self.send(Command::Clone(Box::new(snapshot), None)).await
     }
     pub async fn create(&self) -> Result<OperationResult> {
-        self.send(Command::Create).await
+        self.send(Command::Create(None)).await
+    }
+    pub async fn create_with_deadline(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<OperationResult> {
+        self.send(Command::Create(Some(deadline))).await
+    }
+    pub(crate) async fn create_from_snapshot_with_deadline(
+        &self,
+        snapshot: adx_core::snapshots::Snapshot,
+        deadline: tokio::time::Instant,
+    ) -> Result<OperationResult> {
+        self.send(Command::Clone(Box::new(snapshot), Some(deadline)))
+            .await
     }
     pub async fn delete(&self) -> Result<OperationResult> {
         self.send(Command::Delete).await
@@ -267,6 +284,7 @@ pub(crate) fn spawn_restored(
         demand: demand.clone(),
         observed_demand: 0,
         auto_pause_guard: None,
+        create_deadline: None,
     };
     tokio::spawn(async move {
         while let Some(Envelope {
@@ -360,7 +378,7 @@ impl Controller {
             Command::Network { .. } => "network",
             Command::Reload { .. } => "reload",
             Command::Recover(_) => "recover",
-            Command::Create | Command::Clone(_) => "create",
+            Command::Create(_) | Command::Clone(_, _) => "create",
             Command::Delete => "delete",
             Command::CollectFailed(_) => "collect_failed",
             Command::Sync => "sync",
@@ -401,8 +419,18 @@ impl Controller {
                 expected_revision,
             } => self.reload(operation_id, expected_revision).await,
             Command::Recover(request) => self.recover(request).await,
-            Command::Create => self.create().await,
-            Command::Clone(snapshot) => self.clone_snapshot(*snapshot).await,
+            Command::Create(deadline) => {
+                self.create_deadline = deadline;
+                let result = self.create().await;
+                self.create_deadline = None;
+                result
+            }
+            Command::Clone(snapshot, deadline) => {
+                self.create_deadline = deadline;
+                let result = self.clone_snapshot(*snapshot).await;
+                self.create_deadline = None;
+                result
+            }
             Command::Delete => self.delete().await,
             Command::CollectFailed(revision) => {
                 if self.record.state != EnvironmentState::Failed
@@ -438,6 +466,7 @@ impl Controller {
 }
 
 struct Controller {
+    create_deadline: Option<tokio::time::Instant>,
     auto_pause_guard: Option<((String, u64, u64), u64)>,
     demand: Arc<std::sync::atomic::AtomicU64>,
     observed_demand: u64,
@@ -719,7 +748,9 @@ impl Controller {
         self.record.resources_held = true;
         self.transition(Event::Start)?;
         self.record.failure = None;
-        let initialization_timeout = if self.record.spec.execution.init_timeout_seconds > 0 {
+        let initialization_timeout = if let Some(deadline) = self.create_deadline {
+            deadline.saturating_duration_since(tokio::time::Instant::now())
+        } else if self.record.spec.execution.init_timeout_seconds > 0 {
             std::time::Duration::from_secs(self.record.spec.execution.init_timeout_seconds)
         } else {
             self.services.operation_timeout
@@ -727,6 +758,12 @@ impl Controller {
         let mut awaiting_readiness = false;
         let operation_started = Instant::now();
         let attempt = timeout(initialization_timeout, async {
+            if self
+                .create_deadline
+                .is_some_and(|deadline| deadline <= tokio::time::Instant::now())
+            {
+                return Err(Error::Unavailable("create deadline exceeded".into()));
+            }
             if self.record.spec.lifecycle.idle_action == adx_core::lifecycle::IdleAction::Pause {
                 self.services
                     .runtime
@@ -751,25 +788,34 @@ impl Controller {
                             self.recovery_files = Some(path);
                             self.services
                                 .runtime
-                                .restore_from(
+                                .restore_from_with_deadline(
                                     &self.record.spec,
                                     &self.record.runtime.id,
                                     self.record.assignment.generation,
                                     &self.record.assignment.devices,
-                                    self.recovery_files.as_ref().expect(
-                                        "recovery file is stored immediately before restore",
-                                    ),
-                                    cp.origin.as_ref(),
+                                    crate::RestoreSource {
+                                        path: self.recovery_files.as_ref().expect(
+                                            "recovery file is stored immediately before restore",
+                                        ),
+                                        origin: cp.origin.as_ref(),
+                                    },
+                                    self.create_deadline.unwrap_or_else(|| {
+                                        tokio::time::Instant::now()
+                                            + self.services.operation_timeout
+                                    }),
                                 )
                                 .await
                         } else {
                             self.services
                                 .runtime
-                                .start(
+                                .start_with_deadline(
                                     &self.record.spec,
                                     &self.record.runtime.id,
                                     self.record.assignment.generation,
                                     &self.record.assignment.devices,
+                                    self.create_deadline.unwrap_or_else(|| {
+                                        tokio::time::Instant::now() + initialization_timeout
+                                    }),
                                 )
                                 .await
                         }
@@ -847,7 +893,15 @@ impl Controller {
         self.record.restart_pending = false;
         self.restart_after = None;
         let commit_started = Instant::now();
-        let result = self.sync().await;
+        let result = if let Some(deadline) = self.create_deadline {
+            tokio::time::timeout_at(deadline, self.sync())
+                .await
+                .map_err(|_| {
+                    Error::Unavailable("create state publication remains unknown".into())
+                })?
+        } else {
+            self.sync().await
+        };
         adx_observability::info!(
             event = "environment_start_stages",
             environment_id = %self.record.spec.id,

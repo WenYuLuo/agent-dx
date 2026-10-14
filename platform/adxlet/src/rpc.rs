@@ -123,7 +123,7 @@ impl pb::node_service_server::NodeService for NodeRpc {
             return Err(Status::permission_denied("API Server required"));
         }
         let service = self.clone();
-        let request = request.into_inner();
+        let mut request = request.into_inner();
         let timeout = request
             .create
             .as_ref()
@@ -131,10 +131,21 @@ impl pb::node_service_server::NodeService for NodeRpc {
             .filter(|timeout| !timeout.is_zero())
             .or_else(|| service.coordinator.as_ref().map(|sink| sink.timeout))
             .unwrap_or(Duration::from_secs(90));
-        let deadline = tokio::time::Instant::now() + timeout;
-        tokio::spawn(trace.run(async move { service.create_local(request, deadline).await }))
-            .await
-            .map_err(|_| Status::internal("local creation task failed"))?
+        let create = request
+            .create
+            .as_mut()
+            .ok_or_else(|| Status::invalid_argument("create required"))?;
+        let deadline = if create.create_deadline_unix_millis == 0 {
+            adx_transport::deadline::Deadline::after(timeout)?
+        } else {
+            adx_transport::deadline::Deadline::from_unix_millis(create.create_deadline_unix_millis)?
+        };
+        create.create_deadline_unix_millis = deadline.unix_millis();
+        tokio::spawn(
+            trace.run(async move { service.create_local(request, deadline.instant()).await }),
+        )
+        .await
+        .map_err(|_| Status::internal("local creation task failed"))?
     }
 
     async fn recover_environment(
@@ -273,6 +284,16 @@ impl pb::node_service_server::NodeService for NodeRpc {
                 if self.session_id.is_empty() || r.node_session_id != self.session_id {
                     return Err(Status::failed_precondition("node process session changed"));
                 }
+                let deadline = if r.create_deadline_unix_millis == 0 {
+                    None
+                } else {
+                    Some(
+                        adx_transport::deadline::Deadline::from_unix_millis(
+                            r.create_deadline_unix_millis,
+                        )?
+                        .instant(),
+                    )
+                };
                 let spec = r
                     .spec
                     .ok_or_else(|| Status::invalid_argument("spec required"))?
@@ -285,12 +306,25 @@ impl pb::node_service_server::NodeService for NodeRpc {
                     .map_err(status)?;
                 let handle = self.manager.environment(spec, assignment).map_err(status)?;
                 let result = match r.snapshot {
-                    Some(snapshot) => {
-                        handle
-                            .create_from_snapshot(snapshot.try_into().map_err(status)?)
-                            .await
-                    }
-                    None => handle.create().await,
+                    Some(snapshot) => match deadline {
+                        Some(deadline) => {
+                            handle
+                                .create_from_snapshot_with_deadline(
+                                    snapshot.try_into().map_err(status)?,
+                                    deadline,
+                                )
+                                .await
+                        }
+                        None => {
+                            handle
+                                .create_from_snapshot(snapshot.try_into().map_err(status)?)
+                                .await
+                        }
+                    },
+                    None => match deadline {
+                        Some(deadline) => handle.create_with_deadline(deadline).await,
+                        None => handle.create().await,
+                    },
                 };
                 response(result.map_err(status)?).map_err(status)
             })

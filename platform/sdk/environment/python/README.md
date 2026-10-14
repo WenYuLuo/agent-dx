@@ -112,8 +112,10 @@ Use an explicit shell argv when shell syntax is needed.
 
 Execd runs readiness once per startup/resume/restore and only then reports
 Running. Adxlet activates routes and publishes Running after that report.
-`init_timeout` bounds runtime startup plus readiness; by default the SDK's total
-create budget is scheduling plus initialization plus a 30-second buffer.
+`init_timeout` bounds Execd initialization and readiness after backend preparation.
+The total `create_timeout` also covers scheduling, cold image preparation, runtime
+startup and publication; by default it is scheduling plus initialization plus a
+30-second buffer. Set it explicitly for a cold image that needs more time.
 Readiness failure raises `EnvironmentError` with `probe_failure` and is terminal
 for that create attempt. Initialization is transient runtime state, not a
 separate persisted Environment lifecycle state.

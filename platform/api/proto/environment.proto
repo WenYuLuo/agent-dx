@@ -83,6 +83,10 @@ message CreateEnvironmentRequest {
   uint64 schedule_timeout_seconds = 3;
   // Bounds the complete public create operation across local or central paths.
   uint64 create_timeout_seconds = 4;
+  // Fixed by the entrypoint; retries and every hop retain this deadline.
+  uint64 create_deadline_unix_millis = 5;
+  // When retrying an observed Pending owner, never allocate another generation.
+  Assignment expected_assignment = 6;
 }
 
 message GetEnvironmentRequest { string environment_id = 1; CallerContext caller = 2; }
@@ -94,6 +98,7 @@ message StartAssignedEnvironmentRequest {
   EnvironmentSpec spec = 1;
   Assignment assignment = 2;
   string node_session_id = 3;
+  uint64 create_deadline_unix_millis = 5;
 }
 
 message DeleteEnvironmentRequest {

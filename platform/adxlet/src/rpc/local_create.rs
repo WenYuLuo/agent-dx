@@ -32,6 +32,8 @@ impl NodeRpc {
                     spec: Some(spec.into()),
                     schedule_timeout_seconds: 30,
                     create_timeout_seconds: 90,
+                    create_deadline_unix_millis: 0,
+                    expected_assignment: None,
                 }),
                 node_session_id: self.session_id.clone(),
             };
@@ -44,7 +46,7 @@ impl NodeRpc {
 
     pub(super) async fn create_local(
         &self,
-        request: pb::LocalEnvironmentCreateRequest,
+        mut request: pb::LocalEnvironmentCreateRequest,
         deadline: tokio::time::Instant,
     ) -> std::result::Result<Response<pb::EnvironmentResult>, Status> {
         if request.node_session_id != self.session_id {
@@ -185,10 +187,13 @@ impl NodeRpc {
                 let result = match owned.snapshot {
                     Some(snapshot) => {
                         handle
-                            .create_from_snapshot(snapshot.try_into().map_err(status)?)
+                            .create_from_snapshot_with_deadline(
+                                snapshot.try_into().map_err(status)?,
+                                deadline,
+                            )
                             .await
                     }
-                    None => handle.create().await,
+                    None => handle.create_with_deadline(deadline).await,
                 };
                 response(result.map_err(status)?).map_err(status)
             }
@@ -200,6 +205,10 @@ impl NodeRpc {
                     .map_err(status)?;
                 if record.spec != spec {
                     return Err(Status::already_exists("existing specification changed"));
+                }
+                if let Some(create) = request.create.as_mut() {
+                    create.expected_assignment =
+                        Some(record.assignment.clone().try_into().map_err(status)?);
                 }
                 self.manager
                     .release_local(&spec.id, &reservation)

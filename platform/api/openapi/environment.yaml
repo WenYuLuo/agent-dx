@@ -895,7 +895,7 @@ components:
           minimum: 0
           maximum: 86400
           default: 30
-          description: Runtime startup plus readiness budget. Zero uses the default.
+          description: Execd initialization and readiness budget after backend preparation, also bounded by the total create deadline. Zero uses the default.
         xpu:
           type: string
           description: GPU/NPU whole-device request encoded by the compatibility API.

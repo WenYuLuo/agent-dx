@@ -129,7 +129,9 @@ impl Clients {
         request: pb::CreateEnvironmentRequest,
         budget: Duration,
     ) -> Result<pb::EnvironmentResult, Status> {
-        if self.config.create_mode == crate::config::CreateMode::LocalFirst {
+        if request.expected_assignment.is_none()
+            && self.config.create_mode == crate::config::CreateMode::LocalFirst
+        {
             let node = match request.spec.as_ref() {
                 Some(spec) => self.directory.lock().await.select_for(spec),
                 None => self.directory.lock().await.select(),
@@ -163,10 +165,12 @@ impl Clients {
         let mut client = pb::coordinator_service_client::CoordinatorServiceClient::new(
             self.coordinator().await?,
         );
+        let mut request = trace::inject(request);
+        request.set_timeout(budget);
         self.rpc_with_timeout(
             "apiserver.create",
             budget,
-            client.create_environment(trace::inject(request)),
+            client.create_environment(request),
         )
         .await
     }
