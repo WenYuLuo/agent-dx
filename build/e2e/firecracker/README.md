@@ -8,7 +8,7 @@
 
 - `package/`：经过 `build/release/package.py verify` 验证的统一发布包。
 - `client/bin/python`：已安装该包 Sandbox SDK 的 Python 环境。
-- `e2e/`：本目录所属的 `build/e2e`，以及 `rpc_certificates.py`、发布包验证器 `package.py`。
+- `e2e/`：本目录所属的 `build/e2e`，以及 `rpc_certificates.py`、发布包验证器 `package.py` 和同一发布包的 `lib/package_manifest.py`（复制到 `e2e/package_manifest.py`）。
 - `tools/minio`、`tools/redis-cli`、`tools/distill_fs`；本地 OCI tar 模式另需 `tools/docker-registry`、`execd.tar` 和用于入口继承验收的 `entrypoint.tar`。
 
 外部执行后端在 `/opt/adx-fc/bin/{sandboxd,sbox,checkpoint-restore,firecracker}`，内核和 initrd 在 `/opt/adx-fc/artifacts/`。virtiofsd 与 `distill_fs` 在基目录 `tools/`；后者是 S3/OCI rootfs 和 EROFS mount 的实际读取后端，缺失时验收必须在部署前失败。测试使用新建的显式运行目录，固定监听端口因此每个 Pod/VM 同时运行一套；不在已有业务节点直接执行。
@@ -86,3 +86,27 @@ Lima ARM64 lifecycle r24 的7项故障用例全部通过：backend异常重启�
 `transfer.py` 在专用KVM主机上使用两套网络命名空间与独立sandboxd验证共享checkpoint跨节点恢复。`ADX_TRANSFER_INTERRUPT_COORDINATOR=1` 注入恢复计划落盘后、执行调用前的Coordinator重启。package-v21/Lima r4六项通过，含同ID新代次、PID/内存/文件保留、旧节点清理与最终无残留，见 [运行说明及证据](../../../docs/testing/firecracker-cross-node.md)。此驱动尚未接入正式Kubernetes步骤。
 
 `ADX_TRANSFER_INTERRUPT_NODE=1` 在backend已Running、Redis仍未提交时重启目标Adxlet，检查旧backend清理后同代次重新恢复。package-v21/Lima r5六项及中断证据全部通过，52项驱动回归通过。
+
+## Coordinator 扩缩容运维验收
+
+在已准备的专用 KVM 主机中使用统一发布包、独立安装的同版本 SDK 与当前
+Execd 镜像，选择两套 sandboxd／网络命名空间 fixture 的定向集合：
+
+```sh
+sudo env ADX_FC_BASE=/opt/adx-autoscaling ADX_FC_SUITE=autoscaling \
+  python3 -u /opt/adx-autoscaling/e2e/firecracker/transfer.py \
+  /var/lib/adx-autoscaling/run-001
+```
+
+该集合为 Coordinator 配置无鉴权 `127.0.0.1:19192` 管理 HTTP 入口。测试实例使用
+1 核／128 MiB，并将节点 RPC 预算设为 120 秒，以覆盖管理暂停等待和真实 VM
+启动的累计时间。六项
+必需证据覆盖节点／租户／实例过滤和分页、中央与 local-first 暂停后的真实
+创建及队列恢复、已有运行实例继续执行、手动恢复和真实转发端口流量唤醒在
+管理暂停期间保持 Paused、解除暂停后保留 guest PID 与文件，以及最终实例、
+物理后端和对象存储清理。业务生命周期通过已安装的 SDK 调用；运维请求直接
+到 Coordinator。`sdk-autoscaling.json` 保存逐项证据，`autoscaling_contract.py`
+拒绝缺失用例、暂停期间物理 VM 已启动、缺少 local claim 或清理不完整的结果。
+
+这是一个 KVM 主机内的双逻辑节点定向验收，不等同于默认 checkpoint 集合、
+跨主机或 Kubernetes 验收。每次必须使用新的运行目录。

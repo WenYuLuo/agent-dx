@@ -5,6 +5,7 @@ extend the old POSIX, function, or generic signal services for new functionality
 
 Public HTTP contracts are separate from these internal gRPC protocols:
 
+- [Coordinator autoscaling HTTP](../../../docs/deployment/coordinator-autoscaling.md)
 - [Sandbox management OpenAPI](../openapi/sandbox.yaml)
 - [Environment data-plane OpenAPI](../openapi/data-plane.yaml)
 

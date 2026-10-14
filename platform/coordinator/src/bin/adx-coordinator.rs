@@ -24,6 +24,8 @@ struct Config {
     #[serde(default)]
     metrics_listen: Option<SocketAddr>,
     #[serde(default)]
+    autoscaling_listen: Option<SocketAddr>,
+    #[serde(default)]
     advertised_address: Option<String>,
     #[serde(default = "default_heartbeat")]
     heartbeat_timeout_seconds: u64,
@@ -120,6 +122,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => None,
     };
     let metrics_rpc = rpc.clone();
+    let autoscaling_listener = match config.autoscaling_listen {
+        Some(address) => Some(tokio::net::TcpListener::bind(address).await?),
+        None => None,
+    };
+    let autoscaling_rpc = rpc.clone();
+    let autoscaling = async move {
+        if let Some(listener) = autoscaling_listener {
+            adx_observability::info!(address=%listener.local_addr()?, "Coordinator autoscaling HTTP listening");
+            adx_coordinator::autoscaling::serve(listener, autoscaling_rpc).await?;
+        }
+        std::future::pending::<std::io::Result<()>>().await
+    };
     let metrics = async move {
         if let Some(listener) = metrics_listener {
             adx_coordinator::metrics::serve(listener, metrics_rpc).await?;
@@ -220,6 +234,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ = collection => {}
         _ = recovery => {}
         result = metrics => result?,
+        result = autoscaling => result?,
     }
     Ok(())
 }

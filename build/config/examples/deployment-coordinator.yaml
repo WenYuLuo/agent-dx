@@ -32,6 +32,7 @@ services:
       failed_retention_seconds: 600
       discovery_ttl_seconds: 15
       metrics_listen: 127.0.0.1:19090
+      autoscaling_listen: 127.0.0.1:19092
 logging:
   enabled: true
   max_file_bytes: 104857600

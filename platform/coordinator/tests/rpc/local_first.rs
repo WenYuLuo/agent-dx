@@ -385,6 +385,18 @@ async fn operator_pause_keeps_node_visible_but_removes_it_from_admission() {
             .accepting_allocations
     );
 
+    let created = rig.nodes[0]
+        .create_local_environment(Rig::request("paused-local-fallback", 0))
+        .await
+        .unwrap()
+        .into_inner()
+        .record
+        .unwrap();
+    assert_eq!(created.assignment.as_ref().unwrap().node_id, "b");
+    assert_eq!(rig.backends[0].started.load(Ordering::SeqCst), 0);
+    assert_eq!(rig.backends[1].started.load(Ordering::SeqCst), 1);
+    rig.delete(&created).await;
+
     let resumed = rig.claimants[0]
         .set_node_scheduling(pb::SetNodeSchedulingRequest {
             node_id: "a".into(),
@@ -394,14 +406,20 @@ async fn operator_pause_keeps_node_visible_but_removes_it_from_admission() {
         .unwrap()
         .into_inner();
     assert!(resumed.accepting_allocations);
-    let next = directory.message().await.unwrap().unwrap();
-    assert!(
-        next.nodes
-            .iter()
-            .find(|node| node.node_id == "a")
-            .unwrap()
-            .accepting_allocations
-    );
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let next = directory.message().await.unwrap().unwrap();
+            if next
+                .nodes
+                .iter()
+                .any(|node| node.node_id == "a" && node.accepting_allocations)
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]

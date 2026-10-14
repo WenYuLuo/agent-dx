@@ -20,6 +20,7 @@ from transfer_config import ADDRESSES, HOST, configure
 from transfer_contract import verify as verify_transfer
 from demand_contract import verify as verify_demand
 from demand_physical import audit as audit_demand
+from autoscaling_contract import verify as verify_autoscaling
 from storage_fixture import public as public_storage
 
 
@@ -37,9 +38,12 @@ def _executable(name, environment=None, cwd=None):
 
 def main():
     root = Path(sys.argv[1]).resolve()
-    demand_suite = os.getenv('ADX_FC_SUITE') == 'demand'
-    verify = verify_demand if demand_suite else verify_transfer
-    sdk_result_name = 'sdk-demand.json' if demand_suite else 'sdk-transfer.json'
+    suite = os.getenv('ADX_FC_SUITE', 'transfer')
+    if suite not in ('transfer', 'demand', 'autoscaling'):
+        raise ValueError('unknown Firecracker suite')
+    demand_suite = suite == 'demand'
+    verify = {'transfer': verify_transfer, 'demand': verify_demand, 'autoscaling': verify_autoscaling}[suite]
+    sdk_result_name = 'sdk-' + suite + '.json'
     base = Path(os.environ.get('ADX_FC_BASE', '/opt/adx'))
     if root.exists():
         raise ValueError('run directory must be new')
@@ -291,7 +295,7 @@ def main():
         wait(ready)
         (root / 'backend-pids.json').write_text(json.dumps(backend_pids))
         print('TWO FIRECRACKER NODES READY', flush=True)
-        driver = 'sdk_demand.py' if demand_suite else 'sdk_transfer.py'
+        driver = 'sdk_' + suite + '.py'
         call([base / 'client/bin/python', '-u', base / 'e2e/firecracker' / driver, root, image], timeout=14400 if demand_suite else 900)
         result.update(json.loads((evidence / sdk_result_name).read_text()))
         for name in namespaces:

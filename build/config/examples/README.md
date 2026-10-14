@@ -76,3 +76,5 @@ Coordinator and Adxlet examples enable loopback `metrics_listen` on ports 19090 
 部署示例已启用组件日志滚动与 gzip 压缩，所有历史保留限制按组件计算。配置和异常处理见[组件日志滚动与压缩](../../../docs/testing/log-rotation.md)。
 
 Adxlet 的 `runtime_logs.directory` 独立于 Supervisor 的组件日志。单机和节点示例都将它设为对应 `state_dir/logs/runtime`，以便 Collector 样例从 `$ADX_LOG_DIR/runtime` 采集 `.out/.err`。已终止 runtime 日志保留 24 小时、至多 50 对，并受 1 GiB 总预算限制；运行中文件的后端限制见 [Runtime 日志](../../../docs/testing/runtime-logs.md)。
+
+Coordinator examples enable `autoscaling_listen: 127.0.0.1:19092` for direct HTTP queue, node admission and node Environment queries. This endpoint has no authentication or authorization checks. See [Coordinator autoscaling HTTP](../../../docs/deployment/coordinator-autoscaling.md) for request and shutdown semantics.

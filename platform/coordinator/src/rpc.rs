@@ -1,5 +1,6 @@
 //! Async RPC coordination around the synchronous scheduler and Redis repository.
 use adx_transport::rpc::RpcClient;
+mod autoscaling;
 mod claims;
 mod cloning;
 mod collection;

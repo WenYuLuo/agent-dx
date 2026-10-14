@@ -38,6 +38,7 @@ services:
       heartbeat_timeout_seconds: 30
       discovery_ttl_seconds: 15
       metrics_listen: 127.0.0.1:19090
+      autoscaling_listen: 127.0.0.1:19092
   - id: adxlet
     role: adxlet
     config:

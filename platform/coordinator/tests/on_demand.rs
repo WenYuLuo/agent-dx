@@ -455,6 +455,238 @@ impl Rig {
 
 #[tokio::test]
 #[ignore = "requires dedicated real Redis"]
+async fn coordinator_autoscaling_http_queries_authoritative_node_ownership_without_credentials() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut rig = Rig::new(Duration::from_secs(2)).await;
+    let pending = spec();
+    let mut pending = EnvironmentSpec {
+        id: "a-pending".into(),
+        ..pending
+    };
+    let assignment = adx_core::Assignment {
+        environment_id: pending.id.clone(),
+        node_id: "a".into(),
+        shard_id: 0,
+        generation: 100,
+        devices: vec![],
+    };
+    rig.session
+        .reserve(pending.clone(), assignment)
+        .await
+        .unwrap();
+    pending.id = "b-pending".into();
+    pending.tenant_id = "other".into();
+    rig.session
+        .reserve(
+            pending.clone(),
+            adx_core::Assignment {
+                environment_id: pending.id.clone(),
+                node_id: "b".into(),
+                shard_id: 0,
+                generation: 101,
+                devices: vec![],
+            },
+        )
+        .await
+        .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let rpc = rig.rpc.clone();
+    let task = tokio::spawn(adx_coordinator::autoscaling::serve(listener, rpc));
+    async fn call(
+        address: std::net::SocketAddr,
+        method: &str,
+        path: &str,
+    ) -> (u16, serde_json::Value) {
+        let mut socket = tokio::net::TcpStream::connect(address).await.unwrap();
+        socket.write_all(format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: 0\r\n\r\n").as_bytes()).await.unwrap();
+        let mut bytes = Vec::new();
+        tokio::time::timeout(Duration::from_secs(3), socket.read_to_end(&mut bytes))
+            .await
+            .unwrap()
+            .unwrap();
+        let response = String::from_utf8(bytes).unwrap();
+        let (headers, body) = response.split_once("\r\n\r\n").unwrap();
+        (
+            headers.split_whitespace().nth(1).unwrap().parse().unwrap(),
+            serde_json::from_str(body).unwrap(),
+        )
+    }
+    let base = "/instance-manager/query-tenant-instances";
+    let (code, page) = call(address, "GET", &format!("{base}?node_id=a&page_size=1")).await;
+    assert_eq!(code, 200);
+    assert_eq!(page["count"], 2);
+    assert_eq!(page["instanceInfos"][0]["instanceID"], "a-pending");
+    assert_eq!(page["instanceInfos"][0]["status"], "pending");
+    assert_eq!(page["instanceInfos"][0]["resources_held"], true);
+    let (_, page) = call(
+        address,
+        "GET",
+        &format!("{base}?node_id=a&page_size=1&page=2"),
+    )
+    .await;
+    assert_eq!(page["count"], 2);
+    assert_eq!(page["instanceInfos"][0]["instanceID"], "sleep");
+    assert_eq!(page["instanceInfos"][0]["resources_held"], false);
+    assert_eq!(page["instanceInfos"][0]["node_id"], "a");
+    for (filter, count) in [
+        ("tenant_id=other", 1),
+        ("instance_id=sleep&node_id=b", 0),
+        ("node_id=a&page=9", 2),
+    ] {
+        let (code, page) = call(address, "GET", &format!("{base}?{filter}")).await;
+        assert_eq!(code, 200);
+        assert_eq!(page["count"], count);
+    }
+    for invalid in [
+        "page=0",
+        "page_size=1001",
+        "page=18446744073709551615&page_size=1000",
+        "node_id=",
+        "node_id=a&node_id=b",
+        "nodeId=a",
+    ] {
+        assert_eq!(
+            call(address, "GET", &format!("{base}?{invalid}")).await.0,
+            400
+        );
+    }
+    assert_eq!(
+        call(address, "GET", &format!("{base}?node_id=missing"))
+            .await
+            .0,
+        404
+    );
+    let (code, queue) = call(address, "GET", "/global-scheduler/scheduling_queue").await;
+    assert_eq!(code, 200);
+    assert_eq!(queue, serde_json::json!({"count": 0, "instanceInfos": []}));
+    for (method, status, paused) in [("POST", "evicting", true), ("DELETE", "normal", false)] {
+        let (code, body) = call(
+            address,
+            method,
+            "/global-scheduler/node/localschedulingstatus?node_id=a",
+        )
+        .await;
+        assert_eq!(code, 200);
+        assert_eq!(body["status"], status);
+        assert_eq!(
+            rig.session.snapshot().await.unwrap().nodes["a"].scheduling_paused,
+            paused
+        );
+        let (_, page) = call(address, "GET", &format!("{base}?node_id=a")).await;
+        assert_eq!(page["node"]["scheduling_paused"], paused);
+        if paused {
+            assert_eq!(page["node"]["accepting_allocations"], false);
+            let rpc_address = rig.address.clone();
+            let create = tokio::spawn(async move {
+                let mut queued = spec();
+                queued.id = "http-queued".into();
+                queued
+                    .scheduling
+                    .required_node
+                    .push(adx_core::scheduling::LabelSelector {
+                        expressions: vec![adx_core::scheduling::LabelRequirement {
+                            key: "NODE_ID".into(),
+                            op: adx_core::scheduling::SelectorOp::In,
+                            values: vec!["a".into()],
+                        }],
+                        ..Default::default()
+                    });
+                pb::coordinator_service_client::CoordinatorServiceClient::new(
+                    channel(&rpc_address, Principal::ApiServer).await,
+                )
+                .create_environment(pb::CreateEnvironmentRequest {
+                    spec: Some(queued.into()),
+                    caller: caller(),
+                    schedule_timeout_seconds: 1,
+                    create_timeout_seconds: 10,
+                })
+                .await
+            });
+            tokio::time::timeout(Duration::from_millis(900), async {
+                loop {
+                    let (code, queue) =
+                        call(address, "GET", "/global-scheduler/scheduling_queue").await;
+                    assert_eq!(code, 200);
+                    if queue["count"] == 1 {
+                        assert_eq!(queue["instanceInfos"][0]["instanceID"], "http-queued");
+                        assert_eq!(queue["instanceInfos"][0]["resources"]["cpu"], "100m");
+                        assert!(queue["instanceInfos"][0]["waitDurationMs"].is_string());
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(create.await.unwrap().is_err());
+        }
+    }
+    assert_eq!(
+        call(
+            address,
+            "POST",
+            "/global-scheduler/node/localschedulingstatus"
+        )
+        .await
+        .0,
+        400
+    );
+    assert_eq!(
+        call(
+            address,
+            "POST",
+            "/global-scheduler/node/localschedulingstatus?node_id=missing"
+        )
+        .await
+        .0,
+        404
+    );
+    rig._redis.crash();
+    let (code, error) = call(address, "GET", &format!("{base}?node_id=a")).await;
+    assert_eq!(code, 503);
+    assert_eq!(error["error"]["code"], "Unavailable");
+    assert!(error.get("count").is_none());
+    task.abort();
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis"]
+async fn operator_pause_blocks_manual_and_traffic_restore_until_unpaused() {
+    let rig = Rig::new(Duration::from_secs(2)).await;
+    let mut client = pb::coordinator_service_client::CoordinatorServiceClient::new(
+        channel(&rig.address, Principal::ApiServer).await,
+    );
+    client
+        .set_node_scheduling(pb::SetNodeSchedulingRequest {
+            node_id: "a".into(),
+            accepting_allocations: false,
+        })
+        .await
+        .unwrap();
+    for traffic in [false, true] {
+        let response = tokio::time::timeout(Duration::from_millis(150), rig.resume(traffic)).await;
+        assert!(
+            response.is_err(),
+            "paused node accepted restore: {response:?}"
+        );
+        assert_eq!(rig.source.backend.restored.load(Ordering::SeqCst), 0);
+        assert_eq!(rig.target.backend.restored.load(Ordering::SeqCst), 0);
+    }
+    client
+        .set_node_scheduling(pb::SetNodeSchedulingRequest {
+            node_id: "a".into(),
+            accepting_allocations: true,
+        })
+        .await
+        .unwrap();
+    let restored = rig.resume(false).await.unwrap().record.unwrap();
+    assert_eq!(restored.assignment.unwrap().node_id, "a");
+    assert_eq!(rig.source.backend.restored.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis"]
 async fn multiple_ingress_and_manual_resume_restore_once_on_original_node() {
     let rig = Rig::new(Duration::from_secs(2)).await;
     let mut requests = Vec::new();

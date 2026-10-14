@@ -2,6 +2,7 @@
 
 pub use adx_core::snapshots;
 pub mod auth;
+pub mod autoscaling;
 mod journal;
 pub mod metrics;
 mod queue;

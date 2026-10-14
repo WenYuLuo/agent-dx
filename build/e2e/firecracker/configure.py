@@ -221,6 +221,7 @@ if node == 'node1':
         'coordinator',
         {
             'listen': '0.0.0.0:17000',
+            **({'autoscaling_listen': '127.0.0.1:19192'} if os.getenv('ADX_FC_SUITE') == 'autoscaling' else {}),
             'advertised_address': 'https://127.0.0.1:17000',
             'scheduler_shards': 1,
             'placement': 'spread',
@@ -278,9 +279,9 @@ add(
         'metrics_listen': '127.0.0.1:17003',
         'checkpoint_dir': str(P / 'checkpoints'),
         'report_interval_seconds': 2,
-        # Demand holds readiness across a 45-second checkpoint TTL. The ready
-        # deadline must outlast that hold so this case measures TTL admission.
-        'rpc_timeout_seconds': 120 if os.getenv('ADX_FC_SUITE') == 'demand' else 20,
+        # Demand holds readiness across a checkpoint TTL; autoscaling holds
+        # local-first forwarding while another real VM starts before unpause.
+        'rpc_timeout_seconds': 120 if os.getenv('ADX_FC_SUITE') in ('demand', 'autoscaling') else 20,
         'execd_port': 50090,
         'execd_command': ['/usr/local/bin/adx-execd'],
         'execd_env': {},
@@ -368,7 +369,7 @@ kernel_args = "console=ttyS0 reboot=k panic=1 pci=off init=/init random.trust_cp
 kvm_device = "/dev/kvm"
 default_vcpu_count = 1
 default_memory_mib = 512
-default_overlay_size_bytes = {32 * 1024**2 if os.getenv('ADX_FC_SUITE') == 'demand' else 536870912}
+default_overlay_size_bytes = {32 * 1024**2 if os.getenv('ADX_FC_SUITE') in ('demand', 'autoscaling') else 536870912}
 checkpoint_mode = "full"
 virtiofs_enabled = true
 virtiofsd_path = "{BASE}/tools/virtiofsd"
