@@ -1,5 +1,5 @@
 //! Replay capacity is a cache budget, never a create admission limit.
-use adx_apiserver::{clients::Clients, config::Config, sandbox_service::SandboxService};
+use adx_apiserver::{clients::Clients, config::Config, environment_service::EnvironmentService};
 use adx_protocol::control as pb;
 use serde_json::{json, Value};
 use std::{
@@ -112,7 +112,7 @@ impl pb::environment_directory_service_server::EnvironmentDirectoryService for S
 }
 use futures_util::StreamExt;
 struct Fixture {
-    service: Arc<SandboxService>,
+    service: Arc<EnvironmentService>,
     state: Arc<State>,
     server: tokio::task::JoinHandle<()>,
 }
@@ -145,7 +145,7 @@ impl Fixture {
             "rpc_timeout_seconds":2, "cache_entries":1, "auth_cache_ttl_seconds":1,
             "create_unknown_retention_seconds":retention
         })).unwrap();
-        let service = SandboxService::new(Clients::new(config).unwrap());
+        let service = EnvironmentService::new(Clients::new(config).unwrap());
         tokio::time::timeout(Duration::from_secs(3), async {
             while service.inspect("tenant", "not-created").await.is_err() {
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -199,12 +199,12 @@ async fn completed_cache_capacity_never_rejects_new_creates() {
             .create(&id, &format!("request-{index}"))
             .await
             .unwrap();
-        assert_eq!(result["instanceId"], id);
+        assert_eq!(result["environmentId"], id);
     }
     assert_eq!(fixture.state.starts.load(Ordering::SeqCst), 12);
     // The first response was evicted: current ownership still converges to it.
     assert_eq!(
-        fixture.create("environment-0", "request-0").await.unwrap()["instanceId"],
+        fixture.create("environment-0", "request-0").await.unwrap()["environmentId"],
         "environment-0"
     );
     assert_eq!(fixture.state.starts.load(Ordering::SeqCst), 12);
@@ -273,7 +273,7 @@ async fn active_creates_are_not_evicted_and_same_request_is_serialized() {
         first.await.unwrap().unwrap(),
         duplicate.await.unwrap().unwrap()
     );
-    assert_eq!(second.await.unwrap().unwrap()["instanceId"], "two");
+    assert_eq!(second.await.unwrap().unwrap()["environmentId"], "two");
     assert_eq!(fixture.state.starts.load(Ordering::SeqCst), 2);
     assert_eq!(fixture.state.create_calls.load(Ordering::SeqCst), 2);
 }
@@ -310,12 +310,12 @@ async fn expired_unknown_request_is_collected_without_querying_or_changing_envir
     fixture.state.response_error.store(0, Ordering::SeqCst);
     // Beyond the retry window, the old Request ID no longer pins its arguments.
     assert_eq!(
-        fixture.create("new", "request").await.unwrap()["instanceId"],
+        fixture.create("new", "request").await.unwrap()["environmentId"],
         "new"
     );
     let starts = fixture.state.starts.load(Ordering::SeqCst);
     assert_eq!(
-        fixture.create("old", "retry-old").await.unwrap()["instanceId"],
+        fixture.create("old", "retry-old").await.unwrap()["environmentId"],
         "old"
     );
     assert_eq!(fixture.state.starts.load(Ordering::SeqCst), starts);

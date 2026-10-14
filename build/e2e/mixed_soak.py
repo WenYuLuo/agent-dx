@@ -12,7 +12,7 @@ MINIMUM_OPERATIONS = {'command': 40, 'file': 40, 'create': 5, 'delete': 5}
 
 
 def verify_assignment(instance_id, expected_node, catalog):
-    """Read authoritative ownership for every Sandbox counted by the load test."""
+    """Read authoritative ownership for every Environment counted by the load test."""
     record = json.loads(catalog()['environment:' + instance_id])
     actual = record['assignment']['node_id']
     if actual != expected_node:
@@ -22,20 +22,20 @@ def verify_assignment(instance_id, expected_node, catalog):
     return actual
 
 
-def exercise(sandbox, marker):
-    """Prove a command and a binary file round trip on one live sandbox."""
+def exercise(environment, marker):
+    """Prove a command and a binary file round trip on one live environment."""
     if not re.fullmatch(r'[a-z0-9-]+', marker):
         raise ValueError('invalid mixed-load marker')
     started = time.monotonic()
-    command = sandbox.commands.run("printf '%s' '" + marker + "'")
+    command = environment.commands.run("printf '%s' '" + marker + "'")
     command_ms = (time.monotonic() - started) * 1000
     if command.exit_code != 0 or command.stdout != marker:
         raise AssertionError('mixed-load command result differs from request')
     path = str(PurePosixPath('/tmp') / f'adx-soak-{marker}.bin')
     payload = marker.encode() * 16 + b'\x00\xff'
     started = time.monotonic()
-    sandbox.files.write(path, payload)
-    if sandbox.files.read(path, format='bytes') != payload:
+    environment.files.write(path, payload)
+    if environment.files.read(path, format='bytes') != payload:
         raise AssertionError('mixed-load binary file differs from request')
     return {'command': command_ms, 'file': (time.monotonic() - started) * 1000}
 
@@ -86,8 +86,8 @@ def evaluate(samples, errors, elapsed, minimum_seconds):
 
 
 def run(connection, image, output, seconds=300):
-    """Keep two pinned sandboxes active while a third worker creates and deletes."""
-    from adx_sandbox import Sandbox
+    """Keep two pinned environments active while a third worker creates and deletes."""
+    from adx_environment import Environment
     from node import catalog
 
     if not 1 <= seconds <= 900:
@@ -111,7 +111,7 @@ def run(connection, image, output, seconds=300):
 
     def create(node):
         begin = time.monotonic()
-        sandbox = Sandbox(
+        environment = Environment(
             image=image,
             runtime='runc',
             node_id=node,
@@ -122,31 +122,31 @@ def run(connection, image, output, seconds=300):
             create_timeout=150,
         )
         try:
-            verify_assignment(sandbox.id, node, catalog)
+            verify_assignment(environment.id, node, catalog)
         except Exception:
             try:
-                sandbox.kill()
+                environment.kill()
             finally:
-                sandbox.close()
+                environment.close()
             raise
         with lock:
             verified_placements[node] += 1
         record('create', (time.monotonic() - begin) * 1000)
-        return sandbox
+        return environment
 
-    def delete(sandbox):
+    def delete(environment):
         begin = time.monotonic()
         try:
-            sandbox.kill()
+            environment.kill()
             record('delete', (time.monotonic() - begin) * 1000)
         finally:
-            sandbox.close()
+            environment.close()
 
-    def anchor_work(index, sandbox, deadline):
+    def anchor_work(index, environment, deadline):
         cycle = 0
         try:
             while not stop.is_set() and time.monotonic() < deadline:
-                for name, latency in exercise(sandbox, f'anchor-{index}-{cycle}').items():
+                for name, latency in exercise(environment, f'anchor-{index}-{cycle}').items():
                     record(name, latency)
                 cycle += 1
                 stop.wait(0.25)
@@ -157,14 +157,14 @@ def run(connection, image, output, seconds=300):
         cycle = 0
         try:
             while not stop.is_set() and time.monotonic() < deadline:
-                sandbox = None
+                environment = None
                 try:
-                    sandbox = create('node1' if cycle % 2 == 0 else 'node2')
-                    for name, latency in exercise(sandbox, f'churn-{cycle}').items():
+                    environment = create('node1' if cycle % 2 == 0 else 'node2')
+                    for name, latency in exercise(environment, f'churn-{cycle}').items():
                         record(name, latency)
                 finally:
-                    if sandbox is not None:
-                        delete(sandbox)
+                    if environment is not None:
+                        delete(environment)
                 cycle += 1
                 stop.wait(0.5)
         except Exception as error:

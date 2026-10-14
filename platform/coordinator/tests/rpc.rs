@@ -112,7 +112,7 @@ fn spec(id: &str) -> EnvironmentSpec {
         },
         priority: 0,
         scheduling: Default::default(),
-        sandbox: Default::default(),
+        execution: Default::default(),
     }
 }
 fn caller() -> Option<pb::CallerContext> {
@@ -1638,9 +1638,9 @@ async fn published_routes_drive_real_gateway_streams_and_reconnect_to_new_coordi
         devices: vec![],
     };
     let mut routed_spec = spec("routed");
-    routed_spec.sandbox.ports = vec![target_port];
-    routed_spec.sandbox.data_plane.port_forward =
-        adx_core::sandbox::DataPlaneSecurityMode::TlsToken;
+    routed_spec.execution.ports = vec![target_port];
+    routed_spec.execution.data_plane.port_forward =
+        adx_core::execution::DataPlaneSecurityMode::TlsToken;
     session
         .reserve(routed_spec.clone(), assignment.clone())
         .await

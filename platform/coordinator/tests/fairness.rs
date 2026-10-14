@@ -19,7 +19,7 @@ fn request(id: &str, tenant: &str) -> EnvironmentSpec {
         lifecycle: Default::default(),
         env: Default::default(),
         scheduling: Default::default(),
-        sandbox: Default::default(),
+        execution: Default::default(),
     }
 }
 fn node(available: bool) -> Node {

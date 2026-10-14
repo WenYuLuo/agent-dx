@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check public Sandbox routes, runtime actions, references and payload examples."""
+"""Check public Environment routes, runtime actions, references and payload examples."""
 
 import argparse
 import json
@@ -73,18 +73,18 @@ def control_routes():
     for method, path in re.findall(r'if method == "([A-Z]+)"\s*&&\s*path == "([^"]+)"', source):
         routes.add((method, path))
     # The supported compatibility create alias deliberately has its own envelope.
-    routes.add(('POST', '/api/sandbox/v1/sandboxes'))
+    routes.add(('POST', '/api/environment/v1/environments'))
     for method in re.findall(r'\("([A-Z]+)", None\)', handler(source, 'keys')):
         routes.add((method, '/api/admin/v1/keys'))
     for method in re.findall(r'\("([A-Z]+)", Some\(id\)\)', handler(source, 'keys')):
         routes.add((method, '/api/admin/v1/keys/{id}'))
     for method in re.findall(r'\("([A-Z]+)", None\)', handler(source, 'snapshots')):
-        routes.add((method, '/api/sandbox/v1/snapshots'))
+        routes.add((method, '/api/environment/v1/snapshots'))
     for method in re.findall(r'\("([A-Z]+)", Some\(id\)\)', handler(source, 'snapshots')):
-        routes.add((method, '/api/sandbox/v1/snapshots/{snapshotId}'))
+        routes.add((method, '/api/environment/v1/snapshots/{snapshotId}'))
     for method, action in re.findall(r'\("([A-Z]+)", "([^"]*)"\) => Some\(Kind::', source):
         suffix = f'/{action}' if action else ''
-        routes.add((method, f'/api/sandbox/v1/sandboxes/{{sandboxId}}{suffix}'))
+        routes.add((method, f'/api/environment/v1/environments/{{environmentId}}{suffix}'))
     match = re.search(r'if matches!\(method.as_str\(\), ([^\n]+)\)\s*&&\s*path == "([^"]+)"', source)
     if not match:
         raise ValueError('cannot recognize node scheduling route')
@@ -95,7 +95,7 @@ def control_routes():
 
 def runtime_actions():
     source = (ROOT / 'platform/runtime/execd/src/runtime/dispatch.rs').read_text()
-    table = source.split('fn normalize_sandbox_action(', 1)[1].split('pub(crate) fn dispatch_runtime_action_with_trace', 1)[0]
+    table = source.split('fn normalize_environment_action(', 1)[1].split('pub(crate) fn dispatch_runtime_action_with_trace', 1)[0]
     return set(re.findall(r'"((?:process|file|shell|entrypoint)\.[^"]+)"', table))
 
 
@@ -117,7 +117,7 @@ def create_fields():
 
 def audit(control, data, *, routes=None, actions=None):
     errors = []
-    for label, doc in [('sandbox', control), ('data-plane', data)]:
+    for label, doc in [('environment', control), ('data-plane', data)]:
         ids = []
         for path, entry in doc['paths'].items():
             for method, operation in entry.items():
@@ -148,7 +148,7 @@ def audit(control, data, *, routes=None, actions=None):
     documented = {(method.upper(), path) for path, entry in control['paths'].items() for method in entry if method in METHODS}
     for method, path in sorted((control_routes() if routes is None else routes) - documented):
         errors.append(f'missing control operation: {method} {path}')
-    for name in sorted(create_fields() - control['components']['schemas']['CreateSandboxRequest']['properties'].keys()):
+    for name in sorted(create_fields() - control['components']['schemas']['CreateEnvironmentRequest']['properties'].keys()):
         errors.append(f'missing create field: {name}')
     schemas = data['components']['schemas']
     covered = set()
@@ -177,7 +177,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path)
     args = parser.parse_args()
-    control, data = load('sandbox.yaml'), load('data-plane.yaml')
+    control, data = load('environment.yaml'), load('data-plane.yaml')
     result = {
         'control_operations': sum(method in METHODS for entry in control['paths'].values() for method in entry),
         'runtime_actions': len(runtime_actions()),

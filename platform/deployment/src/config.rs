@@ -417,7 +417,7 @@ impl Deployment {
                     })
             {
                 return Err(
-                    "Sandbox API discovery poll_seconds must be between 1 and 86400".into(),
+                    "Environment API discovery poll_seconds must be between 1 and 86400".into(),
                 );
             }
             if service.role == Role::ApiServer {

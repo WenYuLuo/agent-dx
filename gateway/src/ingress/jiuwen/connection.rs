@@ -37,7 +37,7 @@ impl Connection {
     /// handshake, deadline or route-revocation errors. Only
     /// shared pre-write route/open failures may retry. A refused business port waits
     /// within the same deadline; HTTP upgrades never retry.
-    /// The URI/Origin describe the Sandbox-local service, not a dial destination:
+    /// The URI/Origin describe the Environment-local service, not a dial destination:
     /// all bytes travel over the already-selected Relay stream. No caller headers,
     /// frontend credentials or public URL are forwarded to AgentServer.
     pub async fn connect(

@@ -19,7 +19,7 @@ directories, mount points or filesystem probes. The standalone AFS deployment
 example uses `with_afs: true` and absolute AFS TOML paths; copy those TOML files
 to `/opt/adx/config/afs/` or update the paths before running `adxctl`.
 
-See the [`adxctl` deployment guide](../../../docs/deployment/adxctl.md) for exact commands, role boundaries and split-host startup order. `adx-apiserver` is the current control-plane Frontend and hosts Ingress by default; explicit process isolation requires building `adx-ingress` from source; it is not shipped in the release package.
+See the [`adxctl` deployment guide](../../../docs/deployment/adxctl.md) for exact commands, role boundaries and split-host startup order. `adx-apiserver` serves the public control API and embeds Ingress by default. The release package also includes `adx-ingress` for explicit split-process deployment with `ingress_mode: standalone`.
 
 String values in deployment YAML may use `${VAR}` or `${VAR:-default}`. Expansion happens after YAML parsing, so environment values remain scalar strings and cannot inject mappings or lists. Missing variables without defaults fail configuration loading. Numeric and boolean fields remain native YAML values rather than implicitly converting environment strings.
 
@@ -52,13 +52,24 @@ confirmed unowned or left by uncommitted starts. An unavailable Coordinator neve
 means an empty catalog. Explicit CLI stop performs local Environment cleanup before service shutdown.
 
 
-Coordinator 配置 `advertised_address` 发布可续期的 Redis 地址，默认 TTL 15 秒。Node 与 Sandbox API 示例通过相同 Redis namespace 发现它；也可改用显式 `coordinator_address`，不能同时配置两种方式。Coordinator 心跳超时默认 30 秒，Node 报告间隔应显著小于该值。Node 重启先注册为对账中，完成权威目录恢复后才开放新分配。完整契约见 [发现与恢复](../../../docs/testing/recovery-discovery.md)。
+Coordinator publishes its `advertised_address` in Redis with a renewable lease
+and a default TTL of 15 seconds. Node and Environment API examples discover it
+through the same Redis namespace. An explicit `coordinator_address` is an
+alternative; configure only one discovery mode. Coordinator's heartbeat timeout
+defaults to 30 seconds, so Node reports should arrive much more frequently.
+After restart, a Node registers as reconciling and admits new allocations only
+after recovering the authoritative catalog. See [discovery and recovery](../../../docs/testing/recovery-discovery.md).
 
-Ingress 的 `ingress-control.json` 与 Coordinator 使用相同 Redis namespace；Coordinator `tls.peers` 必须登记 Ingress 证书。默认共进程部署在 Adxlet 的 `env` 中设置 `ADX_DATA_PLANE_RELAY_ACTIVITY_UDS_DIR=/opt/adx/run/node`，其 `proxy_socket` 相应为 `/opt/adx/run/node/route.sock`。代理首次启动与重新同步期间关闭数据准入，完成 Adxlet 全量绑定同步后开放。详见 [路由发布与本机同步](../../../docs/testing/route-publication.md)。
+Ingress's `ingress-control.json` uses the same Redis namespace as Coordinator,
+whose `tls.peers` must include the Ingress certificate. The default embedded
+deployment sets `ADX_DATA_PLANE_RELAY_ACTIVITY_UDS_DIR=/opt/adx/run/node` in
+Adxlet's `env`, with the matching `proxy_socket` at `/opt/adx/run/node/route.sock`.
+Relay closes data admission during initial startup and resynchronization,
+opening it after the full Adxlet binding sync. See [route publication and local synchronization](../../../docs/testing/route-publication.md).
 
 See [process deployment](../../../docs/testing/process-deployment.md) for foreground supervisor commands, managed Redis AOF configuration and explicit stop cleanup. The deployment example requires environment-provided certificates, sandboxd and a configured resource source; it is not a self-contained E2E environment.
 
-For a co-located Ingress, Sandbox API can set `loopback_http: true` with a literal
+For a co-located Ingress, Environment API can set `loopback_http: true` with a literal
 loopback `listen` address such as `127.0.0.1:8888`. Ingress forwards control requests
 there; public SDK traffic still terminates TLS at Ingress and internal RPC remains
 mTLS. HTTPS is the default. Wildcard, hostname and non-loopback HTTP listeners are
@@ -73,8 +84,15 @@ contains a secret. Components use that URL for both storage and discovery.
 
 Coordinator and Adxlet examples enable loopback `metrics_listen` on ports 19090 and 19091. See [instance and resource metrics](../../../docs/testing/environment-resource-metrics.md) for metric definitions and external collection.
 
-部署示例已启用组件日志滚动与 gzip 压缩，所有历史保留限制按组件计算。配置和异常处理见[组件日志滚动与压缩](../../../docs/testing/log-rotation.md)。
+Deployment examples enable component log rotation and gzip compression.
+Retention limits apply per component. See [component log rotation and compression](../../../docs/testing/log-rotation.md)
+for configuration and failure handling.
 
-Adxlet 的 `runtime_logs.directory` 独立于 Supervisor 的组件日志。单机和节点示例都将它设为对应 `state_dir/logs/runtime`，以便 Collector 样例从 `$ADX_LOG_DIR/runtime` 采集 `.out/.err`。已终止 runtime 日志保留 24 小时、至多 50 对，并受 1 GiB 总预算限制；运行中文件的后端限制见 [Runtime 日志](../../../docs/testing/runtime-logs.md)。
+Adxlet's `runtime_logs.directory` is separate from Supervisor component logs.
+Standalone and node examples use the corresponding `state_dir/logs/runtime`,
+so the Collector example can read `.out/.err` files from `$ADX_LOG_DIR/runtime`.
+Terminated Runtime logs are retained for 24 hours, with at most 50 pairs and a
+total 1 GiB budget. See [Runtime logs](../../../docs/testing/runtime-logs.md)
+for backend limits on files belonging to running Runtimes.
 
 Coordinator examples enable `autoscaling_listen: 127.0.0.1:19092` for direct HTTP queue, node admission and node Environment queries. This endpoint has no authentication or authorization checks. See [Coordinator autoscaling HTTP](../../../docs/deployment/coordinator-autoscaling.md) for request and shutdown semantics.

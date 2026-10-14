@@ -30,13 +30,13 @@ def condition(kind, affinity, key, value, **flags):
 
 
 def run_preferences(
-    inventory, connection, image, socket, output, sandbox_factory=None, resource_reader=None, remote=ssh
+    inventory, connection, image, socket, output, environment_factory=None, resource_reader=None, remote=ssh
 ):
     verify_inventory(inventory)
-    if sandbox_factory is None or resource_reader is None:
-        from adx_sandbox import Sandbox, resources
+    if environment_factory is None or resource_reader is None:
+        from adx_environment import Environment, resources
 
-        sandbox_factory = sandbox_factory or Sandbox
+        environment_factory = environment_factory or Environment
         resource_reader = resource_reader or resources
     machines = {machine['role']: machine for machine in inventory['machines']}
     control = machines['control']
@@ -54,7 +54,7 @@ def run_preferences(
     prefix = 'mv-pref-' + uuid.uuid4().hex[:12]
 
     def create(name, **options):
-        sandbox = sandbox_factory(
+        environment = environment_factory(
             name=prefix + '-' + name,
             image=image,
             runtime='runc',
@@ -65,32 +65,32 @@ def run_preferences(
             create_timeout=120,
             **options,
         )
-        handles.append(sandbox)
-        report['instances'].append(sandbox.id)
-        return sandbox
+        handles.append(environment)
+        report['instances'].append(environment.id)
+        return environment
 
     def verify(name, expected, **options):
-        sandbox = create(name, **options)
-        assignment = persisted_assignment(control, sandbox.id, remote)
+        environment = create(name, **options)
+        assignment = persisted_assignment(control, environment.id, remote)
         actual = assignment.get('node_id')
         if actual != expected or assignment.get('state') != 'Running' or not assignment.get('resources_held'):
             raise AssertionError(f'{name}: expected {expected}, got {assignment}')
-        physical = {worker['node_id']: backend_ids(worker, socket, sandbox.id, remote) for worker in workers}
+        physical = {worker['node_id']: backend_ids(worker, socket, environment.id, remote) for worker in workers}
         if len(physical[expected]) != 1 or any(ids for node_id, ids in physical.items() if node_id != expected):
             raise AssertionError(f'{name}: physical backend mismatch: {physical}')
-        result = sandbox.commands.run('printf preference-ok')
+        result = environment.commands.run('printf preference-ok')
         if (result.exit_code, result.stdout) != (0, 'preference-ok'):
             raise AssertionError(f'{name}: command failed')
         report['cases'].append(
             {
                 'name': name,
-                'id': sandbox.id,
+                'id': environment.id,
                 'expected_node': expected,
                 'actual_node': actual,
                 'backend_id': physical[expected][0],
             }
         )
-        sandbox.kill()
+        environment.kill()
 
     try:
         report['machines'] = verify_machines(inventory, remote)
@@ -99,11 +99,11 @@ def run_preferences(
         report['preflight'] = comparable_nodes(nodes, node_ids)
         left = create('anchor-left', node_id=node_ids[0], labels={'peer': 'left'})
         right = create('anchor-right', node_id=node_ids[1], labels={'peer': 'right'})
-        for sandbox, expected in ((left, node_ids[0]), (right, node_ids[1])):
-            actual = persisted_assignment(control, sandbox.id, remote)
+        for environment, expected in ((left, node_ids[0]), (right, node_ids[1])):
+            actual = persisted_assignment(control, environment.id, remote)
             if actual.get('node_id') != expected or actual.get('state') != 'Running':
                 raise AssertionError(f'anchor not assigned to {expected}: {actual}')
-            physical = {worker['node_id']: backend_ids(worker, socket, sandbox.id, remote) for worker in workers}
+            physical = {worker['node_id']: backend_ids(worker, socket, environment.id, remote) for worker in workers}
             if len(physical[expected]) != 1 or any(ids for node_id, ids in physical.items() if node_id != expected):
                 raise AssertionError(f'anchor backend not unique on {expected}: {physical}')
 
@@ -148,27 +148,27 @@ def run_preferences(
         report['error'] = f'{type(error).__name__}: {error}'
         raise
     finally:
-        for sandbox in reversed(handles):
+        for environment in reversed(handles):
             try:
-                sandbox.kill()
+                environment.kill()
             except Exception as error:
-                report['cleanup_errors'].append(f'{sandbox.id} delete: {error}')
+                report['cleanup_errors'].append(f'{environment.id} delete: {error}')
             finally:
                 try:
-                    sandbox.close()
+                    environment.close()
                 except Exception as error:
-                    report['cleanup_errors'].append(f'{sandbox.id} close: {error}')
+                    report['cleanup_errors'].append(f'{environment.id} close: {error}')
         try:
             deadline = time.monotonic() + 15
             while handles:
                 residual = {
-                    sandbox.id: {
-                        'assignment': persisted_assignment(control, sandbox.id, remote),
+                    environment.id: {
+                        'assignment': persisted_assignment(control, environment.id, remote),
                         'backends': {
-                            worker['node_id']: backend_ids(worker, socket, sandbox.id, remote) for worker in workers
+                            worker['node_id']: backend_ids(worker, socket, environment.id, remote) for worker in workers
                         },
                     }
-                    for sandbox in handles
+                    for environment in handles
                 }
                 if all(
                     item['assignment']['state'] == 'Deleted'
@@ -201,7 +201,7 @@ def main():
     parser.add_argument('--output', required=True, type=Path)
     args = parser.parse_args()
     os.environ['SSL_CERT_FILE'] = str(args.ca.resolve())
-    from adx_sandbox import ConnectionConfig
+    from adx_environment import ConnectionConfig
 
     connection = ConnectionConfig(
         server_address=args.endpoint, token=args.token_file.read_text().strip(), use_tls=True, verify_tls=True

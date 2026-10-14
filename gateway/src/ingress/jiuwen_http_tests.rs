@@ -104,19 +104,19 @@ async fn jiuwen_http_streams_ranges_and_rechecks_registration_between_chunks() {
     });
     let (gateway, api, routes) = fixture_with_backend(backend.clone()).await;
     let gateway = Arc::new(with_files(&gateway, backend.clone()));
-    let id = create_sandbox(api.as_ref()).await;
-    let route:crate::common::route::RouteInfo=serde_json::from_value(value!({"instanceID":id,"instanceStatus":{"code":3},"tenantID":"tenant","sandboxID":"runtime","sandboxIP":"127.0.0.1","nodeProxyAddress":address.to_string()})).unwrap();
+    let id = create_environment(api.as_ref()).await;
+    let route:crate::common::route::RouteInfo=serde_json::from_value(value!({"instanceID":id,"instanceStatus":{"code":3},"tenantID":"tenant","environmentID":"runtime","environmentIP":"127.0.0.1","nodeProxyAddress":address.to_string()})).unwrap();
     node.activate_route(
         route.instance_id.clone(),
-        route.sandbox_id.clone(),
-        route.sandbox_ip.parse().unwrap(),
+        route.environment_id.clone(),
+        route.environment_ip.parse().unwrap(),
     )
     .await;
     routes.put(route.clone());
     let reconcile = tokio::spawn(gateway.clone().run_route_reconciler(routes.subscribe()));
     let download = |token: String| {
         Download {
-        ingress:gateway.clone(),context:Arc::new(RequestContext::new(Duration::from_secs(10))),tenant:"tenant".into(),sandbox_id:id.clone(),
+        ingress:gateway.clone(),context:Arc::new(RequestContext::new(Duration::from_secs(10))),tenant:"tenant".into(),environment_id:id.clone(),
         config:DownloadConfig::from_template(&serde_json::from_value(value!({"name":"jiuwen","version":"1","image":"app:1","isolation_runtime":"runc","resources":{"cpu_millis":1000,"memory_mib":512},"env":{"JIUWENSWARM_WORKSPACE":"/work","JIUWENSWARM_DOWNLOAD_ASSET_ROOT":"/assets","JIUWENSWARM_FILE_DOWNLOAD_SECRET":"s".repeat(32)},"service":[{"protocol":"ws","port":18091}]})).unwrap()).unwrap(),
         token,expected_session:Some("session-a".into()),
     }

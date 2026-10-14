@@ -13,17 +13,17 @@ use std::{
 use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
-fn security(value: adx_core::sandbox::DataPlaneSecurityMode) -> i32 {
+fn security(value: adx_core::execution::DataPlaneSecurityMode) -> i32 {
     match value.effective() {
         // The current deployment default is tls-token. Resolve inheritance at
         // publication so every Ingress sees one authoritative per-environment mode.
-        adx_core::sandbox::DataPlaneSecurityMode::Inherit => {
+        adx_core::execution::DataPlaneSecurityMode::Inherit => {
             pb::DataPlaneSecurityMode::DataPlaneSecurityTlsToken as i32
         }
-        adx_core::sandbox::DataPlaneSecurityMode::Tls => {
+        adx_core::execution::DataPlaneSecurityMode::Tls => {
             pb::DataPlaneSecurityMode::DataPlaneSecurityTls as i32
         }
-        adx_core::sandbox::DataPlaneSecurityMode::TlsToken => {
+        adx_core::execution::DataPlaneSecurityMode::TlsToken => {
             pb::DataPlaneSecurityMode::DataPlaneSecurityTlsToken as i32
         }
     }
@@ -106,11 +106,11 @@ impl RoutePublisher {
                     relay_address: r.proxy_address,
                     generation: r.generation,
                     environment_revision: r.environment_revision,
-                    tunnel_security_mode: security(i.spec.sandbox.data_plane.tunnel),
-                    port_forward_security_mode: security(i.spec.sandbox.data_plane.port_forward),
+                    tunnel_security_mode: security(i.spec.execution.data_plane.tunnel),
+                    port_forward_security_mode: security(i.spec.execution.data_plane.port_forward),
                     forwarded_ports: i
                         .spec
-                        .sandbox
+                        .execution
                         .ports
                         .iter()
                         .map(|port| u32::from(*port))
@@ -423,11 +423,11 @@ fn published_route(
         relay_address: node.proxy_address.clone(),
         generation: record.assignment.generation,
         environment_revision: record.revision,
-        tunnel_security_mode: security(record.spec.sandbox.data_plane.tunnel),
-        port_forward_security_mode: security(record.spec.sandbox.data_plane.port_forward),
+        tunnel_security_mode: security(record.spec.execution.data_plane.tunnel),
+        port_forward_security_mode: security(record.spec.execution.data_plane.port_forward),
         forwarded_ports: record
             .spec
-            .sandbox
+            .execution
             .ports
             .iter()
             .map(|port| u32::from(*port))
@@ -448,8 +448,8 @@ fn route_from_published(
     let spec = record.spec.as_ref().ok_or(Error::Conflict)?;
     let assignment = record.assignment.as_ref().ok_or(Error::Conflict)?;
     let runtime = record.runtime.as_ref().ok_or(Error::Conflict)?;
-    let sandbox = spec.sandbox.as_ref().ok_or(Error::Conflict)?;
-    let data_plane = sandbox.data_plane.as_ref().ok_or(Error::Conflict)?;
+    let environment = spec.execution.as_ref().ok_or(Error::Conflict)?;
+    let data_plane = environment.data_plane.as_ref().ok_or(Error::Conflict)?;
     let inherited = pb::DataPlaneSecurityMode::DataPlaneSecurityTlsToken as i32;
     Ok(Some(pb::PublishedRoute {
         environment_id: spec.id.clone(),
@@ -469,7 +469,7 @@ fn route_from_published(
         } else {
             data_plane.port_forward
         },
-        forwarded_ports: sandbox.ports.clone(),
+        forwarded_ports: environment.ports.clone(),
     }))
 }
 

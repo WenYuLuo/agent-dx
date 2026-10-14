@@ -18,7 +18,7 @@ def verify_waiting(expected, observed, completed):
 
 def run(connection, image, output, ca, admin_key):
     """Saturate both nodes, then release capacity while requests are queued."""
-    from adx_sandbox import Sandbox
+    from adx_environment import Environment
     from metrics import check as check_metrics
     from node import catalog
     from schedule_deadline import pending_ids
@@ -35,31 +35,31 @@ def run(connection, image, output, ca, admin_key):
               'cases': []}
 
     def create(name, node_id):
-        sandbox = None
+        environment = None
         try:
-            sandbox = Sandbox(name=name, image=image, runtime='runc', node_id=node_id,
+            environment = Environment(name=name, image=image, runtime='runc', node_id=node_id,
                               cpu=2000, memory=512, idle_timeout=0,
                               connection=connection, schedule_timeout=120,
                               create_timeout=150)
-            record = json.loads(catalog()['environment:' + sandbox.id])
+            record = json.loads(catalog()['environment:' + environment.id])
             assignment = record['assignment']
             if assignment['node_id'] != node_id or record['result']['state'] != 'Running':
-                raise AssertionError(f'wrong pressure assignment: {sandbox.id} {record}')
-            command = sandbox.commands.run("printf 'pressure-ready'")
+                raise AssertionError(f'wrong pressure assignment: {environment.id} {record}')
+            command = environment.commands.run("printf 'pressure-ready'")
             if command.exit_code != 0 or command.stdout != 'pressure-ready':
-                raise AssertionError(f'pressure command failed: {sandbox.id}')
-            return {'id': sandbox.id, 'node_id': node_id,
+                raise AssertionError(f'pressure command failed: {environment.id}')
+            return {'id': environment.id, 'node_id': node_id,
                     'generation': assignment['generation']}
         finally:
-            if sandbox is not None:
+            if environment is not None:
                 try:
-                    sandbox.kill()
+                    environment.kill()
                 finally:
-                    sandbox.close()
+                    environment.close()
 
     try:
         for node_id in ('node1', 'node2'):
-            holder = Sandbox(name=prefix + '-holder-' + node_id, image=image,
+            holder = Environment(name=prefix + '-holder-' + node_id, image=image,
                              runtime='runc', node_id=node_id, cpu=2000, memory=512,
                              idle_timeout=0, connection=connection, create_timeout=150)
             holders.append(holder)

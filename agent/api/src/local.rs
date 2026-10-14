@@ -3,7 +3,7 @@ use crate::{activator::Control, request::RequestContext, Result};
 use adx_activator::Activator;
 use adx_agent_core::{
     activator::{BindingList, BindingPage, Target},
-    sandbox::Sandbox,
+    environment::Environment,
     AgentBinding, Scope, TemplateVersion,
 };
 use adx_agent_store::{AgentState, RedisRepository};
@@ -18,12 +18,12 @@ impl LocalControl {
     pub async fn connect(
         redis_url: &str,
         namespace: &str,
-        sandbox: Arc<dyn Sandbox>,
+        environment: Arc<dyn Environment>,
     ) -> Result<Self> {
         let store = RedisRepository::connect(redis_url, namespace, Duration::from_secs(3)).await?;
         Ok(Self::new(Arc::new(Activator::new(
             AgentState::new(Arc::new(store)).with_deployment_credentials()?,
-            sandbox,
+            environment,
         ))))
     }
 

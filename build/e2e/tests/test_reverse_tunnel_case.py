@@ -10,7 +10,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 REPOSITORY = ROOT.parents[1]
 sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(REPOSITORY / 'platform/sdk/sandbox/python'))
+sys.path.insert(0, str(REPOSITORY / 'platform/sdk/environment/python'))
 
 from functional_data_plane import (  # noqa: E402
     TUNNEL_BODY,
@@ -20,7 +20,7 @@ from functional_data_plane import (  # noqa: E402
 
 
 class ReverseTunnelCaseTests(unittest.TestCase):
-    def test_sandbox_probe_flushes_request_and_reads_complete_response(self):
+    def test_environment_probe_flushes_request_and_reads_complete_response(self):
         upstream = http.server.ThreadingHTTPServer(('127.0.0.1', 0), _TunnelUpstream)
         thread = threading.Thread(target=upstream.serve_forever, daemon=True)
         thread.start()

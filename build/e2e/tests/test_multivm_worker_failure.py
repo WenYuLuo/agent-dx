@@ -39,7 +39,7 @@ def inventory():
     }
 
 
-class FakeSandboxError(Exception):
+class FakeEnvironmentError(Exception):
     pass
 
 
@@ -47,10 +47,10 @@ class WorkerFailureTests(unittest.TestCase):
     def exercise(self, route_leaks=False):
         state = {'instances': {}, 'frozen': False, 'signals': [], 'next_id': 0}
 
-        class Sandbox:
+        class Environment:
             def __init__(self, *, node_id, **_options):
                 state['next_id'] += 1
-                self.id = f'sandbox-{node_id}-{state["next_id"]}'
+                self.id = f'environment-{node_id}-{state["next_id"]}'
                 self.node_id = node_id
                 state['instances'][self.id] = node_id
                 self.commands = SimpleNamespace(run=self.command)
@@ -59,10 +59,10 @@ class WorkerFailureTests(unittest.TestCase):
                 if command == 'printf baseline-route':
                     return SimpleNamespace(stdout='baseline-route', exit_code=0)
                 route_withdrawn = (
-                    self.id == 'sandbox-node2-2' and (state['frozen'] or state.get('recovered')) and not route_leaks
+                    self.id == 'environment-node2-2' and (state['frozen'] or state.get('recovered')) and not route_leaks
                 )
                 if route_withdrawn:
-                    raise FakeSandboxError('route withdrawn')
+                    raise FakeEnvironmentError('route withdrawn')
                 response = 'healthy-worker' if self.node_id == 'node1' else 'resumed-admission'
                 return SimpleNamespace(stdout=response, exit_code=0)
 
@@ -112,7 +112,7 @@ class WorkerFailureTests(unittest.TestCase):
                 'get',
             ):
                 instance_id = command[5]
-                failed = instance_id == 'sandbox-node2-2' and state['frozen']
+                failed = instance_id == 'environment-node2-2' and state['frozen']
                 return json.dumps(
                     {
                         'id': instance_id,
@@ -130,7 +130,7 @@ class WorkerFailureTests(unittest.TestCase):
                 state['signals'].append('CONT')
                 state['frozen'] = False
                 state['recovered'] = True
-                state['instances'].pop('sandbox-node2-2', None)
+                state['instances'].pop('environment-node2-2', None)
                 return ''
             raise AssertionError(command)
 
@@ -150,8 +150,8 @@ class WorkerFailureTests(unittest.TestCase):
                         'image',
                         '/run/sandboxd/sandboxd.sock',
                         output,
-                        Sandbox,
-                        FakeSandboxError,
+                        Environment,
+                        FakeEnvironmentError,
                         remote,
                         wait=wait,
                     )
@@ -163,8 +163,8 @@ class WorkerFailureTests(unittest.TestCase):
                     'image',
                     '/run/sandboxd/sandboxd.sock',
                     output,
-                    Sandbox,
-                    FakeSandboxError,
+                    Environment,
+                    FakeEnvironmentError,
                     remote,
                     wait=wait,
                 )

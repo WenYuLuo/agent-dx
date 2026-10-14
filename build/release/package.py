@@ -39,8 +39,8 @@ def assemble(binary_dir, redis, redis_cli, wheel, output, commit, dirty, target,
     inputs["bin/redis-cli"] = redis_cli
     inputs["install.sh"] = ROOT / "build/release/install.sh"
     inputs["lib/package_manifest.py"] = ROOT / "build/release/package_manifest.py"
-    if not wheel.name.startswith("adx_sandbox-") or wheel.suffix != ".whl":
-        raise ValueError("an adx_sandbox wheel is required")
+    if not wheel.name.startswith("adx_environment-") or wheel.suffix != ".whl":
+        raise ValueError("an adx_environment wheel is required")
     inputs[f"sdk/{wheel.name}"] = wheel
     for source in inputs.values():
         if source.is_symlink() or not source.is_file():

@@ -53,7 +53,7 @@ class ReleaseArchiveTests(unittest.TestCase):
             redis_cli = root / 'redis-cli'
             redis_cli.write_text('#!/bin/sh\necho "redis-cli 7.2.5"\n')
             redis_cli.chmod(0o755)
-            wheel = root / 'adx_sandbox-0.1.0-py3-none-any.whl'
+            wheel = root / 'adx_environment-0.1.0-py3-none-any.whl'
             wheel.write_bytes(b'fixture wheel')
             built = root / 'built'
             package.assemble(

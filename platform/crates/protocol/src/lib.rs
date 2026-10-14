@@ -7,8 +7,8 @@ pub mod control {
 
 pub use adx_core::valid_runtime_id;
 use adx_core::{Error, Result};
+mod execution;
 mod probes;
-mod sandbox;
 mod scheduling;
 
 impl From<adx_core::Resources> for control::Resources {
@@ -51,8 +51,8 @@ impl TryFrom<control::EnvironmentSpec> for adx_core::EnvironmentSpec {
                 .map(TryInto::try_into)
                 .transpose()?
                 .unwrap_or_default(),
-            sandbox: value
-                .sandbox
+            execution: value
+                .execution
                 .map(TryInto::try_into)
                 .transpose()?
                 .unwrap_or_default(),
@@ -76,7 +76,7 @@ impl From<adx_core::EnvironmentSpec> for control::EnvironmentSpec {
             resources: Some(value.resources.into()),
             priority: value.priority,
             scheduling: Some(value.scheduling.into()),
-            sandbox: Some(value.sandbox.into()),
+            execution: Some(value.execution.into()),
         }
     }
 }
@@ -152,7 +152,7 @@ mod tests {
                 disk_bytes: u64::MAX,
             },
             priority: -10,
-            sandbox: Default::default(),
+            execution: Default::default(),
         };
         let bytes = control::EnvironmentSpec::from(value.clone()).encode_to_vec();
         let decoded = control::EnvironmentSpec::decode(bytes.as_slice()).unwrap();

@@ -48,7 +48,7 @@ logging:
 
 Collector 只读活动文件与未压缩归档，排除 `.gz`/`.tmp`，避免把同一日志当成两份输入。采集端停机超过未压缩窗口可能造成未读取日志无法实时补传；压缩归档可另行离线导入，但需自行处理重复。读取位置和有界发送队列持久化可覆盖正常重启与短期后端故障，不承诺任意崩溃/磁盘丢失下的 exactly-once。
 
-Collector 自身指标使用独立的 `127.0.0.1:18888/metrics`，避开 Sandbox API 的 8888 端口。Collector 的内存限制、发送队列和重试可独立配置。Collector 不在实例生命周期调用链内；后端不可用时实例操作继续。队列耗尽会产生背压，进而可能超过文件保留窗口，必须监控 Collector 自身的发送失败、排队及内存指标。
+Collector 自身指标使用独立的 `127.0.0.1:18888/metrics`，避开 Environment API 的 8888 端口。Collector 的内存限制、发送队列和重试可独立配置。Collector 不在实例生命周期调用链内；后端不可用时实例操作继续。队列耗尽会产生背压，进而可能超过文件保留窗口，必须监控 Collector 自身的发送失败、排队及内存指标。
 
 已验证的 Collector 0.161.0 自身指标包括 `otelcol_exporter_queue_size`、`otelcol_exporter_queue_capacity`、`otelcol_exporter_sent_log_records`、`otelcol_receiver_accepted_log_records`、`otelcol_receiver_refused_log_records`。队列单位为批次；重试中的请求不等同于最终丢弃。
 

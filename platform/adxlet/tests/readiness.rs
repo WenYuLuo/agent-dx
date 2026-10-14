@@ -61,7 +61,7 @@ fn record() -> EnvironmentRecord {
                 disk_bytes: 1 << 30,
             },
             priority: 0,
-            sandbox: Default::default(),
+            execution: Default::default(),
         },
         assignment: Assignment {
             devices: vec![],

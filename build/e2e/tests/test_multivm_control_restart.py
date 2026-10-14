@@ -16,9 +16,9 @@ class ControlRestartTests(unittest.TestCase):
         if roles == ('ingress',):
             state['pids']['ingress'] = 13
 
-        class Sandbox:
+        class Environment:
             def __init__(self, *, node_id, **_options):
-                self.id = 'sandbox-' + node_id
+                self.id = 'environment-' + node_id
                 self.commands = SimpleNamespace(run=lambda _command: SimpleNamespace(
                     exit_code=0, stdout='control-restart'))
                 self.files = SimpleNamespace(write=lambda *_args: None,
@@ -94,13 +94,13 @@ class ControlRestartTests(unittest.TestCase):
                 with self.assertRaisesRegex(AssertionError, expected):
                     run_control_restarts(inventory(), object(), 'image',
                                          '/run/sandboxd/sandboxd.sock', output,
-                                         Sandbox, remote, wait, roles=roles)
+                                         Environment, remote, wait, roles=roles)
                 self.assertEqual(json.loads((output / 'control-restart-result.json').read_text())['status'],
                                  'failed')
             else:
                 report = run_control_restarts(inventory(), object(), 'image',
                                               '/run/sandboxd/sandboxd.sock', output,
-                                              Sandbox, remote, wait, roles=roles)
+                                              Environment, remote, wait, roles=roles)
                 self.assertEqual(report['status'], 'passed')
                 self.assertEqual(state['restarts'],
                                  list(roles or ('coordinator', 'apiserver', 'redis')))

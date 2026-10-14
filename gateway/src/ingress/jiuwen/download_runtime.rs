@@ -1,12 +1,12 @@
-//! Jiuwen download claims checked against the common Sandbox file capability.
+//! Jiuwen download claims checked against the common Environment file capability.
 use super::{
     download_config::DownloadConfig,
     download_token::{
         CheckedDownload, DownloadVerifier, TokenError, MAX_REGISTRATION_BYTES, MAX_SECRET_BYTES,
     },
 };
-pub use crate::ingress::sandbox_files::ReadError;
-use crate::ingress::{sandbox_files::Files, server::Ingress};
+pub use crate::ingress::environment_files::ReadError;
+use crate::ingress::{environment_files::Files, server::Ingress};
 use adx_agent_api::request::RequestContext;
 use bytes::Bytes;
 use std::sync::Arc;
@@ -31,14 +31,14 @@ impl Reader {
         ingress: &Arc<Ingress>,
         context: &RequestContext,
         tenant: &str,
-        sandbox_id: &str,
+        environment_id: &str,
     ) -> Result<Self, ReadError> {
         Ok(Self {
-            files: Files::new(ingress, context.deadline(), tenant, sandbox_id)?,
+            files: Files::new(ingress, context.deadline(), tenant, environment_id)?,
             deadline: context.deadline(),
         })
     }
-    /// Admit a download using the same template version as this Sandbox's binding.
+    /// Admit a download using the same template version as this Environment's binding.
     /// Reads the existing key only when config lacks an explicit secret, then the
     /// signed asset's registration (verified only) and file metadata over Execd.
     /// Returns read errors or signature/claim/registration errors. The result is a

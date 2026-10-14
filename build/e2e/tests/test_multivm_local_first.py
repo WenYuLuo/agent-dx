@@ -51,7 +51,7 @@ class LocalFirstTests(unittest.TestCase):
         state = {'live': {}, 'all': {}, 'claimed': set(), 'fallback_count': 0, 'deleted': set()}
         mutex = threading.Lock()
 
-        class Sandbox:
+        class Environment:
             def __init__(self, *, name, cpu, node_id=None, **_options):
                 self.id = 'tenant-' + name
                 self.commands = SimpleNamespace(
@@ -158,7 +158,7 @@ class LocalFirstTests(unittest.TestCase):
                         'image',
                         '/run/sandboxd/sandboxd.sock',
                         output,
-                        Sandbox,
+                        Environment,
                         Conflict,
                         resources,
                         remote,
@@ -174,7 +174,7 @@ class LocalFirstTests(unittest.TestCase):
                     'image',
                     '/run/sandboxd/sandboxd.sock',
                     output,
-                    Sandbox,
+                    Environment,
                     Conflict,
                     resources,
                     remote,

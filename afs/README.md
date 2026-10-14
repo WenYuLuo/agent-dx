@@ -31,7 +31,7 @@ FUSE 依赖使用根工作区声明的官方固定 `fuser =0.18.0`。
 
 Meta 推荐使用 `local-file` 持久后端。`memory` 仅适合一次性演示；etcd、Redis、
 多 Meta/HA、完整 POSIX、跨节点文件锁、复杂故障矩阵和性能达标不在当前承诺内。
-Operator 负责创建 namespace/root grant、配置挂载和回收引用；Sandbox 创建尚不会
+Operator 负责创建 namespace/root grant、配置挂载和回收引用；Environment 创建尚不会
 自动 provision/mount/reclaim AFS。
 
 ## 构建入口

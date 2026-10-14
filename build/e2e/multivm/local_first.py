@@ -92,8 +92,8 @@ def run_local_first(
     image,
     socket,
     output,
-    sandbox_factory=None,
-    sandbox_error=None,
+    environment_factory=None,
+    environment_error=None,
     resource_reader=None,
     remote=ssh,
     claims=claimed_ids,
@@ -101,11 +101,11 @@ def run_local_first(
     wait=wait_until,
 ):
     verify_inventory(inventory)
-    if sandbox_factory is None or sandbox_error is None or resource_reader is None:
-        from adx_sandbox import Sandbox, SandboxError, resources
+    if environment_factory is None or environment_error is None or resource_reader is None:
+        from adx_environment import Environment, EnvironmentError, resources
 
-        sandbox_factory = sandbox_factory or Sandbox
-        sandbox_error = sandbox_error or SandboxError
+        environment_factory = environment_factory or Environment
+        environment_error = environment_error or EnvironmentError
         resource_reader = resource_reader or resources
     machines = {machine['role']: machine for machine in inventory['machines']}
     control = machines['control']
@@ -123,7 +123,7 @@ def run_local_first(
     prefix = 'mv-lf-' + uuid.uuid4().hex[:12]
 
     def create(name, **options):
-        return sandbox_factory(
+        return environment_factory(
             name=name,
             image=image,
             runtime='runc',
@@ -135,8 +135,8 @@ def run_local_first(
             **options,
         )
 
-    def assigned(sandbox):
-        record = persisted_assignment(control, sandbox.id, remote)
+    def assigned(environment):
+        record = persisted_assignment(control, environment.id, remote)
         if (
             record.get('node_id') not in worker_ids
             or record.get('state') != 'Running'
@@ -145,10 +145,10 @@ def run_local_first(
             raise AssertionError(f'invalid local-first assignment: {record}')
         return record
 
-    def physical(sandbox, owner):
-        observed = {worker['node_id']: backend_ids(worker, socket, sandbox.id, remote) for worker in workers}
+    def physical(environment, owner):
+        observed = {worker['node_id']: backend_ids(worker, socket, environment.id, remote) for worker in workers}
         if len(observed[owner]) != 1 or any(ids for node_id, ids in observed.items() if node_id != owner):
-            raise AssertionError(f'duplicate or misplaced physical backend: {sandbox.id} {observed}')
+            raise AssertionError(f'duplicate or misplaced physical backend: {environment.id} {observed}')
         return observed
 
     def available_cpu(node_id):
@@ -164,7 +164,7 @@ def run_local_first(
         handles.append(first)
         second = create(prefix + '-b')
         handles.append(second)
-        owners = [assigned(sandbox)['node_id'] for sandbox in (first, second)]
+        owners = [assigned(environment)['node_id'] for environment in (first, second)]
         if set(owners) != worker_ids:
             raise AssertionError(f'local-first entry rotation did not reach both workers: {owners}')
         report['checks'].append('entry-rotation')
@@ -189,7 +189,7 @@ def run_local_first(
         physical(copies[0], owner)
         report['checks'].append('same-id-atomic-claim')
         try:
-            changed = sandbox_factory(
+            changed = environment_factory(
                 name=prefix + '-race',
                 image=image,
                 runtime='runc',
@@ -199,7 +199,7 @@ def run_local_first(
                 connection=connection,
                 create_timeout=150,
             )
-        except sandbox_error as error:
+        except environment_error as error:
             if error.code != 'CONFLICT' or error.retry != 'never' or error.outcome != 'not_started':
                 raise AssertionError(f'unexpected specification conflict contract: {error}') from error
         else:
@@ -212,8 +212,8 @@ def run_local_first(
         report['checks'].append('local-claim-log-evidence')
 
         reserved = {worker['node_id']: 0 for worker in workers}
-        for sandbox in (first, second, copies[0]):
-            reserved[assigned(sandbox)['node_id']] += 500
+        for environment in (first, second, copies[0]):
+            reserved[assigned(environment)['node_id']] += 500
         wait(
             lambda: all(available_cpu(node_id) == initial[node_id] - amount for node_id, amount in reserved.items()),
             'initial local claims were not visible in scheduler resources',
@@ -221,15 +221,15 @@ def run_local_first(
         before_fallback = available_cpu(workers[1]['node_id'])
         fallback = []
         for index in (1, 2):
-            sandbox = create(prefix + f'-fallback-{index}', node_id=workers[1]['node_id'])
-            handles.append(sandbox)
-            fallback.append(sandbox)
-        fallback_ids_local = {sandbox.id for sandbox in fallback}
-        for sandbox in fallback:
-            record = assigned(sandbox)
+            environment = create(prefix + f'-fallback-{index}', node_id=workers[1]['node_id'])
+            handles.append(environment)
+            fallback.append(environment)
+        fallback_ids_local = {environment.id for environment in fallback}
+        for environment in fallback:
+            record = assigned(environment)
             if record['node_id'] != workers[1]['node_id']:
                 raise AssertionError('node constraint was ignored during fallback')
-            physical(sandbox, workers[1]['node_id'])
+            physical(environment, workers[1]['node_id'])
         # With two available entries, two sequential requests constrained to
         # worker 2 must include one local claim and one central fallback.
 
@@ -258,17 +258,17 @@ def run_local_first(
         report['fallback']['cpu_millis_delta'] = 1000
         report['checks'].append('single-resource-accounting')
 
-        unique = {sandbox.id: sandbox for sandbox in handles}
+        unique = {environment.id: environment for environment in handles}
         if len(unique) != 5:
             raise AssertionError('duplicate request created another ownership identity')
-        for sandbox in unique.values():
-            record = assigned(sandbox)
-            physical(sandbox, record['node_id'])
-            result = sandbox.commands.run('printf local-first-three-vm')
+        for environment in unique.values():
+            record = assigned(environment)
+            physical(environment, record['node_id'])
+            result = environment.commands.run('printf local-first-three-vm')
             if result.exit_code != 0 or result.stdout != 'local-first-three-vm':
-                raise AssertionError(f'{sandbox.id} command failed after ownership confirmation')
+                raise AssertionError(f'{environment.id} command failed after ownership confirmation')
             report['instances'].append(
-                {'id': sandbox.id, 'node_id': record['node_id'], 'generation': record['generation']}
+                {'id': environment.id, 'node_id': record['node_id'], 'generation': record['generation']}
             )
         report['checks'].append('one-backend-per-assignment')
     except Exception as error:
@@ -276,18 +276,18 @@ def run_local_first(
         raise
     finally:
         removed = set()
-        for sandbox in reversed(handles):
+        for environment in reversed(handles):
             try:
-                if sandbox.id not in removed:
-                    sandbox.kill()
-                    removed.add(sandbox.id)
+                if environment.id not in removed:
+                    environment.kill()
+                    removed.add(environment.id)
             except Exception as error:
-                report['cleanup_errors'].append(f'{sandbox.id} delete: {error}')
+                report['cleanup_errors'].append(f'{environment.id} delete: {error}')
             finally:
                 try:
-                    sandbox.close()
+                    environment.close()
                 except Exception as error:
-                    report['cleanup_errors'].append(f'{sandbox.id} close: {error}')
+                    report['cleanup_errors'].append(f'{environment.id} close: {error}')
         try:
             deadline = time.monotonic() + 15
             while removed:
@@ -332,7 +332,7 @@ def main():
     parser.add_argument('--output', required=True, type=Path)
     args = parser.parse_args()
     os.environ['SSL_CERT_FILE'] = str(args.ca.resolve())
-    from adx_sandbox import ConnectionConfig
+    from adx_environment import ConnectionConfig
 
     connection = ConnectionConfig(
         server_address=args.endpoint,

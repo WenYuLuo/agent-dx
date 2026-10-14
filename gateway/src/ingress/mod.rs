@@ -32,7 +32,7 @@ pub use server::{
 pub use service::IngressService;
 
 #[cfg(feature = "agent-api")]
-pub mod sandbox_files;
+pub mod environment_files;
 
 #[cfg(feature = "agent-api")]
 pub mod agent_api;

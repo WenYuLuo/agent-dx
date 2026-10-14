@@ -7,7 +7,7 @@ import os
 import sys
 from pathlib import Path
 
-from adx_sandbox import CommandStatus, ConnectionConfig, Sandbox
+from adx_environment import CommandStatus, ConnectionConfig, Environment
 
 
 def main(image, output):
@@ -18,7 +18,7 @@ def main(image, output):
         use_tls=True,
         verify_tls=True,
     )
-    sandbox = Sandbox(
+    environment = Environment(
         image=image,
         runtime='runc',
         cpu=500,
@@ -30,13 +30,13 @@ def main(image, output):
         create_timeout=150,
     )
     try:
-        command = sandbox.commands.run('sleep 120', background=True, command_id='idle-client-exit')
+        command = environment.commands.run('sleep 120', background=True, command_id='idle-client-exit')
         if not (command.poll() == CommandStatus.RUNNING):
             raise AssertionError()
         output.write_text(
             json.dumps(
                 {
-                    'instance_id': sandbox.id,
+                    'instance_id': environment.id,
                     'command_id': command.id,
                     'command_running_before_exit': True,
                     'client_pid': os.getpid(),
@@ -46,12 +46,12 @@ def main(image, output):
         )
     except Exception:
         try:
-            sandbox.kill()
+            environment.kill()
         except Exception:
             logging.getLogger(__name__).debug("Best-effort operation failed", exc_info=True)
         raise
     finally:
-        sandbox.close()
+        environment.close()
 
 
 if __name__ == '__main__':

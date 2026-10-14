@@ -9,7 +9,7 @@ from command_response_cut import CommandResponseCutProxy
 
 
 def run(connection, image, output, secrets):
-    from adx_sandbox import ConnectionConfig, Sandbox, UnsupportedFeature
+    from adx_environment import ConnectionConfig, Environment, UnsupportedFeature
     from functional_lifecycle import _wait_deleted
     from node import catalog, labeled_backend
 
@@ -18,7 +18,7 @@ def run(connection, image, output, secrets):
     name = 'unsupported-' + uuid.uuid4().hex[:12]
     command_id = 'unsupported-' + uuid.uuid4().hex[:12]
     marker = str(PurePosixPath('/tmp') / f'{command_id}.marker')
-    sandbox = None
+    environment = None
     attached = None
     recovered = None
     deleted = False
@@ -31,7 +31,7 @@ def run(connection, image, output, secrets):
         strip_watch_capability=True,
     )
     try:
-        sandbox = Sandbox(
+        environment = Environment(
             name=name,
             image=image,
             runtime='runc',
@@ -43,8 +43,8 @@ def run(connection, image, output, secrets):
             connection=connection,
             create_timeout=150,
         )
-        initial = json.loads(catalog()['environment:' + sandbox.id])
-        backend = labeled_backend(sandbox.id)
+        initial = json.loads(catalog()['environment:' + environment.id])
+        backend = labeled_backend(environment.id)
         if not (len(backend) == 1):
             raise AssertionError(backend)
 
@@ -55,7 +55,7 @@ def run(connection, image, output, secrets):
                 use_tls=True,
                 verify_tls=True,
             )
-            attached = Sandbox.from_id(sandbox.id, connection=proxied)
+            attached = Environment.from_id(environment.id, connection=proxied)
             try:
                 attached.commands.run(
                     f'printf x > {marker}',
@@ -63,7 +63,7 @@ def run(connection, image, output, secrets):
                     command_id=command_id,
                 )
             except UnsupportedFeature as error:
-                if not (error.sandbox_id == sandbox.id):
+                if not (error.environment_id == environment.id):
                     raise AssertionError(error) from error
                 if not (error.command_id == command_id):
                     raise AssertionError(error) from error
@@ -78,7 +78,7 @@ def run(connection, image, output, secrets):
             attached.close()
             attached = None
 
-        recovered = Sandbox.from_id(sandbox.id, connection=connection)
+        recovered = Environment.from_id(environment.id, connection=connection)
         handle = recovered.commands.run(
             f'printf x > {marker}; printf capability-ok',
             background=True,
@@ -94,17 +94,17 @@ def run(connection, image, output, secrets):
         recovered.close()
         recovered = None
 
-        final = json.loads(catalog()['environment:' + sandbox.id])
+        final = json.loads(catalog()['environment:' + environment.id])
         if not (final['assignment']['generation'] == initial['assignment']['generation']):
             raise AssertionError()
-        if not (labeled_backend(sandbox.id) == backend):
+        if not (labeled_backend(environment.id) == backend):
             raise AssertionError()
-        Sandbox.delete(sandbox.id, connection=connection)
+        Environment.delete(environment.id, connection=connection)
         deleted = True
-        _wait_deleted(sandbox.id, connection, timeout=60)
-        if not ('environment:' + sandbox.id not in catalog()):
+        _wait_deleted(environment.id, connection, timeout=60)
+        if not ('environment:' + environment.id not in catalog()):
             raise AssertionError()
-        if not (not labeled_backend(sandbox.id)):
+        if not (not labeled_backend(environment.id)):
             raise AssertionError()
 
         report['status'] = 'passed'
@@ -113,7 +113,7 @@ def run(connection, image, output, secrets):
                 'id': 'command.unsupported-feature',
                 'status': 'passed',
                 'seconds': round(time.monotonic() - started, 3),
-                'instance_id': sandbox.id,
+                'instance_id': environment.id,
                 'command_id': command_id,
                 'rejected_start_attempts': len(proxy.start_attempts),
                 'backend': backend[0],
@@ -128,13 +128,13 @@ def run(connection, image, output, secrets):
             attached.close()
         if recovered is not None:
             recovered.close()
-        if sandbox is not None:
+        if environment is not None:
             if not deleted:
                 try:
-                    Sandbox.delete(sandbox.id, connection=connection)
+                    Environment.delete(environment.id, connection=connection)
                 except Exception as error:
                     report['cleanup_errors'].append(str(error))
-            sandbox.close()
+            environment.close()
         if report['cleanup_errors']:
             report['status'] = 'failed'
         report['capability_attempts'] = proxy.capability_attempts

@@ -30,8 +30,9 @@ class ComponentManifestTests(unittest.TestCase):
             (root / "adx-apiserver").write_bytes(b"fixture")
             (root / "adx-ingress").write_bytes(b"fixture")
             (root / "adx-relay").write_bytes(b"fixture")
+            (root / "adx-activator").write_bytes(b"fixture")
             manifest = component.create_manifest("gateway", root, "a" * 40, "x86_64-unknown-linux-gnu")
-            self.assertEqual(set(manifest["files"]), {"adx-apiserver", "adx-ingress", "adx-relay"})
+            self.assertEqual(set(manifest["files"]), {"adx-apiserver", "adx-ingress", "adx-relay", "adx-activator"})
             component.verify_manifest(root)
             (root / "adx-data-plane-forward").write_bytes(b"unexpected")
             with self.assertRaises(ValueError):
@@ -83,7 +84,7 @@ class ComponentManifestTests(unittest.TestCase):
 
             release = root / "adx-release.tar.gz"
             package_manifest = root / "release-manifest.json"
-            wheel = root / "adx_sandbox-0.1.0-py3-none-any.whl"
+            wheel = root / "adx_environment-0.1.0-py3-none-any.whl"
             backend_manifest = root / "backend-manifest.json"
             backend_archive = root / "backend.tar.gz"
             release.write_bytes(b"release")
@@ -154,7 +155,7 @@ class ComponentManifestTests(unittest.TestCase):
 
             release = root / "adx-release.tar.gz"
             package_manifest = root / "release-manifest.json"
-            wheel = root / "adx_sandbox-0.1.0-py3-none-any.whl"
+            wheel = root / "adx_environment-0.1.0-py3-none-any.whl"
             backend_manifest = root / "backend-manifest.json"
             backend_archive = root / "backend.tar.gz"
             release.write_bytes(b"release")
@@ -192,7 +193,7 @@ class ComponentManifestTests(unittest.TestCase):
 
             release = root / "adx-release.tar.gz"
             package_manifest = root / "release-manifest.json"
-            wheel = root / "adx_sandbox-0.1.0-py3-none-any.whl"
+            wheel = root / "adx_environment-0.1.0-py3-none-any.whl"
             backend_manifest = root / "backend-manifest.json"
             backend_archive = root / "backend.tar.gz"
             release.write_bytes(b"release")

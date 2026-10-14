@@ -38,9 +38,9 @@ class WorkerRestartTests(unittest.TestCase):
                 return {'status': 'failed', 'grpc_code': 'OK'}
             return {'status': 'passed', 'grpc_code': 'FailedPrecondition'}
 
-        class Sandbox:
+        class Environment:
             def __init__(self, *, node_id, **_options):
-                self.id = 'sandbox-' + node_id
+                self.id = 'environment-' + node_id
                 state['live'][self.id] = node_id
                 self.commands = SimpleNamespace(run=lambda command: SimpleNamespace(
                     stdout=command.removeprefix('printf '), exit_code=0))
@@ -95,17 +95,17 @@ class WorkerRestartTests(unittest.TestCase):
             if replacement_backend:
                 with self.assertRaisesRegex(AssertionError, 'changed instance ownership or backend'):
                     run_restart(inventory(), object(), 'image', '/run/sandboxd/sandboxd.sock',
-                                output, Sandbox, remote, wait, probe=probe if fence else None)
+                                output, Environment, remote, wait, probe=probe if fence else None)
                 self.assertEqual(json.loads((output / 'worker-restart-result.json').read_text())['status'], 'failed')
             elif fence_fail or invalid_probe:
                 expected = 'old session commit was accepted' if fence_fail else 'did not prove fencing'
                 with self.assertRaisesRegex(AssertionError, expected):
                     run_restart(inventory(), object(), 'image', '/run/sandboxd/sandboxd.sock',
-                                output, Sandbox, remote, wait, probe=probe)
+                                output, Environment, remote, wait, probe=probe)
                 self.assertEqual(json.loads((output / 'worker-restart-result.json').read_text())['status'], 'failed')
             else:
                 report = run_restart(inventory(), object(), 'image', '/run/sandboxd/sandboxd.sock',
-                                     output, Sandbox, remote, wait, probe=probe if fence else None)
+                                     output, Environment, remote, wait, probe=probe if fence else None)
                 self.assertEqual(report['status'], 'passed')
                 self.assertEqual(report['restart']['new_session'], 'new')
                 self.assertEqual(report['restart']['old_pid'], 234)
@@ -114,7 +114,7 @@ class WorkerRestartTests(unittest.TestCase):
                     self.assertIn('old-session-commit-rejected', report['checks'])
             if fence:
                 self.assertEqual(state['probe_calls'],
-                                 [('node2', 'sandbox-node2', 'old', 'new')])
+                                 [('node2', 'environment-node2', 'old', 'new')])
         self.assertEqual(state['signals'], ['TERM'])
         self.assertFalse(state['live'])
 
@@ -138,17 +138,17 @@ class WorkerRestartTests(unittest.TestCase):
         worker = {'node_id': 'node2'}
         valid = {'status': 'passed', 'grpc_code': 'FailedPrecondition',
                  'record_unchanged': True, 'node_id': 'node2',
-                 'instance_id': 'sandbox-node2', 'old_session': 'old',
+                 'instance_id': 'environment-node2', 'old_session': 'old',
                  'new_session': 'new'}
         with patch('e2e.multivm.worker_restart.subprocess.run') as command:
             command.return_value = SimpleNamespace(returncode=0, stdout=json.dumps(valid),
                                                    stderr='')
             self.assertEqual(run_session_probe('/tmp/probe', control, worker,
-                                               'sandbox-node2', 'old', 'new'), valid)
+                                               'environment-node2', 'old', 'new'), valid)
             self.assertEqual(command.call_args.args[0],
                              ['/tmp/probe', 'control:19000', 'node2',
-                              'sandbox-node2', 'old', 'new'])
+                              'environment-node2', 'old', 'new'])
             command.return_value.stdout = json.dumps({**valid, 'record_unchanged': False})
             with self.assertRaisesRegex(AssertionError, 'did not prove fencing'):
                 run_session_probe('/tmp/probe', control, worker,
-                                  'sandbox-node2', 'old', 'new')
+                                  'environment-node2', 'old', 'new')

@@ -4,14 +4,14 @@
 
 <h3 align="center">Distributed execution substrate for openJiuwen Agent Runtime</h3>
 
-<p align="center"><strong>English</strong> | <a href="README.zh.md">中文</a></p>
+<p align="center"><strong>English</strong> | <a href="README.zh.md">Chinese</a></p>
 
-Agent DX (**Agent Distributed eXecutor**) is a distributed execution substrate for openJiuwen Agent Runtime. Its Agent layer provides Template and AgentBinding management, with stateless Activators starting user Harnesses on demand for HTTP, WebSocket, and SSH access. It also provides a public Sandbox API and SDK, distributed scheduling, isolated execution, traffic routing, runtime operations, checkpoint recovery, and deployment tooling, while keeping the execution backend replaceable.
+Agent DX (**Agent Distributed eXecutor**) is a distributed execution substrate for openJiuwen Agent Runtime. Its Agent layer provides Template and AgentBinding management, with stateless Activators starting user Harnesses on demand for HTTP, WebSocket, and SSH access. It also provides a public Environment API and SDK, distributed scheduling, isolated execution, traffic routing, runtime operations, checkpoint recovery, and deployment tooling, while keeping the execution backend replaceable.
 
 <p align="center">
   <a href="#-quick-start">🚀 Quick start</a> ·
   <a href="docs/architecture/repository-layout.md">📐 Architecture</a> ·
-  <a href="platform/sdk/sandbox/python/README.md">📦 Sandbox SDK</a> ·
+  <a href="platform/sdk/environment/python/README.md">📦 Environment SDK</a> ·
   <a href="docs/deployment/adxctl.md">⚙️ Deployment</a> ·
   <a href="docs/deployment/adxadmin.md">🔐 Administration</a> ·
   <a href="docs/testing/control-plane-ci.md">✅ Test gates</a>
@@ -25,13 +25,13 @@ Agent DX (**Agent Distributed eXecutor**) is a distributed execution substrate f
 | Share execution capacity across agent services and machines | Split-host roles | Persistent Redis, one Coordinator deployment, one or more worker deployments, and a reachable Gateway |
 | Run a production-style cluster with repeatable acceptance | Kubernetes | Linux workers, persistent Redis, component certificates, sandboxd on worker nodes, and the ADX Kubernetes E2E profile |
 | Pause, resume, clone, or recover long-running work | Standalone or distributed | A checkpoint-capable runtime plus local or S3-compatible checkpoint storage |
-| Schedule accelerator workloads | Distributed | GPU/NPU inventory from workers and matching device requests in the Sandbox specification |
+| Schedule accelerator workloads | Distributed | GPU/NPU inventory from workers and matching device requests in the Environment specification |
 
 ## 🧩 How Agent DX fits your stack
 
 | Layer | Owns | Agent DX relationship |
 |---|---|---|
-| Agent framework or application | Prompts, tools, sessions, task logic, and business policy | Calls the public Sandbox SDK or HTTP API; it does not enter platform scheduling or lifecycle state machines |
+| Agent framework or application | Prompts, tools, sessions, task logic, and business policy | Calls the public Environment SDK or HTTP API; it does not enter platform scheduling or lifecycle state machines |
 | Agent DX | Authentication, placement, Environment state, routing, recovery, and observability | Provides one distributed execution contract across nodes and execution backends |
 | sandboxd | Runtime creation, isolation, networking, and checkpoint primitives | Runs as an external service on each worker and is accessed through the adxlet runtime driver |
 | Execd inside the Runtime | Commands, files, terminals, ports, activity, and runtime recovery cooperation | Receives data traffic through Ingress and Relay after ownership and generation checks |
@@ -43,7 +43,7 @@ Agent DX (**Agent Distributed eXecutor**) is a distributed execution substrate f
 
 | Step | What happens | Where it lives |
 |---|---|---|
-| 1 · Access | A caller authenticates and creates or operates a Sandbox through one public contract. | `gateway/apiserver/`, `platform/sdk/sandbox/python/` |
+| 1 · Access | A caller authenticates and creates or operates an Environment through one public contract. | `gateway/apiserver/`, `platform/sdk/environment/python/` |
 | 2 · Place | API Server uses local-first admission or sends the request to Coordinator. Coordinator rotates across Shards; each Shard queues, filters, scores, and reserves a node. | `platform/coordinator/`, `platform/crates/scheduling/` |
 | 3 · Run | adxlet performs final local admission, serializes the Environment lifecycle, and asks sandboxd to create a Runtime with Execd. | `platform/adxlet/`, `third_party/sandboxd/`, `platform/runtime/execd/` |
 | 4 · Operate and recover | Ingress routes data to the owning Relay. Versioned ownership fences old Runtimes; pause, resume, snapshots, restart policy, and reconciliation converge state after failures. | `gateway/`, `platform/adxlet/`, Redis, checkpoint storage |
@@ -52,7 +52,7 @@ API Server embeds Ingress by default, and adxlet embeds Relay by default. Both p
 
 ## 📦 Installation
 
-ADX release packages target Linux and contain `adx-coordinator`, `adxlet` (embedded Relay by default), `adx-apiserver` (embedded Ingress by default), the optional standalone `adx-ingress` and `adx-relay` binaries, `adxctl`, the read-only [`adx-inspect`](docs/deployment/adx-inspect.md), Execd, the Python Sandbox SDK, and managed Redis with `redis-cli`. The debug forwarder is a source-build tool. sandboxd remains independently managed and is pinned by [`third_party/sandboxd/source.json`](third_party/sandboxd/source.json).
+ADX release packages target Linux and contain `adx-coordinator`, `adxlet` (embedded Relay by default), `adx-apiserver` (embedded Ingress by default), the optional standalone `adx-ingress` and `adx-relay` binaries, `adxctl`, the read-only [`adx-inspect`](docs/deployment/adx-inspect.md), Execd, the Python Environment SDK, and managed Redis with `redis-cli`. The debug forwarder is a source-build tool. sandboxd remains independently managed and is pinned by [`third_party/sandboxd/source.json`](third_party/sandboxd/source.json).
 
 ```sh
 mkdir adx-release
@@ -91,36 +91,36 @@ In another terminal, install the packaged SDK and point it at the public Gateway
 
 ```sh
 python3 -m venv /opt/adx-client
-/opt/adx-client/bin/python -m pip install /opt/adx/current/sdk/adx_sandbox-*.whl
+/opt/adx-client/bin/python -m pip install /opt/adx/current/sdk/adx_environment-*.whl
 
 export ADX_SERVER_ADDRESS=adx.example.com:8443
 export ADX_GATEWAY_ADDRESS=adx.example.com:8443
 export ADX_TOKEN="$(cat /secure/path/tenant-api-key)"
 export ADX_TLS=1
 export ADX_GATEWAY_TLS=1
-export ADX_SANDBOX_IMAGE=python:3.12-slim
+export ADX_ENVIRONMENT_IMAGE=python:3.12-slim
 ```
 
-Create a Sandbox, execute through Execd, and delete it explicitly:
+Create an Environment, execute through Execd, and delete it explicitly:
 
 ```python
 import os
-from adx_sandbox import Sandbox
+from adx_environment import Environment
 
-sandbox = Sandbox(
-    image=os.environ["ADX_SANDBOX_IMAGE"],
+environment = Environment(
+    image=os.environ["ADX_ENVIRONMENT_IMAGE"],
     cpu=1000,
     memory=2048,
     name="readme-demo",
 )
 try:
-    result = sandbox.commands.run("printf 'hello from ADX\\n'")
+    result = environment.commands.run("printf 'hello from ADX\\n'")
     print(result.stdout)
 finally:
-    sandbox.kill()
+    environment.kill()
 ```
 
-The image must be supported by the configured sandboxd and [ADX Runtime Environment](docs/deployment/runtime-environment.md). See the [Sandbox SDK guide](platform/sdk/sandbox/python/README.md) for pause/resume, reusable snapshots, placement, mounts, network configuration, data-plane security, and retry semantics.
+The image must be supported by the configured sandboxd and [ADX Runtime Environment](docs/deployment/runtime-environment.md). See the [Environment SDK guide](platform/sdk/environment/python/README.md) for pause/resume, reusable snapshots, placement, mounts, network configuration, data-plane security, and retry semantics.
 
 ## 🏗️ Deployment options
 
@@ -142,8 +142,8 @@ ADX separates stable logical identity from replaceable execution:
 
 | Abstraction | Meaning and boundary |
 |---|---|
-| `AgentBinding` | Business identity `(tenant, template, version, binding_id)` mapped to a stable `sandbox_id`; managed through stateless Activators |
-| `Sandbox` | Public API and SDK handle presented to applications |
+| `AgentBinding` | Business identity `(tenant, template, version, binding_id)` mapped to a stable `environment_id`; managed through stateless Activators |
+| `Environment` | Public API and SDK handle presented to applications |
 | Platform `Environment` | Stable internal identity containing tenant, specification, lifecycle, and desired/observed state |
 | `RuntimeProfile` | Deployment-owned rootfs, bootstrap and startup variables; configuration rather than a running Environment |
 | `Runtime` | One concrete sandboxd execution of an Environment on one node; restart or recovery may replace it |
@@ -152,7 +152,7 @@ ADX separates stable logical identity from replaceable execution:
 | `Restore Point` / `Snapshot` | A restore point keeps the Environment ID; a reusable Snapshot creates a new Environment |
 | `Request ID` / `Operation ID` | One logical write identity for retry, deduplication, result lookup, and reconciliation |
 
-The fixed control path is Agent/application → Sandbox SDK/HTTP API → API Server → Coordinator/Shard scheduler or local-first adxlet → sandboxd. Runtime traffic follows Ingress → Relay → Execd and does not enter lifecycle queues. Compatibility fields such as `instanceId`, `instance_id`, and `/api/instances` are translated at the public boundary; internal Rust types, RPCs, persistence keys, metrics, and runtime identity use Environment terminology.
+The fixed control path is Agent/application → Environment SDK/HTTP API → API Server → Coordinator/Shard scheduler or local-first adxlet → sandboxd. Runtime traffic follows Ingress → Relay → Execd and does not enter lifecycle queues. Public lifecycle and error payloads identify the Environment with `environmentId`. The directory keeps `/api/instances` and its `instance_id` query parameter; internal Rust types, RPCs, persistence keys, metrics, and runtime identity use Environment terminology.
 
 Execd can initiate a dedicated bidirectional control stream to adxlet, publishing Ready and checkpoint state while receiving checkpoint commands. Enable it with the [node runtime-control configuration](docs/deployment/runtime-control-stream.md); both the node binary and the Execd inside the runtime image must be updated. Without that configuration, runtime cooperation uses HTTP. The [contract](platform/api/proto/runtime-control.md) and [component validation](docs/testing/runtime-control-stream.md) describe identity fencing, reconnect and acknowledgements after authoritative result submission.
 
@@ -179,9 +179,9 @@ make help
 make rust-check
 make rust-test
 make agent-test
-PYTHONPATH=platform/sdk/sandbox/python \
-  python -m pytest -q -c platform/sdk/sandbox/pytest.ini \
-  platform/sdk/sandbox/python/tests
+PYTHONPATH=platform/sdk/environment/python \
+  python -m pytest -q -c platform/sdk/environment/pytest.ini \
+  platform/sdk/environment/python/tests
 make package PYTHON=/path/to/venv/bin/python
 ```
 
@@ -206,7 +206,7 @@ The subsystem responsibilities and current limits are in [architecture](docs/arc
 evidence remain under `docs/migration/`. The packaged configuration examples live under
 [AFS examples](build/config/examples/afs/). Ordinary release packages do not include them unless `ADX_WITH_AFS=1` is set.
 
-Run component and integration suites with `python3 build/ci/run.py <suite>`. End-to-end gates use installed release artifacts, the public Sandbox SDK, Redis, Gateway, the control plane, sandboxd, and Execd. Environment requirements and gate definitions are in [control-plane CI](docs/testing/control-plane-ci.md) and the [Kubernetes E2E guide](build/e2e/kubernetes/README.md).
+Run component and integration suites with `python3 build/ci/run.py <suite>`. End-to-end gates use installed release artifacts, the public Environment SDK, Redis, Gateway, the control plane, sandboxd, and Execd. Environment requirements and gate definitions are in [control-plane CI](docs/testing/control-plane-ci.md) and the [Kubernetes E2E guide](build/e2e/kubernetes/README.md).
 
 Buildkite uses independent `agent-dx` (including SDK, adxadmin and K8s L0), `agent-dx-python-sdk`, `agent-dx-admin`,
 and `agent-dx-full-test` pipelines. The SDK and admin pipelines always build and
@@ -215,20 +215,25 @@ tag-gated option. The Full pipeline
 consumes explicit base-package and SDK build UUIDs and does not rebuild either candidate. See the
 [Buildkite pipeline contract](.buildkite/README.md).
 
-基础出包流水线包含并行的 Linux amd64 / arm64 出包。两种架构使用同样的编译、组包、发布和索引流程；x86 跑测试，ARM 默认只编译与校验产物，可通过 `ADX_ARM_TESTS=1` 开启测试。ARM 在原生 ARM worker 的 Linux 容器中构建；产物及 OBS 路径按架构隔离。Kubernetes L0 当前验证 amd64，详见 [流水线说明](.buildkite/README.md#parallel-linux-arm64-packages)。
+The base-package pipeline builds Linux amd64 and arm64 packages in parallel.
+Both architectures use the same compilation, assembly, publication, and indexing
+steps. Tests run on x86; ARM builds and validates artifacts by default, with
+tests available through `ADX_ARM_TESTS=1`. ARM builds run in Linux containers on
+native ARM workers. Artifacts and OBS paths are separated by architecture.
+Kubernetes L0 currently validates amd64. See the
+[pipeline guide](.buildkite/README.md#parallel-linux-arm64-packages).
 
-
-The SDK distribution is `adx-sandbox`, its Python import is `adx_sandbox`, and its CLI is `adx-sandbox`. ADX environment variables use the `ADX_` prefix, and internal branded HTTP headers use `X-ADX-`.
+The SDK distribution is `adx-environment`, its Python import is `adx_environment`, and its CLI is `adx-environment`. ADX environment variables use the `ADX_` prefix, and internal branded HTTP headers use `X-ADX-`.
 
 ## 📚 Learn more
 
 - [Architecture and repository layout](docs/architecture/repository-layout.md)
 - [Agent usage](agent/README.md)
-- [Sandbox API](gateway/apiserver/docs/sandbox-lifecycle-api.md) and [OpenAPI](platform/api/openapi/sandbox.yaml)
+- [Environment API](gateway/apiserver/docs/environment-lifecycle-api.md) and [OpenAPI](platform/api/openapi/environment.yaml)
 - [Coordinator autoscaling HTTP](docs/deployment/coordinator-autoscaling.md)
 - [Data-plane OpenAPI](platform/api/openapi/data-plane.yaml)
 - [Runtime HTTP actions and errors](platform/api/http/runtime-data.md)
-- [Sandbox Python SDK](platform/sdk/sandbox/python/README.md)
+- [Environment Python SDK](platform/sdk/environment/python/README.md)
 - [Deployment configuration](docs/deployment/adxctl.md) and [examples](build/config/examples/README.md)
 - [Remote cluster administration](docs/deployment/adxadmin.md) and [API Key management](docs/testing/api-key-management.md)
 - [Scheduling](docs/testing/scheduling-performance.md), [node lifecycle](docs/testing/node-lifecycle.md), and [route publication](docs/testing/route-publication.md)

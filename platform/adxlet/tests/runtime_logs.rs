@@ -22,17 +22,25 @@ fn policy(root: &std::path::Path) -> RuntimeLogPolicy {
 fn runtime_paths_are_distinct_and_cannot_escape_the_log_directory() {
     let directory = tempfile::tempdir().unwrap();
     let logs = RuntimeLogs::new(policy(directory.path())).unwrap();
-    let (out, err) = logs.paths("sandbox-1-r2").unwrap();
+    let (out, err) = logs.paths("environment-1-r2").unwrap();
     assert_eq!(
         out,
-        directory.path().join("sandbox-1-r2.out").to_str().unwrap()
+        directory
+            .path()
+            .join("environment-1-r2.out")
+            .to_str()
+            .unwrap()
     );
     assert_eq!(
         err,
-        directory.path().join("sandbox-1-r2.err").to_str().unwrap()
+        directory
+            .path()
+            .join("environment-1-r2.err")
+            .to_str()
+            .unwrap()
     );
     assert!(logs.paths("../outside").is_err());
-    assert!(logs.paths("sandbox/other").is_err());
+    assert!(logs.paths("environment/other").is_err());
 }
 
 #[test]

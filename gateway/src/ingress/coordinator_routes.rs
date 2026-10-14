@@ -122,8 +122,8 @@ fn route_info(r: &pb::PublishedRoute) -> Result<RouteInfo, String> {
     Ok(RouteInfo {
         instance_id: r.environment_id.clone(),
         tenant_id: r.tenant_id.clone(),
-        sandbox_id: r.runtime_id.clone(),
-        sandbox_ip: r.runtime_ip.clone(),
+        environment_id: r.runtime_id.clone(),
+        environment_ip: r.runtime_ip.clone(),
         relay_address: r.relay_address.clone(),
         environment_status: EnvironmentStatus {
             code: 3,
@@ -348,19 +348,19 @@ impl super::resolver::DemandResolver for CoordinatorConnection {
             return Err(ResolveError::NotFound);
         }
         let runtime = record.runtime.as_ref().ok_or(ResolveError::NotFound)?;
-        let data_plane = spec.sandbox.as_ref().and_then(|s| s.data_plane.as_ref());
+        let data_plane = spec.execution.as_ref().and_then(|s| s.data_plane.as_ref());
         let tunnel_security_mode =
             security_mode(data_plane.map_or(0, |d| d.tunnel)).map_err(ResolveError::Unavailable)?;
         let forwarding = security_mode(data_plane.map_or(0, |d| d.port_forward))
             .map_err(ResolveError::Unavailable)?;
         let effective = |mode| match mode {
             DataPlaneSecurityMode::Inherit => {
-                match adx_core::sandbox::DataPlaneSecurityMode::Inherit.effective() {
-                    adx_core::sandbox::DataPlaneSecurityMode::TlsToken => {
+                match adx_core::execution::DataPlaneSecurityMode::Inherit.effective() {
+                    adx_core::execution::DataPlaneSecurityMode::TlsToken => {
                         DataPlaneSecurityMode::TlsToken
                     }
-                    adx_core::sandbox::DataPlaneSecurityMode::Tls => DataPlaneSecurityMode::Tls,
-                    adx_core::sandbox::DataPlaneSecurityMode::Inherit => {
+                    adx_core::execution::DataPlaneSecurityMode::Tls => DataPlaneSecurityMode::Tls,
+                    adx_core::execution::DataPlaneSecurityMode::Inherit => {
                         DataPlaneSecurityMode::Inherit
                     }
                 }
@@ -369,7 +369,7 @@ impl super::resolver::DemandResolver for CoordinatorConnection {
         };
         let tunnel_security_mode = effective(tunnel_security_mode);
         let declared_port = spec
-            .sandbox
+            .execution
             .as_ref()
             .is_some_and(|s| s.ports.contains(&u32::from(port)));
         Ok(RouteHandle {

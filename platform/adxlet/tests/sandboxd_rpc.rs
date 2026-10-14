@@ -129,7 +129,7 @@ impl sandbox_service_server::SandboxService for Server {
             || (!id.is_empty() && id != "generated-backend-id")
         {
             if !id.is_empty() {
-                return Err(Status::not_found("sandbox not found"));
+                return Err(Status::not_found("environment not found"));
             }
             return Ok(Response::new(ListSandboxesResponse::default()));
         }
@@ -206,7 +206,7 @@ impl sandbox_service_server::SandboxService for Server {
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
             .is_ok()
         {
-            return Err(Status::unavailable("sandbox service not ready"));
+            return Err(Status::unavailable("environment service not ready"));
         }
         Ok(Response::new(ListAvailableRuntimesResponse {
             runtime_classes: vec!["runsc".into()],
@@ -299,7 +299,7 @@ fn spec() -> EnvironmentSpec {
             disk_bytes: 1 << 30,
         },
         priority: 0,
-        sandbox: Default::default(),
+        execution: Default::default(),
     }
 }
 
@@ -331,11 +331,11 @@ fn kata_start_prepares_guest_pty_without_privileged_guest_capabilities() {
 fn kata_start_preserves_explicit_terminal_mount() {
     let mut spec = spec();
     spec.runtime_class = "kata".into();
-    spec.sandbox.mounts.push(adx_core::sandbox::Mount {
+    spec.execution.mounts.push(adx_core::execution::Mount {
         kind: "bind".into(),
         target: "/dev/pts".into(),
         options: vec!["rbind".into()],
-        source: adx_core::sandbox::StorageSource::Local("/runtime/pts".into()),
+        source: adx_core::execution::StorageSource::Local("/runtime/pts".into()),
     });
     let request = start_request(&spec, "i-1", 1, &[], &Config::default()).unwrap();
     let mounts: Vec<_> = request
@@ -365,10 +365,10 @@ fn other_runtimes_keep_their_terminal_preparation() {
 }
 
 #[test]
-fn start_maps_public_sandbox_contract_to_backend_protocol() {
-    use adx_core::sandbox as model;
+fn start_maps_public_environment_contract_to_backend_protocol() {
+    use adx_core::execution as model;
     let mut spec = spec();
-    spec.sandbox = model::SandboxOptions {
+    spec.execution = model::ExecutionOptions {
         rootfs: Some(model::Rootfs {
             readonly: true,
             source: model::StorageSource::Image("registry.example/app:v1".into()),
@@ -444,10 +444,10 @@ fn start_maps_public_sandbox_contract_to_backend_protocol() {
 
 #[test]
 fn start_maps_s3_rootfs_credentials() {
-    use adx_core::sandbox as model;
+    use adx_core::execution as model;
     let mut spec = spec();
     spec.image.clear();
-    spec.sandbox.rootfs = Some(model::Rootfs {
+    spec.execution.rootfs = Some(model::Rootfs {
         readonly: false,
         source: model::StorageSource::S3(model::S3Source {
             endpoint: "https://s3.example".into(),
@@ -471,7 +471,7 @@ fn start_maps_s3_rootfs_credentials() {
 
 #[tokio::test]
 async fn dynamic_network_policy_uses_generated_backend_identity_and_can_clear() {
-    use adx_core::sandbox as model;
+    use adx_core::execution as model;
     let server = Server::default();
     let (adapter, _harness) = connect(server.clone()).await;
     adapter.start(&spec(), "i-1", 1, &[]).await.unwrap();
@@ -1120,7 +1120,7 @@ async fn workload_checkpoint_keeps_backend_running() {
 
 #[tokio::test]
 async fn stateless_policy_allows_execd_and_published_port_replies() {
-    use adx_core::sandbox as model;
+    use adx_core::execution as model;
     let policy = model::NetworkPolicy {
         traffic: Some(model::TrafficPolicy {
             ingress_default_action: model::NetworkAction::Deny,
@@ -1131,8 +1131,8 @@ async fn stateless_policy_allows_execd_and_published_port_replies() {
         dns: None,
     };
     let mut spec = spec();
-    spec.sandbox.network = Some(policy.clone());
-    spec.sandbox.ports = vec![8080];
+    spec.execution.network = Some(policy.clone());
+    spec.execution.ports = vec![8080];
     let server = Server::default();
     let (adapter, _harness) = connect(server.clone()).await;
     adapter.start(&spec, "i-1", 1, &[]).await.unwrap();
@@ -1167,7 +1167,7 @@ async fn stateless_policy_allows_execd_and_published_port_replies() {
 
 #[tokio::test]
 async fn blocked_policy_preserves_only_node_control_endpoint_at_start_and_update() {
-    use adx_core::sandbox as model;
+    use adx_core::execution as model;
     let policy = model::NetworkPolicy {
         traffic: Some(model::TrafficPolicy {
             ingress_default_action: model::NetworkAction::Deny,
@@ -1188,7 +1188,7 @@ async fn blocked_policy_preserves_only_node_control_endpoint_at_start_and_update
         ),
     ]);
     let mut spec = spec();
-    spec.sandbox.network = Some(policy.clone());
+    spec.execution.network = Some(policy.clone());
     // A user-provided callback must never become a platform-owned ACL exception.
     spec.env.insert(
         "ADX_RUNTIME_CONTROL_ADDRESS".into(),
@@ -1263,7 +1263,7 @@ async fn blocked_policy_preserves_only_node_control_endpoint_at_start_and_update
 
 #[tokio::test]
 async fn stateful_policy_keeps_execd_replies_independent_of_conntrack_generation() {
-    use adx_core::sandbox as model;
+    use adx_core::execution as model;
     let policy = model::NetworkPolicy {
         traffic: Some(model::TrafficPolicy {
             ingress_default_action: model::NetworkAction::Deny,
@@ -1274,7 +1274,7 @@ async fn stateful_policy_keeps_execd_replies_independent_of_conntrack_generation
         dns: None,
     };
     let mut spec = spec();
-    spec.sandbox.network = Some(policy.clone());
+    spec.execution.network = Some(policy.clone());
     let server = Server::default();
     let (adapter, _harness) = connect(server.clone()).await;
     adapter.start(&spec, "i-1", 1, &[]).await.unwrap();
@@ -1355,15 +1355,16 @@ async fn exited_backend_uses_wait_reason_before_deletion_and_not_exit_code_alone
 #[test]
 fn constructor_cwd_is_owned_by_spec_and_does_not_change_execd_process_cwd() {
     let mut spec = spec();
-    spec.env.insert("ADX_SANDBOX_CWD".into(), "/spoofed".into());
+    spec.env
+        .insert("ADX_ENVIRONMENT_CWD".into(), "/spoofed".into());
     let mut config = Config::default();
     config
         .env
-        .insert("ADX_SANDBOX_CWD".into(), "/deployment".into());
+        .insert("ADX_ENVIRONMENT_CWD".into(), "/deployment".into());
     let omitted = start_request(&spec, "i-1", 1, &[], &config).unwrap();
-    assert!(!omitted.envs.contains_key("ADX_SANDBOX_CWD"));
-    spec.sandbox.cwd = Some("/workspace/nested".into());
+    assert!(!omitted.envs.contains_key("ADX_ENVIRONMENT_CWD"));
+    spec.execution.cwd = Some("/workspace/nested".into());
     let request = start_request(&spec, "i-1", 1, &[], &config).unwrap();
-    assert_eq!(request.envs["ADX_SANDBOX_CWD"], "/workspace/nested");
+    assert_eq!(request.envs["ADX_ENVIRONMENT_CWD"], "/workspace/nested");
     assert_eq!(request.cwd, "/");
 }

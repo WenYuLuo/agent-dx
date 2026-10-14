@@ -20,7 +20,7 @@ message EnvironmentSpec {
   SchedulingPolicy scheduling = 7;
   map<string,string> env = 8;
   LifecyclePolicy lifecycle = 9;
-  SandboxOptions sandbox = 12;
+  ExecutionOptions execution = 12;
 }
 
 message S3Source {
@@ -58,8 +58,8 @@ message NetworkRule {
   NetworkDirection direction = 2;
   NetworkProtocol protocol = 3;
   NetworkPeer peer = 4;
-  uint32 sandbox_port = 5;
-  PortRange sandbox_port_range = 6;
+  uint32 environment_port = 5;
+  PortRange environment_port_range = 6;
   uint32 priority = 7;
 }
 message TrafficPolicy {
@@ -97,7 +97,7 @@ message ProbeFailure {
   optional int32 exit_code = 4; optional uint32 http_status = 5;
 }
 
-message SandboxOptions {
+message ExecutionOptions {
   RootfsSpec rootfs = 1;
   repeated MountSpec mounts = 2;
   NetworkPolicy network = 3;

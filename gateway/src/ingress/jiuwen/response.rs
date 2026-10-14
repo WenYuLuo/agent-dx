@@ -127,7 +127,7 @@ impl Response {
 
     /// Project a response already associated with a pending client request.
     /// Rejects mismatched request/user/channel identities and server pushes. Absent
-    /// backend user IDs rely on the driver's dedicated, authorized Sandbox connection.
+    /// backend user IDs rely on the driver's dedicated, authorized Environment connection.
     /// Metadata busy-state augmentation and other requests' turn IDs belong to the driver.
     pub fn project(
         &self,
@@ -166,7 +166,7 @@ impl Response {
     }
 
     /// Project a side-channel event on a connection bound to this verified user's
-    /// Sandbox. Explicit user/channel mismatches are rejected. A missing user ID
+    /// Environment. Explicit user/channel mismatches are rejected. A missing user ID
     /// is permitted only because the connection itself is dedicated and authorized.
     /// A business push must identify its session; it never completes a unary RPC.
     pub fn project_push(

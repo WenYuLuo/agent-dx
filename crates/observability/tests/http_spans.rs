@@ -10,18 +10,21 @@ async fn http_interface_names_keep_method_route_parent_and_hide_user_input() {
     opentelemetry::global::set_tracer_provider(provider.clone());
     let parent = "00-11111111111111111111111111111111-2222222222222222-01";
     for (path, expected) in [
-        ("/api/sandbox/v1/sandboxes", "/api/sandbox/v1/sandboxes"),
         (
-            "/api/sandbox/v1/sandboxes/private-id/pause?token=secret",
-            "/api/sandbox/v1/sandboxes/{id}/pause",
+            "/api/environment/v1/environments",
+            "/api/environment/v1/environments",
         ),
         (
-            "/api/sandbox/private-id/exec/invoke",
-            "/api/sandbox/{id}/exec/invoke",
+            "/api/environment/v1/environments/private-id/pause?token=secret",
+            "/api/environment/v1/environments/{id}/pause",
         ),
         (
-            "/api/sandbox/v1/snapshots/private-snapshot",
-            "/api/sandbox/v1/snapshots/{id}",
+            "/api/environment/private-id/exec/invoke",
+            "/api/environment/{id}/exec/invoke",
+        ),
+        (
+            "/api/environment/v1/snapshots/private-snapshot",
+            "/api/environment/v1/snapshots/{id}",
         ),
         ("/invoke?path=private-file", "/invoke"),
         ("/download?path=private-file", "/download"),

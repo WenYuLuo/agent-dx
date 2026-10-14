@@ -49,7 +49,7 @@ fn spec() -> EnvironmentSpec {
         env: Default::default(),
         priority: 0,
         scheduling: Default::default(),
-        sandbox: Default::default(),
+        execution: Default::default(),
     }
 }
 fn caller() -> Option<pb::CallerContext> {

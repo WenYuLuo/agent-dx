@@ -86,13 +86,13 @@ def run_session_probe(executable, control, worker, instance_id, old_session, new
 
 
 def run_restart(
-    inventory, connection, image, socket, output, sandbox_factory=None, remote=ssh, wait=wait_until, probe=None
+    inventory, connection, image, socket, output, environment_factory=None, remote=ssh, wait=wait_until, probe=None
 ):
     verify_inventory(inventory)
-    if sandbox_factory is None:
-        from adx_sandbox import Sandbox
+    if environment_factory is None:
+        from adx_environment import Environment
 
-        sandbox_factory = Sandbox
+        environment_factory = Environment
     machines = {machine['role']: machine for machine in inventory['machines']}
     control = machines['control']
     workers = (machines['worker-1'], machines['worker-2'])
@@ -109,7 +109,7 @@ def run_restart(
     try:
         report['machines'] = verify_machines(inventory, remote)
         for worker in workers:
-            sandbox = sandbox_factory(
+            environment = environment_factory(
                 image=image,
                 runtime='runc',
                 node_id=worker['node_id'],
@@ -119,14 +119,14 @@ def run_restart(
                 connection=connection,
                 create_timeout=150,
             )
-            handles.append(sandbox)
-            assignment = persisted_assignment(control, sandbox.id, remote)
+            handles.append(environment)
+            assignment = persisted_assignment(control, environment.id, remote)
             if assignment.get('node_id') != worker['node_id'] or assignment.get('state') != 'Running':
-                raise AssertionError(f'initial assignment mismatch for {sandbox.id}')
-            result = sandbox.commands.run('printf before-restart')
+                raise AssertionError(f'initial assignment mismatch for {environment.id}')
+            result = environment.commands.run('printf before-restart')
             if result.exit_code != 0 or result.stdout != 'before-restart':
-                raise AssertionError(f'initial route failed for {sandbox.id}')
-            report['instances'].append({'id': sandbox.id, 'node_id': worker['node_id']})
+                raise AssertionError(f'initial route failed for {environment.id}')
+            report['instances'].append({'id': environment.id, 'node_id': worker['node_id']})
         report['checks'].append('both-workers-ready')
         affected = handles[1]
         old_assignment = persisted_assignment(control, affected.id, remote)
@@ -158,33 +158,33 @@ def run_restart(
                 raise AssertionError('stale-session probe did not prove fencing')
             report['fencing'] = fencing
             report['checks'].append('old-session-commit-rejected')
-        for sandbox in handles:
-            result = sandbox.commands.run('printf after-restart')
+        for environment in handles:
+            result = environment.commands.run('printf after-restart')
             if result.exit_code != 0 or result.stdout != 'after-restart':
-                raise AssertionError(f'{sandbox.id} route failed after worker restart')
+                raise AssertionError(f'{environment.id} route failed after worker restart')
         report['checks'].append('both-workers-still-serving')
     except Exception as error:
         report['error'] = f'{type(error).__name__}: {error}'
         raise
     finally:
-        for sandbox in reversed(handles):
+        for environment in reversed(handles):
             try:
-                sandbox.kill()
+                environment.kill()
             except Exception as error:
-                report['cleanup_errors'].append(f'{sandbox.id} delete: {error}')
+                report['cleanup_errors'].append(f'{environment.id} delete: {error}')
             finally:
                 try:
-                    sandbox.close()
+                    environment.close()
                 except Exception as error:
-                    report['cleanup_errors'].append(f'{sandbox.id} close: {error}')
+                    report['cleanup_errors'].append(f'{environment.id} close: {error}')
         try:
             deadline = time.monotonic() + 15
             while handles:
                 residual = {
-                    sandbox.id: {
-                        worker['node_id']: backend_ids(worker, socket, sandbox.id, remote) for worker in workers
+                    environment.id: {
+                        worker['node_id']: backend_ids(worker, socket, environment.id, remote) for worker in workers
                     }
-                    for sandbox in handles
+                    for environment in handles
                 }
                 if not any(ids for nodes in residual.values() for ids in nodes.values()):
                     break
@@ -215,7 +215,7 @@ def main():
     if args.session_probe and (not args.session_probe.is_file() or not os.access(args.session_probe, os.X_OK)):
         parser.error('--session-probe must name a built stale_session_probe executable')
     os.environ['SSL_CERT_FILE'] = str(args.ca.resolve())
-    from adx_sandbox import ConnectionConfig
+    from adx_environment import ConnectionConfig
 
     connection = ConnectionConfig(
         server_address=args.endpoint,

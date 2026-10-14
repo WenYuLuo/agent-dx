@@ -8,7 +8,7 @@ administrator sets fail before changing active keys. At least one valid
 administrator key is required. Missing/unreadable key files abort startup.
 
 Existing ingress authentication caches expire normally; rotation does not
-terminate existing streams. See the [deployment contract](../deployment/adxctl.md#管理员-key-的生成读取与轮换)
+terminate existing streams. See the [deployment contract](../deployment/adxctl.md#%E7%AE%A1%E7%90%86%E5%91%98-key-%E7%9A%84%E7%94%9F%E6%88%90%E8%AF%BB%E5%8F%96%E4%B8%8E%E8%BD%AE%E6%8D%A2)
 for retrieval, restart and staged-transition behavior.
 
 ## Verification on 2026-09-22

@@ -696,7 +696,7 @@ fn default_embedded_mode_rejects_a_second_proxy_process() {
 }
 
 #[test]
-fn sandbox_api_discovery_defaults_and_overrides_are_usable() {
+fn environment_api_discovery_defaults_and_overrides_are_usable() {
     let root = tempfile::tempdir().unwrap();
     let mut deployment: Deployment = serde_saphyr::from_str(include_str!(
         "../../../build/config/examples/deployment.yaml"

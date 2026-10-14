@@ -102,12 +102,12 @@ Ingress 当前对缓存缺失最多等待50ms内对应订阅路由的到达，�
 
 2026-09-27 Build #116 的原 HTTP Create 基准，隔离 C1 每次创建后删除：100 次 P50 104.088ms、P95 161.323ms、P99 179.749ms；create 返回后的路由传播单独计时，P99 115.584ms。2026-09-28 Build #121 另有单次 C1 62.089ms，样本仅一条，不能据此声称稳定 P99 为62ms。此前百毫秒级是完整 HTTP Create 到 SSE Running，并非 sandboxd Start 单阶段。
 
-第十九轮的 C1 中位数471.7ms来自 AKernel SDK Sandbox 构造，包含后续 process.list 等就绪访问；使用节点192.168.10.179、自定义镜像、runtime limit 500m/512MiB。旧基准固定另一节点、复用 HTTP 连接，runtime limit 1000m/2GiB。不能把这两种边界直接比较并宣布创建性能回退。仍需在相同节点、镜像、资源限额和计时边界下补配对测试，分别报告 raw Create 和 SDK 构造。
+第十九轮的 C1 中位数471.7ms来自 AKernel SDK Environment 构造，包含后续 process.list 等就绪访问；使用节点192.168.10.179、自定义镜像、runtime limit 500m/512MiB。旧基准固定另一节点、复用 HTTP 连接，runtime limit 1000m/2GiB。不能把这两种边界直接比较并宣布创建性能回退。仍需在相同节点、镜像、资源限额和计时边界下补配对测试，分别报告 raw Create 和 SDK 构造。
 
 ## Failed 自动 GC（2026-10-05）
 
 Coordinator 默认保留终态 Failed 600 秒，支持 `failed_retention_seconds` 配置。失败时间持久化、回收批次有界；在线节点先清理后端再退役，失效归属原子退役后由返回节点对账清理。待重启／恢复受保护，完整契约见 [Failed GC](failed-environment-gc.md)。
 
-真实 Redis storage 全套34项、真实Redis/mTLS RPC全套29项、adxlet lifecycle 28项通过，workspace fmt／严格Clippy通过。Lima ARM64 两节点 standalone 使用真实 runc、Redis和公开Sandbox SDK，注入Start成功后丢失应答及Delete不可用：创建Failed且资源释放，超过3秒测试保留期仍保留无法清理的元数据；解除故障后自动GC，无显式DELETE；12.676秒收敛到后端与Redis Environment为空，同名重建generation 1→2，命令调用及删除成功。fixture清理通过。
+真实 Redis storage 全套34项、真实Redis/mTLS RPC全套29项、adxlet lifecycle 28项通过，workspace fmt／严格Clippy通过。Lima ARM64 两节点 standalone 使用真实 runc、Redis和公开Environment SDK，注入Start成功后丢失应答及Delete不可用：创建Failed且资源释放，超过3秒测试保留期仍保留无法清理的元数据；解除故障后自动GC，无显式DELETE；12.676秒收敛到后端与Redis Environment为空，同名重建generation 1→2，命令调用及删除成功。fixture清理通过。
 
 实际GC验证使用当前源码的Coordinator/adxlet覆盖既有隔离runtime fixture，不代表正式镜像或生产集群已升级。sandboxd故障代理沿用前轮制品，本次未修改sandboxd。证据位于本地 `pr78-local-closure-20261004/failed-gc-standalone-evidence/`，包括身份摘要、逐步日志、`failed-create-release.json`与`result.json`；`failed-gc-standalone.log`保留构建和全程输出。

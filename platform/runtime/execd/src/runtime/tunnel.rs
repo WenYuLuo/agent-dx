@@ -5,11 +5,11 @@
 //! Native Rust reverse-tunnel server (replaces spawning the python tunnel_server).
 //!
 //! Port A (ws_port, 0.0.0.0): WebSocket endpoint the external TunnelClient connects to.
-//! Port B (http_port, 127.0.0.1): HTTP/WS surface the sandbox's own code hits;
+//! Port B (http_port, 127.0.0.1): HTTP/WS surface the environment's own code hits;
 //! each request is framed and forwarded over the Port-A WS to the client, which
 //! relays it to the real upstream and frames the response back.
 //!
-//! The paired sandbox-sdk TunnelClient keeps metadata and small bodies in JSON
+//! The paired environment-sdk TunnelClient keeps metadata and small bodies in JSON
 //! text frames. After V2 hello negotiation, large HTTP bodies use bounded raw
 //! binary envelopes with byte-credit backpressure, while WebSocket binary
 //! messages use the same bounded raw envelope without base64. Headers remain
@@ -1745,13 +1745,13 @@ async fn handle_client(stream: TcpStream, state: Arc<State>) -> Result<(), Strin
             if expected_id.as_deref().is_some_and(|id| {
                 request
                     .headers()
-                    .get("x-sandbox-id")
+                    .get("x-environment-id")
                     .and_then(|value| value.to_str().ok())
                     != Some(id)
             }) {
                 let mut rejection =
                     tokio_tungstenite::tungstenite::handshake::server::ErrorResponse::new(Some(
-                        "sandbox identity mismatch".into(),
+                        "environment identity mismatch".into(),
                     ));
                 *rejection.status_mut() =
                     tokio_tungstenite::tungstenite::http::StatusCode::CONFLICT;
@@ -2404,7 +2404,7 @@ async fn dispatch_binary_from_client(
     }
 }
 
-// ───────────────────────── Port B: sandbox HTTP ─────────────────────────
+// ───────────────────────── Port B: environment HTTP ─────────────────────────
 async fn accept_port_b(listener: TcpListener, state: Arc<State>) {
     let mut connections = tokio::task::JoinSet::new();
     loop {
@@ -3471,7 +3471,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let state = Arc::new(State {
-            expected_environment_id: Some("sandbox-a".into()),
+            expected_environment_id: Some("environment-a".into()),
             ..State::default()
         });
         let server_state = state.clone();
@@ -3492,9 +3492,10 @@ mod tests {
         assert_eq!(state.active_client_generation(), None);
 
         let mut correct = url.clone().into_client_request().unwrap();
-        correct
-            .headers_mut()
-            .insert("X-Sandbox-ID", HeaderValue::from_static("sandbox-a"));
+        correct.headers_mut().insert(
+            "X-Environment-ID",
+            HeaderValue::from_static("environment-a"),
+        );
         let (_active, _) = connect_async(correct).await.unwrap();
         tokio::time::timeout(Duration::from_secs(1), async {
             while state.active_client_generation().is_none() {
@@ -3506,9 +3507,10 @@ mod tests {
         let generation = state.active_client_generation();
 
         let mut wrong = url.into_client_request().unwrap();
-        wrong
-            .headers_mut()
-            .insert("X-Sandbox-ID", HeaderValue::from_static("sandbox-b"));
+        wrong.headers_mut().insert(
+            "X-Environment-ID",
+            HeaderValue::from_static("environment-b"),
+        );
         let rejected = connect_async(wrong).await.unwrap_err();
         assert!(
             matches!(rejected, tokio_tungstenite::tungstenite::Error::Http(response) if response.status() == tokio_tungstenite::tungstenite::http::StatusCode::CONFLICT)

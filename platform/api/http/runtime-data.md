@@ -1,13 +1,13 @@
 # Execd 用户数据 HTTP 契约
 
 机器可读定义为 [data-plane.yaml](../openapi/data-plane.yaml)。用户通过 Ingress
-访问 `POST /direct/{instanceId}/invoke`，请求为 `action`、`args` 和可选 `requestId`。
+访问 `POST /direct/{environmentId}/invoke`，请求为 `action`、`args` 和可选 `requestId`。
 Ingress 校验 API Key 与归属，Relay 核对运行时绑定，再转发给 Execd 的 `/invoke`。
 运行时协作与 Unix checkpoint 使用独立的 [控制契约](runtime-control.md)。
 
 每种 action 在 OpenAPI 中有独立请求变体；`x-adx-result-schema` 指向对应响应。
 响应正文不重复 action，因此 HTTP 200 的 `InvokeResult` 使用 `anyOf`，客户端按
-已发送 action 解码。运行时业务响应不使用 Sandbox 生命周期 envelope。
+已发送 action 解码。运行时业务响应不使用 Environment 生命周期 envelope。
 表中列出主要名称；OpenAPI 同时列出实际支持的 `process.run`、`file.info`、
 `shell.init` 等公共别名。旧 `cmd_*`、`fs_*`、`bash_*` 名称不作为公开契约。
 
@@ -41,7 +41,7 @@ Ingress 校验 API Key 与归属，Relay 核对运行时绑定，再转发给 Ex
 ## 命令、cwd 与超时
 
 构造器 cwd 的初始化发生在 Execd Ready 前，见
-[创建契约](../../../gateway/apiserver/docs/sandbox-lifecycle-api.md#constructor-working-directory)。
+[创建契约](../../../gateway/apiserver/docs/environment-lifecycle-api.md#constructor-working-directory)。
 单次命令的 cwd 覆盖要求目录已存在，不会自动创建。
 
 SDK `commands.run` 的默认／长等待路径和后台命令使用 `process.start`。
@@ -81,9 +81,9 @@ PID 可以在运行时被复用，不能作为长期恢复身份。
 | 缺失能力 | HTTP 501、`UNSUPPORTED_FEATURE` |
 | Ingress 恢复仍在等待 | HTTP 503、`ENV_RESUMING`；仅符合网关标记与 requestForwarded=false 才可安全重试 |
 
-信号 9 或退出码 137 单独不能证明 OOM。Execd 不采集 OOM 计数；沙箱级原因由
+信号 9 或退出码 137 单独不能证明 OOM。Execd 不采集 OOM 计数；Runtime 的 OOM 原因由
 sandboxd 传至 Environment failure，SDK 按 [系统错误契约](error-contract.md#oom-原因与-sdk)
-分类。HTTP 502/503 也不能直接推断沙箱 OOM。
+分类。HTTP 502/503 也不能直接推断 Runtime OOM。
 
 文件 invoke 的二进制编码是十六进制；`/upload`、`/download` 的流式正文是原始字节。
 大文件优先使用流式传输。PTY 与命令 watch 是 WebSocket 协议，其连接与帧定义见 OpenAPI

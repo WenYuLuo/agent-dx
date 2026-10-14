@@ -236,7 +236,7 @@ fn signed_malformed_claims_cannot_select_a_sidecar_outside_the_asset_root() {
 }
 
 #[test]
-fn shared_config_uses_exact_env_key_or_trimmed_sandbox_file_without_generating_a_key() {
+fn shared_config_uses_exact_env_key_or_trimmed_environment_file_without_generating_a_key() {
     use data_plane_gateway::ingress::jiuwen::download_config::DownloadConfig;
     let mut template:adx_agent_core::TemplateVersion=serde_json::from_value(json!({"name":"jiuwen","version":"1","image":"app:1","isolation_runtime":"runc","resources":{"cpu_millis":1,"memory_mib":1},"env":{"JIUWENSWARM_WORKSPACE":"/work","JIUWENSWARM_DOWNLOAD_ASSET_ROOT":"/assets"}})).unwrap();
     let config = DownloadConfig::from_template(&template).unwrap();

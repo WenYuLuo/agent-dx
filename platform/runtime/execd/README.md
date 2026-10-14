@@ -5,7 +5,7 @@ Build with the root Cargo workspace: `cargo build --locked -p adx-execd --bin ad
 `adx-execd` serves Environment operations over HTTP: `/healthz`, `/invoke`, command watches, uploads and downloads. Configure `EXECD_HTTP_PORT` (default 50090) and optional `EXECD_HTTP_TOKEN`. Reverse tunnels use HTTP/WebSocket and are enabled with `EXECD_TUNNEL_WS_PORT` and `EXECD_TUNNEL_HTTP_PORT`.
 
 When `ADX_ENVIRONMENT_ID` is configured, the reverse-tunnel WebSocket handshake
-must carry the same `X-Sandbox-ID`. A mismatched client is rejected before it
+must carry the same `X-Environment-ID`. A mismatched client is rejected before it
 can replace the active connection. Restore refreshes this identity for the new
 listener generation. Binary file downloads close the HTTP connection after the
 body, matching their response header; chunked tar downloads stay reusable.
@@ -53,7 +53,7 @@ RuntimeStatus `initializing`; first success reports `running`, and budget expiry
 reports `failed` with a structured `failure`. Healthcheck starts after readiness
 and reports a sticky failure at its consecutive-failure threshold. Execd does
 not choose restart policy; Adxlet owns cleanup, routes and committed lifecycle.
-See the [public probe contract](../../../gateway/apiserver/docs/sandbox-lifecycle-api.md#workload-probes-on-image-startup).
+See the [public probe contract](../../../gateway/apiserver/docs/environment-lifecycle-api.md#workload-probes-on-image-startup).
 
 Probe execution bypasses user activity/command accounting. Exec checks use the
 managed workload's effective identity, cwd and environment, bounded stdout/stderr,

@@ -1,12 +1,12 @@
 openapi: "3.1.0"
 info:
-  title: ADX Sandbox Runtime Data Plane API
+  title: ADX Environment Runtime Data Plane API
   version: "1.0.0"
   license:
     name: Apache-2.0
     identifier: Apache-2.0
   description: |
-    Typed runtime operations exposed by Ingress at `/direct/{instanceId}`. Ingress
+    Typed runtime operations exposed by Ingress at `/direct/{environmentId}`. Ingress
     resolves the Environment route, Relay verifies the current Runtime binding,
     and EXECD executes the operation inside that Runtime. These calls bypass lifecycle and
     scheduling queues once the Environment is Running. Authorized demand for a
@@ -26,13 +26,13 @@ security:
   - xAuth: []
 tags:
   - name: Runtime
-    description: Typed operations executed by EXECD inside a Sandbox Runtime.
+    description: Typed operations executed by EXECD inside a Environment Runtime.
   - name: Files
     description: Streaming and resumable file transfer.
   - name: Commands
     description: Process and shell execution plus command status observation.
 paths:
-  /direct/{instanceId}/healthz:
+  /direct/{environmentId}/healthz:
     get:
       tags: [Runtime]
       operationId: runtimeHealth
@@ -55,11 +55,11 @@ paths:
           $ref: "#/components/responses/RuntimeError"
         default:
           $ref: "#/components/responses/RuntimeError"
-  /direct/{instanceId}/invoke:
+  /direct/{environmentId}/invoke:
     post:
       tags: [Runtime, Commands]
       operationId: invokeRuntimeAction
-      summary: Invoke a process, shell or file action inside the Sandbox Runtime
+      summary: Invoke a process, shell or file action inside the Environment Runtime
       description: |
         `action` selects an EXECD operation. Mutating calls should carry one
         `X-ADX-Request-ID`; retry an unknown result with the same ID.
@@ -95,7 +95,7 @@ paths:
           $ref: "#/components/responses/RuntimeError"
         default:
           $ref: "#/components/responses/RuntimeError"
-  /direct/{instanceId}/upload:
+  /direct/{environmentId}/upload:
     post:
       tags: [Files]
       operationId: uploadFile
@@ -127,7 +127,7 @@ paths:
           $ref: "#/components/responses/RuntimeError"
         default:
           $ref: "#/components/responses/RuntimeError"
-  /direct/{instanceId}/upload/status:
+  /direct/{environmentId}/upload/status:
     get:
       tags: [Files]
       operationId: getUploadStatus
@@ -149,7 +149,7 @@ paths:
           $ref: "#/components/responses/RuntimeError"
         default:
           $ref: "#/components/responses/RuntimeError"
-  /direct/{instanceId}/upload/commit:
+  /direct/{environmentId}/upload/commit:
     post:
       tags: [Files]
       operationId: commitUpload
@@ -172,7 +172,7 @@ paths:
           $ref: "#/components/responses/RuntimeError"
         default:
           $ref: "#/components/responses/RuntimeError"
-  /direct/{instanceId}/download:
+  /direct/{environmentId}/download:
     get:
       tags: [Files]
       operationId: downloadFile
@@ -214,7 +214,7 @@ paths:
           $ref: "#/components/responses/RuntimeError"
         default:
           $ref: "#/components/responses/RuntimeError"
-  /direct/{instanceId}/pty:
+  /direct/{environmentId}/pty:
     get:
       tags: [Commands]
       operationId: openPty
@@ -244,7 +244,7 @@ paths:
         - name: protocol
           in: query
           required: false
-          schema: {type: string, const: sandbox.pty.v1}
+          schema: {type: string, const: environment.pty.v1}
         - name: Upgrade
           in: header
           required: true
@@ -268,7 +268,7 @@ paths:
           $ref: "#/components/responses/RuntimeError"
         default:
           $ref: "#/components/responses/RuntimeError"
-  /api/sandbox/v1/commands/watch:
+  /api/environment/v1/commands/watch:
     get:
       tags: [Commands]
       operationId: watchCommands
@@ -310,7 +310,7 @@ components:
       description: Compatibility API Key header.
   parameters:
     InstanceId:
-      name: instanceId
+      name: environmentId
       in: path
       required: true
       schema: {type: string, minLength: 1}
@@ -408,7 +408,7 @@ components:
             outcome: {type: string, enum: [not_started, unknown]}
             requestForwarded: {type: boolean}
             requestId: {type: string}
-            instanceId: {type: string}
+            environmentId: {type: string}
     ExecArgs:
       type: object
       properties:

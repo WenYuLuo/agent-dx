@@ -244,9 +244,9 @@ pub fn http_route(path: &str) -> &'static str {
         "/download" => return "/download",
         "/control/v1/checkpoint" => return "/control/v1/checkpoint",
         "/control/v1/status" => return "/control/v1/status",
-        "/api/sandbox/create" => return "/api/sandbox/create",
-        "/api/sandbox/v1/sandboxes" => return "/api/sandbox/v1/sandboxes",
-        "/api/sandbox/v1/snapshots" => return "/api/sandbox/v1/snapshots",
+        "/api/environment/create" => return "/api/environment/create",
+        "/api/environment/v1/environments" => return "/api/environment/v1/environments",
+        "/api/environment/v1/snapshots" => return "/api/environment/v1/snapshots",
         "/api/admin/v1/keys" => return "/api/admin/v1/keys",
         "/api/agent" => return "/api/agent",
         "/global-scheduler/resources" => return "/global-scheduler/resources",
@@ -257,10 +257,10 @@ pub fn http_route(path: &str) -> &'static str {
         _ => (),
     }
     if path
-        .strip_prefix("/api/sandbox/v1/snapshots/")
+        .strip_prefix("/api/environment/v1/snapshots/")
         .is_some_and(|id| !id.is_empty() && !id.contains('/'))
     {
-        return "/api/sandbox/v1/snapshots/{id}";
+        return "/api/environment/v1/snapshots/{id}";
     }
     if path
         .strip_prefix("/api/admin/v1/keys/")
@@ -268,35 +268,35 @@ pub fn http_route(path: &str) -> &'static str {
     {
         return "/api/admin/v1/keys/{id}";
     }
-    if let Some(rest) = path.strip_prefix("/api/sandbox/v1/sandboxes/") {
+    if let Some(rest) = path.strip_prefix("/api/environment/v1/environments/") {
         let (id, action) = rest.split_once('/').unwrap_or((rest, ""));
         if id.is_empty() {
             return "/unmatched";
         }
         return match action {
-            "" => "/api/sandbox/v1/sandboxes/{id}",
-            "pause" => "/api/sandbox/v1/sandboxes/{id}/pause",
-            "resume" => "/api/sandbox/v1/sandboxes/{id}/resume",
-            "reload" => "/api/sandbox/v1/sandboxes/{id}/reload",
-            "network" => "/api/sandbox/v1/sandboxes/{id}/network",
-            "snapshots" => "/api/sandbox/v1/sandboxes/{id}/snapshots",
+            "" => "/api/environment/v1/environments/{id}",
+            "pause" => "/api/environment/v1/environments/{id}/pause",
+            "resume" => "/api/environment/v1/environments/{id}/resume",
+            "reload" => "/api/environment/v1/environments/{id}/reload",
+            "network" => "/api/environment/v1/environments/{id}/network",
+            "snapshots" => "/api/environment/v1/environments/{id}/snapshots",
             _ => "/unmatched",
         };
     }
-    if let Some(rest) = path.strip_prefix("/api/sandbox/") {
+    if let Some(rest) = path.strip_prefix("/api/environment/") {
         let (id, action) = rest.split_once('/').unwrap_or((rest, ""));
         if id.is_empty() {
             return "/unmatched";
         }
         return match action {
-            "" => "/api/sandbox/{id}",
-            "exec/invoke" => "/api/sandbox/{id}/exec/invoke",
-            "exec/commands/watch" => "/api/sandbox/{id}/exec/commands/watch",
-            "exec/pty" => "/api/sandbox/{id}/exec/pty",
-            "exec/upload" => "/api/sandbox/{id}/exec/upload",
-            "exec/upload/status" => "/api/sandbox/{id}/exec/upload/status",
-            "exec/upload/commit" => "/api/sandbox/{id}/exec/upload/commit",
-            "exec/download" => "/api/sandbox/{id}/exec/download",
+            "" => "/api/environment/{id}",
+            "exec/invoke" => "/api/environment/{id}/exec/invoke",
+            "exec/commands/watch" => "/api/environment/{id}/exec/commands/watch",
+            "exec/pty" => "/api/environment/{id}/exec/pty",
+            "exec/upload" => "/api/environment/{id}/exec/upload",
+            "exec/upload/status" => "/api/environment/{id}/exec/upload/status",
+            "exec/upload/commit" => "/api/environment/{id}/exec/upload/commit",
+            "exec/download" => "/api/environment/{id}/exec/download",
             _ => "/unmatched",
         };
     }

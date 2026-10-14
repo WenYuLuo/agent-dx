@@ -14,7 +14,7 @@ pub struct ErrorDetail<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub operation_id: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub instance_id: Option<&'a str>,
+    pub environment_id: Option<&'a str>,
 }
 
 impl<'a> ErrorDetail<'a> {
@@ -22,7 +22,7 @@ impl<'a> ErrorDetail<'a> {
         status: &Status,
         request_id: &'a str,
         operation_id: Option<&'a str>,
-        instance_id: Option<&'a str>,
+        environment_id: Option<&'a str>,
         execution_may_have_started: bool,
     ) -> Self {
         let probe_failure =
@@ -112,7 +112,7 @@ impl<'a> ErrorDetail<'a> {
             outcome,
             request_id,
             operation_id,
-            instance_id,
+            environment_id,
         }
     }
 }

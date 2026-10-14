@@ -23,7 +23,7 @@ fn spec(id: &str) -> EnvironmentSpec {
             disk_bytes: 1,
         },
         priority: 0,
-        sandbox: Default::default(),
+        execution: Default::default(),
     }
 }
 fn node(id: &str, available: bool) -> Node {

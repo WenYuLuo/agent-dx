@@ -26,7 +26,7 @@ Execd 的 `handle_conn` 是 HTTP keep-alive 循环。`handle_one_request` 在 We
 
 修复是在 `/pty` 与 `/commands/watch` 升级分支设置 `close_after_response`，使升级会话结束后退出整个连接任务，不再进入 HTTP keep-alive。未修改 SDK 的关闭超时。修复后 Execd 90 项库测试通过。公开 SDK 直连真实修复版 Execd 的 3 次自然退出关闭耗时为 0.273、0.219、0.222 ms，主动关闭运行中 PTY 为 0.331 ms，4 次后台线程均已结束。此验证未经过 sandboxd 或 Gateway。Workspace Clippy（全部 targets/features、`-D warnings`）、格式和文档检查通过。
 
-证据目录：`out/ci/create-cache-pty-20261009/`。`pty-diagnosis{,-followup}.json` 是旧集群诊断，`execd-red-tcp.log` 与 `execd-green.log` 是本地真实 Socket 的红绿测试。本轮使用新 Execd 镜像更新 cn-north-4 的 4 个节点，并通过真实 runsc Sandbox、Gateway 和公开 ADX SDK 验证 30 次 PTY 自然退出关闭：最大 10.40 ms；未调整 SDK 的关闭超时。
+证据目录：`out/ci/create-cache-pty-20261009/`。`pty-diagnosis{,-followup}.json` 是旧集群诊断，`execd-red-tcp.log` 与 `execd-green.log` 是本地真实 Socket 的红绿测试。本轮使用新 Execd 镜像更新 cn-north-4 的 4 个节点，并通过真实 runsc Environment、Gateway 和公开 ADX SDK 验证 30 次 PTY 自然退出关闭：最大 10.40 ms；未调整 SDK 的关闭超时。
 
 ## 创建重放缓存
 
@@ -61,7 +61,7 @@ services:
 
 ### 定向回归
 
-`gateway/apiserver/tests/create_replay.rs` 启动真实 TCP/gRPC 服务、生产 Clients 与 SandboxService，完成缓存容量固定为 1：
+`gateway/apiserver/tests/create_replay.rs` 启动真实 TCP/gRPC 服务、生产 Clients 与 EnvironmentService，完成缓存容量固定为 1：
 
 - 连续 12 个不同创建均成功；完成项被淘汰后重试仍复用已有归属，不产生第二个后端执行。
 - 多个创建返回未知结果时仍接收新名称；重试先查权威结果，不额外调用 CreateEnvironment；同 Request ID 改参数报冲突。
@@ -69,7 +69,7 @@ services:
 - 未知请求到期后无需客户端重试即可回收，GC 不查询权威状态，原已运行实例保持不变；窗口结束后原 Request ID 不再绑定旧参数。
 - 单元回归覆盖已取得共享身份的等待者、取消后遗留上下文以及从首次未知结果开始的保留时间。
 
-服务夹具模拟应答错误，不是真实网络丢包或 sandboxd 执行。运行入口：`cargo test --locked -p adx-apiserver --test create_replay`。证据保存在上述目录的 `replay-*.log`。本轮 cn-north-4 的独立 API Server 测试入口配置 `cache_entries: 1`，连续创建并保留 12 个 Sandbox，全部成功执行命令；8 个同名并发创建收敛到一个 Environment。随后原规模压力回归以容量 10,000 完成 19,700 次生命周期创建，未再触发缓存容量拒绝，详见[压力回归报告](2026-10-09-cn4-pressure-regression.md)。未知上下文自动 GC 的精确时间与保护条件仍由组件测试看护。
+服务夹具模拟应答错误，不是真实网络丢包或 sandboxd 执行。运行入口：`cargo test --locked -p adx-apiserver --test create_replay`。证据保存在上述目录的 `replay-*.log`。本轮 cn-north-4 的独立 API Server 测试入口配置 `cache_entries: 1`，连续创建并保留 12 个 Environment，全部成功执行命令；8 个同名并发创建收敛到一个 Environment。随后原规模压力回归以容量 10,000 完成 19,700 次生命周期创建，未再触发缓存容量拒绝，详见[压力回归报告](2026-10-09-cn4-pressure-regression.md)。未知上下文自动 GC 的精确时间与保护条件仍由组件测试看护。
 
 ## 生命周期操作表容量
 

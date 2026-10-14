@@ -65,7 +65,7 @@ steps:
         imagePullSecrets:
         - name: swr-pull-secret
         containers:
-        - image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/sandbox-deployer:v20260506_kubectl_py39
+        - image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/environment-deployer:v20260506_kubectl_py39
           resources:
             requests:
               cpu: '1'

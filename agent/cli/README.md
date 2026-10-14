@@ -19,9 +19,9 @@ adx --token-file /run/secrets/adx-token env get demo --template assistant --vers
 adx --token-file /run/secrets/adx-token env delete demo --template assistant --version 1
 ```
 
-`template.json` 使用 [Agent Template](../README.md) 的 `name/version/image/isolation_runtime/env/resources/service` 配置。发布的模板版本不可变；查询和列举 AgentBinding 不激活 Sandbox，删除会调用服务端删除流程。指定 ID 的 AgentBinding 创建由 HTTP/WS/SSH 访问流量或 resolve 请求触发，CLI 不提供显式创建命令。
+`template.json` 使用 [Agent Template](../README.md) 的 `name/version/image/isolation_runtime/env/resources/service` 配置。发布的模板版本不可变；查询和列举 AgentBinding 不激活 Environment，删除会调用服务端删除流程。指定 ID 的 AgentBinding 创建由 HTTP/WS/SSH 访问流量或 resolve 请求触发，CLI 不提供显式创建命令。
 
-`env list` 每次仅请求一页，返回 `bindings` 和 `next_page_token`。后续页传 `--page-token`；默认页大小 50，上限 100。同一 token 只能用于同一租户、模板和版本。列表反映 ADX 元数据，不表示实时 Sandbox 健康状态；并发更新时不保证快照。
+`env list` 每次仅请求一页，返回 `bindings` 和 `next_page_token`。后续页传 `--page-token`；默认页大小 50，上限 100。同一 token 只能用于同一租户、模板和版本。列表反映 ADX 元数据，不表示实时 Environment 健康状态；并发更新时不保证快照。
 
 ## HTTP 调用
 
@@ -78,7 +78,7 @@ adx ssh --template assistant --version 1 --binding-id demo --port 22
 
 可用 `--gateway` 覆盖 `ADX_SSH_ADDRESS` 或配置文件 `ssh_address`；身份文件优先级为 `-i/--identity`、`ADX_SSH_IDENTITY`、配置文件 `ssh_identity`。没有指定身份文件时由 OpenSSH 使用用户自身配置或 ssh-agent。地址为 host:port，端口省略时为 22；`--port` 是 Template 中的后端 SSH service 端口。
 
-省略 `--binding-id` 时由 Gateway 生成 ID，在 shell 开始时打印 `AgentBinding ID` 和 `AgentBinding URN`；正常终端内容和这两行提示都在 stdout，错误诊断走 stderr。该 ID 可用于后续 `--binding-id`、查询和删除；提示不代表 Sandbox 已就绪，失败后仍应回查同一身份。
+省略 `--binding-id` 时由 Gateway 生成 ID，在 shell 开始时打印 `AgentBinding ID` 和 `AgentBinding URN`；正常终端内容和这两行提示都在 stdout，错误诊断走 stderr。该 ID 可用于后续 `--binding-id`、查询和删除；提示不代表 Environment 已就绪，失败后仍应回查同一身份。
 
 当前冷启动可能先返回创建结果未知，或在平台报告 Running 后短暂遇到路由尚未发布。收到 ID 后连接失败时，使用 `adx binding get` 查询，并在再次连接时显式传入 `--binding-id <返回的ID>`；不要再次省略 `--binding-id`，否则会生成另一个 AgentBinding。CLI 不自动重试 SSH 连接。
 

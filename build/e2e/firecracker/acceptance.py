@@ -9,7 +9,7 @@ CASES = {
     'sdk': {
         'create through Frontend and execute through Ingress',
         'S3 rootfs and independent execution limits start through sandboxd',
-        'S3 EROFS mount is visible inside the sandbox',
+        'S3 EROFS mount is visible inside the environment',
         'inherited image entrypoint reports structured exit status',
         'pause with persisted recovery point',
         'Adxlet restart while paused',

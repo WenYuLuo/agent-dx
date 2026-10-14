@@ -2,7 +2,7 @@
 
 This is an opt-in **real hardware** public-SDK test. It is separate from the
 standalone and base Kubernetes gates, which have no GPU/NPU device fixture.
-Install the matching `adx-sandbox` wheel and configure `ADX_SERVER_ADDRESS`,
+Install the matching `adx-environment` wheel and configure `ADX_SERVER_ADDRESS`,
 `ADX_TOKEN`, and TLS settings for the deployment before running it. The selected
 node needs the advertised device, host driver/firmware, sandboxd discovery,
 guest device exposure, and the vendor inventory tool inside the test image.
@@ -25,8 +25,8 @@ python3 build/e2e/device/verify.py \
   --expect 'NPU' --output out/e2e/device/npu-001
 ```
 
-The case requires a running sandbox, a guest character device, and inventory
-output matching the specified pattern. It deletes the sandbox and waits for the
+The case requires a running environment, a guest character device, and inventory
+output matching the specified pattern. It deletes the environment and waits for the
 public lookup to stop returning a running instance. The result is recorded in
 `result.json`; a cleanup failure fails the case. The test
 must be run separately for GPU and NPU. A skipped or fixture-less run is not

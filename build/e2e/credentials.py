@@ -35,7 +35,7 @@ def check_management(secrets, event):
                 raise AssertionError()
             if not (created['apiKey'] not in listed.text):
                 raise AssertionError('list exposed key material')
-            endpoint = '/api/sandbox/v1/snapshots'
+            endpoint = '/api/environment/v1/snapshots'
             if not (client.get(endpoint, headers=credential).status_code == 200):
                 raise AssertionError('new key rejected')
             if not (client.delete(path + '/' + key_id, headers=tenant).status_code == 403):

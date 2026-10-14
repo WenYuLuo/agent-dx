@@ -48,7 +48,7 @@ async fn handler(
     let binding = AgentBinding {
         scope: serde_json::from_value(value["scope"].clone()).unwrap(),
         generation: id,
-        sandbox_id: "sandbox".into(),
+        environment_id: "environment".into(),
         phase: BindingPhase::Active,
     };
     if uri.path().ends_with("/delete") {

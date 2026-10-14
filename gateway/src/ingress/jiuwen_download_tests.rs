@@ -1,8 +1,8 @@
-//! Real Relay transport with a simulated Execd; no live Sandbox claim.
+//! Real Relay transport with a simulated Execd; no live Environment claim.
 use super::*;
 use crate::{
     common::protocol::GatewayPolicy,
-    ingress::sandbox_files::{Files, ReadError},
+    ingress::environment_files::{Files, ReadError},
     node::Relay,
 };
 use adx_agent_api::request::RequestContext;
@@ -133,12 +133,12 @@ async fn jiuwen_execd_reads_are_authorized_bounded_and_cancelled() {
     let (gateway, api, routes) = fixture_with_backend(backend.clone()).await;
     let gateway = Arc::new(with_files(&gateway, backend.clone()));
     let context = RequestContext::new(Duration::from_secs(30));
-    let id = create_sandbox(api.as_ref()).await;
-    let route: crate::common::route::RouteInfo = serde_json::from_value(serde_json::json!({"instanceID":id,"instanceStatus":{"code":3},"tenantID":"tenant","sandboxID":"runtime","sandboxIP":"127.0.0.1","nodeProxyAddress":address.to_string()})).unwrap();
+    let id = create_environment(api.as_ref()).await;
+    let route: crate::common::route::RouteInfo = serde_json::from_value(serde_json::json!({"instanceID":id,"instanceStatus":{"code":3},"tenantID":"tenant","environmentID":"runtime","environmentIP":"127.0.0.1","nodeProxyAddress":address.to_string()})).unwrap();
     node.activate_route(
         route.instance_id.clone(),
-        route.sandbox_id.clone(),
-        route.sandbox_ip.parse().unwrap(),
+        route.environment_id.clone(),
+        route.environment_ip.parse().unwrap(),
     )
     .await;
     routes.put(route.clone());
@@ -187,7 +187,7 @@ async fn jiuwen_execd_reads_are_authorized_bounded_and_cancelled() {
         foreign.read_file("/normal", 5).await,
         Err(ReadError::NotFound)
     ));
-    // A valid Sandbox lookup cannot bypass a conflicting route's tenant.
+    // A valid Environment lookup cannot bypass a conflicting route's tenant.
     let mut wrong_route = route.clone();
     wrong_route.tenant_id = "other".into();
     routes.put(wrong_route);

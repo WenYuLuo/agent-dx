@@ -33,7 +33,7 @@ impl Default for BackendHttpPoolConfig {
             max_idle_connections_per_endpoint: 64,
             // An idle HTTP connection is still an open CONNECT stream at the
             // Relay. Keep this deliberately short so pooling cannot pin a
-            // sandbox busy for an unbounded period.
+            // environment busy for an unbounded period.
             idle_timeout: Duration::from_secs(5),
             acquire_timeout: Duration::from_secs(3),
         }
@@ -206,7 +206,7 @@ impl BackendHttpPool {
                     self.inner.opened_total.fetch_add(1, Ordering::Relaxed);
                     tokio::spawn(async move {
                         if let Err(error) = connection.await {
-                            tracing::debug!(%error, "pooled sandbox HTTP connection closed");
+                            tracing::debug!(%error, "pooled environment HTTP connection closed");
                         }
                     });
                     break sender;
@@ -438,15 +438,15 @@ impl Body for PooledResponseBody {
 
 #[derive(Debug, thiserror::Error)]
 pub enum BackendHttpPoolError {
-    #[error("sandbox HTTP pool is saturated")]
+    #[error("environment HTTP pool is saturated")]
     Saturated,
-    #[error("sandbox HTTP pool is closed")]
+    #[error("environment HTTP pool is closed")]
     Closed,
-    #[error("open sandbox stream: {0}")]
+    #[error("open environment stream: {0}")]
     Connect(io::Error),
-    #[error("sandbox HTTP handshake: {0}")]
+    #[error("environment HTTP handshake: {0}")]
     Handshake(hyper::Error),
-    #[error("sandbox HTTP request: {0}")]
+    #[error("environment HTTP request: {0}")]
     Request(hyper::Error),
 }
 

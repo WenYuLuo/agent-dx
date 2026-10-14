@@ -207,8 +207,8 @@ async fn running_backend(
     store.put(RouteInfo {
         instance_id: "environment".into(),
         tenant_id: "tenant".into(),
-        sandbox_id: "running".into(),
-        sandbox_ip: "127.0.0.1".into(),
+        environment_id: "running".into(),
+        environment_ip: "127.0.0.1".into(),
         relay_address,
         environment_status: EnvironmentStatus {
             code: 3,

@@ -1,22 +1,22 @@
-//! Composition bridge from Activator's local transport to the Sandbox application service.
+//! Composition bridge from Activator's local transport to the Environment application service.
 //! Agent execution specifications are converted in the Activator crate.
-use crate::{http::instance_view, operations::Kind, sandbox_service::SandboxService};
-use adx_activator::local_sandbox::SandboxApplication;
-use adx_agent_core::sandbox::SandboxError;
+use crate::{environment_service::EnvironmentService, http::instance_view, operations::Kind};
+use adx_activator::local_environment::EnvironmentApplication;
+use adx_agent_core::environment::EnvironmentError;
 use adx_protocol::control as pb;
 use async_trait::async_trait;
 use serde_json::Value;
 use tonic::{Code, Status};
 
 #[async_trait]
-impl SandboxApplication for SandboxService {
+impl EnvironmentApplication for EnvironmentService {
     async fn create_request(
         &self,
         tenant: &str,
         input: Value,
         operation_id: &str,
-    ) -> Result<Value, SandboxError> {
-        Box::pin(SandboxService::create_request(
+    ) -> Result<Value, EnvironmentError> {
+        Box::pin(EnvironmentService::create_request(
             self,
             input,
             operation_id,
@@ -25,7 +25,7 @@ impl SandboxApplication for SandboxService {
         .await
         .map_err(|error| map_status(error, true))
     }
-    async fn instance(&self, tenant: &str, id: &str) -> Result<Option<Value>, SandboxError> {
+    async fn instance(&self, tenant: &str, id: &str) -> Result<Option<Value>, EnvironmentError> {
         let Some(owner) = self
             .inspect(tenant, id)
             .await
@@ -45,7 +45,7 @@ impl SandboxApplication for SandboxService {
         id: &str,
         input: Value,
         operation_id: &str,
-    ) -> Result<(), SandboxError> {
+    ) -> Result<(), EnvironmentError> {
         self.execute(Kind::Delete, id, operation_id, input, &caller(tenant))
             .await
             .map_err(|error| map_status(error, true))?;
@@ -58,19 +58,21 @@ fn caller(tenant: &str) -> pb::CallerContext {
         administrator: false,
     }
 }
-fn map_status(status: Status, write: bool) -> SandboxError {
+fn map_status(status: Status, write: bool) -> EnvironmentError {
     match status.code() {
-        Code::PermissionDenied => SandboxError::NotFound,
-        Code::NotFound if !write => SandboxError::NotFound,
-        Code::InvalidArgument => SandboxError::Invalid("API Server rejected request".into()),
+        Code::PermissionDenied => EnvironmentError::NotFound,
+        Code::NotFound if !write => EnvironmentError::NotFound,
+        Code::InvalidArgument => EnvironmentError::Invalid("API Server rejected request".into()),
         Code::AlreadyExists | Code::FailedPrecondition | Code::Aborted => {
-            SandboxError::Conflict("Sandbox identity/specification conflict".into())
+            EnvironmentError::Conflict("Environment identity/specification conflict".into())
         }
-        Code::Unimplemented => SandboxError::Unsupported("Sandbox capability unavailable".into()),
-        _ if write => SandboxError::OutcomeUnknown(
-            "Sandbox write result is unknown; inspect the original ID".into(),
+        Code::Unimplemented => {
+            EnvironmentError::Unsupported("Environment capability unavailable".into())
+        }
+        _ if write => EnvironmentError::OutcomeUnknown(
+            "Environment write result is unknown; inspect the original ID".into(),
         ),
-        _ => SandboxError::Unavailable("Sandbox read is unavailable".into()),
+        _ => EnvironmentError::Unavailable("Environment read is unavailable".into()),
     }
 }
 #[cfg(test)]
@@ -80,19 +82,19 @@ mod tests {
     fn missing_writes_and_private_reads_keep_distinct_errors() {
         assert_eq!(
             map_status(Status::permission_denied("private"), false),
-            SandboxError::NotFound
+            EnvironmentError::NotFound
         );
         assert!(matches!(
             map_status(Status::not_found("absent"), true),
-            SandboxError::OutcomeUnknown(_)
+            EnvironmentError::OutcomeUnknown(_)
         ));
         assert!(matches!(
             map_status(Status::unavailable("lost response"), true),
-            SandboxError::OutcomeUnknown(_)
+            EnvironmentError::OutcomeUnknown(_)
         ));
         assert!(matches!(
             map_status(Status::unavailable("read failed"), false),
-            SandboxError::Unavailable(_)
+            EnvironmentError::Unavailable(_)
         ));
     }
 }

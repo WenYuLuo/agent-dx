@@ -6,13 +6,13 @@ UT 与 E2E 分开管理：UT 按代码模块运行；E2E 按业务闭环和部�
 
 ## 1. UT 不纳入 E2E 层级
 
-UT 包含 Rust workspace、Agent、Sandbox SDK、构建驱动器，以及使用测试进程或隔离 Redis
+UT 包含 Rust workspace、Agent、Environment SDK、构建驱动器，以及使用测试进程或隔离 Redis
 验证组件契约的用例。它们用于快速定位规则和接口错误，但不代表完整平台已经部署。
 
 | UT 类别 | 当前规模／入口 | 作用 |
 |---|---|---|
 | Rust | 404 个静态测试定义；`cargo test --workspace --all-features` | API Server、Coordinator、adxlet、Execd、Gateway、CLI 和公共 crates |
-| Python | 528 个静态测试定义 | Agent、Sandbox SDK、构建和测试驱动器 |
+| Python | 528 个静态测试定义 | Agent、Environment SDK、构建和测试驱动器 |
 | 状态与 RPC 契约 | `storage`、`control-rpc`、`api-control`、`interop` suite | Redis/AOF、mTLS、进程 RPC 和 Execd Socket 协作 |
 
 这些测试都应进入 Buildkite 的代码门禁，但报告为 `UT / component tests`，不使用 L0、
@@ -35,7 +35,7 @@ Standalone 通过替代多 VM，也不能用多 VM 通过替代正式 K8s／目�
 
 ## 3. L0：最小真实端到端用例
 
-L0 只证明最核心的用户闭环。它必须使用发布包、安装后的 Sandbox SDK、真实 Redis、真实
+L0 只证明最核心的用户闭环。它必须使用发布包、安装后的 Environment SDK、真实 Redis、真实
 控制面／Gateway、真实 sandboxd 和真实 Execd；允许所有组件位于一个测试宿主。
 
 | L0 用例 | 必须断言 |
@@ -55,7 +55,7 @@ detached 重连／显式删除与空闲回收；`auth` 提供凭证与租户隔�
 L0 不包含双节点放置、节点失联、跨节点恢复、暂停／快照、性能或长稳。
 
 十一组是部署和清理边界，不是功能用例总数。SDK 的 66 个公开操作、构造参数、错误类型以及
-逐项 E2E 状态见 [Sandbox SDK 公开能力与端到端覆盖](sdk-e2e-coverage.md)。`sdk`、
+逐项 E2E 状态见 [Environment SDK 公开能力与端到端覆盖](sdk-e2e-coverage.md)。`sdk`、
 `data-plane`、`lifecycle` 和 `placement` 会把稳定子用例写入 JUnit，而不再用一个组名掩盖
 组内覆盖数量。
 
@@ -238,7 +238,7 @@ profile；完整 Multi-VM 在补齐部署器前不能标记为通过。
 | `FD-14` | cn-north-4 双 worker 定向通过 | `command-registry-capacity` 仅把 node1 Execd 的命令记录上限设为 1，运行命令占满时第二个稳定命令 ID 获得 `ResourceExhausted`；释放占用后以原 ID 成功，副作用一次，归属／backend 不变且最终清理完成 |
 | `FD-15` | cn-north-4 双 worker 定向通过 | `upload-response-cut` 在 Execd 已提交第一个二进制文件块后切断 SDK 应答，要求 SDK 查询实际上传偏移并沿同一上传 ID 继续，最终文件 SHA256 完全一致，归属／backend 不变且最终清理完成 |
 | `FD-16` | cn-north-4 双 worker 定向通过 | `download-response-cut` 在文件下载的首个 200 应答仅发送部分字节后断开，要求 SDK 保留 `.part` 并使用实际已写入偏移的 Range 续传；最终 SHA256 一致，归属／backend 不变且最终清理完成 |
-| `FD-17` | cn-north-4 双 worker 定向通过 | `command-watch-unavailable` 仅拒绝真实命令 Watch 握手，HTTP 查询保持可用；SDK 重连预算耗尽后返回 `CommandUnavailable` 和原 Sandbox／命令 ID，新客户端查询并终止同一命令，确认未重复启动、归属／backend 不变及最终清理完成 |
+| `FD-17` | cn-north-4 双 worker 定向通过 | `command-watch-unavailable` 仅拒绝真实命令 Watch 握手，HTTP 查询保持可用；SDK 重连预算耗尽后返回 `CommandUnavailable` 和原 Environment／命令 ID，新客户端查询并终止同一命令，确认未重复启动、归属／backend 不变及最终清理完成 |
 | `FD-18` | cn-north-4 双 worker 定向通过 | `command-unsupported-feature` 从真实 Execd capability 应答移除 Watch 能力，要求 SDK 返回 `UnsupportedFeature` 且没有发出 `process.start`；健康客户端以相同命令 ID 执行一次，归属／backend 不变且最终清理完成 |
 | `FD-19` | cn-north-4 双 worker 定向通过 | `command-expiry` 只在 node1 配置一秒 Execd 结果 TTL；从未存在的 ID 必须返回 `CommandNotFound`，终态记录到期必须返回 `CommandExpired`，同时保持原归属／backend 并完成清理。此前旧 Execd 的 `COMMAND_NOT_FOUND` 红灯已修复并在正式部署回归通过 |
 | `FD-20` | cn-north-4 双 worker 定向通过 | `command-watch-query-unavailable` 同时拒绝 Watch 与 `process.get`，要求 SDK 返回携带原命令身份的结构化结果未知；恢复查询后找回原命令，不得重复启动 |
@@ -260,7 +260,7 @@ worker 时把 `FD-05` 设为合入门槛；Multi-VM、FC、XPU 和长稳按 nigh
 
 Buildkite 保留 UT 和 E2E 两条清晰的结果线：
 
-1. **UT gate**：Rust、Agent、Sandbox SDK、驱动器、真实 Redis/mTLS/Execd 组件契约；任何失败阻断。
+1. **UT gate**：Rust、Agent、Environment SDK、驱动器、真实 Redis/mTLS/Execd 组件契约；任何失败阻断。
 2. **L0 E2E gate**：每个提交使用真实发布包部署完整最小平台，执行 L0 全部用例；不能用 mock 后端。
 3. **Full deployment gate**：主分支、合入候选和发布候选执行十一组 K8s 用例、可观测断言及清理。
 4. **Conditional profiles**：checkpoint/snapshot 变更触发 KVM；设备调度变更触发 GPU/NPU worker。

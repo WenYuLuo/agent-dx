@@ -164,7 +164,7 @@ impl Manager {
                 ("status", Value::from("error")),
                 (
                     "message",
-                    Value::from("inherit_entrypoint is not enabled for this sandbox"),
+                    Value::from("inherit_entrypoint is not enabled for this environment"),
                 ),
             ]),
         }

@@ -1,5 +1,5 @@
 //! Optional in-process Ingress using the same service as the standalone binary.
-use adx_agent_core::sandbox::Sandbox;
+use adx_agent_core::environment::Environment;
 use adx_process::resource::raise_nofile_soft_limit_from_env;
 use data_plane_gateway::{
     config::IngressConfig,
@@ -18,15 +18,15 @@ pub struct EmbeddedIngress {
 impl EmbeddedIngress {
     pub async fn start(
         control: ControlConfig,
-        sandbox_service: Option<Arc<dyn Sandbox>>,
-        directory: Arc<dyn data_plane_gateway::ingress::sandbox_files::SandboxDirectory>,
+        environment_service: Option<Arc<dyn Environment>>,
+        directory: Arc<dyn data_plane_gateway::ingress::environment_files::EnvironmentDirectory>,
     ) -> Result<Self> {
         let nofile_soft_limit = raise_nofile_soft_limit_from_env()?;
         adx_observability::info!(nofile_soft_limit, "embedded Ingress FD limit configured");
         let config = IngressConfig::from_env()?;
-        let service = match sandbox_service {
+        let service = match environment_service {
             Some(service) => {
-                IngressService::bind_with_sandbox_service(config, control, service, directory)
+                IngressService::bind_with_environment_service(config, control, service, directory)
                     .await?
             }
             None => IngressService::bind(config, control).await?,

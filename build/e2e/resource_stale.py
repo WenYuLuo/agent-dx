@@ -4,13 +4,13 @@ import json
 import time
 import uuid
 
-from adx_sandbox import Sandbox, SandboxError
+from adx_environment import Environment, EnvironmentError
 from functional_lifecycle import _wait_deleted
 from node import backend, catalog, labeled_backend, persisted_runtime_id
 
 
 def create(connection, image, output):
-    sandbox = Sandbox(
+    environment = Environment(
         image=image,
         runtime='runc',
         cpu=250,
@@ -22,13 +22,13 @@ def create(connection, image, output):
         create_timeout=150,
     )
     try:
-        result = sandbox.commands.run('printf resource-observer-live')
+        result = environment.commands.run('printf resource-observer-live')
         if not (result.exit_code == 0 and result.stdout == 'resource-observer-live'):
             raise AssertionError()
         records = catalog()
-        record = json.loads(records['environment:' + sandbox.id])
+        record = json.loads(records['environment:' + environment.id])
         node = json.loads(records['node:node1'])
-        backends = labeled_backend(sandbox.id)
+        backends = labeled_backend(environment.id)
         if not (record['assignment']['node_id'] == 'node1' and len(backends) == 1):
             raise AssertionError()
         if not (record['result']['state'] == 'Running' and node['node']['available']):
@@ -36,7 +36,7 @@ def create(connection, image, output):
         output.write_text(
             json.dumps(
                 {
-                    'instance_id': sandbox.id,
+                    'instance_id': environment.id,
                     'session_id': node['session']['id'],
                     'runtime_id': persisted_runtime_id(record['result']),
                     'backend': backends[0],
@@ -45,10 +45,10 @@ def create(connection, image, output):
             + '\n'
         )
     except Exception:
-        Sandbox.delete(sandbox.id, connection=connection)
+        Environment.delete(environment.id, connection=connection)
         raise
     finally:
-        sandbox.close()
+        environment.close()
 
 
 def rejected(connection, image, evidence):
@@ -63,7 +63,7 @@ def rejected(connection, image, evidence):
     name = 'stale-rejected-' + uuid.uuid4().hex
     started = time.monotonic()
     try:
-        unexpected = Sandbox(
+        unexpected = Environment(
             name=name,
             image=image,
             runtime='runc',
@@ -75,7 +75,7 @@ def rejected(connection, image, evidence):
             create_timeout=40,
             connection=connection,
         )
-    except SandboxError as error:
+    except EnvironmentError as error:
         if 'central scheduling queue deadline exceeded' not in str(error):
             raise AssertionError(str(error)) from error
     else:
@@ -115,7 +115,7 @@ def verify(connection, image, evidence, output):
     deleted = set()
     report = {'status': 'failed', 'cases': [], 'cleanup_errors': []}
     try:
-        retained = Sandbox.from_id(live['instance_id'], connection=connection)
+        retained = Environment.from_id(live['instance_id'], connection=connection)
         try:
             command = retained.commands.run('printf resource-observer-retained')
             if not (command.exit_code == 0 and command.stdout == 'resource-observer-retained'):
@@ -123,7 +123,7 @@ def verify(connection, image, evidence, output):
         finally:
             retained.close()
 
-        created = Sandbox(
+        created = Environment(
             image=image,
             runtime='runc',
             cpu=250,
@@ -142,7 +142,7 @@ def verify(connection, image, evidence, output):
             raise AssertionError()
 
         for sid in (created.id, live['instance_id']):
-            Sandbox.delete(sid, connection=connection)
+            Environment.delete(sid, connection=connection)
             deleted.add(sid)
             _wait_deleted(sid, connection, timeout=60)
             if not ('environment:' + sid not in catalog()):
@@ -168,7 +168,7 @@ def verify(connection, image, evidence, output):
         for sid in (live['instance_id'], created.id if created else None):
             if sid and sid not in deleted:
                 try:
-                    Sandbox.delete(sid, connection=connection)
+                    Environment.delete(sid, connection=connection)
                 except Exception as error:
                     report['cleanup_errors'].append(str(error))
         if report['cleanup_errors']:

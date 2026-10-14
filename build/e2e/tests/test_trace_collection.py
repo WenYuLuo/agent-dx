@@ -85,12 +85,12 @@ class HttpTraceContractTests(unittest.TestCase):
 
     def test_create_trace_requires_two_linked_http_spans_and_all_stages(self):
         rows = [
-            {'traceId': 't', 'spanId': '1', 'name': 'POST /api/sandbox/v1/sandboxes', 'service': 'adx-apiserver'},
+            {'traceId': 't', 'spanId': '1', 'name': 'POST /api/environment/v1/environments', 'service': 'adx-apiserver'},
             {
                 'traceId': 't',
                 'spanId': '2',
                 'parentSpanId': '1',
-                'name': 'POST /api/sandbox/v1/sandboxes',
+                'name': 'POST /api/environment/v1/environments',
                 'service': 'adx-apiserver',
             },
         ]

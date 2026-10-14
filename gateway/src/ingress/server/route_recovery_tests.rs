@@ -46,9 +46,9 @@ async fn binding_replacement(next_tenant: Option<&str>, change_security: bool) {
             ..Default::default()
         },
         tenant_id: "tenant".into(),
-        sandbox_id: "old-runtime".into(),
+        environment_id: "old-runtime".into(),
         relay_address: node_address.to_string(),
-        sandbox_ip: "127.0.0.1".into(),
+        environment_ip: "127.0.0.1".into(),
         tunnel_security_mode: Default::default(),
         port_forward_security_mode: Default::default(),
         port_forward_routes: Vec::new(),
@@ -86,7 +86,7 @@ async fn binding_replacement(next_tenant: Option<&str>, change_security: bool) {
     .await
     .unwrap();
     if let Some(tenant) = next_tenant {
-        route.sandbox_id = "new-runtime".into();
+        route.environment_id = "new-runtime".into();
         route.tenant_id = tenant.into();
         if change_security {
             route.tunnel_security_mode = crate::common::route::DataPlaneSecurityMode::Tls;
@@ -206,8 +206,8 @@ async fn health_and_metrics_never_wake_paused_or_rejected_old_routes() {
             store.put(RouteInfo {
                 instance_id: "environment".into(),
                 tenant_id: "tenant".into(),
-                sandbox_id: "old-runtime".into(),
-                sandbox_ip: "127.0.0.1".into(),
+                environment_id: "old-runtime".into(),
+                environment_ip: "127.0.0.1".into(),
                 relay_address: relay_address.clone(),
                 environment_status: EnvironmentStatus {
                     code: 3,
@@ -284,8 +284,8 @@ async fn rejected_binding_preserves_temporary_wake_failure_as_retryable() {
     store.put(RouteInfo {
         instance_id: "environment".into(),
         tenant_id: "tenant".into(),
-        sandbox_id: "old-runtime".into(),
-        sandbox_ip: "127.0.0.1".into(),
+        environment_id: "old-runtime".into(),
+        environment_ip: "127.0.0.1".into(),
         relay_address: relay_address.clone(),
         environment_status: EnvironmentStatus {
             code: 3,

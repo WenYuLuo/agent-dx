@@ -263,7 +263,7 @@ impl JiuwenApi {
         if request.method() != http::Method::GET {
             return error(StatusCode::METHOD_NOT_ALLOWED, "METHOD_NOT_ALLOWED");
         }
-        // Validate HTTP upgrade before activating any Sandbox.
+        // Validate HTTP upgrade before activating any Environment.
         let mut handshake = Request::builder()
             .method(request.method())
             .uri(request.uri())
@@ -492,7 +492,7 @@ impl JiuwenApi {
             ingress,
             context,
             tenant: scope.tenant,
-            sandbox_id: target.sandbox_id,
+            environment_id: target.environment_id,
             workspace,
             user_id,
             agent_type: self.config.agent_type.clone(),
@@ -552,7 +552,7 @@ impl JiuwenApi {
             ingress,
             context,
             tenant: scope.tenant.clone(),
-            sandbox_id: target.sandbox_id,
+            environment_id: target.environment_id,
             config,
             token,
             expected_session: None,

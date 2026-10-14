@@ -33,7 +33,7 @@ def call(method_local, path_local, body_local=None, key='a' * 40, extra=None):
 
 for _ in range(100):
     try:
-        code, _ = call('DELETE', '/api/sandbox/absent', key='wrong')
+        code, _ = call('DELETE', '/api/environment/absent', key='wrong')
         if not (code == 401):
             raise AssertionError()
         break
@@ -42,18 +42,18 @@ for _ in range(100):
 else:
     raise AssertionError('Rust API Server did not listen')
 for _ in range(100):
-    if call('DELETE', '/api/sandbox/absent')[0] == 404:
+    if call('DELETE', '/api/environment/absent')[0] == 404:
         break
     time.sleep(0.05)
 else:
     raise AssertionError('Rust API Server Environment directory did not synchronize')
 for invalid_key in ('z' * 40, 'c' * 40):
-    code, _ = call('DELETE', '/api/sandbox/absent', key=invalid_key)
+    code, _ = call('DELETE', '/api/environment/absent', key=invalid_key)
     if not (code == 401):
         raise AssertionError(code)
 code, body = call(
     'POST',
-    '/api/sandbox/v1/sandboxes',
+    '/api/environment/v1/environments',
     {
         'name': 'http-case',
         'namespace': 't',
@@ -71,18 +71,18 @@ code, body = call(
 if not (code == 200):
     raise AssertionError((code, body))
 payload = json.loads(base64.b64decode(body['data']))
-if not (payload['sandboxId'] == 't-http-case'):
+if not (payload['environmentId'] == 't-http-case'):
     raise AssertionError(payload)
-code, _ = call('DELETE', '/api/sandbox/t-http-case', key='b' * 40)
+code, _ = call('DELETE', '/api/environment/t-http-case', key='b' * 40)
 if not (code == 403):
     raise AssertionError(code)
 # Target Node rechecks tenant ownership; valid deletion then succeeds twice.
 for _ in range(2):
-    code, body = call('DELETE', '/api/sandbox/t-http-case')
+    code, body = call('DELETE', '/api/environment/t-http-case')
     if not (code == 200):
         raise AssertionError((code, body))
 code, body = call(
-    'POST', '/api/sandbox/v1/sandboxes/t-http-case/pause', {}, extra={'X-ADX-Request-ID': 'pause-http-case'}
+    'POST', '/api/environment/v1/environments/t-http-case/pause', {}, extra={'X-ADX-Request-ID': 'pause-http-case'}
 )
 if not (code == 409):
     raise AssertionError((code, body))
@@ -90,7 +90,7 @@ print(('Public HTTPS create, credential/tenant checks, repeated delete, pause on
 
 # Real HTTPS -> authenticated API Server -> mTLS Coordinator -> Redis key lifecycle.
 admin = 'd' * 40
-code, current = call('GET', '/api/sandbox/v1/resources')
+code, current = call('GET', '/api/environment/v1/resources')
 if not (code == 200 and current['items'][0]['status'] == 0):
     raise AssertionError((code, current))
 code, compatible = call('GET', '/global-scheduler/resources')
@@ -173,7 +173,7 @@ print(
 def create_placement(name, labels=None, affinities=None):
     code_local, body_local = call(
         'POST',
-        '/api/sandbox/v1/sandboxes',
+        '/api/environment/v1/environments',
         {
             'name': name,
             'namespace': 't',
@@ -186,7 +186,7 @@ def create_placement(name, labels=None, affinities=None):
     )
     if not (code_local == 200):
         raise AssertionError((name, code_local, body_local))
-    return json.loads(base64.b64decode(body_local['data']))['sandboxId']
+    return json.loads(base64.b64decode(body_local['data']))['environmentId']
 
 
 def affinity(kind, mode, key, value_local, **extra):
@@ -211,12 +211,12 @@ client = create_placement(
     ],
 )
 for identity in (client, peer):
-    code, body = call('DELETE', '/api/sandbox/' + identity)
+    code, body = call('DELETE', '/api/environment/' + identity)
     if not (code == 200):
         raise AssertionError((code, body))
 code, body = call(
     'POST',
-    '/api/sandbox/v1/sandboxes',
+    '/api/environment/v1/environments',
     {'name': 'bad-weight', 'image': 'image', 'scheduleAffinities': [affinity(0, 0, 'NODE_ID', 'node', weight=-1)]},
 )
 if not (code == 400):
@@ -228,25 +228,25 @@ request_id = 'http-replay-fixed'
 request = {'name': 'http-replay', 'namespace': 't', 'image': 'image', 'cpu': 100, 'memory': 1}
 created = []
 for _ in range(2):
-    code, value = call('POST', '/api/sandbox/v1/sandboxes', request, extra={'X-Request-Id': request_id})
+    code, value = call('POST', '/api/environment/v1/environments', request, extra={'X-Request-Id': request_id})
     if not (code == 200):
         raise AssertionError((code, value))
-    created.append(json.loads(base64.b64decode(value['data']))['sandboxId'])
+    created.append(json.loads(base64.b64decode(value['data']))['environmentId'])
 if not (created[0] == created[1]):
     raise AssertionError()
-code, _ = call('POST', '/api/sandbox/v1/sandboxes', dict(request, name='changed'), extra={'X-Request-Id': request_id})
+code, _ = call('POST', '/api/environment/v1/environments', dict(request, name='changed'), extra={'X-Request-Id': request_id})
 if not (code == 409):
     raise AssertionError(code)
-code, value = call('POST', '/api/sandbox/v1/sandboxes', request, extra={'X-Request-Id': 'another-request'})
+code, value = call('POST', '/api/environment/v1/environments', request, extra={'X-Request-Id': 'another-request'})
 if not (code == 200):
     raise AssertionError((code, value))
-if not (json.loads(base64.b64decode(value['data']))['sandboxId'] == created[0]):
+if not (json.loads(base64.b64decode(value['data']))['environmentId'] == created[0]):
     raise AssertionError()
-if not (call('DELETE', '/api/sandbox/' + created[0])[0] == 200):
+if not (call('DELETE', '/api/environment/' + created[0])[0] == 200):
     raise AssertionError()
 
 request = urllib.request.Request(
-    endpoint + '/api/sandbox/v1/sandboxes',
+    endpoint + '/api/environment/v1/environments',
     data=json.dumps({'name': 'http-stream', 'namespace': 't', 'image': 'image', 'cpu': 100, 'memory': 1}).encode(),
     headers={'X-Auth': 'a' * 40, 'Content-Type': 'application/json', 'Accept': 'text/event-stream'},
     method='POST',
@@ -259,13 +259,13 @@ if not (events.count('event: accepted') == 1 and events.count('event: final') ==
     raise AssertionError(events)
 if '"status":"running"' not in events:
     raise AssertionError(events)
-if not (call('DELETE', '/api/sandbox/t-http-stream')[0] == 200):
+if not (call('DELETE', '/api/environment/t-http-stream')[0] == 200):
     raise AssertionError()
 
 # Legacy public path retains its response field, without legacy internal messages.
 code, value = call(
     'POST',
-    '/api/sandbox/create',
+    '/api/environment/create',
     {'name': 'http-old-path', 'namespace': 't', 'runtime': 'rust', 'rootfs': 'image', 'cpu': 100, 'memory': 1},
 )
 if not (code == 200):
@@ -273,13 +273,13 @@ if not (code == 200):
 identity = json.loads(base64.b64decode(value['data']))['instance_id']
 if not (identity == 't-http-old-path'):
     raise AssertionError()
-if not (call('DELETE', '/api/sandbox/' + identity)[0] == 200):
+if not (call('DELETE', '/api/environment/' + identity)[0] == 200):
     raise AssertionError()
 print('HTTP request replay/conflict, named duplicate rejection, SSE and legacy path response passed')
 
 # Real HTTPS lifecycle round trips with local checkpoint bytes and Redis metadata.
 identity = create_placement('http-lifecycle')
-pause = '/api/sandbox/v1/sandboxes/' + identity + '/pause'
+pause = '/api/environment/v1/environments/' + identity + '/pause'
 for request_id, value in [('pause-invalid', {'timeoutSeconds': -1}), ('pause-invalid-name', {'name': '   '})]:
     if not (call('POST', pause, value, extra={'X-ADX-Request-ID': request_id})[0] == 400):
         raise AssertionError()
@@ -295,7 +295,7 @@ for _ in range(2):
 for _ in range(2):
     code, value = call(
         'POST',
-        '/api/sandbox/v1/sandboxes/' + identity + '/resume',
+        '/api/environment/v1/environments/' + identity + '/resume',
         {},
         extra={'X-ADX-Request-ID': 'resume-http-positive'},
     )
@@ -306,36 +306,36 @@ for _ in range(2):
         raise AssertionError(value)
 code, value = call(
     'POST',
-    '/api/sandbox/v1/sandboxes/' + identity + '/snapshots',
+    '/api/environment/v1/environments/' + identity + '/snapshots',
     {'name': 'http-saved', 'timeoutSeconds': 10},
     extra={'X-ADX-Request-ID': 'snapshot-http-positive'},
 )
 if not (code == 200):
     raise AssertionError((code, value))
 snapshot = json.loads(base64.b64decode(value['data']))['snapshotId']
-code, value = call('GET', '/api/sandbox/v1/snapshots/' + snapshot)
+code, value = call('GET', '/api/environment/v1/snapshots/' + snapshot)
 if not (code == 200 and json.loads(base64.b64decode(value['data']))['names'] == ['http-saved']):
     raise AssertionError((code, value))
-if not (call('GET', '/api/sandbox/v1/snapshots/' + snapshot, key='b' * 40)[0] == 403):
+if not (call('GET', '/api/environment/v1/snapshots/' + snapshot, key='b' * 40)[0] == 403):
     raise AssertionError()
-code, value = call('GET', '/api/sandbox/v1/snapshots?name=http-saved')
+code, value = call('GET', '/api/environment/v1/snapshots?name=http-saved')
 if not (code == 200 and len(json.loads(base64.b64decode(value['data']))['items']) == 1):
     raise AssertionError((code, value))
 code, value = call(
-    'POST', '/api/sandbox/v1/sandboxes', {'name': 'http-clone', 'namespace': 't', 'snapshotId': snapshot}
+    'POST', '/api/environment/v1/environments', {'name': 'http-clone', 'namespace': 't', 'snapshotId': snapshot}
 )
 if not (code == 200):
     raise AssertionError((code, value))
-clone = json.loads(base64.b64decode(value['data']))['sandboxId']
+clone = json.loads(base64.b64decode(value['data']))['environmentId']
 if not (clone != identity):
     raise AssertionError()
-if not (call('DELETE', '/api/sandbox/' + clone)[0] == 200):
+if not (call('DELETE', '/api/environment/' + clone)[0] == 200):
     raise AssertionError()
-if not (call('DELETE', '/api/sandbox/' + identity)[0] == 200):
+if not (call('DELETE', '/api/environment/' + identity)[0] == 200):
     raise AssertionError()
 if not (
     call(
-        'DELETE', '/api/sandbox/v1/snapshots/' + snapshot, extra={'X-ADX-Request-ID': 'delete-snapshot-http-positive'}
+        'DELETE', '/api/environment/v1/snapshots/' + snapshot, extra={'X-ADX-Request-ID': 'delete-snapshot-http-positive'}
     )[0]
     == 200
 ):
@@ -423,7 +423,7 @@ finally:
 from urllib.parse import quote
 
 identity = create_placement('http space+percent%')
-code, value = call('DELETE', '/api/sandbox/' + quote(identity, safe=''))
+code, value = call('DELETE', '/api/environment/' + quote(identity, safe=''))
 if not (code == 200):
     raise AssertionError((code, value))
 print('Escaped instance ID deletion passed')

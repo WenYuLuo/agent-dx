@@ -71,7 +71,7 @@ for component in "${components[@]}"; do
     ! -name manifest.json -exec cp {} "$stage/" \;
 done
 
-echo "--- :python: Consume tested Sandbox SDK candidate"
+echo "--- :python: Consume tested Environment SDK candidate"
 if [[ ${ADX_CANDIDATE_LOCAL:-0} != 1 ]]; then
   buildkite-agent artifact download 'out/buildkite/sdk/*' . --step sdk-package
 fi
@@ -83,7 +83,7 @@ candidate = json.loads(Path('out/buildkite/sdk/sdk-candidate.json').read_text())
 if candidate['commit'] != os.environ['BUILDKITE_COMMIT'] or candidate['build_id'] != os.environ['BUILDKITE_BUILD_ID']:
     raise SystemExit('SDK candidate belongs to another build')
 CHECK
-wheel=(out/buildkite/sdk/adx_sandbox-*.whl)
+wheel=(out/buildkite/sdk/adx_environment-*.whl)
 [[ ${#wheel[@]} == 1 && -f ${wheel[0]} ]]
 
 echo "--- :package: Assemble unified ADX release"
@@ -133,7 +133,7 @@ if [[ ${ADX_EXTERNAL_BACKEND:-1} == 1 ]]; then
   backend_args=(--backend-manifest out/buildkite/backend/manifest.json --backend-archive out/buildkite/backend.tar.gz)
 fi
 
-wheel=(out/buildkite/sdk/adx_sandbox-*.whl)
+wheel=(out/buildkite/sdk/adx_environment-*.whl)
 [[ ${#wheel[@]} == 1 && -f ${wheel[0]} ]]
 python3 build/release/component.py aggregate \
   --component-root out/buildkite/components \

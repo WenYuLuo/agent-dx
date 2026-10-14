@@ -29,7 +29,7 @@ class CapacityQueueTests(unittest.TestCase):
         state = {'live': {}, 'pending': None, 'deleted': []}
         released = threading.Event()
 
-        class Sandbox:
+        class Environment:
             def __init__(self, *, name=None, node_id=None, **_options):
                 if name is not None:
                     state['pending'] = name
@@ -87,7 +87,7 @@ class CapacityQueueTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             report = run_capacity(inventory(), object(), 'image', 'control:8443',
-                                  'admin', 'ca', Path(directory), Sandbox, resources,
+                                  'admin', 'ca', Path(directory), Environment, resources,
                                   queue, remote, pending_probe_seconds=.01)
             self.assertEqual(report['status'], 'passed')
             self.assertEqual(report['resumed']['node_id'], 'node1')

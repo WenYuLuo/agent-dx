@@ -27,7 +27,7 @@ pub struct ServiceSelection {
     scope: Scope,
     protocol: Protocol,
     port: u16,
-    sandbox_id: String,
+    environment_id: String,
     generation: String,
     retried: bool,
 }
@@ -44,7 +44,7 @@ impl ServiceSelection {
     }
 
     pub(crate) fn forwarding_uri(&self, backend_uri: &http::Uri) -> Result<http::Uri, Error> {
-        format!("/{}/{}{}", self.sandbox_id, self.port, backend_uri)
+        format!("/{}/{}{}", self.environment_id, self.port, backend_uri)
             .parse()
             .map_err(|_| Error::Unavailable("invalid resolved forwarding path".into()))
     }
@@ -79,7 +79,7 @@ impl AgentV2Access {
             scope,
             protocol: selector.protocol,
             port,
-            sandbox_id: target.binding.sandbox_id,
+            environment_id: target.binding.environment_id,
             generation: target.binding.generation,
             retried: false,
         })
@@ -102,7 +102,7 @@ impl AgentV2Access {
                 &selection.generation,
             ))
             .await?;
-        selection.sandbox_id = target.binding.sandbox_id;
+        selection.environment_id = target.binding.environment_id;
         selection.port = port;
         Ok(true)
     }
@@ -144,7 +144,7 @@ impl AgentV2Access {
                     let attempt = async {
                         let route = ingress
                             .resolve_route(
-                                &selection.sandbox_id,
+                                &selection.environment_id,
                                 selection.port,
                                 AccessKind::Direct,
                                 String::new(),

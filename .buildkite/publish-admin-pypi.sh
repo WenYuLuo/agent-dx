@@ -10,6 +10,8 @@ esac
 : "${BUILDKITE_BUILD_ID:?Buildkite build ID required}"
 root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$root"
+source .buildkite/release-tag.sh
+require_repository_release_tag "${BUILDKITE_TAG:-}"
 source .buildkite/python-env.sh
 output=out/buildkite/admin
 publish_output=out/buildkite/admin-publish
@@ -24,13 +26,8 @@ buildkite-agent artifact download 'out/buildkite/admin/*' . --step admin-package
 "$python" build/admin/candidate.py --verify --directory "$output" >/dev/null
 candidate_commit=$("$python" -c 'import json; print(json.load(open("out/buildkite/admin/admin-candidate.json"))["commit"])')
 candidate_build=$("$python" -c 'import json; print(json.load(open("out/buildkite/admin/admin-candidate.json"))["build_id"])')
-version=$("$python" -c 'import json; print(json.load(open("out/buildkite/admin/admin-candidate.json"))["version"])')
 [[ "$candidate_commit" == "$BUILDKITE_COMMIT" ]] || { echo 'admin candidate commit differs from build' >&2; exit 1; }
 [[ "$candidate_build" == "$BUILDKITE_BUILD_ID" ]] || { echo 'admin candidate build ID differs from build' >&2; exit 1; }
-
-tag=${BUILDKITE_TAG:-}
-tag=${tag#refs/tags/}
-[[ "$tag" == "adxadmin-v${version}" ]] || { echo "publishing requires tag adxadmin-v${version}" >&2; exit 1; }
 
 repository=${ADX_ADMIN_PYPI_REPOSITORY:-pypi}
 case "$repository" in

@@ -23,18 +23,18 @@ driver = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(driver)
 functional_spec = importlib.util.spec_from_file_location('functional_data_plane', ROOT / 'functional_data_plane.py')
 functional_data_plane = importlib.util.module_from_spec(functional_spec)
-sdk_stub = types.ModuleType('adx_sandbox')
+sdk_stub = types.ModuleType('adx_environment')
 for exported in (
     'CommandConflict',
     'CommandNotFound',
     'CommandStatus',
     'CommandWaitTimeout',
     'DataPlaneSecurityPolicy',
-    'Sandbox',
+    'Environment',
     'resources',
 ):
     setattr(sdk_stub, exported, object)
-with mock.patch.dict(sys.modules, {'adx_sandbox': sdk_stub}):
+with mock.patch.dict(sys.modules, {'adx_environment': sdk_stub}):
     functional_spec.loader.exec_module(functional_data_plane)
 
 
@@ -69,12 +69,12 @@ class LiveOutputTests(unittest.TestCase):
             server.communicate(timeout=2)
 
     def test_host_forward_uses_instance_subdomain_and_preserves_guest_path(self):
-        class Sandbox:
-            id = 'default-sandbox-123'
+        class Environment:
+            id = 'default-environment-123'
 
             @staticmethod
             def get_port_url(port):
-                return f'https://127.0.0.1:8443/default-sandbox-123/{port}'
+                return f'https://127.0.0.1:8443/default-environment-123/{port}'
 
             @staticmethod
             def get_port_auth_headers():
@@ -87,15 +87,15 @@ class LiveOutputTests(unittest.TestCase):
             mock.patch.object(functional_data_plane.urllib.request, 'urlopen', return_value=response) as opener,
         ):
             self.assertEqual(
-                functional_data_plane._fetch_host_forwarded(Sandbox(), Path('/unused'), port=18081), 'forwarded'
+                functional_data_plane._fetch_host_forwarded(Environment(), Path('/unused'), port=18081), 'forwarded'
             )
         request = opener.call_args.args[0]
         self.assertEqual(request.full_url, 'https://127.0.0.1:8443/functional/host?x=1')
-        self.assertEqual(request.get_header('Host'), 'default-sandbox-123-18081.example.test')
+        self.assertEqual(request.get_header('Host'), 'default-environment-123-18081.example.test')
         self.assertEqual(request.get_header('Authorization'), 'Bearer test-token')
 
     def test_forwarded_port_auth_denial_is_not_retried_as_readiness(self):
-        class Sandbox:
+        class Environment:
             @staticmethod
             def get_port_url(port):
                 return f'https://localhost:{port}'
@@ -110,7 +110,7 @@ class LiveOutputTests(unittest.TestCase):
             mock.patch.object(functional_data_plane.urllib.request, 'urlopen', side_effect=denied) as request,
             self.assertRaises(urllib.error.HTTPError) as raised,
         ):
-            functional_data_plane._fetch_forwarded(Sandbox(), Path('/unused'))
+            functional_data_plane._fetch_forwarded(Environment(), Path('/unused'))
         self.assertEqual(raised.exception.code, 401)
         request.assert_called_once()
 

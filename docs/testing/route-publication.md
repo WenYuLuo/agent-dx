@@ -74,7 +74,7 @@ Ingress 对外 TLS、Ingress → Relay 的网络／mTLS 配置继续单独设置
 
 本机测试另覆盖代理重启重放、完整同步之前禁止准入、坏快照原子拒绝，以及旧同步请求拒绝。Go 服务生成协议、单测、vet 和构建独立执行。
 
-这些测试使用 TCP 回显服务和测试运行时，未启动真实 sandboxd／Execd，也未构成公开 Sandbox SDK 创建—执行—删除的 Buildkite 验收。后续已完成统一进程装配、Node Activity、SQLite 降级、暂停/快照生命周期；基本 K8s 结果见 [Buildkite #21](2026-09-17-observability-k8s.md)，FC 结果见 [路线图](control-plane-roadmap.md)。
+这些测试使用 TCP 回显服务和测试运行时，未启动真实 sandboxd／Execd，也未构成公开 Environment SDK 创建—执行—删除的 Buildkite 验收。后续已完成统一进程装配、Node Activity、SQLite 降级、暂停/快照生命周期；基本 K8s 结果见 [Buildkite #21](2026-09-17-observability-k8s.md)，FC 结果见 [路线图](control-plane-roadmap.md)。
 
 ## 本轮结果
 

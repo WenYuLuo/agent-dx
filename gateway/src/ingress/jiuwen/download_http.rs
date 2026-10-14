@@ -25,7 +25,7 @@ const FILENAME_ESCAPES: &percent_encoding::AsciiSet = &NON_ALPHANUMERIC
     .remove(b'.')
     .remove(b'~');
 
-/// Internally assembled download: tenant, Sandbox and config come from trusted
+/// Internally assembled download: tenant, Environment and config come from trusted
 /// binding resolution; the token remains untrusted and is verified here. The
 /// entrypoint authenticates the user. Deliberately no Debug/Serialize support.
 /// One context bounds admission, per-chunk authorization and the whole transfer.
@@ -33,14 +33,19 @@ pub struct Download {
     pub ingress: Arc<Ingress>,
     pub context: Arc<RequestContext>,
     pub tenant: String,
-    pub sandbox_id: String,
+    pub environment_id: String,
     pub config: DownloadConfig,
     pub token: String,
     pub expected_session: Option<String>,
 }
 impl Download {
     fn reader(&self) -> Result<Reader, ReadError> {
-        Reader::new(&self.ingress, &self.context, &self.tenant, &self.sandbox_id)
+        Reader::new(
+            &self.ingress,
+            &self.context,
+            &self.tenant,
+            &self.environment_id,
+        )
     }
 
     /// Build GET/HEAD responses with the existing ordinary/verified distinction.

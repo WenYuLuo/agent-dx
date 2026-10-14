@@ -171,7 +171,7 @@ class BuildSummaryTests(unittest.TestCase):
             write(root, 'build-manifest.json', {'commit': COMMIT, 'components': {}})
             (root / 'adx-release.tar.gz').write_bytes(b'archive fixture')
             (root / 'sdk').mkdir()
-            (root / 'sdk/adx_sandbox-test.whl').write_bytes(b'wheel fixture')
+            (root / 'sdk/adx_environment-test.whl').write_bytes(b'wheel fixture')
             release = summary.collect(root, 'release', 0, COMMIT)
             self.assertEqual(set(release['stages']), {'release'})
             self.assertIn('artifact://out/buildkite/adx-release.tar.gz', summary.render(release))

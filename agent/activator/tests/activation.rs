@@ -1,5 +1,5 @@
 use adx_activator::{Activator, Error};
-use adx_agent_core::{sandbox::*, *};
+use adx_agent_core::{environment::*, *};
 use adx_agent_store::{AgentState, MemoryRepository};
 use std::{
     collections::HashMap,
@@ -11,29 +11,32 @@ use std::{
 
 #[derive(Default)]
 struct Platform {
-    observations: Mutex<HashMap<(String, String), SandboxObservation>>,
+    observations: Mutex<HashMap<(String, String), EnvironmentObservation>>,
     lose_create_response: AtomicBool,
     lose_delete_response: AtomicBool,
 }
 #[async_trait::async_trait]
-impl Sandbox for Platform {
-    async fn create(&self, r: &CreateSandbox) -> Result<SandboxObservation, SandboxError> {
+impl Environment for Platform {
+    async fn create(
+        &self,
+        r: &CreateEnvironment,
+    ) -> Result<EnvironmentObservation, EnvironmentError> {
         let observed = self
             .observations
             .lock()
             .unwrap()
             .entry((r.tenant.clone(), r.id.clone()))
-            .or_insert_with(|| SandboxObservation {
+            .or_insert_with(|| EnvironmentObservation {
                 id: r.id.clone(),
                 tenant: r.tenant.clone(),
-                phase: SandboxPhase::Running,
+                phase: EnvironmentPhase::Running,
                 ready: true,
                 runtime_id: Some("runtime".into()),
                 message: None,
             })
             .clone();
         if self.lose_create_response.swap(false, Ordering::SeqCst) {
-            return Err(SandboxError::OutcomeUnknown("response lost".into()));
+            return Err(EnvironmentError::OutcomeUnknown("response lost".into()));
         }
         Ok(observed)
     }
@@ -41,7 +44,7 @@ impl Sandbox for Platform {
         &self,
         tenant: &str,
         id: &str,
-    ) -> Result<Option<SandboxObservation>, SandboxError> {
+    ) -> Result<Option<EnvironmentObservation>, EnvironmentError> {
         Ok(self
             .observations
             .lock()
@@ -49,15 +52,21 @@ impl Sandbox for Platform {
             .get(&(tenant.into(), id.into()))
             .cloned())
     }
-    async fn delete(&self, tenant: &str, id: &str) -> Result<SandboxObservation, SandboxError> {
+    async fn delete(
+        &self,
+        tenant: &str,
+        id: &str,
+    ) -> Result<EnvironmentObservation, EnvironmentError> {
         if self.lose_delete_response.swap(false, Ordering::SeqCst) {
-            return Err(SandboxError::OutcomeUnknown("delete response lost".into()));
+            return Err(EnvironmentError::OutcomeUnknown(
+                "delete response lost".into(),
+            ));
         }
         let mut values = self.observations.lock().unwrap();
         let value = values
             .get_mut(&(tenant.into(), id.into()))
-            .ok_or(SandboxError::NotFound)?;
-        value.phase = SandboxPhase::Deleted;
+            .ok_or(EnvironmentError::NotFound)?;
+        value.phase = EnvironmentPhase::Deleted;
         value.ready = false;
         Ok(value.clone())
     }
@@ -124,7 +133,7 @@ async fn replicas_and_unknown_outcomes_keep_the_committed_identity() {
         .await
         .unwrap()
         .binding;
-    assert_ne!(fresh.sandbox_id, original.sandbox_id);
+    assert_ne!(fresh.environment_id, original.environment_id);
     assert_eq!(
         a.activate(
             &scope("e"),
@@ -151,12 +160,12 @@ async fn independent_bindings_and_platform_readiness() {
     );
     let x = a.unwrap().binding;
     let y = b.unwrap().binding;
-    assert_ne!(x.sandbox_id, y.sandbox_id);
+    assert_ne!(x.environment_id, y.environment_id);
     platform
         .observations
         .lock()
         .unwrap()
-        .get_mut(&(x.scope.tenant.clone(), x.sandbox_id.clone()))
+        .get_mut(&(x.scope.tenant.clone(), x.environment_id.clone()))
         .unwrap()
         .ready = false;
     assert!(matches!(

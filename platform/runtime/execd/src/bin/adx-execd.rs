@@ -2,7 +2,7 @@
 // Licensed under the Apache License, Version 2.0.
 // See the LICENSE file in this repository for the complete license text.
 
-//! adx-execd binary: sandbox runtime-mode entrypoint.
+//! adx-execd binary: environment runtime-mode entrypoint.
 //! Start with `adx-execd`; Adxlet supplies the explicit Environment identity.
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

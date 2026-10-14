@@ -99,7 +99,7 @@ def main():
         base / 'package/runtime/adx-runtime-rootfs.img',
         Path('/opt/adx-fc/artifacts/Image'),
         Path('/opt/adx-fc/artifacts/initrd.img'),
-        *sorted((base / 'sdk').glob('adx_sandbox-*.whl')),
+        *sorted((base / 'sdk').glob('adx_environment-*.whl')),
         *sorted((base / 'e2e/firecracker').glob('*.py')),
     ):
         with binary.open('rb') as stream:

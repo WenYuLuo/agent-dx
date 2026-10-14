@@ -70,7 +70,7 @@ struct RouteKey {
 
 struct RouteBinding {
     quiescing: bool,
-    sandbox_ip: IpAddr,
+    environment_ip: IpAddr,
     revision_tx: watch::Sender<u64>,
 }
 
@@ -215,12 +215,12 @@ impl Relay {
         &self.route_shards[hasher.finish() as usize % self.route_shards.len()]
     }
 
-    /// Publish one authoritative sandbox route before FunctionProxy exposes it.
+    /// Publish one authoritative environment route before FunctionProxy exposes it.
     pub async fn activate_route(
         &self,
         instance_id: String,
         workload_id: String,
-        sandbox_ip: IpAddr,
+        environment_ip: IpAddr,
     ) {
         if let Some(tracker) = &self.activity {
             tracker.register(&instance_id);
@@ -242,7 +242,7 @@ impl Relay {
             key,
             RouteBinding {
                 quiescing: false,
-                sandbox_ip,
+                environment_ip,
                 revision_tx,
             },
         );
@@ -429,7 +429,7 @@ impl Relay {
                 send_error(&mut respond, StatusCode::CONFLICT);
                 return;
             };
-            if binding.sandbox_ip != target.target_ip || binding.quiescing {
+            if binding.environment_ip != target.target_ip || binding.quiescing {
                 if binding.quiescing && !passive {
                     if let Some(tracker) = &self.activity {
                         tracker.activate(&target.instance_id);
@@ -454,7 +454,7 @@ impl Relay {
             Ok(stream) => stream,
             Err(ConnectFailure::Io(error)) => {
                 self.metrics.connect_errors.fetch_add(1, Ordering::Relaxed);
-                tracing::debug!(address = %target.socket_addr(), %error, "sandbox TCP connect failed");
+                tracing::debug!(address = %target.socket_addr(), %error, "environment TCP connect failed");
                 send_error(&mut respond, StatusCode::BAD_GATEWAY);
                 return;
             }
@@ -551,7 +551,10 @@ async fn connect_within_budget(
         }
     }
     Err(ConnectFailure::Io(last_error.unwrap_or_else(|| {
-        io::Error::new(io::ErrorKind::NotConnected, "sandbox TCP connect failed")
+        io::Error::new(
+            io::ErrorKind::NotConnected,
+            "environment TCP connect failed",
+        )
     })))
 }
 

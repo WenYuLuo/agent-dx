@@ -19,14 +19,14 @@ parser.add_argument('--output', type=pathlib.Path, required=True)
 parser.add_argument('--runtime', default='runc')
 args = parser.parse_args()
 os.environ['SSL_CERT_FILE'] = str(args.ca.resolve())
-from adx_sandbox import ConnectionConfig, Sandbox
+from adx_environment import ConnectionConfig, Environment
 from node import catalog
 
 out = args.output.resolve()
 out.mkdir(parents=True, exist_ok=True)
 result = {
     'status': 'failed',
-    'sdk_version': importlib.metadata.version('adx-sandbox'),
+    'sdk_version': importlib.metadata.version('adx-environment'),
     'instances': [],
     'placements': [],
     'checks': [],
@@ -39,7 +39,7 @@ instances = []
 try:
     for i in range(2):
         start = time.monotonic()
-        s = Sandbox(
+        s = Environment(
             image=args.image,
             runtime=args.runtime,
             cpu=500,
@@ -57,7 +57,7 @@ try:
             {'id': s.id, 'node_id': record['assignment']['node_id'], 'generation': record['assignment']['generation']}
         )
         print('CREATED', s.id, 'seconds', round(time.monotonic() - start, 3), flush=True)
-    result['cases'].append({'id': 'sandbox.create-query-two-nodes', 'status': 'passed', 'seconds': 0})
+    result['cases'].append({'id': 'environment.create-query-two-nodes', 'status': 'passed', 'seconds': 0})
     for s in instances:
         r = s.commands.run("printf 'adx-e2e'; printf 'stderr-e2e' >&2; exit 7")
         if not (r.stdout == 'adx-e2e' and r.stderr == 'stderr-e2e' and r.exit_code == 7):

@@ -128,7 +128,7 @@ fn processing_timeout_response(
     response
 }
 const L4_COPY_BUFFER_SIZE: usize = 64 * 1024;
-const COMMAND_WATCH_PATH: &str = "/api/sandbox/v1/commands/watch";
+const COMMAND_WATCH_PATH: &str = "/api/environment/v1/commands/watch";
 const EXECD_COMMAND_PORT: u16 = 50090;
 const SLOW_REQUEST_LOG_THRESHOLD_US: u64 = 100_000;
 const REQUEST_DURATION_BUCKETS_US: [(&str, u64); 16] = [
@@ -173,7 +173,7 @@ impl Default for CommandWatchConfig {
 struct CommandWatchMetrics {
     connections: std::sync::atomic::AtomicU64,
     subscriptions: std::sync::atomic::AtomicU64,
-    sandboxes: std::sync::atomic::AtomicU64,
+    environments: std::sync::atomic::AtomicU64,
     reconnects: std::sync::atomic::AtomicU64,
     auth_failures: std::sync::atomic::AtomicU64,
     downstream_streams: std::sync::atomic::AtomicU64,
@@ -327,7 +327,7 @@ pub fn parse_static_routes(value: &str) -> Result<Vec<StaticRoute>, String> {
 #[derive(Clone)]
 pub struct Ingress {
     #[cfg(feature = "agent-api")]
-    pub(super) execd_access: Option<Arc<super::sandbox_files::ExecdAccess>>,
+    pub(super) execd_access: Option<Arc<super::environment_files::ExecdAccess>>,
     #[cfg(feature = "agent-api")]
     pub(super) agent_api: Option<Arc<super::agent_api::AgentApi>>,
     #[cfg(feature = "agent-api")]
@@ -448,7 +448,7 @@ impl Ingress {
     }
 
     #[cfg(feature = "agent-api")]
-    pub fn with_execd_access(mut self, access: Arc<super::sandbox_files::ExecdAccess>) -> Self {
+    pub fn with_execd_access(mut self, access: Arc<super::environment_files::ExecdAccess>) -> Self {
         self.execd_access = Some(access);
         self
     }
@@ -549,7 +549,7 @@ impl Ingress {
         if passive && route.needs_resume {
             return Err(io::Error::new(
                 io::ErrorKind::NotConnected,
-                "passive watch cannot wake a sandbox",
+                "passive watch cannot wake a environment",
             ));
         }
         let error = match self.open_current_stream(route.clone(), passive).await {
@@ -723,9 +723,9 @@ impl Ingress {
             {
                 let still_current = change.current.as_ref().is_some_and(|route| {
                     route.environment_status.code == 3
-                        && route.sandbox_id == session.workload_id
+                        && route.environment_id == session.workload_id
                         && route.relay_address == session.relay_address
-                        && route.sandbox_ip.parse().ok() == Some(session.target_ip)
+                        && route.environment_ip.parse().ok() == Some(session.target_ip)
                 });
                 if !still_current && !*session.cancel.borrow() {
                     self.forced_close_total.fetch_add(1, Ordering::Relaxed);
@@ -893,7 +893,7 @@ impl Ingress {
         let request_id = ensure_request_id(&mut request);
         let instance_id = self.access_fields(&request).1;
         let route = match self.access_fields(&request).0 {
-            "port-forwarding" => "/{sandbox}/{port}/*",
+            "port-forwarding" => "/{environment}/{port}/*",
             "tunnel" => "/tunnel/*",
             "direct" => self
                 .direct_route(&request)
@@ -996,7 +996,7 @@ impl Ingress {
         let response = if let Some(response) = agent_data_error {
             response
         } else if host_route || agent_forward {
-            // A selected Sandbox is already a data-plane target. Its ID must never
+            // A selected Environment is already a data-plane target. Its ID must never
             // be interpreted again as a public management or configured proxy path.
             self.proxy_direct(request, ingress_security).await
         } else {
@@ -1243,7 +1243,7 @@ impl Ingress {
                 // Embedded Ingress exports the API Server's owning PID only once.
                 let process_metrics = adx_observability::process::metrics();
                 format!(
-                    "data_plane_ingress_ready {}\ndata_plane_ingress_route_cache_entries {}\ndata_plane_ingress_route_watch_revision {}\ndata_plane_ingress_route_watch_lag_seconds {}\ndata_plane_ingress_route_point_get_total {}\ndata_plane_ingress_active_sessions {}\ndata_plane_ingress_h2_physical_connections {}\ndata_plane_ingress_route_forced_close_total {}\ndata_plane_ingress_backend_http_idle_connections {}\ndata_plane_ingress_backend_http_opened_total {}\ndata_plane_ingress_backend_http_reused_total {}\ndata_plane_ingress_backend_http_discarded_total {}\ndata_plane_ingress_backend_http_acquire_timeouts_total {}\n{}command_watch_connections {}\ncommand_watch_subscriptions {}\ncommand_watch_sandboxes {}\ncommand_watch_reconnects {}\ncommand_watch_auth_failures {}\ncommand_watch_downstream_streams {}\n{process_metrics}",
+                    "data_plane_ingress_ready {}\ndata_plane_ingress_route_cache_entries {}\ndata_plane_ingress_route_watch_revision {}\ndata_plane_ingress_route_watch_lag_seconds {}\ndata_plane_ingress_route_point_get_total {}\ndata_plane_ingress_active_sessions {}\ndata_plane_ingress_h2_physical_connections {}\ndata_plane_ingress_route_forced_close_total {}\ndata_plane_ingress_backend_http_idle_connections {}\ndata_plane_ingress_backend_http_opened_total {}\ndata_plane_ingress_backend_http_reused_total {}\ndata_plane_ingress_backend_http_discarded_total {}\ndata_plane_ingress_backend_http_acquire_timeouts_total {}\n{}command_watch_connections {}\ncommand_watch_subscriptions {}\ncommand_watch_environments {}\ncommand_watch_reconnects {}\ncommand_watch_auth_failures {}\ncommand_watch_downstream_streams {}\n{process_metrics}",
                     usize::from(self.ready()),
                     self.resolver.cache_len(),
                     self.resolver.watch_revision(),
@@ -1264,7 +1264,7 @@ impl Ingress {
                     self.command_watch_metrics
                         .subscriptions
                         .load(Ordering::Relaxed),
-                    self.command_watch_metrics.sandboxes.load(Ordering::Relaxed),
+                    self.command_watch_metrics.environments.load(Ordering::Relaxed),
                     self.command_watch_metrics
                         .reconnects
                         .load(Ordering::Relaxed),
@@ -1415,12 +1415,12 @@ impl Ingress {
                                     serde_json::json!({
                                         "op": "ready",
                                         "protocolVersion": 1,
-                                        "capabilities": ["multiplexed-command-watch", "sandbox-downstream-aggregation"]
+                                        "capabilities": ["multiplexed-command-watch", "environment-downstream-aggregation"]
                                     }).to_string()
                                 )).await?;
                             }
                             for command in message.commands {
-                                let key = (command.sandbox_id.clone(), command.command_id.clone());
+                                let key = (command.environment_id.clone(), command.command_id.clone());
                                 match message.op.as_str() {
                                     "subscribe" if !subscriptions.contains_key(&key) => {
                                         if subscriptions.len() >= self.command_watch_config.max_subscriptions_per_connection {
@@ -1481,7 +1481,7 @@ impl Ingress {
     ) -> Result<ExternalSubscription, IngressOpenError> {
         let route = self
             .resolve_route(
-                &command.sandbox_id,
+                &command.environment_id,
                 EXECD_COMMAND_PORT,
                 AccessKind::Direct,
                 Uuid::new_v4().to_string(),
@@ -1498,20 +1498,20 @@ impl Ingress {
             .subscribe(self, route, command.command_id.clone())
             .await
             .map_err(IngressOpenError::Connect)?;
-        let sandbox_id = command.sandbox_id.clone();
+        let environment_id = command.environment_id.clone();
         let command_id = command.command_id.clone();
         let task = tokio::spawn(async move {
             loop {
                 match subscription.events.recv().await {
                     Ok(state) if state.command_id == command_id => {
-                        let _ = outbound.send(state.with_sandbox(&sandbox_id)).await;
+                        let _ = outbound.send(state.with_environment(&environment_id)).await;
                     }
                     Ok(_) => {}
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         let _ = outbound
                             .send(WatchState {
                                 op: "state",
-                                sandbox_id: sandbox_id.clone(),
+                                environment_id: environment_id.clone(),
                                 command_id: command_id.clone(),
                                 status: "RECONNECT".into(),
                                 state_version: 0,
@@ -1524,7 +1524,7 @@ impl Ingress {
                         let _ = outbound
                             .send(WatchState {
                                 op: "state",
-                                sandbox_id: sandbox_id.clone(),
+                                environment_id: environment_id.clone(),
                                 command_id: command_id.clone(),
                                 status: "RECONNECT".into(),
                                 state_version: 0,
@@ -1709,7 +1709,7 @@ impl Ingress {
                     request.headers_mut().remove(name);
                 }
                 let cancelled = stream.cancelled.clone();
-                return proxy_http(request, stream, "sandbox", Some(cancelled)).await;
+                return proxy_http(request, stream, "environment", Some(cancelled)).await;
             }
         }
         loop {
@@ -1816,10 +1816,10 @@ impl Ingress {
                         .await
                     {
                         let status = match error {
-                            super::sandbox_files::ReadError::NotFound => StatusCode::NOT_FOUND,
+                            super::environment_files::ReadError::NotFound => StatusCode::NOT_FOUND,
                             _ => StatusCode::BAD_GATEWAY,
                         };
-                        return Ok(plain(status, "Sandbox file access unavailable"));
+                        return Ok(plain(status, "Environment file access unavailable"));
                     }
                 }
             }
@@ -1829,7 +1829,10 @@ impl Ingress {
                 return Ok(error_response(error));
             }
             if route.needs_resume {
-                return Ok(plain(StatusCode::SERVICE_UNAVAILABLE, "Sandbox is paused"));
+                return Ok(plain(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Environment is paused",
+                ));
             }
             // Probe connections stay passive even when Relay rejects a stale
             // binding. Do not pool them with business connections or demand wake.
@@ -1838,7 +1841,7 @@ impl Ingress {
                 Err(error) => return Ok(error_response(IngressOpenError::Connect(error))),
             };
             let cancelled = stream.cancelled.clone();
-            return Ok(proxy_http(request, stream, "sandbox", Some(cancelled)).await);
+            return Ok(proxy_http(request, stream, "environment", Some(cancelled)).await);
         }
 
         let upgrade_requested = request.headers().contains_key(header::UPGRADE);
@@ -1850,7 +1853,7 @@ impl Ingress {
                 }
             };
             let cancelled = stream.cancelled.clone();
-            return Ok(proxy_http(request, stream, "sandbox", Some(cancelled)).await);
+            return Ok(proxy_http(request, stream, "environment", Some(cancelled)).await);
         }
 
         if let Err(error) = self.authorize(&route, &tenant_id) {
@@ -1903,7 +1906,7 @@ struct ExternalWatchRequest {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct WatchCommandRef {
-    sandbox_id: String,
+    environment_id: String,
     command_id: String,
 }
 
@@ -1912,7 +1915,7 @@ struct WatchCommandRef {
 struct WatchState {
     op: &'static str,
     #[serde(default, skip_serializing_if = "String::is_empty")]
-    sandbox_id: String,
+    environment_id: String,
     command_id: String,
     status: String,
     state_version: u64,
@@ -1921,8 +1924,8 @@ struct WatchState {
 }
 
 impl WatchState {
-    fn with_sandbox(mut self, sandbox_id: &str) -> Self {
-        self.sandbox_id = sandbox_id.to_owned();
+    fn with_environment(mut self, environment_id: &str) -> Self {
+        self.environment_id = environment_id.to_owned();
         self
     }
 
@@ -1951,7 +1954,7 @@ impl WatchState {
     fn rejected(command: WatchCommandRef, error: String) -> Self {
         Self {
             op: "state",
-            sandbox_id: command.sandbox_id,
+            environment_id: command.environment_id,
             command_id: command.command_id,
             status: "REJECTED".into(),
             state_version: 0,
@@ -1962,7 +1965,7 @@ impl WatchState {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct WatchKey {
-    sandbox_id: String,
+    environment_id: String,
 }
 
 #[derive(Clone)]
@@ -2012,7 +2015,7 @@ impl CommandWatchHub {
         command_id: String,
     ) -> io::Result<HubSubscription> {
         let key = WatchKey {
-            sandbox_id: route.target.instance_id.clone(),
+            environment_id: route.target.instance_id.clone(),
         };
         let mut entries = self.entries.lock().await;
         let entry = if let Some(entry) = entries.get(&key) {
@@ -2032,7 +2035,7 @@ impl CommandWatchHub {
                 events: events.clone(),
             };
             entries.insert(key.clone(), entry.clone());
-            self.metrics.sandboxes.fetch_add(1, Ordering::Relaxed);
+            self.metrics.environments.fetch_add(1, Ordering::Relaxed);
             self.metrics
                 .downstream_streams
                 .fetch_add(1, Ordering::Relaxed);
@@ -2042,7 +2045,7 @@ impl CommandWatchHub {
             tokio::spawn(async move {
                 run_downstream_watch(websocket, controls, events, ping_interval).await;
                 all_entries.lock().await.remove(&key);
-                metrics.sandboxes.fetch_sub(1, Ordering::Relaxed);
+                metrics.environments.fetch_sub(1, Ordering::Relaxed);
                 metrics.downstream_streams.fetch_sub(1, Ordering::Relaxed);
                 metrics.reconnects.fetch_add(1, Ordering::Relaxed);
             });
@@ -2105,7 +2108,7 @@ async fn run_downstream_watch<S>(
                         if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
                             let state = WatchState {
                                 op: "state",
-                                sandbox_id: String::new(),
+                                environment_id: String::new(),
                                 command_id: value.get("commandId").and_then(|v| v.as_str()).unwrap_or("").to_owned(),
                                 status: value.get("status").and_then(|v| v.as_str()).unwrap_or("NOT_FOUND").to_owned(),
                                 state_version: value.get("stateVersion").and_then(|v| v.as_u64()).unwrap_or(0),
@@ -2187,11 +2190,11 @@ fn backend_pool_error_response(error: BackendHttpPoolError) -> Response<ProxyBod
     match error {
         BackendHttpPoolError::Saturated => plain(
             StatusCode::TOO_MANY_REQUESTS,
-            "sandbox HTTP pool is saturated",
+            "environment HTTP pool is saturated",
         ),
         BackendHttpPoolError::Closed => plain(
             StatusCode::SERVICE_UNAVAILABLE,
-            "sandbox HTTP pool is closed",
+            "environment HTTP pool is closed",
         ),
         BackendHttpPoolError::Connect(error) => error_response(IngressOpenError::Connect(error)),
         BackendHttpPoolError::Handshake(error) | BackendHttpPoolError::Request(error) => {
@@ -2643,7 +2646,7 @@ mod tests {
     #[test]
     fn watch_subscription_failure_reconnects_transient_transport_but_rejects_permissions() {
         let command = || WatchCommandRef {
-            sandbox_id: "sandbox".into(),
+            environment_id: "environment".into(),
             command_id: "command".into(),
         };
         for error in [
@@ -2923,7 +2926,7 @@ mod tests {
             port_forward_auth_mode: port_forward,
             target: ConnectTarget {
                 instance_id: "instance-a".into(),
-                workload_id: "sandbox-a".into(),
+                workload_id: "environment-a".into(),
                 target_ip: "10.88.0.2".parse().unwrap(),
                 target_port: 22,
                 request_id: "request-a".into(),
@@ -3069,12 +3072,12 @@ mod tests {
     #[test]
     fn configured_control_plane_paths_do_not_capture_data_plane_routes() {
         let routes = parse_static_routes(
-            "exact:/,exact:/healthz,prefix:/api/sandbox,prefix:/serverless/v1/functions,prefix:/terminal,prefix:/global-scheduler",
+            "exact:/,exact:/healthz,prefix:/api/environment,prefix:/serverless/v1/functions,prefix:/terminal,prefix:/global-scheduler",
         )
         .unwrap();
         for path in [
             "/",
-            "/api/sandbox/v1/sandboxes",
+            "/api/environment/v1/environments",
             "/serverless/v1/functions/demo",
             "/terminal/session",
             "/global-scheduler/traefik/config",
@@ -3086,7 +3089,7 @@ mod tests {
             "/direct/instance-a",
             "/tunnel/instance-a",
             "/instance-a/8080/healthz",
-            "/api/sandbox-escape",
+            "/api/environment-escape",
         ] {
             assert!(!routes.iter().any(|route| route.matches(path)), "{path}");
         }
@@ -3095,7 +3098,7 @@ mod tests {
     #[test]
     fn rejects_invalid_static_route_specs() {
         assert!(parse_static_routes("").is_err());
-        assert!(parse_static_routes("/api/sandbox").is_err());
+        assert!(parse_static_routes("/api/environment").is_err());
         assert!(parse_static_routes("glob:/api/*").is_err());
         assert!(parse_static_routes("prefix:https://frontend").is_err());
         assert!(parse_static_routes("prefix:/").is_err());

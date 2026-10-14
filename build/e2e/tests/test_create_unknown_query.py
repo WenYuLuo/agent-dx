@@ -28,7 +28,7 @@ class CreateUnknownQueryTests(unittest.TestCase):
                 final = json.dumps(
                     {
                         'status': 'running',
-                        'sandboxId': body['name'],
+                        'environmentId': body['name'],
                         'requestId': self.headers['X-Request-Id'],
                     }
                 ).encode()
@@ -51,7 +51,7 @@ class CreateUnknownQueryTests(unittest.TestCase):
             spec.loader.exec_module(module)
             upstream = f'http://127.0.0.1:{server.server_port}'
             with module.UnknownQueryProxy(upstream) as proxy:
-                url = f'http://127.0.0.1:{proxy.port}/api/sandbox/v1/sandboxes'
+                url = f'http://127.0.0.1:{proxy.port}/api/environment/v1/environments'
                 request = Request(
                     url,
                     data=json.dumps({'name': 'same-capsule'}).encode(),

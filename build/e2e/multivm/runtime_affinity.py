@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Place an unpinned Sandbox on the sole worker advertising its runtime."""
+"""Place an unpinned Environment on the sole worker advertising its runtime."""
 
 from __future__ import annotations
 
@@ -50,16 +50,16 @@ def run_runtime_affinity(
     image,
     socket,
     output,
-    sandbox_factory=None,
+    environment_factory=None,
     remote=ssh,
     runtime_class='runsc',
     wait=wait_until,
 ):
     verify_inventory(inventory)
-    if sandbox_factory is None:
-        from adx_sandbox import Sandbox
+    if environment_factory is None:
+        from adx_environment import Environment
 
-        sandbox_factory = Sandbox
+        environment_factory = Environment
     machines = {machine['role']: machine for machine in inventory['machines']}
     control = machines['control']
     workers = (machines['worker-1'], machines['worker-2'])
@@ -70,13 +70,13 @@ def run_runtime_affinity(
         'checks': [],
         'cleanup_errors': [],
     }
-    sandbox = None
+    environment = None
     output.mkdir(parents=True, exist_ok=True)
     try:
         report['machines'] = verify_machines(inventory, remote)
         expected, report['inventories'] = runtime_owner(control, workers, runtime_class, remote)
         report['checks'].append('live-heterogeneous-runtime-inventory')
-        sandbox = sandbox_factory(
+        environment = environment_factory(
             name='mv-runtime-' + uuid.uuid4().hex[:12],
             image=image,
             runtime=runtime_class,
@@ -86,8 +86,8 @@ def run_runtime_affinity(
             connection=connection,
             create_timeout=150,
         )
-        report['instance_id'] = sandbox.id
-        assignment = persisted_assignment(control, sandbox.id, remote)
+        report['instance_id'] = environment.id
+        assignment = persisted_assignment(control, environment.id, remote)
         report['assignment'] = assignment
         if (
             assignment.get('node_id') != expected
@@ -95,11 +95,11 @@ def run_runtime_affinity(
             or not assignment.get('resources_held')
         ):
             raise AssertionError(f'runtime assignment differs from {expected}: {assignment}')
-        physical = {worker['node_id']: backend_ids(worker, socket, sandbox.id, remote) for worker in workers}
+        physical = {worker['node_id']: backend_ids(worker, socket, environment.id, remote) for worker in workers}
         report['backends'] = physical
         if len(physical[expected]) != 1 or any(ids for node_id, ids in physical.items() if node_id != expected):
             raise AssertionError(f'runtime physical backend differs from assignment: {physical}')
-        result = sandbox.commands.run('printf runtime-ready')
+        result = environment.commands.run('printf runtime-ready')
         if (result.exit_code, result.stdout) != (0, 'runtime-ready'):
             raise AssertionError('runtime command failed through public SDK')
         report['checks'].append('unpinned-runtime-placement-and-command')
@@ -107,22 +107,22 @@ def run_runtime_affinity(
         report['error'] = f'{type(error).__name__}: {error}'
         raise
     finally:
-        if sandbox is not None:
+        if environment is not None:
             try:
-                sandbox.kill()
+                environment.kill()
             except Exception as error:
-                report['cleanup_errors'].append(f'{sandbox.id} delete: {error}')
+                report['cleanup_errors'].append(f'{environment.id} delete: {error}')
             finally:
                 try:
-                    sandbox.close()
+                    environment.close()
                 except Exception as error:
-                    report['cleanup_errors'].append(f'{sandbox.id} close: {error}')
+                    report['cleanup_errors'].append(f'{environment.id} close: {error}')
             try:
 
                 def released():
-                    record = persisted_assignment(control, sandbox.id, remote)
+                    record = persisted_assignment(control, environment.id, remote)
                     backends = {
-                        worker['node_id']: backend_ids(worker, socket, sandbox.id, remote) for worker in workers
+                        worker['node_id']: backend_ids(worker, socket, environment.id, remote) for worker in workers
                     }
                     if (
                         record.get('state') == 'Deleted'
@@ -156,7 +156,7 @@ def main():
     parser.add_argument('--output', required=True, type=Path)
     args = parser.parse_args()
     os.environ['SSL_CERT_FILE'] = str(args.ca.resolve())
-    from adx_sandbox import ConnectionConfig
+    from adx_environment import ConnectionConfig
 
     connection = ConnectionConfig(
         server_address=args.endpoint,

@@ -9,12 +9,12 @@ const SECRET: &str = "JIUWENSWARM_FILE_DOWNLOAD_SECRET";
 
 enum SecretSource {
     Configured(String),
-    SandboxFile(String),
+    EnvironmentFile(String),
 }
 
 /// Internal settings, not a public response or a second deployment configuration.
-/// Both explicit secrets and Sandbox-local file paths come only from template env.
-/// The caller must bind file reads to the authenticated user's resolved Sandbox.
+/// Both explicit secrets and Environment-local file paths come only from template env.
+/// The caller must bind file reads to the authenticated user's resolved Environment.
 pub struct DownloadConfig {
     workspace: String,
     asset_root: String,
@@ -36,7 +36,7 @@ impl fmt::Debug for DownloadConfig {
 impl DownloadConfig {
     /// Fetch the same tenant/template/version used for binding activation through
     /// ManagedService's existing immutable-template cache. This does not resolve or
-    /// create a binding or Sandbox. Scope tenant must come from verified identity.
+    /// create a binding or Environment. Scope tenant must come from verified identity.
     /// Returns scope/configuration, missing-template, control or deadline errors.
     pub async fn load(
         managed: &ManagedService,
@@ -53,7 +53,7 @@ impl DownloadConfig {
     /// Validate shared settings without consulting Ingress env, HOME, UID or disk.
     /// Requires explicit absolute workspace and asset directories. A nonempty
     /// explicit secret must satisfy AgentServer's 32-character minimum; empty or
-    /// absent means read the Sandbox's existing workspace secret file later.
+    /// absent means read the Environment's existing workspace secret file later.
     /// Returns Invalid for malformed templates, missing/relative/traversing paths
     /// or short explicit secrets. Error text never includes secret values.
     pub fn from_template(template: &TemplateVersion) -> Result<Self, Error> {
@@ -72,7 +72,7 @@ impl DownloadConfig {
                 }
                 SecretSource::Configured(value.clone())
             }
-            None => SecretSource::SandboxFile(format!(
+            None => SecretSource::EnvironmentFile(format!(
                 "{}/config/.file_download_secret",
                 workspace.trim_end_matches('/')
             )),
@@ -94,14 +94,14 @@ impl DownloadConfig {
     pub fn configured_secret(&self) -> Option<&str> {
         match &self.secret {
             SecretSource::Configured(value) => Some(value),
-            SecretSource::SandboxFile(_) => None,
+            SecretSource::EnvironmentFile(_) => None,
         }
     }
-    /// Read only from the current authorized Sandbox. Missing files are errors;
+    /// Read only from the current authorized Environment. Missing files are errors;
     /// Ingress must not invoke AgentServer's secret-generation fallback.
     pub fn secret_file(&self) -> Option<&str> {
         match &self.secret {
-            SecretSource::SandboxFile(path) => Some(path),
+            SecretSource::EnvironmentFile(path) => Some(path),
             SecretSource::Configured(_) => None,
         }
     }
@@ -113,10 +113,10 @@ pub(super) fn absolute_directory(value: Option<&str>, name: &str) -> Result<Stri
     };
     if !value.starts_with('/') || value.contains('\0') || value.split('/').any(|p| p == "..") {
         return Err(Error::Invalid(format!(
-            "{name} requires an absolute Sandbox directory without parent traversal"
+            "{name} requires an absolute Environment directory without parent traversal"
         )));
     }
-    // Lexical POSIX normalization only. Never resolve a Sandbox path on the host.
+    // Lexical POSIX normalization only. Never resolve a Environment path on the host.
     let parts: Vec<_> = value
         .split('/')
         .filter(|p| !p.is_empty() && *p != ".")

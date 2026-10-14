@@ -1,4 +1,4 @@
-//! Gateway product facade. Product state and Sandbox lifecycle stay behind the Activator.
+//! Gateway product facade. Product state and Environment lifecycle stay behind the Activator.
 use crate::request::RequestContext;
 use crate::{activator::Control, Error, Result};
 use adx_agent_core::cache::BoundedCache;
@@ -18,7 +18,7 @@ impl ManagedService {
             templates: Mutex::new(BoundedCache::new(1024)),
         }
     }
-    /// Select an AgentBinding identity without creating product or Sandbox state.
+    /// Select an AgentBinding identity without creating product or Environment state.
     /// Returns Invalid for a direct instance target or invalid scope components.
     pub fn binding_scope(tenant: &str, target: &AccessTarget) -> Result<Scope> {
         let (name, version, id) = match target {
@@ -190,7 +190,7 @@ impl ManagedService {
         if target.binding.scope != *scope
             || target.binding.phase != BindingPhase::Active
             || target.binding.generation.is_empty()
-            || target.binding.sandbox_id.is_empty()
+            || target.binding.environment_id.is_empty()
             || target.service != template.service
         {
             return Err(Error::Unavailable(

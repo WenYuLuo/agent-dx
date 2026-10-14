@@ -11,7 +11,7 @@ spec.loader.exec_module(openapi_check)
 class OpenApiContractTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.control = openapi_check.load('sandbox.yaml')
+        cls.control = openapi_check.load('environment.yaml')
         cls.data = openapi_check.load('data-plane.yaml')
 
     def test_current_contracts_cover_implemented_routes_and_actions(self):
@@ -24,7 +24,7 @@ class OpenApiContractTests(unittest.TestCase):
 
     def test_missing_create_field_is_detected(self):
         doc = copy.deepcopy(self.control)
-        del doc['components']['schemas']['CreateSandboxRequest']['properties']['cwd']
+        del doc['components']['schemas']['CreateEnvironmentRequest']['properties']['cwd']
         self.assertIn('missing create field: cwd', '\n'.join(openapi_check.audit(doc, self.data)))
 
     def test_missing_runtime_action_and_missing_typed_args_are_detected(self):
@@ -37,10 +37,10 @@ class OpenApiContractTests(unittest.TestCase):
         self.assertIn('typed args', '\n'.join(openapi_check.audit(self.control, doc)))
 
     def test_new_source_route_and_action_require_contract_updates(self):
-        routes = openapi_check.control_routes() | {('GET', '/api/sandbox/v1/new-feature')}
+        routes = openapi_check.control_routes() | {('GET', '/api/environment/v1/new-feature')}
         actions = openapi_check.runtime_actions() | {'process.new-feature'}
         errors = openapi_check.audit(self.control, self.data, routes=routes, actions=actions)
-        self.assertIn('GET /api/sandbox/v1/new-feature', '\n'.join(errors))
+        self.assertIn('GET /api/environment/v1/new-feature', '\n'.join(errors))
         self.assertIn('process.new-feature', '\n'.join(errors))
 
     def test_dangling_reference_is_detected(self):

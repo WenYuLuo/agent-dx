@@ -1,6 +1,6 @@
 use adx_activator::Activator;
 use adx_agent_api::{activator::Control, local::LocalControl, Error};
-use adx_agent_core::{sandbox::*, Scope, TemplateVersion};
+use adx_agent_core::{environment::*, Scope, TemplateVersion};
 use adx_agent_store::{AgentState, Index, Key, MemoryRepository, Record, Repository, Transaction};
 use std::{sync::Arc, time::Duration};
 
@@ -22,16 +22,23 @@ impl Repository for StalledStore {
         std::future::pending().await
     }
 }
-struct StalledSandbox;
+struct StalledEnvironment;
 #[async_trait::async_trait]
-impl Sandbox for StalledSandbox {
-    async fn create(&self, _: &CreateSandbox) -> Result<SandboxObservation, SandboxError> {
+impl Environment for StalledEnvironment {
+    async fn create(
+        &self,
+        _: &CreateEnvironment,
+    ) -> Result<EnvironmentObservation, EnvironmentError> {
         std::future::pending().await
     }
-    async fn get(&self, _: &str, _: &str) -> Result<Option<SandboxObservation>, SandboxError> {
+    async fn get(
+        &self,
+        _: &str,
+        _: &str,
+    ) -> Result<Option<EnvironmentObservation>, EnvironmentError> {
         std::future::pending().await
     }
-    async fn delete(&self, _: &str, _: &str) -> Result<SandboxObservation, SandboxError> {
+    async fn delete(&self, _: &str, _: &str) -> Result<EnvironmentObservation, EnvironmentError> {
         std::future::pending().await
     }
 }
@@ -54,7 +61,7 @@ fn context() -> adx_agent_api::request::RequestContext {
 async fn caller_deadline_distinguishes_local_reads_and_possible_writes() {
     let control = LocalControl::new(Arc::new(Activator::new(
         AgentState::new(Arc::new(StalledStore)),
-        Arc::new(StalledSandbox),
+        Arc::new(StalledEnvironment),
     )));
     let ctx = context();
     assert!(matches!(
@@ -77,9 +84,12 @@ async fn timed_out_activation_keeps_identity_for_another_local_replica() {
     let state = AgentState::new(Arc::new(MemoryRepository::default()));
     let a = LocalControl::new(Arc::new(Activator::new(
         state.clone(),
-        Arc::new(StalledSandbox),
+        Arc::new(StalledEnvironment),
     )));
-    let b = LocalControl::new(Arc::new(Activator::new(state, Arc::new(StalledSandbox))));
+    let b = LocalControl::new(Arc::new(Activator::new(
+        state,
+        Arc::new(StalledEnvironment),
+    )));
     a.publish(&context(), "tenant", &template()).await.unwrap();
     let ctx = context();
     assert!(matches!(
@@ -105,17 +115,20 @@ async fn timed_out_activation_keeps_identity_for_another_local_replica() {
 }
 
 #[derive(Default)]
-struct ReadySandbox {
-    record: std::sync::Mutex<Option<SandboxObservation>>,
+struct ReadyEnvironment {
+    record: std::sync::Mutex<Option<EnvironmentObservation>>,
     unavailable: std::sync::atomic::AtomicBool,
 }
 #[async_trait::async_trait]
-impl Sandbox for ReadySandbox {
-    async fn create(&self, r: &CreateSandbox) -> Result<SandboxObservation, SandboxError> {
-        let observation = SandboxObservation {
+impl Environment for ReadyEnvironment {
+    async fn create(
+        &self,
+        r: &CreateEnvironment,
+    ) -> Result<EnvironmentObservation, EnvironmentError> {
+        let observation = EnvironmentObservation {
             id: r.id.clone(),
             tenant: r.tenant.clone(),
-            phase: SandboxPhase::Running,
+            phase: EnvironmentPhase::Running,
             ready: true,
             runtime_id: None,
             message: None,
@@ -123,14 +136,20 @@ impl Sandbox for ReadySandbox {
         *self.record.lock().unwrap() = Some(observation.clone());
         Ok(observation)
     }
-    async fn get(&self, _: &str, _: &str) -> Result<Option<SandboxObservation>, SandboxError> {
+    async fn get(
+        &self,
+        _: &str,
+        _: &str,
+    ) -> Result<Option<EnvironmentObservation>, EnvironmentError> {
         if self.unavailable.load(std::sync::atomic::Ordering::SeqCst) {
-            return Err(SandboxError::Unavailable("test backend unavailable".into()));
+            return Err(EnvironmentError::Unavailable(
+                "test backend unavailable".into(),
+            ));
         }
         Ok(self.record.lock().unwrap().clone())
     }
-    async fn delete(&self, _: &str, _: &str) -> Result<SandboxObservation, SandboxError> {
-        Err(SandboxError::Unsupported("unused by this test".into()))
+    async fn delete(&self, _: &str, _: &str) -> Result<EnvironmentObservation, EnvironmentError> {
+        Err(EnvironmentError::Unsupported("unused by this test".into()))
     }
 }
 
@@ -139,7 +158,7 @@ async fn embedded_resolve_bypass_invalidates_warm_binding_before_backend_failure
     use adx_agent_api::managed::ManagedService;
     use adx_agent_core::Protocol;
     use std::sync::atomic::Ordering;
-    let backend = Arc::new(ReadySandbox::default());
+    let backend = Arc::new(ReadyEnvironment::default());
     let control = Arc::new(LocalControl::new(Arc::new(Activator::new(
         AgentState::new(Arc::new(MemoryRepository::default())),
         backend.clone(),

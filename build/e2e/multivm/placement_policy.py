@@ -58,7 +58,7 @@ def run_placement_policy(
     socket,
     output,
     policy,
-    sandbox_factory=None,
+    environment_factory=None,
     resource_reader=None,
     remote=ssh,
     wait=wait_until,
@@ -66,10 +66,10 @@ def run_placement_policy(
     if policy not in ('pack', 'spread'):
         raise ValueError('placement policy must be pack or spread')
     verify_inventory(inventory)
-    if sandbox_factory is None or resource_reader is None:
-        from adx_sandbox import Sandbox, resources
+    if environment_factory is None or resource_reader is None:
+        from adx_environment import Environment, resources
 
-        sandbox_factory = sandbox_factory or Sandbox
+        environment_factory = environment_factory or Environment
         resource_reader = resource_reader or resources
     machines = {machine['role']: machine for machine in inventory['machines']}
     control = machines['control']
@@ -99,7 +99,7 @@ def run_placement_policy(
 
         prefix = 'mv-' + policy + '-' + uuid.uuid4().hex[:12]
         for index in range(2):
-            sandbox = sandbox_factory(
+            environment = environment_factory(
                 name=f'{prefix}-{index}',
                 image=image,
                 runtime='runc',
@@ -109,20 +109,20 @@ def run_placement_policy(
                 connection=connection,
                 create_timeout=150,
             )
-            handles.append(sandbox)
-            assignment = persisted_assignment(control, sandbox.id, remote)
+            handles.append(environment)
+            assignment = persisted_assignment(control, environment.id, remote)
             owner = assignment.get('node_id')
             if owner not in worker_ids or assignment.get('state') != 'Running' or not assignment.get('resources_held'):
                 raise AssertionError(f'placement assignment invalid: {assignment}')
-            physical = {worker['node_id']: backend_ids(worker, socket, sandbox.id, remote) for worker in workers}
+            physical = {worker['node_id']: backend_ids(worker, socket, environment.id, remote) for worker in workers}
             if len(physical[owner]) != 1 or any(ids for node_id, ids in physical.items() if node_id != owner):
                 raise AssertionError(f'physical placement disagrees with assignment: {physical}')
-            result = sandbox.commands.run('printf placement-ok')
+            result = environment.commands.run('printf placement-ok')
             if (result.exit_code, result.stdout) != (0, 'placement-ok'):
-                raise AssertionError(f'{sandbox.id} command failed after placement')
+                raise AssertionError(f'{environment.id} command failed after placement')
             report['instances'].append(
                 {
-                    'id': sandbox.id,
+                    'id': environment.id,
                     'node_id': owner,
                     'generation': assignment['generation'],
                     'backend_id': physical[owner][0],
@@ -138,16 +138,16 @@ def run_placement_policy(
         report['error'] = f'{type(error).__name__}: {error}'
         raise
     finally:
-        for sandbox in reversed(handles):
+        for environment in reversed(handles):
             try:
-                sandbox.kill()
+                environment.kill()
             except Exception as error:
-                report['cleanup_errors'].append(f'{sandbox.id} delete: {error}')
+                report['cleanup_errors'].append(f'{environment.id} delete: {error}')
             finally:
                 try:
-                    sandbox.close()
+                    environment.close()
                 except Exception as error:
-                    report['cleanup_errors'].append(f'{sandbox.id} close: {error}')
+                    report['cleanup_errors'].append(f'{environment.id} close: {error}')
         try:
             if handles:
 
@@ -158,12 +158,12 @@ def run_placement_policy(
                         for node_id in worker_ids
                     ):
                         return None
-                    for sandbox in handles:
-                        record = persisted_assignment(control, sandbox.id, remote)
+                    for environment in handles:
+                        record = persisted_assignment(control, environment.id, remote)
                         if record.get('state') != 'Deleted' or record.get('resources_held'):
                             return None
                     if any(
-                        backend_ids(worker, socket, sandbox.id, remote) for sandbox in handles for worker in workers
+                        backend_ids(worker, socket, environment.id, remote) for environment in handles for worker in workers
                     ):
                         return None
                     return True
@@ -192,7 +192,7 @@ def main():
     parser.add_argument('--output', required=True, type=Path)
     args = parser.parse_args()
     os.environ['SSL_CERT_FILE'] = str(args.ca.resolve())
-    from adx_sandbox import ConnectionConfig
+    from adx_environment import ConnectionConfig
 
     connection = ConnectionConfig(
         server_address=args.endpoint,

@@ -11,7 +11,7 @@ from pathlib import Path
 E = Path('/evidence')
 S = Path('/secrets')
 os.environ['SSL_CERT_FILE'] = str(S / 'tls/ca.pem')
-from adx_sandbox import ConnectionConfig, Sandbox, SandboxError
+from adx_environment import ConnectionConfig, Environment, EnvironmentError
 
 connection = ConnectionConfig(
     server_address='127.0.0.1:8443', token=(S / 'api-key').read_text().strip(), use_tls=True, verify_tls=True
@@ -248,9 +248,9 @@ elif sys.argv[1] == 'partition-observed':
     report = run(connection, image, E, S, E / 'network-partition-observed.json')
     print(json.dumps(report), flush=True)
 elif sys.argv[1] == 'auth':
-    from adx_sandbox import PermissionDenied, SandboxError
+    from adx_environment import PermissionDenied, EnvironmentError
 
-    s = Sandbox(
+    s = Environment(
         image=image, runtime='runc', cpu=500, memory=512, idle_timeout=0, connection=connection, create_timeout=150
     )
     try:
@@ -262,22 +262,22 @@ elif sys.argv[1] == 'auth':
             event('Checking denied read/delete: ' + credential)
             denied = ConnectionConfig(server_address='127.0.0.1:8443', token=token, use_tls=True, verify_tls=True)
             try:
-                handle = Sandbox.from_id(s.id, connection=denied)
+                handle = Environment.from_id(s.id, connection=denied)
                 handle.close()
             except PermissionDenied as error:
                 if not (error.code == 'PERMISSION_DENIED' and error.retry == 'never'):
                     raise AssertionError(error) from error
-            except SandboxError as error:
+            except EnvironmentError as error:
                 if getattr(error, 'status_code', None) not in (401, 403):
                     raise AssertionError(error) from error
             else:
                 raise AssertionError('unauthorized read accepted')
             try:
-                Sandbox.delete(s.id, connection=denied)
+                Environment.delete(s.id, connection=denied)
             except PermissionDenied as error:
                 if not (error.code == 'PERMISSION_DENIED' and error.retry == 'never'):
                     raise AssertionError(error) from error
-            except SandboxError as error:
+            except EnvironmentError as error:
                 if getattr(error, 'status_code', None) not in (401, 403):
                     raise AssertionError(error) from error
             else:
@@ -312,7 +312,7 @@ elif sys.argv[1] == 'capacity':
     instances = []
 
     def create():
-        return Sandbox(
+        return Environment(
             image=image, runtime='runc', cpu=2000, memory=512, idle_timeout=0, connection=connection, create_timeout=150
         )
 
@@ -362,7 +362,7 @@ elif sys.argv[1] in ('create', 'create-marker', 'create-stop'):
             options = {'node_id': f'node{index + 1}'}
             if sys.argv[1] == 'create-stop':
                 options['port_forwardings'] = [18081]
-            s = Sandbox(
+            s = Environment(
                 image=image,
                 runtime='runc',
                 cpu=500,
@@ -387,7 +387,7 @@ elif sys.argv[1] in ('create', 'create-marker', 'create-stop'):
                     raise AssertionError()
                 # Keep s running for supervisor cleanup while an independent
                 # deletion supplies the log/trace contract on each node.
-                temporary = Sandbox(
+                temporary = Environment(
                     image=image,
                     runtime='runc',
                     node_id=f'node{index + 1}',
@@ -408,7 +408,7 @@ elif sys.argv[1] in ('create', 'create-marker', 'create-stop'):
                     try:
                         s.files.write('/tmp/adx-e2e-restart-marker', s.id)
                         break
-                    except SandboxError as error:
+                    except EnvironmentError as error:
                         if (
                             'route point-get is temporarily unavailable' not in str(error)
                             or time.monotonic() > deadline
@@ -426,7 +426,7 @@ elif sys.argv[1] in ('failure-cleanup', 'network-cleanup'):
     from node import catalog
 
     observed = json.loads((E / 'node-failure-observed.json').read_text())
-    healthy = Sandbox.from_id(observed['healthy_id'], connection=connection)
+    healthy = Environment.from_id(observed['healthy_id'], connection=connection)
     try:
         result = healthy.commands.run('printf unaffected')
         if not (result.exit_code == 0 and result.stdout == 'unaffected'):
@@ -434,7 +434,7 @@ elif sys.argv[1] in ('failure-cleanup', 'network-cleanup'):
     finally:
         healthy.close()
     for sid in json.loads((E / 'live-instances.json').read_text()):
-        Sandbox.delete(sid, connection=connection)
+        Environment.delete(sid, connection=connection)
     records = catalog()
     for sid in json.loads((E / 'live-instances.json').read_text()):
         if not ('environment:' + sid not in records):
@@ -451,7 +451,7 @@ elif sys.argv[1] in ('cleanup-live', 'cleanup-live-redis', 'cleanup-live-control
 
     ids = json.loads((E / 'live-instances.json').read_text())
     for sid in ids:
-        Sandbox.delete(sid, connection=connection)
+        Environment.delete(sid, connection=connection)
     records = catalog()
     for sid in ids:
         if not ('environment:' + sid not in records):
@@ -471,7 +471,7 @@ elif sys.argv[1] in ('cleanup-live', 'cleanup-live-redis', 'cleanup-live-control
 elif sys.argv[1] in ('recovered', 'recovered-marker'):
     checks = []
     for sid in json.loads((E / 'live-instances.json').read_text()):
-        s = Sandbox.from_id(sid, connection=connection)
+        s = Environment.from_id(sid, connection=connection)
         try:
             if not (s.is_running()):
                 raise AssertionError()

@@ -31,7 +31,7 @@ fn binding_cache_memory_profile() {
             binding: AgentBinding {
                 scope: scope.clone(),
                 generation: "g".repeat(36),
-                sandbox_id: "s".repeat(40),
+                environment_id: "s".repeat(40),
                 phase: BindingPhase::Active,
             },
             service: vec![adx_agent_core::Service {

@@ -18,7 +18,7 @@ fn request(id: &str) -> EnvironmentSpec {
         },
         priority: 0,
         scheduling: Default::default(),
-        sandbox: Default::default(),
+        execution: Default::default(),
     }
 }
 fn term(key: &str, value: &str, weight: u32) -> WeightedSelector {

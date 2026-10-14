@@ -34,6 +34,8 @@ STANDARD = (
     'stop',
 )
 OPTIONAL_CASES = (
+    'activator-standalone',
+    'activator-embedded',
     'redis-restart',
     'coordinator-restart',
     'coordinator-adxlet-restart',
@@ -93,6 +95,8 @@ def selected_checks(profile, case=None):
 
 
 def setup_environment(selected_case):
+    if selected_case in ('activator-standalone', 'activator-embedded'):
+        return ('ADX_E2E_ACTIVATOR_MODE=' + selected_case.removeprefix('activator-'),)
     if selected_case == 'ingress-restart':
         return ('ADX_E2E_INGRESS_MODE=standalone',)
     if selected_case == 'relay-standalone':
@@ -132,6 +136,8 @@ def verify_bundle(directory):
         raise ValueError('EXECD archive integrity check failed')
     if sha(directory / 'entrypoint.tar') != m.get('entrypoint_archive_sha256'):
         raise ValueError('entrypoint image archive integrity check failed')
+    if 'activator_archive_sha256' in m and sha(directory / 'activator.tar') != m['activator_archive_sha256']:
+        raise ValueError('Activator workload image archive integrity check failed')
     if 'workload_probes_archive_sha256' in m:
         if sha(directory / 'workload-probes.tar') != m['workload_probes_archive_sha256']:
             raise ValueError('workload probe image archive integrity check failed')
@@ -354,6 +360,8 @@ class Run:
         return errors
 
     def deploy(self, m, bundle, secrets):
+        if self.selected_case in ('activator-standalone', 'activator-embedded') and 'activator_archive_sha256' not in m:
+            raise ValueError('Activator E2E requires a bundle prepared with --activator')
         self.docker('load', '-i', bundle / 'images.tar', timeout=600)
         for identity in m['image_ids'].values():
             info = json.loads(self.docker('image', 'inspect', identity))[0]
@@ -392,6 +400,8 @@ class Run:
                 f'{self.output}:/evidence',
             ]
             args += ['-v', f'{bundle / "execd.tar"}:/execd.tar:ro']
+            if 'activator_archive_sha256' in m:
+                args += ['-v', f'{bundle / "activator.tar"}:/activator.tar:ro']
             if 'workload_probes_archive_sha256' in m:
                 args += ['-v', f'{bundle / "workload-probes.tar"}:/workload-probes.tar:ro']
             if os.getenv('ADX_E2E_RUNTIME_CONTROL') == '1':
@@ -417,10 +427,45 @@ class Run:
                 + '.log 2>&1 &',
             )
         self.helper('node1', 'ready', timeout=120)
+        if self.selected_case == 'activator-standalone':
+            for node in self.nodes:
+                self.helper(node, 'activator-start', node, timeout=60)
 
     def scenarios(self, checks, required=None):
         required = tuple(required or STANDARD)
         selected = set(required)
+        for scenario in ('activator-standalone', 'activator-embedded'):
+            if scenario not in selected:
+                continue
+            mode = scenario.removeprefix('activator-')
+            with self.case(scenario, checks) as record:
+                def phase(name):
+                    return self.execute('node1', '/opt/adx/client/bin/python', '-u', '/opt/adx/e2e/activator.py', mode, name, timeout=600)
+
+                def inventory(name):
+                    for node in self.nodes:
+                        self.helper(node, 'activator-inventory', node, name)
+
+                phase('create')
+                inventory('before')
+                phase('physical')
+                for node in self.nodes:
+                    if mode == 'standalone':
+                        self.helper(node, 'activator-restart', node, timeout=60)
+                    else:
+                        self.helper(node, 'gateway-restart', 'apiserver', timeout=120)
+                        (self.output / f'apiserver-restart-{node}.json').write_bytes((self.output / 'apiserver-restart.json').read_bytes())
+                inventory('restarted')
+                phase('recover')
+                for node in self.nodes:
+                    self.helper(node, 'empty', node)
+                phase('recreate')
+                inventory('new')
+                phase('delete')
+                for node in self.nodes:
+                    self.helper(node, 'empty', node)
+                inventory('empty')
+                record['subcases'] = sdk_subcases_from_output(phase('finish'))
         if 'l0' in selected:
             with self.case('l0', checks):
                 self.event('Run the minimum public SDK create/query/command/file/delete flow')
@@ -457,7 +502,7 @@ class Run:
                     self.helper(node, 'empty', node)
                 record['subcases'].append(
                     {
-                        'id': 'sandbox.delete-and-resource-cleanup',
+                        'id': 'environment.delete-and-resource-cleanup',
                         'status': 'passed',
                         'seconds': 0,
                     }

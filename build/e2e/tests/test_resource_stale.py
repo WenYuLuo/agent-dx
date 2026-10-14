@@ -21,13 +21,13 @@ class ResourceStaleScenarioTests(unittest.TestCase):
         backends = {}
         deleted = []
 
-        class SandboxError(Exception):
+        class EnvironmentError(Exception):
             pass
 
-        class Sandbox:
+        class Environment:
             def __init__(self, **options):
                 if options.get('name', '').startswith('stale-rejected-'):
-                    raise SandboxError('central scheduling queue deadline exceeded')
+                    raise EnvironmentError('central scheduling queue deadline exceeded')
                 self.id = 'instance-' + str(len(backends) + len(deleted) + 1)
                 self.commands = types.SimpleNamespace(run=self.run)
                 backends[self.id] = 'backend-' + self.id
@@ -57,7 +57,7 @@ class ResourceStaleScenarioTests(unittest.TestCase):
                 records.pop('environment:' + instance_id)
 
         modules = {
-            'adx_sandbox': types.SimpleNamespace(Sandbox=Sandbox, SandboxError=SandboxError),
+            'adx_environment': types.SimpleNamespace(Environment=Environment, EnvironmentError=EnvironmentError),
             'functional_lifecycle': types.SimpleNamespace(_wait_deleted=lambda *_a, **_kw: None),
             'node': types.SimpleNamespace(
                 catalog=lambda: {key: json.dumps(value) for key, value in records.items()},

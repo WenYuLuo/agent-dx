@@ -47,7 +47,7 @@ Trace配置与当前接线见[跨组件Trace](distributed-traces.md)。下表列
 | 当前模块 | 职责 |
 | --- | --- |
 | `crates/observability/src/logging.rs` | 统一组件日志初始化、过滤、滚动与压缩；共进程共享一个subscriber和Trace provider。 |
-| Sandbox API的HTTP入口与`controlbackend` | 将请求关联上下文带入Coordinator及Node RPC；缓存命中后的直达路径也携带上下文。 |
+| Environment API的HTTP入口与`controlbackend` | 将请求关联上下文带入Coordinator及Node RPC；缓存命中后的直达路径也携带上下文。 |
 | Coordinator的RPC入口与Shard队列 | 串联准入、排队、放置、分配结果；区分排队耗时与实际执行耗时。 |
 | adxlet的`rpc.rs`与`controller.rs` | RPC接收上下文后，在每实例串行任务的命令封装中显式携带；执行、状态提交及响应关联到同一操作。 |
 | Gateway到EXECD的HTTP路径 | 关联路由选择、本机转发与实例执行，避免仅打通控制请求而遗漏数据面。 |

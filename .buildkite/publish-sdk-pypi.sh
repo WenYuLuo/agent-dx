@@ -10,6 +10,8 @@ esac
 : "${BUILDKITE_BUILD_ID:?Buildkite build ID required}"
 root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$root"
+source .buildkite/release-tag.sh
+require_repository_release_tag "${BUILDKITE_TAG:-}"
 source .buildkite/python-env.sh
 output=out/buildkite/sdk
 publish_output=out/buildkite/sdk-publish
@@ -24,22 +26,17 @@ buildkite-agent artifact download 'out/buildkite/sdk/*' . --step sdk-package
 "$python" build/sdk/candidate.py --verify --directory "$output" >/dev/null
 candidate_commit=$("$python" -c 'import json; print(json.load(open("out/buildkite/sdk/sdk-candidate.json"))["commit"])')
 candidate_build=$("$python" -c 'import json; print(json.load(open("out/buildkite/sdk/sdk-candidate.json"))["build_id"])')
-version=$("$python" -c 'import json; print(json.load(open("out/buildkite/sdk/sdk-candidate.json"))["version"])')
 [[ "$candidate_commit" == "$BUILDKITE_COMMIT" ]] || { echo 'SDK candidate commit differs from build' >&2; exit 1; }
 [[ "$candidate_build" == "$BUILDKITE_BUILD_ID" ]] || { echo 'SDK candidate build ID differs from build' >&2; exit 1; }
-
-tag=${BUILDKITE_TAG:-}
-tag=${tag#refs/tags/}
-[[ "$tag" == "sdk-v${version}" ]] || { echo "publishing requires tag sdk-v${version}" >&2; exit 1; }
 
 repository=${ADX_SDK_PYPI_REPOSITORY:-pypi}
 case "$repository" in
   pypi)
-    token=${ADX_SANDBOX_PYPI_TOKEN:-}
+    token=${ADX_ENVIRONMENT_PYPI_TOKEN:-}
     upload_url=https://upload.pypi.org/legacy/
     ;;
   testpypi)
-    token=${ADX_SANDBOX_TEST_PYPI_TOKEN:-}
+    token=${ADX_ENVIRONMENT_TEST_PYPI_TOKEN:-}
     upload_url=https://test.pypi.org/legacy/
     ;;
   *)
@@ -47,7 +44,7 @@ case "$repository" in
     exit 1
     ;;
 esac
-[[ -n "$token" ]] || { echo "adx-sandbox ${repository} API token is not configured" >&2; exit 1; }
+[[ -n "$token" ]] || { echo "adx-environment ${repository} API token is not configured" >&2; exit 1; }
 
 "$python" -m venv "$venv"
 "$venv/bin/python" -m pip install --disable-pip-version-check \

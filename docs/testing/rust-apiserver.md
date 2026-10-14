@@ -8,14 +8,14 @@
 - Domain → Scheduling Shard，代码 `ShardScheduler`，内部字段 `shard_id`，Coordinator 配置 `scheduler_shards`。Global 轮转 → Shard Filter/Score → adxlet 准入的分层保持。
 - 调度指标标签改为 `shard_id`，消费者应同步更新。TLS/DNS domain 与拓扑故障域的名称保持其原本含义。
 - 读取旧 Redis/SQLite 记录时允许旧调度字段别名；新写入使用 Shard 字段。升级需统一更新组件配置和证书角色，不运行混合版本组件。
-- 公共 Sandbox HTTP 路径、响应包装、SSE、请求 ID、租户身份、归属缓存和操作去重保持；内部直接调用 Environment RPC。
+- 公共 Environment HTTP 路径、响应包装、SSE、请求 ID、租户身份、归属缓存和操作去重保持；内部直接调用 Environment RPC。
 - Agent 路由仍为可选业务服务转发，不将旧 FaaS 执行链带入 API Server。
 
 ## 部署迁移
 
 统一更新发布包和部署配置：HTTP 服务角色改为 `apiserver`，启动 `adx-apiserver`；使用 [API Server 配置](../../build/config/examples/apiserver.json) 和 [统一部署示例](../../build/config/examples/deployment.yaml)。内部 mTLS 受信身份映射同步改为 `apiserver`，加载部署环境提供的对应证书，重启组件生效。
 
-Coordinator 使用 `scheduler_shards` 配置逻辑分片数量，节点归属仍由 Coordinator 自动分配。指标查询使用 `shard_id` 标签。旧持久化字段的读取兼容用于数据迁移，不代表旧组件和新组件可以混用。公开 Sandbox URL 与 Python SDK 调用方式保持；客户端不需要感知内部 Shard。
+Coordinator 使用 `scheduler_shards` 配置逻辑分片数量，节点归属仍由 Coordinator 自动分配。指标查询使用 `shard_id` 标签。旧持久化字段的读取兼容用于数据迁移，不代表旧组件和新组件可以混用。公开 Environment URL 与 Python SDK 调用方式保持；客户端不需要感知内部 Shard。
 
 ## 测试驱动记录
 

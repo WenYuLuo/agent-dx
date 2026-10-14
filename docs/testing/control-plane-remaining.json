@@ -36,8 +36,8 @@
     "title": "cn-north-4 现有 AKernel 部署功能冒烟",
     "stage": "7",
     "status": "complete",
-    "detail": "2026-09-25通过现有akernel命名空间的ADX入口运行公开Python SDK：创建runsc Sandbox、执行命令并删除；证据在out/ci/multivm-coverage-0925/cn4-smoke-result.json。此项不代表独立ADX Full部署或故障注入已通过。",
-    "gate": "在现有部署使用公开SDK完成创建、命令和删除，并确认请求对应同一Sandbox ID。"
+    "detail": "2026-09-25通过现有akernel命名空间的ADX入口运行公开Python SDK：创建runsc Environment、执行命令并删除；证据在out/ci/multivm-coverage-0925/cn4-smoke-result.json。此项不代表独立ADX Full部署或故障注入已通过。",
+    "gate": "在现有部署使用公开SDK完成创建、命令和删除，并确认请求对应同一Environment ID。"
   },
   {
     "id": "e2e-resilience-expansion",

@@ -19,10 +19,10 @@ def assigned_to(node, name):
     return False
 
 
-def creates_sandbox(node):
+def creates_environment(node):
     if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Call):
         return False
-    return isinstance(node.value.func, ast.Name) and node.value.func.id == 'Sandbox'
+    return isinstance(node.value.func, ast.Name) and node.value.func.id == 'Environment'
 
 
 def has_labels(node, expected):
@@ -83,7 +83,7 @@ class FirecrackerEvidenceTests(unittest.TestCase):
     def test_paused_restart_targets_the_selected_instance(self):
         checkpoint = (ROOT / 'firecracker/sdk_checkpoint.py').read_text()
         restart = (ROOT / 'firecracker/restart_paused.py').read_text()
-        self.assertIn('[*a.restart_command, sandbox.id]', checkpoint)
+        self.assertIn('[*a.restart_command, environment.id]', checkpoint)
         tree = ast.parse(restart)
         key = next(node.value for node in tree.body if assigned_to(node, 'key'))
         self.assertEqual(ast.dump(key), ast.dump(ast.parse("'environment:' + INSTANCE_ID", mode='eval').body))
@@ -101,7 +101,7 @@ class FirecrackerEvidenceTests(unittest.TestCase):
 
     def test_runtime_network_policy_uses_a_fresh_execution(self):
         source = (ROOT / 'firecracker/sdk_checkpoint.py').read_text()
-        assignments = [node for node in ast.walk(ast.parse(source)) if creates_sandbox(node)]
+        assignments = [node for node in ast.walk(ast.parse(source)) if creates_environment(node)]
         network_case = next(
             node.lineno
             for node in assignments

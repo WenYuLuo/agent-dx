@@ -1,8 +1,8 @@
 use crate::{
     clients::Clients,
+    environment_service::EnvironmentService,
     errors::ErrorDetail,
     operations::{snapshot_value, Kind},
-    sandbox_service::SandboxService,
 };
 use adx_observability::trace;
 use adx_protocol::control as pb;
@@ -36,13 +36,13 @@ const MAX_INSTANCE_PAGE_SIZE: usize = 1000;
 pub type Body = UnsyncBoxBody<Bytes, Error>;
 pub struct Api {
     pub clients: Arc<Clients>,
-    pub sandbox_service: Arc<SandboxService>,
+    pub environment_service: Arc<EnvironmentService>,
     proxy: reqwest::Client,
 }
 impl Api {
     pub fn new(clients: Arc<Clients>) -> Result<Arc<Self>, Error> {
         Ok(Arc::new(Self {
-            sandbox_service: SandboxService::new(clients.clone()),
+            environment_service: EnvironmentService::new(clients.clone()),
             clients,
             proxy: reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
@@ -183,10 +183,10 @@ impl Api {
                 Err(error) => error_response(error, &request_id, None, None, method != "GET"),
             };
         }
-        if method == "GET" && path == "/api/sandbox/v1/capabilities" {
+        if method == "GET" && path == "/api/environment/v1/capabilities" {
             return plain(200, json!({"capabilities": ["workload-probes-v1"]}));
         }
-        if method == "GET" && path == "/api/sandbox/v1/resources" {
+        if method == "GET" && path == "/api/environment/v1/resources" {
             return match self.clients.nodes().await {
                 Ok(nodes) => plain(StatusCode::OK.as_u16(), resource_view(nodes)),
                 Err(error) => error_response(error, &request_id, None, None, false),
@@ -318,9 +318,9 @@ impl Api {
             Err(error) => return error_response(error, &request_id, None, None, false),
         };
         if method == "POST"
-            && (path == "/api/sandbox/v1/sandboxes" || path == "/api/sandbox/create")
+            && (path == "/api/environment/v1/environments" || path == "/api/environment/create")
         {
-            if path == "/api/sandbox/create"
+            if path == "/api/environment/create"
                 && input
                     .get("runtime")
                     .and_then(Value::as_str)
@@ -330,21 +330,25 @@ impl Api {
                     object.remove("runtime");
                 }
             }
-            if stream && path.ends_with("sandboxes") {
-                let spec = match self.sandbox_service.prepare_create(input.clone(), &caller) {
+            if stream && path.ends_with("environments") {
+                let spec = match self
+                    .environment_service
+                    .prepare_create(input.clone(), &caller)
+                {
                     Ok(spec) => spec,
                     Err(error) => return error_response(error, &request_id, None, None, false),
                 };
                 return self.create_stream(spec, input, request_id, caller);
             }
-            let result = Box::pin(
-                self.sandbox_service
-                    .create_request(input, &request_id, &caller),
-            )
+            let result = Box::pin(self.environment_service.create_request(
+                input,
+                &request_id,
+                &caller,
+            ))
             .await;
             return response(
-                if path == "/api/sandbox/create" {
-                    result.map(|v| json!({"instance_id":v["instanceId"]}))
+                if path == "/api/environment/create" {
+                    result.map(|v| json!({"instance_id":v["environmentId"]}))
                 } else {
                     result
                 },
@@ -354,7 +358,7 @@ impl Api {
                 true,
             );
         }
-        if let Some(id) = path.strip_prefix("/api/sandbox/v1/snapshots/") {
+        if let Some(id) = path.strip_prefix("/api/environment/v1/snapshots/") {
             if method == "DELETE" && lifecycle_id.is_empty() {
                 return error_response(
                     Status::invalid_argument("snapshot request ID required"),
@@ -372,7 +376,7 @@ impl Api {
                 method != "GET",
             );
         }
-        if path == "/api/sandbox/v1/snapshots" {
+        if path == "/api/environment/v1/snapshots" {
             return response(
                 Box::pin(self.snapshots(&method, None, &query, &caller)).await,
                 &request_id,
@@ -382,8 +386,8 @@ impl Api {
             );
         }
         let rest = path
-            .strip_prefix("/api/sandbox/v1/sandboxes/")
-            .or_else(|| path.strip_prefix("/api/sandbox/"));
+            .strip_prefix("/api/environment/v1/environments/")
+            .or_else(|| path.strip_prefix("/api/environment/"));
         if let Some(rest) = rest {
             let (id, action) = rest.split_once('/').unwrap_or((rest, ""));
             let kind = match (method.as_str(), action) {
@@ -419,7 +423,7 @@ impl Api {
                 }
                 return response(
                     Box::pin(
-                        self.sandbox_service
+                        self.environment_service
                             .execute(kind, id, op_id, input, &caller),
                     )
                     .await,
@@ -478,7 +482,7 @@ impl Api {
 
             let instance_id = spec.id.clone();
             let create = self
-                .sandbox_service
+                .environment_service
                 .create(spec, input, &request_id, &caller);
             tokio::pin!(create);
             let result = loop {
@@ -491,13 +495,13 @@ impl Api {
                 }
             };
             adx_observability::info!(
-                event = "sandbox_create_stream_completed",
+                event = "environment_create_stream_completed",
                 request_id,
                 environment_id = %instance_id,
                 duration_ms = started.elapsed().as_secs_f64() * 1_000.0,
                 succeeded = result.is_ok(),
                 status_code = result.as_ref().err().map_or("OK", |error| error.code().description()),
-                "Sandbox create stream completed"
+                "Environment create stream completed"
             );
             let final_event = match result {
                 Ok(value) => value,
@@ -1028,9 +1032,9 @@ fn route_name(path: &str) -> &'static str {
     } else if path.starts_with("/api/agent") {
         "/api/agent/*"
     } else if path.contains("/snapshots") {
-        "/api/sandbox/v1/snapshots/*"
-    } else if path.starts_with("/api/sandbox") {
-        "/api/sandbox/*"
+        "/api/environment/v1/snapshots/*"
+    } else if path.starts_with("/api/environment") {
+        "/api/environment/*"
     } else {
         "other"
     }
@@ -1239,7 +1243,7 @@ mod error_contract_tests {
         let view = instance_view(pb::GetEnvironmentResponse {
             record: Some(pb::EnvironmentRecord {
                 spec: Some(pb::EnvironmentSpec {
-                    id: "sandbox-1".into(),
+                    id: "environment-1".into(),
                     tenant_id: "tenant-a".into(),
                     env: HashMap::from([("EXECD_HTTP_TOKEN".into(), "private".into())]),
                     ..Default::default()
@@ -1251,7 +1255,7 @@ mod error_contract_tests {
         })
         .unwrap();
         assert_eq!(view["tenant_id"], "tenant-a");
-        assert_eq!(view["id"], "sandbox-1");
+        assert_eq!(view["id"], "environment-1");
         assert!(view.get("env").is_none());
         assert!(!view.to_string().contains("private"));
     }
@@ -1542,7 +1546,7 @@ mod error_contract_tests {
         assert_eq!(value["error"]["outcome"], "unknown");
         assert_eq!(value["error"]["requestId"], "request-a");
         assert_eq!(value["error"]["operationId"], "pause-a");
-        assert_eq!(value["error"]["instanceId"], "instance-a");
+        assert_eq!(value["error"]["environmentId"], "instance-a");
     }
 
     #[tokio::test]
@@ -1672,7 +1676,7 @@ mod error_contract_tests {
             assert_eq!(value["error"]["outcome"], outcome);
             assert_eq!(value["error"]["requestId"], "request-case");
             assert_eq!(value["error"]["operationId"], "operation-case");
-            assert_eq!(value["error"]["instanceId"], "instance-case");
+            assert_eq!(value["error"]["environmentId"], "instance-case");
         }
     }
 }

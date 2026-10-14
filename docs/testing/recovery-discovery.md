@@ -11,7 +11,7 @@
 | `coordinator/rpc.rs` | 心跳时效、注册／对账握手、完整节点目录、过期节点关闭调度、拒绝旧进程提交 |
 | `adxlet/reconciliation.rs` | 校验权威目录与运行时清单，恢复资源账本／控制器，清理确认未归属的运行时 |
 | `adxlet/controller.rs` | 串行恢复运行实例的本机绑定；清理缺失或未提交的启动并提交失败结果 |
-| `sandbox-api/internal/discovery` | Go Redis 发现与连接级 gRPC resolver；Coordinator／认证客户端共用连接 |
+| `environment-api/internal/discovery` | Go Redis 发现与连接级 gRPC resolver；Coordinator／认证客户端共用连接 |
 | 三个服务进程入口 | 配置加载、续期／心跳循环、连接替换、重启对账装配 |
 
 ```text

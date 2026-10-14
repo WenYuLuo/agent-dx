@@ -91,7 +91,7 @@ python3 -m venv /opt/adx-client
 ```python
 import os
 from pathlib import Path
-from adx_sandbox import ConnectionConfig, Sandbox
+from adx_environment import ConnectionConfig, Environment
 
 os.environ['SSL_CERT_FILE'] = '/opt/adx/config/tls/public-ca.pem'  # 对外证书的签发 CA
 connection = ConnectionConfig(
@@ -99,16 +99,16 @@ connection = ConnectionConfig(
     token=Path('/opt/adx/config/secrets/tenant-key').read_text().strip(),
     use_tls=True, verify_tls=True,
 )
-sandbox = Sandbox(image='YOUR_EXECD_IMAGE', runtime='runc', cpu=250, memory=256,
+environment = Environment(image='YOUR_EXECD_IMAGE', runtime='runc', cpu=250, memory=256,
                   idle_timeout=0, connection=connection, create_timeout=120)
 try:
-    result = sandbox.commands.run('printf ready')
+    result = environment.commands.run('printf ready')
     assert result.exit_code == 0 and result.stdout == 'ready'
 finally:
     try:
-        sandbox.kill()
+        environment.kill()
     finally:
-        sandbox.close()
+        environment.close()
 ```
 
 先安装包内 `sdk/` 下的 wheel。暂停/恢复需使用支持 checkpoint 的后端并准备制品目录或对象存储，不能用 runc 的基础创建验收替代，见 [快照与存储](../testing/snapshot-storage.md)。组件日志位于部署的 `state_dir/logs/`；就绪失败优先检查证书、Redis、资源源、sandboxd、Execd 与 Relay 绑定。

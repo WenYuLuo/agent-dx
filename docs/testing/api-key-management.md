@@ -1,8 +1,8 @@
 # API Key 管理
 
-机器可读契约见 [OpenAPI](../../platform/api/openapi/sandbox.yaml)：
+机器可读契约见 [OpenAPI](../../platform/api/openapi/environment.yaml)：
 `createTenantKey`、`listTenantKeys`、`revokeTenantKey`。三个接口均仅管理员可调用。
-响应不使用 Sandbox 生命周期 envelope；创建返回 201，列表返回 200，吊销返回 204 空正文。
+响应不使用 Environment 生命周期 envelope；创建返回 201，列表返回 200，吊销返回 204 空正文。
 响应带 `Cache-Control: no-store`。`id` 用于吊销，SDK 认证必须使用创建时一次性返回的 `apiKey`。
 
 Coordinator 在 Redis 中保存密钥 SHA256 摘要、租户及可选到期时间。部署配置通过受保护文件注入初始管理员密钥；管理员通过 API Server 管理租户密钥。Ingress 的控制路由须包含 `prefix:/api/admin/v1/keys`，默认路由及统一部署示例已配置。用户传入 `Authorization: Bearer <key>` 或既有 `X-Auth` / `X-Auth-Token`。

@@ -25,7 +25,7 @@ fn spec(id: &str) -> EnvironmentSpec {
         },
         priority: 0,
         scheduling: Default::default(),
-        sandbox: Default::default(),
+        execution: Default::default(),
     }
 }
 fn node(id: &str) -> Node {
@@ -239,7 +239,7 @@ async fn runtime_network_policy_is_the_only_mutable_spec_field() {
     session.commit(initial.clone()).await.unwrap();
 
     let mut updated = initial;
-    updated.spec.sandbox.network = Some(adx_core::sandbox::NetworkPolicy::default());
+    updated.spec.execution.network = Some(adx_core::execution::NetworkPolicy::default());
     updated.revision = 3;
     updated.last_operation = Some(adx_core::CompletedOperation {
         id: "network-1".into(),

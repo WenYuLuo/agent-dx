@@ -20,7 +20,7 @@ struct Alias {
 
 /// Owned by one backend connection and one authenticated frontend attachment.
 /// Never reuse it across users or reconnections. The transport driver supplies
-/// the dedicated Sandbox connection and calls receive serially in wire order.
+/// the dedicated Environment connection and calls receive serially in wire order.
 pub struct Session {
     user_id: String,
     limits: SessionLimits,
@@ -32,7 +32,7 @@ pub struct Session {
 }
 impl Session {
     /// Validate identity and explicit positive capacities. Identity must already
-    /// be authenticated and bound to the backend Sandbox by the caller.
+    /// be authenticated and bound to the backend Environment by the caller.
     pub fn new(user_id: String, limits: SessionLimits) -> Result<Self> {
         if user_id.trim().is_empty()
             || user_id.len() > 256

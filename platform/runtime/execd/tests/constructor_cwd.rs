@@ -28,7 +28,7 @@ fn start(cwd: &Path, log: &Path) -> (Runtime, u16) {
         .env("ADX_ENVIRONMENT_ID", "cwd-test")
         .env("ADX_RUNTIME_ID", "cwd-test-1")
         .env("ADX_OWNERSHIP_GENERATION", "1")
-        .env("ADX_SANDBOX_CWD", cwd)
+        .env("ADX_ENVIRONMENT_CWD", cwd)
         .stdout(Stdio::from(log.try_clone().unwrap()))
         .stderr(Stdio::from(log))
         .spawn()
@@ -101,5 +101,5 @@ fn invalid_constructor_cwd_exits_without_publishing_ready() {
     assert_eq!(std::fs::read_to_string(file).unwrap(), "preserved");
     assert!(std::fs::read_to_string(log)
         .unwrap()
-        .contains("sandbox cwd"));
+        .contains("environment cwd"));
 }

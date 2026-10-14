@@ -20,13 +20,13 @@ class RuntimeLossTests(unittest.TestCase):
         def from_id(instance_id, connection):
             calls.append(instance_id)
             if len(calls) == 1:
-                raise RuntimeError(f'sandbox {instance_id} is not running: failed')
+                raise RuntimeError(f'environment {instance_id} is not running: failed')
             return expected
 
         modules = {
-            'adx_sandbox': types.SimpleNamespace(
+            'adx_environment': types.SimpleNamespace(
                 RestartPolicy=object,
-                Sandbox=types.SimpleNamespace(from_id=from_id),
+                Environment=types.SimpleNamespace(from_id=from_id),
             ),
             'node': types.SimpleNamespace(
                 catalog=lambda: {},
@@ -71,9 +71,9 @@ class RuntimeLossTests(unittest.TestCase):
             record['result']['state'] = 'Deleted'
 
         modules = {
-            'adx_sandbox': types.SimpleNamespace(
+            'adx_environment': types.SimpleNamespace(
                 RestartPolicy=object,
-                Sandbox=types.SimpleNamespace(delete=delete),
+                Environment=types.SimpleNamespace(delete=delete),
             ),
             'node': types.SimpleNamespace(
                 catalog=lambda: {'environment:' + instance_id: json.dumps(record)},

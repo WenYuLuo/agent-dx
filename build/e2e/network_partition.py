@@ -30,7 +30,7 @@ def withdrawn_route(instance_id, secrets):
 
 
 def run(connection, image, evidence, secrets, output):
-    from adx_sandbox import Sandbox, SandboxError, SandboxNotFound
+    from adx_environment import Environment, EnvironmentError, EnvironmentNotFound
     from functional_lifecycle import _wait_deleted
 
     observed = json.loads((evidence / 'node-failure-observed.json').read_text())
@@ -45,8 +45,8 @@ def run(connection, image, evidence, secrets, output):
         deadline = time.monotonic() + 15
         while True:
             try:
-                unexpected = Sandbox.from_id(failed_id, connection=connection)
-            except (SandboxNotFound, SandboxError, RuntimeError):
+                unexpected = Environment.from_id(failed_id, connection=connection)
+            except (EnvironmentNotFound, EnvironmentError, RuntimeError):
                 break
             else:
                 unexpected.close()
@@ -63,14 +63,14 @@ def run(connection, image, evidence, secrets, output):
             }
         )
 
-        healthy = Sandbox.from_id(healthy_id, connection=connection)
+        healthy = Environment.from_id(healthy_id, connection=connection)
         try:
             command = healthy.commands.run('printf partition-unaffected')
             if not (command.exit_code == 0 and command.stdout == 'partition-unaffected'):
                 raise AssertionError()
         finally:
             healthy.close()
-        extra = Sandbox(
+        extra = Environment(
             image=image,
             runtime='runc',
             node_id='node1',
@@ -84,7 +84,7 @@ def run(connection, image, evidence, secrets, output):
         command = extra.commands.run('printf partition-new-allocation')
         if not (command.exit_code == 0 and command.stdout == 'partition-new-allocation'):
             raise AssertionError()
-        Sandbox.delete(extra.id, connection=connection)
+        Environment.delete(extra.id, connection=connection)
         deleted = True
         _wait_deleted(extra.id, connection, timeout=60)
         report['cases'].append(
@@ -106,7 +106,7 @@ def run(connection, image, evidence, secrets, output):
             extra.close()
             if not deleted:
                 try:
-                    Sandbox.delete(extra.id, connection=connection)
+                    Environment.delete(extra.id, connection=connection)
                 except Exception as error:
                     report['cleanup_errors'].append(str(error))
         if report['cleanup_errors']:

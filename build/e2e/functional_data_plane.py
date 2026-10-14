@@ -52,7 +52,7 @@ class _TunnelUpstream(http.server.BaseHTTPRequestHandler):
 def _tunnel_fetch_command(url):
     target = urllib.parse.urlsplit(url.rstrip('/') + '/functional')
     if target.scheme != 'http' or target.hostname != '127.0.0.1' or not target.port:
-        raise ValueError(f'invalid sandbox-side tunnel URL: {url}')
+        raise ValueError(f'invalid environment-side tunnel URL: {url}')
     path = target.path or '/'
     return (
         rf'''perl -MSocket -e '$|=1; '''
@@ -68,21 +68,21 @@ def _tunnel_fetch_command(url):
     )
 
 
-def _fetch_forwarded(sandbox, ca_path, port=PORT, authenticated=True):
+def _fetch_forwarded(environment, ca_path, port=PORT, authenticated=True):
     request = urllib.request.Request(
-        sandbox.get_port_url(port),
-        headers=sandbox.get_port_auth_headers() if authenticated else {},
+        environment.get_port_url(port),
+        headers=environment.get_port_auth_headers() if authenticated else {},
     )
     return _fetch_request(request, ca_path)
 
 
-def _fetch_host_forwarded(sandbox, ca_path, port=PORT, authenticated=True):
-    gateway = urllib.parse.urlsplit(sandbox.get_port_url(port))
+def _fetch_host_forwarded(environment, ca_path, port=PORT, authenticated=True):
+    gateway = urllib.parse.urlsplit(environment.get_port_url(port))
     request = urllib.request.Request(
         f'{gateway.scheme}://{gateway.netloc}/functional/host?x=1',
         headers={
-            'Host': f'{sandbox.id}-{port}.example.test',
-            **(sandbox.get_port_auth_headers() if authenticated else {}),
+            'Host': f'{environment.id}-{port}.example.test',
+            **(environment.get_port_auth_headers() if authenticated else {}),
         },
     )
     return _fetch_request(request, ca_path)
@@ -115,22 +115,22 @@ def run(connection, image, output, ca_path, *, runtime='runc', node_ids=('node1'
     # contract suite does not depend on an installed public SDK. The real
     # functional case runs inside the packaged client environment and imports
     # the SDK at execution time.
-    from adx_sandbox import (
+    from adx_environment import (
         CommandConflict,
         CommandNotFound,
         CommandStatus,
         DataPlaneSecurityPolicy,
-        Sandbox,
+        Environment,
         resources,
     )
 
     checks = {}
     cases = []
-    sandbox = None
+    environment = None
     server = None
-    security_sandbox = None
+    security_environment = None
     security_server = None
-    tunnel_sandbox = None
+    tunnel_environment = None
     tunnel_upstream = None
     tunnel_thread = None
 
@@ -164,8 +164,8 @@ def run(connection, image, output, ca_path, *, runtime='runc', node_ids=('node1'
         checks['resource_discovery'] = sorted(by_id)
         passed('resources.current-capacity', started)
 
-        started = begin('sandbox.create-query-reattach')
-        sandbox = Sandbox(
+        started = begin('environment.create-query-reattach')
+        environment = Environment(
             image=image,
             runtime=runtime,
             cpu=500,
@@ -180,12 +180,12 @@ def run(connection, image, output, ca_path, *, runtime='runc', node_ids=('node1'
             connection=connection,
             create_timeout=150,
         )
-        if not (sandbox.sandbox_id == sandbox.id):
+        if not (environment.environment_id == environment.id):
             raise AssertionError()
-        info = sandbox.get_info()
-        if not (info.id == sandbox.id and info.state == 'running'):
+        info = environment.get_info()
+        if not (info.id == environment.id and info.state == 'running'):
             raise AssertionError()
-        attached = Sandbox.from_id(sandbox.id, connection=connection)
+        attached = Environment.from_id(environment.id, connection=connection)
         try:
             result = attached.commands.run(
                 "printf '%s:%s' \"$PWD\" \"$E2E_FUNCTIONAL_ENV\"", cwd='/tmp', envs={'E2E_FUNCTIONAL_ENV': 'functional'}
@@ -195,34 +195,34 @@ def run(connection, image, output, ca_path, *, runtime='runc', node_ids=('node1'
         finally:
             attached.close()
         checks['query_and_reattach'] = True
-        passed('sandbox.create-query-reattach', started)
+        passed('environment.create-query-reattach', started)
 
         started = begin('command.stdin-handle-recovery')
-        stdin_handle = sandbox.commands.run('cat', background=True, stdin=True, command_id='functional-stdin')
+        stdin_handle = environment.commands.run('cat', background=True, stdin=True, command_id='functional-stdin')
         stdin_handle.send_stdin('line-one\nline-two\n')
         stdin_handle.close_stdin()
         stdin_result = stdin_handle.wait(timeout=20)
         if not (stdin_result.exit_code == 0 and stdin_result.stdout == 'line-one\nline-two\n'):
             raise AssertionError()
-        recovered = sandbox.commands.get('functional-stdin').wait(timeout=2)
+        recovered = environment.commands.get('functional-stdin').wait(timeout=2)
         if not (recovered.stdout == stdin_result.stdout):
             raise AssertionError()
-        if not (any(command.id == 'functional-stdin' for command in sandbox.commands.list())):
+        if not (any(command.id == 'functional-stdin' for command in environment.commands.list())):
             raise AssertionError()
         if not (stdin_handle.id == 'functional-stdin'):
             raise AssertionError()
-        if not (stdin_handle.sandbox_id == sandbox.id):
+        if not (stdin_handle.environment_id == environment.id):
             raise AssertionError()
         passed('command.stdin-handle-recovery', started)
 
         started = begin('command.collection-stdin-async-wait')
-        collection_stdin = sandbox.commands.run(
+        collection_stdin = environment.commands.run(
             'cat', background=True, stdin=True, command_id='functional-collection-stdin'
         )
         if collection_stdin.poll() not in (CommandStatus.PENDING, CommandStatus.RUNNING):
             raise AssertionError()
-        sandbox.commands.send_stdin(collection_stdin.id, 'collection-api\n')
-        sandbox.commands.close_stdin(collection_stdin.id)
+        environment.commands.send_stdin(collection_stdin.id, 'collection-api\n')
+        environment.commands.close_stdin(collection_stdin.id)
         collection_result = asyncio.run(collection_stdin.wait_async(timeout=20))
         if not (collection_result.exit_code == 0):
             raise AssertionError()
@@ -231,12 +231,12 @@ def run(connection, image, output, ca_path, *, runtime='runc', node_ids=('node1'
         passed('command.collection-stdin-async-wait', started)
 
         started = begin('command.idempotent-replay-and-conflict')
-        stable = sandbox.commands.run(
+        stable = environment.commands.run(
             'sleep 0.2; printf stable-command',
             background=True,
             command_id='functional-stable-command',
         )
-        replay = sandbox.commands.run(
+        replay = environment.commands.run(
             'sleep 0.2; printf stable-command',
             background=True,
             command_id='functional-stable-command',
@@ -244,7 +244,7 @@ def run(connection, image, output, ca_path, *, runtime='runc', node_ids=('node1'
         if not (replay.id == stable.id):
             raise AssertionError()
         try:
-            sandbox.commands.run(
+            environment.commands.run(
                 'printf changed-command',
                 background=True,
                 command_id='functional-stable-command',
@@ -260,12 +260,12 @@ def run(connection, image, output, ca_path, *, runtime='runc', node_ids=('node1'
 
         started = begin('command.not-found-and-wait-timeout')
         try:
-            sandbox.commands.get('functional-command-does-not-exist')
+            environment.commands.get('functional-command-does-not-exist')
         except CommandNotFound:
             logging.getLogger(__name__).debug("Best-effort operation failed", exc_info=True)
         else:
             raise AssertionError('missing command did not raise CommandNotFound')
-        waiting = sandbox.commands.run('sleep 120', background=True, command_id='functional-wait-timeout')
+        waiting = environment.commands.run('sleep 120', background=True, command_id='functional-wait-timeout')
         timeout_result = waiting.wait(timeout=0.05)
         if not (timeout_result.status == CommandStatus.RUNNING):
             raise AssertionError()
@@ -278,8 +278,8 @@ def run(connection, image, output, ca_path, *, runtime='runc', node_ids=('node1'
         passed('command.not-found-and-wait-timeout', started)
 
         started = begin('command.collection-kill')
-        killed = sandbox.commands.run('sleep 120', background=True, command_id='functional-kill')
-        if not (sandbox.commands.kill(killed.id)):
+        killed = environment.commands.run('sleep 120', background=True, command_id='functional-kill')
+        if not (environment.commands.kill(killed.id)):
             raise AssertionError()
         killed_result = killed.wait(timeout=20)
         if not (killed_result.status.value == 'KILLED'):
@@ -288,7 +288,7 @@ def run(connection, image, output, ca_path, *, runtime='runc', node_ids=('node1'
         passed('command.collection-kill', started)
 
         async def shell_roundtrip():
-            shell = await sandbox.shells.create(cwd='/tmp', envs={'ADX_SHELL_VALUE': 'seeded'})
+            shell = await environment.shells.create(cwd='/tmp', envs={'ADX_SHELL_VALUE': 'seeded'})
             try:
                 if not (shell.session_id):
                     raise AssertionError()
@@ -306,7 +306,7 @@ def run(connection, image, output, ca_path, *, runtime='runc', node_ids=('node1'
                     raise AssertionError(failed)
             finally:
                 shell.close()
-            disposable = await sandbox.shells.create()
+            disposable = await environment.shells.create()
             await disposable.kill()
 
         started = begin('shell.state-env-cwd-and-exit')
@@ -314,7 +314,7 @@ def run(connection, image, output, ca_path, *, runtime='runc', node_ids=('node1'
         passed('shell.state-env-cwd-and-exit', started)
 
         async def terminal_shell_exit():
-            shell = await sandbox.shells.create()
+            shell = await environment.shells.create()
             try:
                 result = await shell.run('printf shell-ended; exit 9', timeout=5)
                 if not (result.exit_code == 9):
@@ -326,32 +326,32 @@ def run(connection, image, output, ca_path, *, runtime='runc', node_ids=('node1'
 
         started = begin('shell.terminal-exit-does-not-hang')
         asyncio.run(terminal_shell_exit())
-        sandbox.shells.close()
+        environment.shells.close()
         checks['stateful_shell'] = True
         passed('shell.terminal-exit-does-not-hang', started)
 
         started = begin('filesystem.text-crud')
-        sandbox.files.make_dir('/tmp/adx-functional')
-        sandbox.files.write('/tmp/adx-functional/source.txt', 'file-api')
-        info = sandbox.files.get_info('/tmp/adx-functional/source.txt')
+        environment.files.make_dir('/tmp/adx-functional')
+        environment.files.write('/tmp/adx-functional/source.txt', 'file-api')
+        info = environment.files.get_info('/tmp/adx-functional/source.txt')
         if not (info.type == 'file' and info.size == len('file-api')):
             raise AssertionError()
-        sandbox.files.rename('/tmp/adx-functional/source.txt', '/tmp/adx-functional/renamed.txt')
-        if not (sandbox.files.read('/tmp/adx-functional/renamed.txt') == 'file-api'):
+        environment.files.rename('/tmp/adx-functional/source.txt', '/tmp/adx-functional/renamed.txt')
+        if not (environment.files.read('/tmp/adx-functional/renamed.txt') == 'file-api'):
             raise AssertionError()
-        if not (any(entry.name == 'renamed.txt' for entry in sandbox.files.list('/tmp/adx-functional'))):
+        if not (any(entry.name == 'renamed.txt' for entry in environment.files.list('/tmp/adx-functional'))):
             raise AssertionError()
-        sandbox.files.remove('/tmp/adx-functional/renamed.txt')
-        if not (not sandbox.files.exists('/tmp/adx-functional/renamed.txt')):
+        environment.files.remove('/tmp/adx-functional/renamed.txt')
+        if not (not environment.files.exists('/tmp/adx-functional/renamed.txt')):
             raise AssertionError()
         passed('filesystem.text-crud', started)
 
         started = begin('filesystem.binary-read-write')
         binary = b'functional-binary\x00\xff\n' * 8192
-        written = sandbox.files.write('/tmp/adx-functional/binary.bin', binary)
+        written = environment.files.write('/tmp/adx-functional/binary.bin', binary)
         if not (written.size == len(binary)):
             raise AssertionError(written)
-        if not (sandbox.files.read('/tmp/adx-functional/binary.bin', format='bytes') == binary):
+        if not (environment.files.read('/tmp/adx-functional/binary.bin', format='bytes') == binary):
             raise AssertionError()
         passed('filesystem.binary-read-write', started)
 
@@ -363,11 +363,11 @@ def run(connection, image, output, ca_path, *, runtime='runc', node_ids=('node1'
             (source / 'nested').mkdir()
             payload = b'copy-roundtrip\x00\xff' * 131072
             (source / 'nested' / 'payload.bin').write_bytes(payload)
-            sandbox.files.copy_from_local(str(source), '/tmp/adx-functional/copied')
-            entries = sandbox.files.list('/tmp/adx-functional/copied', depth=3)
+            environment.files.copy_from_local(str(source), '/tmp/adx-functional/copied')
+            entries = environment.files.list('/tmp/adx-functional/copied', depth=3)
             if not (any(entry.path.endswith('/nested/payload.bin') for entry in entries)):
                 raise AssertionError(entries)
-            sandbox.files.copy_to_local('/tmp/adx-functional/copied', str(target))
+            environment.files.copy_to_local('/tmp/adx-functional/copied', str(target))
             if not ((target / 'nested' / 'payload.bin').read_bytes() == payload):
                 raise AssertionError()
         checks['filesystem_crud_and_copy'] = True
@@ -375,7 +375,7 @@ def run(connection, image, output, ca_path, *, runtime='runc', node_ids=('node1'
 
         started = begin('pty.output-resize')
         pty_output = bytearray()
-        session = sandbox.pty.create(
+        session = environment.pty.create(
             ['/bin/sh', '-lc', 'sleep 0.2; printf pty-functional'],
             rows=24,
             cols=80,
@@ -397,7 +397,7 @@ def run(connection, image, output, ca_path, *, runtime='runc', node_ids=('node1'
 
         started = begin('pty.stdin-eof-and-session-state')
         interactive_output = bytearray()
-        interactive = sandbox.pty.create(
+        interactive = environment.pty.create(
             ['/bin/sh', '-lc', 'value=$(cat); printf "pty-input:%s" "$value"'],
             on_data=interactive_output.extend,
             timeout=20,
@@ -418,34 +418,34 @@ def run(connection, image, output, ca_path, *, runtime='runc', node_ids=('node1'
         passed('pty.stdin-eof-and-session-state', started)
 
         started = begin('port-forward.tls-token-route')
-        server = sandbox.commands.run(SERVER_COMMAND, background=True, command_id='functional-http')
+        server = environment.commands.run(SERVER_COMMAND, background=True, command_id='functional-http')
         try:
-            _fetch_forwarded(sandbox, ca_path, authenticated=False)
+            _fetch_forwarded(environment, ca_path, authenticated=False)
         except urllib.error.HTTPError as error:
             if error.code not in (401, 403):
                 raise AssertionError(error) from error
         else:
             raise AssertionError('tls-token forwarded port accepted a request without a token')
-        if not (_fetch_forwarded(sandbox, ca_path) == EXPECTED_BODY):
+        if not (_fetch_forwarded(environment, ca_path) == EXPECTED_BODY):
             raise AssertionError()
         checks['forwarded_port'] = True
         passed('port-forward.tls-token-route', started)
 
         started = begin('port-forward.host-subdomain-route')
         try:
-            _fetch_host_forwarded(sandbox, ca_path, authenticated=False)
+            _fetch_host_forwarded(environment, ca_path, authenticated=False)
         except urllib.error.HTTPError as error:
             if error.code not in (401, 403):
                 raise AssertionError(error) from error
         else:
             raise AssertionError('Host forwarded port accepted a request without a token')
-        if not (_fetch_host_forwarded(sandbox, ca_path) == HOST_EXPECTED_BODY):
+        if not (_fetch_host_forwarded(environment, ca_path) == HOST_EXPECTED_BODY):
             raise AssertionError()
         checks['host_subdomain_forwarding'] = True
         passed('port-forward.host-subdomain-route', started)
 
         started = begin('port-forward.per-instance-tls-route')
-        security_sandbox = Sandbox(
+        security_environment = Environment(
             image=image,
             runtime=runtime,
             cpu=500,
@@ -458,8 +458,8 @@ def run(connection, image, output, ca_path, *, runtime='runc', node_ids=('node1'
             create_timeout=150,
         )
         tls_command = SERVER_COMMAND.replace(str(PORT), str(TLS_PORT))
-        security_server = security_sandbox.commands.run(tls_command, background=True, command_id='functional-http-tls')
-        if not (_fetch_forwarded(security_sandbox, ca_path, port=TLS_PORT, authenticated=False) == EXPECTED_BODY):
+        security_server = security_environment.commands.run(tls_command, background=True, command_id='functional-http-tls')
+        if not (_fetch_forwarded(security_environment, ca_path, port=TLS_PORT, authenticated=False) == EXPECTED_BODY):
             raise AssertionError()
         checks['per_instance_data_plane_security'] = True
         passed('port-forward.per-instance-tls-route', started)
@@ -473,7 +473,7 @@ def run(connection, image, output, ca_path, *, runtime='runc', node_ids=('node1'
         )
         tunnel_thread.start()
         upstream_port = tunnel_upstream.server_address[1]
-        tunnel_sandbox = Sandbox(
+        tunnel_environment = Environment(
             image=image,
             runtime=runtime,
             cpu=500,
@@ -485,11 +485,11 @@ def run(connection, image, output, ca_path, *, runtime='runc', node_ids=('node1'
             create_timeout=150,
             tunnel_connect_timeout=30,
         )
-        tunnel_url = tunnel_sandbox.get_tunnel_url()
+        tunnel_url = tunnel_environment.get_tunnel_url()
         command = _tunnel_fetch_command(tunnel_url)
         tunnel_result = None
         for attempt in range(3):
-            tunnel_result = tunnel_sandbox.commands.run(command)
+            tunnel_result = tunnel_environment.commands.run(command)
             if tunnel_result.exit_code == 0 and f'{TUNNEL_BODY}:/functional' in tunnel_result.stdout:
                 break
             if attempt < 2:
@@ -505,7 +505,7 @@ def run(connection, image, output, ca_path, *, runtime='runc', node_ids=('node1'
 
         result = {
             'status': 'passed',
-            'instance_id': sandbox.id,
+            'instance_id': environment.id,
             'checks': checks,
             'cases': cases,
         }
@@ -522,23 +522,23 @@ def run(connection, image, output, ca_path, *, runtime='runc', node_ids=('node1'
                 security_server.kill()
             except Exception:
                 logging.getLogger(__name__).debug("Best-effort operation failed", exc_info=True)
-        if security_sandbox is not None:
+        if security_environment is not None:
             try:
-                security_sandbox.kill()
+                security_environment.kill()
             finally:
-                security_sandbox.close()
-        if tunnel_sandbox is not None:
+                security_environment.close()
+        if tunnel_environment is not None:
             try:
-                tunnel_sandbox.kill()
+                tunnel_environment.kill()
             finally:
-                tunnel_sandbox.close()
+                tunnel_environment.close()
         if tunnel_upstream is not None:
             tunnel_upstream.shutdown()
             tunnel_upstream.server_close()
         if tunnel_thread is not None:
             tunnel_thread.join(timeout=5)
-        if sandbox is not None:
+        if environment is not None:
             try:
-                sandbox.kill()
+                environment.kill()
             finally:
-                sandbox.close()
+                environment.close()

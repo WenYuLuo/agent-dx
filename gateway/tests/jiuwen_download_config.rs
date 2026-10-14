@@ -1,5 +1,5 @@
 #![cfg(feature = "agent-api")]
-use adx_agent_core::{sandbox::ExecutionSpec, TemplateVersion};
+use adx_agent_core::{environment::ExecutionSpec, TemplateVersion};
 use data_plane_gateway::ingress::jiuwen::download_config::DownloadConfig;
 use serde_json::json;
 
@@ -43,7 +43,7 @@ fn configured_secret_has_precedence_and_is_never_trimmed_or_debugged() {
 }
 
 #[test]
-fn missing_or_empty_secret_uses_the_current_sandbox_workspace_file() {
+fn missing_or_empty_secret_uses_the_current_environment_workspace_file() {
     let mut template = template();
     template
         .env

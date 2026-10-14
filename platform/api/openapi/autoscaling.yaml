@@ -16,7 +16,7 @@ paths:
           description: In-memory waiting requests; count is the returned length.
           content:
             application/json:
-              schema: {$ref: './sandbox.yaml#/components/schemas/SchedulingQueue'}
+              schema: {$ref: './environment.yaml#/components/schemas/SchedulingQueue'}
         default: {$ref: '#/components/responses/Error'}
   /global-scheduler/node/localschedulingstatus:
     parameters:
@@ -33,7 +33,7 @@ paths:
           description: Administrative pause recorded.
           content:
             application/json:
-              schema: {$ref: './sandbox.yaml#/components/schemas/NodeSchedulingStatus'}
+              schema: {$ref: './environment.yaml#/components/schemas/NodeSchedulingStatus'}
         default: {$ref: '#/components/responses/Error'}
     delete:
       operationId: resumeCoordinatorNodeScheduling
@@ -44,7 +44,7 @@ paths:
           description: Administrative pause removed.
           content:
             application/json:
-              schema: {$ref: './sandbox.yaml#/components/schemas/NodeSchedulingStatus'}
+              schema: {$ref: './environment.yaml#/components/schemas/NodeSchedulingStatus'}
         default: {$ref: '#/components/responses/Error'}
   /instance-manager/query-tenant-instances:
     get:

@@ -79,7 +79,7 @@ fn spec() -> EnvironmentSpec {
             disk_bytes: 1,
         },
         priority: 0,
-        sandbox: Default::default(),
+        execution: Default::default(),
     }
 }
 

@@ -97,8 +97,8 @@ impl Readiness for ExecdReadiness {
         Ok((status.activity_revision, status.active_requests))
     }
     async fn wait_ready(&self, record: &EnvironmentRecord) -> Result<()> {
-        let ready_timeout = if record.spec.sandbox.init_timeout_seconds > 0 {
-            Duration::from_secs(record.spec.sandbox.init_timeout_seconds)
+        let ready_timeout = if record.spec.execution.init_timeout_seconds > 0 {
+            Duration::from_secs(record.spec.execution.init_timeout_seconds)
         } else {
             self.ready_timeout
         };

@@ -4,7 +4,7 @@ import json
 import logging
 from pathlib import Path
 
-from adx_sandbox import Sandbox
+from adx_environment import Environment
 from functional_lifecycle import _wait_deleted
 
 JOURNAL = Path('/tmp/adx-e2e/degraded/results.sqlite')
@@ -13,7 +13,7 @@ JOURNAL = Path('/tmp/adx-e2e/degraded/results.sqlite')
 def create(connection, image, output, journal_path=JOURNAL):
     created = []
     try:
-        keep = Sandbox(
+        keep = Environment(
             image=image,
             runtime='runc',
             cpu=500,
@@ -25,7 +25,7 @@ def create(connection, image, output, journal_path=JOURNAL):
             create_timeout=150,
         )
         created.append(keep)
-        idle = Sandbox(
+        idle = Environment(
             image=image,
             runtime='runc',
             cpu=500,
@@ -47,7 +47,7 @@ def create(connection, image, output, journal_path=JOURNAL):
     except Exception:
         for instance in created:
             try:
-                Sandbox.delete(instance.id, connection=connection)
+                Environment.delete(instance.id, connection=connection)
             except Exception:
                 logging.getLogger(__name__).debug("Best-effort operation failed", exc_info=True)
         raise
@@ -63,12 +63,12 @@ def verify(connection, evidence, output):
     kept = None
     deleted = False
     try:
-        kept = Sandbox.from_id(live['keep_id'], connection=connection)
+        kept = Environment.from_id(live['keep_id'], connection=connection)
         command = kept.commands.run('printf retained-after-replay')
         if not (command.exit_code == 0 and command.stdout == 'retained-after-replay'):
             raise AssertionError()
         kept.close()
-        Sandbox.delete(live['keep_id'], connection=connection)
+        Environment.delete(live['keep_id'], connection=connection)
         deleted = True
         _wait_deleted(live['keep_id'], connection, timeout=60)
         report = {
@@ -88,4 +88,4 @@ def verify(connection, evidence, output):
         if kept is not None:
             kept.close()
         if not deleted:
-            Sandbox.delete(live['keep_id'], connection=connection)
+            Environment.delete(live['keep_id'], connection=connection)

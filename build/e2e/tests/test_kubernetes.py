@@ -277,7 +277,7 @@ class KubernetesLifecycleTests(unittest.TestCase):
                     return json.dumps({'runtime_ids': ['capsule-1-backend']})
                 if 'sdk' in args:
                     return json.dumps(
-                        {'cases': [{'id': 'sandbox.create-query-two-nodes', 'status': 'passed', 'seconds': 0}]}
+                        {'cases': [{'id': 'environment.create-query-two-nodes', 'status': 'passed', 'seconds': 0}]}
                     )
                 return ''
 

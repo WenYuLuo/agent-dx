@@ -1,7 +1,7 @@
 use adx_activator::{
     registration::{RegistrationConfig, RegistrationLease},
     server,
-    transport::HttpSandbox,
+    transport::HttpEnvironment,
     Activator, CacheSettings,
 };
 use adx_agent_store::{AgentState, RedisRepository};
@@ -14,10 +14,10 @@ struct Settings {
     listen: SocketAddr,
     redis_url: String,
     namespace: String,
-    sandbox_url: String,
-    sandbox_api_key_envs: BTreeMap<String, String>,
+    environment_url: String,
+    environment_api_key_envs: BTreeMap<String, String>,
     allow_plaintext_transport: bool,
-    sandbox_ca_file: Option<String>,
+    environment_ca_file: Option<String>,
     request_timeout_seconds: u64,
     #[serde(default)]
     binding_cache: CacheSettings,
@@ -34,11 +34,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     let timeout = Duration::from_secs(settings.request_timeout_seconds);
-    let ca = settings.sandbox_ca_file.map(std::fs::read).transpose()?;
-    let sandbox = Arc::new(HttpSandbox::new(
-        &settings.sandbox_url,
+    let ca = settings
+        .environment_ca_file
+        .map(std::fs::read)
+        .transpose()?;
+    let environment = Arc::new(HttpEnvironment::new(
+        &settings.environment_url,
         settings
-            .sandbox_api_key_envs
+            .environment_api_key_envs
             .into_iter()
             .map(|(tenant, variable)| std::env::var(variable).map(|key| (tenant, key)))
             .collect::<Result<BTreeMap<_, _>, _>>()?,
@@ -56,7 +59,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let activator = Arc::new(Activator::with_cache(
         AgentState::new(store).with_deployment_credentials()?,
-        sandbox,
+        environment,
         settings.binding_cache,
     )?);
     let app = server::router(

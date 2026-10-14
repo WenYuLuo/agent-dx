@@ -6,7 +6,7 @@ extend the old POSIX, function, or generic signal services for new functionality
 Public HTTP contracts are separate from these internal gRPC protocols:
 
 - [Coordinator autoscaling HTTP](../../../docs/deployment/coordinator-autoscaling.md)
-- [Sandbox management OpenAPI](../openapi/sandbox.yaml)
+- [Environment management OpenAPI](../openapi/environment.yaml)
 - [Environment data-plane OpenAPI](../openapi/data-plane.yaml)
 
 | Contract | Responsibility | Status |
@@ -25,8 +25,10 @@ The Rust API Server converts public HTTP JSON directly into Environment RPC type
 All owned protobuf definitions are generated through the Cargo protocol crate.
 The control files retain the `adx.control.v1` package. This internal rename is a
 schema boundary: deployments must upgrade all components together and start
-with a fresh Redis/SQLite control state. Public Sandbox HTTP fields such as
-`instanceId` and `instance_id` remain compatible and are translated only by API Server.
+with a fresh Redis/SQLite control state. Public Environment lifecycle responses use `environmentId`; Python SDK and
+AgentBinding identities use `environment_id`. Platform execution settings are
+`EnvironmentSpec.execution` / `ExecutionOptions`. The existing `/api/instances`
+directory retains its query parameters.
 
 EXECD user operations use HTTP. Runtime cooperation uses an Execd-initiated
 bidirectional gRPC stream when `adxlet.runtime_control` is configured; otherwise
@@ -66,7 +68,8 @@ snapshot means unknown, not idle. The session must be supplied by node process
 registration/assembly; receiving activity never implicitly authorizes a session.
 
 All changes here intentionally require matching component versions in the
-unified release. Public Sandbox HTTP paths and response envelopes retain SDK compatibility.
+unified release. Environment lifecycle paths are rooted at `/api/environment/v1/environments`.
+The SDK, API Server, Ingress and Activator must use this same contract.
 
 ## Scheduling payloads
 

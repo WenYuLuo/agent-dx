@@ -2,7 +2,7 @@
 set -euo pipefail
 : "${ADX_E2E_IMAGE_REPOSITORY:?set the registry repository}"
 : "${ADX_BASE_PACKAGE_BUILD_ID:?set the immutable base-package Buildkite build UUID}"
-: "${ADX_SDK_BUILD_ID:?set the immutable Python SDK Buildkite build UUID}"
+: "${ADX_SDK_BUILD_ID:?set the immutable Environment SDK Buildkite build UUID}"
 component_args=()
 case "${ADX_WITH_AFS:-0}" in
   0) ;;
@@ -33,7 +33,7 @@ tar -xzf out/buildkite/backend.tar.gz -C out/buildkite/backend
 python3 build/e2e/verify_backend.py \
   --directory out/buildkite/backend \
   --target x86_64-unknown-linux-gnu
-base_wheels=(out/buildkite/package/sdk/adx_sandbox-*.whl)
+base_wheels=(out/buildkite/package/sdk/adx_environment-*.whl)
 [[ ${#base_wheels[@]} == 1 && -f ${base_wheels[0]} ]] || { echo 'base package SDK wheel is missing' >&2; exit 1; }
 python3 build/release/component.py verify-build \
   --manifest out/buildkite/build-manifest.json \
@@ -44,10 +44,10 @@ python3 build/release/component.py verify-build \
   --wheel "${base_wheels[0]}" \
   --backend-manifest out/buildkite/backend/manifest.json \
   --backend-archive out/buildkite/backend.tar.gz "${component_args[@]}"
-echo "--- :python: Verify independent Sandbox SDK handoff"
+echo "--- :python: Verify independent Environment SDK handoff"
 buildkite-agent artifact download 'out/buildkite/sdk/sdk-candidate.json' . --step sdk-package --build "$ADX_SDK_BUILD_ID"
-buildkite-agent artifact download 'out/buildkite/sdk/adx_sandbox-*.whl' . --step sdk-package --build "$ADX_SDK_BUILD_ID"
-sdk_wheels=(out/buildkite/sdk/adx_sandbox-*.whl)
+buildkite-agent artifact download 'out/buildkite/sdk/adx_environment-*.whl' . --step sdk-package --build "$ADX_SDK_BUILD_ID"
+sdk_wheels=(out/buildkite/sdk/adx_environment-*.whl)
 [[ ${#sdk_wheels[@]} == 1 && -f ${sdk_wheels[0]} ]] || { echo 'exactly one SDK wheel is required' >&2; exit 1; }
 daemon_pid=''
 cleanup() {

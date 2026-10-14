@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1440" height="1100" viewBox="0 0 1440 1100" role="img" aria-labelledby="title desc">
-  <title id="title">Agent DX architecture</title>
-  <desc id="desc">Gateway Ingress hosts the Agent API. Stateless Activators manage Template and Environment metadata in a separate Redis namespace and activate one stable Sandbox through the Gateway Sandbox adapter. Inline lifecycle calls use that adapter directly. User Harness HTTP, WebSocket and SSH traffic follows Ingress and Relay. Platform owns Environment lifecycle and Execd owns the user process. API Server embeds Ingress by default; adxlet embeds Relay. Both pairs support separate processes.</desc>
+  <title id="title">Agent DX Environment architecture</title>
+  <desc id="desc">Gateway Ingress hosts the Agent API and selects Activators by AgentBinding scope. Stateless Activators manage Template and AgentBinding metadata in a separate Redis namespace, mapping each binding to one stable Environment. Independent Activators use the API Server Environment HTTP interface; embedded Activators call its local Environment application service. User Harness HTTP, WebSocket and SSH traffic follows Ingress and Relay to the Runtime. Platform owns Environment lifecycle and Execd owns the user process. API Server embeds Ingress by default; adxlet embeds Relay. Both pairs support separate processes.</desc>
   <defs>
     <marker id="blue" markerWidth="9" markerHeight="9" refX="8" refY="4" orient="auto"><path d="M0 0L8 4L0 8" fill="none" stroke="#2563eb" stroke-width="1.5"/></marker>
     <marker id="green" markerWidth="9" markerHeight="9" refX="8" refY="4" orient="auto"><path d="M0 0L8 4L0 8" fill="none" stroke="#0d806c" stroke-width="1.5"/></marker>
@@ -24,11 +24,11 @@
   <rect x="48" y="120" width="1344" height="116" rx="16" fill="#f1edff" stroke="#ded6f5"/>
   <text x="72" y="146" class="section">PRODUCT &amp; PUBLIC CONTRACT</text>
   <text x="72" y="179" class="name">Stateless Activator</text>
-  <text x="72" y="207" class="small">Template / Environment · agent/activator</text>
+  <text x="72" y="207" class="small">Template / AgentBinding · agent/activator</text>
   <path d="M450 182H535" class="support"/>
   <text x="565" y="179" class="name">Agent Redis</text>
   <text x="565" y="207" class="small">Product metadata</text>
-  <text x="888" y="179" class="name">Agent clients / Sandbox SDK</text>
+  <text x="888" y="179" class="name">Agent clients / Environment SDK</text>
   <text x="888" y="207" class="small">Public HTTPS APIs / Harness traffic</text>
 
   <rect x="48" y="284" width="300" height="648" rx="16" fill="#edf8f5" stroke="#c8e7de"/>
@@ -42,15 +42,15 @@
   <text x="72" y="591" class="small">Data requests use caches</text>
   <text x="72" y="616" class="small">and local binding checks.</text>
   <text x="72" y="685" class="small">Agent API → Activator</text>
-  <text x="72" y="710" class="small">Inline → Sandbox adapter</text>
-  <text x="72" y="735" class="small">Sandbox adapter → Platform RPC</text>
+  <text x="72" y="710" class="small">Lifecycle → API Server</text>
+  <text x="72" y="735" class="small">User traffic → Relay</text>
 
   <rect x="430" y="284" width="398" height="648" rx="16" fill="#eef3ff" stroke="#d0dcf4"/>
   <text x="454" y="312" class="section">CONTROL PLANE / PLATFORM</text>
   <rect x="454" y="350" width="350" height="108" rx="12" fill="white" stroke="#b5c9f0"/>
   <text x="476" y="384" class="name">API Server</text>
-  <text x="476" y="411" class="body">Sandbox HTTP API · ownership cache</text>
-  <text x="476" y="437" class="small">API Key verification / tenant context</text>
+  <text x="476" y="411" class="body">Environment HTTP API</text>
+  <text x="476" y="437" class="small">Ownership cache / API Key / tenant</text>
   <rect x="454" y="520" width="350" height="205" rx="12" fill="white" stroke="#b5c9f0"/>
   <text x="476" y="555" class="name">Coordinator</text>
   <text x="476" y="583" class="body">Global: round-robin across shards</text>
@@ -71,7 +71,7 @@
   <text x="976" y="437" class="small">HTTP/2 CONNECT → target TCP</text>
   <rect x="954" y="536" width="366" height="133" rx="12" fill="white" stroke="#dcc391"/>
   <text x="976" y="573" class="name">adxlet</text>
-  <text x="976" y="602" class="body">Environment lifecycle · local admission</text>
+  <text x="976" y="602" class="body">Environment lifecycle / admission</text>
   <text x="976" y="629" class="body">RuntimeDriver · reconcile</text>
   <text x="976" y="652" class="small">StateSink → Coordinator → Redis</text>
   <rect x="954" y="728" width="366" height="68" rx="12" fill="white" stroke="#dcc391"/>
@@ -81,10 +81,8 @@
   <text x="976" y="864" class="name">Runtime: Execd + Harness</text>
   <text x="976" y="891" class="small">Commands / files / ports · HTTP control</text>
 
-  <path d="M180 236V350" class="support"/>
+  <path d="M180 236V272H790V350" class="support"/>
   <path d="M280 350V236" class="control"/>
-  <text x="96" y="252" class="small">Sandbox API</text>
-  <text x="285" y="278" class="small">Agent API</text>
   <path d="M1182 236V260H60V376H72" class="support"/>
   <text x="648" y="254" class="small">Public HTTPS requests</text>
   <path d="M324 402H454" class="control"/>
@@ -112,6 +110,8 @@
   <text x="641" y="767" class="label">Persist / discover</text>
   <path d="M454 693H394V481H324" class="control"/>
   <text x="408" y="698" class="label" transform="rotate(-90 408 698)">Full + delta routes / gRPC</text>
+  <text x="180" y="266" class="label">Environment API</text>
+  <text x="285" y="278" class="label">Agent API</text>
 
   <rect x="48" y="958" width="1344" height="96" rx="14" fill="#e8edf3"/>
   <text x="72" y="990" class="body" font-weight="600">Deployment: adxctl supervisor + unified release · native processes or processes inside Kubernetes Pods</text>

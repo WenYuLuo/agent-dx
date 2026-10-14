@@ -3,7 +3,7 @@
 import json
 import time
 
-from adx_sandbox import RestartPolicy, Sandbox
+from adx_environment import RestartPolicy, Environment
 from node import catalog, labeled_backend, persisted_runtime_id
 
 
@@ -26,13 +26,13 @@ def _attach_after_restart(instance_id, connection, seconds=5):
     deadline = time.monotonic() + seconds
     while True:
         try:
-            return Sandbox.from_id(instance_id, connection=connection)
+            return Environment.from_id(instance_id, connection=connection)
         except RuntimeError as error:
-            if str(error) != f'sandbox {instance_id} is not running: failed':
+            if str(error) != f'environment {instance_id} is not running: failed':
                 raise
             if time.monotonic() >= deadline:
                 raise AssertionError(
-                    'Redis reports the restarted sandbox Running, but API Server '
+                    'Redis reports the restarted environment Running, but API Server '
                     f'still reports Failed after {seconds}s: {instance_id}'
                 ) from error
             time.sleep(0.2)
@@ -48,7 +48,7 @@ def create(connection, image, evidence, policy):
             initial_backoff_seconds=2,
             max_backoff_seconds=4,
         )
-    sandbox = Sandbox(
+    environment = Environment(
         image=image,
         runtime='runc',
         node_id='node1',
@@ -61,14 +61,14 @@ def create(connection, image, evidence, policy):
         **options,
     )
     try:
-        if not (sandbox.commands.run('printf before-daemon-loss').stdout == 'before-daemon-loss'):
+        if not (environment.commands.run('printf before-daemon-loss').stdout == 'before-daemon-loss'):
             raise AssertionError()
-        record = _record(sandbox.id)
-        backends = labeled_backend(sandbox.id)
+        record = _record(environment.id)
+        backends = labeled_backend(environment.id)
         if not (record['result']['state'] == 'Running' and len(backends) == 1):
             raise AssertionError()
         payload = {
-            'instance_id': sandbox.id,
+            'instance_id': environment.id,
             'assignment': record['assignment'],
             'runtime_id': persisted_runtime_id(record['result']),
             'backend_id': backends[0],
@@ -76,10 +76,10 @@ def create(connection, image, evidence, policy):
         (evidence / ('loss-' + policy + '-created.json')).write_text(json.dumps(payload, indent=2) + '\n')
         return payload
     except Exception:
-        Sandbox.delete(sandbox.id, connection=connection)
+        Environment.delete(environment.id, connection=connection)
         raise
     finally:
-        sandbox.close()
+        environment.close()
 
 
 def verify(connection, evidence, secrets, policy):
@@ -140,17 +140,17 @@ def verify(connection, evidence, secrets, policy):
             if not (len(backends) == 1 and backends[0] != before['backend_id']):
                 raise AssertionError(backends)
             visibility_started = time.monotonic()
-            sandbox = _attach_after_restart(instance_id, connection)
+            environment = _attach_after_restart(instance_id, connection)
             api_visibility_seconds = round(time.monotonic() - visibility_started, 3)
             try:
-                command = sandbox.commands.run('printf after-daemon-loss')
+                command = environment.commands.run('printf after-daemon-loss')
                 if not (command.exit_code == 0 and command.stdout == 'after-daemon-loss'):
                     raise AssertionError()
             finally:
-                sandbox.close()
+                environment.close()
             case_id = 'reliability.daemon-loss-restart'
             extra = {'backend_id': backends[0], 'restart_attempts': 1, 'api_visibility_seconds': api_visibility_seconds}
-        Sandbox.delete(instance_id, connection=connection)
+        Environment.delete(instance_id, connection=connection)
         deleted = True
 
         def deleted_runtime_record():
@@ -189,7 +189,7 @@ def verify(connection, evidence, secrets, policy):
     finally:
         if not deleted:
             try:
-                Sandbox.delete(instance_id, connection=connection)
+                Environment.delete(instance_id, connection=connection)
             except Exception as error:
                 report['cleanup_errors'].append(str(error))
         if report['cleanup_errors']:

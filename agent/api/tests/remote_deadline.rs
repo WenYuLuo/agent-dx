@@ -1,6 +1,6 @@
 use adx_activator::Activator;
 use adx_agent_api::{activator::ActivatorClient, Error};
-use adx_agent_core::{sandbox::*, Scope, TemplateVersion};
+use adx_agent_core::{environment::*, Scope, TemplateVersion};
 use adx_agent_store::{AgentState, Index, Key, MemoryRepository, Record, Repository, Transaction};
 use std::{sync::Arc, time::Duration};
 
@@ -22,16 +22,23 @@ impl Repository for StalledStore {
         std::future::pending().await
     }
 }
-struct StalledSandbox;
+struct StalledEnvironment;
 #[async_trait::async_trait]
-impl Sandbox for StalledSandbox {
-    async fn create(&self, _: &CreateSandbox) -> Result<SandboxObservation, SandboxError> {
+impl Environment for StalledEnvironment {
+    async fn create(
+        &self,
+        _: &CreateEnvironment,
+    ) -> Result<EnvironmentObservation, EnvironmentError> {
         std::future::pending().await
     }
-    async fn get(&self, _: &str, _: &str) -> Result<Option<SandboxObservation>, SandboxError> {
+    async fn get(
+        &self,
+        _: &str,
+        _: &str,
+    ) -> Result<Option<EnvironmentObservation>, EnvironmentError> {
         std::future::pending().await
     }
-    async fn delete(&self, _: &str, _: &str) -> Result<SandboxObservation, SandboxError> {
+    async fn delete(&self, _: &str, _: &str) -> Result<EnvironmentObservation, EnvironmentError> {
         std::future::pending().await
     }
 }
@@ -54,7 +61,7 @@ fn context() -> adx_agent_api::request::RequestContext {
 async fn caller_deadline_distinguishes_remote_reads_and_possible_writes() {
     let control = remote_control(Activator::new(
         AgentState::new(Arc::new(StalledStore)),
-        Arc::new(StalledSandbox),
+        Arc::new(StalledEnvironment),
     ))
     .await;
     let ctx = context();
@@ -76,8 +83,8 @@ async fn caller_deadline_distinguishes_remote_reads_and_possible_writes() {
 #[tokio::test]
 async fn timed_out_activation_keeps_identity_for_another_replica() {
     let state = AgentState::new(Arc::new(MemoryRepository::default()));
-    let a = remote_control(Activator::new(state.clone(), Arc::new(StalledSandbox))).await;
-    let b = remote_control(Activator::new(state, Arc::new(StalledSandbox))).await;
+    let a = remote_control(Activator::new(state.clone(), Arc::new(StalledEnvironment))).await;
+    let b = remote_control(Activator::new(state, Arc::new(StalledEnvironment))).await;
     a.publish(&context(), "tenant", &template()).await.unwrap();
     let ctx = context();
     assert!(matches!(
@@ -113,30 +120,38 @@ async fn remote_control(activator: Activator) -> ActivatorClient {
 }
 
 #[tokio::test]
-async fn remote_activation_passes_the_original_deadline_to_sandbox_create() {
+async fn remote_activation_passes_the_original_deadline_to_environment_create() {
     struct ObserveDeadline(std::sync::Mutex<Option<u64>>);
     #[async_trait::async_trait]
-    impl Sandbox for ObserveDeadline {
+    impl Environment for ObserveDeadline {
         async fn create(
             &self,
-            request: &CreateSandbox,
-        ) -> Result<SandboxObservation, SandboxError> {
+            request: &CreateEnvironment,
+        ) -> Result<EnvironmentObservation, EnvironmentError> {
             *self.0.lock().unwrap() = request.deadline_unix_ms;
-            Ok(SandboxObservation {
+            Ok(EnvironmentObservation {
                 id: request.id.clone(),
                 tenant: request.tenant.clone(),
-                phase: SandboxPhase::Running,
+                phase: EnvironmentPhase::Running,
                 ready: true,
                 runtime_id: None,
                 message: None,
             })
         }
-        async fn get(&self, _: &str, _: &str) -> Result<Option<SandboxObservation>, SandboxError> {
+        async fn get(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<Option<EnvironmentObservation>, EnvironmentError> {
             tokio::time::sleep(Duration::from_millis(50)).await;
             Ok(None)
         }
-        async fn delete(&self, _: &str, _: &str) -> Result<SandboxObservation, SandboxError> {
-            Err(SandboxError::NotFound)
+        async fn delete(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<EnvironmentObservation, EnvironmentError> {
+            Err(EnvironmentError::NotFound)
         }
     }
     let backend = Arc::new(ObserveDeadline(std::sync::Mutex::new(None)));

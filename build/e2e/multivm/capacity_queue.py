@@ -43,7 +43,7 @@ def run_capacity(
     admin_key,
     ca,
     output,
-    sandbox_factory=None,
+    environment_factory=None,
     resource_reader=None,
     queue_reader=pending_ids,
     remote=ssh,
@@ -53,10 +53,10 @@ def run_capacity(
     socket='/run/sandboxd/sandboxd.sock',
 ):
     verify_inventory(inventory)
-    if sandbox_factory is None or resource_reader is None:
-        from adx_sandbox import Sandbox, resources
+    if environment_factory is None or resource_reader is None:
+        from adx_environment import Environment, resources
 
-        sandbox_factory = sandbox_factory or Sandbox
+        environment_factory = environment_factory or Environment
         resource_reader = resource_reader or resources
     control = next(machine for machine in inventory['machines'] if machine['role'] == 'control')
     workers = [machine for machine in inventory['machines'] if machine['role'] != 'control']
@@ -80,7 +80,7 @@ def run_capacity(
             cpu[worker['node_id']] = int(available_cpu)
         report['measured_cpu_millis'] = cpu
         for worker in workers:
-            sandbox = sandbox_factory(
+            environment = environment_factory(
                 image=image,
                 runtime='runc',
                 node_id=worker['node_id'],
@@ -90,19 +90,19 @@ def run_capacity(
                 connection=connection,
                 create_timeout=150,
             )
-            handles.append(sandbox)
-            assignment = persisted_assignment(control, sandbox.id, remote)
+            handles.append(environment)
+            assignment = persisted_assignment(control, environment.id, remote)
             if assignment.get('node_id') != worker['node_id'] or assignment.get('state') != 'Running':
                 raise AssertionError(f'capacity holder assigned incorrectly: {assignment}')
             report['holders'].append(
-                {'id': sandbox.id, 'node_id': worker['node_id'], 'cpu_millis': cpu[worker['node_id']]}
+                {'id': environment.id, 'node_id': worker['node_id'], 'cpu_millis': cpu[worker['node_id']]}
             )
         report['checks'].append('two-worker-capacity-reserved')
 
         name = 'mv-queue-' + uuid.uuid4().hex[:12]
 
         def create_pending():
-            return sandbox_factory(
+            return environment_factory(
                 name=name,
                 image=image,
                 runtime='runc',
@@ -153,7 +153,7 @@ def run_capacity(
                 report['checks'].append('release-wakes-one-queued-request')
             finally:
                 # A queue-probe error must not leave a create waiting until its
-                # scheduler deadline, then silently materialize a live Sandbox.
+                # scheduler deadline, then silently materialize a live Environment.
                 if not released:
                     handles[0].kill()
                     deleted.add(handles[0].id)
@@ -175,29 +175,29 @@ def run_capacity(
         report['error'] = f'{type(error).__name__}: {error}'
         raise
     finally:
-        for sandbox in reversed(handles):
+        for environment in reversed(handles):
             try:
-                if sandbox.id not in deleted:
-                    sandbox.kill()
-                    deleted.add(sandbox.id)
+                if environment.id not in deleted:
+                    environment.kill()
+                    deleted.add(environment.id)
             except Exception as error:
-                report['cleanup_errors'].append(f'{sandbox.id} delete: {error}')
+                report['cleanup_errors'].append(f'{environment.id} delete: {error}')
             finally:
                 try:
-                    sandbox.close()
+                    environment.close()
                 except Exception as error:
-                    report['cleanup_errors'].append(f'{sandbox.id} close: {error}')
+                    report['cleanup_errors'].append(f'{environment.id} close: {error}')
         try:
             deadline = clock() + 15
             while handles:
                 residual = {
-                    sandbox.id: {
-                        'record': persisted_assignment(control, sandbox.id, remote),
+                    environment.id: {
+                        'record': persisted_assignment(control, environment.id, remote),
                         'backends': {
-                            worker['node_id']: backend_ids(worker, socket, sandbox.id, remote) for worker in workers
+                            worker['node_id']: backend_ids(worker, socket, environment.id, remote) for worker in workers
                         },
                     }
-                    for sandbox in handles
+                    for environment in handles
                 }
                 if all(
                     item['record']['state'] == 'Deleted'
@@ -232,7 +232,7 @@ def main():
     parser.add_argument('--output', required=True, type=Path)
     args = parser.parse_args()
     os.environ['SSL_CERT_FILE'] = str(args.ca.resolve())
-    from adx_sandbox import ConnectionConfig
+    from adx_environment import ConnectionConfig
 
     connection = ConnectionConfig(
         server_address=args.endpoint,

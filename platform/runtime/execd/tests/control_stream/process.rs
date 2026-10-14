@@ -92,7 +92,7 @@ fn record() -> EnvironmentRecord {
             runtime_class: "runsc".into(),
             resources: Resources::default(),
             priority: 0,
-            sandbox: Default::default(),
+            execution: Default::default(),
         },
         assignment: Assignment {
             environment_id: "i".into(),

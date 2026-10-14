@@ -1,5 +1,5 @@
-use adx_activator::transport::HttpSandbox;
-use adx_agent_core::sandbox::*;
+use adx_activator::transport::HttpEnvironment;
+use adx_agent_core::environment::*;
 use axum::{routing::get, Json, Router};
 use std::{
     sync::{
@@ -19,7 +19,7 @@ async fn serve(router: Router) -> (String, tokio::task::JoinHandle<()>) {
     (format!("http://{address}"), task)
 }
 #[tokio::test]
-async fn sandbox_client_rejects_mismatched_identity_and_never_replays_or_redirects() {
+async fn environment_client_rejects_mismatched_identity_and_never_replays_or_redirects() {
     let calls = Arc::new(AtomicUsize::new(0));
     let count = calls.clone();
     let router = Router::new()
@@ -34,32 +34,36 @@ async fn sandbox_client_rejects_mismatched_identity_and_never_replays_or_redirec
             }),
         )
         .route(
-            "/api/sandbox/v1/sandboxes/adx-id",
+            "/api/environment/v1/environments/adx-id",
             axum::routing::delete(|| async { axum::response::Redirect::temporary("/wrong-place") }),
         );
     let (url, task) = serve(router).await;
-    assert!(HttpSandbox::new(&url, credentials(), Duration::from_secs(1), None, false).is_err());
-    let client = HttpSandbox::new(&url, credentials(), Duration::from_secs(1), None, true).unwrap();
+    assert!(
+        HttpEnvironment::new(&url, credentials(), Duration::from_secs(1), None, false).is_err()
+    );
+    let client =
+        HttpEnvironment::new(&url, credentials(), Duration::from_secs(1), None, true).unwrap();
     assert!(matches!(
         client.get("tenant", "adx-id").await,
-        Err(SandboxError::Unavailable(_))
+        Err(EnvironmentError::Unavailable(_))
     ));
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert!(matches!(
         client.delete("tenant", "adx-id").await,
-        Err(SandboxError::OutcomeUnknown(_))
+        Err(EnvironmentError::OutcomeUnknown(_))
     ));
     task.abort();
 }
 
 #[tokio::test]
-async fn sandbox_connect_failure_is_unavailable_even_for_writes() {
+async fn environment_connect_failure_is_unavailable_even_for_writes() {
     // Release a listener immediately so the connect is refused before HTTP submission.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     drop(listener);
-    let client = HttpSandbox::new(&url, credentials(), Duration::from_secs(1), None, true).unwrap();
-    let create: CreateSandbox = serde_json::from_value(serde_json::json!({
+    let client =
+        HttpEnvironment::new(&url, credentials(), Duration::from_secs(1), None, true).unwrap();
+    let create: CreateEnvironment = serde_json::from_value(serde_json::json!({
         "id":"adx-id", "tenant":"tenant", "execution": {
             "image":"app:1", "isolation_runtime":"runc", "inherit_entrypoint":true, "entrypoint":[],
             "working_dir":"", "user":null, "env":{}, "resources":{"cpu_millis":1000,"memory_mib":128}, "service":[]
@@ -67,16 +71,16 @@ async fn sandbox_connect_failure_is_unavailable_even_for_writes() {
     })).unwrap();
     let result = client.create(&create).await;
     assert!(
-        matches!(result, Err(SandboxError::Unavailable(_))),
+        matches!(result, Err(EnvironmentError::Unavailable(_))),
         "unexpected create result: {result:?}"
     );
     assert!(matches!(
         client.delete("tenant", "adx-id").await,
-        Err(SandboxError::Unavailable(_))
+        Err(EnvironmentError::Unavailable(_))
     ));
     assert!(matches!(
         client.get("tenant", "adx-id").await,
-        Err(SandboxError::Unavailable(_))
+        Err(EnvironmentError::Unavailable(_))
     ));
 }
 
@@ -93,16 +97,16 @@ async fn lost_http_reply_is_unknown_only_for_writes() {
             // The peer received the request, then lost the reply.
         });
         let client =
-            HttpSandbox::new(&url, credentials(), Duration::from_secs(1), None, true).unwrap();
+            HttpEnvironment::new(&url, credentials(), Duration::from_secs(1), None, true).unwrap();
         if write {
             assert!(matches!(
                 client.delete("tenant", "adx-id").await,
-                Err(SandboxError::OutcomeUnknown(_))
+                Err(EnvironmentError::OutcomeUnknown(_))
             ));
         } else {
             assert!(matches!(
                 client.get("tenant", "adx-id").await,
-                Err(SandboxError::Unavailable(_))
+                Err(EnvironmentError::Unavailable(_))
             ));
         }
         peer.await.unwrap();
@@ -110,13 +114,13 @@ async fn lost_http_reply_is_unknown_only_for_writes() {
 }
 
 #[tokio::test]
-async fn sandbox_create_uses_the_callers_remaining_deadline() {
+async fn environment_create_uses_the_callers_remaining_deadline() {
     let calls = Arc::new(AtomicUsize::new(0));
     let received = Arc::new(std::sync::Mutex::new(None));
     let count = calls.clone();
     let seen = received.clone();
     let (url, task) = serve(Router::new().route(
-        "/api/sandbox/v1/sandboxes",
+        "/api/environment/v1/environments",
         axum::routing::post(move |Json(body): Json<serde_json::Value>| {
             let count = count.clone();
             let seen = seen.clone();
@@ -129,7 +133,8 @@ async fn sandbox_create_uses_the_callers_remaining_deadline() {
         }),
     ))
     .await;
-    let client = HttpSandbox::new(&url, credentials(), Duration::from_secs(5), None, true).unwrap();
+    let client =
+        HttpEnvironment::new(&url, credentials(), Duration::from_secs(5), None, true).unwrap();
     let deadline = adx_agent_core::unix_time_millis() + 250;
     let body = serde_json::json!({
         "id":"adx-id", "tenant":"tenant", "deadline_unix_ms":deadline, "execution": {
@@ -137,11 +142,11 @@ async fn sandbox_create_uses_the_callers_remaining_deadline() {
             "working_dir":"", "user":null, "env":{}, "resources":{"cpu_millis":1000,"memory_mib":128}, "service":[]
         }
     });
-    let create: CreateSandbox = serde_json::from_value(body.clone()).unwrap();
+    let create: CreateEnvironment = serde_json::from_value(body.clone()).unwrap();
     let started = std::time::Instant::now();
     assert!(matches!(
         client.create(&create).await,
-        Err(SandboxError::OutcomeUnknown(_))
+        Err(EnvironmentError::OutcomeUnknown(_))
     ));
     assert!(started.elapsed() < Duration::from_secs(1));
     assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -152,10 +157,10 @@ async fn sandbox_create_uses_the_callers_remaining_deadline() {
     let mut expired = body;
     expired["deadline_unix_ms"] =
         serde_json::json!(adx_agent_core::unix_time_millis().saturating_sub(1));
-    let expired: CreateSandbox = serde_json::from_value(expired).unwrap();
+    let expired: CreateEnvironment = serde_json::from_value(expired).unwrap();
     assert!(matches!(
         client.create(&expired).await,
-        Err(SandboxError::Unavailable(_))
+        Err(EnvironmentError::Unavailable(_))
     ));
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     task.abort();
@@ -172,7 +177,7 @@ async fn apiserver_contract_preserves_identity_tenant_credentials_and_idempotenc
     let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
     let capture = seen.clone();
     let router = Router::new()
-        .route("/api/sandbox/v1/sandboxes", post(move |headers: HeaderMap, Json(body): Json<serde_json::Value>| {
+        .route("/api/environment/v1/environments", post(move |headers: HeaderMap, Json(body): Json<serde_json::Value>| {
             let capture = capture.clone();
             async move {
                 assert_eq!(headers["authorization"], format!("Bearer {TOKEN}"));
@@ -187,7 +192,7 @@ async fn apiserver_contract_preserves_identity_tenant_credentials_and_idempotenc
                 assert!(body.get("tenant").is_none());
                 capture.lock().unwrap().push((headers["x-request-id"].to_str().unwrap().to_string(), body));
                 Json(serde_json::json!({"code":200,"data":base64::engine::general_purpose::STANDARD.encode(
-                    r#"{"sandboxId":"adx-id","instanceId":"adx-id","status":"running"}"#
+                    r#"{"environmentId":"adx-id","status":"running"}"#
                 )}))
             }
         }))
@@ -197,13 +202,14 @@ async fn apiserver_contract_preserves_identity_tenant_credentials_and_idempotenc
             assert_eq!(query["instance_id"], "adx-id");
             Json(serde_json::json!([{"id":"adx-id", "status":"running"}]))
         }))
-        .route("/api/sandbox/v1/sandboxes/adx-id", delete(|headers: HeaderMap| async move {
+        .route("/api/environment/v1/environments/adx-id", delete(|headers: HeaderMap| async move {
             assert!(headers["x-request-id"].to_str().unwrap().starts_with("activator-delete-"));
             Json(serde_json::json!({"code":200,"data":null}))
         }));
     let (url, task) = serve(router).await;
-    let client = HttpSandbox::new(&url, credentials(), Duration::from_secs(5), None, true).unwrap();
-    let mut create: CreateSandbox = serde_json::from_value(serde_json::json!({
+    let client =
+        HttpEnvironment::new(&url, credentials(), Duration::from_secs(5), None, true).unwrap();
+    let mut create: CreateEnvironment = serde_json::from_value(serde_json::json!({
         "id":"adx-id", "tenant":"tenant", "execution": {
             "image":"app:1", "isolation_runtime":"runc", "inherit_entrypoint":true, "entrypoint":[],
             "working_dir":"", "user":null, "env":{"MODEL_KEY":"test-model-key"}, "resources":{"cpu_millis":1000,"memory_mib":128}, "service":[]
@@ -211,7 +217,7 @@ async fn apiserver_contract_preserves_identity_tenant_credentials_and_idempotenc
     })).unwrap();
     assert_eq!(
         client.create(&create).await.unwrap().phase,
-        SandboxPhase::Running
+        EnvironmentPhase::Running
     );
     create.deadline_unix_ms = Some(adx_agent_core::unix_time_millis() + 1000);
     assert_eq!(client.create(&create).await.unwrap().id, "adx-id");
@@ -223,11 +229,11 @@ async fn apiserver_contract_preserves_identity_tenant_credentials_and_idempotenc
     assert!(client.get("tenant", "adx-id").await.unwrap().unwrap().ready);
     assert_eq!(
         client.delete("tenant", "adx-id").await.unwrap().phase,
-        SandboxPhase::Deleted
+        EnvironmentPhase::Deleted
     );
     assert!(matches!(
         client.get("unconfigured", "adx-id").await,
-        Err(SandboxError::NotFound)
+        Err(EnvironmentError::NotFound)
     ));
     task.abort();
 }
@@ -236,11 +242,12 @@ async fn apiserver_contract_preserves_identity_tenant_credentials_and_idempotenc
 async fn apiserver_absence_does_not_confirm_deletion() {
     let (url, task) =
         serve(Router::new().fallback(|| async { axum::http::StatusCode::NOT_FOUND })).await;
-    let client = HttpSandbox::new(&url, credentials(), Duration::from_secs(1), None, true).unwrap();
+    let client =
+        HttpEnvironment::new(&url, credentials(), Duration::from_secs(1), None, true).unwrap();
     assert!(client.get("tenant", "adx-id").await.unwrap().is_none());
     assert!(matches!(
         client.delete("tenant", "adx-id").await,
-        Err(SandboxError::OutcomeUnknown(_))
+        Err(EnvironmentError::OutcomeUnknown(_))
     ));
     task.abort();
 }
@@ -267,7 +274,7 @@ async fn tenant_keys_are_selected_without_forwarding_tenant_query() {
         ),
     ))
     .await;
-    let client = HttpSandbox::new(
+    let client = HttpEnvironment::new(
         &url,
         [
             ("a".into(), "key-adx-a".into()),
@@ -290,7 +297,7 @@ async fn tenant_keys_are_selected_without_forwarding_tenant_query() {
     }
     assert!(matches!(
         client.delete("unknown", "adx-id").await,
-        Err(SandboxError::NotFound)
+        Err(EnvironmentError::NotFound)
     ));
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     task.abort();
@@ -305,7 +312,7 @@ async fn invalid_or_incomplete_write_success_is_never_confirmed() {
         serde_json::json!({"code":503,"data":null}),
     ] {
         let (url, task) = serve(Router::new().route(
-            "/api/sandbox/v1/sandboxes/adx-id",
+            "/api/environment/v1/environments/adx-id",
             delete(move || {
                 let body = body.clone();
                 async move { Json(body) }
@@ -313,10 +320,10 @@ async fn invalid_or_incomplete_write_success_is_never_confirmed() {
         ))
         .await;
         let client =
-            HttpSandbox::new(&url, credentials(), Duration::from_secs(1), None, true).unwrap();
+            HttpEnvironment::new(&url, credentials(), Duration::from_secs(1), None, true).unwrap();
         assert!(matches!(
             client.delete("tenant", "adx-id").await,
-            Err(SandboxError::OutcomeUnknown(_))
+            Err(EnvironmentError::OutcomeUnknown(_))
         ));
         task.abort();
     }
@@ -329,14 +336,15 @@ async fn forbidden_queries_do_not_become_absence_or_leak_server_details() {
         Router::new().fallback(|| async { (StatusCode::FORBIDDEN, "private upstream detail") }),
     )
     .await;
-    let client = HttpSandbox::new(&url, credentials(), Duration::from_secs(1), None, true).unwrap();
+    let client =
+        HttpEnvironment::new(&url, credentials(), Duration::from_secs(1), None, true).unwrap();
     assert_eq!(
         client.get("tenant", "adx-id").await.unwrap_err(),
-        SandboxError::NotFound
+        EnvironmentError::NotFound
     );
     assert_eq!(
         client.delete("tenant", "adx-id").await.unwrap_err(),
-        SandboxError::NotFound
+        EnvironmentError::NotFound
     );
     task.abort();
 }

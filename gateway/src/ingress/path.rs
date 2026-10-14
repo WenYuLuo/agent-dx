@@ -154,24 +154,26 @@ mod tests {
     fn host_subdomain_routes_preserve_the_guest_path() {
         assert_eq!(
             parse_port_host_route(
-                "default-sandbox-123-18081.example.test:8080",
+                "default-environment-123-18081.example.test:8080",
                 "/nested/hello",
                 "example.test",
             ),
             Some(ParsedDirectPath {
-                instance_id: "default-sandbox-123".into(),
+                instance_id: "default-environment-123".into(),
                 target_port: 18081,
                 stripped_path: "/nested/hello".into(),
                 access_kind: AccessKind::PortForwarding,
             })
         );
         assert!(parse_port_host_route("other.example.test", "/", "example.test").is_none());
-        assert!(
-            parse_port_host_route("default-sandbox-123-0.example.test", "/", "example.test")
-                .is_none()
-        );
         assert!(parse_port_host_route(
-            "default-sandbox-123-18081.badexample.test",
+            "default-environment-123-0.example.test",
+            "/",
+            "example.test"
+        )
+        .is_none());
+        assert!(parse_port_host_route(
+            "default-environment-123-18081.badexample.test",
             "/",
             "example.test"
         )

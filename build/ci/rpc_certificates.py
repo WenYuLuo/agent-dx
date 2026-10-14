@@ -49,7 +49,7 @@ run(
     (
         'basicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncip'
         'herment\nextendedKeyUsage=serverAuth,clientAuth\nsubjectAltNam'
-        'e=DNS:localhost,IP:127.0.0.1\n'
+        'e=DNS:localhost,DNS:coordinator,DNS:node2,IP:127.0.0.1\n'
     )
 )
 for name in ['coordinator', 'node', 'apiserver', 'ingress', 'unknown']:

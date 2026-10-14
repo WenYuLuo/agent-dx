@@ -7,7 +7,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from adx_sandbox import Sandbox, SandboxError
+from adx_environment import Environment, EnvironmentError
 from node import catalog
 
 
@@ -16,7 +16,7 @@ def run(connection, image, output):
     prefix = 'lf-' + uuid.uuid4().hex[:10]
 
     def create(name, **extra):
-        return Sandbox(
+        return Environment(
             name=name,
             image=image,
             runtime='runc',
@@ -50,7 +50,7 @@ def run(connection, image, output):
             if not (result.exit_code == 0 and result.stdout == 'local-first-ready'):
                 raise AssertionError()
         try:
-            changed = Sandbox(
+            changed = Environment(
                 name=prefix + '-race',
                 image=image,
                 runtime='runc',
@@ -60,7 +60,7 @@ def run(connection, image, output):
                 connection=connection,
                 create_timeout=150,
             )
-        except SandboxError as error:
+        except EnvironmentError as error:
             if not (error.code == 'CONFLICT'):
                 raise AssertionError(error.code) from error
             if not (error.retry == 'never'):

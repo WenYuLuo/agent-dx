@@ -264,7 +264,7 @@ def complete_create_trace_ids(rows):
         for candidate in spans:
             if candidate.get('service') != 'adx-apiserver':
                 continue
-            if candidate['name'] == 'POST /api/sandbox/v1/sandboxes':
+            if candidate['name'] == 'POST /api/environment/v1/environments':
                 http_spans.append(candidate)
         ids = {span['spanId'] for span in http_spans}
         if len(ids) >= 2 and any(span.get('parentSpanId') in ids for span in http_spans):

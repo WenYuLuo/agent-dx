@@ -102,7 +102,7 @@ Coordinator 每 5 秒独立扫描删除中且无引用的快照，通过带节�
 
 本轮定向证据：`reconciliation-red.log` / `reconciliation-green.log`、`gc-red.log` / `gc-green.log`、`create-red.log` / `create-green-1.log`、`snapshot-commit-red.log` / `create-final-rust.log`，均位于 `out/ci/stage-3/`。节点 80 项测试、Coordinator 7 项真实 Redis/mTLS 测试、Clippy、全部 Go 测试/vet、SDK 139 项单测及部署驱动 47 项测试已通过。
 
-公共 SDK 的 `Sandbox.get_snapshot`、`list_snapshots`、`delete_snapshot` 支持可选 `connection=ConnectionConfig(...)`，可沿用源实例的地址、凭证和 TLS 校验设置。
+公共 SDK 的 `Environment.get_snapshot`、`list_snapshots`、`delete_snapshot` 支持可选 `connection=ConnectionConfig(...)`，可沿用源实例的地址、凭证和 TLS 校验设置。
 
 ### 创建与删除的真实 Firecracker 验收
 
@@ -115,7 +115,7 @@ package-v13 / Lima r16 再次通过相同13项验收，并确认 SDK 命令订�
 
 ## 从可复用快照创建新 Environment
 
-公共入口为 `Sandbox.create(snapshot, connection=...)`。未指定的镜像、运行时、CPU/内存/磁盘从源快照继承。当前 Firecracker 实现要求显式资源与 checkpoint 的资源规格一致，不做恢复时扩缩容。调用者可指定新名称、环境变量和节点约束；新 Environment ID 必须不同于源实例。
+公共入口为 `Environment.create(snapshot, connection=...)`。未指定的镜像、运行时、CPU/内存/磁盘从源快照继承。当前 Firecracker 实现要求显式资源与 checkpoint 的资源规格一致，不做恢复时扩缩容。调用者可指定新名称、环境变量和节点约束；新 Environment ID 必须不同于源实例。
 
 Coordinator 将 `snapshot_id` 纳入创建规格与幂等校验；加入 Shard 内存队列前在 Redis 持有以目标 Environment ID 命名的恢复引用。local-only 制品给每个候选节点条件附加源 NODE_ID 约束；共享存储沿正常调度路径选择节点。正在删除的快照仅允许已持有引用的请求继续，禁止新增克隆。Coordinator 重启清理没有持久化分配的旧队列引用，保留已经分配的请求引用。
 

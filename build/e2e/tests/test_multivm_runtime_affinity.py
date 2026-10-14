@@ -13,7 +13,7 @@ class RuntimeAffinityTests(unittest.TestCase):
         classes = classes or {'node1': ['runc'], 'node2': ['runc', 'runsc']}
         state = {'created': 0, 'deleted': False, 'closed': False, 'options': None}
 
-        class Sandbox:
+        class Environment:
             def __init__(self, **options):
                 state['created'] += 1
                 state['options'] = options
@@ -78,19 +78,19 @@ class RuntimeAffinityTests(unittest.TestCase):
             if sum('runsc' in value for value in classes.values()) != 1:
                 with self.assertRaisesRegex(AssertionError, 'exactly one'):
                     run_runtime_affinity(
-                        inventory(), object(), 'image', '/run/sandboxd/sandboxd.sock', output, Sandbox, remote
+                        inventory(), object(), 'image', '/run/sandboxd/sandboxd.sock', output, Environment, remote
                     )
                 self.assertEqual(state['created'], 0)
                 self.assertEqual(json.loads((output / 'runtime-affinity-result.json').read_text())['status'], 'failed')
             elif assigned != 'node2':
                 with self.assertRaisesRegex(AssertionError, 'assignment'):
                     run_runtime_affinity(
-                        inventory(), object(), 'image', '/run/sandboxd/sandboxd.sock', output, Sandbox, remote
+                        inventory(), object(), 'image', '/run/sandboxd/sandboxd.sock', output, Environment, remote
                     )
                 self.assertTrue(state['deleted'] and state['closed'])
             else:
                 report = run_runtime_affinity(
-                    inventory(), object(), 'image', '/run/sandboxd/sandboxd.sock', output, Sandbox, remote
+                    inventory(), object(), 'image', '/run/sandboxd/sandboxd.sock', output, Environment, remote
                 )
                 self.assertEqual(report['status'], 'passed')
                 self.assertEqual(report['assignment']['node_id'], 'node2')

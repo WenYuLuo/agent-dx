@@ -47,10 +47,10 @@ ping, supervisor PID or three unique machine IDs is only deployment evidence,
 not a passing business acceptance result.
 
 `sdk_accept.py` is a runnable subset after the three VMs have been deployed.
-Run it on a client with the installed `adx-sandbox` SDK, access to Ingress and
+Run it on a client with the installed `adx-environment` SDK, access to Ingress and
 non-interactive SSH access to all three guests. Each worker needs `sbox` on
 `PATH`. The CLI verifies the release archive SHA256, each guest's machine
-identity, assigned IP and installed manifest. It creates one pinned Sandbox
+identity, assigned IP and installed manifest. It creates one pinned Environment
 on each worker through the public SDK, reads the persisted assignment through
 `adx-inspect` on the control VM, confirms each physical sandboxd backend
 on the expected VM and its absence on the other VM, runs commands and binary
@@ -77,7 +77,7 @@ Multi-VM acceptance. The SDK subset does not stop the shared services.
 `auth_accept.py` extends the L0 check across the public HTTPS Ingress. It
 requires the administrator key in addition to the owner tenant key. The case
 creates a temporary key for another tenant, verifies that invalid and
-cross-tenant keys cannot read or delete the owner's Sandbox, verifies the
+cross-tenant keys cannot read or delete the owner's Environment, verifies the
 administrator-only key API, revokes the temporary key and waits for cached
 authentication to expire. The report contains no key material. Run it before
 fault injection on a deployed three-VM environment:
@@ -101,7 +101,7 @@ SSH account on worker 2 needs non-interactive `sudo -n kill` permission. The
 script stops only the adxlet process with `SIGSTOP` and always sends `SIGCONT`
 on its failure path. It asserts that an initially working route is invalidated,
 worker 1 continues serving, worker 2 clears the stale sandboxd backend before
-readmission with a new session, and a fresh pinned Sandbox works on worker 2.
+readmission with a new session, and a fresh pinned Environment works on worker 2.
 Its wait budgets are 90 seconds for heartbeat expiry and 90 seconds for
 reconciliation, plus creation and cleanup time.
 
@@ -121,7 +121,7 @@ inventory and release archive.
 
 `capacity_queue.py` covers the resource-exhaustion and queue-wakeup portion
 of `MV-03`. It measures each worker's current allocatable CPU through the
-public SDK, reserves that amount with one pinned Sandbox per worker, confirms
+public SDK, reserves that amount with one pinned Environment per worker, confirms
 an additional create appears in the Coordinator's admin-only waiting queue,
 releases one holder, then requires the queued create to run on that worker.
 It verifies the final persisted resource state and physical backend cleanup.
@@ -149,7 +149,7 @@ local-first entry bypasses global scoring. The case checks the resolved
 deployment configuration and rejects nodes whose initial free-resource
 fractions differ enough to make the two-request expectation ambiguous. Each
 worker needs at least 1,000 millicores and 1,024 MiB free. The test releases
-both Sandboxes and checks persisted deletion and resource/backend cleanup.
+both Environments and checks persisted deletion and resource/backend cleanup.
 
 ```sh
 python3 build/e2e/multivm/placement_policy.py \
@@ -188,7 +188,7 @@ This case has not yet passed on real VMs.
 `runtime_affinity.py` tests the runtime-fit rule merged into `refactor` on
 a heterogeneous deployment. Both workers must report live sandboxd runtime
 inventories, and exactly one must advertise `runsc`. The case creates an
-unpinned public SDK Sandbox with `runtime='runsc'`, then checks persisted
+unpinned public SDK Environment with `runtime='runsc'`, then checks persisted
 ownership, the sole physical backend, command execution and cleanup. It
 fails its preflight before creating anything on a runc-only deployment.
 
@@ -207,7 +207,7 @@ This case has not yet passed on heterogeneous real VMs.
 `worker_restart.py` covers the quick-restart portion of `MV-07`: it kills only
 worker 2's adxlet child, lets `adxctl` restart it, and checks that the new
 node session reattaches the same sandboxd backend and assignment generation
-while both Sandboxes continue serving. Its reattachment budget is 25 seconds,
+while both Environments continue serving. Its reattachment budget is 25 seconds,
 below the default 30-second heartbeat expiry. Run it on dedicated VMs where
 the worker 2 SSH account has non-interactive `sudo -n kill` permission.
 
@@ -279,12 +279,12 @@ This is a runnable case, not evidence that it has passed on real VMs.
 
 `control_restart.py` covers the default embedded-Ingress `MV-08` profile on a
 pre-provisioned control VM with supervised Coordinator, API Server, and managed
-Redis. It keeps one Sandbox on each worker while killing and restarting those
+Redis. It keeps one Environment on each worker while killing and restarting those
 three child processes in turn. Each restart must preserve persisted ownership,
 generation, physical backend IDs, file contents, and public SDK commands.
 Coordinator restart must advance the epoch; API Server restart must not. After
 each restart, both workers must again be routable. The test removes its two
-Sandboxes and verifies persisted release and physical cleanup. It requires
+Environments and verifies persisted release and physical cleanup. It requires
 the supervisor to restart each child within 90 seconds and does not stop the
 control VM or the whole deployment.
 
@@ -318,7 +318,7 @@ Neither deployment profile has passed this case on three real VMs yet.
 
 `stop.py` is the final destructive `MV-09` case for dedicated VMs. It refuses
 to run without `--confirm-dedicated` and requires both worker sandboxd
-inventories to be empty before creating its own Sandboxes. It stops worker 2,
+inventories to be empty before creating its own Environments. It stops worker 2,
 then worker 1, then the control VM through each supervisor. After each worker
 stop it checks the backend inventory, persisted deletion, route withdrawal,
 and continued service on any remaining worker. Run this only after all other

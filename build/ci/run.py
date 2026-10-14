@@ -34,7 +34,7 @@ SUITES = (
     "rust",
     "apiserver",
     "agent",
-    "sandbox-sdk",
+    "environment-sdk",
     "interop",
     "package",
     "storage",
@@ -129,8 +129,8 @@ def commands_for(suite, output, jobs):
         return [[os.environ.get("CARGO", "cargo"), "test", "--locked", "-p", "adx-apiserver", "-j", str(jobs)]]
     if suite == "agent":
         return [make + ["agent-test"]]
-    if suite == "sandbox-sdk":
-        return [make + ["sandbox-sdk-test", f"PYTEST_ARGS=--junitxml={output / 'junit.xml'}"]]
+    if suite == "environment-sdk":
+        return [make + ["environment-sdk-test", f"PYTEST_ARGS=--junitxml={output / 'junit.xml'}"]]
     if suite == "interop":
         cargo = os.environ.get("CARGO", "cargo")
         target = Path(os.environ.get("CARGO_TARGET_DIR", ROOT / "target")).resolve()
@@ -141,14 +141,14 @@ def commands_for(suite, output, jobs):
                 "ADX_TUNNEL_PROTOCOL_VERSION=2",
                 "ADX_TUNNEL_FAST_PATH_BODY_BYTES=65536",
                 f"EXECD_RUNTIME={target / 'debug/adx-execd'}",
-                f"PYTHONPATH={ROOT / 'platform/sdk/sandbox/python'}",
+                f"PYTHONPATH={ROOT / 'platform/sdk/environment/python'}",
                 python,
                 "platform/runtime/execd/tests/tunnel_interop.py",
             ],
             [python, "build/ci/rpc_certificates.py", str(output / "tls")],
             [
                 "env",
-                f"PYTHONPATH={ROOT / 'platform/sdk/sandbox/python'}",
+                f"PYTHONPATH={ROOT / 'platform/sdk/environment/python'}",
                 python,
                 "build/ci/command_watch_tls.py",
                 "--tls",
@@ -156,7 +156,7 @@ def commands_for(suite, output, jobs):
             ],
         ]
     if suite == "package":
-        packages = ["platform/sdk/sandbox/python"]
+        packages = ["platform/sdk/environment/python"]
         return [
             [python, "-m", "build", "--no-isolation", "--wheel", "--sdist", "--outdir", str(output / "wheels"), package]
             for package in packages

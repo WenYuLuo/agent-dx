@@ -55,7 +55,7 @@ class CommandResponseCutProxy:
 
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self):
-                if proxy.reject_watch and self.path.startswith('/api/sandbox/v1/commands/watch'):
+                if proxy.reject_watch and self.path.startswith('/api/environment/v1/commands/watch'):
                     with proxy._lock:
                         proxy.watch_attempts += 1
                         if proxy.reject_get_on_watch:
@@ -162,10 +162,10 @@ class CommandResponseCutProxy:
 
 def run(connection, image, output, secrets):
     """Recover a real command whose every successful start response was lost."""
-    from adx_sandbox import (
+    from adx_environment import (
         CommandSubmissionError,
         ConnectionConfig,
-        Sandbox,
+        Environment,
     )
     from functional_lifecycle import _wait_deleted
     from node import catalog, labeled_backend
@@ -175,7 +175,7 @@ def run(connection, image, output, secrets):
     name = 'command-cut-' + uuid.uuid4().hex[:12]
     command_id = 'command-cut-' + uuid.uuid4().hex[:12]
     marker = str(PurePosixPath('/tmp') / f'{command_id}.marker')
-    sandbox = None
+    environment = None
     attached = None
     recovered_handle = None
     deleted = False
@@ -186,7 +186,7 @@ def run(connection, image, output, secrets):
         ca=secrets / 'tls/ca.pem',
     )
     try:
-        sandbox = Sandbox(
+        environment = Environment(
             name=name,
             image=image,
             runtime='runc',
@@ -198,8 +198,8 @@ def run(connection, image, output, secrets):
             connection=connection,
             create_timeout=150,
         )
-        initial = json.loads(catalog()['environment:' + sandbox.id])
-        initial_backend = labeled_backend(sandbox.id)
+        initial = json.loads(catalog()['environment:' + environment.id])
+        initial_backend = labeled_backend(environment.id)
         if not (len(initial_backend) == 1):
             raise AssertionError(initial_backend)
 
@@ -210,7 +210,7 @@ def run(connection, image, output, secrets):
                 use_tls=True,
                 verify_tls=True,
             )
-            attached = Sandbox.from_id(sandbox.id, connection=proxied)
+            attached = Environment.from_id(environment.id, connection=proxied)
             try:
                 attached.commands.run(
                     f"printf x >> {marker}; printf command-cut-complete",
@@ -221,7 +221,7 @@ def run(connection, image, output, secrets):
                 outcome_identity_lost = (
                     error.command_id != command_id
                     or not error.may_have_started
-                    or error.sandbox_id != sandbox.id
+                    or error.environment_id != environment.id
                     or not error.request_id
                 )
                 if outcome_identity_lost:
@@ -244,7 +244,7 @@ def run(connection, image, output, secrets):
 
         # A fresh client on the healthy public entry recovers the committed
         # command without replaying process.start or changing its command ID.
-        recovered_handle = Sandbox.from_id(sandbox.id, connection=connection)
+        recovered_handle = Environment.from_id(environment.id, connection=connection)
         recovered = recovered_handle.commands.get(command_id).wait(timeout=30)
         if not (recovered.exit_code == 0 and recovered.stdout == 'command-cut-complete'):
             raise AssertionError(recovered)
@@ -255,17 +255,17 @@ def run(connection, image, output, secrets):
         recovered_handle.close()
         recovered_handle = None
 
-        final = json.loads(catalog()['environment:' + sandbox.id])
+        final = json.loads(catalog()['environment:' + environment.id])
         if not (final['assignment']['generation'] == initial['assignment']['generation']):
             raise AssertionError()
-        if not (labeled_backend(sandbox.id) == initial_backend):
+        if not (labeled_backend(environment.id) == initial_backend):
             raise AssertionError()
-        Sandbox.delete(sandbox.id, connection=connection)
+        Environment.delete(environment.id, connection=connection)
         deleted = True
-        _wait_deleted(sandbox.id, connection, timeout=60)
-        if not ('environment:' + sandbox.id not in catalog()):
+        _wait_deleted(environment.id, connection, timeout=60)
+        if not ('environment:' + environment.id not in catalog()):
             raise AssertionError()
-        if not (not labeled_backend(sandbox.id)):
+        if not (not labeled_backend(environment.id)):
             raise AssertionError()
 
         report['status'] = 'passed'
@@ -274,7 +274,7 @@ def run(connection, image, output, secrets):
                 'id': 'reliability.command-start-response-cut',
                 'status': 'passed',
                 'seconds': round(time.monotonic() - started, 3),
-                'instance_id': sandbox.id,
+                'instance_id': environment.id,
                 'command_id': command_id,
                 'request_id': report['request_id'],
                 'start_attempts': len(attempts),
@@ -290,13 +290,13 @@ def run(connection, image, output, secrets):
             attached.close()
         if recovered_handle is not None:
             recovered_handle.close()
-        if sandbox is not None:
+        if environment is not None:
             if not deleted:
                 try:
-                    Sandbox.delete(sandbox.id, connection=connection)
+                    Environment.delete(environment.id, connection=connection)
                 except Exception as error:
                     report['cleanup_errors'].append(str(error))
-            sandbox.close()
+            environment.close()
         if report['cleanup_errors']:
             report['status'] = 'failed'
         report['cut_attempts'] = proxy.cut_attempts

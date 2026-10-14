@@ -38,7 +38,7 @@ Lima r1未进入用例：sandboxd在 `ip netns exec` 环境下报告 `cgroup v1 
 
 2026-09-16，package-v21、Lima ARM64 KVM，六项全部通过，另包含计划落盘后、恢复RPC执行前的Coordinator重启注入。
 
-- Environment `default-sandbox-4f4175ba-327e-45aa-b84c-8223a2906ed2`：node1/generation 1 → node2/generation 2。
+- Environment `default-environment-4f4175ba-327e-45aa-b84c-8223a2906ed2`：node1/generation 1 → node2/generation 2。
 - 故障注入期间Coordinator epoch 1 → 2，原恢复计划与目标代次不变；成功恢复后再次重启Coordinator，runtime ID和代次保持不变。
 - PID `11` 保留，计数器 `9 → 33`，二进制文件逐字节一致。
 - 原节点返回后backend清单为空；目标保持一个运行实例，已登记S3制品仍可读。
@@ -58,7 +58,7 @@ Lima r1未进入用例：sandboxd在 `ip netns exec` 环境下报告 `cgroup v1 
 
 2026-09-16，package-v21，`ADX_TRANSFER_INTERRUPT_NODE=1`，六项用例及目标节点中断断言全部通过；52项驱动回归通过。
 
-- Environment `default-sandbox-a469af4b-ffc5-4a4d-94f6-85d77cc270b4` 从node1/代次1恢复到node2/代次2。
+- Environment `default-environment-a469af4b-ffc5-4a4d-94f6-85d77cc270b4` 从node1/代次1恢复到node2/代次2。
 - 崩溃时Redis仍为Paused且pending；实际运行的未提交backend为 `sbox-21f5cda3-a0ff-4516-af39-c48851fa54aa`。
 - 重启后节点session改变，原backend清理，新backend为 `sbox-5b22503f-4643-45ae-b9bb-5251130caad8`；归属仍为node2/代次2，最终仅一个执行。
 - PID `11`、内存计数 `8 → 36`、二进制文件一致。源节点返回清理、恢复后Coordinator重启与显式删除均通过。
@@ -92,7 +92,7 @@ demand 严格集合为 12 项；创建和手动 pause 使用显式 RetentionPoli
 | 捕获前新请求 | 非 root 透明代理暂缓实际 Execd 的 idle Prepared 应答；Ingress 请求先形成持久唤醒意图，再放行。必须保留原 backend，不能生成 checkpoint。 |
 | 捕获后新请求 | 仅阻断源节点到 OBS 的 HTTPS；确认实际 VM 已停止，再发 HTTP。请求等待实际上传完成并恢复，PID、内存和文件保持。 |
 | 并发唤醒 | 12 个真实 HTTP 请求同时唤醒 Paused；原节点仍可用时应保持原归属，最终只有一个 VM，每个 nonce 一次。 |
-| 原节点容量不足 | 为专属测试容器设置实际 4 核 cgroup CPU 配额，sandboxd 实测后由 adxlet 上报；在两节点各运行一个占满 CPU 配额的 Firecracker Sandbox。12 个并发 HTTP 请求先触发健康原节点的 EnsureRunning，并明确得到 NoCapacity；Redis 保留原归属和 local_rejected。释放第二节点的占用 Sandbox 后才转移，同一唤醒意图完成恢复。必须保持源 session 和占用 VM，目标只有一个新 VM，每个 nonce 一次。 |
+| 原节点容量不足 | 为专属测试容器设置实际 4 核 cgroup CPU 配额，sandboxd 实测后由 adxlet 上报；在两节点各运行一个占满 CPU 配额的 Firecracker Environment。12 个并发 HTTP 请求先触发健康原节点的 EnsureRunning，并明确得到 NoCapacity；Redis 保留原归属和 local_rejected。释放第二节点的占用 Environment 后才转移，同一唤醒意图完成恢复。必须保持源 session 和占用 VM，目标只有一个新 VM，每个 nonce 一次。 |
 | 节点失效 | SIGSTOP 源 adxlet，等待心跳失效；Paused 保持休眠且目标 VM 数量为零。随后 HTTP 才触发另一节点从 OBS 恢复。 |
 | 恢复中重启 | 阻断目标 Execd readiness；等实际 backend 为 Running、Redis 仍为 Paused 且 recovery.pending，再 SIGKILL Coordinator 或目标 adxlet。检查意图、归属、session/epoch 和 VM 清理。 |
 | TTL 已过期 | 到期后真实 HTTP 必须失败，两节点都不能启动执行。 |

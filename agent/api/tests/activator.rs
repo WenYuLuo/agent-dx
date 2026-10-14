@@ -1,6 +1,6 @@
 use adx_activator::Activator;
 use adx_agent_api::{activator::ActivatorClient, managed::ManagedService, Error};
-use adx_agent_core::{sandbox::*, *};
+use adx_agent_core::{environment::*, *};
 use adx_agent_store::{AgentState, MemoryRepository};
 use std::{
     sync::{
@@ -15,26 +15,37 @@ fn context() -> adx_agent_api::request::RequestContext {
 const TOKEN: &str = "test-activator-token-at-least-32-bytes";
 struct Backend(AtomicUsize);
 #[async_trait::async_trait]
-impl Sandbox for Backend {
-    async fn create(&self, r: &CreateSandbox) -> Result<SandboxObservation, SandboxError> {
+impl Environment for Backend {
+    async fn create(
+        &self,
+        r: &CreateEnvironment,
+    ) -> Result<EnvironmentObservation, EnvironmentError> {
         self.0.fetch_add(1, Ordering::SeqCst);
-        Ok(SandboxObservation {
+        Ok(EnvironmentObservation {
             id: r.id.clone(),
             tenant: r.tenant.clone(),
-            phase: SandboxPhase::Running,
+            phase: EnvironmentPhase::Running,
             ready: true,
             runtime_id: None,
             message: None,
         })
     }
-    async fn get(&self, _: &str, _: &str) -> Result<Option<SandboxObservation>, SandboxError> {
+    async fn get(
+        &self,
+        _: &str,
+        _: &str,
+    ) -> Result<Option<EnvironmentObservation>, EnvironmentError> {
         Ok(None)
     }
-    async fn delete(&self, tenant: &str, id: &str) -> Result<SandboxObservation, SandboxError> {
-        Ok(SandboxObservation {
+    async fn delete(
+        &self,
+        tenant: &str,
+        id: &str,
+    ) -> Result<EnvironmentObservation, EnvironmentError> {
+        Ok(EnvironmentObservation {
             id: id.into(),
             tenant: tenant.into(),
-            phase: SandboxPhase::Deleted,
+            phase: EnvironmentPhase::Deleted,
             ready: false,
             runtime_id: None,
             message: None,
@@ -186,7 +197,7 @@ async fn authenticated_services_observe_binding_deletion_and_recreation() {
         .0
         .binding;
     assert_ne!(fresh.generation, env.generation);
-    assert_ne!(fresh.sandbox_id, env.sandbox_id);
+    assert_ne!(fresh.environment_id, env.environment_id);
     assert!(matches!(
         other_client
             .activate(&context(), &scope, Some(&env.generation))

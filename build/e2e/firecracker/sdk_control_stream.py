@@ -30,13 +30,13 @@ p.add_argument('--base', type=Path, required=True)
 p.add_argument('--image', required=True)
 a = p.parse_args()
 os.environ['SSL_CERT_FILE'] = str(a.run / 'secrets/tls/ca.pem')
-from adx_sandbox import (
+from adx_environment import (
     RetentionPolicy,
     ConnectionConfig,
     DNSPolicy,
     NetworkPolicy,
     NetworkRule,
-    Sandbox,
+    Environment,
     TrafficPolicy,
 )
 
@@ -120,7 +120,7 @@ try:
     policy = deny_all()
     result['network_policy'] = policy.to_dict()
     t = time.monotonic()
-    s = Sandbox(
+    s = Environment(
         image=a.image,
         runtime='firecracker',
         cpu=500,

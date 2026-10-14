@@ -13,8 +13,8 @@ class AuthAcceptanceTests(unittest.TestCase):
         actions = []
         self.actions = actions
 
-        class Sandbox:
-            id = 'sandbox-owned'
+        class Environment:
+            id = 'environment-owned'
 
             def __init__(self, **options):
                 self.commands = SimpleNamespace(run=lambda _command: SimpleNamespace(exit_code=0, stdout='still-owned'))
@@ -48,11 +48,11 @@ class AuthAcceptanceTests(unittest.TestCase):
                 self.assertEqual(token, 'admin')
                 revoked = True
                 return 204, {}
-            if path == '/api/sandbox/v1/snapshots':
+            if path == '/api/environment/v1/snapshots':
                 return (401 if revoked else 200), {}
             if path.startswith('/api/instances'):
                 return (401 if token == 'invalid-acceptance-key' else denied_read), {}
-            if path == '/api/sandbox/v1/sandboxes/sandbox-owned':
+            if path == '/api/environment/v1/environments/environment-owned':
                 return (401 if token == 'invalid-acceptance-key' else 403), {}
             raise AssertionError(f'unexpected request: {method} {path}')
 
@@ -64,7 +64,7 @@ class AuthAcceptanceTests(unittest.TestCase):
                 Path(directory),
                 owner_token='owner',
                 admin_token='admin',
-                sandbox_factory=Sandbox,
+                environment_factory=Environment,
                 request=request,
                 verify=lambda _inventory: ['verified'],
             )
@@ -76,13 +76,13 @@ class AuthAcceptanceTests(unittest.TestCase):
         self.assertEqual(result['status'], 'passed')
         self.assertEqual(report['status'], 'passed')
         self.assertIn('temporary-key-revoked', result['checks'])
-        self.assertIn(('kill', 'sandbox-owned'), actions)
-        self.assertIn(('close', 'sandbox-owned'), actions)
+        self.assertIn(('kill', 'environment-owned'), actions)
+        self.assertIn(('close', 'environment-owned'), actions)
         self.assertNotIn('other', json.dumps(report))
 
     def test_cross_tenant_read_acceptance_fails_and_cleans(self):
         with self.assertRaisesRegex(AssertionError, 'tenant read'):
             self.exercise(denied_read=200)
         self.assertIn(('DELETE', '/api/admin/v1/keys/key-1', 'admin'), self.actions)
-        self.assertIn(('kill', 'sandbox-owned'), self.actions)
-        self.assertIn(('close', 'sandbox-owned'), self.actions)
+        self.assertIn(('kill', 'environment-owned'), self.actions)
+        self.assertIn(('close', 'environment-owned'), self.actions)

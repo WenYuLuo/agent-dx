@@ -32,7 +32,7 @@ os.environ.update(
     NO_PROXY="*",
     no_proxy="*",
 )
-from adx_sandbox import Sandbox
+from adx_environment import Environment
 
 
 def docker(command_args, check=True):
@@ -80,14 +80,14 @@ MAP_CODE = (
     " if s.get('annotations',{}).get('adx.environment_id')!=sid:continue\n"
     " cg=s['linux']['cgroupsPath'];path=(Path('/sys/fs/cgroup')/cg.lstrip('/')).resolve()\n"
     " if not (str(path).startswith('/sys/fs/cgroup/') and path.name not in ['akernel','system.slice']):raise "
-    "RuntimeError('unsafe sandbox cgroup')\n"
+    "RuntimeError('unsafe environment cgroup')\n"
     " d={'backend_id':p.parent.name,'cgroup':str(path),'cgroup_config':cg,'memory_limit':s['linux']"
     ".get('resources',{}).get('memory',{}),'runtime_id':s.get('annotations',{}).get('adx.runtime_id')}\n"
     " for n in ['memory.max','memory.current','memory.oom.group','memory.events']:\n"
     "  try:d[n]=(path/n).read_text().strip()\n"
     "  except OSError:d[n]=None\n"
     " matches.append(d)\n"
-    "if len(matches)!=1:raise RuntimeError('ambiguous sandbox identity: '+str(len(matches)))\n"
+    "if len(matches)!=1:raise RuntimeError('ambiguous environment identity: '+str(len(matches)))\n"
     "print(json.dumps(matches[0]))"
 )
 MONITOR = (
@@ -129,7 +129,7 @@ def main():
         raise RuntimeError("Standalone has unrelated backends; defer OOM test")
     identity = {
         "parent_before": {k: parent_before["State"][k] for k in ["Pid", "StartedAt"]},
-        "sdk": importlib.metadata.version("adx-sandbox"),
+        "sdk": importlib.metadata.version("adx-environment"),
         "image": subprocess.check_output(["docker", "inspect", "-f", "{{.Image}}", NAME], text=True).strip(),
         "container": NAME,
         "release_commit": json.loads(docker(["cat", "/opt/adx/current/manifest.json"]).stdout).get("commit"),
@@ -152,7 +152,7 @@ def main():
             emit({"kind": "case-start", **case_data})
             requested_name = "oom-probe-" + uuid.uuid4().hex[:10]
             case_data["environment_id"] = "default-" + requested_name
-            sb = Sandbox(
+            sb = Environment(
                 image="swr.cn-north-4.myhuaweicloud.com/openyuanrong/e2e-oci:python312-curl-http-20260927",
                 runtime=runtime,
                 memory=256,
@@ -180,7 +180,7 @@ def main():
             cap = mapping["memory.max"]
             if runtime != "firecracker":
                 if not cap or cap == "max" or not 0 < int(cap) <= 512 * 1048576:
-                    raise RuntimeError("unsafe sandbox memory limit: " + json.dumps(mapping))
+                    raise RuntimeError("unsafe environment memory limit: " + json.dumps(mapping))
             else:
                 memtotal = (
                     int(next((line.split()[1] for line in proof.stdout.splitlines() if line.startswith("MemTotal:"))))
@@ -195,7 +195,7 @@ def main():
                         "-c",
                         (
                             "from pathlib import Path\nimport sys\np=Path(sys.argv[1])\nif not p.is_dir():raise "
-                            'RuntimeError("sandbox cgroup is absent")\n'
+                            'RuntimeError("environment cgroup is absent")\n'
                             '(p/"memory.oom.group").write_text("1")'
                         ),
                         mapping["cgroup"],
@@ -249,7 +249,7 @@ def main():
                     raise AssertionError("backend OOM reason did not reach SDK get_info: " + json.dumps(view))
                 after = case_data.get("subsequent_command_error", {})
                 if (
-                    after.get("fields", {}).get("code") != "SANDBOX_OOM"
+                    after.get("fields", {}).get("code") != "ENVIRONMENT_OOM"
                     or after.get("fields", {}).get("retry") != "never"
                 ):
                     raise AssertionError("backend OOM must be a terminal SDK error: " + json.dumps(after))
@@ -297,7 +297,7 @@ def main():
                     case_data["delete_error"] = error(e)
             if not sb and case_data.get("environment_id"):
                 try:
-                    Sandbox.delete(case_data["environment_id"])
+                    Environment.delete(case_data["environment_id"])
                     case_data["failed_create_delete"] = "success"
                 except Exception as e:
                     case_data["failed_create_delete_error"] = error(e)

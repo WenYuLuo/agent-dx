@@ -22,6 +22,7 @@ JOBS ?= 2
 OUT ?= $(CURDIR)/out
 PYTEST_ARGS ?=
 E2E_PROFILE ?= standalone
+E2E_CGROUPNS ?= private
 K8S_E2E_PROFILE ?= k8s-basic
 RUST_POLICY_PACKAGES := -p adx-apiserver -p adx-deployment -p adx-coordinator \
 	-p adxlet -p adx-core -p adx-discovery -p adx-observability \
@@ -50,7 +51,7 @@ else
 $(error ADX_AFS_ALL_FEATURES must be 0 or 1)
 endif
 
-.PHONY: help cargo-cache-info cargo-cache-env cargo-cache-isolated-env generate build test rust-check rust-test afs-check afs-build afs-lint afs-all-features-lint afs-test scheduler-bench python-test agent-test sandbox-sdk-test admin-test package ci data-plane-gateway data-plane-gateway-dev data-plane-gateway-ut
+.PHONY: help cargo-cache-info cargo-cache-env cargo-cache-isolated-env generate build test rust-check rust-test afs-check afs-build afs-lint afs-all-features-lint afs-test scheduler-bench python-test agent-test activator-e2e environment-sdk-test admin-test package ci data-plane-gateway data-plane-gateway-dev data-plane-gateway-ut
 help:
 	@echo 'generate | build | test | package | ci SUITE=<suite>; set ADX_WITH_AFS=1 for Agent FS (AFS); tests: rust-check rust-test scheduler-bench python-test; cache: cargo-cache-info cargo-cache-env cargo-cache-isolated-env'
 cargo-cache-info:
@@ -96,19 +97,23 @@ afs-test:
 	$(CARGO) test --locked $(AFS_PACKAGES) --all-targets -j $(JOBS) -- --test-threads=$(JOBS)
 scheduler-bench:
 	$(CARGO) test --locked --release -p adx-coordinator --test benchmark -j $(JOBS) -- --ignored --nocapture
-python-test: sandbox-sdk-test admin-test
+python-test: environment-sdk-test admin-test
+activator-e2e:
+	@test -n "$(BUNDLE)" || { echo 'set BUNDLE to a bundle prepared with --activator' >&2; exit 2; }
+	$(PYTHON) build/e2e/run.py --bundle "$(BUNDLE)" --output "$(OUT)/activator-standalone" --profile standalone --case activator-standalone --cgroupns $(E2E_CGROUPNS)
+	$(PYTHON) build/e2e/run.py --bundle "$(BUNDLE)" --output "$(OUT)/activator-embedded" --profile standalone --case activator-embedded --cgroupns $(E2E_CGROUPNS)
 agent-test:
 	$(CARGO) test --locked -p adx-agent-core -p adx-agent-store -p adx-agent-api -p adx-activator -p adx-cli --features adx-agent-store/test-memory -j $(JOBS) -- --test-threads=$(JOBS)
 	$(CARGO) test --locked -p data-plane-gateway --features agent-api --lib -j $(JOBS) -- --test-threads=$(JOBS)
-sandbox-sdk-test:
-	PYTHONPATH=platform/sdk/sandbox/python $(PYTHON) -m pytest -q -c platform/sdk/sandbox/pytest.ini platform/sdk/sandbox/python/tests $(PYTEST_ARGS)
+environment-sdk-test:
+	PYTHONPATH=platform/sdk/environment/python $(PYTHON) -m pytest -q -c platform/sdk/environment/pytest.ini platform/sdk/environment/python/tests $(PYTEST_ARGS)
 admin-test:
 	PYTHONPATH=tools/admin/src $(PYTHON) -m unittest discover -s tools/admin/tests -p 'test_*.py'
 ci:
 	$(PYTHON) build/ci/run.py $(SUITE) --jobs $(JOBS)
 test: rust-check rust-test python-test
 package:
-	PYTHON='$(PYTHON)' bash platform/sdk/sandbox/python/build.sh '$(OUT)/wheels'
+	PYTHON='$(PYTHON)' bash platform/sdk/environment/python/build.sh '$(OUT)/wheels'
 	PYTHON='$(PYTHON)' bash tools/admin/build.sh '$(OUT)/wheels'
 data-plane-gateway:
 	$(CARGO) build --locked -p data-plane-gateway --all-features --release -j $(JOBS)

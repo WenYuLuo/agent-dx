@@ -84,7 +84,7 @@ cargo test --locked -p adx-coordinator -p adxlet -p adx-protocol -p adx-core -p 
 - 容量耗尽后的创建请求等待，API Server 超时后操作继续，释放资源后成功执行。
 - 删除结果提交时 Redis 故障，重启后重试只补交结果；最终路由视图和运行时集合为空。
 
-协议规则测试另验证 EnvironmentRecord 往返、无效状态／身份拒绝，以及请求头不能冒充 TLS 身份。生成的 Go 协议需要通过现有 Sandbox API 测试与 vet，保证本轮协议变更不破坏保留的兼容层。
+协议规则测试另验证 EnvironmentRecord 往返、无效状态／身份拒绝，以及请求头不能冒充 TLS 身份。生成的 Go 协议需要通过现有 Environment API 测试与 vet，保证本轮协议变更不破坏保留的兼容层。
 
 本轮结果（2026-09-15）：
 

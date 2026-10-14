@@ -13,6 +13,7 @@ BINARIES = (
     "adx-coordinator",
     "adxlet",
     "adx-apiserver",
+    "adx-activator",
     "adx-ingress",
     "adx-relay",
 )
@@ -65,7 +66,7 @@ def verify(directory: Path, *, enforce_host_architecture: bool = False) -> dict:
     elif afs_artifacts:
         raise ValueError("AFS artifacts are present in a default package")
     if not required.issubset(expected) or not any(
-        name.startswith("sdk/adx_sandbox-") and name.endswith(".whl") for name in expected
+        name.startswith("sdk/adx_environment-") and name.endswith(".whl") for name in expected
     ):
         raise ValueError("incomplete package")
 

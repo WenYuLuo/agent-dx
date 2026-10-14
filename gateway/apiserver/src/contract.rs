@@ -261,8 +261,8 @@ struct Rule {
     direction: String,
     protocol: String,
     peer: Peer,
-    sandbox_port: u32,
-    sandbox_port_range: Option<PortRange>,
+    environment_port: u32,
+    environment_port_range: Option<PortRange>,
     priority: u32,
 }
 #[derive(Default, Deserialize)]
@@ -330,8 +330,8 @@ fn positive(value: i64, scale: u64) -> Result<u64, Status> {
         .filter(|v| *v <= (1u64 << 53))
         .ok_or_else(|| invalid("invalid resource amount"))
 }
-fn s3(value: S3) -> Result<adx_core::sandbox::S3Source, Status> {
-    let source = adx_core::sandbox::S3Source {
+fn s3(value: S3) -> Result<adx_core::execution::S3Source, Status> {
+    let source = adx_core::execution::S3Source {
         endpoint: value.endpoint,
         bucket: value.bucket,
         object: value.object,
@@ -438,8 +438,8 @@ fn rootfs(value: Value, top_level_image: &str) -> Result<Rootfs, Status> {
     serde_json::from_value(value).map_err(|_| invalid("invalid rootfs"))
 }
 
-fn storage_source(root: &Rootfs) -> Result<Option<adx_core::sandbox::StorageSource>, Status> {
-    use adx_core::sandbox::StorageSource;
+fn storage_source(root: &Rootfs) -> Result<Option<adx_core::execution::StorageSource>, Status> {
+    use adx_core::execution::StorageSource;
     match root.r#type.as_str() {
         "" => Ok(None),
         "image" => Ok(Some(StorageSource::Image(root.imageurl.clone()))),
@@ -451,8 +451,8 @@ fn storage_source(root: &Rootfs) -> Result<Option<adx_core::sandbox::StorageSour
         _ => Err(invalid("unsupported rootfs type")),
     }
 }
-fn mount(value: Value) -> Result<adx_core::sandbox::Mount, Status> {
-    use adx_core::sandbox::StorageSource;
+fn mount(value: Value) -> Result<adx_core::execution::Mount, Status> {
+    use adx_core::execution::StorageSource;
     let value: Mount = serde_json::from_value(value).map_err(|_| invalid("invalid mount"))?;
     let source = match (
         value.image_url.is_empty(),
@@ -464,7 +464,7 @@ fn mount(value: Value) -> Result<adx_core::sandbox::Mount, Status> {
         (true, None, false) => return Err(invalid("public host mounts are not allowed")),
         _ => return Err(invalid("mount requires exactly one source")),
     };
-    let result = adx_core::sandbox::Mount {
+    let result = adx_core::execution::Mount {
         kind: value.r#type,
         target: value.target,
         options: value.options,
@@ -475,40 +475,40 @@ fn mount(value: Value) -> Result<adx_core::sandbox::Mount, Status> {
         .map_err(|error| invalid(&error.to_string()))?;
     Ok(result)
 }
-fn network_action(value: &str) -> Result<adx_core::sandbox::NetworkAction, Status> {
+fn network_action(value: &str) -> Result<adx_core::execution::NetworkAction, Status> {
     match value {
-        "allow" => Ok(adx_core::sandbox::NetworkAction::Allow),
-        "deny" => Ok(adx_core::sandbox::NetworkAction::Deny),
+        "allow" => Ok(adx_core::execution::NetworkAction::Allow),
+        "deny" => Ok(adx_core::execution::NetworkAction::Deny),
         _ => Err(invalid("invalid network action")),
     }
 }
-fn network_direction(value: &str) -> Result<adx_core::sandbox::NetworkDirection, Status> {
+fn network_direction(value: &str) -> Result<adx_core::execution::NetworkDirection, Status> {
     match value {
-        "ingress" => Ok(adx_core::sandbox::NetworkDirection::Ingress),
-        "egress" => Ok(adx_core::sandbox::NetworkDirection::Egress),
-        "both" => Ok(adx_core::sandbox::NetworkDirection::Both),
+        "ingress" => Ok(adx_core::execution::NetworkDirection::Ingress),
+        "egress" => Ok(adx_core::execution::NetworkDirection::Egress),
+        "both" => Ok(adx_core::execution::NetworkDirection::Both),
         _ => Err(invalid("invalid network direction")),
     }
 }
-fn network_protocol(value: &str) -> Result<adx_core::sandbox::NetworkProtocol, Status> {
+fn network_protocol(value: &str) -> Result<adx_core::execution::NetworkProtocol, Status> {
     match value {
-        "any" => Ok(adx_core::sandbox::NetworkProtocol::Any),
-        "tcp" => Ok(adx_core::sandbox::NetworkProtocol::Tcp),
-        "udp" => Ok(adx_core::sandbox::NetworkProtocol::Udp),
-        "icmp" => Ok(adx_core::sandbox::NetworkProtocol::Icmp),
+        "any" => Ok(adx_core::execution::NetworkProtocol::Any),
+        "tcp" => Ok(adx_core::execution::NetworkProtocol::Tcp),
+        "udp" => Ok(adx_core::execution::NetworkProtocol::Udp),
+        "icmp" => Ok(adx_core::execution::NetworkProtocol::Icmp),
         _ => Err(invalid("invalid network protocol")),
     }
 }
-fn port_range(value: PortRange) -> adx_core::sandbox::PortRange {
-    adx_core::sandbox::PortRange {
+fn port_range(value: PortRange) -> adx_core::execution::PortRange {
+    adx_core::execution::PortRange {
         first: value.first,
         last: value.last,
     }
 }
 pub(crate) fn network_policy(
     value: Value,
-) -> Result<Option<adx_core::sandbox::NetworkPolicy>, Status> {
-    use adx_core::sandbox as model;
+) -> Result<Option<adx_core::execution::NetworkPolicy>, Status> {
+    use adx_core::execution as model;
     if !active(&value) {
         return Ok(None);
     }
@@ -562,8 +562,8 @@ pub(crate) fn network_policy(
                                     domain: rule.peer.domain,
                                     port_range: rule.peer.port_range.map(port_range),
                                 },
-                                sandbox_port: rule.sandbox_port,
-                                sandbox_port_range: rule.sandbox_port_range.map(port_range),
+                                environment_port: rule.environment_port,
+                                environment_port_range: rule.environment_port_range.map(port_range),
                                 priority: rule.priority,
                             })
                         })
@@ -600,11 +600,11 @@ pub(crate) fn network_policy(
         .map_err(|error| invalid(&error.to_string()))?;
     Ok(Some(policy))
 }
-fn security(value: &str) -> Result<adx_core::sandbox::DataPlaneSecurityMode, Status> {
+fn security(value: &str) -> Result<adx_core::execution::DataPlaneSecurityMode, Status> {
     match value {
-        "" => Ok(adx_core::sandbox::DataPlaneSecurityMode::Inherit),
-        "tls" => Ok(adx_core::sandbox::DataPlaneSecurityMode::Tls),
-        "tls-token" => Ok(adx_core::sandbox::DataPlaneSecurityMode::TlsToken),
+        "" => Ok(adx_core::execution::DataPlaneSecurityMode::Inherit),
+        "tls" => Ok(adx_core::execution::DataPlaneSecurityMode::Tls),
+        "tls-token" => Ok(adx_core::execution::DataPlaneSecurityMode::TlsToken),
         _ => Err(invalid("invalid data-plane security mode")),
     }
 }
@@ -740,7 +740,7 @@ pub fn create_spec_with_environment(
         .or_else(|| runtime_profile.map(|value| value.rootfs.readonly))
         .unwrap_or(false);
     let rootfs =
-        storage_source(&root)?.map(|source| adx_core::sandbox::Rootfs { readonly, source });
+        storage_source(&root)?.map(|source| adx_core::execution::Rootfs { readonly, source });
     let mounts = r
         .mounts
         .into_iter()
@@ -753,7 +753,7 @@ pub fn create_spec_with_environment(
     } else {
         DataPlane::default()
     };
-    let data_plane = adx_core::sandbox::DataPlanePolicy {
+    let data_plane = adx_core::execution::DataPlanePolicy {
         tunnel: security(&data_plane.tunnel_security_mode)?,
         port_forward: security(&data_plane.port_forward_security_mode)?,
     };
@@ -761,9 +761,9 @@ pub fn create_spec_with_environment(
         String::new()
     } else {
         serde_json::to_string(&r.extra_config)
-            .map_err(|_| invalid("invalid sandbox extra_config"))?
+            .map_err(|_| invalid("invalid environment extra_config"))?
     };
-    let sandbox = adx_core::sandbox::SandboxOptions {
+    let environment = adx_core::execution::ExecutionOptions {
         cwd: r.cwd,
         rootfs,
         mounts,
@@ -779,14 +779,14 @@ pub fn create_spec_with_environment(
         } else {
             r.init_timeout as u64
         },
-        limits: adx_core::sandbox::ResourceLimits {
+        limits: adx_core::execution::ResourceLimits {
             cpu_millis: cpu_limit,
             memory_bytes: memory_limit,
             disk_bytes: disk_limit,
         },
         extra_config,
     };
-    sandbox
+    environment
         .validate(&adx_core::Resources {
             cpu_millis: cpu,
             memory_bytes: memory,
@@ -836,7 +836,7 @@ pub fn create_spec_with_environment(
         });
     }
     if r.name.is_empty() {
-        r.name = format!("sandbox-{}", uuid::Uuid::new_v4());
+        r.name = format!("environment-{}", uuid::Uuid::new_v4());
     }
     if r.namespace.is_empty() {
         r.namespace = "default".into();
@@ -934,7 +934,7 @@ pub fn create_spec_with_environment(
             }),
         }),
         snapshot_id: snapshot,
-        sandbox: Some(sandbox.into()),
+        execution: Some(environment.into()),
     })
 }
 
@@ -1055,7 +1055,7 @@ pub fn resolve_create_timeout(create: i64, schedule: i64, init: i64) -> Result<u
             .ok_or_else(|| invalid("timeout overflow"))
     };
     let result = match (create, schedule) {
-        (0, 0) => std::env::var("ADX_SANDBOX_CREATE_TIMEOUT")
+        (0, 0) => std::env::var("ADX_ENVIRONMENT_CREATE_TIMEOUT")
             .ok()
             .and_then(|s| s.parse::<i64>().ok())
             .unwrap_or(90)

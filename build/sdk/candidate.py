@@ -25,12 +25,12 @@ def wheel_metadata(wheel):
 def create(directory, commit, build_id=None):
     if not re.fullmatch(r'[0-9a-f]{40}', commit):
         raise ValueError('SDK candidate requires a 40-character Git commit')
-    wheel = sorted(directory.glob('adx_sandbox-*-py3-none-any.whl'))
-    source = sorted(directory.glob('adx_sandbox-*.tar.gz'))
+    wheel = sorted(directory.glob('adx_environment-*-py3-none-any.whl'))
+    source = sorted(directory.glob('adx_environment-*.tar.gz'))
     if len(wheel) != 1 or len(source) != 1:
         raise ValueError('SDK candidate requires exactly one wheel and one source archive')
     metadata = wheel_metadata(wheel[0])
-    if metadata['Name'] != 'adx-sandbox' or not metadata['Version']:
+    if metadata['Name'] != 'adx-environment' or not metadata['Version']:
         raise ValueError('unexpected SDK package metadata')
     result = {
         'schema_version': 1,

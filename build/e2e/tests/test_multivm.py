@@ -115,9 +115,9 @@ class MultiVmSdkAcceptanceTests(unittest.TestCase):
     def test_live_backends_on_both_vms_are_required_and_cleaned(self):
         state = {'actual': {}, 'deleted': []}
 
-        class FakeSandbox:
+        class FakeEnvironment:
             def __init__(self, *, node_id, **_options):
-                self.id = 'sandbox-' + node_id
+                self.id = 'environment-' + node_id
                 state['actual'][self.id] = node_id
                 self.commands = SimpleNamespace(
                     run=lambda _command: SimpleNamespace(stdout='adx-three-vm', stderr='stderr', exit_code=7)
@@ -160,7 +160,7 @@ class MultiVmSdkAcceptanceTests(unittest.TestCase):
                 return json.dumps(
                     {
                         'id': instance_id,
-                        'node_id': instance_id.removeprefix('sandbox-'),
+                        'node_id': instance_id.removeprefix('environment-'),
                         'state': 'Running',
                         'resources_held': True,
                     }
@@ -181,7 +181,7 @@ class MultiVmSdkAcceptanceTests(unittest.TestCase):
                 'image',
                 '/run/sandboxd/sandboxd.sock',
                 Path(directory),
-                FakeSandbox,
+                FakeEnvironment,
                 resources,
                 remote,
                 placement_timeout=0,
@@ -189,12 +189,12 @@ class MultiVmSdkAcceptanceTests(unittest.TestCase):
             self.assertEqual(report['status'], 'passed')
             self.assertEqual(len(report['backends']), 2)
             self.assertEqual(len(report['assignments']), 2)
-            self.assertEqual(set(state['deleted']), {'sandbox-node1', 'sandbox-node2'})
+            self.assertEqual(set(state['deleted']), {'environment-node1', 'environment-node2'})
             self.assertFalse(state['actual'])
 
         state['actual'].clear()
 
-        class MisplacedSandbox(FakeSandbox):
+        class MisplacedEnvironment(FakeEnvironment):
             def __init__(self, *, node_id, **options):
                 super().__init__(node_id=node_id, **options)
                 state['actual'][self.id] = 'node2' if node_id == 'node1' else 'node1'
@@ -207,7 +207,7 @@ class MultiVmSdkAcceptanceTests(unittest.TestCase):
                     'image',
                     '/run/sandboxd/sandboxd.sock',
                     Path(directory),
-                    MisplacedSandbox,
+                    MisplacedEnvironment,
                     resources,
                     remote,
                     placement_timeout=0,

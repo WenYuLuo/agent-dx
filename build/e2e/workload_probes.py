@@ -5,7 +5,7 @@ import os
 import time
 from pathlib import Path
 
-from adx_sandbox import HealthcheckProbe, ReadinessProbe, RestartPolicy, Sandbox, SandboxError
+from adx_environment import HealthcheckProbe, ReadinessProbe, RestartPolicy, Environment, EnvironmentError
 from node import catalog, labeled_backend, persisted_runtime_id
 from route_ready import wait_for_route
 
@@ -57,7 +57,7 @@ def run(connection, image, output):
             cpu=500, memory=512, idle_timeout=0, init_timeout=20,
             create_timeout=150, connection=connection,
         )
-        instance = Sandbox(**{**defaults, **options})
+        instance = Environment(**{**defaults, **options})
         instances.append(instance)
         wait_for_route(instance)
         if stream_enabled:
@@ -94,7 +94,7 @@ def run(connection, image, output):
         started = time.monotonic()
         tcp = create(readiness_probe=ReadinessProbe.tcp_socket(port=8080, period_seconds=1))
         if tcp.commands.run('printf tcp-ready').stdout != 'tcp-ready':
-            raise AssertionError('TCP-ready sandbox is not executable')
+            raise AssertionError('TCP-ready environment is not executable')
         passed('tcp-readiness', started, instance_id=tcp.id)
         delete(tcp)
 
@@ -116,24 +116,24 @@ def run(connection, image, output):
                     command=['/bin/sh', '-c', 'printf not-ready >&2; exit 7'], period_seconds=1,
                 ),
             )
-        except SandboxError as error:
+        except EnvironmentError as error:
             failure = error.probe_failure
             if not failure or failure['kind'] != 'readiness_timeout':
                 raise AssertionError(('missing readiness failure', vars(error))) from error
-            if error.retry != 'never' or error.outcome != 'terminal' or not error.instance_id:
+            if error.retry != 'never' or error.outcome != 'terminal' or not error.environment_id:
                 raise AssertionError(('nonterminal readiness result', vars(error))) from error
-            failed_id = error.instance_id
+            failed_id = error.environment_id
             failed_instances.append(failed_id)
             failed = wait(lambda: terminal(failed_id))
             wait(lambda: not labeled_backend(failed_id))
             if failed['failure']['probe_failure']['kind'] != 'readiness_timeout':
                 raise AssertionError('persisted readiness failure missing')
             passed('readiness-timeout-cleanup', started, instance_id=failed_id, failure=failure)
-            Sandbox.delete(failed_id, connection=connection)
+            Environment.delete(failed_id, connection=connection)
             wait(lambda: record(failed_id) is None and not labeled_backend(failed_id))
             failed_instances.remove(failed_id)
         else:
-            raise AssertionError('failing readiness returned a sandbox: ' + unexpected.id)
+            raise AssertionError('failing readiness returned a environment: ' + unexpected.id)
 
         started = time.monotonic()
         health = create(
@@ -207,7 +207,7 @@ def run(connection, image, output):
     finally:
         for instance_id in failed_instances:
             try:
-                Sandbox.delete(instance_id, connection=connection)
+                Environment.delete(instance_id, connection=connection)
             except Exception as error:
                 report['cleanup_errors'].append(f'{instance_id}: {error}')
         for instance in instances:

@@ -1,4 +1,4 @@
-//! HTTP sandbox action dispatch.
+//! HTTP environment action dispatch.
 
 use super::codec;
 use std::collections::{HashMap, VecDeque};
@@ -406,7 +406,7 @@ fn run_command(
     }
 }
 
-pub(crate) fn normalize_sandbox_action(action: &str) -> Option<&'static str> {
+pub(crate) fn normalize_environment_action(action: &str) -> Option<&'static str> {
     match action {
         "ping" | "noop" => Some("ping"),
         "cmd_run" | "exec" | "process.exec" | "process.run" | "cmd.run" => Some("cmd_run"),
@@ -515,40 +515,40 @@ pub(crate) fn dispatch_runtime_action_with_trace(
     }
 }
 
-/// Execute one public sandbox action through the same normalized EXECD primitive
+/// Execute one public environment action through the same normalized EXECD primitive
 /// used by the HTTP endpoint.
-pub(crate) fn execute_sandbox_action(
+pub(crate) fn execute_environment_action(
     action: &str,
     kw: &std::collections::BTreeMap<String, rmpv::Value>,
     trace_id: &str,
 ) -> Result<rmpv::Value, String> {
     let started = Instant::now();
-    let method = normalize_sandbox_action(action)
-        .ok_or_else(|| format!("unsupported sandbox action: {action}"))?;
+    let method = normalize_environment_action(action)
+        .ok_or_else(|| format!("unsupported environment action: {action}"))?;
     let command = access_command_summary(method, kw);
     let result = dispatch_runtime_action_with_trace(method, kw, trace_id)
-        .ok_or_else(|| format!("unsupported sandbox action: {action}"));
+        .ok_or_else(|| format!("unsupported environment action: {action}"));
     log_access(trace_id, &command, started);
     result
 }
 
-/// Execute a sandbox action at most once for a non-empty request ID. Both
+/// Execute a environment action at most once for a non-empty request ID. Both
 /// HTTP requests use this cache, so concurrent retries
 /// observe the same result.
-pub(crate) fn execute_sandbox_action_once(
+pub(crate) fn execute_environment_action_once(
     request_id: Option<&str>,
     action: &str,
     kw: &std::collections::BTreeMap<String, rmpv::Value>,
     trace_id: &str,
 ) -> Result<rmpv::Value, String> {
     let Some(request_id) = request_id.filter(|id| !id.is_empty()) else {
-        return execute_sandbox_action(action, kw, trace_id);
+        return execute_environment_action(action, kw, trace_id);
     };
     let (slot, owner) = reserve_request_id(request_id);
     if !owner {
         return wait_dedup_response(slot);
     }
-    let response = execute_sandbox_action(action, kw, trace_id);
+    let response = execute_environment_action(action, kw, trace_id);
     complete_dedup_response(&slot, response.clone());
     response
 }
@@ -560,20 +560,26 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
-    fn normalizes_public_sandbox_actions_to_execd_methods() {
-        assert_eq!(normalize_sandbox_action("ping"), Some("ping"));
-        assert_eq!(normalize_sandbox_action("noop"), Some("ping"));
-        assert_eq!(normalize_sandbox_action("process.exec"), Some("cmd_run"));
-        assert_eq!(normalize_sandbox_action("file.read"), Some("fs_read"));
-        assert_eq!(normalize_sandbox_action("shell.run"), Some("bash_submit"));
-        assert_eq!(normalize_sandbox_action("unknown"), None);
+    fn normalizes_public_environment_actions_to_execd_methods() {
+        assert_eq!(normalize_environment_action("ping"), Some("ping"));
+        assert_eq!(normalize_environment_action("noop"), Some("ping"));
+        assert_eq!(
+            normalize_environment_action("process.exec"),
+            Some("cmd_run")
+        );
+        assert_eq!(normalize_environment_action("file.read"), Some("fs_read"));
+        assert_eq!(
+            normalize_environment_action("shell.run"),
+            Some("bash_submit")
+        );
+        assert_eq!(normalize_environment_action("unknown"), None);
     }
 
     #[test]
     fn dispatches_public_ping_and_noop_actions() {
         let kw = BTreeMap::new();
         for action in ["ping", "noop"] {
-            let result = execute_sandbox_action(action, &kw, "trace-test")
+            let result = execute_environment_action(action, &kw, "trace-test")
                 .expect("lightweight action should dispatch through the shared path");
             assert_eq!(result_field(&result, "status").as_str(), Some("ok"));
         }
@@ -696,7 +702,7 @@ mod tests {
             ("exit 137", None, 137),
         ] {
             let kw = BTreeMap::from([("cmd".into(), rmpv::Value::from(command))]);
-            let value = execute_sandbox_action("process.exec", &kw, "signal-test").unwrap();
+            let value = execute_environment_action("process.exec", &kw, "signal-test").unwrap();
             let rmpv::Value::Map(fields) = value else {
                 panic!("expected command result")
             };
@@ -716,10 +722,10 @@ mod tests {
         let mut kw = BTreeMap::new();
         kw.insert(
             "cmd".to_string(),
-            rmpv::Value::from("printf sandbox-invoke"),
+            rmpv::Value::from("printf environment-invoke"),
         );
-        let result = execute_sandbox_action("process.exec", &kw, "trace-test")
-            .expect("sandbox action should dispatch through the shared path");
+        let result = execute_environment_action("process.exec", &kw, "trace-test")
+            .expect("environment action should dispatch through the shared path");
         if let rmpv::Value::Map(fields) = result {
             let stdout = fields
                 .iter()
@@ -731,7 +737,7 @@ mod tests {
                 .find_map(|(k, v)| (k.as_str() == Some("exit_code")).then_some(v.as_i64()))
                 .flatten()
                 .unwrap_or_default();
-            assert_eq!(stdout, "sandbox-invoke");
+            assert_eq!(stdout, "environment-invoke");
             assert_eq!(exit_code, 0);
         } else {
             panic!("cmd_run should return a map");
@@ -801,18 +807,18 @@ mod tests {
     }
 
     #[test]
-    fn deduplicates_sandbox_actions_by_request_id() {
+    fn deduplicates_environment_actions_by_request_id() {
         let first_args = BTreeMap::from([("cmd".to_string(), rmpv::Value::from("printf first"))]);
         let second_args = BTreeMap::from([("cmd".to_string(), rmpv::Value::from("printf second"))]);
 
-        let first = execute_sandbox_action_once(
+        let first = execute_environment_action_once(
             Some("execd-dedup-test-request"),
             "process.exec",
             &first_args,
             "trace-first",
         )
         .expect("first action should run");
-        let duplicate = execute_sandbox_action_once(
+        let duplicate = execute_environment_action_once(
             Some("execd-dedup-test-request"),
             "process.exec",
             &second_args,

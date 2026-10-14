@@ -24,7 +24,7 @@ enum Command {
     Resume(ResumeRequest),
     EnsureRunning(String),
     Network {
-        policy: Option<adx_core::sandbox::NetworkPolicy>,
+        policy: Option<adx_core::execution::NetworkPolicy>,
         operation_id: String,
         expected_revision: u64,
     },
@@ -110,7 +110,7 @@ impl EnvironmentHandle {
     }
     pub async fn update_network_policy(
         &self,
-        policy: Option<adx_core::sandbox::NetworkPolicy>,
+        policy: Option<adx_core::execution::NetworkPolicy>,
         operation_id: String,
         expected_revision: u64,
     ) -> Result<OperationResult> {
@@ -719,8 +719,8 @@ impl Controller {
         self.record.resources_held = true;
         self.transition(Event::Start)?;
         self.record.failure = None;
-        let initialization_timeout = if self.record.spec.sandbox.init_timeout_seconds > 0 {
-            std::time::Duration::from_secs(self.record.spec.sandbox.init_timeout_seconds)
+        let initialization_timeout = if self.record.spec.execution.init_timeout_seconds > 0 {
+            std::time::Duration::from_secs(self.record.spec.execution.init_timeout_seconds)
         } else {
             self.services.operation_timeout
         };
@@ -800,7 +800,7 @@ impl Controller {
             Ok(stages) => stages,
             Err(start_error) => {
                 let start_error =
-                    if awaiting_readiness && self.record.spec.sandbox.readiness_probe.is_some() {
+                    if awaiting_readiness && self.record.spec.execution.readiness_probe.is_some() {
                         match start_error {
                             Error::ProbeFailed(_) => start_error,
                             other => Error::ProbeFailed(adx_core::probes::ProbeFailure::timeout(

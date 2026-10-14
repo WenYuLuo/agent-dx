@@ -4,6 +4,41 @@ Buildkite deploys to **Kubernetes** through [kubernetes/run.py](kubernetes/READM
 It creates a dedicated namespace with two node Pods and Services, using immutable
 images from the build step. Each Pod runs the platform as processes.
 
+## Activator deployment acceptance
+
+The native Linux Docker driver supports complete Activator deployment acceptance in
+both independent and embedded modes. Add `--activator` to the `prepare.py` command
+above to include a digest-verified inherited HTTP workload. Use a newly built
+package containing `bin/adx-activator`, API Server, Coordinator, adxlet, Execd and
+Redis, plus the pinned sandboxd backend. Then run both modes:
+
+```sh
+make activator-e2e BUNDLE=/absolute/path/to/bundle OUT=/absolute/path/to/new-results
+```
+
+Set `E2E_CGROUPNS=host` when the Docker host requires the host cgroup namespace
+(the same option as `run.py --cgroupns host`).
+
+Each mode gets its own isolated two-node deployment and writes `result.json`,
+`activator-result.json`, JUnit and component logs. Both public HTTPS Agent
+entrypoints share real Redis. Independent mode starts one `adx-activator` process
+per node and exercises both private control endpoints; embedded mode runs one
+Activator inside each API Server. The tests publish a Template, reject foreign
+traffic before side effects, send concurrent cold HTTP traffic, compare durable
+AgentBinding and Platform identities, inspect the real sandboxd label/inventory,
+run installed SDK commands and binary file operations through Execd, refresh the
+binding cache, restart both Activators, delete and recreate the binding, and
+require empty backend inventories and no remaining bindings/Environments.
+
+The independent restart sends SIGTERM to the Activator; the embedded restart
+restarts its API Server process through the supervisor. Stable binding generation,
+Environment ID, runtime identity, backend inventory and workload boot ID must all
+survive. These are logical two-node tests on one Docker host; they do not establish
+cross-host or Kubernetes acceptance. Individual modes can be run with
+`run.py --profile standalone --case activator-standalone` or
+`--case activator-embedded`. They are additional targeted groups and do not replace
+the eleven-group standalone profile.
+
 ## Installed example reproduction
 
 [Installed example acceptance](example/README.md) runs the shipped complete
@@ -25,7 +60,7 @@ python3 build/e2e/build_backend.py \
   --redis-cli /path/to/redis-cli --jobs 2 --output out/e2e/backend
 python3 build/e2e/prepare.py \
   --package out/release/package --backend out/e2e/backend \
-  --sdk-wheel out/sdk/adx_sandbox-0.1.0-py3-none-any.whl \
+  --sdk-wheel out/sdk/adx_environment-0.1.0-py3-none-any.whl \
   --sdk-candidate out/sdk/sdk-candidate.json \
   --runtime-base registry.example/adx-e2e-tools@sha256:DIGEST \
   --execd-base ubuntu@sha256:DIGEST --output out/e2e/bundle
@@ -60,7 +95,7 @@ checks delayed HTTP readiness, TCP readiness, exec environment/working directory
 terminal readiness errors with resource cleanup, health failure thresholds,
 bounded cold restart with a new backend, and idle deletion while probes run.
 Stream mode also requires and saves Execd's successful control registration
-from the host runtime log for each returned sandbox.
+from the host runtime log for each returned environment.
 The result is a targeted case with seven functional subcases; it does not
 replace the complete standalone profile. The fixture archive is hash-verified
 with the release bundle, and business requests use its installed SDK wheel.
@@ -177,13 +212,13 @@ Local Docker reproduction requires access to the same bind-mounted paths as the 
   `ADX_E2E_ARTIFACT_COMMIT` of the verified product alongside
   `ADX_E2E_TARGET_CASE=runtime-affinity`; the harness commit may differ from
   the product commit, and both identities are recorded.
-- `mixed-soak` (targeted stability case): keep one public-SDK Sandbox active on
+- `mixed-soak` (targeted stability case): keep one public-SDK Environment active on
   each node while a third worker alternates create/command/file/delete between
   nodes for 300 seconds. Two concurrent workers exercise command and binary
-  file round trips on the retained Sandboxes. Require at least 40 commands and
+  file round trips on the retained Environments. Require at least 40 commands and
   file round trips, five creations and deletions, zero operation errors, and
   physical backend cleanup on both nodes. Read back the authoritative node
-  assignment for every created Sandbox and record verified counts per node.
+  assignment for every created Environment and record verified counts per node.
   Record operation counts and p50/p95/p99/max latency in
   `mixed-soak-result.json`. Select it with
   `--profile full --case mixed-soak` or `--profile standalone --case mixed-soak`;
@@ -200,14 +235,14 @@ Local Docker reproduction requires access to the same bind-mounted paths as the 
   Select it with `--profile full --case relay-standalone`; it requires a bundle
   containing `adx-relay`.
 - `runtime-exit` (targeted sandboxd fault case): delete a real runc backend
-  beneath a live SDK Sandbox. Verify that the default Never policy becomes
+  beneath a live SDK Environment. Verify that the default Never policy becomes
   Failed without a replacement, then verify a policy with two retries creates
   two distinct runtime identities and reaches Failed after the third loss.
   Check the persisted assignment, retry count, physical backend inventory,
   public SDK command access and final cleanup. Select with
   `--profile full --case runtime-exit`.
 - `sandboxd-runtime-loss` (targeted combined daemon/backend fault): create one
-  pinned Sandbox, pause adxlet briefly, remove the runtime through sandboxd,
+  pinned Environment, pause adxlet briefly, remove the runtime through sandboxd,
   restart the sandboxd daemon, then resume adxlet. Repeat for the default Never
   policy and a two-attempt restart policy. Require Never to reach Failed with
   resources released, and the restart policy to run a new backend under the
@@ -215,23 +250,23 @@ Local Docker reproduction requires access to the same bind-mounted paths as the 
   physical backend inventory. Select with
   `--profile full --case sandboxd-runtime-loss`.
 - `coordinator-adxlet-restart` (targeted combined process fault): retain one
-  Sandbox per node, then kill Coordinator and node2 adxlet concurrently under
+  Environment per node, then kill Coordinator and node2 adxlet concurrently under
   their supervisor. Require a new Coordinator epoch and adxlet session, unchanged
   Redis ownership and physical backend identities, restored public SDK command
   and file access, and final deletion. Select with
   `--profile full --case coordinator-adxlet-restart`.
 - `sqlite-fallback` (targeted Coordinator outage case): enable the adxlet
   degradation journal only for this fixture, create a retained and an idle
-  Sandbox, then suspend Coordinator while managed Redis remains available.
+  Environment, then suspend Coordinator while managed Redis remains available.
   Require the idle backend to be deleted with a durable SQLite pending record
   while Redis still has the old Running result. Resume Coordinator before the
   extended heartbeat deadline; require journal replay, Redis Deleted state,
-  an empty pending table and the retained Sandbox serving a new SDK command
+  an empty pending table and the retained Environment serving a new SDK command
   with its original backend. Select with `--profile full --case sqlite-fallback`.
 - `create-response-cut` (targeted lost-acknowledgment case): a TLS proxy reads
   the first successful create final event from the real Ingress, verifies the
   Redis assignment and physical sandboxd backend, then closes the downstream
-  connection without delivering that event. The installed Sandbox SDK must
+  connection without delivering that event. The installed Environment SDK must
   retry with the same request ID and name; the final generation and backend
   must remain unchanged, and the instance must execute and delete normally.
   Select with `--profile full --case create-response-cut`.
@@ -242,7 +277,7 @@ Local Docker reproduction requires access to the same bind-mounted paths as the 
   retry; require one Redis assignment, one physical backend, a working command
   and full cleanup. Select with `--profile full --case create-unknown-query`.
 - `command-response-cut` (targeted unknown command submission): after creating
-  a real runc Sandbox, a TLS proxy forwards each `process.start` to Execd and
+  a real runc Environment, a TLS proxy forwards each `process.start` to Execd and
   discards its successful response. The installed SDK must return
   `CommandSubmissionError` with the stable command and request IDs. A new SDK
   client recovers the result by command ID; a marker written by the command
@@ -270,7 +305,7 @@ Local Docker reproduction requires access to the same bind-mounted paths as the 
 - `command-expiry` (expired-result contract):
   node1's Execd uses a one-second command-result TTL. The installed SDK must
   distinguish a never-seen command (`CommandNotFound`) from a completed command
-  whose record expired (`CommandExpired`), then prove the Sandbox still runs and
+  whose record expired (`CommandExpired`), then prove the Environment still runs and
   cleans up. Execd retains a bounded expired-ID tombstone and reports
   `COMMAND_EXPIRED` for this case. The cn-north-4 two-worker targeted run on
   2026-09-25 passed; select with `--profile full --case command-expiry`.
@@ -374,4 +409,12 @@ or turn historical data-plane scripts into a control-plane acceptance result.
 
 The capacity group also scrapes the live Coordinator and both Adxlet metrics endpoints. It checks two running instances and 4000 allocated CPU millis, one queued request while full, and zero instances/reservations after deletion. Per-node CPU, memory and disk allocation gauges must agree across Coordinator and Adxlet. Raw scrapes are retained as `metrics-allocated.json`, `metrics-queued.json` and `metrics-released.json`.
 
-组件日志采集验收复用现有 Ingress/Relay 指标端点，并通过真实 OpenTelemetry Collector 接收结构化组件日志。stop 组包含后端 503、文件滚动与 Collector 重启，控制台输出 `[METRICS PASS]` / `[COLLECTION PASS]`；产物含 `gateway-metrics-node*.json`、`collection-node*.json`、`collected-logs.jsonl` 和 `collector-process.log`。部署及保证边界见 `docs/testing/log-collection.md`。Trace 已纳入采集验收，输出 `[TRACE PASS]` 并保存 `traces-node*.json` 和 `collected-traces.jsonl`；正式结果见 [Buildkite #21](../../docs/testing/2026-09-17-observability-k8s.md)。
+Component log-collection acceptance reuses the Ingress/Relay metrics endpoints
+and receives structured component logs through a real OpenTelemetry Collector.
+The stop group covers backend HTTP 503 responses, file rotation, and Collector
+restart. It prints `[METRICS PASS]` / `[COLLECTION PASS]` and saves
+`gateway-metrics-node*.json`, `collection-node*.json`, `collected-logs.jsonl`,
+and `collector-process.log`. See the [log-collection contract](../../docs/testing/log-collection.md)
+for deployment and guarantee boundaries. Trace acceptance prints `[TRACE PASS]`
+and saves `traces-node*.json` and `collected-traces.jsonl`. Formal results are
+recorded in [Buildkite #21](../../docs/testing/2026-09-17-observability-k8s.md).

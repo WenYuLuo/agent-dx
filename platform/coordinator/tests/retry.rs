@@ -17,7 +17,7 @@ fn spec() -> EnvironmentSpec {
             disk_bytes: 0,
         },
         scheduling: Default::default(),
-        sandbox: Default::default(),
+        execution: Default::default(),
     }
 }
 #[test]

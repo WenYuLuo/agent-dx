@@ -169,9 +169,9 @@ def render(result):
             '组件：' + ', '.join(code(Path(p).name) for p in manifest['files'] if p.startswith(('bin/', 'runtime/'))),
         ]
         if release['sdk']:
-            lines += ['', 'SDK：' + ' · '.join(link(name, 'sdk/' + name) for name in release['sdk'])]
+            lines += ['', 'Environment SDK：' + ' · '.join(link(name, 'sdk/' + name) for name in release['sdk'])]
         if release.get('sdk_source'):
-            lines += ['', 'SDK sdist：' + ' · '.join(link(name, 'sdk/' + name) for name in release['sdk_source'])]
+            lines += ['', 'Environment SDK sdist：' + ' · '.join(link(name, 'sdk/' + name) for name in release['sdk_source'])]
         if release.get('admin'):
             lines += ['', 'adxadmin：' + ' · '.join(link(name, 'admin/' + name) for name in release['admin'])]
         if release.get('execd'):

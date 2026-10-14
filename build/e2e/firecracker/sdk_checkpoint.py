@@ -40,16 +40,16 @@ p.add_argument('--output', type=Path, required=True)
 p.add_argument('--restart-command', nargs='+')
 a = p.parse_args()
 os.environ['SSL_CERT_FILE'] = str(a.ca.resolve())
-from adx_sandbox import RetentionPolicy, ConnectionConfig, Mount, NetworkPolicy, S3Config, Sandbox
+from adx_environment import RetentionPolicy, ConnectionConfig, Mount, NetworkPolicy, S3Config, Environment
 from s3_client import Client as S3Client
 
 out = a.output.resolve()
 out.mkdir(parents=True, exist_ok=False)
-result = {'status': 'failed', 'sdk_version': importlib.metadata.version('adx-sandbox'), 'cases': []}
+result = {'status': 'failed', 'sdk_version': importlib.metadata.version('adx-environment'), 'cases': []}
 connection = ConnectionConfig(
     server_address=a.endpoint, token=a.token_file.read_text().strip(), use_tls=True, verify_tls=True
 )
-sandbox = None
+environment = None
 snapshot = None
 clones = []
 buddy = None
@@ -63,7 +63,7 @@ def passed(name, **details):
 
 
 def command(script):
-    value = sandbox.commands.run(script)
+    value = environment.commands.run(script)
     if not (value.exit_code == 0):
         raise AssertionError(value)
     return value.stdout.strip()
@@ -84,7 +84,7 @@ try:
         secret_key=s3.secret,
     )
 
-    s3_root = Sandbox(
+    s3_root = Environment(
         rootfs=source,
         runtime='firecracker',
         cpu=500,
@@ -105,7 +105,7 @@ try:
     s3_root.close()
     fixtures.remove(s3_root)
 
-    mounted = Sandbox(
+    mounted = Environment(
         image=a.image,
         runtime='firecracker',
         cpu=500,
@@ -119,12 +119,12 @@ try:
     mounted_check = mounted.commands.run('test -x /mnt/runtime/usr/local/bin/adx-execd')
     if not (mounted_check.exit_code == 0):
         raise AssertionError(mounted_check)
-    passed('S3 EROFS mount is visible inside the sandbox')
+    passed('S3 EROFS mount is visible inside the environment')
     mounted.kill()
     mounted.close()
     fixtures.remove(mounted)
 
-    inherited = Sandbox(
+    inherited = Environment(
         image=a.entrypoint_image,
         runtime='firecracker',
         cpu=500,
@@ -154,7 +154,7 @@ try:
     # Firecracker snapshot may retain guest ARP/FDB state from its previous TAP;
     # that backend-specific recovery condition must not turn the policy baseline
     # into a test of checkpoint networking.
-    networked = Sandbox(
+    networked = Environment(
         image=a.image,
         runtime='firecracker',
         cpu=500,
@@ -194,7 +194,7 @@ try:
     networked.close()
     fixtures.remove(networked)
 
-    blocked = Sandbox(
+    blocked = Environment(
         image=a.image,
         runtime='firecracker',
         cpu=500,
@@ -218,7 +218,7 @@ try:
     blocked.close()
     fixtures.remove(blocked)
 
-    sandbox = Sandbox(
+    environment = Environment(
         labels={'app': 'checkpoint-source'},
         image=a.image,
         runtime='firecracker',
@@ -229,7 +229,7 @@ try:
         connection=connection,
         create_timeout=180,
     )
-    result['instance_id'] = sandbox.id
+    result['instance_id'] = environment.id
     passed('create through Frontend and execute through Ingress', output=command("printf checkpoint-ready"))
     # A detached process carries a shell variable across the checkpoint. Its PID
     # and counter prove that resume did not just cold-start the original image.
@@ -244,9 +244,9 @@ try:
     before = int(command('cat /tmp/counter'))
     pid = command('cat /tmp/counter.pid')
     payload = b'checkpoint-preserved\x00\xff' * 4096
-    sandbox.files.write('/tmp/checkpoint.bin', payload)
-    paused = sandbox.pause(retention=RetentionPolicy.for_seconds(600), timeout_seconds=120)
-    if not (paused.sandbox_id == sandbox.id and paused.size > 0):
+    environment.files.write('/tmp/checkpoint.bin', payload)
+    paused = environment.pause(retention=RetentionPolicy.for_seconds(600), timeout_seconds=120)
+    if not (paused.environment_id == environment.id and paused.size > 0):
         raise AssertionError()
     passed(
         'pause with persisted recovery point',
@@ -255,11 +255,11 @@ try:
         expires_at=paused.expires_at,
     )
     if a.restart_command:
-        subprocess.run([*a.restart_command, sandbox.id], check=True, timeout=180)
+        subprocess.run([*a.restart_command, environment.id], check=True, timeout=180)
         passed('Adxlet restart while paused')
         passed('remote orphan GC preserves registered checkpoint')
-    resumed = sandbox.resume()
-    if not (resumed.sandbox_id == sandbox.id):
+    resumed = environment.resume()
+    if not (resumed.environment_id == environment.id):
         raise AssertionError()
     time.sleep(1)
     after = int(command('cat /tmp/counter'))
@@ -267,10 +267,10 @@ try:
         raise AssertionError((before, after))
     if not (command('cat /tmp/counter.pid') == pid):
         raise AssertionError()
-    if not (sandbox.files.read('/tmp/checkpoint.bin', format='bytes') == payload):
+    if not (environment.files.read('/tmp/checkpoint.bin', format='bytes') == payload):
         raise AssertionError()
     passed('resume preserves process memory, PID and binary file', before=before, after=after, pid=pid)
-    if not (sandbox.reload()):
+    if not (environment.reload()):
         raise AssertionError()
     time.sleep(1)
     reloaded = int(command('cat /tmp/counter'))
@@ -278,7 +278,7 @@ try:
         raise AssertionError()
     if not (command('cat /tmp/counter.pid') == pid):
         raise AssertionError()
-    if not (sandbox.files.read('/tmp/checkpoint.bin', format='bytes') == payload):
+    if not (environment.files.read('/tmp/checkpoint.bin', format='bytes') == payload):
         raise AssertionError()
     passed('reload restores the latest recovery point without a cold start', counter=reloaded, pid=pid)
 
@@ -290,7 +290,7 @@ try:
             **extra,
         }
 
-    buddy = Sandbox(
+    buddy = Environment(
         image=a.image,
         runtime='firecracker',
         cpu=1000,
@@ -314,12 +314,12 @@ try:
     buddy.close()
     buddy = None
     passed('SDK labels peer affinity and ordered weighted placement')
-    snapshot = sandbox.create_snapshot(name="fc-reusable", timeout_seconds=120)
+    snapshot = environment.create_snapshot(name="fc-reusable", timeout_seconds=120)
     time.sleep(1)
     snapshot_counter = int(command('cat /tmp/counter'))
     if not (snapshot_counter > after and command('cat /tmp/counter.pid') == pid):
         raise AssertionError()
-    if not (sandbox.files.read('/tmp/checkpoint.bin', format='bytes') == payload):
+    if not (environment.files.read('/tmp/checkpoint.bin', format='bytes') == payload):
         raise AssertionError()
     passed(
         'reusable snapshot preserves running source',
@@ -328,20 +328,20 @@ try:
         pid=pid,
     )
     command('kill "$(cat /tmp/counter.pid)"')
-    sandbox.kill()
+    environment.kill()
     passed('explicit delete')
-    if not (Sandbox.get_snapshot(snapshot.snapshot_id, connection=connection).snapshot_id == snapshot.snapshot_id):
+    if not (Environment.get_snapshot(snapshot.snapshot_id, connection=connection).snapshot_id == snapshot.snapshot_id):
         raise AssertionError()
-    saved, _ = Sandbox.list_snapshots(name="fc-reusable", connection=connection)
+    saved, _ = Environment.list_snapshots(name="fc-reusable", connection=connection)
     if not (any(s.snapshot_id == snapshot.snapshot_id for s in saved)):
         raise AssertionError()
     passed('snapshot remains queryable after source deletion')
-    source_id = sandbox.id
+    source_id = environment.id
     for _ in range(2):
         # Omit image/runtime/resources: these must inherit the saved geometry.
-        clone = Sandbox.create(snapshot, idle_timeout=0, connection=connection, create_timeout=180)
+        clone = Environment.create(snapshot, idle_timeout=0, connection=connection, create_timeout=180)
         clones.append(clone)
-        sandbox = clone
+        environment = clone
         if not (clone.id != source_id):
             raise AssertionError()
         if not (command('cat /tmp/counter.pid') == pid):
@@ -362,7 +362,7 @@ try:
     if not (clones[1].files.read('/tmp/checkpoint.bin', format='bytes') == payload):
         raise AssertionError()
     passed('snapshot clones have independent identity and writable files')
-    Sandbox.delete_snapshot(snapshot.snapshot_id, connection=connection)
+    Environment.delete_snapshot(snapshot.snapshot_id, connection=connection)
     passed('snapshot deletion accepted for artifact collection')
     # Source reference release and physical GC run asynchronously. Prove the
     # remaining clones survive after the shared snapshot has been collected.
@@ -393,7 +393,7 @@ try:
             raise TimeoutError('source snapshot physical collection did not complete')
         time.sleep(1)
     for clone in clones:
-        sandbox = clone
+        environment = clone
         count = int(command('cat /tmp/counter'))
         checkpoint = clone.pause(retention=RetentionPolicy.for_seconds(600), timeout_seconds=120)
         if not (checkpoint.size > 0):
@@ -444,15 +444,15 @@ finally:
         clone.close()
     if snapshot:
         try:
-            Sandbox.delete_snapshot(snapshot.snapshot_id, connection=connection)
+            Environment.delete_snapshot(snapshot.snapshot_id, connection=connection)
         except Exception as error:
             result['cleanup_error'] = str(error)
-    if sandbox:
+    if environment:
         try:
-            sandbox.kill()
+            environment.kill()
         except Exception as error:
             result['cleanup_error'] = str(error)
-        sandbox.close()
+        environment.close()
     try:
         if 's3' in locals():
             s3.request('DELETE', FIXTURE_OBJECT)

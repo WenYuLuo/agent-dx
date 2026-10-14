@@ -6,8 +6,8 @@ use adx_agent_api::{
     managed::ManagedService,
     Error,
 };
+use adx_agent_core::environment::Environment;
 use adx_agent_core::limits;
-use adx_agent_core::sandbox::Sandbox;
 use adx_agent_core::{Protocol, Scope, TemplateVersion};
 use bytes::Bytes;
 use http::{Request, Response};
@@ -103,10 +103,10 @@ impl AgentApi {
         })
     }
 
-    /// Bind an embedded Activator directly to the API Server's Sandbox service.
+    /// Bind an embedded Activator directly to the API Server's Environment service.
     pub async fn new_embedded(
         config: AgentConfig,
-        sandbox: Arc<dyn Sandbox>,
+        environment: Arc<dyn Environment>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         if config.activator.is_some() {
             return Err(Error::Invalid("configure exactly one Activator mode".into()).into());
@@ -121,7 +121,7 @@ impl AgentApi {
             );
         }
         let control: Arc<dyn Control> = Arc::new(
-            LocalControl::connect(&settings.redis_url, &settings.namespace, sandbox).await?,
+            LocalControl::connect(&settings.redis_url, &settings.namespace, environment).await?,
         );
         Ok(Self {
             managed: Arc::new(ManagedService::new(control)),
@@ -258,7 +258,7 @@ impl AgentApi {
                     .resolve_with_cache(ctx, &scope, input.protocol, input.port, input.bypass_cache)
                     .await?;
                 Ok(
-                    serde_json::json!({"sandbox_id":target.binding.sandbox_id,"port":port,"protocol":input.protocol}),
+                    serde_json::json!({"environment_id":target.binding.environment_id,"port":port,"protocol":input.protocol}),
                 )
             }
             _ => Err(Error::NotFound),
@@ -278,8 +278,8 @@ impl AgentApi {
             .map(|retry| (retry.selection, retry.backend_uri))
     }
 
-    /// Rewrite a managed HTTP/WS request into the existing fixed Sandbox forwarding path.
-    /// SSH clients use the resolve endpoint then the existing Sandbox-ID CONNECT/tunnel interface.
+    /// Rewrite a managed HTTP/WS request into the existing fixed Environment forwarding path.
+    /// SSH clients use the resolve endpoint then the existing Environment-ID CONNECT/tunnel interface.
     pub fn can_retry_data<B>(&self, request: &Request<B>) -> bool {
         request.extensions().get::<SelectionRetry>().is_some()
     }

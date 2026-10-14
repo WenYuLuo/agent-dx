@@ -4,12 +4,12 @@
 
 //! EXECD atomic-operation HTTP/1.1 server.
 //!
-//! Purpose: expose sandbox-embedded EXECD atomic operations over HTTP through sandboxRouter as an L7 reverse proxy,
+//! Purpose: expose environment-embedded EXECD atomic operations over HTTP through environmentRouter as an L7 reverse proxy,
 //! serving atomic operations directly over HTTP.
 //!
 //! Protocol:
-//! - `POST /invoke`, body = `{"action": "...", "args": {...}}`, shaped like sandbox_invoke,
-//!   reuse dispatch::normalize_sandbox_action + dispatch_runtime_action and return action result JSON.
+//! - `POST /invoke`, body = `{"action": "...", "args": {...}}`, shaped like environment_invoke,
+//!   reuse dispatch::normalize_environment_action + dispatch_runtime_action and return action result JSON.
 //! - `POST /upload?path=/abs/file&type=file|tar`, body is raw binary or a tar stream.
 //! - `GET /download?path=/abs/file&type=file|tar`, response body is raw binary or a tar stream.
 //! - `GET /pty?command=...`, WebSocket carrying PTY bytes and lifecycle frames.
@@ -424,7 +424,7 @@ async fn handle_one_request(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    if let Some(operation) = super::dispatch::normalize_sandbox_action(&action) {
+    if let Some(operation) = super::dispatch::normalize_environment_action(&action) {
         adx_observability::trace::attribute("rpc.method", operation.to_owned());
     }
     let kw = json_args_to_kwargs(parsed.get("args"));
@@ -762,9 +762,14 @@ async fn execute_invoke(
     kw: BTreeMap<String, rmpv::Value>,
     trace_id: String,
 ) -> CachedResponse {
-    let normalized_action = super::dispatch::normalize_sandbox_action(&action);
+    let normalized_action = super::dispatch::normalize_environment_action(&action);
     let result = tokio::task::spawn_blocking(move || {
-        super::dispatch::execute_sandbox_action_once(request_id.as_deref(), &action, &kw, &trace_id)
+        super::dispatch::execute_environment_action_once(
+            request_id.as_deref(),
+            &action,
+            &kw,
+            &trace_id,
+        )
     })
     .await;
 
@@ -2235,7 +2240,7 @@ mod tests {
             let _ = serve_listener(listener, None).await;
         });
         let uri = format!(
-            "ws://{address}/pty?protocol=sandbox.pty.v1&command=%2Fbin%2Fsh&command=-c&command=exit%200"
+            "ws://{address}/pty?protocol=environment.pty.v1&command=%2Fbin%2Fsh&command=-c&command=exit%200"
         );
         let (mut websocket, _) = tokio_tungstenite::connect_async(uri).await.unwrap();
         let mut exited = false;
@@ -2305,7 +2310,7 @@ mod tests {
             let _ = serve_listener(listener, None).await;
         });
         let uri = format!(
-            "ws://{address}/pty?rows=24&cols=80&protocol=sandbox.pty.v1&command=%2Fbin%2Fsh&command=-lc&command=sleep%200.2%3B%20printf%20pty-ok"
+            "ws://{address}/pty?rows=24&cols=80&protocol=environment.pty.v1&command=%2Fbin%2Fsh&command=-lc&command=sleep%200.2%3B%20printf%20pty-ok"
         );
         let (mut websocket, _) = tokio_tungstenite::connect_async(uri).await.unwrap();
 

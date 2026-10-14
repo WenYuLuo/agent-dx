@@ -5,38 +5,41 @@ use crate::ingress::{
     auth::{AuthError, AuthenticatedIdentity, CredentialVerifier},
     H2PoolConfig, RouteStore,
 };
-use adx_agent_core::sandbox::*;
+use adx_agent_core::environment::*;
 use adx_agent_store::{AgentState, MemoryRepository};
 
 #[derive(Default)]
 struct Backend(
-    Mutex<std::collections::HashMap<(String, String), SandboxObservation>>,
+    Mutex<std::collections::HashMap<(String, String), EnvironmentObservation>>,
     std::sync::atomic::AtomicUsize,
 );
 #[async_trait::async_trait]
-impl Sandbox for Backend {
-    async fn list(&self, tenant: &str) -> Result<Vec<SandboxInfo>, SandboxError> {
+impl Environment for Backend {
+    async fn list(&self, tenant: &str) -> Result<Vec<EnvironmentInfo>, EnvironmentError> {
         Ok(self
             .0
             .lock()
             .unwrap()
             .values()
-            .filter(|v| v.tenant == tenant && v.phase == SandboxPhase::Running)
+            .filter(|v| v.tenant == tenant && v.phase == EnvironmentPhase::Running)
             .cloned()
-            .map(|observation| SandboxInfo {
+            .map(|observation| EnvironmentInfo {
                 observation,
                 node_ip: None,
-                sandbox_ip: None,
+                environment_ip: None,
                 execution: None,
             })
             .collect())
     }
 
-    async fn create(&self, r: &CreateSandbox) -> Result<SandboxObservation, SandboxError> {
-        let observed = SandboxObservation {
+    async fn create(
+        &self,
+        r: &CreateEnvironment,
+    ) -> Result<EnvironmentObservation, EnvironmentError> {
+        let observed = EnvironmentObservation {
             id: r.id.clone(),
             tenant: r.tenant.clone(),
-            phase: SandboxPhase::Running,
+            phase: EnvironmentPhase::Running,
             ready: true,
             runtime_id: Some(format!("{}-runtime", r.id)),
             message: None,
@@ -51,26 +54,30 @@ impl Sandbox for Backend {
         &self,
         tenant: &str,
         id: &str,
-    ) -> Result<Option<SandboxObservation>, SandboxError> {
+    ) -> Result<Option<EnvironmentObservation>, EnvironmentError> {
         self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let entries = self.0.lock().unwrap();
         let observed = entries.get(&(tenant.into(), id.into())).cloned();
         if observed.is_none() && entries.keys().any(|(_, instance)| instance == id) {
-            return Err(SandboxError::NotFound);
+            return Err(EnvironmentError::NotFound);
         }
         Ok(observed)
     }
-    async fn delete(&self, tenant: &str, id: &str) -> Result<SandboxObservation, SandboxError> {
+    async fn delete(
+        &self,
+        tenant: &str,
+        id: &str,
+    ) -> Result<EnvironmentObservation, EnvironmentError> {
         let mut entries = self.0.lock().unwrap();
         if !entries.contains_key(&(tenant.into(), id.into()))
             && entries.keys().any(|(_, instance)| instance == id)
         {
-            return Err(SandboxError::NotFound);
+            return Err(EnvironmentError::NotFound);
         }
         let value = entries
             .get_mut(&(tenant.into(), id.into()))
-            .ok_or_else(|| SandboxError::OutcomeUnknown("deletion not confirmed".into()))?;
-        value.phase = SandboxPhase::Deleted;
+            .ok_or_else(|| EnvironmentError::OutcomeUnknown("deletion not confirmed".into()))?;
+        value.phase = EnvironmentPhase::Deleted;
         value.ready = false;
         Ok(value.clone())
     }
@@ -89,16 +96,16 @@ impl CredentialVerifier for Identity {
         }
     }
 }
-async fn fixture() -> (Arc<Ingress>, Arc<dyn Sandbox>) {
+async fn fixture() -> (Arc<Ingress>, Arc<dyn Environment>) {
     let (gateway, backend, _) = fixture_with_routes().await;
     (gateway, backend)
 }
-async fn fixture_with_routes() -> (Arc<Ingress>, Arc<dyn Sandbox>, Arc<RouteStore>) {
+async fn fixture_with_routes() -> (Arc<Ingress>, Arc<dyn Environment>, Arc<RouteStore>) {
     fixture_with_backend(Arc::new(Backend::default())).await
 }
 async fn fixture_with_backend(
-    backend: Arc<dyn Sandbox>,
-) -> (Arc<Ingress>, Arc<dyn Sandbox>, Arc<RouteStore>) {
+    backend: Arc<dyn Environment>,
+) -> (Arc<Ingress>, Arc<dyn Environment>, Arc<RouteStore>) {
     let store = Arc::new(RouteStore::new());
     store.set_ready(true);
     let gateway = Arc::new(Ingress::new(
@@ -112,8 +119,8 @@ async fn fixture_with_backend(
     ));
     (gateway, backend, store)
 }
-async fn create_sandbox(backend: &dyn Sandbox) -> String {
-    let request: CreateSandbox = serde_json::from_value(serde_json::json!({
+async fn create_environment(backend: &dyn Environment) -> String {
+    let request: CreateEnvironment = serde_json::from_value(serde_json::json!({
         "id":uuid::Uuid::new_v4().to_string(),"tenant":"tenant","execution":{
             "image":"app:1","isolation_runtime":"runc","inherit_entrypoint":true,
             "entrypoint":[],"working_dir":"","user":null,"env":{},
@@ -280,7 +287,10 @@ async fn independent_activators_share_redis_identity() {
         .await
         .unwrap();
     assert_ne!(original.0.binding.generation, fresh.0.binding.generation);
-    assert_ne!(original.0.binding.sandbox_id, fresh.0.binding.sandbox_id);
+    assert_ne!(
+        original.0.binding.environment_id,
+        fresh.0.binding.environment_id
+    );
     a.managed
         .delete_binding(&control_context(), &scope)
         .await
@@ -377,7 +387,7 @@ async fn managed_binding_management_and_protocol_forwarding() {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         json(response).await;
     }
-    let id = binding["sandbox_id"].as_str().unwrap();
+    let id = binding["environment_id"].as_str().unwrap();
     let response = sender
         .send_request(request(
             "POST",
@@ -390,7 +400,7 @@ async fn managed_binding_management_and_protocol_forwarding() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let resolved = json(response).await;
-    assert_eq!(resolved["sandbox_id"], id);
+    assert_eq!(resolved["environment_id"], id);
     assert_eq!(resolved["port"], 22);
     assert_eq!(
         backend.1.load(std::sync::atomic::Ordering::SeqCst),
@@ -408,11 +418,11 @@ async fn managed_binding_management_and_protocol_forwarding() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(json(response).await["sandbox_id"], id);
+    assert_eq!(json(response).await["environment_id"], id);
     assert_eq!(
         backend.1.load(std::sync::atomic::Ordering::SeqCst),
         2,
-        "public bypasscache reaches Sandbox GET"
+        "public bypasscache reaches Environment GET"
     );
     let response = sender
         .send_request(request(
@@ -494,12 +504,12 @@ async fn managed_binding_management_and_protocol_forwarding() {
 #[tokio::test]
 async fn uuid_platform_routes_keep_their_existing_access_policy() {
     let (gateway, api, routes) = fixture_with_routes().await;
-    // A real Sandbox ID must not shadow a literal Platform route.
-    let id = create_sandbox(api.as_ref()).await;
+    // A real Environment ID must not shadow a literal Platform route.
+    let id = create_environment(api.as_ref()).await;
     routes.put(
         serde_json::from_value(serde_json::json!({
             "instanceID":id,"instanceStatus":{"code":3},"tenantID":"tenant",
-            "sandboxID":"literal-runtime","sandboxIP":"127.0.0.1","nodeProxyAddress":"127.0.0.1:1"
+            "environmentID":"literal-runtime","environmentIP":"127.0.0.1","nodeProxyAddress":"127.0.0.1:1"
         }))
         .unwrap(),
     );
@@ -576,7 +586,7 @@ async fn only_managed_data_entrypoint_resolves_and_reuses_authenticated_identity
     let template = serde_json::from_value(serde_json::json!({"name":"test","version":"1","image":"app:1","isolation_runtime":"runc","resources":{"cpu_millis":1000,"memory_mib":512},"service":[{"protocol":"http","port":8080}]})).unwrap();
     state.publish("tenant", &template).await.unwrap();
     state.create_binding(scope.clone()).await.unwrap();
-    let id = state.binding(&scope).await.unwrap().unwrap().sandbox_id;
+    let id = state.binding(&scope).await.unwrap().unwrap().environment_id;
     let control = Arc::new(
         remote_control(adx_activator::Activator::new(
             state.clone(),
@@ -588,7 +598,7 @@ async fn only_managed_data_entrypoint_resolves_and_reuses_authenticated_identity
         managed: Arc::new(adx_agent_api::managed::ManagedService::new(control)),
         request_timeout: adx_agent_core::limits::AGENT_REQUEST_TIMEOUT,
     }));
-    // Even a UUID present in ADX state is a literal Sandbox target on shared routes.
+    // Even a UUID present in ADX state is a literal Environment target on shared routes.
     for target in [&id, &format!("adx-{id}")] {
         for connect in [false, true] {
             let uri = if connect {
@@ -645,16 +655,23 @@ async fn only_managed_data_entrypoint_resolves_and_reuses_authenticated_identity
     assert_eq!(error.status(), StatusCode::NOT_FOUND);
 }
 
-struct StalledSandbox;
+struct StalledEnvironment;
 #[async_trait::async_trait]
-impl Sandbox for StalledSandbox {
-    async fn create(&self, _: &CreateSandbox) -> Result<SandboxObservation, SandboxError> {
+impl Environment for StalledEnvironment {
+    async fn create(
+        &self,
+        _: &CreateEnvironment,
+    ) -> Result<EnvironmentObservation, EnvironmentError> {
         std::future::pending().await
     }
-    async fn get(&self, _: &str, _: &str) -> Result<Option<SandboxObservation>, SandboxError> {
+    async fn get(
+        &self,
+        _: &str,
+        _: &str,
+    ) -> Result<Option<EnvironmentObservation>, EnvironmentError> {
         std::future::pending().await
     }
-    async fn delete(&self, _: &str, _: &str) -> Result<SandboxObservation, SandboxError> {
+    async fn delete(&self, _: &str, _: &str) -> Result<EnvironmentObservation, EnvironmentError> {
         std::future::pending().await
     }
 }
@@ -695,7 +712,7 @@ async fn managed_http_entry_authenticates_before_creating_binding() {
     assert_eq!(page.bindings.len(), 1);
     assert_eq!(
         managed.uri().to_string(),
-        format!("/{}/8080/chat?q=one", page.bindings[0].sandbox_id)
+        format!("/{}/8080/chat?q=one", page.bindings[0].environment_id)
     );
     for (path, token, status) in [
         (
@@ -841,12 +858,12 @@ async fn unified_access_forwards_payloads_and_returns_binding_headers() {
         binding_id: "env".into(),
     };
     let binding = state.create_binding(scope).await.unwrap();
-    for id in ["api", &binding.sandbox_id] {
-        let route: crate::common::route::RouteInfo = serde_json::from_value(serde_json::json!({"instanceID":id,"instanceStatus":{"code":3},"tenantID":"tenant","sandboxID":format!("runtime-{id}"),"sandboxIP":"127.0.0.1","nodeProxyAddress":node_address.to_string()})).unwrap();
+    for id in ["api", &binding.environment_id] {
+        let route: crate::common::route::RouteInfo = serde_json::from_value(serde_json::json!({"instanceID":id,"instanceStatus":{"code":3},"tenantID":"tenant","environmentID":format!("runtime-{id}"),"environmentIP":"127.0.0.1","nodeProxyAddress":node_address.to_string()})).unwrap();
         node.activate_route(
             route.instance_id.clone(),
-            route.sandbox_id.clone(),
-            route.sandbox_ip.parse().unwrap(),
+            route.environment_id.clone(),
+            route.environment_ip.parse().unwrap(),
         )
         .await;
         routes.put(route);
@@ -942,7 +959,7 @@ async fn managed_http_and_ws_activation_are_bounded_by_the_entry_deadline() {
         managed: Arc::new(adx_agent_api::managed::ManagedService::new(Arc::new(
             remote_control(adx_activator::Activator::new(
                 state,
-                Arc::new(StalledSandbox),
+                Arc::new(StalledEnvironment),
             ))
             .await,
         ))),
@@ -1013,34 +1030,41 @@ struct RuntimeBackend {
 }
 #[cfg(feature = "mock-e2e")]
 #[async_trait::async_trait]
-impl Sandbox for RuntimeBackend {
-    async fn create(&self, request: &CreateSandbox) -> Result<SandboxObservation, SandboxError> {
+impl Environment for RuntimeBackend {
+    async fn create(
+        &self,
+        request: &CreateEnvironment,
+    ) -> Result<EnvironmentObservation, EnvironmentError> {
         self.inner.create(request).await
     }
     async fn get(
         &self,
         tenant: &str,
         id: &str,
-    ) -> Result<Option<SandboxObservation>, SandboxError> {
+    ) -> Result<Option<EnvironmentObservation>, EnvironmentError> {
         self.inner.get(tenant, id).await
     }
-    async fn delete(&self, tenant: &str, id: &str) -> Result<SandboxObservation, SandboxError> {
+    async fn delete(
+        &self,
+        tenant: &str,
+        id: &str,
+    ) -> Result<EnvironmentObservation, EnvironmentError> {
         self.inner.delete(tenant, id).await
     }
-    async fn list(&self, tenant: &str) -> Result<Vec<SandboxInfo>, SandboxError> {
+    async fn list(&self, tenant: &str) -> Result<Vec<EnvironmentInfo>, EnvironmentError> {
         self.inner.list(tenant).await
     }
 }
 
 #[cfg(feature = "mock-e2e")]
 #[async_trait::async_trait]
-impl crate::ingress::sandbox_files::SandboxDirectory for RuntimeBackend {
+impl crate::ingress::environment_files::EnvironmentDirectory for RuntimeBackend {
     async fn authorize(
         &self,
         tenant: &str,
         id: &str,
-    ) -> Result<(), crate::ingress::sandbox_files::ReadError> {
-        use crate::ingress::sandbox_files::ReadError;
+    ) -> Result<(), crate::ingress::environment_files::ReadError> {
+        use crate::ingress::environment_files::ReadError;
         self.queries
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let observed = self
@@ -1049,7 +1073,7 @@ impl crate::ingress::sandbox_files::SandboxDirectory for RuntimeBackend {
             .await
             .map_err(|_| ReadError::NotFound)?
             .ok_or(ReadError::NotFound)?;
-        if observed.phase != SandboxPhase::Running {
+        if observed.phase != EnvironmentPhase::Running {
             return Err(ReadError::Runtime);
         }
         Ok(())
@@ -1059,7 +1083,7 @@ impl crate::ingress::sandbox_files::SandboxDirectory for RuntimeBackend {
 fn with_files(gateway: &Ingress, backend: Arc<RuntimeBackend>) -> Ingress {
     let port = backend.port;
     gateway.clone().with_execd_access(Arc::new(
-        crate::ingress::sandbox_files::ExecdAccess::new(
+        crate::ingress::environment_files::ExecdAccess::new(
             backend,
             port,
             "runtime-only-secret".into(),
@@ -1129,7 +1153,7 @@ async fn shared_service_access_retries_only_unsent_generation_and_checks_tenant(
         )
         .await
         .unwrap();
-    routes.put(serde_json::from_value(serde_json::json!({"instanceID":binding.sandbox_id,"instanceStatus":{"code":3},"tenantID":"other","sandboxID":"runtime","sandboxIP":"127.0.0.1","nodeProxyAddress":"127.0.0.1:1"})).unwrap());
+    routes.put(serde_json::from_value(serde_json::json!({"instanceID":binding.environment_id,"instanceStatus":{"code":3},"tenantID":"other","environmentID":"runtime","environmentIP":"127.0.0.1","nodeProxyAddress":"127.0.0.1:1"})).unwrap());
     let before = backend.1.load(Ordering::SeqCst);
     assert!(matches!(
         access.connect_service(&gateway, selection).await,
@@ -1175,7 +1199,7 @@ async fn shared_service_access_retries_only_unsent_generation_and_checks_tenant(
         )
         .await
         .unwrap();
-    routes.delete(&binding.sandbox_id);
+    routes.delete(&binding.environment_id);
     assert!(matches!(
         access.connect_service(&gateway, pending).await,
         Err(ServiceAccessError::Agent(adx_agent_api::Error::Conflict(_)))
@@ -1224,11 +1248,11 @@ async fn jiuwen_cold_start_waits_for_backend_listener_before_ws_handshake() {
         binding_id: "jiuwen".into(),
     };
     let binding = state.create_binding(scope.clone()).await.unwrap();
-    let route: crate::common::route::RouteInfo = serde_json::from_value(serde_json::json!({"instanceID":binding.sandbox_id,"instanceStatus":{"code":3},"tenantID":"tenant","sandboxID":"runtime-jiuwen","sandboxIP":"127.0.0.1","nodeProxyAddress":address.to_string()})).unwrap();
+    let route: crate::common::route::RouteInfo = serde_json::from_value(serde_json::json!({"instanceID":binding.environment_id,"instanceStatus":{"code":3},"tenantID":"tenant","environmentID":"runtime-jiuwen","environmentIP":"127.0.0.1","nodeProxyAddress":address.to_string()})).unwrap();
     node.activate_route(
         route.instance_id.clone(),
-        route.sandbox_id.clone(),
-        route.sandbox_ip.parse().unwrap(),
+        route.environment_id.clone(),
+        route.environment_ip.parse().unwrap(),
     )
     .await;
     routes.put(route.clone());
@@ -1345,11 +1369,11 @@ async fn jiuwen_concurrent_connections_obey_handshake_deadline_and_revocation() 
         binding_id: "jiuwen".into(),
     };
     let binding = state.create_binding(scope.clone()).await.unwrap();
-    let route: crate::common::route::RouteInfo = serde_json::from_value(serde_json::json!({"instanceID":binding.sandbox_id,"instanceStatus":{"code":3},"tenantID":"tenant","sandboxID":"runtime-jiuwen","sandboxIP":"127.0.0.1","nodeProxyAddress":address.to_string()})).unwrap();
+    let route: crate::common::route::RouteInfo = serde_json::from_value(serde_json::json!({"instanceID":binding.environment_id,"instanceStatus":{"code":3},"tenantID":"tenant","environmentID":"runtime-jiuwen","environmentIP":"127.0.0.1","nodeProxyAddress":address.to_string()})).unwrap();
     node.activate_route(
         route.instance_id.clone(),
-        route.sandbox_id.clone(),
-        route.sandbox_ip.parse().unwrap(),
+        route.environment_id.clone(),
+        route.environment_ip.parse().unwrap(),
     )
     .await;
     routes.put(route.clone());
@@ -1522,7 +1546,7 @@ async fn jiuwen_concurrent_connections_obey_handshake_deadline_and_revocation() 
         assert_eq!(envelope["method"], "session.list");
     }
     assert_eq!(gateway.active_sessions(), 1);
-    routes.delete(&binding.sandbox_id);
+    routes.delete(&binding.environment_id);
     assert!(matches!(
         tokio::time::timeout(Duration::from_secs(2), running)
             .await

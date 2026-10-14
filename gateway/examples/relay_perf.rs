@@ -330,8 +330,8 @@ async fn run_http_benchmark(
             let mut bytes_received = 0u64;
             for request_index in 0..count {
                 // When concurrency is an integer multiple of targets this
-                // pins every connection to one sandbox, so total concurrency
-                // is exactly targets * per-sandbox concurrency.
+                // pins every connection to one environment, so total concurrency
+                // is exactly targets * per-environment concurrency.
                 let target = (worker_index + request_index * concurrency) % targets;
                 let started = Instant::now();
                 bytes_received +=
@@ -358,7 +358,7 @@ async fn run_http_benchmark(
     let usage_after = process_usage();
     samples.sort_by(f64::total_cmp);
     let cpu_seconds = (usage_after.cpu_seconds - usage_before.cpu_seconds).max(0.0);
-    let per_sandbox_concurrency = concurrency as f64 / targets as f64;
+    let per_environment_concurrency = concurrency as f64 / targets as f64;
     println!(
         "{}",
         serde_json::json!({
@@ -367,7 +367,7 @@ async fn run_http_benchmark(
             "concurrency": concurrency,
             "connection_count": concurrency,
             "logical_targets": targets,
-            "per_sandbox_concurrency": per_sandbox_concurrency,
+            "per_environment_concurrency": per_environment_concurrency,
             "errors": 0,
             "elapsed_ms": elapsed * 1000.0,
             "requests_per_second": samples.len() as f64 / elapsed,

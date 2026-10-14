@@ -1,11 +1,11 @@
 //! Embedded lifecycle calls must return errors without overflowing a normal worker stack.
-use adx_activator::{local_sandbox::LocalSandbox, Activator};
+use adx_activator::{local_environment::LocalEnvironment, Activator};
 use adx_agent_api::{
     activator::Control, local::LocalControl, managed::ManagedService, request::RequestContext,
 };
-use adx_agent_core::{sandbox::Sandbox, TemplateVersion};
+use adx_agent_core::{environment::Environment, TemplateVersion};
 use adx_agent_store::{AgentState, MemoryRepository};
-use adx_apiserver::{clients::Clients, config::Config, sandbox_service::SandboxService};
+use adx_apiserver::{clients::Clients, config::Config, environment_service::EnvironmentService};
 use adx_protocol::control as pb;
 use data_plane_gateway::ingress::{
     auth::{AuthError, AuthenticatedIdentity, CredentialVerifier},
@@ -106,8 +106,8 @@ fn embedded_create_returns_rpc_failure_on_normal_worker_stack() {
             })).unwrap();
             config.runtime_profile = Some(profile);
             let clients = Clients::new(config).unwrap();
-            let service = SandboxService::new(clients);
-            let adapter = Arc::new(LocalSandbox::new(service, std::time::Duration::from_secs(60)).unwrap());
+            let service = EnvironmentService::new(clients);
+            let adapter = Arc::new(LocalEnvironment::new(service, std::time::Duration::from_secs(60)).unwrap());
             tokio::time::timeout(std::time::Duration::from_secs(3), async {
                 loop {
                     if matches!(adapter.get("tenant", "embedded-stack").await, Ok(None)) { break; }

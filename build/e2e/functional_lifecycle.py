@@ -9,7 +9,7 @@ import time
 import uuid
 from pathlib import Path
 
-from adx_sandbox import Sandbox, SandboxNotFound
+from adx_environment import Environment, EnvironmentNotFound
 
 
 def _wait_deleted(instance_id, connection, timeout=90):
@@ -17,8 +17,8 @@ def _wait_deleted(instance_id, connection, timeout=90):
     last_error = None
     while time.monotonic() < deadline:
         try:
-            handle = Sandbox.from_id(instance_id, connection=connection)
-        except SandboxNotFound:
+            handle = Environment.from_id(instance_id, connection=connection)
+        except EnvironmentNotFound:
             return
         except RuntimeError as error:
             if 'is not running' in str(error):
@@ -48,7 +48,7 @@ def run(connection, image, output):
 
     try:
         started = begin('lifecycle.detached-close-reattach-delete')
-        detached = Sandbox(
+        detached = Environment(
             image=image,
             runtime='runc',
             cpu=500,
@@ -62,14 +62,14 @@ def run(connection, image, output):
         detached_id = detached.id
         remaining.add(detached_id)
         detached.kill()
-        attached = Sandbox.from_id(detached_id, connection=connection)
+        attached = Environment.from_id(detached_id, connection=connection)
         try:
             result = attached.commands.run("printf 'reattached'")
             if not (result.exit_code == 0 and result.stdout == 'reattached'):
                 raise AssertionError()
         finally:
             attached.close()
-        Sandbox.delete(detached_id, connection=connection)
+        Environment.delete(detached_id, connection=connection)
         remaining.remove(detached_id)
         _wait_deleted(detached_id, connection)
         checks['detached_reattach_and_delete'] = detached_id
@@ -77,7 +77,7 @@ def run(connection, image, output):
 
         started = begin('lifecycle.named-create-reuses-running-owner')
         name = f'e2e-named-{uuid.uuid4().hex[:12]}'
-        first = Sandbox(
+        first = Environment(
             name=name,
             image=image,
             runtime='runc',
@@ -91,7 +91,7 @@ def run(connection, image, output):
         named_id = first.id
         remaining.add(named_id)
         first.close()
-        reopened = Sandbox(
+        reopened = Environment(
             name=name,
             image=image,
             runtime='runc',
@@ -109,13 +109,13 @@ def run(connection, image, output):
                 raise AssertionError()
         finally:
             reopened.close()
-        Sandbox.delete(named_id, connection=connection)
+        Environment.delete(named_id, connection=connection)
         remaining.remove(named_id)
         _wait_deleted(named_id, connection)
         passed('lifecycle.named-create-reuses-running-owner', started)
 
         started = begin('lifecycle.attached-close-preserves-instance')
-        attached = Sandbox(
+        attached = Environment(
             image=image,
             runtime='runc',
             cpu=500,
@@ -128,7 +128,7 @@ def run(connection, image, output):
         attached_id = attached.id
         remaining.add(attached_id)
         attached.close()
-        reopened = Sandbox.from_id(attached_id, connection=connection)
+        reopened = Environment.from_id(attached_id, connection=connection)
         try:
             result = reopened.commands.run("printf 'close-preserved'")
             if not (result.exit_code == 0 and result.stdout == 'close-preserved'):
@@ -137,14 +137,14 @@ def run(connection, image, output):
             reopened.close()
         # A handle obtained through from_id is detached from ownership by
         # design. Delete explicitly after proving close preserved the remote.
-        Sandbox.delete(attached_id, connection=connection)
+        Environment.delete(attached_id, connection=connection)
         remaining.remove(attached_id)
         _wait_deleted(attached_id, connection)
         passed('lifecycle.attached-close-preserves-instance', started)
 
         started = begin('lifecycle.context-manager-deletes')
         context_id = ''
-        with Sandbox(
+        with Environment(
             image=image,
             runtime='runc',
             cpu=500,
@@ -163,7 +163,7 @@ def run(connection, image, output):
         passed('lifecycle.context-manager-deletes', started)
 
         started = begin('lifecycle.idle-timeout-reclaims')
-        idle = Sandbox(
+        idle = Environment(
             image=image,
             runtime='runc',
             cpu=500,
@@ -212,6 +212,6 @@ def run(connection, image, output):
     finally:
         for instance_id in remaining:
             try:
-                Sandbox.delete(instance_id, connection=connection)
+                Environment.delete(instance_id, connection=connection)
             except Exception:
                 logging.getLogger(__name__).debug("Best-effort operation failed", exc_info=True)

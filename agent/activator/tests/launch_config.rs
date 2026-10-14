@@ -1,5 +1,5 @@
 use adx_activator::Activator;
-use adx_agent_core::{launch::LaunchConfig, sandbox::*, *};
+use adx_agent_core::{environment::*, launch::LaunchConfig, *};
 use adx_agent_store::{AgentState, MemoryRepository};
 use std::{
     collections::BTreeMap,
@@ -7,25 +7,32 @@ use std::{
 };
 
 #[derive(Default)]
-struct Capture(Mutex<Vec<CreateSandbox>>);
+struct Capture(Mutex<Vec<CreateEnvironment>>);
 #[async_trait::async_trait]
-impl Sandbox for Capture {
-    async fn create(&self, request: &CreateSandbox) -> Result<SandboxObservation, SandboxError> {
+impl Environment for Capture {
+    async fn create(
+        &self,
+        request: &CreateEnvironment,
+    ) -> Result<EnvironmentObservation, EnvironmentError> {
         self.0.lock().unwrap().push(request.clone());
-        Ok(SandboxObservation {
+        Ok(EnvironmentObservation {
             id: request.id.clone(),
             tenant: request.tenant.clone(),
-            phase: SandboxPhase::Running,
+            phase: EnvironmentPhase::Running,
             ready: true,
             runtime_id: None,
             message: None,
         })
     }
-    async fn get(&self, _: &str, _: &str) -> Result<Option<SandboxObservation>, SandboxError> {
+    async fn get(
+        &self,
+        _: &str,
+        _: &str,
+    ) -> Result<Option<EnvironmentObservation>, EnvironmentError> {
         Ok(None)
     }
-    async fn delete(&self, _: &str, _: &str) -> Result<SandboxObservation, SandboxError> {
-        Err(SandboxError::NotFound)
+    async fn delete(&self, _: &str, _: &str) -> Result<EnvironmentObservation, EnvironmentError> {
+        Err(EnvironmentError::NotFound)
     }
 }
 #[tokio::test]

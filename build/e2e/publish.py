@@ -91,4 +91,8 @@ if __name__ == '__main__':
     digest = publish('/execd.tar')
     Path('/secrets/image').write_text('127.0.0.1:5000/adx-execd@' + digest)
     Path('/evidence/execd-image.json').write_text(json.dumps({'registry_digest': digest}))
+    if Path('/activator.tar').is_file():
+        activator_digest = publish('/activator.tar', repository='adx-activator-workload')
+        Path('/secrets/activator-image').write_text('127.0.0.1:5000/adx-activator-workload@' + activator_digest)
+        Path('/evidence/activator-image.json').write_text(json.dumps({'registry_digest': activator_digest}))
     print('EXECD manifest uploaded and verified', digest)

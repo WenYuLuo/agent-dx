@@ -1,10 +1,12 @@
-//! Stateless AgentBinding activation. Platform owns Sandbox lifecycle and readiness.
-pub mod local_sandbox;
-pub mod sandbox_request;
+//! Stateless AgentBinding activation. Platform owns Environment lifecycle and readiness.
+pub mod environment_request;
+pub mod local_environment;
 pub mod server;
 pub mod transport;
+use adx_agent_core::environment::{
+    CreateEnvironment, Environment, EnvironmentObservation, EnvironmentPhase,
+};
 pub use adx_agent_core::error::{Error, Result};
-use adx_agent_core::sandbox::{CreateSandbox, Sandbox, SandboxObservation, SandboxPhase};
 use adx_agent_core::{activator::Target, AgentBinding, BindingPhase, Scope, TemplateVersion};
 use adx_agent_store::AgentState;
 use hashlink::LinkedHashMap;
@@ -36,15 +38,15 @@ struct Binding {
 
 pub struct Activator {
     state: AgentState,
-    sandbox: Arc<dyn Sandbox>,
+    environment: Arc<dyn Environment>,
     bindings: Mutex<LinkedHashMap<Scope, Binding>>,
     cache: CacheSettings,
 }
 impl Activator {
-    pub fn new(state: AgentState, sandbox: Arc<dyn Sandbox>) -> Self {
+    pub fn new(state: AgentState, environment: Arc<dyn Environment>) -> Self {
         Self {
             state,
-            sandbox,
+            environment,
             bindings: Mutex::new(LinkedHashMap::new()),
             cache: CacheSettings::default(),
         }
@@ -52,7 +54,7 @@ impl Activator {
     /// Returns Invalid for a zero idle timeout. Capacity zero disables the cache.
     pub fn with_cache(
         state: AgentState,
-        sandbox: Arc<dyn Sandbox>,
+        environment: Arc<dyn Environment>,
         cache: CacheSettings,
     ) -> Result<Self> {
         if cache.idle_seconds == 0 {
@@ -62,7 +64,7 @@ impl Activator {
         }
         Ok(Self {
             cache,
-            ..Self::new(state, sandbox)
+            ..Self::new(state, environment)
         })
     }
     async fn invalidate(&self, scope: &Scope) {
@@ -72,7 +74,7 @@ impl Activator {
         }
     }
     pub async fn publish(&self, tenant: &str, template: &TemplateVersion) -> Result<()> {
-        self.sandbox.validate_execution(&template.into())?;
+        self.environment.validate_execution(&template.into())?;
         self.state.publish(tenant, template).await?;
         Ok(())
     }
@@ -99,10 +101,13 @@ impl Activator {
             .await?;
         Ok(self.state.list_bindings(query).await?)
     }
-    fn validate_observation(binding: &AgentBinding, observed: &SandboxObservation) -> Result<()> {
-        if observed.id != binding.sandbox_id || observed.tenant != binding.scope.tenant {
+    fn validate_observation(
+        binding: &AgentBinding,
+        observed: &EnvironmentObservation,
+    ) -> Result<()> {
+        if observed.id != binding.environment_id || observed.tenant != binding.scope.tenant {
             return Err(Error::Unavailable(
-                "Sandbox response identity mismatch".into(),
+                "Environment response identity mismatch".into(),
             ));
         }
         Ok(())
@@ -116,9 +121,9 @@ impl Activator {
         let template = self
             .template(&scope.tenant, &scope.template, &scope.version)
             .await?;
-        let mut execution: adx_agent_core::sandbox::ExecutionSpec = (&template).into();
+        let mut execution: adx_agent_core::environment::ExecutionSpec = (&template).into();
         execution.env.extend(launch.env.clone());
-        self.sandbox.validate_execution(&execution)?;
+        self.environment.validate_execution(&execution)?;
         Ok(self
             .state
             .create_binding_with_launch(scope.clone(), Some(launch))
@@ -198,17 +203,21 @@ impl Activator {
         if binding.phase != BindingPhase::Active {
             return Err(Error::Conflict("binding is deleting".into()));
         }
-        let mut execution: adx_agent_core::sandbox::ExecutionSpec = (&template).into();
+        let mut execution: adx_agent_core::environment::ExecutionSpec = (&template).into();
         if let Some(launch) = self.state.launch_config(&binding).await? {
             execution.env.extend(launch.env);
         }
-        self.sandbox.validate_execution(&execution)?;
-        let observed = match self.sandbox.get(&scope.tenant, &binding.sandbox_id).await? {
+        self.environment.validate_execution(&execution)?;
+        let observed = match self
+            .environment
+            .get(&scope.tenant, &binding.environment_id)
+            .await?
+        {
             Some(observed) => observed,
             None => {
-                self.sandbox
-                    .create(&CreateSandbox {
-                        id: binding.sandbox_id.clone(),
+                self.environment
+                    .create(&CreateEnvironment {
+                        id: binding.environment_id.clone(),
                         tenant: scope.tenant.clone(),
                         execution,
                         deadline_unix_ms: Some(deadline_unix_ms),
@@ -224,7 +233,7 @@ impl Activator {
             return Err(Error::Conflict("binding changed during activation".into()));
         }
         match observed.phase {
-            SandboxPhase::Running if observed.ready => {
+            EnvironmentPhase::Running if observed.ready => {
                 let mut bindings = self.bindings.lock().await;
                 if let Some(cached) = bindings.get_mut(scope) {
                     if Arc::ptr_eq(&cached.attempt, &attempt) {
@@ -240,14 +249,14 @@ impl Activator {
                     service: template.service,
                 })
             }
-            SandboxPhase::Creating | SandboxPhase::Running => Err(Error::NotReady(
-                "Sandbox is not ready; retry the same AgentBinding".into(),
+            EnvironmentPhase::Creating | EnvironmentPhase::Running => Err(Error::NotReady(
+                "Environment is not ready; retry the same AgentBinding".into(),
             )),
-            SandboxPhase::Failed => Err(Error::Conflict(
-                "Sandbox failed; inspect Platform state".into(),
+            EnvironmentPhase::Failed => Err(Error::Conflict(
+                "Environment failed; inspect Platform state".into(),
             )),
-            SandboxPhase::Deleted => Err(Error::Conflict(
-                "Sandbox was deleted; create a new AgentBinding lifecycle".into(),
+            EnvironmentPhase::Deleted => Err(Error::Conflict(
+                "Environment was deleted; create a new AgentBinding lifecycle".into(),
             )),
         }
     }
@@ -258,11 +267,11 @@ impl Activator {
         let binding = self.state.begin_delete(scope).await?;
         self.invalidate(scope).await;
         let observed = self
-            .sandbox
-            .delete(&scope.tenant, &binding.sandbox_id)
+            .environment
+            .delete(&scope.tenant, &binding.environment_id)
             .await?;
         Self::validate_observation(&binding, &observed)?;
-        if observed.phase != SandboxPhase::Deleted {
+        if observed.phase != EnvironmentPhase::Deleted {
             return Err(Error::OutcomeUnknown(
                 "Platform has not confirmed deletion; retry this AgentBinding deletion".into(),
             ));

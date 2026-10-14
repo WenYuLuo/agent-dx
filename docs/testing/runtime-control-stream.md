@@ -69,7 +69,7 @@ Gateway 最终 lib 检查 108 项通过、2 项忽略，包含上述 4 项真实
 
 复用上述 Lima、KVM 和 sandboxd kit，在真实 SDK 创建请求中配置双向、任意协议、`0.0.0.0/0` 拒绝规则，优先级为用户可用最大值 `4294967294`；入站、出站及 DNS 默认动作均为拒绝。先验证 stateful，再在线切换 stateless。受控 TCP 目标先确认被阻断，临时添加窄范围允许规则后确认可访问，再恢复全拒绝并确认阻断，避免把目标服务不可达误判为策略生效。
 
-首次 `firecracker-009` 在专项第 4 项失败：切换 stateless 后，SDK 提交出站探测命令发生读取超时，尚未进入第二次 checkpoint。原因是平台只允许 Execd 服务端口的入站流量，stateless 无连接跟踪，TCP 回包被用户全拒绝规则拦截。修复后，Execd 50090 和声明的公开 TCP 端口在 stateless 模式下使用按沙箱本地端口匹配的双向系统规则；stateful 仍使用入站规则和连接跟踪。主动控制连接继续只放行本节点 IPv4／控制端口的系统规则。规则及管理访问例外见[部署契约](../deployment/runtime-control-stream.md)。本轮未修改或重建 sandboxd。
+首次 `firecracker-009` 在专项第 4 项失败：切换 stateless 后，SDK 提交出站探测命令发生读取超时，尚未进入第二次 checkpoint。原因是平台只允许 Execd 服务端口的入站流量，stateless 无连接跟踪，TCP 回包被用户全拒绝规则拦截。修复后，Execd 50090 和声明的公开 TCP 端口在 stateless 模式下使用按运行环境本地端口匹配的双向系统规则；stateful 仍使用入站规则和连接跟踪。主动控制连接继续只放行本节点 IPv4／控制端口的系统规则。规则及管理访问例外见[部署契约](../deployment/runtime-control-stream.md)。本轮未修改或重建 sandboxd。
 
 新增 `stateless_policy_allows_execd_and_published_port_replies` 先在真实 gRPC／UDS 适配器测试中失败，修复后转绿，覆盖 Start 和运行期策略更新；adxlet 全套 162 项、workspace 全 targets/features Clippy 和 fmt 均通过。随后重建 adxlet，统一包的 29 个文件全部校验通过，与前一份包相比仅 `bin/adxlet` 内容变化。
 

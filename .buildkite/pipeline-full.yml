@@ -1,5 +1,5 @@
 steps:
-- label: ':docker: Compose and publish Full-test images'
+- label: 'Images · Environment Full Acceptance'
   key: platform-images
   if: build.env("ADX_E2E_ARTIFACT_BUILD") == null
   agents:
@@ -39,7 +39,7 @@ steps:
               secretKeyRef: {name: swr-pull-secret, key: .dockerconfigjson, optional: true}
         volumes:
         - {name: docker-graph, emptyDir: {}}
-- label: ':kubernetes: ADX Full acceptance (11 groups)'
+- label: 'Acceptance · Environment SDK · Kubernetes Full (11 groups)'
   key: platform-e2e
   depends_on: platform-images
   agents:
@@ -61,12 +61,12 @@ steps:
         imagePullSecrets:
         - name: swr-pull-secret
         containers:
-        - image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/sandbox-deployer:v20260506_kubectl_py39
+        - image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/environment-deployer:v20260506_kubectl_py39
           resources:
             requests: {cpu: '2', memory: 4Gi}
             limits: {cpu: '4', memory: 8Gi}
           env: *registry-env
-- label: ':kubernetes: Firecracker checkpoint + snapshots + faults'
+- label: 'Acceptance · Environment · Firecracker checkpoint + snapshots + faults'
   key: platform-fc-e2e
   if: build.env("ADX_E2E_ARTIFACT_BUILD") == null && build.env("ADX_E2E_CHECKPOINT") == "1"
   depends_on: platform-images
@@ -88,7 +88,7 @@ steps:
         imagePullSecrets:
         - name: swr-pull-secret
         containers:
-        - image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/sandbox-deployer:v20260506_kubectl_py39
+        - image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/environment-deployer:v20260506_kubectl_py39
           resources:
             requests: {cpu: '2', memory: 4Gi}
             limits: {cpu: '4', memory: 8Gi}

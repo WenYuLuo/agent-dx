@@ -151,7 +151,7 @@ pub trait RuntimeDriver: Send + Sync {
     async fn set_network_policy(
         &self,
         _runtime_id: &str,
-        _policy: Option<&adx_core::sandbox::NetworkPolicy>,
+        _policy: Option<&adx_core::execution::NetworkPolicy>,
         _ports: &[u16],
     ) -> Result<()> {
         Err(Error::Invalid(

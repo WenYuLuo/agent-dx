@@ -16,7 +16,7 @@ class IdleActiveScenarioTests(unittest.TestCase):
     def fixture(self, *, running=True):
         state = {"now": 0, "created": 0, "closed": False, "deleted": False, "waited": False, "command": None}
 
-        class Sandbox:
+        class Environment:
             def __init__(self, **options):
                 state["created"] += 1
                 state["options"] = options
@@ -59,7 +59,7 @@ class IdleActiveScenarioTests(unittest.TestCase):
             state["deleted"] = True
 
         modules = {
-            "adx_sandbox": types.SimpleNamespace(Sandbox=Sandbox),
+            "adx_environment": types.SimpleNamespace(Environment=Environment),
             "node": types.SimpleNamespace(catalog=catalog),
             "functional_lifecycle": types.SimpleNamespace(_wait_deleted=wait_deleted),
         }

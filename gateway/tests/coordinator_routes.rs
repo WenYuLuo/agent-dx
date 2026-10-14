@@ -233,7 +233,7 @@ fn resumed_execution_route_replaces_source_and_rejects_older_revision() {
         ..Default::default()
     })
     .unwrap();
-    assert_eq!(store.get("i").unwrap().sandbox_id, "i-1-r5");
+    assert_eq!(store.get("i").unwrap().environment_id, "i-1-r5");
     assert!(c
         .apply(RouteFrame {
             epoch: 1,

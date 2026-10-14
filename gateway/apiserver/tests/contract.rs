@@ -69,11 +69,11 @@ fn sandboxd_options_are_typed_and_preserved() {
         "failover":true,"inheritEntrypoint":true,
         "ports":["8080"],
         "mounts":[{"type":"bind","target":"/models","options":["ro"],"image_url":"registry.example/models:v2"}],
-        "network":{"schemaVersion":2,"traffic":{"ingressDefaultAction":"deny","egressDefaultAction":"allow","mode":"stateful","rules":[{"action":"allow","direction":"ingress","protocol":"tcp","sandboxPort":8080,"priority":100}]}},
+        "network":{"schemaVersion":2,"traffic":{"ingressDefaultAction":"deny","egressDefaultAction":"allow","mode":"stateful","rules":[{"action":"allow","direction":"ingress","protocol":"tcp","environmentPort":8080,"priority":100}]}},
         "dataPlane":{"tunnelSecurityMode":"tls","portForwardSecurityMode":"tls-token"},
         "extra_config":{"networkStack":"netstack"}
     }), &caller()).unwrap();
-    let options = spec.sandbox.unwrap();
+    let options = spec.execution.unwrap();
     assert!(options.failover && options.inherit_entrypoint);
     assert_eq!(options.ports, vec![8080]);
     assert_eq!(options.mounts.len(), 1);
@@ -96,7 +96,7 @@ fn s3_rootfs_and_mount_credentials_follow_sandboxd_contract() {
         "rootfs":{"runtime":"runsc","type":"s3","storageInfo":{"endpoint":"https://s3.example","bucket":"rootfs","object":"base.erofs","accessKey":"key","secretKey":"secret"}},
         "mounts":[{"type":"erofs","target":"/weights","options":["ro"],"s3_config":{"endpoint":"https://s3.example","bucket":"models","object":"weights.erofs"}}]
     }), &caller()).unwrap();
-    let options = spec.sandbox.unwrap();
+    let options = spec.execution.unwrap();
     assert!(matches!(
         options.rootfs.unwrap().source.unwrap().source.unwrap(),
         pb::storage_source::Source::S3(_)
@@ -114,7 +114,7 @@ fn s3_rootfs_and_mount_credentials_follow_sandboxd_contract() {
 }
 
 #[test]
-fn unsafe_or_inconsistent_sandbox_options_are_rejected() {
+fn unsafe_or_inconsistent_environment_options_are_rejected() {
     for body in [
         json!({"image":"img","mounts":[{"type":"bind","target":"/data","hostPath":"/host"}]}),
         json!({"rootfs":{"runtime":"runsc","type":"local","path":"/host/root"}}),
@@ -275,7 +275,7 @@ fn deployment_environment_supplies_default_root_and_runtime_but_snapshot_inherit
     assert_eq!(runtime_only.runtime_class, "firecracker");
     let environment = runtime_only.runtime_profile.unwrap();
     assert_eq!(environment.rootfs.unwrap().runtime_class, "firecracker");
-    assert!(runtime_only.sandbox.unwrap().rootfs.is_none());
+    assert!(runtime_only.execution.unwrap().rootfs.is_none());
 
     let readonly_only = create(json!({"rootfs":{"readonly":true}}));
     assert!(readonly_only.image.is_empty());
@@ -287,7 +287,7 @@ fn deployment_environment_supplies_default_root_and_runtime_but_snapshot_inherit
             .unwrap()
             .readonly
     );
-    assert!(readonly_only.sandbox.unwrap().rootfs.is_none());
+    assert!(readonly_only.execution.unwrap().rootfs.is_none());
 
     let custom = create(json!({"image":"ubuntu:24.04"}));
     assert_eq!(custom.image, "ubuntu:24.04");
@@ -315,14 +315,14 @@ fn rootfs_source_replacement_inherits_default_readonly_unless_explicitly_overrid
     };
 
     let inherited = create(json!({"type":"image","imageurl":"app:v1"}));
-    assert!(inherited.sandbox.unwrap().rootfs.unwrap().readonly);
+    assert!(inherited.execution.unwrap().rootfs.unwrap().readonly);
 
     let writable = create(json!({
         "type":"image",
         "imageurl":"app:v1",
         "readonly":false
     }));
-    assert!(!writable.sandbox.unwrap().rootfs.unwrap().readonly);
+    assert!(!writable.execution.unwrap().rootfs.unwrap().readonly);
 }
 
 #[test]
@@ -336,7 +336,8 @@ fn workload_probes_preserve_actions_defaults_and_initialization_budget() {
         &caller(),
     )
     .unwrap();
-    let options: adx_core::sandbox::SandboxOptions = spec.sandbox.unwrap().try_into().unwrap();
+    let options: adx_core::execution::ExecutionOptions =
+        spec.execution.unwrap().try_into().unwrap();
     assert_eq!(options.init_timeout_seconds, 120);
     let readiness = options.readiness_probe.unwrap();
     assert_eq!(
@@ -391,7 +392,7 @@ fn constructor_cwd_is_preserved_and_invalid_paths_are_rejected() {
     )
     .unwrap();
     let model: adx_core::EnvironmentSpec = spec.try_into().unwrap();
-    assert_eq!(model.sandbox.cwd.as_deref(), Some("/workspace/nested"));
+    assert_eq!(model.execution.cwd.as_deref(), Some("/workspace/nested"));
     for cwd in [
         "",
         "relative/path",
@@ -403,7 +404,7 @@ fn constructor_cwd_is_preserved_and_invalid_paths_are_rejected() {
     }
     assert!(create_spec(json!({"image":"image"}), &caller())
         .unwrap()
-        .sandbox
+        .execution
         .unwrap()
         .cwd
         .is_none());

@@ -22,7 +22,7 @@ fn snapshot() -> Snapshot {
             scheduling: Default::default(),
             env: Default::default(),
             lifecycle: Default::default(),
-            sandbox: Default::default(),
+            execution: Default::default(),
         },
         "node1".into(),
         "source-1".into(),

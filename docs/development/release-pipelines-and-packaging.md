@@ -148,10 +148,10 @@ execd-images.json
 logs/、junit/
 ```
 
-当前发布包默认共进程部署：`adx-apiserver` 内嵌 Ingress，`adxlet` 内嵌 Relay；同时提供 `adx-ingress` 和 `adx-relay`，供显式分进程部署。调试用 `adx-data-plane-forward` 不随包发布。
+当前发布包默认共进程部署：`adx-apiserver` 内嵌 Ingress，`adxlet` 内嵌 Relay；同时提供 `adx-ingress`、`adx-relay` 和 `adx-activator`，供显式分进程部署。调试用 `adx-data-plane-forward` 不随包发布。
 
-平台包的 `bin/` 为 `adxctl`、`adx-coordinator`、`adxlet`、`adx-apiserver` 和
-`redis-server`；一体化归档继续包含 `runtime/adx-execd`、EROFS payload 与 SDK。
+平台包的 `bin/` 为 `adxctl`、`adx-inspect`、`adx-coordinator`、`adxlet`、`adx-apiserver`、
+`adx-ingress`、`adx-relay`、`adx-activator`、`redis-server` 和 `redis-cli`；一体化归档继续包含 `runtime/adx-execd`、EROFS payload 与 SDK。
 
 基础出包的 `source-gate` 负责单元、契约和静态检查，`package-smoke` 负责验证刚生成
 制品的最小真实闭环。它证明基础包可安装、可启动和可完成一次 Environment 生命周期，
@@ -159,21 +159,26 @@ logs/、junit/
 候选才允许进入 OBS；上传步骤失败时，该候选不具备可发布状态。`source-gate` 同时
 运行 `adxadmin` 的快速 HTTP/CLI 契约测试，但管理工具 wheel 仍按独立制品构建。
 
-## 流水线二：ADX Python SDK Package
+## 流水线二：ADX Environment SDK
 
 Buildkite pipeline slug 为 `agent-dx-python-sdk`，配置入口为
 `.buildkite/pipeline-sdk.yml`。
+
+线上展示名为 `Agent DX Environment SDK`。基础流水线与独立 SDK 流水线的
+step 展示名统一使用 `Environment SDK`；Full 流水线展示名为
+`Agent DX Environment Full Test`。URL slug 与 `sdk-package`、`sdk-obs`、
+`sdk-pypi` step key 保持稳定，跨流水线下载仍能定位历史候选制品。
 
 ### 触发
 
 - SDK、公开 OpenAPI、数据面协议或兼容性测试发生变化时，由 Pull Request 触发。
 - 主分支提交生成开发候选。
-- SDK 标签 `sdk-vX.Y.Z` 生成正式候选；SDK 继续使用自己的版本号。
+- 仓库统一 release tag（如 `v0.1.0rc1`）生成正式候选；SDK 包版本读取其 `pyproject.toml`。
 
 ### 步骤
 
 1. `sdk-contract`
-   - 检查 SDK 与 `sandbox.yaml`、`data-plane.yaml` 的能力和错误映射。
+   - 检查 SDK 与 `environment.yaml`、`data-plane.yaml` 的能力和错误映射。
 2. `sdk-test-py{310,311,312,313}`
    - 单元、传输、重试、PTY、reverse tunnel 和类型契约测试。
 3. `sdk-build`
@@ -183,7 +188,7 @@ Buildkite pipeline slug 为 `agent-dx-python-sdk`，配置入口为
 5. `sdk-candidate-index`
    - 输出版本、提交、Python 范围、公开协议版本、文件 SHA256 和 build ID。
 6. `sdk-publish`
-   - `ADX_SDK_PYPI_UPLOAD=1` 且标签严格匹配 `sdk-v<version>` 时才执行；
+   - `ADX_SDK_PYPI_UPLOAD=1` 且构建使用仓库统一 release tag 时才执行；
      `ADX_SDK_PYPI_REPOSITORY` 可选择 PyPI 或 TestPyPI。
    - 只上传 `sdk-package` 生成并校验的 wheel/sdist，上传后按文件名和 SHA256 回读索引；
      OBS 发布仍由独立的 `ADX_OBS_UPLOAD` 控制。
@@ -191,8 +196,8 @@ Buildkite pipeline slug 为 `agent-dx-python-sdk`，配置入口为
 ### 产物
 
 ```text
-adx_sandbox-<sdk-version>-py3-none-any.whl
-adx_sandbox-<sdk-version>.tar.gz
+adx_environment-<sdk-version>-py3-none-any.whl
+adx_environment-<sdk-version>.tar.gz
 sdk-candidate.json
 sdk-sbom.spdx.json
 logs/、junit/
@@ -210,7 +215,7 @@ SDK wheel 不再隐式跟随平台版本。一个 ADX release 通过 `release.js
 
 上传是可选动作。默认没有发布步骤；只有 `ADX_ADMIN_PYPI_UPLOAD=1` 时才运行
 `admin-pypi`。`ADX_ADMIN_PYPI_REPOSITORY` 可设为 `testpypi` 或 `pypi`，省略时选择
-正式 PyPI。发布还要求标签严格为 `adxadmin-v<version>`，从 Kubernetes Secret
+正式 PyPI。发布还要求构建使用仓库统一 release tag，从 Kubernetes Secret
 `adx-pypi-credentials` 读取对应 API Token。发布步骤只消费 `admin-package` 的不可变
 候选，不重新构建，也不跳过已存在版本；上传后通过索引 JSON API 核对完整文件集合和
 SHA256。这样普通提交、PR 和未显式开启上传的标签构建都只留下可审查制品，不修改包
@@ -321,7 +326,7 @@ Runtime Pack 与平台包分开，是因为 runc 与 Firecracker 的宿主权限
 更新频率不同。安装器可以安装并生成 sandboxd 的 systemd unit，但 ADX supervisor
 仍不托管 sandboxd。
 
-### 4. Python SDK 包
+### 4. Environment SDK 包
 
 标准 wheel/sdist 是唯一 SDK 发布物。平台包不再复制一份可能过期的 wheel；离线包
 可以携带 `packages/python/` 下由 `release.json` 指定的 wheel。
@@ -341,7 +346,7 @@ adx-offline-<release-version>-linux-<arch>.tar.zst
 ├── packages/platform.tar.zst
 ├── packages/execd.tar.zst
 ├── packages/runtime-runc.tar.zst
-├── packages/python/adx_sandbox-*.whl
+├── packages/python/adx_environment-*.whl
 ├── packages/python/adxadmin-*.whl
 ├── deploy/process/              # YAML profiles、systemd 模板
 ├── deploy/kubernetes/           # Helm chart，仅渲染现有进程/Pod，不增加 Operator
@@ -362,7 +367,7 @@ adx-offline-<release-version>-linux-<arch>.tar.zst
   "commit": "<40-hex>",
   "platform": {"version": "0.2.0", "target": "linux-amd64", "sha256": "..."},
   "execd": {"version": "0.2.3", "protocol": 1, "sha256": "..."},
-  "sdk": {"name": "adx-sandbox", "version": "0.2.1", "sha256": "..."},
+  "sdk": {"name": "adx-environment", "version": "0.2.1", "sha256": "..."},
   "runtime": {"backend": "runc", "version": "sandboxd-efc2015.1", "sha256": "..."},
   "images": {"node": "registry/adx-node@sha256:...", "execd": "registry/adx-execd@sha256:..."}
 }
@@ -401,7 +406,9 @@ chart 只组织现有进程、Secret、Service、持久卷和外部 sandboxd Run
 
 ## 版本与发布规则
 
-- Platform 使用 `vX.Y.Z`，Execd 使用独立版本字段，SDK 使用独立 `sdk-vX.Y.Z`，
+- 仓库使用统一 release tag `vX.Y.Z` 或其预发布形式（如 `v0.1.0rc1`）。Platform、
+  Execd、SDK 和 adxadmin 共享这次仓库发布身份；SDK 和 adxadmin 的包版本分别读取
+  自身 `pyproject.toml`，不要求与仓库 tag 字符串一致。
   Runtime Pack 使用后端提交和补丁集派生的不可变版本。Platform 与 Execd 可在同一次
   基础出包构建中生成，但必须是两个独立归档和两个独立 manifest。
 - `release.json` 才定义一次 ADX 产品发布中 Platform、Execd、SDK 和 Runtime Pack 的

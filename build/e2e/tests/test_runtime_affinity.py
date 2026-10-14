@@ -18,7 +18,7 @@ class RuntimeAffinityScenarioTests(unittest.TestCase):
     def fixture(self, *, runsc_node="node2", assigned_node="node2"):
         state = {"created": 0, "deleted": False, "closed": False, "commands": []}
 
-        class Sandbox:
+        class Environment:
             def __init__(self, **options):
                 state["created"] += 1
                 state["options"] = options
@@ -63,7 +63,7 @@ class RuntimeAffinityScenarioTests(unittest.TestCase):
             return result
 
         modules = {
-            "adx_sandbox": types.SimpleNamespace(Sandbox=Sandbox),
+            "adx_environment": types.SimpleNamespace(Environment=Environment),
             "node": types.SimpleNamespace(catalog=catalog),
             "runtime_inventory": runtime_inventory,
         }

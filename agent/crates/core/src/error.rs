@@ -18,9 +18,9 @@ impl std::fmt::Display for Error {
 }
 impl std::error::Error for Error {}
 pub type Result<T> = std::result::Result<T, Error>;
-impl From<crate::sandbox::SandboxError> for Error {
-    fn from(value: crate::sandbox::SandboxError) -> Self {
-        use crate::sandbox::SandboxError as E;
+impl From<crate::environment::EnvironmentError> for Error {
+    fn from(value: crate::environment::EnvironmentError) -> Self {
+        use crate::environment::EnvironmentError as E;
         match value {
             E::NotFound => Self::NotFound,
             E::Invalid(s) => Self::Invalid(s),

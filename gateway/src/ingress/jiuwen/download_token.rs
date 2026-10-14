@@ -54,7 +54,7 @@ impl DownloadVerifier {
     }
 
     /// Explicit template env takes precedence. Otherwise use bytes read from
-    /// config.secret_file() in the already-authorized Sandbox. Like AgentServer,
+    /// config.secret_file() in the already-authorized Environment. Like AgentServer,
     /// strip file whitespace, but never create a new key when missing/invalid.
     /// Returns InvalidSecret for absent/non-UTF8/short file contents or TooLarge.
     pub fn from_config(config: &DownloadConfig, file_contents: Option<&[u8]>) -> Result<Self> {
@@ -190,7 +190,7 @@ pub struct SignedDownload {
     expires: Option<f64>,
     asset: Option<Asset>,
 }
-pub use crate::ingress::sandbox_files::FileMetadata;
+pub use crate::ingress::environment_files::FileMetadata;
 pub struct CheckedDownload {
     path: String,
     name: String,
@@ -250,7 +250,7 @@ impl SignedDownload {
         )))
     }
 
-    /// Check metadata obtained for path() in the same authorized Sandbox. Verified
+    /// Check metadata obtained for path() in the same authorized Environment. Verified
     /// claims also require sidecar bytes read at registration_path(asset_root).
     /// Returns expiry, root/registration, size or file-type errors. Digest is compared
     /// to the durable registration, not recalculated over downloaded content. These

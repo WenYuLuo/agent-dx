@@ -20,7 +20,7 @@
 | api-control | 真实 Rust HTTPS 进程 → Rust Coordinator／Node RPC → Redis，另验证 Coordinator 进程启动重启 | 生产 API 二进制摘要、TLS／进程日志；运行时为测试实现 |
 | apiserver | Rust API Server 契约与缓存测试 | Cargo 测试日志 |
 | agent | 原 Agent 测试集 | 日志、JUnit XML |
-| sandbox-sdk | 完整离线 SDK 测试集 | 日志、JUnit XML |
+| environment-sdk | 完整离线 SDK 测试集 | 日志、JUnit XML |
 | interop | SDK → 真实 Execd → 测试 HTTP upstream 的 Socket 互操作 | 构建与进程测试日志 |
 | package | Python SDK 与 `adxadmin` 分别生成 wheel 和 sdist | 安装包及 SHA256 |
 
@@ -44,7 +44,7 @@ export PIP_CACHE_DIR=/your/cache/pip
 .venv/bin/python build/ci/run.py rust --jobs 2
 .venv/bin/python build/ci/run.py apiserver --jobs 2
 .venv/bin/python build/ci/run.py agent
-.venv/bin/python build/ci/run.py sandbox-sdk
+.venv/bin/python build/ci/run.py environment-sdk
 .venv/bin/python build/ci/run.py interop --jobs 2
 .venv/bin/python build/ci/run.py package
 ```
@@ -70,13 +70,13 @@ agent-dx-python-sdk ───┘                         ↓
 
 ### 1. 构建及制品交接
 
-基础包流水线生成 Coordinator、adxlet、Sandbox API、Ingress、Relay、Execd 和部署工具；SDK 流水线独立测试并生成 wheel、sdist 与候选清单。Full 要求 `ADX_BASE_PACKAGE_BUILD_ID` 和 `ADX_SDK_BUILD_ID`，核对 commit 和 SHA256 后才组合镜像；部署阶段不重新编译或从开发机借用程序。
+基础包流水线生成 Coordinator、adxlet、Environment API、Ingress、Relay、Execd 和部署工具；SDK 流水线独立测试并生成 wheel、sdist 与候选清单。Full 要求 `ADX_BASE_PACKAGE_BUILD_ID` 和 `ADX_SDK_BUILD_ID`，核对 commit 和 SHA256 后才组合镜像；部署阶段不重新编译或从开发机借用程序。
 
 `build/images/Dockerfile.ci` 保留为构建环境配方，发布后按 digest 引用。运行环境按 sandboxd 的真实运行要求配置；Buildkite 以 Kubernetes Pod 承载测试进程，Pod 内使用统一 supervisor；通过 kubectl 清单部署，不增加产品 Kubernetes 控制器。
 
 ### 2. 部署完整平台
 
-- 平台组件：Redis、单 Coordinator（Global 与内嵌 Shard）、Sandbox API、Ingress、两个 adxlet 和 Relay。
+- 平台组件：Redis、单 Coordinator（Global 与内嵌 Shard）、Environment API、Ingress、两个 adxlet 和 Relay。
 - 执行后端：测试环境独立托管 sandboxd，锁定 PR #56 提交 `efc201531d7e2e9d69505da151eb66084b61eebf`（见 `third_party/sandboxd/source.json`）；使用本次构建的 Execd 准备真实实例环境。
 - 客户端：干净 Python 环境安装本次构建的 SDK wheel，通过对外入口操作；禁止用源码 PYTHONPATH 代替安装包验收。
 - 用例资源：本轮独立的租户/API Key、实例、端口与目录。快照阶段接入实际的对象存储测试后端；GPU/NPU 在对应环境与能力实现后扩展。
@@ -114,13 +114,13 @@ Full 流水线默认执行十组用例：SDK、数据面、生命周期、认证
 ### 第一条纵向链路：创建、命令、删除
 
 ```text
-Sandbox SDK → Rust API Server → Coordinator / Global → Shard → adxlet → sandboxd
+Environment SDK → Rust API Server → Coordinator / Global → Shard → adxlet → sandboxd
                        现有实例操作 ────────────────────────┘
 命令与文件：SDK → Ingress → Relay → Execd
 状态提交：adxlet → Coordinator → Redis；Coordinator → Ingress 发布路由
 ```
 
-先实现纯 Environment 状态与资源类型、adxlet 串行控制器及 RuntimeDriver 边界。紧接着接入最小 RPC、Redis 提交、内嵌 Shard、Sandbox API 后端，打通完整链路。Global 保留轮转职责，Shard 实际选择节点，adxlet 本机复核并拥有生命周期状态机。
+先实现纯 Environment 状态与资源类型、adxlet 串行控制器及 RuntimeDriver 边界。紧接着接入最小 RPC、Redis 提交、内嵌 Shard、Environment API 后端，打通完整链路。Global 保留轮转职责，Shard 实际选择节点，adxlet 本机复核并拥有生命周期状态机。
 
 首批必过的真实功能用例：
 
@@ -151,11 +151,11 @@ Sandbox SDK → Rust API Server → Coordinator / Global → Shard → adxlet �
 
 环境驱动器统一负责部署、探测、收集和清理：每轮唯一标识、独立目录与端口，只清理本轮启动的 PID/容器和测试实例，不按进程名批量 kill。普通功能两节点可共宿主；真实节点故障与网络分区必须使用可独立隔离的环境。sandboxd 由测试环境独立托管，产品 supervisor 不托管它。
 
-Agent 业务通过 Sandbox SDK 验收；平台基础流水线无需启动 Agent 服务。Agent 对新 Sandbox SDK 的真实适配完成后，增加单独跨层测试，不以当前路由透传测试代替业务闭环。
+Agent 业务通过 Environment SDK 验收；平台基础流水线无需启动 Agent 服务。Agent 对新 Environment SDK 的真实适配完成后，增加单独跨层测试，不以当前路由透传测试代替业务闭环。
 
 ## 早期组件验证记录（历史批次）
 
-基于 `1e49d86` 加当前 CI 工作树修改，通过同一 runner 验证：本地执行器 7 项；Rust 199 项；Go 107 个顶层测试（含子测试 200 项）及 vet；Agent 234 项通过、1 项跳过；Sandbox SDK 233 项通过；真实 SDK/Execd Socket 互操作 11 项；四包 8 个 wheel/sdist，SHA256 已复核。
+基于 `1e49d86` 加当前 CI 工作树修改，通过同一 runner 验证：本地执行器 7 项；Rust 199 项；Go 107 个顶层测试（含子测试 200 项）及 vet；Agent 234 项通过、1 项跳过；Environment SDK 233 项通过；真实 SDK/Execd Socket 互操作 11 项；四包 8 个 wheel/sdist，SHA256 已复核。
 
 Go 使用 Linux arm64 容器，其余使用 macOS arm64。完整平台尚未部署，以上结果不包含 Environment 生命周期 E2E。
 

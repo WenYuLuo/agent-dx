@@ -22,7 +22,7 @@ fn spec(id: &str, tenant: &str, priority: i32) -> EnvironmentSpec {
         resources: resources(1),
         priority,
         scheduling: Default::default(),
-        sandbox: Default::default(),
+        execution: Default::default(),
     }
 }
 

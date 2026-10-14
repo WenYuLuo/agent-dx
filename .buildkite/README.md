@@ -2,12 +2,18 @@
 
 ADX uses four Buildkite pipelines backed by one repository:
 
-| Buildkite pipeline | Configuration | Responsibility |
-|---|---|---|
-| `agent-dx` | `pipeline-package.yml` | Platform/Execd/SDK/adxadmin UT and packages, install smoke, real Kubernetes L0, default OBS upload and optional PyPI publication |
-| `agent-dx-python-sdk` | `pipeline-sdk.yml` | Python SDK tests, wheel/sdist, clean install smoke and optional OBS/PyPI publication |
-| `agent-dx-admin` | `pipeline-admin.yml` | Standalone adxadmin UT, wheel/sdist, install smoke and optional PyPI publication |
-| `agent-dx-full-test` | `pipeline-full.yml` | Compose exact base/SDK candidates and run the eleven-group Kubernetes Full gate |
+| Buildkite display name | URL slug | Configuration | Responsibility |
+|---|---|---|---|
+| Agent DX | `agent-dx` | `pipeline-package.yml` | Platform/Execd/SDK/adxadmin UT and packages, install smoke, real Kubernetes L0, default OBS upload and optional PyPI publication |
+| Agent DX Environment SDK | `agent-dx-python-sdk` | `pipeline-sdk.yml` | Environment SDK tests, wheel/sdist, clean install smoke and optional OBS/PyPI publication |
+| agent-dx-admin | `agent-dx-admin` | `pipeline-admin.yml` | Standalone adxadmin UT, wheel/sdist, install smoke and optional PyPI publication |
+| Agent DX Environment Full Test | `agent-dx-full-test` | `pipeline-full.yml` | Compose exact base/SDK candidates and run the eleven-group Kubernetes Full gate |
+
+SDK step labels use `Environment SDK` for testing/packaging, OBS upload, PyPI
+publication and Kubernetes acceptance. URL slugs and `sdk-*` step keys remain
+stable so existing dispatch, build links and historical candidate downloads
+continue to resolve. Online bootstrap steps load the matching release,
+Environment SDK or Environment Full pipeline from this repository.
 
 `.buildkite/pipeline.yml` only dispatches by `BUILDKITE_PIPELINE_SLUG`; it does
 not contain product build or test jobs. Collector mirroring and target-node
@@ -44,9 +50,9 @@ Set these variables on a Buildkite build or in that pipeline's environment setti
 | `ADX_RELEASE_VERSION` | tag-derived | OBS release path version |
 | `ADX_OBS_BUCKET` / `ADX_OBS_ENDPOINT` | `openyuanrong` / `obs.cn-southwest-2.myhuaweicloud.com` | OBS intermediate transport and final publication destination |
 | `ADX_ARTIFACT_TRANSPORT` | `obs` | Base components: `obs` staging or explicit `buildkite` transport |
-| `ADX_ADMIN_PYPI_UPLOAD` | `0` | Base/admin: `1` enables adxadmin publication, exact `adxadmin-v<version>` tag required |
+| `ADX_ADMIN_PYPI_UPLOAD` | `0` | Base/admin: `1` enables adxadmin publication on a repository release tag |
 | `ADX_ADMIN_PYPI_REPOSITORY` | `pypi` | Base/admin: `pypi` or `testpypi` |
-| `ADX_SDK_PYPI_UPLOAD` | `0` | Base/SDK: `1` enables Sandbox SDK publication, exact `sdk-v<version>` tag required |
+| `ADX_SDK_PYPI_UPLOAD` | `0` | Base/SDK: `1` enables Environment SDK publication on a repository release tag |
 | `ADX_SDK_PYPI_REPOSITORY` | `pypi` | Base/SDK: `pypi` or `testpypi` |
 | `ADX_BASE_PACKAGE_BUILD_ID` / `ADX_SDK_BUILD_ID` | required | Full: exact input candidates; Full never publishes Python packages |
 
@@ -149,7 +155,7 @@ The base pipeline retains all these downloadable outputs:
 - `adx-release.tar.gz`: installable package, including the tested SDK wheel.
 - `adx-execd.tar.gz`: independent Execd binary, runtime EROFS filesystem and component manifest; a separate SHA256 file is provided.
 - `backend.tar.gz`: pinned sandboxd/runc dependency bundle, distinct from Execd.
-- `sdk/`: Sandbox SDK wheel, sdist, candidate and test evidence.
+- `sdk/`: Environment SDK wheel, sdist, candidate and test evidence.
 - `admin/`: adxadmin wheel, sdist, candidate and install evidence.
 
 Execd also remains in the unified installer bundle. Its independent archive is
@@ -187,18 +193,27 @@ files.
 
 `admin-pypi` is omitted unless the build explicitly sets
 `ADX_ADMIN_PYPI_UPLOAD=1`. It accepts `ADX_ADMIN_PYPI_REPOSITORY=pypi` (the
-default) or `testpypi`, and only publishes a build whose tag exactly matches
-`adxadmin-v<package-version>`. The step consumes the candidate from
+default) or `testpypi`, and only publishes a build carrying the repository's
+release tag, such as `v0.1.0rc1`. The step consumes the candidate from
 `admin-package`, never rebuilds it, and does not use `--skip-existing`. After
 upload, it reads the selected index JSON API and verifies the exact filenames
 and SHA256 values before writing `out/buildkite/admin-publish/publish.json`.
 
 The existing `sdk-package` step follows the same candidate contract for
-`adx-sandbox`. `sdk-pypi` is omitted unless `ADX_SDK_PYPI_UPLOAD=1` on an exact
-`sdk-v<package-version>` tag. `ADX_SDK_PYPI_REPOSITORY` selects `pypi` (the
+`adx-environment`. `sdk-pypi` is omitted unless `ADX_SDK_PYPI_UPLOAD=1` on a
+repository release tag. `ADX_SDK_PYPI_REPOSITORY` selects `pypi` (the
 default) or `testpypi`; successful readback is written to
 `out/buildkite/sdk-publish/publish.json`. OBS upload remains independent and is
 still controlled by `ADX_OBS_UPLOAD`.
+
+The Environment SDK starts at package version `0.1.0rc1`, declared in its
+`pyproject.toml`. Its wheel is
+`adx_environment-0.1.0rc1-py3-none-any.whl`. One repository release tag, such
+as `v0.1.0rc1`, can publish both Python packages when their respective upload
+flags are enabled. Each package keeps the version declared in its own
+`pyproject.toml`; a repository tag does not overwrite that version. Wheel
+filenames use normalized Python package versions, which omit the optional
+leading `v`.
 
 The Kubernetes execution namespace must contain this Secret:
 
@@ -211,8 +226,8 @@ type: Opaque
 stringData:
   admin-pypi-token: pypi-...
   admin-testpypi-token: pypi-...
-  sandbox-pypi-token: pypi-...
-  sandbox-testpypi-token: pypi-...
+  environment-pypi-token: pypi-...
+  environment-testpypi-token: pypi-...
 ```
 
 The four entries are optional independently; a selected package and repository
@@ -232,8 +247,8 @@ umask 077
 kubectl -n <buildkite-agent-namespace> create secret generic adx-pypi-credentials \
   --from-file=admin-pypi-token=/secure/adxadmin-pypi.token \
   --from-file=admin-testpypi-token=/secure/adxadmin-testpypi.token \
-  --from-file=sandbox-pypi-token=/secure/adx-sandbox-pypi.token \
-  --from-file=sandbox-testpypi-token=/secure/adx-sandbox-testpypi.token \
+  --from-file=environment-pypi-token=/secure/adx-environment-pypi.token \
+  --from-file=environment-testpypi-token=/secure/adx-environment-testpypi.token \
   --dry-run=client -o yaml | kubectl apply -f -
 ```
 
@@ -241,7 +256,7 @@ kubectl -n <buildkite-agent-namespace> create secret generic adx-pypi-credential
 
 | Resource in the test namespace | Processes |
 |---|---|
-| `node1` Pod | Redis, Coordinator with embedded Shard, Sandbox API, Ingress, Adxlet, Relay, independently hosted sandboxd |
+| `node1` Pod | Redis, Coordinator with embedded Shard, Environment API, Ingress, Adxlet, Relay, independently hosted sandboxd |
 | `node2` Pod | Adxlet, Relay, independently hosted sandboxd |
 | `coordinator` / `node2` Services | Service addresses for Redis, Coordinator and Ingress; nodes advertise their Pod IPs for RPC/forwarding |
 | `adx-test-credentials` Secret | Short-lived test certificates and API/Redis keys |
@@ -279,12 +294,12 @@ and the Kubernetes plugin. Worker images follow the existing CI profiles:
 | `build-platform` / `build-gateway` / `build-execd` / `source-gate` | immutable `ci_image` digest in `build/images/build-environment.json` |
 | `platform-build` | same immutable ADX build image |
 | `admin-package` / `sdk-package` / `platform-images` | `swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/sandbox-packager:v20260506_kubectl` |
-| `platform-e2e` | `swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/sandbox-deployer:v20260506_kubectl_py39` |
+| `platform-e2e` | `swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/environment-deployer:v20260506_kubectl_py39` |
 
 The builder reuses `/mnt/paas` with ADX cache subdirectories. The packager uses
 its privileged Docker setup and an emptyDir at `/var/lib/docker`, starting only
 its own daemon when required. The deployer uses the existing Agent Stack patch:
-Secret `sandbox-target-kubeconfig` is mounted at
+Secret `environment-target-kubeconfig` is mounted at
 `/var/run/yr-k8s/target/kubeconfig` on `container-0`. Container names are left to
 the controller so this patch continues to apply. `ADX_KUBE_CONTEXT` may select
 a context from that file. The target kubeconfig needs permission to manage the
@@ -443,7 +458,16 @@ available separately for development reproduction in [build/e2e](../build/e2e/RE
 Buildkite syntax follows the official [Agent Stack execution](https://buildkite.com/docs/agent/self-hosted/agent-stack-k8s/running-builds)
 and [PodSpec configuration](https://buildkite.com/docs/agent/self-hosted/agent-stack-k8s/podspec).
 
-构建会在复用的 worker 中按版本和 SHA256 准备 Go 1.25.5、Redis 7.2.5。基础流水线通过 OBS 下载 `third_party/sandboxd/artifacts.json` 固定的 sandboxd 后端归档，校验完整包、提交、文件摘要和实际 ELF 架构。源码重建维护入口为 `build/e2e/build_backend.py`，不作为常规出包的自动回退。未指定基础镜像时，打包步骤按仓库 Dockerfile 构建并发布测试基础镜像，再用 registry digest 构建节点与 EXECD 镜像。`ADX_REDIS_SERVER` / `ADX_REDIS_CLI` 和 `ADX_E2E_RUNTIME_BASE` / `ADX_E2E_EXECD_BASE` 可显式覆盖。
+Builds use version- and SHA256-pinned Go 1.25.5 and Redis 7.2.5 on reusable
+workers. The base pipeline downloads the sandboxd backend archive pinned by
+`third_party/sandboxd/artifacts.json` from OBS and verifies the complete package,
+commit, file digests, and actual ELF architecture. `build/e2e/build_backend.py`
+is the maintenance entrypoint for source rebuilds; regular packaging does not
+fall back to it automatically. When no base image is supplied, packaging builds
+and publishes the test base images from the repository Dockerfiles, then uses
+their registry digests to build the node and EXECD images. Explicit overrides
+are available through `ADX_REDIS_SERVER` / `ADX_REDIS_CLI` and
+`ADX_E2E_RUNTIME_BASE` / `ADX_E2E_EXECD_BASE`.
 
 ## ADX build image and Cargo cache
 
@@ -561,17 +585,42 @@ an isolated Kubernetes Pod and publishes deployment, per-case, JUnit and cleanup
 evidence. See [runtime kit and invocation](../build/e2e/firecracker/README.md).
 The existing basic E2E result alone does not count as this profile passing.
 
-组件日志采集验收复用现有 Ingress/Relay 指标端点，并通过真实 OpenTelemetry Collector 接收结构化组件日志。stop 组包含后端 503、文件滚动与 Collector 重启，控制台输出 `[METRICS PASS]` / `[COLLECTION PASS]`；产物含 `gateway-metrics-node*.json`、`collection-node*.json`、`collected-logs.jsonl` 和 `collector-process.log`。部署及保证边界见 `docs/testing/log-collection.md`。Trace验收输出 `[TRACE PASS]`，保存 `traces-node*.json` 与 `collected-traces.jsonl`，检查完整创建链路和实例队列父子关系；配置见 `docs/testing/distributed-traces.md`。
+Component log-collection acceptance reuses the Ingress/Relay metrics endpoints
+and receives structured component logs through a real OpenTelemetry Collector.
+The stop group covers backend HTTP 503 responses, file rotation, and Collector
+restart. It prints `[METRICS PASS]` / `[COLLECTION PASS]` and saves
+`gateway-metrics-node*.json`, `collection-node*.json`, `collected-logs.jsonl`,
+and `collector-process.log`. See the [log-collection contract](../docs/testing/log-collection.md)
+for deployment and guarantee boundaries. Trace acceptance prints `[TRACE PASS]`,
+saves `traces-node*.json` and `collected-traces.jsonl`, and checks the complete
+creation chain and parent-child relationships in the Environment queue. See
+[distributed tracing](../docs/testing/distributed-traces.md) for configuration.
 
-### Collector 镜像同步
+### Collector image synchronization
 
-设置 `ADX_COLLECTOR_SYNC_ONLY=1` 触发独立 `collector-sync` 步骤，跳过编译、产品镜像和 K8s 验收。复用现有 SWR Secret，将 `build/observability/source.json` 锁定的 Linux AMD64 manifest 同步至 `ADX_E2E_IMAGE_REPOSITORY`。默认从 GHCR 拉取，可通过 `ADX_COLLECTOR_SYNC_SOURCE` 指定其他仓库，摘要保持不变。
+Set `ADX_COLLECTOR_SYNC_ONLY=1` to trigger the independent `collector-sync` step,
+skipping compilation, product images, and Kubernetes acceptance. It reuses the
+existing SWR Secret to mirror the Linux AMD64 manifest pinned by
+`build/observability/source.json` into `ADX_E2E_IMAGE_REPOSITORY`. GHCR is the
+default source; `ADX_COLLECTOR_SYNC_SOURCE` selects another repository while
+preserving the digest.
 
-步骤日志记录下载、推送和按原摘要回拉，产物位于 `out/buildkite/collector-sync/`，含 `result.json` 与镜像地址。同步成功后才更新正式构建的 Collector 默认地址；同步步骤通过不代表 K8s 验收通过。
+The step logs download, push, and pull-back verification against the original
+digest. Artifacts under `out/buildkite/collector-sync/` include `result.json`
+and the image reference. Update the regular build's default Collector reference
+only after synchronization succeeds. A successful synchronization step does
+not establish Kubernetes acceptance.
 
-正式镜像构建默认使用 `source.json` 中的 `ci_image`，即西南二区 SWR 的 Linux AMD64 固定摘要，已通过 [Buildkite #20](https://buildkite.com/agent-dx/agent-dx/builds/20) 推送及回拉验证。`ADX_COLLECTOR_IMAGE` 可覆盖完整引用；`ADX_COLLECTOR_MIRROR` 继续用于选择承载上游多架构索引的镜像站。本地构建默认仍使用上游多架构镜像。
+Regular image builds default to `ci_image` in `source.json`: the digest-pinned
+Linux AMD64 image in the cn-southwest-2 SWR registry, whose push and pull-back
+verification was recorded in [Buildkite #20](https://buildkite.com/agent-dx/agent-dx/builds/20).
+`ADX_COLLECTOR_IMAGE` overrides the complete reference. `ADX_COLLECTOR_MIRROR`
+selects a mirror hosting the upstream multi-architecture index. Local builds
+still default to the upstream multi-architecture image.
 
-OBS 后端 pin 按目标架构选择归档。归档无法下载或校验失败时，本轮装配失败；CI 不切换源、不重新编译 sandboxd。ADX 产品每次从当前提交构建。
+The OBS backend pin selects an archive for the target architecture. A download
+or verification failure fails assembly; CI does not switch sources or rebuild
+sandboxd. ADX product components are built from the selected commit on every run.
 
 The basic acceptance driver also runs an independent `local-first` case: restart API Server with `create_mode=local_first`, verify concurrent public SDK creation, real commands and deletion, require confirmed-claim evidence, then restore central mode. The default `k8s-basic` profile contains five bounded cases. The eleven-case `full` and local `standalone` profiles carry installed-SDK `data-plane`, `lifecycle` and fault/restart/stop coverage. [Buildkite #30](https://buildkite.com/agent-dx/agent-dx/builds/30) passed the previous eight-case OCI profile; the current profile split requires fresh formal evidence.
 

@@ -7,7 +7,7 @@ import urllib.request
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 
-from adx_sandbox import Sandbox, SandboxError
+from adx_environment import Environment, EnvironmentError
 from node import catalog
 from runtime_inventory import require_runc_only_inventory, require_unassigned_create
 
@@ -46,7 +46,7 @@ def run(connection, image, output, ca, admin_key, *, queue_reader=pending_ids, c
     started = clock()
 
     def create():
-        return Sandbox(
+        return Environment(
             name=name,
             image=image,
             runtime='runsc',
@@ -73,13 +73,13 @@ def run(connection, image, output, ca, admin_key, *, queue_reader=pending_ids, c
                     sleep(0.05)
                 try:
                     unexpected = future.result(timeout=90)
-                except SandboxError as error:
+                except EnvironmentError as error:
                     deadline_contract_invalid = (
                         'central scheduling queue deadline exceeded' not in str(error)
                         or error.code != 'OUTCOME_UNKNOWN'
                         or error.retry != 'same_operation'
                         or error.outcome != 'unknown'
-                        or error.instance_id != instance_id
+                        or error.environment_id != instance_id
                     )
                     if deadline_contract_invalid:
                         raise AssertionError(f'wrong scheduling deadline contract: {error}') from error
@@ -87,7 +87,7 @@ def run(connection, image, output, ca, admin_key, *, queue_reader=pending_ids, c
                         'code': error.code,
                         'retry': error.retry,
                         'outcome': error.outcome,
-                        'instance_id': error.instance_id,
+                        'instance_id': error.environment_id,
                     }
                 else:
                     try:
@@ -100,7 +100,7 @@ def run(connection, image, output, ca, admin_key, *, queue_reader=pending_ids, c
                     # Do not leave a create running after a failed observation.
                     try:
                         unexpected = future.result(timeout=90)
-                    except SandboxError:
+                    except EnvironmentError:
                         pass
                     except Exception as error:
                         report['cleanup_errors'].append(f'create did not settle: {error}')

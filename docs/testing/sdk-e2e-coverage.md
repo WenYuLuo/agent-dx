@@ -1,9 +1,9 @@
-# Sandbox SDK 公开能力与端到端覆盖
+# Environment SDK 公开能力与端到端覆盖
 
-本清单从 `adx_sandbox` 的公开导出反向检查端到端用例。当前 `__all__` 有 48 个名字：6 个
+本清单从 `adx_environment` 的公开导出反向检查端到端用例。当前 `__all__` 有 48 个名字：6 个
 操作入口类、12 个错误类型、28 个数据／策略类型，以及 `resources()` 和
-`SDK_CAPABILITIES`。`Commands` 与 `Filesystem` 不单独顶层导出，但由 `Sandbox` 属性返回，
-也是用户接口。`SandboxFailure` 是 `SandboxInfo.failure` 使用的结构化失败数据，
+`SDK_CAPABILITIES`。`Commands` 与 `Filesystem` 不单独顶层导出，但由 `Environment` 属性返回，
+也是用户接口。`EnvironmentFailure` 是 `EnvironmentInfo.failure` 使用的结构化失败数据，
 不新增独立操作；公开操作仍为 66 个。
 
 操作数的统计口径是上述操作入口及其返回对象的每个公开方法／属性，加顶层
@@ -19,7 +19,7 @@ E2E case ID；静态测试会在 SDK 新增、删除或漏登记公开成员时�
 
 | 公开对象 | 操作数 | E2E 覆盖 | 运行层级 | 说明 |
 |---|---:|---:|---|---|
-| `Sandbox` | 26 | 26 | Standalone + KVM FC | 普通生命周期、访问操作和 reverse tunnel 由 Standalone 验证；checkpoint、S3 rootfs/mount、入口继承、reload、运行期网络策略和 failover 由 FC 验证 |
+| `Environment` | 26 | 26 | Standalone + KVM FC | 普通生命周期、访问操作和 reverse tunnel 由 Standalone 验证；checkpoint、S3 rootfs/mount、入口继承、reload、运行期网络策略和 failover 由 FC 验证 |
 | `CommandHandle` | 8 | 8 | Standalone | ID、归属、poll、同步／异步 wait、kill、stdin、EOF |
 | `Commands` | 6 | 6 | Standalone | run/get/list/kill/send_stdin/close_stdin |
 | `Filesystem` | 10 | 10 | Standalone | 文本／二进制、CRUD、深度目录、双向目录复制 |
@@ -39,12 +39,12 @@ SDK 查询实际偏移并沿同一上传 ID 继续；`download-response-cut` 在
 
 ### Reverse tunnel 集成
 
-`Sandbox(upstream=...)` 创建请求携带 tunnel 配置，API Server 写入 Execd tunnel 端口，Ingress 将
+`Environment(upstream=...)` 创建请求携带 tunnel 配置，API Server 写入 Execd tunnel 端口，Ingress 将
 `/tunnel/{instance}` 解析为 8765，Relay 复核实例绑定后连接 Execd，SDK `TunnelClient` 再把
 请求转给本机 upstream。adxlet 不得给生产 Execd 注入隔离测试专用的
 `EXECD_HTTP_ONLY=1`，否则 Execd 只启动命令／文件 HTTP listener，tunnel 握手会在 Ingress 返回 502。
 
-Standalone r11 的 `reverse-tunnel.sdk-upstream-roundtrip` 从 Sandbox 内访问
+Standalone r11 的 `reverse-tunnel.sdk-upstream-roundtrip` 从 Environment 内访问
 `get_tunnel_url()`，经过 Execd、Relay、Ingress 和 SDK TunnelClient 到达 SDK 进程中的真实 HTTP
 upstream，并校验响应体和路径。该项不是客户端序列化单测。
 
@@ -70,7 +70,7 @@ upstream，并校验响应体和路径。该项不是客户端序列化单测。
 
 | 错误 | 当前 E2E |
 |---|---|
-| `SandboxNotFound`、`PermissionDenied` | 已覆盖 |
+| `EnvironmentNotFound`、`PermissionDenied` | 已覆盖 |
 | `CommandConflict`、`CommandNotFound`、等待超时返回 `RUNNING`／`WAIT_TIMEOUT`、重复 kill 返回 `False` | SDK 单测覆盖；端到端覆盖以对应运行记录为准 |
 | `CommandSubmissionError` | `command-response-cut` 在 cn-north-4 双 worker 定向 Full 实跑通过：真实 `process.start` 应答被 TLS 代理切断，新 SDK 客户端以稳定命令 ID 查询结果并检查副作用仅一次；见本轮测试报告 |
 | `CommandUnavailable` | `command-watch-unavailable` 和 `command-watch-query-unavailable` 均在 cn-north-4 双 worker 定向部署通过；后一项同时拒绝 Watch 与 `process.get`，验证结构化结果未知 |

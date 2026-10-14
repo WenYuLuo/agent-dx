@@ -1,6 +1,6 @@
 use adx_core::{
+    execution::{Rootfs, StorageSource},
     runtime_profile::RuntimeProfile,
-    sandbox::{Rootfs, StorageSource},
     EnvironmentSpec,
 };
 use adxlet::sandboxd::{proto, start_request, Config};
@@ -87,11 +87,11 @@ fn custom_image_mounts_the_same_local_environment_read_only() {
     };
     let mut wanted = spec("ubuntu:24.04");
     wanted.image.clear();
-    wanted.sandbox.rootfs = Some(Rootfs {
+    wanted.execution.rootfs = Some(Rootfs {
         readonly: false,
         source: StorageSource::Image("ubuntu:24.04".into()),
     });
-    wanted.sandbox.inherit_entrypoint = true;
+    wanted.execution.inherit_entrypoint = true;
     let r = start_request(&wanted, "i-1", 1, &[], &config).unwrap();
     assert_eq!(
         r.rootfs.unwrap().source,
@@ -163,14 +163,14 @@ fn custom_rootfs_mounts_the_oci_runtime_image_read_only() {
 
 #[test]
 fn s3_rootfs_mounts_the_configured_environment() {
-    use adx_core::sandbox::{Rootfs, S3Source, StorageSource};
+    use adx_core::execution::{Rootfs, S3Source, StorageSource};
 
     let config = Config {
         runtime_profile: Some(runtime_profile()),
         ..Default::default()
     };
     let mut wanted = spec("");
-    wanted.sandbox.rootfs = Some(Rootfs {
+    wanted.execution.rootfs = Some(Rootfs {
         readonly: false,
         source: StorageSource::S3(S3Source {
             endpoint: "https://s3.example".into(),

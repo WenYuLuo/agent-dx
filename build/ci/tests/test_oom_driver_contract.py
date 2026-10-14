@@ -37,9 +37,9 @@ class OomDriverContractTests(unittest.TestCase):
 
     def test_unsafe_or_ambiguous_execution_is_rejected_under_optimization(self):
         for paths, message in [
-            (["/"], "unsafe sandbox cgroup"),
-            (["/../../tmp"], "unsafe sandbox cgroup"),
-            (["/akernel/test/runc", "/akernel/test/runc"], "ambiguous sandbox identity"),
+            (["/"], "unsafe environment cgroup"),
+            (["/../../tmp"], "unsafe environment cgroup"),
+            (["/akernel/test/runc", "/akernel/test/runc"], "ambiguous environment identity"),
         ]:
             with self.subTest(paths=paths), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)

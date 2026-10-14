@@ -305,7 +305,7 @@ steps:
           hostPath:
             path: /mnt/paas
             type: DirectoryOrCreate
-- label: Python · Sandbox SDK
+- label: Test & Package · Environment SDK
   key: sdk-package
   agents:
     queue: default
@@ -506,7 +506,7 @@ steps:
         imagePullSecrets:
         - name: swr-pull-secret
         containers:
-        - image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/sandbox-deployer:v20260506_kubectl_py39
+        - image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/environment-deployer:v20260506_kubectl_py39
           resources:
             requests:
               cpu: '1'
@@ -584,7 +584,7 @@ steps:
   depends_on:
   - platform-build
   - publish-amd64
-- label: Acceptance · Kubernetes L0
+- label: Acceptance · Environment SDK · Kubernetes L0
   key: platform-e2e
   depends_on: platform-images
   agents:
@@ -606,7 +606,7 @@ steps:
         imagePullSecrets:
         - name: swr-pull-secret
         containers:
-        - image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/sandbox-deployer:v20260506_kubectl_py39
+        - image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/environment-deployer:v20260506_kubectl_py39
           resources:
             requests:
               cpu: '2'
@@ -686,7 +686,7 @@ steps:
           hostPath:
             path: /mnt/paas
             type: DirectoryOrCreate
-- label: Publish · Sandbox SDK · PyPI
+- label: Publish · Environment SDK · PyPI
   key: sdk-pypi
   depends_on: platform-e2e
   if: build.env("ADX_SDK_PYPI_UPLOAD") == "1" && build.tag != null
@@ -722,17 +722,17 @@ steps:
               cpu: '2'
               memory: 4Gi
           env:
-          - name: ADX_SANDBOX_PYPI_TOKEN
+          - name: ADX_ENVIRONMENT_PYPI_TOKEN
             valueFrom:
               secretKeyRef:
                 name: adx-pypi-credentials
-                key: sandbox-pypi-token
+                key: environment-pypi-token
                 optional: true
-          - name: ADX_SANDBOX_TEST_PYPI_TOKEN
+          - name: ADX_ENVIRONMENT_TEST_PYPI_TOKEN
             valueFrom:
               secretKeyRef:
                 name: adx-pypi-credentials
-                key: sandbox-testpypi-token
+                key: environment-testpypi-token
                 optional: true
         volumes:
         - name: build-cache

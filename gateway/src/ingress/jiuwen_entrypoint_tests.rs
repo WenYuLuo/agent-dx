@@ -85,7 +85,7 @@ async fn jiuwen_auth_is_transport_independent_while_management_requires_tls() {
         response.collect().await.unwrap();
 
         // Valid business credentials reach protocol validation in either mode,
-        // without activating a Sandbox or opening a backend connection.
+        // without activating a Environment or opening a backend connection.
         let mut invalid_upgrade = upgrade_request();
         invalid_upgrade
             .headers_mut()
@@ -208,12 +208,12 @@ async fn jiuwen_public_routes_share_one_e2a_and_download_on_another_replica() {
     let managed = Arc::new(ManagedService::new(Arc::new(LocalControl::new(Arc::new(
         adx_activator::Activator::new(state, backend.clone()),
     )))));
-    let route:crate::common::route::RouteInfo=serde_json::from_value(json!({"instanceID":binding.sandbox_id,"instanceStatus":{"code":3},"tenantID":"tenant","sandboxID":"runtime-local","sandboxIP":"127.0.0.1","nodeProxyAddress":address.to_string()})).unwrap();
+    let route:crate::common::route::RouteInfo=serde_json::from_value(json!({"instanceID":binding.environment_id,"instanceStatus":{"code":3},"tenantID":"tenant","environmentID":"runtime-local","environmentIP":"127.0.0.1","nodeProxyAddress":address.to_string()})).unwrap();
     relay
         .activate_route(
             route.instance_id.clone(),
-            route.sandbox_id.clone(),
-            route.sandbox_ip.parse().unwrap(),
+            route.environment_id.clone(),
+            route.environment_ip.parse().unwrap(),
         )
         .await;
     let auth = Arc::new(TestAuth(std::sync::atomic::AtomicBool::new(false)));
@@ -448,14 +448,14 @@ async fn jiuwen_public_routes_share_one_e2a_and_download_on_another_replica() {
         backends.try_recv().is_err(),
         "upload must not create another E2A stream"
     );
-    // The ordinary Sandbox direct entry uses the same deployment credential;
+    // The ordinary Environment direct entry uses the same deployment credential;
     // a client supplies only its management identity, never the Execd secret.
     if security == IngressSecurity::Tls {
         let response = download
             .send_request(
                 Request::get(format!(
                     "/direct/{}/download?path=/work/report.txt&type=file",
-                    binding.sandbox_id
+                    binding.environment_id
                 ))
                 .header("authorization", "Bearer tenant")
                 .header("range", "bytes=0-4")
@@ -473,7 +473,7 @@ async fn jiuwen_public_routes_share_one_e2a_and_download_on_another_replica() {
             .send_request(
                 Request::get(format!(
                     "/direct/{}/download?path=/work/report.txt&type=file",
-                    binding.sandbox_id
+                    binding.environment_id
                 ))
                 .header("authorization", "Bearer other")
                 .header("range", "bytes=0-4")

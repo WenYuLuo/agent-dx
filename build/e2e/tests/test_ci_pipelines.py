@@ -88,7 +88,7 @@ class IndependentPipelineTests(unittest.TestCase):
         publisher = (ROOT / ".buildkite/publish-admin-pypi.sh").read_text()
         self.assertIn('build.env("ADX_ADMIN_PYPI_UPLOAD") == "1"', pipeline)
         self.assertIn("build.tag != null", pipeline)
-        self.assertIn("adxadmin-v${version}", publisher)
+        self.assertIn('require_repository_release_tag "${BUILDKITE_TAG:-}"', publisher)
         self.assertIn("TWINE_PASSWORD", publisher)
         self.assertIn("build/python/verify_index.py", publisher)
         self.assertNotIn("--skip-existing", publisher)
@@ -98,7 +98,7 @@ class IndependentPipelineTests(unittest.TestCase):
         publisher = (ROOT / ".buildkite/publish-sdk-pypi.sh").read_text()
         self.assertIn('build.env("ADX_SDK_PYPI_UPLOAD") == "1"', pipeline)
         self.assertIn("build.tag != null", pipeline)
-        self.assertIn("sdk-v${version}", publisher)
+        self.assertIn('require_repository_release_tag "${BUILDKITE_TAG:-}"', publisher)
         self.assertIn("TWINE_PASSWORD", publisher)
         self.assertIn("build/python/verify_index.py", publisher)
         self.assertNotIn("--skip-existing", publisher)
@@ -126,7 +126,7 @@ class IndependentPipelineTests(unittest.TestCase):
                 "git": '#!/bin/sh\n[ "$1" = rev-parse ] && echo fixture-commit\nexit 0\n',
                 "buildkite-agent": (
                     "#!/bin/sh\nmkdir -p out/buildkite/package/sdk\ntouch "
-                    "out/buildkite/package/sdk/adx_sandbox-fixture.whl\n"
+                    "out/buildkite/package/sdk/adx_environment-fixture.whl\n"
                 ),
                 "sha256sum": "#!/bin/sh\nexit 0\n",
                 "tar": "#!/bin/sh\nexit 0\n",
@@ -171,13 +171,13 @@ class IndependentPipelineTests(unittest.TestCase):
         spec.loader.exec_module(module)
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            wheel = root / "adx_sandbox-0.1.0-py3-none-any.whl"
+            wheel = root / "adx_environment-0.1.0-py3-none-any.whl"
             wheel.write_bytes(b"wheel")
             candidate = root / "sdk-candidate.json"
             candidate.write_text(
                 '{"schema_version":1,"commit":"'
                 + "a" * 40
-                + '","version":"0.1.0","files":{"adx_sandbox-0.1.0-py3-none-any.whl":"'
+                + '","version":"0.1.0","files":{"adx_environment-0.1.0-py3-none-any.whl":"'
                 + module.sha(wheel)
                 + '"}}'
             )

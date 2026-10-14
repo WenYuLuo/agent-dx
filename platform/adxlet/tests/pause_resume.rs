@@ -301,7 +301,7 @@ fn fixture() -> (
         priority: 0,
         env: Default::default(),
         scheduling: Default::default(),
-        sandbox: Default::default(),
+        execution: Default::default(),
     };
     let assignment = Assignment {
         environment_id: spec.id.clone(),
@@ -784,7 +784,7 @@ async fn unexpected_exit_restarts_with_fresh_identity_and_bounded_backoff() {
 #[tokio::test]
 async fn failover_restores_latest_checkpoint_without_cold_start() {
     let (_temp, backend, node, mut spec, assignment) = fixture();
-    spec.sandbox.failover = true;
+    spec.execution.failover = true;
     let handle = node.environment(spec, assignment).unwrap();
     let created = handle.create().await.unwrap();
     let paused = handle.pause(pause(created.record.revision)).await.unwrap();
@@ -823,7 +823,7 @@ async fn failover_restores_latest_checkpoint_without_cold_start() {
 #[tokio::test]
 async fn failover_without_checkpoint_fails_without_cold_start() {
     let (_temp, backend, node, mut spec, assignment) = fixture();
-    spec.sandbox.failover = true;
+    spec.execution.failover = true;
     let handle = node.environment(spec, assignment).unwrap();
     handle.create().await.unwrap();
     backend.running.lock().unwrap().clear();
@@ -1412,7 +1412,7 @@ async fn recovery_retries_publication_without_repeating_backend_restore() {
 #[tokio::test]
 async fn workload_checkpoint_keeps_execution_and_commits_before_acknowledging() {
     let (_temp, backend, node, mut spec, assignment) = fixture();
-    spec.sandbox.failover = true;
+    spec.execution.failover = true;
     let handle = node.environment(spec, assignment).unwrap();
     let created = handle.create().await.unwrap();
     *backend.workload_request.lock().unwrap() = Some("workload-a".into());
@@ -1504,7 +1504,7 @@ async fn expired_workload_checkpoint_is_rejected_without_starting_the_backend() 
 #[tokio::test]
 async fn workload_checkpoint_uses_configured_shared_store_before_acknowledging() {
     let (temp, backend, _node, mut spec, assignment) = fixture();
-    spec.sandbox.failover = true;
+    spec.execution.failover = true;
     let node = Adxlet::new(
         "node".into(),
         backend.clone(),
@@ -1555,7 +1555,7 @@ async fn workload_checkpoint_uses_configured_shared_store_before_acknowledging()
 #[tokio::test]
 async fn workload_checkpoint_rejects_unavailable_shared_publication() {
     let (temp, backend, _node, mut spec, assignment) = fixture();
-    spec.sandbox.failover = true;
+    spec.execution.failover = true;
     let node = Adxlet::new(
         "node".into(),
         backend.clone(),

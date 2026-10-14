@@ -338,6 +338,15 @@ def main():
                     continue
                 raise RuntimeError('fixture service exited')
             time.sleep(1)
+    elif action == 'activator-inventory':
+        prefix = sys.argv[3]
+        ids = json.loads((E / 'live-instances.json').read_text())
+        data = {'node': node, 'backends': backend(), 'labeled': [runtime for identity in ids for runtime in labeled_backend(identity)]}
+        (E / f'activator-{prefix}-{node}.json').write_text(json.dumps(data))
+    elif action in ('activator-start', 'activator-restart'):
+        from activator_fixture import start
+
+        print(json.dumps(start(node, restart=action == 'activator-restart')), flush=True)
     elif action == 'backend-ready':
         end = time.monotonic() + 30
         while True:
@@ -888,7 +897,7 @@ def main():
 
         context = ssl.create_default_context(cafile=str(S / 'tls/ca.pem'))
         request = urllib.request.Request(
-            'https://127.0.0.1:8443/api/sandbox/v1/resources',
+            'https://127.0.0.1:8443/api/environment/v1/resources',
             headers={
                 'Authorization': 'Bearer ' + (S / 'api-key').read_text().strip(),
             },
@@ -1083,7 +1092,7 @@ def main():
         os.kill(previous_pid, signal.SIGKILL)
         context = ssl.create_default_context(cafile=str(S / 'tls/ca.pem'))
         request = urllib.request.Request(
-            'https://127.0.0.1:8443/api/sandbox/v1/resources',
+            'https://127.0.0.1:8443/api/environment/v1/resources',
             headers={
                 'Authorization': 'Bearer ' + (S / 'api-key').read_text().strip(),
             },

@@ -19,22 +19,22 @@ class ScheduleDeadlineTests(unittest.TestCase):
     def test_queue_is_observed_then_drained_without_assignment(self):
         state = {'pending': False, 'created': 0, 'queries': 0}
 
-        class SandboxError(Exception):
+        class EnvironmentError(Exception):
             def __init__(self, instance_id):
                 super().__init__('central scheduling queue deadline exceeded')
                 self.code = 'OUTCOME_UNKNOWN'
                 self.retry = 'same_operation'
                 self.outcome = 'unknown'
-                self.instance_id = instance_id
+                self.environment_id = instance_id
 
-        class Sandbox:
+        class Environment:
             def __init__(self, **options):
                 state['created'] += 1
                 state['options'] = options
                 state['pending'] = True
                 time.sleep(0.08)
                 state['pending'] = False
-                raise SandboxError('default-' + options['name'])
+                raise EnvironmentError('default-' + options['name'])
 
         nodes = {
             'node:' + node: json.dumps(
@@ -55,7 +55,7 @@ class ScheduleDeadlineTests(unittest.TestCase):
         spec = importlib.util.spec_from_file_location('schedule_deadline_case', ROOT / 'schedule_deadline.py')
         scenario = importlib.util.module_from_spec(spec)
         modules = {
-            'adx_sandbox': types.SimpleNamespace(Sandbox=Sandbox, SandboxError=SandboxError),
+            'adx_environment': types.SimpleNamespace(Environment=Environment, EnvironmentError=EnvironmentError),
             'node': types.SimpleNamespace(catalog=lambda: nodes),
             'runtime_inventory': runtime_inventory,
         }

@@ -12,7 +12,7 @@ class PlacementPolicyTests(unittest.TestCase):
     def exercise(self, policy, forced_owner=None, configured_policy=None):
         state = {'owners': {}, 'deleted': set()}
 
-        class Sandbox:
+        class Environment:
             def __init__(self, **_options):
                 self.id = 'placement-' + str(len(state['owners']) + 1)
                 owner = forced_owner or ('node1' if policy == 'pack' or not state['owners']
@@ -74,17 +74,17 @@ class PlacementPolicyTests(unittest.TestCase):
                 with self.assertRaisesRegex(AssertionError, 'configured placement'):
                     run_placement_policy(inventory(), object(), 'image',
                                          '/run/sandboxd/sandboxd.sock', output, policy,
-                                         Sandbox, resources, remote)
+                                         Environment, resources, remote)
             elif forced_owner and policy == 'spread':
                 with self.assertRaisesRegex(AssertionError, 'Spread'):
                     run_placement_policy(inventory(), object(), 'image',
                                          '/run/sandboxd/sandboxd.sock', output, policy,
-                                         Sandbox, resources, remote)
+                                         Environment, resources, remote)
                 self.assertEqual(state['deleted'], set(state['owners']))
             else:
                 report = run_placement_policy(inventory(), object(), 'image',
                                               '/run/sandboxd/sandboxd.sock', output, policy,
-                                              Sandbox, resources, remote)
+                                              Environment, resources, remote)
                 self.assertEqual(report['status'], 'passed')
                 self.assertEqual(len(report['instances']), 2)
                 self.assertEqual(state['deleted'], set(state['owners']))

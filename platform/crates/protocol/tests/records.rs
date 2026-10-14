@@ -4,10 +4,10 @@ use adx_core::{
 use adx_protocol::control;
 
 #[test]
-fn sandbox_options_roundtrip_preserves_backend_contract() {
-    use adx_core::sandbox as model;
+fn environment_options_roundtrip_preserves_backend_contract() {
+    use adx_core::execution as model;
 
-    let options = model::SandboxOptions {
+    let options = model::ExecutionOptions {
         cwd: Some("/workspace/task".into()),
         rootfs: Some(model::Rootfs {
             readonly: true,
@@ -34,8 +34,8 @@ fn sandbox_options_roundtrip_preserves_backend_contract() {
                     direction: model::NetworkDirection::Ingress,
                     protocol: model::NetworkProtocol::Tcp,
                     peer: Default::default(),
-                    sandbox_port: 8080,
-                    sandbox_port_range: None,
+                    environment_port: 8080,
+                    environment_port_range: None,
                     priority: 100,
                 }],
                 mode: model::TrafficMode::Stateful,
@@ -65,8 +65,8 @@ fn sandbox_options_roundtrip_preserves_backend_contract() {
         },
         extra_config: r#"{"networkStack":"netstack"}"#.into(),
     };
-    let wire: control::SandboxOptions = options.clone().into();
-    assert_eq!(model::SandboxOptions::try_from(wire).unwrap(), options);
+    let wire: control::ExecutionOptions = options.clone().into();
+    assert_eq!(model::ExecutionOptions::try_from(wire).unwrap(), options);
 }
 
 #[test]
@@ -107,7 +107,7 @@ fn record_roundtrip_preserves_identity_state_and_ownership() {
         },
         priority: 0,
         scheduling: Default::default(),
-    sandbox: Default::default(),
+    execution: Default::default(),
     };
     let r = EnvironmentRecord {
         restart_attempts: 0,
@@ -132,7 +132,7 @@ fn record_roundtrip_preserves_identity_state_and_ownership() {
             probe_failure: None,
             reason: adx_core::RuntimeFailureReason::OomKilled,
             exit_code: Some(137),
-            message: "sandbox backend was OOM-killed".into(),
+            message: "environment backend was OOM-killed".into(),
         }),
         last_operation: None,
     };

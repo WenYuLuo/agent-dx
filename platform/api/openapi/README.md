@@ -5,16 +5,16 @@ surface. The Rust API Server and Gateway/EXECD implementations remain the source
 of truth; changes to a public route must update the matching contract in the
 same change.
 
-- [`sandbox.yaml`](sandbox.yaml) describes the public Sandbox management API,
+- [`environment.yaml`](environment.yaml) describes the public Environment management API,
   schedulable node resources, scheduler compatibility operations and
   administrator-only tenant API Key management. API Server serves these routes
-  through Ingress. Agent components use the same Sandbox capability; Agent
+  through Ingress. Agent components use the same Environment capability; Agent
   business routes are documented separately under `agent/`.
 - [`data-plane.yaml`](data-plane.yaml) describes the typed runtime data API
   forwarded by Ingress and Relay to EXECD: health, invocation, resumable upload,
   download, PTY and command-watch WebSocket setup.
 
-The generic `/{instanceId}/{port}/{path}` and `/tunnel/{instanceId}/...`
+The generic `/{environmentId}/{port}/{path}` and `/tunnel/{environmentId}/...`
 surfaces proxy application-defined protocols. They are routing contracts rather
 than typed ADX payloads and are not expanded as OpenAPI operations. EXECD
 checkpoint cooperation is an internal Adxlet contract documented in
@@ -47,7 +47,7 @@ Idle pause uses `idleTimeoutSeconds`, `idleAction: pause` and `pauseOptions`.
 The resulting Paused Environment supports either manual resume or authorized
 traffic-triggered resume. Both share the same durable intent; no separate
 auto-resume flag is required. See the
-[lifecycle API](../../../gateway/apiserver/docs/sandbox-lifecycle-api.md#idle-pause-and-auto-resume).
+[lifecycle API](../../../gateway/apiserver/docs/environment-lifecycle-api.md#idle-pause-and-auto-resume).
 
 ## Contract checks
 
@@ -60,7 +60,7 @@ python3 build/docs/check.py
 ```
 
 The basic CI source gate runs the OpenAPI checks. They compare the implemented
-Sandbox/scheduler/admin routes, create JSON fields and all public
+Environment/scheduler/admin routes, create JSON fields and all public
 `process.*`/`file.*`/`shell.*`/`entrypoint.*` dispatch aliases with the contracts;
 validate schema syntax, local references, operation IDs and schema examples;
 and test missing-route/field/action detection and invalid payloads.
@@ -69,5 +69,5 @@ This is a contract gate, not runtime E2E acceptance or a proof that every
 implementation branch matches the schema. Changes to Rust routing/dispatch
 structure must keep the extractor and its tests in sync. Generic forwarding,
 internal RPCs and Agent business APIs are outside this check's scope. Older
-`/api/sandbox/create` and `/api/sandbox/{id}` lifecycle aliases keep their
+`/api/environment/create` and `/api/environment/{id}` lifecycle aliases keep their
 existing compatibility behavior; the canonical public contract is v1.

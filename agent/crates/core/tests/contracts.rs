@@ -40,7 +40,7 @@ fn binding_identity_round_trips_between_wire_scope_and_target() {
         "binding": {
             "scope": scope_json,
             "generation": "generation-a",
-            "sandbox_id": "sandbox-a",
+            "environment_id": "environment-a",
             "phase": "active"
         },
         "service": [{"protocol": "ws", "port": 8080}]
@@ -73,12 +73,15 @@ fn isolation_and_reserved_environment_are_not_silently_changed() {
 fn internal_response_additions_are_allowed_but_write_specs_remain_strict() {
     let observation = serde_json::json!({"id":"i", "tenant":"t", "phase":"running", "ready":true, "runtime_id":null, "message":null, "future_field":42});
     assert!(
-        serde_json::from_value::<adx_agent_core::sandbox::SandboxObservation>(observation).is_ok()
+        serde_json::from_value::<adx_agent_core::environment::EnvironmentObservation>(observation)
+            .is_ok()
     );
-    let target = serde_json::json!({"binding":{"sandbox_id":"s", "scope":{"tenant":"t","template":"a","version":"1","binding_id":"e"}, "generation":"g", "phase":"active"}, "service":[], "future_field":42});
+    let target = serde_json::json!({"binding":{"environment_id":"s", "scope":{"tenant":"t","template":"a","version":"1","binding_id":"e"}, "generation":"g", "phase":"active"}, "service":[], "future_field":42});
     assert!(serde_json::from_value::<adx_agent_core::activator::Target>(target).is_ok());
     let execution = serde_json::json!({"image":"app", "isolation_runtime":"runc", "entrypoint":[], "working_dir":"/", "user":null, "env":{}, "resources":{"cpu_millis":1,"memory_mib":1}, "service":[], "future_field":42});
-    assert!(serde_json::from_value::<adx_agent_core::sandbox::ExecutionSpec>(execution).is_err());
+    assert!(
+        serde_json::from_value::<adx_agent_core::environment::ExecutionSpec>(execution).is_err()
+    );
 }
 
 #[test]
@@ -96,7 +99,7 @@ fn managed_template_inherits_image_process_without_overrides() {
         serde_json::to_value(&template).unwrap().get("working_dir"),
         None
     );
-    let execution = adx_agent_core::sandbox::ExecutionSpec::from(&template);
+    let execution = adx_agent_core::environment::ExecutionSpec::from(&template);
     execution.validate().unwrap();
     assert_eq!(
         serde_json::to_value(execution).unwrap()["inherit_entrypoint"],

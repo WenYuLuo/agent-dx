@@ -2,17 +2,17 @@
 
 import time
 
-from adx_sandbox import SandboxError
+from adx_environment import EnvironmentError
 
 
-def wait_for_route(sandbox, *, timeout=10, clock=time.monotonic, sleep=time.sleep):
+def wait_for_route(environment, *, timeout=10, clock=time.monotonic, sleep=time.sleep):
     """Use a read-only command query; retry only a missing synchronized route."""
     deadline = clock() + timeout
     while True:
         try:
-            sandbox.commands.list()
+            environment.commands.list()
             return
-        except SandboxError as error:
+        except EnvironmentError as error:
             if 'route absent from synchronized cache' not in str(error):
                 raise
             if clock() >= deadline:

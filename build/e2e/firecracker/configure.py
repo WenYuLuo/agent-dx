@@ -354,11 +354,11 @@ print('configured', node, capacity)
 (P / 'capacity.json').write_text(
     json.dumps({'capacity': capacity, 'devices': [], 'valid_until_unix_seconds': int(time.time()) + 7200})
 )
-sandbox_config = (R / 'config.toml').read_text()
-a = sandbox_config.index('[plugin.runtime.runc]')
-b = sandbox_config.index('[plugin.image]', a)
-sandbox_config = (
-    sandbox_config[:a]
+environment_config = (R / 'config.toml').read_text()
+a = environment_config.index('[plugin.runtime.runc]')
+b = environment_config.index('[plugin.image]', a)
+environment_config = (
+    environment_config[:a]
     + f"""[plugin.node_resource]
 provider = "cgroup"
 sock_path = "{P}/resource.sock"
@@ -378,9 +378,9 @@ firecracker = ""
 [plugin.runtime.runtime_binary]
 firecracker = "/opt/adx-fc/bin/firecracker"
 """
-    + sandbox_config[b:]
+    + environment_config[b:]
 )
-(R / 'config.toml').write_text(sandbox_config)
+(R / 'config.toml').write_text(environment_config)
 (P / 'registry.yaml').write_text(
     (
         f"version: 0.1\nlog:\n  level: warn\nstorage:\n  "

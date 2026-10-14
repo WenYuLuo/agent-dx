@@ -110,7 +110,7 @@ impl Operations {
                 .ok_or_else(|| Status::data_loss("resume assignment missing"))?
                 .node_id
                 .clone();
-            let value = json!({"sandboxId": id, "state": "running", "routeAddress": owner.relay_address,
+            let value = json!({"environmentId": id, "state": "running", "routeAddress": owner.relay_address,
                 "functionProxyId": node, "nodeId": node, "portMappings": {}});
             self.clients.put_owner(owner).await?;
             return Ok(value);
@@ -378,7 +378,7 @@ impl Operations {
                                 .ok_or_else(|| Status::data_loss("invalid checkpoint artifact"))?
                                 .size_bytes;
                             json!({
-                                "sandboxId": id,
+                                "environmentId": id,
                                 "snapshotId": checkpoint.id,
                                 "size": size,
                                 "state": "paused",

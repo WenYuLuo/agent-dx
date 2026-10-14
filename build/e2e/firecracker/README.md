@@ -1,13 +1,13 @@
 # Firecracker checkpoint 验收
 
-这组脚本由独立 Linux VM 或 Kubernetes Pod 内的进程部署共用。运行完整 ADX 发布包、外部 sandboxd/Firecracker、真实 S3 服务与公共 Sandbox SDK。不会用模拟后端替代 checkpoint。运行前要求 `/dev/kvm` 支持 API 12；Linux 内核、EROFS、网络及 FC 制品还需符合所选 sandboxd 版本。
+这组脚本由独立 Linux VM 或 Kubernetes Pod 内的进程部署共用。运行完整 ADX 发布包、外部 sandboxd/Firecracker、真实 S3 服务与公共 Environment SDK。不会用模拟后端替代 checkpoint。运行前要求 `/dev/kvm` 支持 API 12；Linux 内核、EROFS、网络及 FC 制品还需符合所选 sandboxd 版本。
 
 ## 运行布局
 
 默认基目录 `/opt/adx`，可设置 `ADX_FC_BASE`。目录需包含：
 
 - `package/`：经过 `build/release/package.py verify` 验证的统一发布包。
-- `client/bin/python`：已安装该包 Sandbox SDK 的 Python 环境。
+- `client/bin/python`：已安装该包 Environment SDK 的 Python 环境。
 - `e2e/`：本目录所属的 `build/e2e`，以及 `rpc_certificates.py`、发布包验证器 `package.py` 和同一发布包的 `lib/package_manifest.py`（复制到 `e2e/package_manifest.py`）。
 - `tools/minio`、`tools/redis-cli`、`tools/distill_fs`；本地 OCI tar 模式另需 `tools/docker-registry`、`execd.tar` 和用于入口继承验收的 `entrypoint.tar`。
 
@@ -24,7 +24,7 @@ sudo env ADX_FC_BASE=/opt/adx ADX_FC_PROXY_MODE=embedded \
 
 对支持主动控制流的当前 Execd 镜像，可设置 `ADX_E2E_RUNTIME_CONTROL=1`。驱动为 adxlet 配置网桥网关 `10.231.16.1:19003` 上的 gRPC 监听及节点私有凭据文件；FC guest 默认回连 `http://10.231.16.1:19003`，可通过 `ADX_E2E_RUNTIME_CONTROL_ADDRESS` 与 `ADX_E2E_RUNTIME_CONTROL_LISTEN` 分别指定回连和监听地址。使用同一版本的 ADX 发布包、静态 Execd 与 SDK，不能用旧镜像验证该模式。
 
-另外在基目录准备静态 `checkpoint-probe`。它由本目录的 `checkpoint_probe.rs` 为 guest 架构编译，是通过 SDK 上传到沙箱内的 Unix HTTP 客户端，实际调用 `/run/adx/execd.sock`，不是模拟 checkpoint 后端。ARM64 musl 构建示例：
+另外在基目录准备静态 `checkpoint-probe`。它由本目录的 `checkpoint_probe.rs` 为 guest 架构编译，是通过 SDK 上传到运行环境内的 Unix HTTP 客户端，实际调用 `/run/adx/execd.sock`，不是模拟 checkpoint 后端。ARM64 musl 构建示例：
 
 ```sh
 rustc --edition=2024 --target aarch64-unknown-linux-musl \
@@ -33,7 +33,7 @@ sudo env ADX_FC_BASE=/opt/adx ADX_E2E_RUNTIME_CONTROL=1 \
   python3 -u /opt/adx/e2e/firecracker/node.py /var/lib/adx-fc-test/control-stream
 ```
 
-启用后，驱动先执行 `sdk_control_stream.py` 的七项公共 SDK 检查：全网段拒绝下主动 Ready 创建；普通出网阻断而 SDK 命令／文件可用；stateful 全封禁下沙箱内 Unix checkpoint 与持久化完成；切换 stateless 全封禁后再次 checkpoint；reload 的执行身份切换、数据回滚与出网仍阻断；暂停后仅重启 adxlet 并恢复、出网仍阻断；删除后的 Redis 和物理后端清理。策略包含用户最高优先级的双向 Any／`0.0.0.0/0` Deny 和双向默认 Deny。通过临时仅允许探测 peer 的地址与端口确认目标实际可达，恢复全封禁后再次验证。结果写到 `evidence/sdk-control-stream.json`，任一项失败会阻止后续全量 FC 集合。
+启用后，驱动先执行 `sdk_control_stream.py` 的七项公共 SDK 检查：全网段拒绝下主动 Ready 创建；普通出网阻断而 SDK 命令／文件可用；stateful 全封禁下运行环境内 Unix checkpoint 与持久化完成；切换 stateless 全封禁后再次 checkpoint；reload 的执行身份切换、数据回滚与出网仍阻断；暂停后仅重启 adxlet 并恢复、出网仍阻断；删除后的 Redis 和物理后端清理。策略包含用户最高优先级的双向 Any／`0.0.0.0/0` Deny 和双向默认 Deny。通过临时仅允许探测 peer 的地址与端口确认目标实际可达，恢复全封禁后再次验证。结果写到 `evidence/sdk-control-stream.json`，任一项失败会阻止后续全量 FC 集合。
 
 本地两节点 Docker 驱动同样接受 `ADX_E2E_RUNTIME_CONTROL=1`，将监听地址设为每个容器的可达节点地址。基础功能仍由原 Standalone 用例集合验证。
 

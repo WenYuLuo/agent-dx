@@ -32,7 +32,7 @@ Adxlet 核对完整身份和 `running`，状态确认后再检查 sandboxd 实�
 ## 工作负载 probes
 
 Execd 执行用户 readiness / healthcheck，公开配置见
-[Sandbox API](../../../gateway/apiserver/docs/sandbox-lifecycle-api.md#workload-probes-on-image-startup)。
+[Environment API](../../../gateway/apiserver/docs/environment-lifecycle-api.md#workload-probes-on-image-startup)。
 Readiness 等待期间 `phase=initializing`，首次成功才进入 `running`。
 初始化截止或 healthcheck 达到阈值时 `phase=failed`，增加 `failure`：
 

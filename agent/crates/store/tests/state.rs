@@ -30,7 +30,7 @@ async fn exercise(a: Arc<dyn Repository>, b: Arc<dyn Repository>) {
     assert_eq!(original, y.unwrap());
     assert_eq!(a.binding(&scope).await.unwrap(), Some(original.clone()));
     let deleting = b.begin_delete(&scope).await.unwrap();
-    assert_eq!(deleting.sandbox_id, original.sandbox_id);
+    assert_eq!(deleting.environment_id, original.environment_id);
     assert_eq!(deleting.phase, BindingPhase::Deleting);
     assert!(matches!(
         a.create_binding(scope.clone()).await,
@@ -40,7 +40,7 @@ async fn exercise(a: Arc<dyn Repository>, b: Arc<dyn Repository>) {
     assert!(b.binding(&scope).await.unwrap().is_none());
     let fresh = b.create_binding(scope.clone()).await.unwrap();
     assert_ne!(fresh.generation, original.generation);
-    assert_ne!(fresh.sandbox_id, original.sandbox_id);
+    assert_ne!(fresh.environment_id, original.environment_id);
     a.finish_delete(&deleting).await.unwrap();
     assert_eq!(a.binding(&scope).await.unwrap(), Some(fresh));
     let other = Scope {

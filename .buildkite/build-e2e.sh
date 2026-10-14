@@ -16,7 +16,7 @@ echo "--- :test_tube: Release tooling tests"
 python3 -u -m unittest discover -s build/release/tests -v 2>&1 | tee out/buildkite/logs/release-tests.log
 echo "--- :rust: Rust guideline gate"
 make rust-check JOBS="${JOBS:-2}" 2>&1 | tee out/buildkite/logs/rust-check.log
-echo "--- :package: Rust platform and Sandbox SDK release"
+echo "--- :package: Rust platform and Environment SDK release"
 bash build/release/build.sh 2>&1 | tee out/buildkite/logs/release.log
 # One archive preserves top-level metadata, nested files and executable modes.
 tar -czf out/buildkite/adx-release.tar.gz -C out/buildkite/package .

@@ -167,7 +167,7 @@ class UploadResponseCutProxy:
 
 def run(connection, image, output, secrets):
     """Use the installed SDK with real Execd and verify the final file digest."""
-    from adx_sandbox import ConnectionConfig, Sandbox
+    from adx_environment import ConnectionConfig, Environment
     from functional_lifecycle import _wait_deleted
     from node import catalog, labeled_backend
     from route_ready import wait_for_route
@@ -176,7 +176,7 @@ def run(connection, image, output, secrets):
     report = {'status': 'failed', 'cases': [], 'cleanup_errors': []}
     name = 'upload-cut-' + uuid.uuid4().hex[:12]
     remote_path = str(PurePosixPath('/tmp') / f'{name}.bin')
-    sandbox = None
+    environment = None
     attached = None
     recovered = None
     deleted = False
@@ -187,7 +187,7 @@ def run(connection, image, output, secrets):
         ca=secrets / 'tls/ca.pem',
     )
     try:
-        sandbox = Sandbox(
+        environment = Environment(
             name=name,
             image=image,
             runtime='runc',
@@ -199,11 +199,11 @@ def run(connection, image, output, secrets):
             connection=connection,
             create_timeout=150,
         )
-        initial = json.loads(catalog()['environment:' + sandbox.id])
-        backend = labeled_backend(sandbox.id)
+        initial = json.loads(catalog()['environment:' + environment.id])
+        backend = labeled_backend(environment.id)
         if not (len(backend) == 1):
             raise AssertionError(backend)
-        wait_for_route(sandbox)
+        wait_for_route(environment)
 
         with tempfile.TemporaryDirectory(prefix='adx-upload-cut-') as directory:
             source = Path(directory) / 'source.bin'
@@ -222,7 +222,7 @@ def run(connection, image, output, secrets):
                         use_tls=True,
                         verify_tls=True,
                     )
-                    attached = Sandbox.from_id(sandbox.id, connection=proxied)
+                    attached = Environment.from_id(environment.id, connection=proxied)
                     attached.files.copy_from_local(str(source), remote_path)
                     attached.close()
                     attached = None
@@ -255,7 +255,7 @@ def run(connection, image, output, secrets):
             if not (all(item['status'] == 200 for item in proxy.chunks)):
                 raise AssertionError(proxy.chunks)
 
-            recovered = Sandbox.from_id(sandbox.id, connection=connection)
+            recovered = Environment.from_id(environment.id, connection=connection)
             recovered.files.copy_to_local(remote_path, str(target))
             actual_digest = hashlib.sha256(target.read_bytes()).hexdigest()
             if not (actual_digest == expected_digest):
@@ -263,17 +263,17 @@ def run(connection, image, output, secrets):
             recovered.close()
             recovered = None
 
-        final = json.loads(catalog()['environment:' + sandbox.id])
+        final = json.loads(catalog()['environment:' + environment.id])
         if not (final['assignment']['generation'] == initial['assignment']['generation']):
             raise AssertionError()
-        if not (labeled_backend(sandbox.id) == backend):
+        if not (labeled_backend(environment.id) == backend):
             raise AssertionError()
-        Sandbox.delete(sandbox.id, connection=connection)
+        Environment.delete(environment.id, connection=connection)
         deleted = True
-        _wait_deleted(sandbox.id, connection, timeout=60)
-        if not ('environment:' + sandbox.id not in catalog()):
+        _wait_deleted(environment.id, connection, timeout=60)
+        if not ('environment:' + environment.id not in catalog()):
             raise AssertionError()
-        if not (not labeled_backend(sandbox.id)):
+        if not (not labeled_backend(environment.id)):
             raise AssertionError()
 
         report['status'] = 'passed'
@@ -282,7 +282,7 @@ def run(connection, image, output, secrets):
                 'id': 'file.resumable-upload-response-cut',
                 'status': 'passed',
                 'seconds': round(time.monotonic() - started, 3),
-                'instance_id': sandbox.id,
+                'instance_id': environment.id,
                 'upload_id': cut['upload_id'],
                 'cut_offset': cut['committed_offset'],
                 'chunks': len(proxy.chunks),
@@ -299,13 +299,13 @@ def run(connection, image, output, secrets):
             attached.close()
         if recovered is not None:
             recovered.close()
-        if sandbox is not None:
+        if environment is not None:
             if not deleted:
                 try:
-                    Sandbox.delete(sandbox.id, connection=connection)
+                    Environment.delete(environment.id, connection=connection)
                 except Exception as error:
                     report['cleanup_errors'].append(str(error))
-            sandbox.close()
+            environment.close()
         if report['cleanup_errors']:
             report['status'] = 'failed'
         report['cut_chunk'] = proxy.cut_chunk

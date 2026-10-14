@@ -90,7 +90,7 @@ impl RuntimeDriver for Dependencies {
     async fn set_network_policy(
         &self,
         _runtime_id: &str,
-        policy: Option<&adx_core::sandbox::NetworkPolicy>,
+        policy: Option<&adx_core::execution::NetworkPolicy>,
         ports: &[u16],
     ) -> Result<()> {
         self.event(if policy.is_some() {
@@ -162,7 +162,7 @@ fn spec(id: &str) -> EnvironmentSpec {
         runtime_class: "runtime".into(),
         resources: resources(),
         priority: 0,
-        sandbox: Default::default(),
+        execution: Default::default(),
     }
 }
 fn assignment(id: &str) -> Assignment {
@@ -281,11 +281,11 @@ async fn failed_collection_does_not_cancel_pending_restart() {
 
 #[tokio::test]
 async fn network_policy_replacement_is_serialized_and_published_idempotently() {
-    use adx_core::sandbox::{NetworkAction, NetworkPolicy, TrafficMode, TrafficPolicy};
+    use adx_core::execution::{NetworkAction, NetworkPolicy, TrafficMode, TrafficPolicy};
     let deps = Dependencies::new(false);
     let node = node(&deps);
     let mut value = spec("network");
-    value.sandbox.ports = vec![8080];
+    value.execution.ports = vec![8080];
     let environment = node.environment(value, assignment("network")).unwrap();
     let created = environment.create().await.unwrap();
     let policy = NetworkPolicy {
@@ -305,14 +305,14 @@ async fn network_policy_replacement_is_serialized_and_published_idempotently() {
         )
         .await
         .unwrap();
-    assert_eq!(updated.record.spec.sandbox.network, Some(policy));
+    assert_eq!(updated.record.spec.execution.network, Some(policy));
     assert_eq!(
         updated.record.last_operation.as_ref().unwrap().id,
         "network-a"
     );
     let replay = environment
         .update_network_policy(
-            updated.record.spec.sandbox.network.clone(),
+            updated.record.spec.execution.network.clone(),
             "network-a".into(),
             created.record.revision,
         )
@@ -323,7 +323,7 @@ async fn network_policy_replacement_is_serialized_and_published_idempotently() {
         .update_network_policy(None, "network-b".into(), updated.record.revision)
         .await
         .unwrap();
-    assert!(cleared.record.spec.sandbox.network.is_none());
+    assert!(cleared.record.spec.execution.network.is_none());
     let events = deps.events.lock().unwrap();
     assert_eq!(
         events
@@ -1020,7 +1020,7 @@ async fn backend_oom_is_committed_before_cleanup_and_retained_on_retry() {
         probe_failure: None,
         reason: adx_core::RuntimeFailureReason::OomKilled,
         exit_code: Some(137),
-        message: "sandbox backend was OOM-killed".into(),
+        message: "environment backend was OOM-killed".into(),
     };
     *deps.failure.lock().unwrap() = Some(failure.clone());
     deps.actual
@@ -1046,10 +1046,10 @@ async fn backend_oom_is_committed_before_cleanup_and_retained_on_retry() {
 }
 
 fn workload_spec(id: &str, healthcheck: bool) -> EnvironmentSpec {
-    use adx_core::{probes::*, sandbox::*};
+    use adx_core::{execution::*, probes::*};
     let mut spec = spec(id);
-    spec.sandbox.inherit_entrypoint = true;
-    spec.sandbox.rootfs = Some(Rootfs {
+    spec.execution.inherit_entrypoint = true;
+    spec.execution.rootfs = Some(Rootfs {
         readonly: false,
         source: StorageSource::Image("image".into()),
     });
@@ -1061,9 +1061,9 @@ fn workload_spec(id: &str, healthcheck: bool) -> EnvironmentSpec {
         failure_threshold: 1,
     };
     if healthcheck {
-        spec.sandbox.healthcheck_probe = Some(probe);
+        spec.execution.healthcheck_probe = Some(probe);
     } else {
-        spec.sandbox.readiness_probe = Some(probe);
+        spec.execution.readiness_probe = Some(probe);
     }
     spec
 }

@@ -34,7 +34,7 @@ API Server 通过 `EnvironmentDirectoryService.WatchEnvironments` 维护完整�
 
 ## HTTP 兼容与支持范围
 
-沿用既有 Sandbox URL、请求／响应封装和 SSE 行为。认证接受 SDK 的 `X-Auth`、`X-Auth-Token` 与 Bearer；调用者不能通过请求体或 `X-Tenant-Id` 自报租户。当前适配镜像、隔离 runtime、CPU、内存、磁盘、GPU/NPU 整卡、环境变量和 Environment ID。CPU 使用 millicores、HTTP 内存 MiB 转成内部字节；环境随 Spec 持久化和下发，执行身份及节点部署参数由 sandboxd 适配器最后覆盖。
+沿用既有 Environment URL、请求／响应封装和 SSE 行为。认证接受 SDK 的 `X-Auth`、`X-Auth-Token` 与 Bearer；调用者不能通过请求体或 `X-Tenant-Id` 自报租户。当前适配镜像、隔离 runtime、CPU、内存、磁盘、GPU/NPU 整卡、环境变量和 Environment ID。CPU 使用 millicores、HTTP 内存 MiB 转成内部字节；环境随 Spec 持久化和下发，执行身份及节点部署参数由 sandboxd 适配器最后覆盖。
 
 公开 JSON 直接转换为 `adx.control.v1` 的 Environment 类型；协议按 Environment、快照、凭证和路由职责拆分。已接通暂停／恢复、reload、可复用快照、空闲回收、重启策略、failover、HTTP 亲和策略、S3 rootfs／mount、镜像入口继承、创建及运行期网络策略、独立 request/limit、extra_config、每实例数据面安全模式、鉴权端口转发和 `upstream` reverse tunnel。公开 API 拒绝本机 rootfs 与 host mount，防止客户端把节点路径作为租户契约；它们只属于部署拥有的本地运行环境。旧 `/invoke` 兼容传输仍未接入；用户命令走 Execd HTTP 数据接口。Agent 路由保留，配置 Agent 服务地址时转发给上层 Agent 服务；未配置时返回暂不可用。
 
@@ -85,7 +85,7 @@ Rust 重写已通过 [Buildkite #24](2026-09-17-rust-apiserver-k8s.md) 独立K8s
 
 Go 测试／构建使用 Linux ARM64 Go 1.25.5 容器，交叉编译 macOS ARM64 API 二进制；RPC、独立 Coordinator 进程与 Redis 7.2.5 在 macOS ARM64 运行。adxlet 入口通过编译和静态检查，未用真实 sandboxd 启动完整节点。`source-manifest.json` 保存源码和可执行文件 SHA256；最终 RPC 结果另包含 API 与 Redis 二进制摘要。基准提交为 `1e49d86f2123173a8f5358182ca294fab9a9b1e4`，验证对象是其上的未提交工作树。
 
-`integration-complete/frontend-http.log`、`sandbox-api.log`、`coordinator-process-0.log` 和 `coordinator-process-1.log` 分别保存跨语言断言、API 进程以及 Coordinator 首次启动／重启证据。普通 Rust 回归中的忽略用例不算通过；对应真实入口分别实际执行上述 2 项 RPC 和 6 项 Redis 测试。
+`integration-complete/frontend-http.log`、`environment-api.log`、`coordinator-process-0.log` 和 `coordinator-process-1.log` 分别保存跨语言断言、API 进程以及 Coordinator 首次启动／重启证据。普通 Rust 回归中的忽略用例不算通过；对应真实入口分别实际执行上述 2 项 RPC 和 6 项 Redis 测试。
 
 
 ## 创建入口模式

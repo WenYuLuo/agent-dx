@@ -2,8 +2,8 @@
 
 `adxadmin` 是运行在管理员工作站、运维机或 CI 中的 Python 客户端。它只通过 Ingress/API
 Server 的公开 HTTPS API 管理 ADX，不读取部署 YAML，不连接 Redis，也不调用 Coordinator
-内部 gRPC。主机进程部署仍由 [`adxctl`](adxctl.md) 负责，Sandbox 业务操作仍由
-`adx-sandbox` 或 Python SDK 负责。
+内部 gRPC。主机进程部署仍由 [`adxctl`](adxctl.md) 负责，Environment 业务操作仍由
+`adx-environment` 或 Python SDK 负责。
 
 ## 安装
 

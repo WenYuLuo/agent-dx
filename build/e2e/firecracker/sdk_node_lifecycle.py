@@ -33,7 +33,7 @@ config = json.loads((root / 'deployment.yaml').read_text())
 if not (Path(config['package_dir']).resolve() == a.package.resolve()):
     raise AssertionError()
 os.environ['SSL_CERT_FILE'] = str(root / 'secrets/tls/ca.pem')
-from adx_sandbox import RetentionPolicy, ConnectionConfig, RestartPolicy, Sandbox
+from adx_environment import RetentionPolicy, ConnectionConfig, RestartPolicy, Environment
 
 connection = ConnectionConfig(
     server_address=a.endpoint, token=(root / 'secrets/api-key').read_text().strip(), use_tls=True, verify_tls=True
@@ -92,7 +92,7 @@ def passed(name, **details):
 
 
 def create(**kwargs):
-    s_local = Sandbox(
+    s_local = Environment(
         image=a.image, runtime='firecracker', cpu=1000, memory=512, connection=connection, create_timeout=180, **kwargs
     )
     instances.append(s_local)

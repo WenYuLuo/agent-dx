@@ -5,7 +5,7 @@
 The local Linux ARM64 environment runs two isolated Docker nodes. Each node runs
 real sandboxd (PR #56, `efc201531d7e2e9d69505da151eb66084b61eebf`), adxlet
 and Relay. Node 1 also hosts Redis 7.2.5, Coordinator with an embedded Shard,
-Sandbox API and Ingress. ADX processes are launched from the unified release package
+Environment API and Ingress. ADX processes are launched from the unified release package
 by `adxctl`; sandboxd is independently hosted. The SDK is installed from a wheel.
 
 Control requests enter Ingress over verified TLS, then use the co-located API Server
@@ -44,7 +44,7 @@ benchmark. Earlier failed attempts remain in separate evidence directories.
 
 ## Backend-generated identity
 
-The adapter leaves `StartRequest.sandbox_id` empty. It associates the returned
+The adapter leaves sandboxd's `StartRequest.sandbox_id` empty. It associates the returned
 `StartResponse.id` with the platform execution ID. List, Stats and Delete use the
 returned backend ID; Execd control and routing retain the platform execution ID.
 The labels `adx.environment_id`, `adx.tenant_id`, `adx.runtime_id` and
@@ -139,13 +139,17 @@ At that time no target kubeconfig was available for a real cluster run; neither 
 nor the prior Docker results establish Kubernetes or remote Buildkite acceptance.
 
 The Kubernetes pipeline now directly reuses the existing CI `default/linux/amd64`
-queue, Rust builder, sandbox packager/deployer, Agent Stack target-kubeconfig
+queue, Rust builder, environment packager/deployer, Agent Stack target-kubeconfig
 mount and SWR secrets. ADX supplies its own namespace and component artifacts.
 Compilation, image publication and Kubernetes acceptance are distinct mandatory
 steps. The separate ADX deployer-image recipe was removed. Reuse/credential
 contracts are included in `out/ci/k8s-e2e/reuse-final-tests.log`; this is source and
 local contract evidence, not a hosted CI run.
 
-## 2026-09-16 放置约束扩展
+## 2026-09-16 placement constraint expansion
 
-该批次基础门禁扩展为六组（当前为七组）。package-v17 已完成新一轮双节点真实验收，包含六项亲和／反亲和和节点偏好规则；结果、制品身份与正式 K8s 边界见 [本轮记录](2026-09-16-placement-e2e.md)。以上较早结果保留其当时的覆盖范围。
+That batch expanded the basic gate to six groups; the current driver has seven.
+The package-v17 two-node acceptance run covered six affinity/anti-affinity and
+node-preference rules. See the [batch report](2026-09-16-placement-e2e.md) for
+results, artifact identities, and the formal Kubernetes boundary. Earlier
+results above retain the coverage limits of their original batches.

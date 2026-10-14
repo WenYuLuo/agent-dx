@@ -3,18 +3,18 @@
 import json
 from time import monotonic
 
-from adx_sandbox import Sandbox
+from adx_environment import Environment
 from functional_lifecycle import _wait_deleted
 from node import catalog
 
 
 def run(connection, image, output):
-    sandbox = None
+    environment = None
     closed = False
     deleted = False
     report = {"status": "failed", "cases": [], "cleanup_errors": []}
     try:
-        sandbox = Sandbox(
+        environment = Environment(
             image=image,
             runtime="runc",
             cpu=500,
@@ -26,7 +26,7 @@ def run(connection, image, output):
             create_timeout=150,
         )
         started = monotonic()
-        command = sandbox.commands.run(
+        command = environment.commands.run(
             "sleep 12; printf active-request-complete",
             timeout=20,
         )
@@ -35,17 +35,17 @@ def run(connection, image, output):
             raise AssertionError(command)
         if not (elapsed >= 10):
             raise AssertionError(f"foreground request ended too soon: {elapsed:.3f}s")
-        if not (sandbox.is_running()):
+        if not (environment.is_running()):
             raise AssertionError("active request did not protect the instance from idle reclaim")
-        record = json.loads(catalog()["environment:" + sandbox.id])
+        record = json.loads(catalog()["environment:" + environment.id])
         if not (record["result"]["state"] == "Running"):
             raise AssertionError(record["result"])
         if not (record["result"]["resources_held"]):
             raise AssertionError(record["result"])
-        sandbox.close()
+        environment.close()
         closed = True
-        _wait_deleted(sandbox.id, connection, timeout=90)
-        if not ("environment:" + sandbox.id not in catalog()):
+        _wait_deleted(environment.id, connection, timeout=90)
+        if not ("environment:" + environment.id not in catalog()):
             raise AssertionError()
         deleted = True
         report["cases"].append(
@@ -60,15 +60,15 @@ def run(connection, image, output):
         report["error"] = str(error)
         raise
     finally:
-        if sandbox is not None:
+        if environment is not None:
             if not closed:
                 try:
-                    sandbox.close()
+                    environment.close()
                 except Exception as error:
                     report["cleanup_errors"].append(str(error))
             if not deleted:
                 try:
-                    Sandbox.delete(sandbox.id, connection=connection)
+                    Environment.delete(environment.id, connection=connection)
                 except Exception as error:
                     report["cleanup_errors"].append(str(error))
         if report["cleanup_errors"]:

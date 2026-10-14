@@ -14,7 +14,7 @@
 
 2026-09-23 的 `3141e27` 真实容器验证（当时组件名为 RRT，现名 Execd）中已观察到：业务 HTTP 返回 200，但 Execd `/control/v1/status` 持续超时，Platform 因而保持 Creating。与运行二进制相同 Build ID 的调试符号定位到 Execd 主线程在 `entrypoint::Manager::complete_create()` 等待子进程 Mutex；监视线程在 `start_from_environment()` 的 `match child.lock().try_wait()` 分支中持有同一把锁休眠 10ms，并循环抢锁。同步锁等待会阻塞 Execd 的单线程异步运行时，导致控制接口也无法处理请求。
 
-2026-10-08 经用户授权，仅将 `start_from_environment()` 的子进程锁限制在 try_wait 调用范围内，结果处理及 10ms 休眠在锁外执行。新增进程回归先复现旧逻辑超时，修复后连续四次启动通过；Execd 聚焦测试 95 项、fmt 及全工作区严格 Clippy 通过。独立 Activator 的真实 Sandbox 创建、镜像启动继承、AgentServer 监听及 Gateway runtime 端口／凭据验证通过，已复现的 Execd 锁阻塞解除。原始诊断在 `out/jiuwen-inherit-20261008/`，修复后证据在 `out/jiuwen-inherit-fixed-20261008/`。这不补齐业务健康检查或文件读取一致性。
+2026-10-08 经用户授权，仅将 `start_from_environment()` 的子进程锁限制在 try_wait 调用范围内，结果处理及 10ms 休眠在锁外执行。新增进程回归先复现旧逻辑超时，修复后连续四次启动通过；Execd 聚焦测试 95 项、fmt 及全工作区严格 Clippy 通过。独立 Activator 的真实 Environment 创建、镜像启动继承、AgentServer 监听及 Gateway runtime 端口／凭据验证通过，已复现的 Execd 锁阻塞解除。原始诊断在 `out/jiuwen-inherit-20261008/`，修复后证据在 `out/jiuwen-inherit-fixed-20261008/`。这不补齐业务健康检查或文件读取一致性。
 
 ## 嵌入式 Activator 真实创建栈溢出
 
@@ -26,15 +26,15 @@ ADX 从入口传递绝对期限，独立 Activator 用剩余时间限制 API Ser
 
 ## 管理入口与文件访问
 
-独立与嵌入式 Activator 均只经 API Server 管理 Sandbox。独立模式用部署者配置的租户 Platform API Key，API Server 从 key 决定租户；现有查询响应不返回租户，配置归属须由部署者保证。
+独立与嵌入式 Activator 均只经 API Server 管理 Environment。独立模式用部署者配置的租户 Platform API Key，API Server 从 key 决定租户；现有查询响应不返回租户，配置归属须由部署者保证。
 
-PlatformSandbox 和旧 runtime 查询已删除。Ingress 通用文件能力经 API Server 的既有实例查询或 SandboxService 校验租户归属和 Running，文件正文走 Relay/Execd。共享数据面读取部署注入的 Execd 凭据，Jiuwen 不取得 token。旧 `/api/sandbox/v2/instances` 与 OpenAPI 声明已删除。
+PlatformEnvironment 和旧 runtime 查询已删除。Ingress 通用文件能力经 API Server 的既有实例查询或 EnvironmentService 校验租户归属和 Running，文件正文走 Relay/Execd。共享数据面读取部署注入的 Execd 凭据，Jiuwen 不取得 token。旧 `/api/environment/v2/instances` 与 OpenAPI 声明已删除。
 
-API Server runtime profile、节点和数据面必须共用端口及 Secret。节点 env 可覆盖 runtime_profile.env，实例目录不足以证明最终凭据；当前没有跨进程配置一致性自动检查，也不支持任意节点独立凭据或单侧轮换。新链路已通过本地组件测试及独立部署的真实新建 Sandbox、跨副本上传下载验证。详细范围见[文件访问方案](../docs/development/jiuwenswarm-adx-gateway-design.md#通用沙箱文件访问与管理查询)。
+API Server runtime profile、节点和数据面必须共用端口及 Secret。节点 env 可覆盖 runtime_profile.env，实例目录不足以证明最终凭据；当前没有跨进程配置一致性自动检查，也不支持任意节点独立凭据或单侧轮换。新链路已通过本地组件测试及独立部署的真实新建 Environment、跨副本上传下载验证。详细范围见[文件访问方案](../docs/development/jiuwenswarm-adx-gateway-design.md#通用运行环境文件访问与管理查询)。
 
 ## AgentBinding 的中间记录与删除
 
-流量触发激活时，ADX 先写入 AgentBinding 身份，再向平台提交同一 Sandbox ID。进程中断、创建失败或响应丢失时，可能存在“有 AgentBinding 元数据、无已确认可用 Sandbox”的状态；Active 表示产品记录可用于激活，不代表运行健康。
+流量触发激活时，ADX 先写入 AgentBinding 身份，再向平台提交同一 Environment ID。进程中断、创建失败或响应丢失时，可能存在“有 AgentBinding 元数据、无已确认可用 Environment”的状态；Active 表示产品记录可用于激活，不代表运行健康。
 
 AgentBinding 统一由 HTTP/WS/SSH 访问触发；查询和列表可能看到上述未完成激活的中间记录，重试使用已返回的原 AgentBinding ID。
 

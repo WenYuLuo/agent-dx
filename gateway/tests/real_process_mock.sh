@@ -80,7 +80,7 @@ openssl x509 -req -days 1 -in "${mock_dir}/ingress.csr" \
 
 printf '%s\n' 'gateway-real-process-ok' > "${mock_dir}/index.html"
 python3 -m http.server "${target_port}" --bind 0.0.0.0 --directory "${mock_dir}" \
-    >"${mock_dir}/sandbox.log" 2>&1 &
+    >"${mock_dir}/environment.log" 2>&1 &
 pids+=("$!")
 
 cat >"${mock_dir}/command_watch_mock.py" <<'PY'
@@ -181,7 +181,7 @@ pids+=("$!")
 wait_http_status "http://127.0.0.1:${node_health_port}/readyz" 200
 
 route_key=/adx/route/business/adxk/mock-instance
-running_route=$(printf '{"instanceID":"mock-instance","instanceStatus":{"code":3},"tenantID":"mock-tenant","sandboxID":"mock-sandbox","nodeProxyAddress":"127.0.0.1:%s","sandboxIP":"%s"}' "${node_port}" "${host_ip}")
+running_route=$(printf '{"instanceID":"mock-instance","instanceStatus":{"code":3},"tenantID":"mock-tenant","environmentID":"mock-environment","nodeProxyAddress":"127.0.0.1:%s","environmentIP":"%s"}' "${node_port}" "${host_ip}")
 docker exec "${container_name}" /usr/local/bin/etcdctl \
     --endpoints=http://127.0.0.1:2379 put "${route_key}" "${running_route}" >/dev/null
 
@@ -239,8 +239,8 @@ import asyncio
 import sys
 import time
 
-from adx_sandbox._command_watch import manager_for
-from adx_sandbox.types import ConnectionConfig
+from adx_environment._command_watch import manager_for
+from adx_environment.types import ConnectionConfig
 
 host, port, token, output = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
 connection = ConnectionConfig(
@@ -263,7 +263,7 @@ open(output, "w").write("sdk-multiplex-watch-ok\n")
 # Keep the hidden SDK connection observable long enough for metrics assertions.
 time.sleep(2)
 PY
-PYTHONPATH="${repo_root}/platform/sdk/sandbox/python" uv run --with httpx --with websockets \
+PYTHONPATH="${repo_root}/platform/sdk/environment/python" uv run --with httpx --with websockets \
     python "${mock_dir}/command_watch_client.py" 127.0.0.1 "${ingress_tls_port}" \
     "${mock_token}" "${mock_dir}/command-watch-client.ok" \
     >"${mock_dir}/command-watch-client.log" 2>&1 &
@@ -281,7 +281,7 @@ watch_metrics=$(curl -sS "http://127.0.0.1:${ingress_health_port}/metrics")
 [[ ${watch_metrics} == *"data_plane_ingress_active_sessions 1"* ]]
 [[ ${watch_metrics} == *"command_watch_connections 1"* ]]
 [[ ${watch_metrics} == *"command_watch_subscriptions 2"* ]]
-[[ ${watch_metrics} == *"command_watch_sandboxes 1"* ]]
+[[ ${watch_metrics} == *"command_watch_environments 1"* ]]
 [[ ${watch_metrics} == *"command_watch_downstream_streams 1"* ]]
 
 "${bin_dir}/adx-data-plane-forward" \
@@ -295,7 +295,7 @@ if ! wait_http_status "http://127.0.0.1:${forward_port}/index.html" 200; then
     exit 1
 fi
 
-token_route=$(printf '{"instanceID":"mock-instance","instanceStatus":{"code":3},"tenantID":"mock-tenant","sandboxID":"mock-sandbox","nodeProxyAddress":"127.0.0.1:%s","sandboxIP":"%s","portForwardRoutes":[{"targetPort":%s,"authMode":"TOKEN"}]}' "${node_port}" "${host_ip}" "${target_port}")
+token_route=$(printf '{"instanceID":"mock-instance","instanceStatus":{"code":3},"tenantID":"mock-tenant","environmentID":"mock-environment","nodeProxyAddress":"127.0.0.1:%s","environmentIP":"%s","portForwardRoutes":[{"targetPort":%s,"authMode":"TOKEN"}]}' "${node_port}" "${host_ip}" "${target_port}")
 docker exec "${container_name}" /usr/local/bin/etcdctl \
     --endpoints=http://127.0.0.1:2379 put "${route_key}" "${token_route}" >/dev/null
 for attempt in $(seq 1 100); do
@@ -326,7 +326,7 @@ tls_port_with_token=$(printf 'GET /mock-instance/%s/index.html HTTP/1.1\r\nHost:
 docker exec "${container_name}" /usr/local/bin/etcdctl \
     --endpoints=http://127.0.0.1:2379 put "${route_key}" "${running_route}" >/dev/null
 
-failed_route=$(printf '{"instanceID":"mock-instance","instanceStatus":{"code":5,"msg":"mock sandbox stopped","errCode":42},"tenantID":"mock-tenant","sandboxID":"mock-sandbox","nodeProxyAddress":"127.0.0.1:%s","sandboxIP":"%s"}' "${node_port}" "${host_ip}")
+failed_route=$(printf '{"instanceID":"mock-instance","instanceStatus":{"code":5,"msg":"mock environment stopped","errCode":42},"tenantID":"mock-tenant","environmentID":"mock-environment","nodeProxyAddress":"127.0.0.1:%s","environmentIP":"%s"}' "${node_port}" "${host_ip}")
 docker exec "${container_name}" /usr/local/bin/etcdctl \
     --endpoints=http://127.0.0.1:2379 put "${route_key}" "${failed_route}" >/dev/null
 for attempt in $(seq 1 100); do
@@ -334,7 +334,7 @@ for attempt in $(seq 1 100); do
         "${mock_token}" | openssl s_client -quiet \
         -connect "127.0.0.1:${ingress_tls_port}" -CAfile "${mock_dir}/ca.crt" \
         -verify_return_error 2>/dev/null || true)
-    if [[ ${status_response} == *"HTTP/1.1 409"* ]] && [[ ${status_response} == *"mock sandbox stopped"* ]]; then
+    if [[ ${status_response} == *"HTTP/1.1 409"* ]] && [[ ${status_response} == *"mock environment stopped"* ]]; then
         break
     fi
     if [[ ${attempt} == 100 ]]; then

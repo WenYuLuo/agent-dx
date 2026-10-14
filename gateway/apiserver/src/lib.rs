@@ -4,12 +4,12 @@ pub mod activator;
 pub mod clients;
 pub mod config;
 pub mod contract;
+pub mod environment_service;
 pub mod errors;
 pub mod http;
 pub mod ingress;
 pub mod operations;
 pub mod ownership;
-pub mod sandbox_service;
 
 mod directory;
 mod environment_directory;

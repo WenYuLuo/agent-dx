@@ -48,8 +48,8 @@ HTTP 与 SDK 已接通实例亲和／反亲和、权重和顺序偏好。`Placem
 - 最多8组，每组256个候选条件；组内每个条件的标签表达式为AND，条件之间为OR。`NotIn` 继续保留“标签存在且值不属于集合”的HTTP语义。
 
 ```python
-peer = Sandbox(image="my-image", labels={"app": "database"}, connection=connection)
-worker = Sandbox(
+peer = Environment(image="my-image", labels={"app": "database"}, connection=connection)
+worker = Environment(
     image="my-image", labels={"app": "worker"}, connection=connection,
     schedule_affinities=[{
         "kind": 1, "affinity": 2,

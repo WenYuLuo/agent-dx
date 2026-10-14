@@ -35,11 +35,13 @@ Coordinator 保存集群状态，内嵌 Global 轮转与 ShardScheduler。adxlet
 
 运行环境的本地 EROFS 与 OCI 来源、用户 rootfs 覆盖规则见 [内置运行环境](../deployment/runtime-environment.md)。
 
-## Agent 与公开 Sandbox 边界
+## Agent 与公开 Environment 边界
 
-Agent 层的 `adx_agent_core::AgentBinding` 表示 `(tenant, template, version, binding_id)` 到稳定 `sandbox_id` 的业务绑定，由 Activator 管理元数据、绑定代次与删除意图。`sandbox_id` 即 Platform Environment ID；平台 `adx_core::EnvironmentRecord` 独占调度和执行生命周期。Environment 专指平台运行环境，AgentBinding 不复制平台运行状态。
+Agent 层的 `adx_agent_core::AgentBinding` 表示 `(tenant, template, version, binding_id)` 到稳定 `environment_id` 的业务绑定，由 Activator 管理元数据、绑定代次与删除意图。`environment_id` 即 Platform Environment ID；平台 `adx_core::EnvironmentRecord` 独占调度和执行生命周期。Environment 专指平台运行环境，AgentBinding 不复制平台运行状态。
 
-公开 Python 包仍为 `adx-sandbox` / `adx_sandbox`，用户仍使用 `Sandbox`。公开 HTTP 路径 `/api/instances`、字段 `instanceId` 和 SDK 的 `instance_id` 保持现有接口定义，由 API Server 在边界映射到平台 `environment_id`。内部组件重命名不把 Agent 产品接口并入平台 API。
+公开 Python 包为 `adx-environment`，导入命名空间为 `adx_environment`，CLI 为 `adx-environment`，用户通过 `Environment` 操作运行环境。生命周期管理使用 `/api/environment/v1/environments`，响应身份字段为 `environmentId`，SDK 属性和 AgentBinding 字段为 `environment_id`。资源查询与命令订阅位于同一 `/api/environment/v1` 前缀。`/api/instances` 保留为现有目录查询入口，其 `instance_id` 查询参数不属于 SDK 生命周期返回契约。
+
+平台执行设置使用 `adx_core::execution::ExecutionOptions` 与 `EnvironmentSpec.execution`；Agent 的 Environment 能力接口与 Platform 生命周期模型保持独立。迁移需要同步更新 SDK、API Server、Ingress、Activator 和平台组件；AgentBinding 的序列化字段与 EnvironmentSpec 的执行设置字段已改变，部署切换使用新的控制状态和 Agent 元数据 namespace。AKernel 消费 `adx_environment.Environment`，其公开 `akernel_sdk.Sandbox` 接口保持原有定义。
 
 ## 配置与构建
 

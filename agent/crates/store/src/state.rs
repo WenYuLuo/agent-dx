@@ -1,4 +1,4 @@
-//! Product metadata transactions. Sandbox lifecycle belongs to Platform.
+//! Product metadata transactions. Environment lifecycle belongs to Platform.
 use crate::*;
 use adx_agent_core::activator::{BindingList, BindingPage};
 use adx_agent_core::cache::BoundedCache;
@@ -233,7 +233,7 @@ impl AgentState {
             next_page_token,
         })
     }
-    /// Commit one stable Sandbox identity before any activation side effect.
+    /// Commit one stable Environment identity before any activation side effect.
     pub async fn create_binding(&self, scope: Scope) -> Result<AgentBinding> {
         self.create_binding_with_launch(scope, None).await
     }
@@ -257,7 +257,7 @@ impl AgentState {
         let generation = uuid::Uuid::new_v4().to_string();
         let value = AgentBinding {
             scope,
-            sandbox_id: format!("adx-{generation}"),
+            environment_id: format!("adx-{generation}"),
             generation,
             phase: BindingPhase::Active,
         };
@@ -354,7 +354,9 @@ impl AgentState {
         if current.generation != binding.generation {
             return Ok(());
         }
-        if current.phase != BindingPhase::Deleting || current.sandbox_id != binding.sandbox_id {
+        if current.phase != BindingPhase::Deleting
+            || current.environment_id != binding.environment_id
+        {
             return Err(Error::Conflict("binding deletion identity mismatch".into()));
         }
         let private_key = launch_key(&binding.scope)?;

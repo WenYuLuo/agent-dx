@@ -6,12 +6,12 @@
 
 <p align="center"><a href="README.md">English</a> | <strong>中文</strong></p>
 
-Agent DX（**Agent Distributed eXecutor**）是 openJiuwen Agent Runtime 的一种分布式执行底座，Agent 层提供 Template 与 Environment 管理，由无状态 Activator 按需启动用户 Harness，支持 HTTP、WebSocket 和 SSH 访问。同时提供公开 Sandbox API 与 SDK、分布式调度、隔离执行、流量路由、运行时操作、Checkpoint 恢复与部署工具，并保持执行后端可替换。
+Agent DX（**Agent Distributed eXecutor**）是 openJiuwen Agent Runtime 的一种分布式执行底座，Agent 层提供 Template 与 AgentBinding 管理，由无状态 Activator 按需启动用户 Harness，支持 HTTP、WebSocket 和 SSH 访问。同时提供公开 Environment API 与 SDK、分布式调度、隔离执行、流量路由、运行时操作、Checkpoint 恢复与部署工具，并保持执行后端可替换。
 
 <p align="center">
   <a href="#-快速开始">🚀 快速开始</a> ·
   <a href="docs/architecture/repository-layout.md">📐 架构</a> ·
-  <a href="platform/sdk/sandbox/python/README.md">📦 Sandbox SDK</a> ·
+  <a href="platform/sdk/environment/python/README.md">📦 Environment SDK</a> ·
   <a href="docs/deployment/adxctl.md">⚙️ 部署</a> ·
   <a href="docs/deployment/adxadmin.md">🔐 管理</a> ·
   <a href="docs/testing/control-plane-ci.md">✅ 测试门禁</a>
@@ -25,13 +25,13 @@ Agent DX（**Agent Distributed eXecutor**）是 openJiuwen Agent Runtime 的一�
 | 让多个 Agent 服务共享跨机器执行资源 | 按角色多机部署 | 持久化 Redis、一个 Coordinator 部署、一个或多个 Worker 部署和可访问的 Gateway |
 | 以可重复验收方式运行生产形态集群 | Kubernetes | Linux Worker、持久化 Redis、组件证书、Worker 上的 sandboxd 和 ADX Kubernetes E2E 配置 |
 | 暂停、恢复、克隆或接管长时间任务 | 单机或分布式 | 支持 Checkpoint 的运行时，以及本地或 S3 兼容 Checkpoint 存储 |
-| 调度加速卡工作负载 | 分布式 | Worker 上报 GPU/NPU 清单，Sandbox 规格申请匹配设备 |
+| 调度加速卡工作负载 | 分布式 | Worker 上报 GPU/NPU 清单，Environment 规格申请匹配设备 |
 
 ## 🧩 Agent DX 在技术栈中的位置
 
 | 层 | 负责内容 | 与 Agent DX 的关系 |
 |---|---|---|
-| Agent 框架或业务应用 | Prompt、工具、会话、任务逻辑和业务策略 | 调用公开 Sandbox SDK 或 HTTP API，不进入平台调度或生命周期状态机 |
+| Agent 框架或业务应用 | Prompt、工具、会话、任务逻辑和业务策略 | 调用公开 Environment SDK 或 HTTP API，不进入平台调度或生命周期状态机 |
 | Agent DX | 认证、放置、Environment 状态、路由、恢复和可观测 | 在多个节点和执行后端之上提供统一分布式执行契约 |
 | sandboxd | 运行时创建、隔离、网络和 Checkpoint 原语 | 作为每个 Worker 上的外部服务，由 adxlet 的运行时驱动调用 |
 | Runtime 内的 Execd | 命令、文件、终端、端口、活动统计和恢复协作 | Ingress 与 Relay 完成归属和 generation 校验后转发数据请求 |
@@ -43,7 +43,7 @@ Agent DX（**Agent Distributed eXecutor**）是 openJiuwen Agent Runtime 的一�
 
 | 步骤 | 发生的事情 | 所在模块 |
 |---|---|---|
-| 1 · 接入 | 调用方认证后，通过统一公开契约创建或操作 Sandbox。 | `gateway/apiserver/`、`platform/sdk/sandbox/python/` |
+| 1 · 接入 | 调用方认证后，通过统一公开契约创建或操作 Environment。 | `gateway/apiserver/`、`platform/sdk/environment/python/` |
 | 2 · 放置 | API Server 使用本地优先准入或提交 Coordinator。Coordinator 在 Shard 间轮转，Shard 负责排队、过滤、评分和节点预留。 | `platform/coordinator/`、`platform/crates/scheduling/` |
 | 3 · 运行 | adxlet 完成本机最终准入、串行管理 Environment 生命周期，并调用 sandboxd 创建带 Execd 的 Runtime。 | `platform/adxlet/`、`third_party/sandboxd/`、`platform/runtime/execd/` |
 | 4 · 操作与恢复 | Ingress 把数据请求路由到归属 Relay。版本化归属隔离旧 Runtime；暂停、恢复、快照、重启策略和对账在故障后收敛状态。 | `gateway/`、`platform/adxlet/`、Redis、Checkpoint 存储 |
@@ -52,7 +52,7 @@ API Server 默认内嵌 Ingress，adxlet 默认内嵌 Relay；显式拆分进程
 
 ## 📦 安装
 
-ADX 发布包面向 Linux，提供 `adx-coordinator`、默认内嵌 Relay 的 `adxlet`、默认内嵌 Ingress 的 `adx-apiserver`、供显式分进程部署的 `adx-ingress` 与 `adx-relay`、`adxctl`、Execd、Python Sandbox SDK 和托管 Redis 二进制。调试转发程序不随包发布。sandboxd 由部署环境独立托管，版本固定在 [`third_party/sandboxd/source.json`](third_party/sandboxd/source.json)。
+ADX 发布包面向 Linux，提供 `adx-coordinator`、默认内嵌 Relay 的 `adxlet`、默认内嵌 Ingress 的 `adx-apiserver`、供显式分进程部署的 `adx-ingress` 与 `adx-relay`、`adxctl`、Execd、Python Environment SDK 和托管 Redis 二进制。调试转发程序不随包发布。sandboxd 由部署环境独立托管，版本固定在 [`third_party/sandboxd/source.json`](third_party/sandboxd/source.json)。
 
 ```sh
 mkdir adx-release
@@ -89,36 +89,36 @@ adxadmin key create --tenant example
 
 ```sh
 python3 -m venv /opt/adx-client
-/opt/adx-client/bin/python -m pip install /opt/adx/current/sdk/adx_sandbox-*.whl
+/opt/adx-client/bin/python -m pip install /opt/adx/current/sdk/adx_environment-*.whl
 
 export ADX_SERVER_ADDRESS=adx.example.com:8443
 export ADX_GATEWAY_ADDRESS=adx.example.com:8443
 export ADX_TOKEN="$(cat /secure/path/tenant-api-key)"
 export ADX_TLS=1
 export ADX_GATEWAY_TLS=1
-export ADX_SANDBOX_IMAGE=python:3.12-slim
+export ADX_ENVIRONMENT_IMAGE=python:3.12-slim
 ```
 
-创建 Sandbox，通过 Execd 执行命令，然后显式删除：
+创建 Environment，通过 Execd 执行命令，然后显式删除：
 
 ```python
 import os
-from adx_sandbox import Sandbox
+from adx_environment import Environment
 
-sandbox = Sandbox(
-    image=os.environ["ADX_SANDBOX_IMAGE"],
+environment = Environment(
+    image=os.environ["ADX_ENVIRONMENT_IMAGE"],
     cpu=1000,
     memory=2048,
     name="readme-demo",
 )
 try:
-    result = sandbox.commands.run("printf 'hello from ADX\\n'")
+    result = environment.commands.run("printf 'hello from ADX\\n'")
     print(result.stdout)
 finally:
-    sandbox.kill()
+    environment.kill()
 ```
 
-镜像必须由当前 sandboxd 和 [ADX Runtime Environment](docs/deployment/runtime-environment.md) 支持。暂停恢复、可复用快照、放置约束、挂载、网络、数据面安全和重试语义见 [Sandbox SDK 指南](platform/sdk/sandbox/python/README.md)。
+镜像必须由当前 sandboxd 和 [ADX Runtime Environment](docs/deployment/runtime-environment.md) 支持。暂停恢复、可复用快照、放置约束、挂载、网络、数据面安全和重试语义见 [Environment SDK 指南](platform/sdk/environment/python/README.md)。
 
 ## 🏗️ 部署组合
 
@@ -140,8 +140,8 @@ ADX 将稳定逻辑身份与可替换物理执行分开：
 
 | 抽象 | 含义与边界 |
 |---|---|
-| Agent `Environment` | Agent 执行上下文，与稳定逻辑 Sandbox 1:1 绑定，由无状态 Activator 管理 |
-| `Sandbox` | 面向应用的公开 API 与 SDK 句柄 |
+| Agent `AgentBinding` | 保存业务绑定及其到稳定逻辑 Environment 的映射，由无状态 Activator 管理 |
+| `Environment` | 面向应用的公开 API 与 SDK 句柄 |
 | Platform `Environment` | 稳定内部身份，包含租户、规格、生命周期和期望／实际状态 |
 | `RuntimeProfile` | 部署侧 rootfs、bootstrap 与启动环境变量配置；不是运行中的 Environment |
 | `Runtime` | Environment 在一个节点上的一次 sandboxd 执行；重启或恢复可替换 Runtime |
@@ -150,7 +150,7 @@ ADX 将稳定逻辑身份与可替换物理执行分开：
 | `Restore Point` / `Snapshot` | 恢复点保留 Environment ID；可复用 Snapshot 创建新的 Environment |
 | `Request ID` / `Operation ID` | 用于重试、去重、结果查询和对账的一次逻辑写身份 |
 
-固定控制链路为 Agent／应用 → Sandbox SDK／HTTP API → API Server → Coordinator／Shard 调度器或本地优先 adxlet → sandboxd。运行时数据请求走 Ingress → Relay → Execd，不进入生命周期队列。`instanceId`、`instance_id` 和 `/api/instances` 等兼容字段只在公开边界转换；内部 Rust 类型、RPC、持久化字段、指标和运行身份统一使用 Environment 命名。
+固定控制链路为 Agent／应用 → Environment SDK／HTTP API → API Server → Coordinator／Shard 调度器或本地优先 adxlet → sandboxd。运行时数据请求走 Ingress → Relay → Execd，不进入生命周期队列。公开生命周期与错误响应使用 `environmentId`；目录查询保留 `/api/instances` 及其 `instance_id` 查询参数。内部 Rust 类型、RPC、持久化字段、指标和运行身份统一使用 Environment 命名。
 
 Execd 支持主动向 adxlet 建立独立双向控制流，上报 Ready 和 checkpoint 状态，接收准备与完成命令。通过[节点运行时控制配置](docs/deployment/runtime-control-stream.md)启用，需要同时更新节点程序和运行镜像内的 Execd；未配置时运行时协作使用 HTTP。[接口契约](platform/api/proto/runtime-control.md)与[组件验证](docs/testing/runtime-control-stream.md)说明执行身份隔离、重连及权威结果提交后的应答规则。
 
@@ -177,9 +177,9 @@ make help
 make rust-check
 make rust-test
 make agent-test
-PYTHONPATH=platform/sdk/sandbox/python \
-  python -m pytest -q -c platform/sdk/sandbox/pytest.ini \
-  platform/sdk/sandbox/python/tests
+PYTHONPATH=platform/sdk/environment/python \
+  python -m pytest -q -c platform/sdk/environment/pytest.ini \
+  platform/sdk/environment/python/tests
 make package PYTHON=/path/to/venv/bin/python
 ```
 
@@ -195,22 +195,23 @@ python3 build/ci/run.py afs
 
 子系统职责、当前范围和真实限制见 [架构边界](docs/architecture/afs.md)、[部署说明](docs/deployment/afs.md)、[测试验收](docs/testing/afs.md)和 [AFS 演进计划](docs/development/afs-plan.md)。来源与带日期的历史证据保留在 `docs/migration/`；它们不定义当前运行合同。发布包配置示例位于 [AFS 示例目录](build/config/examples/afs/)。
 
-组件与集成测试使用 `python3 build/ci/run.py <suite>`。端到端门禁使用已安装发布包、公开 Sandbox SDK、Redis、Gateway、控制面、sandboxd 和 Execd。环境要求与门禁定义见[控制面 CI](docs/testing/control-plane-ci.md)和 [Kubernetes E2E 指南](build/e2e/kubernetes/README.md)。
+组件与集成测试使用 `python3 build/ci/run.py <suite>`。端到端门禁使用已安装发布包、公开 Environment SDK、Redis、Gateway、控制面、sandboxd 和 Execd。环境要求与门禁定义见[控制面 CI](docs/testing/control-plane-ci.md)和 [Kubernetes E2E 指南](build/e2e/kubernetes/README.md)。
 
-Buildkite 使用相互独立的 `agent-dx`、`agent-dx-python-sdk` 和
-`agent-dx-full-test` 三条流水线。Full 流水线只消费显式指定的基础包与 SDK build
-UUID，不重新构建任一候选；契约见 [Buildkite 流水线说明](.buildkite/README.md)。
+Buildkite 使用相互独立的 `agent-dx`、`agent-dx-python-sdk`、`agent-dx-admin` 和
+`agent-dx-full-test` 四条流水线。SDK 和 admin 流水线始终构建并检查 wheel/sdist；
+各自的 PyPI 上传需要独立显式开关与仓库 release tag。Full 流水线只消费显式指定的
+基础包与 SDK build UUID，不重新构建任一候选；契约见 [Buildkite 流水线说明](.buildkite/README.md)。
 
-SDK 发布名为 `adx-sandbox`，Python 导入名为 `adx_sandbox`，CLI 为 `adx-sandbox`。ADX 环境变量使用 `ADX_` 前缀，内部品牌 HTTP 头使用 `X-ADX-`。
+SDK 发布名为 `adx-environment`，Python 导入名为 `adx_environment`，CLI 为 `adx-environment`。ADX 环境变量使用 `ADX_` 前缀，内部品牌 HTTP 头使用 `X-ADX-`。
 
 ## 📚 深入了解
 
 - [架构与仓库目录](docs/architecture/repository-layout.md)
 - [Agent 使用](agent/README.md)
-- [Sandbox API](gateway/apiserver/docs/sandbox-lifecycle-api.md)与 [OpenAPI](platform/api/openapi/sandbox.yaml)
+- [Environment API](gateway/apiserver/docs/environment-lifecycle-api.md)与 [OpenAPI](platform/api/openapi/environment.yaml)
 - [数据面 OpenAPI](platform/api/openapi/data-plane.yaml)
 - [运行时 HTTP 操作与错误](platform/api/http/runtime-data.md)
-- [Sandbox Python SDK](platform/sdk/sandbox/python/README.md)
+- [Environment Python SDK](platform/sdk/environment/python/README.md)
 - [部署配置](docs/deployment/adxctl.md)与[配置示例](build/config/examples/README.md)
 - [远程集群管理](docs/deployment/adxadmin.md)与 [API Key 管理](docs/testing/api-key-management.md)
 - [调度](docs/testing/scheduling-performance.md)、[节点生命周期](docs/testing/node-lifecycle.md)与[路由发布](docs/testing/route-publication.md)

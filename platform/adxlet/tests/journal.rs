@@ -41,7 +41,7 @@ fn record(revision: u64) -> EnvironmentRecord {
                 disk_bytes: 0,
             },
             priority: 0,
-            sandbox: Default::default(),
+            execution: Default::default(),
         },
         assignment: Assignment {
             environment_id: "i".into(),

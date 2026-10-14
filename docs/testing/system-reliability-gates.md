@@ -1,10 +1,10 @@
 # 系统错误、超时与故障可靠性门禁
 
-本文定义跨 API Server、Coordinator、adxlet、Relay、Execd 和 sandboxd 的系统级验收契约。组件 UT 只能证明局部规则；标记为 E2E 的项目必须经公共 Sandbox SDK 发起，并同时核对客户端结果、Redis 权威状态、路由和 sandboxd 物理实例。
+本文定义跨 API Server、Coordinator、adxlet、Relay、Execd 和 sandboxd 的系统级验收契约。组件 UT 只能证明局部规则；标记为 E2E 的项目必须经公共 Environment SDK 发起，并同时核对客户端结果、Redis 权威状态、路由和 sandboxd 物理实例。
 
 ## 错误契约
 
-统一错误响应需要稳定携带 `code`、`message`、`retry`、`outcome`、`requestId`、`operationId` 和 `instanceId`。`retry` 只允许 `never`、`same_operation`、`after_backoff`；`outcome` 只允许 `not_started`、`unknown`、`committed`、`terminal`。HTTP、内部 gRPC 和 SDK 必须保持同一含义，不能把 `unknown` 降级成普通 404，也不能换 Environment ID 重建。
+统一错误响应需要稳定携带 `code`、`message`、`retry`、`outcome`、`requestId`、`operationId` 和 `environmentId`。`retry` 只允许 `never`、`same_operation`、`after_backoff`；`outcome` 只允许 `not_started`、`unknown`、`committed`、`terminal`。HTTP、内部 gRPC 和 SDK 必须保持同一含义，不能把 `unknown` 降级成普通 404，也不能换 Environment ID 重建。
 
 | 门禁 | 场景 | 通过条件 | 当前状态 |
 |---|---|---|---|

@@ -37,10 +37,10 @@ fi
 stage=$(mktemp -d "${TMPDIR:-/tmp}/adx-build.XXXXXX")
 trap 'rm -rf "$stage"' EXIT
 echo "--- :rust: Compile control plane, gateway and EXECD"
-cargo build --locked --release -j "$JOBS" -p adx-apiserver -p adx-deployment -p adx-coordinator -p adxlet -p adx-execd --bins
+cargo build --locked --release -j "$JOBS" -p adx-activator -p adx-apiserver -p adx-deployment -p adx-coordinator -p adxlet -p adx-execd --bins
 cargo build --locked --release -j "$JOBS" \
   -p data-plane-gateway --features agent-api --bin adx-ingress --bin adx-relay
-for name in adx-apiserver adx-ingress adx-relay adxctl adx-inspect adx-coordinator adxlet adx-execd; do
+for name in adx-activator adx-apiserver adx-ingress adx-relay adxctl adx-inspect adx-coordinator adxlet adx-execd; do
  cp "$CARGO_TARGET_DIR/release/$name" "$stage/$name"
 done
 if [[ "$ADX_WITH_AFS" == "1" ]]; then
@@ -57,9 +57,9 @@ if [[ "$host" == *-linux-gnu ]]; then
   cp "$CARGO_TARGET_DIR/$musl_target/release/adx-execd" "$stage/adx-execd"
   "$PYTHON" build/runtime/rootfs.py --binary "$stage/adx-execd" --output "$stage/adx-runtime-rootfs.img"
 fi
-echo "--- :python: Build Sandbox SDK wheel"
-PYTHON="$PYTHON" bash platform/sdk/sandbox/python/build.sh "$stage/sdk"
-wheel=("$stage"/sdk/adx_sandbox-*.whl)
+echo "--- :python: Build Environment SDK wheel"
+PYTHON="$PYTHON" bash platform/sdk/environment/python/build.sh "$stage/sdk"
+wheel=("$stage"/sdk/adx_environment-*.whl)
 [[ ${#wheel[@]} == 1 && -f "${wheel[0]}" ]]
 package_args=(
   build/release/package.py

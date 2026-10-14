@@ -60,8 +60,8 @@ def run_failure(
     image,
     socket,
     output,
-    sandbox_factory=None,
-    sandbox_error=None,
+    environment_factory=None,
+    environment_error=None,
     remote=ssh,
     failure_timeout=90,
     recovery_timeout=90,
@@ -69,11 +69,11 @@ def run_failure(
 ):
     """Freeze only the selected worker's manager; never stop the VM/sandboxd."""
     verify_inventory(inventory)
-    if sandbox_factory is None or sandbox_error is None:
-        from adx_sandbox import Sandbox, SandboxError
+    if environment_factory is None or environment_error is None:
+        from adx_environment import Environment, EnvironmentError
 
-        sandbox_factory = sandbox_factory or Sandbox
-        sandbox_error = sandbox_error or SandboxError
+        environment_factory = environment_factory or Environment
+        environment_error = environment_error or EnvironmentError
     machines = {machine['role']: machine for machine in inventory['machines']}
     control = machines['control']
     healthy_worker, affected_worker = machines['worker-1'], machines['worker-2']
@@ -91,7 +91,7 @@ def run_failure(
         report['machines'] = verify_machines(inventory, remote)
         report['checks'].append('machine-identity')
         for worker in (healthy_worker, affected_worker):
-            sandbox = sandbox_factory(
+            environment = environment_factory(
                 image=image,
                 runtime='runc',
                 node_id=worker['node_id'],
@@ -101,17 +101,17 @@ def run_failure(
                 connection=connection,
                 create_timeout=150,
             )
-            handles.append(sandbox)
-            report['instances'].append({'id': sandbox.id, 'node_id': worker['node_id']})
+            handles.append(environment)
+            report['instances'].append({'id': environment.id, 'node_id': worker['node_id']})
         expected = {item['id']: item['node_id'] for item in report['instances']}
         report['before_backends'] = wait_for_backends((healthy_worker, affected_worker), socket, expected, remote)
-        for sandbox in handles:
-            assignment = persisted_assignment(control, sandbox.id, remote)
-            if assignment.get('node_id') != expected[sandbox.id] or assignment.get('state') != 'Running':
+        for environment in handles:
+            assignment = persisted_assignment(control, environment.id, remote)
+            if assignment.get('node_id') != expected[environment.id] or assignment.get('state') != 'Running':
                 raise AssertionError(f'initial assignment mismatch: {assignment}')
-            baseline = sandbox.commands.run('printf baseline-route')
+            baseline = environment.commands.run('printf baseline-route')
             if baseline.exit_code != 0 or baseline.stdout != 'baseline-route':
-                raise AssertionError(f'initial route to {sandbox.id} did not work')
+                raise AssertionError(f'initial route to {environment.id} did not work')
         report['checks'].append('both-workers-running')
         old_session = node_record(control, affected_worker['node_id'], remote)['session']['id']
         pid = manager_pid(affected_worker, remote)
@@ -128,7 +128,7 @@ def run_failure(
         report['checks'].append('heartbeat-expiry')
         try:
             affected.commands.run('printf stale-route-must-not-execute')
-        except sandbox_error:
+        except environment_error:
             report['checks'].append('route-withdrawn')
         else:
             raise AssertionError('failed worker remained reachable through Ingress')
@@ -147,11 +147,11 @@ def run_failure(
         report['checks'].append('stale-backend-cleanup-before-readmission')
         try:
             affected.commands.run('printf old-route-must-stay-invalid')
-        except sandbox_error:
+        except environment_error:
             report['checks'].append('old-route-still-invalid-after-rejoin')
         else:
             raise AssertionError('old instance route revived after worker rejoined')
-        replacement = sandbox_factory(
+        replacement = environment_factory(
             image=image,
             runtime='runc',
             node_id=affected_worker['node_id'],
@@ -183,30 +183,30 @@ def run_failure(
             except Exception as error:
                 report['cleanup_errors'].append(f'resume adxlet: {error}')
         affected_handle = handles[1] if len(handles) > 1 else None
-        for sandbox in reversed(handles):
+        for environment in reversed(handles):
             try:
-                sandbox.kill()
-            except sandbox_error as error:
+                environment.kill()
+            except environment_error as error:
                 # An invalidated instance may already be terminal. Physical
                 # cleanup below remains the authority for this test.
-                if sandbox is not affected_handle:
-                    report['cleanup_errors'].append(f'{sandbox.id} delete: {error}')
+                if environment is not affected_handle:
+                    report['cleanup_errors'].append(f'{environment.id} delete: {error}')
             except Exception as error:
-                report['cleanup_errors'].append(f'{sandbox.id} delete: {error}')
+                report['cleanup_errors'].append(f'{environment.id} delete: {error}')
             finally:
                 try:
-                    sandbox.close()
+                    environment.close()
                 except Exception as error:
-                    report['cleanup_errors'].append(f'{sandbox.id} close: {error}')
+                    report['cleanup_errors'].append(f'{environment.id} close: {error}')
         try:
             deadline = time.monotonic() + 15
             while handles:
                 residual = {
-                    sandbox.id: {
-                        worker['node_id']: backend_ids(worker, socket, sandbox.id, remote)
+                    environment.id: {
+                        worker['node_id']: backend_ids(worker, socket, environment.id, remote)
                         for worker in (healthy_worker, affected_worker)
                     }
-                    for sandbox in handles
+                    for environment in handles
                 }
                 if not any(ids for nodes in residual.values() for ids in nodes.values()):
                     break
@@ -258,7 +258,7 @@ def main():
     parser.add_argument('--output', required=True, type=Path)
     args = parser.parse_args()
     os.environ['SSL_CERT_FILE'] = str(args.ca.resolve())
-    from adx_sandbox import ConnectionConfig
+    from adx_environment import ConnectionConfig
 
     connection = ConnectionConfig(
         server_address=args.endpoint,

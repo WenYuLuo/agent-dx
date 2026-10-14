@@ -14,7 +14,7 @@ class NodePreferencesTests(unittest.TestCase):
                     'node2', 'node1', 'node2', 'node2']
         state = {'owners': {}, 'deleted': set(), 'options': []}
 
-        class Sandbox:
+        class Environment:
             def __init__(self, **options):
                 index = len(state['options'])
                 self.id = 'pref-' + str(index)
@@ -68,13 +68,13 @@ class NodePreferencesTests(unittest.TestCase):
                 with self.assertRaisesRegex(AssertionError, 'weighted node preference'):
                     run_preferences(inventory(), object(), 'image',
                                     '/run/sandboxd/sandboxd.sock', output,
-                                    Sandbox, resources, remote)
+                                    Environment, resources, remote)
                 self.assertEqual(json.loads((output / 'node-preferences-result.json').read_text())['status'],
                                  'failed')
             else:
                 report = run_preferences(inventory(), object(), 'image',
                                          '/run/sandboxd/sandboxd.sock', output,
-                                         Sandbox, resources, remote)
+                                         Environment, resources, remote)
                 self.assertEqual(report['status'], 'passed')
                 self.assertEqual(len(report['cases']), 5)
                 self.assertEqual(state['options'][2]['schedule_affinities'][1]['weight'], 9)
@@ -84,5 +84,5 @@ class NodePreferencesTests(unittest.TestCase):
     def test_preference_and_affinity_cases_prove_real_assignments(self):
         self.exercise()
 
-    def test_wrong_weighted_node_fails_and_cleans_every_created_sandbox(self):
+    def test_wrong_weighted_node_fails_and_cleans_every_created_environment(self):
         self.exercise(weighted_wrong=True)

@@ -366,7 +366,7 @@ fn validate_result(r: &EnvironmentRecord) -> Result<()> {
 }
 fn next_result(old: &StoredEnvironment, r: &EnvironmentRecord) -> Result<bool> {
     let mut expected_spec = old.spec.clone();
-    expected_spec.sandbox.network = r.spec.sandbox.network.clone();
+    expected_spec.execution.network = r.spec.execution.network.clone();
     if expected_spec != r.spec || old.assignment != r.assignment {
         return Err(Error::Conflict);
     }

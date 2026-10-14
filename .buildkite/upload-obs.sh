@@ -57,7 +57,7 @@ if [[ ${ADX_EXTERNAL_BACKEND:-1} == 1 ]]; then
   sha256sum "$runtime_archive" > "$runtime_archive.sha256"
   runtime_artifacts=("$runtime_archive" "$runtime_archive.sha256")
 fi
-base_wheels=("$verify_dir"/sdk/adx_sandbox-*.whl)
+base_wheels=("$verify_dir"/sdk/adx_environment-*.whl)
 [[ ${#base_wheels[@]} == 1 && -f ${base_wheels[0]} ]] || { echo 'base package SDK wheel is missing' >&2; exit 1; }
 "$python" build/release/component.py verify-build \
   --manifest out/buildkite/build-manifest.json \

@@ -23,7 +23,7 @@ class CreateResponseCutTests(unittest.TestCase):
                 final = json.dumps(
                     {
                         'status': 'running',
-                        'sandboxId': body['name'],
+                        'environmentId': body['name'],
                         'requestId': self.headers['X-Request-Id'],
                     }
                 ).encode()
@@ -46,7 +46,7 @@ class CreateResponseCutTests(unittest.TestCase):
             spec.loader.exec_module(proxy_module)
             upstream = f'http://127.0.0.1:{server.server_port}'
             with proxy_module.ResponseCutProxy(upstream) as proxy:
-                url = f'http://127.0.0.1:{proxy.port}/api/sandbox/v1/sandboxes'
+                url = f'http://127.0.0.1:{proxy.port}/api/environment/v1/environments'
                 request = Request(
                     url,
                     data=json.dumps({'name': 'same-capsule'}).encode(),
@@ -57,7 +57,7 @@ class CreateResponseCutTests(unittest.TestCase):
                 with urlopen(request, timeout=5) as response:
                     self.assertEqual(response.status, 200)
                     self.assertIn('event: final', response.read().decode())
-                self.assertEqual(proxy.first_final['sandboxId'], 'same-capsule')
+                self.assertEqual(proxy.first_final['environmentId'], 'same-capsule')
                 self.assertEqual(proxy.attempts, [('same-request', 'same-capsule')] * 2)
                 self.assertEqual(received, proxy.attempts)
         finally:

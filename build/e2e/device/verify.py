@@ -27,28 +27,28 @@ def main() -> int:
     if not args.device_path.startswith("/dev/"):
         parser.error("--device-path must be an absolute path under /dev")
     expected = re.compile(args.expect)
-    from adx_sandbox import Sandbox, SandboxNotFound
+    from adx_environment import Environment, EnvironmentNotFound
 
     args.output.mkdir(parents=True, exist_ok=False)
 
     started = time.monotonic()
     report = {"case": f"whole-device-{kind}", "status": "failed", "xpu": args.xpu,
-              "runtime": args.runtime, "node_id": args.node_id, "sandbox_id": None,
+              "runtime": args.runtime, "node_id": args.node_id, "environment_id": None,
               "cleanup_error": None, "error": None}
-    sandbox = None
+    environment = None
     try:
-        sandbox = Sandbox(
+        environment = Environment(
             image=args.image, runtime=args.runtime, xpu=args.xpu,
             node_id=args.node_id, cpu=1000, memory=2048,
             create_timeout=150,
         )
-        report["sandbox_id"] = sandbox.id
-        if not sandbox.is_running():
-            raise AssertionError("device sandbox was not running after create")
-        device = sandbox.commands.run(f"test -c {shlex.quote(args.device_path)}")
+        report["environment_id"] = environment.id
+        if not environment.is_running():
+            raise AssertionError("device environment was not running after create")
+        device = environment.commands.run(f"test -c {shlex.quote(args.device_path)}")
         if device.exit_code != 0:
             raise AssertionError(f"guest character device {args.device_path} is absent")
-        inventory = sandbox.commands.run(args.probe_command)
+        inventory = environment.commands.run(args.probe_command)
         if inventory.exit_code != 0:
             raise AssertionError(f"device inventory command exited {inventory.exit_code}: "
                                  f"{inventory.stderr[:500]}")
@@ -59,15 +59,15 @@ def main() -> int:
     except Exception as error:
         report["error"] = f"{type(error).__name__}: {error}"
     finally:
-        if sandbox is not None:
+        if environment is not None:
             try:
-                sandbox_id = sandbox.id
-                sandbox.kill()
+                environment_id = environment.id
+                environment.kill()
                 deadline = time.monotonic() + 60
                 while time.monotonic() < deadline:
                     try:
-                        remaining = Sandbox.from_id(sandbox_id)
-                    except SandboxNotFound:
+                        remaining = Environment.from_id(environment_id)
+                    except EnvironmentNotFound:
                         break
                     except RuntimeError as error:
                         if "is not running" in str(error):
@@ -77,7 +77,7 @@ def main() -> int:
                         remaining.close()
                     time.sleep(1)
                 else:
-                    raise TimeoutError("deleted device sandbox remained available")
+                    raise TimeoutError("deleted device environment remained available")
             except Exception as error:
                 report["cleanup_error"] = f"{type(error).__name__}: {error}"
                 report["status"] = "failed"

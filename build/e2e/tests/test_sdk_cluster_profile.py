@@ -27,12 +27,12 @@ class SDKClusterProfileTest(unittest.TestCase):
             raise AllocationReached()
 
         native = types.SimpleNamespace(
-            Sandbox=create, resources=lambda **_kwargs: nodes,
+            Environment=create, resources=lambda **_kwargs: nodes,
             CommandConflict=Exception, CommandNotFound=Exception,
             CommandStatus=object, DataPlaneSecurityPolicy=lambda **kwargs: kwargs,
         )
         with tempfile.TemporaryDirectory() as directory, patch.dict(
-            sys.modules, {'adx_sandbox': native}
+            sys.modules, {'adx_environment': native}
         ):
             with self.assertRaises(AllocationReached):
                 functional_data_plane.run(

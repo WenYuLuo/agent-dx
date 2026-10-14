@@ -70,7 +70,7 @@ cleanup() {
     done
     for node in "${worker1}" "${worker2}"; do
         remote "${node}" \
-            "sudo ip netns delete adx-sandbox 2>/dev/null || true; sudo ip link delete yrsb-host 2>/dev/null || true" \
+            "sudo ip netns delete adx-environment 2>/dev/null || true; sudo ip link delete yrsb-host 2>/dev/null || true" \
             >/dev/null 2>&1 || true
     done
     if "${test_ok}"; then
@@ -96,7 +96,7 @@ for node in "${coordinator}" "${worker1}" "${worker2}"; do
     remote "${node}" "
         sudo pkill -f '^${remote_root}/' 2>/dev/null || true
         sudo pkill -f '^python3 ${remote_root}/' 2>/dev/null || true
-        sudo ip netns delete adx-sandbox 2>/dev/null || true
+        sudo ip netns delete adx-environment 2>/dev/null || true
         sudo ip link delete yrsb-host 2>/dev/null || true
         rm -rf ${remote_root}
         mkdir -p ${remote_root}/bin ${remote_root}/logs ${remote_root}/results
@@ -135,37 +135,37 @@ copy_to "${evidence_dir}/ca.crt" "${coordinator}" "${remote_root}/ca.crt"
 copy_to "${evidence_dir}/ingress.crt" "${coordinator}" "${remote_root}/ingress.crt"
 copy_to "${evidence_dir}/ingress.key" "${coordinator}" "${remote_root}/ingress.key"
 
-start_sandbox() {
+start_environment() {
     local node=$1
     local host_ip=$2
-    local sandbox_ip=$3
+    local environment_ip=$3
     local node_ip=$4
     remote "${node}" "
-        sudo ip netns delete adx-sandbox 2>/dev/null || true
+        sudo ip netns delete adx-environment 2>/dev/null || true
         sudo ip link delete yrsb-host 2>/dev/null || true
-        mkdir -p ${remote_root}/sandbox
-        printf '%s\n' 'three-vm-${node}' >${remote_root}/sandbox/small.txt
-        truncate -s 33554432 ${remote_root}/sandbox/blob.bin
-        sudo ip netns add adx-sandbox
+        mkdir -p ${remote_root}/environment
+        printf '%s\n' 'three-vm-${node}' >${remote_root}/environment/small.txt
+        truncate -s 33554432 ${remote_root}/environment/blob.bin
+        sudo ip netns add adx-environment
         sudo ip link add yrsb-host type veth peer name yrsb-net
-        sudo ip link set yrsb-net netns adx-sandbox
+        sudo ip link set yrsb-net netns adx-environment
         sudo ip address add ${host_ip}/24 dev yrsb-host
         sudo ip link set yrsb-host up
-        sudo ip netns exec adx-sandbox ip link set lo up
-        sudo ip netns exec adx-sandbox ip address add ${sandbox_ip}/24 dev yrsb-net
-        sudo ip netns exec adx-sandbox ip link set yrsb-net up
-        sudo ip netns exec adx-sandbox bash -lc 'nohup python3 ${remote_root}/keepalive_http_server.py ${sandbox_ip} 18080 ${remote_root}/sandbox >${remote_root}/logs/sandbox-http.log 2>&1 & echo \$! >${remote_root}/sandbox-http.pid'
-        sudo ip netns exec adx-sandbox bash -lc 'nohup python3 ${remote_root}/idle_echo_server.py ${sandbox_ip} 18081 >${remote_root}/logs/sandbox-echo.log 2>&1 & echo \$! >${remote_root}/sandbox-echo.pid'
-        sudo ip netns exec adx-sandbox bash -lc 'nohup ${remote_root}/bin/relay_perf server ${sandbox_ip}:19001 >${remote_root}/logs/sandbox-relay-perf.log 2>&1 & echo \$! >${remote_root}/sandbox-relay-perf.pid'
-        nohup python3 ${remote_root}/keepalive_http_server.py ${node_ip} 18082 ${remote_root}/sandbox >${remote_root}/logs/direct-http.log 2>&1 &
+        sudo ip netns exec adx-environment ip link set lo up
+        sudo ip netns exec adx-environment ip address add ${environment_ip}/24 dev yrsb-net
+        sudo ip netns exec adx-environment ip link set yrsb-net up
+        sudo ip netns exec adx-environment bash -lc 'nohup python3 ${remote_root}/keepalive_http_server.py ${environment_ip} 18080 ${remote_root}/environment >${remote_root}/logs/environment-http.log 2>&1 & echo \$! >${remote_root}/environment-http.pid'
+        sudo ip netns exec adx-environment bash -lc 'nohup python3 ${remote_root}/idle_echo_server.py ${environment_ip} 18081 >${remote_root}/logs/environment-echo.log 2>&1 & echo \$! >${remote_root}/environment-echo.pid'
+        sudo ip netns exec adx-environment bash -lc 'nohup ${remote_root}/bin/relay_perf server ${environment_ip}:19001 >${remote_root}/logs/environment-relay-perf.log 2>&1 & echo \$! >${remote_root}/environment-relay-perf.pid'
+        nohup python3 ${remote_root}/keepalive_http_server.py ${node_ip} 18082 ${remote_root}/environment >${remote_root}/logs/direct-http.log 2>&1 &
         echo \$! >${remote_root}/direct-http.pid
         nohup ${remote_root}/bin/relay_perf server ${node_ip}:19000 >${remote_root}/logs/direct-relay-perf.log 2>&1 &
         echo \$! >${remote_root}/direct-relay-perf.pid
     "
 }
 
-start_sandbox "${worker1}" 10.88.1.1 10.88.1.2 "${worker1_ip}"
-start_sandbox "${worker2}" 10.88.2.1 10.88.2.2 "${worker2_ip}"
+start_environment "${worker1}" 10.88.1.1 10.88.1.2 "${worker1_ip}"
+start_environment "${worker2}" 10.88.2.1 10.88.2.2 "${worker2_ip}"
 
 start_node() {
     local node=$1
@@ -219,10 +219,10 @@ remote "${coordinator}" "
     exit 1
 "
 
-route1=$(printf '{"instanceID":"vm-sandbox-1","instanceStatus":{"code":3},"tenantID":"mock-tenant","sandboxID":"vm-sandbox-1","nodeProxyAddress":"%s:8443","sandboxIP":"10.88.1.2"}' "${worker1_ip}")
-route2=$(printf '{"instanceID":"vm-sandbox-2","instanceStatus":{"code":3},"tenantID":"mock-tenant","sandboxID":"vm-sandbox-2","nodeProxyAddress":"%s:8443","sandboxIP":"10.88.2.2"}' "${worker2_ip}")
-remote "${coordinator}" "${remote_root}/bin/etcdctl --endpoints=http://127.0.0.1:2379 put /adx/route/business/adxk/vm-sandbox-1 '${route1}' >/dev/null"
-remote "${coordinator}" "${remote_root}/bin/etcdctl --endpoints=http://127.0.0.1:2379 put /adx/route/business/adxk/vm-sandbox-2 '${route2}' >/dev/null"
+route1=$(printf '{"instanceID":"vm-environment-1","instanceStatus":{"code":3},"tenantID":"mock-tenant","environmentID":"vm-environment-1","nodeProxyAddress":"%s:8443","environmentIP":"10.88.1.2"}' "${worker1_ip}")
+route2=$(printf '{"instanceID":"vm-environment-2","instanceStatus":{"code":3},"tenantID":"mock-tenant","environmentID":"vm-environment-2","nodeProxyAddress":"%s:8443","environmentIP":"10.88.2.2"}' "${worker2_ip}")
+remote "${coordinator}" "${remote_root}/bin/etcdctl --endpoints=http://127.0.0.1:2379 put /adx/route/business/adxk/vm-environment-1 '${route1}' >/dev/null"
+remote "${coordinator}" "${remote_root}/bin/etcdctl --endpoints=http://127.0.0.1:2379 put /adx/route/business/adxk/vm-environment-2 '${route2}' >/dev/null"
 
 remote "${coordinator}" "
     nohup env \
@@ -256,11 +256,11 @@ remote "${coordinator}" "
 remote "${coordinator}" "
     set -e
     status=\$(curl -sS -o /dev/null -w '%{http_code}' --cacert ${remote_root}/ca.crt \
-      https://127.0.0.1:8443/direct/vm-sandbox-1/small.txt)
+      https://127.0.0.1:8443/direct/vm-environment-1/small.txt)
     test \"\${status}\" = 401
     curl -fsS --cacert ${remote_root}/ca.crt \
       -H 'Authorization: Bearer ${token}' \
-      https://127.0.0.1:8443/direct/vm-sandbox-1/small.txt \
+      https://127.0.0.1:8443/direct/vm-environment-1/small.txt \
       | grep -q three-vm-adx-worker-1
     curl -fsS --cacert ${remote_root}/ca.crt \
       https://127.0.0.1:8443/control.txt | grep -q control-plane-forwarded
@@ -270,11 +270,11 @@ remote "${coordinator}" "
 
 remote "${coordinator}" "
     nohup ${remote_root}/bin/adx-data-plane-forward port-forward \
-      127.0.0.1:8080 vm-sandbox-2 18080 127.0.0.1:19080 \
+      127.0.0.1:8080 vm-environment-2 18080 127.0.0.1:19080 \
       >${remote_root}/logs/forward-http.log 2>&1 &
     echo \$! >${remote_root}/forward-http.pid
     nohup ${remote_root}/bin/adx-data-plane-forward port-forward \
-      127.0.0.1:8080 vm-sandbox-2 18081 127.0.0.1:19081 \
+      127.0.0.1:8080 vm-environment-2 18081 127.0.0.1:19081 \
       >${remote_root}/logs/forward-idle.log 2>&1 &
     echo \$! >${remote_root}/forward-idle.pid
     for attempt in \$(seq 1 100); do
@@ -292,34 +292,34 @@ remote "${coordinator}" "
       http://${worker1_ip}:18082/small.txt --requests 200 --warmup 10 \
       | tee ${remote_root}/results/direct-keepalive-c1.json
     python3 ${remote_root}/http_keepalive_bench.py \
-      https://127.0.0.1:8443/direct/vm-sandbox-1/small.txt \
+      https://127.0.0.1:8443/direct/vm-environment-1/small.txt \
       --requests 200 --warmup 10 --ca ${remote_root}/ca.crt --token '${token}' \
       | tee ${remote_root}/results/ingress-tls-keepalive-c1.json
     python3 ${remote_root}/http_keepalive_bench.py \
       http://${worker1_ip}:18082/blob.bin --requests 4 --warmup 0 \
       | tee ${remote_root}/results/direct-throughput-c1.json
     python3 ${remote_root}/http_keepalive_bench.py \
-      https://127.0.0.1:8443/direct/vm-sandbox-1/blob.bin \
+      https://127.0.0.1:8443/direct/vm-environment-1/blob.bin \
       --requests 4 --warmup 0 --ca ${remote_root}/ca.crt --token '${token}' \
       | tee ${remote_root}/results/ingress-tls-throughput-c1.json
     python3 ${remote_root}/http_keepalive_bench.py \
       http://${worker1_ip}:18082/blob.bin --requests 16 --concurrency 8 --warmup 0 \
       | tee ${remote_root}/results/direct-throughput-c8.json
     python3 ${remote_root}/http_keepalive_bench.py \
-      https://127.0.0.1:8443/direct/vm-sandbox-1/blob.bin \
+      https://127.0.0.1:8443/direct/vm-environment-1/blob.bin \
       --requests 16 --concurrency 8 --warmup 0 --ca ${remote_root}/ca.crt --token '${token}' \
       | tee ${remote_root}/results/ingress-tls-throughput-c8.json
     ${remote_root}/bin/relay_perf bench-direct ${worker1_ip}:19000 download 33554432 4 1 \
       | tee ${remote_root}/results/raw-direct-c1.json
     ${remote_root}/bin/relay_perf bench-node ${worker1_ip}:8443 10.88.1.2 19001 download 33554432 4 1 \
       | tee ${remote_root}/results/raw-node-h2-c1.json
-    ${remote_root}/bin/relay_perf bench-ingress 127.0.0.1:8080 vm-sandbox-1 19001 download 33554432 4 1 \
+    ${remote_root}/bin/relay_perf bench-ingress 127.0.0.1:8080 vm-environment-1 19001 download 33554432 4 1 \
       | tee ${remote_root}/results/raw-ingress-node-c1.json
     ${remote_root}/bin/relay_perf bench-direct ${worker1_ip}:19000 download 33554432 16 8 \
       | tee ${remote_root}/results/raw-direct-c8.json
     ${remote_root}/bin/relay_perf bench-node ${worker1_ip}:8443 10.88.1.2 19001 download 33554432 16 8 \
       | tee ${remote_root}/results/raw-node-h2-c8.json
-    ${remote_root}/bin/relay_perf bench-ingress 127.0.0.1:8080 vm-sandbox-1 19001 download 33554432 16 8 \
+    ${remote_root}/bin/relay_perf bench-ingress 127.0.0.1:8080 vm-environment-1 19001 download 33554432 16 8 \
       | tee ${remote_root}/results/raw-ingress-node-c8.json
     curl -fsS http://${worker1_ip}:18443/metrics >${remote_root}/results/worker1-metrics-after.txt
     curl -fsS http://${worker2_ip}:18443/metrics >${remote_root}/results/worker2-metrics-after.txt
@@ -331,7 +331,7 @@ remote "${coordinator}" "
     set -e
     for batch in \$(seq 1 12); do
       seq 1 500 | xargs -P 24 -I@ \
-        curl -sS -o /dev/null http://127.0.0.1:8080/direct/vm-sandbox-1/small.txt
+        curl -sS -o /dev/null http://127.0.0.1:8080/direct/vm-environment-1/small.txt
       test -f ${remote_root}/logs/ingress-frontend-access.log.1.gz && break
     done
     test -s ${remote_root}/logs/ingress-frontend-access.log

@@ -1,5 +1,5 @@
-use adx_activator::local_sandbox::LocalSandbox;
-use adx_agent_core::{limits, sandbox::Sandbox};
+use adx_activator::local_environment::LocalEnvironment;
+use adx_agent_core::{environment::Environment, limits};
 use adx_apiserver::{
     clients::Clients,
     config::{Config, IngressMode},
@@ -37,15 +37,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let listener = TcpListener::bind(config.listen).await?;
     let mut embedded_ingress = if config.ingress_mode == IngressMode::Embedded {
-        let sandbox_service = embedded_sandbox_service(&api)?;
+        let environment_service = embedded_environment_service(&api)?;
         Some(
             EmbeddedIngress::start(
                 config
                     .ingress_control
                     .clone()
                     .ok_or("embedded Ingress control configuration missing")?,
-                sandbox_service,
-                api.sandbox_service.clone(),
+                environment_service,
+                api.environment_service.clone(),
             )
             .await
             .map_err(local_error)?,
@@ -128,12 +128,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn embedded_sandbox_service(
+fn embedded_environment_service(
     api: &Arc<Api>,
-) -> Result<Option<Arc<dyn Sandbox>>, Box<dyn std::error::Error>> {
-    Ok(Some(Arc::new(LocalSandbox::new(
-        api.sandbox_service.clone(),
-        limits::SANDBOX_REQUEST_TIMEOUT,
+) -> Result<Option<Arc<dyn Environment>>, Box<dyn std::error::Error>> {
+    Ok(Some(Arc::new(LocalEnvironment::new(
+        api.environment_service.clone(),
+        limits::ENVIRONMENT_REQUEST_TIMEOUT,
     )?)))
 }
 

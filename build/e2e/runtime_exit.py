@@ -7,7 +7,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from adx_sandbox import RestartPolicy, Sandbox
+from adx_environment import RestartPolicy, Environment
 from node import catalog, persisted_runtime_id
 
 
@@ -62,7 +62,7 @@ def run(connection, image, output):
     report = {"status": "failed", "cases": [], "cleanup_errors": []}
 
     def create(**options):
-        instance = Sandbox(
+        instance = Environment(
             image=image,
             runtime="runc",
             cpu=500,

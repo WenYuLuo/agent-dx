@@ -134,7 +134,7 @@ class UnknownQueryProxy:
 
 def run(connection, image, output, secrets):
     """Check the installed SDK, real API lookup, Redis owner and physical backend."""
-    from adx_sandbox import ConnectionConfig, Sandbox, SandboxNotFound
+    from adx_environment import ConnectionConfig, Environment, EnvironmentNotFound
     from functional_lifecycle import _wait_deleted
     from node import catalog, labeled_backend, persisted_runtime_id
 
@@ -143,10 +143,10 @@ def run(connection, image, output, secrets):
     instance_id = 'default-' + name
     report = {'status': 'failed', 'cases': [], 'cleanup_errors': []}
     deleted = False
-    sandbox = None
+    environment = None
 
     def committed(final):
-        sid = final.get('sandboxId') or final.get('instanceId')
+        sid = final.get('environmentId')
         if sid != instance_id:
             raise AssertionError(f'first create changed instance identity: {sid}')
         record = json.loads(catalog()['environment:' + sid])
@@ -177,7 +177,7 @@ def run(connection, image, output, secrets):
                 verify_tls=True,
             )
             future = executor.submit(
-                Sandbox,
+                Environment,
                 image=image,
                 runtime='runc',
                 cpu=500,
@@ -193,8 +193,8 @@ def run(connection, image, output, secrets):
                 if not proxy.first_cut.wait(10):
                     raise AssertionError('first create was not observed by the fault proxy')
                 try:
-                    missing = Sandbox.from_id(instance_id, connection=connection)
-                except SandboxNotFound:
+                    missing = Environment.from_id(instance_id, connection=connection)
+                except EnvironmentNotFound:
                     report['query_404_after_unknown'] = True
                 else:
                     missing.close()
@@ -203,13 +203,13 @@ def run(connection, image, output, secrets):
                     raise AssertionError('first create reached Redis before the 404 probe')
             finally:
                 proxy.release_first.set()
-            sandbox = future.result(timeout=180)
+            environment = future.result(timeout=180)
             if not proxy.first_finished.wait(5) or proxy.first_error is not None:
                 raise AssertionError(f'original create did not commit: {proxy.first_error}')
-            if sandbox.id != instance_id:
-                raise AssertionError(f'SDK changed instance ID: {sandbox.id}')
-            sandbox.close()
-            sandbox = None
+            if environment.id != instance_id:
+                raise AssertionError(f'SDK changed instance ID: {environment.id}')
+            environment.close()
+            environment = None
 
         first = proxy.first_evidence
         if first is None:
@@ -227,14 +227,14 @@ def run(connection, image, output, secrets):
             or labeled_backend(instance_id) != [first['backend']]
         ):
             raise AssertionError('retry created a second assignment or backend')
-        attached = Sandbox.from_id(instance_id, connection=connection)
+        attached = Environment.from_id(instance_id, connection=connection)
         try:
             command = attached.commands.run('printf unknown-query-recovered')
             if not (command.exit_code == 0 and command.stdout == 'unknown-query-recovered'):
                 raise AssertionError()
         finally:
             attached.close()
-        Sandbox.delete(instance_id, connection=connection)
+        Environment.delete(instance_id, connection=connection)
         deleted = True
         _wait_deleted(instance_id, connection, timeout=60)
         if not ('environment:' + instance_id not in catalog()):
@@ -262,11 +262,11 @@ def run(connection, image, output, secrets):
         proxy.release_first.set()
         if proxy.first_cut.is_set() and not proxy.first_finished.wait(30):
             report['cleanup_errors'].append('original create did not settle before cleanup')
-        if sandbox is not None:
-            sandbox.close()
+        if environment is not None:
+            environment.close()
         if instance_id and not deleted:
             try:
-                Sandbox.delete(instance_id, connection=connection)
+                Environment.delete(instance_id, connection=connection)
             except Exception as error:
                 report['cleanup_errors'].append(str(error))
         if report['cleanup_errors']:

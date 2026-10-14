@@ -36,7 +36,7 @@ fn shipped_example_routes_reach_its_frontend_listener() {
     .unwrap();
     for path in [
         "/api/instances",
-        "/api/sandbox/v1/snapshots",
+        "/api/environment/v1/snapshots",
         "/api/admin/v1/keys",
     ] {
         assert!(

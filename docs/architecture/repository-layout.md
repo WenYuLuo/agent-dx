@@ -1,6 +1,6 @@
 # Agent DX 当前目录与组件边界
 
-核对日期：2026-10-13。此页描述当前源码布局；首次导入记录保留在 [迁移报告](../migration/2026-09-14-import.md)。[HTML 阅读版](repository-layout.html) 从本文件生成，架构图为仓库内 SVG。
+核对日期：2026-10-14。此页描述当前源码布局；首次导入记录保留在 [迁移报告](../migration/2026-09-14-import.md)。[HTML 阅读版](repository-layout.html) 从本文件生成，架构图为仓库内 SVG。
 
 ![当前组件与调用方向](../../assets/architecture/current-architecture.svg)
 
@@ -8,14 +8,14 @@
 
 | 层 | 职责 | 当前状态 |
 |---|---|---|
-| Agent 产品 `agent/` | Template、AgentBinding、无状态 Activator | Rust 产品 API 集成在 Gateway Ingress；AgentBinding 保存业务身份到稳定逻辑 Sandbox 的映射，首次访问按需激活 |
-| 公开能力 `platform/sdk/sandbox` | Sandbox 生命周期、命令/文件、快照、放置约束 | Python SDK 已实现；客户端保留字段与新服务端支持范围不同 |
+| Agent 产品 `agent/` | Template、AgentBinding、无状态 Activator | Rust 产品 API 集成在 Gateway Ingress；AgentBinding 保存业务身份到稳定逻辑 Environment 的映射，首次访问按需激活 |
+| 公开能力 `platform/sdk/environment` | Environment 生命周期、命令/文件、快照、放置约束 | Python SDK 已实现；客户端保留字段与新服务端支持范围不同 |
 | 执行平台 `platform/` | 通用 Environment、调度、持久化、节点生命周期、Execd | Coordinator、adxlet、本地优先创建及 EROFS/OCI 运行环境已接入；沿用已有实现；本次验证见 [命名调整记录](../testing/environment-naming.md) |
-| 共享接入 `gateway/` | Sandbox API Server、Ingress、Relay、反向代理与转发 | API Server 默认内嵌 Ingress；adxlet 默认内嵌 Relay；Agent API 装配于 Ingress，业务规则归 Agent 层 |
+| 共享接入 `gateway/` | Environment API Server、Ingress、Relay、反向代理与转发 | API Server 默认内嵌 Ingress；adxlet 默认内嵌 Relay；Agent API 装配于 Ingress，业务规则归 Agent 层 |
 
-Agent API 在 Gateway Ingress 内处理产品请求。独立模式通过 ActivatorClient 调用远程 Activator，后者经 API Server Sandbox HTTP 接口访问平台；API Server 内嵌模式通过 LocalControl 调用同进程 Activator，直接复用 Sandbox 应用服务。两种模式均由 Activator 持久化 Template/AgentBinding。Agent 执行规格先由 Activator 的共享 mapper 转为 Sandbox 请求；API Server 应用服务再统一校验、转换为 EnvironmentSpec 并注入 runtime。Gateway 与 Activator 均缓存不可变模板；Activator 的 AgentBinding 激活缓存采用有界 LRU，默认 200000 条、5 小时滑动 TTL，请求命中续期，过期检查只随请求发生。独立模式全热解析只有一次 Activator RPC，嵌入式模式仅本地调用，不访问 Agent Redis 或 Sandbox API。bypass 在查询权威状态前失效旧绑定，HTTP/WS 的发送前目标重试自动启用并固定 generation；删除中的并发请求允许成功或失败，缓存不代表实时健康。
+Agent API 在 Gateway Ingress 内处理产品请求。独立模式通过 ActivatorClient 调用远程 Activator，后者经 API Server Environment HTTP 接口访问平台；API Server 内嵌模式通过 LocalControl 调用同进程 Activator，直接复用 Environment 应用服务。两种模式均由 Activator 持久化 Template/AgentBinding。Agent 执行规格先由 Activator 的共享 mapper 转为 Environment 请求；API Server 应用服务再统一校验、转换为 EnvironmentSpec 并注入 runtime。Gateway 与 Activator 均缓存不可变模板；Activator 的 AgentBinding 激活缓存采用有界 LRU，默认 200000 条、5 小时滑动 TTL，请求命中续期，过期检查只随请求发生。独立模式全热解析只有一次 Activator RPC，嵌入式模式仅本地调用，不访问 Agent Redis 或 Environment API。bypass 在查询权威状态前失效旧绑定，HTTP/WS 的发送前目标重试自动启用并固定 generation；删除中的并发请求允许成功或失败，缓存不代表实时健康。
 
-独立 Activator 模式下，Gateway 按完整 AgentBinding scope 做 Rendezvous Hash 亲和路由；静态直达实例列表和 Redis 注册发现二选一。启用发现时，Activator 默认每 5 秒续租 15 秒成员租约，Gateway 约每 5 秒刷新本地列表；请求路径不访问注册目录。Gateway 只读取独立注册键，Template/AgentBinding 权威元数据仍仅由 Activator 访问。成员变化和故障转移只改变缓存归属，不迁移 Sandbox，不新增生命周期控制器。Agent 不直接操作平台 Redis/SQLite 或 sandboxd。Activator 的生命周期访问只经 API Server：独立部署调用现有 HTTP 接口，嵌入部署调用应用服务；Ingress 不提供旧 Sandbox v2 管理入口。Jiuwen 通过 Ingress 通用文件能力读写 Sandbox，归属与 Running 状态经 API Server 查询，文件正文经 Relay/Execd 传输；Execd 凭据由共享数据面持有。用户 Harness 的 HTTP/WS/SSH 经共享数据面转发，业务协议由用户定义。
+独立 Activator 模式下，Gateway 按完整 AgentBinding scope 做 Rendezvous Hash 亲和路由；静态直达实例列表和 Redis 注册发现二选一。启用发现时，Activator 默认每 5 秒续租 15 秒成员租约，Gateway 约每 5 秒刷新本地列表；请求路径不访问注册目录。Gateway 只读取独立注册键，Template/AgentBinding 权威元数据仍仅由 Activator 访问。成员变化和故障转移只改变缓存归属，不迁移 Environment，不新增生命周期控制器。Agent 不直接操作平台 Redis/SQLite 或 sandboxd。Activator 的生命周期访问只经 API Server：独立部署调用现有 HTTP 接口，嵌入部署调用应用服务；Ingress 不提供旧 Environment v2 管理入口。Jiuwen 通过 Ingress 通用文件能力读写 Environment，归属与 Running 状态经 API Server 查询，文件正文经 Relay/Execd 传输；Execd 凭据由共享数据面持有。用户 Harness 的 HTTP/WS/SSH 经共享数据面转发，业务协议由用户定义。
 
 API Server 仍保留原有九条 `/api/agent` 兼容转发路由，由 `agent_address` 指向外部 Agent 服务；这是平台侧既有入口，不属于当前 Ingress Agent API／Activator 链路，本轮保持不变。
 
@@ -23,7 +23,7 @@ API Server 仍保留原有九条 `/api/agent` 兼容转发路由，由 `agent_ad
 
 Environment 自动暂停复用 idle timeout，策略为 delete/pause；匿名恢复点可按配置发布到共享对象存储。Ingress 认证首请求后与 API Server 手动 resume 共用 Coordinator `EnsureRunning`。Coordinator 持久化恢复意图、优先原节点准入，仅在明确资源不足或执行已失效时调度兼容目标；adxlet 执行恢复并提交 Running。节点失效保留 Paused，等待需求或到期/删除。Ingress 获得该执行的已发布路由后才转发业务字节。详见 [节点生命周期](../testing/node-lifecycle.md)。
 
-公开 Sandbox HTTP/SDK 契约继续使用 `/api/instances`、`instanceId` 和 `instance_id`；API Server 在边界将这些兼容字段映射为 `environment_id`。内部 Rust 类型、gRPC、持久化字段与 Metrics 统一使用 Environment/Runtime。详见 [命名与抽象](naming.md)。
+公开 Environment 生命周期 HTTP 契约使用 `/api/environment/v1/environments` 与 `environmentId`，Python SDK 使用 `adx_environment.Environment` 与 `environment_id`；`/api/instances` 保留为目录查询入口。内部 Rust 类型、gRPC、持久化字段与 Metrics 使用 Environment/Runtime，执行设置位于 `EnvironmentSpec.execution`。详见 [命名与抽象](naming.md)。
 
 AFS（Agent FS）是可选文件系统组件，源码、整体文档、构建、CI 和发布入口统一使用 `afs`。OwnerFs 与 DFS 是其内部平级模式；模式模块及 `ownerfs_*`／`dfs_*` 配置沿用各自名称。参见 [AFS 架构](afs.md)。
 
@@ -69,15 +69,15 @@ agent-dx/
 │   │   └── http/runtime-control.md
 │   ├── runtime/execd/            # HTTP 数据操作与双向控制流
 │   ├── deployment/                # 统一 adxctl / supervisor；管理控制面和数据面进程
-│   └── sdk/sandbox/python/        # adx-sandbox / adx_sandbox
+│   └── sdk/environment/python/        # adx-environment / adx_environment
 ├── gateway/
 │   ├── apiserver/                # Rust HTTP、认证缓存和 Environment RPC
 │   │   ├── src/                   # contract、http、clients、operations
 │   │   ├── tests/                 # HTTP 契约与校验
-│   │   └── docs/                  # Sandbox HTTP 支持范围
+│   │   └── docs/                  # Environment HTTP 支持范围
 │   └── src/
 │       ├── common/                # Gateway 内部监听、路由与数据面协议
-│       ├── ingress/               # Agent/Sandbox 适配、路由订阅、认证、连接池、反向代理
+│       ├── ingress/               # Agent/Environment 适配、路由订阅、认证、连接池、反向代理
 │       ├── node/                  # RelayService、绑定、活动、转发
 │       └── bin/                   # Ingress、Relay、forwarder
 ├── tools/
@@ -138,17 +138,17 @@ Proxy 首次启动关闭 Environment 准入，adxlet 完成权威对账与全量
 
 ## 协议与持久化
 
-公开 HTTP 路由和请求响应由 Rust HTTP handler 实现，SDK 调用公开契约；`platform/api/openapi/sandbox.yaml` 与 `data-plane.yaml` 记录当前公开接口，但尚未用于生成服务端代码。参考 [HTTP 文档](../../gateway/apiserver/docs/sandbox-lifecycle-api.md)。
+公开 HTTP 路由和请求响应由 Rust HTTP handler 实现，SDK 调用公开契约；`platform/api/openapi/environment.yaml` 与 `data-plane.yaml` 记录当前公开接口，但尚未用于生成服务端代码。参考 [HTTP 文档](../../gateway/apiserver/docs/environment-lifecycle-api.md)。
 
 内部 gRPC 按 Environment、快照、凭证、路由及节点本地控制拆分，详见 [协议目录](../../platform/api/proto/README.md)。Execd 用户操作使用 HTTP。配置 `adxlet.runtime_control` 后，Execd 主动建立到节点的双向 gRPC 控制流，上报 Ready／checkpoint 状态并接收准备与完成命令；未配置时使用 HTTP 控制。共享类型在 `core/src/runtime.rs`，见 [运行时控制契约](../../platform/api/proto/runtime-control.md) 与 [部署配置](../deployment/runtime-control-stream.md)。
 
-镜像继承入口可配置 readiness 与 healthcheck。Execd 在实例内执行探测，readiness 首次成功后才报告 Running；adxlet 直接等待该状态再绑定路由。Healthcheck 达到失败阈值后，通过现有串行控制器清理并应用既有恢复策略。Initializing 仅保留在运行时内存；最终 failure 元数据随现有 Environment 状态提交。暂停/恢复重新探测，内部探测不增加用户活动。详见 [SDK](../../platform/sdk/sandbox/python/README.md#workload-probes) 与 [Probe 契约](../../gateway/apiserver/docs/sandbox-lifecycle-api.md#workload-probes-on-image-startup)。
+镜像继承入口可配置 readiness 与 healthcheck。Execd 在实例内执行探测，readiness 首次成功后才报告 Running；adxlet 直接等待该状态再绑定路由。Healthcheck 达到失败阈值后，通过现有串行控制器清理并应用既有恢复策略。Initializing 仅保留在运行时内存；最终 failure 元数据随现有 Environment 状态提交。暂停/恢复重新探测，内部探测不增加用户活动。详见 [SDK](../../platform/sdk/environment/python/README.md#workload-probes) 与 [Probe 契约](../../gateway/apiserver/docs/environment-lifecycle-api.md#workload-probes-on-image-startup)。
 
 正常结果经 Coordinator 写 Redis；SQLite 只在提交不可用时保存待补交结果。Journaled 不发布 Ingress 路由。节点重启而 Coordinator 不可用时等待对账，不从不完整日志重建目录。快照制品走独立的本地/S3 存储抽象。Redis 使用 `environment:<environment_id>`，SQLite journal 使用 `environment` 字段；Coordinator 启动时仅将已删除且不占资源的旧 `capsule:*` 记录原子迁移为 `environment:*`。其他旧控制状态和节点 SQLite journal 不能据此视为兼容，升级前需要单独评估和迁移。详见 [持久化契约](../testing/coordinator-storage.md)和[节点契约](../testing/node-lifecycle.md)。
 
 ## 构建、部署和验收
 
-Rust 共用根 Cargo workspace，Python 工具独立打包；外部 sandboxd 按其锁定版本构建。`adxctl` 是平台运维 CLI，支持 validate/render/run/start/status/stop；`adxadmin` 是只访问公开 HTTPS API 的平台无关 Python 管理 CLI。统一平台包带控制面、Gateway、`adxctl`、静态 Execd、Sandbox SDK、EROFS 运行环境和锁定 Redis；`adxadmin` 以独立 wheel 发布。平台可选择外部 Redis，sandboxd 始终由部署环境托管。运行环境也可使用不可变 OCI image；自定义用户镜像从同一环境只读挂载 `/__adx`。
+Rust 共用根 Cargo workspace，Python 工具独立打包；外部 sandboxd 按其锁定版本构建。`adxctl` 是平台运维 CLI，支持 validate/render/run/start/status/stop；`adxadmin` 是只访问公开 HTTPS API 的平台无关 Python 管理 CLI。统一平台包带控制面、Gateway、`adxctl`、静态 Execd、Environment SDK、EROFS 运行环境和锁定 Redis；`adxadmin` 以独立 wheel 发布。平台可选择外部 Redis，sandboxd 始终由部署环境托管。运行环境也可使用不可变 OCI image；自定义用户镜像从同一环境只读挂载 `/__adx`。
 
 普通进程与 Pod 内都使用相同组件和 supervisor。Buildkite 先构建，再发布不可变镜像，最后独立执行 K8s 八组用例及清理。[Buildkite #30](../testing/2026-09-18-runtime-environment-k8s.md) 已验证 Rust API Server、本地优先创建及 OCI default/runtime-only/custom 三种环境路径；两个 Pod 同宿主。本地 FC 与基础 K8s 分开统计，实际未完成项和后置项见 [路线图](../testing/control-plane-roadmap.md)。
 

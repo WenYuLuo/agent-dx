@@ -12,12 +12,12 @@ def audit(evidence, result):
     identities, restores = {}, []
     for node in ('node1', 'node2'):
         for line in (evidence / f'{node}-sandboxd-service.log').read_text().splitlines():
-            created = re.search(r'Type:create SandboxID:(sbox-[\w-]+)', line)
+            created = re.search(r'Type:create EnvironmentID:(sbox-[\w-]+)', line)
             if created:
                 for case in cases:
                     if re.search(r'(?<![\w-])' + re.escape(case['instance_id']) + r'(?![\w-])', line):
                         identities[(node, created[1])] = case['instance_id']
-            restored = re.search(r'firecracker: restored sandbox (sbox-[\w-]+) pid=(\d+)', line)
+            restored = re.search(r'firecracker: restored environment (sbox-[\w-]+) pid=(\d+)', line)
             if restored:
                 restores.append({'node': node, 'backend': restored[1], 'vmm_pid': int(restored[2])})
     if any((r['node'], r['backend']) not in identities for r in restores):

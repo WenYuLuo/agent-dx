@@ -45,7 +45,7 @@ fn spec(i: usize) -> EnvironmentSpec {
             disk_bytes: 0,
         },
         scheduling: Default::default(),
-        sandbox: Default::default(),
+        execution: Default::default(),
     }
 }
 fn coordinator(cache: usize, capacity: u64) -> Coordinator {

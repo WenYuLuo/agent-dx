@@ -26,12 +26,12 @@ pub struct RouteInfo {
     pub environment_status: EnvironmentStatus,
     #[serde(rename = "tenantID", default)]
     pub tenant_id: String,
-    #[serde(rename = "sandboxID", default)]
-    pub sandbox_id: String,
+    #[serde(rename = "environmentID", default)]
+    pub environment_id: String,
     #[serde(rename = "nodeProxyAddress", default)]
     pub relay_address: String,
-    #[serde(rename = "sandboxIP", default)]
-    pub sandbox_ip: String,
+    #[serde(rename = "environmentIP", default)]
+    pub environment_ip: String,
     #[serde(
         rename = "tunnelSecurityMode",
         default,
@@ -149,20 +149,20 @@ impl RouteInfo {
     }
 
     /// Build the node CONNECT metadata for any TCP port selected by the Ingress
-    /// policy. The route itself supplies the sandbox identity and sandbox IP;
+    /// policy. The route itself supplies the environment identity and environment IP;
     /// sandboxd does not need to know the application protocol or port list.
     pub fn connect_target(
         &self,
         target_port: u16,
         request_id: impl Into<String>,
     ) -> Option<ConnectTarget> {
-        if self.sandbox_id.is_empty() || self.sandbox_ip.is_empty() || target_port == 0 {
+        if self.environment_id.is_empty() || self.environment_ip.is_empty() || target_port == 0 {
             return None;
         }
         Some(ConnectTarget {
             instance_id: self.instance_id.clone(),
-            workload_id: self.sandbox_id.clone(),
-            target_ip: self.sandbox_ip.parse::<IpAddr>().ok()?,
+            workload_id: self.environment_id.clone(),
+            target_ip: self.environment_ip.parse::<IpAddr>().ok()?,
             target_port,
             request_id: request_id.into(),
         })
@@ -292,10 +292,10 @@ mod tests {
     use super::*;
     #[test]
     fn route_keeps_environment_status_and_endpoint() {
-        let route: RouteInfo = serde_json::from_str(r#"{"instanceID":"i","instanceStatus":{"code":3,"msg":"ok"},"sandboxID":"s","nodeProxyAddress":"gw:8443","sandboxIP":"10.0.0.2"}"#).unwrap();
+        let route: RouteInfo = serde_json::from_str(r#"{"instanceID":"i","instanceStatus":{"code":3,"msg":"ok"},"environmentID":"s","nodeProxyAddress":"gw:8443","environmentIP":"10.0.0.2"}"#).unwrap();
         let cache = RouteCache::default();
         cache.put(route.clone());
-        assert_eq!(cache.get("i").unwrap().sandbox_ip, "10.0.0.2");
+        assert_eq!(cache.get("i").unwrap().environment_ip, "10.0.0.2");
         assert_eq!(cache.get("i").unwrap().environment_status.code, 3);
     }
 
@@ -323,7 +323,8 @@ mod tests {
     #[test]
     fn cache_resolves_raw_and_safe_instance_ids() {
         let mut route: RouteInfo =
-            serde_json::from_str(r#"{"instanceID":"user@host/f.v_1","sandboxID":"s"}"#).unwrap();
+            serde_json::from_str(r#"{"instanceID":"user@host/f.v_1","environmentID":"s"}"#)
+                .unwrap();
         route.environment_status.code = 3;
         let cache = RouteCache::default();
         cache.put(route);
@@ -335,7 +336,8 @@ mod tests {
         assert!(cache.get("user-at-host-f-v-1").is_none());
 
         let route: RouteInfo =
-            serde_json::from_str(r#"{"instanceID":"user@host/f.v_1","sandboxID":"s"}"#).unwrap();
+            serde_json::from_str(r#"{"instanceID":"user@host/f.v_1","environmentID":"s"}"#)
+                .unwrap();
         cache.put(route);
         cache.delete("user-at-host-f-v-1");
         assert!(cache.get("user@host/f.v_1").is_none());

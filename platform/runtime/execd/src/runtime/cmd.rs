@@ -1,4 +1,4 @@
-//! Durable-for-the-sandbox command registry.
+//! Durable-for-the-environment command registry.
 //!
 //! `command_id` is generated before submission and is the authoritative
 //! identity. Legacy callers may omit it and continue using the OS pid.

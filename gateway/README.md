@@ -1,10 +1,10 @@
 # Rust Gateway
 
 `gateway/` owns shared ingress. The nested [`apiserver`](apiserver/README.md)
-crate serves the public Sandbox control API and embeds Ingress by default. The
+crate serves the public Environment control API and embeds Ingress by default. The
 root `data-plane-gateway` crate contains the reusable Ingress-to-Node data plane
 gateway and the standalone `adx-ingress` fallback. Its core
-CONNECT protocol identifies a workload and target endpoint; sandbox routing is
+CONNECT protocol identifies a workload and target endpoint; environment routing is
 the first adapter, not part of the generic relay contract:
 
 * `adx-relay` accepts HTTP/2 `CONNECT` and relays one stream to one
@@ -19,7 +19,7 @@ instance URLs or Redis membership discovery; discovery refresh runs in the
 background and requests use a local member snapshot. Embedded Activator mode calls
 the local module without cross-instance AgentBinding affinity. Both modes share AgentBinding activation caching
 and explicit bypass semantics. See the
-[Agent deployment and cache contract](../agent/README.md#activator-发现与-agentbinding-亲和路由).
+[Agent deployment and cache contract](../agent/README.md#activator-%E5%8F%91%E7%8E%B0%E4%B8%8E-agentbinding-%E4%BA%B2%E5%92%8C%E8%B7%AF%E7%94%B1).
 
 The typed public Ingress → Relay → EXECD operations are defined by the
 [`data-plane.yaml`](../platform/api/openapi/data-plane.yaml) OpenAPI contract.
@@ -40,8 +40,8 @@ Root targets stage host-native binaries in `target/` (or `CARGO_TARGET_DIR`). Op
 
 The node never resolves DNS, accepts a user API Key, or chooses an arbitrary target
 address. The target IP must be present in
-`ADX_DATA_PLANE_ALLOWED_TARGET_CIDRS`; for the current sandbox adapter this is
-the node's sandbox bridge CIDR. The Ingress chooses the TCP port. Ingress-to-Node
+`ADX_DATA_PLANE_ALLOWED_TARGET_CIDRS`; for the current environment adapter this is
+the node's environment bridge CIDR. The Ingress chooses the TCP port. Ingress-to-Node
 defaults to plaintext H2/TCP inside a network-isolated trust boundary; optional
 mTLS, Node peer CIDR admission, and Ingress client CIDR admission are implemented
 in-process. Production configuration fails closed when required CIDR or mTLS
@@ -64,10 +64,10 @@ plaintext H2/TCP and relies on a mandatory Ingress-only network boundary; `mtls`
 adds mutually authenticated TLS. Untrusted or cross-cloud networks must use
 mTLS.
 
-The remaining platform ACL TODO is to install an immutable sandbox-egress
+The remaining platform ACL TODO is to install an immutable environment-egress
 policy that rejects protected internal CIDRs, with only platform-managed DNS
 and runtime-control exceptions. Until that is implemented, deployments must
-provide equivalent sandbox-veth/host-firewall isolation before enabling
+provide equivalent environment-veth/host-firewall isolation before enabling
 `network` mode. User NetworkPolicy must not be able to weaken that baseline.
 `ADX_DATA_PLANE_RELAY_ALLOW_ANY_INGRESS=1` /
 `ADX_DATA_PLANE_INGRESS_ALLOW_ANY_CLIENT=1` remain development-only ACL escapes.
@@ -94,8 +94,8 @@ socket without retaining a connection driver. This adds one round trip when
 creating a physical connection; reused connections do not repeat the check.
 
 Ordinary Direct HTTP requests use a bounded keep-alive pool keyed by the full
-endpoint identity `(node, instance, workload, sandbox IP, port)`.
-Consequently, a connection can never move between sandboxes or survive an
+endpoint identity `(node, instance, workload, environment IP, port)`.
+Consequently, a connection can never move between environments or survive an
 route change. WebSocket/Upgrade and raw CONNECT traffic remain
 one logical H2 stream per client connection. Route changes and explicit Node
 Proxy retirement,
@@ -105,7 +105,7 @@ The pool defaults to 64 concurrent connections per endpoint, 64 idle
 connections per endpoint, 1024 idle connections globally, a 3 second acquire
 timeout, and a 5 second idle lifetime. An idle pooled HTTP connection is still
 an active Node CONNECT stream, so the short lifetime deliberately bounds how
-long pooling can defer sandbox idle reclamation. These settings are tunable:
+long pooling can defer environment idle reclamation. These settings are tunable:
 
 ```text
 ADX_DATA_PLANE_INGRESS_BACKEND_HTTP_MAX_CONNECTIONS_PER_ENDPOINT=64
@@ -133,7 +133,7 @@ Independent Ingress replicas coalesce through Coordinator and can deliver retrie
 using their own route cache and connection pool. Without the HTTP deadline header,
 wake plus committed-route delivery share one default 300-second deadline;
 forwarding and upgraded-connection lifetimes otherwise retain their existing policy.
-See the [SDK timeout and demand retry contract](../platform/sdk/sandbox/python/README.md).
+See the [SDK timeout and demand retry contract](../platform/sdk/environment/python/README.md).
 
 Pool admission timeout returns HTTP 429. Metrics expose current idle
 connections plus opened, reused, discarded, and acquire-timeout totals. The L4
@@ -181,7 +181,7 @@ prefix is normalized. With `strip_prefix: true`, `/grafana/api/live/?x=1` become
 `/api/live/?x=1`; with false the original path is retained. Query strings and
 escaped path bytes are preserved. Host-specific routes take precedence over
 host-independent routes; within that group the longest matching prefix wins.
-Explicit application routes precede the legacy Frontend and sandbox HTTP routes.
+Explicit application routes precede the legacy Frontend and environment HTTP routes.
 The command-watch endpoint and CONNECT handling remain reserved. A `/` route is
 therefore a catch-all for other HTTP requests on its matching host.
 
@@ -259,7 +259,7 @@ Compression failure retains the uncompressed staging file and reports an error
 rather than deleting log data. When a dedicated access file exists, enabled access/audit events go there. Without a file sink, enabled events enter stdout. The access and audit enable switches are independent; disabling one drops its corresponding events.
 
 Ingress also replaces Traefik for the existing public control-plane
-surface. Only a fixed set of paths such as `/api/sandbox`, `/functions`,
+surface. Only a fixed set of paths such as `/api/environment`, `/functions`,
 `/serverless`, `/terminal`, `/invocations`, and `/global-scheduler` is proxied to the configured
 `ADX_DATA_PLANE_INGRESS_CONTROL_PLANE_ADDRESS`. These paths are accepted
 only on the TLS listener. Their authentication remains owned by Frontend and
@@ -322,7 +322,7 @@ Run the complete local protocol matrix with:
 cargo test --locked --all-features --test mock_e2e
 ```
 
-It starts real in-process Node and Ingress listeners plus mock sandbox HTTP and TCP
+It starts real in-process Node and Ingress listeners plus mock environment HTTP and TCP
 services and covers readiness, tenant admission, direct HTTP, WebSocket,
 CONNECT tunnel, port-forwarding, SSH/raw TCP, route retirement, status errors,
 drain, H2 reuse, and activity-count convergence.
@@ -338,7 +338,7 @@ bash gateway/tests/local_3vm_e2e.sh
 ```
 
 It deploys one Ingress on `adx-coordinator`, one Relay on each worker,
-and sandbox-like services behind worker-local netns/veth sandbox IPs. It covers
+and environment-like services behind worker-local netns/veth environment IPs. It covers
 TLS direct/auth, plaintext standard CONNECT port forwarding, static control
 proxying, two-node routing, a 65-second byte-idle stream, relay byte metrics,
 latency/throughput, secret-free access/audit records, and size rotation. The
@@ -346,7 +346,7 @@ VM IPs are rediscovered on every run and all processes/netns are removed before
 the reusable VMs are stopped. Evidence is retained under
 `.adx-cache/data-plane-gateway-3vm/<run-id>/`.
 
-For the current public Sandbox SDK platform acceptance, use [build/e2e](../build/e2e/README.md). The old full-cluster AIO harness was not imported and is not a runnable command in this repository.
+For the current public Environment SDK platform acceptance, use [build/e2e](../build/e2e/README.md). The old full-cluster AIO harness was not imported and is not a runnable command in this repository.
 
 The relay library supports tunnel, SSH and configured user-port forwarding. Public create validates forwarded ports and data-plane security settings, and Coordinator publishes the resulting routes. Generic reverse-proxy routes can forward Agent traffic to a separately supplied service; they do not implement the Agent backend.
 
@@ -362,13 +362,13 @@ does not replay a command or an HTTP request already delivered to Execd.
 ### Management boundary
 
 Ingress forwards data and calls Activator for AgentBinding activation. Standalone
-Activator uses the API Server's existing Sandbox REST API; embedded Activator uses
+Activator uses the API Server's existing Environment REST API; embedded Activator uses
 its application service. The Inline HTTP/JWT compatibility adapter and Ingress
-`/api/sandbox/v2/instances` endpoint have been removed. Configure standalone
+`/api/environment/v2/instances` endpoint have been removed. Configure standalone
 Activator with an API Server management URL and tenant-scoped API key environment
-references (see [Activator](../agent/activator/README.md)). Common Sandbox file
+references (see [Activator](../agent/activator/README.md)). Common Environment file
 access uses the API Server instance directory for admission and the shared data
-plane for Relay/Execd transport. PlatformSandbox and its runtime lookup have been
+plane for Relay/Execd transport. PlatformEnvironment and its runtime lookup have been
 removed. This source change does not redeploy the cluster.
 
 ### Managed Agent service access
@@ -397,10 +397,10 @@ The backend handshake uses `/`, Host `127.0.0.1:<service-port>` and Origin
 or forward frontend credentials. If AgentServer Origin checks are enabled, its
 allowlist must include `127.0.0.1`. Local Relay/mock-backend component tests cover
 authorized WS reuse, handshake timeout and route revocation. After the narrowly
-scoped Execd entrypoint-lock fix, real isolated Sandbox creation through the
+scoped Execd entrypoint-lock fix, real isolated Environment creation through the
 independent Activator passed, including AgentServer argv/working directory and
 service listening. The earlier embedded stack overflow was fixed and covered by a 2 MiB worker-stack
-regression. Standalone cloud validation covers new Sandbox creation, cross-replica
+regression. Standalone cloud validation covers new Environment creation, cross-replica
 file transfers, and real DeepSeek responses through LiteLLM. The subsequent upstream
 merge passed local regression checks and has not been redeployed; see the
 [design](../docs/development/jiuwenswarm-adx-gateway-design.md).
@@ -409,14 +409,14 @@ incomplete.
 
 Jiuwen download settings are decoded from the selected `TemplateVersion.env` by
 `jiuwen::download_config::DownloadConfig::load`, using the shared ManagedService
-and its tenant/template/version cache without creating a binding or Sandbox.
+and its tenant/template/version cache without creating a binding or Environment.
 The same env is already passed to AgentServer through ExecutionSpec. Templates
 must explicitly set absolute `JIUWENSWARM_WORKSPACE` and
 `JIUWENSWARM_DOWNLOAD_ASSET_ROOT` paths. A nonempty
 `JIUWENSWARM_FILE_DOWNLOAD_SECRET` takes precedence and must contain at least 32
 characters; it is kept verbatim and redacted in Debug. If absent or empty, the
 adapter selects `<workspace>/config/.file_download_secret` in the authorized
-Sandbox. No second Ingress configuration or process-environment probing is used.
+Environment. No second Ingress configuration or process-environment probing is used.
 Public identity and binding routing use authenticated business sessions.
 
 `jiuwen::download_token` implements HMAC verification over the original Base64URL
@@ -426,8 +426,8 @@ type/size for verified assets before returning `CheckedDownload`. Digest matchin
 uses the registration; it does not hash the entire download. Verification input
 limits are 16 KiB for a token and 64 KiB each for secret/registration contents.
 `jiuwen::download_runtime::Reader::authorize` combines these checks with bounded
-reads from the common `sandbox_files::Files` capability. The common data plane
-checks Sandbox ownership/state through the API Server and supplies Execd
+reads from the common `environment_files::Files` capability. The common data plane
+checks Environment ownership/state through the API Server and supplies Execd
 credentials internally; Jiuwen never receives them. It reads a key file only when needed, a registration only for verified
 assets, and path metadata before admission. The original deadline covers lookup,
 connect and body reads; revocation or caller cancellation drops the owned HTTP
@@ -443,27 +443,27 @@ transfer, including metadata reads and all chunks. Buffered first bytes
 are admitted again when consumed; backpressure does not start background reads.
 The caller's deadline covers the whole transfer. Errors before headers produce
 bounded JSON responses; later errors abort the body without a successful truncation.
-Local Relay/simulated-Execd tests cover these paths; real Sandbox validation and
+Local Relay/simulated-Execd tests cover these paths; real Environment validation and
 production account integration remains subject to the validation below. CheckedDownload is a
 point-in-time result, not a reusable authorization credential.
 
-### Common Sandbox file access
+### Common Environment file access
 
-With `agent-api`, set `ADX_SANDBOX_FILES_CONFIG` to a JSON configuration:
-[standalone](examples/sandbox-files.json) or
-[embedded](examples/sandbox-files-embedded.json). `token_env` references a protected
+With `agent-api`, set `ADX_ENVIRONMENT_FILES_CONFIG` to a JSON configuration:
+[standalone](examples/environment-files.json) or
+[embedded](examples/environment-files-embedded.json). `token_env` references a protected
 process environment variable containing the deployment-owned Execd token; no inline
 secret is stored in JSON. `port` must equal the Ingress `default_direct_port`.
 Standalone Ingress uses `directory` and `api_key_envs` to call the existing API
 Server `GET /api/instances?instance_id=...`; keys must be tenant-scoped, never admin
-keys. Embedded Ingress receives `SandboxService` directly and rejects HTTP directory
-configuration. Both require the requested Sandbox to belong to the tenant and be
+keys. Embedded Ingress receives `EnvironmentService` directly and rejects HTTP directory
+configuration. Both require the requested Environment to belong to the tenant and be
 Running. Each frontend upload/download request owns one `Files` context: its first
 backend operation queries the directory, and the result is reused for all metadata,
 secret/registration reads, body chunks, and upload/commit operations in that request.
 A multipart request also shares admission across its files. A new frontend request
 must query again; failed admission is not repeatedly queried within the same context.
-Neither lookup activates a Sandbox or returns credentials.
+Neither lookup activates an Environment or returns credentials.
 
 The context pins the admitted runtime route. Each operation checks local route
 currency and retained route-change events; a target change, removal, or lost event
@@ -491,7 +491,7 @@ be updated to the new configuration before using this binary.
 Build with `--features agent-api`. Configure `ADX_JIUWEN_CONFIG` using
 [jiuwen.json](examples/jiuwen.json), and `ADX_ACCOUNT_CONFIG` using
 [accounts.json](examples/accounts.json). Both standalone and embedded Ingress
-require Agent configuration and `ADX_SANDBOX_FILES_CONFIG` as described above. Fixed-user `local_fixed` mode
+require Agent configuration and `ADX_ENVIRONMENT_FILES_CONFIG` as described above. Fixed-user `local_fixed` mode
 has been removed; Jiuwen requires business session tokens independently of the
 listener transport. It neither checks TLS state nor trusts `X-Forwarded-Proto`
 for authorization. Both HTTP and HTTPS listeners use the same business checks.
@@ -520,7 +520,7 @@ of total request body (up to 20 files). The optional upload query parameter
 `session_id` is accepted for client compatibility but does not change the
 selected binding. The `user_id` field and `X-User-Id` header, if present, must match the
 authenticated user. Upload paths are relative to the immutable template's
-`JIUWENSWARM_WORKSPACE` and written to that user's bound Sandbox through
+`JIUWENSWARM_WORKSPACE` and written to that user's bound Environment through
 Relay and Execd. The response has Jiuwen's
 `{"ok":true,"files":[{"filename":"...","path":"...","mime_type":"...","size_bytes":0}],"errors":[]}`
 shape. Upload does not open another AgentServer WS connection.
@@ -535,9 +535,9 @@ Huawei application secrets and LiteLLM administrative keys remain on Ingress.
 
 The first WS for a new binding provisions/reconciles a user model key, then
 prepares an immutable private binding launch configuration. Activator overlays
-that configuration on the shared template environment before Sandbox creation.
+that configuration on the shared template environment before Environment creation.
 Retries and rebuilds reuse it; public Binding metadata does not return it.
-Downloads resolve existing bindings without provisioning keys or creating Sandboxes.
+Downloads resolve existing bindings without provisioning keys or creating Environments.
 
 WS checks sessions before business messages and periodically while idle; download
 streams also stop on expiry/revocation. Multiple independent WS connections may

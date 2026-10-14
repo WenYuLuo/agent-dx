@@ -1,6 +1,9 @@
 # AFS POSIX smoke probes
 
-锁工具属于后置专题：本次版本不承诺跨节点 fcntl/flock、阻塞锁取消或 bind/native↔FUSE 锁域一致性。以下工具用于记录行为，不代表当前产品已通过或支持这些能力。
+Locking is a later workstream. This version does not promise cross-node
+`fcntl`/`flock`, cancellation of blocking lock requests, or a shared lock domain
+across bind/native and FUSE access. These tools record behavior; their presence
+does not establish product support or acceptance for those capabilities.
 
 `posix_smoke.py` is a short, real filesystem probe used during P2c/POSIX bring-up. It creates one exclusive random fixture directory under the supplied mount and records every step in JSON evidence.
 
@@ -107,9 +110,14 @@ The `host` command takes JSON worker command prefixes, the OwnerFs workspace and
 
 Run `python3 consistency_cross.py selftest` on Linux to verify positive reference behavior, bounded silent-worker timeout, wrong-binary rejection and rejection of unqualified mounts. Reference selftests do not qualify AFS behavior. Evidence includes exact commands, phase-specific errors, content, sizes, identities and discovered step accounting.
 
-## mmap 新鲜度探针
+## mmap freshness probe
 
-`mmap_freshness.py` 保留原 `p1b-probe.py` 的真实挂载核验和读写检查，改名不改变语义：热驻留只读映射对覆盖、append、truncate/扩展的即时可见性，以及共享可写 mmap 的 flush/fsync/close/reopen。只在已有 Linux FUSE 测试挂载执行，不负责部署或启动服务，也不替代完整 POSIX 验收。
+`mmap_freshness.py` preserves the real mount verification and read/write checks
+from `p1b-probe.py`; the rename does not change their semantics. It checks
+immediate visibility of overwrite, append, truncation, and extension through
+resident read-only mappings, plus flush/fsync/close/reopen for shared writable
+`mmap`. Run it only against existing Linux FUSE test mounts. It does not deploy
+or start services and does not replace full POSIX acceptance.
 
 ```sh
 python3 build/e2e/afs/acceptance/probes/mmap_freshness.py \

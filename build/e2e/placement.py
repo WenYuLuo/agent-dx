@@ -3,7 +3,7 @@
 import json
 import uuid
 
-from adx_sandbox import Sandbox, SandboxError
+from adx_environment import Environment, EnvironmentError
 from node import catalog
 from runtime_inventory import require_runc_only_inventory, require_unassigned_create
 
@@ -21,7 +21,7 @@ def run(connection, image, output):
         }
 
     def create(**options):
-        sandbox = Sandbox(
+        environment = Environment(
             image=image,
             runtime='runc',
             cpu=250,
@@ -31,28 +31,28 @@ def run(connection, image, output):
             create_timeout=120,
             **options,
         )
-        handles.append(sandbox)
-        report['instances'].append(sandbox.id)
-        return sandbox
+        handles.append(environment)
+        report['instances'].append(environment.id)
+        return environment
 
-    def assigned(sandbox):
-        record = json.loads(catalog()['environment:' + sandbox.id])
+    def assigned(environment):
+        record = json.loads(catalog()['environment:' + environment.id])
         if not (record['result']['state'] == 'Running'):
             raise AssertionError()
         return record['assignment']['node_id']
 
     def verify(name, expected, **options):
         print('[PLACEMENT RUN]', name, flush=True)
-        sandbox = create(**options)
-        actual = assigned(sandbox)
+        environment = create(**options)
+        actual = assigned(environment)
         if not (actual == expected):
             raise AssertionError((name, expected, actual))
-        command = sandbox.commands.run('printf placement-ready')
+        command = environment.commands.run('printf placement-ready')
         if not (command.exit_code == 0 and command.stdout == 'placement-ready'):
             raise AssertionError()
-        sandbox.kill()
+        environment.kill()
         report['cases'].append(
-            {'name': name, 'expected_node': expected, 'actual_node': actual, 'instance_id': sandbox.id, 'passed': True}
+            {'name': name, 'expected_node': expected, 'actual_node': actual, 'instance_id': environment.id, 'passed': True}
         )
         print('[PLACEMENT PASS]', name, 'node=' + actual, flush=True)
 
@@ -107,7 +107,7 @@ def run(connection, image, output):
         rejected_id = 'default-' + rejected_name
         print('[PLACEMENT RUN] unavailable runtime stays unassigned', flush=True)
         try:
-            unexpected = Sandbox(
+            unexpected = Environment(
                 name=rejected_name,
                 image=image,
                 runtime='runsc',
@@ -119,7 +119,7 @@ def run(connection, image, output):
                 schedule_timeout=3,
                 create_timeout=40,
             )
-        except SandboxError as error:
+        except EnvironmentError as error:
             if 'central scheduling queue deadline exceeded' not in str(error):
                 raise AssertionError(str(error)) from error
         else:
@@ -136,13 +136,13 @@ def run(connection, image, output):
         report['error'] = str(error)
         raise
     finally:
-        for sandbox in reversed(handles):
+        for environment in reversed(handles):
             try:
-                sandbox.kill()
+                environment.kill()
             except Exception as error:
                 report['cleanup_errors'].append(str(error))
             finally:
-                sandbox.close()
+                environment.close()
         try:
             records = catalog()
             for sid in report['instances']:

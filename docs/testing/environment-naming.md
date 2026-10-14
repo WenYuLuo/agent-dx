@@ -1,12 +1,14 @@
 # Environment 与组件命名调整验证
 
+> 历史记录：下述接口、组件和产物名称对应 2026-09-23 的验证版本；当前 Environment SDK、HTTP 契约和 AgentBinding 模型见 [组件命名与抽象](../architecture/naming.md)。
+
 日期：2026-09-23。基于 `community/refactor` 提交 `c66a0240e79be5e3c417901ac05bbd70ba4ad2ea`，在独立 `refactor/environment-naming` worktree 验证未提交修改。命名与配置契约见 [组件命名与抽象](../architecture/naming.md)。
 
 ## 修改范围
 
 进程统一为 `adx-coordinator`、`adxlet`、`adx-apiserver`、`adx-ingress`、`adx-relay`、`adx-execd`。平台 Capsule 更名 Environment，部署 rootfs/bootstrap 模型更名 RuntimeProfile。目录、内部协议、Redis/SQLite 字段、部署角色、发布清单、环境变量、指标、SDK 内部 Execd 连接配置和测试驱动同步调整。
 
-公开 Sandbox 类、包名和生命周期 HTTP 路径保持现有定义。Agent Environment 产品状态与平台 Environment 生命周期分别管理。API Server + Ingress、adxlet + Relay 的默认合进程和可选拆分能力保留。
+当时公开 Sandbox 类、包名和生命周期 HTTP 路径保持原有定义。Agent Environment 产品状态与平台 Environment 生命周期分别管理。API Server + Ingress、adxlet + Relay 的默认合进程和可选拆分能力保留。
 
 本次使用新 namespace 和临时数据库进行验证；不提供旧持久化格式读取或迁移流程。
 
@@ -20,7 +22,7 @@
 | Redis storage，包括 AOF、原子归属与恢复 | 27 项通过 | `out/ci/environment-naming/real-redis/` |
 | Coordinator/adxlet/Gateway RPC、真实 API Server 进程、mTLS | 21 项通过 | `out/ci/environment-naming/api-control-final/` |
 | SDK ↔ Execd 真实 Socket、TLS command watch | 通过 | `out/ci/environment-naming/interop/` |
-| Sandbox SDK | 246 项、64 subtests 通过 | `out/ci/environment-naming/sdk-final.log` |
+| 当时的 Sandbox SDK | 246 项、64 subtests 通过 | `out/ci/environment-naming/sdk-final.log` |
 | 部署、CI、缓存、发布、E2E 驱动与管理客户端测试 | 155 项、3 subtests 通过，1 项跳过 | `out/ci/environment-naming/harness-final.log` |
 | SDK wheel + sdist 构建 | 通过 | `out/ci/environment-naming/sdk-package/` |
 | Shell / Python 源码语法 | 36 个 Shell、160 个 Python 文件通过 | `out/ci/environment-naming/script-syntax.log` |

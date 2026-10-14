@@ -52,7 +52,7 @@ def verify_sdk(wheel, candidate_path, expected_commit):
         raise ValueError('SDK artifact digest mismatch')
     if (
         Path(wheel.name).name != wheel.name
-        or not wheel.name.startswith('adx_sandbox-')
+        or not wheel.name.startswith('adx_environment-')
         or not wheel.name.endswith('-py3-none-any.whl')
     ):
         raise ValueError('invalid SDK wheel name')
@@ -81,6 +81,7 @@ def main():
         p.add_argument('--' + name, type=Path, required=True)
     p.add_argument('--runtime-base', required=True)
     p.add_argument('--execd-base', required=True)
+    p.add_argument('--activator', action='store_true', help='include the inherited Activator business workload')
     p.add_argument('--workload-probes', action='store_true', help='include the managed probe workload fixture')
     p.add_argument('--firecracker-kit', type=Path)
     p.add_argument('--runsc-bin', type=Path, help='optional verified native runsc for the heterogeneous runtime E2E')
@@ -118,6 +119,8 @@ def main():
         'execd': f'adx-e2e-execd:{uid}',
         'entrypoint': f'adx-e2e-entrypoint:{uid}',
     }
+    if a.activator:
+        tags['activator'] = f'adx-e2e-activator:{uid}'
     if a.workload_probes:
         tags['probes'] = f'adx-e2e-probes:{uid}'
     with tempfile.TemporaryDirectory(prefix='adx-e2e-image-') as d:
@@ -182,6 +185,12 @@ def main():
             'ENTRYPOINT ["/bin/sh", "-c", "sleep 30; echo adx-entrypoint-stderr >&2; exit 7"]\n'
         )
         roles = [('node', a.runtime_base), ('execd', a.execd_base), ('entrypoint', a.execd_base)]
+        if a.activator:
+            (context / 'Dockerfile.activator').write_text(
+                'ARG BASE\nFROM ${BASE}\nCOPY e2e/activator_workload.py /opt/adx/activator-workload.py\n'
+                'ENTRYPOINT ["python3", "/opt/adx/activator-workload.py"]\n'
+            )
+            roles.append(('activator', a.runtime_base))
         if a.workload_probes:
             (context / 'Dockerfile.probes').write_text(
                 'ARG BASE\nFROM ${BASE}\n'
@@ -232,6 +241,8 @@ def main():
             check=True,
             timeout=300,
         )
+        if a.activator:
+            subprocess.run([_executable('docker'), 'save', '-o', str(a.output / 'activator.tar'), tags['activator']], check=True, timeout=300)
         if a.workload_probes:
             subprocess.run(
                 [_executable('docker'), 'save', '-o', str(a.output / 'workload-probes.tar'), tags['probes']],
@@ -250,6 +261,8 @@ def main():
         'base_images': {'node': a.runtime_base, 'execd': a.execd_base},
     }
     result['collector'] = {**collector, 'image': collector_image}
+    if a.activator:
+        result['activator_archive_sha256'] = sha(a.output / 'activator.tar')
     if a.workload_probes:
         result['workload_probes_archive_sha256'] = sha(a.output / 'workload-probes.tar')
     if runsc_sha256:

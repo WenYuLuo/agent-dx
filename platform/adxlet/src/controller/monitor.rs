@@ -177,8 +177,8 @@ impl Controller {
     }
     pub(super) async fn runtime_probe_failure(&mut self) -> Result<bool> {
         if self.record.state != EnvironmentState::Running
-            || (self.record.spec.sandbox.healthcheck_probe.is_none()
-                && self.record.spec.sandbox.readiness_probe.is_none())
+            || (self.record.spec.execution.healthcheck_probe.is_none()
+                && self.record.spec.execution.readiness_probe.is_none())
         {
             return Ok(false);
         }
@@ -198,7 +198,7 @@ impl Controller {
         self.idle = None;
         let cleanup = self.cleanup().await;
         self.transition(Event::Fail)?;
-        if self.record.spec.sandbox.failover {
+        if self.record.spec.execution.failover {
             self.record.restart_pending = false;
             self.restart_after = None;
             if let Err(error) = cleanup {

@@ -80,7 +80,7 @@ class NetworkPartitionTests(unittest.TestCase):
                 409,
                 'Conflict',
                 {},
-                io.BytesIO(b'sandbox instance is not connectable'),
+                io.BytesIO(b'environment instance is not connectable'),
             )
             with (
                 patch.object(scenario.ssl, 'create_default_context'),

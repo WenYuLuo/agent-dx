@@ -270,9 +270,9 @@ impl Sandboxd {
             };
             if !response.id.is_empty() {
                 adx_observability::info!(
-                    event = "sandbox_identity_mapped",
+                    event = "environment_identity_mapped",
                     runtime_id = %logical_id,
-                    sandbox_id = %response.id,
+                    backend_id = %response.id,
                     "sandboxd physical identity mapped to ADX runtime"
                 );
                 backend_ids
@@ -289,9 +289,9 @@ impl Sandboxd {
             let ip: IpAddr = response
                 .sandbox_ip
                 .parse()
-                .map_err(|_| unavailable("Start did not return a valid sandbox IP"))?;
+                .map_err(|_| unavailable("Start did not return a valid environment IP"))?;
             if ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() {
-                return Err(unavailable("Start returned a non-routable sandbox IP"));
+                return Err(unavailable("Start returned a non-routable environment IP"));
             }
             *state = StartState::Started(ip);
             Ok(ip)
@@ -337,7 +337,7 @@ impl Sandboxd {
                 selector,
             }))
             .await;
-        let mut sandboxes = match response {
+        let mut environments = match response {
             Ok(response) => response.into_inner().sandboxes,
             Err(error) if physical.is_some() && error.code() == Code::NotFound => {
                 return Ok(Vec::new());
@@ -345,32 +345,32 @@ impl Sandboxd {
             Err(error) => return Err(unavailable(error)),
         };
         let mut discovered = BTreeMap::new();
-        for sandbox in &mut sandboxes {
-            if !sandbox.labels.contains_key("adx.environment_id") {
+        for backend in &mut environments {
+            if !backend.labels.contains_key("adx.environment_id") {
                 continue;
             }
-            let environment = &sandbox.labels["adx.environment_id"];
-            let generation = sandbox
+            let environment = &backend.labels["adx.environment_id"];
+            let generation = backend
                 .labels
                 .get("adx.generation")
                 .and_then(|v| v.parse::<u64>().ok())
                 .filter(|v| *v > 0)
                 .ok_or_else(|| unavailable("managed runtime has no valid generation"))?;
-            let logical = sandbox
+            let logical = backend
                 .labels
                 .get("adx.runtime_id")
                 .filter(|id| adx_core::valid_runtime_id(environment, generation, id))
                 .ok_or_else(|| unavailable("managed runtime has invalid execution labels"))?;
-            if sandbox.id.is_empty()
+            if backend.id.is_empty()
                 || environment.is_empty()
                 || (!logical_id.is_empty() && logical != logical_id)
                 || discovered
-                    .insert(logical.clone(), sandbox.id.clone())
+                    .insert(logical.clone(), backend.id.clone())
                     .is_some()
             {
                 return Err(unavailable("ambiguous managed runtime identity"));
             }
-            sandbox.id = logical.clone();
+            backend.id = logical.clone();
         }
         let mut ids = self.backend_ids.lock().expect("shared state lock poisoned");
         for (logical, physical) in &discovered {
@@ -382,7 +382,7 @@ impl Sandboxd {
             }
         }
         ids.extend(discovered);
-        Ok(sandboxes)
+        Ok(environments)
     }
     async fn physical_id(&self, logical_id: &str) -> Result<Option<String>> {
         if let Some(id) = self
@@ -421,8 +421,8 @@ impl Sandboxd {
 
     pub async fn observe(&self, id: &str) -> Result<crate::RuntimeStatus> {
         use adx_core::{RuntimeFailure, RuntimeFailureReason};
-        let sandboxes = self.list_id(id).await?;
-        let Some(status) = sandboxes.iter().find(|status| status.id == id) else {
+        let environments = self.list_id(id).await?;
+        let Some(status) = environments.iter().find(|status| status.id == id) else {
             return Ok(crate::RuntimeStatus {
                 running: false,
                 failure: Some(RuntimeFailure {
@@ -552,17 +552,17 @@ pub fn start_request(
         };
         xpu.entry(kind.into()).or_default().push(d.id);
     }
-    let options = &spec.sandbox;
+    let options = &spec.execution;
     // Only the typed constructor option may configure runtime initialization.
-    envs.remove("ADX_SANDBOX_CWD");
+    envs.remove("ADX_ENVIRONMENT_CWD");
     if let Some(cwd) = &options.cwd {
-        adx_core::sandbox::validate_cwd(cwd)?;
-        envs.insert("ADX_SANDBOX_CWD".into(), cwd.clone());
+        adx_core::execution::validate_cwd(cwd)?;
+        envs.insert("ADX_ENVIRONMENT_CWD".into(), cwd.clone());
     }
     let mut mounts = options
         .mounts
         .iter()
-        .map(sandbox_mount)
+        .map(environment_mount)
         .collect::<Result<Vec<_>>>()?;
     if options.rootfs.is_some() || !spec.image.is_empty() {
         mounts.extend(environment.map_or_else(Vec::new, |e| {
@@ -652,7 +652,7 @@ pub fn start_request(
         sandbox_id: String::new(),
         runtime: spec.runtime_class.clone(),
         rootfs: Some(if let Some(rootfs) = &options.rootfs {
-            sandbox_rootfs(rootfs)?
+            environment_rootfs(rootfs)?
         } else if let Some(e) = environment.filter(|_| spec.image.is_empty()) {
             if e.rootfs.r#type == "image" {
                 proto::RootfsConfig {
@@ -707,7 +707,7 @@ pub fn start_request(
         network_policy: options
             .network
             .as_ref()
-            .map(|policy| sandbox_network_policy(policy, &options.ports, config))
+            .map(|policy| environment_network_policy(policy, &options.ports, config))
             .transpose()?,
         inject_entrypoint: if options.inherit_entrypoint {
             image_process_config.into()
@@ -739,7 +739,7 @@ fn deployment_environment_accepts(
     }
 }
 
-fn sandbox_s3(value: &adx_core::sandbox::S3Source) -> proto::S3Config {
+fn environment_s3(value: &adx_core::execution::S3Source) -> proto::S3Config {
     proto::S3Config {
         endpoint: value.endpoint.clone(),
         bucket: value.bucket.clone(),
@@ -749,8 +749,8 @@ fn sandbox_s3(value: &adx_core::sandbox::S3Source) -> proto::S3Config {
     }
 }
 
-fn sandbox_rootfs(value: &adx_core::sandbox::Rootfs) -> Result<proto::RootfsConfig> {
-    use adx_core::sandbox::StorageSource;
+fn environment_rootfs(value: &adx_core::execution::Rootfs) -> Result<proto::RootfsConfig> {
+    use adx_core::execution::StorageSource;
     let (kind, source) = match &value.source {
         StorageSource::Image(value) => (
             proto::RootfsSrcType::Image,
@@ -758,7 +758,7 @@ fn sandbox_rootfs(value: &adx_core::sandbox::Rootfs) -> Result<proto::RootfsConf
         ),
         StorageSource::S3(value) => (
             proto::RootfsSrcType::S3,
-            proto::rootfs_config::Source::S3Config(sandbox_s3(value)),
+            proto::rootfs_config::Source::S3Config(environment_s3(value)),
         ),
         StorageSource::Local(value) => (
             proto::RootfsSrcType::Local,
@@ -773,11 +773,11 @@ fn sandbox_rootfs(value: &adx_core::sandbox::Rootfs) -> Result<proto::RootfsConf
     })
 }
 
-fn sandbox_mount(value: &adx_core::sandbox::Mount) -> Result<proto::Mount> {
-    use adx_core::sandbox::StorageSource;
+fn environment_mount(value: &adx_core::execution::Mount) -> Result<proto::Mount> {
+    use adx_core::execution::StorageSource;
     let source = match &value.source {
         StorageSource::Image(value) => proto::mount::Source::ImageUrl(value.clone()),
-        StorageSource::S3(value) => proto::mount::Source::S3Config(sandbox_s3(value)),
+        StorageSource::S3(value) => proto::mount::Source::S3Config(environment_s3(value)),
         StorageSource::Local(value) => proto::mount::Source::HostPath(value.clone()),
     };
     Ok(proto::Mount {
@@ -788,12 +788,12 @@ fn sandbox_mount(value: &adx_core::sandbox::Mount) -> Result<proto::Mount> {
     })
 }
 
-fn sandbox_network_policy(
-    value: &adx_core::sandbox::NetworkPolicy,
+fn environment_network_policy(
+    value: &adx_core::execution::NetworkPolicy,
     ports: &[u16],
     config: &Config,
 ) -> Result<proto::NetworkPolicy> {
-    use adx_core::sandbox as model;
+    use adx_core::execution as model;
     let action = |value| match value {
         model::NetworkAction::Allow => proto::NetworkPolicyAction::Allow as i32,
         model::NetworkAction::Deny => proto::NetworkPolicyAction::Deny as i32,
@@ -826,8 +826,8 @@ fn sandbox_network_policy(
                         last: range.last,
                     }),
                 }),
-                sandbox_port: rule.sandbox_port,
-                sandbox_port_range: rule.sandbox_port_range.as_ref().map(|range| {
+                sandbox_port: rule.environment_port,
+                sandbox_port_range: rule.environment_port_range.as_ref().map(|range| {
                     proto::PortRange {
                         first: range.first,
                         last: range.last,
@@ -1059,7 +1059,7 @@ impl RuntimeDriver for Sandboxd {
     async fn set_network_policy(
         &self,
         runtime_id: &str,
-        policy: Option<&adx_core::sandbox::NetworkPolicy>,
+        policy: Option<&adx_core::execution::NetworkPolicy>,
         ports: &[u16],
     ) -> Result<()> {
         let id = self.physical_id(runtime_id).await?.ok_or(Error::NotFound)?;
@@ -1069,7 +1069,7 @@ impl RuntimeDriver for Sandboxd {
                 self.request(proto::SetNetworkPolicyRequest {
                     sandbox_id: id,
                     network_policy: policy
-                        .map(|value| sandbox_network_policy(value, ports, &self.config))
+                        .map(|value| environment_network_policy(value, ports, &self.config))
                         .transpose()?,
                 }),
             )
@@ -1218,9 +1218,9 @@ fn runtime_failure(result: proto::WaitResponse) -> adx_core::RuntimeFailure {
         },
         exit_code: Some(result.exit_code),
         message: if oom {
-            "sandbox backend was OOM-killed".into()
+            "environment backend was OOM-killed".into()
         } else {
-            "sandbox backend exited".into()
+            "environment backend exited".into()
         },
     }
 }
@@ -1231,7 +1231,7 @@ mod tests {
     use prost::Message;
 
     #[test]
-    fn field_four_is_the_sandbox_ip() {
+    fn field_four_is_the_environment_ip() {
         let decoded = proto::StartResponse::decode(&b"\x22\x0810.0.0.2"[..]).unwrap();
         assert_eq!(decoded.sandbox_ip, "10.0.0.2");
         assert_eq!(
@@ -1263,7 +1263,7 @@ mod tests {
                 disk_bytes: 5 * 1024 * 1024 * 1024,
             },
             priority: 0,
-            sandbox: Default::default(),
+            execution: Default::default(),
         };
         let default_request = start_request(&spec, "i-7", 7, &[], &Config::default()).unwrap();
         assert!(!default_request.envs.contains_key("EXECD_HTTP_ONLY"));
@@ -1316,7 +1316,7 @@ mod tests {
             env: Default::default(),
             scheduling: Default::default(),
             priority: 0,
-            sandbox: Default::default(),
+            execution: Default::default(),
         };
         spec.env.insert(
             "ADX_RUNTIME_CONTROL_ADDRESS".into(),
@@ -1362,11 +1362,11 @@ mod tests {
     #[test]
     fn workload_probe_configuration_is_node_owned_and_preserves_init_budget() {
         let workload = EnvironmentSpec {
-            sandbox: adx_core::sandbox::SandboxOptions {
+            execution: adx_core::execution::ExecutionOptions {
                 inherit_entrypoint: true,
-                rootfs: Some(adx_core::sandbox::Rootfs {
+                rootfs: Some(adx_core::execution::Rootfs {
                     readonly: false,
-                    source: adx_core::sandbox::StorageSource::Image("server".into()),
+                    source: adx_core::execution::StorageSource::Image("server".into()),
                 }),
                 init_timeout_seconds: 120,
                 readiness_probe: Some(adx_core::probes::ProbeSpec {
@@ -1402,9 +1402,9 @@ mod tests {
         let probes: adx_core::probes::ProbeConfig =
             serde_json::from_str(&request.envs[adx_core::probes::CONFIG_ENV]).unwrap();
         assert_eq!(probes.init_timeout_seconds, 120);
-        assert_eq!(probes.readiness, workload.sandbox.readiness_probe);
+        assert_eq!(probes.readiness, workload.execution.readiness_probe);
         let mut plain = workload;
-        plain.sandbox.readiness_probe = None;
+        plain.execution.readiness_probe = None;
         let without_probes = start_request(&plain, "i-8", 8, &[], &config).unwrap();
         assert!(!without_probes
             .envs

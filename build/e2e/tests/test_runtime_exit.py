@@ -16,7 +16,7 @@ class RuntimeExitScenarioTests(unittest.TestCase):
     def fixture(self, *, reuse_identity=False):
         state = {"records": {}, "backends": {}, "deleted": [], "commands": [], "stale_status_reads": {}}
 
-        class Sandbox:
+        class Environment:
             def __init__(self, **options):
                 self.id = f"instance-{len(state['records']) + 1}"
                 self.commands = types.SimpleNamespace(run=self.run)
@@ -53,7 +53,7 @@ class RuntimeExitScenarioTests(unittest.TestCase):
                 pass
 
         modules = {
-            "adx_sandbox": types.SimpleNamespace(Sandbox=Sandbox, RestartPolicy=lambda **options: options),
+            "adx_environment": types.SimpleNamespace(Environment=Environment, RestartPolicy=lambda **options: options),
             "node": types.SimpleNamespace(
                 catalog=lambda: {}, persisted_runtime_id=lambda result: result["runtime"]["id"]
             ),

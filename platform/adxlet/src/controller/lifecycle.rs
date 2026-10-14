@@ -73,7 +73,7 @@ impl Controller {
 
     pub(super) async fn update_network_policy(
         &mut self,
-        policy: Option<adx_core::sandbox::NetworkPolicy>,
+        policy: Option<adx_core::execution::NetworkPolicy>,
         operation_id: String,
         expected_revision: u64,
     ) -> Result<OperationResult> {
@@ -91,10 +91,10 @@ impl Controller {
             .set_network_policy(
                 &self.record.runtime.id,
                 policy.as_ref(),
-                &self.record.spec.sandbox.ports,
+                &self.record.spec.execution.ports,
             )
             .await?;
-        self.record.spec.sandbox.network = policy;
+        self.record.spec.execution.network = policy;
         self.record.revision = self.record.revision.checked_add(1).ok_or(Error::Conflict)?;
         self.completed(operation_id, expected_revision, LifecycleKind::Network);
         self.durability = None;
@@ -388,8 +388,8 @@ impl Controller {
         self.record.resources_held = true;
         self.transition(Event::Resume)?;
         self.record.failure = None;
-        let initialization_timeout = if self.record.spec.sandbox.init_timeout_seconds > 0 {
-            Duration::from_secs(self.record.spec.sandbox.init_timeout_seconds)
+        let initialization_timeout = if self.record.spec.execution.init_timeout_seconds > 0 {
+            Duration::from_secs(self.record.spec.execution.init_timeout_seconds)
         } else {
             self.services.operation_timeout
         };

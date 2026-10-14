@@ -37,28 +37,28 @@ def run_acceptance(
     *,
     owner_token,
     admin_token,
-    sandbox_factory=None,
+    environment_factory=None,
     request,
     verify=None,
     now=time.monotonic,
     sleep=time.sleep,
 ):
     verify_inventory(inventory)
-    if sandbox_factory is None:
-        from adx_sandbox import Sandbox
+    if environment_factory is None:
+        from adx_environment import Environment
 
-        sandbox_factory = Sandbox
+        environment_factory = Environment
     verify = verify or (lambda value: verify_machines(value, ssh))
     worker = next(machine for machine in inventory['machines'] if machine['role'] == 'worker-1')
     report = {'status': 'failed', 'profile': 'multi-vm-auth', 'checks': [], 'instances': [], 'cleanup_errors': []}
     output.mkdir(parents=True, exist_ok=True)
-    sandbox = None
+    environment = None
     key_id = None
     revoked = False
     try:
         report['machines'] = verify(inventory)
         report['checks'].append('machine-identity')
-        sandbox = sandbox_factory(
+        environment = environment_factory(
             image=image,
             runtime='runc',
             node_id=worker['node_id'],
@@ -68,11 +68,11 @@ def run_acceptance(
             connection=connection,
             create_timeout=150,
         )
-        if not sandbox.is_running():
-            raise AssertionError('owner Sandbox did not reach Running')
-        report['instances'].append({'id': sandbox.id, 'node_id': worker['node_id']})
-        path = '/api/sandbox/v1/sandboxes/' + sandbox.id
-        query = {'instance_id': sandbox.id}
+        if not environment.is_running():
+            raise AssertionError('owner Environment did not reach Running')
+        report['instances'].append({'id': environment.id, 'node_id': worker['node_id']})
+        path = '/api/environment/v1/environments/' + environment.id
+        query = {'instance_id': environment.id}
         bad = 'invalid-acceptance-key'
         require_status(request, 'GET', '/api/instances', bad, 401, 'invalid key read', params=query)
         require_status(request, 'DELETE', path, bad, 401, 'invalid key delete')
@@ -95,7 +95,7 @@ def run_acceptance(
             raise AssertionError('administrator list exposed key material')
         report['checks'].append('key-management-admin-only')
 
-        require_status(request, 'GET', '/api/sandbox/v1/snapshots', other_token, 200, 'temporary key authentication')
+        require_status(request, 'GET', '/api/environment/v1/snapshots', other_token, 200, 'temporary key authentication')
         require_status(request, 'GET', '/api/instances', other_token, 403, 'tenant read', params=query)
         require_status(request, 'DELETE', path, other_token, 403, 'tenant delete')
         report['checks'].append('tenant-isolation')
@@ -104,7 +104,7 @@ def run_acceptance(
         revoked = True
         deadline = now() + 20
         while True:
-            status, _ = request('GET', '/api/sandbox/v1/snapshots', other_token)
+            status, _ = request('GET', '/api/environment/v1/snapshots', other_token)
             if status == 401:
                 break
             if status != 200 or now() >= deadline:
@@ -112,9 +112,9 @@ def run_acceptance(
             sleep(0.25)
         report['checks'].append('temporary-key-revoked')
 
-        result = sandbox.commands.run('printf still-owned')
-        if not sandbox.is_running() or (result.exit_code, result.stdout) != (0, 'still-owned'):
-            raise AssertionError('owner Sandbox stopped serving after denied requests')
+        result = environment.commands.run('printf still-owned')
+        if not environment.is_running() or (result.exit_code, result.stdout) != (0, 'still-owned'):
+            raise AssertionError('owner Environment stopped serving after denied requests')
         report['checks'].append('owner-still-serving')
     except Exception as error:
         report['error'] = f'{type(error).__name__}: {error}'
@@ -125,15 +125,15 @@ def run_acceptance(
                 require_status(request, 'DELETE', MANAGEMENT + '/' + key_id, admin_token, 204, 'temporary key cleanup')
             except Exception as error:
                 report['cleanup_errors'].append(f'temporary key revoke: {error}')
-        if sandbox is not None:
+        if environment is not None:
             try:
-                sandbox.kill()
+                environment.kill()
             except Exception as error:
-                report['cleanup_errors'].append(f'{sandbox.id} delete: {error}')
+                report['cleanup_errors'].append(f'{environment.id} delete: {error}')
             try:
-                sandbox.close()
+                environment.close()
             except Exception as error:
-                report['cleanup_errors'].append(f'{sandbox.id} close: {error}')
+                report['cleanup_errors'].append(f'{environment.id} close: {error}')
         if not report.get('error') and not report['cleanup_errors']:
             report['status'] = 'passed'
         (output / 'auth-result.json').write_text(json.dumps(report, indent=2) + '\n')
@@ -155,7 +155,7 @@ def main():
     args = parser.parse_args()
     os.environ['SSL_CERT_FILE'] = str(args.ca.resolve())
     import httpx
-    from adx_sandbox import ConnectionConfig
+    from adx_environment import ConnectionConfig
 
     owner_token = args.token_file.read_text().strip()
     admin_token = args.admin_token_file.read_text().strip()

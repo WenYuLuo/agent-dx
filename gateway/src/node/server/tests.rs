@@ -85,7 +85,7 @@ async fn open_stream(
         .method(http::Method::CONNECT)
         .uri(address.to_string())
         .header("x-adx-instance-id", "instance")
-        .header("x-adx-workload-id", "sandbox")
+        .header("x-adx-workload-id", "environment")
         .header("x-adx-target-ip", address.ip().to_string())
         .header("x-adx-target-port", address.port().to_string())
         .header("x-adx-request-id", "request")

@@ -2,7 +2,7 @@
 """Run public-SDK placement and data-path checks on three named Linux VMs.
 
 The machines and ADX services must already be provisioned. This program does
-not stop shared services; it removes only the Sandboxes it creates.
+not stop shared services; it removes only the Environments it creates.
 """
 
 from __future__ import annotations
@@ -153,7 +153,7 @@ def run_acceptance(
     image,
     socket,
     output,
-    sandbox_factory=None,
+    environment_factory=None,
     resource_reader=None,
     remote=ssh,
     placement_timeout=15,
@@ -161,10 +161,10 @@ def run_acceptance(
 ):
     """Public SDK -> Ingress -> separate worker Relays and Execd processes."""
     verify_inventory(inventory)
-    if sandbox_factory is None or resource_reader is None:
-        from adx_sandbox import Sandbox, resources
+    if environment_factory is None or resource_reader is None:
+        from adx_environment import Environment, resources
 
-        sandbox_factory = sandbox_factory or Sandbox
+        environment_factory = environment_factory or Environment
         resource_reader = resource_reader or resources
     workers = [machine for machine in inventory['machines'] if machine['role'] != 'control']
     control = next(machine for machine in inventory['machines'] if machine['role'] == 'control')
@@ -185,7 +185,7 @@ def run_acceptance(
                 raise AssertionError(f"{worker['node_id']} is not accepting instances")
         report['checks'].append('resource-discovery')
         for worker in workers:
-            sandbox = sandbox_factory(
+            environment = environment_factory(
                 image=image,
                 runtime='runc',
                 node_id=worker['node_id'],
@@ -195,10 +195,10 @@ def run_acceptance(
                 connection=connection,
                 create_timeout=150,
             )
-            handles.append(sandbox)
-            if not sandbox.is_running():
-                raise AssertionError(f'{sandbox.id} did not reach running')
-            report['instances'].append({'id': sandbox.id, 'node_id': worker['node_id']})
+            handles.append(environment)
+            if not environment.is_running():
+                raise AssertionError(f'{environment.id} did not reach running')
+            report['instances'].append({'id': environment.id, 'node_id': worker['node_id']})
         expected = {item['id']: item['node_id'] for item in report['instances']}
         report['assignments'] = {}
         for instance_id, node_id in expected.items():
@@ -212,37 +212,37 @@ def run_acceptance(
             report['assignments'][instance_id] = assignment
         report['backends'] = wait_for_backends(workers, socket, expected, remote, timeout=placement_timeout)
         report['checks'].append('physical-placement')
-        for sandbox in handles:
-            command = sandbox.commands.run("printf 'adx-three-vm'; printf 'stderr' >&2; exit 7")
+        for environment in handles:
+            command = environment.commands.run("printf 'adx-three-vm'; printf 'stderr' >&2; exit 7")
             if (command.stdout, command.stderr, command.exit_code) != ('adx-three-vm', 'stderr', 7):
-                raise AssertionError(f'{sandbox.id} command result mismatch')
+                raise AssertionError(f'{environment.id} command result mismatch')
             payload = b'adx-three-vm\x00\xff\n' * 1024
-            sandbox.files.write('/tmp/adx-three-vm.bin', payload)
-            if sandbox.files.read('/tmp/adx-three-vm.bin', format='bytes') != payload:
-                raise AssertionError(f'{sandbox.id} binary file mismatch')
+            environment.files.write('/tmp/adx-three-vm.bin', payload)
+            if environment.files.read('/tmp/adx-three-vm.bin', format='bytes') != payload:
+                raise AssertionError(f'{environment.id} binary file mismatch')
         report['checks'].append('cross-vm-command-file')
     except Exception as error:
         report['error'] = f'{type(error).__name__}: {error}'
         raise
     finally:
-        for sandbox in reversed(handles):
+        for environment in reversed(handles):
             try:
-                sandbox.kill()
+                environment.kill()
             except Exception as error:
-                report['cleanup_errors'].append(f'{sandbox.id}: {error}')
+                report['cleanup_errors'].append(f'{environment.id}: {error}')
             finally:
                 try:
-                    sandbox.close()
+                    environment.close()
                 except Exception as error:
-                    report['cleanup_errors'].append(f'{sandbox.id} close: {error}')
+                    report['cleanup_errors'].append(f'{environment.id} close: {error}')
         try:
             deadline = time.monotonic() + 15
             while handles:
                 residual = {
-                    sandbox.id: {
-                        worker['node_id']: backend_ids(worker, socket, sandbox.id, remote) for worker in workers
+                    environment.id: {
+                        worker['node_id']: backend_ids(worker, socket, environment.id, remote) for worker in workers
                     }
-                    for sandbox in handles
+                    for environment in handles
                 }
                 if not any(ids for nodes in residual.values() for ids in nodes.values()):
                     break
@@ -275,7 +275,7 @@ def main():
     parser.add_argument('--output', required=True, type=Path)
     args = parser.parse_args()
     os.environ['SSL_CERT_FILE'] = str(args.ca.resolve())
-    from adx_sandbox import ConnectionConfig
+    from adx_environment import ConnectionConfig
 
     connection = ConnectionConfig(
         server_address=args.endpoint,

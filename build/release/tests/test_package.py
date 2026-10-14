@@ -30,7 +30,7 @@ class PackageTests(unittest.TestCase):
             redis_cli = root / "redis-cli"
             redis_cli.write_text("#!/bin/sh\necho 'redis-cli 7.2.5'\n")
             redis_cli.chmod(0o700)
-            wheel = root / "adx_sandbox-1-py3-none-any.whl"
+            wheel = root / "adx_environment-1-py3-none-any.whl"
             wheel.write_bytes(b"fixture wheel")
             out = root / "package"
             m = pkg.assemble(binaries, redis, redis_cli, wheel, out, "a" * 40, True, "test-fixture", "debug")
@@ -94,6 +94,7 @@ class PackageTests(unittest.TestCase):
                 "adx-coordinator",
                 "adxlet",
                 "adx-apiserver",
+                "adx-activator",
                 "adx-ingress",
                 "adx-relay",
             }
@@ -105,7 +106,7 @@ class PackageTests(unittest.TestCase):
             redis_cli = root / "redis-cli"
             redis_cli.write_text("#!/bin/sh\necho 'redis-cli 7.2.5'\n")
             redis_cli.chmod(0o700)
-            wheel = root / "adx_sandbox-1-py3-none-any.whl"
+            wheel = root / "adx_environment-1-py3-none-any.whl"
             wheel.write_bytes(b"fixture")
             output = root / "package"
             manifest = pkg.assemble(binaries, redis, redis_cli, wheel, output, "a" * 40, True, "test-fixture", "debug")
@@ -127,7 +128,7 @@ class PackageTests(unittest.TestCase):
             redis_cli = root / "redis-cli"
             redis_cli.write_text("#!/bin/sh\necho 'redis-cli 7.2.5'\n")
             redis_cli.chmod(0o700)
-            wheel = root / "adx_sandbox-1-py3-none-any.whl"
+            wheel = root / "adx_environment-1-py3-none-any.whl"
             wheel.write_bytes(b"fixture")
 
             default_output = root / "default-package"
@@ -185,7 +186,7 @@ class PackageTests(unittest.TestCase):
             redis_cli = root / "redis-cli"
             redis_cli.write_text("#!/bin/sh\necho 'redis-cli 7.2.5'\n")
             redis_cli.chmod(0o700)
-            wheel = root / "adx_sandbox-1-py3-none-any.whl"
+            wheel = root / "adx_environment-1-py3-none-any.whl"
             wheel.write_bytes(b"fixture")
             output = root / "package"
 
@@ -232,7 +233,7 @@ class PackageTests(unittest.TestCase):
             redis_cli = root / "redis-cli"
             redis_cli.write_text("#!/bin/sh\necho 'redis-cli 7.2.5'\n")
             redis_cli.chmod(0o700)
-            wheel = root / "adx_sandbox-1-py3-none-any.whl"
+            wheel = root / "adx_environment-1-py3-none-any.whl"
             wheel.write_bytes(b"fixture")
             with self.assertRaises(ValueError):
                 pkg.assemble(
@@ -257,7 +258,7 @@ class PackageTests(unittest.TestCase):
                     root,
                     root / "redis",
                     root / "redis-cli",
-                    root / "adx_sandbox-1.whl",
+                    root / "adx_environment-1.whl",
                     out,
                     "a" * 40,
                     True,
@@ -281,7 +282,7 @@ class PackageTests(unittest.TestCase):
             redis_cli = root / "redis-cli"
             redis_cli.write_text("#!/bin/sh\necho 'redis-cli 7.2.5'\n")
             redis_cli.chmod(0o700)
-            wheel = root / "adx_sandbox-1-py3-none-any.whl"
+            wheel = root / "adx_environment-1-py3-none-any.whl"
             wheel.write_bytes(b"fixture wheel")
             package = root / "package"
             target = f"{platform.machine()}-unknown-linux-gnu"

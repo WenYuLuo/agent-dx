@@ -1,5 +1,5 @@
 steps:
-- label: ':python: Test and package ADX Sandbox SDK'
+- label: 'Test & Package · Environment SDK'
   key: sdk-package
   agents:
     queue: default
@@ -62,7 +62,7 @@ steps:
           hostPath:
             path: /mnt/paas
             type: DirectoryOrCreate
-- label: ':cloud: Upload ADX Sandbox SDK to OBS'
+- label: 'Upload · Environment SDK · OBS'
   key: sdk-obs
   depends_on: sdk-package
   if: build.env("ADX_OBS_UPLOAD") == "1"
@@ -104,7 +104,7 @@ steps:
                 name: obs-credentials
                 key: SK
                 optional: false
-- label: ':pypi: Publish ADX Sandbox SDK'
+- label: 'Publish · Environment SDK · PyPI'
   key: sdk-pypi
   depends_on: sdk-package
   if: build.env("ADX_SDK_PYPI_UPLOAD") == "1" && build.tag != null
@@ -140,17 +140,17 @@ steps:
               cpu: '2'
               memory: 4Gi
           env:
-          - name: ADX_SANDBOX_PYPI_TOKEN
+          - name: ADX_ENVIRONMENT_PYPI_TOKEN
             valueFrom:
               secretKeyRef:
                 name: adx-pypi-credentials
-                key: sandbox-pypi-token
+                key: environment-pypi-token
                 optional: true
-          - name: ADX_SANDBOX_TEST_PYPI_TOKEN
+          - name: ADX_ENVIRONMENT_TEST_PYPI_TOKEN
             valueFrom:
               secretKeyRef:
                 name: adx-pypi-credentials
-                key: sandbox-testpypi-token
+                key: environment-testpypi-token
                 optional: true
         volumes:
         - name: build-cache

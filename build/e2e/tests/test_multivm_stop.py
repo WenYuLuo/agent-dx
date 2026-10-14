@@ -20,9 +20,9 @@ class StopTests(unittest.TestCase):
     def exercise(self, route_leak=False, published_routes=0):
         state = {'owners': {}, 'stopped': set(), 'order': [], 'deleted': set()}
 
-        class Sandbox:
+        class Environment:
             def __init__(self, *, node_id, **_options):
-                self.id = 'sandbox-' + node_id
+                self.id = 'environment-' + node_id
                 state['owners'][self.id] = node_id
                 self.commands = SimpleNamespace(run=self.run)
 
@@ -94,17 +94,17 @@ class StopTests(unittest.TestCase):
                 expected = 'remained routable' if route_leak else 'published routes remain'
                 with self.assertRaisesRegex(AssertionError, expected):
                     run_stop(inventory(), object(), 'image', '/run/sandboxd/sandboxd.sock',
-                             output, dedicated=True, sandbox_factory=Sandbox,
+                             output, dedicated=True, environment_factory=Environment,
                              remote=remote, wait=wait, route_probe=route_probe)
                 self.assertEqual(state['order'], ['worker-2'] if route_leak else
                                  ['worker-2', 'worker-1'])
                 if route_leak:
-                    self.assertEqual(state['deleted'], {'sandbox-node1'})
+                    self.assertEqual(state['deleted'], {'environment-node1'})
                 self.assertEqual(json.loads((output / 'stop-result.json').read_text())['status'],
                                  'failed')
             else:
                 report = run_stop(inventory(), object(), 'image', '/run/sandboxd/sandboxd.sock',
-                                  output, dedicated=True, sandbox_factory=Sandbox,
+                                  output, dedicated=True, environment_factory=Environment,
                                   remote=remote, wait=wait, route_probe=route_probe)
                 self.assertEqual(report['status'], 'passed')
                 self.assertEqual(state['order'], ['worker-2', 'worker-1', 'control'])

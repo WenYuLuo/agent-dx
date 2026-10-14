@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Real TCP -> Rust EXECD -> sandbox-sdk -> HTTP/1 framing checks."""
+"""Real TCP -> Rust EXECD -> environment-sdk -> HTTP/1 framing checks."""
 
 import gzip
 import http.server
@@ -24,7 +24,7 @@ import threading
 import time
 from typing import ClassVar
 
-from adx_sandbox.tunnel_client import TunnelClient
+from adx_environment.tunnel_client import TunnelClient
 
 LOG = logging.getLogger(__name__)
 STARTUP_RETRIES = 50

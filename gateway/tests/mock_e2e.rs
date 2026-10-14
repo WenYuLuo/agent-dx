@@ -51,17 +51,17 @@ async fn mock_full_data_plane_protocol_matrix() {
             ..Default::default()
         },
         tenant_id: "tenant-a".into(),
-        sandbox_id: "sandbox-a".into(),
+        environment_id: "environment-a".into(),
         relay_address: node_address.to_string(),
-        sandbox_ip: "127.0.0.1".into(),
+        environment_ip: "127.0.0.1".into(),
         tunnel_security_mode: Default::default(),
         port_forward_security_mode: Default::default(),
         port_forward_routes: Vec::new(),
     };
     node.activate_route(
         route.instance_id.clone(),
-        route.sandbox_id.clone(),
-        route.sandbox_ip.parse().unwrap(),
+        route.environment_id.clone(),
+        route.environment_ip.parse().unwrap(),
     )
     .await;
     store.put(route.clone());
@@ -108,7 +108,7 @@ async fn mock_full_data_plane_protocol_matrix() {
     assert_plaintext_rejects_credentials(ingress_http_address, http_target.port()).await;
     assert_optional_port_forwarding_without_token(ingress_http_address, http_target.port()).await;
     assert_eq!(seen_paths.recv().await.unwrap().path, "/anonymous");
-    assert_sandbox_port_forward_security_override(
+    assert_environment_port_forward_security_override(
         ingress_http_address,
         http_target.port(),
         &store,
@@ -335,7 +335,7 @@ async fn assert_http_keepalive_reuse(
     seen: &mut mpsc::Receiver<SeenRequest>,
     accepts: &AtomicUsize,
 ) {
-    // Let the route reconciler consume the preceding sandbox-policy updates so
+    // Let the route reconciler consume the preceding environment-policy updates so
     // this assertion measures pooling rather than intentional invalidation.
     sleep(Duration::from_millis(50)).await;
     let before = accepts.load(Ordering::Relaxed);
@@ -352,7 +352,7 @@ async fn assert_http_keepalive_reuse(
     }
     assert!(
         accepts.load(Ordering::Relaxed) - before <= 1,
-        "two sequential requests must not open two sandbox HTTP connections"
+        "two sequential requests must not open two environment HTTP connections"
     );
 }
 
@@ -388,7 +388,7 @@ async fn assert_optional_port_forwarding_without_token(ingress: std::net::Socket
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
 }
 
-async fn assert_sandbox_port_forward_security_override(
+async fn assert_environment_port_forward_security_override(
     ingress: std::net::SocketAddr,
     port: u16,
     store: &RouteStore,
@@ -404,7 +404,7 @@ async fn assert_sandbox_port_forward_security_override(
     let anonymous = raw_http(
         ingress,
         &format!(
-            "GET /instance-a/{port}/sandbox-policy HTTP/1.1\r\nHost: ingress\r\nConnection: close\r\n\r\n"
+            "GET /instance-a/{port}/environment-policy HTTP/1.1\r\nHost: ingress\r\nConnection: close\r\n\r\n"
         ),
     )
     .await;
@@ -449,7 +449,7 @@ async fn assert_environment_status_is_preserved(
     failed.environment_status = EnvironmentStatus {
         code: 5,
         exit_code: 137,
-        msg: "sandbox crashed".into(),
+        msg: "environment crashed".into(),
         kind: 9,
         err_code: 42,
     };
@@ -463,7 +463,7 @@ async fn assert_environment_status_is_preserved(
     .await;
     assert!(response.starts_with("HTTP/1.1 409"), "{response}");
     assert!(response.contains("code=5"), "{response}");
-    assert!(response.contains("sandbox crashed"), "{response}");
+    assert!(response.contains("environment crashed"), "{response}");
     assert!(response.contains("err_code=42"), "{response}");
     store.put(route.clone());
 }
@@ -729,8 +729,8 @@ async fn assert_half_closed_route_cancel(websocket: bool) {
                 code: 3,
                 ..Default::default()
             },
-            sandbox_id: id.into(),
-            sandbox_ip: backend_address.ip().to_string(),
+            environment_id: id.into(),
+            environment_ip: backend_address.ip().to_string(),
             relay_address: node_address.to_string(),
             tenant_id: String::new(),
             tunnel_security_mode: Default::default(),

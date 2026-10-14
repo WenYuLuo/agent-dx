@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Real TLS WebSocket acceptance for the installed Sandbox SDK command watcher."""
+"""Real TLS WebSocket acceptance for the installed Environment SDK command watcher."""
 
 import argparse
 import asyncio
@@ -11,8 +11,8 @@ from pathlib import Path
 
 
 async def check(tls):
-    from adx_sandbox._command_watch import _CommandWaitManager
-    from adx_sandbox.types import ConnectionConfig
+    from adx_environment._command_watch import _CommandWaitManager
+    from adx_environment.types import ConnectionConfig
     from websockets.asyncio.server import serve
 
     server_tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -22,7 +22,7 @@ async def check(tls):
     received = []
 
     async def server(ws):
-        if not (ws.request.path == '/api/sandbox/v1/commands/watch'):
+        if not (ws.request.path == '/api/environment/v1/commands/watch'):
             raise AssertionError()
         if not (ws.request.headers['Authorization'] == 'Bearer test-key'):
             raise AssertionError()
@@ -35,12 +35,12 @@ async def check(tls):
             == {
                 'op': 'subscribe',
                 'protocolVersion': 1,
-                'commands': [{'sandboxId': 'instance', 'commandId': 'command'}],
+                'commands': [{'environmentId': 'instance', 'commandId': 'command'}],
             }
         ):
             raise AssertionError()
         received.append(request)
-        await ws.send(json.dumps({'sandboxId': 'instance', 'commandId': 'command', 'status': 'SUCCEEDED'}))
+        await ws.send(json.dumps({'environmentId': 'instance', 'commandId': 'command', 'status': 'SUCCEEDED'}))
         await ws.wait_closed()
 
     async with serve(server, '127.0.0.1', 0, ssl=server_tls) as listener:

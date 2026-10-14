@@ -176,12 +176,12 @@ class DemandFixtureTests(unittest.TestCase):
                 node = 'node2' if index == 11 else 'node1'
                 for attempt in range(count):
                     backend = f'sbox-{index}-{attempt}'
-                    logs[node].extend([f'firecracker: restored sandbox {backend} pid=123',
-                                       f'Type:create SandboxID:{backend} adx.environment_id {case["instance_id"]}'])
+                    logs[node].extend([f'firecracker: restored environment {backend} pid=123',
+                                       f'Type:create EnvironmentID:{backend} adx.environment_id {case["instance_id"]}'])
             for node, lines in logs.items(): (root/f'{node}-sandboxd-service.log').write_text('\n'.join(lines)+'\n')
             self.assertEqual(len(audit(root, result)), 12)
             with (root/'node2-sandboxd-service.log').open('a') as log:
-                log.write('firecracker: restored sandbox sbox-extra pid=124\nType:create SandboxID:sbox-extra adx.environment_id env-11\n')
+                log.write('firecracker: restored environment sbox-extra pid=124\nType:create EnvironmentID:sbox-extra adx.environment_id env-11\n')
             with self.assertRaises(ValueError): audit(root, result)
 
     def test_missing_real_fault_boundary_cannot_pass(self):

@@ -15,13 +15,13 @@ class CandidateTests(unittest.TestCase):
     def test_candidate_records_and_verifies_both_distributions(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            wheel = root / 'adx_sandbox-0.1.0-py3-none-any.whl'
+            wheel = root / 'adx_environment-0.1.0-py3-none-any.whl'
             with zipfile.ZipFile(wheel, 'w') as archive:
                 archive.writestr(
-                    'adx_sandbox-0.1.0.dist-info/METADATA',
-                    'Name: adx-sandbox\nVersion: 0.1.0\nRequires-Python: >=3.10\n',
+                    'adx_environment-0.1.0.dist-info/METADATA',
+                    'Name: adx-environment\nVersion: 0.1.0\nRequires-Python: >=3.10\n',
                 )
-            (root / 'adx_sandbox-0.1.0.tar.gz').write_bytes(b'source')
+            (root / 'adx_environment-0.1.0.tar.gz').write_bytes(b'source')
             created = candidate.create(root, 'a' * 40, 'build-id')
             self.assertEqual(created['version'], '0.1.0')
             self.assertEqual(candidate.verify(root), created)

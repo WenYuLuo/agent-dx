@@ -148,7 +148,7 @@ def sdk_placement(report, inventory):
     }
     instances = report.get('instances', [])
     if len(instances) != 2 or {item.get('node_id') for item in instances} != set(node_roles):
-        raise ValueError('SDK did not place one Sandbox on each worker')
+        raise ValueError('SDK did not place one Environment on each worker')
     if len({item.get('id') for item in instances}) != 2:
         raise ValueError('SDK instance IDs are missing or duplicated')
     placements = []

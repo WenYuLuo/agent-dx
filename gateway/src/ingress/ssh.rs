@@ -312,7 +312,7 @@ impl SessionTarget {
                     .await
                     .map_err(|e| Error::Target(e.to_string()))?;
                 (
-                    target.binding.sandbox_id,
+                    target.binding.environment_id,
                     scope.tenant.as_str(),
                     port,
                     trace,

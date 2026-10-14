@@ -117,13 +117,13 @@ class Runner:
             WORKER: [
                 ("node", f"{REMOTE_ROOT}/relay.pid"),
                 ("direct_relay", f"{REMOTE_ROOT}/direct-relay-perf.pid"),
-                ("sandbox_relay", f"{REMOTE_ROOT}/sandbox-relay-perf.pid"),
+                ("environment_relay", f"{REMOTE_ROOT}/environment-relay-perf.pid"),
                 ("direct_http", f"{REMOTE_ROOT}/direct-http.pid"),
-                ("sandbox_http", f"{REMOTE_ROOT}/sandbox-http.pid"),
+                ("environment_http", f"{REMOTE_ROOT}/environment-http.pid"),
             ],
             WORKER2: [
                 ("node", f"{REMOTE_ROOT}/relay.pid"),
-                ("sandbox_http", f"{REMOTE_ROOT}/sandbox-http.pid"),
+                ("environment_http", f"{REMOTE_ROOT}/environment-http.pid"),
             ],
         }
         for node, processes in specs.items():
@@ -178,10 +178,10 @@ class Runner:
         if case.path == "node":
             return f"{binary} bench-node {self.worker_ip}:8443 10.88.1.2 19001 {tail}"
         if case.path == "ingress-plain":
-            return f"{binary} bench-ingress 127.0.0.1:8080 vm-sandbox-1 19001 {tail}"
+            return f"{binary} bench-ingress 127.0.0.1:8080 vm-environment-1 19001 {tail}"
         if case.path == "ingress-tls":
             return (
-                f"{binary} bench-ingress-tls 127.0.0.1:8443 vm-sandbox-1 19001 "
+                f"{binary} bench-ingress-tls 127.0.0.1:8443 vm-environment-1 19001 "
                 f"{REMOTE_ROOT}/ca.crt adx-ingress.local {tail}"
             )
         raise ValueError(case.path)
@@ -216,7 +216,7 @@ class Runner:
             url = f"http://{self.worker_ip}:18082/{case.path}"
             security = ""
         else:
-            url = f"https://127.0.0.1:8443/direct/vm-sandbox-1/{case.path}"
+            url = f"https://127.0.0.1:8443/direct/vm-environment-1/{case.path}"
             security = f"--ca {REMOTE_ROOT}/ca.crt --token {shlex.quote(TOKEN)}"
         warmup = 10 if case.path == "small.txt" else 0
         command = (
@@ -264,7 +264,7 @@ class Runner:
             routing = (
                 f"--ca {REMOTE_ROOT}/ca.crt --token {shlex.quote(TOKEN)} "
                 f"--targets {case.targets} "
-                f"--path-template '/direct/perf-sandbox-{{target:04d}}/bytes/{case.body_size}'"
+                f"--path-template '/direct/perf-environment-{{target:04d}}/bytes/{case.body_size}'"
             )
         command = (
             f"python3 {REMOTE_ROOT}/http_keepalive_bench.py {url} "
@@ -294,33 +294,33 @@ class Runner:
 
     def prepare_request_targets(self, count=100):
         targets_per_node = (count + 1) // 2
-        for node, address, sandbox_subnet in (
+        for node, address, environment_subnet in (
             (WORKER, self.worker_ip, "10.88.1"),
             (WORKER2, self.worker2_ip, "10.88.2"),
         ):
             alias_commands = "; ".join(
-                f"ip address replace {sandbox_subnet}.{index + 2}/24 dev yrsb-net"
+                f"ip address replace {environment_subnet}.{index + 2}/24 dev yrsb-net"
                 for index in range(targets_per_node)
             )
             # Enter the namespace and sudo once per node. Repeating both for
             # every alias adds seconds of process/namespace setup latency on
-            # Lima and used to make a 100-sandbox benchmark spend minutes in
+            # Lima and used to make a 100-environment benchmark spend minutes in
             # setup before sending its first request.
             aliases = (
-                "sudo ip netns exec adx-sandbox bash -lc "
+                "sudo ip netns exec adx-environment bash -lc "
                 f"{shlex.quote(alias_commands)}"
             )
             self.run_remote(
                 node,
                 f"{aliases}; "
                 f"kill $(cat {REMOTE_ROOT}/direct-http.pid) 2>/dev/null || true; "
-                f"sudo kill $(cat {REMOTE_ROOT}/sandbox-http.pid) 2>/dev/null || true; "
+                f"sudo kill $(cat {REMOTE_ROOT}/environment-http.pid) 2>/dev/null || true; "
                 f"nohup {REMOTE_ROOT}/bin/relay_perf http-server {address}:18082 "
                 f">{REMOTE_ROOT}/logs/direct-http-rust.log 2>&1 & "
                 f"echo $! >{REMOTE_ROOT}/direct-http.pid; "
-                f"sudo ip netns exec adx-sandbox bash -lc 'nohup {REMOTE_ROOT}/bin/relay_perf "
-                f"http-server 0.0.0.0:18080 >{REMOTE_ROOT}/logs/sandbox-http-rust.log 2>&1 & "
-                f"echo $! >{REMOTE_ROOT}/sandbox-http.pid'",
+                f"sudo ip netns exec adx-environment bash -lc 'nohup {REMOTE_ROOT}/bin/relay_perf "
+                f"http-server 0.0.0.0:18080 >{REMOTE_ROOT}/logs/environment-http-rust.log 2>&1 & "
+                f"echo $! >{REMOTE_ROOT}/environment-http.pid'",
             )
         commands = []
         for index in range(count):
@@ -328,15 +328,15 @@ class Runner:
             address = self.worker_ip if use_first else self.worker2_ip
             subnet = "10.88.1" if use_first else "10.88.2"
             bridge = f"{subnet}.{index // 2 + 2}"
-            instance = f"perf-sandbox-{index:04d}"
+            instance = f"perf-environment-{index:04d}"
             route = json.dumps(
                 {
                     "instanceID": instance,
                     "instanceStatus": {"code": 3},
                     "tenantID": "mock-tenant",
-                    "sandboxID": instance,
+                    "environmentID": instance,
                     "nodeProxyAddress": f"{address}:8443",
-                    "sandboxIP": bridge,
+                    "environmentIP": bridge,
                 },
                 separators=(",", ":"),
             )
@@ -356,7 +356,7 @@ class Runner:
             COORDINATOR,
             f"curl -fsS http://{self.worker_ip}:18082/bytes/128 >/dev/null; "
             f"curl -fsS --cacert {REMOTE_ROOT}/ca.crt -H 'Authorization: Bearer {TOKEN}' "
-            "https://127.0.0.1:8443/direct/perf-sandbox-0000/bytes/128 >/dev/null",
+            "https://127.0.0.1:8443/direct/perf-environment-0000/bytes/128 >/dev/null",
         )
 
     def preflight(self):

@@ -387,7 +387,7 @@ class PipelineContracts(unittest.TestCase):
         self.assertEqual(steps["sdk-pypi"]["depends_on"], "platform-e2e")
         self.assertTrue((ROOT / ".buildkite/pipeline-admin.yml").exists())
         assemble = (ROOT / ".buildkite/package-components.sh").read_text()
-        self.assertNotIn("platform/sdk/sandbox/python/build.sh", assemble)
+        self.assertNotIn("platform/sdk/environment/python/build.sh", assemble)
         self.assertIn("--step sdk-package", assemble)
         self.assertIn("components=(platform gateway execd)", assemble)
         self.assertIn("components+=(afs)", assemble)

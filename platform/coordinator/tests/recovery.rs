@@ -23,7 +23,7 @@ fn saved() -> StoredSnapshot {
         },
         priority: 0,
         scheduling: Default::default(),
-        sandbox: Default::default(),
+        execution: Default::default(),
     };
     let node = Node {
         runtime_classes: vec![

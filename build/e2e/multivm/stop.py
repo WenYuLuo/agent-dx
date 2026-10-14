@@ -89,7 +89,7 @@ def run_stop(
     socket,
     output,
     dedicated=False,
-    sandbox_factory=None,
+    environment_factory=None,
     remote=ssh,
     wait=wait_until,
     route_probe=None,
@@ -97,10 +97,10 @@ def run_stop(
     if not dedicated:
         raise ValueError('stop acceptance requires explicit dedicated-VM confirmation')
     verify_inventory(inventory)
-    if sandbox_factory is None:
-        from adx_sandbox import Sandbox
+    if environment_factory is None:
+        from adx_environment import Environment
 
-        sandbox_factory = Sandbox
+        environment_factory = Environment
     machines = {machine['role']: machine for machine in inventory['machines']}
     control = machines['control']
     workers = (machines['worker-1'], machines['worker-2'])
@@ -125,7 +125,7 @@ def run_stop(
                 raise AssertionError(f"{worker['role']} is not empty before destructive test")
         report['checks'].append('dedicated-empty-workers')
         for worker in workers:
-            sandbox = sandbox_factory(
+            environment = environment_factory(
                 image=image,
                 runtime='runc',
                 node_id=worker['node_id'],
@@ -135,16 +135,16 @@ def run_stop(
                 connection=connection,
                 create_timeout=150,
             )
-            handles[worker['role']] = sandbox
-            assignment = persisted_assignment(control, sandbox.id, remote)
+            handles[worker['role']] = environment
+            assignment = persisted_assignment(control, environment.id, remote)
             if assignment.get('node_id') != worker['node_id'] or assignment.get('state') != 'Running':
                 raise AssertionError(f'initial ownership mismatch: {assignment}')
             if len(backend_inventory(worker, socket, remote)) != 1:
                 raise AssertionError(f"{worker['role']} has no unique backend")
-            result = sandbox.commands.run('printf still-running')
+            result = environment.commands.run('printf still-running')
             if (result.exit_code, result.stdout) != (0, 'still-running'):
-                raise AssertionError(f'{sandbox.id} did not serve before stop')
-            report['instances'].append({'id': sandbox.id, 'node_id': worker['node_id']})
+                raise AssertionError(f'{environment.id} did not serve before stop')
+            report['instances'].append({'id': environment.id, 'node_id': worker['node_id']})
         report['checks'].append('both-workers-serving')
 
         for stopped_worker, surviving_worker in ((workers[1], workers[0]), (workers[0], None)):
@@ -202,17 +202,17 @@ def run_stop(
         raise
     finally:
         if report.get('error') and 'control' not in report['stop_order']:
-            for role, sandbox in handles.items():
+            for role, environment in handles.items():
                 if role not in report['stop_order']:
                     try:
-                        sandbox.kill()
+                        environment.kill()
                     except Exception as error:
-                        report['cleanup_errors'].append(f'{sandbox.id} delete: {error}')
-        for sandbox in handles.values():
+                        report['cleanup_errors'].append(f'{environment.id} delete: {error}')
+        for environment in handles.values():
             try:
-                sandbox.close()
+                environment.close()
             except Exception as error:
-                report['cleanup_errors'].append(f'{sandbox.id} close: {error}')
+                report['cleanup_errors'].append(f'{environment.id} close: {error}')
         if not report.get('error') and not report['cleanup_errors']:
             report['status'] = 'passed'
         (output / 'stop-result.json').write_text(json.dumps(report, indent=2) + '\n')
@@ -236,7 +236,7 @@ def main():
     if args.route_probe and (not args.route_probe.is_file() or not os.access(args.route_probe, os.X_OK)):
         parser.error('--route-probe must name a built route_snapshot_probe executable')
     os.environ['SSL_CERT_FILE'] = str(args.ca.resolve())
-    from adx_sandbox import ConnectionConfig
+    from adx_environment import ConnectionConfig
 
     connection = ConnectionConfig(
         server_address=args.endpoint,

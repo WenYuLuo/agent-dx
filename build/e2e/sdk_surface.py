@@ -1,4 +1,4 @@
-"""Machine-readable ownership of the public Sandbox SDK E2E surface."""
+"""Machine-readable ownership of the public Environment SDK E2E surface."""
 
 _FILESYSTEM_OPERATIONS = (
     'read',
@@ -13,7 +13,7 @@ _FILESYSTEM_OPERATIONS = (
     'copy_to_local',
 )
 SURFACE = {
-    'Sandbox': {
+    'Environment': {
         'create': 'firecracker',
         'get_snapshot': 'firecracker',
         'list_snapshots': 'firecracker',
@@ -24,7 +24,7 @@ SURFACE = {
         'shells': 'standalone',
         'pty': 'standalone',
         'id': 'standalone',
-        'sandbox_id': 'standalone',
+        'environment_id': 'standalone',
         'get_port_url': 'standalone',
         'get_port_auth_headers': 'standalone',
         'get_tunnel_url': 'standalone',
@@ -43,7 +43,7 @@ SURFACE = {
     },
     'CommandHandle': {
         name: 'standalone'
-        for name in ('id', 'sandbox_id', 'poll', 'wait', 'wait_async', 'kill', 'send_stdin', 'close_stdin')
+        for name in ('id', 'environment_id', 'poll', 'wait', 'wait_async', 'kill', 'send_stdin', 'close_stdin')
     },
     'Commands': {name: 'standalone' for name in ('run', 'get', 'list', 'kill', 'send_stdin', 'close_stdin')},
     'Filesystem': {name: 'standalone' for name in _FILESYSTEM_OPERATIONS},
@@ -61,34 +61,34 @@ SURFACE = {
 # These IDs are emitted by the Standalone or Firecracker acceptance drivers and
 # make the surface audit independently reviewable from the ten scenario groups.
 OPERATION_CASES = {
-    'Sandbox.create': ('snapshot clones inherit geometry and preserve process memory',),
-    'Sandbox.get_snapshot': ('snapshot remains queryable after source deletion',),
-    'Sandbox.list_snapshots': ('snapshot remains queryable after source deletion',),
-    'Sandbox.delete_snapshot': ('snapshot deletion accepted for artifact collection',),
-    'Sandbox.from_id': ('sandbox.create-query-reattach',),
-    'Sandbox.files': ('filesystem.text-crud',),
-    'Sandbox.commands': ('command.stdin-handle-recovery',),
-    'Sandbox.shells': ('shell.state-env-cwd-and-exit',),
-    'Sandbox.pty': ('pty.output-resize',),
-    'Sandbox.id': ('sandbox.create-query-reattach',),
-    'Sandbox.sandbox_id': ('sandbox.create-query-reattach',),
-    'Sandbox.get_port_url': ('port-forward.tls-token-route', 'port-forward.per-instance-tls-route'),
-    'Sandbox.get_port_auth_headers': ('port-forward.tls-token-route',),
-    'Sandbox.get_tunnel_url': ('reverse-tunnel.sdk-upstream-roundtrip',),
-    'Sandbox.wait_entrypoint': ('inherited image entrypoint reports structured exit status',),
-    'Sandbox.entrypoint_exit_info': ('inherited image entrypoint reports structured exit status',),
-    'Sandbox.is_running': ('lifecycle.context-manager-deletes',),
-    'Sandbox.get_info': ('sandbox.create-query-reattach',),
-    'Sandbox.create_snapshot': ('reusable snapshot preserves running source',),
-    'Sandbox.pause': ('pause with persisted recovery point',),
-    'Sandbox.resume': ('resume preserves process memory, PID and binary file',),
-    'Sandbox.reload': ('reload restores the latest recovery point without a cold start',),
-    'Sandbox.update_network_policy': ('runtime network policy replacement blocks egress and preserves EXECD control',),
-    'Sandbox.close': ('lifecycle.attached-close-preserves-instance',),
-    'Sandbox.kill': ('lifecycle.attached-close-preserves-instance',),
-    'Sandbox.delete': ('lifecycle.detached-close-reattach-delete',),
+    'Environment.create': ('snapshot clones inherit geometry and preserve process memory',),
+    'Environment.get_snapshot': ('snapshot remains queryable after source deletion',),
+    'Environment.list_snapshots': ('snapshot remains queryable after source deletion',),
+    'Environment.delete_snapshot': ('snapshot deletion accepted for artifact collection',),
+    'Environment.from_id': ('environment.create-query-reattach',),
+    'Environment.files': ('filesystem.text-crud',),
+    'Environment.commands': ('command.stdin-handle-recovery',),
+    'Environment.shells': ('shell.state-env-cwd-and-exit',),
+    'Environment.pty': ('pty.output-resize',),
+    'Environment.id': ('environment.create-query-reattach',),
+    'Environment.environment_id': ('environment.create-query-reattach',),
+    'Environment.get_port_url': ('port-forward.tls-token-route', 'port-forward.per-instance-tls-route'),
+    'Environment.get_port_auth_headers': ('port-forward.tls-token-route',),
+    'Environment.get_tunnel_url': ('reverse-tunnel.sdk-upstream-roundtrip',),
+    'Environment.wait_entrypoint': ('inherited image entrypoint reports structured exit status',),
+    'Environment.entrypoint_exit_info': ('inherited image entrypoint reports structured exit status',),
+    'Environment.is_running': ('lifecycle.context-manager-deletes',),
+    'Environment.get_info': ('environment.create-query-reattach',),
+    'Environment.create_snapshot': ('reusable snapshot preserves running source',),
+    'Environment.pause': ('pause with persisted recovery point',),
+    'Environment.resume': ('resume preserves process memory, PID and binary file',),
+    'Environment.reload': ('reload restores the latest recovery point without a cold start',),
+    'Environment.update_network_policy': ('runtime network policy replacement blocks egress and preserves EXECD control',),
+    'Environment.close': ('lifecycle.attached-close-preserves-instance',),
+    'Environment.kill': ('lifecycle.attached-close-preserves-instance',),
+    'Environment.delete': ('lifecycle.detached-close-reattach-delete',),
     'CommandHandle.id': ('command.stdin-handle-recovery',),
-    'CommandHandle.sandbox_id': ('command.stdin-handle-recovery',),
+    'CommandHandle.environment_id': ('command.stdin-handle-recovery',),
     'CommandHandle.poll': ('command.collection-stdin-async-wait',),
     'CommandHandle.wait': ('command.stdin-handle-recovery',),
     'CommandHandle.wait_async': ('command.collection-stdin-async-wait',),

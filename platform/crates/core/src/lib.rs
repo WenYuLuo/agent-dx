@@ -7,9 +7,9 @@ pub mod snapshots;
 pub use checkpoint::{
     valid_runtime_id, CheckpointArtifact, CompletedOperation, LifecycleKind, RestorePoint,
 };
+pub mod execution;
 pub mod probes;
 pub mod runtime;
-pub mod sandbox;
 pub mod scheduling;
 
 use serde::{Deserialize, Serialize};
@@ -91,7 +91,7 @@ pub struct EnvironmentSpec {
     #[serde(default)]
     pub scheduling: scheduling::SchedulingPolicy,
     #[serde(default)]
-    pub sandbox: sandbox::SandboxOptions,
+    pub execution: execution::ExecutionOptions,
 }
 
 impl EnvironmentSpec {
@@ -107,7 +107,7 @@ impl EnvironmentSpec {
         }
         if let Some(environment) = &self.runtime_profile {
             environment.validate()?;
-        } else if self.image.trim().is_empty() && self.sandbox.rootfs.is_none() {
+        } else if self.image.trim().is_empty() && self.execution.rootfs.is_none() {
             return Err(Error::Invalid(
                 "image or runtime environment is required".into(),
             ));
@@ -115,7 +115,7 @@ impl EnvironmentSpec {
         self.lifecycle.validate()?;
         self.resources.validate()?;
         self.scheduling.validate()?;
-        self.sandbox.validate(&self.resources)
+        self.execution.validate(&self.resources)
     }
 }
 

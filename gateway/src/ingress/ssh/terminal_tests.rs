@@ -117,20 +117,23 @@ struct RoutingBackend {
 }
 impl RoutingBackend {
     async fn install(&self, tenant: &str, id: &str) {
-        let route: crate::common::route::RouteInfo = serde_json::from_value(serde_json::json!({"instanceID":id,"instanceStatus":{"code":3},"tenantID":tenant,"sandboxID":format!("runtime-{id}"),"sandboxIP":"127.0.0.1","nodeProxyAddress":self.node_address.to_string()})).unwrap();
+        let route: crate::common::route::RouteInfo = serde_json::from_value(serde_json::json!({"instanceID":id,"instanceStatus":{"code":3},"tenantID":tenant,"environmentID":format!("runtime-{id}"),"environmentIP":"127.0.0.1","nodeProxyAddress":self.node_address.to_string()})).unwrap();
         self.node
             .activate_route(
                 route.instance_id.clone(),
-                route.sandbox_id.clone(),
-                route.sandbox_ip.parse().unwrap(),
+                route.environment_id.clone(),
+                route.environment_ip.parse().unwrap(),
             )
             .await;
         self.routes.put(route);
     }
 }
 #[async_trait::async_trait]
-impl Sandbox for RoutingBackend {
-    async fn create(&self, req: &CreateSandbox) -> Result<SandboxObservation, SandboxError> {
+impl Environment for RoutingBackend {
+    async fn create(
+        &self,
+        req: &CreateEnvironment,
+    ) -> Result<EnvironmentObservation, EnvironmentError> {
         let result = self.inner.create(req).await?;
         self.install(&req.tenant, &req.id).await;
         Ok(result)
@@ -139,10 +142,14 @@ impl Sandbox for RoutingBackend {
         &self,
         tenant: &str,
         id: &str,
-    ) -> Result<Option<SandboxObservation>, SandboxError> {
+    ) -> Result<Option<EnvironmentObservation>, EnvironmentError> {
         self.inner.get(tenant, id).await
     }
-    async fn delete(&self, tenant: &str, id: &str) -> Result<SandboxObservation, SandboxError> {
+    async fn delete(
+        &self,
+        tenant: &str,
+        id: &str,
+    ) -> Result<EnvironmentObservation, EnvironmentError> {
         self.inner.delete(tenant, id).await
     }
 }
@@ -219,20 +226,20 @@ async fn terminal_case(native: bool) {
         })
     };
     let (gateway, _, routes) = fixture_with_routes().await;
-    let sandbox = Arc::new(RoutingBackend {
+    let environment = Arc::new(RoutingBackend {
         inner: Backend::default(),
         routes,
         node,
         node_address,
     });
-    sandbox.install("tenant", "inline-instance").await;
-    sandbox.install("other", "other-instance").await;
+    environment.install("tenant", "inline-instance").await;
+    environment.install("other", "other-instance").await;
     let state = AgentState::new(Arc::new(MemoryRepository::default()));
     let template = serde_json::from_value(serde_json::json!({"name":"demo","version":"1","image":"app:1","isolation_runtime":"runc","resources":{"cpu_millis":1000,"memory_mib":512},"service":[{"protocol":"ssh","port":port}]})).unwrap();
     state.publish("tenant", &template).await.unwrap();
     let api = Arc::new(AgentApi {
         managed: Arc::new(adx_agent_api::managed::ManagedService::new(Arc::new(
-            remote_control(adx_activator::Activator::new(state.clone(), sandbox)).await,
+            remote_control(adx_activator::Activator::new(state.clone(), environment)).await,
         ))),
         request_timeout: adx_agent_core::limits::AGENT_REQUEST_TIMEOUT,
     });

@@ -1,5 +1,5 @@
-//! Authenticated Jiuwen multipart uploads into the selected Sandbox workspace.
-use crate::ingress::sandbox_files::{Files, ReadError};
+//! Authenticated Jiuwen multipart uploads into the selected Environment workspace.
+use crate::ingress::environment_files::{Files, ReadError};
 use crate::ingress::server::{Ingress, ProxyBody};
 use adx_agent_api::request::RequestContext;
 use bytes::Bytes;
@@ -18,7 +18,7 @@ pub struct Upload {
     pub ingress: Arc<Ingress>,
     pub context: Arc<RequestContext>,
     pub tenant: String,
-    pub sandbox_id: String,
+    pub environment_id: String,
     pub workspace: String,
     pub user_id: String,
     pub agent_type: String,
@@ -71,7 +71,7 @@ impl Upload {
             &self.ingress,
             self.context.deadline(),
             &self.tenant,
-            &self.sandbox_id,
+            &self.environment_id,
         ) {
             Ok(value) => value,
             Err(_) => return error(StatusCode::FORBIDDEN, "FORBIDDEN"),

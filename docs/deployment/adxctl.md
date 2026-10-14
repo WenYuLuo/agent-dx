@@ -2,7 +2,7 @@
 
 当前发布包默认共进程部署：`adx-apiserver` 内嵌 Ingress，`adxlet` 内嵌 Relay；同时提供 `adx-ingress` 和 `adx-relay`，供显式分进程部署。调试用 `adx-data-plane-forward` 不随包发布。
 
-`adxctl` 是 ADX 统一发布包的本机进程部署工具。它读取一份 YAML 部署文件，生成本机各组件的最终配置，并以前台 supervisor 方式启动这些组件。它不创建 Environment，也不调用 Sandbox API；集群 API Key 等远程管理操作使用独立的 [`adxadmin`](adxadmin.md)。
+`adxctl` 是 ADX 统一发布包的本机进程部署工具。它读取一份 YAML 部署文件，生成本机各组件的最终配置，并以前台 supervisor 方式启动这些组件。它不创建 Environment，也不调用 Environment API；集群 API Key 等远程管理操作使用独立的 [`adxadmin`](adxadmin.md)。
 
 release 安装器默认创建 `/usr/local/bin/adxctl -> /opt/adx/current/bin/adxctl`。因此日常命令直接使用 `adxctl`；切换 `/opt/adx/current` 后，命令自动指向新版本。安装器不会把其他内部服务二进制加入系统 `PATH`。发布包还包含与 Redis Server 同为 7.2.5 的 `/opt/adx/current/bin/redis-cli`，供部署者进入 Coordinator 容器后检查 Redis；它不会自动连接或认证，使用时应从部署环境获取地址和凭证。
 
@@ -17,7 +17,7 @@ release 安装器默认创建 `/usr/local/bin/adxctl -> /opt/adx/current/bin/adx
 | `coordinator` | `adx-coordinator` | 控制节点 | 持久化状态、全局轮转、Shard 调度、节点心跳与路由发布 |
 | `adxlet` | `adxlet` | 每个工作节点 | 本机资源准入、Environment 生命周期、sandboxd 与恢复；默认同时嵌入 Relay |
 | `relay` | `adx-relay` | 显式选择分进程时 | 数据面绑定和到 Environment Execd 的转发 |
-| `apiserver` | `adx-apiserver` | 接入节点，默认内嵌 Ingress | 用户 API Key、Sandbox HTTP API、归属缓存和生命周期转发 |
+| `apiserver` | `adx-apiserver` | 接入节点，默认内嵌 Ingress | 用户 API Key、Environment HTTP API、归属缓存和生命周期转发 |
 | `ingress` | 内嵌时无独立进程；分进程时为 `adx-ingress` | 接入节点 | 对外 TLS、控制请求转发以及到 Relay 的数据连接 |
 | `redis` | `redis-server` | 可选，仅一个主机 | 由 `adxctl` 托管的 Redis 7.2.5 和 AOF |
 | `afs-meta` | `afs-meta` | 显式 Agent FS（AFS） 主机 | AFS 命名空间、版本、布局和副本目录；仅 `with_afs: true` 可用 |
@@ -27,7 +27,7 @@ release 安装器默认创建 `/usr/local/bin/adxctl -> /opt/adx/current/bin/adx
 
 sandboxd 不属于上述角色，始终由部署环境独立启动。Execd 位于发布包 `runtime/`，进入 Environment 环境运行，也不是宿主机服务。
 
-Execd 主动控制连接是节点服务的可选配置，见[运行时控制流部署](runtime-control-stream.md)；它需要沙箱能够访问本节点控制地址，并配套新 Execd。
+Execd 主动控制连接是节点服务的可选配置，见[运行时控制流部署](runtime-control-stream.md)；它需要运行环境能够访问本节点控制地址，并配套新 Execd。
 
 ## 命令
 
@@ -285,7 +285,7 @@ sudo adxctl validate
 sudo adxctl run
 ```
 
-API Frontend 对应 `role: "apiserver"` 和 `adx-apiserver`。示例将 API 监听绑定到 `127.0.0.1:8888` 并启用 `loopback_http`。`role: "ingress"` 提供 Ingress 的控制配置和 `ADX_DATA_PLANE_*` 环境；默认由 `adxctl render` 合并进 API Server 进程。Ingress 对外监听 `0.0.0.0:8443`，将 Sandbox 控制请求转发到同进程的 API 回环监听，并按 Coordinator 路由把实例数据请求转发到目标 Relay。
+API Frontend 对应 `role: "apiserver"` 和 `adx-apiserver`。示例将 API 监听绑定到 `127.0.0.1:8888` 并启用 `loopback_http`。`role: "ingress"` 提供 Ingress 的控制配置和 `ADX_DATA_PLANE_*` 环境；默认由 `adxctl render` 合并进 API Server 进程。Ingress 对外监听 `0.0.0.0:8443`，将 Environment 控制请求转发到同进程的 API 回环监听，并按 Coordinator 路由把实例数据请求转发到目标 Relay。
 
 需要独立故障域、日志或资源限制时，在 `apiserver.config` 中设置 `ingress_mode: standalone`。此时渲染结果包含 `adx-apiserver` 与 `adx-ingress` 两个进程，但继续使用相同的 Ingress 服务实现、端口和证书配置。默认模式下不要手工启动 `adx-ingress`，否则会争用 Ingress 监听端口。
 

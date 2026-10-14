@@ -3,13 +3,13 @@
 import json
 from pathlib import Path
 
-from adx_sandbox import Sandbox
+from adx_environment import Environment
 
 
 def run(connection, image, output):
     results = []
     for name, options in [('default', {}), ('runtime-only', {'runtime': 'runc'}), ('custom', {'image': image})]:
-        s = Sandbox(cpu=500, memory=512, idle_timeout=0, connection=connection, create_timeout=150, **options)
+        s = Environment(cpu=500, memory=512, idle_timeout=0, connection=connection, create_timeout=150, **options)
         try:
             command = "test -x /__adx/usr/local/bin/adx-execd && printf 'runtime_profile-ready'"
             if name == 'custom' and Path('/secrets/runtime-image').is_file():

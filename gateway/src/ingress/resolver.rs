@@ -53,9 +53,9 @@ impl AccessKind {
 pub enum ResolveError {
     #[error("route cache is not ready")]
     NotReady,
-    #[error("sandbox route not found")]
+    #[error("environment route not found")]
     NotFound,
-    #[error("sandbox instance is not connectable: code={code}, msg={msg}, err_code={err_code}, exit_code={exit_code}, type={kind}")]
+    #[error("environment instance is not connectable: code={code}, msg={msg}, err_code={err_code}, exit_code={exit_code}, type={kind}")]
     EnvironmentStatus {
         code: i32,
         msg: String,
@@ -160,7 +160,7 @@ impl IngressRouteResolver {
                     return Err(ResolveError::NotReady);
                 }
                 if let Some(info) = self.store.get(&route.target.instance_id) {
-                    if is_connectable(&info.environment_status) && info.sandbox_id == runtime {
+                    if is_connectable(&info.environment_status) && info.environment_id == runtime {
                         let mut ready = self
                             .resolve(
                                 &route.target.instance_id,
@@ -224,8 +224,8 @@ impl IngressRouteResolver {
             .is_some_and(|route| {
                 is_connectable(&route.environment_status)
                     && route.relay_address == handle.relay_address
-                    && route.sandbox_id == handle.target.workload_id
-                    && route.sandbox_ip.parse().ok() == Some(handle.target.target_ip)
+                    && route.environment_id == handle.target.workload_id
+                    && route.environment_ip.parse().ok() == Some(handle.target.target_ip)
             })
     }
 
@@ -385,9 +385,9 @@ mod tests {
                 ..Default::default()
             },
             tenant_id: "tenant-a".into(),
-            sandbox_id: "s".into(),
+            environment_id: "s".into(),
             relay_address: "relay:8443".into(),
-            sandbox_ip: "10.88.0.2".into(),
+            environment_ip: "10.88.0.2".into(),
             tunnel_security_mode: DataPlaneSecurityMode::Inherit,
             port_forward_security_mode: DataPlaneSecurityMode::Inherit,
             port_forward_routes: Vec::new(),

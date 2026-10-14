@@ -4,10 +4,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub mod activator;
 pub mod cache;
+pub mod environment;
 pub mod error;
 pub mod launch;
 pub mod limits;
-pub mod sandbox;
 pub mod target;
 pub mod transport;
 
@@ -166,8 +166,8 @@ pub struct AgentBinding {
     pub scope: Scope,
     pub generation: String,
     /// Stable Platform identity, including across retries and runtime pause/resume.
-    pub sandbox_id: String,
-    /// Product deletion intent only; Sandbox runtime state belongs to Platform.
+    pub environment_id: String,
+    /// Product deletion intent only; Environment runtime state belongs to Platform.
     pub phase: BindingPhase,
 }
 

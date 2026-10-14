@@ -24,7 +24,7 @@ fn environment_identity_survives_runtime_replacement() {
             },
             priority: 0,
             scheduling: Default::default(),
-            sandbox: Default::default(),
+            execution: Default::default(),
         },
         assignment: adx_core::Assignment {
             environment_id: "environment-a".into(),

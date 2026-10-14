@@ -30,7 +30,7 @@ def call(method, path, body=None, request_id='probe', key='a' * 40):
 def create(name, request_id, **extra):
     return call(
         'POST',
-        '/api/sandbox/v1/sandboxes',
+        '/api/environment/v1/environments',
         {'name': name, 'namespace': 'lf', 'image': 'image', 'cpu': 100, 'memory': 1, **extra},
         request_id,
     )
@@ -40,12 +40,12 @@ def identity(result):
     status, value = result
     if not (status == 200):
         raise AssertionError(result)
-    return json.loads(base64.b64decode(value['data']))['sandboxId']
+    return json.loads(base64.b64decode(value['data']))['environmentId']
 
 
 for _ in range(100):
     try:
-        if not (call('DELETE', '/api/sandbox/absent', key='wrong')[0] == 401):
+        if not (call('DELETE', '/api/environment/absent', key='wrong')[0] == 401):
             raise AssertionError()
         break
     except urllib.error.URLError:
@@ -54,7 +54,7 @@ else:
     raise AssertionError('API Server did not listen')
 # Readiness requires both the Environment directory and the local-first node view.
 for _ in range(100):
-    if call('DELETE', '/api/sandbox/absent')[0] == 404:
+    if call('DELETE', '/api/environment/absent')[0] == 404:
         break
     time.sleep(0.05)
 else:
@@ -75,7 +75,7 @@ if not (create('race', 'changed', image='other-image')[0] == 409):
 if not (
     call(
         'POST',
-        '/api/sandbox/v1/sandboxes',
+        '/api/environment/v1/environments',
         {
             'name': 'race',
             'namespace': 'lf',
@@ -90,6 +90,6 @@ if not (
 ):
     raise AssertionError()
 for instance in (first, second, 'lf-race'):
-    if not (call('DELETE', '/api/sandbox/' + instance, request_id='delete-' + instance)[0] == 200):
+    if not (call('DELETE', '/api/environment/' + instance, request_id='delete-' + instance)[0] == 200):
         raise AssertionError()
 print(('PASS HTTPS local-first: round-robin, four concurrent creates, same-ID replay, spec/tenant conflicts, deletion'))

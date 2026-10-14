@@ -86,7 +86,7 @@ class SqliteFallbackOracleTests(unittest.TestCase):
     def test_sdk_scenario_preserves_live_backend_and_rejects_eager_journal(self):
         state = {"created": [], "deleted": [], "waited": [], "commands": []}
 
-        class Sandbox:
+        class Environment:
             def __init__(self, **options):
                 self.id = f"instance-{len(state['created']) + 1}"
                 self.commands = types.SimpleNamespace(run=self.run)
@@ -115,7 +115,7 @@ class SqliteFallbackOracleTests(unittest.TestCase):
             state['waited'].append(instance_id)
 
         modules = {
-            'adx_sandbox': types.SimpleNamespace(Sandbox=Sandbox),
+            'adx_environment': types.SimpleNamespace(Environment=Environment),
             'functional_lifecycle': types.SimpleNamespace(_wait_deleted=wait_deleted),
         }
         spec = importlib.util.spec_from_file_location('sqlite_sdk_case', ROOT / 'sqlite_fallback.py')

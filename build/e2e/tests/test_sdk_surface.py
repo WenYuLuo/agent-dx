@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-SDK = ROOT.parents[1] / 'platform/sdk/sandbox/python/adx_sandbox'
+SDK = ROOT.parents[1] / 'platform/sdk/environment/python/adx_environment'
 spec = importlib.util.spec_from_file_location('sdk_surface', ROOT / 'sdk_surface.py')
 surface = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(surface)
@@ -12,7 +12,7 @@ spec.loader.exec_module(surface)
 
 class PublicSdkSurfaceTests(unittest.TestCase):
     SOURCES = {
-        'Sandbox': 'sandbox_api.py',
+        'Environment': 'environment_api.py',
         'CommandHandle': 'commands.py',
         'Commands': 'commands.py',
         'Filesystem': 'filesystem.py',
@@ -49,7 +49,7 @@ class PublicSdkSurfaceTests(unittest.TestCase):
                 break
         self.assertIsNotNone(exports, '__all__ assignment is missing')
         self.assertEqual(len(exports), 48)
-        self.assertTrue({'Sandbox', 'CommandHandle', 'PtySession', 'PausePolicy', 'SandboxFailure', 'resources'}.issubset(exports))
+        self.assertTrue({'Environment', 'CommandHandle', 'PtySession', 'PausePolicy', 'EnvironmentFailure', 'resources'}.issubset(exports))
         self.assertTrue({'ReadinessProbe', 'HealthcheckProbe'}.issubset(exports))
         self.assertIn('resources', exports)
         self.assertEqual(surface.SURFACE['<module>'], {'resources': 'standalone'})
@@ -67,7 +67,7 @@ class PublicSdkSurfaceTests(unittest.TestCase):
 
     def test_reverse_tunnel_has_a_real_standalone_case_owner(self):
         self.assertEqual(
-            surface.OPERATION_CASES['Sandbox.get_tunnel_url'],
+            surface.OPERATION_CASES['Environment.get_tunnel_url'],
             ('reverse-tunnel.sdk-upstream-roundtrip',),
         )
 

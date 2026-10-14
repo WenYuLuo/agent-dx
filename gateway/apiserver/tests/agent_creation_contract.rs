@@ -1,7 +1,9 @@
 //! Agent transports submit the same public request; API Server owns runtime injection.
-use adx_activator::sandbox_request::create_input;
-use adx_agent_core::sandbox::CreateSandbox;
-use adx_apiserver::{clients::Clients, config::Config, contract, sandbox_service::SandboxService};
+use adx_activator::environment_request::create_input;
+use adx_agent_core::environment::CreateEnvironment;
+use adx_apiserver::{
+    clients::Clients, config::Config, contract, environment_service::EnvironmentService,
+};
 use adx_protocol::control as pb;
 use serde_json::json;
 use std::time::Duration;
@@ -17,8 +19,8 @@ async fn embedded_and_http_creation_use_the_same_platform_contract() {
         }
     })).unwrap();
     let runtime = config.runtime_profile.clone();
-    let service = SandboxService::new(Clients::new(config).unwrap());
-    let create: CreateSandbox = serde_json::from_value(json!({"tenant":"tenant","id":"adx-generation","execution":{
+    let service = EnvironmentService::new(Clients::new(config).unwrap());
+    let create: CreateEnvironment = serde_json::from_value(json!({"tenant":"tenant","id":"adx-generation","execution":{
         "image":"app:1","isolation_runtime":"runc","inherit_entrypoint":true,"entrypoint":[],"working_dir":"","user":null,"env":{"MODEL_KEY":"test-model-value"},"resources":{"cpu_millis":1500,"memory_mib":768},"service":[]
     }})).unwrap();
     let input = create_input(&create, Duration::from_secs(60)).unwrap();
@@ -35,7 +37,7 @@ async fn embedded_and_http_creation_use_the_same_platform_contract() {
         local.resources.as_ref().unwrap().memory_bytes,
         768 * 1048576
     );
-    assert!(local.sandbox.as_ref().unwrap().inherit_entrypoint);
+    assert!(local.execution.as_ref().unwrap().inherit_entrypoint);
     assert_eq!(local.env["MODEL_KEY"], "test-model-value");
     assert_eq!(
         local.runtime_profile.unwrap().env["EXECD_HTTP_TOKEN"],

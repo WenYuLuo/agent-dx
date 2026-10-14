@@ -32,7 +32,7 @@ image = sys.argv[2]
 base = pathlib.Path(os.environ['ADX_FC_BASE'])
 output = root / 'evidence/sdk-transfer.json'
 os.environ['SSL_CERT_FILE'] = str(root / 'secrets/tls/ca.pem')
-from adx_sandbox import RetentionPolicy, ConnectionConfig, Sandbox
+from adx_environment import RetentionPolicy, ConnectionConfig, Environment
 
 connection = ConnectionConfig(
     server_address='127.0.0.1:8443', token=(root / 'secrets/api-key').read_text().strip(), use_tls=True, verify_tls=True
@@ -44,7 +44,7 @@ result = {
     'interruption_requested': os.getenv('ADX_TRANSFER_INTERRUPT_COORDINATOR') == '1',
     'node_interruption_requested': os.getenv('ADX_TRANSFER_INTERRUPT_NODE') == '1',
 }
-sandbox = None
+environment = None
 stopped = None
 blocked_rpc = None
 blocked_execd = None
@@ -71,7 +71,7 @@ def wait(predicate, seconds=180):
 
 
 def command(text):
-    r = sandbox.commands.run(text)
+    r = environment.commands.run(text)
     if not (r.exit_code == 0):
         raise AssertionError(r)
     return r.stdout.strip()
@@ -100,7 +100,7 @@ def inventory(node):
 
 
 try:
-    sandbox = Sandbox(
+    environment = Environment(
         image=image,
         runtime='firecracker',
         cpu=1000,
@@ -120,17 +120,17 @@ try:
     before = int(command('cat /tmp/counter'))
     saved_pid = command('cat /tmp/counter.pid')
     payload = b'cross-node-checkpoint\x00\xff' * 4096
-    sandbox.files.write('/tmp/transfer.bin', payload)
-    paused = sandbox.pause(retention=RetentionPolicy.for_seconds(900), timeout_seconds=120)
+    environment.files.write('/tmp/transfer.bin', payload)
+    paused = environment.pause(retention=RetentionPolicy.for_seconds(900), timeout_seconds=120)
     if not (paused.size > 0):
         raise AssertionError()
-    sandbox.resume()
-    old = catalog()['environment:' + sandbox.id]
+    environment.resume()
+    old = catalog()['environment:' + environment.id]
     source = old['assignment']['node_id']
     target = 'node2' if source == 'node1' else 'node1'
     if not (old['result']['checkpoint']['artifact']['storage'] == 'shared'):
         raise AssertionError()
-    passed(0, instance_id=sandbox.id, source=source, checkpoint=paused.snapshot_id)
+    passed(0, instance_id=environment.id, source=source, checkpoint=paused.snapshot_id)
     if result['interruption_requested']:
         blocked_rpc = [
             'OUTPUT',
@@ -159,14 +159,14 @@ try:
     if result['interruption_requested']:
 
         def pending():
-            r = catalog()['environment:' + sandbox.id]
+            r = catalog()['environment:' + environment.id]
             return r if r['assignment']['node_id'] == target and r.get('recovery', {}).get('pending') else None
 
         planned = wait(pending)
         epoch = catalog()['header']['epoch']
         os.kill(pid(root, 'coordinator'), signal.SIGKILL)
         wait(lambda: catalog()['header']['epoch'] > epoch)
-        kept = catalog()['environment:' + sandbox.id]
+        kept = catalog()['environment:' + environment.id]
         if not (kept['assignment'] == planned['assignment'] and kept['recovery']['pending']):
             raise AssertionError()
         result['mid_recovery_restart'] = {
@@ -184,14 +184,14 @@ try:
     if result['node_interruption_requested']:
 
         def uncommitted_backend():
-            r = catalog()['environment:' + sandbox.id]
+            r = catalog()['environment:' + environment.id]
             backends_local = inventory(target)
             recovery_backend_ready = (
                 r['assignment']['node_id'] == target
                 and r.get('recovery', {}).get('pending')
                 and r['result']['state'] == 'Paused'
                 and len(backends_local) == 1
-                and 'SANDBOX_STATE_RUNNING' in backends_local[0]
+                and 'ENVIRONMENT_STATE_RUNNING' in backends_local[0]
             )
             if recovery_backend_ready:
                 return r, backends_local[0].split()[0]
@@ -213,7 +213,7 @@ try:
         blocked_execd = None
         wait(lambda: catalog()['node:' + target]['session']['id'] != session)
         print('TARGET NODE MANAGER RESTARTED WITH UNCOMMITTED BACKEND', physical, flush=True)
-    new = wait(lambda: (lambda r: r if recovered(old, r) else None)(catalog()['environment:' + sandbox.id]))
+    new = wait(lambda: (lambda r: r if recovered(old, r) else None)(catalog()['environment:' + environment.id]))
     if result['node_interruption_requested']:
         backends = inventory(target)
         if not (len(backends) == 1):
@@ -238,7 +238,7 @@ try:
         raise AssertionError((before, after))
     if not (command('cat /tmp/counter.pid') == saved_pid):
         raise AssertionError()
-    if not (sandbox.files.read('/tmp/transfer.bin', format='bytes') == payload):
+    if not (environment.files.read('/tmp/transfer.bin', format='bytes') == payload):
         raise AssertionError()
     passed(2, before=before, after=after, pid=saved_pid)
     os.kill(stopped, signal.SIGCONT)
@@ -268,15 +268,15 @@ try:
             and all(catalog()['node:' + n]['session']['routable'] for n in ('node1', 'node2'))
         )
     )
-    same = catalog()['environment:' + sandbox.id]
+    same = catalog()['environment:' + environment.id]
     if not (same['assignment'] == new['assignment'] and runtime_id(same['result']) == old_runtime):
         raise AssertionError()
     if not (command('cat /tmp/counter.pid') == saved_pid):
         raise AssertionError()
     passed(4, generation=same['assignment']['generation'], runtime_id=old_runtime)
-    sandbox.kill()
-    sandbox.close()
-    sandbox = None
+    environment.kill()
+    environment.close()
+    environment = None
     wait(lambda: not inventory('node1') and not inventory('node2'))
     records = {k: v for k, v in catalog().items() if k.startswith('environment:')}
     if not (not records):
@@ -294,10 +294,10 @@ finally:
         subprocess.run([_executable('iptables'), '-D', *blocked_rpc], check=True)
     if stopped:
         os.kill(stopped, signal.SIGCONT)
-    if sandbox:
+    if environment:
         try:
-            sandbox.kill()
-            sandbox.close()
+            environment.kill()
+            environment.close()
         except Exception as error:
             result['delete_error'] = repr(error)
     output.write_text(json.dumps(result, indent=2))

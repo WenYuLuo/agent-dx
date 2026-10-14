@@ -115,19 +115,19 @@ class ResponseCutProxy:
 
 def run(connection, image, output, secrets):
     """Prove a lost committed response converges through the installed public SDK."""
-    from adx_sandbox import ConnectionConfig, Sandbox
+    from adx_environment import ConnectionConfig, Environment
     from functional_lifecycle import _wait_deleted
     from node import catalog, labeled_backend, persisted_runtime_id
 
     started = time.monotonic()
     name = 'response-cut-' + uuid.uuid4().hex
     report = {'status': 'failed', 'cases': [], 'cleanup_errors': []}
-    sandbox = None
+    environment = None
     instance_id = None
     deleted = False
 
     def committed(final):
-        sid = final.get('sandboxId') or final.get('instanceId')
+        sid = final.get('environmentId')
         if not sid:
             raise AssertionError('first committed final omitted its instance ID')
         record = json.loads(catalog()['environment:' + sid])
@@ -157,7 +157,7 @@ def run(connection, image, output, secrets):
                 use_tls=True,
                 verify_tls=True,
             )
-            sandbox = Sandbox(
+            environment = Environment(
                 image=image,
                 runtime='runc',
                 cpu=500,
@@ -169,9 +169,9 @@ def run(connection, image, output, secrets):
                 connection=proxy_connection,
                 create_timeout=150,
             )
-            instance_id = sandbox.id
-            sandbox.close()
-            sandbox = None
+            instance_id = environment.id
+            environment.close()
+            environment = None
 
         if proxy.first_error is not None:
             raise AssertionError(f'first committed response observation failed: {proxy.first_error}')
@@ -192,14 +192,14 @@ def run(connection, image, output, secrets):
             raise AssertionError(record['result'])
         if not (labeled_backend(instance_id) == [first['backend']]):
             raise AssertionError()
-        attached = Sandbox.from_id(instance_id, connection=connection)
+        attached = Environment.from_id(instance_id, connection=connection)
         try:
             command = attached.commands.run('printf response-cut-recovered')
             if not (command.exit_code == 0 and command.stdout == 'response-cut-recovered'):
                 raise AssertionError()
         finally:
             attached.close()
-        Sandbox.delete(instance_id, connection=connection)
+        Environment.delete(instance_id, connection=connection)
         deleted = True
         _wait_deleted(instance_id, connection, timeout=60)
         if not ('environment:' + instance_id not in catalog()):
@@ -224,13 +224,13 @@ def run(connection, image, output, secrets):
         report['error'] = str(error)
         raise
     finally:
-        if sandbox is not None:
-            sandbox.close()
+        if environment is not None:
+            environment.close()
         if instance_id is None and proxy.first_final is not None:
-            instance_id = proxy.first_final.get('sandboxId') or proxy.first_final.get('instanceId')
+            instance_id = proxy.first_final.get('environmentId')
         if instance_id and not deleted:
             try:
-                Sandbox.delete(instance_id, connection=connection)
+                Environment.delete(instance_id, connection=connection)
             except Exception as error:
                 report['cleanup_errors'].append(str(error))
         if report['cleanup_errors']:

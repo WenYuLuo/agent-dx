@@ -25,7 +25,7 @@ async fn connect_tunnel(
         .unwrap();
     request
         .headers_mut()
-        .insert("X-Sandbox-ID", "i".parse().unwrap());
+        .insert("X-Environment-ID", "i".parse().unwrap());
     tokio_tungstenite::connect_async(request).await.unwrap().0
 }
 
@@ -65,7 +65,7 @@ fn record(generation: u64) -> EnvironmentRecord {
             runtime_class: "runsc".into(),
             priority: 0,
             resources: Resources::default(),
-            sandbox: Default::default(),
+            execution: Default::default(),
         },
         assignment: Assignment {
             devices: vec![],
@@ -240,7 +240,7 @@ async fn real_http_client_prepares_retries_aborts_and_refreshes_restored_identit
     let restored_cwd = runtime.temp.path().join("restored/workspace");
     assert!(!restored_cwd.exists());
     runtime.handoff(
-        &format!("ADX_ENVIRONMENT_ID=i\nADX_RUNTIME_ID=i-2\nADX_OWNERSHIP_GENERATION=2\nEXECD_HTTP_TOKEN=after\nADX_SANDBOX_CWD={}\n", restored_cwd.display()),
+        &format!("ADX_ENVIRONMENT_ID=i\nADX_RUNTIME_ID=i-2\nADX_OWNERSHIP_GENERATION=2\nEXECD_HTTP_TOKEN=after\nADX_ENVIRONMENT_CWD={}\n", restored_cwd.display()),
         "restore",
     );
     let restored_client = runtime.client("after");

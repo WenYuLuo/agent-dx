@@ -14,12 +14,12 @@ use tokio::{
 use tokio_rustls::TlsAcceptor;
 
 #[cfg(feature = "agent-api")]
-type SandboxOverride = Option<(
-    Arc<dyn adx_agent_core::sandbox::Sandbox>,
-    Arc<dyn super::sandbox_files::SandboxDirectory>,
+type EnvironmentOverride = Option<(
+    Arc<dyn adx_agent_core::environment::Environment>,
+    Arc<dyn super::environment_files::EnvironmentDirectory>,
 )>;
 #[cfg(not(feature = "agent-api"))]
-type SandboxOverride = ();
+type EnvironmentOverride = ();
 
 pub type ServiceError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -47,13 +47,13 @@ impl IngressService {
         Self::bind_inner(config, control, injected).await
     }
 
-    /// Use the embedding API Server's Sandbox application service for Agent lifecycle calls.
+    /// Use the embedding API Server's Environment application service for Agent lifecycle calls.
     #[cfg(feature = "agent-api")]
-    pub async fn bind_with_sandbox_service(
+    pub async fn bind_with_environment_service(
         config: IngressConfig,
         control: ControlConfig,
-        service: Arc<dyn adx_agent_core::sandbox::Sandbox>,
-        directory: Arc<dyn super::sandbox_files::SandboxDirectory>,
+        service: Arc<dyn adx_agent_core::environment::Environment>,
+        directory: Arc<dyn super::environment_files::EnvironmentDirectory>,
     ) -> Result<Self, ServiceError> {
         Self::bind_inner(config, control, Some((service, directory))).await
     }
@@ -61,18 +61,18 @@ impl IngressService {
     async fn bind_inner(
         config: IngressConfig,
         control: ControlConfig,
-        injected: SandboxOverride,
+        injected: EnvironmentOverride,
     ) -> Result<Self, ServiceError> {
         #[cfg(not(feature = "agent-api"))]
         let () = injected;
         #[cfg(not(feature = "agent-api"))]
-        if std::env::var_os("ADX_SANDBOX_FILES_CONFIG").is_some()
+        if std::env::var_os("ADX_ENVIRONMENT_FILES_CONFIG").is_some()
             || std::env::var_os("ADX_AGENT_CONFIG").is_some()
             || std::env::var_os("ADX_SSH_CONFIG").is_some()
             || std::env::var_os("ADX_JIUWEN_CONFIG").is_some()
         {
             return Err(
-                "Sandbox, Agent, Jiuwen and SSH configuration require a Gateway built with --features agent-api".into(),
+                "Environment, Agent, Jiuwen and SSH configuration require a Gateway built with --features agent-api".into(),
             );
         }
         let tls_listener = TcpListener::bind(config.tls_bind).await?;
@@ -90,12 +90,12 @@ impl IngressService {
         let connector = DataPlaneL4Connector::new(config.h2_pool_config()?);
         let authenticator = IngressAuthenticator::with_verifier(watcher.clone());
         #[cfg(feature = "agent-api")]
-        let file_access = if let Ok(path) = std::env::var("ADX_SANDBOX_FILES_CONFIG") {
-            let settings: super::sandbox_files::FileAccessConfig =
+        let file_access = if let Ok(path) = std::env::var("ADX_ENVIRONMENT_FILES_CONFIG") {
+            let settings: super::environment_files::FileAccessConfig =
                 serde_json::from_slice(&std::fs::read(path)?)
-                    .map_err(|_| "invalid Sandbox file configuration")?;
+                    .map_err(|_| "invalid Environment file configuration")?;
             if settings.port != config.default_direct_port {
-                return Err("Sandbox file port must match Ingress direct port".into());
+                return Err("Environment file port must match Ingress direct port".into());
             }
             Some(settings.build(injected.as_ref().map(|(_, directory)| directory.clone()))?)
         } else {
@@ -112,7 +112,7 @@ impl IngressService {
                     injected
                         .as_ref()
                         .map(|(service, _)| service.clone())
-                        .ok_or("embedded Activator requires a Sandbox service")?,
+                        .ok_or("embedded Activator requires a Environment service")?,
                 )
                 .await
                 .map_err(send_error)?
@@ -141,7 +141,7 @@ impl IngressService {
                 .as_ref()
                 .ok_or("Jiuwen requires ADX_AGENT_CONFIG")?;
             if file_access.is_none() {
-                return Err("Jiuwen requires ADX_SANDBOX_FILES_CONFIG".into());
+                return Err("Jiuwen requires ADX_ENVIRONMENT_FILES_CONFIG".into());
             }
             let account_path = std::env::var("ADX_ACCOUNT_CONFIG")
                 .map_err(|_| "Jiuwen requires ADX_ACCOUNT_CONFIG")?;

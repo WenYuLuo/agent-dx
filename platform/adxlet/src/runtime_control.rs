@@ -533,9 +533,9 @@ fn unavailable(error: impl std::fmt::Display) -> Error {
 mod tests {
     use super::*;
     use adx_core::{
+        execution::ExecutionOptions,
         lifecycle::LifecyclePolicy,
         runtime::{CheckpointPhase, CheckpointStatus},
-        sandbox::SandboxOptions,
         scheduling::SchedulingPolicy,
         Assignment, EnvironmentSpec, EnvironmentState, Resources,
     };
@@ -566,7 +566,7 @@ mod tests {
                 },
                 priority: 0,
                 scheduling: SchedulingPolicy::default(),
-                sandbox: SandboxOptions::default(),
+                execution: ExecutionOptions::default(),
             },
             assignment: Assignment {
                 environment_id: "environment-a".into(),

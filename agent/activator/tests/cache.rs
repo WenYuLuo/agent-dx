@@ -1,5 +1,5 @@
 use adx_activator::{Activator, Error};
-use adx_agent_core::{sandbox::*, *};
+use adx_agent_core::{environment::*, *};
 use adx_agent_store::{AgentState, Index, Key, MemoryRepository, Record, Repository, Transaction};
 use std::{
     collections::HashMap,
@@ -43,19 +43,22 @@ impl Repository for Store {
 
 #[derive(Default)]
 struct Platform {
-    records: Mutex<HashMap<String, SandboxObservation>>,
+    records: Mutex<HashMap<String, EnvironmentObservation>>,
     gets: AtomicUsize,
     pause_next_get: AtomicBool,
     get_started: tokio::sync::Notify,
     release_get: tokio::sync::Notify,
 }
 #[async_trait::async_trait]
-impl Sandbox for Platform {
-    async fn create(&self, r: &CreateSandbox) -> Result<SandboxObservation, SandboxError> {
-        let record = SandboxObservation {
+impl Environment for Platform {
+    async fn create(
+        &self,
+        r: &CreateEnvironment,
+    ) -> Result<EnvironmentObservation, EnvironmentError> {
+        let record = EnvironmentObservation {
             id: r.id.clone(),
             tenant: r.tenant.clone(),
-            phase: SandboxPhase::Running,
+            phase: EnvironmentPhase::Running,
             ready: true,
             runtime_id: None,
             message: None,
@@ -66,7 +69,11 @@ impl Sandbox for Platform {
             .insert(r.id.clone(), record.clone());
         Ok(record)
     }
-    async fn get(&self, _: &str, id: &str) -> Result<Option<SandboxObservation>, SandboxError> {
+    async fn get(
+        &self,
+        _: &str,
+        id: &str,
+    ) -> Result<Option<EnvironmentObservation>, EnvironmentError> {
         self.gets.fetch_add(1, Ordering::SeqCst);
         let record = self.records.lock().unwrap().get(id).cloned();
         if self.pause_next_get.swap(false, Ordering::SeqCst) {
@@ -75,12 +82,16 @@ impl Sandbox for Platform {
         }
         Ok(record)
     }
-    async fn delete(&self, tenant: &str, id: &str) -> Result<SandboxObservation, SandboxError> {
+    async fn delete(
+        &self,
+        tenant: &str,
+        id: &str,
+    ) -> Result<EnvironmentObservation, EnvironmentError> {
         self.records.lock().unwrap().remove(id);
-        Ok(SandboxObservation {
+        Ok(EnvironmentObservation {
             id: id.into(),
             tenant: tenant.into(),
-            phase: SandboxPhase::Deleted,
+            phase: EnvironmentPhase::Deleted,
             ready: false,
             runtime_id: None,
             message: None,
@@ -119,7 +130,7 @@ async fn warm_activation_skips_redis_and_platform() {
     assert_eq!(
         platform.gets.load(Ordering::SeqCst),
         0,
-        "warm activation must not query Sandbox"
+        "warm activation must not query Environment"
     );
     assert_eq!(
         store.reads.load(Ordering::SeqCst),
@@ -195,7 +206,7 @@ async fn bypasscache_refreshes_and_failed_refresh_does_not_leave_a_success_hit()
         .records
         .lock()
         .unwrap()
-        .get_mut(&first.binding.sandbox_id)
+        .get_mut(&first.binding.environment_id)
         .unwrap()
         .ready = false;
     let response = reqwest::Client::new()
@@ -268,7 +279,7 @@ async fn older_observation_cannot_refill_cache_after_newer_refresh_fails() {
         .records
         .lock()
         .unwrap()
-        .get_mut(&first.binding.sandbox_id)
+        .get_mut(&first.binding.environment_id)
         .unwrap()
         .ready = false;
     assert!(matches!(
@@ -293,11 +304,11 @@ async fn not_ready_binding_is_not_cached_and_can_become_ready() {
     let binding = state.create_binding(scope()).await.unwrap();
     let platform = Arc::new(Platform::default());
     platform.records.lock().unwrap().insert(
-        binding.sandbox_id.clone(),
-        SandboxObservation {
-            id: binding.sandbox_id.clone(),
+        binding.environment_id.clone(),
+        EnvironmentObservation {
+            id: binding.environment_id.clone(),
             tenant: binding.scope.tenant.clone(),
-            phase: SandboxPhase::Creating,
+            phase: EnvironmentPhase::Creating,
             ready: false,
             runtime_id: None,
             message: None,
@@ -310,8 +321,8 @@ async fn not_ready_binding_is_not_cached_and_can_become_ready() {
     ));
     {
         let mut records = platform.records.lock().unwrap();
-        let record = records.get_mut(&binding.sandbox_id).unwrap();
-        record.phase = SandboxPhase::Running;
+        let record = records.get_mut(&binding.environment_id).unwrap();
+        record.phase = EnvironmentPhase::Running;
         record.ready = true;
     }
     let ready = service.activate(&scope(), None, deadline()).await.unwrap();

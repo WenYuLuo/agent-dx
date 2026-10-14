@@ -105,7 +105,7 @@ class CommandResponseCutTests(unittest.TestCase):
             ) as proxy:
                 base = f'http://127.0.0.1:{proxy.port}'
                 with self.assertRaisesRegex(Exception, '503'):
-                    urlopen(base + '/api/sandbox/v1/commands/watch', timeout=5)
+                    urlopen(base + '/api/environment/v1/commands/watch', timeout=5)
                 with urlopen(base + '/api/instances', timeout=5) as response:
                     self.assertEqual(json.load(response), {'status': 'running'})
                 request = Request(
@@ -180,7 +180,7 @@ class CommandResponseCutTests(unittest.TestCase):
                 with urlopen(invoke('process.get'), timeout=5) as response:
                     self.assertEqual(json.load(response)['status'], 'RUNNING')
                 with self.assertRaisesRegex(Exception, '503'):
-                    urlopen(f'http://127.0.0.1:{proxy.port}/api/sandbox/v1/commands/watch', timeout=5)
+                    urlopen(f'http://127.0.0.1:{proxy.port}/api/environment/v1/commands/watch', timeout=5)
                 with self.assertRaisesRegex(Exception, '503'):
                     urlopen(invoke('process.get'), timeout=5)
                 self.assertEqual(proxy.rejected_get_attempts, 1)

@@ -24,8 +24,12 @@ candidate_commit=$("$python" -c 'import json; print(json.load(open("out/buildkit
 channel=${ADX_OBS_UPLOAD_CHANNEL:-daily}
 version_args=()
 if [[ $channel == release ]]; then
+  if [[ -z ${ADX_RELEASE_VERSION:-} ]]; then
+    source .buildkite/release-tag.sh
+    require_repository_release_tag "${BUILDKITE_TAG:-}"
+  fi
   version=${ADX_RELEASE_VERSION:-${BUILDKITE_TAG:-}}
-  version=${version#refs/tags/}; version=${version#sdk-v}; version=${version#v}
+  version=${version#refs/tags/}; version=${version#v}
   [[ -n $version ]] || { echo 'SDK release upload requires a version' >&2; exit 1; }
   version_args=(--version "$version")
 fi

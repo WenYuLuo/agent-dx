@@ -33,7 +33,7 @@ fn request() -> EnvironmentSpec {
             memory_bytes: 1,
             disk_bytes: 1,
         },
-        sandbox: Default::default(),
+        execution: Default::default(),
     }
 }
 #[test]
