@@ -56,6 +56,8 @@ python3 build/ci/run.py afs
 同样读取该开关以纳入 AFS lint。仓内脚本不根据文件变化自行推断或打开该开关。
 默认包始终排除 `afs-meta`、`afs-node` 和 AFS 示例配置。
 
+SHM 的 memfd、sealing 与原子 CLOEXEC FD 传递实现及对应运行测试只在 Linux 编译。macOS 上返回 `ShmError::Unsupported`，仅检查该不支持契约；这不代表 AFS/FUSE 在 macOS 可运行。
+
 ## 当前能力边界
 
 - OwnerFs workspace bind mount 默认 OFF；当前实际试用场景需要显式配置 ON。

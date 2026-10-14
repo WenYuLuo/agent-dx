@@ -16,7 +16,7 @@ use std::{
     ffi::CString,
     fmt,
     fs::{self, File},
-    io::{self, IoSlice, IoSliceMut, Read, Write},
+    io::{self, Read, Write},
     mem,
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
@@ -30,12 +30,16 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(target_os = "linux")]
+use std::io::{IoSlice, IoSliceMut};
+
 // broker 握手是本机短路径：超时要足够短，避免取消/失败请求长期占用线程和 slot。
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_REGION_BYTES: usize = 1024 * 1024;
 const MAX_GRANTS: usize = 64;
 const MAX_TOKEN_BYTES: usize = 256;
 const MAX_PATH_BYTES: usize = 4096;
+#[cfg(target_os = "linux")]
 const REQUIRED_SEALS: i32 = libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW;
 
 #[derive(Debug)]
@@ -421,6 +425,7 @@ fn set_file_len(fd: RawFd, len: usize) -> Result<(), ShmError> {
 
 // 添加 shrink/grow/seal 三类 seal：防止大小变化和后续撤销 seal，
 // 但不添加 F_SEAL_WRITE，因为 read 路径需要 node 写入 target memfd。
+#[cfg(target_os = "linux")]
 fn add_required_seals(fd: RawFd) -> Result<(), ShmError> {
     // SAFETY: F_ADD_SEALS takes an integer bitmask and no pointer; kernel errors are propagated.
     let result = unsafe { libc::fcntl(fd, libc::F_ADD_SEALS, REQUIRED_SEALS) };
@@ -468,6 +473,7 @@ fn validate_file_len(fd: RawFd, required_len: usize) -> Result<(), ShmError> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn validate_seals(fd: RawFd) -> Result<(), ShmError> {
     // SAFETY: F_GET_SEALS takes no pointer; the kernel validates the integer descriptor.
     let seals = unsafe { libc::fcntl(fd, libc::F_GET_SEALS) };
@@ -610,6 +616,7 @@ fn wait_fd_ready(fd: RawFd, events: i16, deadline: Instant) -> Result<(), ShmErr
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn connect_before(path: &Path, deadline: Instant) -> Result<UnixStream, ShmError> {
     use nix::sys::socket::{AddressFamily, SockFlag, SockType, UnixAddr, connect, socket};
     let address = UnixAddr::new(path).map_err(|e| ShmError::Syscall("address", e.into()))?;
@@ -638,6 +645,7 @@ fn connect_before(path: &Path, deadline: Instant) -> Result<UnixStream, ShmError
     Ok(UnixStream::from(fd))
 }
 
+#[cfg(target_os = "linux")]
 fn send_fd(stream: &UnixStream, fd: RawFd) -> Result<(), ShmError> {
     use nix::sys::socket::{ControlMessage, MsgFlags, sendmsg};
     let bytes = [0u8];
@@ -664,6 +672,7 @@ fn send_fd(stream: &UnixStream, fd: RawFd) -> Result<(), ShmError> {
 
 // 接收 SCM_RIGHTS fd。异常消息里的多余 fd 会先被 OwnedFd 接管再随 Vec drop 关闭，
 // 防止恶意/buggy 对端通过多 fd 消息泄漏描述符。
+#[cfg(target_os = "linux")]
 fn recv_fd_before(stream: &UnixStream, deadline: Instant) -> Result<OwnedFd, ShmError> {
     use nix::sys::socket::{ControlMessageOwned, MsgFlags, recvmsg};
     loop {
@@ -723,7 +732,7 @@ fn remove_owned_socket_sync(path: &Path, identity: SocketIdentity) -> io::Result
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
     use std::{fs::OpenOptions, os::fd::IntoRawFd, thread};
@@ -903,5 +912,56 @@ mod tests {
         let server = FdBrokerServer::bind(&path).unwrap();
         let error = server.serve_one().unwrap_err();
         assert!(matches!(error, ShmError::Protocol("deadline exceeded")));
+    }
+}
+
+// Linux guarantees sealing and atomic CLOEXEC descriptor transfer. Other hosts
+// fail closed rather than substituting unsealed buffers or inheritable FDs.
+#[cfg(not(target_os = "linux"))]
+fn add_required_seals(_fd: RawFd) -> Result<(), ShmError> {
+    Err(ShmError::Unsupported)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn validate_seals(_fd: RawFd) -> Result<(), ShmError> {
+    Err(ShmError::Unsupported)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn connect_before(_path: &Path, _deadline: Instant) -> Result<UnixStream, ShmError> {
+    Err(ShmError::Unsupported)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn send_fd(_stream: &UnixStream, _fd: RawFd) -> Result<(), ShmError> {
+    Err(ShmError::Unsupported)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn recv_fd_before(_stream: &UnixStream, _deadline: Instant) -> Result<OwnedFd, ShmError> {
+    Err(ShmError::Unsupported)
+}
+
+#[cfg(all(test, not(target_os = "linux")))]
+mod unsupported_tests {
+    use super::*;
+
+    #[test]
+    fn memfd_regions_and_descriptor_transfer_are_unsupported() {
+        assert!(matches!(
+            SharedRegion::create("afs-test", 8),
+            Err(ShmError::Unsupported)
+        ));
+        assert!(matches!(validate_seals(-1), Err(ShmError::Unsupported)));
+        let (sender, receiver) = UnixStream::pair().unwrap();
+        assert!(matches!(send_fd(&sender, -1), Err(ShmError::Unsupported)));
+        assert!(matches!(
+            recv_fd_before(&receiver, Instant::now()),
+            Err(ShmError::Unsupported)
+        ));
+        assert!(matches!(
+            connect_before(Path::new("/unused"), Instant::now()),
+            Err(ShmError::Unsupported)
+        ));
     }
 }
