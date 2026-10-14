@@ -294,12 +294,16 @@ and the Kubernetes plugin. Worker images follow the existing CI profiles:
 | `build-platform` / `build-gateway` / `build-execd` / `source-gate` | immutable `ci_image` digest in `build/images/build-environment.json` |
 | `platform-build` | same immutable ADX build image |
 | `admin-package` / `sdk-package` / `platform-images` | `swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/sandbox-packager:v20260506_kubectl` |
-| `platform-e2e` | `swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/environment-deployer:v20260506_kubectl_py39` |
+| `platform-e2e` | `swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/sandbox-deployer@sha256:6cf47d937f48c089030c7f936c6bdd9b389bdea13de6f93fcefcae5d95cb2fb1` |
+
+The deployer reference uses the published CI infrastructure repository and an
+immutable digest verified against SWR. Its registry repository and target
+kubeconfig Secret are existing Agent Stack resources.
 
 The builder reuses `/mnt/paas` with ADX cache subdirectories. The packager uses
 its privileged Docker setup and an emptyDir at `/var/lib/docker`, starting only
 its own daemon when required. The deployer uses the existing Agent Stack patch:
-Secret `environment-target-kubeconfig` is mounted at
+Secret `sandbox-target-kubeconfig` is mounted at
 `/var/run/yr-k8s/target/kubeconfig` on `container-0`. Container names are left to
 the controller so this patch continues to apply. `ADX_KUBE_CONTEXT` may select
 a context from that file. The target kubeconfig needs permission to manage the

@@ -61,7 +61,7 @@ steps:
         imagePullSecrets:
         - name: swr-pull-secret
         containers:
-        - image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/environment-deployer:v20260506_kubectl_py39
+        - image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/sandbox-deployer@sha256:6cf47d937f48c089030c7f936c6bdd9b389bdea13de6f93fcefcae5d95cb2fb1
           resources:
             requests: {cpu: '2', memory: 4Gi}
             limits: {cpu: '4', memory: 8Gi}
@@ -88,7 +88,7 @@ steps:
         imagePullSecrets:
         - name: swr-pull-secret
         containers:
-        - image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/environment-deployer:v20260506_kubectl_py39
+        - image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/sandbox-deployer@sha256:6cf47d937f48c089030c7f936c6bdd9b389bdea13de6f93fcefcae5d95cb2fb1
           resources:
             requests: {cpu: '2', memory: 4Gi}
             limits: {cpu: '4', memory: 8Gi}
