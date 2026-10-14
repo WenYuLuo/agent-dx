@@ -226,6 +226,7 @@ The SDK distribution is `adx-sandbox`, its Python import is `adx_sandbox`, and i
 - [Agent usage](agent/README.md)
 - [Sandbox API](gateway/apiserver/docs/sandbox-lifecycle-api.md) and [OpenAPI](platform/api/openapi/sandbox.yaml)
 - [Data-plane OpenAPI](platform/api/openapi/data-plane.yaml)
+- [Runtime HTTP actions and errors](platform/api/http/runtime-data.md)
 - [Sandbox Python SDK](platform/sdk/sandbox/python/README.md)
 - [Deployment configuration](docs/deployment/adxctl.md) and [examples](build/config/examples/README.md)
 - [Remote cluster administration](docs/deployment/adxadmin.md) and [API Key management](docs/testing/api-key-management.md)

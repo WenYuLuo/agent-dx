@@ -209,6 +209,7 @@ SDK 发布名为 `adx-sandbox`，Python 导入名为 `adx_sandbox`，CLI 为 `ad
 - [Agent 使用](agent/README.md)
 - [Sandbox API](gateway/apiserver/docs/sandbox-lifecycle-api.md)与 [OpenAPI](platform/api/openapi/sandbox.yaml)
 - [数据面 OpenAPI](platform/api/openapi/data-plane.yaml)
+- [运行时 HTTP 操作与错误](platform/api/http/runtime-data.md)
 - [Sandbox Python SDK](platform/sdk/sandbox/python/README.md)
 - [部署配置](docs/deployment/adxctl.md)与[配置示例](build/config/examples/README.md)
 - [远程集群管理](docs/deployment/adxadmin.md)与 [API Key 管理](docs/testing/api-key-management.md)

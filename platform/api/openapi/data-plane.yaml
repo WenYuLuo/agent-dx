@@ -90,7 +90,7 @@ paths:
           description: Action-specific JSON result.
           content:
             application/json:
-              schema: {type: object, additionalProperties: true}
+              schema: {$ref: "#/components/schemas/InvokeResult"}
         "4XX":
           $ref: "#/components/responses/RuntimeError"
         default:
@@ -409,48 +409,1381 @@ components:
             requestForwarded: {type: boolean}
             requestId: {type: string}
             instanceId: {type: string}
-    InvokeRequest:
+    ExecArgs:
       type: object
+      properties:
+        command:
+          type: string
+          default: ''
+        cmd:
+          type: string
+        cwd:
+          type:
+          - string
+          - 'null'
+          description: Must already exist; this override never creates directories.
+        working_dir:
+          type:
+          - string
+          - 'null'
+        envs:
+          type:
+          - object
+          - 'null'
+          additionalProperties:
+            type: string
+        env:
+          type:
+          - object
+          - 'null'
+          additionalProperties:
+            type: string
+        timeout:
+          type: number
+          minimum: 0
+          description: Execution timeout in seconds; omitted waits without a command deadline. Zero is an immediate
+            deadline.
+      required: []
       additionalProperties: false
-      required: [action]
+    StartArgs:
+      type: object
+      properties:
+        command_id:
+          type: string
+          minLength: 1
+          maxLength: 128
+          pattern: ^[A-Za-z0-9._:-]+$
+          description: Stable command identity; retain for retries of identical arguments.
+        command:
+          type: string
+          default: ''
+        cmd:
+          type: string
+        cwd:
+          type:
+          - string
+          - 'null'
+          description: Must already exist; this override never creates directories.
+        envs:
+          type:
+          - object
+          - 'null'
+          additionalProperties:
+            type: string
+        want_stdin:
+          type: boolean
+          default: false
+        timeout:
+          type: number
+          minimum: 0
+          description: Execution timeout; omitted or zero disables it.
+      required: []
+      additionalProperties: false
+    CommandIdentity:
+      type: object
+      properties:
+        command_id:
+          type: string
+          minLength: 1
+        pid:
+          type: integer
+          format: int64
+      required: []
+      additionalProperties: false
+      anyOf:
+      - required:
+        - command_id
+      - required:
+        - pid
+      description: Prefer command_id. PID fallback is retained for older clients. If both are sent, command_id is
+        authoritative.
+    CommandPollArgs:
+      type: object
+      properties:
+        command_id:
+          type: string
+          minLength: 1
+        pid:
+          type: integer
+          format: int64
+        wait_timeout:
+          type: number
+          minimum: 0
+          default: 0
+      required: []
+      additionalProperties: false
+      anyOf:
+      - required:
+        - command_id
+      - required:
+        - pid
+    CommandWaitArgs:
+      type: object
+      properties:
+        command_id:
+          type: string
+          minLength: 1
+        pid:
+          type: integer
+          format: int64
+        timeout:
+          type: number
+          minimum: 0
+          description: Wait deadline only; timeout leaves the process running. Omission waits without a deadline.
+      required: []
+      additionalProperties: false
+      anyOf:
+      - required:
+        - command_id
+      - required:
+        - pid
+    StdinArgs:
+      type: object
+      properties:
+        command_id:
+          type: string
+          minLength: 1
+        pid:
+          type: integer
+          format: int64
+        data:
+          type: string
+          default: ''
+        eof:
+          type: boolean
+          default: false
+      required: []
+      additionalProperties: false
+      anyOf:
+      - required:
+        - command_id
+      - required:
+        - pid
+    EmptyArgs:
+      type: object
+      properties: {}
+      required: []
+      additionalProperties: false
+    EntrypointArgs:
+      type: object
+      properties:
+        wait_timeout:
+          type: number
+          minimum: 0
+          default: 10
+          description: Wait up to this many seconds, clamped to 30; does not kill the entrypoint.
+      required: []
+      additionalProperties: false
+    FilePathArgs:
+      type: object
+      properties:
+        path:
+          type: string
+          minLength: 1
+          description: Path inside the runtime filesystem.
+      required:
+      - path
+      additionalProperties: false
+    FileReadArgs:
+      type: object
+      properties:
+        path:
+          type: string
+          minLength: 1
+          description: Path inside the runtime filesystem.
+        binary:
+          type: boolean
+          default: false
+      required:
+      - path
+      additionalProperties: false
+    FileWriteArgs:
+      type: object
+      properties:
+        path:
+          type: string
+          minLength: 1
+          description: Path inside the runtime filesystem.
+        data:
+          type: string
+        binary:
+          type: boolean
+          default: false
+          description: True selects hex bytes; false writes UTF-8 text.
+      required:
+      - path
+      - data
+      additionalProperties: false
+    FileWriteChunkArgs:
+      type: object
+      properties:
+        path:
+          type: string
+          minLength: 1
+          description: Path inside the runtime filesystem.
+        data:
+          type: string
+          pattern: ^(?:[0-9a-fA-F]{2})*$
+          description: Hex-encoded bytes, not base64.
+        offset:
+          type: integer
+          format: int64
+          minimum: 0
+          default: 0
+          description: Zero creates/truncates; later offsets seek before writing.
+      required:
+      - path
+      - data
+      additionalProperties: false
+    FileReadChunkArgs:
+      type: object
+      properties:
+        path:
+          type: string
+          minLength: 1
+          description: Path inside the runtime filesystem.
+        offset:
+          type: integer
+          format: int64
+          minimum: 0
+          default: 0
+        limit:
+          type: integer
+          format: int64
+          default: 65536
+          minimum: 1
+          maximum: 4194304
+          description: Read chunk bytes; the backend clamps to this interval.
+      required:
+      - path
+      additionalProperties: false
+    FileListArgs:
+      type: object
+      properties:
+        path:
+          type: string
+          minLength: 1
+          description: Path inside the runtime filesystem.
+        depth:
+          type: integer
+          minimum: 1
+          maximum: 64
+          default: 1
+      required:
+      - path
+      additionalProperties: false
+    FileRenameArgs:
+      type: object
+      properties:
+        old_path:
+          type: string
+          minLength: 1
+          description: Path inside the runtime filesystem.
+        new_path:
+          type: string
+          minLength: 1
+          description: Path inside the runtime filesystem.
+      required:
+      - old_path
+      - new_path
+      additionalProperties: false
+    ShellCreateArgs:
+      type: object
+      properties:
+        session_id:
+          type: string
+          minLength: 1
+        shell:
+          type: string
+          default: /bin/bash
+      required:
+      - session_id
+      additionalProperties: false
+      description: Creates a persistent PTY shell. Apply cwd/env through shell.run commands; these are not shell.create
+        parameters.
+    ShellIdentityArgs:
+      type: object
+      properties:
+        session_id:
+          type: string
+          minLength: 1
+      required:
+      - session_id
+      additionalProperties: false
+    ShellRunArgs:
+      type: object
+      properties:
+        session_id:
+          type: string
+          minLength: 1
+        command:
+          type: string
+        timeout:
+          type: number
+          minimum: 0
+          description: SDK compatibility argument; the backend does not enforce this timeout. The SDK bounds its
+            polling wait.
+      required:
+      - session_id
+      - command
+      additionalProperties: false
+      description: Submits asynchronously. Poll for completion; cwd/env are applied in the command string. The backend
+        ignores timeout.
+    ShellPollArgs:
+      type: object
+      properties:
+        session_id:
+          type: string
+          minLength: 1
+        wait_timeout:
+          type: number
+          minimum: 0
+          description: Compatibility argument; the current backend returns its immediately available snapshot and
+            does not wait.
+      required:
+      - session_id
+      additionalProperties: false
+    ExecResult:
+      type: object
+      properties:
+        stdout:
+          type: string
+        stderr:
+          type: string
+        exit_code:
+          type: integer
+          format: int64
+        exit_signal:
+          type:
+          - integer
+          - 'null'
+          format: int64
+      required:
+      - stdout
+      - stderr
+      - exit_code
+      additionalProperties: false
+      description: Synchronous process.exec result, distinct from stable command records. Spawn/timeout failure
+        uses exit_code=-1 and stderr; a signal alone is not OOM.
+    CommandStarted:
+      type: object
+      properties:
+        command_id:
+          type: string
+        pid:
+          type: integer
+          format: int64
+        status:
+          type: string
+          enum:
+          - PENDING
+          - RUNNING
+          - SUCCEEDED
+          - FAILED
+          - TIMED_OUT
+          - KILLED
+          - running
+          - done
+          - error
+        error_code:
+          type:
+          - string
+          - 'null'
+        error:
+          type:
+          - string
+          - 'null'
+      required:
+      - command_id
+      - pid
+      - status
+      - error_code
+      - error
+      additionalProperties: false
+    CommandRecord:
+      type: object
+      properties:
+        command_id:
+          type: string
+        pid:
+          type: integer
+          format: int64
+        cmd:
+          type: string
+        status:
+          type: string
+          enum:
+          - PENDING
+          - RUNNING
+          - SUCCEEDED
+          - FAILED
+          - TIMED_OUT
+          - KILLED
+          - running
+          - done
+          - error
+        running:
+          type: boolean
+        state_version:
+          type: integer
+          format: int64
+          minimum: 0
+        stdout:
+          type: string
+        stderr:
+          type: string
+        exit_code:
+          type:
+          - integer
+          - 'null'
+          format: int64
+        exit_signal:
+          type:
+          - integer
+          - 'null'
+          format: int64
+        created_at_ms:
+          type: integer
+          format: int64
+        started_at_ms:
+          type:
+          - integer
+          - 'null'
+          format: int64
+        finished_at_ms:
+          type:
+          - integer
+          - 'null'
+          format: int64
+        stdout_truncated:
+          type: boolean
+        stderr_truncated:
+          type: boolean
+        truncated:
+          type: boolean
+        stdout_total_bytes:
+          type: integer
+          format: int64
+        stdout_retained_bytes:
+          type: integer
+          format: int64
+        stderr_total_bytes:
+          type: integer
+          format: int64
+        stderr_retained_bytes:
+          type: integer
+          format: int64
+        error_code:
+          type:
+          - string
+          - 'null'
+        error_message:
+          type:
+          - string
+          - 'null'
+        error:
+          type:
+          - string
+          - 'null'
+      required:
+      - command_id
+      - pid
+      - cmd
+      - status
+      - running
+      - state_version
+      - stdout
+      - stderr
+      - exit_code
+      - exit_signal
+      additionalProperties: false
+      description: Stable command records use uppercase status; PID-only lookup uses running/done/error. Spawn failure
+        is FAILED/SPAWN_FAILED with null exit_code and an error_message. Terminal output may be truncated; byte
+        counters describe the retained suffix.
+    CommandWaitTimeout:
+      type: object
+      properties:
+        status:
+          type: string
+          const: running
+        error_code:
+          type: string
+          const: WAIT_TIMEOUT
+        error_message:
+          type: string
+        error:
+          type: 'null'
+      required:
+      - status
+      - error_code
+      - error_message
+      - error
+      additionalProperties: false
+      examples:
+      - status: running
+        error_code: WAIT_TIMEOUT
+        error_message: command wait timed out
+        error: null
+    CommandResult:
+      anyOf:
+      - $ref: '#/components/schemas/CommandRecord'
+      - $ref: '#/components/schemas/CommandWaitTimeout'
+    StartResult:
+      anyOf:
+      - $ref: '#/components/schemas/CommandStarted'
+      - $ref: '#/components/schemas/CommandRecord'
+    CommandListResult:
+      type: object
+      properties:
+        processes:
+          type: array
+          items:
+            $ref: '#/components/schemas/CommandRecord'
+      required:
+      - processes
+      additionalProperties: false
+    CommandCapabilities:
+      type: object
+      properties:
+        protocol_version:
+          type: integer
+          format: int64
+        capabilities:
+          type: array
+          items:
+            type: string
+      required:
+      - protocol_version
+      - capabilities
+      additionalProperties: false
+    CommandKillResult:
+      type: object
+      properties:
+        status:
+          type: string
+          enum:
+          - NOT_FOUND
+          - ALREADY_EXITED
+          - KILLED
+          - SIGNAL_FAILED
+        killed:
+          type: boolean
+        error_code:
+          type:
+          - string
+          - 'null'
+        error:
+          type:
+          - string
+          - 'null'
+      required:
+      - status
+      - killed
+      - error_code
+      - error
+      additionalProperties: false
+    OperationResult:
+      type: object
+      properties:
+        error:
+          type:
+          - string
+          - 'null'
+        error_code:
+          type:
+          - string
+          - 'null'
+      required:
+      - error
+      additionalProperties: false
+    EntrypointResult:
+      type: object
+      properties:
+        status:
+          type: string
+          enum:
+          - running
+          - exited
+          - error
+        pid:
+          type: integer
+          format: int64
+        started_at:
+          type: integer
+          format: int64
+        type:
+          type: string
+        status_kind:
+          type: string
+        exit_code:
+          type:
+          - integer
+          - 'null'
+          format: int64
+        signal:
+          type:
+          - integer
+          - 'null'
+          format: int64
+        signal_name:
+          type:
+          - string
+          - 'null'
+        shell_exit_code:
+          type: integer
+          format: int64
+        core_dumped:
+          type: boolean
+        exited_at:
+          type: integer
+          format: int64
+        runtime_ms:
+          type: integer
+          format: int64
+        stderr_tail:
+          type: string
+        message:
+          type: string
+        code:
+          type: integer
+          format: int64
+      required:
+      - status
+      additionalProperties: false
+    EntryInfo:
+      type: object
+      properties:
+        name:
+          type: string
+        path:
+          type: string
+        type:
+          type: string
+          enum:
+          - file
+          - dir
+          - symlink
+        size:
+          type: integer
+          format: int64
+        permissions:
+          type: string
+          description: Octal mode string, e.g. 644.
+        modified_time:
+          type: number
+          description: Unix seconds, may include a fractional part.
+      required:
+      - name
+      - path
+      - type
+      - size
+      - permissions
+      - modified_time
+      additionalProperties: false
+    FileReadResult:
+      type: object
+      properties:
+        data:
+          type:
+          - string
+          - 'null'
+          description: UTF-8 text, or hex bytes when binary=true.
+        error:
+          type:
+          - string
+          - 'null'
+      required:
+      - data
+      - error
+      additionalProperties: false
+    FileWriteResult:
+      type: object
+      properties:
+        name:
+          type: string
+        path:
+          type: string
+        type:
+          type: string
+        size:
+          type: integer
+          format: int64
+        error:
+          type:
+          - string
+          - 'null'
+      required:
+      - name
+      - path
+      - type
+      - size
+      - error
+      additionalProperties: false
+    FileWriteChunkResult:
+      type: object
+      properties:
+        path:
+          type: string
+        offset:
+          type: integer
+          format: int64
+        bytes_written:
+          type: integer
+          format: int64
+        error:
+          type:
+          - string
+          - 'null'
+      required:
+      - path
+      - offset
+      - bytes_written
+      - error
+      additionalProperties: false
+    FileReadChunkResult:
+      type: object
+      properties:
+        path:
+          type: string
+        offset:
+          type: integer
+          format: int64
+        data:
+          type: string
+          pattern: ^(?:[0-9a-fA-F]{2})*$
+          description: Hex-encoded bytes, not base64.
+        bytes_read:
+          type: integer
+          format: int64
+        eof:
+          type: boolean
+        error:
+          type:
+          - string
+          - 'null'
+      required:
+      - path
+      - offset
+      - data
+      - bytes_read
+      - eof
+      - error
+      additionalProperties: false
+    FileListResult:
+      type: object
+      properties:
+        entries:
+          type: array
+          items:
+            $ref: '#/components/schemas/EntryInfo'
+        error:
+          type:
+          - string
+          - 'null'
+      required:
+      - entries
+      - error
+      additionalProperties: false
+    FileExistsResult:
+      type: object
+      properties:
+        exists:
+          type: boolean
+      required:
+      - exists
+      additionalProperties: false
+    FileMkdirResult:
+      type: object
+      properties:
+        created:
+          type: boolean
+        error:
+          type:
+          - string
+          - 'null'
+      required:
+      - created
+      - error
+      additionalProperties: false
+    FileStatResult:
+      allOf:
+      - type: object
+        properties:
+          name:
+            type: string
+          path:
+            type: string
+          type:
+            type: string
+            enum:
+            - file
+            - dir
+            - symlink
+          size:
+            type: integer
+            format: int64
+          permissions:
+            type: string
+            description: Octal mode string, e.g. 644.
+          modified_time:
+            type: number
+            description: Unix seconds, may include a fractional part.
+        required:
+        - name
+        - path
+        - type
+        - size
+        - permissions
+        - modified_time
+        additionalProperties: true
+      - type: object
+        properties:
+          name:
+            type: string
+          path:
+            type: string
+          type:
+            type: string
+            enum:
+            - file
+            - dir
+            - symlink
+          size:
+            type: integer
+            format: int64
+          permissions:
+            type: string
+            description: Octal mode string, e.g. 644.
+          modified_time:
+            type: number
+            description: Unix seconds, may include a fractional part.
+          error:
+            type:
+            - string
+            - 'null'
+        required:
+        - name
+        - path
+        - type
+        - size
+        - permissions
+        - modified_time
+        - error
+        additionalProperties: false
+    ShellPollResult:
+      type: object
+      properties:
+        status:
+          type: string
+          enum:
+          - running
+          - done
+          - error
+        stdout:
+          type: string
+        stderr:
+          type: string
+        exit_code:
+          type: integer
+          format: int64
+        error:
+          type: string
+      required:
+      - status
+      additionalProperties: false
+      description: PTY stdout may include terminal echo and framing markers; the SDK strips framing. Running has
+        no exit_code.
+    ProcessExecRequest:
+      type: object
       properties:
         action:
           type: string
           enum:
-            - process.exec
-            - process.run
-            - process.start
-            - process.get
-            - process.poll
-            - process.wait
-            - process.kill
-            - process.list
-            - process.capabilities
-            - process.stdin
-            - process.send_stdin
-            - entrypoint.poll
-            - file.read
-            - file.write
-            - file.write_chunk
-            - file.read_chunk
-            - file.list
-            - file.exists
-            - file.remove
-            - file.rename
-            - file.mkdir
-            - file.make_dir
-            - file.stat
-            - shell.create
-            - shell.run
-            - shell.poll
-            - shell.close
+          - process.exec
+          - process.run
         args:
-          type: object
-          additionalProperties: true
+          $ref: '#/components/schemas/ExecArgs'
           default: {}
         requestId:
           type: string
-          description: Body compatibility form of the operation identity.
+          description: Compatibility request identity; the X-ADX-Request-ID header takes precedence.
+      required:
+      - action
+      additionalProperties: false
+      x-adx-result-schema: '#/components/schemas/ExecResult'
+    ProcessStartRequest:
+      type: object
+      properties:
+        action:
+          type: string
+          enum:
+          - process.start
+        args:
+          $ref: '#/components/schemas/StartArgs'
+          default: {}
+        requestId:
+          type: string
+          description: Compatibility request identity; the X-ADX-Request-ID header takes precedence.
+      required:
+      - action
+      additionalProperties: false
+      x-adx-result-schema: '#/components/schemas/StartResult'
+      examples:
+      - action: process.start
+        args:
+          command_id: cmd-demo
+          command: pwd
+          cwd: /tmp
+          want_stdin: false
+    ProcessGetRequest:
+      type: object
+      properties:
+        action:
+          type: string
+          enum:
+          - process.get
+        args:
+          $ref: '#/components/schemas/CommandIdentity'
+          default: {}
+        requestId:
+          type: string
+          description: Compatibility request identity; the X-ADX-Request-ID header takes precedence.
+      required:
+      - action
+      additionalProperties: false
+      x-adx-result-schema: '#/components/schemas/CommandRecord'
+    ProcessPollRequest:
+      type: object
+      properties:
+        action:
+          type: string
+          enum:
+          - process.poll
+        args:
+          $ref: '#/components/schemas/CommandPollArgs'
+          default: {}
+        requestId:
+          type: string
+          description: Compatibility request identity; the X-ADX-Request-ID header takes precedence.
+      required:
+      - action
+      additionalProperties: false
+      x-adx-result-schema: '#/components/schemas/CommandRecord'
+    ProcessWaitRequest:
+      type: object
+      properties:
+        action:
+          type: string
+          enum:
+          - process.wait
+        args:
+          $ref: '#/components/schemas/CommandWaitArgs'
+          default: {}
+        requestId:
+          type: string
+          description: Compatibility request identity; the X-ADX-Request-ID header takes precedence.
+      required:
+      - action
+      additionalProperties: false
+      x-adx-result-schema: '#/components/schemas/CommandResult'
+    ProcessKillRequest:
+      type: object
+      properties:
+        action:
+          type: string
+          enum:
+          - process.kill
+        args:
+          $ref: '#/components/schemas/CommandIdentity'
+          default: {}
+        requestId:
+          type: string
+          description: Compatibility request identity; the X-ADX-Request-ID header takes precedence.
+      required:
+      - action
+      additionalProperties: false
+      x-adx-result-schema: '#/components/schemas/CommandKillResult'
+    ProcessListRequest:
+      type: object
+      properties:
+        action:
+          type: string
+          enum:
+          - process.list
+        args:
+          $ref: '#/components/schemas/EmptyArgs'
+          default: {}
+        requestId:
+          type: string
+          description: Compatibility request identity; the X-ADX-Request-ID header takes precedence.
+      required:
+      - action
+      additionalProperties: false
+      x-adx-result-schema: '#/components/schemas/CommandListResult'
+    ProcessCapabilitiesRequest:
+      type: object
+      properties:
+        action:
+          type: string
+          enum:
+          - process.capabilities
+        args:
+          $ref: '#/components/schemas/EmptyArgs'
+          default: {}
+        requestId:
+          type: string
+          description: Compatibility request identity; the X-ADX-Request-ID header takes precedence.
+      required:
+      - action
+      additionalProperties: false
+      x-adx-result-schema: '#/components/schemas/CommandCapabilities'
+    ProcessStdinRequest:
+      type: object
+      properties:
+        action:
+          type: string
+          enum:
+          - process.stdin
+          - process.send_stdin
+        args:
+          $ref: '#/components/schemas/StdinArgs'
+          default: {}
+        requestId:
+          type: string
+          description: Compatibility request identity; the X-ADX-Request-ID header takes precedence.
+      required:
+      - action
+      additionalProperties: false
+      x-adx-result-schema: '#/components/schemas/OperationResult'
+    EntrypointPollRequest:
+      type: object
+      properties:
+        action:
+          type: string
+          enum:
+          - entrypoint.poll
+        args:
+          $ref: '#/components/schemas/EntrypointArgs'
+          default: {}
+        requestId:
+          type: string
+          description: Compatibility request identity; the X-ADX-Request-ID header takes precedence.
+      required:
+      - action
+      additionalProperties: false
+      x-adx-result-schema: '#/components/schemas/EntrypointResult'
+    FileReadRequest:
+      type: object
+      properties:
+        action:
+          type: string
+          enum:
+          - file.read
+        args:
+          $ref: '#/components/schemas/FileReadArgs'
+          default: {}
+        requestId:
+          type: string
+          description: Compatibility request identity; the X-ADX-Request-ID header takes precedence.
+      required:
+      - action
+      additionalProperties: false
+      x-adx-result-schema: '#/components/schemas/FileReadResult'
+      examples:
+      - action: file.read
+        args:
+          path: /tmp/data
+          binary: true
+    FileWriteRequest:
+      type: object
+      properties:
+        action:
+          type: string
+          enum:
+          - file.write
+        args:
+          $ref: '#/components/schemas/FileWriteArgs'
+          default: {}
+        requestId:
+          type: string
+          description: Compatibility request identity; the X-ADX-Request-ID header takes precedence.
+      required:
+      - action
+      additionalProperties: false
+      x-adx-result-schema: '#/components/schemas/FileWriteResult'
+    FileWriteChunkRequest:
+      type: object
+      properties:
+        action:
+          type: string
+          enum:
+          - file.write_chunk
+          - file.upload.chunk
+        args:
+          $ref: '#/components/schemas/FileWriteChunkArgs'
+          default: {}
+        requestId:
+          type: string
+          description: Compatibility request identity; the X-ADX-Request-ID header takes precedence.
+      required:
+      - action
+      additionalProperties: false
+      x-adx-result-schema: '#/components/schemas/FileWriteChunkResult'
+      examples:
+      - action: file.write_chunk
+        args:
+          path: /tmp/data
+          offset: 0
+          data: 00ff
+    FileReadChunkRequest:
+      type: object
+      properties:
+        action:
+          type: string
+          enum:
+          - file.read_chunk
+          - file.download.chunk
+        args:
+          $ref: '#/components/schemas/FileReadChunkArgs'
+          default: {}
+        requestId:
+          type: string
+          description: Compatibility request identity; the X-ADX-Request-ID header takes precedence.
+      required:
+      - action
+      additionalProperties: false
+      x-adx-result-schema: '#/components/schemas/FileReadChunkResult'
+    FileListRequest:
+      type: object
+      properties:
+        action:
+          type: string
+          enum:
+          - file.list
+        args:
+          $ref: '#/components/schemas/FileListArgs'
+          default: {}
+        requestId:
+          type: string
+          description: Compatibility request identity; the X-ADX-Request-ID header takes precedence.
+      required:
+      - action
+      additionalProperties: false
+      x-adx-result-schema: '#/components/schemas/FileListResult'
+    FileExistsRequest:
+      type: object
+      properties:
+        action:
+          type: string
+          enum:
+          - file.exists
+        args:
+          $ref: '#/components/schemas/FilePathArgs'
+          default: {}
+        requestId:
+          type: string
+          description: Compatibility request identity; the X-ADX-Request-ID header takes precedence.
+      required:
+      - action
+      additionalProperties: false
+      x-adx-result-schema: '#/components/schemas/FileExistsResult'
+    FileRemoveRequest:
+      type: object
+      properties:
+        action:
+          type: string
+          enum:
+          - file.remove
+        args:
+          $ref: '#/components/schemas/FilePathArgs'
+          default: {}
+        requestId:
+          type: string
+          description: Compatibility request identity; the X-ADX-Request-ID header takes precedence.
+      required:
+      - action
+      additionalProperties: false
+      x-adx-result-schema: '#/components/schemas/OperationResult'
+    FileRenameRequest:
+      type: object
+      properties:
+        action:
+          type: string
+          enum:
+          - file.rename
+        args:
+          $ref: '#/components/schemas/FileRenameArgs'
+          default: {}
+        requestId:
+          type: string
+          description: Compatibility request identity; the X-ADX-Request-ID header takes precedence.
+      required:
+      - action
+      additionalProperties: false
+      x-adx-result-schema: '#/components/schemas/FileStatResult'
+    FileMkdirRequest:
+      type: object
+      properties:
+        action:
+          type: string
+          enum:
+          - file.mkdir
+          - file.make_dir
+        args:
+          $ref: '#/components/schemas/FilePathArgs'
+          default: {}
+        requestId:
+          type: string
+          description: Compatibility request identity; the X-ADX-Request-ID header takes precedence.
+      required:
+      - action
+      additionalProperties: false
+      x-adx-result-schema: '#/components/schemas/FileMkdirResult'
+    FileStatRequest:
+      type: object
+      properties:
+        action:
+          type: string
+          enum:
+          - file.stat
+          - file.info
+        args:
+          $ref: '#/components/schemas/FilePathArgs'
+          default: {}
+        requestId:
+          type: string
+          description: Compatibility request identity; the X-ADX-Request-ID header takes precedence.
+      required:
+      - action
+      additionalProperties: false
+      x-adx-result-schema: '#/components/schemas/FileStatResult'
+    ShellCreateRequest:
+      type: object
+      properties:
+        action:
+          type: string
+          enum:
+          - shell.create
+          - shell.init
+        args:
+          $ref: '#/components/schemas/ShellCreateArgs'
+          default: {}
+        requestId:
+          type: string
+          description: Compatibility request identity; the X-ADX-Request-ID header takes precedence.
+      required:
+      - action
+      additionalProperties: false
+      x-adx-result-schema: '#/components/schemas/OperationResult'
+    ShellRunRequest:
+      type: object
+      properties:
+        action:
+          type: string
+          enum:
+          - shell.run
+          - shell.submit
+        args:
+          $ref: '#/components/schemas/ShellRunArgs'
+          default: {}
+        requestId:
+          type: string
+          description: Compatibility request identity; the X-ADX-Request-ID header takes precedence.
+      required:
+      - action
+      additionalProperties: false
+      x-adx-result-schema: '#/components/schemas/OperationResult'
+      examples:
+      - action: shell.run
+        args:
+          session_id: shell-demo
+          command: pwd
+    ShellPollRequest:
+      type: object
+      properties:
+        action:
+          type: string
+          enum:
+          - shell.poll
+        args:
+          $ref: '#/components/schemas/ShellPollArgs'
+          default: {}
+        requestId:
+          type: string
+          description: Compatibility request identity; the X-ADX-Request-ID header takes precedence.
+      required:
+      - action
+      additionalProperties: false
+      x-adx-result-schema: '#/components/schemas/ShellPollResult'
+    ShellCloseRequest:
+      type: object
+      properties:
+        action:
+          type: string
+          enum:
+          - shell.close
+          - shell.delete
+          - shell.destroy
+        args:
+          $ref: '#/components/schemas/ShellIdentityArgs'
+          default: {}
+        requestId:
+          type: string
+          description: Compatibility request identity; the X-ADX-Request-ID header takes precedence.
+      required:
+      - action
+      additionalProperties: false
+      x-adx-result-schema: '#/components/schemas/OperationResult'
+    InvokeRequest:
+      oneOf:
+      - $ref: '#/components/schemas/ProcessExecRequest'
+      - $ref: '#/components/schemas/ProcessStartRequest'
+      - $ref: '#/components/schemas/ProcessGetRequest'
+      - $ref: '#/components/schemas/ProcessPollRequest'
+      - $ref: '#/components/schemas/ProcessWaitRequest'
+      - $ref: '#/components/schemas/ProcessKillRequest'
+      - $ref: '#/components/schemas/ProcessListRequest'
+      - $ref: '#/components/schemas/ProcessCapabilitiesRequest'
+      - $ref: '#/components/schemas/ProcessStdinRequest'
+      - $ref: '#/components/schemas/EntrypointPollRequest'
+      - $ref: '#/components/schemas/FileReadRequest'
+      - $ref: '#/components/schemas/FileWriteRequest'
+      - $ref: '#/components/schemas/FileWriteChunkRequest'
+      - $ref: '#/components/schemas/FileReadChunkRequest'
+      - $ref: '#/components/schemas/FileListRequest'
+      - $ref: '#/components/schemas/FileExistsRequest'
+      - $ref: '#/components/schemas/FileRemoveRequest'
+      - $ref: '#/components/schemas/FileRenameRequest'
+      - $ref: '#/components/schemas/FileMkdirRequest'
+      - $ref: '#/components/schemas/FileStatRequest'
+      - $ref: '#/components/schemas/ShellCreateRequest'
+      - $ref: '#/components/schemas/ShellRunRequest'
+      - $ref: '#/components/schemas/ShellPollRequest'
+      - $ref: '#/components/schemas/ShellCloseRequest'
+      description: Typed public actions and aliases. args uses the action-specific schema. Older cmd_*/fs_*/bash_*
+        aliases are not the public contract.
+    InvokeResult:
+      anyOf:
+      - $ref: '#/components/schemas/CommandCapabilities'
+      - $ref: '#/components/schemas/CommandKillResult'
+      - $ref: '#/components/schemas/CommandListResult'
+      - $ref: '#/components/schemas/CommandRecord'
+      - $ref: '#/components/schemas/CommandResult'
+      - $ref: '#/components/schemas/EntrypointResult'
+      - $ref: '#/components/schemas/ExecResult'
+      - $ref: '#/components/schemas/FileExistsResult'
+      - $ref: '#/components/schemas/FileListResult'
+      - $ref: '#/components/schemas/FileMkdirResult'
+      - $ref: '#/components/schemas/FileReadChunkResult'
+      - $ref: '#/components/schemas/FileReadResult'
+      - $ref: '#/components/schemas/FileStatResult'
+      - $ref: '#/components/schemas/FileWriteChunkResult'
+      - $ref: '#/components/schemas/FileWriteResult'
+      - $ref: '#/components/schemas/OperationResult'
+      - $ref: '#/components/schemas/ShellPollResult'
+      - $ref: '#/components/schemas/StartResult'
+      description: Choose the response schema referenced by the request variant x-adx-result-schema; action is not
+        echoed in the response. Gateway errors and operation errors use their separate error responses.
     UploadResult:
       type: object
       additionalProperties: true
@@ -472,3 +1805,9 @@ components:
       required: [error]
       properties:
         error: {type: string}
+        error_code:
+          type: [string, "null"]
+          description: Stable command error such as COMMAND_NOT_FOUND, COMMAND_EXPIRED, COMMAND_CONFLICT or RESOURCE_EXHAUSTED.
+        error_message: {type: [string, "null"]}
+        command_id: {type: string}
+        pid: {type: integer, format: int64}

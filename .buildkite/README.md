@@ -317,7 +317,11 @@ compiling and packaging. Platform owns shared platform/common crate tests;
 Gateway owns API Server, routing and Agent crate tests; Execd owns runtime tests.
 The test partition is checked against Cargo workspace membership. Explicitly
 ignored integration tests still require their dedicated environments; this is
-not the Full E2E gate. `source-gate` owns fmt/Clippy and CI/release tooling checks.
+not the Full E2E gate. `source-gate` owns fmt/Clippy, public OpenAPI coverage,
+schema/example validation, document links and CI/release tooling checks. The
+contract checks use an isolated Python environment with the pinned dependencies
+in `build/docs/requirements.txt`; logs and JSON verdicts are saved under
+`out/buildkite/`. This gate does not replace runtime E2E acceptance.
 `admin-package` and `sdk-package` produce tested Python artifacts in parallel.
 
 The base SDK step reuses the independent SDK pipeline command and produces a

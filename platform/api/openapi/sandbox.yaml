@@ -28,9 +28,115 @@ tags:
     description: Current online node capacity and admission status exposed to the Sandbox SDK.
   - name: Scheduler compatibility
     description: Administrator compatibility surface for established scheduler operations.
+  - name: API Keys
+    description: Administrator-only tenant key creation, listing and revocation.
   - name: Snapshots
     description: Tenant-scoped reusable checkpoint catalog.
 paths:
+  /api/admin/v1/keys:
+    post:
+      tags:
+      - API Keys
+      operationId: createTenantKey
+      summary: Create a tenant API Key (administrator only)
+      description: Returns plaintext apiKey once. The key id is a SHA256 identifier and cannot authenticate requests.
+        Expiry zero or omitted means no expiry; a positive expiry must be in the future. Caller tenant headers cannot
+        elevate privileges.
+      parameters:
+      - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateTenantKeyRequest'
+      responses:
+        '201':
+          description: Metadata and the one-time plaintext key; no lifecycle envelope.
+          headers:
+            Cache-Control:
+              description: Key responses must not be cached.
+              schema:
+                type: string
+                const: no-store
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreatedTenantKey'
+        '403':
+          $ref: '#/components/responses/Error'
+        default:
+          $ref: '#/components/responses/Error'
+    get:
+      tags:
+      - API Keys
+      operationId: listTenantKeys
+      summary: List tenant key metadata (administrator only)
+      description: Never returns plaintext keys. Use id for revocation and the original apiKey for SDK authentication.
+      parameters:
+      - name: tenantId
+        in: query
+        schema:
+          type: string
+        description: Optional tenant filter; omitted or empty selects all tenants.
+      - name: pageSize
+        in: query
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 1000
+          default: 100
+      - name: pageToken
+        in: query
+        schema:
+          type: string
+        description: Opaque cursor from nextPageToken.
+      responses:
+        '200':
+          description: Paginated metadata; no lifecycle envelope.
+          headers:
+            Cache-Control:
+              description: Key responses must not be cached.
+              schema:
+                type: string
+                const: no-store
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TenantKeyList'
+        '403':
+          $ref: '#/components/responses/Error'
+        default:
+          $ref: '#/components/responses/Error'
+  /api/admin/v1/keys/{id}:
+    delete:
+      tags:
+      - API Keys
+      operationId: revokeTenantKey
+      summary: Revoke a tenant API Key (administrator only)
+      description: Idempotent revocation; already revoked or absent returns 204. Authentication-cache propagation
+        follows the configured cache lifetime.
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          minLength: 1
+        description: Key identifier, not the plaintext apiKey.
+      responses:
+        '204':
+          description: Revoked; empty response body.
+          headers:
+            Cache-Control:
+              description: Key responses must not be cached.
+              schema:
+                type: string
+                const: no-store
+        '403':
+          $ref: '#/components/responses/Error'
+        default:
+          $ref: '#/components/responses/Error'
   /api/sandbox/v1/capabilities:
     get:
       tags: [Sandboxes]
@@ -288,7 +394,13 @@ paths:
       tags: [Sandboxes]
       operationId: resumeSandbox
       summary: Resume a paused Sandbox
-      description: Authorized business traffic also resumes both manually and automatically paused Sandboxes through the same Coordinator entry.
+      description: |
+        Manual resume accepts both manually and idle-automatically paused Sandboxes.
+        Authorized business traffic also resumes either kind through the same
+        Coordinator entry without an auto-resume switch. Concurrent manual and
+        traffic-triggered demands share one durable restore intent. A valid,
+        unexpired checkpoint is required; local-only points require the owning node.
+        Health, metrics and passive subscriptions do not trigger resume.
       parameters:
         - $ref: "#/components/parameters/SandboxId"
         - $ref: "#/components/parameters/ResumeOperationId"
@@ -736,7 +848,10 @@ components:
           type: string
           enum: [delete, pause]
           default: delete
-          description: Pause requires positive idleTimeoutSeconds and checkpoint capability.
+          description: |
+            Pause requires positive idleTimeoutSeconds and checkpoint capability.
+            Idle pause produces the same Paused state as manual pause and remains
+            eligible for manual resume or authorized traffic-triggered resume.
         pauseOptions: {$ref: "#/components/schemas/PausePolicy"}
         restartPolicy: {$ref: "#/components/schemas/RestartPolicy"}
         failover:
@@ -760,6 +875,7 @@ components:
           description: Serialized to sandboxd's runtime-specific extra_config field.
         scheduleAffinities:
           type: array
+          maxItems: 256
           items: {$ref: "#/components/schemas/ScheduleAffinity"}
         createTimeoutSeconds:
           type: integer
@@ -956,23 +1072,61 @@ components:
     ScheduleAffinity:
       type: object
       additionalProperties: false
+      required: [labelOps]
       properties:
-        kind: {type: integer, format: int32}
-        affinity: {type: integer, format: int32}
-        weight: {type: integer, format: int64}
-        preferredPriority: {type: boolean}
-        preferredAntiOtherLabels: {type: boolean}
+        kind:
+          type: integer
+          enum: [0, 1]
+          default: 0
+          description: "0 selects nodes; 1 selects existing Environments. Runtime selection uses the create runtime field."
+        affinity:
+          type: integer
+          enum: [0, 1, 2, 3]
+          default: 0
+          description: "0 preferred affinity; 1 preferred anti-affinity; 2 required affinity; 3 required anti-affinity."
+        weight:
+          type: integer
+          minimum: 0
+          maximum: 1000
+          default: 0
+          description: Zero is normalized to weight 1.
+        preferredPriority:
+          type: boolean
+          default: false
+          description: Ordered preference terms; ordering must be consistent within the same placement group.
+        preferredAntiOtherLabels:
+          type: boolean
+          const: false
+          default: false
+          description: True is unsupported and returns UNIMPLEMENTED.
         labelOps:
           type: array
+          minItems: 1
+          maxItems: 64
           items:
             type: object
             additionalProperties: false
+            required: [labelKey]
             properties:
-              type: {type: integer, format: int32}
-              labelKey: {type: string}
+              type:
+                type: integer
+                enum: [0, 1, 2, 3]
+                default: 0
+                description: "0 In; 1 NotIn (also requires the label to exist); 2 Exists; 3 DoesNotExist."
+              labelKey: {type: string, minLength: 1}
               labelValues:
                 type: array
                 items: {type: string}
+            allOf:
+              - if:
+                  properties:
+                    type: {enum: [2, 3]}
+                  required: [type]
+                then: {}
+                else:
+                  required: [labelValues]
+                  properties:
+                    labelValues: {minItems: 1}
     TunnelRequest:
       type: object
       additionalProperties: false
@@ -1221,3 +1375,70 @@ components:
         requestId: {type: string}
         operationId: {type: string}
         instanceId: {type: string}
+
+    CreateTenantKeyRequest:
+      type: object
+      properties:
+        tenantId:
+          type: string
+          minLength: 1
+        expiresAtUnixSeconds:
+          type: integer
+          format: int64
+          minimum: 0
+          default: 0
+          description: Unix seconds; 0 means no expiry.
+      required:
+      - tenantId
+      additionalProperties: false
+      examples:
+      - tenantId: team-a
+        expiresAtUnixSeconds: 0
+    TenantKey:
+      type: object
+      properties:
+        id:
+          type: string
+        tenantId:
+          type: string
+        expiresAtUnixSeconds:
+          type: integer
+          format: int64
+          minimum: 0
+      required:
+      - id
+      - tenantId
+      - expiresAtUnixSeconds
+      additionalProperties: false
+    CreatedTenantKey:
+      type: object
+      properties:
+        key:
+          $ref: '#/components/schemas/TenantKey'
+        apiKey:
+          type: string
+          minLength: 32
+          description: One-time plaintext credential. Store securely; list cannot recover it.
+      required:
+      - key
+      - apiKey
+      additionalProperties: false
+    TenantKeyList:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/TenantKey'
+        nextPageToken:
+          type: string
+      required:
+      - items
+      - nextPageToken
+      additionalProperties: false
+      examples:
+      - items:
+        - id: example-key-id
+          tenantId: team-a
+          expiresAtUnixSeconds: 0
+        nextPageToken: ''

@@ -170,6 +170,13 @@ Admission rejection across all nodes retains a pending intent with a 30-second
 capacity retry round. EnsureRunning waits at most 300 seconds at these callers;
 timeout does not prove restore failed or permit another node to run concurrently.
 
+An idle-automatically paused Environment can also be resumed manually with
+`POST /api/sandbox/v1/sandboxes/{sandboxId}/resume` or SDK `sandbox.resume()`.
+The same operation-prefixed request ID rules apply. Manual and traffic-triggered
+resume converge on one intent even when they race. Either requires an unexpired,
+valid checkpoint; local-only restore requires the owning node. After successful
+resume the idle policy remains enabled and may pause the Environment again.
+
 ## Reusable snapshots
 
 Creating a reusable snapshot leaves its source sandbox running and requests a

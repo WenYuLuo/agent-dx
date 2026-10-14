@@ -278,6 +278,12 @@ to its configured object store. Configure an OBS S3-compatible endpoint on every
 eligible node, with the same alias/bucket/prefix. The shared setting also limits
 creation placement to nodes advertising shared checkpoint storage.
 
+An automatically paused sandbox also supports `sandbox.resume()` explicitly.
+It uses the same restore intent as traffic-triggered wake-up, so concurrent
+manual and automatic requests do not start two runtimes. The checkpoint must
+still be valid and unexpired; local-only restore requires the owning node.
+The idle policy stays enabled after resume.
+
 The existing idle window observes Execd client operations and Relay streams;
 health, metrics and command observation do not keep the sandbox busy. A detached
 background command can be checkpointed. Automatic pause atomically closes new
