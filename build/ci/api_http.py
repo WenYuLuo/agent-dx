@@ -347,7 +347,7 @@ if not (call('DELETE', '/api/environment/' + identity)[0] == 200):
 if not (
     call(
         'DELETE',
-        '/api/environment/v1/snapshots/' + snapshot,
+        f'/api/environment/v1/snapshots/{snapshot}',
         extra={'X-ADX-Request-ID': 'delete-snapshot-http-positive'},
     )[0]
     == 200
