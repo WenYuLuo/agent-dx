@@ -2,11 +2,17 @@
 BEGIN;
 CREATE SCHEMA IF NOT EXISTS adx_accounts;
 CREATE TABLE IF NOT EXISTS adx_accounts.schema_version (version integer PRIMARY KEY);
+DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM adx_accounts.schema_version WHERE version <> 1) THEN
+        RAISE EXCEPTION 'Unsupported account schema version';
+    END IF;
+END $$;
 INSERT INTO adx_accounts.schema_version VALUES (1) ON CONFLICT DO NOTHING;
 CREATE TABLE IF NOT EXISTS adx_accounts.users (
     tenant text NOT NULL,
     user_id text NOT NULL,
     provider text NOT NULL DEFAULT 'huawei',
+    display_name text CHECK (char_length(display_name) <= 128),
     developer_scope text NOT NULL,
     client_id text NOT NULL,
     union_id text COLLATE "C" NOT NULL,

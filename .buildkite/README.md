@@ -131,7 +131,7 @@ The base pipeline's `admin-package` uses the same outer Docker runner as the SDK
 pipeline, with the digest-pinned Python 3.12 image. It runs UT, builds wheel/sdist,
 checks them with Twine and performs a clean installation smoke test. The outer
 runner verifies the exact clean Git checkout. The Python image does not need Git.
-Rust build tooling continues to use the builder's Python 3.9.
+Rust build tooling uses the selected builder's Python: the owned AMD64 builder supplies Python 3.11.14; the separately pinned ARM builder retains its existing interpreter.
 
 ## Base package deployment mode
 
@@ -476,7 +476,10 @@ are available through `ADX_REDIS_SERVER` / `ADX_REDIS_CLI` and
 ## ADX build image and Cargo cache
 
 `build/images/build-environment.json` is the source of truth for the immutable
-Linux AMD64 build-image digest. Regular package jobs run through
+Linux AMD64 build-image digest. The AMD64 recipe bootstraps Rust, Protobuf,
+Python and the remaining tools from digest-pinned official Ubuntu 20.04 while
+preserving the focal GNU ABI. ARM, Python, packager and acceptance jobs retain
+their separately pinned image profiles. Regular package jobs run through
 `.buildkite/run-build-container.sh` and never install build dependencies at job
 time. Set `ADX_BUILD_IMAGE_SYNC_ONLY=1` on the base pipeline to dispatch the
 maintenance job that builds the Ubuntu 20.04 recipe, pushes the immutable image,

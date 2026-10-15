@@ -52,10 +52,11 @@ async fn directory_uses_existing_instance_api_without_returning_credentials() {
 }
 
 #[tokio::test]
-async fn directory_rejects_non_running_or_substituted_instances() {
+async fn directory_rejects_unroutable_or_substituted_instances() {
     for body in [
         r#"[{"id":"other","status":"running"}]"#,
-        r#"[{"id":"environment-a","status":"paused"}]"#,
+        r#"[{"id":"environment-a","status":"failed"}]"#,
+        r#"[{"id":"environment-a","status":"deleting"}]"#,
         r#"[]"#,
         r#"[{"id":"environment-a","status":"running"},{"id":"other","status":"running"}]"#,
         r#"{"id":"environment-a","status":"running"}"#,
@@ -102,4 +103,40 @@ async fn read_headers(stream: &mut tokio::net::TcpStream) -> String {
         bytes.extend_from_slice(&chunk[..n]);
     }
     String::from_utf8(bytes).unwrap()
+}
+
+#[tokio::test]
+async fn directory_admits_dormant_owner_before_gateway_wake() {
+    for state in ["pausing", "paused", "resuming"] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let backend = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_headers(&mut stream).await;
+            assert!(request.starts_with("GET /api/instances?instance_id=sandbox-a "));
+            let body = serde_json::json!([{"id":"sandbox-a","status":state}]).to_string();
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+        let directory = HttpDirectory::new(
+            DirectoryConfig {
+                url: format!("http://{address}"),
+                allow_http: true,
+                ca_file: None,
+            },
+            BTreeMap::from([("tenant-a".into(), "management-test".into())]),
+        )
+        .unwrap();
+        assert!(directory.authorize("tenant-b", "sandbox-a").await.is_err());
+        directory.authorize("tenant-a", "sandbox-a").await.unwrap();
+        backend.await.unwrap();
+    }
 }

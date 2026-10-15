@@ -69,17 +69,18 @@ impl AccountStore {
         drop(client);
         Ok(store)
     }
-    pub async fn login(
+    pub(crate) async fn login(
         &self,
         config: &AccountConfig,
-        client_id: &str,
-        union_id: &str,
+        scoped: ScopedIdentity<'_>,
         agreement: Option<&str>,
         token_digest: &str,
     ) -> Result<(String, i64)> {
+        let identity = scoped.identity;
+        let union_id = &identity.subject;
         let mut client = self.pool.get().await.map_err(|_| Error::Unavailable)?;
         let tx = client.transaction().await.map_err(|_| Error::Unavailable)?;
-        let existing = tx.query_opt("SELECT user_id,status FROM adx_accounts.users WHERE tenant=$1 AND provider='huawei' AND developer_scope=$2 AND union_id=$3 FOR UPDATE", &[&config.tenant,&config.developer_scope,&union_id]).await.map_err(|_| Error::Unavailable)?;
+        let existing = tx.query_opt("SELECT user_id,status FROM adx_accounts.users WHERE tenant=$1 AND provider=$2 AND developer_scope=$3 AND union_id=$4 FOR UPDATE", &[&config.tenant,&scoped.provider,&scoped.scope,&union_id]).await.map_err(|_| Error::Unavailable)?;
         let user = match existing {
             Some(row) => row,
             None => {
@@ -87,13 +88,15 @@ impl AccountStore {
                     return Err(Error::AgreementRequired);
                 }
                 let id = uuid::Uuid::new_v4().to_string();
-                tx.query_one("INSERT INTO adx_accounts.users(tenant,user_id,developer_scope,client_id,union_id,agreement_version) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(tenant,provider,developer_scope,union_id) DO UPDATE SET union_id=EXCLUDED.union_id RETURNING user_id,status", &[&config.tenant,&id,&config.developer_scope,&client_id,&union_id,&config.agreement_version]).await.map_err(|_|Error::Unavailable)?
+                tx.query_one("INSERT INTO adx_accounts.users(tenant,user_id,provider,developer_scope,client_id,union_id,agreement_version) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(tenant,provider,developer_scope,union_id) DO UPDATE SET union_id=EXCLUDED.union_id RETURNING user_id,status", &[&config.tenant,&id,&scoped.provider,&scoped.scope,&scoped.client_id,&union_id,&config.agreement_version]).await.map_err(|_|Error::Unavailable)?
             }
         };
         if user.get::<_, String>(1) != "active" {
-            return Err(Error::Forbidden);
+            return Err(Error::AccountDisabled);
         }
         let user_id: String = user.get(0);
+        // Missing profile permission must not erase a nickname learned earlier.
+        tx.execute("UPDATE adx_accounts.users SET display_name=COALESCE($3,display_name) WHERE tenant=$1 AND user_id=$2", &[&config.tenant,&user_id,&identity.display_name]).await.map_err(|_| Error::Unavailable)?;
         let ttl = config.session_ttl_seconds as i64;
         let row=tx.query_one("INSERT INTO adx_accounts.sessions(token_digest,tenant,user_id,expires_at) VALUES($1,$2,$3,EXTRACT(EPOCH FROM clock_timestamp())::bigint+$4) RETURNING expires_at", &[&token_digest,&config.tenant,&user_id,&ttl]).await.map_err(|_|Error::Unavailable)?;
         let expiry = row.get(0);
@@ -104,7 +107,7 @@ impl AccountStore {
         let client = self.pool.get().await.map_err(|_| Error::Unavailable)?;
         let row=client.query_opt("SELECT s.user_id,s.expires_at,u.status FROM adx_accounts.sessions s JOIN adx_accounts.users u ON u.tenant=s.tenant AND u.user_id=s.user_id WHERE s.tenant=$1 AND s.token_digest=$2 AND s.revoked_at IS NULL AND s.expires_at>EXTRACT(EPOCH FROM clock_timestamp())", &[&tenant,&token_digest]).await.map_err(|_|Error::Unavailable)?.ok_or(Error::Unauthorized)?;
         if row.get::<_, String>(2) != "active" {
-            return Err(Error::Forbidden);
+            return Err(Error::AccountDisabled);
         }
         Ok(Principal {
             tenant: tenant.into(),
@@ -117,6 +120,21 @@ impl AccountStore {
         self.pool.get().await.map_err(|_|Error::Unavailable)?.execute("UPDATE adx_accounts.sessions SET revoked_at=COALESCE(revoked_at,now()) WHERE tenant=$1 AND token_digest=$2", &[&tenant,&token_digest]).await.map_err(|_|Error::Unavailable)?;
         Ok(())
     }
+    pub(crate) async fn model_key_alias(&self, principal: &Principal) -> Result<String> {
+        let client = self.pool.get().await.map_err(|_| Error::Unavailable)?;
+        let row = client.query_opt(
+            "SELECT provider,display_name FROM adx_accounts.users WHERE tenant=$1 AND user_id=$2 AND status='active'",
+            &[&principal.tenant, &principal.user_id],
+        ).await.map_err(|_| Error::Unavailable)?.ok_or(Error::Forbidden)?;
+        let provider: String = row.get(0);
+        let name: Option<String> = row.get(1);
+        Ok(super::model_key_alias(
+            &provider,
+            &principal.user_id,
+            name.as_deref(),
+        ))
+    }
+
     pub(crate) async fn credential(
         &self,
         principal: &Principal,

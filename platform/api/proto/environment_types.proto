@@ -45,6 +45,7 @@ message MountSpec {
   string target = 2;
   repeated string options = 3;
   StorageSource source = 4;
+  bool create_if_missing = 5;
 }
 
 enum NetworkAction { NETWORK_ACTION_UNSPECIFIED = 0; NETWORK_ACTION_ALLOW = 1; NETWORK_ACTION_DENY = 2; }

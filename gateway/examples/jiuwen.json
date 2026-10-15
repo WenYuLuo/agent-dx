@@ -6,5 +6,6 @@
   "allowed_hosts": ["agent.example.com"],
   "allowed_origins": [],
   "request_timeout_seconds": 60,
+  "output_queue_timeout_seconds": 5,
   "download_timeout_seconds": 300
 }

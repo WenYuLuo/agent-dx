@@ -7,7 +7,11 @@ pub mod cache;
 pub mod environment;
 pub mod error;
 pub mod launch;
+pub mod lifecycle;
 pub mod limits;
+pub mod mounts;
+pub mod network;
+pub mod probes;
 pub mod target;
 pub mod transport;
 
@@ -87,6 +91,10 @@ pub struct Service {
 pub struct Resources {
     pub cpu_millis: u64,
     pub memory_mib: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_limit_millis: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_limit_mib: Option<u64>,
 }
 
 impl Resources {
@@ -94,9 +102,14 @@ impl Resources {
         if self.cpu_millis == 0 || self.memory_mib == 0 {
             return Err("cpu_millis and memory_mib must be positive".into());
         }
-        self.memory_mib
+        let cpu_limit = self.cpu_limit_millis.unwrap_or(self.cpu_millis);
+        let memory_limit = self.memory_limit_mib.unwrap_or(self.memory_mib);
+        if cpu_limit < self.cpu_millis || memory_limit < self.memory_mib {
+            return Err("resource limits must not be below requests".into());
+        }
+        memory_limit
             .checked_mul(1_048_576)
-            .ok_or("memory_mib exceeds representable byte count")?;
+            .ok_or("memory limit exceeds representable byte count")?;
         Ok(())
     }
 }
@@ -111,11 +124,34 @@ pub struct TemplateVersion {
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     pub resources: Resources,
+    #[serde(
+        default,
+        skip_serializing_if = "lifecycle::LifecyclePolicy::is_default"
+    )]
+    pub lifecycle: lifecycle::LifecyclePolicy,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mounts: Vec<mounts::Mount>,
     #[serde(default)]
     pub service: Vec<Service>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub init_timeout_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readiness_probe: Option<probes::ReadinessProbe>,
 }
 
 impl TemplateVersion {
+    /// Render Local mount paths from immutable Binding parameters, or reject missing/unsafe values.
+    pub fn render_mounts(
+        &self,
+        parameters: &mounts::Parameters,
+    ) -> Result<Vec<mounts::Mount>, String> {
+        mounts::validate_parameters(parameters)?;
+        mounts::validate_mounts(&self.mounts)?;
+        self.mounts
+            .iter()
+            .map(|mount| mount.render_validated(parameters))
+            .collect()
+    }
     pub fn validate(&self) -> ValidationResult {
         for (label, value) in [
             ("name", &self.name),
@@ -149,6 +185,17 @@ impl TemplateVersion {
                 return Err("service ports must be nonzero and protocol/port pairs unique".into());
             }
         }
+        mounts::validate_mounts(&self.mounts)?;
+        self.lifecycle.validate()?;
+        if self
+            .init_timeout_seconds
+            .is_some_and(|seconds| seconds == 0 || seconds > 86400)
+        {
+            return Err("init_timeout_seconds must be between 1 and 86400".into());
+        }
+        if let Some(probe) = &self.readiness_probe {
+            probe.validate()?;
+        }
         self.resources.validate()
     }
 }
@@ -169,6 +216,8 @@ pub struct AgentBinding {
     pub environment_id: String,
     /// Product deletion intent only; Environment runtime state belongs to Platform.
     pub phase: BindingPhase,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub parameters: mounts::Parameters,
 }
 
 pub mod discovery;

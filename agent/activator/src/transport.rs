@@ -1,5 +1,6 @@
 //! Standalone Activator adapter for the existing API Server management API.
 use crate::environment_request::{self, observation, validate_identity};
+use adx_agent_core::network::SandboxNetworkPolicy;
 use adx_agent_core::{
     environment::*,
     limits,
@@ -18,6 +19,7 @@ pub struct HttpEnvironment {
     base: Url,
     api_keys: BTreeMap<String, String>,
     timeout: Duration,
+    network: SandboxNetworkPolicy,
 }
 impl HttpEnvironment {
     /// Keys must be tenant-scoped Platform API keys; API Server derives ownership from the key.
@@ -27,6 +29,7 @@ impl HttpEnvironment {
         timeout: Duration,
         ca_pem: Option<&[u8]>,
         allow_http: bool,
+        network: SandboxNetworkPolicy,
     ) -> Result<Self, EnvironmentError> {
         let base = service_origin(base, allow_http).map_err(EnvironmentError::Invalid)?;
         if api_keys.is_empty() {
@@ -47,6 +50,7 @@ impl HttpEnvironment {
             }
         }
         environment_request::validate_timeout(timeout)?;
+        environment_request::network_input(&network)?;
         let mut builder = Client::builder()
             .timeout(timeout)
             .connect_timeout(timeout.min(limits::CONNECT_TIMEOUT))
@@ -64,6 +68,7 @@ impl HttpEnvironment {
             base,
             api_keys,
             timeout,
+            network,
         })
     }
 
@@ -77,12 +82,16 @@ impl HttpEnvironment {
     ) -> Result<Option<Value>, EnvironmentError> {
         validate_identity(tenant)?;
         validate_identity(id)?;
-        let key = self
-            .api_keys
-            .get(tenant)
-            .ok_or(EnvironmentError::NotFound)?;
+        let key = self.api_keys.get(tenant).ok_or_else(|| {
+            if method == Method::GET {
+                EnvironmentError::NotFound
+            } else {
+                EnvironmentError::Unavailable("Platform tenant credential is not configured".into())
+            }
+        })?;
         let read = method == Method::GET;
         let create = method == Method::POST;
+        let delete = method == Method::DELETE;
         let mut url = self
             .base
             .join(if read {
@@ -153,7 +162,7 @@ impl HttpEnvironment {
             body.extend_from_slice(&chunk);
         }
         if !status.is_success() {
-            // Do not expose server messages or interpret absence as completed deletion.
+            // Keep explicit DELETE absence distinct from authentication and transport failures.
             return Err(match status {
                 StatusCode::BAD_REQUEST => {
                     EnvironmentError::Invalid("API Server rejected request".into())
@@ -161,7 +170,11 @@ impl HttpEnvironment {
                 StatusCode::CONFLICT => {
                     EnvironmentError::Conflict("Environment identity/specification conflict".into())
                 }
-                StatusCode::FORBIDDEN => EnvironmentError::NotFound,
+                StatusCode::NOT_FOUND if delete => EnvironmentError::NotFound,
+                StatusCode::FORBIDDEN if read => EnvironmentError::NotFound,
+                StatusCode::FORBIDDEN => {
+                    EnvironmentError::Unavailable("API Server permission denied".into())
+                }
                 StatusCode::UNAUTHORIZED => {
                     EnvironmentError::Unavailable("API Server credential rejected".into())
                 }
@@ -202,7 +215,7 @@ impl Environment for HttpEnvironment {
         &self,
         request: &CreateEnvironment,
     ) -> Result<EnvironmentObservation, EnvironmentError> {
-        let payload = environment_request::create_input(request, self.timeout)?;
+        let payload = environment_request::create_input(request, self.timeout, &self.network)?;
         self.request(
             Method::POST,
             &request.tenant,

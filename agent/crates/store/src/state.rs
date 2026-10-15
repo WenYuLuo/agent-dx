@@ -242,24 +242,33 @@ impl AgentState {
         scope: Scope,
         launch: Option<&LaunchConfig>,
     ) -> Result<AgentBinding> {
+        self.create_binding_with_parameters(scope, launch, &Default::default())
+            .await
+    }
+    /// Create one immutable binding specification; parameter changes conflict on reuse.
+    pub async fn create_binding_with_parameters(
+        &self,
+        scope: Scope,
+        launch: Option<&LaunchConfig>,
+        parameters: &adx_agent_core::mounts::Parameters,
+    ) -> Result<AgentBinding> {
         if let Some(launch) = launch {
             launch.validate().map_err(Error::Invalid)?;
             self.cipher()?;
         }
         let key = binding_key(&scope)?;
-        if self
+        let template = self
             .template(&scope.tenant, &scope.template, &scope.version)
             .await?
-            .is_none()
-        {
-            return Err(Error::Invalid("template version does not exist".into()));
-        }
+            .ok_or_else(|| Error::Invalid("template version does not exist".into()))?;
+        template.render_mounts(parameters).map_err(Error::Invalid)?;
         let generation = uuid::Uuid::new_v4().to_string();
         let value = AgentBinding {
             scope,
             environment_id: format!("adx-{generation}"),
             generation,
             phase: BindingPhase::Active,
+            parameters: parameters.clone(),
         };
         let private_key = launch_key(&value.scope)?;
         let mut checks = vec![
@@ -298,6 +307,9 @@ impl AgentState {
             .ok_or_else(|| Error::Conflict("binding changed".into()))?
             .decode()?;
         if existing.phase == BindingPhase::Active {
+            if existing.parameters != *parameters {
+                return Err(Error::Conflict("binding parameters are immutable".into()));
+            }
             if let Some(launch) = launch {
                 if self.launch_config(&existing).await?.as_ref() != Some(launch) {
                     return Err(Error::Conflict(
@@ -344,7 +356,7 @@ impl AgentState {
         }
         Err(Error::Conflict("binding deletion contention".into()))
     }
-    /// Only after Platform confirms deletion. A late completion cannot erase a new lifecycle.
+    /// After Platform confirms deletion or explicit absence. A late completion cannot erase a new lifecycle.
     pub async fn finish_delete(&self, binding: &AgentBinding) -> Result<()> {
         let key = binding_key(&binding.scope)?;
         let Some(record) = self.store.get(&key).await? else {

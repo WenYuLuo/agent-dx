@@ -1,6 +1,7 @@
 //! One bounded frontend socket and its owned backend driver, cancelled together.
 use super::{
     connection::ConnectionError,
+    driver::DriverError,
     protocol::{ProtocolError, Request, MAX_FRAME_BYTES},
 };
 use futures_util::{SinkExt, StreamExt};
@@ -12,7 +13,7 @@ use tokio::{
     time::Instant,
 };
 use tokio_tungstenite::{
-    tungstenite::{protocol::frame::coding::CloseCode, protocol::CloseFrame, Message},
+    tungstenite::{self, protocol::frame::coding::CloseCode, protocol::CloseFrame, Message},
     WebSocketStream,
 };
 
@@ -113,7 +114,7 @@ where
         let (requests, incoming) = mpsc::channel(config.queue_capacity);
         let (output, outgoing) = mpsc::channel(config.queue_capacity);
         let driver = backend(incoming, output);
-        let transport = forward(&mut socket, config, requests, outgoing, guard.as_ref());
+        let transport = forward(&mut socket, config, requests, outgoing);
         let revoked = async {
             match &guard {
                 Some(guard) => guard.watch().await,
@@ -123,9 +124,20 @@ where
         tokio::pin!(driver, transport);
         tokio::select! {
             biased;
-            _ = revoked => Err(FrontendError::Session),
-            result = &mut driver => result.map_err(FrontendError::from),
-            result = &mut transport => result,
+            _ = revoked => {
+                let result = Err(FrontendError::Session);
+                log_exit("auth_watch", &result);
+                result
+            },
+            result = &mut driver => {
+                let result = result.map_err(FrontendError::from);
+                log_exit("backend", &result);
+                result
+            },
+            result = &mut transport => {
+                log_exit("frontend", &result);
+                result
+            },
         }
     };
     // Drop the losing future (including the E2A connection owner) before waiting
@@ -143,8 +155,73 @@ where
         }
         .into(),
     };
-    let _ = tokio::time::timeout(config.write_timeout, socket.close(Some(frame))).await;
+    let close_code = u16::from(frame.code);
+    match tokio::time::timeout(config.write_timeout, socket.close(Some(frame))).await {
+        Ok(Ok(())) => tracing::info!(close_code, "Jiuwen frontend close written"),
+        Ok(Err(error)) => tracing::warn!(
+            close_code,
+            transport_kind = transport_kind(&error),
+            "Jiuwen frontend close failed"
+        ),
+        Err(_) => tracing::warn!(close_code, "Jiuwen frontend close timed out"),
+    }
     result
+}
+
+// Log inside the winning branch, before the losing future/connection is dropped.
+// Protocol messages are static; transport errors may contain payloads or HTTP
+// headers, so only their category and numeric I/O details are logged.
+fn log_exit(winner: &'static str, result: &Result<(), FrontendError>) {
+    let Err(error) = result else {
+        tracing::info!(winner, "Jiuwen WebSocket exited before cleanup");
+        return;
+    };
+    let (error_kind, protocol, transport) = match error {
+        FrontendError::Protocol(e) => ("frontend_protocol", Some(e), None),
+        FrontendError::Transport(e) => ("frontend_transport", None, Some(e)),
+        FrontendError::Backend(ConnectionError::Driver(DriverError::Protocol(e))) => {
+            ("backend_protocol", Some(e), None)
+        }
+        FrontendError::Backend(ConnectionError::Driver(DriverError::Transport(e))) => {
+            ("backend_transport", None, Some(e.as_ref()))
+        }
+        FrontendError::Backend(ConnectionError::Driver(DriverError::Disconnected)) => {
+            ("backend_disconnected", None, None)
+        }
+        FrontendError::Backend(ConnectionError::Driver(DriverError::Timeout)) => {
+            ("backend_timeout", None, None)
+        }
+        FrontendError::Backend(ConnectionError::Driver(DriverError::SlowConsumer)) => {
+            ("output_queue_timeout", None, None)
+        }
+        FrontendError::Backend(ConnectionError::Revoked) => ("route_revoked", None, None),
+        FrontendError::Backend(_) => ("backend_connect", None, None),
+        FrontendError::Session => ("auth_revoked", None, None),
+        FrontendError::Timeout => ("frontend_timeout", None, None),
+        FrontendError::Capacity => ("request_queue_full", None, None),
+        FrontendError::OutputClosed => ("output_closed", None, None),
+    };
+    let io_error = transport.and_then(|e| match e {
+        tungstenite::Error::Io(e) => Some(e),
+        _ => None,
+    });
+    tracing::warn!(winner, error_kind, protocol_error = ?protocol.map(ToString::to_string),
+        transport_kind = ?transport.map(transport_kind), io_kind = ?io_error.map(|e| e.kind()),
+        os_code = ?io_error.and_then(|e| e.raw_os_error()), "Jiuwen WebSocket exited before cleanup");
+}
+
+fn transport_kind(error: &tungstenite::Error) -> &'static str {
+    match error {
+        tungstenite::Error::Protocol(
+            tungstenite::error::ProtocolError::ResetWithoutClosingHandshake,
+        ) => "reset_without_closing_handshake",
+        tungstenite::Error::Protocol(_) => "websocket_protocol",
+        tungstenite::Error::Io(_) => "io",
+        tungstenite::Error::Http(_) | tungstenite::Error::HttpFormat(_) => "http_handshake",
+        tungstenite::Error::Capacity(_) | tungstenite::Error::WriteBufferFull(_) => "capacity",
+        tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed => "closed",
+        _ => "other_transport",
+    }
 }
 
 async fn forward<S>(
@@ -152,7 +229,6 @@ async fn forward<S>(
     config: FrontendConfig,
     requests: mpsc::Sender<Request>,
     mut outgoing: mpsc::Receiver<Value>,
-    guard: Option<&crate::ingress::accounts::SessionGuard>,
 ) -> Result<(), FrontendError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -167,9 +243,6 @@ where
                 let Some(message) = incoming else { return Ok(()); };
                 let message = message?;
                 last_received = Instant::now();
-                if matches!(message, Message::Text(_)) {
-                    if let Some(guard)=guard {guard.check().await.map_err(|_|FrontendError::Session)?;}
-                }
                 match message {
                     Message::Text(raw) => match Request::parse(raw.as_bytes()) {
                         Ok(request) => requests.try_send(request).map_err(|error| match error {
@@ -215,6 +288,16 @@ where
     tokio::time::timeout(config.write_timeout, socket.send(Message::Text(text)))
         .await
         .map_err(|_| FrontendError::Timeout)??;
+    if matches!(
+        frame["event"].as_str(),
+        Some("chat.final" | "chat.error" | "chat.processing_status")
+    ) {
+        tracing::info!(event = ?frame["event"].as_str(),
+            request_id = ?super::driver::log_field(frame["payload"]["request_id"].as_str()),
+            session_id = ?super::driver::log_field(frame["payload"]["session_id"].as_str()),
+            is_complete = ?frame["payload"]["is_complete"].as_bool(),
+            is_processing = ?frame["payload"]["is_processing"].as_bool(), "Jiuwen terminal/status frame written");
+    }
     Ok(())
 }
 

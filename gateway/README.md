@@ -369,7 +369,7 @@ Activator with an API Server management URL and tenant-scoped API key environmen
 references (see [Activator](../agent/activator/README.md)). Common Environment file
 access uses the API Server instance directory for admission and the shared data
 plane for Relay/Execd transport. PlatformEnvironment and its runtime lookup have been
-removed. This source change does not redeploy the cluster.
+removed.
 
 ### Managed Agent service access
 
@@ -390,22 +390,20 @@ same binding, including while another handshake is pending. The gateway does not
 arbitrate per-binding connection concurrency; the business service owns concurrent
 session semantics. Dropping a connection releases only its own Relay stream.
 Authentication, route revocation and the existing transport resource limits still
-apply to each connection.
+apply to each connection. Each Jiuwen frontend has separate bounded request and
+output queues (`queue_capacity`, default 64). When the output queue fills, the
+backend driver waits up to `output_queue_timeout_seconds` (default 5) for space;
+a longer stall closes that WebSocket with code 1011. This wait is independent of
+`write_timeout_seconds`, which bounds writes to the frontend socket.
 
 The backend handshake uses `/`, Host `127.0.0.1:<service-port>` and Origin
 `http://127.0.0.1:<service-port>` on the selected stream; it does not dial that URL
 or forward frontend credentials. If AgentServer Origin checks are enabled, its
 allowlist must include `127.0.0.1`. Local Relay/mock-backend component tests cover
-authorized WS reuse, handshake timeout and route revocation. After the narrowly
-scoped Execd entrypoint-lock fix, real isolated Environment creation through the
-independent Activator passed, including AgentServer argv/working directory and
-service listening. The earlier embedded stack overflow was fixed and covered by a 2 MiB worker-stack
-regression. Standalone cloud validation covers new Environment creation, cross-replica
-file transfers, and real DeepSeek responses through LiteLLM. The subsequent upstream
-merge passed local regression checks and has not been redeployed; see the
-[design](../docs/development/jiuwenswarm-adx-gateway-design.md).
-Real Huawei login and beegent device validation remain
-incomplete.
+authorized WS reuse, handshake timeout and route revocation. The embedded stack
+uses a 2 MiB worker-stack regression fixture. See the
+[design](../docs/development/jiuwenswarm-adx-gateway-design.md) for the contract and
+remaining validation boundaries.
 
 Jiuwen download settings are decoded from the selected `TemplateVersion.env` by
 `jiuwen::download_config::DownloadConfig::load`, using the shared ManagedService
@@ -452,13 +450,15 @@ point-in-time result, not a reusable authorization credential.
 With `agent-api`, set `ADX_ENVIRONMENT_FILES_CONFIG` to a JSON configuration:
 [standalone](examples/environment-files.json) or
 [embedded](examples/environment-files-embedded.json). `token_env` references a protected
-process environment variable containing the deployment-owned Execd token; no inline
+process environment variable containing the server-owned Execd token; no inline
 secret is stored in JSON. `port` must equal the Ingress `default_direct_port`.
 Standalone Ingress uses `directory` and `api_key_envs` to call the existing API
 Server `GET /api/instances?instance_id=...`; keys must be tenant-scoped, never admin
 keys. Embedded Ingress receives `EnvironmentService` directly and rejects HTTP directory
 configuration. Both require the requested Environment to belong to the tenant and be
-Running. Each frontend upload/download request owns one `Files` context: its first
+Running or a resumable Pausing/Paused/Resuming state. Authorized transfers use the
+shared Gateway EnsureRunning path before opening Execd; directory reads alone never wake.
+Each frontend upload/download request owns one `Files` context: its first
 backend operation queries the directory, and the result is reused for all metadata,
 secret/registration reads, body chunks, and upload/commit operations in that request.
 A multipart request also shares admission across its files. A new frontend request
@@ -480,11 +480,11 @@ Public `/direct` requests targeting the configured Execd port use the same
 Execd tokens. Files never pass through API Server.
 
 API Server runtime profile, node and Ingress must use the same Execd port and
-Secret. Cross-process configuration agreement is a deployment requirement, not an
-automatically verified property: node environment overrides can change the actual
+Secret. Cross-process configuration agreement is not automatically verified: node
+environment overrides can change the actual
 credential. Different per-node credentials and one-sided rotation are unsupported.
-There is no old `spec.env` credential fallback. Existing deployment manifests must
-be updated to the new configuration before using this binary.
+There is no old `spec.env` credential fallback; all participating processes must
+use the new configuration before using this binary.
 
 ## Jiuwen authenticated entrypoints
 
@@ -504,9 +504,50 @@ Restrict the HTTP port to the deployment's internal network and configure the
 public hostname in `allowed_hosts`. This does not change the existing TLS-only
 management routes or Ingress-to-Node mTLS.
 
-`POST /auth/huawei/login` exchanges an Account Kit authorization code and returns
-an opaque business token. First registration requires `agreementVersion`.
-`POST /auth/logout` revokes that session only. `/ws`, `GET/HEAD
+`POST /api/v1/auth/huawei/login` exchanges an Account Kit authorization code and returns
+an opaque business token. `POST /api/v1/auth/agc/login` accepts
+`{"agcAccessToken":"...","agreementVersion":"1"}` and exchanges a current AGC Auth
+user access token for the same kind of business session. First registration through
+either provider requires `agreementVersion`; clients never submit an external UID,
+phone number, ADX user ID, tenant, or project.
+
+AGC verification is enabled by the optional `accounts.agc` block. The checked-in example
+uses the Jiuwen CN project and reads the API client secret from
+`ADX_AGC_API_CLIENT_SECRET`. `api_client_id` and that secret are server REST credentials,
+not a user token. Ingress obtains a short-lived service credential from the fixed CN AGC
+endpoint and calls the official `verify-token` API for every login, so revoked user tokens
+are not accepted. It also requires the returned `productId` and the remotely verified JWT
+`iss`, `aud`, `sub`, and `exp` to agree with the configured project and UID. The JWT
+`agc.sign_in_provider` value is not used as an account-type decision because it is not the
+client SDK's anonymous-account flag. Invalid, expired, revoked, and wrong-project credentials
+return `401 INVALID_AGC_ACCESS_TOKEN`; AGC/API-client/network failures return
+`503 AUTH_UNAVAILABLE`. The service credential is cached until shortly before expiry;
+user access tokens and verification results are not cached. Each failed verification emits one
+sanitized warning with its stage, failure reason, and available upstream HTTP status/return code;
+the user token, UID, profile data, and credentials are never logged.
+
+The actual Ingress route includes the version prefix:
+`/api/v1/auth/agc/login`. With a public `authBaseUrl` ending in `/api/v1`, the client
+appends `/auth/agc/login`. There is no separate unversioned `/auth/agc/login` route in
+the current Gateway implementation.
+
+`POST /api/v1/auth/logout` revokes that session only. `GET /api/v1/auth/quota`
+requires the business Bearer token and returns the same quota payload as
+Jiuwenswarm: `{"ok":true,"available":true,"quota":{"total":5,"balance":3.75,
+"used":1.25,"low_balance":false,"exhausted":false,"reset_period":"",
+"reset_at":""}}`. Values are LiteLLM key `max_budget` and `spend` presented
+1:1 as points; they are not literal token counts. LiteLLM interprets
+`max_budget` as USD. The [MaaS configuration](../build/config/examples/litellm-maas.md)
+uses uniform quota rates instead: one point per million input + output tokens,
+including cached input. Paired with the account example (`5.0`, `1d`), this gives
+a five-million-token daily budget, resetting at midnight UTC on LiteLLM 1.104.2.
+Spend in this mode is not actual provider cost; concurrent calls may overshoot.
+`budget_duration: null` gives a one-time key budget;
+a configured duration enables resets. Existing keys retain their LiteLLM
+budget policy; configuration changes apply to newly issued keys. The query
+creates or reconciles the user's persisted key if needed, without creating a Sandbox. It does not
+accept query parameters and returns `Cache-Control: no-store`.
+`/ws`, `GET/HEAD
 /file-api/download?token=...`, and `POST /file-api/upload` require
 `Authorization: Bearer <business token>`.
 User identity comes only from the session. On `/ws`, the optional `user_id`
@@ -529,22 +570,84 @@ remain separate. Use a Jiuwen hostname outside the direct-port host domain.
 
 Accounts, hashed sessions and encrypted per-user LiteLLM credentials use a shared
 PostgreSQL schema. Apply [schema.sql](src/ingress/accounts/schema.sql) before
-startup. Ingress and standalone Activators share `ADX_CREDENTIAL_KEY_FILE`, a
+startup for a fresh database. The unpublished schema remains version 1. For an existing
+development database created from an older version of that definition, the schema owner
+adds the nullable `users.display_name` column directly before starting the updated Ingress;
+no version-2 marker or migration file is used. Ingress and standalone Activators share `ADX_CREDENTIAL_KEY_FILE`, a
 protected file containing a persistent 32-byte encryption key as 64 hex characters.
-Huawei application secrets and LiteLLM administrative keys remain on Ingress.
+Huawei application secrets, the AGC API client secret, and LiteLLM administrative keys
+remain on Ingress. Account rows use an explicit provider and provider scope. AGC identity
+is keyed by tenant, `agc`, configured project ID, and verified UID; Huawei identity retains
+its existing tenant/developer-scope/UnionID key. Equal external identifier strings across
+the two providers do not link accounts or resources.
 
-The first WS for a new binding provisions/reconciles a user model key, then
+The first WS for a new binding, or the first quota query, provisions/reconciles
+a user model key. The WS then
 prepares an immutable private binding launch configuration. Activator overlays
 that configuration on the shared template environment before Environment creation.
 Retries and rebuilds reuse it; public Binding metadata does not return it.
+The private launch environment supplies only `API_KEY` and `API_BASE`. Model
+selection belongs to the template, not `accounts.litellm`; the account configuration
+has no `model` field. Jiuwen templates may declare `JIUWEN_PLATFORM_MODELS` as a
+JSON array in `TemplateVersion.env`, consumed by their image's startup adapter.
+ADX forwards that public environment unchanged; it does not parse Jiuwen's model
+configuration or add model names to the image.
+
+User keys are created with `models: ["all-proxy-models"]`, covering current and
+future LiteLLM proxy models. Preparing a launch or querying quota also reconciles
+an existing owner's key through `/key/update`, changing only model access and the display alias. Key
+identity, spend, budget and rate limits remain unchanged. Ownership mismatch or a
+blocked key is rejected before an update; failed or lost responses are retried with
+the same key. Warm binding access does not call LiteLLM management: existing warm
+users acquire expanded access on a quota query, new binding preparation, or an
+explicit reconciliation. The template's list controls the models shown
+in Jiuwen, not the LiteLLM key's authorization boundary.
+
+Huawei login reads the optional `display_name` from the verified ID token when
+the authorization includes `profile`. The nickname is persisted and refreshed on
+login; an absent or invalid nickname does not erase an existing one. Client-supplied
+nicknames are not accepted. Key aliases use `huawei-<nickname>-<first 8 user-ID chars>`
+with a bounded, sanitized nickname, or `huawei-<first 8 user-ID chars>` when unavailable.
+AGC accounts currently do not import a display name and use
+`agc-<first 8 user-ID chars>`.
+Quota queries and new-binding preparation synchronize aliases for existing keys,
+including requests with older valid sessions. Historical users need a new Huawei
+login to populate a nickname that was never stored. Alias changes alone do not
+change LiteLLM's native client error text; that requires a LiteLLM error callback.
+
 Downloads resolve existing bindings without provisioning keys or creating Environments.
 
-WS checks sessions before business messages and periodically while idle; download
-streams also stop on expiry/revocation. Multiple independent WS connections may
+WS authenticates before upgrade and checks sessions every 30 seconds while connected;
+messages do not query the account database. Logout immediately rejects new connections,
+while existing WS connections close on their next periodic check or absolute expiry.
+Download streams also stop on expiry/revocation. Multiple independent WS connections may
 use the same binding; business concurrency is owned by AgentServer.
 Platform-wide target connection limits remain deferred, as does
 Execd's path/open race. Ordinary and verified download token/registry checks remain.
 
-Deployment, two authentication boundaries, client requirements and verification
-limits are documented in the
+At the normal INFO filter, Jiuwen WebSocket logs include `connection_id`, client/
+backend request mapping, response parse/projection errors, terminal handling and
+socket-write results. The select winner and safe error category are logged before
+connection cleanup; backend EOF/close records include the last response's request
+ID, sequence and final flag. These diagnostics do not change forwarding or close
+behavior and do not print message bodies, tool arguments, credentials or peer
+close reasons. A completed socket write is not a peer delivery acknowledgement.
+
+The two authentication boundaries, client requirements and verification limits are documented in the
 [Jiuwen gateway design](../docs/development/jiuwenswarm-adx-gateway-design.md).
+
+
+### Network policy for embedded template sandboxes
+
+When `ADX_AGENT_CONFIG` selects an embedded Activator, `embedded.sandbox_network`
+is required. API Server passes this configured policy to the Agent-side
+`LocalEnvironment` adapter; the Environment API's public network contract is unchanged.
+The standalone Activator uses the same mapping. See the
+[Activator network configuration](../agent/activator/README.md#模板沙箱网络隔离)
+for address pools, public egress and explicit internal service exceptions.
+
+### Jiuwen persistent workspace parameters
+
+Jiuwen prepares each new AgentBinding with `parameters.workspace = "w-" + SHA256(JSON([tenant, template, user_id]))`, using the authenticated internal user ID and the full hexadecimal digest. The directory identity excludes template version, agent_type, Binding generation and Sandbox ID. Activator receives a generic parameter map; it does not receive a new user/owner identity. Existing Bindings reuse their stored parameters.
+
+Use the [Jiuwen SFS template example](../agent/activator/examples/jiuwen-sfs-template.json) to render a node-visible Local source into `/home/jiuwen`. Different template versions can refer to the same directory, but this mapping does not enforce exclusive access. Until workspace admission is implemented, the caller must stop the previous Sandbox completely before starting another with the same directory. The source directories must already exist; this code does not provision storage or migrate existing user data.

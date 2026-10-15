@@ -1,3 +1,5 @@
+mod support;
+
 use adx_activator::transport::HttpEnvironment;
 use adx_agent_core::environment::*;
 use axum::{routing::get, Json, Router};
@@ -8,6 +10,7 @@ use std::{
     },
     time::Duration,
 };
+use support::network_policy;
 fn credentials() -> std::collections::BTreeMap<String, String> {
     [("tenant".into(), TOKEN.into())].into()
 }
@@ -38,11 +41,24 @@ async fn environment_client_rejects_mismatched_identity_and_never_replays_or_red
             axum::routing::delete(|| async { axum::response::Redirect::temporary("/wrong-place") }),
         );
     let (url, task) = serve(router).await;
-    assert!(
-        HttpEnvironment::new(&url, credentials(), Duration::from_secs(1), None, false).is_err()
-    );
-    let client =
-        HttpEnvironment::new(&url, credentials(), Duration::from_secs(1), None, true).unwrap();
+    assert!(HttpEnvironment::new(
+        &url,
+        credentials(),
+        Duration::from_secs(1),
+        None,
+        false,
+        network_policy()
+    )
+    .is_err());
+    let client = HttpEnvironment::new(
+        &url,
+        credentials(),
+        Duration::from_secs(1),
+        None,
+        true,
+        network_policy(),
+    )
+    .unwrap();
     assert!(matches!(
         client.get("tenant", "adx-id").await,
         Err(EnvironmentError::Unavailable(_))
@@ -61,8 +77,15 @@ async fn environment_connect_failure_is_unavailable_even_for_writes() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     drop(listener);
-    let client =
-        HttpEnvironment::new(&url, credentials(), Duration::from_secs(1), None, true).unwrap();
+    let client = HttpEnvironment::new(
+        &url,
+        credentials(),
+        Duration::from_secs(1),
+        None,
+        true,
+        network_policy(),
+    )
+    .unwrap();
     let create: CreateEnvironment = serde_json::from_value(serde_json::json!({
         "id":"adx-id", "tenant":"tenant", "execution": {
             "image":"app:1", "isolation_runtime":"runc", "inherit_entrypoint":true, "entrypoint":[],
@@ -96,8 +119,15 @@ async fn lost_http_reply_is_unknown_only_for_writes() {
             assert!(socket.read(&mut bytes).await.unwrap() > 0);
             // The peer received the request, then lost the reply.
         });
-        let client =
-            HttpEnvironment::new(&url, credentials(), Duration::from_secs(1), None, true).unwrap();
+        let client = HttpEnvironment::new(
+            &url,
+            credentials(),
+            Duration::from_secs(1),
+            None,
+            true,
+            network_policy(),
+        )
+        .unwrap();
         if write {
             assert!(matches!(
                 client.delete("tenant", "adx-id").await,
@@ -133,8 +163,15 @@ async fn environment_create_uses_the_callers_remaining_deadline() {
         }),
     ))
     .await;
-    let client =
-        HttpEnvironment::new(&url, credentials(), Duration::from_secs(5), None, true).unwrap();
+    let client = HttpEnvironment::new(
+        &url,
+        credentials(),
+        Duration::from_secs(5),
+        None,
+        true,
+        network_policy(),
+    )
+    .unwrap();
     let deadline = adx_agent_core::unix_time_millis() + 250;
     let body = serde_json::json!({
         "id":"adx-id", "tenant":"tenant", "deadline_unix_ms":deadline, "execution": {
@@ -188,6 +225,7 @@ async fn apiserver_contract_preserves_identity_tenant_credentials_and_idempotenc
                 assert_eq!(body["cpu"], 1000);
                 assert_eq!(body["memory"], 128);
                 assert_eq!(body["inheritEntrypoint"], true);
+                assert_eq!(body["network"], adx_activator::environment_request::network_input(&network_policy()).unwrap());
                 assert_eq!(body["env"]["MODEL_KEY"], "test-model-key");
                 assert!(body.get("tenant").is_none());
                 capture.lock().unwrap().push((headers["x-request-id"].to_str().unwrap().to_string(), body));
@@ -207,8 +245,15 @@ async fn apiserver_contract_preserves_identity_tenant_credentials_and_idempotenc
             Json(serde_json::json!({"code":200,"data":null}))
         }));
     let (url, task) = serve(router).await;
-    let client =
-        HttpEnvironment::new(&url, credentials(), Duration::from_secs(5), None, true).unwrap();
+    let client = HttpEnvironment::new(
+        &url,
+        credentials(),
+        Duration::from_secs(5),
+        None,
+        true,
+        network_policy(),
+    )
+    .unwrap();
     let mut create: CreateEnvironment = serde_json::from_value(serde_json::json!({
         "id":"adx-id", "tenant":"tenant", "execution": {
             "image":"app:1", "isolation_runtime":"runc", "inherit_entrypoint":true, "entrypoint":[],
@@ -239,15 +284,22 @@ async fn apiserver_contract_preserves_identity_tenant_credentials_and_idempotenc
 }
 
 #[tokio::test]
-async fn apiserver_absence_does_not_confirm_deletion() {
+async fn apiserver_delete_absence_is_explicit_not_found() {
     let (url, task) =
         serve(Router::new().fallback(|| async { axum::http::StatusCode::NOT_FOUND })).await;
-    let client =
-        HttpEnvironment::new(&url, credentials(), Duration::from_secs(1), None, true).unwrap();
+    let client = HttpEnvironment::new(
+        &url,
+        credentials(),
+        Duration::from_secs(1),
+        None,
+        true,
+        network_policy(),
+    )
+    .unwrap();
     assert!(client.get("tenant", "adx-id").await.unwrap().is_none());
     assert!(matches!(
         client.delete("tenant", "adx-id").await,
-        Err(EnvironmentError::OutcomeUnknown(_))
+        Err(EnvironmentError::NotFound)
     ));
     task.abort();
 }
@@ -284,6 +336,7 @@ async fn tenant_keys_are_selected_without_forwarding_tenant_query() {
         Duration::from_secs(1),
         None,
         true,
+        network_policy(),
     )
     .unwrap();
     for tenant in ["a", "b"] {
@@ -297,7 +350,7 @@ async fn tenant_keys_are_selected_without_forwarding_tenant_query() {
     }
     assert!(matches!(
         client.delete("unknown", "adx-id").await,
-        Err(EnvironmentError::NotFound)
+        Err(EnvironmentError::Unavailable(_))
     ));
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     task.abort();
@@ -319,8 +372,15 @@ async fn invalid_or_incomplete_write_success_is_never_confirmed() {
             }),
         ))
         .await;
-        let client =
-            HttpEnvironment::new(&url, credentials(), Duration::from_secs(1), None, true).unwrap();
+        let client = HttpEnvironment::new(
+            &url,
+            credentials(),
+            Duration::from_secs(1),
+            None,
+            true,
+            network_policy(),
+        )
+        .unwrap();
         assert!(matches!(
             client.delete("tenant", "adx-id").await,
             Err(EnvironmentError::OutcomeUnknown(_))
@@ -336,15 +396,22 @@ async fn forbidden_queries_do_not_become_absence_or_leak_server_details() {
         Router::new().fallback(|| async { (StatusCode::FORBIDDEN, "private upstream detail") }),
     )
     .await;
-    let client =
-        HttpEnvironment::new(&url, credentials(), Duration::from_secs(1), None, true).unwrap();
+    let client = HttpEnvironment::new(
+        &url,
+        credentials(),
+        Duration::from_secs(1),
+        None,
+        true,
+        network_policy(),
+    )
+    .unwrap();
     assert_eq!(
         client.get("tenant", "adx-id").await.unwrap_err(),
         EnvironmentError::NotFound
     );
-    assert_eq!(
-        client.delete("tenant", "adx-id").await.unwrap_err(),
-        EnvironmentError::NotFound
-    );
+    assert!(matches!(
+        client.delete("tenant", "adx-id").await,
+        Err(EnvironmentError::Unavailable(_))
+    ));
     task.abort();
 }

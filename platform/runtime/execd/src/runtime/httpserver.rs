@@ -116,10 +116,10 @@ pub(crate) struct HttpServerControl {
 
 #[derive(Debug)]
 struct HttpServerControlInner {
-    // This descriptor owns the kernel socket but is never registered with a
-    // Tokio reactor. Each generation clones it and installs that clone in the
-    // current reactor, so restored epoll state is never the only accept path.
-    listener: std::net::TcpListener,
+    // Restore binds a fresh kernel socket after the previous accept task exits.
+    // Cloning a checkpoint-restored descriptor retains its backlog and readiness
+    // state, even when the clone gets a new Tokio registration.
+    address: std::net::SocketAddr,
     token: RwLock<Option<String>>,
     accept_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     generation: AtomicU64,
@@ -132,18 +132,17 @@ impl HttpServerControl {
         token: Option<String>,
         ready_tx: watch::Sender<super::RuntimeReadyState>,
     ) -> std::io::Result<Self> {
-        let listener = listener.into_std()?;
-        listener.set_nonblocking(true)?;
+        let address = listener.local_addr()?;
         let control = Self {
             inner: Arc::new(HttpServerControlInner {
-                listener,
+                address,
                 token: RwLock::new(token),
                 accept_task: Mutex::new(None),
                 generation: AtomicU64::new(0),
                 ready_tx,
             }),
         };
-        control.rearm()?;
+        control.install(Some(listener))?;
         Ok(control)
     }
 
@@ -157,43 +156,74 @@ impl HttpServerControl {
     }
 
     pub(crate) fn rearm(&self) -> std::io::Result<u64> {
+        self.install(None)
+    }
+
+    fn install(&self, listener: Option<TcpListener>) -> std::io::Result<u64> {
         let mut accept_task =
             self.inner.accept_task.lock().map_err(|_| {
                 std::io::Error::other("EXECD HTTP listener control lock is poisoned")
             })?;
-        let listener = self.inner.listener.try_clone()?;
-        listener.set_nonblocking(true)?;
-        let listener = TcpListener::from_std(listener)?;
-        let generation = self.inner.generation.load(Ordering::Relaxed) + 1;
+        let generation = self
+            .inner
+            .generation
+            .load(Ordering::Relaxed)
+            .checked_add(1)
+            .ok_or_else(|| std::io::Error::other("EXECD HTTP listener generation exhausted"))?;
         let token = self
             .inner
             .token
             .read()
             .map_err(|_| std::io::Error::other("token lock poisoned"))?
             .clone();
+        let previous = accept_task.take();
+        if let Some(previous) = &previous {
+            previous.abort();
+        }
         self.inner.generation.store(generation, Ordering::Release);
-        // Publish the replacement generation before it can report a failure;
-        // a fast accept error must win over Ready rather than be overwritten.
-        let _ = self.inner.ready_tx.send(super::RuntimeReadyState::Ready);
+        self.inner
+            .ready_tx
+            .send_replace(super::RuntimeReadyState::Starting);
+        let address = self.inner.address;
         let inner = Arc::downgrade(&self.inner);
-        let task = tokio::spawn(async move {
-            if let Err(error) = serve_listener(listener, token).await {
+        *accept_task = Some(tokio::spawn(async move {
+            let result = async {
+                // Await cancellation so the inherited listener is closed before
+                // binding the same address. Pending source connections are retired
+                // with the socket instead of surviving through a duplicated FD.
+                if let Some(previous) = previous {
+                    if let Err(error) = previous.await {
+                        if !error.is_cancelled() {
+                            return Err(std::io::Error::other(error).into());
+                        }
+                    }
+                }
+                let listener = match listener {
+                    Some(listener) => listener,
+                    None => TcpListener::bind(address).await?,
+                };
+                if let Some(inner) = inner.upgrade() {
+                    if inner.generation.load(Ordering::Acquire) == generation {
+                        inner.ready_tx.send_replace(super::RuntimeReadyState::Ready);
+                    }
+                }
+                execd_info!("[execd-http] listener generation installed generation={generation}");
+                serve_listener(listener, token).await
+            }
+            .await;
+            if let Err(error) = result {
                 if let Some(inner) = inner.upgrade() {
                     if inner.generation.load(Ordering::Acquire) == generation {
                         let message =
                             format!("EXECD HTTP accept generation {generation} stopped: {error}");
                         execd_error!("[execd-http] {message}");
-                        let _ = inner
+                        inner
                             .ready_tx
-                            .send(super::RuntimeReadyState::Failed(message));
+                            .send_replace(super::RuntimeReadyState::Failed(message));
                     }
                 }
             }
-        });
-        if let Some(previous) = accept_task.replace(task) {
-            previous.abort();
-        }
-        execd_info!("[execd-http] listener generation installed generation={generation}");
+        }));
         Ok(generation)
     }
 }
@@ -343,7 +373,15 @@ async fn handle_one_request(
             body.extend_from_slice(&tmp[..n]);
         }
         let response = control_response(&method, route, &body[..content_len]).await;
-        return write_resp(sock, response.status, &response.body).await;
+        let checkpoint_control = route.starts_with("/control/v1/checkpoint/");
+        if checkpoint_control {
+            execd_info!("[checkpoint-control] http_response_ready path={} status={}", route, response.status);
+        }
+        let result = write_resp(sock, response.status, &response.body).await;
+        if checkpoint_control {
+            execd_info!("[checkpoint-control] http_response_written path={} status={} success={}", route, response.status, result.is_ok());
+        }
+        return result;
     }
     if super::control::current().is_some_and(|controller| {
         controller.status().phase != adx_core::runtime::RuntimePhase::Running
@@ -1776,6 +1814,53 @@ mod tests {
     };
     use futures_util::{SinkExt, StreamExt};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn restore_discards_inherited_listener_backlog() {
+        let listener = bind(0).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        // Establish a source-generation connection before any accept task runs.
+        let mut inherited = tokio::net::TcpStream::connect(address).await.unwrap();
+        let (ready, mut receiver) =
+            tokio::sync::watch::channel(crate::runtime::RuntimeReadyState::Starting);
+        let control = super::HttpServerControl::start(listener, None, ready).unwrap();
+        control.rearm().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if *receiver.borrow_and_update() == crate::runtime::RuntimeReadyState::Ready {
+                    break;
+                }
+                receiver.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        // A restored listener must not accept a connection inherited from the
+        // checkpoint's backlog, even when its request arrives after restore.
+        let request = b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+        if inherited.write_all(request).await.is_ok() {
+            let mut response = [0; 256];
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                inherited.read(&mut response),
+            )
+            .await
+            .unwrap();
+            assert!(
+                matches!(result, Ok(0) | Err(_)),
+                "inherited connection was served: {result:?}"
+            );
+        }
+        let mut fresh = tokio::net::TcpStream::connect(address).await.unwrap();
+        fresh.write_all(request).await.unwrap();
+        let (head, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            read_http_response(&mut fresh),
+        )
+        .await
+        .unwrap();
+        assert!(head.starts_with("HTTP/1.1 200"));
+    }
 
     async fn read_http_head(stream: &mut tokio::net::TcpStream) -> String {
         let mut bytes = Vec::new();

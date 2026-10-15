@@ -22,6 +22,7 @@ pub trait Control: Send + Sync {
         _ctx: &RequestContext,
         _scope: &Scope,
         _launch: &adx_agent_core::launch::LaunchConfig,
+        _parameters: &adx_agent_core::mounts::Parameters,
     ) -> Result<AgentBinding> {
         Err(Error::Unsupported(
             "private binding preparation unavailable".into(),
@@ -248,6 +249,7 @@ impl Control for ActivatorClient {
         ctx: &RequestContext,
         scope: &Scope,
         launch: &adx_agent_core::launch::LaunchConfig,
+        parameters: &adx_agent_core::mounts::Parameters,
     ) -> Result<AgentBinding> {
         self.request(
             ctx,
@@ -255,6 +257,7 @@ impl Control for ActivatorClient {
             &PrepareBindingRequest {
                 scope: scope.clone(),
                 launch: launch.clone(),
+                parameters: parameters.clone(),
             },
             true,
             Some(scope),

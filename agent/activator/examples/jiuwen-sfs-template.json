@@ -1,0 +1,55 @@
+{
+  "name": "jiuwen",
+  "version": "sfs-autopause-v1",
+  "image": "registry.example/jiuwenswarm:v1",
+  "isolation_runtime": "runsc",
+  "env": {
+    "HOME": "/home/jiuwen",
+    "JIUWENSWARM_HOME": "/home/jiuwen",
+    "JIUWENSWARM_DATA_DIR": "/home/jiuwen/.jiuwenswarm",
+    "JIUWENSWARM_WORKSPACE": "/home/jiuwen/.jiuwenswarm",
+    "JIUWENSWARM_TASKS_DIR": "/home/jiuwen/Documents/JiuwenSwarm",
+    "JIUWENSWARM_DOWNLOAD_ASSET_ROOT": "/home/jiuwen/.jiuwenswarm/assets"
+  },
+  "resources": {
+    "cpu_millis": 1000,
+    "memory_mib": 1024
+  },
+  "service": [
+    {
+      "protocol": "ws",
+      "port": 18092
+    }
+  ],
+  "init_timeout_seconds": 30,
+  "readiness_probe": {
+    "tcp_socket": {
+      "port": 18092
+    },
+    "initial_delay_seconds": 3,
+    "period_seconds": 3,
+    "timeout_seconds": 2
+  },
+  "mounts": [
+    {
+      "type": "bind",
+      "host_path": "/mnt/sfs/workspaces/${workspace}",
+      "target": "/home/jiuwen",
+      "options": [
+        "rw"
+      ],
+      "create_if_missing": true
+    }
+  ],
+  "lifecycle": {
+    "idle_timeout_seconds": 600,
+    "idle_action": "pause",
+    "pause": {
+      "retention": {
+        "kind": "forever"
+      },
+      "timeout_seconds": 300,
+      "storage": "shared"
+    }
+  }
+}

@@ -52,3 +52,6 @@ env/
 
 # Local verification environments
 /.local/
+
+# Local cloud access keys
+credentials*.csv

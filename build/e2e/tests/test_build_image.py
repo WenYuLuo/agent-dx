@@ -149,6 +149,14 @@ class BuildImageContractTests(unittest.TestCase):
         self.assertIn("strace", self.verify)
         self.assertIn("$VERSION_ID == 20.04", self.verify)
 
+    def test_recipe_bootstraps_tools_from_plain_ubuntu(self):
+        self.assertIn('rustup-init', self.dockerfile)
+        self.assertIn('RUSTUP_TOOLCHAIN=${RUST_VERSION}', self.dockerfile)
+        self.assertIn('Python-${PYTHON_VERSION}.tar.xz', self.dockerfile)
+        self.assertIn('protoc-${PROTOC_VERSION}-linux-${protoc_arch}.zip', self.dockerfile)
+        self.assertIn('libsqlite3-dev', self.dockerfile)
+        self.assertIn('libffi-dev', self.dockerfile)
+
     def test_sync_rechecks_the_pushed_digest(self):
         self.assertIn("dockerd --host=", self.sync)
         self.assertIn("trap cleanup EXIT", self.sync)

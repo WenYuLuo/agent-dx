@@ -596,7 +596,13 @@ impl data_plane_gateway::ingress::environment_files::EnvironmentDirectory for En
         if spec.tenant_id != tenant || spec.id != environment_id {
             return Err(ReadError::NotFound);
         }
-        if record.state != pb::EnvironmentState::Running as i32 {
+        if !matches!(
+            pb::EnvironmentState::try_from(record.state),
+            Ok(pb::EnvironmentState::Running
+                | pb::EnvironmentState::Pausing
+                | pb::EnvironmentState::Paused
+                | pb::EnvironmentState::Resuming)
+        ) {
             return Err(ReadError::Runtime);
         }
         Ok(())

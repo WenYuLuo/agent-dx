@@ -116,7 +116,6 @@ fn s3_rootfs_and_mount_credentials_follow_sandboxd_contract() {
 #[test]
 fn unsafe_or_inconsistent_environment_options_are_rejected() {
     for body in [
-        json!({"image":"img","mounts":[{"type":"bind","target":"/data","hostPath":"/host"}]}),
         json!({"rootfs":{"runtime":"runsc","type":"local","path":"/host/root"}}),
         json!({"image":"img","cpu":1000,"cpu_limit":500}),
     ] {
@@ -408,4 +407,77 @@ fn constructor_cwd_is_preserved_and_invalid_paths_are_rejected() {
         .unwrap()
         .cwd
         .is_none());
+}
+
+#[test]
+fn local_mount_accepts_both_spellings_and_preserves_rw() {
+    for field in ["host_path", "hostPath"] {
+        let mut mount = json!({"type":"bind","target":"/home/jiuwen","options":["rw"],"create_if_missing":true});
+        mount[field] = json!("/mnt/sfs/workspaces/user-a");
+        let spec = create_spec(json!({"image":"app", "mounts":[mount]}), &caller()).unwrap();
+        let mounts = spec.execution.unwrap().mounts;
+        assert_eq!(mounts[0].options, ["rw"]);
+        assert!(mounts[0].create_if_missing);
+        assert!(
+            matches!(mounts[0].source.as_ref().unwrap().source.as_ref().unwrap(),
+            pb::storage_source::Source::Local(path) if path == "/mnt/sfs/workspaces/user-a")
+        );
+    }
+}
+
+#[test]
+fn mount_requires_exactly_one_source_for_every_combination() {
+    for image in [false, true] {
+        for s3 in [false, true] {
+            for local in [false, true] {
+                let mut mount = json!({"type":"bind","target":"/data","options":["rw"]});
+                if image {
+                    mount["image_url"] = json!("registry/models:v1");
+                }
+                if s3 {
+                    mount["s3_config"] = json!({"endpoint":"https://s3.example","bucket":"data","object":"data.erofs"});
+                }
+                if local {
+                    mount["host_path"] = json!("/mnt/sfs/user");
+                }
+                let result = create_spec(json!({"image":"app", "mounts":[mount]}), &caller());
+                assert_eq!(
+                    result.is_ok(),
+                    [image, s3, local].into_iter().filter(|v| *v).count() == 1,
+                    "image={image}, s3={s3}, local={local}: {result:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn local_mount_rejects_relative_traversal_and_control_characters() {
+    for path in [
+        "relative",
+        "/data/../etc",
+        "/data/./user",
+        "/data/\u{0}user",
+        "/data/\nuser",
+    ] {
+        let result = create_spec(
+            json!({"image":"app", "mounts":[{"type":"bind","target":"/data","host_path":path}]}),
+            &caller(),
+        );
+        assert_eq!(
+            result.unwrap_err().code(),
+            tonic::Code::InvalidArgument,
+            "{path:?}"
+        );
+    }
+}
+
+#[test]
+fn directory_creation_rejects_non_local_or_non_bind_mounts() {
+    for mount in [
+        json!({"type":"bind","target":"/data","image_url":"app","create_if_missing":true}),
+        json!({"type":"erofs","target":"/data","host_path":"/mnt/sfs/data","create_if_missing":true}),
+    ] {
+        assert!(create_spec(json!({"image":"app","mounts":[mount]}), &caller()).is_err());
+    }
 }

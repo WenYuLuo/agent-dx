@@ -20,6 +20,7 @@ fn config() -> DriverConfig {
             busy: 4,
         },
         write_timeout: Duration::from_secs(1),
+        output_queue_timeout: Duration::from_millis(100),
         idle_timeout: Duration::from_secs(2),
         ping_interval: Duration::from_millis(10),
         request_timeout: Duration::from_millis(60),
@@ -62,6 +63,10 @@ async fn text(socket: &mut WebSocketStream<DuplexStream>) -> Value {
 }
 async fn ack(socket: &mut WebSocketStream<DuplexStream>) {
     socket.send(Message::Text(json!({"type":"event","event":"connection.ack","payload":{"status":"warming","readiness":"WARMING"}}).to_string())).await.unwrap();
+}
+
+async fn legacy_ack(socket: &mut WebSocketStream<DuplexStream>) {
+    socket.send(Message::Text(json!({"type":"event","event":"connection.ack","payload":{"status":"ready","heartbeat_job_owner":"agentserver","heartbeat_job_protocol":1,"heartbeat_job_ready":true}}).to_string())).await.unwrap();
 }
 #[tokio::test]
 async fn one_connection_carries_requests_events_and_stops_without_replay() {
@@ -125,6 +130,73 @@ async fn project_list_uses_the_existing_e2a_connection_without_a_gateway_ack() {
 }
 
 #[tokio::test]
+async fn legacy_agentserver_health_check_is_answered_without_model_execution() {
+    let (socket, mut backend) = pair().await;
+    let (send, requests) = mpsc::channel(2);
+    let (output, mut frames) = mpsc::channel(4);
+    let mut limits = config();
+    limits.ping_interval = Duration::from_secs(1);
+    let task = tokio::spawn(run(socket, "user".into(), limits, requests, output));
+
+    legacy_ack(&mut backend).await;
+    assert_eq!(frames.recv().await.unwrap()["event"], "connection.ack");
+    send.send(
+        Request::parse(
+            br#"{"type":"req","id":"health","method":"health_check.get_conf","params":{}}"#,
+        )
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+
+    let response = frames.recv().await.unwrap();
+    assert_eq!(response["type"], "res");
+    assert_eq!(response["id"], "health");
+    assert_eq!(response["ok"], true);
+    assert_eq!(response["payload"]["state"], "AGENT_READY");
+    assert_eq!(response["payload"]["agent_ready"], true);
+    assert_eq!(response["payload"]["capabilities"]["execution"], true);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), backend.next())
+            .await
+            .is_err()
+    );
+
+    drop(send);
+    assert!(task.await.unwrap().is_ok());
+}
+
+#[tokio::test]
+async fn explicit_readiness_agentserver_receives_health_check() {
+    let (socket, mut backend) = pair().await;
+    let (send, requests) = mpsc::channel(2);
+    let (output, mut frames) = mpsc::channel(4);
+    let task = tokio::spawn(run(socket, "user".into(), config(), requests, output));
+
+    ack(&mut backend).await;
+    assert_eq!(frames.recv().await.unwrap()["event"], "connection.ack");
+    send.send(
+        Request::parse(
+            br#"{"type":"req","id":"health","method":"health_check.get_conf","params":{}}"#,
+        )
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+
+    let envelope = text(&mut backend).await;
+    assert_eq!(envelope["method"], "health_check.get_conf");
+    assert!(frames.try_recv().is_err());
+
+    backend.close(None).await.unwrap();
+    assert!(matches!(
+        task.await.unwrap(),
+        Err(DriverError::Disconnected)
+    ));
+    drop(send);
+}
+
+#[tokio::test]
 async fn slow_frontend_is_bounded_and_does_not_replay_sent_request() {
     let (socket, mut backend) = pair().await;
     let (send, requests) = mpsc::channel(2);
@@ -134,9 +206,34 @@ async fn slow_frontend_is_bounded_and_does_not_replay_sent_request() {
     send.send(request("one", "chat.send")).await.unwrap();
     assert_eq!(text(&mut backend).await["method"], "chat.send");
     assert!(matches!(
-        task.await.unwrap(),
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap(),
         Err(DriverError::SlowConsumer)
     ));
+}
+#[tokio::test]
+async fn full_output_queue_waits_for_frontend_to_drain() {
+    let (socket, mut backend) = pair().await;
+    let (send, requests) = mpsc::channel(2);
+    let (output, mut frames) = mpsc::channel(1);
+    let mut limits = config();
+    limits.output_queue_timeout = Duration::from_secs(5);
+    let task = tokio::spawn(run(socket, "user".into(), limits, requests, output));
+
+    ack(&mut backend).await;
+    send.send(request("one", "chat.send")).await.unwrap();
+    assert_eq!(text(&mut backend).await["method"], "chat.send");
+    assert_eq!(frames.recv().await.unwrap()["event"], "connection.ack");
+    assert_eq!(frames.recv().await.unwrap()["payload"]["accepted"], true);
+
+    drop(send);
+    assert!(tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .is_ok());
 }
 #[tokio::test]
 async fn unary_timeout_retires_only_that_request_without_closing_the_connection() {

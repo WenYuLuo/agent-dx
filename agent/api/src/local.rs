@@ -39,9 +39,12 @@ impl Control for LocalControl {
         ctx: &RequestContext,
         scope: &Scope,
         launch: &adx_agent_core::launch::LaunchConfig,
+        parameters: &adx_agent_core::mounts::Parameters,
     ) -> Result<AgentBinding> {
         ctx.start_write();
-        self.activator.prepare_binding(scope, launch).await
+        self.activator
+            .prepare_binding(scope, launch, parameters)
+            .await
     }
     async fn publish(
         &self,

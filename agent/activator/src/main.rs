@@ -16,6 +16,7 @@ struct Settings {
     namespace: String,
     environment_url: String,
     environment_api_key_envs: BTreeMap<String, String>,
+    sandbox_network: adx_agent_core::network::SandboxNetworkPolicy,
     allow_plaintext_transport: bool,
     environment_ca_file: Option<String>,
     request_timeout_seconds: u64,
@@ -48,6 +49,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         timeout,
         ca.as_deref(),
         settings.allow_plaintext_transport,
+        settings.sandbox_network,
     )?);
     let store = Arc::new(
         RedisRepository::connect(

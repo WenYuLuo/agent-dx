@@ -61,7 +61,8 @@ pub struct FileMetadata {
 }
 
 /// Read-only management boundary. Implementations must enforce tenant ownership
-/// and Running state, and must not create or activate a Environment.
+/// and a Running or resumable state. It must not create or wake an Environment;
+/// authorized business transfer admission uses the shared Gateway wake path.
 #[async_trait::async_trait]
 pub trait EnvironmentDirectory: Send + Sync {
     async fn authorize(&self, tenant: &str, environment_id: &str) -> Result<(), ReadError>;
@@ -238,7 +239,10 @@ impl EnvironmentDirectory for HttpDirectory {
             return Err(ReadError::Runtime);
         };
         if value["id"].as_str() != Some(environment_id)
-            || value["status"].as_str() != Some("running")
+            || !matches!(
+                value["status"].as_str(),
+                Some("running" | "pausing" | "paused" | "resuming")
+            )
         {
             return Err(ReadError::Runtime);
         }

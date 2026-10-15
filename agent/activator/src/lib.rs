@@ -4,7 +4,7 @@ pub mod local_environment;
 pub mod server;
 pub mod transport;
 use adx_agent_core::environment::{
-    CreateEnvironment, Environment, EnvironmentObservation, EnvironmentPhase,
+    CreateEnvironment, Environment, EnvironmentError, EnvironmentObservation, EnvironmentPhase,
 };
 pub use adx_agent_core::error::{Error, Result};
 use adx_agent_core::{activator::Target, AgentBinding, BindingPhase, Scope, TemplateVersion};
@@ -74,7 +74,10 @@ impl Activator {
         }
     }
     pub async fn publish(&self, tenant: &str, template: &TemplateVersion) -> Result<()> {
-        self.environment.validate_execution(&template.into())?;
+        let mut execution: adx_agent_core::environment::ExecutionSpec = template.into();
+        // Mount syntax is checked at publication; concrete paths require Binding parameters.
+        execution.mounts.clear();
+        self.environment.validate_execution(&execution)?;
         self.state.publish(tenant, template).await?;
         Ok(())
     }
@@ -116,17 +119,19 @@ impl Activator {
         &self,
         scope: &Scope,
         launch: &adx_agent_core::launch::LaunchConfig,
+        parameters: &adx_agent_core::mounts::Parameters,
     ) -> Result<AgentBinding> {
         launch.validate().map_err(Error::Invalid)?;
         let template = self
             .template(&scope.tenant, &scope.template, &scope.version)
             .await?;
         let mut execution: adx_agent_core::environment::ExecutionSpec = (&template).into();
+        execution.mounts = template.render_mounts(parameters).map_err(Error::Invalid)?;
         execution.env.extend(launch.env.clone());
         self.environment.validate_execution(&execution)?;
         Ok(self
             .state
-            .create_binding_with_launch(scope.clone(), Some(launch))
+            .create_binding_with_parameters(scope.clone(), Some(launch), parameters)
             .await?)
     }
     pub async fn activate(
@@ -204,6 +209,9 @@ impl Activator {
             return Err(Error::Conflict("binding is deleting".into()));
         }
         let mut execution: adx_agent_core::environment::ExecutionSpec = (&template).into();
+        execution.mounts = template
+            .render_mounts(&binding.parameters)
+            .map_err(Error::Invalid)?;
         if let Some(launch) = self.state.launch_config(&binding).await? {
             execution.env.extend(launch.env);
         }
@@ -232,49 +240,64 @@ impl Activator {
         if current != binding {
             return Err(Error::Conflict("binding changed during activation".into()));
         }
+        // A target is a stable identity, not proof of a live execution. Only the
+        // authorized Gateway data path requests Platform EnsureRunning.
         match observed.phase {
-            EnvironmentPhase::Running if observed.ready => {
-                let mut bindings = self.bindings.lock().await;
-                if let Some(cached) = bindings.get_mut(scope) {
-                    if Arc::ptr_eq(&cached.attempt, &attempt) {
-                        cached.target = Some(Target {
-                            binding: binding.clone(),
-                            service: template.service.clone(),
-                        });
-                        cached.touched = Instant::now();
-                    }
-                }
-                Ok(Target {
-                    binding,
-                    service: template.service,
-                })
+            EnvironmentPhase::Running if observed.ready => (),
+            EnvironmentPhase::Pausing | EnvironmentPhase::Paused | EnvironmentPhase::Resuming => (),
+            EnvironmentPhase::Creating | EnvironmentPhase::Running => {
+                return Err(Error::NotReady(
+                    "Environment is not ready; retry the same AgentBinding".into(),
+                ))
             }
-            EnvironmentPhase::Creating | EnvironmentPhase::Running => Err(Error::NotReady(
-                "Environment is not ready; retry the same AgentBinding".into(),
-            )),
-            EnvironmentPhase::Failed => Err(Error::Conflict(
-                "Environment failed; inspect Platform state".into(),
-            )),
-            EnvironmentPhase::Deleted => Err(Error::Conflict(
-                "Environment was deleted; create a new AgentBinding lifecycle".into(),
-            )),
+            EnvironmentPhase::Failed => {
+                return Err(Error::Conflict(
+                    "Environment failed; inspect Platform state".into(),
+                ))
+            }
+            EnvironmentPhase::Deleted => {
+                return Err(Error::Conflict(
+                    "Environment was deleted; create a new AgentBinding lifecycle".into(),
+                ))
+            }
         }
+        let target = Target {
+            binding,
+            service: template.service,
+        };
+        let mut bindings = self.bindings.lock().await;
+        if let Some(cached) = bindings.get_mut(scope) {
+            if Arc::ptr_eq(&cached.attempt, &attempt) {
+                cached.target = Some(target.clone());
+                cached.touched = Instant::now();
+            }
+        }
+        Ok(target)
     }
+
     pub async fn delete_binding(&self, scope: &Scope) -> Result<()> {
         scope.validate().map_err(Error::Invalid)?;
         self.invalidate(scope).await;
         self.binding(scope).await?;
         let binding = self.state.begin_delete(scope).await?;
         self.invalidate(scope).await;
-        let observed = self
+        match self
             .environment
             .delete(&scope.tenant, &binding.environment_id)
-            .await?;
-        Self::validate_observation(&binding, &observed)?;
-        if observed.phase != EnvironmentPhase::Deleted {
-            return Err(Error::OutcomeUnknown(
-                "Platform has not confirmed deletion; retry this AgentBinding deletion".into(),
-            ));
+            .await
+        {
+            Ok(observed) => {
+                Self::validate_observation(&binding, &observed)?;
+                if observed.phase != EnvironmentPhase::Deleted {
+                    return Err(Error::OutcomeUnknown(
+                        "Platform has not confirmed deletion; retry this AgentBinding deletion"
+                            .into(),
+                    ));
+                }
+            }
+            // Explicit absence completes the product deletion; transport failures do not.
+            Err(EnvironmentError::NotFound) => {}
+            Err(error) => return Err(error.into()),
         }
         self.state.finish_delete(&binding).await?;
         Ok(())

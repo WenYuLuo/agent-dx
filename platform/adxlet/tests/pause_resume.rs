@@ -15,6 +15,7 @@ use std::{
 
 #[derive(Default)]
 struct Backend {
+    prepare_ids: Mutex<Vec<String>>,
     prepare_gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
     prepare_entered: tokio::sync::Notify,
     checkpoint_gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
@@ -203,7 +204,8 @@ impl CheckpointCooperation for Backend {
         self.workload_request.lock().unwrap().take();
         Ok(())
     }
-    async fn prepare(&self, _: &EnvironmentRecord, _: &str) -> Result<()> {
+    async fn prepare(&self, _: &EnvironmentRecord, operation_id: &str) -> Result<()> {
+        self.prepare_ids.lock().unwrap().push(operation_id.into());
         self.event("prepare");
         self.prepare_entered.notify_one();
         let gate = self.prepare_gate.lock().unwrap().clone();
@@ -1962,4 +1964,37 @@ async fn object_pause_seeds_same_node_resume_without_remote_manifest() {
     let running = h.resume(resume(paused.record.revision)).await.unwrap();
     assert_eq!(running.record.state, EnvironmentState::Running);
     h.delete().await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn idle_pause_after_aborted_prepare_uses_a_new_operation() {
+    let (_temp, backend, node, mut spec, assignment) = fixture();
+    spec.lifecycle.idle_timeout_seconds = 10;
+    spec.lifecycle.idle_action = adx_core::lifecycle::IdleAction::Pause;
+    let handle = node.environment(spec, assignment).unwrap();
+    handle.create().await.unwrap();
+    *backend.activity.lock().unwrap() = Some((1, 0));
+    *backend.fail_prepare.lock().unwrap() = true;
+    handle.tick().await.unwrap();
+    tokio::time::advance(Duration::from_secs(10)).await;
+    assert!(handle.tick().await.is_err());
+    assert_eq!(
+        handle.sync().await.unwrap().record.state,
+        EnvironmentState::Running
+    );
+    assert!(backend.events.lock().unwrap().iter().any(|e| e == "abort"));
+    *backend.fail_prepare.lock().unwrap() = false;
+    handle.tick().await.unwrap();
+    tokio::time::advance(Duration::from_secs(10)).await;
+    handle.tick().await.unwrap();
+    let ids = backend.prepare_ids.lock().unwrap().clone();
+    assert_eq!(ids.len(), 2);
+    assert_ne!(
+        ids[0], ids[1],
+        "an aborted operation cannot identify a new prepare attempt"
+    );
+    assert_eq!(
+        handle.sync().await.unwrap().record.state,
+        EnvironmentState::Paused
+    );
 }

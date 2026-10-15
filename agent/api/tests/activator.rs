@@ -261,11 +261,13 @@ async fn private_launch_configuration_crosses_only_authenticated_control_api() {
         credential_version: "1".into(),
         env: std::collections::BTreeMap::from([("API_KEY".into(), "sk-private".into())]),
     };
+    let parameters = std::collections::BTreeMap::from([("workspace".into(), "w-user".into())]);
     let response = reqwest::Client::new()
         .post(format!("{url}/internal/adx/v1/bindings/prepare"))
         .json(&adx_agent_core::activator::PrepareBindingRequest {
             scope: scope.clone(),
             launch: launch.clone(),
+            parameters: parameters.clone(),
         })
         .send()
         .await
@@ -274,9 +276,10 @@ async fn private_launch_configuration_crosses_only_authenticated_control_api() {
     let client =
         ActivatorClient::new(vec![url], TOKEN.into(), Duration::from_secs(3), None, true).unwrap();
     let binding = client
-        .prepare_binding(&context(), &scope, &launch)
+        .prepare_binding(&context(), &scope, &launch, &parameters)
         .await
         .unwrap();
+    assert_eq!(binding.parameters, parameters);
     assert_eq!(client.binding(&context(), &scope).await.unwrap(), binding);
     assert!(!serde_json::to_string(&binding)
         .unwrap()

@@ -8,6 +8,7 @@ mod controller;
 mod local;
 pub use local::LocalReservation;
 pub mod journal;
+pub mod managed_mounts;
 pub mod metrics;
 pub mod proxy;
 pub mod readiness;

@@ -255,6 +255,7 @@ async fn frontend_and_e2a_driver_preserve_user_and_runtime_request_correlation()
                         busy: 4,
                     },
                     write_timeout: Duration::from_millis(100),
+                    output_queue_timeout: Duration::from_secs(1),
                     idle_timeout: Duration::from_secs(3),
                     ping_interval: Duration::from_secs(1),
                     request_timeout: Duration::from_secs(2),
