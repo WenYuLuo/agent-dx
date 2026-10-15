@@ -615,6 +615,10 @@ async fn coordinator_autoscaling_http_queries_authoritative_node_ownership_witho
                     if queue["count"] == 1 {
                         assert_eq!(queue["instanceInfos"][0]["instanceID"], "http-queued");
                         assert_eq!(queue["instanceInfos"][0]["resources"]["cpu"], "100m");
+                        assert_eq!(
+                            queue["instanceInfos"][0]["schedulingRequirements"],
+                            serde_json::json!({"runtimeClass": "test-runtime"})
+                        );
                         assert!(queue["instanceInfos"][0]["waitDurationMs"].is_string());
                         break;
                     }

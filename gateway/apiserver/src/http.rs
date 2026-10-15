@@ -1214,6 +1214,7 @@ fn scheduling_queue_view(queue: pb::GetSchedulingQueueResponse) -> Value {
                 "instanceID": spec.id,
                 "requestID": spec.id,
                 "resources": public_resources,
+                "schedulingRequirements": {"runtimeClass": spec.runtime_class},
                 "enqueueTimeMs": pending.enqueue_time_millis.to_string(),
                 "waitDurationMs": now.saturating_sub(pending.enqueue_time_millis).to_string(),
             }))
@@ -1496,6 +1497,36 @@ mod error_contract_tests {
                 ["count"]["vectors"]["cards"]["values"][0],
             2
         );
+    }
+
+    #[test]
+    fn scheduling_queue_view_exposes_each_requested_runtime_class() {
+        let runtimes = ["runc", "runsc", "firecracker", "kata", "custom-runtime"];
+        let value = scheduling_queue_view(pb::GetSchedulingQueueResponse {
+            environments: runtimes
+                .iter()
+                .map(|runtime| pb::PendingEnvironment {
+                    spec: Some(pb::EnvironmentSpec {
+                        id: format!("environment-{runtime}"),
+                        runtime_class: (*runtime).into(),
+                        ..Default::default()
+                    }),
+                    enqueue_time_millis: 1,
+                })
+                .collect(),
+        });
+        assert_eq!(value["count"], runtimes.len());
+        for (entry, runtime) in value["instanceInfos"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .zip(runtimes)
+        {
+            assert_eq!(
+                entry["schedulingRequirements"],
+                json!({"runtimeClass": runtime})
+            );
+        }
     }
 
     #[test]

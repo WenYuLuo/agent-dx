@@ -11,7 +11,9 @@ Coordinator owns their state and decisions. `/global-scheduler/resources` reads 
 watched in-memory node directory and renders the legacy `resource.fragment`
 shape; `/api/environment/v1/resources` keeps the ADX `items` shape. Administrator-only
 `/global-scheduler/scheduling_queue` reads the bounded, memory-only central
-wait queue. `POST /global-scheduler/node/localschedulingstatus?node_id=...`
+wait queue. Each waiting entry includes `schedulingRequirements.runtimeClass`,
+the resolved runtime that a candidate node must support.
+`POST /global-scheduler/node/localschedulingstatus?node_id=...`
 pauses new allocation to a node and `DELETE` removes that pause. Existing
 Environments keep running. The pause is persisted by Coordinator and is not cleared by
 Adxlet heartbeats; local pressure or reconciliation can still keep a
