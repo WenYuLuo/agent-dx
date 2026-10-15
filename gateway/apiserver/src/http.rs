@@ -1550,6 +1550,26 @@ mod error_contract_tests {
     }
 
     #[tokio::test]
+    async fn confirmed_create_timeout_serializes_phase_and_terminal_contract() {
+        let message = "create deadline exceeded during Execd readiness";
+        let response = error_response(
+            adx_protocol::status(adx_core::Error::DeadlineExceeded(message.into())),
+            "create-a",
+            None,
+            Some("environment-a"),
+            true,
+        );
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        let value = error_body(response).await;
+        assert_eq!(value["message"], message);
+        assert_eq!(value["error"]["code"], "DEADLINE_EXCEEDED");
+        assert_eq!(value["error"]["retry"], "never");
+        assert_eq!(value["error"]["outcome"], "terminal");
+        assert!(value.get("stage").is_none());
+        assert!(value["error"].get("stage").is_none());
+    }
+
+    #[tokio::test]
     async fn documented_grpc_classes_keep_http_retry_and_outcome_semantics() {
         let cases = [
             (
@@ -1646,7 +1666,7 @@ mod error_contract_tests {
                 Code::DeadlineExceeded,
                 true,
                 504,
-                "OUTCOME_UNKNOWN",
+                "DEADLINE_EXCEEDED",
                 "same_operation",
                 "unknown",
             ),

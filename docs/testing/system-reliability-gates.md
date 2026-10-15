@@ -15,7 +15,7 @@
 
 ## Deadline 契约
 
-`createTimeoutSeconds` 是从 API Server 接受请求到返回最终结果的整体预算。`scheduleTimeoutSeconds` 只在中心 ShardScheduler 尚未形成 Assignment 时生效。Local-first 本地准入不分配固定的一半预算，也不消耗中心排队预算；本地明确不满足后，由入口 adxlet 用同一 Environment ID 转交 Coordinator，中心排队计时从此开始。一旦形成 Assignment，启动 sandboxd、Execd ready、路由绑定和 Redis 提交不再受 schedule timeout 约束，但仍受整体 create deadline 及各阶段更短的内部 deadline 约束。
+`createTimeoutSeconds` 是从 API Server 接受请求起的业务执行整体预算；仅用于超时错误回传的窗口最多另占 3 秒，不延长下游执行截止时间。`scheduleTimeoutSeconds` 只在中心 ShardScheduler 尚未形成 Assignment 时生效。Local-first 本地准入不分配固定的一半预算，也不消耗中心排队预算；本地明确不满足后，由入口 adxlet 用同一 Environment ID 转交 Coordinator，中心排队计时从此开始。一旦形成 Assignment，启动 sandboxd、Execd ready、路由绑定和 Redis 提交不再受 schedule timeout 约束，但仍受整体 create deadline 及各阶段更短的内部 deadline 约束。
 
 下游只能继承上游剩余预算或使用更短的阶段预算，不能重新获得更长 deadline。任何超时都不等于操作未发生；返回结果未知时，调用方使用同一身份查询或重试。
 

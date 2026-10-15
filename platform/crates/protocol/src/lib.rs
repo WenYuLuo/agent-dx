@@ -267,6 +267,23 @@ pub fn status(error: adx_core::Error) -> tonic::Status {
         Error::NotFound => tonic::Status::not_found("environment or node not found"),
         Error::NoCapacity => tonic::Status::resource_exhausted("capacity unavailable"),
         Error::Unavailable(message) => tonic::Status::unavailable(message),
+        Error::ResponseTimeout(message) => tonic::Status::deadline_exceeded(message),
+        Error::DeadlineExceeded(message) => {
+            let failure = adx_core::RuntimeFailure {
+                reason: adx_core::RuntimeFailureReason::DeadlineExceeded,
+                message: message.clone(),
+                exit_code: None,
+                probe_failure: None,
+            };
+            match serde_json::to_vec(&failure) {
+                Ok(details) => tonic::Status::with_details(
+                    tonic::Code::DeadlineExceeded,
+                    message,
+                    details.into(),
+                ),
+                Err(_) => tonic::Status::internal("deadline failure encoding failed"),
+            }
+        }
         Error::ProbeFailed(failure) => match serde_json::to_vec(&failure) {
             Ok(details) => tonic::Status::with_details(
                 tonic::Code::FailedPrecondition,
@@ -278,6 +295,9 @@ pub fn status(error: adx_core::Error) -> tonic::Status {
     }
 }
 pub fn dependency_status(status: tonic::Status) -> Error {
+    if let Some(failure) = deadline_failure(&status) {
+        return Error::DeadlineExceeded(failure.message);
+    }
     if let Ok(failure) = serde_json::from_slice(status.details()) {
         return Error::ProbeFailed(failure);
     }
@@ -288,6 +308,16 @@ pub fn dependency_status(status: tonic::Status) -> Error {
         tonic::Code::InvalidArgument => Error::Invalid("remote request rejected".into()),
         _ => Error::Unavailable("control RPC unavailable".into()),
     }
+}
+
+/// A node-confirmed failed create, distinct from a transport wait expiring.
+pub fn deadline_failure(status: &tonic::Status) -> Option<adx_core::RuntimeFailure> {
+    if status.code() != tonic::Code::DeadlineExceeded {
+        return None;
+    }
+    serde_json::from_slice::<adx_core::RuntimeFailure>(status.details())
+        .ok()
+        .filter(|failure| failure.reason == adx_core::RuntimeFailureReason::DeadlineExceeded)
 }
 
 impl From<adx_core::RestorePoint> for control::RestorePoint {
@@ -499,6 +529,7 @@ impl TryFrom<control::RuntimeFailure> for adx_core::RuntimeFailure {
             Ok(Wire::Exited) => Reason::Exited,
             Ok(Wire::Missing) => Reason::Missing,
             Ok(Wire::ProbeFailed) => Reason::ProbeFailed,
+            Ok(Wire::DeadlineExceeded) => Reason::DeadlineExceeded,
             _ => return Err(Error::Invalid("invalid runtime failure reason".into())),
         };
         let probe_failure = value.probe_failure.map(TryInto::try_into).transpose()?;
@@ -524,6 +555,7 @@ impl From<adx_core::RuntimeFailure> for control::RuntimeFailure {
             Reason::Exited => Wire::Exited,
             Reason::Missing => Wire::Missing,
             Reason::ProbeFailed => Wire::ProbeFailed,
+            Reason::DeadlineExceeded => Wire::DeadlineExceeded,
         };
         Self {
             reason: reason as i32,

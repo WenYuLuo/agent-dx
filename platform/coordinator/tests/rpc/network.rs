@@ -364,4 +364,50 @@ async fn create_retries_delivery_and_lost_response_on_the_same_assignment() {
         Err(adx_core::Error::NotFound)
     ));
     assert_eq!(backend.1.load(Ordering::SeqCst), 1);
+    // Release the successful control execution, then expire a different create
+    // while its backend is preparing. The node's phase must survive RPC timers.
+    let mut node_api =
+        pb::node_service_client::NodeServiceClient::new(connect(na, Principal::ApiServer).await);
+    node_api
+        .delete_environment(pb::DeleteEnvironmentRequest {
+            assignment: record.assignment.clone(),
+            caller: caller(),
+            node_session_id: String::new(),
+            failed_revision: None,
+        })
+        .await
+        .unwrap();
+    let mut timed = create("timeout-cold");
+    timed.create_deadline_unix_millis =
+        adx_transport::deadline::Deadline::after(Duration::from_secs(1))
+            .unwrap()
+            .unix_millis();
+    let error = api.create_environment(timed).await.unwrap_err();
+    assert_eq!(error.code(), tonic::Code::DeadlineExceeded, "{error:?}");
+    assert!(
+        error
+            .message()
+            .contains("backend preparation/runtime start"),
+        "{error:?}"
+    );
+    assert!(adx_protocol::deadline_failure(&error).is_some());
+    let failed = session.get("timeout-cold").await.unwrap();
+    let failed_record = failed.result.unwrap();
+    assert_eq!(failed_record.state, adx_core::EnvironmentState::Failed);
+    assert!(!failed_record.resources_held);
+    assert_eq!(failed_record.failure.unwrap().message, error.message());
+    // A fresh request reaches the authoritative Coordinator even when an API
+    // directory has not yet consumed its Failed delta. No execution is replayed.
+    let replay = api
+        .create_environment(create("timeout-cold"))
+        .await
+        .unwrap_err();
+    assert_eq!(replay.message(), error.message());
+    assert!(adx_protocol::deadline_failure(&replay).is_some());
+    assert_eq!(
+        session.get("timeout-cold").await.unwrap().assignment,
+        failed.assignment
+    );
+    assert_eq!(backend.1.load(Ordering::SeqCst), 2);
+    assert_eq!(backend.0.started.load(Ordering::SeqCst), 1);
 }
