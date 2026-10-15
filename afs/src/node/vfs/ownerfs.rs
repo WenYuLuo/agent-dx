@@ -4807,7 +4807,7 @@ impl LocalOwnerFs {
     /// D4: 删除整个 root 目录（spec §5.4）。
     ///
     /// 顺序：解析 root_id → 卸载 bind mount → RootManager::delete_root
-    /// （revoke → 缓存移除 → Meta deactivate → catalog → 物理目录）→
+    /// （revoke → 缓存移除 → Meta deactivate → 物理目录 → catalog）→
     /// OwnerState 索引清理 → PrivateFuseCache 清理。任一步失败时后续步骤
     /// 不再执行，残留记录由 reconcile_on_startup 的 zombie 检测在下一次
     /// 启动时清理。
@@ -4838,7 +4838,7 @@ impl LocalOwnerFs {
         afs_logging::info!("ownerfs.rmdir_root.unmounted"; "root_id" => ?root_id);
 
         // 3. RootManager::delete_root（revoke → 缓存移除 → Meta deactivate
-        //    → catalog 条目 → 物理目录）。
+        //    → 物理目录 → catalog）。
         self.roots.delete_root(&root_id)?;
         afs_logging::info!("ownerfs.rmdir_root.root_deleted"; "root_id" => ?root_id);
 

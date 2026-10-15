@@ -1035,9 +1035,12 @@ impl RootManager {
 
     /// D4: 完整删除一个 active root。
     ///
-    /// 调用顺序：revoke → 缓存移除 → Meta deactivate → catalog → 物理目录。
+    /// 调用顺序：revoke → 缓存移除 → Meta deactivate → 物理目录 → catalog。
     /// 每步幂等，部分失败可安全重试。并发 rmdir 中，缓存移除是线性化点：
     /// 第二个调用在缓存中找不到 root，返回 invalid_grant（FUSE 层转 ENOENT）。
+    /// 物理目录删除先于 catalog 移除：非空目录使 remove_dir 返回 ENOTEMPTY 时
+    /// catalog 记录仍保留，root 可被重启 reconcile 继续收敛，不会成为
+    /// 控制面记录先于数据被清除的孤儿（review: 非空 root 删除失败会丢失控制面记录）。
     /// Meta 不可达时在 deactivate 处失败并保持 catalog/物理目录不变，
     /// 残留记录由 reconcile_on_startup 的 zombie 检测在下次启动时清理。
     pub fn delete_root(&self, id: &RootId) -> Result<()> {
@@ -1081,13 +1084,14 @@ impl RootManager {
             .deactivate_root(id, record.epoch, &self.local_node_id, &self.session_id)?;
         afs_logging::info!("root.delete_root.meta_deactivated"; "root_id" => ?id, "epoch" => record.epoch);
 
-        // 4. 清除 catalog 条目。
-        self.catalog.remove_prepared_root(&record)?;
-        afs_logging::info!("root.delete_root.catalog_removed"; "root_id" => ?id);
-
-        // 5. 删除物理目录。
+        // 4. 删除物理目录。先于 catalog 移除：目录删除失败（如非空）时
+        //    catalog 记录仍存在，root 可被重启 reconcile 重新收敛或继续清理。
         self.remove_abandoned_dir(&record.data_dir)?;
         afs_logging::info!("root.delete_root.dir_removed"; "root_id" => ?id, "data_dir" => ?record.data_dir);
+
+        // 5. 清除 catalog 条目。
+        self.catalog.remove_prepared_root(&record)?;
+        afs_logging::info!("root.delete_root.catalog_removed"; "root_id" => ?id);
 
         Ok(())
     }
@@ -1204,10 +1208,23 @@ impl RootManager {
 
         for record in records.into_values() {
             let Some(location) = active.get(&record.id) else {
-                // Crash after Abort CAS but before local cleanup. A prepared
-                // catalog entry never granted access by itself, and the empty
-                // directory cannot contain acknowledged root writes.
-                self.remove_abandoned_dir(&record.data_dir)?;
+                // 两种来源：(1) Abort CAS 后崩溃、本地清理前的 pending reservation；
+                // (2) delete_root 已提交 Meta deactivate 但物理目录/catalog 清理被
+                // 中断（含非空目录删除失败）。两者都表示该 root 已逻辑删除：收敛为
+                // 移除 catalog 条目；物理目录非空（ENOTEMPTY）时记录警告并保留，
+                // 等待人工清理，不阻塞启动（review: 非空 root 删除失败会丢失控制面记录）。
+                match self.remove_abandoned_dir(&record.data_dir) {
+                    Ok(()) => {}
+                    Err(error) if error.code() == afs_error::IO_DIRECTORY_NOT_EMPTY => {
+                        afs_logging::warn!(
+                            "root.reconcile.leftover_data_dir";
+                            "root_id" => ?record.id,
+                            "data_dir" => ?record.data_dir,
+                            "error" => error.to_string(),
+                        );
+                    }
+                    Err(error) => return Err(error),
+                }
                 self.catalog.remove_prepared_root(&record)?;
                 continue;
             };
@@ -2644,6 +2661,79 @@ mod tests {
         assert!(manager.cached_local_roots().unwrap().is_empty());
         assert!(meta.0.lock().unwrap().active.is_none());
         // catalog 无记录（manager 持有独占锁，先释放再验证）。
+        drop(manager);
+        let locked = LocalFsRootCatalog::new(disk.clone())
+            .lock_and_open()
+            .unwrap();
+        assert!(locked.scan_roots().unwrap().is_empty());
+    }
+
+    #[test]
+    fn delete_root_keeps_catalog_when_physical_dir_not_empty() {
+        let temp = tempfile::tempdir().unwrap();
+        let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
+        let meta = Arc::new(RecoveryMeta::default());
+        let name = OsStr::new("job");
+        let id = root_id_from_name(name).unwrap();
+        let data_dir = root_data_dir(name, 1).unwrap();
+        disk.mkdir(&data_dir, 0o700).unwrap();
+        disk.sync_root().unwrap();
+        meta.0.lock().unwrap().active = Some(RootLocation {
+            id: id.clone(),
+            epoch: 1,
+            home_node_id: "node-a".into(),
+            home_session_id: "session-a".into(),
+        });
+        meta.0.lock().unwrap().active_prepare_id = Some("prepare-1:session-a".into());
+        let catalog = LocalFsRootCatalog::new(disk.clone());
+        let locked = catalog.lock_and_open().unwrap();
+        locked
+            .persist_prepared_root(&LocalRootRecord {
+                id: id.clone(),
+                name: name.into(),
+                epoch: 1,
+                data_dir: data_dir.clone(),
+                local_prepare_id: "prepare-1:session-a".into(),
+            })
+            .unwrap();
+        drop(locked);
+
+        let manager = RootManager::open(
+            "node-a".into(),
+            "session-a".into(),
+            meta.clone(),
+            disk.clone(),
+        )
+        .unwrap();
+        assert_eq!(manager.cached_local_roots().unwrap().len(), 1);
+
+        // 制造非空目录：删除必然 ENOTEMPTY。
+        std::fs::write(temp.path().join(data_dir.as_path()).join("payload"), b"x").unwrap();
+
+        // 删除在物理目录一步失败：Meta 已 deactivate、缓存已移除，
+        // 但 catalog 记录必须保留，否则数据成为无法重新准入的孤儿。
+        let err = manager.delete_root(&id).unwrap_err();
+        assert_eq!(err.code(), afs_error::IO_DIRECTORY_NOT_EMPTY);
+
+        // catalog 记录仍在（manager 持有独占锁，先释放再验证）。
+        drop(manager);
+        let locked = LocalFsRootCatalog::new(disk.clone())
+            .lock_and_open()
+            .unwrap();
+        assert_eq!(locked.scan_roots().unwrap().len(), 1);
+        drop(locked);
+
+        // 重启 reconcile：catalog 有记录但 Meta 无 active，收敛为移除
+        // catalog 条目；非空目录被保留并告警，不阻塞启动。
+        let manager = RootManager::open(
+            "node-a".into(),
+            "session-a".into(),
+            meta.clone(),
+            disk.clone(),
+        )
+        .unwrap();
+        assert!(manager.cached_local_roots().unwrap().is_empty());
+        assert!(meta.0.lock().unwrap().active.is_none());
         drop(manager);
         let locked = LocalFsRootCatalog::new(disk.clone())
             .lock_and_open()

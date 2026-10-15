@@ -123,7 +123,11 @@ mod linux {
                 .verify_current(&self.owner)
                 .map_err(|error| io::Error::other(error.to_string()))?;
             self.export.activate()?;
+            // verify_current 失败说明挂载后授权失效：回滚已生效的 bind，
+            // 避免上层把错误降级为 FuseOnly 后 bind 仍残留在 namespace 中
+            // （review: 挂载生效后的错误路径没有回滚）。
             self.verify_current()
+                .inspect_err(|_| self.export.rollback_mount())
         }
 
         pub(in crate::node) fn verify_current(&self) -> io::Result<()> {
@@ -184,38 +188,45 @@ mod linux {
     pub(in crate::node) fn scan_egress_binds(egress_root: &Path) -> io::Result<Vec<OsString>> {
         use std::io::{BufRead, BufReader};
 
-        let root = egress_root.as_os_str().as_bytes();
         let mut names = Vec::new();
         let mountinfo = std::fs::File::open("/proc/self/mountinfo")?;
         for line in BufReader::new(mountinfo).lines() {
             let line = line?;
-            let Some((identity, detail)) = line.split_once(" - ") else {
-                continue;
-            };
-            let mount_point = match identity.split_whitespace().nth(4) {
-                Some(point) => point,
-                None => continue,
-            };
-            let point = mount_point.as_bytes();
-            if !point.starts_with(root) || point.len() <= root.len() {
-                continue;
+            if let Some(name) = egress_bind_name_from_line(&line, egress_root) {
+                names.push(name);
             }
-            let Some(tail) = point.get(root.len()..) else {
-                continue;
-            };
-            if !tail.starts_with(b"/") || tail.len() == 1 || tail[1..].contains(&b'/') {
-                continue;
-            }
-            // Managed signature: the super options carry NOSUID|NODEV. Bind
-            // mounts report source paths from the activating fd, so the target
-            // location plus policy options identify our own exports.
-            let options = detail.split_whitespace().nth(2).unwrap_or("");
-            if !options.contains("nosuid") || !options.contains("nodev") {
-                continue;
-            }
-            names.push(OsString::from(OsStr::from_bytes(&tail[1..])));
         }
         Ok(names)
+    }
+
+    /// Decide whether a mountinfo line describes a managed egress bind directly
+    /// under `egress_root` with the NOSUID|NODEV policy, returning the child name.
+    ///
+    /// mountinfo lines split at " - " into identity and detail. `nosuid,nodev`
+    /// are **mount options** in the identity part (0-based field 5), not the
+    /// super options in the detail part (field 2) — reading super options would
+    /// miss our own mounts and leave residual binds unrecoverable (review:
+    /// mountinfo 读取字段错误导致残留挂载无法回收).
+    fn egress_bind_name_from_line(line: &str, egress_root: &Path) -> Option<OsString> {
+        let root = egress_root.as_os_str().as_bytes();
+        let (identity, _detail) = line.split_once(" - ")?;
+        let mount_point = identity.split_whitespace().nth(4)?;
+        let point = mount_point.as_bytes();
+        if !point.starts_with(root) || point.len() <= root.len() {
+            return None;
+        }
+        let tail = point.get(root.len()..)?;
+        if !tail.starts_with(b"/") || tail.len() == 1 || tail[1..].contains(&b'/') {
+            return None;
+        }
+        // Managed signature: the mount options carry NOSUID|NODEV. Bind mounts
+        // report source paths from the activating fd, so the target location
+        // plus policy options identify our own exports.
+        let options = identity.split_whitespace().nth(5).unwrap_or("");
+        if !options.contains("nosuid") || !options.contains("nodev") {
+            return None;
+        }
+        Some(OsString::from(OsStr::from_bytes(&tail[1..])))
     }
 
     /// Detach a residual workspace egress bind by path (D4 §4.4).
@@ -299,17 +310,36 @@ mod linux {
             };
             drop(fresh_target);
 
+            // 挂载已生效：后续任何校验失败都必须回滚（MNT_DETACH），否则
+            // bind 残留在 namespace 中且上层只把错误降级为 FuseOnly，挂载
+            // 无法回收（review: 挂载生效后的错误路径没有回滚）。
             if mount.source != self.source_identity {
+                self.rollback_mount();
                 return Err(errno(libc::ESTALE));
             }
             self.mount = Some(mount);
             self.activated = true;
 
             if self.inspect()?.as_ref() != Some(&mount) {
+                self.rollback_mount();
                 return Err(errno(libc::ESTALE));
             }
-            self.check_policy()?;
+            if let Err(error) = self.check_policy() {
+                self.rollback_mount();
+                return Err(error);
+            }
             Ok(())
+        }
+
+        /// Best-effort detach of a just-activated mount by its target path, and
+        /// reset the mount state so a later detach() is a no-op. Ignores errors:
+        /// rollback must not mask the original failure.
+        fn rollback_mount(&mut self) {
+            if let Ok(path) = self.target_proc_path() {
+                let _ = lazy_unmount(&path);
+            }
+            self.mount = None;
+            self.activated = false;
         }
 
         /// New mount API path: open_tree + mount_setattr + move_mount (Linux 5.2+).
@@ -339,8 +369,14 @@ mod linux {
             drop(tree);
 
             // If mount_setattr was unavailable, apply NOSUID|NODEV via remount.
-            if !policy_applied {
-                apply_policy_legacy_remount(target)?;
+            // attach_tree 成功后挂载已生效：remount 失败必须 lazy_unmount
+            // 回滚，否则 bind 残留在 namespace 中且上层只把错误降级为
+            // FuseOnly，挂载无法回收（review: 挂载生效后的错误路径没有回滚）。
+            if !policy_applied && let Err(error) = apply_policy_legacy_remount(target) {
+                if let Ok(path) = fd_proc_path(target) {
+                    let _ = lazy_unmount(&path);
+                }
+                return Err(error);
             }
 
             Ok(mount)
@@ -357,22 +393,34 @@ mod linux {
             // Legacy bind mount: mount(2) with MS_BIND.
             mount_bind(source_path.as_c_str(), target_path.as_c_str())?;
 
+            // mount_bind 成功后挂载已生效：后续任何失败都 lazy_unmount 回滚，
+            // 否则 bind 残留在 namespace 中且无法回收（review: 挂载生效后
+            // 的错误路径没有回滚）。
+            let rollback = |error: io::Error| -> io::Error {
+                let _ = lazy_unmount(target_path.as_c_str());
+                error
+            };
+
             // Make the bind private so detach cannot fail on shared peer busy (D4).
-            make_private(target_path.as_c_str())?;
+            if let Err(error) = make_private(target_path.as_c_str()) {
+                return Err(rollback(error));
+            }
 
             // Apply NOSUID|NODEV via remount: mount(2) with MS_REMOUNT.
-            mount_remount_nosuid_nodev(target_path.as_c_str())?;
+            if let Err(error) = mount_remount_nosuid_nodev(target_path.as_c_str()) {
+                return Err(rollback(error));
+            }
 
             // Re-open target to get mount identity after bind mount.
-            let target = open_child(&self.parent, &self.name)?;
-
-            Ok(MountIdentity {
+            let target = open_child(&self.parent, &self.name).map_err(rollback)?;
+            let identity = MountIdentity {
                 namespace: self.namespace,
-                mount_id: mount_id(&target)?,
-                unique_mount_id: unique_mount_id(&target)?,
-                source: directory_identity(&target)?,
+                mount_id: mount_id(&target).map_err(rollback)?,
+                unique_mount_id: unique_mount_id(&target).map_err(rollback)?,
+                source: directory_identity(&target).map_err(rollback)?,
                 covered_target: self.target_identity,
-            })
+            };
+            Ok(identity)
         }
 
         pub(in crate::node) fn detach(&mut self) -> io::Result<()> {
@@ -822,9 +870,14 @@ mod linux {
 
     /// Apply NOSUID|NODEV policy via legacy mount(2) remount on a File descriptor.
     fn apply_policy_legacy_remount(target: &File) -> io::Result<()> {
-        let path = CString::new(format!("/proc/thread-self/fd/{}", target.as_raw_fd()))
-            .map_err(|_| errno(libc::EINVAL))?;
-        mount_remount_nosuid_nodev(path.as_c_str())
+        mount_remount_nosuid_nodev(fd_proc_path(target)?.as_c_str())
+    }
+
+    /// Resolve a file descriptor to a `/proc/thread-self/fd/<fd>` path usable as
+    /// a mount(2)/umount2(2) target, keeping every operation descriptor-confined.
+    fn fd_proc_path(file: &File) -> io::Result<CString> {
+        CString::new(format!("/proc/thread-self/fd/{}", file.as_raw_fd()))
+            .map_err(|_| errno(libc::EINVAL))
     }
 
     #[allow(unsafe_code)]
@@ -1019,6 +1072,63 @@ mod linux {
             bind.detach().unwrap();
             drop(bind);
             fs::remove_dir_all(retained).unwrap();
+        }
+
+        #[test]
+        fn egress_bind_name_from_line_matches_managed_signature_only() {
+            let root = Path::new("/egress_root");
+            // 合成 mountinfo 行：identity 的第 5 个字段（0 基）是挂载选项，
+            // nosuid,nodev 位于其中；detail 的第 3 个字段是 super options。
+            let line = |mount_options: &str, super_options: &str| {
+                format!(
+                    "42 7 8:1 / {}/workspace {} - ext4 /var/lib/afs rw,relatime {}",
+                    root.display(),
+                    mount_options,
+                    super_options
+                )
+            };
+
+            // 挂载选项携带策略 → 识别为 managed bind。
+            let name = egress_bind_name_from_line(&line("rw,nosuid,nodev", "rw,relatime"), root);
+            assert_eq!(
+                name.as_deref().map(OsStr::new),
+                Some(OsStr::new("workspace"))
+            );
+
+            // 挂载选项缺策略 → 拒绝。
+            assert!(
+                egress_bind_name_from_line(&line("rw,relatime", "rw,relatime"), root).is_none()
+            );
+
+            // 策略只出现在 super options（detail 字段）而挂载选项没有 →
+            // 不是本模块创建的挂载，必须拒绝。回归 review: mountinfo 读取
+            // 字段错误导致残留挂载无法回收。
+            assert!(
+                egress_bind_name_from_line(&line("rw,relatime", "rw,nosuid,nodev"), root).is_none()
+            );
+
+            // 挂载选项与 super options 都带策略 → 识别。
+            let name =
+                egress_bind_name_from_line(&line("rw,nosuid,nodev", "rw,nosuid,nodev"), root);
+            assert_eq!(
+                name.as_deref().map(OsStr::new),
+                Some(OsStr::new("workspace"))
+            );
+
+            // 非直系子路径 /egress_root/a/b → 拒绝。
+            let nested = format!(
+                "42 7 8:1 / {}/a/b rw,nosuid,nodev - ext4 /x rw",
+                root.display()
+            );
+            assert!(egress_bind_name_from_line(&nested, root).is_none());
+
+            // 挂载点就是 egress_root 本身 → 拒绝。
+            let exact = format!("42 7 8:1 / {} rw,nosuid,nodev - ext4 /x rw", root.display());
+            assert!(egress_bind_name_from_line(&exact, root).is_none());
+
+            // 不在 egress_root 之下 → 拒绝。
+            let foreign = "42 7 8:1 / /other/workspace rw,nosuid,nodev - ext4 /x rw";
+            assert!(egress_bind_name_from_line(foreign, root).is_none());
         }
 
         #[test]

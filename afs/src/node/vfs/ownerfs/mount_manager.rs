@@ -10,8 +10,9 @@ use std::{
     ffi::OsString,
     io,
     path::PathBuf,
-    sync::{Arc, Mutex, Weak},
+    sync::{Arc, Condvar, Mutex, Weak},
     thread,
+    time::{Duration, Instant},
 };
 
 use afs_error::Result;
@@ -31,6 +32,10 @@ pub(in crate::node) struct MountManager {
 
 struct MountEntry {
     state: Mutex<MountState>,
+    /// 挂载 worker 收敛（进入 NativeActive / FuseOnly）时唤醒 detach_entry
+    /// 的等待者，消除"卸载时 worker 仍在挂载"的竞态（review: Mounting 与
+    /// 卸载竞态会泄漏 bind mount）。
+    wait: Condvar,
     root_id: RootId,
     name: OsString,
 }
@@ -86,6 +91,7 @@ impl MountManager {
                 .or_insert_with(|| {
                     Arc::new(MountEntry {
                         state: Mutex::new(MountState::FuseReady),
+                        wait: Condvar::new(),
                         root_id: root_id.clone(),
                         name: name.clone(),
                     })
@@ -116,7 +122,10 @@ impl MountManager {
     /// Called from the Node shutdown path after the FUSE session ends.
     /// Without this call, active binds keep a strong OwnerFs reference and
     /// prevent clean drop. Detach uses MNT_DETACH so a busy tree (active
-    /// container fds) cannot strand the shutdown.
+    /// container fds) cannot strand the shutdown. Still-mounting workers are
+    /// awaited up to `DETACH_MOUNTING_TIMEOUT` so their bind is detached
+    /// before teardown; a pathological timeout is covered by the next startup's
+    /// `reconcile_egress`.
     pub(in crate::node) fn shutdown(&self) {
         let entries: Vec<Arc<MountEntry>> = {
             let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
@@ -129,28 +138,44 @@ impl MountManager {
         }
     }
 
-    /// D4: 删除流程的卸载步骤——从 entries 移除该 root，detach 活跃 bind
-    /// （MNT_DETACH，不因活跃 fd 失败），再清理出口目标空目录。
+    /// D4: 删除流程的卸载步骤——detach 该 root 的活跃 bind（MNT_DETACH，
+    /// 不因活跃 fd 失败），从 entries 移除，再清理出口目标空目录。
     ///
-    /// 幂等：root_id 不在 entries 中时返回 Ok(())。detach 失败时把 entry 放回
-    /// entries 保留后续重试能力并记录日志，不阻塞删除流程；物理目录删除可能
-    /// 随后失败，由 reconcile_on_startup 在下次启动时重试。
+    /// 幂等：root_id 不在 entries 中时返回 Ok(())。若异步 worker 仍在挂载
+    /// （Mounting），detach 等待其收敛（至多 `DETACH_MOUNTING_TIMEOUT`），
+    /// **期间 entry 保持被跟踪**：worker 收敛为 NativeActive 时仍能被 detach，
+    /// 同 root 的 request_mount 也保持幂等，不会派生第二个 worker
+    /// （review: Mounting 与卸载竞态会泄漏 bind mount）。
+    /// 超时或 detach 失败时保留 entry 供后续重试并记录日志，不阻塞删除流程；
+    /// 物理目录删除可能随后失败，由 reconcile_on_startup 在下次启动时重试。
     pub(in crate::node) fn request_unmount(&self, root_id: &RootId) -> Result<()> {
         let entry = {
-            let mut entries = self.entries.lock().map_err(|_| poisoned())?;
-            entries.remove(root_id)
+            let entries = self.entries.lock().map_err(|_| poisoned())?;
+            entries.get(root_id).cloned()
         };
-        if let Some(entry) = entry {
-            if let Err(error) = Self::detach_entry(&entry) {
-                afs_logging::warn!(
-                    "ownerfs.mount_manager.detach_failed_retained";
-                    "root_id" => ?root_id, "error" => error.to_string()
-                );
-                let mut entries = self.entries.lock().map_err(|_| poisoned())?;
-                entries.insert(root_id.clone(), entry);
-            } else {
-                self.cleanup_egress_target(&entry);
+        let Some(entry) = entry else {
+            return Ok(());
+        };
+
+        if let Err(error) = Self::detach_entry(&entry) {
+            afs_logging::warn!(
+                "ownerfs.mount_manager.detach_failed_retained";
+                "root_id" => ?root_id, "error" => error.to_string()
+            );
+            return Ok(());
+        }
+
+        // 仅移除同一个 entry：若 detach 等待期间同 root 被重新创建（新 entry、
+        // 新 worker 正在挂载到同一出口目标），不能误删新建的挂载记录。
+        let removed = {
+            let mut entries = self.entries.lock().map_err(|_| poisoned())?;
+            match entries.get(root_id) {
+                Some(current) if Arc::ptr_eq(current, &entry) => entries.remove(root_id).is_some(),
+                _ => false,
             }
+        };
+        if removed {
+            self.cleanup_egress_target(&entry);
         }
         Ok(())
     }
@@ -215,22 +240,60 @@ impl MountManager {
         }
     }
 
+    /// 卸载在挂载 worker 仍处于 Mounting 时最长等待的时长。超过后返回
+    /// 超时错误：`request_unmount` 保留 entry 供重试，`shutdown` 记录日志
+    /// 并由下次启动的 reconcile_egress 兜底清理残留 bind。
+    #[cfg(target_os = "linux")]
+    const DETACH_MOUNTING_TIMEOUT: Duration = Duration::from_secs(5);
+
     #[cfg(target_os = "linux")]
     fn detach_entry(entry: &MountEntry) -> io::Result<()> {
+        Self::detach_entry_with_timeout(entry, Self::DETACH_MOUNTING_TIMEOUT)
+    }
+
+    /// detach 活跃 bind；entry 仍在挂载（Mounting）时等待 worker 收敛后再
+    /// 处理，而不是对 Mounting 直接返回成功——否则 worker 随后写入
+    /// NativeActive，而该 entry 已从 entries 移除，bind 残留且无法再卸载
+    /// （review: Mounting 与卸载竞态会泄漏 bind mount）。
+    ///
+    /// 等待以 `timeout` 为上限：worker 收敛为 NativeActive 则 detach 并转为
+    /// FuseOnly；收敛为 FuseOnly 则无事可做；超时返回 Err 让调用方保留 entry
+    /// 重试。`timeout` 参数化以便测试覆盖等待与超时两条路径。
+    #[cfg(target_os = "linux")]
+    fn detach_entry_with_timeout(entry: &MountEntry, timeout: Duration) -> io::Result<()> {
         let mut state = entry
             .state
             .lock()
             .map_err(|_| io::Error::other("mount entry state poisoned"))?;
-        if let MountState::NativeActive { bind } = &mut *state {
-            let result = bind.detach();
-            if result.is_ok() {
-                *state = MountState::FuseOnly {
-                    reason: "detached for teardown".to_string(),
-                };
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let MountState::NativeActive { bind } = &mut *state {
+                let result = bind.detach();
+                if result.is_ok() {
+                    *state = MountState::FuseOnly {
+                        reason: "detached for teardown".to_string(),
+                    };
+                }
+                return result;
             }
-            result
-        } else {
-            Ok(())
+            match &*state {
+                // 等待挂载 worker 收敛（spawn_mount_worker 失败路径或
+                // mount_worker_loop 结束块都会 notify_all）。
+                MountState::Mounting => {}
+                _ => return Ok(()),
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "mount worker did not settle before unmount timeout",
+                ));
+            }
+            let (new_state, _wait_result) = entry
+                .wait
+                .wait_timeout(state, remaining)
+                .map_err(|_| io::Error::other("mount entry state poisoned"))?;
+            state = new_state;
         }
     }
 
@@ -318,6 +381,8 @@ impl MountManager {
                 };
             }
         }
+        // 唤醒可能正等待本 worker 收敛的 detach_entry（Mounting → 卸载竞态）。
+        entry.wait.notify_all();
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -343,6 +408,8 @@ impl MountManager {
             }
         }
         *state = MountState::FuseOnly { reason };
+        // 唤醒可能正等待 worker 收敛的 detach_entry。
+        entry.wait.notify_all();
     }
 }
 
@@ -507,6 +574,123 @@ mod tests {
     fn reconcile_egress_without_egress_root_is_a_no_op() {
         let manager = MountManager::new(None);
         manager.reconcile_egress(&HashSet::new()).unwrap();
+        assert!(manager.entries.lock().unwrap().is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn detach_entry_waits_for_mounting_worker_to_settle() {
+        let manager = MountManager::new(None);
+        manager
+            .request_mount(root_id("agent1"), OsString::from("agent1"))
+            .unwrap();
+        let entry = manager
+            .entries
+            .lock()
+            .unwrap()
+            .get(&root_id("agent1"))
+            .unwrap()
+            .clone();
+        // 手工回到 Mounting，模拟异步 worker 正在挂载。
+        {
+            let mut state = entry.state.lock().unwrap();
+            *state = MountState::Mounting;
+        }
+
+        // 模拟挂载 worker 稍后收敛（如 bind 失败回退 FuseOnly）。
+        let settling_entry = entry.clone();
+        let settle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            MountManager::set_fuse_only(&settling_entry, "simulated worker settle");
+        });
+
+        let start = Instant::now();
+        let result = MountManager::detach_entry_with_timeout(&entry, Duration::from_secs(5));
+        settle.join().unwrap();
+        // detach 必须等到 worker 收敛，而不是对 Mounting 直接返回成功。
+        assert!(result.is_ok(), "unexpected detach failure: {result:?}");
+        assert!(
+            start.elapsed() >= Duration::from_millis(30),
+            "detach returned before the mounting worker settled"
+        );
+        assert!(matches!(
+            *entry.state.lock().unwrap(),
+            MountState::FuseOnly { .. }
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn detach_entry_times_out_while_worker_still_mounting() {
+        let manager = MountManager::new(None);
+        manager
+            .request_mount(root_id("agent1"), OsString::from("agent1"))
+            .unwrap();
+        let entry = manager
+            .entries
+            .lock()
+            .unwrap()
+            .get(&root_id("agent1"))
+            .unwrap()
+            .clone();
+        {
+            let mut state = entry.state.lock().unwrap();
+            *state = MountState::Mounting;
+        }
+
+        // 没有 worker 会收敛：detach 必须超时返回 Err，而不是假装成功。
+        let err =
+            MountManager::detach_entry_with_timeout(&entry, Duration::from_millis(50)).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        // 状态保持 Mounting：request_unmount 会保留 entry 供后续重试。
+        assert!(matches!(*entry.state.lock().unwrap(), MountState::Mounting));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn request_unmount_keeps_entry_tracked_while_worker_mounting() {
+        let manager = Arc::new(MountManager::new(None));
+        manager
+            .request_mount(root_id("agent1"), OsString::from("agent1"))
+            .unwrap();
+        let entry = manager
+            .entries
+            .lock()
+            .unwrap()
+            .get(&root_id("agent1"))
+            .unwrap()
+            .clone();
+        // 手工回到 Mounting，模拟异步 worker 正在挂载。
+        {
+            let mut state = entry.state.lock().unwrap();
+            *state = MountState::Mounting;
+        }
+
+        // 观察者：在 detach 等待期间确认 entry 仍被跟踪，然后让 worker 收敛。
+        let observer = {
+            let manager = manager.clone();
+            let root_id = root_id("agent1");
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                let tracked = manager.entries.lock().unwrap().contains_key(&root_id);
+                assert!(
+                    tracked,
+                    "entry must stay tracked while the mount worker is awaited"
+                );
+                let entry = manager
+                    .entries
+                    .lock()
+                    .unwrap()
+                    .get(&root_id)
+                    .unwrap()
+                    .clone();
+                MountManager::set_fuse_only(&entry, "settle for unmount");
+            })
+        };
+
+        manager.request_unmount(&root_id("agent1")).unwrap();
+        observer.join().unwrap();
+        // 卸载完成：entry 已收敛并被移除。
         assert!(manager.entries.lock().unwrap().is_empty());
     }
 
