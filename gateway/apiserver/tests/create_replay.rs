@@ -23,6 +23,7 @@ struct State {
     block_response: AtomicBool,
     pending_response: AtomicBool,
     deadlines: Mutex<Vec<u64>>,
+    timeout_phase: Mutex<Option<String>>,
     release: Notify,
 }
 #[derive(Clone)]
@@ -50,6 +51,7 @@ service_impl!(pb::coordinator_service_server::CoordinatorService, {
         Ok(Response::new(owner))
     }
     async fn create_environment(&self, request: Request<pb::CreateEnvironmentRequest>) -> Result<Response<pb::EnvironmentResult>, Status> {
+        let deadline = request.get_ref().create_deadline_unix_millis;
         self.0.deadlines.lock().unwrap().push(request.get_ref().create_deadline_unix_millis);
         self.0.create_calls.fetch_add(1, Ordering::SeqCst);
         let spec = request.into_inner().spec.unwrap();
@@ -79,6 +81,25 @@ assignment: Some(pb::Assignment { environment_id: spec.id.clone(), node_id: "nod
         };
         if self.0.block_response.load(Ordering::SeqCst) {
             self.0.release.notified().await;
+        }
+        let phase = self.0.timeout_phase.lock().unwrap().clone();
+        if let Some(phase) = phase {
+            let deadline = adx_transport::deadline::Deadline::from_unix_millis(deadline).unwrap();
+            tokio::time::sleep_until(deadline.instant()).await;
+            // The actual failed result reaches the caller after the business
+            // deadline, rather than being masked by a transport timer.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let message = format!("create deadline exceeded during {phase}");
+            let mut failed = record.clone();
+            failed.state = pb::EnvironmentState::Failed as i32;
+            failed.resources_held = false;
+            failed.failure = Some(Box::new(adx_core::RuntimeFailure {
+                reason: adx_core::RuntimeFailureReason::DeadlineExceeded,
+                message: message.clone(), exit_code: None, probe_failure: None,
+            }.into()));
+            let id = failed.spec.as_ref().unwrap().id.clone();
+            self.0.owners.lock().unwrap().get_mut(&id).unwrap().record = Some(failed);
+            return Err(adx_protocol::status(adx_core::Error::DeadlineExceeded(message)));
         }
         let error = tonic::Code::from_i32(self.0.response_error.load(Ordering::SeqCst) as i32);
         if error != tonic::Code::Ok {
@@ -123,6 +144,7 @@ impl pb::environment_directory_service_server::EnvironmentDirectoryService for S
 use futures_util::StreamExt;
 struct Fixture {
     service: Arc<EnvironmentService>,
+    clients: Arc<Clients>,
     state: Arc<State>,
     server: tokio::task::JoinHandle<()>,
 }
@@ -155,7 +177,8 @@ impl Fixture {
             "rpc_timeout_seconds":2, "cache_entries":1, "auth_cache_ttl_seconds":1,
             "create_unknown_retention_seconds":retention
         })).unwrap();
-        let service = EnvironmentService::new(Clients::new(config).unwrap());
+        let clients = Clients::new(config).unwrap();
+        let service = EnvironmentService::new(clients.clone());
         tokio::time::timeout(Duration::from_secs(3), async {
             while service.inspect("tenant", "not-created").await.is_err() {
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -165,6 +188,7 @@ impl Fixture {
         .unwrap();
         Self {
             service,
+            clients,
             state,
             server,
         }
@@ -199,6 +223,52 @@ fn caller() -> pb::CallerContext {
         tenant_id: "tenant".into(),
         administrator: false,
     }
+}
+
+#[tokio::test]
+async fn confirmed_timeout_survives_rpc_timers_and_replay() {
+    let phase = "backend preparation/runtime start";
+    let fixture = Fixture::new().await;
+    *fixture.state.timeout_phase.lock().unwrap() = Some(phase.into());
+    let input = json!({"name":"phase-timeout", "createTimeoutSeconds":35, "scheduleTimeoutSeconds":1, "initCallTimeoutSeconds":1});
+    let start = tokio::time::Instant::now();
+    let error = Box::pin(fixture.service.create(
+        spec("phase-timeout"),
+        input.clone(),
+        "create-phase",
+        &caller(),
+    ))
+    .await
+    .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::DeadlineExceeded, "{error:?}");
+    assert!(error.message().contains(phase), "{error:?}");
+    assert!(adx_protocol::deadline_failure(&error).is_some());
+    assert!(start.elapsed() >= Duration::from_secs(35));
+    assert!(start.elapsed() < Duration::from_secs(38));
+    let replay = Box::pin(fixture.service.create(
+        spec("phase-timeout"),
+        input.clone(),
+        "create-phase",
+        &caller(),
+    ))
+    .await
+    .unwrap_err();
+    assert_eq!(replay.message(), error.message());
+    // A different request ID must recover the same persisted failure too.
+    let published = fixture.state.owners.lock().unwrap()["phase-timeout"].clone();
+    fixture.clients.put_owner(published).await.unwrap();
+    let replay = Box::pin(fixture.service.create(
+        spec("phase-timeout"),
+        input,
+        "create-other",
+        &caller(),
+    ))
+    .await
+    .unwrap_err();
+    assert_eq!(replay.message(), error.message());
+    assert!(adx_protocol::deadline_failure(&replay).is_some());
+    assert_eq!(fixture.state.starts.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.state.create_calls.load(Ordering::SeqCst), 1);
 }
 #[tokio::test]
 async fn completed_cache_capacity_never_rejects_new_creates() {

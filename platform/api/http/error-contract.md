@@ -58,14 +58,33 @@ SSE 创建的 `final` 事件保留 `errorCode` 数值字段，并携带同一个
 | `RESOURCE_EXHAUSTED` | `ResourceExhausted` | 429 | `after_backoff` | `not_started` | 准入、队列或资源暂时不足 |
 | `UNSUPPORTED` | `Unimplemented` | 501 | `never` | `not_started` | 当前版本不提供该能力 |
 | `UNAVAILABLE` | `Unavailable` | 503 | `after_backoff` | `not_started` | 请求尚未进入执行边界，下游暂不可用 |
-| `DEADLINE_EXCEEDED` | `DeadlineExceeded` | 504 | `same_operation` | `not_started` | 服务端确认操作尚未执行，例如中心队列在 Assignment 前过期 |
-| `OUTCOME_UNKNOWN` | `Cancelled`、`Unknown`、`DeadlineExceeded`、`Unavailable`、`Internal` | 500、503、504 | `same_operation` | `unknown` | 写请求已越过执行边界，但最终应答未确认 |
+| `DEADLINE_EXCEEDED` | `DeadlineExceeded` | 504 | `never` / `same_operation` | `terminal` / `not_started` / `unknown` | 节点确认创建超时失败时为 terminal/never；单纯等待超时保留原身份查询或重试 |
+| `OUTCOME_UNKNOWN` | `Cancelled`、`Unknown`、`Unavailable`、`Internal` | 500、503 | `same_operation` | `unknown` | 写请求已越过执行边界，但最终应答未确认 |
 | `DATA_LOSS` | `DataLoss` | 500 | `never` | `terminal` | 权威记录不完整、身份不一致或持久化数据损坏 |
 | `INTERNAL` | 其他未分类状态 | 500 | `after_backoff` | `not_started` | 服务端在进入执行边界前失败；必须记录日志并补充明确分类 |
 
 同一个 gRPC 状态可能映射成不同稳定码。例如 `Unavailable` 在写请求尚未提交时是 `UNAVAILABLE`，在 Adxlet 已经接受创建或生命周期操作后是 `OUTCOME_UNKNOWN`。API Server 根据请求是否越过执行边界作出映射；SDK 不重新猜测。
 
-内部 RPC 的连接拒绝、连接重置等传输不可用返回 HTTP 503。Tonic 在握手或重连期间将部分连接重置报告为 `Unknown / transport error` 或带有传输来源的 `Cancelled`；API Server 仅在错误来源链包含 `tonic::transport::Error` 时归一为 `Unavailable`，不会把应用返回的 `Unknown`、`Cancelled` 或 `Internal` 一律改成 503。RPC 超时仍返回 504。写请求的结果可能未知，重试必须沿用原 Request ID、Operation ID、Environment ID 和归属代次；连接失败不能作为释放归属或换 ID 重建的依据。
+内部 RPC 的连接拒绝、连接重置等传输不可用返回 HTTP 503。Tonic 在握手或重连期间将部分连接重置报告为 `Unknown / transport error` 或带有传输来源的 `Cancelled`；API Server 仅在错误来源链包含 `tonic::transport::Error` 时归一为 `Unavailable`，不会把应用返回的 `Unknown`、`Cancelled` 或 `Internal` 一律改成 503。RPC 超时归一为 504、`DEADLINE_EXCEEDED`；只有等待超时而没有确认终态时，仍使用 `outcome=unknown`、`retry=same_operation`。写请求的结果可能未知，重试必须沿用原 Request ID、Operation ID、Environment ID 和归属代次；连接失败不能作为释放归属或换 ID 重建的依据。
+
+### 创建超时阶段
+
+创建超时使用 HTTP 504 和 `DEADLINE_EXCEEDED`。节点确认该创建已失败时，返回
+`retry=never`、`outcome=terminal`；`message` 指明 `backend preparation/runtime start`、
+`Execd readiness` 或 `route activation`，不增加公开 `stage` 字段。后端准备和运行时启动
+属于同一次 sandboxd Start，当前接口不能细分镜像下载与运行时启动内部阶段。
+相同 Request ID 重放或查询后重放保留该失败原因，不重新启动原执行。
+工作负载配置了 readiness probe 时，保留下文既有 `ProbeFailure` 契约。
+
+API Server、Coordinator 和入口节点为创建错误回传预留最多 3 秒；节点失败状态发布
+最多使用其中 1 秒。请求携带的绝对创建截止时间保持不变，后端启动、就绪等待和
+路由激活均仍受原截止时间限制。该窗口不延长业务执行预算，也不等待物理清理。
+失败控制器继续按既有对账路径清理资源。若此窗口仍未收到节点结果，错误文案说明
+等待调度/节点初始化结果超时，`outcome=unknown`，不猜测某个底层步骤已完成。
+断连、应答丢失等无法确认的结果继续使用 `OUTCOME_UNKNOWN`。
+节点已判定超时，但失败记录未确认写入权威存储或本地持久日志时，同样返回
+`DEADLINE_EXCEEDED` 和原阶段文案，附带发布未确认说明；此时使用
+`outcome=unknown`、`retry=same_operation`，由后续对账补写，不能宣称已确认终态。
 
 ### 创建重放缓存
 

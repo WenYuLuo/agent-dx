@@ -1160,7 +1160,7 @@ components:
       additionalProperties: false
       required: [reason, exit_code, message]
       properties:
-        reason: {type: string, enum: [OomKilled, Exited, Missing, ProbeFailed]}
+        reason: {type: string, enum: [OomKilled, Exited, Missing, ProbeFailed, DeadlineExceeded]}
         exit_code: {type: [integer, "null"], format: int32}
         message: {type: string}
         probe_failure: {$ref: "#/components/schemas/ProbeFailure"}

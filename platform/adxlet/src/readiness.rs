@@ -139,6 +139,6 @@ impl Readiness for ExecdReadiness {
             }
         })
         .await
-        .map_err(|_| unavailable("deadline exceeded"))?
+        .map_err(|_| Error::DeadlineExceeded("Execd readiness deadline exceeded".into()))?
     }
 }

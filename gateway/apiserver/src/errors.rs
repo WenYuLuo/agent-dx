@@ -27,7 +27,14 @@ impl<'a> ErrorDetail<'a> {
     ) -> Self {
         let probe_failure =
             serde_json::from_slice::<adx_core::probes::ProbeFailure>(status.details()).ok();
-        let (code, retry, outcome) = if probe_failure.is_some() {
+        let terminal_deadline = adx_protocol::deadline_failure(status).is_some();
+        let (code, retry, outcome) = if terminal_deadline {
+            (
+                ErrorCode::DeadlineExceeded,
+                RetryDirective::Never,
+                OperationOutcome::Terminal,
+            )
+        } else if probe_failure.is_some() {
             (
                 ErrorCode::Unavailable,
                 RetryDirective::Never,
@@ -70,10 +77,14 @@ impl<'a> ErrorDetail<'a> {
                     RetryDirective::Never,
                     OperationOutcome::NotStarted,
                 ),
-                Code::DeadlineExceeded if !execution_may_have_started => (
+                Code::DeadlineExceeded => (
                     ErrorCode::DeadlineExceeded,
                     RetryDirective::SameOperation,
-                    OperationOutcome::NotStarted,
+                    if execution_may_have_started {
+                        OperationOutcome::Unknown
+                    } else {
+                        OperationOutcome::NotStarted
+                    },
                 ),
                 Code::Unavailable if !execution_may_have_started => (
                     ErrorCode::Unavailable,
@@ -85,11 +96,7 @@ impl<'a> ErrorDetail<'a> {
                     RetryDirective::Never,
                     OperationOutcome::Terminal,
                 ),
-                Code::Cancelled
-                | Code::Unknown
-                | Code::DeadlineExceeded
-                | Code::Unavailable
-                | Code::Internal
+                Code::Cancelled | Code::Unknown | Code::Unavailable | Code::Internal
                     if execution_may_have_started =>
                 {
                     (
@@ -160,6 +167,35 @@ mod tests {
     }
 
     #[test]
+    fn deadline_after_submission_retains_timeout_classification() {
+        let detail = ErrorDetail::from_status(
+            &Status::deadline_exceeded("create deadline exceeded during node initialization"),
+            "create-a",
+            None,
+            Some("env-a"),
+            true,
+        );
+        assert_eq!(detail.code, ErrorCode::DeadlineExceeded);
+        // A transport wait timeout alone does not establish a terminal result.
+        assert_eq!(detail.outcome, OperationOutcome::Unknown);
+        assert_eq!(detail.retry, RetryDirective::SameOperation);
+    }
+
+    #[test]
+    fn confirmed_create_timeout_is_terminal_and_preserves_its_message() {
+        let status = adx_protocol::status(adx_core::Error::DeadlineExceeded(
+            "create deadline exceeded during backend preparation/runtime start".into(),
+        ));
+        let detail = ErrorDetail::from_status(&status, "create-a", None, Some("env-a"), true);
+        assert_eq!(detail.code, ErrorCode::DeadlineExceeded);
+        assert_eq!(detail.retry, RetryDirective::Never);
+        assert_eq!(detail.outcome, OperationOutcome::Terminal);
+        assert!(status
+            .message()
+            .contains("backend preparation/runtime start"));
+    }
+
+    #[test]
     fn unavailable_before_submission_uses_backoff() {
         let detail = ErrorDetail::from_status(
             &Status::unavailable("dependency unavailable"),
@@ -191,7 +227,7 @@ mod tests {
             (Code::DataLoss, false, "DATA_LOSS"),
             (Code::Internal, false, "INTERNAL"),
             (Code::Unavailable, true, "OUTCOME_UNKNOWN"),
-            (Code::DeadlineExceeded, true, "OUTCOME_UNKNOWN"),
+            (Code::DeadlineExceeded, true, "DEADLINE_EXCEEDED"),
             (Code::Cancelled, true, "OUTCOME_UNKNOWN"),
             (Code::Unknown, true, "OUTCOME_UNKNOWN"),
             (Code::Internal, true, "OUTCOME_UNKNOWN"),

@@ -27,6 +27,10 @@ pub enum Error {
     NotFound,
     #[error("dependency unavailable: {0}")]
     Unavailable(String),
+    #[error("deadline exceeded: {0}")]
+    DeadlineExceeded(String),
+    #[error("response deadline exceeded: {0}")]
+    ResponseTimeout(String),
     #[error("workload probe failed: {0:?}")]
     ProbeFailed(probes::ProbeFailure),
 }
@@ -267,6 +271,7 @@ pub enum RuntimeFailureReason {
     Exited,
     Missing,
     ProbeFailed,
+    DeadlineExceeded,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

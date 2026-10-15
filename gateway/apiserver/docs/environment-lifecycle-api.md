@@ -154,7 +154,15 @@ result; an existing terminal Failed result is not restarted by create replay.
 Clock synchronization is required across processes. Deploy API Server, Coordinator
 and Adxlet together for this internal protocol change. Cleanup and late-runtime
 reconciliation may continue after caller deadline expiry. The default remains
-90 seconds for create and 30 seconds for central scheduling. User commands use the separate EXECD HTTP data path.
+90 seconds for create and 30 seconds for central scheduling. Create responses may
+use up to three additional seconds solely to report a deadline failure; backend
+execution keeps the original absolute deadline. Confirmed failed creates return
+HTTP 504 / `DEADLINE_EXCEEDED`, `retry=never`, `outcome=terminal`, with the phase
+in `message` (backend preparation/runtime start, Execd readiness, or route
+activation). Query and replay retain the failure message. Transport wait expiry
+uses the same timeout code with `outcome=unknown` / `retry=same_operation`;
+disconnections and lost replies retain `OUTCOME_UNKNOWN`. User commands use the
+separate EXECD HTTP data path.
 
 For snapshot creation, omitted/zero resource values inherit the source. Positive CPU/memory/disk values must equal its resource geometry; restoring with larger limits or resizing is rejected. This applies to the new Rust resolver even though the HTTP handler can encode positive overrides.
 

@@ -129,6 +129,7 @@ impl Clients {
         request: pb::CreateEnvironmentRequest,
         budget: Duration,
     ) -> Result<pb::EnvironmentResult, Status> {
+        let budget = adx_transport::deadline::create_response_timeout(budget);
         if request.expected_assignment.is_none()
             && self.config.create_mode == crate::config::CreateMode::LocalFirst
         {
@@ -275,7 +276,11 @@ impl Clients {
             .run_result(async {
                 tokio::time::timeout(timeout, future)
                     .await
-                    .map_err(|_| Status::deadline_exceeded("control RPC deadline exceeded"))?
+                    .map_err(|_| {
+                        Status::deadline_exceeded(format!(
+                            "{name}: control RPC response deadline exceeded"
+                        ))
+                    })?
                     .map_err(normalize_rpc_error)
                     .map(Response::into_inner)
             })
@@ -379,16 +384,28 @@ fn normalize_rpc_error(status: Status) -> Status {
         return status;
     }
     let mut source = std::error::Error::source(&status);
+    let mut transport = false;
     while let Some(error) = source {
-        if error.is::<tonic::transport::Error>() {
+        if error.is::<tonic::TimeoutExpired>() {
             return Status::with_details_and_metadata(
-                Code::Unavailable,
-                status.message(),
+                Code::DeadlineExceeded,
+                "control RPC response deadline exceeded",
                 Bytes::copy_from_slice(status.details()),
                 status.metadata().clone(),
             );
         }
+        if error.is::<tonic::transport::Error>() {
+            transport = true;
+        }
         source = error.source();
+    }
+    if transport {
+        return Status::with_details_and_metadata(
+            Code::Unavailable,
+            status.message(),
+            Bytes::copy_from_slice(status.details()),
+            status.metadata().clone(),
+        );
     }
     status
 }
@@ -530,6 +547,16 @@ mod tests {
             assert_eq!(normalized.code(), original.code());
             assert_eq!(normalized.message(), original.message());
         }
+    }
+
+    #[test]
+    fn tonic_timeout_is_a_deadline_not_a_disconnect() {
+        let original = Status::from_error(Box::new(tonic::TimeoutExpired(())));
+        assert_eq!(original.code(), Code::Cancelled);
+        let normalized = normalize_rpc_error(original);
+        assert_eq!(normalized.code(), Code::DeadlineExceeded);
+        assert!(normalized.message().contains("response deadline exceeded"));
+        assert!(adx_protocol::deadline_failure(&normalized).is_none());
     }
 
     #[tokio::test]

@@ -76,7 +76,7 @@ def run(connection, image, output, ca, admin_key, *, queue_reader=pending_ids, c
                 except EnvironmentError as error:
                     deadline_contract_invalid = (
                         'central scheduling queue deadline exceeded' not in str(error)
-                        or error.code != 'OUTCOME_UNKNOWN'
+                        or error.code != 'DEADLINE_EXCEEDED'
                         or error.retry != 'same_operation'
                         or error.outcome != 'unknown'
                         or error.environment_id != instance_id
