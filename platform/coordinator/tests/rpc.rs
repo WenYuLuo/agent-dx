@@ -169,6 +169,30 @@ impl RuntimeDriver for Backend {
         let allocation = self.session.get(&spec.id).await?;
         assert_eq!(allocation.assignment.generation, generation);
         assert_eq!(allocation.spec, *spec);
+        // Validate public HTTP input at the execution boundary, before deletion
+        // retires its authoritative record.
+        match spec.id.as_str() {
+            "t-http-case" => {
+                assert_eq!(spec.tenant_id, "tenant");
+                assert_eq!(spec.env["USER_VALUE"], "propagated");
+            }
+            "t-http-peer" => assert_eq!(spec.scheduling.labels["app"], "db"),
+            "t-http-affinity" => {
+                assert_eq!(spec.scheduling.placement_groups.len(), 3);
+                assert!(spec.scheduling.placement_groups.iter().any(|g| g.ordered));
+                assert!(spec
+                    .scheduling
+                    .placement_groups
+                    .iter()
+                    .any(|g| g.required && g.terms.len() == 2));
+                assert!(spec
+                    .scheduling
+                    .placement_groups
+                    .iter()
+                    .any(|g| g.anti && g.terms[0].weight == 7));
+            }
+            _ => (),
+        }
         self.started.fetch_add(1, Ordering::SeqCst);
         self.running.lock().unwrap().insert(id.into());
         Ok("10.0.0.2".parse().unwrap())
@@ -765,31 +789,12 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
             "{}",
             String::from_utf8_lossy(&result.stderr)
         );
-        let record = session.get("t-http-case").await.unwrap();
-        assert_eq!(record.spec.tenant_id, "tenant");
-        assert_eq!(record.spec.env["USER_VALUE"], "propagated");
-        let peer = session.get("t-http-peer").await.unwrap();
-        assert_eq!(peer.spec.scheduling.labels["app"], "db");
-        let client = session.get("t-http-affinity").await.unwrap();
-        assert_eq!(client.spec.scheduling.placement_groups.len(), 3);
-        assert!(client
-            .spec
-            .scheduling
-            .placement_groups
-            .iter()
-            .any(|g| g.ordered));
-        assert!(client
-            .spec
-            .scheduling
-            .placement_groups
-            .iter()
-            .any(|g| g.required && g.terms.len() == 2));
-        assert!(client
-            .spec
-            .scheduling
-            .placement_groups
-            .iter()
-            .any(|g| g.anti && g.terms[0].weight == 7));
+        for id in ["t-http-case", "t-http-peer", "t-http-affinity"] {
+            assert!(matches!(
+                session.get(id).await,
+                Err(adx_core::Error::NotFound)
+            ));
+        }
         assert!(backend.running.lock().unwrap().is_empty());
         assert!(session
             .snapshot()
