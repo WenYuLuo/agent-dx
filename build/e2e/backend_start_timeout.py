@@ -8,12 +8,34 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 from pathlib import Path
+import shutil
 import subprocess
 import time
 import uuid
 
 import httpx
+
+
+DOCKER = shutil.which('docker')
+if DOCKER is None:
+    raise RuntimeError('docker executable is required')
+DOCKER = str(Path(DOCKER).resolve())
+
+
+def require(condition: bool, detail: object) -> None:
+    if not condition:
+        raise AssertionError(detail)
+
+
+def response_field(value: dict, *keys):
+    try:
+        for key in keys:
+            value = value[key]
+    except (KeyError, TypeError, IndexError) as error:
+        raise RuntimeError(f'missing required response field: {keys}') from error
+    return value
 
 
 TLS_SERVER = r'''
@@ -80,7 +102,7 @@ os.execv('/usr/local/bin/runc.backend-timeout-real', sys.argv)
 
 
 def docker(container: str, script: str, *, detached: bool = False) -> str:
-    args = ['docker', 'exec'] + (['-d'] if detached else ['-i'])
+    args = [DOCKER, 'exec'] + (['-d'] if detached else ['-i'])
     args += [container, 'python3', '-c', script]
     return subprocess.check_output(args, text=True)
 
@@ -127,7 +149,7 @@ if original.exists():
     original.replace(binary)
 print(hashlib.sha256(binary.read_bytes()).hexdigest())
 '''
-    assert docker(container, restore).strip() == digest, 'runc restoration checksum mismatch'
+    require(docker(container, restore).strip() == digest, 'runc restoration checksum mismatch')
 
 
 def create(client: httpx.Client, body: dict, request_id: str, sse: bool) -> dict:
@@ -139,7 +161,7 @@ def create(client: httpx.Client, body: dict, request_id: str, sse: bool) -> dict
     if sse:
         finals = [json.loads(block.split('data: ', 1)[1]) for block in response.text.split('\n\n')
                   if block.startswith('event: final\n')]
-        assert len(finals) == 1, response.text
+        require(len(finals) == 1, response.text)
         value = finals[0]
         status = value.get('errorCode', response.status_code)
     else:
@@ -149,11 +171,12 @@ def create(client: httpx.Client, body: dict, request_id: str, sse: bool) -> dict
 
 
 def assert_timeout(result: dict, stage: str, budget: int) -> None:
-    assert result['status'] == 504, result
-    error = result['body']['error']
-    assert (error['code'], error['retry'], error['outcome']) == ('DEADLINE_EXCEEDED', 'never', 'terminal'), result
-    assert stage in result['body']['message'], result
-    assert result['seconds'] < budget - 10, result
+    require(response_field(result, 'status') == 504, result)
+    error = response_field(result, 'body', 'error')
+    semantics = tuple(response_field(error, key) for key in ('code', 'retry', 'outcome'))
+    require(semantics == ('DEADLINE_EXCEEDED', 'never', 'terminal'), result)
+    require(stage in response_field(result, 'body', 'message'), result)
+    require(response_field(result, 'seconds') < budget - 10, result)
 
 
 def run_case(args: argparse.Namespace, client: httpx.Client, stage: str, sse: bool, digest: str) -> dict:
@@ -178,14 +201,14 @@ def run_case(args: argparse.Namespace, client: httpx.Client, stage: str, sse: bo
         if stage == 'runtime start':
             claimed = json.loads(docker(args.container,
                 "from pathlib import Path; print(Path('/tmp/adx-backend-timeout/claimed.json').read_text())"))
-            result['injected_pid'] = claimed['pid']
+            result['injected_pid'] = response_field(claimed, 'pid')
         # Both original-request replay and authoritative failed-record replay
         # must retain the exact internal phase without issuing another Start.
         for replay_id in [request_id, 'create-' + str(uuid.uuid4())]:
             replay = create(client, body, replay_id, sse)
             assert_timeout(replay, stage, args.budget)
-            assert replay['body']['message'] == result['body']['message'], replay
-            assert replay['seconds'] < 3, replay
+            require(response_field(replay, 'body', 'message') == response_field(result, 'body', 'message'), replay)
+            require(response_field(replay, 'seconds') < 3, replay)
     except Exception as error:
         failure = error
         result['failure'] = str(error)
@@ -199,7 +222,7 @@ def run_case(args: argparse.Namespace, client: httpx.Client, stage: str, sse: bo
         try:
             deletion = client.delete(f'/api/environment/v1/environments/{environment_id}')
             result['delete_status'] = deletion.status_code
-            assert deletion.status_code in (200, 404), deletion.text
+            require(deletion.status_code in (200, 404), deletion.text)
         except Exception as error:
             cleanup_errors.append(str(error))
         result['cleanup_errors'] = cleanup_errors
@@ -207,14 +230,15 @@ def run_case(args: argparse.Namespace, client: httpx.Client, stage: str, sse: bo
         if cleanup_errors and failure is None:
             raise RuntimeError('; '.join(cleanup_errors))
     if stage == 'runtime start':
+        injected_pid = response_field(claimed, 'pid')
         for _ in range(50):
-            alive = docker(args.container, f"from pathlib import Path; print(Path('/proc/{claimed['pid']}').exists())")
+            alive = docker(args.container, f"from pathlib import Path; print(Path('/proc/{injected_pid}').exists())")
             if alive.strip() == 'False':
                 break
             time.sleep(.1)
         else:
             raise AssertionError('injected runtime process outlived rollback')
-    print(json.dumps(result), flush=True)
+    logging.info('%s', json.dumps(result))
     return result
 
 
@@ -229,24 +253,26 @@ def rejected_image(args: argparse.Namespace, client: httpx.Client, kind: str, ss
                        'imageurl': f'image-timeout.test:5052/{kind}:latest'},
             'createTimeoutSeconds': args.budget, 'scheduleTimeoutSeconds': 1,
             'inheritEntrypoint': False, 'failover': False, 'lifecycle': 'detached'}
+    status, code = expected.get(kind, (None, None))
+    require(status is not None, f'unknown registry rejection kind: {kind}')
     result = {}
     try:
         result = create(client, body, 'create-' + str(uuid.uuid4()), sse)
         result.update(kind=kind, sse=sse)
-        assert result['status'] == expected[kind][0], result
-        assert result['body']['error']['code'] == expected[kind][1], result
-        assert result['body']['error']['retry'] == 'never', result
+        require(response_field(result, 'status') == status, result)
+        require(response_field(result, 'body', 'error', 'code') == code, result)
+        require(response_field(result, 'body', 'error', 'retry') == 'never', result)
         if kind == 'limited':
-            assert result['body']['error']['outcome'] == 'terminal', result
-        assert 'controlled image ' + kind in result['body']['message'], result
-        assert 'image pull' in result['body']['message'], result
-        assert result['seconds'] < args.budget - 10, result
-        print(json.dumps(result), flush=True)
+            require(response_field(result, 'body', 'error', 'outcome') == 'terminal', result)
+        require('controlled image ' + kind in response_field(result, 'body', 'message'), result)
+        require('image pull' in response_field(result, 'body', 'message'), result)
+        require(response_field(result, 'seconds') < args.budget - 10, result)
+        logging.info('%s', json.dumps(result))
         return result
     finally:
         (args.evidence / (name + '.json')).write_text(json.dumps(result, indent=2))
         deletion = client.delete(f'/api/environment/v1/environments/default-{name}')
-        assert deletion.status_code in (200, 404), deletion.text
+        require(deletion.status_code in (200, 404), deletion.text)
 
 
 def healthy_create(args: argparse.Namespace, client: httpx.Client) -> dict:
@@ -258,14 +284,15 @@ def healthy_create(args: argparse.Namespace, client: httpx.Client) -> dict:
             'lifecycle': 'detached', 'idleTimeoutSeconds': 300, 'idleAction': 'delete'}
     try:
         result = create(client, body, 'create-' + str(uuid.uuid4()), False)
-        assert result['status'] == 200, result
+        require(response_field(result, 'status') == 200, result)
         return result
     finally:
         response = client.delete(f'/api/environment/v1/environments/default-{name}')
-        assert response.status_code in (200, 404), response.text
+        require(response.status_code in (200, 404), response.text)
 
 
 def main() -> None:
+    logging.basicConfig(level=logging.INFO, format='%(message)s')
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--container', required=True)
     parser.add_argument('--api-url', required=True)
@@ -274,10 +301,10 @@ def main() -> None:
     parser.add_argument('--budget', type=int, default=180)
     parser.add_argument('--evidence', type=Path, required=True)
     args = parser.parse_args()
-    assert args.budget >= 90, 'budget must leave room beyond internal TLS/runtime timers'
+    require(args.budget >= 90, 'budget must leave room beyond internal TLS/runtime timers')
     labels = json.loads(subprocess.check_output([
-        'docker', 'inspect', '--format', '{{json .Config.Labels}}', args.container], text=True))
-    assert labels.get('adx.e2e.backend-timeout') == 'true', 'requires a disposable, labelled fixture'
+        DOCKER, 'inspect', '--format', '{{json .Config.Labels}}', args.container], text=True))
+    require(labels.get('adx.e2e.backend-timeout') == 'true', 'requires a disposable, labelled fixture')
     args.evidence.mkdir(parents=True, exist_ok=False)
     digest = install(args.container)
     with httpx.Client(base_url=args.api_url, verify=False, trust_env=False, timeout=args.budget + 10,
