@@ -77,8 +77,11 @@ class OptimizedCacheDriverTests(unittest.TestCase):
         module = ast.Module(body=[function], type_ignores=[])
         namespace = {}
         exec(compile(module, str(source), 'exec', optimize=2), namespace)
+        run_command = namespace.get('command')
+        if not callable(run_command):
+            raise TypeError('compiled cache driver must define a callable command')
         environment = SimpleNamespace(commands=SimpleNamespace(run=lambda *args, **kwargs: response))
-        return namespace['command'](environment, 'test command')
+        return run_command(environment, 'test command')
 
     def test_failed_sdk_command_is_rejected_with_optimization(self):
         response = SimpleNamespace(exit_code=7, stdout='', stderr='execution failed')
