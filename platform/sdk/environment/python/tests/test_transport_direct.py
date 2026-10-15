@@ -153,33 +153,37 @@ def test_create_rejects_timeout_final():
     print("ok: create rejects timeout final")
 
 
+def _check_confirmed_timeout_phase_without_retry(sse: bool) -> None:
+    attempts = []
+    message = "create deadline exceeded during backend preparation/runtime start"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        request_id = request.headers["X-Request-Id"]
+        body = json.loads(request.read())
+        attempts.append(request_id)
+        detail = {"code": "DEADLINE_EXCEEDED", "retry": "never", "outcome": "terminal",
+                  "requestId": request_id, "environmentId": body["name"]}
+        if sse:
+            final = {"status": "timeout", "errorCode": 504, "message": message, "error": detail}
+            return httpx.Response(200, headers={"content-type": "text/event-stream"},
+                                  text="event: final\ndata: " + json.dumps(final) + "\n\n")
+        return httpx.Response(504, json={"code": 504, "message": message, "data": None, "error": detail})
+
+    try:
+        _make_client(handler).create_info({"createTimeoutSeconds": 35})
+    except EnvironmentHTTPError as error:
+        _check(error.code == "DEADLINE_EXCEEDED", str(error))
+        _check(error.retry == "never" and error.outcome == "terminal", str(error))
+        _check(message in str(error), str(error))
+        _check(error.request_id == attempts[0], str(error))
+    else:
+        raise AssertionError("confirmed deadline must reach the caller")
+    _check(len(attempts) == 1, f"terminal create retried: {attempts}")
+
+
 def test_create_preserves_confirmed_timeout_phase_without_retry():
     for sse in (False, True):
-        attempts = []
-        message = "create deadline exceeded during backend preparation/runtime start"
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            request_id = request.headers["X-Request-Id"]
-            body = json.loads(request.read())
-            attempts.append(request_id)
-            detail = {"code": "DEADLINE_EXCEEDED", "retry": "never", "outcome": "terminal",
-                      "requestId": request_id, "environmentId": body["name"]}
-            if sse:
-                final = {"status": "timeout", "errorCode": 504, "message": message, "error": detail}
-                return httpx.Response(200, headers={"content-type": "text/event-stream"},
-                                      text="event: final\ndata: " + json.dumps(final) + "\n\n")
-            return httpx.Response(504, json={"code": 504, "message": message, "data": None, "error": detail})
-
-        try:
-            _make_client(handler).create_info({"createTimeoutSeconds": 35})
-        except EnvironmentHTTPError as error:
-            _check(error.code == "DEADLINE_EXCEEDED", str(error))
-            _check(error.retry == "never" and error.outcome == "terminal", str(error))
-            _check(message in str(error), str(error))
-            _check(error.request_id == attempts[0], str(error))
-        else:
-            raise AssertionError("confirmed deadline must reach the caller")
-        _check(len(attempts) == 1, f"terminal create retried: {attempts}")
+        _check_confirmed_timeout_phase_without_retry(sse)
 
 
 def test_create_rejects_stream_without_final():
@@ -1640,7 +1644,10 @@ def test_copy_to_local_dir_uses_direct_tar_download():
             _check(f.read() == b"from-tar", "tar download extract mismatch")
 
     _check(calls[0][1] == "/direct/environment-demo/invoke", f"stat call: {calls}")
-    _check(calls[1] == ("GET", "/direct/environment-demo/download", "/tmp/remote-dir", "tar"), f"download call: {calls}")
+    _check(
+        calls[1] == ("GET", "/direct/environment-demo/download", "/tmp/remote-dir", "tar"),
+        f"download call: {calls}",
+    )
     print("ok: copy_to_local dir uses direct tar download ->", calls)
 
 

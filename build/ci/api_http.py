@@ -237,7 +237,12 @@ for _ in range(2):
     created.append(json.loads(base64.b64decode(value['data']))['environmentId'])
 if not (created[0] == created[1]):
     raise AssertionError()
-code, _ = call('POST', '/api/environment/v1/environments', dict(request, name='changed'), extra={'X-Request-Id': request_id})
+code, _ = call(
+    'POST',
+    '/api/environment/v1/environments',
+    dict(request, name='changed'),
+    extra={'X-Request-Id': request_id},
+)
 if not (code == 409):
     raise AssertionError(code)
 code, value = call('POST', '/api/environment/v1/environments', request, extra={'X-Request-Id': 'another-request'})
@@ -288,7 +293,10 @@ for request_id, value in [('pause-invalid', {'timeoutSeconds': -1}), ('pause-inv
         raise AssertionError()
 for _ in range(2):
     code, value = call(
-        'POST', pause, {'retention': {'kind': 'ttl', 'ttlSeconds': 120}, 'timeoutSeconds': 10}, extra={'X-ADX-Request-ID': 'pause-http-positive'}
+        'POST',
+        pause,
+        {'retention': {'kind': 'ttl', 'ttlSeconds': 120}, 'timeoutSeconds': 10},
+        extra={'X-ADX-Request-ID': 'pause-http-positive'},
     )
     if not (code == 200):
         raise AssertionError((code, value))
@@ -338,7 +346,9 @@ if not (call('DELETE', '/api/environment/' + identity)[0] == 200):
     raise AssertionError()
 if not (
     call(
-        'DELETE', '/api/environment/v1/snapshots/' + snapshot, extra={'X-ADX-Request-ID': 'delete-snapshot-http-positive'}
+        'DELETE',
+        '/api/environment/v1/snapshots/' + snapshot,
+        extra={'X-ADX-Request-ID': 'delete-snapshot-http-positive'},
     )[0]
     == 200
 ):
