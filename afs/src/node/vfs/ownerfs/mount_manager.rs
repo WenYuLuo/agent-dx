@@ -323,17 +323,26 @@ impl MountManager {
             }
         };
 
+        let worker_entry = entry.clone();
         if let Err(error) = thread::Builder::new()
             .name(format!("afs-mount-{}", entry.root_id.0))
             .spawn(move || {
-                Self::mount_worker_loop(owner, egress_root, entry);
+                Self::mount_worker_loop(owner, egress_root, worker_entry);
             })
         {
-            afs_logging::warn!(
-                "ownerfs.mount_manager.spawn_failed";
-                "error" => error.to_string()
-            );
+            Self::note_worker_spawn_failure(&entry, &error);
         }
+    }
+
+    /// 挂载 worker 线程创建失败（如资源耗尽 EAGAIN）：收敛为 FuseOnly 并
+    /// 唤醒等待中的 detach，避免 entry 永久停留在 Mounting 造成 no-op、
+    /// 卸载 5s 阻塞和 shutdown 串行阻塞（review: spawn 失败未收敛）。
+    fn note_worker_spawn_failure(entry: &MountEntry, error: &io::Error) {
+        afs_logging::warn!(
+            "ownerfs.mount_manager.spawn_failed";
+            "error" => error.to_string()
+        );
+        Self::set_fuse_only(entry, format!("mount worker spawn failed: {error}"));
     }
 
     #[cfg(target_os = "linux")]
@@ -644,6 +653,53 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
         // 状态保持 Mounting：request_unmount 会保留 entry 供后续重试。
         assert!(matches!(*entry.state.lock().unwrap(), MountState::Mounting));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn spawn_failure_converges_entry_to_fuse_only_and_unblocks_detach() {
+        let manager = MountManager::new(None);
+        manager
+            .request_mount(root_id("agent1"), OsString::from("agent1"))
+            .unwrap();
+        let entry = manager
+            .entries
+            .lock()
+            .unwrap()
+            .get(&root_id("agent1"))
+            .unwrap()
+            .clone();
+        // 模拟 spawn 已把状态置为 Mounting、但 OS 线程创建失败。
+        {
+            let mut state = entry.state.lock().unwrap();
+            *state = MountState::Mounting;
+        }
+
+        // 删除流程的卸载步骤正阻塞在 detach，等待 worker 收敛。
+        let waiting = {
+            let entry = entry.clone();
+            std::thread::spawn(move || {
+                MountManager::detach_entry_with_timeout(&entry, Duration::from_secs(5))
+            })
+        };
+        // 等待观察者进入等待，再触发 spawn 失败处理。
+        std::thread::sleep(Duration::from_millis(50));
+        MountManager::note_worker_spawn_failure(
+            &entry,
+            &std::io::Error::new(std::io::ErrorKind::WouldBlock, "simulated EAGAIN"),
+        );
+
+        // detach 必须被唤醒并立即成功（FuseOnly 无事可做），而不是等满 5s 超时。
+        let result = waiting.join().unwrap();
+        assert!(
+            result.is_ok(),
+            "detach should unblock after spawn failure: {result:?}"
+        );
+        // 收敛为 FuseOnly：request_mount 可重试，不再是永久 no-op。
+        assert!(matches!(
+            *entry.state.lock().unwrap(),
+            MountState::FuseOnly { .. }
+        ));
     }
 
     #[cfg(target_os = "linux")]
