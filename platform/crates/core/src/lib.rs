@@ -33,6 +33,32 @@ pub enum Error {
     ResponseTimeout(String),
     #[error("workload probe failed: {0:?}")]
     ProbeFailed(probes::ProbeFailure),
+    #[error("{message}")]
+    BackendFailure {
+        code: BackendFailureCode,
+        message: String,
+    },
+}
+
+/// Backend failure categories retained across control-plane boundaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendFailureCode {
+    Cancelled,
+    Unknown,
+    InvalidArgument,
+    DeadlineExceeded,
+    NotFound,
+    AlreadyExists,
+    PermissionDenied,
+    ResourceExhausted,
+    FailedPrecondition,
+    Aborted,
+    OutOfRange,
+    Unimplemented,
+    Internal,
+    Unavailable,
+    DataLoss,
+    Unauthenticated,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

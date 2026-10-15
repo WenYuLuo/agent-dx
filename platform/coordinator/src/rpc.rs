@@ -659,7 +659,13 @@ impl CoordinatorRpc {
                 .await
                 {
                     Ok(result) => result.into_inner(),
-                    Err(error) if error.code() == tonic::Code::ResourceExhausted => {
+                    Err(error)
+                        if error.code() == tonic::Code::ResourceExhausted
+                            && error
+                                .metadata()
+                                .get("adx-backend-failure")
+                                .is_none_or(|value| value != "true") =>
+                    {
                         // A node can hold an as-yet unconfirmed local attempt.
                         // Keep this confirmed owner; retry admission after that
                         // attempt resolves, never allocate another generation.

@@ -153,9 +153,8 @@ def test_create_rejects_timeout_final():
     print("ok: create rejects timeout final")
 
 
-def _check_confirmed_timeout_phase_without_retry(sse: bool) -> None:
+def _check_confirmed_timeout_phase_without_retry(sse: bool, message: str) -> None:
     attempts = []
-    message = "create deadline exceeded during backend preparation/runtime start"
 
     def handler(request: httpx.Request) -> httpx.Response:
         request_id = request.headers["X-Request-Id"]
@@ -182,8 +181,13 @@ def _check_confirmed_timeout_phase_without_retry(sse: bool) -> None:
 
 
 def test_create_preserves_confirmed_timeout_phase_without_retry():
-    for sse in (False, True):
-        _check_confirmed_timeout_phase_without_retry(sse)
+    for message in (
+        "create deadline exceeded during backend preparation/runtime start",
+        "sandboxd: image pull (rootfs): net/http: TLS handshake timeout",
+        "sandboxd: runtime start (runc): waiting for runc container start: context deadline exceeded",
+    ):
+        for sse in (False, True):
+            _check_confirmed_timeout_phase_without_retry(sse, message)
 
 
 def test_create_rejects_stream_without_final():

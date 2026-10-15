@@ -318,12 +318,25 @@ impl Sandboxd {
             let response = match client.start(request).await {
                 Ok(response) => response.into_inner(),
                 Err(error) => {
-                    if deadline.is_some_and(|deadline| deadline <= tokio::time::Instant::now()) {
+                    if error.code() == Code::DeadlineExceeded
+                        && error
+                            .metadata()
+                            .get("sandboxd-start-failure")
+                            .is_some_and(|value| value == "true")
+                    {
+                        return Err(Error::DeadlineExceeded(format!(
+                            "sandboxd: {}",
+                            error.message()
+                        )));
+                    }
+                    if error.code() == Code::DeadlineExceeded
+                        && deadline.is_some_and(|deadline| deadline <= tokio::time::Instant::now())
+                    {
                         return Err(Error::DeadlineExceeded(format!(
                             "sandboxd Start deadline exceeded: {error}"
                         )));
                     }
-                    return Err(unavailable(error));
+                    return Err(adx_protocol::backend_error(error));
                 }
             };
             if !response.id.is_empty() {

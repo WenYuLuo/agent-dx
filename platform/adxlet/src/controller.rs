@@ -854,11 +854,10 @@ impl Controller {
         let (runtime_start_ms, runtime_ready_ms, route_activate_ms) = match attempt {
             Ok(stages) => stages,
             Err(start_error) => {
-                let start_error = if matches!(start_error, Error::DeadlineExceeded(_))
-                    || (matches!(start_error, Error::Unavailable(_))
-                        && self
-                            .create_deadline
-                            .is_some_and(|deadline| deadline <= tokio::time::Instant::now()))
+                let start_error = if matches!(start_error, Error::Unavailable(_))
+                    && self
+                        .create_deadline
+                        .is_some_and(|deadline| deadline <= tokio::time::Instant::now())
                 {
                     Error::DeadlineExceeded(format!(
                         "environment initialization deadline exceeded during {stage}"

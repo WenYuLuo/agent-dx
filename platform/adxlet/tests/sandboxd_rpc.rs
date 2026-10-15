@@ -33,6 +33,7 @@ struct Server {
     settled_error_after_start: bool,
     retain_after_delete: bool,
     exit_message: Option<String>,
+    start_timeout: Option<String>,
 }
 impl Default for Server {
     fn default() -> Self {
@@ -55,6 +56,7 @@ impl Default for Server {
             settled_error_after_start: false,
             retain_after_delete: false,
             exit_message: None,
+            start_timeout: None,
         }
     }
 }
@@ -75,6 +77,13 @@ impl sandbox_service_server::SandboxService for Server {
             .push(format!("start:{}", request.sandbox_id));
         self.entered.add_permits(1);
         self.release.acquire().await.unwrap().forget();
+        if let Some(message) = &self.start_timeout {
+            let mut status = Status::deadline_exceeded(message);
+            status
+                .metadata_mut()
+                .insert("sandboxd-start-failure", "true".parse().unwrap());
+            return Err(status);
+        }
         if self.invalid_argument {
             return Err(Status::invalid_argument("invalid start request"));
         }
@@ -1454,4 +1463,110 @@ async fn controller_cold_preparation_uses_total_create_budget_then_readiness_bud
     );
     assert_eq!(server.starts.lock().unwrap().len(), 1);
     environment.delete().await.unwrap();
+}
+
+#[tokio::test]
+async fn internal_backend_timeouts_keep_stage_before_create_deadline() {
+    for message in [
+        "image pull (rootfs): net/http: TLS handshake timeout",
+        "runtime start (runc): waiting for runc container start: context deadline exceeded",
+    ] {
+        let server = Server {
+            start_timeout: Some(message.into()),
+            ..Default::default()
+        };
+        let (adapter, _server) = connect(server.clone()).await;
+        let hooks = Arc::new(LifecycleHooks::default());
+        let node = lifecycle_node(adapter, &hooks);
+        let environment = node.environment(spec(), lifecycle_assignment()).unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let error = environment
+            .create_with_deadline(deadline)
+            .await
+            .unwrap_err();
+        assert!(tokio::time::Instant::now() < deadline);
+        let status = adx_protocol::status(error);
+        assert_eq!(status.code(), tonic::Code::DeadlineExceeded, "{status:?}");
+        assert!(status.message().contains(message), "{status:?}");
+        assert!(adx_protocol::deadline_failure(&status).is_some());
+        let record = environment.sync().await.unwrap().record;
+        assert_eq!(record.state, EnvironmentState::Failed);
+        assert_eq!(record.failure.unwrap().message, status.message());
+        assert!(!record.resources_held);
+        assert_eq!(server.starts.lock().unwrap().len(), 1);
+        assert_eq!(
+            environment
+                .create_with_deadline(deadline)
+                .await
+                .unwrap_err(),
+            adx_core::Error::Conflict
+        );
+        assert_eq!(server.starts.lock().unwrap().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn backend_start_errors_preserve_non_timeout_status_and_message() {
+    for code in [
+        tonic::Code::InvalidArgument,
+        tonic::Code::NotFound,
+        tonic::Code::AlreadyExists,
+        tonic::Code::PermissionDenied,
+        tonic::Code::Unauthenticated,
+        tonic::Code::ResourceExhausted,
+        tonic::Code::FailedPrecondition,
+        tonic::Code::Aborted,
+        tonic::Code::OutOfRange,
+        tonic::Code::Unimplemented,
+        tonic::Code::Internal,
+        tonic::Code::Unknown,
+        tonic::Code::Cancelled,
+        tonic::Code::Unavailable,
+        tonic::Code::DataLoss,
+        tonic::Code::DeadlineExceeded,
+    ] {
+        let (adapter, _server) = connect(Server {
+            unsettled_error: Some(code),
+            ..Default::default()
+        })
+        .await;
+        let error = adapter
+            .start_with_deadline(
+                &spec(),
+                "i-1",
+                1,
+                &[],
+                tokio::time::Instant::now() + Duration::from_secs(30),
+            )
+            .await
+            .unwrap_err();
+        let status = adx_protocol::status(error);
+        assert_eq!(status.code(), code, "{status:?}");
+        assert_eq!(
+            status.metadata().get("adx-backend-failure").unwrap(),
+            "true"
+        );
+        assert!(status
+            .message()
+            .contains("runtime start failed without settlement proof"));
+        assert!(adx_protocol::deadline_failure(&status).is_none());
+    }
+}
+
+#[tokio::test]
+async fn backend_transport_failure_remains_unavailable() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    let transport = tonic::transport::Endpoint::from_shared(format!("http://{address}"))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap_err();
+    let status = adx_protocol::status(adx_protocol::backend_error(Status::from_error(Box::new(
+        transport,
+    ))));
+    assert_eq!(status.code(), tonic::Code::Unavailable);
+    assert!(status.message().contains("sandboxd transport"));
+    assert!(adx_protocol::deadline_failure(&status).is_none());
 }

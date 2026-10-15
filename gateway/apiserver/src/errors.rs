@@ -34,6 +34,17 @@ impl<'a> ErrorDetail<'a> {
                 RetryDirective::Never,
                 OperationOutcome::Terminal,
             )
+        } else if status.code() == Code::ResourceExhausted
+            && status
+                .metadata()
+                .get("adx-backend-failure")
+                .is_some_and(|value| value == "true")
+        {
+            (
+                ErrorCode::ResourceExhausted,
+                RetryDirective::Never,
+                OperationOutcome::Terminal,
+            )
         } else if probe_failure.is_some() {
             (
                 ErrorCode::Unavailable,
@@ -127,6 +138,26 @@ impl<'a> ErrorDetail<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backend_resource_rejection_is_terminal_while_admission_remains_retryable() {
+        let backend = adx_protocol::status(adx_protocol::backend_error(
+            Status::resource_exhausted("image registry rate limited the pull"),
+        ));
+        let rejected = ErrorDetail::from_status(&backend, "request", None, None, true);
+        assert_eq!(rejected.code, ErrorCode::ResourceExhausted);
+        assert_eq!(rejected.retry, RetryDirective::Never);
+        assert_eq!(rejected.outcome, OperationOutcome::Terminal);
+        let admission = ErrorDetail::from_status(
+            &Status::resource_exhausted("node capacity"),
+            "request",
+            None,
+            None,
+            true,
+        );
+        assert_eq!(admission.retry, RetryDirective::AfterBackoff);
+        assert_eq!(admission.outcome, OperationOutcome::NotStarted);
+    }
 
     #[test]
     fn final_probe_failure_retains_metadata_and_terminal_retry_contract() {

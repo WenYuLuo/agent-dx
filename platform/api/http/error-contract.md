@@ -55,7 +55,7 @@ SSE 创建的 `final` 事件保留 `errorCode` 数值字段，并携带同一个
 | `PERMISSION_DENIED` | `PermissionDenied` | 403 | `never` | `not_started` | 已认证身份没有权限；实例接口可以为租户隔离映射成 404 |
 | `NOT_FOUND` | `NotFound` | 404 | `never` | `terminal` | 权威状态确认资源不存在；删除接口可以将其视为幂等成功 |
 | `CONFLICT` | `AlreadyExists`、`FailedPrecondition`、`Aborted` | 409 | `never` | `not_started` | 身份、规格、代次、状态或操作参数冲突 |
-| `RESOURCE_EXHAUSTED` | `ResourceExhausted` | 429 | `after_backoff` | `not_started` | 准入、队列或资源暂时不足 |
+| `RESOURCE_EXHAUSTED` | `ResourceExhausted` | 429 | `after_backoff` / `never` | `not_started` / `terminal` | 准入、队列或资源暂时不足可退避；后端明确返回的创建限流失败为 terminal/never |
 | `UNSUPPORTED` | `Unimplemented` | 501 | `never` | `not_started` | 当前版本不提供该能力 |
 | `UNAVAILABLE` | `Unavailable` | 503 | `after_backoff` | `not_started` | 请求尚未进入执行边界，下游暂不可用 |
 | `DEADLINE_EXCEEDED` | `DeadlineExceeded` | 504 | `never` / `same_operation` | `terminal` / `not_started` / `unknown` | 节点确认创建超时失败时为 terminal/never；单纯等待超时保留原身份查询或重试 |
@@ -72,7 +72,9 @@ SSE 创建的 `final` 事件保留 `errorCode` 数值字段，并携带同一个
 创建超时使用 HTTP 504 和 `DEADLINE_EXCEEDED`。节点确认该创建已失败时，返回
 `retry=never`、`outcome=terminal`；`message` 指明 `backend preparation/runtime start`、
 `Execd readiness` 或 `route activation`，不增加公开 `stage` 字段。后端准备和运行时启动
-属于同一次 sandboxd Start，当前接口不能细分镜像下载与运行时启动内部阶段。
+属于同一次 sandboxd Start。后端明确返回的内部超时保留 `image pull (rootfs)`、
+`image pull (volume <target>)` 或 `runtime start (<runtime>)` 及原始原因，即使创建总期限尚未到。
+只有外层计时器先到且未收到后端阶段结果时，才使用合并的准备/启动阶段文案。
 相同 Request ID 重放或查询后重放保留该失败原因，不重新启动原执行。
 工作负载配置了 readiness probe 时，保留下文既有 `ProbeFailure` 契约。
 
@@ -93,6 +95,19 @@ API Server、Coordinator 和入口节点为创建错误回传预留最多 3 秒�
 API Server 的已完成创建响应使用 600 秒 TTL 与 `cache_entries` 容量淘汰；缓存满只淘汰旧完成项，不产生 `RESOURCE_EXHAUSTED`。正在执行和结果未知的请求保留同一租户、Request ID、Environment ID 与规格，不受完成缓存容量限制。结果未知的重试在保留窗口内查询权威归属，或以原身份进入原子创建链路；不会仅凭传输超时将 Environment 标为 Failed 或释放节点预留。未知上下文的 `create_unknown_retention_seconds` 默认 600 秒，从首次未知结果计时，不因未决重试续期；到期后周期 GC 直接回收，不查询权威状态，执行中或仍有共享身份等待的请求不回收。GC 不改变 Environment 或资源状态。完成响应过期、淘汰、未知请求 GC 或进程重启后，重试按当前 Environment 状态处理，不再保证历史请求去重或参数绑定。
 
 ### sandboxd Start 失败
+
+sandboxd 应用明确返回的 Start 超时使用 gRPC `DeadlineExceeded`，并携带内部 trailer
+`sandboxd-start-failure: true`。adxlet 保留其阶段和原因，将节点失败结果按既有机制发布；
+发布确认后 HTTP/JSON 与 SSE final 均为 `DEADLINE_EXCEEDED / never / terminal`。
+非超时 Start 失败保留后端 gRPC 分类和原始 message，不统一转换成 `Unavailable`。
+镜像无效请求、认证失败、权限拒绝、不存在和限流分别映射为 `InvalidArgument`、
+`Unauthenticated`、`PermissionDenied`、`NotFound` 和 `ResourceExhausted`，公开错误
+继续遵循上表既有重试语义。后端限流属于该创建已失败的结果，返回
+`RESOURCE_EXHAUSTED / never / terminal`；只有节点准入/容量不足继续使用
+`after_backoff / not_started`，Coordinator 不将后端限流当作准入失败重试。
+只对真实网络超时和明确的超时状态执行超时分类。
+该 trailer 表示后端返回了应用失败，不表示物理资源已清理。没有该标记的 RPC 超时
+继续按外层期限和结果确认状态处理，不能仅凭传输错误确认后端结果。
 
 adxlet 未获得有效 Start 成功结果（失败、超时、应答丢失或无效载荷）时，将 Environment 创建判定为 `Failed`，不会重复启动同一执行，也不会把迟到后端接纳为成功实例。创建进入 Failed 即释放本机标量资源和 GPU/NPU 预留，并在清理之前提交 `resources_held=false`；查询、删除失败或清理超时不阻止资源释放。Failed 控制器独立重试清理迟到执行及补写未发布结果。节点重启按权威目录对账。
 
