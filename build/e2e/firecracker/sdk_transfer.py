@@ -282,7 +282,22 @@ try:
     if not (not records):
         raise AssertionError(records)
     (root / 'evidence/catalog-final.json').write_text(json.dumps(records, indent=2))
-    passed(5)
+    # A source-node LRU copy can remain within quota while another node owns
+    # the live restore. After global deletion, authoritative node reconciliation
+    # must remove it without touching any active execution or shared object.
+    cleanup_restarts = {}
+    for node in ('node1', 'node2'):
+        previous = catalog()['node:' + node]['session']['id']
+        os.kill(pid(root / node, 'adxlet'), signal.SIGKILL)
+        wait(lambda node=node, previous=previous: (
+            catalog()['node:' + node]['session']['id'] != previous
+            and catalog()['node:' + node]['session']['routable']
+            and catalog()['node:' + node]['node']['available']
+        ))
+        wait(lambda node=node: not any(path.is_file() for path in (root / node / 'checkpoints').rglob('*')))
+        cleanup_restarts[node] = catalog()['node:' + node]['session']['id']
+    (root / 'evidence/cache-reconciliation-cleanup.json').write_text(json.dumps({'local_files': 0, 'node_sessions': cleanup_restarts}, indent=2))
+    passed(5, local_files=0, cache_reconciled=True)
     result['status'] = 'passed'
 except BaseException as error:
     result['error'] = repr(error)

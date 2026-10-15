@@ -281,7 +281,7 @@ add(
         'report_interval_seconds': 2,
         # Demand holds readiness across a checkpoint TTL; autoscaling holds
         # local-first forwarding while another real VM starts before unpause.
-        'rpc_timeout_seconds': 120 if os.getenv('ADX_FC_SUITE') in ('demand', 'autoscaling') else 20,
+        'rpc_timeout_seconds': 120 if os.getenv('ADX_FC_SUITE') in ('demand', 'autoscaling', 'cache') else 20,
         'execd_port': 50090,
         'execd_command': ['/usr/local/bin/adx-execd'],
         'execd_env': {},
@@ -369,7 +369,7 @@ kernel_args = "console=ttyS0 reboot=k panic=1 pci=off init=/init random.trust_cp
 kvm_device = "/dev/kvm"
 default_vcpu_count = 1
 default_memory_mib = 512
-default_overlay_size_bytes = {32 * 1024**2 if os.getenv('ADX_FC_SUITE') in ('demand', 'autoscaling') else 536870912}
+default_overlay_size_bytes = {32 * 1024**2 if os.getenv('ADX_FC_SUITE') in ('demand', 'autoscaling', 'cache') else 536870912}
 checkpoint_mode = "full"
 virtiofs_enabled = true
 virtiofsd_path = "{BASE}/tools/virtiofsd"
@@ -413,6 +413,10 @@ for service in deployment['services']:
             'root': str(RUN / 'checkpoints'),
             'cache_budget_bytes': 4 * 1024**3,
         }
+        if os.getenv('ADX_FC_SUITE') == 'cache':
+            # Exercise the production defaults before the SDK fixture lowers
+            # quotas through a node-only restart for boundary scenarios.
+            c['checkpoint_storage'].pop('cache_budget_bytes')
         selected = public_storage(RUN)
         if selected['kind'] == 'real_obs':
             c['checkpoint_storage'].update({key: selected[key] for key in ('alias', 'bucket', 'region', 'endpoint', 'prefix')})
@@ -422,6 +426,8 @@ for service in deployment['services']:
             service['env']['AWS_TIMEOUT'] = '240s'
         if selected['kind'] != 'real_obs':
             c['checkpoint_gc'] = {'enabled': True, 'min_age_seconds': 0, 'interval_seconds': 1, 'max_artifacts': 100}
+        if os.getenv('ADX_FC_SUITE') == 'cache':
+            c['checkpoint_gc'] = {'enabled': False}
         service['env'].update(
             {
                 'AWS_ACCESS_KEY_ID': (PRIVATE / 's3-user').read_text().strip(),

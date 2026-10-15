@@ -570,7 +570,12 @@ impl Controller {
             if self.record.state == EnvironmentState::Failed {
                 return self.sync().await;
             }
-            if self.recovery_files.is_none() {
+            if self.recovery_files.is_none()
+                && self
+                    .services
+                    .runtime
+                    .retains_checkpoint_files(&self.record.spec.runtime_class)
+            {
                 if let (Some(cp), Some(services)) =
                     (&self.record.checkpoint, &self.services.checkpoint)
                 {
@@ -784,9 +789,10 @@ impl Controller {
                                 .ok_or(Error::Conflict)?
                                 .store;
                             let path = store.materialize(&cp.artifact).await?;
-                            // Firecracker reads restore files after the RPC has returned.
+                            // Retain through the RPC, including ambiguous failure.
                             self.recovery_files = Some(path);
-                            self.services
+                            let result = self
+                                .services
                                 .runtime
                                 .restore_from_with_deadline(
                                     &self.record.spec,
@@ -804,7 +810,16 @@ impl Controller {
                                             + self.services.operation_timeout
                                     }),
                                 )
-                                .await
+                                .await;
+                            if result.is_ok()
+                                && !self
+                                    .services
+                                    .runtime
+                                    .retains_checkpoint_files(&self.record.spec.runtime_class)
+                            {
+                                self.recovery_files = None;
+                            }
+                            result
                         } else {
                             self.services
                                 .runtime

@@ -984,6 +984,12 @@ fn runtime_control_peer(config: &Config) -> Result<Option<proto::NetworkEndpoint
 
 #[async_trait]
 impl RuntimeDriver for Sandboxd {
+    fn retains_checkpoint_files(&self, runtime_class: &str) -> bool {
+        // sandboxd completes runsc's synchronous Restore before returning Start.
+        // Firecracker v2 retains its caller-owned incremental memory base.
+        runtime_class != "runsc"
+    }
+
     async fn stats(&self, runtime_id: &str) -> Result<crate::metrics::RuntimeUsage> {
         let value = Sandboxd::stats(self, runtime_id).await?;
         Ok(crate::metrics::RuntimeUsage {
