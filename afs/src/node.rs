@@ -30,6 +30,7 @@ use crate::{
 };
 use rpc::meta::{MetaPersistenceCapability, NodeRegistrationReadiness};
 use std::{
+    collections::HashSet,
     future::Future,
     os::unix::ffi::OsStrExt,
     path::{Component, Path, PathBuf},
@@ -1362,8 +1363,19 @@ async fn run_node(
         ) {
             workspace_bind_root_control = Some((root_meta, roots.clone()));
         }
-        let owner = if cfg.experimental_native_workspace || cfg.experimental_ownerfs_workspace_bind
-        {
+        let roots_for_startup = roots.clone();
+        let owner = if cfg.experimental_ownerfs_workspace_bind {
+            let egress_root = cfg
+                .ownerfs_workspace_egress_root
+                .clone()
+                .expect("workspace bind requires egress root");
+            vfs::ownerfs::OwnerFs::new_local_with_mount_manager(
+                roots,
+                disk,
+                remote_factory,
+                egress_root,
+            )
+        } else if cfg.experimental_native_workspace {
             vfs::ownerfs::OwnerFs::new_local_native_eligible_with_remote(
                 roots,
                 disk,
@@ -1372,7 +1384,30 @@ async fn run_node(
         } else {
             vfs::ownerfs::OwnerFs::new_local_with_remote(roots, disk, remote_factory)
         };
-        Some(Arc::new(owner))
+        let owner = Arc::new(owner);
+        if let Some(mm) = owner.mount_manager() {
+            mm.attach_owner(&owner);
+            // Startup egress reconciliation (D4 §4.4): detach residual bind
+            // targets left by a previous process, then re-trigger mounts for
+            // the recovered roots whose live claims were lost on restart.
+            let recovered = roots_for_startup.recovered_roots();
+            let known: HashSet<_> = recovered.iter().map(|(id, _)| id.clone()).collect();
+            if let Err(error) = mm.reconcile_egress(&known) {
+                afs_logging::warn!(
+                    "ownerfs.mount_manager.reconcile_egress_failed";
+                    "error" => error.to_string()
+                );
+            }
+            for (id, name) in recovered {
+                if let Err(error) = mm.request_mount(id, name) {
+                    afs_logging::warn!(
+                        "ownerfs.mount_manager.restart_mount_failed";
+                        "error" => error.to_string()
+                    );
+                }
+            }
+        }
+        Some(owner)
     } else {
         None
     };
@@ -2000,41 +2035,8 @@ async fn run_node(
         (native_workspace_worker, native_workspace_startup_error) =
             register_native_workspace_startup(&mut services, startup);
     }
-    #[cfg(feature = "ownerfs")]
-    let mut workspace_bind_worker = None;
-    #[cfg(feature = "ownerfs")]
-    if cfg.experimental_ownerfs_workspace_bind {
-        let owner = state
-            .ownerfs
-            .clone()
-            .expect("workspace bind requires OwnerFs");
-        let mount = cfg
-            .ownerfs_mount
-            .clone()
-            .expect("workspace bind requires mount");
-        let workspace = cfg
-            .ownerfs_workspace_bind
-            .as_ref()
-            .expect("workspace bind requires settings")
-            .workspace
-            .clone();
-        let startup = tokio::task::spawn_blocking(move || {
-            WorkspaceBindWorker::start(owner, mount, workspace)
-        })
-        .await;
-        match startup {
-            Ok(Ok((worker, ready))) => {
-                let monitor = worker.monitor(services.stop.subscribe());
-                services.spawn(async move { monitor.await.map_err(Into::into) });
-                workspace_bind_worker = Some(worker);
-                if let Err(error) = ready {
-                    native_workspace_startup_error = Some(error.into());
-                }
-            }
-            Ok(Err(error)) => native_workspace_startup_error = Some(error.into()),
-            Err(error) => native_workspace_startup_error = Some(error.into()),
-        }
-    }
+    // Multi-workspace bind mount is handled by MountManager via mkdir triggers.
+    // No single-workspace startup worker is needed.
     #[cfg(feature = "ownerfs")]
     if native_workspace_startup_error.is_none()
         && let Some((meta, roots)) = workspace_bind_root_control
@@ -2074,18 +2076,8 @@ async fn run_node(
         }
     }
     #[cfg(feature = "ownerfs")]
-    if let Some(worker) = workspace_bind_worker {
-        let closure = tokio::task::spawn_blocking(move || worker.shutdown()).await;
-        let error: Option<BoxError> = match closure {
-            Ok(Ok(())) => None,
-            Ok(Err(error)) => Some(error.into()),
-            Err(error) => Some(error.into()),
-        };
-        if let Some(error) = error {
-            afs_logging::error!("ownerfs.workspace_bind_closure_failed"; "error" => error.to_string());
-            remember_shutdown_error(&mut shutdown_error, error);
-            std::future::pending::<()>().await;
-        }
+    if let Some(owner) = state.ownerfs.as_ref() {
+        owner.mount_manager_shutdown();
     }
     // Stop FUSE admission and observe its thread cleanup before the final dirty drain.
     // Dropping BackgroundSession alone detaches the thread and cannot prove this boundary.
@@ -2312,127 +2304,6 @@ async fn run_workspace_bind_root_commands(
     }
 }
 
-#[cfg(feature = "ownerfs")]
-struct WorkspaceBindWorker {
-    stop: Arc<AtomicBool>,
-    worker: Option<std::thread::JoinHandle<std::io::Result<()>>>,
-    finished: tokio::sync::watch::Receiver<Option<(Option<i32>, String)>>,
-}
-
-#[cfg(feature = "ownerfs")]
-impl WorkspaceBindWorker {
-    // Even a failed activation returns the original worker to Node: attachment
-    // may have succeeded before its postcondition failed. Never drop its claim.
-    fn start(
-        owner: Arc<vfs::ownerfs::OwnerFs>,
-        mount: PathBuf,
-        workspace: String,
-    ) -> std::io::Result<(Self, std::io::Result<()>)> {
-        use std::{ffi::OsStr, io, sync::mpsc, thread};
-        use vfs::ownerfs::bind_mount::AuthorizedWorkspaceBind;
-        let stop = Arc::new(AtomicBool::new(false));
-        let worker_stop = stop.clone();
-        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
-        let (finished_tx, finished) = tokio::sync::watch::channel(None);
-        // Inherit the Node startup namespace. No unshare/setns or runc here.
-        let worker = thread::Builder::new()
-            .name("afs-workspace-bind".into())
-            .spawn(move || {
-                let mut bind =
-                    match AuthorizedWorkspaceBind::prepare(owner, &mount, OsStr::new(&workspace)) {
-                        Ok(bind) => bind,
-                        Err(error) => {
-                            let _ = ready_tx.send(Err(io::Error::other(error.to_string())));
-                            return Ok(());
-                        }
-                    };
-                let mut failure = bind.activate().err();
-                let _ = ready_tx.send(match &failure {
-                    Some(error) => Err(io::Error::other(error.to_string())),
-                    None => Ok(()),
-                });
-                while failure.is_none() && !worker_stop.load(Ordering::Acquire) {
-                    if let Err(error) = bind.verify_current() {
-                        failure = Some(error);
-                        break;
-                    }
-                    thread::sleep(Duration::from_millis(100));
-                }
-                // Notify before closure, so an unresolved claim cannot prevent
-                // Node from starting its process-wide shutdown watchdog.
-                if let Some(error) = &failure {
-                    let _ = finished_tx.send(Some((error.raw_os_error(), error.to_string())));
-                }
-                loop {
-                    match bind.detach() {
-                        Ok(()) => return Ok(()),
-                        Err(error) if error.raw_os_error() == Some(libc::EBUSY) => {
-                            thread::sleep(Duration::from_millis(50));
-                        }
-                        Err(error) => {
-                            let _ =
-                                finished_tx.send(Some((error.raw_os_error(), error.to_string())));
-                            // Retain both original descriptors/authority and FUSE;
-                            // a terminal identity error is not successful teardown.
-                            loop {
-                                thread::park();
-                            }
-                        }
-                    }
-                }
-            })?;
-        let ready = ready_rx
-            .recv()
-            .unwrap_or_else(|error| Err(io::Error::other(error)));
-        Ok((
-            Self {
-                stop,
-                worker: Some(worker),
-                finished,
-            },
-            ready,
-        ))
-    }
-
-    fn monitor(
-        &self,
-        stop: tokio::sync::watch::Receiver<bool>,
-    ) -> impl std::future::Future<Output = std::io::Result<()>> + Send + 'static {
-        let worker_stop = self.stop.clone();
-        let mut finished = self.finished.clone();
-        async move {
-            tokio::select! {
-                biased;
-                _ = cancelled(stop) => {
-                    worker_stop.store(true, Ordering::Release);
-                    Ok(())
-                }
-                _ = finished.changed() => Err(match finished.borrow().as_ref() {
-                    Some((Some(errno), _)) => std::io::Error::from_raw_os_error(*errno),
-                    Some((None, message)) => std::io::Error::other(message.clone()),
-                    None => std::io::Error::other("workspace bind worker exited unexpectedly"),
-                }),
-            }
-        }
-    }
-
-    fn shutdown(mut self) -> std::io::Result<()> {
-        self.stop.store(true, Ordering::Release);
-        self.worker
-            .take()
-            .expect("owned workspace bind worker")
-            .join()
-            .map_err(|_| std::io::Error::other("workspace bind worker panicked"))?
-    }
-}
-
-#[cfg(feature = "ownerfs")]
-impl Drop for WorkspaceBindWorker {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-    }
-}
-
 #[cfg(all(test, feature = "ownerfs"))]
 mod workspace_bind_root_command_tests {
     use super::*;
@@ -2580,57 +2451,6 @@ mod workspace_bind_root_command_tests {
         )
         .unwrap_err();
         assert_eq!(error.code(), afs_error::NODE_OWNER_INVALID_GRANT);
-    }
-}
-
-#[cfg(all(test, feature = "ownerfs"))]
-mod workspace_bind_worker_tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn workspace_bind_observer_reports_failure_without_joining_owned_worker() {
-        let stop = Arc::new(AtomicBool::new(false));
-        let (finished_tx, finished) = tokio::sync::watch::channel(None);
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let owner = WorkspaceBindWorker {
-            stop: stop.clone(),
-            worker: Some(std::thread::spawn(move || {
-                release_rx.recv().unwrap();
-                Ok(())
-            })),
-            finished,
-        };
-        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-        let observer = owner.monitor(cancel_rx);
-        finished_tx
-            .send(Some((Some(libc::ESTALE), "claim changed".into())))
-            .unwrap();
-        assert_eq!(
-            observer.await.unwrap_err().raw_os_error(),
-            Some(libc::ESTALE)
-        );
-        assert!(!owner.worker.as_ref().unwrap().is_finished());
-        let mut closure = tokio::task::spawn_blocking(move || owner.shutdown());
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), &mut closure)
-                .await
-                .is_err()
-        );
-        assert!(stop.load(Ordering::Acquire));
-        release_tx.send(()).unwrap();
-        closure.await.unwrap().unwrap();
-    }
-
-    #[test]
-    fn workspace_bind_failed_prepare_retains_worker_for_explicit_closure() {
-        use vfs::ownerfs::native_home_tests::{fixture, mkdir_root};
-        let (temp, owner, ctx, _disk) = fixture(true);
-        mkdir_root(&owner, &ctx, "workspace");
-        let (worker, ready) =
-            WorkspaceBindWorker::start(Arc::new(owner), temp.path().into(), "workspace".into())
-                .unwrap();
-        assert!(ready.unwrap_err().to_string().contains("FUSE parent"));
-        worker.shutdown().unwrap();
     }
 }
 

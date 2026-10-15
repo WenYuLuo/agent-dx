@@ -25,7 +25,12 @@ experimental_native_workspace = false
 # Only one already-existing local Home workspace is supported. Stop managed
 # users before shutdown/root changes; native FDs are not instantly revocable.
 # Do not enable both experimental entries together.
+# When enabled, ownerfs_workspace_egress_root is required: an absolute native
+# path outside ownerfs_mount and data_dir whose children receive the bind
+# targets (<egress_root>/<workspace>); schedulers read the same file to mount
+# containers from that path.
 experimental_ownerfs_workspace_bind = false
+# ownerfs_workspace_egress_root = "/opt/adx/egress"
 # [ownerfs_workspace_bind]
 # workspace = "agent1"
 

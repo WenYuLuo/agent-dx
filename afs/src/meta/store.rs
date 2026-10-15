@@ -339,6 +339,11 @@ pub enum MetaRead {
         holder_node_id: String,
         holder_session_id: String,
     },
+    /// Fetches every grant held for a root, regardless of holder. Used by
+    /// deactivate_root to delete all holder grants in the same transaction.
+    RootGrants {
+        root_id: String,
+    },
     /// Fetches the current grant that matches presented P2P access facts.
     ///
     /// The backend must atomically compare the grant, current root generation,
@@ -511,6 +516,7 @@ pub enum StoreOperation {
     RegisterNode,
     ReserveRoot,
     AbortRoot,
+    DeactivateRoot,
     ActivateRoot,
     AcquireRoot,
     RecoverRoot,
@@ -1294,6 +1300,7 @@ impl MetaStore for StoreState {
                     holder_node_id: holder_node_id.clone(),
                     holder_session_id: holder_session_id.clone(),
                 }),
+                MetaRead::RootGrants { .. } => None,
                 MetaRead::RootGrant {
                     root_id,
                     root_epoch,
@@ -1460,6 +1467,34 @@ impl MetaStore for StoreState {
                     (
                         revision,
                         tasks
+                            .into_iter()
+                            .map(|(_, versioned)| versioned.entity)
+                            .collect(),
+                    )
+                }
+                MetaRead::RootGrants { root_id } => {
+                    let mut grants = state
+                        .entities
+                        .iter()
+                        .filter_map(|(key, versioned)| match (key, &versioned.entity) {
+                            (
+                                MetaKey::RootGrant {
+                                    root_id: key_root, ..
+                                },
+                                MetaEntity::RootGrant(grant),
+                            ) if key_root == root_id => {
+                                Some((grant.holder_node_id.clone(), versioned.clone()))
+                            }
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+                    grants.sort_by(|left, right| left.0.cmp(&right.0));
+                    let revision = grants
+                        .iter()
+                        .fold(state.revision, |max, (_, entity)| max.max(entity.revision));
+                    (
+                        revision,
+                        grants
                             .into_iter()
                             .map(|(_, versioned)| versioned.entity)
                             .collect(),

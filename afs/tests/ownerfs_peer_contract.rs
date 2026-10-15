@@ -255,6 +255,17 @@ impl RootMeta for ContractMeta {
         Ok(())
     }
 
+    fn deactivate_root(
+        &self,
+        _root_id: &RootId,
+        _epoch: u64,
+        _home_node_id: &str,
+        _session_id: &str,
+    ) -> afs_error::Result<()> {
+        *self.active.lock().unwrap() = None;
+        Ok(())
+    }
+
     fn lookup_root(&self, id: &RootId) -> afs_error::Result<Option<RootLocation>> {
         Ok(self
             .active

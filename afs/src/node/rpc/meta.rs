@@ -18,9 +18,9 @@ use afs_error::{
 };
 #[cfg(feature = "ownerfs")]
 use afs_protocol::meta::{
-    AbortRootRequest, AcquireRootRequest, ActivateRootRequest, ListOwnerRootsRequest,
-    LookupNodeRequest, LookupRootRequest, PollRootCommandBatchRequest, RecoverRootRequest,
-    ReserveConflictPolicy, ReserveRootRequest, ValidateRootAccessRequest,
+    AbortRootRequest, AcquireRootRequest, ActivateRootRequest, DeactivateRootRequest,
+    ListOwnerRootsRequest, LookupNodeRequest, LookupRootRequest, PollRootCommandBatchRequest,
+    RecoverRootRequest, ReserveConflictPolicy, ReserveRootRequest, ValidateRootAccessRequest,
     owner_roots_client::OwnerRootsClient,
 };
 use afs_protocol::meta::{
@@ -655,6 +655,25 @@ impl RootMeta for GrpcRootMeta {
             create_intent_id: reservation.create_intent_id.clone(),
             reason: "local root preparation failed".into(),
             prepare_token: reservation.prepare_token.clone(),
+        }))?;
+        Ok(())
+    }
+
+    fn deactivate_root(
+        &self,
+        root_id: &RootId,
+        epoch: u64,
+        home_node_id: &str,
+        session_id: &str,
+    ) -> Result<()> {
+        let mut client = self.client();
+        self.run(client.deactivate_root(DeactivateRootRequest {
+            request_id: self.request_id(),
+            root_id: root_id.0.clone(),
+            root_epoch: epoch,
+            home_node_id: home_node_id.to_owned(),
+            home_session_id: session_id.to_owned(),
+            reason: "root directory deleted".into(),
         }))?;
         Ok(())
     }
