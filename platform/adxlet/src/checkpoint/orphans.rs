@@ -126,6 +126,10 @@ impl ObjectCheckpointStore {
                 || !old_enough(meta.last_modified.timestamp())
                 || meta.size > 2048
                 || cache
+                    .operations
+                    .get(id)
+                    .is_some_and(|operation| operation.strong_count() > 0)
+                || cache
                     .entries
                     .get(id)
                     .is_some_and(|entry| std::sync::Arc::strong_count(&entry.pin) > 1)
@@ -166,6 +170,7 @@ impl ObjectCheckpointStore {
                     .await
                     .map_err(io_error)?;
             }
+            self.remove_index(id).await?;
             removed += 1;
             if removed >= self.gc_config.max_artifacts {
                 break;

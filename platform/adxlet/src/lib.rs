@@ -68,6 +68,12 @@ pub struct RuntimeStatus {
 
 #[async_trait]
 pub trait RuntimeDriver: Send + Sync {
+    /// Whether a successful restore/capture keeps caller-owned checkpoint files.
+    /// Unknown drivers conservatively retain their input until execution stops.
+    fn retains_checkpoint_files(&self, _runtime_class: &str) -> bool {
+        true
+    }
+
     /// Prepare and start within the create deadline rather than the node RPC cap.
     async fn start_with_deadline(
         &self,

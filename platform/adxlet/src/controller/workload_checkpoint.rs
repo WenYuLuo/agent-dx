@@ -242,6 +242,16 @@ impl Controller {
                 return Err(error);
             }
         };
+        // Firecracker keeps a running capture's memory as its next incremental
+        // base. Pin the original local path before authoritative commit admits
+        // it to the cache. runsc does not retain its capture inputs.
+        if self
+            .services
+            .runtime
+            .retains_checkpoint_files(&self.record.spec.runtime_class)
+        {
+            self.recovery_files = Some(services.store.materialize(&artifact).await?);
+        }
         if let Some(previous) = self.record.checkpoint.take() {
             self.obsolete_checkpoints.push(previous.artifact);
         }

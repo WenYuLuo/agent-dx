@@ -12,6 +12,7 @@ fn s3_checkpoint_storage_initializes_without_prior_tls_calls() {
         prefix: "test".into(),
         root: root.path().into(),
         cache_budget_bytes: 1024,
+        cache_max_entries: 500,
     };
 
     assert!(storage.build().is_ok());

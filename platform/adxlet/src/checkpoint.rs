@@ -5,6 +5,15 @@ use adx_core::{CheckpointArtifact, EnvironmentRecord, Error, Result};
 use async_trait::async_trait;
 pub use object::ObjectCheckpointStore;
 pub use orphans::RemoteGcConfig;
+/// Default limits for unreferenced reusable checkpoint copies.
+pub const DEFAULT_CACHE_MAX_ENTRIES: usize = 500;
+pub const DEFAULT_CACHE_BUDGET_BYTES: u64 = 50 * 1024 * 1024 * 1024;
+fn default_cache_max_entries() -> usize {
+    DEFAULT_CACHE_MAX_ENTRIES
+}
+fn default_cache_budget_bytes() -> u64 {
+    DEFAULT_CACHE_BUDGET_BYTES
+}
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
@@ -247,13 +256,13 @@ pub trait CheckpointStore: Send + Sync {
 /// A restore may keep memory mapped files open after its RPC has returned.
 pub struct MaterializedCheckpoint {
     path: PathBuf,
-    _pin: Option<Arc<()>>,
+    _pin: Option<object::CacheLease>,
 }
 impl MaterializedCheckpoint {
     fn local(path: PathBuf) -> Self {
         Self { path, _pin: None }
     }
-    fn pinned(path: PathBuf, pin: Arc<()>) -> Self {
+    fn pinned(path: PathBuf, pin: object::CacheLease) -> Self {
         Self {
             path,
             _pin: Some(pin),
@@ -432,7 +441,10 @@ pub enum StorageConfig {
         allow_http: bool,
         prefix: String,
         root: PathBuf,
+        #[serde(default = "default_cache_budget_bytes")]
         cache_budget_bytes: u64,
+        #[serde(default = "default_cache_max_entries")]
+        cache_max_entries: usize,
     },
 }
 impl StorageConfig {
@@ -463,6 +475,7 @@ impl StorageConfig {
                 prefix,
                 root,
                 cache_budget_bytes,
+                cache_max_entries,
             } => {
                 adx_transport::install_crypto_provider();
                 let mut builder = object_store::aws::AmazonS3Builder::from_env()
@@ -479,7 +492,8 @@ impl StorageConfig {
                     prefix,
                     root,
                     cache_budget_bytes,
-                )?;
+                )?
+                .with_max_entries(cache_max_entries)?;
                 let store = if let Some((node, session, gc)) = owner {
                     store.with_owner(node, session, gc)?
                 } else {

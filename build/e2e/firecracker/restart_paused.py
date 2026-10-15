@@ -62,8 +62,6 @@ for r in records.values():
         ],
         check=True,
     )
-    if not (not [p for p in (P / 'checkpoints').rglob('*') if p.is_file()]):
-        raise AssertionError('pause left local data; remote-only recovery was not established')
 inventory = subprocess.check_output(
     ['/opt/adx-fc/bin/sbox', '-a', str(P / 'sandboxd/sandboxd.sock'), 'list'], text=True
 )
@@ -80,7 +78,24 @@ session = json.loads(c['node:node1'])['session']['id']
 from orphan_fixture import OrphanFixture
 
 orphan = OrphanFixture(P, artifact["location"], session)
-os.kill(node[0]['pid'], signal.SIGKILL)
+# Every backend is stopped and the selected Environment is authoritatively
+# Paused. Inject loss of this node's disposable cache before restart to retain
+# the remote-only recovery assertion even though Pause now seeds local copies.
+checkpoint_root = P / 'checkpoints'
+lost = P / 'checkpoint-cache-lost'
+local_files = sum(path.is_file() for path in checkpoint_root.rglob('*'))
+os.kill(node[0]['pid'], signal.SIGSTOP)
+try:
+    checkpoint_root.rename(lost)
+    checkpoint_root.mkdir(mode=0o700)
+finally:
+    os.kill(node[0]['pid'], signal.SIGKILL)
+shutil.rmtree(lost)
+(E / 'local-cache-loss.json').write_text(json.dumps({
+    'removed_files': local_files,
+    'backend_inventory_empty': True,
+    'remote_manifest_verified': True,
+}))
 end = time.monotonic() + 90
 while time.monotonic() < end:
     c = catalog()
