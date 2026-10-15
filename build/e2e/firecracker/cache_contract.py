@@ -14,8 +14,9 @@ CASES = (
 def verify(result):
     cases = result.get('cases', [])
     if (result.get('status') != 'passed' or result.get('cleanup_errors') != []
-            or result.get('inventories') != {'node1': 0, 'node2': 0}
-            or [case.get('name') for case in cases] != list(CASES)
+            or result.get('inventories') != {'node1': 0, 'node2': 0}):
+        raise ValueError('incomplete checkpoint-cache E2E evidence')
+    if ([case.get('name') for case in cases] != list(CASES)
             or not all(case.get('passed') is True for case in cases)):
         raise ValueError('incomplete checkpoint-cache E2E evidence')
     if not cases[0].get('storage_blocked') or not cases[0].get('pid_preserved'):
@@ -30,7 +31,8 @@ def verify(result):
     if (not cases[4].get('session_changed') or not cases[4].get('pid_preserved')
             or not cases[4].get('files_preserved')):
         raise ValueError('live restore files must survive node reconciliation')
-    if not cases[5].get('session_changed') or not cases[5].get('oldest_evicted') or not cases[5].get('newest_preserved'):
+    if (not cases[5].get('session_changed') or not cases[5].get('oldest_evicted')
+            or not cases[5].get('newest_preserved')):
         raise ValueError('missing restart LRU reconstruction evidence')
     if (cases[6].get('remaining_environments') != 0 or cases[6].get('local_files') != 0
             or cases[6].get('s3_objects') != 0):

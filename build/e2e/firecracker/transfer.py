@@ -43,7 +43,12 @@ def main():
     if suite not in ('transfer', 'demand', 'autoscaling', 'cache'):
         raise ValueError('unknown Firecracker suite')
     demand_suite = suite == 'demand'
-    verify = {'transfer': verify_transfer, 'demand': verify_demand, 'autoscaling': verify_autoscaling, 'cache': verify_cache}[suite]
+    verify = {
+        'transfer': verify_transfer,
+        'demand': verify_demand,
+        'autoscaling': verify_autoscaling,
+        'cache': verify_cache,
+    }[suite]
     sdk_result_name = 'sdk-' + suite + '.json'
     base = Path(os.environ.get('ADX_FC_BASE', '/opt/adx'))
     if root.exists():

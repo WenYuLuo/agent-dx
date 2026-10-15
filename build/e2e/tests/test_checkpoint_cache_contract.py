@@ -1,10 +1,15 @@
+import ast
 import copy
-import sys
+import importlib.util
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'firecracker'))
-from cache_contract import CASES, verify
+DRIVER_ROOT = Path(__file__).resolve().parents[1] / 'firecracker'
+SPEC = importlib.util.spec_from_file_location('checkpoint_cache_contract', DRIVER_ROOT / 'cache_contract.py')
+CONTRACT = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(CONTRACT)
+CASES, verify = CONTRACT.CASES, CONTRACT.verify
 
 
 def complete():
@@ -22,6 +27,18 @@ def complete():
 class CheckpointCacheContractTests(unittest.TestCase):
     def test_complete_evidence_is_accepted(self):
         verify(complete())
+
+    def test_invalid_overall_evidence_is_rejected(self):
+        for change in ('failed-status', 'case-order', 'failed-case'):
+            result = complete()
+            if change == 'failed-status':
+                result['status'] = 'failed'
+            elif change == 'case-order':
+                result['cases'].reverse()
+            else:
+                result['cases'][0]['passed'] = False
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                verify(result)
 
     def test_missing_scenario_or_dirty_backend_is_rejected(self):
         for change in ('missing-case', 'runtime-leak', 'cleanup-error'):
@@ -50,6 +67,27 @@ class CheckpointCacheContractTests(unittest.TestCase):
             result['cases'][6][field] = 1
             with self.subTest(field=field), self.assertRaises(ValueError):
                 verify(result)
+
+
+class OptimizedCacheDriverTests(unittest.TestCase):
+    def command(self, response):
+        source = DRIVER_ROOT / 'sdk_cache.py'
+        tree = ast.parse(source.read_text())
+        function = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == 'command')
+        module = ast.Module(body=[function], type_ignores=[])
+        namespace = {}
+        exec(compile(module, str(source), 'exec', optimize=2), namespace)
+        environment = SimpleNamespace(commands=SimpleNamespace(run=lambda *args, **kwargs: response))
+        return namespace['command'](environment, 'test command')
+
+    def test_failed_sdk_command_is_rejected_with_optimization(self):
+        response = SimpleNamespace(exit_code=7, stdout='', stderr='execution failed')
+        with self.assertRaises(AssertionError):
+            self.command(response)
+
+    def test_successful_sdk_command_returns_output_with_optimization(self):
+        response = SimpleNamespace(exit_code=0, stdout='  preserved value\n', stderr='')
+        self.assertEqual(self.command(response), 'preserved value')
 
 
 if __name__ == '__main__':

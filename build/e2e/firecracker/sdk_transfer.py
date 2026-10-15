@@ -286,17 +286,22 @@ try:
     # the live restore. After global deletion, authoritative node reconciliation
     # must remove it without touching any active execution or shared object.
     cleanup_restarts = {}
-    for node in ('node1', 'node2'):
-        previous = catalog()['node:' + node]['session']['id']
-        os.kill(pid(root / node, 'adxlet'), signal.SIGKILL)
-        wait(lambda node=node, previous=previous: (
-            catalog()['node:' + node]['session']['id'] != previous
-            and catalog()['node:' + node]['session']['routable']
-            and catalog()['node:' + node]['node']['available']
+    for cleanup_node in ('node1', 'node2'):
+        previous = catalog()['node:' + cleanup_node]['session']['id']
+        os.kill(pid(root / cleanup_node, 'adxlet'), signal.SIGKILL)
+        wait(lambda node_id=cleanup_node, session_id=previous: (
+            catalog()['node:' + node_id]['session']['id'] != session_id
+            and catalog()['node:' + node_id]['session']['routable']
+            and catalog()['node:' + node_id]['node']['available']
         ))
-        wait(lambda node=node: not any(path.is_file() for path in (root / node / 'checkpoints').rglob('*')))
-        cleanup_restarts[node] = catalog()['node:' + node]['session']['id']
-    (root / 'evidence/cache-reconciliation-cleanup.json').write_text(json.dumps({'local_files': 0, 'node_sessions': cleanup_restarts}, indent=2))
+        wait(lambda node_id=cleanup_node: not any(
+            path.is_file() for path in (root / node_id / 'checkpoints').rglob('*')
+        ))
+        cleanup_restarts[cleanup_node] = catalog()['node:' + cleanup_node]['session']['id']
+    (root / 'evidence/cache-reconciliation-cleanup.json').write_text(json.dumps({
+        'local_files': 0,
+        'node_sessions': cleanup_restarts,
+    }, indent=2))
     passed(5, local_files=0, cache_reconciled=True)
     result['status'] = 'passed'
 except BaseException as error:

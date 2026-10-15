@@ -91,7 +91,11 @@ try:
 finally:
     os.kill(node[0]['pid'], signal.SIGKILL)
 shutil.rmtree(lost)
-(E / 'local-cache-loss.json').write_text(json.dumps({'removed_files': local_files, 'backend_inventory_empty': True, 'remote_manifest_verified': True}))
+(E / 'local-cache-loss.json').write_text(json.dumps({
+    'removed_files': local_files,
+    'backend_inventory_empty': True,
+    'remote_manifest_verified': True,
+}))
 end = time.monotonic() + 90
 while time.monotonic() < end:
     c = catalog()
