@@ -17,6 +17,7 @@ struct Dependencies {
     start_entered: Semaphore,
     start_release: Semaphore,
     block_start: bool,
+    block_stage: Mutex<Option<String>>,
     actual: std::sync::atomic::AtomicBool,
     fail_cleanup: std::sync::atomic::AtomicBool,
     failure: Mutex<Option<adx_core::RuntimeFailure>>,
@@ -34,6 +35,7 @@ impl Dependencies {
             start_entered: Semaphore::new(0),
             start_release: Semaphore::new(0),
             block_start,
+            block_stage: Mutex::default(),
             actual: std::sync::atomic::AtomicBool::new(false),
             fail_cleanup: std::sync::atomic::AtomicBool::new(false),
             failure: Mutex::default(),
@@ -112,6 +114,10 @@ impl Readiness for Dependencies {
     }
     async fn wait_ready(&self, _record: &EnvironmentRecord) -> Result<()> {
         self.event("ready")?;
+        let block = self.block_stage.lock().unwrap().as_deref() == Some("ready");
+        if block {
+            std::future::pending::<()>().await;
+        }
         if let Some(failure) = self
             .probe_failure
             .lock()
@@ -127,6 +133,10 @@ impl Readiness for Dependencies {
 #[async_trait]
 impl Routes for Dependencies {
     async fn activate(&self, _record: &EnvironmentRecord) -> Result<()> {
+        let block = self.block_stage.lock().unwrap().as_deref() == Some("activate");
+        if block {
+            std::future::pending::<()>().await;
+        }
         self.event("activate")
     }
     async fn retire(&self, _record: &EnvironmentRecord) -> Result<()> {
@@ -535,6 +545,68 @@ async fn timed_out_start_releases_capacity_before_cleanup() {
         ["start", "commit:Failed", "retire", "remove"]
     );
     assert_eq!(node.used(), Resources::default());
+}
+
+#[tokio::test(start_paused = true)]
+async fn create_deadline_identifies_the_active_stage() {
+    for (blocked, expected) in [
+        ("start", "backend preparation/runtime start"),
+        ("ready", "Execd readiness"),
+        ("activate", "route activation"),
+    ] {
+        let deps = Dependencies::new(blocked == "start");
+        *deps.block_stage.lock().unwrap() = Some(blocked.into());
+        let node = node(&deps);
+        let environment = node
+            .environment(spec("timeout"), assignment("timeout"))
+            .unwrap();
+        let error = environment
+            .create_with_deadline(tokio::time::Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        let status = adx_protocol::status(error);
+        assert_eq!(status.code(), tonic::Code::DeadlineExceeded, "{status:?}");
+        assert!(status.message().contains(expected), "{status:?}");
+        let failed = environment.sync().await.unwrap().record;
+        assert_eq!(failed.state, EnvironmentState::Failed);
+        assert!(!failed.resources_held);
+        assert!(failed.failure.unwrap().message.contains(expected));
+        environment.tick().await.unwrap();
+        assert!(!deps.actual.load(std::sync::atomic::Ordering::SeqCst));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn timed_out_create_with_unconfirmed_publication_retains_retry_identity() {
+    let deps = Dependencies::new(true);
+    *deps.fail_at.lock().unwrap() = Some("commit:Failed".into());
+    let node = node(&deps);
+    let environment = node
+        .environment(spec("timeout"), assignment("timeout"))
+        .unwrap();
+    let error = environment
+        .create_with_deadline(tokio::time::Instant::now() + Duration::from_secs(1))
+        .await
+        .unwrap_err();
+    let status = adx_protocol::status(error);
+    assert_eq!(status.code(), tonic::Code::DeadlineExceeded);
+    assert!(status
+        .message()
+        .contains("backend preparation/runtime start"));
+    assert!(
+        adx_protocol::deadline_failure(&status).is_none(),
+        "{status:?}"
+    );
+    assert_eq!(node.used(), Resources::default());
+    *deps.fail_at.lock().unwrap() = None;
+    environment.tick().await.unwrap();
+    let record = environment.sync().await.unwrap().record;
+    assert_eq!(record.state, EnvironmentState::Failed);
+    assert!(record
+        .failure
+        .unwrap()
+        .message
+        .contains("backend preparation/runtime start"));
 }
 
 #[tokio::test]

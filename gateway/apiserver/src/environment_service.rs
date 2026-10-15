@@ -248,7 +248,7 @@ impl EnvironmentService {
         // The typed Environment payload includes workload probe configuration.
         // Keep the RPC orchestration future off callers' stack frames.
         let result = tokio::time::timeout_at(
-            operation.deadline.instant(),
+            operation.deadline.instant() + adx_transport::deadline::CREATE_RESPONSE_GRACE,
             Box::pin(self.perform_create(
                 &mut operation,
                 &input,
@@ -260,7 +260,7 @@ impl EnvironmentService {
         .await
         .unwrap_or_else(|_| {
             Err(Status::deadline_exceeded(
-                "create deadline exceeded; query the environment result",
+                "create response deadline exceeded while waiting for scheduling/node initialization result; query the same environment",
             ))
         });
         self.names.lock().await.remove(&operation.spec.id);
@@ -278,14 +278,15 @@ impl EnvironmentService {
         // Unknown outcomes retain their identity for a finite retry window.
         // Repeated inconclusive retries do not renew that window.
         if result.as_ref().is_err_and(|error| {
-            matches!(
-                error.code(),
-                Code::Cancelled
-                    | Code::Unknown
-                    | Code::Unavailable
-                    | Code::DeadlineExceeded
-                    | Code::Internal
-            )
+            adx_protocol::deadline_failure(error).is_none()
+                && matches!(
+                    error.code(),
+                    Code::Cancelled
+                        | Code::Unknown
+                        | Code::Unavailable
+                        | Code::DeadlineExceeded
+                        | Code::Internal
+                )
         }) {
             operation.unknown_since.get_or_insert_with(Instant::now);
             return;
@@ -352,7 +353,9 @@ impl EnvironmentService {
         };
 
         let timeouts = contract::create_timeouts(input)?;
-        let budget = deadline.remaining()?;
+        let budget = deadline.remaining().map_err(|_| {
+            Status::deadline_exceeded("create deadline exceeded during ownership lookup")
+        })?;
         // The RPC future is large in debug builds; keep it off the nested
         // embedded HTTP/Activator polling stack while preserving cancellation.
         let result = Box::pin(self.clients.create_environment(
@@ -450,6 +453,11 @@ fn existing_running_response(
         if let Some(failure) = &record.failure {
             let failure: adx_core::RuntimeFailure =
                 failure.clone().try_into().map_err(adx_protocol::status)?;
+            if failure.reason == adx_core::RuntimeFailureReason::DeadlineExceeded {
+                return Err(adx_protocol::status(adx_core::Error::DeadlineExceeded(
+                    failure.message,
+                )));
+            }
             if let Some(probe_failure) = failure.probe_failure {
                 return Err(adx_protocol::status(adx_core::Error::ProbeFailed(
                     probe_failure,

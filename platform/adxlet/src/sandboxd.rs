@@ -303,8 +303,11 @@ impl Sandboxd {
         }
         if let Some(deadline) = deadline {
             request.set_timeout(
-                adx_transport::deadline::remaining(deadline, Duration::MAX)
-                    .ok_or_else(|| unavailable("runtime start deadline exceeded"))?,
+                adx_transport::deadline::remaining(deadline, Duration::MAX).ok_or_else(|| {
+                    Error::DeadlineExceeded(
+                        "backend preparation/runtime start deadline exceeded".into(),
+                    )
+                })?,
             );
         }
         *state = StartState::Failed;
@@ -314,7 +317,27 @@ impl Sandboxd {
         tokio::spawn(async move {
             let response = match client.start(request).await {
                 Ok(response) => response.into_inner(),
-                Err(error) => return Err(unavailable(error)),
+                Err(error) => {
+                    if error.code() == Code::DeadlineExceeded
+                        && error
+                            .metadata()
+                            .get("sandboxd-start-failure")
+                            .is_some_and(|value| value == "true")
+                    {
+                        return Err(Error::DeadlineExceeded(format!(
+                            "sandboxd: {}",
+                            error.message()
+                        )));
+                    }
+                    if error.code() == Code::DeadlineExceeded
+                        && deadline.is_some_and(|deadline| deadline <= tokio::time::Instant::now())
+                    {
+                        return Err(Error::DeadlineExceeded(format!(
+                            "sandboxd Start deadline exceeded: {error}"
+                        )));
+                    }
+                    return Err(adx_protocol::backend_error(error));
+                }
             };
             if !response.id.is_empty() {
                 adx_observability::info!(

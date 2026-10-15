@@ -418,3 +418,16 @@ and `collector-process.log`. See the [log-collection contract](../../docs/testin
 for deployment and guarantee boundaries. Trace acceptance prints `[TRACE PASS]`
 and saves `traces-node*.json` and `collected-traces.jsonl`. Formal results are
 recorded in [Buildkite #21](../../docs/testing/2026-09-17-observability-k8s.md).
+
+## Early backend timeout regression
+
+`backend_start_timeout.py` exercises a standalone public API with real Redis, API Server, Coordinator, adxlet and sandboxd. It requires an idle disposable Linux container labelled `adx.e2e.backend-timeout=true`, native runc and a reachable OCI image. The test creates a TLS handshake blackhole for image preparation and blocks one runc `run` per runtime case. Other runc operations use the original executable; a parent-death signal bounds the blocked process to its shim. The runner restores the executable checksum in `finally`; the owner must remove the disposable container even if the runner is interrupted.
+
+```sh
+python3 build/e2e/backend_start_timeout.py \
+  --container "$CONTAINER" --api-url https://127.0.0.1:40446 \
+  --token-file "$DATA/token" --image "$RUNC_IMAGE" \
+  --budget 180 --evidence "$OUT/early-backend-timeouts"
+```
+
+Both image and runtime internal timers must fire at least ten seconds before the overall create budget. JSON and SSE must return `504 / DEADLINE_EXCEEDED / never / terminal` with the precise backend stage, and both original-request replay and authoritative failed-record replay must retain the exact message. The same real registry also returns missing-image, permission-denied, authentication-failure and rate-limit responses; JSON/SSE must retain their 404/403/401/429 categories and original message. Healthy create/delete calls before and after the faults verify runtime recovery. Evidence includes each response and an aggregate JSON verdict. This test injects faults only into the labelled disposable container.

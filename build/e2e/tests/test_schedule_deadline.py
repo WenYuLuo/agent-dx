@@ -22,7 +22,7 @@ class ScheduleDeadlineTests(unittest.TestCase):
         class EnvironmentError(Exception):
             def __init__(self, instance_id):
                 super().__init__('central scheduling queue deadline exceeded')
-                self.code = 'OUTCOME_UNKNOWN'
+                self.code = 'DEADLINE_EXCEEDED'
                 self.retry = 'same_operation'
                 self.outcome = 'unknown'
                 self.environment_id = instance_id

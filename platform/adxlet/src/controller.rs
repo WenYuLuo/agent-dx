@@ -756,13 +756,16 @@ impl Controller {
             self.services.operation_timeout
         };
         let mut awaiting_readiness = false;
+        let mut stage = "backend preparation/runtime start";
         let operation_started = Instant::now();
         let attempt = timeout(initialization_timeout, async {
             if self
                 .create_deadline
                 .is_some_and(|deadline| deadline <= tokio::time::Instant::now())
             {
-                return Err(Error::Unavailable("create deadline exceeded".into()));
+                return Err(Error::DeadlineExceeded(format!(
+                    "create deadline exceeded during {stage}"
+                )));
             }
             if self.record.spec.lifecycle.idle_action == adx_core::lifecycle::IdleAction::Pause {
                 self.services
@@ -824,12 +827,14 @@ impl Controller {
             );
             let runtime_start_ms = runtime_start_started.elapsed().as_secs_f64() * 1_000.0;
             awaiting_readiness = true;
+            stage = "Execd readiness";
             let runtime_ready_started = Instant::now();
             adx_observability::trace::Trace::child("environment.runtime.ready")
                 .run_result(self.services.readiness.wait_ready(&self.record))
                 .await?;
             let runtime_ready_ms = runtime_ready_started.elapsed().as_secs_f64() * 1_000.0;
             awaiting_readiness = false;
+            stage = "route activation";
             let route_started = Instant::now();
             adx_observability::trace::Trace::child("environment.route.activate")
                 .run_result(self.services.routes.activate(&self.record))
@@ -841,10 +846,25 @@ impl Controller {
             ))
         })
         .await
-        .unwrap_or_else(|_| Err(Error::Unavailable("environment start timed out".into())));
+        .unwrap_or_else(|_| {
+            Err(Error::DeadlineExceeded(format!(
+                "create deadline exceeded during {stage}"
+            )))
+        });
         let (runtime_start_ms, runtime_ready_ms, route_activate_ms) = match attempt {
             Ok(stages) => stages,
             Err(start_error) => {
+                let start_error = if matches!(start_error, Error::Unavailable(_))
+                    && self
+                        .create_deadline
+                        .is_some_and(|deadline| deadline <= tokio::time::Instant::now())
+                {
+                    Error::DeadlineExceeded(format!(
+                        "environment initialization deadline exceeded during {stage}"
+                    ))
+                } else {
+                    start_error
+                };
                 let start_error =
                     if awaiting_readiness && self.record.spec.execution.readiness_probe.is_some() {
                         match start_error {
@@ -859,6 +879,14 @@ impl Controller {
                 if let Error::ProbeFailed(failure) = &start_error {
                     self.record.failure = Some(failure.clone().into());
                 }
+                if let Error::DeadlineExceeded(message) = &start_error {
+                    self.record.failure = Some(adx_core::RuntimeFailure {
+                        reason: adx_core::RuntimeFailureReason::DeadlineExceeded,
+                        message: message.clone(),
+                        exit_code: None,
+                        probe_failure: None,
+                    });
+                }
                 self.transition(Event::Fail)?;
                 self.release_capacity()?;
                 self.record.restart_pending = restart
@@ -871,6 +899,25 @@ impl Controller {
                         .as_ref()
                         .is_some_and(|p| self.record.restart_attempts < p.max_attempts);
                 self.restart_after = None;
+                if self.create_deadline.is_some()
+                    && matches!(start_error, Error::DeadlineExceeded(_))
+                {
+                    // Report the known failed attempt without waiting for physical
+                    // cleanup. Failed controllers retain ownership and reconcile it.
+                    let publication = tokio::time::timeout(
+                        adx_transport::deadline::CREATE_RESPONSE_GRACE / 3,
+                        self.sync(),
+                    )
+                    .await;
+                    if !matches!(publication, Ok(Ok(_))) {
+                        adx_observability::warn!(environment_id = %self.record.spec.id,
+                            "timed-out create publication requires reconciliation");
+                        return Err(Error::ResponseTimeout(format!(
+                            "{start_error}; failure publication not confirmed; query the same environment"
+                        )));
+                    }
+                    return Err(start_error);
+                }
                 let commit = self.sync().await;
                 let cleanup = self.cleanup().await;
                 return match (cleanup, commit) {

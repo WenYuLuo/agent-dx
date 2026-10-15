@@ -262,11 +262,36 @@ impl TryFrom<adx_core::EnvironmentRecord> for control::EnvironmentRecord {
 }
 pub fn status(error: adx_core::Error) -> tonic::Status {
     match error {
+        Error::BackendFailure { code, message } => {
+            let mut status = tonic::Status::new(backend_wire_code(code), message);
+            status.metadata_mut().insert(
+                "adx-backend-failure",
+                tonic::metadata::MetadataValue::from_static("true"),
+            );
+            status
+        }
         Error::Invalid(message) => tonic::Status::invalid_argument(message),
         Error::Conflict => tonic::Status::failed_precondition("identity or version conflict"),
         Error::NotFound => tonic::Status::not_found("environment or node not found"),
         Error::NoCapacity => tonic::Status::resource_exhausted("capacity unavailable"),
         Error::Unavailable(message) => tonic::Status::unavailable(message),
+        Error::ResponseTimeout(message) => tonic::Status::deadline_exceeded(message),
+        Error::DeadlineExceeded(message) => {
+            let failure = adx_core::RuntimeFailure {
+                reason: adx_core::RuntimeFailureReason::DeadlineExceeded,
+                message: message.clone(),
+                exit_code: None,
+                probe_failure: None,
+            };
+            match serde_json::to_vec(&failure) {
+                Ok(details) => tonic::Status::with_details(
+                    tonic::Code::DeadlineExceeded,
+                    message,
+                    details.into(),
+                ),
+                Err(_) => tonic::Status::internal("deadline failure encoding failed"),
+            }
+        }
         Error::ProbeFailed(failure) => match serde_json::to_vec(&failure) {
             Ok(details) => tonic::Status::with_details(
                 tonic::Code::FailedPrecondition,
@@ -278,6 +303,9 @@ pub fn status(error: adx_core::Error) -> tonic::Status {
     }
 }
 pub fn dependency_status(status: tonic::Status) -> Error {
+    if let Some(failure) = deadline_failure(&status) {
+        return Error::DeadlineExceeded(failure.message);
+    }
     if let Ok(failure) = serde_json::from_slice(status.details()) {
         return Error::ProbeFailed(failure);
     }
@@ -288,6 +316,16 @@ pub fn dependency_status(status: tonic::Status) -> Error {
         tonic::Code::InvalidArgument => Error::Invalid("remote request rejected".into()),
         _ => Error::Unavailable("control RPC unavailable".into()),
     }
+}
+
+/// A node-confirmed failed create, distinct from a transport wait expiring.
+pub fn deadline_failure(status: &tonic::Status) -> Option<adx_core::RuntimeFailure> {
+    if status.code() != tonic::Code::DeadlineExceeded {
+        return None;
+    }
+    serde_json::from_slice::<adx_core::RuntimeFailure>(status.details())
+        .ok()
+        .filter(|failure| failure.reason == adx_core::RuntimeFailureReason::DeadlineExceeded)
 }
 
 impl From<adx_core::RestorePoint> for control::RestorePoint {
@@ -499,6 +537,7 @@ impl TryFrom<control::RuntimeFailure> for adx_core::RuntimeFailure {
             Ok(Wire::Exited) => Reason::Exited,
             Ok(Wire::Missing) => Reason::Missing,
             Ok(Wire::ProbeFailed) => Reason::ProbeFailed,
+            Ok(Wire::DeadlineExceeded) => Reason::DeadlineExceeded,
             _ => return Err(Error::Invalid("invalid runtime failure reason".into())),
         };
         let probe_failure = value.probe_failure.map(TryInto::try_into).transpose()?;
@@ -524,6 +563,7 @@ impl From<adx_core::RuntimeFailure> for control::RuntimeFailure {
             Reason::Exited => Wire::Exited,
             Reason::Missing => Wire::Missing,
             Reason::ProbeFailed => Wire::ProbeFailed,
+            Reason::DeadlineExceeded => Wire::DeadlineExceeded,
         };
         Self {
             reason: reason as i32,
@@ -538,5 +578,61 @@ impl TryFrom<Box<control::RuntimeFailure>> for adx_core::RuntimeFailure {
     type Error = Error;
     fn try_from(value: Box<control::RuntimeFailure>) -> Result<Self> {
         (*value).try_into()
+    }
+}
+
+/// Preserve a backend application status without inferring a confirmed timeout.
+/// Confirmed Start deadlines use the separate DeadlineExceeded failure contract.
+pub fn backend_error(status: tonic::Status) -> adx_core::Error {
+    let mut source = std::error::Error::source(&status);
+    while let Some(error) = source {
+        if error.is::<tonic::transport::Error>() {
+            return Error::Unavailable(format!("sandboxd transport: {}", status.message()));
+        }
+        source = error.source();
+    }
+    let code = match status.code() {
+        tonic::Code::Cancelled => adx_core::BackendFailureCode::Cancelled,
+        tonic::Code::Unknown => adx_core::BackendFailureCode::Unknown,
+        tonic::Code::InvalidArgument => adx_core::BackendFailureCode::InvalidArgument,
+        tonic::Code::DeadlineExceeded => adx_core::BackendFailureCode::DeadlineExceeded,
+        tonic::Code::NotFound => adx_core::BackendFailureCode::NotFound,
+        tonic::Code::AlreadyExists => adx_core::BackendFailureCode::AlreadyExists,
+        tonic::Code::PermissionDenied => adx_core::BackendFailureCode::PermissionDenied,
+        tonic::Code::ResourceExhausted => adx_core::BackendFailureCode::ResourceExhausted,
+        tonic::Code::FailedPrecondition => adx_core::BackendFailureCode::FailedPrecondition,
+        tonic::Code::Aborted => adx_core::BackendFailureCode::Aborted,
+        tonic::Code::OutOfRange => adx_core::BackendFailureCode::OutOfRange,
+        tonic::Code::Unimplemented => adx_core::BackendFailureCode::Unimplemented,
+        tonic::Code::Internal => adx_core::BackendFailureCode::Internal,
+        tonic::Code::Unavailable => adx_core::BackendFailureCode::Unavailable,
+        tonic::Code::DataLoss => adx_core::BackendFailureCode::DataLoss,
+        tonic::Code::Unauthenticated => adx_core::BackendFailureCode::Unauthenticated,
+        tonic::Code::Ok => adx_core::BackendFailureCode::Internal,
+    };
+    Error::BackendFailure {
+        code,
+        message: format!("sandboxd: {}", status.message()),
+    }
+}
+
+fn backend_wire_code(code: adx_core::BackendFailureCode) -> tonic::Code {
+    match code {
+        adx_core::BackendFailureCode::Cancelled => tonic::Code::Cancelled,
+        adx_core::BackendFailureCode::Unknown => tonic::Code::Unknown,
+        adx_core::BackendFailureCode::InvalidArgument => tonic::Code::InvalidArgument,
+        adx_core::BackendFailureCode::DeadlineExceeded => tonic::Code::DeadlineExceeded,
+        adx_core::BackendFailureCode::NotFound => tonic::Code::NotFound,
+        adx_core::BackendFailureCode::AlreadyExists => tonic::Code::AlreadyExists,
+        adx_core::BackendFailureCode::PermissionDenied => tonic::Code::PermissionDenied,
+        adx_core::BackendFailureCode::ResourceExhausted => tonic::Code::ResourceExhausted,
+        adx_core::BackendFailureCode::FailedPrecondition => tonic::Code::FailedPrecondition,
+        adx_core::BackendFailureCode::Aborted => tonic::Code::Aborted,
+        adx_core::BackendFailureCode::OutOfRange => tonic::Code::OutOfRange,
+        adx_core::BackendFailureCode::Unimplemented => tonic::Code::Unimplemented,
+        adx_core::BackendFailureCode::Internal => tonic::Code::Internal,
+        adx_core::BackendFailureCode::Unavailable => tonic::Code::Unavailable,
+        adx_core::BackendFailureCode::DataLoss => tonic::Code::DataLoss,
+        adx_core::BackendFailureCode::Unauthenticated => tonic::Code::Unauthenticated,
     }
 }
