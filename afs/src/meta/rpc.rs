@@ -8,9 +8,10 @@
 use afs_protocol::meta::{
     AbortRootReply, AbortRootRequest, AckRevocationReply, AckRevocationRequest, AcquireRootReply,
     AcquireRootRequest, ActivateRootReply, ActivateRootRequest, CommitFileVersionReply,
-    CommitFileVersionRequest, DfsCallerContext as PbDfsCallerContext, DfsCommitMetadataMode,
-    DfsCreateReply, DfsCreateRequest, DfsDentryRecord as PbDfsDentryRecord, DfsGetXattrReply,
-    DfsGetXattrRequest, DfsInodeAttributeUpdate as PbDfsInodeAttributeUpdate,
+    CommitFileVersionRequest, DeactivateRootReply, DeactivateRootRequest,
+    DfsCallerContext as PbDfsCallerContext, DfsCommitMetadataMode, DfsCreateReply,
+    DfsCreateRequest, DfsDentryRecord as PbDfsDentryRecord, DfsGetXattrReply, DfsGetXattrRequest,
+    DfsInodeAttributeUpdate as PbDfsInodeAttributeUpdate,
     DfsInodeAttributes as PbDfsInodeAttributes, DfsInodeKind as PbDfsInodeKind,
     DfsInodeRecord as PbDfsInodeRecord, DfsLayoutRoot as PbDfsLayoutRoot, DfsLinkReply,
     DfsLinkRequest, DfsListXattrReply, DfsListXattrRequest, DfsLookupReply, DfsLookupRequest,
@@ -557,6 +558,32 @@ impl OwnerRootsService for OwnerRootsRpc {
             .await
             .map_err(afs_transport::grpc::error_status::error_to_status)?;
         Ok(Response::new(AbortRootReply {}))
+    }
+
+    async fn deactivate_root(
+        &self,
+        request: Request<DeactivateRootRequest>,
+    ) -> Result<Response<DeactivateRootReply>, Status> {
+        let authenticated = authenticated_node_id(&self.0, &request)?;
+        let request = request.into_inner();
+        require_text(&request.request_id, "request_id")?;
+        require_text(&request.root_id, "root_id")?;
+        require_text(&request.home_node_id, "home_node_id")?;
+        require_text(&request.home_session_id, "home_session_id")?;
+        self.0
+            .owner_roots
+            .deactivate_root(super::owner_roots::DeactivateRootInput {
+                request_id: request.request_id,
+                root_id: request.root_id,
+                root_epoch: request.root_epoch,
+                home_node_id: request.home_node_id,
+                home_session_id: request.home_session_id,
+                reason: request.reason,
+                authenticated_home_node_id: authenticated,
+            })
+            .await
+            .map_err(afs_transport::grpc::error_status::error_to_status)?;
+        Ok(Response::new(DeactivateRootReply {}))
     }
 
     async fn lookup_root(
