@@ -216,6 +216,22 @@ pub trait Backend: Send + Sync {
         Err(unsupported("read"))
     }
 
+    /// Optional owned read response for backends that can build a private final
+    /// payload without first filling a caller-owned buffer. The default keeps
+    /// legacy backends compatible by delegating to `read`.
+    fn read_owned(
+        &self,
+        ctx: &types::RequestContext,
+        handle: types::FileHandle,
+        offset: u64,
+        size: usize,
+    ) -> Result<Vec<u8>> {
+        let mut out = vec![0; size];
+        let n = self.read(ctx, handle, offset, &mut out)?;
+        out.truncate(n);
+        Ok(out)
+    }
+
     /// 返回底层确认的实际字节数；不能把部分成功或未知结果报成整笔成功。
     /// O_APPEND 的末尾定位属于打开句柄语义，后端不能盲信传入 offset。
     fn write(
@@ -422,4 +438,48 @@ fn unsupported(operation: &str) -> Error {
         afs_error::NODE_VFS_UNIMPLEMENTED,
         format!("VFS backend operation '{operation}' is not implemented"),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        Backend,
+        types::{BackendInode, FileHandle, RequestContext},
+    };
+    use afs_error::Result;
+
+    struct DefaultReadOwnedBackend;
+
+    impl Backend for DefaultReadOwnedBackend {
+        fn root_inode(&self) -> BackendInode {
+            BackendInode { value: 1 }
+        }
+
+        fn read(
+            &self,
+            _ctx: &RequestContext,
+            handle: FileHandle,
+            offset: u64,
+            out: &mut [u8],
+        ) -> Result<usize> {
+            assert_eq!(handle, FileHandle(7));
+            assert_eq!(offset, 3);
+            out[..5].copy_from_slice(b"owned");
+            Ok(5)
+        }
+    }
+
+    #[test]
+    fn default_read_owned_delegates_to_buffered_read() {
+        let backend = DefaultReadOwnedBackend;
+        let ctx = RequestContext {
+            uid: 1000,
+            gid: 1000,
+            pid: 1234,
+            umask: 0,
+            supplementary_gids: Vec::new(),
+        };
+        let data = backend.read_owned(&ctx, FileHandle(7), 3, 16).unwrap();
+        assert_eq!(data, b"owned");
+    }
 }

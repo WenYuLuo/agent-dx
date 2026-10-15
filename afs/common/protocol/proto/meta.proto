@@ -387,6 +387,9 @@ service DfsMeta {
   rpc ReportChunkCorruption(ReportDfsChunkCorruptionRequest) returns (ReportDfsChunkCorruptionReply);
   rpc GetChunkSources(GetDfsChunkSourcesRequest) returns (GetDfsChunkSourcesReply);
   rpc ValidateReadGrants(ValidateDfsReadGrantsRequest) returns (ValidateDfsReadGrantsReply);
+  rpc ValidateExternalReadGrants(ValidateExternalReadGrantsRequest) returns (ValidateExternalReadGrantsReply);
+  rpc AuthorizeCurrentExternalRead(AuthorizeCurrentExternalReadRequest) returns (AuthorizeCurrentExternalReadReply);
+  rpc AuthorizeExternalVersionRead(AuthorizeExternalVersionReadRequest) returns (AuthorizeExternalVersionReadReply);
   rpc SyncInodeMetadata(SyncDfsInodeMetadataRequest) returns (SyncDfsInodeMetadataReply);
   rpc CommitFileVersion(CommitFileVersionRequest) returns (CommitFileVersionReply);
 }
@@ -629,6 +632,14 @@ message DfsFileVersion {
   uint64 created_at_unix_ms = 6;
 }
 
+message DfsExternalCommitReceipt {
+  string store_id = 1;
+  string generation = 2;
+  string object_key = 3;
+  uint64 persisted_bytes = 4;
+  bytes verified_digest = 5;
+  DfsDigestAlgorithm verified_digest_algorithm = 6;
+}
 message DfsChunkReceipt {
   string operation_id = 1;
   string chunk_id = 2;
@@ -640,6 +651,7 @@ message DfsChunkReceipt {
   string replica_group_id = 11;
   repeated DfsReplicaAck durable_acks = 12;
   DfsDigestAlgorithm content_digest_algorithm = 13;
+  DfsExternalCommitReceipt external_commit = 14;
 }
 
 message DfsWriteLease {
@@ -1069,6 +1081,7 @@ message DfsSourceCandidate {
 message DfsChunkSources {
   string chunk_id = 1;
   repeated DfsSourceCandidate sources = 2;
+  DfsChunkObject chunk = 3;
 }
 
 message GetDfsChunkSourcesRequest {
@@ -1123,6 +1136,11 @@ message DfsReadValidation {
   uint64 chunk_offset = 4;
   uint64 length = 5;
 }
+message DfsMissingReadSource {
+  string chunk_id = 1;
+  uint64 chunk_offset = 2;
+  uint64 length = 3;
+}
 message DfsAuthorizedRead {
   DfsReadValidation validation = 1;
   message Range { uint64 offset = 1; uint64 length = 2; }
@@ -1136,3 +1154,49 @@ message ValidateDfsReadGrantsRequest {
   repeated DfsReadValidation validations = 4;
 }
 message ValidateDfsReadGrantsReply { repeated DfsAuthorizedRead authorizations = 1; }
+
+message DfsExternalAuthorizedRead {
+  DfsAuthorizedRead authorized = 1;
+  DfsChunkObject chunk = 2;
+  DfsCopyLocation location = 3;
+}
+message ValidateExternalReadGrantsRequest {
+  string caller_id = 1;
+  repeated DfsReadValidation validations = 2;
+}
+message ValidateExternalReadGrantsReply {
+  repeated DfsExternalAuthorizedRead authorizations = 1;
+}
+
+// Validates a speculative immutable layout and the current inode head in one
+// Meta read view. A changed head never carries authority for the old layout.
+message AuthorizeCurrentExternalReadRequest {
+  string caller_id = 1;
+  string inode_id = 2;
+  string namespace_id = 3;
+  string expected_head_version_id = 4;
+  string layout_root_id = 5;
+  repeated DfsReadValidation validations = 6;
+  repeated DfsMissingReadSource missing_sources = 7;
+}
+message AuthorizeCurrentExternalReadReply {
+  DfsInodeRecord inode = 1;
+  bool head_changed = 2;
+  repeated DfsExternalAuthorizedRead authorizations = 3;
+}
+
+// Authorizes object reads against one immutable file version. The caller must
+// already have established the open-time freshness boundary; this operation only
+// re-admits source ranges in the fixed version/layout and current reader session.
+message AuthorizeExternalVersionReadRequest {
+  string caller_id = 1;
+  string inode_id = 2;
+  string namespace_id = 3;
+  string file_version_id = 4;
+  string layout_root_id = 5;
+  repeated DfsMissingReadSource requests = 6;
+}
+message AuthorizeExternalVersionReadReply {
+  repeated DfsExternalAuthorizedRead authorizations = 1;
+  uint64 remaining_validity_ms = 2;
+}

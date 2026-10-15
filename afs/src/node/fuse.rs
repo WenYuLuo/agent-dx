@@ -22,6 +22,7 @@ use std::{
 };
 
 use afs_error::{Error, Result};
+use afs_tracing::tracing;
 use fuser::{
     AccessFlags, BackgroundSession, Config, Errno, FileAttr, FileHandle as FuseFileHandle,
     FileType, Filesystem, FopenFlags, Generation, INodeNo, InitFlags, KernelConfig, LockOwner,
@@ -35,7 +36,7 @@ use crate::node::vfs::ownerfs::OwnerFs;
 use crate::node::vfs::{
     Backend,
     types::{
-        AttributeChange, BackendInode, DirectoryEntry, Entry, FileAttributes, FileKind,
+        AttributeChange, BackendInode, DirectoryEntry, Entry, FileAttributes, FileHandle, FileKind,
         FileLockOwner, FilesystemCapacity, OpenOptions, ReleaseKind, RenameFlags, RequestContext,
         SetAttrOptions, SpecialFileKind, SyncMode, WriteOptions, is_legacy_privilege_clear,
     },
@@ -65,6 +66,16 @@ fn inline_local_read_data(
     }
     let n = read(&mut scratch[..size])?;
     Ok(Cow::Borrowed(&scratch[..n.min(size)]))
+}
+
+fn backend_read_data(
+    backend: &dyn Backend,
+    ctx: &RequestContext,
+    handle: FileHandle,
+    offset: u64,
+    size: usize,
+) -> Result<Vec<u8>> {
+    backend.read_owned(ctx, handle, offset, size)
 }
 
 /// Implemented first-party FUSE callback entries, including failed requests.
@@ -609,6 +620,12 @@ impl AfsFuse {
         }
     }
 
+    fn filesystem_label(&self) -> &'static str {
+        self.requests
+            .as_ref()
+            .map_or("unknown", |(_, filesystem)| *filesystem)
+    }
+
     fn remember_cached_inode(&self, _inode: BackendInode, ino: u64) {
         #[cfg(feature = "ownerfs")]
         if let Some(ownerfs) = &self.ownerfs {
@@ -1135,12 +1152,23 @@ impl Filesystem for AfsFuse {
         let file_handle_inodes = self.file_handle_inodes.clone();
         let context = Self::context(req, 0);
         let cached_io = self.cached_io;
+        let enqueue_at = std::time::Instant::now();
+        let open_span = tracing::info_span!(
+            "node.fuse.open",
+            ino,
+            flags,
+            queue_wait_us = tracing::field::Empty,
+        );
         #[cfg(feature = "ownerfs")]
         let ownerfs = self.ownerfs.clone();
         let run = move || {
-            let result = backend
-                .open_with_options(&context, inode, flags, options)
-                .map_err(errno);
+            open_span.record("queue_wait_us", enqueue_at.elapsed().as_micros() as u64);
+            let _entered = open_span.enter();
+            let result = tracing::info_span!("node.fuse.open.backend").in_scope(|| {
+                backend
+                    .open_with_options(&context, inode, flags, options)
+                    .map_err(errno)
+            });
             match result {
                 Ok(handle) => {
                     let fh = state
@@ -1181,6 +1209,13 @@ impl Filesystem for AfsFuse {
         self.record_request("read");
         let ino = ino.0;
         let fh = fh.0;
+        let request_span = tracing::info_span!(
+            "node.fuse.read.request",
+            ino,
+            fh,
+            offset,
+            requested_bytes = size as u64,
+        );
         let inline_local_read = self
             .state
             .lock()
@@ -1190,43 +1225,70 @@ impl Filesystem for AfsFuse {
         let backend = self.backend.clone();
         let state = self.state.clone();
         let context = Self::context(req, 0);
+        let enqueue_at = std::time::Instant::now();
+        let filesystem = self.filesystem_label();
+        let fuse_span = tracing::info_span!(
+            parent: &request_span,
+            "node.fuse.read",
+            filesystem,
+            ino,
+            fh,
+            offset,
+            requested_bytes = size as u64,
+            queue_wait_us = tracing::field::Empty,
+            returned_bytes = tracing::field::Empty,
+        );
         if inline_local_read {
             let mut scratch = self.inline_local_read_scratch.lock().unwrap();
-            let file = state.lock().unwrap().file_handle(fh);
-            let file = file
-                .ok_or(libc::ESTALE)
-                .and_then(|file| AfsFuse::validate_handle_inode_in(&state, ino).map(|()| file));
-            let result = match file {
-                Ok(file) => inline_local_read_data(&mut scratch, size as usize, |out| {
-                    backend
-                        .read(&context, file.handle, offset, out)
-                        .map_err(errno)
-                }),
-                Err(error) => Err(error),
-            };
+            let result = fuse_span.in_scope(|| {
+                tracing::info_span!("node.fuse.read.execute").in_scope(|| {
+                    fuse_span.record("queue_wait_us", 0_u64);
+                    let file = state.lock().unwrap().file_handle(fh);
+                    let file = file.ok_or(libc::ESTALE).and_then(|file| {
+                        AfsFuse::validate_handle_inode_in(&state, ino).map(|()| file)
+                    });
+                    match file {
+                        Ok(file) => inline_local_read_data(&mut scratch, size as usize, |out| {
+                            backend
+                                .read(&context, file.handle, offset, out)
+                                .map_err(errno)
+                        }),
+                        Err(error) => Err(error),
+                    }
+                })
+            });
             match result {
-                Ok(data) => reply.data(&data),
+                Ok(data) => {
+                    fuse_span.record("returned_bytes", data.len() as u64);
+                    tracing::info_span!(parent: &request_span, "node.fuse.read.reply", returned_bytes = data.len() as u64)
+                        .in_scope(|| reply.data(&data))
+                }
                 Err(error) => reply.error(fuse_errno(error)),
             }
             return;
         }
         let run = move || {
-            let result = (|| {
-                let file = state.lock().unwrap().file_handle(fh).ok_or(libc::ESTALE)?;
-                AfsFuse::validate_handle_inode_in(&state, ino)?;
-                let mut out = vec![0; size as usize];
-                Ok(backend.as_ref()).and_then(|backend| {
-                    backend
-                        .read(&context, file.handle, offset, &mut out)
-                        .map(|n| {
-                            out.truncate(n);
-                            out
-                        })
-                        .map_err(errno)
+            let result = fuse_span.in_scope(|| {
+                tracing::info_span!("node.fuse.read.execute").in_scope(|| {
+                    fuse_span.record("queue_wait_us", enqueue_at.elapsed().as_micros() as u64);
+                    let file = state.lock().unwrap().file_handle(fh).ok_or(libc::ESTALE)?;
+                    AfsFuse::validate_handle_inode_in(&state, ino)?;
+                    backend_read_data(
+                        backend.as_ref(),
+                        &context,
+                        file.handle,
+                        offset,
+                        size as usize,
+                    )
+                    .map_err(errno)
                 })
-            })();
+            });
             match result {
-                Ok(data) => reply.data(&data),
+                Ok(data) => {
+                    fuse_span.record("returned_bytes", data.len() as u64);
+                    tracing::info_span!(parent: &request_span, "node.fuse.read.reply", returned_bytes = data.len() as u64)
+                        .in_scope(|| reply.data(&data))
+                }
                 Err(error) => reply.error(fuse_errno(error)),
             }
         };
@@ -1251,12 +1313,39 @@ impl Filesystem for AfsFuse {
         let backend = self.backend.clone();
         let state = self.state.clone();
         let context = Self::context(req, 0);
-        let data = data.to_vec();
+        let request_span = tracing::info_span!(
+            "node.fuse.write.request",
+            ino,
+            fh,
+            offset,
+            requested_bytes = data.len() as u64,
+        );
+        let data = tracing::info_span!(
+            parent: &request_span,
+            "node.fuse.write.input_copy",
+            copied_bytes = data.len() as u64,
+        )
+        .in_scope(|| data.to_vec());
         let options = WriteOptions {
             kill_suidgid: write_kill_suidgid(write_flags),
         };
+        let enqueue_at = std::time::Instant::now();
+        let requested_bytes = data.len() as u64;
+        let filesystem = self.filesystem_label();
+        let fuse_span = tracing::info_span!(
+            parent: &request_span,
+            "node.fuse.write",
+            filesystem,
+            ino,
+            fh,
+            offset,
+            requested_bytes,
+            queue_wait_us = tracing::field::Empty,
+            returned_bytes = tracing::field::Empty,
+        );
         self.dispatch.submit_keyed(fh, move || {
-            let result = (|| {
+            let result = fuse_span.in_scope(|| tracing::info_span!("node.fuse.write.execute").in_scope(|| {
+                fuse_span.record("queue_wait_us", enqueue_at.elapsed().as_micros() as u64);
                 let file = state.lock().unwrap().file_handle(fh).ok_or(libc::ESTALE)?;
                 AfsFuse::validate_handle_inode_in(&state, ino)?;
                 Ok(backend.as_ref()).and_then(|backend| {
@@ -1264,10 +1353,14 @@ impl Filesystem for AfsFuse {
                         .write_with_options(&context, file.handle, offset, &data, options)
                         .map_err(errno)
                 })
-            })();
+            }));
             match result {
                 Ok(written) => match u32::try_from(written) {
-                    Ok(written) => reply.written(written),
+                    Ok(written) => {
+                        fuse_span.record("returned_bytes", written as u64);
+                        tracing::info_span!(parent: &request_span, "node.fuse.write.reply", returned_bytes = written as u64)
+                            .in_scope(|| reply.written(written))
+                    }
                     Err(_) => reply.error(fuse_errno(libc::EIO)),
                 },
                 Err(error) => reply.error(fuse_errno(error)),
@@ -2210,6 +2303,121 @@ mod dispatch_tests {
             assert_eq!(scratch.as_ptr(), pointer);
             assert_eq!(scratch, contents);
         }
+    }
+
+    struct OwnedReadBackend {
+        owned: Vec<u8>,
+        buffered: &'static [u8],
+        read_calls: std::sync::atomic::AtomicUsize,
+        read_owned_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl super::Backend for OwnedReadBackend {
+        fn root_inode(&self) -> super::BackendInode {
+            super::BackendInode { value: 1 }
+        }
+
+        fn read_owned(
+            &self,
+            _ctx: &super::RequestContext,
+            handle: super::FileHandle,
+            offset: u64,
+            size: usize,
+        ) -> super::Result<Vec<u8>> {
+            self.read_owned_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(handle, super::FileHandle(9));
+            assert_eq!(offset, 4);
+            assert_eq!(size, 32);
+            Ok(self.owned.clone())
+        }
+
+        fn read(
+            &self,
+            _ctx: &super::RequestContext,
+            handle: super::FileHandle,
+            offset: u64,
+            out: &mut [u8],
+        ) -> super::Result<usize> {
+            self.read_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(handle, super::FileHandle(9));
+            assert_eq!(offset, 4);
+            out[..self.buffered.len()].copy_from_slice(self.buffered);
+            Ok(self.buffered.len())
+        }
+    }
+
+    fn test_context() -> super::RequestContext {
+        super::RequestContext {
+            uid: 1000,
+            gid: 1000,
+            pid: 1234,
+            umask: 0,
+            supplementary_gids: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn backend_read_data_prefers_owned_response_without_buffered_read() {
+        let backend = OwnedReadBackend {
+            owned: b"private".to_vec(),
+            buffered: b"fallback",
+            read_calls: std::sync::atomic::AtomicUsize::new(0),
+            read_owned_calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let data = super::backend_read_data(&backend, &test_context(), super::FileHandle(9), 4, 32)
+            .unwrap();
+        assert_eq!(data, b"private");
+        assert_eq!(
+            backend
+                .read_owned_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            backend.read_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+    }
+
+    #[test]
+    fn backend_read_data_uses_backend_default_owned_fallback() {
+        struct BufferedOnlyBackend {
+            read_calls: std::sync::atomic::AtomicUsize,
+        }
+
+        impl super::Backend for BufferedOnlyBackend {
+            fn root_inode(&self) -> super::BackendInode {
+                super::BackendInode { value: 1 }
+            }
+
+            fn read(
+                &self,
+                _ctx: &super::RequestContext,
+                handle: super::FileHandle,
+                offset: u64,
+                out: &mut [u8],
+            ) -> super::Result<usize> {
+                self.read_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                assert_eq!(handle, super::FileHandle(9));
+                assert_eq!(offset, 4);
+                out[..8].copy_from_slice(b"fallback");
+                Ok(8)
+            }
+        }
+
+        let backend = BufferedOnlyBackend {
+            read_calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let data = super::backend_read_data(&backend, &test_context(), super::FileHandle(9), 4, 32)
+            .unwrap();
+        assert_eq!(data, b"fallback");
+        assert_eq!(
+            backend.read_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
     }
 
     #[test]
