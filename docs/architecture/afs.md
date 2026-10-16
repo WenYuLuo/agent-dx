@@ -45,6 +45,64 @@ Node 的 Meta、peer control 和 data 诊断请求复用生产 TLS 配置，诊�
 这里的 Node ID 绑定发生在服务端对调用方的校验中；客户端仍按 CA 和
 `tls_server_name` 验证服务端，不承诺按目标 Node ID 对服务端证书逐一 pinning。
 
+## DFS 原生节点读取上下文
+
+未配置外部后端时，新open从Meta取得fresh inode，之后同句柄复用已提交版本视图
+最多5秒。截止从fresh请求前的单调时刻起算，并受Node/session原期限限制；命中和
+心跳不延长该视图。到期刷新head，已有getattr、本机成功发布或truncate刷新点
+使旧视图失效。close-to-open保证新打开读取最新已提交状态，不承诺已打开句柄
+每次read即时感知外部修改，也不固定为永久快照；rename/unlink沿用inode及版本
+保留规则，不因视图复用扩展GC或文件描述符生命周期。
+
+版本新鲜度和授权独立。Node注册、心跳、epoch变化和停止接入同一有界读取授权，
+read开始与私有结果交付前检查；source缓存仍为500ms，A端grant缓存仍最多5秒，
+原grant有效期不延长。普通Meta断链只允许继续已获且未到期的上下文；新open、
+head/source/授权刷新需要Meta时失败即报错。读取拒绝失效对应上下文，Node级
+拒绝或epoch变化才停止共享授权，不能由单个grant到期停止所有合法句柄。
+
+A端完整BLAKE3通过后可复用当前不可变对象，单槽最多4MiB；填充、驻留、退役
+但仍被流持有的载荷、range回退与RDMA packed共用8MiB容量。catalog及物理身份
+变化失效重验。保留逐range授权及范围checksum；完整已验证对象响应复用可信根摘要，partial／fallback仍实际计算范围checksum。不预读下一对象；B可选纯磁盘缓存
+与A的正文额度分别核算，帧通道和扫描scratch仍受原独立上限，不把8MiB当作整个Node RSS。
+
+B 的原生 `dfs_peer_cache` 是可丢弃磁盘缓存，默认 OFF；不写入 LocalChunkStore
+副本目录，不产生 DurableReplica 或持久 ACK。Meta 的 ChunkSources 可附带同一授权
+视图中的合法区间，缺失或超过128段提示时保守沿用原范围读取；原 MAC 与权限不变。
+缓存文件由 namespace 和完整 ChunkObject 身份隔离，命中先确认有效 grant／Node session，
+完整对齐1MiB命中直接读入既有私有结果，再以完整分段BLAKE3核验；partial／跨段／尾段使用64KiB临时scratch保守路径。两者都经最终授权检查才交付结果。初次获取和重启恢复仍完整验证可信Meta根；分段摘要仅从这些已验证正文派生。完整文件身份（device／inode／length／mtime／ctime）变化使证明失效并完整重验；metadata未变的未请求段静默损坏延后到该段被读取才检测。没有常驻RAM正文槽。
+miss 仅在当前整个对象获授权且填充额度＋私有输出不超单批读预算时获取当前对象。
+一个cache operation串行保护当前对象，不建立跨对象异步fill队列或下个对象预取。
+读取准备一次产出已验证的文件Metadata及正文offset，完整段快路径使用positioned read，
+不再重复初次fstat或修改cursor；partial仍保守读取。root、私有权限、header及前后FD／path身份检查保持。
+
+满足有界接收窗口与multi-thread runtime条件的gRPC适配器，用既有runtime的单producer
+接收当前对象；全链仅复用两个256KiB独占载荷块，producer从至多64KiB wire帧直接复制入块，
+满块或对象尾部按序交给原blocking读调用者。consumer计算完整根及段BLAKE3、写私有pending文件、
+提取本次授权区间后才归还块；队列至多一项，无完整对象Vec或逐帧独占正文分配。
+块actual capacity及最后owner贯穿空闲池、producer、队列和consumer，归还不退账，真正销毁后才退账；
+块交接复制仍真实计数，不称零复制。Header先于正文，尾块先于Completion，wire身份／顺序／长度检查保留。
+原4MiB填充额度保守覆盖512KiB载荷块、256KiB控制余量、受限解码及HTTP/2积压，私有输出另按原读预算计费；
+窗口超出可证明范围或current-thread／其他transport走原完整对象缓冲路径，不扩大额度。
+缓存创建／配额／写盘失败只禁用可选sink，同次RPC继续完整校验与提取区间，不重复回源。
+
+完整gRPC接收核对可信Meta根、server checksum及所有帧身份；合法Completion、实际EOF及
+producer排空后才产生完成凭证。它借用未公开的请求区间结果，并将根／段摘要绑定实际私有FD、
+正文长度和文件身份。引擎最后授权后才rename为Ready，交付前仍检查授权；校验、late Status、
+期限或授权失败不公开私有输出。取消关闭接收端并等待producer真实退出，载荷块最后owner释放后才退账，等待空闲块及交接均受同一截止时间约束。
+其它transport保留原完整正文借用证明及保守验证，不隐式继承本优化。
+ready文件（正文与header）及staging按实际分配保守计费，目录和marker管理开销另计；
+摘要及文件身份元信息有独立1MiB硬上限，按实际结构／分配保守计费；不足时完整扫描，不能偷用正文额度。索引条目有界，近似LRU淘汰只删除
+专属缓存；cache不包含长期授权，close-to-open仍通过新open的fresh版本选择保证。
+缓存损坏／可选写盘失败回退或跳过缓存；已知授权拒绝、真实Peer／Meta错误不可隐藏。
+
+原生gRPC读的64KiB正文帧通过Bytes共享已验证对象的合法范围，不再为每帧
+复制正文Vec。帧owner保留原对象及容量租约，缓存淘汰、producer退出或流取消
+都不能提前归还仍被切片引用的正文容量；最后一个真实持有者释放后才退账。
+授权和帧生产在同一个blocking任务中完成，授权结果先通知RPC handler，拒绝仍
+在返回stream之前传播。任务持有read permit到实际退出，已观察取消后不再启动
+后续正文读取。原4帧队列、8read slots、完整对象与范围BLAKE3、单RPC总截止
+及最终交付检查保持。Bytes共享不是整个Prost／TLS／网络栈零复制。
+
 ## OwnerFs 远端与 bind 数据路径
 
 ![OwnerFs 远端访问与本地 workspace bind](../../assets/architecture/afs-ownerfs.svg)

@@ -92,6 +92,15 @@ pub struct DfsExternalCacheConfig {
     pub cache_large_write: bool,
 }
 
+/// Optional native Peer read disk cache. It carries no durability or authority.
+/// Payload memory is temporary; there is no resident RAM cache configuration.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DfsPeerCacheConfig {
+    pub directory: PathBuf,
+    pub capacity_bytes: u64,
+}
+
 impl DfsExternalBackendConfig {
     /// Reject ambiguous namespaces, implicit plaintext and relative secret paths.
     pub fn validate(&self) -> Result<()> {
@@ -273,6 +282,7 @@ struct FileConfig {
     ownerfs_workspace_bind: Option<WorkspaceBindConfig>,
     dfs_mount: Option<PathBuf>,
     dfs_external_backend: Option<DfsExternalBackendConfig>,
+    dfs_peer_cache: Option<DfsPeerCacheConfig>,
     dfs_desired_copies: Option<u16>,
     dfs_sync_required_copies: Option<u16>,
     dfs_min_distinct_nodes: Option<u16>,
@@ -318,6 +328,7 @@ pub struct Config {
     pub ownerfs_workspace_bind: Option<WorkspaceBindConfig>,
     pub dfs_mount: Option<PathBuf>,
     pub dfs_external_backend: Option<DfsExternalBackendConfig>,
+    pub dfs_peer_cache: Option<DfsPeerCacheConfig>,
     pub dfs_desired_copies: u16,
     pub dfs_sync_required_copies: u16,
     pub dfs_min_distinct_nodes: u16,
@@ -498,6 +509,7 @@ impl Config {
             ownerfs_workspace_bind: file.ownerfs_workspace_bind,
             dfs_mount: cli.dfs_mount.or(file.dfs_mount),
             dfs_external_backend: file.dfs_external_backend,
+            dfs_peer_cache: file.dfs_peer_cache,
             dfs_desired_copies,
             dfs_sync_required_copies,
             dfs_min_distinct_nodes,
@@ -533,6 +545,34 @@ impl Config {
             {
                 return Err(invalid(
                     "external backend requires DFS with fixed single-copy defaults; Node replication combinations are unsupported",
+                ));
+            }
+        }
+        if let Some(cache) = &cfg.dfs_peer_cache {
+            let overlaps = |other: &std::path::Path| {
+                cache.directory.starts_with(other) || other.starts_with(&cache.directory)
+            };
+            if role != Role::Node
+                || !cfg.dfs
+                || cfg.dfs_external_backend.is_some()
+                || !cache.directory.is_absolute()
+                || cache.directory.parent().is_none()
+                || cache.directory.components().any(|part| {
+                    matches!(
+                        part,
+                        std::path::Component::ParentDir | std::path::Component::CurDir
+                    )
+                })
+                || cache.capacity_bytes == 0
+                || cache.capacity_bytes > MAX_DFS_EXTERNAL_CACHE_CAPACITY_BYTES
+                || overlaps(&cfg.data_dir)
+                || [&cfg.dfs_mount, &cfg.ownerfs_mount]
+                    .into_iter()
+                    .flatten()
+                    .any(|mount| overlaps(mount))
+            {
+                return Err(invalid(
+                    "dfs_peer_cache requires a native DFS Node, a separate absolute directory without traversal, and capacity in 1..=1 TiB; external-backend Peer caching is not enabled",
                 ));
             }
         }

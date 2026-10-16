@@ -315,6 +315,7 @@ pub struct RecoveryReport {
 pub struct PinnedChunkReader {
     file: File,
     chunk: ChunkObject,
+    read_work: Option<super::read_work::ReadWorkMetrics>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -334,8 +335,17 @@ impl PinnedChunkReader {
         // A pinned descriptor protects identity across rename, not integrity
         // after disk damage. Return the exact bytes covered by this digest,
         // rather than verifying and then issuing another unverified read.
-        let bytes = verified_range(&self.file, &self.chunk, offset, allowed)?;
+        let bytes = verified_range(
+            &self.file,
+            &self.chunk,
+            offset,
+            allowed,
+            self.read_work.as_ref(),
+        )?;
         out[..allowed].copy_from_slice(&bytes);
+        if let Some(metrics) = &self.read_work {
+            metrics.copy("pinned_range_to_output", allowed as u64);
+        }
         Ok(allowed)
     }
 
@@ -348,7 +358,14 @@ impl PinnedChunkReader {
         ranges: &[VerifiedRangeCopy],
         out: &mut [u8],
     ) -> Result<Vec<usize>> {
-        verified_ranges_into(&self.file, &self.chunk, ranges, out, false)
+        verified_ranges_into(
+            &self.file,
+            &self.chunk,
+            ranges,
+            out,
+            false,
+            self.read_work.as_ref(),
+        )
     }
 }
 
@@ -435,6 +452,169 @@ impl LocalCatalog {
     }
 }
 
+/// Shared across the current verified object, in-flight ranges and RDMA packed
+/// payloads. This replaces independent per-request payload allowances; it does
+/// not add a second retained-cache budget.
+pub(crate) const PEER_READ_PAYLOAD_LIMIT: usize = 8 * 1024 * 1024;
+pub(crate) const PEER_READ_OBJECT_LIMIT: usize = 4 * 1024 * 1024;
+
+#[derive(Debug, Default)]
+struct PeerReadBudget {
+    used: AtomicU64,
+    peak: AtomicU64,
+}
+
+#[derive(Debug)]
+pub(crate) struct PeerReadReservation {
+    budget: Arc<PeerReadBudget>,
+    bytes: u64,
+    metrics: Option<super::read_work::ReadWorkMetrics>,
+}
+
+impl PeerReadReservation {
+    // Vec::try_reserve_exact normally gives the requested capacity; still
+    // account the allocator's actual capacity before handing a payload onward.
+    pub(crate) fn retain_capacity(&mut self, capacity: usize) -> Result<()> {
+        let capacity = u64::try_from(capacity).map_err(|_| peer_payload_capacity())?;
+        if capacity > self.bytes {
+            let extra = capacity - self.bytes;
+            reserve_peer_bytes(&self.budget, extra, self.metrics.as_ref())?;
+            self.bytes = capacity;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for PeerReadReservation {
+    fn drop(&mut self) {
+        self.budget.used.fetch_sub(self.bytes, Ordering::AcqRel);
+        if let Some(metrics) = &self.metrics {
+            metrics.peer_payload_released(self.bytes);
+        }
+    }
+}
+
+fn peer_payload_capacity() -> Error {
+    Error::coded(
+        afs_error::IO_CAPACITY,
+        "shared Peer read payload budget exhausted",
+    )
+}
+
+fn reserve_peer_bytes(
+    budget: &PeerReadBudget,
+    bytes: u64,
+    metrics: Option<&super::read_work::ReadWorkMetrics>,
+) -> Result<()> {
+    let mut used = budget.used.load(Ordering::Acquire);
+    loop {
+        let next = used
+            .checked_add(bytes)
+            .filter(|next| *next <= PEER_READ_PAYLOAD_LIMIT as u64)
+            .ok_or_else(peer_payload_capacity)?;
+        match budget
+            .used
+            .compare_exchange_weak(used, next, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => {
+                let old_peak = budget.peak.fetch_max(next, Ordering::AcqRel);
+                if let Some(metrics) = metrics {
+                    metrics.peer_payload_reserved(bytes, next.saturating_sub(old_peak));
+                }
+                return Ok(());
+            }
+            Err(actual) => used = actual,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PeerFileIdentity {
+    length: u64,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    modified: (i64, i64),
+    #[cfg(unix)]
+    changed: (i64, i64),
+}
+
+impl PeerFileIdentity {
+    fn read(file: &File) -> Result<Self> {
+        let metadata = file.metadata().map_err(Error::from)?;
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        Ok(Self {
+            length: metadata.len(),
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+            #[cfg(unix)]
+            modified: (metadata.mtime(), metadata.mtime_nsec()),
+            #[cfg(unix)]
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
+        })
+    }
+}
+
+#[derive(Debug)]
+struct PeerVerifiedObject {
+    bytes: Vec<u8>,
+    _reservation: PeerReadReservation,
+    // A range fallback is never resident and needs no reusable identity.
+    identity: Option<(LocalChunkRecord, PeerFileIdentity)>,
+}
+
+/// A view into an immutable private allocation. Its shared reservation remains
+/// charged even after the single cache slot is replaced or an RPC is cancelled.
+#[derive(Debug)]
+pub(crate) struct PeerReadPayload {
+    object: Arc<PeerVerifiedObject>,
+    start: usize,
+    length: usize,
+}
+
+impl PeerReadPayload {
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        &self.object.bytes[self.start..self.start + self.length]
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.length
+    }
+
+    /// Content-only proof from the complete verified immutable allocation.
+    /// A subrange or nonresident fallback still needs its own range digest;
+    /// neither transport headers nor callers can manufacture this capability.
+    pub(crate) fn verified_full_object_digest(&self) -> Option<ContentDigest> {
+        let (record, identity) = self.object.identity.as_ref()?;
+        if self.start != 0
+            || self.length != self.object.bytes.len()
+            || self.length as u64 != record.chunk.length
+            || identity.length != record.chunk.length
+            || record.stored_length != record.chunk.length
+            || record.stored_checksum != record.chunk.content_digest
+        {
+            return None;
+        }
+        Some(record.chunk.content_digest.clone())
+    }
+
+    /// Frame slices retain both immutable bytes and their original budget lease.
+    pub(crate) fn into_shared_bytes(self) -> prost::bytes::Bytes {
+        prost::bytes::Bytes::from_owner(self)
+    }
+}
+
+impl AsRef<[u8]> for PeerReadPayload {
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
 #[derive(Debug)]
 pub struct LocalChunkStore {
     node_id: String,
@@ -447,6 +627,9 @@ pub struct LocalChunkStore {
     catalog_path: PathBuf,
     catalog: Mutex<LocalCatalog>,
     next_staging: AtomicU64,
+    read_work: Option<super::read_work::ReadWorkMetrics>,
+    peer_read_budget: Arc<PeerReadBudget>,
+    peer_read_cache: Mutex<Option<Arc<PeerVerifiedObject>>>,
 }
 
 impl LocalChunkStore {
@@ -471,9 +654,74 @@ impl LocalChunkStore {
             catalog_path,
             catalog: Mutex::new(catalog),
             next_staging: AtomicU64::new(1),
+            read_work: None,
+            peer_read_budget: Arc::new(PeerReadBudget::default()),
+            peer_read_cache: Mutex::new(None),
         };
         store.recover()?;
         Ok(store)
+    }
+
+    pub(crate) fn with_read_work_metrics(
+        mut self,
+        metrics: super::read_work::ReadWorkMetrics,
+    ) -> Self {
+        self.read_work = Some(metrics);
+        self
+    }
+
+    pub(crate) fn record_peer_disk_cache_event(&self, result: &'static str) {
+        if let Some(metrics) = &self.read_work {
+            metrics.peer_disk_cache_event(result);
+        }
+    }
+
+    pub(crate) fn record_peer_cache_fill_stage(
+        &self,
+        stage: &'static str,
+        wall_ns: u64,
+        cpu_ns: Option<u64>,
+    ) {
+        if let Some(metrics) = &self.read_work {
+            metrics.peer_cache_fill_stage(stage, wall_ns, cpu_ns);
+        }
+    }
+
+    pub(crate) fn peer_disk_cache_fill_work(
+        &self,
+        bytes: usize,
+        output: usize,
+    ) -> Option<super::read_work::PeerCacheFillWork> {
+        self.read_work
+            .as_ref()
+            .map(|metrics| metrics.peer_disk_cache_fill_work(bytes, output))
+    }
+
+    pub(crate) fn peer_disk_cache_stream_work(
+        &self,
+        output: usize,
+    ) -> Option<super::read_work::PeerCacheStreamWork> {
+        self.read_work
+            .as_ref()
+            .map(|metrics| metrics.peer_stream_pipeline(output))
+    }
+
+    pub(crate) fn record_read_hash(&self, stage: &'static str, bytes: u64) {
+        if let Some(metrics) = &self.read_work {
+            metrics.hash(stage, bytes);
+        }
+    }
+
+    pub(crate) fn record_read_copy(&self, stage: &'static str, bytes: u64) {
+        if let Some(metrics) = &self.read_work {
+            metrics.copy(stage, bytes);
+        }
+    }
+
+    pub(crate) fn record_peer_read_event(&self, event: &'static str) {
+        if let Some(metrics) = &self.read_work {
+            metrics.peer_read_event(event);
+        }
     }
 
     pub fn capacity(&self) -> Result<FilesystemCapacity> {
@@ -718,7 +966,65 @@ impl LocalChunkStore {
             })
     }
 
-    pub fn open_verified(&self, chunk_id: &ChunkId) -> Result<PinnedChunkReader> {
+    /// Fill a caller-owned, unpublished range with one complete integrity scan.
+    /// The output may be dirtied on failure and must not be returned to a peer
+    /// until this operation succeeds. No verified reader or cache is retained.
+    pub(crate) fn read_range_at_uncommitted(
+        &self,
+        chunk_id: &ChunkId,
+        offset: u64,
+        out: &mut [u8],
+    ) -> Result<usize> {
+        let reader = self.open_cataloged(chunk_id)?;
+        let result = verified_ranges_into(
+            &reader.file,
+            &reader.chunk,
+            &[VerifiedRangeCopy {
+                chunk_offset: offset,
+                length: out.len(),
+                output_offset: 0,
+            }],
+            out,
+            true,
+            self.read_work.as_ref(),
+        );
+        result.map(|counts| counts[0]).inspect_err(|error| {
+            if verified_copy_is_invalid(error) {
+                self.try_quarantine(chunk_id);
+            }
+        })
+    }
+
+    fn reserve_peer_read_payload_inner(&self, bytes: usize) -> Result<PeerReadReservation> {
+        let bytes = u64::try_from(bytes).map_err(|_| peer_payload_capacity())?;
+        reserve_peer_bytes(&self.peer_read_budget, bytes, self.read_work.as_ref())?;
+        Ok(PeerReadReservation {
+            budget: self.peer_read_budget.clone(),
+            bytes,
+            metrics: self.read_work.clone(),
+        })
+    }
+
+    /// Admission is immediate. Eviction can reclaim only an unpinned resident
+    /// object; payloads held by senders keep their charge until the last drop.
+    pub(crate) fn reserve_peer_read_payload(&self, bytes: usize) -> Result<PeerReadReservation> {
+        match self.reserve_peer_read_payload_inner(bytes) {
+            Ok(reservation) => Ok(reservation),
+            Err(error) => {
+                if let Ok(mut slot) = self.peer_read_cache.try_lock()
+                    && slot
+                        .as_ref()
+                        .is_some_and(|object| Arc::strong_count(object) == 1)
+                {
+                    slot.take();
+                }
+                self.reserve_peer_read_payload_inner(bytes)
+                    .map_err(|_| error)
+            }
+        }
+    }
+
+    fn peer_catalog_record(&self, chunk_id: &ChunkId) -> Result<LocalChunkRecord> {
         let record = self
             .catalog
             .lock()
@@ -730,23 +1036,177 @@ impl LocalChunkStore {
         if record.state != LocalChunkState::Durable {
             return Err(corrupt(chunk_id, "local copy is quarantined"));
         }
-        let path = self.path_for_record(&record)?;
-        let file = File::open(path).map_err(Error::from).and_then(|file| {
-            verified_range(&file, &record.chunk, 0, 0)?;
-            Ok(file)
-        });
-        let file = match file {
-            Ok(file) => file,
-            Err(error) => {
-                if verified_copy_is_invalid(&error) {
+        if record.chunk.id != *chunk_id
+            || record.device_id != self.device_id
+            || record.device_epoch != self.device_epoch
+            || record.stored_length != record.chunk.length
+            || record.stored_checksum != record.chunk.content_digest
+            || record.encoding != PhysicalEncoding::Raw
+        {
+            return Err(invalid(
+                "durable local Chunk record is internally inconsistent",
+            ));
+        }
+        self.path_for_record(&record)?;
+        Ok(record)
+    }
+
+    /// Reuse only the currently demanded object, never prefetch a next object.
+    /// The slot mutex also supplies singleflight for a complete private fill.
+    /// Authorization remains with each caller; this proof is content-only.
+    pub(crate) fn read_peer_range(
+        &self,
+        chunk_id: &ChunkId,
+        offset: u64,
+        length: usize,
+    ) -> Result<PeerReadPayload> {
+        let mut slot = self
+            .peer_read_cache
+            .lock()
+            .map_err(|_| invalid("Peer verified object lock is poisoned"))?;
+        let result = (|| {
+            let record = self.peer_catalog_record(chunk_id)?;
+            let file = File::open(self.path_for_record(&record)?).map_err(Error::from)?;
+            let before = PeerFileIdentity::read(&file)?;
+            if before.length != record.chunk.length {
+                return Err(corrupt(chunk_id, "length mismatch"));
+            }
+            let allowed = usize::try_from(
+                record
+                    .chunk
+                    .length
+                    .saturating_sub(offset)
+                    .min(length as u64),
+            )
+            .map_err(|_| invalid("Chunk read length is too large"))?;
+            if let Some(object) = slot.as_ref()
+                && object.identity.as_ref() == Some(&(record.clone(), before.clone()))
+            {
+                if self.peer_catalog_record(chunk_id)? != record
+                    || PeerFileIdentity::read(&file)? != before
+                {
+                    return Err(corrupt(chunk_id, "identity changed during cached read"));
+                }
+                if let Some(metrics) = &self.read_work {
+                    metrics.peer_object_cache("hit");
+                }
+                return Ok(PeerReadPayload {
+                    object: object.clone(),
+                    start: usize::try_from(offset.min(record.chunk.length))
+                        .map_err(|_| invalid("Chunk offset is too large"))?,
+                    length: allowed,
+                });
+            }
+            // Never retain an unrelated current object while filling another.
+            // Any externally held old allocation stays alive and fully charged.
+            slot.take();
+            if let Some(metrics) = &self.read_work {
+                metrics.peer_object_cache("miss");
+            }
+            let resident = record.chunk.length <= PEER_READ_OBJECT_LIMIT as u64;
+            let allocation = if resident {
+                usize::try_from(record.chunk.length).map_err(|_| peer_payload_capacity())?
+            } else {
+                allowed
+            };
+            let mut reservation = self.reserve_peer_read_payload_inner(allocation)?;
+            let mut bytes = Vec::new();
+            bytes
+                .try_reserve_exact(allocation)
+                .map_err(|_| peer_payload_capacity())?;
+            reservation.retain_capacity(bytes.capacity())?;
+            bytes.resize(allocation, 0);
+            verified_ranges_into(
+                &file,
+                &record.chunk,
+                &[VerifiedRangeCopy {
+                    chunk_offset: if resident { 0 } else { offset },
+                    length: allocation,
+                    output_offset: 0,
+                }],
+                &mut bytes,
+                true,
+                self.read_work.as_ref(),
+            )?;
+            if PeerFileIdentity::read(&file)? != before
+                || self.peer_catalog_record(chunk_id)? != record
+            {
+                return Err(corrupt(chunk_id, "identity changed during verification"));
+            }
+            // Reopen the path as well: a pinned old descriptor must not seed a
+            // cache after another inode has replaced its cataloged pathname.
+            let current = File::open(self.path_for_record(&record)?).map_err(Error::from)?;
+            if PeerFileIdentity::read(&current)? != before {
+                return Err(corrupt(chunk_id, "path changed during verification"));
+            }
+            let object = Arc::new(PeerVerifiedObject {
+                bytes,
+                _reservation: reservation,
+                identity: resident.then_some((record, before)),
+            });
+            if resident {
+                *slot = Some(object.clone());
+            }
+            Ok(PeerReadPayload {
+                object,
+                start: if resident {
+                    usize::try_from(offset.min(allocation as u64))
+                        .map_err(|_| invalid("Chunk offset is too large"))?
+                } else {
+                    0
+                },
+                length: allowed,
+            })
+        })();
+        if result.is_err() {
+            slot.take();
+        }
+        drop(slot);
+        if let Err(error) = &result
+            && verified_copy_is_invalid(error)
+        {
+            self.try_quarantine(chunk_id);
+        }
+        result
+    }
+
+    pub fn open_verified(&self, chunk_id: &ChunkId) -> Result<PinnedChunkReader> {
+        let reader = self.open_cataloged(chunk_id)?;
+        verified_range(&reader.file, &reader.chunk, 0, 0, self.read_work.as_ref()).inspect_err(
+            |error| {
+                if verified_copy_is_invalid(error) {
                     self.try_quarantine(chunk_id);
                 }
-                return Err(error);
-            }
-        };
+            },
+        )?;
+        Ok(reader)
+    }
+
+    // Pin the cataloged inode without claiming its integrity. Both callers
+    // perform a complete scan on this descriptor before returning any bytes.
+    fn open_cataloged(&self, chunk_id: &ChunkId) -> Result<PinnedChunkReader> {
+        let record = self
+            .catalog
+            .lock()
+            .map_err(|_| invalid("local chunk catalog lock is poisoned"))?
+            .records
+            .get(chunk_id)
+            .cloned()
+            .ok_or_else(|| invalid(format!("local Chunk '{}' is not cataloged", chunk_id.0)))?;
+        if record.state != LocalChunkState::Durable {
+            return Err(corrupt(chunk_id, "local copy is quarantined"));
+        }
+        let file = File::open(self.path_for_record(&record)?)
+            .map_err(Error::from)
+            .inspect_err(|error| {
+                if verified_copy_is_invalid(error) {
+                    self.try_quarantine(chunk_id);
+                }
+            })?;
         Ok(PinnedChunkReader {
             file,
             chunk: record.chunk,
+            read_work: self.read_work.clone(),
         })
     }
 
@@ -924,13 +1384,19 @@ fn open_device_epoch(root: &Path) -> Result<u64> {
 
 fn verify_file(path: &Path, chunk: &ChunkObject) -> Result<()> {
     let file = File::open(path).map_err(Error::from)?;
-    verified_range(&file, chunk, 0, 0).map(|_| ())
+    verified_range(&file, chunk, 0, 0, None).map(|_| ())
 }
 
 /// Hash the pinned file once and retain only the requested overlap. The
 /// temporary range is bounded by the caller's output; scan memory is 64KiB.
 /// Nothing is published to the caller until all content checks pass.
-fn verified_range(file: &File, chunk: &ChunkObject, offset: u64, length: usize) -> Result<Vec<u8>> {
+fn verified_range(
+    file: &File,
+    chunk: &ChunkObject,
+    offset: u64,
+    length: usize,
+    metrics: Option<&super::read_work::ReadWorkMetrics>,
+) -> Result<Vec<u8>> {
     offset
         .checked_add(length as u64)
         .filter(|end| *end <= chunk.length)
@@ -946,6 +1412,7 @@ fn verified_range(file: &File, chunk: &ChunkObject, offset: u64, length: usize) 
         }],
         &mut bytes,
         true,
+        metrics,
     )?;
     Ok(bytes)
 }
@@ -956,6 +1423,7 @@ fn verified_ranges_into(
     ranges: &[VerifiedRangeCopy],
     out: &mut [u8],
     force_scan: bool,
+    metrics: Option<&super::read_work::ReadWorkMetrics>,
 ) -> Result<Vec<usize>> {
     let mut counts = Vec::with_capacity(ranges.len());
     let mut active = Vec::new();
@@ -984,6 +1452,7 @@ fn verified_ranges_into(
     if file.metadata().map_err(Error::from)?.len() != chunk.length {
         return Err(corrupt(&chunk.id, "length mismatch"));
     }
+    let mut work = metrics.map(super::read_work::ReadWorkMetrics::scan);
     let mut scratch = [0; 64 * 1024];
     let mut hasher = blake3::Hasher::new();
     let mut position = 0;
@@ -994,6 +1463,11 @@ fn verified_ranges_into(
             return Err(corrupt(&chunk.id, "ended during verification"));
         }
         hasher.update(&scratch[..count]);
+        if let Some(work) = &mut work {
+            work.bytes += count as u64;
+        }
+        #[cfg(test)]
+        VERIFIED_SCAN_BYTES.with(|bytes| bytes.set(bytes.get() + count as u64));
         let next = position + count as u64;
         for (range, allowed) in &active {
             let range_end = range.chunk_offset + *allowed as u64;
@@ -1003,6 +1477,9 @@ fn verified_ranges_into(
                 let output_start =
                     range.output_offset + (overlap_start - range.chunk_offset) as usize;
                 let output_end = range.output_offset + (overlap_end - range.chunk_offset) as usize;
+                if let Some(work) = &mut work {
+                    work.copied += (output_end - output_start) as u64;
+                }
                 out[output_start..output_end].copy_from_slice(
                     &scratch
                         [(overlap_start - position) as usize..(overlap_end - position) as usize],
@@ -1064,8 +1541,538 @@ fn invalid(message: impl Into<String>) -> Error {
 }
 
 #[cfg(test)]
+std::thread_local! {
+    static VERIFIED_SCAN_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
 mod replica_replay_tests {
     use super::*;
+
+    #[test]
+    fn peer_object_digest_capability_requires_the_complete_verified_view() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+        let staged = StagedChunk::new(OperationId::new("whole-proof"), vec![37; 150_001]);
+        store.put(staged.clone()).unwrap();
+        VERIFIED_SCAN_BYTES.with(|count| count.set(0));
+        let whole = store
+            .read_peer_range(&staged.chunk.id, 0, staged.bytes().len())
+            .unwrap();
+        assert_eq!(
+            whole.verified_full_object_digest(),
+            Some(staged.chunk.content_digest.clone())
+        );
+        assert!(
+            store
+                .read_peer_range(&staged.chunk.id, 0, staged.bytes().len() - 1)
+                .unwrap()
+                .verified_full_object_digest()
+                .is_none()
+        );
+        assert!(
+            store
+                .read_peer_range(&staged.chunk.id, 1, staged.bytes().len() - 1)
+                .unwrap()
+                .verified_full_object_digest()
+                .is_none()
+        );
+        assert_eq!(
+            VERIFIED_SCAN_BYTES.with(|count| count.get()),
+            staged.chunk.length
+        );
+    }
+
+    #[test]
+    fn peer_object_digest_capability_is_absent_for_full_range_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+        let staged = StagedChunk::new(
+            OperationId::new("fallback-proof"),
+            vec![19; PEER_READ_OBJECT_LIMIT + 1],
+        );
+        store.put(staged.clone()).unwrap();
+        let whole = store
+            .read_peer_range(&staged.chunk.id, 0, staged.bytes().len())
+            .unwrap();
+        assert_eq!(whole.as_slice(), staged.bytes());
+        assert!(whole.object.identity.is_none());
+        assert!(whole.verified_full_object_digest().is_none());
+        assert!(store.peer_read_cache.lock().unwrap().is_none());
+        drop(whole);
+        assert_eq!(store.peer_read_budget.used.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn peer_object_digest_does_not_release_shared_frame_budget_early() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+        let staged = StagedChunk::new(OperationId::new("proof-lease"), vec![29; 150_001]);
+        store.put(staged.clone()).unwrap();
+        let whole = store
+            .read_peer_range(&staged.chunk.id, 0, staged.bytes().len())
+            .unwrap();
+        let digest = whole.verified_full_object_digest().unwrap();
+        let bytes = whole.into_shared_bytes();
+        let frame = bytes.slice(17..100);
+        store.peer_read_cache.lock().unwrap().take();
+        drop(bytes);
+        assert_eq!(
+            store.peer_read_budget.used.load(Ordering::Acquire),
+            staged.chunk.length
+        );
+        assert_eq!(digest, staged.chunk.content_digest);
+        assert_eq!(&frame[..], &[29; 83]);
+        drop(frame);
+        assert_eq!(store.peer_read_budget.used.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn peer_object_reuses_one_complete_scan_for_multiple_ranges() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+        let bytes = vec![37; 4 * 1024 * 1024];
+        let staged = StagedChunk::new(OperationId::new("peer-reuse"), bytes.clone());
+        store.put(staged.clone()).unwrap();
+        VERIFIED_SCAN_BYTES.with(|count| count.set(0));
+        for index in 0..4 {
+            let payload = store
+                .read_peer_range(&staged.chunk.id, index * 1024 * 1024, 1024 * 1024)
+                .unwrap();
+            assert_eq!(payload.as_slice(), &bytes[..1024 * 1024]);
+        }
+        assert_eq!(
+            VERIFIED_SCAN_BYTES.with(|count| count.get()),
+            bytes.len() as u64
+        );
+        assert_eq!(
+            store.peer_read_budget.used.load(Ordering::Acquire),
+            bytes.len() as u64
+        );
+    }
+
+    #[test]
+    fn peer_object_revalidates_replacement_missing_and_quarantined_files() {
+        for change in [
+            "replace",
+            "missing",
+            "quarantine",
+            "corrupt",
+            "epoch",
+            "revision",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+            let bytes = vec![53; 150_001];
+            let staged = StagedChunk::new(OperationId::new("peer-identity"), bytes.clone());
+            store.put(staged.clone()).unwrap();
+            drop(store.read_peer_range(&staged.chunk.id, 3, 19).unwrap());
+            VERIFIED_SCAN_BYTES.with(|count| count.set(0));
+            match change {
+                "replace" => {
+                    let replacement = temp.path().join("replacement");
+                    fs::write(&replacement, &bytes).unwrap();
+                    fs::rename(replacement, store.chunk_path(&staged.chunk.id)).unwrap();
+                }
+                "missing" => fs::remove_file(store.chunk_path(&staged.chunk.id)).unwrap(),
+                "corrupt" => {
+                    fs::write(store.chunk_path(&staged.chunk.id), vec![1; bytes.len()]).unwrap()
+                }
+                _ => {
+                    let mut catalog = store.catalog.lock().unwrap();
+                    let record = catalog.records.get_mut(&staged.chunk.id).unwrap();
+                    match change {
+                        "quarantine" => record.state = LocalChunkState::Quarantined,
+                        "epoch" => record.device_epoch += 1,
+                        "revision" => record.catalog_revision += 1,
+                        _ => unreachable!(),
+                    }
+                }
+            }
+            let result = store.read_peer_range(&staged.chunk.id, 3, 19);
+            if change == "replace" || change == "revision" {
+                assert_eq!(result.unwrap().as_slice(), &bytes[3..22]);
+                assert_eq!(
+                    VERIFIED_SCAN_BYTES.with(|count| count.get()),
+                    bytes.len() as u64
+                );
+            } else {
+                assert!(result.is_err(), "{change} must not reuse a stale proof");
+                assert!(store.peer_read_cache.lock().unwrap().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn peer_object_failed_fill_releases_budget_and_never_publishes() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+        let staged = StagedChunk::new(OperationId::new("peer-failed"), vec![5; 4096]);
+        store.put(staged.clone()).unwrap();
+        fs::write(store.chunk_path(&staged.chunk.id), vec![9; 4096]).unwrap();
+        assert!(store.read_peer_range(&staged.chunk.id, 0, 3).is_err());
+        assert!(store.peer_read_cache.lock().unwrap().is_none());
+        assert_eq!(store.peer_read_budget.used.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn peer_object_evicted_references_and_packed_payload_share_the_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+        let chunks: Vec<_> = (1..=3)
+            .map(|byte| {
+                let chunk = StagedChunk::new(
+                    OperationId::new(format!("peer-budget-{byte}")),
+                    vec![byte; 4 * 1024 * 1024],
+                );
+                store.put(chunk.clone()).unwrap();
+                chunk
+            })
+            .collect();
+        let first = store.read_peer_range(&chunks[0].chunk.id, 0, 1).unwrap();
+        let second = store.read_peer_range(&chunks[1].chunk.id, 0, 1).unwrap();
+        assert_eq!(
+            store.peer_read_budget.used.load(Ordering::Acquire),
+            PEER_READ_PAYLOAD_LIMIT as u64
+        );
+        assert_eq!(
+            store
+                .read_peer_range(&chunks[2].chunk.id, 0, 1)
+                .unwrap_err()
+                .code(),
+            afs_error::IO_CAPACITY
+        );
+        assert_eq!(
+            store.reserve_peer_read_payload(1).unwrap_err().code(),
+            afs_error::IO_CAPACITY
+        );
+        assert_eq!(first.as_slice(), &[1]);
+        drop(first);
+        drop(second);
+        let mut packed = store.reserve_peer_read_payload(4 * 1024 * 1024).unwrap();
+        packed.retain_capacity(4 * 1024 * 1024).unwrap();
+        assert!(store.read_peer_range(&chunks[2].chunk.id, 0, 1).is_ok());
+        assert_eq!(
+            store.peer_read_budget.used.load(Ordering::Acquire),
+            PEER_READ_PAYLOAD_LIMIT as u64
+        );
+        drop(packed);
+        assert_eq!(
+            store.peer_read_budget.used.load(Ordering::Acquire),
+            4 * 1024 * 1024
+        );
+        assert_eq!(
+            store
+                .reserve_peer_read_payload(PEER_READ_PAYLOAD_LIMIT + 1)
+                .unwrap_err()
+                .code(),
+            afs_error::IO_CAPACITY
+        );
+    }
+
+    #[test]
+    fn peer_object_budget_reservation_drop_and_capacity_growth_are_charged() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+        let mut lease = store.reserve_peer_read_payload(19).unwrap();
+        lease.retain_capacity(31).unwrap();
+        assert_eq!(store.peer_read_budget.used.load(Ordering::Acquire), 31);
+        assert!(lease.retain_capacity(PEER_READ_PAYLOAD_LIMIT + 1).is_err());
+        assert_eq!(store.peer_read_budget.used.load(Ordering::Acquire), 31);
+        drop(lease);
+        assert_eq!(store.peer_read_budget.used.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn peer_object_concurrent_ranges_share_the_same_verified_payload() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
+        let staged = StagedChunk::new(
+            OperationId::new("peer-singleflight"),
+            vec![73; 4 * 1024 * 1024],
+        );
+        store.put(staged.clone()).unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                let store = store.clone();
+                let id = staged.chunk.id.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    store.read_peer_range(&id, 0, 19).unwrap()
+                })
+            })
+            .collect();
+        let payloads: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        for payload in &payloads {
+            assert!(Arc::ptr_eq(&payload.object, &payloads[0].object));
+            assert_eq!(payload.as_slice(), &[73; 19]);
+        }
+        assert_eq!(
+            store.peer_read_budget.used.load(Ordering::Acquire),
+            4 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn peer_object_shared_frame_slices_retain_allocation_and_lease() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+        let staged = StagedChunk::new(
+            OperationId::new("shared-frame-owner"),
+            vec![29; 4 * 1024 * 1024],
+        );
+        store.put(staged.clone()).unwrap();
+        let payload = store.read_peer_range(&staged.chunk.id, 17, 128).unwrap();
+        let pointer = payload.as_slice().as_ptr();
+        let bytes = payload.into_shared_bytes();
+        assert_eq!(bytes.as_ptr(), pointer);
+        let frame = bytes.slice(3..67);
+        assert_eq!(frame.as_ptr(), bytes[3..].as_ptr());
+        let retained = frame.clone();
+        drop(frame);
+        drop(bytes);
+        store.peer_read_cache.lock().unwrap().take();
+        assert_eq!(&retained[..], &[29; 64]);
+        assert_eq!(
+            store.peer_read_budget.used.load(Ordering::Acquire),
+            4 * 1024 * 1024
+        );
+        drop(retained);
+        assert_eq!(store.peer_read_budget.used.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn peer_object_oversized_chunk_uses_charged_range_fallback_without_residency() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+        let staged = StagedChunk::new(
+            OperationId::new("peer-fallback"),
+            vec![91; PEER_READ_OBJECT_LIMIT + 1],
+        );
+        store.put(staged.clone()).unwrap();
+        let range = store
+            .read_peer_range(&staged.chunk.id, PEER_READ_OBJECT_LIMIT as u64, 19)
+            .unwrap();
+        assert_eq!(range.as_slice(), &[91]);
+        assert!(store.peer_read_cache.lock().unwrap().is_none());
+        assert_eq!(store.peer_read_budget.used.load(Ordering::Acquire), 1);
+        let pointer = range.as_slice().as_ptr();
+        let bytes = range.into_shared_bytes();
+        assert_eq!(bytes.as_ptr(), pointer);
+        let retained = bytes.slice(..);
+        drop(bytes);
+        assert_eq!(store.peer_read_budget.used.load(Ordering::Acquire), 1);
+        assert_eq!(&retained[..], &[91]);
+        drop(retained);
+        assert_eq!(store.peer_read_budget.used.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn private_range_reads_scan_once_and_copy_only_the_requested_overlap() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+        let bytes: Vec<_> = (0..150_001).map(|index| (index % 251) as u8).collect();
+        let staged = StagedChunk::new(OperationId::new("single-scan"), bytes.clone());
+        store.put(staged.clone()).unwrap();
+        let mut out = [9; 19];
+        VERIFIED_SCAN_BYTES.with(|bytes| bytes.set(0));
+        assert_eq!(
+            store.read_at(&staged.chunk.id, 65_531, &mut out).unwrap(),
+            19
+        );
+        assert_eq!(
+            VERIFIED_SCAN_BYTES.with(|bytes| bytes.get()),
+            2 * bytes.len() as u64
+        );
+        for offset in [65_531, 149_990] {
+            out.fill(9);
+            VERIFIED_SCAN_BYTES.with(|bytes| bytes.set(0));
+            let count = store
+                .read_range_at_uncommitted(&staged.chunk.id, offset, &mut out)
+                .unwrap();
+            let expected = 19.min(bytes.len() - offset as usize);
+            assert_eq!(count, expected);
+            assert_eq!(
+                &out[..count],
+                &bytes[offset as usize..offset as usize + count]
+            );
+            assert!(out[count..].iter().all(|byte| *byte == 9));
+            assert_eq!(
+                VERIFIED_SCAN_BYTES.with(|bytes| bytes.get()),
+                bytes.len() as u64
+            );
+        }
+    }
+
+    #[test]
+    fn private_range_pins_identity_before_its_only_scan() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+        let staged = StagedChunk::new(OperationId::new("single-pin"), b"abcdef".to_vec());
+        store.put(staged.clone()).unwrap();
+        VERIFIED_SCAN_BYTES.with(|bytes| bytes.set(0));
+        let reader = store.open_cataloged(&staged.chunk.id).unwrap();
+        assert_eq!(VERIFIED_SCAN_BYTES.with(|bytes| bytes.get()), 0);
+        let path = temp.path().join("chunks").join(&staged.chunk.id.0);
+        fs::rename(&path, temp.path().join("old-inode")).unwrap();
+        fs::write(&path, b"abXdef").unwrap();
+        let mut private = [9; 3];
+        assert_eq!(
+            reader
+                .read_ranges_at_uncommitted(
+                    &[VerifiedRangeCopy {
+                        chunk_offset: 1,
+                        length: private.len(),
+                        output_offset: 0,
+                    }],
+                    &mut private,
+                )
+                .unwrap(),
+            vec![3]
+        );
+        assert_eq!(&private, b"bcd");
+        assert_eq!(VERIFIED_SCAN_BYTES.with(|bytes| bytes.get()), 6);
+        assert!(
+            store
+                .read_range_at_uncommitted(&staged.chunk.id, 1, &mut private)
+                .is_err()
+        );
+        assert_eq!(store.quarantined_chunks().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn private_range_rejects_outside_damage_and_quarantines_until_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+        let staged = StagedChunk::new(OperationId::new("single-corrupt"), vec![42; 150_001]);
+        store.put(staged.clone()).unwrap();
+        let path = temp.path().join("chunks").join(&staged.chunk.id.0);
+        let mut damaged = staged.bytes().to_vec();
+        damaged[150_000] ^= 1;
+        fs::write(&path, damaged).unwrap();
+        let mut private = [9; 19];
+        assert_eq!(
+            store
+                .read_range_at_uncommitted(&staged.chunk.id, 65_531, &mut private)
+                .unwrap_err()
+                .code(),
+            afs_error::NODE_TRANSFER_CORRUPT_DATA
+        );
+        assert_eq!(store.quarantined_chunks().unwrap().len(), 1);
+        store.put(staged.clone()).unwrap();
+        assert!(store.quarantined_chunks().unwrap().is_empty());
+        assert_eq!(
+            store
+                .read_range_at_uncommitted(&staged.chunk.id, 65_531, &mut private)
+                .unwrap(),
+            private.len()
+        );
+        assert_eq!(private, [42; 19]);
+    }
+
+    #[test]
+    fn private_range_and_verified_open_quarantine_missing_cataloged_files() {
+        for private_read in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+            let staged = StagedChunk::new(OperationId::new("missing-file"), b"abcdef".to_vec());
+            store.put(staged.clone()).unwrap();
+            fs::remove_file(temp.path().join("chunks").join(&staged.chunk.id.0)).unwrap();
+            if private_read {
+                assert!(
+                    store
+                        .read_range_at_uncommitted(&staged.chunk.id, 0, &mut [9; 3])
+                        .is_err()
+                );
+            } else {
+                assert!(store.open_verified(&staged.chunk.id).is_err());
+            }
+            assert_eq!(store.quarantined_chunks().unwrap().len(), 1);
+            store.put(staged.clone()).unwrap();
+            assert!(store.quarantined_chunks().unwrap().is_empty());
+            let mut out = [9; 3];
+            assert_eq!(
+                store
+                    .read_range_at_uncommitted(&staged.chunk.id, 0, &mut out)
+                    .unwrap(),
+                3
+            );
+            assert_eq!(&out, b"abc");
+        }
+    }
+
+    #[test]
+    fn private_range_work_metrics_count_actual_scan_and_copy_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = afs_metrics::Registry::new();
+        let store = LocalChunkStore::open(temp.path(), "node-a")
+            .unwrap()
+            .with_read_work_metrics(
+                super::super::read_work::ReadWorkMetrics::register(&registry).unwrap(),
+            );
+        let staged = StagedChunk::new(OperationId::new("work-counts"), vec![7; 65_537]);
+        store.put(staged.clone()).unwrap();
+        store.read_at(&staged.chunk.id, 0, &mut [0; 3]).unwrap();
+        store
+            .read_range_at_uncommitted(&staged.chunk.id, 0, &mut [0; 3])
+            .unwrap();
+        let text = afs_metrics::encode_text(&registry).unwrap();
+        assert!(text.contains("afs_dfs_read_scans_total 3\n"), "{text}");
+        assert!(
+            text.contains("afs_dfs_read_scan_bytes_total 196611\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("afs_dfs_read_copy_bytes_total{stage=\"scan_to_range\"} 6\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("afs_dfs_read_copy_bytes_total{stage=\"pinned_range_to_output\"} 3\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn private_range_rejects_truncated_files_and_keeps_eof_behavior() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+        let staged = StagedChunk::new(OperationId::new("single-truncate"), b"abcdef".to_vec());
+        store.put(staged.clone()).unwrap();
+        let mut private = [9; 8];
+        assert_eq!(
+            store
+                .read_range_at_uncommitted(&staged.chunk.id, 4, &mut private)
+                .unwrap(),
+            2
+        );
+        assert_eq!(&private, &[b'e', b'f', 9, 9, 9, 9, 9, 9]);
+        assert_eq!(
+            store
+                .read_range_at_uncommitted(&staged.chunk.id, u64::MAX, &mut private)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .read_range_at_uncommitted(&staged.chunk.id, 0, &mut [])
+                .unwrap(),
+            0
+        );
+        fs::write(temp.path().join("chunks").join(&staged.chunk.id.0), b"abc").unwrap();
+        assert_eq!(
+            store
+                .read_range_at_uncommitted(&staged.chunk.id, 0, &mut private)
+                .unwrap_err()
+                .code(),
+            afs_error::NODE_TRANSFER_CORRUPT_DATA
+        );
+        assert_eq!(store.quarantined_chunks().unwrap().len(), 1);
+    }
 
     #[test]
     fn corrupt_cataloged_chunk_is_replaced_by_immutable_retry() {

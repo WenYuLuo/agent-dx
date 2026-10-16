@@ -57,3 +57,10 @@ node-a = "/opt/adx/config/afs/tls/node-a.pem"
 # capacity_bytes = 268435456
 # pending_bytes = 37748736
 # cache_large_write = false
+
+# Optional native DFS Peer disk cache; OFF when omitted, no RAM resident cache.
+# Use only without dfs_external_backend, separate from data_dir/FUSE mounts.
+# Capacity is configurable; 256MiB is only an example.
+# [dfs_peer_cache]
+# directory = "/opt/adx/cache/afs/peer"
+# capacity_bytes = 268435456

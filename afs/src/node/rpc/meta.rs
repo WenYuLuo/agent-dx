@@ -865,6 +865,7 @@ pub struct GrpcDfsMeta {
     timeout: Duration,
     sequence: AtomicU64,
     placement: Mutex<Option<Arc<crate::dfs::PlacementSnapshot>>>,
+    read_work: Option<crate::node::read_work::ReadWorkMetrics>,
 }
 
 #[cfg(feature = "dfs")]
@@ -899,7 +900,22 @@ impl GrpcDfsMeta {
             timeout,
             sequence: AtomicU64::new(1),
             placement: Mutex::new(None),
+            read_work: None,
         })
+    }
+
+    pub(crate) fn with_read_work_metrics(
+        mut self,
+        metrics: crate::node::read_work::ReadWorkMetrics,
+    ) -> Self {
+        self.read_work = Some(metrics);
+        self
+    }
+
+    fn record_read_rpc(&self, method: &'static str) {
+        if let Some(metrics) = &self.read_work {
+            metrics.read_rpc(method);
+        }
     }
 
     fn request_id(&self) -> String {
@@ -974,6 +990,7 @@ impl GrpcDfsMeta {
         &self,
         request: crate::dfs::ValidateDfsReadGrants,
     ) -> afs_error::Result<Vec<crate::dfs::DfsAuthorizedRead>> {
+        self.record_read_rpc("validate_read_grants");
         let validations = request
             .validations
             .into_iter()
@@ -1318,6 +1335,7 @@ impl crate::node::dfs_read::ReadSourceProvider for GrpcDfsMeta {
         &self,
         request: crate::dfs::DfsChunkSourcesRequest,
     ) -> afs_error::Result<crate::dfs::DfsChunkSourcesReply> {
+        self.record_read_rpc("get_chunk_sources");
         let reply = self
             .run(
                 self.client()
@@ -1719,6 +1737,7 @@ impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
         &self,
         inode_id: &crate::dfs::InodeId,
     ) -> afs_error::Result<crate::dfs::InodeRecord> {
+        self.record_read_rpc("get_inode");
         let reply = self
             .run(
                 self.client()
@@ -1736,6 +1755,7 @@ impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
         &self,
         version_id: &crate::dfs::FileVersionId,
     ) -> afs_error::Result<(crate::dfs::FileVersion, crate::dfs::LayoutRoot)> {
+        self.record_read_rpc("get_file_version");
         let reply = self
             .run(
                 self.client()
@@ -2786,6 +2806,22 @@ fn domain_dfs_chunk_sources(
             "chunk source object identity mismatch",
         ));
     }
+    if value.allowed_ranges.len() > 128
+        || value.allowed_ranges.iter().any(|range| {
+            range.length == 0
+                || chunk.as_ref().is_none_or(|object| {
+                    range
+                        .offset
+                        .checked_add(range.length)
+                        .is_none_or(|end| end > object.length)
+                })
+        })
+    {
+        return Err(Error::coded(
+            CLIENT_PROTOCOL_VIOLATION,
+            "chunk source grant ranges exceed the bounded object identity",
+        ));
+    }
     Ok(crate::dfs::ChunkSources {
         chunk_id,
         chunk,
@@ -2794,6 +2830,11 @@ fn domain_dfs_chunk_sources(
             .into_iter()
             .map(domain_dfs_source_candidate)
             .collect::<afs_error::Result<Vec<_>>>()?,
+        allowed_ranges: value
+            .allowed_ranges
+            .into_iter()
+            .map(|range| (range.offset, range.length))
+            .collect(),
     })
 }
 
@@ -3525,6 +3566,75 @@ mod tests {
     use crate::node::vfs::dfs::DfsMeta;
 
     #[test]
+    fn chunk_source_ranges_wire_roundtrip_and_legacy_fallback() {
+        use prost::Message;
+
+        let chunk = current_read_authorization().chunk.unwrap();
+        let wire = afs_protocol::meta::DfsChunkSources {
+            chunk_id: chunk.chunk_id.clone(),
+            chunk: Some(chunk),
+            sources: Vec::new(),
+            allowed_ranges: vec![afs_protocol::meta::dfs_authorized_read::Range {
+                offset: 1,
+                length: 2,
+            }],
+        };
+        let decoded =
+            afs_protocol::meta::DfsChunkSources::decode(wire.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(decoded, wire);
+        assert_eq!(
+            domain_dfs_chunk_sources(decoded).unwrap().allowed_ranges,
+            vec![(1, 2)]
+        );
+
+        let mut legacy_wire = wire;
+        legacy_wire.allowed_ranges.clear();
+        let legacy =
+            afs_protocol::meta::DfsChunkSources::decode(legacy_wire.encode_to_vec().as_slice())
+                .unwrap();
+        assert!(
+            domain_dfs_chunk_sources(legacy)
+                .unwrap()
+                .allowed_ranges
+                .is_empty()
+        );
+        let old_json = serde_json::json!({ "chunk_id": "legacy", "chunk": null, "sources": [] });
+        let legacy: crate::dfs::ChunkSources = serde_json::from_value(old_json).unwrap();
+        assert!(legacy.allowed_ranges.is_empty());
+    }
+
+    #[test]
+    fn chunk_source_ranges_wire_rejects_unbounded_or_invalid_hints() {
+        let chunk = current_read_authorization().chunk.unwrap();
+        let range =
+            |offset, length| afs_protocol::meta::dfs_authorized_read::Range { offset, length };
+        for allowed_ranges in [
+            vec![range(0, 1); 129],
+            vec![range(0, 0)],
+            vec![range(u64::MAX, 1)],
+            vec![range(3, 2)],
+        ] {
+            let error = domain_dfs_chunk_sources(afs_protocol::meta::DfsChunkSources {
+                chunk_id: chunk.chunk_id.clone(),
+                chunk: Some(chunk.clone()),
+                sources: Vec::new(),
+                allowed_ranges,
+            })
+            .unwrap_err();
+            assert_eq!(error.code(), CLIENT_PROTOCOL_VIOLATION);
+        }
+        assert!(
+            domain_dfs_chunk_sources(afs_protocol::meta::DfsChunkSources {
+                chunk_id: chunk.chunk_id,
+                chunk: None,
+                sources: Vec::new(),
+                allowed_ranges: vec![range(0, 1)],
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
     fn external_authorization_wire_rejects_node_receiver_and_changed_object_key() {
         let chunk_id = crate::dfs::ChunkId::new(format!("blake3-{}-4", "a".repeat(64)));
         let key = crate::dfs::external_object_key("filesystem", "g1", &chunk_id).unwrap();
@@ -3757,6 +3867,67 @@ mod tests {
             TlsConfig::Disabled,
         )
         .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_rpc_metrics_count_real_adapter_invocations_even_on_failure() {
+        let (endpoint, server) = hanging_endpoint().await;
+        let registry = afs_metrics::Registry::new();
+        let metrics = crate::node::read_work::ReadWorkMetrics::register(&registry).unwrap();
+        let meta = test_meta(&endpoint, Duration::from_millis(30)).with_read_work_metrics(metrics);
+        tokio::task::spawn_blocking(move || {
+            use crate::node::{dfs_read::ReadSourceProvider, vfs::dfs::DfsMeta};
+            assert!(
+                meta.get_inode(&crate::dfs::InodeId::new("missing"))
+                    .is_err()
+            );
+            assert!(
+                meta.get_file_version(&crate::dfs::FileVersionId::new("missing"))
+                    .is_err()
+            );
+            assert!(
+                meta.sources_for(crate::dfs::DfsChunkSourcesRequest {
+                    caller_id: "node-a".into(),
+                    namespace_id: crate::dfs::NamespaceId::new("default"),
+                    file_version_id: crate::dfs::FileVersionId::new("missing"),
+                    layout_root_id: crate::dfs::LayoutRootId::new("missing"),
+                    chunk_ids: Vec::new(),
+                })
+                .is_err()
+            );
+            assert!(
+                meta.validate_read_grants(crate::dfs::ValidateDfsReadGrants {
+                    receiver_node_id: "node-a".into(),
+                    receiver_node_epoch: 1,
+                    peer_node_id: "node-b".into(),
+                    validations: Vec::new(),
+                })
+                .is_err()
+            );
+        })
+        .await
+        .unwrap();
+        server.abort();
+        let families = registry.gather();
+        let calls = families
+            .iter()
+            .find(|family| family.name() == "afs_dfs_read_rpc_calls_total")
+            .unwrap();
+        assert_eq!(calls.get_metric().len(), 5);
+        for metric in calls.get_metric() {
+            let method = metric
+                .get_label()
+                .iter()
+                .find(|label| label.name() == "method")
+                .unwrap()
+                .value();
+            let expected = if method == "peer_read_ranges" {
+                0.0
+            } else {
+                1.0
+            };
+            assert_eq!(metric.get_counter().get_value(), expected, "{method}");
+        }
     }
 
     fn test_lease() -> crate::dfs::WriteLease {

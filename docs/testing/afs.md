@@ -175,6 +175,60 @@ BLAKE3错误不得产生成功载荷；并发观测快照不能倒退累计计�
 | `afs_dfs_s3_slow_gets_total{result}` | 所有达到50ms慢GET阈值的成功请求数；日志每60秒最多16条，因此条数可能更少 |
 | `afs_dfs_s3_get_failures_total{stage,result}` | headers／body／metadata／verify错误及read timeout；计数只证明失败阶段，不提供完整失败耗时 |
 
+原生Peer读另外提供`afs_dfs_read_scan_bytes_total`、`afs_dfs_read_scans_total`和
+`afs_dfs_read_copy_bytes_total{stage}`。scan记录实际主读验证循环的逻辑文件读取／BLAKE3输入，
+包含失败前已扫描字节，不等于物理磁盘IO；每次scan汇总一次计数。copy固定六个阶段：
+scan_to_range、pinned_range_to_output、range_to_frame、frame_to_attempt、attempt_to_staging、
+staging_to_output；只统计这些自有载荷交接，不包含codec、TLS或内核复制，也不是内存峰值。
+计数不能换算为E2E时延或与嵌套阶段累计耗时直接相加。
+原生单连续范围采用A单次完整扫描和B私有最终结果交付；复杂布局保留原回退路径。
+完整BLAKE3、授权和错误传播保持。原生DFS新open仍取得fresh inode；已打开句柄
+复用已提交读视图最多5秒，截止从fresh请求前开始并受原Node/session期限约束，
+命中和心跳不延长本次视图。到期重新取得head，本机发布、truncate、getattr等已有
+刷新点使旧视图失效；不承诺旧句柄每次read立即看到其他客户端修改，也不是永久快照。
+read开始和最终交付均检查session/epoch、停止及原截止，borrowed输出在成功前不修改。
+普通Meta断链不会伪造撤销，但新open、head刷新、source miss或授权刷新需要Meta时
+失败直接报错。read/grant拒绝清除受影响上下文，Node注册拒绝、epoch变化或停止才
+停止共享授权。source缓存500ms、A授权缓存最多5秒及原grant期限不延长。
+
+A端Peer服务仅复用当前被请求的
+已验证不可变对象，不预读下一个对象；B的可选纯磁盘缓存单独验收。对象首次完整BLAKE3通过后
+才可入单槽；命中仍核对catalog、Durable、device/epoch、record revision及当前物理文件的
+dev/ino/size/mtime/ctime，变化则失效重验。命中交付的是已验证的内存字节，不能声称每次
+命中都重新检测磁盘后来发生的静默损坏；缓存不是读授权，逐range授权与范围checksum保留。
+
+A端每个LocalChunkStore共用8MiB Peer读载荷额度，当前对象槽最多4MiB。
+填充、驻留、淘汰后仍被发送流持有的对象、范围回退正文和RDMA packed正文，均按实际
+capacity计费至最后一个载荷所有者释放；额度不足返回结构化容量错误，不暗增内存。
+原8个read slots、每流4个64KiB待发送帧及扫描scratch仍各受原上限约束，需单独计入
+进程资源预算；8MiB不是总RSS，也不是每个请求额外获得8MiB。大于4MiB对象保留范围
+读取，协议允许的最大请求不代表当前共享额度一定能准入。fsync与持久提交路径不变。
+
+`afs_dfs_peer_read_payload_bytes`和`afs_dfs_peer_read_payload_peak_bytes`分别报告当前
+计费载荷及历史峰值；`afs_dfs_peer_read_payload_reserved_bytes_total`／
+`afs_dfs_peer_read_payload_released_bytes_total`记录准入和最终释放容量。
+`afs_dfs_peer_read_object_cache_total{result="hit|miss"}`仅记录固定标签的槽查询结果。
+这些指标不授予权限、不执行准入；槽中4MiB驻留并非泄漏，取消／排空及最终引用退账
+须用针对性回归分别确认，不能仅看RSS推断。
+
+原生gRPC正文帧使用Bytes持有原PeerReadPayload：保留Data frame后取消流、淘汰
+缓存槽，必须继续计费直到最后一个frame／对象引用释放；范围fallback遵守同一规则。
+授权与帧生产共用一个blocking任务，授权拒绝仍在返回stream之前发生；取消发生在
+不可中断授权期间，permit必须保持到任务真实退出，已观察取消后不再读取正文。
+回归应同时覆盖slice地址共享、最后引用退账、预算耗尽、损坏无Header、wire兼容、
+遗漏Completion及错误checksum拒绝。帧仍为64KiB、队列仍为4，完整校验不省略。
+
+`afs_dfs_peer_read_events_total{event}`按固定标签记录blocking_authorize、
+blocking_produce、blocking_combined任务提交，以及data_frame、body_vec_allocation、
+shared_frame正文事件。旧独立阶段标签在合并路径上为0；任务提交不代表已经完成，
+帧事件不代表消费方成功交付。与copy／scan／RPC计数同窗口核对，不从计数换算耗时，
+也不能以正文帧共享宣称codec、TLS或内核复制消失。
+
+`afs_dfs_read_rpc_calls_total{method}`记录客户端get_inode、get_file_version、
+get_chunk_sources、validate_read_grants和peer_read_ranges调用尝试，包含失败。
+按Node和操作窗口取增量；get_inode还包含open/getattr等调用，不能把其总数当作
+read-head次数，也不能把客户端尝试当作服务端成功次数。指标不含所有DFS控制RPC。
+
 64MiB验证保留全缓存重复读；数据规模超过既定磁盘缓存时，第二遍称repeat，
 不能继续称全暖缓存。双方预读关闭，固定接口、数据、并发、缓存、持久屏障及
 p95判据，分时运行；实际GET次数／字节、整体时延、调用p50／p95／p99和阶段
@@ -186,3 +240,30 @@ p95判据，分时运行；实际GET次数／字节、整体时延、调用p50�
 新增桶与选择原因仅记录每cache前1024次成功淘汰，复用原计数并输出截断数，
 不分配事件缓冲。fill的written_bytes只统计成功完整写入，outcome区分失败，
 不能把写入成功等同持久保证或将接纳当Ready完成。诊断不替代OFF完整E2E对照。
+
+## 原生 Peer 磁盘读缓存验收
+
+开启 `dfs_peer_cache` 后需分别验证：miss 回填→关闭重开命中、覆盖写后新open读取新版本、
+截断与partial grant不扩大读取范围、授权到期／已知session拒绝、损坏与短文件安全回源、
+容量淘汰与重启恢复、unsafe目录拒绝、正常停止不再接纳fill。缓存不能增加持久副本数，
+必须核对B的durable chunk目录为空、Meta仍只有A的单持久副本。失败不改公开输出。
+
+功能验证之后，固定数据／并发／缓存容量／预读0／持久屏障及冷读到重复读的间隔，再做
+分时对照；若同guest两读之间不采样，Peer与工作量只报告两读合计，不虚构逐阶段计数。
+独立功能测量可证明重复读Peer正文为0。完整对齐1MiB命中需核对实际数据读取attempt与显式copy；直读应无scratch→输出复制，partial／跨段／尾段保留强校验及保守fallback，短读／EINTR的重试单独计真实调用，不由逻辑段数冒充系统调用数。直读后hash／身份／授权失败仍不能公开私有结果。首次获取和重启恢复必须完整验证可信Meta根；稳定磁盘命中逐完整1MiB分段BLAKE3验证，不跳过当前请求覆盖段。另验crosssegment／尾段、段内损坏、身份变化后的完整重验、metadata未变的段外损坏延后、独立1MiB元信息额度／淘汰／停止退账。完整接收证明必须核对Meta根及全部帧身份，并在Completion与实际EOF后才可交接；late Status／额外帧不得产生证明。
+`afs_dfs_peer_disk_cache_events_total`按固定结果标签记录命中与填充；
+`afs_dfs_read_hash_bytes_total{stage}`按实际BLAKE3执行记录本地根、范围stream、接收根、fallback根、分段摘要生成及磁盘段／全文校验字节；根和分段各执行一次即各计一次，不能把新建摘要当免费。旧`afs_dfs_peer_disk_cache_hash_bytes_total`已由按实际执行计数的新指标替代；历史数据保持原指标口径。失败／部分扫描不代表完整验证成功。`afs_dfs_peer_disk_cache_metadata_bytes`与`afs_dfs_peer_disk_cache_metadata_peak_bytes`观察独立元信息额度，不能冒充正文驻留或Node RSS。 `afs_dfs_peer_disk_cache_data_read_calls_total`记录实际正文区间read尝试（含失败／中断，不含header及尾部EOF探测）；`afs_dfs_read_copy_bytes_total{stage="cache_to_output"}`记录实际cache私有结果复制，直读为0，失败时已发生的工作也计入。`afs_dfs_peer_disk_cache_stage_nanoseconds_total{stage}`与`afs_dfs_peer_disk_cache_stage_observations_total{stage}`按operation聚合准备、直读、段hash、fallback流式读hash及结束检查；不逐64KiB取时钟。固定低频计数／计时属于产品观测，trace导出OFF运行仍包含其开销，不称零扰动、不换算或扣减E2E，也不伪拆两读合计为逐阶段。fill当前／峰值和private峰值指标仅观察真实生命周期，不执行准入；
+B的临时fill与A的8MiB共享载荷额度分别报告，不当成整个Node RSS或全局B读输出池。
+应用阶段之和须明确排除等待和控制采样，不冒称连续单时钟E2E。历史通过不自动继承。
+
+填充链另有固定低频`afs_dfs_peer_disk_cache_fill_stage_nanoseconds_total{stage}`／`afs_dfs_peer_disk_cache_fill_stage_observations_total{stage}`，仅实际进入完整对象fill后报告lock_wait、lookup、prepare、receive_verify、store、deliver和total。lock_wait覆盖cache.operation准入及首次root检查，不是纯锁争用；lookup不包含此前Meta sources RPC。receive_verify包含完整Peer调用、解码／复制、根及段校验、Completion与真实EOF，不是纯网络时间。旧完整缓冲路径store为store_verified完整调用；流式路径receive_verify含接收／校验与私有写盘，store只覆盖最后Ready提交，deliver只覆盖其后最终交付检查。流式写盘与接收重叠，不将其累计子耗时重复加入父阶段，也不直接对旧store毫秒承诺节省；prepare可由多个互斥片段组成，观察次数不等于fill次数。total是父阶段，不与子阶段相加，也不是完整FUSE回调计时。失败已发生的阶段也计入，不改变错误／重试／缓存准入。
+
+`afs_dfs_peer_disk_cache_fill_stage_thread_cpu_nanoseconds_total{stage}`及`afs_dfs_peer_disk_cache_fill_stage_thread_cpu_observations_total{stage}`只统计同步调用线程的有效CPU样本，排除远端和h2／TLS等后台线程；跨线程或clock失败缺少CPU观察，不冒充零CPU。墙钟覆盖CPU采样区间，但wall−threadCPU不能直接命名为网络／磁盘等待。每阶段低频聚合，无逐64KiB取clock；正式测量包含实际观测开销，不承诺零扰动。诊断若采用cold后单独采样，其repeat间隔与固定1秒正式三轮不同，重复读只能核对正确性／0Peer等机制，不继承正式性能口径。
+
+同对象流式填充需针对性验证：实际EOF／late Status／坏根不产生Ready；文件完成凭证不能跨FD／对象或复用被修改的私有输出；缓存创建、配额和写盘失败仍以同次完整校验RPC交付合法区间；最终授权失效不能提交Ready或公开输出；满队列取消／超时必须真实join后退账；current-thread、过大窗口或小批预算保留原路径。复读仍只用磁盘cache，不引入驻留正文RAM。固定块另需验证超过两块后的真实复用、跨1MiB段／不足256KiB尾块、Header／Completion／额外帧错误；空闲块等待／归还及满队列取消受绝对期限约束，错误attempt不混入旧尾块或摘要。
+
+`afs_dfs_peer_disk_cache_stream_reserved_bytes`／`stream_reserved_peak_bytes`记录原4MiB额度的保守流式reservation；`stream_private_peak_bytes`另含既有私有输出，不代表实际分配或Node RSS。`afs_dfs_peer_disk_cache_stream_frame_bytes`／`stream_frame_peak_bytes`仅记录两个固定载荷块的真实capacity，归还空闲池仍占账，最后owner销毁才释放；控制字段另有独立有界余量，不含transport buffer。历史规范化帧版本保留原观测范围，不以新旧峰值直接推断RSS变化。旧`fill_bytes`系列只观察旧完整Vec路径，两者互斥，不能相加当同一填充峰值。wire帧上限、两个固定块、单cache操作、窗口／解码约束才执行准入，指标不授予额度。`peer_frame_to_block`统计当前帧到块的实际复制，`peer_frame_detach`保留历史／规范化路径计数，`fill_to_output`统计请求区间提取；必须按实测工作量判断是否减少复制，不能因没有完整Vec就宣称零复制。
+
+64MiB本地对照可在预授权控制连接建立后固定等待30秒，由A单调时钟从create前覆盖发布及B首次完整读校验ACK。完整双读总时延若含固定1秒复读等待必须明确标注；阶段之和仅作辅助。测试专用控制适配器在本地测试方案维护，不进入产品包。
+
+`afs_dfs_peer_read_events_total`的`stream_frame`记录接收到的wire帧（含控制帧）；`stream_block_alloc`记录固定块实际分配，`stream_block_handoff`记录成功正文块交接，`stream_block_write`记录consumer对正文块进入私有sink的调用，不等于物理write系统调用或缓存落盘成功。64MiB完整4MiB对象对照应分别核对1024个Data帧、256次正文块交接和写入入口；尾块按实际长度计数，不从事件数推算性能。

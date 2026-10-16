@@ -2757,6 +2757,14 @@ impl DfsService {
                 Some(MetaEntity::DfsChunk(chunk)) => chunk,
                 _ => return Err(invalid("DFS source chunk identity is missing")),
             };
+            // Compute once from the same authority view used for every MAC.
+            // Large layouts keep precise grants but omit the optional hint.
+            let ranges = read_chunk_intervals(&layout, &chunk)?;
+            let allowed_ranges = if ranges.len() <= 128 {
+                ranges.clone()
+            } else {
+                Vec::new()
+            };
             let placement_snapshot = view.read(MetaRead::DfsPlacement(chunk_id.clone())).await?;
             revision = revision.max(placement_snapshot.revision.0);
             let Some(MetaEntity::DfsPlacement(placement)) = placement_snapshot.entity else {
@@ -2764,6 +2772,7 @@ impl DfsService {
                     chunk_id,
                     chunk: Some(chunk),
                     sources: Vec::new(),
+                    allowed_ranges,
                 });
                 continue;
             };
@@ -2811,7 +2820,6 @@ impl DfsService {
                     fence: revision,
                     token: String::new(),
                 };
-                let ranges = read_chunk_intervals(&layout, &chunk)?;
                 read_grant.token =
                     self.read_grant_token(&read_grant, &serving_copy, &chunk, &ranges)?;
                 sources.push(SourceCandidate {
@@ -2829,6 +2837,7 @@ impl DfsService {
                 chunk_id,
                 chunk: Some(chunk),
                 sources,
+                allowed_ranges,
             });
         }
         Ok(DfsChunkSourcesReply { revision, chunks })
@@ -6078,6 +6087,10 @@ mod read_recovery_tests {
     }
 
     async fn fixture() -> Fixture {
+        fixture_with_bytes(b"data").await
+    }
+
+    async fn fixture_with_bytes(bytes: &[u8]) -> Fixture {
         let temp = tempfile::tempdir().unwrap();
         let local = LocalChunkStore::open(temp.path(), "receiver").unwrap();
         let store = Arc::new(
@@ -6094,7 +6107,7 @@ mod read_recovery_tests {
             vec![local.device_descriptor().unwrap()],
         )
         .await;
-        let staged = StagedChunk::new(OperationId::new("durable-r1"), b"data".to_vec());
+        let staged = StagedChunk::new(OperationId::new("durable-r1"), bytes.to_vec());
         let receipt = local.put(staged.clone()).unwrap();
         let ack = &receipt.durable_acks[0];
         let copy = CopyRecord {
@@ -6119,10 +6132,10 @@ mod read_recovery_tests {
         inode.head_version = Some(FileVersionId::new("version"));
         let layout = LayoutRoot {
             id: LayoutRootId::new("layout"),
-            file_length: 4,
+            file_length: staged.chunk.length,
             inline_extents: vec![Extent {
                 file_offset: 0,
-                length: 4,
+                length: staged.chunk.length,
                 chunk_id: staged.chunk.id.clone(),
                 chunk_offset: 0,
             }],
@@ -6137,7 +6150,7 @@ mod read_recovery_tests {
                 id: FileVersionId::new("version"),
                 inode_id: InodeId::new("file"),
                 parent_version: None,
-                length: 4,
+                length: staged.chunk.length,
                 layout_root: layout.id.clone(),
                 created_at_unix_ms: 1,
             })),
@@ -6173,6 +6186,116 @@ mod read_recovery_tests {
             },
             copy,
         }
+    }
+
+    async fn replace_source_layout(f: &Fixture, extents: Vec<Extent>) {
+        let key = RequestKey::new("fixture", "source-range-layout");
+        let mut txn = MetaTxn::new(key.clone(), StoreOperation::DfsCommitFileVersion);
+        txn.conditions
+            .push(TxnCondition::RequestAbsent(key.clone()));
+        txn.mutations.extend([
+            TxnMutation::Put(MetaEntity::DfsLayoutRoot(LayoutRoot {
+                id: f.request.layout_root_id.clone(),
+                file_length: f.copy.persisted_bytes,
+                inline_extents: extents,
+            })),
+            TxnMutation::RecordRequestOutcome(RequestOutcome {
+                request: key,
+                operation: StoreOperation::DfsCommitFileVersion,
+                result: OperationResult::Empty,
+            }),
+        ]);
+        f.store.compare_and_commit(txn).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn chunk_sources_publish_only_committed_grant_ranges() {
+        let f = fixture().await;
+        replace_source_layout(
+            &f,
+            vec![Extent {
+                file_offset: 1,
+                chunk_offset: 1,
+                length: 2,
+                chunk_id: f.copy.chunk_id.clone(),
+            }],
+        )
+        .await;
+        let set = f
+            .service
+            .chunk_sources(f.request.clone())
+            .await
+            .unwrap()
+            .chunks
+            .remove(0);
+        assert_eq!(set.allowed_ranges, vec![(1, 2)]);
+        let mut request = ValidateDfsReadGrants {
+            receiver_node_id: "receiver".into(),
+            receiver_node_epoch: 1,
+            peer_node_id: "reader".into(),
+            validations: vec![DfsReadValidation {
+                grant: set.sources[0].read_grant.clone(),
+                chunk_id: set.chunk_id,
+                copy_id: set.sources[0].copy_id.clone(),
+                chunk_offset: 1,
+                length: 2,
+            }],
+        };
+        let authorized = f
+            .service
+            .validate_read_grants(request.clone())
+            .await
+            .unwrap();
+        assert_eq!(authorized[0].allowed_ranges, set.allowed_ranges);
+        request.validations[0].chunk_offset = 0;
+        request.validations[0].length = 4;
+        assert!(f.service.validate_read_grants(request).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn chunk_sources_fragmented_ranges_keep_grants_but_omit_cache_hint() {
+        let f = fixture_with_bytes(&[b'x'; 259]).await;
+        replace_source_layout(
+            &f,
+            (0..129)
+                .map(|index| Extent {
+                    file_offset: index * 2,
+                    chunk_offset: index * 2,
+                    length: 1,
+                    chunk_id: f.copy.chunk_id.clone(),
+                })
+                .collect(),
+        )
+        .await;
+        let set = f
+            .service
+            .chunk_sources(f.request.clone())
+            .await
+            .unwrap()
+            .chunks
+            .remove(0);
+        assert!(set.allowed_ranges.is_empty());
+        assert_eq!(set.sources.len(), 1);
+        let mut request = ValidateDfsReadGrants {
+            receiver_node_id: "receiver".into(),
+            receiver_node_epoch: 1,
+            peer_node_id: "reader".into(),
+            validations: vec![DfsReadValidation {
+                grant: set.sources[0].read_grant.clone(),
+                chunk_id: set.chunk_id,
+                copy_id: set.sources[0].copy_id.clone(),
+                chunk_offset: 0,
+                length: 1,
+            }],
+        };
+        let authorized = f
+            .service
+            .validate_read_grants(request.clone())
+            .await
+            .unwrap();
+        assert_eq!(authorized[0].allowed_ranges, vec![(0, 1)]);
+        request.validations[0].length = 2;
+        assert!(f.service.validate_read_grants(request).await.is_err());
     }
 
     #[tokio::test]

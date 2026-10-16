@@ -26,7 +26,11 @@ use crate::{
         DfsChunkSourcesRequest, DfsExternalAuthorizedRead, DfsMissingReadSource, DfsReadGrant,
         DfsReadValidation, FileVersionId, LayoutRootId, SourceCandidate,
     },
-    node::chunk::{LocalChunkStore, PinnedChunkReader, VerifiedRangeCopy},
+    node::{
+        chunk::{LocalChunkStore, PinnedChunkReader, VerifiedRangeCopy},
+        peer_cache::{CompletedPeerDiskRead, DiskPeerCache, PeerStreamSink, VerifiedPeerChunk},
+        read_work::PeerFillClock,
+    },
 };
 
 /// Hard protocol budgets shared by the scheduler, peer adapter and service.
@@ -449,6 +453,85 @@ pub trait ChunkTransfer: Send + Sync {
     /// every operation completes. An adapter must drain or retain any DMA
     /// resources before returning, including on cancellation or timeout.
     fn read_ranges(&self, batch: &PeerReadBatch, out: &mut [u8]) -> Result<()>;
+
+    /// Capability check before creating or admitting a private cache file.
+    /// Unsupported runtimes/transports preserve the original cache path.
+    fn supports_verified_object_sink(&self) -> bool {
+        false
+    }
+
+    /// Optional complete-object stream into a private disk sink and the
+    /// currently requested private range. `None` means unsupported before
+    /// starting an RPC or changing either destination. A successful sealed
+    /// completion is still subject to the engine's final authority checks.
+    fn read_verified_object_to_sink<'output>(
+        &self,
+        _batch: &PeerReadBatch,
+        _chunk: &ChunkObject,
+        _requested_offset: u64,
+        _private_out: &'output mut [u8],
+        _sink: &mut PeerStreamSink<'_>,
+    ) -> Result<Option<CompletedPeerDiskRead<'output>>> {
+        Ok(None)
+    }
+
+    /// Optional observation only; never grants permission or memory admission.
+    fn verification_metrics(&self) -> Option<&crate::node::read_work::ReadWorkMetrics> {
+        None
+    }
+
+    /// Return one complete immutable object bound to trusted Meta identity.
+    /// Adapters without a completed-stream proof retain full root verification.
+    fn read_verified_object<'a>(
+        &self,
+        batch: &PeerReadBatch,
+        chunk: &'a ChunkObject,
+        out: &'a mut [u8],
+    ) -> Result<VerifiedPeerChunk<'a>> {
+        validate_verified_peer_object_request(batch, chunk, out.len())?;
+        self.read_ranges(batch, out)?;
+        if let Some(metrics) = self.verification_metrics() {
+            metrics.hash("root_fallback", chunk.length);
+        }
+        let verified = VerifiedPeerChunk::verify(chunk, out)?;
+        if let Some(metrics) = self.verification_metrics() {
+            metrics.hash("segment_index_bytes", chunk.length);
+        }
+        Ok(verified)
+    }
+}
+
+pub(super) fn validate_verified_peer_object_request(
+    batch: &PeerReadBatch,
+    chunk: &ChunkObject,
+    output_len: usize,
+) -> Result<()> {
+    batch.validate(output_len)?;
+    if batch.operations.len() != 1
+        || chunk.id.0.is_empty()
+        || chunk.id.0.len() > 512
+        || chunk.encoding != crate::dfs::ChunkEncoding::Raw
+        || chunk.content_digest.algorithm != crate::dfs::DigestAlgorithm::Blake3
+        || chunk.length == 0
+        || chunk.length > crate::node::chunk::MAX_STAGED_CHUNK_BYTES as u64
+        || output_len as u64 != chunk.length
+    {
+        return Err(invalid(
+            "verified Peer read requires one bounded complete object",
+        ));
+    }
+    let item = &batch.operations[0];
+    if item.op.chunk_id != chunk.id
+        || item.source.chunk_id != chunk.id
+        || item.op.chunk_offset != 0
+        || item.op.output_offset != 0
+        || item.op.length != chunk.length
+    {
+        return Err(invalid(
+            "verified Peer read differs from the full object identity",
+        ));
+    }
+    Ok(())
 }
 
 fn same_peer_context(left: &SourceCandidate, right: &SourceCandidate) -> bool {
@@ -525,10 +608,16 @@ type SourceCacheKey = (FileVersionId, LayoutRootId, ChunkId);
 const MAX_CACHED_SOURCES: usize = 1024;
 const MAX_PINNED_READERS: usize = 256;
 
-#[derive(Clone, Debug)]
-struct LocalReadAuthoritySnapshot {
+#[derive(Clone, Copy, Debug)]
+pub(super) struct NativeReadAuthoritySnapshot {
     epoch: u64,
     expires_at: Option<Instant>,
+}
+
+impl NativeReadAuthoritySnapshot {
+    pub(super) fn expires_at(&self) -> Option<Instant> {
+        self.expires_at
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -577,7 +666,12 @@ impl LocalReadAuthority {
         if state.stopped {
             return Err(external_denied("DFS read authority has stopped"));
         }
-        if expires_at <= Instant::now() {
+        if expires_at <= Instant::now()
+            || state
+                .expires_at
+                .is_some_and(|deadline| deadline <= Instant::now())
+        {
+            state.stopped = true;
             return Err(external_denied("DFS read authority expired"));
         }
         if state.epoch != epoch {
@@ -594,7 +688,23 @@ impl LocalReadAuthority {
         }
     }
 
-    fn snapshot(&self) -> Result<LocalReadAuthoritySnapshot> {
+    fn check_snapshot(&self, snapshot: &NativeReadAuthoritySnapshot) -> Result<()> {
+        // Same-epoch heartbeats may extend future admissions, never an already
+        // captured operation or opened view. Known stop/epoch changes win.
+        let current = self.snapshot()?;
+        if current.epoch != snapshot.epoch
+            || snapshot
+                .expires_at
+                .is_some_and(|deadline| deadline <= Instant::now())
+        {
+            return Err(external_denied(
+                "DFS read authority changed or expired before publication",
+            ));
+        }
+        Ok(())
+    }
+
+    fn snapshot(&self) -> Result<NativeReadAuthoritySnapshot> {
         let state = self
             .state
             .lock()
@@ -608,7 +718,7 @@ impl LocalReadAuthority {
         {
             return Err(external_denied("DFS read authority expired"));
         }
-        Ok(LocalReadAuthoritySnapshot {
+        Ok(NativeReadAuthoritySnapshot {
             epoch: state.epoch,
             expires_at: state.expires_at,
         })
@@ -676,7 +786,7 @@ impl ExternalAuthorityCache {
         key: &ExternalAuthorityKey,
         requested_start: u64,
         requested_len: u64,
-        local: &LocalReadAuthoritySnapshot,
+        local: &NativeReadAuthoritySnapshot,
     ) -> Option<Arc<ExternalAuthorityEntry>> {
         let now = Instant::now();
         self.entries
@@ -750,6 +860,42 @@ impl ExternalAuthorityCache {
     }
 }
 
+/// One low-frequency fill stage. Total encloses the whole fill. A streaming
+/// receive also includes private disk writes; store then covers only the Ready
+/// commit. Nested producer/write observations must not be added to this parent.
+struct PeerFillStage<'a> {
+    local: &'a LocalChunkStore,
+    stage: &'static str,
+    clock: PeerFillClock,
+    active: bool,
+}
+
+impl<'a> PeerFillStage<'a> {
+    fn start(local: &'a LocalChunkStore, stage: &'static str) -> Self {
+        Self::since(local, stage, PeerFillClock::start())
+    }
+
+    fn since(local: &'a LocalChunkStore, stage: &'static str, clock: PeerFillClock) -> Self {
+        Self {
+            local,
+            stage,
+            clock,
+            active: true,
+        }
+    }
+}
+
+impl Drop for PeerFillStage<'_> {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let (wall_ns, cpu_ns) = self.clock.elapsed();
+        self.local
+            .record_peer_cache_fill_stage(self.stage, wall_ns, cpu_ns);
+    }
+}
+
 pub struct DfsReadEngine {
     namespace_id: crate::dfs::NamespaceId,
     local_node_id: String,
@@ -758,6 +904,7 @@ pub struct DfsReadEngine {
     transfer: Arc<dyn ChunkTransfer>,
     config: DfsReadConfig,
     external_backend: Option<ExternalReadBackend>,
+    peer_cache: Option<Arc<DiskPeerCache>>,
     read_authority: Arc<LocalReadAuthority>,
     readers: Mutex<HashMap<ChunkId, Arc<PinnedChunkReader>>>,
     source_cache: Mutex<HashMap<SourceCacheKey, CachedSources>>,
@@ -826,6 +973,7 @@ impl DfsReadEngine {
             transfer,
             config,
             external_backend: None,
+            peer_cache: None,
             read_authority: Arc::new(LocalReadAuthority::unbounded_for_tests_and_legacy()),
             readers: Mutex::new(HashMap::new()),
             source_cache: Mutex::new(HashMap::new()),
@@ -844,9 +992,100 @@ impl DfsReadEngine {
         self
     }
 
+    /// Disposable local storage for already verified native Peer objects.
+    /// Cache contents never supply grant, Node/session or file-view authority.
+    pub(super) fn with_peer_cache(mut self, cache: Arc<DiskPeerCache>) -> Self {
+        self.peer_cache = Some(cache);
+        self
+    }
+
     pub(super) fn with_read_authority(mut self, authority: Arc<LocalReadAuthority>) -> Self {
         self.read_authority = authority;
         self
+    }
+
+    pub(super) fn capture_native_read_authority(&self) -> Result<NativeReadAuthoritySnapshot> {
+        self.read_authority.snapshot()
+    }
+
+    pub(super) fn check_native_read_authority(
+        &self,
+        snapshot: &NativeReadAuthoritySnapshot,
+    ) -> Result<()> {
+        self.read_authority.check_snapshot(snapshot)
+    }
+
+    fn invalidate_native_batch_authority(&self, batch: &ReadBatch) {
+        // A read/grant denial belongs to this immutable read context, not the
+        // Node registration lease. Drop its sources so a later attempt must
+        // return to Meta; only Node lifecycle events stop global authority.
+        if let Some(version) = &batch.file_version_id
+            && let Ok(mut cache) = self.source_cache.lock()
+        {
+            for op in &batch.ops {
+                cache.remove(&(
+                    version.clone(),
+                    batch.layout_root_id.clone(),
+                    op.chunk_id.clone(),
+                ));
+            }
+        }
+    }
+
+    fn invalidate_native_batch_on_error(&self, batch: &ReadBatch, error: &Error) {
+        if matches!(
+            error.kind(),
+            afs_error::ErrorKind::PermissionDenied | afs_error::ErrorKind::Unauthenticated
+        ) {
+            self.invalidate_native_batch_authority(batch);
+        }
+    }
+
+    pub(super) fn validate_native_read_size(&self, size: usize) -> Result<()> {
+        self.config.validate()?;
+        if size as u64 > self.config.max_inflight_bytes {
+            return Err(invalid("DFS private read exceeds inflight byte budget"));
+        }
+        Ok(())
+    }
+
+    /// Fill a caller-owned, unpublished native result without an additional
+    /// aggregate staging allocation. On error this private buffer may change
+    /// and must be discarded. Borrowed public output must use `read_batch`.
+    pub(super) fn read_batch_native_into_private(
+        &self,
+        batch: &ReadBatch,
+        out: &mut [u8],
+    ) -> Result<()> {
+        self.validate_native_read_size(out.len())?;
+        batch.validate_for_output(out.len(), &self.config)?;
+        if self.external_backend.is_some() {
+            return Err(Error::coded(
+                afs_error::NODE_TRANSFER_UNSUPPORTED,
+                "private native read cannot use an external backend",
+            ));
+        }
+        // Native layout operations are disjoint. Reject overlaps explicitly:
+        // direct local grouping must not change the old scatter precedence.
+        for (index, left) in batch.ops.iter().enumerate() {
+            if left.length == 0 {
+                continue;
+            }
+            let left_end = left.output_offset + left.length as usize;
+            if batch.ops[index + 1..].iter().any(|right| {
+                right.length != 0
+                    && left.output_offset < right.output_offset + right.length as usize
+                    && right.output_offset < left_end
+            }) {
+                return Err(invalid("private native read output ranges overlap"));
+            }
+        }
+        let authority = self.capture_native_read_authority()?;
+        self.read_batch_into_private(batch, out, true)
+            .inspect_err(|error| {
+                self.invalidate_native_batch_on_error(batch, error);
+            })?;
+        self.check_native_read_authority(&authority)
     }
 
     pub fn has_external_backend(&self) -> bool {
@@ -867,6 +1106,11 @@ impl DfsReadEngine {
         );
         let _entered = span.enter();
         batch.validate_for_output(out.len(), &self.config)?;
+        let native_authority = if self.external_backend.is_none() {
+            Some(self.capture_native_read_authority()?)
+        } else {
+            None
+        };
         // Stage only requested bytes, bounded by the validated batch budget.
         // Local successes and peer retries become visible together after every
         // range succeeds; a failed read never alters the caller's output.
@@ -880,7 +1124,10 @@ impl DfsReadEngine {
         let expires_at = if let Some(backend) = &self.external_backend {
             self.read_external_batch(backend, &staged_batch, &mut staged)?
         } else {
-            self.read_batch_into(&staged_batch, &mut staged)?;
+            self.read_batch_into(&staged_batch, &mut staged)
+                .inspect_err(|error| {
+                    self.invalidate_native_batch_on_error(batch, error);
+                })?;
             None
         };
         // Full-object fetches may outlive the authorization that allowed them.
@@ -890,11 +1137,16 @@ impl DfsReadEngine {
                 "external read authority expired before publication",
             ));
         }
+        if let Some(authority) = &native_authority {
+            self.check_native_read_authority(authority)?;
+        }
         for (original, packed) in batch.ops.iter().zip(&staged_batch.ops) {
             if original.length == 0 {
                 continue;
             }
             let length = original.length as usize;
+            self.local
+                .record_read_copy("staging_to_output", original.length);
             tracing::info_span!(
                 "node.dfs.read.copy",
                 copy_stage = "staged_to_output",
@@ -907,6 +1159,44 @@ impl DfsReadEngine {
             });
         }
         Ok(())
+    }
+
+    /// Read one contiguous native range into its private final response.
+    /// Unsupported layouts retain the borrowed scheduler. Validate before
+    /// allocation; a failed transfer can modify only this unpublished Vec.
+    pub fn read_batch_native_owned(
+        &self,
+        batch: &ReadBatch,
+        output_len: usize,
+    ) -> Result<Option<Vec<u8>>> {
+        if output_len as u64 > self.config.max_inflight_bytes {
+            return Err(invalid("DFS owned read exceeds inflight byte budget"));
+        }
+        batch.validate_for_output(output_len, &self.config)?;
+        if self.external_backend.is_some()
+            || batch.ops.len() != 1
+            || batch.ops[0].output_offset != 0
+            || batch.ops[0].length != output_len as u64
+        {
+            return Ok(None);
+        }
+        let span = tracing::info_span!(
+            "node.dfs.read.batch",
+            ops = batch.ops.len(),
+            requested_bytes = output_len as u64,
+            output_bytes = output_len as u64,
+            external = false,
+            owned = true,
+        );
+        let _entered = span.enter();
+        let authority = self.capture_native_read_authority()?;
+        let mut result = vec![0; output_len];
+        self.read_batch_into_private(batch, &mut result, true)
+            .inspect_err(|error| {
+                self.invalidate_native_batch_on_error(batch, error);
+            })?;
+        self.check_native_read_authority(&authority)?;
+        Ok(Some(result))
     }
 
     pub fn read_batch_current_external(
@@ -1812,6 +2102,7 @@ impl DfsReadEngine {
                 CachedSources {
                     expires_at,
                     sources: ChunkSources {
+                        allowed_ranges: Vec::new(),
                         chunk_id: read.chunk.id.clone(),
                         chunk: Some(read.chunk.clone()),
                         sources: vec![read.source.clone()],
@@ -1859,6 +2150,15 @@ impl DfsReadEngine {
     }
 
     fn read_batch_into(&self, batch: &ReadBatch, out: &mut [u8]) -> Result<()> {
+        self.read_batch_into_private(batch, out, false)
+    }
+
+    fn read_batch_into_private(
+        &self,
+        batch: &ReadBatch,
+        out: &mut [u8],
+        final_owned: bool,
+    ) -> Result<()> {
         let mut groups: Vec<(ChunkId, Vec<usize>)> = Vec::new();
         let mut positions: HashMap<ChunkId, usize> = HashMap::new();
         for (index, op) in batch.ops.iter().enumerate() {
@@ -1935,7 +2235,19 @@ impl DfsReadEngine {
             ops: remote_ops,
         };
         let sources = self.sources_for(&remote_batch)?;
-        self.read_remote_batch(&remote_batch, &sources, out)?;
+        let authority = self.capture_native_read_authority()?;
+        if authority.epoch != 0
+            && sources
+                .iter()
+                .flat_map(|set| &set.sources)
+                .any(|source| source.read_grant.caller_node_epoch != authority.epoch)
+        {
+            self.invalidate_native_batch_authority(batch);
+            return Err(external_denied(
+                "DFS source caller epoch differs from the registered session",
+            ));
+        }
+        self.read_remote_batch(&remote_batch, &sources, out, final_owned)?;
         Ok(())
     }
 
@@ -2050,6 +2362,9 @@ impl DfsReadEngine {
                     source.chunk_id != set.chunk_id || !self.source_matches(batch, source)
                 })
             {
+                if self.external_backend.is_none() {
+                    self.invalidate_native_batch_authority(batch);
+                }
                 return Err(invalid(
                     "DFS source reply changed the requested content or authorization identity",
                 ));
@@ -2095,11 +2410,385 @@ impl DfsReadEngine {
             && !grant.token.is_empty()
     }
 
+    fn peer_cache_source_eligible(
+        &self,
+        batch: &ReadBatch,
+        chunk: &ChunkObject,
+        source: &SourceCandidate,
+    ) -> bool {
+        self.source_matches(batch, source)
+            && source.state.is_readable()
+            && matches!(
+                source.role,
+                CopyRole::DurableReplica | CopyRole::VerifiedCache
+            )
+            && source.chunk_id == chunk.id
+            && !source.copy_id.0.is_empty()
+            && source
+                .data_endpoint
+                .as_deref()
+                .is_some_and(|endpoint| !endpoint.is_empty())
+            && matches!(&source.location, CopyLocation::Node {
+                node_id, node_epoch, device_id, device_epoch, catalog_revision,
+            } if node_id != &self.local_node_id && !node_id.is_empty() && *node_epoch != 0
+                && !device_id.is_empty() && *device_epoch != 0 && *catalog_revision != 0)
+    }
+
+    fn check_peer_cache_authority(
+        &self,
+        batch: &ReadBatch,
+        source: &SourceCandidate,
+        authority: &NativeReadAuthoritySnapshot,
+    ) -> Result<()> {
+        self.check_native_read_authority(authority)?;
+        if !self.source_matches(batch, source)
+            || (authority.epoch != 0 && source.read_grant.caller_node_epoch != authority.epoch)
+        {
+            return Err(external_denied(
+                "Peer cache read grant expired or changed before publication",
+            ));
+        }
+        Ok(())
+    }
+
+    fn read_native_peer_cache(
+        &self,
+        batch: &ReadBatch,
+        sources: &[ChunkSources],
+        out: &mut [u8],
+        final_owned: bool,
+    ) -> Result<bool> {
+        let Some(cache) = &self.peer_cache else {
+            return Ok(false);
+        };
+        // The cache never changes external-backend routing or complex batch
+        // scatter/retry semantics. Only the currently requested object is read.
+        if self.external_backend.is_some() || batch.ops.len() != 1 {
+            return Ok(false);
+        }
+        if cache.namespace_id() != &self.namespace_id {
+            return Err(invalid("Peer cache namespace differs from the read engine"));
+        }
+        let op = &batch.ops[0];
+        let Some(set) = sources.iter().find(|set| set.chunk_id == op.chunk_id) else {
+            return Ok(false);
+        };
+        let Some(chunk) = &set.chunk else {
+            return Ok(false);
+        };
+        if chunk.id != op.chunk_id
+            || chunk.length == 0
+            || set.allowed_ranges.len() > MAX_DFS_READ_OPS
+            || set.allowed_ranges.iter().any(|(start, length)| {
+                *length == 0
+                    || start
+                        .checked_add(*length)
+                        .is_none_or(|end| end > chunk.length)
+            })
+        {
+            self.invalidate_native_batch_authority(batch);
+            return Err(invalid(
+                "Peer cache source has an invalid immutable object or grant range",
+            ));
+        }
+        if chunk.length > crate::node::chunk::MAX_STAGED_CHUNK_BYTES as u64
+            || set.allowed_ranges.is_empty()
+        {
+            return Ok(false);
+        }
+        if !range_covered(&set.allowed_ranges, op.chunk_offset, op.length) {
+            return Err(external_denied(
+                "Peer cache requested range is outside the committed grant",
+            ));
+        }
+        let source = set
+            .sources
+            .iter()
+            .find(|source| self.peer_cache_source_eligible(batch, chunk, source));
+        let Some(source) = source else {
+            return Ok(false);
+        };
+        let authority = self.capture_native_read_authority()?;
+        self.check_peer_cache_authority(batch, source, &authority)?;
+        // Acquire the one synchronous cache operation before any full-object
+        // allocation. No retained payload, additional fill or prefetch queue.
+        let mut total = PeerFillStage {
+            local: &self.local,
+            stage: "total",
+            clock: PeerFillClock::start(),
+            active: false,
+        };
+        let mut operation = match cache.operation() {
+            Ok(operation) => operation,
+            Err(error) => {
+                self.local.record_peer_disk_cache_event("fallback");
+                afs_logging::warn!("dfs.peer_cache_unavailable"; "error" => error.to_string());
+                return Ok(false);
+            }
+        };
+        let lock_wait_elapsed = total.clock.elapsed();
+        let lookup_clock = PeerFillClock::start();
+        self.check_peer_cache_authority(batch, source, &authority)?;
+        let start = op.output_offset;
+        let end = start + op.length as usize; // batch validated before scheduling
+        match operation.read_range(chunk, op.chunk_offset, &mut out[start..end]) {
+            Ok(true) => {
+                self.local.record_peer_disk_cache_event("hit");
+                self.check_peer_cache_authority(batch, source, &authority)?;
+                return Ok(true);
+            }
+            Ok(false) => {}
+            Err(error) => {
+                self.local.record_peer_disk_cache_event("corrupt_or_io");
+                afs_logging::warn!("dfs.peer_cache_read_failed"; "error" => error.to_string());
+            }
+        }
+        self.local.record_peer_disk_cache_event("miss");
+        // Partial layout grants permit their requested ranges, never an
+        // expanded full-object Peer fetch. Unknown old-server grants fall back.
+        if !final_owned
+            || !range_covered(&set.allowed_ranges, 0, chunk.length)
+            || chunk
+                .length
+                .checked_add(out.len() as u64)
+                .is_none_or(|bytes| bytes > self.config.max_inflight_bytes)
+        {
+            self.local.record_peer_disk_cache_event("fallback");
+            return Ok(false);
+        }
+        // Emit fill timings only after an actual complete-object fill has been
+        // admitted. A cache hit or range fallback never increments fill counts.
+        let lookup_elapsed = lookup_clock.elapsed();
+        // The guard was declared before `operation`, so total also includes
+        // its drain/observation drop and the private body's release.
+        total.active = true;
+        self.local.record_peer_cache_fill_stage(
+            "lock_wait",
+            lock_wait_elapsed.0,
+            lock_wait_elapsed.1,
+        );
+        self.local
+            .record_peer_cache_fill_stage("lookup", lookup_elapsed.0, lookup_elapsed.1);
+        let mut preparation = Some(PeerFillStage::start(&self.local, "prepare"));
+        self.check_peer_cache_authority(batch, source, &authority)?;
+        let length = usize::try_from(chunk.length)
+            .map_err(|_| invalid("Peer cache object length is too large"))?;
+        // Only an unsupported streaming adapter allocates the legacy body.
+        // After that decision, retries keep the old mechanism rather than hold
+        // a full Vec alongside a new streaming pipeline reservation.
+        let mut use_stream = self.transfer.supports_verified_object_sink()
+            && (crate::node::chunk::MAX_STAGED_CHUNK_BYTES as u64)
+                .checked_add(out.len() as u64)
+                .is_some_and(|bytes| bytes <= self.config.max_inflight_bytes);
+        let mut _legacy_fill_work = None;
+        let mut body = Vec::new();
+        let version = batch
+            .file_version_id
+            .clone()
+            .ok_or_else(|| invalid("verified Peer cache fill requires a fixed FileVersion"))?;
+        let mut last_error = None;
+        // Each distinct eligible source gets one full-object attempt. A proof
+        // is consumed entirely in its success branch, never mixed with another
+        // attempt or reconstructed by rehashing an already completed stream.
+        let mut attempted_copies = BTreeSet::new();
+        for source in set
+            .sources
+            .iter()
+            .filter(|source| self.peer_cache_source_eligible(batch, chunk, source))
+            .take(MAX_DFS_READ_OPS)
+        {
+            if !attempted_copies.insert(&source.copy_id) {
+                continue;
+            }
+            self.check_peer_cache_authority(batch, source, &authority)?;
+            let attempt = PeerReadBatch {
+                file_version_id: version.clone(),
+                layout_root_id: batch.layout_root_id.clone(),
+                operations: vec![ResolvedReadOp {
+                    op: ChunkReadOp {
+                        chunk_id: chunk.id.clone(),
+                        chunk_offset: 0,
+                        length: chunk.length,
+                        output_offset: 0,
+                    },
+                    source: source.clone(),
+                }],
+            };
+            if use_stream {
+                // Declare the allowance first: a failed or cancelled transfer
+                // must drain its producer and release sink/proof/frame owners
+                // before the conservative pipeline reservation is returned.
+                let _stream_work = self.local.peer_disk_cache_stream_work(out.len());
+                let mut sink = operation.begin_stream(chunk)?;
+                let output_pointer = out[start..end].as_ptr() as usize;
+                let output_length = end - start;
+                let prepare_elapsed = preparation.as_ref().map(|stage| stage.clock.elapsed());
+                let receive_clock = PeerFillClock::start();
+                let received = self.transfer.read_verified_object_to_sink(
+                    &attempt,
+                    chunk,
+                    op.chunk_offset,
+                    &mut out[start..end],
+                    &mut sink,
+                );
+                if !received.as_ref().is_ok_and(Option::is_none) {
+                    // An unsupported probe starts no RPC. Retain the legacy
+                    // prepare clock in that case instead of inventing an
+                    // extra receive observation or overlapping prepare work.
+                    if let Some(mut stage) = preparation.take() {
+                        stage.active = false;
+                    }
+                    if let Some(elapsed) = prepare_elapsed {
+                        self.local
+                            .record_peer_cache_fill_stage("prepare", elapsed.0, elapsed.1);
+                    }
+                    let elapsed = receive_clock.elapsed();
+                    self.local
+                        .record_peer_cache_fill_stage("receive_verify", elapsed.0, elapsed.1);
+                    preparation = Some(PeerFillStage::start(&self.local, "prepare"));
+                }
+                match received {
+                    Ok(Some(completed)) => {
+                        if completed.chunk() != chunk
+                            || completed.requested_offset() != op.chunk_offset
+                            || completed.requested_length() != output_length
+                            || completed.root_digest() != &chunk.content_digest.bytes
+                            || !completed
+                                .matches_private_output_identity(output_pointer, output_length)
+                        {
+                            return Err(corrupt(
+                                "streamed Peer completion changed trusted identity or private output",
+                            ));
+                        }
+                        self.check_peer_cache_authority(batch, source, &authority)?;
+                        drop(preparation.take());
+                        let stored = {
+                            let _store = PeerFillStage::start(&self.local, "store");
+                            sink.commit(completed)
+                        };
+                        let _delivery = PeerFillStage::start(&self.local, "deliver");
+                        match stored {
+                            Ok(true) => self.local.record_peer_disk_cache_event("fill"),
+                            Ok(false) => self.local.record_peer_disk_cache_event("fill_failed"),
+                            Err(error) => {
+                                self.local.record_peer_disk_cache_event("fill_failed");
+                                afs_logging::warn!("dfs.peer_cache_stream_commit_failed"; "error" => error.to_string());
+                            }
+                        }
+                        // The adapter already extracted the range into the
+                        // unpublished final output and counted actual copies.
+                        // Cache I/O/quota failure does not cause another RPC.
+                        self.check_peer_cache_authority(batch, source, &authority)?;
+                        return Ok(true);
+                    }
+                    Ok(None) => use_stream = false,
+                    Err(error) => {
+                        self.local.record_peer_disk_cache_event("fill_failed");
+                        self.invalidate_native_batch_on_error(batch, &error);
+                        if matches!(
+                            error.kind(),
+                            afs_error::ErrorKind::PermissionDenied
+                                | afs_error::ErrorKind::Unauthenticated
+                        ) {
+                            return Err(error);
+                        }
+                        self.check_native_read_authority(&authority)?;
+                        last_error = Some(error);
+                        continue;
+                    }
+                }
+            }
+            // The unsupported sink and its pipeline allowance have dropped
+            // before the original complete-object Vec is admitted.
+            if body.is_empty() {
+                _legacy_fill_work = self.local.peer_disk_cache_fill_work(length, out.len());
+                body.resize(length, 0);
+            }
+            drop(preparation.take());
+            let received = {
+                let _receive = PeerFillStage::start(&self.local, "receive_verify");
+                self.transfer
+                    .read_verified_object(&attempt, chunk, &mut body)
+            };
+            // Preparation resumes for proof identity/authorization checks, or
+            // for error bookkeeping and the next bounded copy attempt.
+            preparation = Some(PeerFillStage::start(&self.local, "prepare"));
+            match received {
+                Ok(verified) => {
+                    if verified.chunk() != chunk || verified.bytes().len() as u64 != chunk.length {
+                        return Err(corrupt(
+                            "verified Peer object proof changed trusted identity",
+                        ));
+                    }
+                    if !verified.uses_completed_stream_proof()
+                        && self.transfer.verification_metrics().is_none()
+                    {
+                        self.local.record_read_hash("root_fallback", chunk.length);
+                        self.local
+                            .record_read_hash("segment_index_bytes", chunk.length);
+                    }
+                    self.check_peer_cache_authority(batch, source, &authority)?;
+                    drop(preparation.take());
+                    let stored = {
+                        let _store = PeerFillStage::start(&self.local, "store");
+                        operation.store_verified(&verified)
+                    };
+                    let _delivery = PeerFillStage::start(&self.local, "deliver");
+                    match stored {
+                        Ok(true) => self.local.record_peer_disk_cache_event("fill"),
+                        Ok(false) => self.local.record_peer_disk_cache_event("fill_failed"),
+                        Err(error) => {
+                            self.local.record_peer_disk_cache_event("fill_failed");
+                            afs_logging::warn!("dfs.peer_cache_write_failed"; "error" => error.to_string());
+                        }
+                    }
+                    self.check_peer_cache_authority(batch, source, &authority)?;
+                    let chunk_start = op.chunk_offset as usize;
+                    out[start..end].copy_from_slice(
+                        &verified.bytes()[chunk_start..chunk_start + op.length as usize],
+                    );
+                    self.local.record_read_copy("fill_to_output", op.length);
+                    self.check_peer_cache_authority(batch, source, &authority)?;
+                    return Ok(true);
+                }
+                Err(error) => {
+                    self.local.record_peer_disk_cache_event("fill_failed");
+                    self.invalidate_native_batch_on_error(batch, &error);
+                    if matches!(
+                        error.kind(),
+                        afs_error::ErrorKind::PermissionDenied
+                            | afs_error::ErrorKind::Unauthenticated
+                    ) {
+                        return Err(error);
+                    }
+                    self.check_native_read_authority(&authority)?;
+                    last_error = Some(error);
+                }
+            }
+        }
+        Err(last_error
+            .unwrap_or_else(|| corrupt("Peer cache fill has no readable authorized source")))
+    }
+
     fn read_remote_batch(
         &self,
         batch: &ReadBatch,
         sources: &[ChunkSources],
         out: &mut [u8],
+        final_owned: bool,
+    ) -> Result<()> {
+        if self.read_native_peer_cache(batch, sources, out, final_owned)? {
+            return Ok(());
+        }
+        self.read_remote_ranges(batch, sources, out, final_owned)
+    }
+
+    fn read_remote_ranges(
+        &self,
+        batch: &ReadBatch,
+        sources: &[ChunkSources],
+        out: &mut [u8],
+        final_owned: bool,
     ) -> Result<()> {
         let version = batch
             .file_version_id
@@ -2152,12 +2841,39 @@ impl DfsReadEngine {
                     layout_root_id: batch.layout_root_id.clone(),
                     operations,
                 };
-                let mut scratch = vec![0; length];
-                match self.transfer.read_ranges(&attempt, &mut scratch) {
+                // Only the private, single contiguous final response may be
+                // used directly. Borrowed output and complex batches retain
+                // per-attempt isolation and the existing retry scheduler.
+                let direct = final_owned
+                    && batch.ops.len() == 1
+                    && group.len() == 1
+                    && batch.ops[0].output_offset == 0
+                    && length == out.len();
+                let mut scratch = if direct { Vec::new() } else { vec![0; length] };
+                let result = if direct {
+                    self.transfer.read_ranges(&attempt, out)
+                } else {
+                    self.transfer.read_ranges(&attempt, &mut scratch)
+                };
+                match result {
                     Ok(()) => {
+                        if attempt
+                            .operations
+                            .iter()
+                            .any(|item| !self.source_matches(batch, &item.source))
+                        {
+                            return Err(external_denied(
+                                "native peer read authority expired before publication",
+                            ));
+                        }
+                        if direct {
+                            continue;
+                        }
                         for (&index, item) in group.iter().zip(&attempt.operations) {
                             let original = &batch.ops[index];
                             let len = original.length as usize;
+                            self.local
+                                .record_read_copy("attempt_to_staging", original.length);
                             out[original.output_offset..original.output_offset + len]
                                 .copy_from_slice(
                                     &scratch[item.op.output_offset..item.op.output_offset + len],
@@ -2165,6 +2881,15 @@ impl DfsReadEngine {
                         }
                     }
                     Err(error) => {
+                        self.invalidate_native_batch_on_error(batch, &error);
+                        if matches!(
+                            error.kind(),
+                            afs_error::ErrorKind::PermissionDenied
+                                | afs_error::ErrorKind::Unauthenticated
+                        ) {
+                            return Err(error);
+                        }
+                        self.capture_native_read_authority()?;
                         last_error = Some(error);
                         // A batch error does not identify which copy failed. Before
                         // discarding a valid source for its neighbours, retry each
@@ -2186,13 +2911,33 @@ impl DfsReadEngine {
                                     .read_ranges(&single_batch, &mut single_scratch)
                                 {
                                     Ok(()) => {
+                                        if !self.source_matches(batch, &item.source) {
+                                            return Err(external_denied(
+                                                "native peer read authority expired before publication",
+                                            ));
+                                        }
                                         let original = &batch.ops[index];
+                                        self.local.record_read_copy(
+                                            "attempt_to_staging",
+                                            original.length,
+                                        );
                                         out[original.output_offset
                                             ..original.output_offset + single_scratch.len()]
                                             .copy_from_slice(&single_scratch);
                                         continue;
                                     }
-                                    Err(error) => last_error = Some(error),
+                                    Err(error) => {
+                                        self.invalidate_native_batch_on_error(batch, &error);
+                                        if matches!(
+                                            error.kind(),
+                                            afs_error::ErrorKind::PermissionDenied
+                                                | afs_error::ErrorKind::Unauthenticated
+                                        ) {
+                                            return Err(error);
+                                        }
+                                        self.capture_native_read_authority()?;
+                                        last_error = Some(error);
+                                    }
                                 }
                             }
                             next[index] += 1;
@@ -2896,6 +3641,7 @@ mod tests {
         let sources = Arc::new(StaticSources::new(DfsChunkSourcesReply {
             revision: 1,
             chunks: vec![ChunkSources {
+                allowed_ranges: Vec::new(),
                 chunk: None,
                 chunk_id: chunk_id.clone(),
                 sources: vec![source("remote-short", &chunk_id, "node-b")],
@@ -3023,6 +3769,7 @@ mod tests {
         let sources = Arc::new(StaticSources::new(DfsChunkSourcesReply {
             revision: 1,
             chunks: vec![ChunkSources {
+                allowed_ranges: Vec::new(),
                 chunk: None,
                 chunk_id: chunk_id.clone(),
                 sources: vec![source("healthy-b", &chunk_id, "node-b")],
@@ -3094,6 +3841,7 @@ mod tests {
         let sources = Arc::new(StaticSources::new(DfsChunkSourcesReply {
             revision: 1,
             chunks: vec![ChunkSources {
+                allowed_ranges: Vec::new(),
                 chunk: None,
                 chunk_id: chunk_id.clone(),
                 sources: Vec::new(),
@@ -3134,6 +3882,7 @@ mod tests {
         let sources = Arc::new(StaticSources::new(DfsChunkSourcesReply {
             revision: 1,
             chunks: vec![ChunkSources {
+                allowed_ranges: Vec::new(),
                 chunk: None,
                 chunk_id: chunk_id.clone(),
                 sources: vec![
@@ -3171,6 +3920,1609 @@ mod tests {
             .unwrap();
         assert_eq!(&out, &[9, b'r', b'e', b'm', b'o', b't', b'e', 9]);
     }
+
+    #[test]
+    fn native_authority_snapshot_keeps_original_deadline_and_stops_on_epoch_change() {
+        let authority = LocalReadAuthority::new(7, Instant::now() + Duration::from_secs(10));
+        let original = authority.snapshot().unwrap();
+        authority
+            .refresh(7, Instant::now() + Duration::from_secs(30))
+            .unwrap();
+        assert!(authority.snapshot().unwrap().expires_at() > original.expires_at());
+        assert!(authority.check_snapshot(&original).is_ok());
+        let expired = NativeReadAuthoritySnapshot {
+            epoch: 7,
+            expires_at: Some(Instant::now()),
+        };
+        assert!(authority.check_snapshot(&expired).is_err());
+        assert!(
+            authority
+                .refresh(8, Instant::now() + Duration::from_secs(30))
+                .is_err()
+        );
+        assert!(authority.check_snapshot(&original).is_err());
+        assert!(
+            authority
+                .refresh(7, Instant::now() + Duration::from_secs(30))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn native_authority_refresh_cannot_revive_expired_or_stopped_session() {
+        for stopped in [false, true] {
+            let authority = LocalReadAuthority::new(
+                1,
+                if stopped {
+                    Instant::now() + Duration::from_secs(30)
+                } else {
+                    Instant::now()
+                },
+            );
+            if stopped {
+                authority.stop();
+            }
+            assert!(
+                authority
+                    .refresh(1, Instant::now() + Duration::from_secs(30))
+                    .is_err()
+            );
+            assert!(authority.snapshot().is_err());
+        }
+    }
+
+    #[test]
+    fn native_authority_stopped_session_rejects_local_and_sparse_reads_without_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
+        let chunk_id = put_local_chunk(&local, "native-stop", b"abcdef");
+        let authority = Arc::new(LocalReadAuthority::new(
+            1,
+            Instant::now() + Duration::from_secs(30),
+        ));
+        let engine = DfsReadEngine::new(
+            crate::dfs::NamespaceId::new("default"),
+            "node-a".into(),
+            local,
+            Arc::new(UnimplementedReadSourceProvider),
+            Arc::new(UnimplementedChunkTransfer),
+            DfsReadConfig::default(),
+        )
+        .with_read_authority(authority.clone());
+        let mut batch = ReadBatch {
+            file_version_id: Some(FileVersionId::new("version")),
+            layout_root_id: LayoutRootId::new("layout"),
+            ops: vec![ChunkReadOp {
+                chunk_id,
+                chunk_offset: 0,
+                length: 6,
+                output_offset: 0,
+            }],
+        };
+        assert_eq!(
+            engine.read_batch_native_owned(&batch, 6).unwrap().unwrap(),
+            b"abcdef"
+        );
+        authority.stop();
+        for sparse in [false, true] {
+            if sparse {
+                batch.ops.clear();
+            }
+            let mut output = [b'!'; 6];
+            assert!(engine.read_batch(&batch, &mut output).is_err());
+            assert_eq!(output, [b'!'; 6]);
+            if !sparse {
+                assert!(engine.read_batch_native_owned(&batch, 6).is_err());
+            }
+        }
+    }
+
+    struct NativeAuthorityTransfer {
+        authority: Arc<LocalReadAuthority>,
+        action: &'static str,
+    }
+
+    impl ChunkTransfer for NativeAuthorityTransfer {
+        fn read_ranges(&self, _batch: &PeerReadBatch, output: &mut [u8]) -> Result<()> {
+            output.fill(b'x');
+            match self.action {
+                "stop" => self.authority.stop(),
+                "renew_then_expire" => {
+                    let deadline = self.authority.snapshot()?.expires_at().unwrap();
+                    self.authority
+                        .refresh(1, Instant::now() + Duration::from_secs(30))?;
+                    std::thread::sleep(
+                        deadline.saturating_duration_since(Instant::now())
+                            + Duration::from_millis(1),
+                    );
+                }
+                "expire_then_refresh" => {
+                    let deadline = self.authority.snapshot()?.expires_at().unwrap();
+                    std::thread::sleep(
+                        deadline.saturating_duration_since(Instant::now())
+                            + Duration::from_millis(1),
+                    );
+                    let _ = self
+                        .authority
+                        .refresh(1, Instant::now() + Duration::from_secs(30));
+                }
+                "epoch" => {
+                    let _ = self
+                        .authority
+                        .refresh(2, Instant::now() + Duration::from_secs(30));
+                }
+                "denied" => return Err(external_denied("injected known denial")),
+                "unavailable" => return Err(unavailable("injected ordinary transport failure")),
+                _ => {}
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn native_authority_late_failure_never_commits_borrowed_or_owned_output() {
+        for action in [
+            "stop",
+            "expire_then_refresh",
+            "renew_then_expire",
+            "epoch",
+            "denied",
+            "unavailable",
+        ] {
+            for owned in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let chunk_id = ChunkId::new("missing-authority");
+                let sources = Arc::new(StaticSources::new(DfsChunkSourcesReply {
+                    revision: 1,
+                    chunks: vec![ChunkSources {
+                        allowed_ranges: Vec::new(),
+                        chunk: None,
+                        chunk_id: chunk_id.clone(),
+                        sources: vec![source("b", &chunk_id, "node-b")],
+                    }],
+                }));
+                let authority = Arc::new(LocalReadAuthority::new(
+                    1,
+                    Instant::now()
+                        + if matches!(action, "expire_then_refresh" | "renew_then_expire") {
+                            Duration::from_millis(20)
+                        } else {
+                            Duration::from_secs(30)
+                        },
+                ));
+                let engine = DfsReadEngine::new(
+                    crate::dfs::NamespaceId::new("default"),
+                    "node-a".into(),
+                    Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap()),
+                    sources,
+                    Arc::new(NativeAuthorityTransfer {
+                        authority: authority.clone(),
+                        action,
+                    }),
+                    DfsReadConfig::default(),
+                )
+                .with_read_authority(authority.clone());
+                let batch = ReadBatch {
+                    file_version_id: Some(FileVersionId::new("version")),
+                    layout_root_id: LayoutRootId::new("layout"),
+                    ops: vec![ChunkReadOp {
+                        chunk_id,
+                        chunk_offset: 0,
+                        length: 6,
+                        output_offset: 0,
+                    }],
+                };
+                if owned {
+                    assert!(
+                        engine.read_batch_native_owned(&batch, 6).is_err(),
+                        "{action}"
+                    );
+                } else {
+                    let mut output = [b'!'; 6];
+                    assert!(engine.read_batch(&batch, &mut output).is_err(), "{action}");
+                    assert_eq!(output, [b'!'; 6], "{action}");
+                }
+                assert_eq!(
+                    authority.snapshot().is_ok(),
+                    matches!(action, "unavailable" | "renew_then_expire" | "denied"),
+                    "{action}"
+                );
+            }
+        }
+    }
+
+    struct NativeScopedDenialTransfer {
+        calls: std::sync::atomic::AtomicUsize,
+        unauthenticated: bool,
+    }
+
+    impl ChunkTransfer for NativeScopedDenialTransfer {
+        fn read_ranges(&self, _batch: &PeerReadBatch, output: &mut [u8]) -> Result<()> {
+            output.fill(b'x');
+            if self.calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                return Err(if self.unauthenticated {
+                    Error::new(
+                        afs_error::IO_PERMISSION_DENIED,
+                        afs_error::ErrorKind::Unauthenticated,
+                        "injected scoped grant denial",
+                    )
+                } else {
+                    external_denied("injected scoped grant denial")
+                });
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn native_authority_read_denial_clears_only_batch_sources_and_allows_fresh_authorization() {
+        for unauthenticated in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let chunk_id = ChunkId::new("scoped-denial");
+            let reply = DfsChunkSourcesReply {
+                revision: 1,
+                chunks: vec![ChunkSources {
+                    allowed_ranges: Vec::new(),
+                    chunk: None,
+                    chunk_id: chunk_id.clone(),
+                    sources: vec![source("b", &chunk_id, "node-b")],
+                }],
+            };
+            let sources = Arc::new(StaticSources::new(reply.clone()));
+            let authority = Arc::new(LocalReadAuthority::new(
+                1,
+                Instant::now() + Duration::from_secs(30),
+            ));
+            let engine = DfsReadEngine::new(
+                crate::dfs::NamespaceId::new("default"),
+                "node-a".into(),
+                Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap()),
+                sources.clone(),
+                Arc::new(NativeScopedDenialTransfer {
+                    calls: std::sync::atomic::AtomicUsize::new(0),
+                    unauthenticated,
+                }),
+                DfsReadConfig::default(),
+            )
+            .with_read_authority(authority);
+            let unrelated = (
+                FileVersionId::new("other-version"),
+                LayoutRootId::new("other-layout"),
+                chunk_id.clone(),
+            );
+            engine.source_cache.lock().unwrap().insert(
+                unrelated.clone(),
+                CachedSources {
+                    expires_at: Instant::now() + Duration::from_secs(30),
+                    sources: reply.chunks[0].clone(),
+                },
+            );
+            let batch = ReadBatch {
+                file_version_id: Some(FileVersionId::new("version")),
+                layout_root_id: LayoutRootId::new("layout"),
+                ops: vec![ChunkReadOp {
+                    chunk_id,
+                    chunk_offset: 0,
+                    length: 6,
+                    output_offset: 0,
+                }],
+            };
+            let mut output = [b'!'; 6];
+            let error = engine.read_batch(&batch, &mut output).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                if unauthenticated {
+                    afs_error::ErrorKind::Unauthenticated
+                } else {
+                    afs_error::ErrorKind::PermissionDenied
+                }
+            );
+            assert_eq!(output, [b'!'; 6]);
+            assert!(engine.capture_native_read_authority().is_ok());
+            let cache = engine.source_cache.lock().unwrap();
+            assert_eq!(cache.len(), 1);
+            assert!(cache.contains_key(&unrelated));
+            drop(cache);
+            engine.read_batch(&batch, &mut output).unwrap();
+            assert_eq!(output, [b'x'; 6]);
+            assert_eq!(
+                *sources.calls.lock().unwrap(),
+                2,
+                "rejected context must return to Meta"
+            );
+        }
+    }
+
+    #[test]
+    fn native_private_read_uses_existing_final_buffer_and_preserves_sparse_local_ranges() {
+        let temp = tempfile::tempdir().unwrap();
+        let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
+        let chunk = put_local_chunk(&local, "native-private", b"abcdef");
+        let transfer = Arc::new(OwnedTransferProbe {
+            destination: std::sync::atomic::AtomicUsize::new(0),
+            fail_first: AtomicBool::new(false),
+            fail_all: false,
+            expire_before_return: false,
+        });
+        let missing = ChunkId::new("missing-private");
+        let sources = Arc::new(StaticSources::new(DfsChunkSourcesReply {
+            revision: 1,
+            chunks: vec![ChunkSources {
+                allowed_ranges: Vec::new(),
+                chunk: None,
+                chunk_id: missing.clone(),
+                sources: vec![source("b", &missing, "node-b")],
+            }],
+        }));
+        let engine = DfsReadEngine::new(
+            crate::dfs::NamespaceId::new("default"),
+            "node-a".into(),
+            local,
+            sources,
+            transfer.clone(),
+            DfsReadConfig::default(),
+        );
+        let mut batch = ReadBatch {
+            file_version_id: Some(FileVersionId::new("version")),
+            layout_root_id: LayoutRootId::new("layout"),
+            ops: vec![ChunkReadOp {
+                chunk_id: missing,
+                chunk_offset: 0,
+                length: 6,
+                output_offset: 0,
+            }],
+        };
+        let mut private = [0; 6];
+        engine
+            .read_batch_native_into_private(&batch, &mut private)
+            .unwrap();
+        assert_eq!(private, [b'x'; 6]);
+        assert_eq!(
+            transfer.destination.load(Ordering::Relaxed),
+            private.as_ptr() as usize,
+            "private helper must not allocate another aggregate staging destination"
+        );
+        batch.ops = vec![
+            ChunkReadOp {
+                chunk_id: chunk.clone(),
+                chunk_offset: 4,
+                length: 2,
+                output_offset: 4,
+            },
+            ChunkReadOp {
+                chunk_id: chunk,
+                chunk_offset: 0,
+                length: 2,
+                output_offset: 1,
+            },
+        ];
+        private.fill(0);
+        engine
+            .read_batch_native_into_private(&batch, &mut private)
+            .unwrap();
+        assert_eq!(&private, b"\0ab\0ef");
+    }
+
+    #[test]
+    fn native_private_read_rejects_overlap_and_budget_before_work() {
+        let temp = tempfile::tempdir().unwrap();
+        let sources = Arc::new(StaticSources::default());
+        let engine = DfsReadEngine::new(
+            crate::dfs::NamespaceId::new("default"),
+            "node-a".into(),
+            Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap()),
+            sources.clone(),
+            Arc::new(UnimplementedChunkTransfer),
+            DfsReadConfig {
+                max_inflight_bytes: 6,
+                ..DfsReadConfig::default()
+            },
+        );
+        assert!(engine.validate_native_read_size(7).is_err());
+        assert!(engine.validate_native_read_size(6).is_ok());
+        let batch = ReadBatch {
+            file_version_id: Some(FileVersionId::new("version")),
+            layout_root_id: LayoutRootId::new("layout"),
+            ops: vec![
+                ChunkReadOp {
+                    chunk_id: ChunkId::new("one"),
+                    chunk_offset: 0,
+                    length: 2,
+                    output_offset: 1,
+                },
+                ChunkReadOp {
+                    chunk_id: ChunkId::new("two"),
+                    chunk_offset: 0,
+                    length: 2,
+                    output_offset: 2,
+                },
+            ],
+        };
+        let mut private = [b'!'; 6];
+        assert!(
+            engine
+                .read_batch_native_into_private(&batch, &mut private)
+                .is_err()
+        );
+        assert_eq!(private, [b'!'; 6]);
+        assert_eq!(*sources.calls.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn native_private_read_late_stop_returns_error_before_private_output_publication() {
+        let temp = tempfile::tempdir().unwrap();
+        let chunk_id = ChunkId::new("late-private");
+        let sources = Arc::new(StaticSources::new(DfsChunkSourcesReply {
+            revision: 1,
+            chunks: vec![ChunkSources {
+                allowed_ranges: Vec::new(),
+                chunk: None,
+                chunk_id: chunk_id.clone(),
+                sources: vec![source("b", &chunk_id, "node-b")],
+            }],
+        }));
+        let authority = Arc::new(LocalReadAuthority::new(
+            1,
+            Instant::now() + Duration::from_secs(30),
+        ));
+        let engine = DfsReadEngine::new(
+            crate::dfs::NamespaceId::new("default"),
+            "node-a".into(),
+            Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap()),
+            sources,
+            Arc::new(NativeAuthorityTransfer {
+                authority: authority.clone(),
+                action: "stop",
+            }),
+            DfsReadConfig::default(),
+        )
+        .with_read_authority(authority);
+        let batch = ReadBatch {
+            file_version_id: Some(FileVersionId::new("version")),
+            layout_root_id: LayoutRootId::new("layout"),
+            ops: vec![ChunkReadOp {
+                chunk_id,
+                chunk_offset: 0,
+                length: 6,
+                output_offset: 0,
+            }],
+        };
+        let mut private = [0; 6];
+        assert!(
+            engine
+                .read_batch_native_into_private(&batch, &mut private)
+                .is_err()
+        );
+        assert_eq!(
+            private, [b'x'; 6],
+            "unpublished private payload is discarded by its caller"
+        );
+    }
+
+    struct NativeCacheTransfer {
+        bytes: Mutex<Vec<u8>>,
+        batches: Mutex<Vec<PeerReadBatch>>,
+        corrupt: AtomicBool,
+        delay: Duration,
+    }
+
+    impl ChunkTransfer for NativeCacheTransfer {
+        fn read_ranges(&self, batch: &PeerReadBatch, out: &mut [u8]) -> Result<()> {
+            batch.validate(out.len())?;
+            self.batches.lock().unwrap().push(batch.clone());
+            let bytes = self.bytes.lock().unwrap();
+            for item in &batch.operations {
+                let start = item.op.chunk_offset as usize;
+                let length = item.op.length as usize;
+                out[item.op.output_offset..item.op.output_offset + length]
+                    .copy_from_slice(&bytes[start..start + length]);
+            }
+            if self.corrupt.load(Ordering::Relaxed) {
+                let last = out.len() - 1;
+                out[last] ^= 1;
+            }
+            std::thread::sleep(self.delay);
+            Ok(())
+        }
+    }
+
+    struct NativeCacheFixture {
+        _temp: tempfile::TempDir,
+        engine: DfsReadEngine,
+        cache: Arc<crate::node::peer_cache::DiskPeerCache>,
+        sources: Arc<StaticSources>,
+        transfer: Arc<NativeCacheTransfer>,
+        batch: ReadBatch,
+        chunk: ChunkObject,
+    }
+
+    impl NativeCacheFixture {
+        fn new(max_inflight_bytes: u64, ranges: Vec<(u64, u64)>, delay: Duration) -> Self {
+            let temp = tempfile::tempdir().unwrap();
+            let bytes = (0..64 * 1024)
+                .map(|index| (index % 251) as u8)
+                .collect::<Vec<_>>();
+            let staged = StagedChunk::new(OperationId::new("native-disk-cache"), bytes.clone());
+            let chunk = staged.chunk.clone();
+            let sources = Arc::new(StaticSources::new(DfsChunkSourcesReply {
+                revision: 1,
+                chunks: vec![ChunkSources {
+                    allowed_ranges: ranges,
+                    chunk: Some(chunk.clone()),
+                    chunk_id: chunk.id.clone(),
+                    sources: vec![source("b", &chunk.id, "node-b")],
+                }],
+            }));
+            let cache = Arc::new(
+                crate::node::peer_cache::DiskPeerCache::open(
+                    crate::node::peer_cache::PeerCacheOptions {
+                        directory: temp.path().join("cache"),
+                        capacity_bytes: 2 * 1024 * 1024,
+                        namespace_id: crate::dfs::NamespaceId::new("default"),
+                    },
+                )
+                .unwrap(),
+            );
+            let transfer = Arc::new(NativeCacheTransfer {
+                bytes: Mutex::new(bytes),
+                batches: Mutex::new(Vec::new()),
+                corrupt: AtomicBool::new(false),
+                delay,
+            });
+            let engine = DfsReadEngine::new(
+                crate::dfs::NamespaceId::new("default"),
+                "node-a".into(),
+                Arc::new(LocalChunkStore::open(temp.path().join("local"), "node-a").unwrap()),
+                sources.clone(),
+                transfer.clone(),
+                DfsReadConfig {
+                    max_inflight_bytes,
+                    ..DfsReadConfig::default()
+                },
+            )
+            .with_read_authority(Arc::new(LocalReadAuthority::new(
+                1,
+                Instant::now() + Duration::from_secs(30),
+            )))
+            .with_peer_cache(cache.clone());
+            let batch = ReadBatch {
+                file_version_id: Some(FileVersionId::new("version")),
+                layout_root_id: LayoutRootId::new("layout"),
+                ops: vec![ChunkReadOp {
+                    chunk_id: chunk.id.clone(),
+                    chunk_offset: 1,
+                    length: 2,
+                    output_offset: 0,
+                }],
+            };
+            Self {
+                _temp: temp,
+                engine,
+                cache,
+                sources,
+                transfer,
+                batch,
+                chunk,
+            }
+        }
+    }
+
+    #[test]
+    fn native_peer_disk_cache_fetches_current_object_once_and_reuses_without_peer_rpc() {
+        let mut fixture =
+            NativeCacheFixture::new(MAX_DFS_READ_BYTES, vec![(0, 64 * 1024)], Duration::ZERO);
+        assert_eq!(
+            fixture
+                .engine
+                .read_batch_native_owned(&fixture.batch, 2)
+                .unwrap()
+                .unwrap(),
+            [1, 2]
+        );
+        fixture.batch.ops[0].chunk_offset = 8;
+        assert_eq!(
+            fixture
+                .engine
+                .read_batch_native_owned(&fixture.batch, 2)
+                .unwrap()
+                .unwrap(),
+            [8, 9]
+        );
+        let calls = fixture.transfer.batches.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].operations[0].op.chunk_offset, 0);
+        assert_eq!(calls[0].operations[0].op.length, 64 * 1024);
+        assert_eq!(*fixture.sources.calls.lock().unwrap(), 1);
+    }
+
+    struct NativeStreamingCacheTransfer {
+        inner: Arc<NativeCacheTransfer>,
+        stream_supported: AtomicBool,
+        streamed_calls: std::sync::atomic::AtomicUsize,
+        fail_first: AtomicBool,
+        deny_first: bool,
+        stop_after_completion: Option<Arc<LocalReadAuthority>>,
+    }
+
+    impl ChunkTransfer for NativeStreamingCacheTransfer {
+        fn read_ranges(&self, batch: &PeerReadBatch, out: &mut [u8]) -> Result<()> {
+            self.inner.read_ranges(batch, out)
+        }
+
+        fn supports_verified_object_sink(&self) -> bool {
+            self.stream_supported.load(Ordering::Relaxed)
+        }
+
+        fn read_verified_object_to_sink<'output>(
+            &self,
+            batch: &PeerReadBatch,
+            chunk: &ChunkObject,
+            requested_offset: u64,
+            out: &'output mut [u8],
+            sink: &mut PeerStreamSink<'_>,
+        ) -> Result<Option<CompletedPeerDiskRead<'output>>> {
+            validate_verified_peer_object_request(batch, chunk, chunk.length as usize)?;
+            self.streamed_calls.fetch_add(1, Ordering::Relaxed);
+            if self.fail_first.swap(false, Ordering::Relaxed) {
+                out.fill(13);
+                return Err(if self.deny_first {
+                    external_denied("streamed grant rejected")
+                } else {
+                    corrupt("streamed completion failed")
+                });
+            }
+            let bytes = self.inner.bytes.lock().unwrap();
+            let completed = crate::node::rpc::peer::complete_peer_disk_read_for_test(
+                chunk,
+                &bytes,
+                requested_offset,
+                out,
+                sink,
+            )?;
+            if let Some(authority) = &self.stop_after_completion {
+                authority.stop();
+            }
+            Ok(Some(completed))
+        }
+    }
+
+    fn streaming_cache_transfer(fixture: &NativeCacheFixture) -> Arc<NativeStreamingCacheTransfer> {
+        Arc::new(NativeStreamingCacheTransfer {
+            inner: fixture.transfer.clone(),
+            stream_supported: AtomicBool::new(true),
+            streamed_calls: std::sync::atomic::AtomicUsize::new(0),
+            fail_first: AtomicBool::new(false),
+            deny_first: false,
+            stop_after_completion: None,
+        })
+    }
+
+    #[test]
+    fn native_stream_fill_success_and_hit_never_invoke_legacy_full_body_transfer() {
+        let mut fixture =
+            NativeCacheFixture::new(MAX_DFS_READ_BYTES, vec![(0, 64 * 1024)], Duration::ZERO);
+        let transfer = streaming_cache_transfer(&fixture);
+        fixture.engine.transfer = transfer.clone();
+        assert_eq!(
+            fixture
+                .engine
+                .read_batch_native_owned(&fixture.batch, 2)
+                .unwrap()
+                .unwrap(),
+            [1, 2]
+        );
+        assert_eq!(fixture.cache.stats().unwrap().entries, 1);
+        fixture.batch.ops[0].chunk_offset = 8;
+        assert_eq!(
+            fixture
+                .engine
+                .read_batch_native_owned(&fixture.batch, 2)
+                .unwrap()
+                .unwrap(),
+            [8, 9]
+        );
+        assert_eq!(transfer.streamed_calls.load(Ordering::Relaxed), 1);
+        assert!(fixture.transfer.batches.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn native_stream_fill_revocation_before_commit_returns_no_output_or_ready_object() {
+        let mut fixture =
+            NativeCacheFixture::new(MAX_DFS_READ_BYTES, vec![(0, 64 * 1024)], Duration::ZERO);
+        let transfer = Arc::new(NativeStreamingCacheTransfer {
+            inner: fixture.transfer.clone(),
+            stream_supported: AtomicBool::new(true),
+            streamed_calls: std::sync::atomic::AtomicUsize::new(0),
+            fail_first: AtomicBool::new(false),
+            deny_first: false,
+            stop_after_completion: Some(fixture.engine.read_authority.clone()),
+        });
+        fixture.engine.transfer = transfer.clone();
+        assert!(
+            fixture
+                .engine
+                .read_batch_native_owned(&fixture.batch, 2)
+                .is_err()
+        );
+        assert_eq!(transfer.streamed_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(fixture.cache.stats().unwrap().entries, 0);
+        assert!(fixture.transfer.batches.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn native_stream_fill_transfer_failure_never_publishes_or_retries_legacy_path() {
+        let mut fixture =
+            NativeCacheFixture::new(MAX_DFS_READ_BYTES, vec![(0, 64 * 1024)], Duration::ZERO);
+        let transfer = streaming_cache_transfer(&fixture);
+        transfer.fail_first.store(true, Ordering::Relaxed);
+        fixture.engine.transfer = transfer.clone();
+        assert!(
+            fixture
+                .engine
+                .read_batch_native_owned(&fixture.batch, 2)
+                .is_err()
+        );
+        assert_eq!(transfer.streamed_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(fixture.cache.stats().unwrap().entries, 0);
+        assert!(fixture.transfer.batches.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn native_stream_fill_cache_quota_failure_keeps_same_rpc_verified_range_success() {
+        let mut fixture =
+            NativeCacheFixture::new(MAX_DFS_READ_BYTES, vec![(0, 64 * 1024)], Duration::ZERO);
+        let cache = Arc::new(
+            DiskPeerCache::open(crate::node::peer_cache::PeerCacheOptions {
+                directory: fixture._temp.path().join("stream-tiny-cache"),
+                capacity_bytes: 16,
+                namespace_id: crate::dfs::NamespaceId::new("default"),
+            })
+            .unwrap(),
+        );
+        fixture.engine.peer_cache = Some(cache.clone());
+        let transfer = streaming_cache_transfer(&fixture);
+        fixture.engine.transfer = transfer.clone();
+        assert_eq!(
+            fixture
+                .engine
+                .read_batch_native_owned(&fixture.batch, 2)
+                .unwrap()
+                .unwrap(),
+            [1, 2]
+        );
+        assert_eq!(transfer.streamed_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(cache.stats().unwrap().entries, 0);
+        assert!(fixture.transfer.batches.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn native_stream_fill_retry_overwrites_failed_private_range_and_does_not_mix_proofs() {
+        let mut fixture =
+            NativeCacheFixture::new(MAX_DFS_READ_BYTES, vec![(0, 64 * 1024)], Duration::ZERO);
+        fixture.sources.reply.lock().unwrap().chunks[0]
+            .sources
+            .push(source("c", &fixture.chunk.id, "node-c"));
+        let transfer = streaming_cache_transfer(&fixture);
+        transfer.fail_first.store(true, Ordering::Relaxed);
+        fixture.engine.transfer = transfer.clone();
+        assert_eq!(
+            fixture
+                .engine
+                .read_batch_native_owned(&fixture.batch, 2)
+                .unwrap()
+                .unwrap(),
+            [1, 2]
+        );
+        assert_eq!(transfer.streamed_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(fixture.cache.stats().unwrap().entries, 1);
+        assert!(fixture.transfer.batches.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn native_stream_fill_known_denial_stops_other_copy_retry_and_clears_sources() {
+        let mut fixture =
+            NativeCacheFixture::new(MAX_DFS_READ_BYTES, vec![(0, 64 * 1024)], Duration::ZERO);
+        fixture.sources.reply.lock().unwrap().chunks[0]
+            .sources
+            .push(source("c", &fixture.chunk.id, "node-c"));
+        let transfer = Arc::new(NativeStreamingCacheTransfer {
+            inner: fixture.transfer.clone(),
+            stream_supported: AtomicBool::new(true),
+            streamed_calls: std::sync::atomic::AtomicUsize::new(0),
+            fail_first: AtomicBool::new(true),
+            deny_first: true,
+            stop_after_completion: None,
+        });
+        fixture.engine.transfer = transfer.clone();
+        assert!(
+            fixture
+                .engine
+                .read_batch_native_owned(&fixture.batch, 2)
+                .is_err()
+        );
+        assert_eq!(transfer.streamed_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(fixture.cache.stats().unwrap().entries, 0);
+        assert!(fixture.engine.source_cache.lock().unwrap().is_empty());
+        assert!(fixture.engine.capture_native_read_authority().is_ok());
+        assert!(fixture.transfer.batches.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn native_stream_fill_unsupported_or_smaller_budget_preserves_legacy_transfer() {
+        for (supported, budget) in [(false, MAX_DFS_READ_BYTES), (true, 128 * 1024)] {
+            let mut fixture = NativeCacheFixture::new(budget, vec![(0, 64 * 1024)], Duration::ZERO);
+            let transfer = streaming_cache_transfer(&fixture);
+            transfer
+                .stream_supported
+                .store(supported, Ordering::Relaxed);
+            fixture.engine.transfer = transfer.clone();
+            assert_eq!(
+                fixture
+                    .engine
+                    .read_batch_native_owned(&fixture.batch, 2)
+                    .unwrap()
+                    .unwrap(),
+                [1, 2]
+            );
+            assert_eq!(transfer.streamed_calls.load(Ordering::Relaxed), 0);
+            assert_eq!(fixture.transfer.batches.lock().unwrap().len(), 1);
+            assert_eq!(fixture.cache.stats().unwrap().entries, 1);
+        }
+    }
+
+    #[test]
+    fn native_peer_disk_cache_partial_grant_or_fill_budget_preserves_range_fallback() {
+        for (budget, ranges) in [
+            (MAX_DFS_READ_BYTES, vec![(1, 2)]),
+            (6, vec![(0, 64 * 1024)]),
+            (MAX_DFS_READ_BYTES, Vec::new()),
+        ] {
+            let fixture = NativeCacheFixture::new(budget, ranges, Duration::ZERO);
+            assert_eq!(
+                fixture
+                    .engine
+                    .read_batch_native_owned(&fixture.batch, 2)
+                    .unwrap()
+                    .unwrap(),
+                [1, 2]
+            );
+            let calls = fixture.transfer.batches.lock().unwrap();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].operations[0].op.chunk_offset, 1);
+            assert_eq!(calls[0].operations[0].op.length, 2);
+            assert!(
+                !fixture
+                    .cache
+                    .operation()
+                    .unwrap()
+                    .read_range(&fixture.chunk, 1, &mut [0; 2])
+                    .unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn native_peer_disk_cache_denies_outside_grant_without_cache_or_peer_success() {
+        let fixture = NativeCacheFixture::new(MAX_DFS_READ_BYTES, vec![(0, 1)], Duration::ZERO);
+        let mut output = [b'!'; 2];
+        assert_eq!(
+            fixture
+                .engine
+                .read_batch(&fixture.batch, &mut output)
+                .unwrap_err()
+                .kind(),
+            afs_error::ErrorKind::PermissionDenied
+        );
+        assert_eq!(output, [b'!'; 2]);
+        assert!(fixture.transfer.batches.lock().unwrap().is_empty());
+        assert!(fixture.engine.source_cache.lock().unwrap().is_empty());
+        assert!(fixture.engine.capture_native_read_authority().is_ok());
+    }
+
+    #[test]
+    fn native_peer_disk_cache_rejects_complete_hash_mismatch_before_admission_or_output() {
+        let fixture =
+            NativeCacheFixture::new(MAX_DFS_READ_BYTES, vec![(0, 64 * 1024)], Duration::ZERO);
+        fixture.transfer.corrupt.store(true, Ordering::Relaxed);
+        assert!(
+            fixture
+                .engine
+                .read_batch_native_owned(&fixture.batch, 2)
+                .is_err()
+        );
+        assert!(
+            !fixture
+                .cache
+                .operation()
+                .unwrap()
+                .read_range(&fixture.chunk, 1, &mut [0; 2])
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn native_peer_disk_cache_final_grant_expiry_does_not_admit_or_publish() {
+        let fixture = NativeCacheFixture::new(
+            MAX_DFS_READ_BYTES,
+            vec![(0, 64 * 1024)],
+            Duration::from_millis(100),
+        );
+        fixture.sources.reply.lock().unwrap().chunks[0].sources[0]
+            .read_grant
+            .expires_at_unix_ms = now_unix_ms() + 50;
+        assert!(
+            fixture
+                .engine
+                .read_batch_native_owned(&fixture.batch, 2)
+                .is_err()
+        );
+        assert_eq!(fixture.transfer.batches.lock().unwrap().len(), 1);
+        assert!(fixture.engine.source_cache.lock().unwrap().is_empty());
+        assert!(fixture.engine.capture_native_read_authority().is_ok());
+        assert!(
+            !fixture
+                .cache
+                .operation()
+                .unwrap()
+                .read_range(&fixture.chunk, 1, &mut [0; 2])
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn native_peer_disk_cache_new_version_cannot_reuse_old_object_content() {
+        let mut fixture =
+            NativeCacheFixture::new(MAX_DFS_READ_BYTES, vec![(0, 64 * 1024)], Duration::ZERO);
+        assert_eq!(
+            fixture
+                .engine
+                .read_batch_native_owned(&fixture.batch, 2)
+                .unwrap()
+                .unwrap(),
+            [1, 2]
+        );
+        let bytes = vec![97; 64 * 1024];
+        let next = StagedChunk::new(OperationId::new("next-native-cache"), bytes.clone());
+        let mut next_source = source("next-copy", &next.chunk.id, "node-b");
+        next_source.read_grant.file_version_id = FileVersionId::new("next-version");
+        fixture.sources.reply.lock().unwrap().chunks = vec![ChunkSources {
+            allowed_ranges: vec![(0, next.chunk.length)],
+            chunk: Some(next.chunk.clone()),
+            chunk_id: next.chunk.id.clone(),
+            sources: vec![next_source],
+        }];
+        *fixture.transfer.bytes.lock().unwrap() = bytes;
+        fixture.batch.file_version_id = Some(FileVersionId::new("next-version"));
+        fixture.batch.ops[0].chunk_id = next.chunk.id;
+        assert_eq!(
+            fixture
+                .engine
+                .read_batch_native_owned(&fixture.batch, 2)
+                .unwrap()
+                .unwrap(),
+            [97, 97]
+        );
+        assert_eq!(fixture.transfer.batches.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn native_peer_disk_cache_hit_still_requires_current_grant() {
+        let fixture =
+            NativeCacheFixture::new(MAX_DFS_READ_BYTES, vec![(0, 64 * 1024)], Duration::ZERO);
+        assert!(
+            fixture
+                .engine
+                .read_batch_native_owned(&fixture.batch, 2)
+                .unwrap()
+                .is_some()
+        );
+        fixture.engine.source_cache.lock().unwrap().clear();
+        fixture.sources.reply.lock().unwrap().chunks[0].sources[0]
+            .read_grant
+            .expires_at_unix_ms = 0;
+        let mut output = [b'!'; 2];
+        assert!(
+            fixture
+                .engine
+                .read_batch(&fixture.batch, &mut output)
+                .is_err()
+        );
+        assert_eq!(output, [b'!'; 2]);
+        assert_eq!(
+            fixture.transfer.batches.lock().unwrap().len(),
+            1,
+            "neither disk cache nor an expired grant may bypass fresh Meta authority"
+        );
+        assert!(fixture.engine.capture_native_read_authority().is_ok());
+    }
+
+    #[test]
+    fn native_peer_disk_cache_corruption_outside_requested_range_refetches_peer() {
+        let fixture =
+            NativeCacheFixture::new(MAX_DFS_READ_BYTES, vec![(0, 64 * 1024)], Duration::ZERO);
+        assert_eq!(
+            fixture
+                .engine
+                .read_batch_native_owned(&fixture.batch, 2)
+                .unwrap()
+                .unwrap(),
+            [1, 2]
+        );
+        let mut directories = vec![fixture._temp.path().join("cache")];
+        let mut damaged = false;
+        while let Some(directory) = directories.pop() {
+            for entry in std::fs::read_dir(directory).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    directories.push(path);
+                } else if path.metadata().unwrap().len() >= fixture.chunk.length {
+                    let mut bytes = std::fs::read(&path).unwrap();
+                    let last = bytes.len() - 1;
+                    bytes[last] ^= 1; // Deliberately outside the requested range.
+                    std::fs::write(path, bytes).unwrap();
+                    damaged = true;
+                }
+            }
+        }
+        assert!(damaged, "verified object must exist on disk");
+        assert_eq!(
+            fixture
+                .engine
+                .read_batch_native_owned(&fixture.batch, 2)
+                .unwrap()
+                .unwrap(),
+            [1, 2]
+        );
+        assert_eq!(fixture.transfer.batches.lock().unwrap().len(), 2);
+        assert_eq!(fixture.cache.stats().unwrap().corruptions, 1);
+    }
+
+    #[test]
+    fn native_peer_disk_cache_admission_failure_does_not_fail_verified_read() {
+        let mut fixture =
+            NativeCacheFixture::new(MAX_DFS_READ_BYTES, vec![(0, 64 * 1024)], Duration::ZERO);
+        let cache = Arc::new(
+            DiskPeerCache::open(crate::node::peer_cache::PeerCacheOptions {
+                directory: fixture._temp.path().join("small-cache"),
+                capacity_bytes: 4096,
+                namespace_id: crate::dfs::NamespaceId::new("default"),
+            })
+            .unwrap(),
+        );
+        fixture.engine.peer_cache = Some(cache.clone());
+        assert_eq!(
+            fixture
+                .engine
+                .read_batch_native_owned(&fixture.batch, 2)
+                .unwrap()
+                .unwrap(),
+            [1, 2]
+        );
+        assert_eq!(cache.stats().unwrap().entries, 0);
+        assert_eq!(fixture.transfer.batches.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn native_peer_disk_cache_borrowed_miss_does_not_expand_fill_but_can_use_verified_hit() {
+        let fixture =
+            NativeCacheFixture::new(MAX_DFS_READ_BYTES, vec![(0, 64 * 1024)], Duration::ZERO);
+        let mut output = [b'!'; 2];
+        fixture
+            .engine
+            .read_batch(&fixture.batch, &mut output)
+            .unwrap();
+        assert_eq!(output, [1, 2]);
+        assert_eq!(
+            fixture.transfer.batches.lock().unwrap()[0].operations[0]
+                .op
+                .length,
+            2,
+            "borrowed caller plus aggregate staging must not allocate a third full payload"
+        );
+        assert_eq!(fixture.cache.stats().unwrap().entries, 0);
+        assert!(
+            fixture
+                .engine
+                .read_batch_native_owned(&fixture.batch, 2)
+                .unwrap()
+                .is_some()
+        );
+        let calls_before_hit = fixture.transfer.batches.lock().unwrap().len();
+        fixture
+            .engine
+            .read_batch(&fixture.batch, &mut output)
+            .unwrap();
+        assert_eq!(output, [1, 2]);
+        assert_eq!(
+            fixture.transfer.batches.lock().unwrap().len(),
+            calls_before_hit
+        );
+    }
+
+    struct NativeVerifiedTransfer {
+        inner: Arc<NativeCacheTransfer>,
+        verified_calls: std::sync::atomic::AtomicUsize,
+        fail_first: AtomicBool,
+        deny_first: bool,
+        stop_after_proof: Option<Arc<LocalReadAuthority>>,
+    }
+
+    impl ChunkTransfer for NativeVerifiedTransfer {
+        fn read_ranges(&self, batch: &PeerReadBatch, out: &mut [u8]) -> Result<()> {
+            self.inner.read_ranges(batch, out)
+        }
+
+        fn read_verified_object<'a>(
+            &self,
+            batch: &PeerReadBatch,
+            chunk: &'a ChunkObject,
+            out: &'a mut [u8],
+        ) -> Result<VerifiedPeerChunk<'a>> {
+            validate_verified_peer_object_request(batch, chunk, out.len())?;
+            self.verified_calls.fetch_add(1, Ordering::Relaxed);
+            if self.fail_first.swap(false, Ordering::Relaxed) {
+                out.fill(13);
+                return Err(if self.deny_first {
+                    external_denied("known grant rejection")
+                } else {
+                    corrupt("failed full-object completion")
+                });
+            }
+            self.inner.read_ranges(batch, out)?;
+            let verified = VerifiedPeerChunk::verify(chunk, out)?;
+            if let Some(authority) = &self.stop_after_proof {
+                authority.stop();
+            }
+            Ok(verified)
+        }
+    }
+
+    #[test]
+    fn native_verified_object_default_rejects_partial_or_changed_identity_before_transfer() {
+        let fixture =
+            NativeCacheFixture::new(MAX_DFS_READ_BYTES, vec![(0, 64 * 1024)], Duration::ZERO);
+        let candidate = fixture.sources.reply.lock().unwrap().chunks[0].sources[0].clone();
+        let mut full = PeerReadBatch {
+            file_version_id: FileVersionId::new("version"),
+            layout_root_id: LayoutRootId::new("layout"),
+            operations: vec![ResolvedReadOp {
+                op: ChunkReadOp {
+                    chunk_id: fixture.chunk.id.clone(),
+                    chunk_offset: 0,
+                    length: fixture.chunk.length,
+                    output_offset: 0,
+                },
+                source: candidate,
+            }],
+        };
+        let mut body = vec![0; fixture.chunk.length as usize];
+        full.operations[0].op.length -= 1;
+        assert!(
+            fixture
+                .transfer
+                .read_verified_object(&full, &fixture.chunk, &mut body)
+                .is_err()
+        );
+        full.operations[0].op.length += 1;
+        full.operations[0].op.chunk_offset = 1;
+        assert!(
+            fixture
+                .transfer
+                .read_verified_object(&full, &fixture.chunk, &mut body)
+                .is_err()
+        );
+        full.operations[0].op.chunk_offset = 0;
+        let mut other = fixture.chunk.clone();
+        other.id = ChunkId::new("different-root-object");
+        assert!(
+            fixture
+                .transfer
+                .read_verified_object(&full, &other, &mut body)
+                .is_err()
+        );
+        assert!(fixture.transfer.batches.lock().unwrap().is_empty());
+        let verified = fixture
+            .transfer
+            .read_verified_object(&full, &fixture.chunk, &mut body)
+            .unwrap();
+        assert_eq!(verified.chunk(), &fixture.chunk);
+        assert_eq!(verified.bytes().len(), fixture.chunk.length as usize);
+    }
+
+    #[test]
+    fn native_verified_object_retry_consumes_only_successful_full_object_proof() {
+        let mut fixture =
+            NativeCacheFixture::new(MAX_DFS_READ_BYTES, vec![(0, 64 * 1024)], Duration::ZERO);
+        fixture.sources.reply.lock().unwrap().chunks[0]
+            .sources
+            .push(source("c", &fixture.chunk.id, "node-c"));
+        let transfer = Arc::new(NativeVerifiedTransfer {
+            inner: fixture.transfer.clone(),
+            verified_calls: std::sync::atomic::AtomicUsize::new(0),
+            fail_first: AtomicBool::new(true),
+            deny_first: false,
+            stop_after_proof: None,
+        });
+        fixture.engine.transfer = transfer.clone();
+        assert_eq!(
+            fixture
+                .engine
+                .read_batch_native_owned(&fixture.batch, 2)
+                .unwrap()
+                .unwrap(),
+            [1, 2]
+        );
+        assert_eq!(transfer.verified_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            fixture.transfer.batches.lock().unwrap().len(),
+            1,
+            "engine must not repeat ordinary range transfer after obtaining proof"
+        );
+        assert_eq!(fixture.cache.stats().unwrap().entries, 1);
+    }
+
+    #[test]
+    fn native_verified_object_known_denial_does_not_retry_another_copy() {
+        let mut fixture =
+            NativeCacheFixture::new(MAX_DFS_READ_BYTES, vec![(0, 64 * 1024)], Duration::ZERO);
+        fixture.sources.reply.lock().unwrap().chunks[0]
+            .sources
+            .push(source("c", &fixture.chunk.id, "node-c"));
+        let transfer = Arc::new(NativeVerifiedTransfer {
+            inner: fixture.transfer.clone(),
+            verified_calls: std::sync::atomic::AtomicUsize::new(0),
+            fail_first: AtomicBool::new(true),
+            deny_first: true,
+            stop_after_proof: None,
+        });
+        fixture.engine.transfer = transfer.clone();
+        assert!(
+            fixture
+                .engine
+                .read_batch_native_owned(&fixture.batch, 2)
+                .is_err()
+        );
+        assert_eq!(transfer.verified_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(fixture.cache.stats().unwrap().entries, 0);
+        assert!(fixture.engine.source_cache.lock().unwrap().is_empty());
+        assert!(fixture.engine.capture_native_read_authority().is_ok());
+    }
+
+    #[test]
+    fn native_verified_object_late_node_stop_rejects_proof_before_admission() {
+        let mut fixture =
+            NativeCacheFixture::new(MAX_DFS_READ_BYTES, vec![(0, 64 * 1024)], Duration::ZERO);
+        let transfer = Arc::new(NativeVerifiedTransfer {
+            inner: fixture.transfer.clone(),
+            verified_calls: std::sync::atomic::AtomicUsize::new(0),
+            fail_first: AtomicBool::new(false),
+            deny_first: false,
+            stop_after_proof: Some(fixture.engine.read_authority.clone()),
+        });
+        fixture.engine.transfer = transfer;
+        assert!(
+            fixture
+                .engine
+                .read_batch_native_owned(&fixture.batch, 2)
+                .is_err()
+        );
+        assert_eq!(fixture.cache.stats().unwrap().entries, 0);
+    }
+
+    struct NativeObservedVerificationTransfer {
+        inner: Arc<NativeCacheTransfer>,
+        metrics: crate::node::read_work::ReadWorkMetrics,
+    }
+
+    impl ChunkTransfer for NativeObservedVerificationTransfer {
+        fn read_ranges(&self, batch: &PeerReadBatch, out: &mut [u8]) -> Result<()> {
+            self.inner.read_ranges(batch, out)
+        }
+
+        fn verification_metrics(&self) -> Option<&crate::node::read_work::ReadWorkMetrics> {
+            Some(&self.metrics)
+        }
+    }
+
+    #[test]
+    fn native_verified_object_fallback_counts_root_failure_without_unperformed_segment_hash() {
+        for corrupt_root in [false, true] {
+            let fixture =
+                NativeCacheFixture::new(MAX_DFS_READ_BYTES, vec![(0, 64 * 1024)], Duration::ZERO);
+            fixture
+                .transfer
+                .corrupt
+                .store(corrupt_root, Ordering::Relaxed);
+            let registry = afs_metrics::Registry::new();
+            let transfer = NativeObservedVerificationTransfer {
+                inner: fixture.transfer.clone(),
+                metrics: crate::node::read_work::ReadWorkMetrics::register(&registry).unwrap(),
+            };
+            let batch = PeerReadBatch {
+                file_version_id: FileVersionId::new("version"),
+                layout_root_id: LayoutRootId::new("layout"),
+                operations: vec![ResolvedReadOp {
+                    op: ChunkReadOp {
+                        chunk_id: fixture.chunk.id.clone(),
+                        chunk_offset: 0,
+                        length: fixture.chunk.length,
+                        output_offset: 0,
+                    },
+                    source: fixture.sources.reply.lock().unwrap().chunks[0].sources[0].clone(),
+                }],
+            };
+            let mut body = vec![0; fixture.chunk.length as usize];
+            assert_eq!(
+                transfer
+                    .read_verified_object(&batch, &fixture.chunk, &mut body)
+                    .is_err(),
+                corrupt_root
+            );
+            let family = registry
+                .gather()
+                .into_iter()
+                .find(|family| family.name() == "afs_dfs_read_hash_bytes_total")
+                .unwrap();
+            let count = |stage: &str| {
+                family
+                    .get_metric()
+                    .iter()
+                    .find(|metric| {
+                        metric
+                            .get_label()
+                            .iter()
+                            .any(|label| label.name() == "stage" && label.value() == stage)
+                    })
+                    .unwrap()
+                    .get_counter()
+                    .get_value() as u64
+            };
+            assert_eq!(count("root_fallback"), fixture.chunk.length);
+            assert_eq!(
+                count("segment_index_bytes"),
+                if corrupt_root {
+                    0
+                } else {
+                    fixture.chunk.length
+                }
+            );
+            assert_eq!(count("root_in_receive"), 0);
+        }
+    }
+
+    #[test]
+    fn native_peer_cache_fill_stage_metrics_exclude_hits_and_retain_failed_receive() {
+        for receive_failure in [false, true] {
+            let mut fixture =
+                NativeCacheFixture::new(MAX_DFS_READ_BYTES, vec![(0, 64 * 1024)], Duration::ZERO);
+            let registry = afs_metrics::Registry::new();
+            let metrics = crate::node::read_work::ReadWorkMetrics::register(&registry).unwrap();
+            fixture.engine.local = Arc::new(
+                LocalChunkStore::open(fixture._temp.path().join("timing-local"), "node-a")
+                    .unwrap()
+                    .with_read_work_metrics(metrics),
+            );
+            if receive_failure {
+                fixture.engine.transfer = Arc::new(NativeVerifiedTransfer {
+                    inner: fixture.transfer.clone(),
+                    verified_calls: std::sync::atomic::AtomicUsize::new(0),
+                    fail_first: AtomicBool::new(true),
+                    deny_first: true,
+                    stop_after_proof: None,
+                });
+            }
+            assert_eq!(
+                fixture
+                    .engine
+                    .read_batch_native_owned(&fixture.batch, 2)
+                    .is_err(),
+                receive_failure
+            );
+            if !receive_failure {
+                assert_eq!(
+                    fixture
+                        .engine
+                        .read_batch_native_owned(&fixture.batch, 2)
+                        .unwrap()
+                        .unwrap(),
+                    [1, 2]
+                );
+                assert_eq!(fixture.transfer.batches.lock().unwrap().len(), 1);
+            }
+            let family = registry
+                .gather()
+                .into_iter()
+                .find(|family| {
+                    family.name() == "afs_dfs_peer_disk_cache_fill_stage_observations_total"
+                })
+                .unwrap();
+            let count = |stage: &str| {
+                family
+                    .get_metric()
+                    .iter()
+                    .find(|metric| {
+                        metric
+                            .get_label()
+                            .iter()
+                            .any(|label| label.name() == "stage" && label.value() == stage)
+                    })
+                    .unwrap()
+                    .get_counter()
+                    .get_value() as u64
+            };
+            for stage in ["lock_wait", "lookup", "receive_verify", "total"] {
+                assert_eq!(count(stage), 1, "{stage}: failure={receive_failure}");
+            }
+            assert_eq!(count("prepare"), 2);
+            for stage in ["store", "deliver"] {
+                assert_eq!(
+                    count(stage),
+                    u64::from(!receive_failure),
+                    "{stage}: failure={receive_failure}"
+                );
+            }
+        }
+    }
+
+    struct OwnedTransferProbe {
+        destination: std::sync::atomic::AtomicUsize,
+        fail_first: AtomicBool,
+        fail_all: bool,
+        expire_before_return: bool,
+    }
+
+    impl ChunkTransfer for OwnedTransferProbe {
+        fn read_ranges(&self, batch: &PeerReadBatch, out: &mut [u8]) -> Result<()> {
+            batch.validate(out.len())?;
+            self.destination
+                .store(out.as_ptr() as usize, Ordering::Relaxed);
+            out.fill(b'?');
+            if self.fail_all || self.fail_first.swap(false, Ordering::Relaxed) {
+                return Err(corrupt("injected late stream completion failure"));
+            }
+            out.fill(b'x');
+            if self.expire_before_return {
+                let deadline = batch.operations[0].source.read_grant.expires_at_unix_ms;
+                while now_unix_ms() < deadline {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn native_owned_peer_returns_the_transfer_destination_and_discards_failed_attempts() {
+        for fail_first in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let chunk = ChunkId::new("missing-owned");
+            let sources = Arc::new(StaticSources::new(DfsChunkSourcesReply {
+                revision: 1,
+                chunks: vec![ChunkSources {
+                    allowed_ranges: Vec::new(),
+                    chunk: None,
+                    chunk_id: chunk.clone(),
+                    sources: vec![source("b", &chunk, "node-b"), source("c", &chunk, "node-c")],
+                }],
+            }));
+            let transfer = Arc::new(OwnedTransferProbe {
+                destination: std::sync::atomic::AtomicUsize::new(0),
+                fail_first: AtomicBool::new(fail_first),
+                fail_all: false,
+                expire_before_return: false,
+            });
+            let engine = DfsReadEngine::new(
+                crate::dfs::NamespaceId::new("default"),
+                "node-a".into(),
+                Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap()),
+                sources,
+                transfer.clone(),
+                DfsReadConfig::default(),
+            );
+            let batch = ReadBatch {
+                file_version_id: Some(FileVersionId::new("version")),
+                layout_root_id: LayoutRootId::new("layout"),
+                ops: vec![ChunkReadOp {
+                    chunk_id: chunk,
+                    chunk_offset: 0,
+                    length: 6,
+                    output_offset: 0,
+                }],
+            };
+            let result = engine.read_batch_native_owned(&batch, 6).unwrap().unwrap();
+            assert_eq!(result, b"xxxxxx");
+            assert_eq!(
+                result.as_ptr() as usize,
+                transfer.destination.load(Ordering::Relaxed)
+            );
+        }
+    }
+
+    #[test]
+    fn native_owned_peer_rejects_late_failure_expiry_and_excess_budget() {
+        for expire_before_return in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let chunk = ChunkId::new("missing-owned");
+            let mut candidate = source("b", &chunk, "node-b");
+            if expire_before_return {
+                candidate.read_grant.expires_at_unix_ms = now_unix_ms() + 100;
+            }
+            let sources = Arc::new(StaticSources::new(DfsChunkSourcesReply {
+                revision: 1,
+                chunks: vec![ChunkSources {
+                    allowed_ranges: Vec::new(),
+                    chunk: None,
+                    chunk_id: chunk.clone(),
+                    sources: vec![candidate],
+                }],
+            }));
+            let engine = DfsReadEngine::new(
+                crate::dfs::NamespaceId::new("default"),
+                "node-a".into(),
+                Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap()),
+                sources.clone(),
+                Arc::new(OwnedTransferProbe {
+                    destination: std::sync::atomic::AtomicUsize::new(0),
+                    fail_first: AtomicBool::new(false),
+                    fail_all: !expire_before_return,
+                    expire_before_return,
+                }),
+                DfsReadConfig::default(),
+            );
+            let batch = ReadBatch {
+                file_version_id: Some(FileVersionId::new("version")),
+                layout_root_id: LayoutRootId::new("layout"),
+                ops: vec![ChunkReadOp {
+                    chunk_id: chunk,
+                    chunk_offset: 0,
+                    length: 6,
+                    output_offset: 0,
+                }],
+            };
+            assert!(
+                engine
+                    .read_batch_native_owned(&batch, MAX_DFS_READ_BYTES as usize + 1)
+                    .is_err()
+            );
+            assert_eq!(
+                *sources.calls.lock().unwrap(),
+                0,
+                "budget rejection must precede source lookup"
+            );
+            assert!(engine.read_batch_native_owned(&batch, 6).is_err());
+            assert!(engine.capture_native_read_authority().is_ok());
+            if expire_before_return {
+                assert!(
+                    engine.source_cache.lock().unwrap().is_empty(),
+                    "expired grant context must not be reused"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn native_owned_complex_batch_uses_existing_borrowed_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let engine = DfsReadEngine::new(
+            crate::dfs::NamespaceId::new("default"),
+            "node-a".into(),
+            Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap()),
+            Arc::new(UnimplementedReadSourceProvider),
+            Arc::new(UnimplementedChunkTransfer),
+            DfsReadConfig::default(),
+        );
+        let batch = ReadBatch {
+            file_version_id: Some(FileVersionId::new("version")),
+            layout_root_id: LayoutRootId::new("layout"),
+            ops: vec![ChunkReadOp {
+                chunk_id: ChunkId::new("missing"),
+                chunk_offset: 0,
+                length: 1,
+                output_offset: 1,
+            }],
+        };
+        assert!(engine.read_batch_native_owned(&batch, 2).unwrap().is_none());
+    }
     #[derive(Default)]
     struct RecordingTransfer {
         batches: Mutex<Vec<PeerReadBatch>>,
@@ -3200,11 +5552,13 @@ mod tests {
             revision: 1,
             chunks: vec![
                 ChunkSources {
+                    allowed_ranges: Vec::new(),
                     chunk: None,
                     chunk_id: chunks[0].clone(),
                     sources: vec![source("a-copy", &chunks[0], "node-b")],
                 },
                 ChunkSources {
+                    allowed_ranges: Vec::new(),
                     chunk: None,
                     chunk_id: chunks[1].clone(),
                     sources: vec![second],
@@ -3253,6 +5607,7 @@ mod tests {
         let sources = Arc::new(StaticSources::new(DfsChunkSourcesReply {
             revision: 1,
             chunks: vec![ChunkSources {
+                allowed_ranges: Vec::new(),
                 chunk: None,
                 chunk_id: chunk.clone(),
                 sources: vec![source("a-copy", &chunk, "node-b")],
@@ -3330,11 +5685,13 @@ mod tests {
                 revision: 1,
                 chunks: vec![
                     ChunkSources {
+                        allowed_ranges: Vec::new(),
                         chunk: None,
                         chunk_id: a.clone(),
                         sources: vec![source("a-only", &a, "node-x")],
                     },
                     ChunkSources {
+                        allowed_ranges: Vec::new(),
                         chunk: None,
                         chunk_id: b.clone(),
                         sources: vec![
@@ -3500,6 +5857,7 @@ mod tests {
             Arc::new(StaticSources::new(DfsChunkSourcesReply {
                 revision: 1,
                 chunks: vec![ChunkSources {
+                    allowed_ranges: Vec::new(),
                     chunk: Some(self.chunk.clone()),
                     chunk_id: self.chunk.id.clone(),
                     sources: vec![self.candidate.clone()],
@@ -3833,6 +6191,7 @@ mod tests {
             CachedSources {
                 expires_at: Instant::now() + ttl,
                 sources: ChunkSources {
+                    allowed_ranges: Vec::new(),
                     chunk_id: fixture.chunk.id.clone(),
                     chunk: Some(fixture.chunk.clone()),
                     sources: vec![source],
@@ -4578,6 +6937,7 @@ mod tests {
             chunks: [&first, &second]
                 .iter()
                 .map(|fixture| ChunkSources {
+                    allowed_ranges: Vec::new(),
                     chunk_id: fixture.chunk.id.clone(),
                     chunk: Some(fixture.chunk.clone()),
                     sources: vec![fixture.candidate.clone()],
@@ -4618,6 +6978,7 @@ mod tests {
             chunks: [&first, &second]
                 .iter()
                 .map(|fixture| ChunkSources {
+                    allowed_ranges: Vec::new(),
                     chunk_id: fixture.chunk.id.clone(),
                     chunk: Some(fixture.chunk.clone()),
                     sources: vec![fixture.candidate.clone()],

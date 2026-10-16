@@ -464,3 +464,43 @@ fn external_backend_cache_is_optional_and_rejects_unbounded_or_relative_settings
         "omitting cache preserves OFF configuration"
     );
 }
+
+#[cfg(feature = "dfs")]
+#[test]
+fn peer_disk_cache_is_opt_in_and_requires_an_isolated_bounded_directory() {
+    let default =
+        Config::resolve(Role::Node, Cli::parse_from(["afs-node", "--fs", "dfs"])).unwrap();
+    assert!(default.dfs_peer_cache.is_none());
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("node.toml");
+    let base = "fs='dfs'\ndata_dir='/srv/afs/data'\ndfs_mount='/mnt/afs'\n[dfs_peer_cache]\ndirectory='/srv/afs/peer-cache'\ncapacity_bytes=268435456\n";
+    std::fs::write(&path, base).unwrap();
+    let resolve = |role| {
+        Config::resolve(
+            role,
+            Cli::parse_from(["afs-node", "--config", path.to_str().unwrap()]),
+        )
+    };
+    let cfg = resolve(Role::Node).unwrap();
+    let cache = cfg.dfs_peer_cache.unwrap();
+    assert_eq!(cache.capacity_bytes, 256 * 1024 * 1024);
+    assert_eq!(cache.directory, std::path::Path::new("/srv/afs/peer-cache"));
+    assert!(resolve(Role::Meta).is_err());
+    for bad in [
+        base.replace("'/srv/afs/peer-cache'", "'relative'"),
+        base.replace("'/srv/afs/peer-cache'", "'/'"),
+        base.replace("'/srv/afs/peer-cache'", "'/srv/../cache'"),
+        base.replace("'/srv/afs/peer-cache'", "'/srv/afs/data/cache'"),
+        base.replace("'/srv/afs/peer-cache'", "'/srv/afs'"),
+        base.replace("'/srv/afs/peer-cache'", "'/mnt/afs/cache'"),
+        base.replace("capacity_bytes=268435456", "capacity_bytes=0"),
+        base.replace("capacity_bytes=268435456", "capacity_bytes=1099511627777"),
+        base.replace(
+            "capacity_bytes=268435456",
+            "capacity_bytes=268435456\nresident_bytes=4194304",
+        ),
+    ] {
+        std::fs::write(&path, bad).unwrap();
+        assert!(resolve(Role::Node).is_err());
+    }
+}

@@ -931,6 +931,11 @@ pub struct ChunkSources {
     #[serde(default)]
     pub chunk: Option<ChunkObject>,
     pub sources: Vec<SourceCandidate>,
+    /// Committed chunk-relative ranges covered by these existing grants.
+    /// Missing or overly fragmented hints stay empty and cannot authorize
+    /// fetching the whole object instead of the requested range.
+    #[serde(default)]
+    pub allowed_ranges: Vec<(u64, u64)>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

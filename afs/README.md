@@ -72,6 +72,12 @@ SHM 的 memfd、sealing 与原子 CLOEXEC FD 传递实现及对应运行测试�
 
 必要正确性边界仍需保留：读写新鲜度、close-to-open、权限和 suid/sgid 清除、错误传播、持久化屏障、direct-I/O mmap 能力协商、正常卸载和受管引用排空。
 
+原生DFS新open取得fresh状态，已打开读视图最多复用5秒、命中不续期；Node/session
+授权与版本视图分别检查，已知失效停止交付。A当前已验证对象单槽最多4MiB，与在途
+正文共用8MiB容量；B可显式启用可丢弃的磁盘读缓存，不新增常驻正文RAM缓存。具体期限、断链、失效与资源范围见
+[读取上下文边界](../docs/architecture/afs.md#dfs-原生节点读取上下文)及
+[验收与指标](../docs/testing/afs.md)。这不改变成功fsync的持久要求。
+
 ## 文档入口
 
 - 演进计划、支持范围和后续验收：[docs/development/afs-plan.md](../docs/development/afs-plan.md)
@@ -85,6 +91,19 @@ SHM 的 memfd、sealing 与原子 CLOEXEC FD 传递实现及对应运行测试�
 
 历史来源不自动构成当前候选版本的运行结论。所有功能、性能和交付状态必须以
 当前 Agent DX 源码、二进制和对应 Linux 证据登记。
+
+## 原生 DFS 可选磁盘读缓存
+
+未配置外部存储时，Node 可通过 `[dfs_peer_cache]` 指定专用目录和 `capacity_bytes`；
+省略即 OFF。容量由部署选择，256MiB只是一种配置示例。缓存按不可变 chunk 身份隔离，
+近似 LRU 淘汰；不登记持久副本，不替代 A 的权威数据，不允许据此删除唯一持久副本。
+B 命中仍取得有效 Meta grant；首次获取／身份改变完整验证可信Meta根，稳定命中完整校验本次覆盖的1MiB分段后交付授权范围。
+只有 grant 覆盖整个当前对象时才整块回填，不预读下一对象；partial／旧协议缺少范围提示
+沿用范围读取。符合runtime／窗口／原预算条件的gRPC回填复用两个256KiB私有载荷块，
+按块交接同对象接收、完整校验和私有文件写入；wire正文帧仍为64KiB，块归还后才能复用。
+实际EOF及任务排空后，最终授权通过才提交Ready与交付。缓存I/O失败继续同次RPC验证读取，
+不增加持久副本或正文RAM缓存；其他适配器保留原缓冲路径。磁盘或填充失败不伪造fsync成功，权限拒绝与远端读取错误仍传播。
+配置、资源和验收出口见[部署说明](../docs/deployment/afs.md#原生-peer-可丢弃磁盘读缓存)。
 
 ## DFS 外部 S3 后端（实验接入）
 

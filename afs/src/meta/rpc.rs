@@ -2226,6 +2226,16 @@ fn wire_chunk_sources_reply(
                     .into_iter()
                     .map(wire_source_candidate)
                     .collect(),
+                allowed_ranges: chunk
+                    .allowed_ranges
+                    .into_iter()
+                    .map(
+                        |(offset, length)| afs_protocol::meta::dfs_authorized_read::Range {
+                            offset,
+                            length,
+                        },
+                    )
+                    .collect(),
             })
             .collect(),
     }
@@ -2675,6 +2685,34 @@ fn optional_id(value: String) -> Option<String> {
 mod tests {
     use super::*;
     use tonic::Code;
+
+    #[test]
+    fn chunk_sources_wire_preserves_bounded_grant_ranges() {
+        use prost::Message;
+
+        let chunk = crate::node::chunk::StagedChunk::new(
+            crate::dfs::OperationId::new("source-range-codec"),
+            b"data".to_vec(),
+        )
+        .chunk;
+        let encoded = wire_chunk_sources_reply(crate::dfs::DfsChunkSourcesReply {
+            revision: 9,
+            chunks: vec![crate::dfs::ChunkSources {
+                chunk_id: chunk.id.clone(),
+                chunk: Some(chunk),
+                sources: Vec::new(),
+                allowed_ranges: vec![(1, 2)],
+            }],
+        });
+        let decoded =
+            afs_protocol::meta::GetDfsChunkSourcesReply::decode(encoded.encode_to_vec().as_slice())
+                .unwrap();
+        assert_eq!(decoded, encoded);
+        assert_eq!(decoded.revision, 9);
+        assert_eq!(decoded.chunks[0].allowed_ranges.len(), 1);
+        assert_eq!(decoded.chunks[0].allowed_ranges[0].offset, 1);
+        assert_eq!(decoded.chunks[0].allowed_ranges[0].length, 2);
+    }
 
     #[test]
     fn external_commit_boundary_requires_explicit_digest_and_safe_identity() {

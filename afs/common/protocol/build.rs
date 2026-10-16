@@ -24,6 +24,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .boxed(".afs.node.data.v1.DfsPutReplicaHeader.repair_claim")
         // Share the owned decode buffer for bulk reads; protobuf wire tags stay unchanged.
         .bytes(".afs.node.data.v1.OwnerReadReply.data")
+        .bytes(".afs.node.data.v1.DfsReadRangesFrame.data")
         .compile_protos(&["proto/node_data.proto"], &["proto"])?;
     std::fs::copy(
         data_out.join("afs.node.data.v1.rs"),

@@ -1082,6 +1082,9 @@ message DfsChunkSources {
   string chunk_id = 1;
   repeated DfsSourceCandidate sources = 2;
   DfsChunkObject chunk = 3;
+  // Existing grant coverage, not additional authority. At most 128 entries;
+  // omitted by older peers or fragmented layouts: use requested ranges only.
+  repeated DfsAuthorizedRead.Range allowed_ranges = 4;
 }
 
 message GetDfsChunkSourcesRequest {
