@@ -46,6 +46,9 @@ async fn embedded_file_directory_accepts_new_specs_without_legacy_credentials() 
     for (id, state) in [
         ("new-running", pb::EnvironmentState::Running),
         ("new-paused", pb::EnvironmentState::Paused),
+        ("new-pausing", pb::EnvironmentState::Pausing),
+        ("new-resuming", pb::EnvironmentState::Resuming),
+        ("new-failed", pb::EnvironmentState::Failed),
     ] {
         let spec = contract::create_spec_with_environment(json!({"namespace":"new","name":id.strip_prefix("new-").unwrap(),"image":"app:1","runtime":"runc","cpu":1000,"memory":512,"inheritEntrypoint":true}), &caller, Some(&profile)).unwrap();
         assert!(!spec.env.contains_key("EXECD_HTTP_TOKEN"));
@@ -109,8 +112,15 @@ async fn embedded_file_directory_accepts_new_specs_without_legacy_credentials() 
         service.authorize("tenant", "absent").await,
         Err(ReadError::NotFound)
     ));
+    for id in ["new-pausing", "new-paused", "new-resuming"] {
+        service.authorize("tenant", id).await.unwrap();
+        assert!(matches!(
+            service.authorize("other", id).await,
+            Err(ReadError::NotFound)
+        ));
+    }
     assert!(matches!(
-        service.authorize("tenant", "new-paused").await,
+        service.authorize("tenant", "new-failed").await,
         Err(ReadError::Runtime)
     ));
     server.abort();

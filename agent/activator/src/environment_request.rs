@@ -1,6 +1,12 @@
 //! Agent-side conversion to the public Environment management protocol.
 //! No Platform model or RPC client is used here.
-use adx_agent_core::{environment::*, limits};
+use adx_agent_core::{
+    environment::*,
+    lifecycle::RetentionPolicy,
+    limits,
+    network::{EgressProtocol, SandboxNetworkPolicy},
+};
+use ipnet::IpNet;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::time::Duration;
@@ -55,8 +61,16 @@ pub fn validate_execution(execution: &ExecutionSpec) -> Result<(), EnvironmentEr
     {
         return Err(EnvironmentError::Invalid("reserved environment key".into()));
     }
-    if execution.resources.cpu_millis > i64::MAX as u64
-        || execution.resources.memory_mib > (i64::MAX as u64 / 1048576)
+    if execution
+        .resources
+        .cpu_limit_millis
+        .unwrap_or(execution.resources.cpu_millis)
+        > i64::MAX as u64
+        || execution
+            .resources
+            .memory_limit_mib
+            .unwrap_or(execution.resources.memory_mib)
+            > (i64::MAX as u64 / 1048576)
     {
         return Err(EnvironmentError::Invalid(
             "Environment resources exceed API Server limits".into(),
@@ -68,6 +82,7 @@ pub fn validate_execution(execution: &ExecutionSpec) -> Result<(), EnvironmentEr
 pub fn create_input(
     request: &CreateEnvironment,
     timeout: Duration,
+    network: &SandboxNetworkPolicy,
 ) -> Result<Value, EnvironmentError> {
     validate_execution(&request.execution)?;
     validate_identity(&request.tenant)?;
@@ -84,12 +99,59 @@ pub fn create_input(
     let execution = &request.execution;
     // Keep the submitted specification stable across retries. The caller's absolute
     // deadline bounds HTTP waiting; API Server owns its independent create budget.
-    Ok(json!({
+    let mut input = json!({
         "namespace":"adx", "name":name, "image":execution.image, "runtime":execution.isolation_runtime,
         "cpu":execution.resources.cpu_millis, "memory":execution.resources.memory_mib,
         "inheritEntrypoint":true, "env":execution.env,
+        "network":network_input(network)?,
+        "ports":execution.service.iter().map(|service| service.port.to_string()).collect::<std::collections::BTreeSet<_>>(),
         "createTimeoutSeconds":timeout.as_secs().max(1),
-    }))
+    });
+    if !execution.lifecycle.is_default() {
+        input["idleTimeoutSeconds"] = json!(execution.lifecycle.idle_timeout_seconds);
+        input["idleAction"] = json!(execution.lifecycle.idle_action);
+        if let Some(pause) = &execution.lifecycle.pause {
+            let retention = match pause.retention {
+                RetentionPolicy::Ttl { ttl_seconds } => {
+                    json!({"kind":"ttl","ttlSeconds":ttl_seconds})
+                }
+                RetentionPolicy::Forever {} => json!({"kind":"forever"}),
+            };
+            input["pauseOptions"] = json!({"retention":retention,"timeoutSeconds":pause.timeout_seconds,"storage":pause.storage});
+        }
+    }
+    if !execution.mounts.is_empty() {
+        input["mounts"] = json!(execution.mounts);
+    }
+    if let Some(seconds) = execution.init_timeout_seconds {
+        input["initCallTimeoutSeconds"] = json!(seconds);
+    }
+    if let Some(probe) = &execution.readiness_probe {
+        input["readinessProbe"] = readiness_probe_input(probe)?;
+    }
+    if let Some(limit) = execution.resources.cpu_limit_millis {
+        input["cpu_limit"] = json!(limit);
+    }
+    if let Some(limit) = execution.resources.memory_limit_mib {
+        input["mem_limit"] = json!(limit);
+    }
+    Ok(input)
+}
+
+fn readiness_probe_input(
+    probe: &adx_agent_core::probes::ReadinessProbe,
+) -> Result<Value, EnvironmentError> {
+    use adx_agent_core::probes::ProbeAction;
+    let action = match probe.action().map_err(EnvironmentError::Invalid)? {
+        ProbeAction::HttpGet { port, path } => json!({"httpGet":{"port":port,"path":path}}),
+        ProbeAction::TcpSocket { port } => json!({"tcpSocket":{"port":port}}),
+        ProbeAction::Exec { command } => json!({"exec":{"command":command}}),
+    };
+    let mut input = action;
+    input["initialDelaySeconds"] = json!(probe.initial_delay_seconds);
+    input["periodSeconds"] = json!(probe.period_seconds);
+    input["timeoutSeconds"] = json!(probe.timeout_seconds);
+    Ok(input)
 }
 pub fn operation_id(action: &str, tenant: &str, id: &str) -> Result<String, EnvironmentError> {
     validate_identity(tenant)?;
@@ -124,16 +186,125 @@ pub(crate) fn observed(
         Some("running") => EnvironmentPhase::Running,
         Some("pending" | "starting") => EnvironmentPhase::Creating,
         Some("failed") => EnvironmentPhase::Failed,
-        Some("paused" | "pausing" | "resuming" | "deleting") => {
+        Some("pausing") => EnvironmentPhase::Pausing,
+        Some("paused") => EnvironmentPhase::Paused,
+        Some("resuming") => EnvironmentPhase::Resuming,
+        Some("deleting") => {
             return Err(EnvironmentError::Conflict(
                 "Environment is not available for Agent activation".into(),
-            ))
+            ));
         }
         _ => {
             return Err(EnvironmentError::Unavailable(
                 "unknown API Server instance state".into(),
-            ))
+            ));
         }
     };
     Ok(observation(tenant, id, phase))
+}
+
+/// Compile deployment policy to the public Environment network contract.
+/// The sandboxd backend accepts IPv4 only. Unsupported CIDRs, overlapping service
+/// exceptions and invalid port ranges fail closed before creating an Environment.
+pub fn network_input(config: &SandboxNetworkPolicy) -> Result<Value, EnvironmentError> {
+    fn cidr(value: &str) -> Result<IpNet, EnvironmentError> {
+        value.parse::<ipnet::Ipv4Net>().map(IpNet::V4).map_err(|_| {
+            EnvironmentError::Invalid("Environment network requires an IPv4 CIDR".into())
+        })
+    }
+    if config.sandbox_cidrs.is_empty()
+        || config.sandbox_cidrs.len() + config.internal_cidrs.len() + config.egress_allow.len()
+            > 256
+    {
+        return Err(EnvironmentError::Invalid(
+            "Environment network requires address pools and at most 256 configured rules".into(),
+        ));
+    }
+    let pools = config
+        .sandbox_cidrs
+        .iter()
+        .map(|v| cidr(v))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut rules = Vec::new();
+    let mut rule = |action: &str, direction: &str, protocol: Value, peer: Value, priority: u32| {
+        rules.push(json!({"action":action,"direction":direction,"protocol":protocol,"peer":peer,"priority":priority}));
+    };
+    if config.public_egress {
+        rule(
+            "allow",
+            "egress",
+            json!("any"),
+            json!({"cidr":"0.0.0.0/0"}),
+            100,
+        );
+    }
+    // Non-public and special-use destinations are never included in public egress.
+    // Deployment-specific globally addressed cluster networks must be listed too.
+    for net in [
+        "0.0.0.0/8",
+        "10.0.0.0/8",
+        "100.64.0.0/10",
+        "127.0.0.0/8",
+        "169.254.0.0/16",
+        "172.16.0.0/12",
+        "192.0.0.0/24",
+        "192.0.2.0/24",
+        "192.168.0.0/16",
+        "198.18.0.0/15",
+        "198.51.100.0/24",
+        "203.0.113.0/24",
+        "224.0.0.0/4",
+        "240.0.0.0/4",
+    ]
+    .into_iter()
+    .chain(config.internal_cidrs.iter().map(String::as_str))
+    {
+        let net = cidr(net)?;
+        rule(
+            "deny",
+            "egress",
+            json!("any"),
+            json!({"cidr":net.to_string()}),
+            200,
+        );
+    }
+    for allow in &config.egress_allow {
+        let net = cidr(&allow.cidr)?;
+        if pools
+            .iter()
+            .any(|pool| pool.contains(&net.network()) || net.contains(&pool.network()))
+        {
+            return Err(EnvironmentError::Invalid(
+                "egress exception overlaps an Environment address pool".into(),
+            ));
+        }
+        match (&allow.ports, allow.protocol) {
+            (Some(ports), EgressProtocol::Tcp | EgressProtocol::Udp)
+                if ports.first > 0 && ports.first <= ports.last => {}
+            (None, EgressProtocol::Icmp) => (),
+            _ => {
+                return Err(EnvironmentError::Invalid(
+                    "TCP/UDP exceptions require a valid port range; ICMP does not accept ports"
+                        .into(),
+                ));
+            }
+        }
+        let mut peer = json!({"cidr":net.to_string()});
+        if let Some(ports) = &allow.ports {
+            peer["portRange"] = json!(ports);
+        }
+        rule("allow", "egress", json!(allow.protocol), peer, 300);
+    }
+    for net in pools {
+        rule(
+            "deny",
+            "both",
+            json!("any"),
+            json!({"cidr":net.to_string()}),
+            400,
+        );
+    }
+    Ok(
+        json!({"schemaVersion":2,"traffic":{"ingressDefaultAction":"deny","egressDefaultAction":"deny","mode":"stateful","rules":rules}}),
+    )
 }

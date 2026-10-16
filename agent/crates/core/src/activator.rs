@@ -85,4 +85,6 @@ impl BindingList {
 pub struct PrepareBindingRequest {
     pub scope: Scope,
     pub launch: crate::launch::LaunchConfig,
+    #[serde(default)]
+    pub parameters: crate::mounts::Parameters,
 }

@@ -4,7 +4,7 @@
 
 AgentState 为不可变模板提供最多 1024 条 FIFO 本地缓存，键包括 tenant/name/version；克隆 AgentState 共享该缓存，同键在途加载合并。不存在和错误结果不缓存，模板发布仍执行原权威条件写。AgentBinding 查询始终访问 Repository，不使用模板缓存作为存储故障降级；Activator 自身可缓存已验证的成功激活绑定，见 [Activator](../../activator/README.md#激活缓存)。
 
-AgentBinding scope 包含 tenant、template、version、binding_id。首次条件写提交 generation 和稳定 environment_id，并发创建返回胜出的同一记录。产品 Active/Deleting 不代表 Environment 运行状态。删除在平台确认后按 revision 条件清理，旧 generation 的清理不能影响同名新环境。
+AgentBinding scope 包含 tenant、template、version、binding_id。首次条件写提交 generation 和稳定 environment_id，并发创建返回胜出的同一记录。产品 Active/Deleting 不代表 Environment 运行状态。删除在平台确认 Deleted 或明确返回 NotFound 后按 revision 条件清理绑定与私有启动配置，旧 generation 的清理不能影响同名新环境；超时、鉴权失败和未知结果不触发最终清理。
 
 每条记录使用 UUID revision。事务先检查全部条件再修改；不持久化 Environment 运行状态或操作流水。
 

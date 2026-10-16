@@ -5,13 +5,17 @@
   "database_url_env": "ADX_ACCOUNT_DATABASE_URL",
   "database_allow_plaintext": false,
   "session_ttl_seconds": 604800,
+  "agc": {
+    "project_id": "101653523864899612",
+    "api_client_id": "2061575285978955776",
+    "api_client_secret_env": "ADX_AGC_API_CLIENT_SECRET"
+  },
   "litellm": {
     "management_url": "https://litellm.internal.example.com",
     "api_base": "https://litellm.internal.example.com/v1",
     "admin_key_env": "ADX_LITELLM_ADMIN_KEY",
-    "model": "agent-model",
     "max_budget": 5.0,
-    "budget_duration": "30d",
+    "budget_duration": "1d",
     "rpm_limit": 30,
     "tpm_limit": 30000,
     "allow_plaintext": false

@@ -11,7 +11,7 @@ cargo install --locked --path agent/cli
 
 ```sh
 export ADX_SERVER_ADDRESS=https://gateway.example.com:8443
-# ADX_TOKEN 由部署环境注入，或使用 --token-file 指向管理员提供的租户密钥文件。
+# ADX_TOKEN 由运行环境注入，或使用 --token-file 指向管理员提供的租户密钥文件。
 adx --token-file /run/secrets/adx-token template publish -f template.json
 adx --token-file /run/secrets/adx-token template get assistant --version 1
 adx --token-file /run/secrets/adx-token env list --template assistant --version 1 --page-size 50
@@ -90,6 +90,6 @@ adx ssh --template assistant --version 1 --binding-id demo --port 22
 
 SSH 参数用例覆盖显式/自动 AgentBinding、身份文件路径及 IPv6 地址。Gateway 组件另用原生 OpenSSH 验证终端 stdout 的 ID/URN 与退出码。
 
-2026-09-22 的真实容器验证覆盖 CLI 模板发布/读取、AgentBinding 三页查询和跨 Gateway 查询/删除、已有 AgentBinding SSH、自动生成 ID 后同 ID 重连，终端输出与后端退出码正确。2026-09-23 的 `3141e27` 另行通过 HTTP CLI 的自动 AgentBinding 通知、原 ID 重试及 Harness 正文输出，整体 19 项端到端检查通过。上述验证在本次上游命名调整合并前完成；组件测试另覆盖流式响应、文件/stdin 请求体和 Ctrl-C 退出。
+组件测试另覆盖 HTTP CLI 的自动 AgentBinding 通知、原 ID 重试、流式响应、文件/stdin 请求体和 Ctrl-C 退出。
 
-首次冷启动仍可能遇到平台就绪或路由发布延迟，需要按上文使用原 ID 重试；这些结果不是多机或 Kubernetes 验收。完整范围和限制见 [Agent 验证说明](../README.md#验证)。
+首次冷启动仍可能遇到 Platform 就绪或路由发布延迟，需要按上文使用原 ID 重试。完整范围和限制见[Agent 验证说明](../README.md#验证)。

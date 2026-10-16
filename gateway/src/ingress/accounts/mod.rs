@@ -5,7 +5,7 @@ use adx_agent_core::launch::{CredentialCipher, LaunchConfig};
 use async_trait::async_trait;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use http::{header, HeaderMap, StatusCode};
-pub use providers::{Huawei, IdentityProvider, LiteLlm, ModelProvider};
+pub use providers::{Agc, AgcIdentityProvider, Huawei, IdentityProvider, LiteLlm, ModelProvider};
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -18,8 +18,12 @@ pub enum Error {
     Invalid,
     #[error("business session is invalid or expired")]
     Unauthorized,
+    #[error("AGC access token is invalid, expired, or revoked")]
+    InvalidAgcAccessToken,
     #[error("account is disabled or access is forbidden")]
     Forbidden,
+    #[error("account is disabled or deleted")]
+    AccountDisabled,
     #[error("registration agreement is required")]
     AgreementRequired,
     #[error("identity provider or account service unavailable")]
@@ -31,8 +35,10 @@ impl Error {
     pub fn status(&self) -> StatusCode {
         match self {
             Self::Invalid => StatusCode::BAD_REQUEST,
-            Self::Unauthorized => StatusCode::UNAUTHORIZED,
-            Self::Forbidden | Self::AgreementRequired => StatusCode::FORBIDDEN,
+            Self::Unauthorized | Self::InvalidAgcAccessToken => StatusCode::UNAUTHORIZED,
+            Self::Forbidden | Self::AccountDisabled | Self::AgreementRequired => {
+                StatusCode::FORBIDDEN
+            }
             _ => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
@@ -40,7 +46,9 @@ impl Error {
         match self {
             Self::Invalid => "INVALID_LOGIN_REQUEST",
             Self::Unauthorized => "UNAUTHORIZED",
+            Self::InvalidAgcAccessToken => "INVALID_AGC_ACCESS_TOKEN",
             Self::Forbidden => "FORBIDDEN",
+            Self::AccountDisabled => "ACCOUNT_DISABLED",
             Self::AgreementRequired => "AGREEMENT_REQUIRED",
             _ => "AUTH_UNAVAILABLE",
         }
@@ -54,6 +62,12 @@ pub struct LoginRequest {
     pub authorization_code: String,
     pub agreement_version: Option<String>,
 }
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgcLoginRequest {
+    pub agc_access_token: String,
+    pub agreement_version: Option<String>,
+}
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoginResponse {
@@ -62,6 +76,36 @@ pub struct LoginResponse {
     pub token_type: &'static str,
     pub expires_in: u64,
 }
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct ModelQuota {
+    pub total: f64,
+    pub balance: f64,
+    pub used: f64,
+    pub low_balance: bool,
+    pub exhausted: bool,
+    pub reset_period: String,
+    pub reset_at: String,
+}
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct QuotaResponse {
+    pub ok: bool,
+    pub available: bool,
+    pub quota: ModelQuota,
+}
+/// Identity and optional profile supplied by a verified identity provider.
+#[derive(Debug, PartialEq)]
+pub struct VerifiedIdentity {
+    pub subject: String,
+    pub display_name: Option<String>,
+}
+
+pub(crate) struct ScopedIdentity<'a> {
+    pub provider: &'a str,
+    pub scope: &'a str,
+    pub client_id: &'a str,
+    pub identity: &'a VerifiedIdentity,
+}
+
 #[derive(Clone)]
 pub struct Principal {
     pub tenant: String,
@@ -73,9 +117,13 @@ pub struct Principal {
 #[async_trait]
 pub trait BusinessAuth: Send + Sync {
     async fn login(&self, request: LoginRequest) -> Result<LoginResponse>;
+    async fn agc_login(&self, _request: AgcLoginRequest) -> Result<LoginResponse> {
+        Err(Error::Unavailable)
+    }
     async fn authenticate(&self, token: &str) -> Result<Principal>;
     async fn check(&self, principal: &Principal) -> Result<()>;
     async fn logout(&self, token: &str) -> Result<()>;
+    async fn quota(&self, principal: &Principal) -> Result<QuotaResponse>;
     async fn launch_config(&self, principal: &Principal) -> Result<LaunchConfig>;
 }
 #[derive(Deserialize)]
@@ -90,6 +138,8 @@ pub struct AccountConfig {
     pub database_allow_plaintext: bool,
     #[serde(default = "session_ttl")]
     pub session_ttl_seconds: u64,
+    #[serde(default)]
+    pub agc: Option<AgcConfig>,
     pub litellm: ModelConfig,
 }
 fn session_ttl() -> u64 {
@@ -97,13 +147,20 @@ fn session_ttl() -> u64 {
 }
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct AgcConfig {
+    pub project_id: String,
+    pub api_client_id: String,
+    pub api_client_secret_env: String,
+}
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelConfig {
     pub management_url: String,
     pub api_base: String,
     pub admin_key_env: String,
-    pub model: String,
     pub max_budget: f64,
-    pub budget_duration: String,
+    #[serde(default)]
+    pub budget_duration: Option<String>,
     pub rpm_limit: u32,
     pub tpm_limit: u32,
     #[serde(default)]
@@ -112,6 +169,7 @@ pub struct ModelConfig {
 pub struct AccountService {
     pub(crate) store: AccountStore,
     identity: Arc<dyn IdentityProvider>,
+    agc_identity: Option<Arc<dyn AgcIdentityProvider>>,
     models: Arc<dyn ModelProvider>,
     cipher: CredentialCipher,
     config: AccountConfig,
@@ -129,14 +187,41 @@ impl AccountService {
         let key: [u8; 32] = bytes.try_into().map_err(|_| Error::Configuration)?;
         let store = AccountStore::connect(&config).await?;
         let identity = Arc::new(Huawei::new(client_id.clone(), secret)?);
+        let agc_identity = match &config.agc {
+            Some(agc) => {
+                let secret =
+                    std::env::var(&agc.api_client_secret_env).map_err(|_| Error::Configuration)?;
+                Some(Arc::new(Agc::new(agc.clone(), secret)?) as Arc<dyn AgcIdentityProvider>)
+            }
+            None => None,
+        };
         let models = Arc::new(LiteLlm::new(config.litellm.clone())?);
-        Self::new(config, client_id, store, identity, models, key)
+        Self::new_with_agc(
+            config,
+            client_id,
+            store,
+            identity,
+            agc_identity,
+            models,
+            key,
+        )
     }
     pub fn new(
         config: AccountConfig,
         client_id: String,
         store: AccountStore,
         identity: Arc<dyn IdentityProvider>,
+        models: Arc<dyn ModelProvider>,
+        key: [u8; 32],
+    ) -> Result<Self> {
+        Self::new_with_agc(config, client_id, store, identity, None, models, key)
+    }
+    pub fn new_with_agc(
+        config: AccountConfig,
+        client_id: String,
+        store: AccountStore,
+        identity: Arc<dyn IdentityProvider>,
+        agc_identity: Option<Arc<dyn AgcIdentityProvider>>,
         models: Arc<dyn ModelProvider>,
         key: [u8; 32],
     ) -> Result<Self> {
@@ -152,14 +237,53 @@ impl AccountService {
         if !(60..=604800).contains(&config.session_ttl_seconds) {
             return Err(Error::Configuration);
         }
+        if let Some(agc) = &config.agc {
+            for value in [&agc.project_id, &agc.api_client_id] {
+                adx_agent_core::identifier(value, "AGC account configuration")
+                    .map_err(|_| Error::Configuration)?;
+            }
+            if agc.api_client_secret_env.trim().is_empty() || agc_identity.is_none() {
+                return Err(Error::Configuration);
+            }
+        } else if agc_identity.is_some() {
+            return Err(Error::Configuration);
+        }
         config.litellm.validate()?;
         Ok(Self {
             store,
             identity,
+            agc_identity,
             models,
             cipher: CredentialCipher::new(key),
             config,
             client_id,
+        })
+    }
+
+    async fn create_session(
+        &self,
+        provider: &str,
+        provider_scope: &str,
+        client_id: &str,
+        identity: &VerifiedIdentity,
+        agreement_version: Option<&str>,
+    ) -> Result<LoginResponse> {
+        let token = random_token()?;
+        let identity = ScopedIdentity {
+            provider,
+            scope: provider_scope,
+            client_id,
+            identity,
+        };
+        let (user_id, _) = self
+            .store
+            .login(&self.config, identity, agreement_version, &digest(&token))
+            .await?;
+        Ok(LoginResponse {
+            user_id,
+            token,
+            token_type: "Bearer",
+            expires_in: self.config.session_ttl_seconds,
         })
     }
 }
@@ -172,27 +296,44 @@ impl BusinessAuth for AccountService {
         {
             return Err(Error::Invalid);
         }
-        let union_id = self.identity.exchange(&request.authorization_code).await?;
+        let identity = self.identity.exchange(&request.authorization_code).await?;
+        let union_id = &identity.subject;
         if union_id.is_empty() || union_id.len() > 2048 || union_id.chars().any(char::is_control) {
             return Err(Error::Unauthorized);
         }
-        let token = random_token()?;
-        let (user_id, _) = self
-            .store
-            .login(
-                &self.config,
-                &self.client_id,
-                &union_id,
-                request.agreement_version.as_deref(),
-                &digest(&token),
-            )
-            .await?;
-        Ok(LoginResponse {
-            user_id,
-            token,
-            token_type: "Bearer",
-            expires_in: self.config.session_ttl_seconds,
-        })
+        self.create_session(
+            "huawei",
+            &self.config.developer_scope,
+            &self.client_id,
+            &identity,
+            request.agreement_version.as_deref(),
+        )
+        .await
+    }
+    async fn agc_login(&self, request: AgcLoginRequest) -> Result<LoginResponse> {
+        if !valid_agc_access_token(&request.agc_access_token) {
+            return Err(Error::Invalid);
+        }
+        let provider = self.agc_identity.as_ref().ok_or(Error::Unavailable)?;
+        let config = self.config.agc.as_ref().ok_or(Error::Unavailable)?;
+        let identity = provider.verify(&request.agc_access_token).await?;
+        if identity.subject.is_empty()
+            || identity.subject.len() > 1024
+            || identity
+                .subject
+                .chars()
+                .any(|character| character.is_control() || character.is_whitespace())
+        {
+            return Err(Error::InvalidAgcAccessToken);
+        }
+        self.create_session(
+            "agc",
+            &config.project_id,
+            &config.api_client_id,
+            &identity,
+            request.agreement_version.as_deref(),
+        )
+        .await
     }
     async fn authenticate(&self, token: &str) -> Result<Principal> {
         if token.len() > 512 || token.len() < 32 {
@@ -219,6 +360,14 @@ impl BusinessAuth for AccountService {
         // Idempotent logout, including an already revoked/expired session.
         self.store.logout(&self.config.tenant, &digest(token)).await
     }
+    async fn quota(&self, principal: &Principal) -> Result<QuotaResponse> {
+        let launch = self.launch_config(principal).await?;
+        let key = launch.env.get("API_KEY").ok_or(Error::Unavailable)?;
+        let owner = litellm_user(&principal.tenant, &principal.user_id);
+        let quota = self.models.quota(&owner, key).await?;
+        self.check(principal).await?;
+        Ok(quota)
+    }
     async fn launch_config(&self, principal: &Principal) -> Result<LaunchConfig> {
         self.check(principal).await?;
         let aad = serde_json::to_vec(&("litellm", &principal.tenant, &principal.user_id))
@@ -235,11 +384,13 @@ impl BusinessAuth for AccountService {
                 .map_err(|_| Error::Unavailable)?,
         )
         .map_err(|_| Error::Unavailable)?;
+        // Reconcile model access and account alias even for a ready credential when preparing a new
+        // binding or serving quota. Warm Sandbox traffic never enters this path.
+        // Persist the key BEFORE remote creation so retries cannot mint another key.
+        let owner = litellm_user(&principal.tenant, &principal.user_id);
+        let alias = self.store.model_key_alias(principal).await?;
+        self.models.ensure(&owner, &key, &alias).await?;
         if !record.ready {
-            // Persist the random key BEFORE remote creation. Every retry and replica uses
-            // this exact key, so a lost provider response cannot mint a second credential.
-            let owner = litellm_user(&principal.tenant, &principal.user_id);
-            self.models.ensure(&owner, &key).await?;
             self.store.mark_ready(principal, &record.version).await?;
         }
         self.check(principal).await?;
@@ -248,11 +399,12 @@ impl BusinessAuth for AccountService {
             env: BTreeMap::from([
                 ("API_KEY".into(), key),
                 ("API_BASE".into(), self.config.litellm.api_base.clone()),
-                ("MODEL_NAME".into(), self.config.litellm.model.clone()),
-                ("MODEL_PROVIDER".into(), "OpenAI".into()),
             ]),
         })
     }
+}
+fn valid_agc_access_token(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 8192 && value.bytes().all(|byte| byte.is_ascii_graphic())
 }
 pub fn bearer(headers: &HeaderMap) -> Result<&str> {
     let mut values = headers.get_all(header::AUTHORIZATION).iter();
@@ -280,6 +432,23 @@ pub(crate) fn litellm_user(tenant: &str, user_id: &str) -> String {
         digest(&serde_json::json!([tenant, user_id]).to_string())
     )
 }
+fn model_key_alias(provider: &str, user_id: &str, display_name: Option<&str>) -> String {
+    let provider = if provider == "agc" { "agc" } else { "huawei" };
+    let short_id: String = user_id.chars().take(8).collect();
+    let nickname: String = display_name
+        .unwrap_or_default()
+        .chars()
+        .filter(|c| c.is_alphanumeric() || matches!(c, ' ' | '-' | '_'))
+        .take(128)
+        .collect();
+    let nickname = nickname.trim();
+    if nickname.is_empty() {
+        format!("{provider}-{short_id}")
+    } else {
+        format!("{provider}-{nickname}-{short_id}")
+    }
+}
+
 pub(crate) fn random_token() -> Result<String> {
     let mut bytes = [0; 32];
     SystemRandom::new()

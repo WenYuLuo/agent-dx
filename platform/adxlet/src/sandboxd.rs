@@ -240,9 +240,9 @@ impl Sandboxd {
                     .insert("ADX_ENV_FILE".into(), info.restore_env_path);
             }
         }
-        Ok(self.request(start_request(
-            spec, runtime_id, generation, devices, &config,
-        )?))
+        let request = start_request(spec, runtime_id, generation, devices, &config)?;
+        crate::managed_mounts::prepare(spec).await?;
+        Ok(self.request(request))
     }
 
     async fn restore_request(

@@ -109,10 +109,17 @@ impl ManagedService {
         ctx: &RequestContext,
         scope: &Scope,
         launch: &adx_agent_core::launch::LaunchConfig,
+        parameters: &adx_agent_core::mounts::Parameters,
     ) -> Result<AgentBinding> {
         scope.validate().map_err(Error::Invalid)?;
-        let binding = self.control.prepare_binding(ctx, scope, launch).await?;
-        if binding.scope != *scope || binding.phase != BindingPhase::Active {
+        let binding = self
+            .control
+            .prepare_binding(ctx, scope, launch, parameters)
+            .await?;
+        if binding.scope != *scope
+            || binding.phase != BindingPhase::Active
+            || binding.parameters != *parameters
+        {
             return Err(Error::Unavailable(
                 "prepared binding identity mismatch".into(),
             ));

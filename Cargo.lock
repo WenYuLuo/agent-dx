@@ -18,6 +18,7 @@ dependencies = [
  "axum 0.7.9",
  "base64 0.22.1",
  "hashlink",
+ "ipnet",
  "reqwest 0.12.28",
  "serde",
  "serde_json",

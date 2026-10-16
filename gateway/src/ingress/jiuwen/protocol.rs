@@ -112,6 +112,10 @@ impl Request {
         self.is_stream
     }
 
+    pub(super) fn is_health_check_get_conf(&self) -> bool {
+        self.method_name == "health_check.get_conf"
+    }
+
     pub fn is_unary(&self) -> bool {
         matches!(
             self.method,

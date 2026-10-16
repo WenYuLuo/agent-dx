@@ -79,6 +79,7 @@ impl From<core::Mount> for pb::MountSpec {
     fn from(value: core::Mount) -> Self {
         Self {
             r#type: value.kind,
+            create_if_missing: value.create_if_missing,
             target: value.target,
             options: value.options,
             source: Some(value.source.into()),
@@ -90,6 +91,7 @@ impl TryFrom<pb::MountSpec> for core::Mount {
     fn try_from(value: pb::MountSpec) -> Result<Self> {
         Ok(Self {
             kind: value.r#type,
+            create_if_missing: value.create_if_missing,
             target: value.target,
             options: value.options,
             source: value

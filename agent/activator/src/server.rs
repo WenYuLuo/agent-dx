@@ -158,7 +158,11 @@ async fn prepare(
     Json(r): Json<PrepareBindingRequest>,
 ) -> Response {
     p.start_write();
-    match s.activator.prepare_binding(&r.scope, &r.launch).await {
+    match s
+        .activator
+        .prepare_binding(&r.scope, &r.launch, &r.parameters)
+        .await
+    {
         Ok(v) => Json(v).into_response(),
         Err(e) => failure(e),
     }

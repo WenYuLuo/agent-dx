@@ -19,7 +19,18 @@ pub struct ExecutionSpec {
     pub user: Option<String>,
     pub env: BTreeMap<String, String>,
     pub resources: Resources,
+    #[serde(
+        default,
+        skip_serializing_if = "crate::lifecycle::LifecyclePolicy::is_default"
+    )]
+    pub lifecycle: crate::lifecycle::LifecyclePolicy,
     pub service: Vec<Service>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mounts: Vec<crate::mounts::Mount>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub init_timeout_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readiness_probe: Option<crate::probes::ReadinessProbe>,
 }
 impl From<&TemplateVersion> for ExecutionSpec {
     fn from(value: &TemplateVersion) -> Self {
@@ -32,7 +43,11 @@ impl From<&TemplateVersion> for ExecutionSpec {
             user: None,
             env: value.env.clone(),
             resources: value.resources.clone(),
+            lifecycle: value.lifecycle.clone(),
             service: value.service.clone(),
+            mounts: value.mounts.clone(),
+            init_timeout_seconds: value.init_timeout_seconds,
+            readiness_probe: value.readiness_probe.clone(),
         }
     }
 }
@@ -45,9 +60,16 @@ impl ExecutionSpec {
             isolation_runtime: self.isolation_runtime.clone(),
             env: self.env.clone(),
             resources: self.resources.clone(),
+            lifecycle: self.lifecycle.clone(),
             service: self.service.clone(),
+            mounts: self.mounts.clone(),
+            init_timeout_seconds: self.init_timeout_seconds,
+            readiness_probe: self.readiness_probe.clone(),
         };
         template.validate()?;
+        for mount in &self.mounts {
+            mount.validate()?;
+        }
         if self.inherit_entrypoint {
             if !self.entrypoint.is_empty() || !self.working_dir.is_empty() || self.user.is_some() {
                 return Err("image process inheritance cannot include startup overrides".into());
@@ -98,6 +120,9 @@ pub struct CreateEnvironment {
 pub enum EnvironmentPhase {
     Creating,
     Running,
+    Pausing,
+    Paused,
+    Resuming,
     Failed,
     Deleted,
 }
@@ -113,7 +138,7 @@ pub struct EnvironmentObservation {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "message", rename_all = "snake_case")]
 pub enum EnvironmentError {
-    /// Absent from the caller's visible scope; never confirms physical deletion.
+    /// Absent from the caller's scope. On delete, completes binding cleanup, not a physical-deletion guarantee.
     NotFound,
     Invalid(String),
     Unsupported(String),
@@ -175,6 +200,8 @@ pub trait Environment: Send + Sync {
         id: &str,
     ) -> Result<Option<EnvironmentObservation>, EnvironmentError>;
     /// Deleted is returned only with backend confirmation/fencing; absence alone may race a late create.
+    /// Explicit NotFound permits binding cleanup; authentication and transport failures must
+    /// use other errors so they cannot be mistaken for an absent environment.
     async fn delete(
         &self,
         tenant: &str,

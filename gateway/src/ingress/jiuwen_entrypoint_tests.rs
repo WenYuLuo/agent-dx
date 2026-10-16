@@ -94,6 +94,22 @@ async fn jiuwen_auth_is_transport_independent_while_management_requires_tls() {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         response.collect().await.unwrap();
 
+        let quota = sender
+            .send_request(
+                Request::get("/api/v1/auth/quota")
+                    .header("host", "localhost")
+                    .header("authorization", "Bearer alice-session")
+                    .body(Full::new(Bytes::new()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(quota.status(), StatusCode::OK);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&quota.collect().await.unwrap().to_bytes()).unwrap(),
+            json!({"ok":true,"available":true,"quota":{"total":5.0,"balance":3.75,"used":1.25,"low_balance":false,"exhausted":false,"reset_period":"","reset_at":""}})
+        );
+
         // Business credentials must not authorize management requests. A scheme
         // header also cannot promote a plaintext request to the TLS listener.
         let response = sender
@@ -246,7 +262,7 @@ async fn jiuwen_public_routes_share_one_e2a_and_download_on_another_replica() {
         sender.send_request(wrong_host).await.unwrap().status(),
         StatusCode::FORBIDDEN
     );
-    let login = Request::post("/auth/huawei/login")
+    let login = Request::post("/api/v1/auth/huawei/login")
         .header("host", "localhost")
         .header("content-type", "application/json")
         .body(Full::new(Bytes::from_static(
@@ -257,7 +273,21 @@ async fn jiuwen_public_routes_share_one_e2a_and_download_on_another_replica() {
         sender.send_request(login).await.unwrap().status(),
         StatusCode::UNAUTHORIZED
     );
-    let logout = Request::post("/auth/logout")
+    let agc_login = Request::post("/api/v1/auth/agc/login")
+        .header("host", "localhost")
+        .header("content-type", "application/json")
+        .body(Full::new(Bytes::from_static(
+            br#"{"agcAccessToken":"header.payload.signature","agreementVersion":"1"}"#,
+        )))
+        .unwrap();
+    let response = sender.send_request(agc_login).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&response.into_body().collect().await.unwrap().to_bytes())
+            .unwrap()["code"],
+        "INVALID_AGC_ACCESS_TOKEN"
+    );
+    let logout = Request::post("/api/v1/auth/logout")
         .header("host", "localhost")
         .body(Full::new(Bytes::new()))
         .unwrap();
@@ -492,10 +522,24 @@ async fn jiuwen_public_routes_share_one_e2a_and_download_on_another_replica() {
         ))
         .await
         .unwrap();
-    let ended = tokio::time::timeout(Duration::from_secs(3), frontend.next())
+    let envelope = ws_frame(&mut agent).await;
+    assert_eq!(envelope["user_id"], "alice");
+    agent
+        .send(Message::Text(
+            json!({
+                "protocol_version": "1.0",
+                "request_id": envelope["request_id"],
+                "sequence": 0,
+                "is_final": true,
+                "status": "succeeded",
+                "response_kind": "e2a.complete",
+                "body": {"result": {"sessions": [], "total": 0}}
+            })
+            .to_string(),
+        ))
         .await
         .unwrap();
-    assert!(matches!(ended, None | Some(Ok(Message::Close(_)))));
+    assert_eq!(ws_frame(&mut frontend).await["id"], "after-logout");
     assert!(backends.try_recv().is_err());
     // Closing either side releases its stream; requests are not replayed.
     let _ = agent.close(None).await;
@@ -523,6 +567,12 @@ impl crate::ingress::accounts::BusinessAuth for TestAuth {
     ) -> crate::ingress::accounts::Result<crate::ingress::accounts::LoginResponse> {
         Err(crate::ingress::accounts::Error::Unauthorized)
     }
+    async fn agc_login(
+        &self,
+        _: crate::ingress::accounts::AgcLoginRequest,
+    ) -> crate::ingress::accounts::Result<crate::ingress::accounts::LoginResponse> {
+        Err(crate::ingress::accounts::Error::InvalidAgcAccessToken)
+    }
     async fn authenticate(
         &self,
         token: &str,
@@ -549,6 +599,24 @@ impl crate::ingress::accounts::BusinessAuth for TestAuth {
     }
     async fn logout(&self, _: &str) -> crate::ingress::accounts::Result<()> {
         Ok(())
+    }
+    async fn quota(
+        &self,
+        _: &crate::ingress::accounts::Principal,
+    ) -> crate::ingress::accounts::Result<crate::ingress::accounts::QuotaResponse> {
+        Ok(crate::ingress::accounts::QuotaResponse {
+            ok: true,
+            available: true,
+            quota: crate::ingress::accounts::ModelQuota {
+                total: 5.0,
+                balance: 3.75,
+                used: 1.25,
+                low_balance: false,
+                exhausted: false,
+                reset_period: String::new(),
+                reset_at: String::new(),
+            },
+        })
     }
     async fn launch_config(
         &self,
