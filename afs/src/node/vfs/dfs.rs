@@ -25,7 +25,7 @@ mod pending_trace;
 use pending_trace::PendingTrace;
 
 use super::{
-    Backend,
+    Backend, WriteAdmissionMode,
     locks::{LockError, LockRequest, LockTable, LockWaiterId, LockWaiterOutcome},
     types::{
         AttributeChange, BackendInode, CreatedFile, DirectoryEntry, DirectoryHandle, Entry,
@@ -45,8 +45,8 @@ use crate::{
         XattrSetMode,
     },
     node::chunk::{
-        ChunkBuilder, ChunkStore, DeferredChunkPut, DeferredWriteBudget, StagedChunk,
-        WriteBudgetReservation,
+        ChunkBuilder, ChunkStore, DeferredChunkPut, DeferredWriteBudget, SharedChunkBytes,
+        StagedChunk, WriteBudgetReservation, WriteBufferPool,
     },
     node::dfs_read::{
         ChunkReadOp, CurrentExternalReadOutcome, DfsReadEngine, NativeReadAuthoritySnapshot,
@@ -253,6 +253,7 @@ pub struct DistributedFs {
     remote_operation_results: Mutex<HashMap<RemoteOperationKey, RemoteOperationResult>>,
     readonly_version_cache: Mutex<Option<ReadOnlyVersionCache>>,
     dirty_budget_bytes: u64,
+    write_buffer_pool: Arc<WriteBufferPool>,
     inode_to_backend: Mutex<HashMap<InodeId, u64>>,
     backend_to_inode: Mutex<HashMap<u64, InodeId>>,
     next_inode: AtomicU64,
@@ -1130,8 +1131,9 @@ impl PublicationWindow {
             chunk_id = tracing::field::Empty,
         )
         .in_scope(|| {
-            // The Vec and Arc coexist during conversion. Only that bounded transient
-            // uses the publisher reserve; the long-lived allocation stays normal.
+            // Keep the existing conservative publisher admission. Freezing now
+            // moves the Vec allocation; the long-lived normal lease must cover
+            // its actual capacity, including a partially filled final buffer.
             let mut reservation = self
                 .pending_reservation
                 .take()
@@ -1146,7 +1148,7 @@ impl PublicationWindow {
             .in_scope(|| builder.replace(std::mem::take(&mut self.pending)));
             let mut staged = builder.stage(self.operation_id.clone());
             tracing::Span::current().record("chunk_id", staged.chunk.id.0.as_str());
-            reservation.reduce_normal_to(length)?;
+            reservation.reduce_normal_to(staged.shared_bytes().capacity() as u64)?;
             staged.retain_write_budget(std::slice::from_ref(&reservation));
             self.pending_start = None;
             Ok(WindowStagedChunk {
@@ -1198,7 +1200,9 @@ struct DirtyExtent {
     file_offset: u64,
     length: u64,
     write_seq: u64,
-    data: Option<Arc<[u8]>>,
+    data: Option<SharedChunkBytes>,
+    builder: Option<usize>,
+    source_offset: usize,
     uploaded: Option<UploadedDirtyExtent>,
     // A resolved dirty read view can outlive publication and must keep the
     // original allocation charged even after the inode/window releases it.
@@ -1211,9 +1215,44 @@ struct UploadedDirtyExtent {
     receipt: ChunkReceipt,
 }
 
-#[derive(Clone, Default)]
+#[derive(Default)]
 struct DirtyExtentMap {
     extents: Vec<DirtyExtent>,
+    builders: Vec<NativeDirtyBuilder>,
+    native_admitted_bytes: Option<u64>,
+}
+
+struct NativeDirtyBuilder {
+    file_offset: u64,
+    builder: ChunkBuilder,
+}
+
+// Frozen maps and S3 maps only clone immutable owners. The sole mutable-map
+// clone fallback is a read snapshot; production reads use snapshot_range instead.
+impl Clone for DirtyExtentMap {
+    fn clone(&self) -> Self {
+        let bodies = self
+            .builders
+            .iter()
+            .map(|entry| SharedChunkBytes::from_vec(entry.builder.as_bytes().to_vec()))
+            .collect::<Vec<_>>();
+        let extents = self
+            .extents
+            .iter()
+            .map(|extent| {
+                let mut extent = extent.clone();
+                if let Some(index) = extent.builder.take() {
+                    extent.data = Some(bodies[index].clone());
+                }
+                extent
+            })
+            .collect();
+        Self {
+            extents,
+            builders: Vec::new(),
+            native_admitted_bytes: self.native_admitted_bytes,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1253,7 +1292,7 @@ struct CommitPlan {
 struct OverlaySegment {
     file_offset: u64,
     length: u64,
-    data: Option<(Arc<[u8]>, usize)>,
+    data: Option<(SharedChunkBytes, usize)>,
 }
 
 #[derive(Clone)]
@@ -1379,6 +1418,7 @@ impl DistributedFs {
             remote_operation_results: Mutex::new(HashMap::new()),
             readonly_version_cache: Mutex::new(None),
             dirty_budget_bytes: DEFAULT_DIRTY_DATA_BUDGET_BYTES,
+            write_buffer_pool: WriteBufferPool::new(128 * 1024 * 1024),
             inode_to_backend: Mutex::new(HashMap::from([(InodeId::new("1"), ROOT_INODE)])),
             backend_to_inode: Mutex::new(HashMap::from([(ROOT_INODE, InodeId::new("1"))])),
             next_inode: AtomicU64::new(ROOT_INODE + 1),
@@ -1390,6 +1430,11 @@ impl DistributedFs {
 
     pub fn with_dirty_budget_bytes(mut self, budget: u64) -> Self {
         self.dirty_budget_bytes = budget.max(1);
+        self
+    }
+
+    pub fn with_write_buffer_pool(mut self, pool: Arc<WriteBufferPool>) -> Self {
+        self.write_buffer_pool = pool;
         self
     }
 
@@ -2227,7 +2272,7 @@ impl DistributedFs {
                         .in_flight
                         .as_ref()
                         .and_then(InFlightCommit::dirty_extents),
-                    active: state.dirty_extents.clone(),
+                    active: state.dirty_extents.snapshot_range(offset, out.len())?,
                 }
             };
             return self.read_visible_resolved(view, offset, out);
@@ -2823,8 +2868,7 @@ impl DistributedFs {
                         state.commit_busy = true;
                         break 'action CommitAction::Send(pending);
                     } else {
-                        let mut frozen = Self::freeze_state_for_commit(&state);
-                        frozen.dirty_extents = std::mem::take(&mut state.dirty_extents);
+                        let mut frozen = Self::freeze_state_for_commit(&mut state);
                         frozen.dirty_budget_reservations =
                             std::mem::take(&mut state.dirty_budget_reservations);
                         let publication_window = state.publication_window.take();
@@ -2930,60 +2974,88 @@ impl DistributedFs {
     ) -> Result<Option<u64>> {
         let committed_kill_suidgid = matches!(&pending, InFlightCommit::File(pending) if pending.frozen.kill_suidgid_dirty)
             || matches!(&pending, InFlightCommit::Metadata(sync, _) if sync.metadata_delta.kill_suidgid);
-        let result = (|| match &pending {
-            InFlightCommit::Preparing(_, _) => {
-                Err(unavailable("DFS inode commit is still preparing"))
-            }
-            InFlightCommit::File(pending) => {
-                let committed_full_metadata =
-                    pending.batch.commit.metadata_delta.mode == CommitMetadataMode::Full;
-                let version = pending.batch.commit.file_version.clone();
-                let layout = pending.batch.commit.layout_root.clone();
-                if let Some(trace) = &self.pending_trace
-                    && let Ok(state) = cell.lock()
-                {
-                    trace.observe("dfs_pending_commit_send", branch, &state, pending, None);
+        let result =
+            (|| match &pending {
+                InFlightCommit::Preparing(_, _) => {
+                    Err(unavailable("DFS inode commit is still preparing"))
                 }
-                let publish_span = tracing::info_span!(
-                    "node.dfs.commit.publish",
-                    branch,
-                    inode_id = %pending.batch.commit.inode_id.0,
-                    operation_id = %pending.batch.commit.operation_id.0,
-                    through_seq = pending.batch.through_seq,
-                    chunks = pending.batch.commit.chunk_receipts.len(),
-                    file_length = pending.batch.commit.file_version.length,
-                    metadata_mode = ?pending.batch.commit.metadata_delta.mode,
-                    has_timeout = timeout.is_some(),
-                );
-                let updated = self.validate_inode(publish_span.in_scope(|| {
+                InFlightCommit::File(pending) => {
+                    let committed_full_metadata =
+                        pending.batch.commit.metadata_delta.mode == CommitMetadataMode::Full;
+                    let version = pending.batch.commit.file_version.clone();
+                    let layout = pending.batch.commit.layout_root.clone();
+                    if let Some(trace) = &self.pending_trace
+                        && let Ok(state) = cell.lock()
+                    {
+                        trace.observe("dfs_pending_commit_send", branch, &state, pending, None);
+                    }
+                    let publish_span = tracing::info_span!(
+                        "node.dfs.commit.publish",
+                        branch,
+                        inode_id = %pending.batch.commit.inode_id.0,
+                        operation_id = %pending.batch.commit.operation_id.0,
+                        through_seq = pending.batch.through_seq,
+                        chunks = pending.batch.commit.chunk_receipts.len(),
+                        file_length = pending.batch.commit.file_version.length,
+                        metadata_mode = ?pending.batch.commit.metadata_delta.mode,
+                        has_timeout = timeout.is_some(),
+                    );
+                    let rpc_started = Instant::now();
+                    let updated = self.validate_inode(publish_span.in_scope(|| {
                     if let Some(timeout) = timeout {
                         self.meta
                             .commit_file_version_with_timeout(pending.batch.commit.clone(), timeout)
                     } else {
                         self.meta.commit_file_version(pending.batch.commit.clone())
                     }
+                }).inspect_err(|error| {
+                    afs_logging::warn!("dfs.commit_rpc_failed";
+                        "method" => "commit_file_version",
+                        "inode_id" => pending.batch.commit.inode_id.0.as_str(),
+                        "operation_id" => pending.batch.commit.operation_id.0.as_str(),
+                        "branch" => branch,
+                        "timeout" => timeout.map(|value| format!("{}ms", value.as_millis()))
+                            .unwrap_or_else(|| "foreground_default".to_owned()),
+                        "elapsed_ms" => rpc_started.elapsed().as_secs_f64() * 1000.0,
+                        "error" => error.to_string()
+                    );
                 })?)?;
-                Ok(AppliedCommit::File {
-                    through_seq: pending.batch.through_seq,
-                    committed_full_metadata,
-                    version,
-                    layout,
-                    updated,
-                })
-            }
-            InFlightCommit::Metadata(sync, through_seq) => {
-                let updated = self.validate_inode(if let Some(timeout) = timeout {
-                    self.meta
-                        .sync_inode_metadata_with_timeout(sync.clone(), timeout)?
-                } else {
-                    self.meta.sync_inode_metadata(sync.clone())?
-                })?;
-                Ok(AppliedCommit::Metadata {
-                    through_seq: *through_seq,
-                    updated,
-                })
-            }
-        })();
+                    Ok(AppliedCommit::File {
+                        through_seq: pending.batch.through_seq,
+                        committed_full_metadata,
+                        version,
+                        layout,
+                        updated,
+                    })
+                }
+                InFlightCommit::Metadata(sync, through_seq) => {
+                    let rpc_started = Instant::now();
+                    let updated = self.validate_inode(
+                        (if let Some(timeout) = timeout {
+                            self.meta
+                                .sync_inode_metadata_with_timeout(sync.clone(), timeout)
+                        } else {
+                            self.meta.sync_inode_metadata(sync.clone())
+                        })
+                        .inspect_err(|error| {
+                            afs_logging::warn!("dfs.commit_rpc_failed";
+                                "method" => "sync_inode_metadata",
+                                "inode_id" => sync.inode_id.0.as_str(),
+                                "operation_id" => sync.operation_id.0.as_str(),
+                                "branch" => branch,
+                                "timeout" => timeout.map(|value| format!("{}ms", value.as_millis()))
+                                    .unwrap_or_else(|| "foreground_default".to_owned()),
+                                "elapsed_ms" => rpc_started.elapsed().as_secs_f64() * 1000.0,
+                                "error" => error.to_string()
+                            );
+                        })?,
+                    )?;
+                    Ok(AppliedCommit::Metadata {
+                        through_seq: *through_seq,
+                        updated,
+                    })
+                }
+            })();
 
         let mut state = cell
             .lock()
@@ -3651,6 +3723,13 @@ impl DistributedFs {
             return Ok(());
         };
         self.update_handle_error_cursor(handle, observed.cursor)?;
+        afs_logging::warn!("dfs.background_error_consumed";
+            "inode_id" => snapshot.inode_id.0.as_str(),
+            "handle" => handle.0,
+            "previous_cursor" => session.local.error_cursor,
+            "cursor" => observed.cursor,
+            "error" => observed.error.to_string()
+        );
         Err(observed.error)
     }
 
@@ -5380,8 +5459,7 @@ impl DistributedFs {
         if state.in_flight.is_some() || !state.dirty || state.publication_window.is_none() {
             return Ok(None);
         }
-        let mut frozen = Self::freeze_state_for_commit(&state);
-        frozen.dirty_extents = std::mem::take(&mut state.dirty_extents);
+        let mut frozen = Self::freeze_state_for_commit(&mut state);
         frozen.dirty_budget_reservations = std::mem::take(&mut state.dirty_budget_reservations);
         let through_seq = frozen.through_seq;
         let logical_length = frozen.logical_length;
@@ -5448,7 +5526,9 @@ impl DistributedFs {
         Ok(None)
     }
 
-    fn freeze_state_for_commit(state: &InodeWriteState) -> FrozenCommit {
+    fn freeze_state_for_commit(state: &mut InodeWriteState) -> FrozenCommit {
+        let mut dirty_extents = std::mem::take(&mut state.dirty_extents);
+        dirty_extents.freeze_builders();
         FrozenCommit {
             through_seq: state.visible_write_seq,
             logical_length: state.logical_length,
@@ -5456,7 +5536,7 @@ impl DistributedFs {
             write_lease: state.write_lease.clone(),
             base_version: state.base_version.clone(),
             base_layout: state.base_layout.clone(),
-            dirty_extents: state.dirty_extents.clone(),
+            dirty_extents,
             dirty_budget_reservations: state.dirty_budget_reservations.clone(),
             kill_suidgid_dirty: state.kill_suidgid_dirty,
         }
@@ -5779,6 +5859,11 @@ impl DistributedFs {
             .background_error
             .as_ref()
             .map_or(1, |previous| previous.cursor.saturating_add(1));
+        afs_logging::warn!("dfs.background_error_recorded";
+            "inode_id" => inode_id.0.as_str(),
+            "cursor" => cursor,
+            "error" => error.to_string()
+        );
         state.background_error = Some(ObservedWriteError { cursor, error });
         Ok(())
     }
@@ -5811,19 +5896,172 @@ impl From<&DfsFileHandle> for DfsFileHandleSnapshot {
     }
 }
 
-fn account_arc_bytes(seen: &mut HashSet<usize>, data: &Arc<[u8]>) -> u64 {
-    if data.is_empty() {
+fn account_arc_bytes(seen: &mut HashSet<usize>, data: &SharedChunkBytes) -> u64 {
+    if data.capacity() == 0 {
         return 0;
     }
-    let key = data.as_ptr() as usize;
+    let key = data.allocation_id() as usize;
     if seen.insert(key) {
-        data.len() as u64
+        data.capacity() as u64
     } else {
         0
     }
 }
 
 impl DirtyExtentMap {
+    fn write_native_at(
+        &mut self,
+        offset: u64,
+        data: &[u8],
+        write_seq: u64,
+        pool: &Arc<WriteBufferPool>,
+        logical_length: u64,
+    ) -> Result<usize> {
+        offset
+            .checked_add(data.len() as u64)
+            .ok_or_else(file_too_large)?;
+        self.native_admitted_bytes.get_or_insert(0);
+        let mut accepted = 0;
+        while accepted < data.len() {
+            let position = offset + accepted as u64;
+            let latest = self.extents.iter().rev().find(|extent| {
+                extent.file_offset <= position && position < extent.file_offset + extent.length
+            });
+            let existing = latest.and_then(|extent| {
+                extent.builder.map(|index| {
+                    let source = extent.source_offset + (position - extent.file_offset) as usize;
+                    (
+                        index,
+                        source,
+                        (extent.file_offset + extent.length - position) as usize,
+                    )
+                })
+            });
+            let append = if existing.is_none() && position >= logical_length {
+                self.builders
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .find_map(|(index, entry)| {
+                        let length = entry.builder.len();
+                        (entry.file_offset + length as u64 == position
+                            && length < entry.builder.writable_capacity())
+                        .then_some((index, length, entry.builder.writable_capacity() - length))
+                    })
+            } else {
+                None
+            };
+            let (index, source_offset, available) = if let Some(existing) = existing.or(append) {
+                existing
+            } else {
+                let remaining = data.len() - accepted;
+                let capacity = if position >= logical_length {
+                    COMMIT_CHUNK_BYTES as usize
+                } else {
+                    remaining
+                        .min(COMMIT_CHUNK_BYTES as usize)
+                        .max(4096)
+                        .next_power_of_two()
+                };
+                let builder = match ChunkBuilder::with_pool(pool.clone(), capacity) {
+                    Ok(builder) => builder,
+                    Err(_error) if accepted > 0 => return Ok(accepted),
+                    Err(error) => return Err(error),
+                };
+                let index = self.builders.len();
+                self.builders.push(NativeDirtyBuilder {
+                    file_offset: position,
+                    builder,
+                });
+                (index, 0, capacity)
+            };
+            let take = available.min(data.len() - accepted);
+            self.builders[index]
+                .builder
+                .write_at(source_offset as u64, &data[accepted..accepted + take])?;
+            self.extents.push(DirtyExtent {
+                file_offset: position,
+                length: take as u64,
+                write_seq,
+                data: None,
+                builder: Some(index),
+                source_offset,
+                uploaded: None,
+                budget_reservations: Vec::new(),
+            });
+            let admitted = self.native_admitted_bytes.get_or_insert(0);
+            *admitted = admitted.saturating_add(take as u64);
+            accepted += take;
+        }
+        Ok(accepted)
+    }
+
+    // Consuming builders is the only path that exposes their allocation to
+    // asynchronous holders. No writable alias survives this transition.
+    fn freeze_builders(&mut self) {
+        let bodies = std::mem::take(&mut self.builders)
+            .into_iter()
+            .map(|entry| entry.builder.freeze())
+            .collect::<Vec<_>>();
+        for extent in &mut self.extents {
+            if let Some(index) = extent.builder.take() {
+                extent.data = Some(bodies[index].clone());
+            }
+        }
+    }
+
+    // Called while the inode mutex is held. Copy only bytes intersecting this
+    // read; a later write may mutate its builder while network reads run.
+    fn snapshot_range(&self, offset: u64, length: usize) -> Result<Self> {
+        let end = offset
+            .checked_add(length as u64)
+            .ok_or_else(|| invalid("dirty snapshot range overflow"))?;
+        let mut snapshot = Self::default();
+        for extent in &self.extents {
+            let start = offset.max(extent.file_offset);
+            let stop = end.min(
+                extent
+                    .file_offset
+                    .checked_add(extent.length)
+                    .ok_or_else(|| invalid("dirty snapshot extent overflow"))?,
+            );
+            if start >= stop {
+                continue;
+            }
+            let mut copied = extent.clone();
+            copied.file_offset = start;
+            copied.length = stop - start;
+            let source = extent.source_offset
+                + usize::try_from(start - extent.file_offset)
+                    .map_err(|_| invalid("dirty snapshot source overflow"))?;
+            if let Some(index) = extent.builder {
+                let bytes = &self.builders[index].builder.as_bytes();
+                // Holes installed by truncate can mask an obsolete tail. Do not
+                // even read that tail into the snapshot before applying holes.
+                let available = bytes
+                    .len()
+                    .saturating_sub(source)
+                    .min(copied.length as usize);
+                let mut body = vec![0; copied.length as usize];
+                if available > 0 {
+                    body[..available].copy_from_slice(&bytes[source..source + available]);
+                }
+                tracing::info_span!(
+                    "node.dfs.write_buffer.read_snapshot_copy",
+                    bytes = available as u64
+                )
+                .in_scope(|| {});
+                copied.data = Some(SharedChunkBytes::from_vec(body));
+                copied.source_offset = 0;
+                copied.builder = None;
+            } else {
+                copied.source_offset = source;
+            }
+            snapshot.extents.push(copied);
+        }
+        Ok(snapshot)
+    }
+
     fn write_at(&mut self, offset: u64, data: &[u8], write_seq: u64) -> Result<usize> {
         let _ = usize::try_from(offset).map_err(|_| invalid("write offset is too large"))?;
         if !data.is_empty() {
@@ -5831,7 +6069,9 @@ impl DirtyExtentMap {
                 file_offset: offset,
                 length: data.len() as u64,
                 write_seq,
-                data: Some(Arc::from(data)),
+                data: Some(SharedChunkBytes::from_vec(data.to_vec())),
+                builder: None,
+                source_offset: 0,
                 uploaded: None,
                 budget_reservations: Vec::new(),
             });
@@ -5848,6 +6088,24 @@ impl DirtyExtentMap {
     }
 
     fn resize(&mut self, old_length: u64, new_length: u64, write_seq: u64) -> Result<()> {
+        if new_length < old_length {
+            for entry in &mut self.builders {
+                let keep = new_length
+                    .saturating_sub(entry.file_offset)
+                    .min(entry.builder.len() as u64) as usize;
+                entry.builder.truncate(keep);
+            }
+            // A masked tail must not survive as an extent longer than the
+            // now-shorter immutable body when this batch is frozen/retried.
+            for extent in &mut self.extents {
+                if extent.builder.is_some() {
+                    extent.length = extent
+                        .length
+                        .min(new_length.saturating_sub(extent.file_offset));
+                }
+            }
+            self.extents.retain(|extent| extent.length > 0);
+        }
         let (start, stop) = if new_length < old_length {
             (new_length, old_length)
         } else {
@@ -5859,6 +6117,8 @@ impl DirtyExtentMap {
                 length: stop - start,
                 write_seq,
                 data: None,
+                builder: None,
+                source_offset: 0,
                 uploaded: None,
                 budget_reservations: Vec::new(),
             });
@@ -5886,8 +6146,9 @@ impl DirtyExtentMap {
                 .map_err(|_| invalid("dirty overlay length is too large"))?;
             match &extent.data {
                 Some(data) => {
-                    let data_start = usize::try_from(start - extent.file_offset)
-                        .map_err(|_| invalid("dirty data offset is too large"))?;
+                    let data_start = extent.source_offset
+                        + usize::try_from(start - extent.file_offset)
+                            .map_err(|_| invalid("dirty data offset is too large"))?;
                     out[output_start..output_start + length]
                         .copy_from_slice(&data[data_start..data_start + length]);
                 }
@@ -5906,12 +6167,17 @@ impl DirtyExtentMap {
         older.extents.append(&mut self.extents);
         older.extents.sort_by_key(|extent| extent.write_seq);
         self.extents = older.extents;
+        self.native_admitted_bytes = match (older.native_admitted_bytes, self.native_admitted_bytes)
+        {
+            (None, None) => None,
+            (left, right) => Some(left.unwrap_or(0).saturating_add(right.unwrap_or(0))),
+        };
     }
 
     fn replace_range_with_shared(
         &mut self,
         offset: u64,
-        data: Arc<[u8]>,
+        data: SharedChunkBytes,
         write_seq: u64,
         budget_reservations: Vec<WriteBudgetReservation>,
     ) -> Result<()> {
@@ -5940,13 +6206,15 @@ impl DirtyExtentMap {
                 let left_len = offset - extent.file_offset;
                 let left_data = extent.data.as_ref().map(|bytes| {
                     let len = usize::try_from(left_len).unwrap_or(bytes.len());
-                    Arc::<[u8]>::from(&bytes[..len])
+                    bytes.slice(extent.source_offset..extent.source_offset + len)
                 });
                 rebuilt.push(DirtyExtent {
                     file_offset: extent.file_offset,
                     length: left_len,
                     write_seq: extent.write_seq,
                     data: left_data,
+                    builder: None,
+                    source_offset: 0,
                     uploaded: None,
                     budget_reservations: extent.budget_reservations.clone(),
                 });
@@ -5956,13 +6224,17 @@ impl DirtyExtentMap {
                 let right_len = extent_end - end;
                 let right_data = extent.data.as_ref().map(|bytes| {
                     let start = usize::try_from(end - extent.file_offset).unwrap_or(bytes.len());
-                    Arc::<[u8]>::from(&bytes[start..])
+                    bytes.slice(
+                        extent.source_offset + start..extent.source_offset + extent.length as usize,
+                    )
                 });
                 rebuilt.push(DirtyExtent {
                     file_offset: right_offset,
                     length: right_len,
                     write_seq: extent.write_seq,
                     data: right_data,
+                    builder: None,
+                    source_offset: 0,
                     uploaded: None,
                     budget_reservations: extent.budget_reservations.clone(),
                 });
@@ -5973,6 +6245,8 @@ impl DirtyExtentMap {
             length: data.len() as u64,
             write_seq,
             data: Some(data),
+            builder: None,
+            source_offset: 0,
             uploaded: None,
             budget_reservations,
         });
@@ -6035,6 +6309,9 @@ impl DirtyExtentMap {
     }
 
     fn dirty_data_bytes(&self) -> u64 {
+        if let Some(accepted) = self.native_admitted_bytes {
+            return accepted;
+        }
         self.extents
             .iter()
             .filter(|extent| {
@@ -6081,6 +6358,102 @@ impl CommitPlanner {
             extents = subtract_range(extents, segment.file_offset, segment.length)?;
         }
 
+        if frozen.dirty_extents.native_admitted_bytes.is_some() {
+            let mut visible_sources: HashMap<(u64, usize, usize), Vec<(usize, usize)>> =
+                HashMap::new();
+            for segment in &overlay {
+                let Some((bytes, source_offset)) = &segment.data else {
+                    continue;
+                };
+                let length = usize::try_from(segment.length)
+                    .map_err(|_| invalid("native source range is too large"))?;
+                let end = source_offset
+                    .checked_add(length)
+                    .filter(|end| *end <= bytes.len())
+                    .ok_or_else(|| invalid("native source range exceeds immutable body"))?;
+                let identity = (bytes.allocation_id(), bytes.as_ptr() as usize, bytes.len());
+                visible_sources
+                    .entry(identity)
+                    .or_default()
+                    .push((*source_offset, end));
+            }
+            for ranges in visible_sources.values_mut() {
+                ranges.sort_unstable();
+                let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+                for (start, end) in ranges.drain(..) {
+                    if let Some(previous) = merged.last_mut()
+                        && start <= previous.1
+                    {
+                        previous.1 = previous.1.max(end);
+                    } else {
+                        merged.push((start, end));
+                    }
+                }
+                *ranges = merged;
+            }
+            let mut staged_chunks = Vec::new();
+            let mut staged_by_source = HashMap::new();
+            for segment in overlay {
+                let Some((bytes, source_offset)) = segment.data else {
+                    continue;
+                };
+                let identity = (bytes.allocation_id(), bytes.as_ptr() as usize, bytes.len());
+                let source_end = source_offset + segment.length as usize;
+                let (start, end) = visible_sources
+                    .get(&identity)
+                    .and_then(|ranges| {
+                        ranges
+                            .iter()
+                            .copied()
+                            .find(|(start, end)| *start <= source_offset && source_end <= *end)
+                    })
+                    .ok_or_else(|| invalid("native source has no final visible interval"))?;
+                // Only final visible contiguous source ranges are hashed and
+                // persisted. Restored frozen tails and overwritten interiors
+                // stay owned but never become new submitted payload bytes.
+                let key = (identity, start, end);
+                let staged_index = match staged_by_source.get(&key) {
+                    Some(index) => *index,
+                    None => {
+                        let index = staged_chunks.len();
+                        staged_chunks.push(StagedChunk::from_shared(
+                            operation_id.clone(),
+                            bytes.slice(start..end),
+                        ));
+                        staged_by_source.insert(key, index);
+                        index
+                    }
+                };
+                let staged: &StagedChunk = &staged_chunks[staged_index];
+                extents.push(Extent {
+                    file_offset: segment.file_offset,
+                    length: segment.length,
+                    chunk_id: staged.chunk.id.clone(),
+                    chunk_offset: (source_offset - start) as u64,
+                });
+            }
+            extents.sort_by_key(|extent| extent.file_offset);
+            let mut coalesced: Vec<Extent> = Vec::with_capacity(extents.len());
+            for extent in extents {
+                if let Some(previous) = coalesced.last_mut()
+                    && previous.file_offset + previous.length == extent.file_offset
+                    && previous.chunk_id == extent.chunk_id
+                    && previous.chunk_offset + previous.length == extent.chunk_offset
+                {
+                    previous.length += extent.length;
+                } else {
+                    coalesced.push(extent);
+                }
+            }
+            return Ok(CommitPlan {
+                layout_root: LayoutRoot {
+                    id: layout_id,
+                    file_length: frozen.logical_length,
+                    inline_extents: coalesced,
+                },
+                staged_chunks,
+            });
+        }
         let mut staged_chunks = Vec::new();
         let mut pending_start = None;
         let mut pending = Vec::new();
@@ -6209,7 +6582,7 @@ fn normalized_overlay(map: &DirtyExtentMap, file_length: u64) -> Result<Vec<Over
             file_offset: dirty.file_offset,
             length: dirty_end - dirty.file_offset,
             data: match &dirty.data {
-                Some(bytes) => Some((bytes.clone(), 0)),
+                Some(bytes) => Some((bytes.clone(), dirty.source_offset)),
                 None if dirty.uploaded.is_some() => {
                     return Err(unavailable(
                         "DFS uploaded dirty extent must use its publication receipt",
@@ -8350,6 +8723,20 @@ impl Backend for DistributedFs {
         self.write_with_options(ctx, handle, offset, data, WriteOptions::default())
     }
 
+    fn write_admission_mode(&self, handle: FileHandle) -> WriteAdmissionMode {
+        if !self.deferred_publication_enabled()
+            && self
+                .handle_snapshot(handle)
+                .ok()
+                .and_then(|snapshot| snapshot.write_session)
+                .is_some_and(|session| session.remote.is_none())
+        {
+            WriteAdmissionMode::Borrowed
+        } else {
+            WriteAdmissionMode::Queued
+        }
+    }
+
     fn write_with_options(
         &self,
         _: &RequestContext,
@@ -8651,7 +9038,18 @@ impl Backend for DistributedFs {
                     }
                     written
                 } else {
-                    let written = state.dirty_extents.write_at(file_offset, chunk, next_seq)?;
+                    let logical_length = state.logical_length;
+                    let written = if deferred_publication {
+                        state.dirty_extents.write_at(file_offset, chunk, next_seq)?
+                    } else {
+                        state.dirty_extents.write_native_at(
+                            file_offset,
+                            chunk,
+                            next_seq,
+                            &self.write_buffer_pool,
+                            logical_length,
+                        )?
+                    };
                     if let Some(reservation) = deferred_reservation.take() {
                         state
                             .dirty_extents
@@ -8660,7 +9058,9 @@ impl Backend for DistributedFs {
                     }
                     written
                 };
-                let end_offset = _end_offset;
+                let end_offset = file_offset
+                    .checked_add(written as u64)
+                    .ok_or_else(file_too_large)?;
                 state.logical_length = state.logical_length.max(end_offset);
                 if written > 0 {
                     state.next_write_seq = next_seq;
@@ -8731,6 +9131,11 @@ impl Backend for DistributedFs {
                         return Ok(total_written);
                     }
                 }
+            }
+            if written < planned_take {
+                // A fallible builder allocation accepted only a prefix. Keep
+                // the existing sync handling below and report a legal short write.
+                break;
             }
             if over_budget {
                 dirty_budget_commits = dirty_budget_commits.saturating_add(1);
@@ -10488,7 +10893,7 @@ fn push_dirty_allocated_ranges(
     logical_length: u64,
 ) -> Result<()> {
     for extent in &map.extents {
-        if extent.data.is_some() {
+        if extent.data.is_some() || extent.builder.is_some() {
             push_allocated_range(ranges, extent.file_offset, extent.length, logical_length)?;
         }
     }
@@ -12144,6 +12549,353 @@ mod tests {
         ) -> Result<usize> {
             self.inner.read_at(chunk_id, offset, out)
         }
+    }
+
+    #[test]
+    fn native_builder_six_megabytes_freezes_two_allocations_without_body_move() {
+        let pool = WriteBufferPool::new(16 * 1024 * 1024);
+        let mut dirty = DirtyExtentMap::default();
+        for index in 0..6u64 {
+            let bytes = vec![index as u8 + 1; 1024 * 1024];
+            assert_eq!(
+                dirty
+                    .write_native_at(
+                        index * 1024 * 1024,
+                        &bytes,
+                        index + 1,
+                        &pool,
+                        index * 1024 * 1024
+                    )
+                    .unwrap(),
+                bytes.len()
+            );
+        }
+        assert_eq!(dirty.builders.len(), 2);
+        assert_eq!(dirty.builders[0].builder.len(), 4 * 1024 * 1024);
+        assert_eq!(dirty.builders[1].builder.len(), 2 * 1024 * 1024);
+        let identities = dirty
+            .builders
+            .iter()
+            .map(|entry| {
+                (
+                    entry.builder.data_ptr(),
+                    entry.builder.capacity(),
+                    entry.builder.allocation_id(),
+                )
+            })
+            .collect::<Vec<_>>();
+        dirty.freeze_builders();
+        assert!(dirty.builders.is_empty());
+        let mut bodies = HashMap::new();
+        for extent in &dirty.extents {
+            let body = extent.data.as_ref().unwrap();
+            bodies.entry(body.allocation_id()).or_insert(body.clone());
+        }
+        assert_eq!(bodies.len(), 2);
+        for (pointer, capacity, generation) in identities {
+            let body = &bodies[&generation];
+            assert_eq!(body.as_ptr(), pointer);
+            assert_eq!(body.capacity(), capacity);
+        }
+        assert_eq!(dirty.dirty_data_bytes(), 6 * 1024 * 1024);
+    }
+
+    #[test]
+    fn native_builder_uncommitted_overwrite_is_in_place_and_counts_admission() {
+        let pool = WriteBufferPool::new(0);
+        let mut dirty = DirtyExtentMap::default();
+        dirty
+            .write_native_at(0, &vec![3; 4 * 1024 * 1024], 1, &pool, 0)
+            .unwrap();
+        let pointer = dirty.builders[0].builder.data_ptr();
+        dirty
+            .write_native_at(8192, &[7; 4096], 2, &pool, 4 * 1024 * 1024)
+            .unwrap();
+        assert_eq!(dirty.builders.len(), 1);
+        assert_eq!(dirty.builders[0].builder.data_ptr(), pointer);
+        assert_eq!(
+            &dirty.builders[0].builder.as_bytes()[8192..12288],
+            &[7; 4096]
+        );
+        assert_eq!(dirty.dirty_data_bytes(), 4 * 1024 * 1024 + 4096);
+    }
+
+    #[test]
+    fn native_builder_committed_patch_is_small_and_truncate_extension_is_a_hole() {
+        let pool = WriteBufferPool::new(0);
+        let mut patch = DirtyExtentMap::default();
+        patch
+            .write_native_at(8192, &[9; 4096], 1, &pool, 6 * 1024 * 1024)
+            .unwrap();
+        assert_eq!(patch.builders[0].builder.capacity(), 4096);
+        assert_eq!(patch.builders[0].builder.len(), 4096);
+        let mut dirty = DirtyExtentMap::default();
+        dirty.write_native_at(0, &[5; 16384], 1, &pool, 0).unwrap();
+        dirty.resize(16384, 8192, 2).unwrap();
+        dirty.resize(8192, 16384, 3).unwrap();
+        let snapshot = dirty.snapshot_range(0, 16384).unwrap();
+        let mut out = vec![99; 16384];
+        snapshot.overlay(0, &mut out).unwrap();
+        assert_eq!(&out[..8192], &[5; 8192]);
+        assert_eq!(&out[8192..], &[0; 8192]);
+        dirty.freeze_builders();
+        assert_eq!(dirty.extents[0].data.as_ref().unwrap().len(), 8192);
+    }
+
+    #[test]
+    fn native_builder_allocation_failure_retains_old_body_and_allows_short_write() {
+        let pool = WriteBufferPool::new(0);
+        let mut dirty = DirtyExtentMap::default();
+        dirty
+            .write_native_at(0, &[1; 4096], 1, &pool, 8192)
+            .unwrap();
+        pool.fail_next_allocation();
+        let error = dirty
+            .write_native_at(8192, &[2; 4096], 2, &pool, 16384)
+            .unwrap_err();
+        assert_eq!(error.code(), afs_error::IO_OUT_OF_MEMORY);
+        assert_eq!(dirty.dirty_data_bytes(), 4096);
+        assert_eq!(dirty.builders[0].builder.as_bytes(), &[1; 4096]);
+        // The first 4KiB overwrites an existing owner; the second needs an allocation.
+        pool.fail_next_allocation();
+        assert_eq!(
+            dirty
+                .write_native_at(0, &[3; 8192], 3, &pool, 16384)
+                .unwrap(),
+            4096
+        );
+        assert_eq!(dirty.dirty_data_bytes(), 8192);
+        assert_eq!(dirty.builders[0].builder.as_bytes(), &[3; 4096]);
+    }
+
+    #[cfg(feature = "dfs")]
+    #[test]
+    fn native_builder_commit_planner_keeps_two_bodies_and_small_followup_patch() {
+        let (_temp, meta, fs) = test_fs();
+        let pool = WriteBufferPool::new(16 * 1024 * 1024);
+        let fs = fs.with_write_buffer_pool(pool.clone());
+        let created = fs
+            .create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new("native-bodies.bin"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        let mut expected = Vec::new();
+        for index in 0..6u64 {
+            let bytes = vec![index as u8 + 1; 1024 * 1024];
+            fs.write(&context(), created.handle, index * 1024 * 1024, &bytes)
+                .unwrap();
+            expected.extend_from_slice(&bytes);
+        }
+        assert_eq!(meta.commit_count(), 0);
+        assert_eq!(pool.snapshot().copied_bytes, expected.len() as u64);
+        assert_eq!(pool.snapshot().allocations, 2);
+        fs.fsync(&context(), created.handle, SyncMode::Full)
+            .unwrap();
+        let first = meta.commits.lock().unwrap()[0].clone();
+        assert_eq!(first.layout_root.inline_extents.len(), 2);
+        assert_eq!(first.layout_root.inline_extents[0].length, 4 * 1024 * 1024);
+        assert_eq!(first.layout_root.inline_extents[1].length, 2 * 1024 * 1024);
+        assert_eq!(pool.snapshot().copied_bytes, expected.len() as u64);
+        fs.write(&context(), created.handle, 8192, &[17; 4096])
+            .unwrap();
+        fs.fsync(&context(), created.handle, SyncMode::Full)
+            .unwrap();
+        expected[8192..12288].fill(17);
+        let second = meta.commits.lock().unwrap()[1].clone();
+        assert_eq!(second.layout_root.inline_extents.len(), 4);
+        assert_eq!(second.layout_root.inline_extents[1].length, 4096);
+        assert_eq!(
+            second.layout_root.inline_extents[0].chunk_id,
+            first.layout_root.inline_extents[0].chunk_id
+        );
+        assert_eq!(
+            second.layout_root.inline_extents[2].chunk_id,
+            first.layout_root.inline_extents[0].chunk_id
+        );
+        let mut actual = vec![0; expected.len()];
+        assert_eq!(
+            fs.read(&context(), created.handle, 0, &mut actual).unwrap(),
+            expected.len()
+        );
+        assert_eq!(actual, expected);
+        assert_eq!(pool.snapshot().copied_bytes, expected.len() as u64 + 4096);
+    }
+
+    #[cfg(feature = "dfs")]
+    #[test]
+    fn native_builder_vfs_short_write_does_not_extend_unaccepted_tail() {
+        for sync_flag in [0, libc::O_SYNC, libc::O_DSYNC] {
+            let (_temp, meta, fs) = test_fs();
+            let pool = WriteBufferPool::new(0);
+            let fs = fs.with_write_buffer_pool(pool.clone());
+            let created = fs
+                .create(
+                    &context(),
+                    fs.root_inode(),
+                    OsStr::new("native-short.bin"),
+                    0o640,
+                    libc::O_RDWR,
+                )
+                .unwrap();
+            let prefix = COMMIT_CHUNK_BYTES as usize - 4096;
+            assert_eq!(
+                fs.write(&context(), created.handle, 0, &vec![5; prefix])
+                    .unwrap(),
+                prefix
+            );
+            let writer = fs
+                .open(&context(), created.entry.inode, libc::O_RDWR | sync_flag)
+                .unwrap();
+            pool.fail_next_allocation();
+            assert_eq!(
+                fs.write(&context(), writer, prefix as u64, &[7; 8192])
+                    .unwrap(),
+                4096
+            );
+            assert_eq!(
+                fs.getattr(&context(), created.entry.inode, Some(writer))
+                    .unwrap()
+                    .size,
+                COMMIT_CHUNK_BYTES
+            );
+            assert_eq!(
+                meta.commit_count(),
+                usize::from(sync_flag != 0),
+                "accepted short prefix follows the handle's original sync flag"
+            );
+            fs.fsync(&context(), writer, SyncMode::Full).unwrap();
+            assert_eq!(
+                meta.commits.lock().unwrap()[0].file_version.length,
+                COMMIT_CHUNK_BYTES
+            );
+            let mut tail = [0; 8192];
+            assert_eq!(
+                fs.read(&context(), writer, prefix as u64, &mut tail)
+                    .unwrap(),
+                4096
+            );
+            assert_eq!(&tail[..4096], &[7; 4096]);
+            assert_eq!(
+                fs.read(&context(), writer, COMMIT_CHUNK_BYTES, &mut tail)
+                    .unwrap(),
+                0
+            );
+            assert_eq!(pool.snapshot().copied_bytes, COMMIT_CHUNK_BYTES);
+        }
+    }
+
+    #[cfg(feature = "dfs")]
+    #[test]
+    fn native_builder_prepare_failure_truncate_extend_excludes_old_tail_and_patch() {
+        struct FailOnceStore {
+            inner: Arc<LocalChunkStore>,
+            fail: AtomicBool,
+            attempts: Mutex<Vec<Vec<ChunkObject>>>,
+        }
+        impl ChunkStore for FailOnceStore {
+            fn put_batch(&self, staged: Vec<StagedChunk>) -> Result<Vec<ChunkReceipt>> {
+                self.attempts
+                    .lock()
+                    .unwrap()
+                    .push(staged.iter().map(|chunk| chunk.chunk.clone()).collect());
+                if self.fail.swap(false, Ordering::SeqCst) {
+                    return Err(unavailable("injected prepare put failure"));
+                }
+                self.inner.put_batch(staged)
+            }
+            fn read_at(
+                &self,
+                chunk_id: &crate::dfs::ChunkId,
+                offset: u64,
+                out: &mut [u8],
+            ) -> Result<usize> {
+                self.inner.read_at(chunk_id, offset, out)
+            }
+        }
+        let meta = Arc::new(RecordingMeta::new());
+        let temp = tempfile::tempdir().unwrap();
+        let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
+        let store = Arc::new(FailOnceStore {
+            inner: local.clone(),
+            fail: AtomicBool::new(true),
+            attempts: Mutex::new(Vec::new()),
+        });
+        let pool = WriteBufferPool::new(0);
+        let fs = distributed_fs_with_chunk_store(
+            meta.clone(),
+            local,
+            store.clone(),
+            DEFAULT_DIRTY_DATA_BUDGET_BYTES,
+        )
+        .with_write_buffer_pool(pool.clone());
+        let created = fs
+            .create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new("native-restore-tail.bin"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        let half = COMMIT_CHUNK_BYTES as usize / 2;
+        let mut original = vec![5; COMMIT_CHUNK_BYTES as usize];
+        original[half..].fill(9);
+        fs.write(&context(), created.handle, 0, &original).unwrap();
+        assert!(
+            fs.fsync(&context(), created.handle, SyncMode::Full)
+                .is_err()
+        );
+        assert_eq!(meta.commit_count(), 0);
+        let inode_id = meta.inode.lock().unwrap().inode_id.clone();
+        let cell = fs.write_state(&inode_id).unwrap().unwrap();
+        assert!(cell.lock().unwrap().dirty_extents.builders.is_empty());
+        for length in [half as u64, COMMIT_CHUNK_BYTES] {
+            fs.setattr(
+                &context(),
+                created.entry.inode,
+                Some(created.handle),
+                &AttributeChange {
+                    size: Some(length),
+                    ..AttributeChange::default()
+                },
+            )
+            .unwrap();
+        }
+        fs.write(&context(), created.handle, 8192, &[7; 4096])
+            .unwrap();
+        fs.fsync(&context(), created.handle, SyncMode::Full)
+            .unwrap();
+        let attempts = store.attempts.lock().unwrap();
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0][0].length, COMMIT_CHUNK_BYTES);
+        let final_chunks = &attempts[1];
+        assert_eq!(final_chunks.len(), 3);
+        assert_eq!(
+            final_chunks.iter().map(|chunk| chunk.length).sum::<u64>(),
+            half as u64
+        );
+        for chunk in final_chunks {
+            let body = match chunk.length {
+                4096 => vec![7; 4096],
+                length => vec![5; length as usize],
+            };
+            assert_eq!(chunk.content_digest.bytes, *blake3::hash(&body).as_bytes());
+        }
+        drop(attempts);
+        let mut expected = original;
+        expected[half..].fill(0);
+        expected[8192..12288].fill(7);
+        let mut actual = vec![0; expected.len()];
+        assert_eq!(
+            fs.read(&context(), created.handle, 0, &mut actual).unwrap(),
+            expected.len()
+        );
+        assert_eq!(actual, expected);
+        assert_eq!(pool.snapshot().copied_bytes, COMMIT_CHUNK_BYTES + 4096);
     }
 
     #[cfg(feature = "dfs")]
@@ -13881,6 +14633,8 @@ mod tests {
     #[test]
     fn dirty_budget_unknown_commit_ack_preserves_exact_request_and_backpressures_next_write() {
         let (_temp, meta, fs) = test_fs_with_dirty_budget(4);
+        let pool = WriteBufferPool::new(0);
+        let fs = fs.with_write_buffer_pool(pool.clone());
         let created = fs
             .create(
                 &context(),
@@ -13898,6 +14652,31 @@ mod tests {
             "buffered write reports bytes admitted into the exact pending request"
         );
         let failed = meta.failed_commits.lock().unwrap()[0].clone();
+        let inode_id = fs.inode_id(created.entry.inode).unwrap();
+        let cell = fs.write_state(&inode_id).unwrap().unwrap();
+        let retained_body = {
+            let state = cell.lock().unwrap();
+            let InFlightCommit::File(pending) = state.in_flight.as_ref().unwrap() else {
+                panic!("unknown Meta outcome must retain the exact prepared commit");
+            };
+            assert_eq!(
+                serde_json::to_vec(&pending.batch.commit).unwrap(),
+                serde_json::to_vec(&failed).unwrap()
+            );
+            pending.frozen.dirty_extents.extents[0]
+                .data
+                .as_ref()
+                .unwrap()
+                .clone()
+        };
+        let pointer = retained_body.as_ptr();
+        let generation = retained_body.allocation_id();
+        let capacity = retained_body.capacity();
+        let last_holder = retained_body.clone();
+        assert_eq!(retained_body.as_ref(), b"data");
+        assert_eq!(pool.snapshot().live_bytes, capacity);
+        assert_eq!(pool.snapshot().idle_bytes, 0);
+        assert_eq!(pool.snapshot().released_bytes, 0);
 
         assert_eq!(
             fs.write(&context(), created.handle, 4, b"!")
@@ -13906,9 +14685,30 @@ mod tests {
             afs_error::NODE_VFS_UNAVAILABLE,
             "the unknown commit is reported before admitting new mutation"
         );
+        {
+            let state = cell.lock().unwrap();
+            let InFlightCommit::File(pending) = state.in_flight.as_ref().unwrap() else {
+                panic!("unobserved retry must not retire pending identity");
+            };
+            let body = pending.frozen.dirty_extents.extents[0]
+                .data
+                .as_ref()
+                .unwrap();
+            assert_eq!(body.as_ptr(), pointer);
+            assert_eq!(body.allocation_id(), generation);
+            assert_eq!(
+                serde_json::to_vec(&pending.batch.commit).unwrap(),
+                serde_json::to_vec(&failed).unwrap()
+            );
+        }
+        assert_eq!(pool.snapshot().live_bytes, capacity);
         assert_eq!(fs.write(&context(), created.handle, 4, b"!").unwrap(), 1);
         let commits = meta.commits.lock().unwrap();
         assert_eq!(commits.len(), 1);
+        assert_eq!(
+            serde_json::to_vec(&failed).unwrap(),
+            serde_json::to_vec(&commits[0]).unwrap()
+        );
         assert_eq!(failed.operation_id, commits[0].operation_id);
         assert_eq!(failed.file_version.id, commits[0].file_version.id);
         assert_eq!(failed.layout_root.id, commits[0].layout_root.id);
@@ -13919,6 +14719,124 @@ mod tests {
         let commits = meta.commits.lock().unwrap();
         assert_eq!(commits.len(), 2);
         assert_eq!(commits[1].file_version.length, 5);
+        drop(commits);
+        assert!(cell.lock().unwrap().in_flight.is_none());
+        assert_eq!(
+            pool.snapshot().live_bytes,
+            capacity,
+            "an ACK and inode retirement cannot release an independent body holder"
+        );
+        assert_eq!(pool.snapshot().idle_bytes, 0);
+        assert_eq!(retained_body.as_ptr(), pointer);
+        assert_eq!(retained_body.allocation_id(), generation);
+        assert_eq!(retained_body.as_ref(), b"data");
+        drop(retained_body);
+        assert_eq!(pool.snapshot().live_bytes, capacity);
+        drop(last_holder);
+        assert_eq!(pool.snapshot().live_bytes, 0);
+        assert_eq!(pool.snapshot().idle_bytes, 0);
+        assert_eq!(pool.snapshot().copied_bytes, 5);
+    }
+
+    #[test]
+    fn native_builder_slow_put_and_transport_retry_keep_pool_live_until_last_owner() {
+        struct SlowStore {
+            inner: Arc<LocalChunkStore>,
+            pause: Arc<CommitPause>,
+            held: Mutex<Option<StagedChunk>>,
+        }
+        impl ChunkStore for SlowStore {
+            fn put_batch(&self, staged: Vec<StagedChunk>) -> Result<Vec<ChunkReceipt>> {
+                *self.held.lock().unwrap() = staged.first().cloned();
+                self.pause.block();
+                self.inner.put_batch(staged)
+            }
+            fn read_at(
+                &self,
+                chunk_id: &crate::dfs::ChunkId,
+                offset: u64,
+                out: &mut [u8],
+            ) -> Result<usize> {
+                self.inner.read_at(chunk_id, offset, out)
+            }
+        }
+        let meta = Arc::new(RecordingMeta::new());
+        let temp = tempfile::tempdir().unwrap();
+        let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
+        let pause = Arc::new(CommitPause::new(0));
+        let store = Arc::new(SlowStore {
+            inner: local.clone(),
+            pause: pause.clone(),
+            held: Mutex::new(None),
+        });
+        let pool = WriteBufferPool::new(0);
+        let fs = Arc::new(
+            distributed_fs_with_chunk_store(
+                meta.clone(),
+                local,
+                store.clone(),
+                DEFAULT_DIRTY_DATA_BUDGET_BYTES,
+            )
+            .with_write_buffer_pool(pool.clone()),
+        );
+        let created = fs
+            .create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new("native-slow-put.bin"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        let payload = vec![23; 64 * 1024];
+        fs.write(&context(), created.handle, 0, &payload).unwrap();
+        let inode_id = fs.inode_id(created.entry.inode).unwrap();
+        let cell = fs.write_state(&inode_id).unwrap().unwrap();
+        let (pointer, generation, capacity) = {
+            let state = cell.lock().unwrap();
+            let builder = &state.dirty_extents.builders[0].builder;
+            (
+                builder.data_ptr(),
+                builder.allocation_id(),
+                builder.capacity(),
+            )
+        };
+        let writer_fs = fs.clone();
+        let writer =
+            std::thread::spawn(move || writer_fs.fsync(&context(), created.handle, SyncMode::Full));
+        pause.wait_until_reached();
+        let during_put = pool.snapshot();
+        let commit_count_during_put = meta.commit_count();
+        let retained = store.held.lock().unwrap().take().unwrap();
+        let body = retained.shared_bytes();
+        // Always unblock the test store before assertions, including a failed
+        // invariant, so the runtime thread cannot be stranded by this test.
+        pause.release();
+        writer.join().unwrap().unwrap();
+        assert_eq!(during_put.live_bytes, capacity);
+        assert_eq!(during_put.idle_bytes, 0);
+        assert_eq!(during_put.released_bytes, 0);
+        assert_eq!(commit_count_during_put, 0);
+        assert_eq!(body.as_ptr(), pointer);
+        assert_eq!(body.allocation_id(), generation);
+        assert_eq!(body.as_ref(), payload.as_slice());
+        assert_eq!(pool.snapshot().live_bytes, capacity);
+        assert_eq!(pool.snapshot().idle_bytes, 0);
+        let transport = axum::body::Bytes::from_owner(retained);
+        let retry = transport.clone();
+        drop(body);
+        drop(transport);
+        assert_eq!(
+            pool.snapshot().live_bytes,
+            capacity,
+            "a slow/retry transport clone retains the same allocation after Meta ACK"
+        );
+        assert_eq!(retry.as_ref(), payload.as_slice());
+        drop(retry);
+        assert_eq!(pool.snapshot().live_bytes, 0);
+        assert_eq!(pool.snapshot().idle_bytes, 0);
+        assert_eq!(pool.snapshot().released_bytes, capacity as u64);
+        assert_eq!(pool.snapshot().copied_bytes, payload.len() as u64);
     }
 
     #[test]
@@ -14359,8 +15277,8 @@ mod tests {
             .unwrap();
         assert_eq!(
             deferred_budget_counts(&fs),
-            (full_budget + 4, descriptor_budget, 1,),
-            "actual stages retained beyond publication must retain their write leases",
+            (full_budget + COMMIT_CHUNK_BYTES, descriptor_budget, 1,),
+            "retained full and tail stages each charge actual 4MiB allocation capacity",
         );
         let mut staged = deferred.retained_staged.lock().unwrap().take().unwrap();
         assert_eq!(staged.len(), 2);

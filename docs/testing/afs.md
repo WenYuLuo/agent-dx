@@ -258,12 +258,60 @@ B的临时fill与A的8MiB共享载荷额度分别报告，不当成整个Node RS
 
 填充链另有固定低频`afs_dfs_peer_disk_cache_fill_stage_nanoseconds_total{stage}`／`afs_dfs_peer_disk_cache_fill_stage_observations_total{stage}`，仅实际进入完整对象fill后报告lock_wait、lookup、prepare、receive_verify、store、deliver和total。lock_wait覆盖cache.operation准入及首次root检查，不是纯锁争用；lookup不包含此前Meta sources RPC。receive_verify包含完整Peer调用、解码／复制、根及段校验、Completion与真实EOF，不是纯网络时间。旧完整缓冲路径store为store_verified完整调用；流式路径receive_verify含接收／校验与私有写盘，store只覆盖最后Ready提交，deliver只覆盖其后最终交付检查。流式写盘与接收重叠，不将其累计子耗时重复加入父阶段，也不直接对旧store毫秒承诺节省；prepare可由多个互斥片段组成，观察次数不等于fill次数。total是父阶段，不与子阶段相加，也不是完整FUSE回调计时。失败已发生的阶段也计入，不改变错误／重试／缓存准入。
 
-`afs_dfs_peer_disk_cache_fill_stage_thread_cpu_nanoseconds_total{stage}`及`afs_dfs_peer_disk_cache_fill_stage_thread_cpu_observations_total{stage}`只统计同步调用线程的有效CPU样本，排除远端和h2／TLS等后台线程；跨线程或clock失败缺少CPU观察，不冒充零CPU。墙钟覆盖CPU采样区间，但wall−threadCPU不能直接命名为网络／磁盘等待。每阶段低频聚合，无逐64KiB取clock；正式测量包含实际观测开销，不承诺零扰动。诊断若采用cold后单独采样，其repeat间隔与固定1秒正式三轮不同，重复读只能核对正确性／0Peer等机制，不继承正式性能口径。
+`afs_dfs_peer_disk_cache_fill_stage_thread_cpu_nanoseconds_total{stage}`及`afs_dfs_peer_disk_cache_fill_stage_thread_cpu_observations_total{stage}`只统计同步调用线程的有效CPU样本，排除远端、producer根校验和h2／TLS等后台线程；跨线程或clock失败缺少CPU观察，不冒充零CPU。墙钟覆盖CPU采样区间，但wall−threadCPU不能直接命名为网络／磁盘等待。每阶段低频聚合，无逐64KiB取clock；正式测量包含实际观测开销，不承诺零扰动。诊断若采用cold后单独采样，其repeat间隔与固定1秒正式三轮不同，重复读只能核对正确性／0Peer等机制，不继承正式性能口径。
 
 同对象流式填充需针对性验证：实际EOF／late Status／坏根不产生Ready；文件完成凭证不能跨FD／对象或复用被修改的私有输出；缓存创建、配额和写盘失败仍以同次完整校验RPC交付合法区间；最终授权失效不能提交Ready或公开输出；满队列取消／超时必须真实join后退账；current-thread、过大窗口或小批预算保留原路径。复读仍只用磁盘cache，不引入驻留正文RAM。固定块另需验证超过两块后的真实复用、跨1MiB段／不足256KiB尾块、Header／Completion／额外帧错误；空闲块等待／归还及满队列取消受绝对期限约束，错误attempt不混入旧尾块或摘要。
+根校验归producer的双块路径还须验证：consumer不重复计算根，producer按块恰扫描完整正文一次；尾块／control前flush顺序及根／段摘要均正确。consumer的Completion只登记待确认状态，实际EOF／成功join后的内部回执必须匹配可信Meta根、Completion摘要／长度以及私有sink／输出绑定，再允许完成凭证。错误长度／摘要／绑定、自洽正文但错误Meta根、Completion后late Status、取消／超时均不得提前放行；legacy／非流水路径保持原完整校验。
 
 `afs_dfs_peer_disk_cache_stream_reserved_bytes`／`stream_reserved_peak_bytes`记录原4MiB额度的保守流式reservation；`stream_private_peak_bytes`另含既有私有输出，不代表实际分配或Node RSS。`afs_dfs_peer_disk_cache_stream_frame_bytes`／`stream_frame_peak_bytes`仅记录两个固定载荷块的真实capacity，归还空闲池仍占账，最后owner销毁才释放；控制字段另有独立有界余量，不含transport buffer。历史规范化帧版本保留原观测范围，不以新旧峰值直接推断RSS变化。旧`fill_bytes`系列只观察旧完整Vec路径，两者互斥，不能相加当同一填充峰值。wire帧上限、两个固定块、单cache操作、窗口／解码约束才执行准入，指标不授予额度。`peer_frame_to_block`统计当前帧到块的实际复制，`peer_frame_detach`保留历史／规范化路径计数，`fill_to_output`统计请求区间提取；必须按实测工作量判断是否减少复制，不能因没有完整Vec就宣称零复制。
 
 64MiB本地对照可在预授权控制连接建立后固定等待30秒，由A单调时钟从create前覆盖发布及B首次完整读校验ACK。完整双读总时延若含固定1秒复读等待必须明确标注；阶段之和仅作辅助。测试专用控制适配器在本地测试方案维护，不进入产品包。
 
 `afs_dfs_peer_read_events_total`的`stream_frame`记录接收到的wire帧（含控制帧）；`stream_block_alloc`记录固定块实际分配，`stream_block_handoff`记录成功正文块交接，`stream_block_write`记录consumer对正文块进入私有sink的调用，不等于物理write系统调用或缓存落盘成功。64MiB完整4MiB对象对照应分别核对1024个Data帧、256次正文块交接和写入入口；尾块按实际长度计数，不从事件数推算性能。
+
+## 原生写 buffer 验证
+
+以下是受影响定向检查入口；通过数与候选身份以各轮实际 Linux 记录为准，不替代完整 POSIX、
+可靠性、正式安装包或性能验收。
+
+```sh
+cargo test --locked -p afs --lib write_buffer_tests
+cargo test --locked -p afs --lib native_builder_
+cargo test --locked -p afs --lib dispatch_tests
+cargo test --locked -p afs --test config_contract
+cargo test --locked -p afs --bin afs-node allocator::tests
+cargo fmt --all -- --check
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+```
+
+真实 FUSE 使用本地 owner、NodeReplicated R1、无 S3：六次应用1MiB写入合计6MiB，记录内核实际
+回调大小和中途提交轨迹；同批原提交入口冻结4MiB＋2MiB有效正文，复制入口合计6MiB、地址保持，
+远端重新打开核对 SHA／长度／EOF。随后偏移8192覆盖4KiB，验证小 Chunk、新布局和旧 Chunk 不变；
+另验证未冻结时同位置原地覆盖。若后台中途提交，功能结果与“同批两正文”结构验收必须分开登记。
+
+`afs_dfs_write_buffer_*` 记录实际 live/idle/peak capacity、分配、复用、释放和输入 copy；
+`input_copy_bytes_total`／`input_copies_total` 来自实际 slice-copy/extend 入口，不能当端到端总复制。
+诊断轮设 `log_level="debug"`，固定 `fuse_write_admission` 和 `dfs.write_buffer.*` 事件关联真实回调、
+buffer offset、世代、冻结前后指针与最后引用；不记录正文。hash、网络、SDK、读快照和 profiler 抽样
+分别记账，诊断时延不作正常性能收益。常规回收轮保持日志低等级、trace OFF。
+
+`afs_node_allocator_*` 将 jemalloc 的 allocated/active/resident/retained、后台开关、decay 和观测有效位
+分别公开；它们不等于 AFS live/idle 或 Linux RSS。峰值测试测前固定池基线、实际触页 live 峰值、
+RSS允许偏差和观测窗口，完成原提交入口、释放所有引用后核对 live下降、idle≤基线、超额释放和RSS回落；
+重复负载不得逐轮累积。慢副本、读取引用和未知提交必须继续持有正文，不能为回落提前退账。
+
+必须补充不对齐／跨块／稀疏／截断扩展／并发覆盖、合法短写与同步标志、prepare失败恢复和
+未知 Meta ACK 精确重试、停止排空，以及受影响 OwnerFs／RN／RDMA／S3 回归。完整BLAKE3、授权、
+成功 fsync 和 close-to-open 不因这些优化放松；RDMA仍按现有独立注册 endpoint 缓冲合同验证。
+
+## 原生读粗粒度诊断
+
+原生读粗诊断由默认OFF的`dfs_read_diagnostics_enabled`显式开启，使用固定有界对象聚合。根／段双块诊断分别记录producer根校验和consumer的写入／提取／段校验，成功join后计算两组有序区间的真实交集；空、时钟失败或固定区间容量溢出不能记成有效零重叠。它不保存逐帧事件或正文，不增加载荷额度。ON时延不作OFF成绩，聚合hash／交集不从完整E2E扣减；同步线程CPU降低也不等于全Node CPU降低。
+
+
+通过现有Node管理HTTP的 `GET /v1/diagnostics/dfs-read-timing` 在测量窗口外读取固定快照。
+先检查schema、容量、overflow、clock_failures及每条success/completed；该进程前256条之后不轮转，
+因此长时测量记录不完整时只能登记缺口。正文收齐只表示最后预期Data帧已解码，不能当作真实EOF、
+校验完成或授权交付。Meta、FUSE及对象父阶段按实际嵌套与重叠核对，不能直接相加；
+consumer线程CPU不含producer或远端CPU。快照不保留正文／路径／授权信息，也不是业务授权来源。
+开启配置及监听范围见[部署说明](../deployment/afs.md#原生读粗粒度诊断)。

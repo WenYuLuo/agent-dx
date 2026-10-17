@@ -35,6 +35,11 @@ fn test_config(data_dir: PathBuf) -> Config {
 
 fn node_with_readiness(config: Config, readiness: Arc<NodeReadiness>) -> Arc<Node> {
     Arc::new(Node {
+        #[cfg(feature = "dfs")]
+        read_work_metrics: afs::node::read_work::ReadWorkMetrics::register(
+            &afs_metrics::Registry::default(),
+        )
+        .unwrap(),
         config,
         observability: Observability::new().unwrap(),
         session_id: "session-health-test".into(),
@@ -699,4 +704,25 @@ async fn resource_sampler_is_singleflight_and_reports_blocked_worker() {
         "readiness sampler is still running"
     );
     let _ = release.send(());
+}
+
+#[cfg(feature = "dfs")]
+#[tokio::test]
+async fn read_timing_endpoint_absent_when_diagnostics_disabled() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = test_config(temp.path().to_owned());
+    let readiness = Arc::new(NodeReadiness::new(
+        false, None, None, None, None, "grpc", None,
+    ));
+    let node = node_with_readiness(config, readiness);
+    let response = rest::router(node)
+        .oneshot(
+            Request::builder()
+                .uri("/v1/diagnostics/dfs-read-timing")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }

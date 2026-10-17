@@ -504,3 +504,61 @@ fn peer_disk_cache_is_opt_in_and_requires_an_isolated_bounded_directory() {
         assert!(resolve(Role::Node).is_err());
     }
 }
+
+#[test]
+fn native_write_buffer_idle_baseline_is_not_a_live_quota() {
+    let default = Config::resolve(Role::Node, Cli::parse_from(["afs-node"])).unwrap();
+    assert_eq!(
+        serde_json::to_value(default).unwrap()["dfs_write_buffer_idle_bytes"],
+        134_217_728_u64
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("node.toml");
+    for bytes in [0_u64, 4096, 1_u64 << 40] {
+        std::fs::write(&path, format!("dfs_write_buffer_idle_bytes = {bytes}\n")).unwrap();
+        let config = Config::resolve(
+            Role::Node,
+            Cli::parse_from(["afs-node", "--config", path.to_str().unwrap()]),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(config).unwrap()["dfs_write_buffer_idle_bytes"],
+            bytes
+        );
+    }
+    std::fs::write(&path, "dfs_write_buffer_idle_bytes = 1099511627777\n").unwrap();
+    assert!(
+        Config::resolve(
+            Role::Node,
+            Cli::parse_from(["afs-node", "--config", path.to_str().unwrap()])
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn read_diagnostics_default_off_and_explicit_cli_overrides_file() {
+    let default = Config::resolve(Role::Node, Cli::parse_from(["afs-node"])).unwrap();
+    assert!(!default.dfs_read_diagnostics_enabled);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("diagnostic.toml");
+    std::fs::write(&path, "dfs_read_diagnostics_enabled=true\n").unwrap();
+    let from_file = Config::resolve(
+        Role::Node,
+        Cli::parse_from(["afs-node", "--config", path.to_str().unwrap()]),
+    )
+    .unwrap();
+    assert!(from_file.dfs_read_diagnostics_enabled);
+    let from_cli = Config::resolve(
+        Role::Node,
+        Cli::parse_from([
+            "afs-node",
+            "--config",
+            path.to_str().unwrap(),
+            "--dfs-read-diagnostics-enabled",
+            "false",
+        ]),
+    )
+    .unwrap();
+    assert!(!from_cli.dfs_read_diagnostics_enabled);
+}

@@ -45,6 +45,32 @@ Node 的 Meta、peer control 和 data 诊断请求复用生产 TLS 配置，诊�
 这里的 Node ID 绑定发生在服务端对调用方的校验中；客户端仍按 CA 和
 `tls_server_name` 验证服务端，不承诺按目标 Node ID 对服务端证书逐一 pinning。
 
+## DFS 原生写正文所有权
+
+普通 FUSE 到本地 inode owner 的 NodeReplicated 写入在同句柄 FIFO 和 inode 门禁内接纳借用输入，
+直接复制到最终 `ChunkBuilder` 分配。顺序写优先使用4MiB容量块；满块只切换下一块，
+仍可原地覆盖，不新增冻结、下盘或发布入口。已提交内容的小覆盖使用普通小 Chunk，
+大写不强制按4KiB切分。远端 owner、OwnerFs 和 S3 保留各自调度与正文账本。
+
+原 sync/fdatasync、同步标志、累计接纳16MiB（包括覆盖）、后台写回、FUSE flush 和排空入口
+消费可写 builder，将同一 Vec 分配移入共享只读 owner；planner 按最终有效来源范围形成 Chunk，
+不拼接正文或将 Vec 搬成 Arc 切片。冻结不计算新的可见性保证；成功 fsync 仍等待原持久屏障和
+Meta 确认。未知提交保留原 OperationId、精确请求、正文和回执，后续修改不能越过；准备失败
+恢复的正文保持不可变，不能在仍有异步引用时重新变成可写。活动 dirty 读取在 inode 锁内形成
+本次读取范围的只读快照，其读复制单独统计。
+
+Node 写 buffer 池限制的是可复用空闲容量，默认128MiB、最多1024条，不限制 live 正文，
+不增加全局配额等待或压力提交。共享范围按父分配实际 capacity 计费一次；最后持有者释放后
+才能归池或释放。停止清空空闲列表，迟到引用结束后直接释放；池不延长 Node 生命周期。
+Linux `afs-node` 默认使用官方 jemalloc：后台回收开启、dirty decay1000ms、muzzy decay0。
+AFS live/idle、allocator allocated/active/resident/retained 与进程 RSS 是不同指标，
+保留虚拟映射不等于保留同量物理页。S3 原有窗口、正文和 descriptor 预算独立保持，
+尾块也按保留的真实 capacity 计费；本节不引入正文 RAM 内容缓存或变更读授权。
+
+正文一次复制只指上述本地写接纳到提交正文的用户态范围；内核、远端接收、读回和完整 hash
+另列。借用写会占用当前单 FUSE receiver 至接纳／原同步触发结束，不能据 worker 测试声称
+新 FUSE 请求仍可并行接收。具体功能、回收及平台验证边界见[测试说明](../testing/afs.md#原生写-buffer-验证)。
+
 ## DFS 原生节点读取上下文
 
 未配置外部后端时，新open从Meta取得fresh inode，之后同句柄复用已提交版本视图
@@ -77,16 +103,18 @@ miss 仅在当前整个对象获授权且填充额度＋私有输出不超单批
 
 满足有界接收窗口与multi-thread runtime条件的gRPC适配器，用既有runtime的单producer
 接收当前对象；全链仅复用两个256KiB独占载荷块，producer从至多64KiB wire帧直接复制入块，
-满块或对象尾部按序交给原blocking读调用者。consumer计算完整根及段BLAKE3、写私有pending文件、
-提取本次授权区间后才归还块；队列至多一项，无完整对象Vec或逐帧独占正文分配。
+满块或对象尾部先由producer按序更新完整根BLAKE3，再交给原blocking读调用者。consumer写私有pending文件、
+提取本次授权区间并计算独立段BLAKE3后才归还块；两条工作链可在两个块之间重叠。
+队列至多一项，无完整对象Vec、逐帧独占正文分配或跨请求驻留正文缓存。
 块actual capacity及最后owner贯穿空闲池、producer、队列和consumer，归还不退账，真正销毁后才退账；
 块交接复制仍真实计数，不称零复制。Header先于正文，尾块先于Completion，wire身份／顺序／长度检查保留。
 原4MiB填充额度保守覆盖512KiB载荷块、256KiB控制余量、受限解码及HTTP/2积压，私有输出另按原读预算计费；
 窗口超出可证明范围或current-thread／其他transport走原完整对象缓冲路径，不扩大额度。
 缓存创建／配额／写盘失败只禁用可选sink，同次RPC继续完整校验与提取区间，不重复回源。
 
-完整gRPC接收核对可信Meta根、server checksum及所有帧身份；合法Completion、实际EOF及
-producer排空后才产生完成凭证。它借用未公开的请求区间结果，并将根／段摘要绑定实际私有FD、
+完整gRPC接收核对可信Meta根、server checksum及所有帧身份；consumer接收合法Completion后仍不能独立产生完成凭证。
+实际EOF及producer成功join后，以仅含长度、根摘要和私有sink／输出绑定的内部回执核对可信Meta根与Completion，
+通过后才收口完成凭证；错误、缺失或跨对象／输出回执不能放行。它借用未公开的请求区间结果，并将根／段摘要绑定实际私有FD、
 正文长度和文件身份。引擎最后授权后才rename为Ready，交付前仍检查授权；校验、late Status、
 期限或授权失败不公开私有输出。取消关闭接收端并等待producer真实退出，载荷块最后owner释放后才退账，等待空闲块及交接均受同一截止时间约束。
 其它transport保留原完整正文借用证明及保守验证，不隐式继承本优化。

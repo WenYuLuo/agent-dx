@@ -10,9 +10,10 @@ use std::{
     collections::{HashMap, HashSet},
     fs::{self, File, OpenOptions},
     io::{BufRead, BufReader, Write},
+    ops::{Bound, Deref, RangeBounds},
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, Weak,
         atomic::{AtomicU64, Ordering},
     },
     time::{SystemTime, UNIX_EPOCH},
@@ -34,31 +35,640 @@ use crate::{
     node::{storage::localfs::capacity_from_statvfs_fd, vfs::types::FilesystemCapacity},
 };
 
+// A generation identifies one checkout, even when jemalloc or the idle pool
+// reuses the same address. It is diagnostic identity, never persistent identity.
+static WRITE_ALLOCATION_GENERATION: AtomicU64 = AtomicU64::new(1);
+const MAX_IDLE_WRITE_BUFFERS: usize = 1024;
+
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub struct WriteBufferPoolStats {
+    pub live_bytes: usize,
+    pub live_buffers: usize,
+    pub live_peak_bytes: usize,
+    pub idle_bytes: usize,
+    pub idle_buffers: usize,
+    pub allocations: u64,
+    pub reuses: u64,
+    pub released_bytes: u64,
+    pub released_buffers: u64,
+    pub copied_bytes: u64,
+    pub copy_operations: u64,
+}
+
 #[derive(Debug, Default)]
-pub struct ChunkBuilder {
+struct WriteBufferPoolState {
+    idle: Vec<Vec<u8>>,
+    stats: WriteBufferPoolStats,
+    stopped: bool,
+    metrics: Option<WriteBufferPoolMetrics>,
+    #[cfg(test)]
+    fail_next_allocation: bool,
+}
+
+#[derive(Debug)]
+struct WriteBufferPoolMetrics {
+    live_bytes: afs_metrics::IntGauge,
+    live_buffers: afs_metrics::IntGauge,
+    live_peak_bytes: afs_metrics::IntGauge,
+    idle_bytes: afs_metrics::IntGauge,
+    idle_buffers: afs_metrics::IntGauge,
+    allocations: afs_metrics::IntCounter,
+    reuses: afs_metrics::IntCounter,
+    released_bytes: afs_metrics::IntCounter,
+    released_buffers: afs_metrics::IntCounter,
+    copied_bytes: afs_metrics::IntCounter,
+    copy_operations: afs_metrics::IntCounter,
+    previous: WriteBufferPoolStats,
+}
+
+impl WriteBufferPoolMetrics {
+    fn register(
+        registry: &afs_metrics::Registry,
+    ) -> std::result::Result<Self, afs_metrics::MetricsError> {
+        let live_bytes = afs_metrics::IntGauge::new(
+            "afs_dfs_write_buffer_live_bytes",
+            "Actual capacity of final write allocations still held by any owner.",
+        )?;
+        let live_buffers = afs_metrics::IntGauge::new(
+            "afs_dfs_write_buffer_live_allocations",
+            "Final write allocations still held by any owner.",
+        )?;
+        let live_peak_bytes = afs_metrics::IntGauge::new(
+            "afs_dfs_write_buffer_live_peak_bytes",
+            "Peak actual live final write allocation capacity.",
+        )?;
+        let idle_bytes = afs_metrics::IntGauge::new(
+            "afs_dfs_write_buffer_idle_bytes",
+            "Actual capacity retained only by the bounded idle list.",
+        )?;
+        let idle_buffers = afs_metrics::IntGauge::new(
+            "afs_dfs_write_buffer_idle_allocations",
+            "Allocations retained only by the bounded idle list.",
+        )?;
+        let allocations = afs_metrics::IntCounter::new(
+            "afs_dfs_write_buffer_allocations_total",
+            "Successful new final write payload allocations.",
+        )?;
+        let reuses = afs_metrics::IntCounter::new(
+            "afs_dfs_write_buffer_reuses_total",
+            "Idle allocations checked out without moving payload storage.",
+        )?;
+        let released_bytes = afs_metrics::IntCounter::new(
+            "afs_dfs_write_buffer_released_bytes_total",
+            "Allocation capacity released from the pool to the allocator, not a physical RSS measurement.",
+        )?;
+        let released_buffers = afs_metrics::IntCounter::new(
+            "afs_dfs_write_buffer_released_allocations_total",
+            "Final write allocations released to the allocator.",
+        )?;
+        let copied_bytes = afs_metrics::IntCounter::new(
+            "afs_dfs_write_buffer_input_copy_bytes_total",
+            "Actual input bytes copied into final mutable write buffers.",
+        )?;
+        let copy_operations = afs_metrics::IntCounter::new(
+            "afs_dfs_write_buffer_input_copies_total",
+            "Actual slice-copy or extend entries into final mutable write buffers.",
+        )?;
+        afs_metrics::register_collector(registry, &live_bytes)?;
+        afs_metrics::register_collector(registry, &live_buffers)?;
+        afs_metrics::register_collector(registry, &live_peak_bytes)?;
+        afs_metrics::register_collector(registry, &idle_bytes)?;
+        afs_metrics::register_collector(registry, &idle_buffers)?;
+        afs_metrics::register_collector(registry, &allocations)?;
+        afs_metrics::register_collector(registry, &reuses)?;
+        afs_metrics::register_collector(registry, &released_bytes)?;
+        afs_metrics::register_collector(registry, &released_buffers)?;
+        afs_metrics::register_collector(registry, &copied_bytes)?;
+        afs_metrics::register_collector(registry, &copy_operations)?;
+        Ok(Self {
+            live_bytes,
+            live_buffers,
+            live_peak_bytes,
+            idle_bytes,
+            idle_buffers,
+            allocations,
+            reuses,
+            released_bytes,
+            released_buffers,
+            copied_bytes,
+            copy_operations,
+            previous: WriteBufferPoolStats::default(),
+        })
+    }
+
+    fn publish(&mut self, stats: WriteBufferPoolStats) {
+        self.live_bytes
+            .set(i64::try_from(stats.live_bytes).unwrap_or(i64::MAX));
+        self.live_buffers
+            .set(i64::try_from(stats.live_buffers).unwrap_or(i64::MAX));
+        self.live_peak_bytes
+            .set(i64::try_from(stats.live_peak_bytes).unwrap_or(i64::MAX));
+        self.idle_bytes
+            .set(i64::try_from(stats.idle_bytes).unwrap_or(i64::MAX));
+        self.idle_buffers
+            .set(i64::try_from(stats.idle_buffers).unwrap_or(i64::MAX));
+        self.allocations
+            .inc_by(stats.allocations.saturating_sub(self.previous.allocations));
+        self.reuses
+            .inc_by(stats.reuses.saturating_sub(self.previous.reuses));
+        self.released_bytes.inc_by(
+            stats
+                .released_bytes
+                .saturating_sub(self.previous.released_bytes),
+        );
+        self.released_buffers.inc_by(
+            stats
+                .released_buffers
+                .saturating_sub(self.previous.released_buffers),
+        );
+        self.copied_bytes.inc_by(
+            stats
+                .copied_bytes
+                .saturating_sub(self.previous.copied_bytes),
+        );
+        self.copy_operations.inc_by(
+            stats
+                .copy_operations
+                .saturating_sub(self.previous.copy_operations),
+        );
+        self.previous = stats;
+    }
+}
+
+impl WriteBufferPoolState {
+    fn publish_metrics(&mut self) {
+        if let Some(metrics) = &mut self.metrics {
+            metrics.publish(self.stats);
+        }
+    }
+}
+
+/// Nonblocking reuse of released write allocations. The baseline bounds only
+/// idle capacity; it never grants, waits for or limits live payload capacity.
+#[derive(Debug)]
+pub struct WriteBufferPool {
+    idle_baseline_bytes: usize,
+    state: Mutex<WriteBufferPoolState>,
+}
+
+impl WriteBufferPool {
+    pub fn new(idle_baseline_bytes: usize) -> Arc<Self> {
+        Arc::new(Self {
+            idle_baseline_bytes,
+            state: Mutex::new(WriteBufferPoolState::default()),
+        })
+    }
+
+    /// Register exact lifecycle counters with the process-owned registry.
+    pub fn register_metrics(
+        &self,
+        registry: &afs_metrics::Registry,
+    ) -> std::result::Result<(), afs_metrics::MetricsError> {
+        let metrics = WriteBufferPoolMetrics::register(registry)?;
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.metrics = Some(metrics);
+        state.publish_metrics();
+        Ok(())
+    }
+
+    pub fn snapshot(&self) -> WriteBufferPoolStats {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.stats
+    }
+
+    /// Release retained idle allocations outside the pool lock. Live owners
+    /// continue to own their allocation; future returns cannot enter the pool.
+    pub fn stop(&self) {
+        let idle = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.stopped = true;
+            state.stats.released_bytes = state
+                .stats
+                .released_bytes
+                .saturating_add(state.stats.idle_bytes as u64);
+            state.stats.released_buffers = state
+                .stats
+                .released_buffers
+                .saturating_add(state.stats.idle_buffers as u64);
+            state.stats.idle_bytes = 0;
+            state.stats.idle_buffers = 0;
+            state.publish_metrics();
+            std::mem::take(&mut state.idle)
+        };
+        drop(idle);
+    }
+
+    fn checkout(self: &Arc<Self>, capacity: usize) -> Result<ChunkBuffer> {
+        {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| invalid("write buffer pool is poisoned"))?;
+            let index = if state.stopped {
+                None
+            } else {
+                state
+                    .idle
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, bytes)| {
+                        bytes.capacity() >= capacity
+                            && bytes.capacity() < capacity.saturating_mul(2)
+                    })
+                    .min_by_key(|(_, bytes)| bytes.capacity())
+                    .map(|(index, _)| index)
+            };
+            if let Some(index) = index {
+                let bytes = state.idle.swap_remove(index);
+                state.stats.idle_bytes -= bytes.capacity();
+                state.stats.idle_buffers -= 1;
+                state.stats.live_bytes += bytes.capacity();
+                state.stats.live_buffers += 1;
+                state.stats.live_peak_bytes =
+                    state.stats.live_peak_bytes.max(state.stats.live_bytes);
+                state.stats.reuses += 1;
+                state.publish_metrics();
+                drop(state);
+                let allocation_id = WRITE_ALLOCATION_GENERATION.fetch_add(1, Ordering::Relaxed);
+                afs_logging::debug!("dfs.write_buffer.checkout";
+                    "event" => "checkout",
+                    "reused" => true,
+                    "allocation_id" => allocation_id,
+                    "capacity" => bytes.capacity() as u64,
+                    "body_pointer" => bytes.as_ptr() as usize,
+                );
+                return Ok(ChunkBuffer {
+                    bytes,
+                    pool: Arc::downgrade(self),
+                    allocation_id,
+                });
+            }
+            #[cfg(test)]
+            if std::mem::take(&mut state.fail_next_allocation) {
+                return Err(write_allocation_error());
+            }
+        }
+        // Only metadata/list lookup is under the lock. Payload allocation and
+        // allocator failure handling happen outside it.
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(capacity)
+            .map_err(|_| write_allocation_error())?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| invalid("write buffer pool is poisoned"))?;
+        state.stats.live_bytes += bytes.capacity();
+        state.stats.live_buffers += 1;
+        state.stats.live_peak_bytes = state.stats.live_peak_bytes.max(state.stats.live_bytes);
+        state.stats.allocations += 1;
+        state.publish_metrics();
+        drop(state);
+        let allocation_id = WRITE_ALLOCATION_GENERATION.fetch_add(1, Ordering::Relaxed);
+        afs_logging::debug!("dfs.write_buffer.checkout";
+            "event" => "checkout",
+            "reused" => false,
+            "allocation_id" => allocation_id,
+            "capacity" => bytes.capacity() as u64,
+            "body_pointer" => bytes.as_ptr() as usize,
+        );
+        Ok(ChunkBuffer {
+            bytes,
+            pool: Arc::downgrade(self),
+            allocation_id,
+        })
+    }
+
+    fn record_copy(&self, bytes: usize) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.stats.copied_bytes = state.stats.copied_bytes.saturating_add(bytes as u64);
+        state.stats.copy_operations = state.stats.copy_operations.saturating_add(1);
+        state.publish_metrics();
+    }
+
+    #[cfg(test)]
+    pub(super) fn fail_next_allocation(&self) {
+        self.state.lock().unwrap().fail_next_allocation = true;
+    }
+}
+
+#[derive(Debug)]
+struct ChunkBuffer {
     bytes: Vec<u8>,
+    pool: Weak<WriteBufferPool>,
+    allocation_id: u64,
+}
+
+impl ChunkBuffer {
+    fn unpooled(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes,
+            pool: Weak::new(),
+            allocation_id: WRITE_ALLOCATION_GENERATION.fetch_add(1, Ordering::Relaxed),
+        }
+    }
+}
+
+impl Drop for ChunkBuffer {
+    fn drop(&mut self) {
+        let capacity = self.bytes.capacity();
+        let body_pointer = self.bytes.as_ptr() as usize;
+        let Some(pool) = self.pool.upgrade() else {
+            let bytes = std::mem::take(&mut self.bytes);
+            drop(bytes);
+            afs_logging::debug!("dfs.write_buffer.last_owner_release";
+                "event" => "last_owner_release",
+                "allocation_id" => self.allocation_id,
+                "capacity" => capacity as u64,
+                "body_pointer" => body_pointer,
+                "reason" => "pool_unavailable",
+            );
+            return;
+        };
+        let mut bytes = std::mem::take(&mut self.bytes);
+        // Clear the initialized logical length. On reuse, resize initializes
+        // each newly exposed byte before any caller can read a previous body.
+        bytes.clear();
+        {
+            let mut state = pool
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.stats.live_bytes -= capacity;
+            state.stats.live_buffers -= 1;
+            if !state.stopped
+                && capacity != 0
+                && state.idle.len() < MAX_IDLE_WRITE_BUFFERS
+                && capacity
+                    <= pool
+                        .idle_baseline_bytes
+                        .saturating_sub(state.stats.idle_bytes)
+            {
+                state.stats.idle_bytes += capacity;
+                state.stats.idle_buffers += 1;
+                state.idle.push(bytes);
+                state.publish_metrics();
+                drop(state);
+                afs_logging::debug!("dfs.write_buffer.last_owner_return";
+                    "event" => "last_owner_return",
+                    "allocation_id" => self.allocation_id,
+                    "capacity" => capacity as u64,
+                    "body_pointer" => body_pointer,
+                );
+                return;
+            }
+            state.stats.released_bytes = state.stats.released_bytes.saturating_add(capacity as u64);
+            state.stats.released_buffers = state.stats.released_buffers.saturating_add(1);
+            state.publish_metrics();
+        }
+        // Ineligible allocations are freed only after releasing the pool lock.
+        drop(bytes);
+        afs_logging::debug!("dfs.write_buffer.last_owner_release";
+            "event" => "last_owner_release",
+            "allocation_id" => self.allocation_id,
+            "capacity" => capacity as u64,
+            "body_pointer" => body_pointer,
+            "reason" => "idle_not_retained",
+        );
+    }
+}
+
+/// Shared immutable view of one final allocation. Cloning or slicing moves
+/// ownership metadata only; the final reference retires the entire allocation.
+#[derive(Clone, Debug)]
+pub struct SharedChunkBytes {
+    buffer: Arc<ChunkBuffer>,
+    start: usize,
+    end: usize,
+}
+
+impl SharedChunkBytes {
+    pub fn from_vec(bytes: Vec<u8>) -> Self {
+        Self::from_buffer(ChunkBuffer::unpooled(bytes))
+    }
+
+    fn from_buffer(buffer: ChunkBuffer) -> Self {
+        let end = buffer.bytes.len();
+        Self {
+            buffer: Arc::new(buffer),
+            start: 0,
+            end,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.end - self.start
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    pub fn as_ptr(&self) -> *const u8 {
+        self.as_ref().as_ptr()
+    }
+    pub fn capacity(&self) -> usize {
+        self.buffer.bytes.capacity()
+    }
+    pub fn allocation_id(&self) -> u64 {
+        self.buffer.allocation_id
+    }
+
+    /// Share a subrange without changing the retained allocation or its charge.
+    ///
+    /// # Panics
+    /// Panics when the requested range is outside this view or overflows usize.
+    pub fn slice(&self, range: impl RangeBounds<usize>) -> Self {
+        let start = match range.start_bound() {
+            Bound::Included(value) => *value,
+            Bound::Excluded(value) => value
+                .checked_add(1)
+                .expect("shared chunk range start overflow"),
+            Bound::Unbounded => 0,
+        };
+        let end = match range.end_bound() {
+            Bound::Included(value) => value
+                .checked_add(1)
+                .expect("shared chunk range end overflow"),
+            Bound::Excluded(value) => *value,
+            Bound::Unbounded => self.len(),
+        };
+        assert!(
+            start <= end && end <= self.len(),
+            "shared chunk range is outside its view"
+        );
+        Self {
+            buffer: self.buffer.clone(),
+            start: self.start + start,
+            end: self.start + end,
+        }
+    }
+}
+
+impl From<Vec<u8>> for SharedChunkBytes {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self::from_vec(bytes)
+    }
+}
+
+impl AsRef<[u8]> for SharedChunkBytes {
+    fn as_ref(&self) -> &[u8] {
+        &self.buffer.bytes[self.start..self.end]
+    }
+}
+
+impl Deref for SharedChunkBytes {
+    type Target = [u8];
+    fn deref(&self) -> &Self::Target {
+        self.as_ref()
+    }
+}
+
+/// One mutable final payload allocation. Pooled builders are fixed capacity;
+/// the legacy Default builder remains fallibly growable for other callers.
+#[derive(Debug)]
+pub struct ChunkBuilder {
+    buffer: ChunkBuffer,
+    fixed_capacity: Option<usize>,
+}
+
+impl Default for ChunkBuilder {
+    fn default() -> Self {
+        Self {
+            buffer: ChunkBuffer::unpooled(Vec::new()),
+            fixed_capacity: None,
+        }
+    }
 }
 
 impl ChunkBuilder {
+    /// Acquire capacity without a live quota. Allocation refusal returns ENOMEM.
+    pub fn with_pool(pool: Arc<WriteBufferPool>, capacity: usize) -> Result<Self> {
+        Ok(Self {
+            buffer: pool.checkout(capacity)?,
+            fixed_capacity: Some(capacity),
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.buffer.bytes.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.buffer.bytes.is_empty()
+    }
+    pub fn capacity(&self) -> usize {
+        self.buffer.bytes.capacity()
+    }
+    /// Usable body limit; actual allocation capacity may be larger on reuse.
+    pub fn writable_capacity(&self) -> usize {
+        self.fixed_capacity.unwrap_or_else(|| self.capacity())
+    }
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.buffer.bytes
+    }
+    pub fn data_ptr(&self) -> *const u8 {
+        self.buffer.bytes.as_ptr()
+    }
+    pub fn allocation_id(&self) -> u64 {
+        self.buffer.allocation_id
+    }
+
+    /// Copy accepted input directly to the final storage. Fixed builders never
+    /// reallocate; allocation errors leave the previous bytes and length intact.
     pub fn write_at(&mut self, offset: u64, data: &[u8]) -> Result<usize> {
+        if data.is_empty() {
+            return Ok(0);
+        }
         let offset = usize::try_from(offset).map_err(|_| invalid("chunk offset is too large"))?;
         let end = offset
             .checked_add(data.len())
             .ok_or_else(|| invalid("chunk write range overflow"))?;
-        if end > self.bytes.len() {
-            self.bytes.resize(end, 0);
+        if self.fixed_capacity.is_some_and(|capacity| end > capacity) {
+            return Err(write_allocation_error());
         }
-        self.bytes[offset..end].copy_from_slice(data);
+        if end > self.buffer.bytes.capacity() {
+            self.buffer
+                .bytes
+                .try_reserve_exact(end - self.buffer.bytes.len())
+                .map_err(|_| write_allocation_error())?;
+        }
+        let old_len = self.buffer.bytes.len();
+        let overwritten = old_len.saturating_sub(offset).min(data.len());
+        if overwritten != 0 {
+            self.buffer.bytes[offset..offset + overwritten].copy_from_slice(&data[..overwritten]);
+            self.record_input_copy(offset, overwritten);
+        }
+        if overwritten < data.len() {
+            if offset > old_len {
+                self.buffer.bytes.resize(offset, 0);
+            }
+            // Capacity has already been proved sufficient, so this extend
+            // initializes only accepted input and cannot move the allocation.
+            self.buffer.bytes.extend_from_slice(&data[overwritten..]);
+            self.record_input_copy(offset + overwritten, data.len() - overwritten);
+        }
         Ok(data.len())
     }
 
+    fn record_input_copy(&self, offset: usize, bytes: usize) {
+        if let Some(pool) = self.buffer.pool.upgrade() {
+            pool.record_copy(bytes);
+        }
+        afs_logging::debug!("dfs.write_buffer.input_copy";
+            "event" => "input_copy",
+            "allocation_id" => self.allocation_id(),
+            "capacity" => self.capacity() as u64,
+            "body_pointer" => self.data_ptr() as usize,
+            "buffer_offset" => offset as u64,
+            "copied_bytes" => bytes as u64,
+        );
+    }
+
+    /// Shrink logical content without releasing or reallocating its storage.
+    pub fn truncate(&mut self, length: usize) {
+        self.buffer.bytes.truncate(length);
+    }
+
+    /// Legacy full-body ownership transfer; pooled builders are not used here.
     pub fn replace(&mut self, bytes: Vec<u8>) {
-        self.bytes = bytes;
+        self.buffer = ChunkBuffer::unpooled(bytes);
+        self.fixed_capacity = None;
+    }
+
+    pub fn freeze(self) -> SharedChunkBytes {
+        let pointer_before = self.data_ptr() as usize;
+        let frozen = SharedChunkBytes::from_buffer(self.buffer);
+        afs_logging::debug!("dfs.write_buffer.freeze";
+            "event" => "freeze",
+            "allocation_id" => frozen.allocation_id(),
+            "capacity" => frozen.capacity() as u64,
+            "body_bytes" => frozen.len() as u64,
+            "pointer_before" => pointer_before,
+            "pointer_after" => frozen.as_ptr() as usize,
+        );
+        frozen
     }
 
     pub fn stage(self, operation_id: OperationId) -> StagedChunk {
-        StagedChunk::new(operation_id, self.bytes)
+        StagedChunk::from_shared(operation_id, self.freeze())
     }
+}
+
+fn write_allocation_error() -> Error {
+    Error::coded(
+        afs_error::IO_OUT_OF_MEMORY,
+        "write buffer capacity allocation refused",
+    )
 }
 
 /// Shared producer/replica budget per immutable staged chunk, never a file limit.
@@ -69,7 +679,7 @@ pub(crate) const MAX_STAGED_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 pub struct StagedChunk {
     pub operation_id: OperationId,
     pub chunk: ChunkObject,
-    bytes: Arc<[u8]>,
+    bytes: SharedChunkBytes,
     // This private identity is produced only by the complete initial hash. Public
     // metadata remains compatible with replica callers, but is not itself proof.
     #[cfg(feature = "dfs")]
@@ -80,17 +690,24 @@ pub struct StagedChunk {
 
 impl StagedChunk {
     pub fn new(operation_id: OperationId, bytes: Vec<u8>) -> Self {
+        Self::from_shared(
+            operation_id,
+            SharedChunkBytes::from_buffer(ChunkBuffer::unpooled(bytes)),
+        )
+    }
+
+    pub fn from_shared(operation_id: OperationId, bytes: SharedChunkBytes) -> Self {
         tracing::info_span!(
             "node.dfs.chunk.stage",
             operation_id = %operation_id.0,
             bytes = bytes.len() as u64,
+            allocation_id = bytes.allocation_id(),
+            capacity = bytes.capacity() as u64,
+            body_pointer = bytes.as_ptr() as usize,
             chunk_id = tracing::field::Empty,
         )
         .in_scope(|| {
             let bytes_len = bytes.len() as u64;
-            let bytes: Arc<[u8]> =
-                tracing::info_span!("node.dfs.chunk.vec_to_arc", bytes = bytes_len,)
-                    .in_scope(|| bytes.into());
             let content_digest = tracing::info_span!("node.dfs.chunk.hash", bytes = bytes_len,)
                 .in_scope(|| digest(&bytes));
             let chunk = ChunkObject {
@@ -138,7 +755,7 @@ impl StagedChunk {
     }
 
     #[cfg(feature = "dfs")]
-    pub(crate) fn shared_bytes(&self) -> Arc<[u8]> {
+    pub(crate) fn shared_bytes(&self) -> SharedChunkBytes {
         self.bytes.clone()
     }
 }
@@ -2317,5 +2934,278 @@ mod replica_replay_tests {
             recovered.persist(&first, &newer_target, 6, 7).unwrap(),
             floor_ack
         );
+    }
+}
+
+#[cfg(test)]
+mod write_buffer_tests {
+    use super::*;
+
+    #[test]
+    fn writable_capacity_keeps_requested_limit_separate_from_reused_allocation() {
+        let pool = WriteBufferPool::new(8192);
+        drop(ChunkBuilder::with_pool(pool.clone(), 4096).unwrap());
+        let mut builder = ChunkBuilder::with_pool(pool.clone(), 3000).unwrap();
+        assert_eq!(builder.capacity(), 4096);
+        assert_eq!(builder.writable_capacity(), 3000);
+        builder.write_at(2999, &[7]).unwrap();
+        assert_eq!(
+            builder.write_at(3000, &[8]).unwrap_err().code(),
+            afs_error::IO_OUT_OF_MEMORY
+        );
+        assert_eq!(pool.snapshot().live_bytes, 4096);
+    }
+
+    #[test]
+    fn hot_large_allocation_cannot_inflate_a_small_patch() {
+        let pool = WriteBufferPool::new(8 * 1024 * 1024);
+        let large = ChunkBuilder::with_pool(pool.clone(), 4 * 1024 * 1024).unwrap();
+        let large_pointer = large.data_ptr();
+        drop(large);
+        let mut patch = ChunkBuilder::with_pool(pool.clone(), 4096).unwrap();
+        patch.write_at(0, &[3; 4096]).unwrap();
+        assert_eq!(patch.capacity(), 4096);
+        assert_ne!(patch.data_ptr(), large_pointer);
+        assert_eq!(pool.snapshot().live_bytes, 4096);
+        assert_eq!(pool.snapshot().idle_bytes, 4 * 1024 * 1024);
+        assert_eq!(pool.snapshot().allocations, 2);
+        assert_eq!(pool.snapshot().reuses, 0);
+    }
+
+    #[test]
+    fn six_mebibyte_body_uses_two_final_allocations_without_freeze_copy() {
+        const MIB: usize = 1024 * 1024;
+        let pool = WriteBufferPool::new(8 * MIB);
+        let mut first = ChunkBuilder::with_pool(pool.clone(), 4 * MIB).unwrap();
+        let mut tail = ChunkBuilder::with_pool(pool.clone(), 4 * MIB).unwrap();
+        let input = vec![37; MIB];
+        for index in 0..6 {
+            let (builder, offset) = if index < 4 {
+                (&mut first, index * MIB)
+            } else {
+                (&mut tail, (index - 4) * MIB)
+            };
+            builder.write_at(offset as u64, &input).unwrap();
+        }
+        let first_pointer = first.data_ptr();
+        let tail_pointer = tail.data_ptr();
+        let first_generation = first.allocation_id();
+        let tail_generation = tail.allocation_id();
+        let first = first.stage(OperationId::new("four-mib"));
+        let tail = tail.stage(OperationId::new("two-mib"));
+        assert_eq!(first.bytes().len(), 4 * MIB);
+        assert_eq!(tail.bytes().len(), 2 * MIB);
+        assert_eq!(first.bytes().as_ptr(), first_pointer);
+        assert_eq!(tail.bytes().as_ptr(), tail_pointer);
+        assert_eq!(first.bytes.allocation_id(), first_generation);
+        assert_eq!(tail.bytes.allocation_id(), tail_generation);
+        assert!(
+            first
+                .bytes()
+                .iter()
+                .chain(tail.bytes())
+                .all(|byte| *byte == 37)
+        );
+        let stats = pool.snapshot();
+        assert_eq!(stats.live_bytes, 8 * MIB);
+        assert_eq!(stats.copied_bytes, 6 * MIB as u64);
+        assert_eq!(stats.copy_operations, 6);
+        assert_eq!(stats.allocations, 2);
+        drop(first);
+        drop(tail);
+        assert_eq!(pool.snapshot().live_bytes, 0);
+        assert_eq!(pool.snapshot().idle_bytes, 8 * MIB);
+    }
+
+    #[test]
+    fn actual_copy_entries_count_overlap_extension_and_zeroed_holes_separately() {
+        let pool = WriteBufferPool::new(32);
+        let mut builder = ChunkBuilder::with_pool(pool.clone(), 16).unwrap();
+        builder.write_at(0, b"abc").unwrap();
+        builder.write_at(2, b"def").unwrap();
+        builder.write_at(8, b"g").unwrap();
+        assert_eq!(builder.as_bytes(), b"abdef\0\0\0g");
+        assert_eq!(pool.snapshot().copied_bytes, 7);
+        // The extension crossing the initialized tail copies one existing and
+        // one new range; sparse zero initialization is not input copying.
+        assert_eq!(pool.snapshot().copy_operations, 4);
+    }
+
+    #[test]
+    fn exact_metrics_track_last_owner_reuse_and_stop() {
+        let registry = afs_metrics::Registry::new();
+        let pool = WriteBufferPool::new(4096);
+        pool.register_metrics(&registry).unwrap();
+        let mut builder = ChunkBuilder::with_pool(pool.clone(), 4096).unwrap();
+        builder.write_at(0, b"data").unwrap();
+        let frozen = builder.freeze();
+        let delayed = frozen.slice(..);
+        drop(frozen);
+        let before = afs_metrics::encode_text(&registry).unwrap();
+        assert!(
+            before.contains("afs_dfs_write_buffer_live_bytes 4096\n"),
+            "{before}"
+        );
+        assert!(
+            before.contains("afs_dfs_write_buffer_idle_bytes 0\n"),
+            "{before}"
+        );
+        drop(delayed);
+        let reused = ChunkBuilder::with_pool(pool.clone(), 4096).unwrap();
+        drop(reused);
+        pool.stop();
+        let after = afs_metrics::encode_text(&registry).unwrap();
+        for expected in [
+            "afs_dfs_write_buffer_live_bytes 0\n",
+            "afs_dfs_write_buffer_idle_bytes 0\n",
+            "afs_dfs_write_buffer_live_peak_bytes 4096\n",
+            "afs_dfs_write_buffer_allocations_total 1\n",
+            "afs_dfs_write_buffer_reuses_total 1\n",
+            "afs_dfs_write_buffer_released_bytes_total 4096\n",
+            "afs_dfs_write_buffer_input_copy_bytes_total 4\n",
+            "afs_dfs_write_buffer_input_copies_total 1\n",
+        ] {
+            assert!(after.contains(expected), "missing {expected} in {after}");
+        }
+    }
+
+    #[test]
+    fn freeze_and_shared_ranges_keep_allocation_until_last_owner() {
+        let pool = WriteBufferPool::new(8192);
+        let mut builder = ChunkBuilder::with_pool(pool.clone(), 4096).unwrap();
+        builder.write_at(0, b"abcdef").unwrap();
+        let pointer = builder.data_ptr();
+        let generation = builder.allocation_id();
+        let capacity = builder.capacity();
+        let frozen = builder.freeze();
+        assert_eq!(frozen.as_ptr(), pointer);
+        assert_eq!(frozen.allocation_id(), generation);
+        assert_eq!(frozen.capacity(), capacity);
+        let range = frozen.slice(1..4);
+        let staged = StagedChunk::from_shared(OperationId::new("shared-freeze"), range.clone());
+        assert_eq!(staged.bytes(), b"bcd");
+        assert_eq!(staged.bytes().as_ptr(), pointer.wrapping_add(1));
+        assert_eq!(staged.chunk.length, 3);
+        assert_eq!(pool.snapshot().copied_bytes, 6);
+        drop(frozen);
+        drop(range);
+        assert_eq!(pool.snapshot().live_buffers, 1);
+        assert_eq!(pool.snapshot().idle_bytes, 0);
+        drop(staged);
+        assert_eq!(pool.snapshot().live_bytes, 0);
+        assert_eq!(pool.snapshot().idle_bytes, capacity);
+    }
+
+    #[test]
+    fn reuse_has_new_generation_and_never_exposes_old_data() {
+        let pool = WriteBufferPool::new(8192);
+        let mut first = ChunkBuilder::with_pool(pool.clone(), 4096).unwrap();
+        first.write_at(0, &[0xa5; 4096]).unwrap();
+        let pointer = first.data_ptr();
+        let generation = first.allocation_id();
+        drop(first);
+        let mut next = ChunkBuilder::with_pool(pool.clone(), 4096).unwrap();
+        assert_eq!(next.data_ptr(), pointer);
+        assert_ne!(next.allocation_id(), generation);
+        assert_eq!(next.len(), 0);
+        next.write_at(8, &[7]).unwrap();
+        assert_eq!(next.as_bytes(), &[0, 0, 0, 0, 0, 0, 0, 0, 7]);
+        next.truncate(3);
+        next.write_at(8, &[9]).unwrap();
+        assert_eq!(next.as_bytes(), &[0, 0, 0, 0, 0, 0, 0, 0, 9]);
+        assert_eq!(pool.snapshot().allocations, 1);
+        assert_eq!(pool.snapshot().reuses, 1);
+    }
+
+    #[test]
+    fn idle_baseline_does_not_limit_live_and_stop_retires_late_owners() {
+        let pool = WriteBufferPool::new(4096);
+        let mut builders = Vec::new();
+        for _ in 0..3 {
+            let mut builder = ChunkBuilder::with_pool(pool.clone(), 4096).unwrap();
+            builder.write_at(0, &[1; 4096]).unwrap();
+            builders.push(builder);
+        }
+        assert_eq!(pool.snapshot().live_bytes, 3 * 4096);
+        let retained = builders.pop().unwrap().freeze();
+        drop(builders);
+        assert_eq!(pool.snapshot().live_bytes, 4096);
+        assert_eq!(pool.snapshot().idle_bytes, 4096);
+        assert_eq!(pool.snapshot().released_bytes, 4096);
+        pool.stop();
+        assert_eq!(pool.snapshot().idle_bytes, 0);
+        assert_eq!(pool.snapshot().live_bytes, 4096);
+        drop(retained);
+        assert_eq!(pool.snapshot().live_bytes, 0);
+        assert_eq!(pool.snapshot().released_bytes, 3 * 4096);
+        let after_stop = ChunkBuilder::with_pool(pool.clone(), 4096).unwrap();
+        drop(after_stop);
+        assert_eq!(pool.snapshot().idle_bytes, 0);
+    }
+
+    #[test]
+    fn fixed_capacity_failure_keeps_previously_accepted_bytes() {
+        let pool = WriteBufferPool::new(0);
+        let mut builder = ChunkBuilder::with_pool(pool.clone(), 4).unwrap();
+        builder.write_at(0, b"abcd").unwrap();
+        let pointer = builder.data_ptr();
+        let error = builder.write_at(3, b"ef").unwrap_err();
+        assert_eq!(error.code(), afs_error::IO_OUT_OF_MEMORY);
+        assert_eq!(builder.as_bytes(), b"abcd");
+        assert_eq!(builder.data_ptr(), pointer);
+        assert_eq!(pool.snapshot().copied_bytes, 4);
+        assert_eq!(pool.snapshot().copy_operations, 1);
+        pool.fail_next_allocation();
+        assert_eq!(
+            ChunkBuilder::with_pool(pool.clone(), 8).unwrap_err().code(),
+            afs_error::IO_OUT_OF_MEMORY
+        );
+        assert_eq!(pool.snapshot().live_bytes, 4);
+    }
+
+    #[test]
+    fn pooled_builder_cannot_keep_pool_alive_or_modify_a_frozen_chunk() {
+        let pool = WriteBufferPool::new(4096);
+        let weak = Arc::downgrade(&pool);
+        let mut builder = ChunkBuilder::with_pool(pool.clone(), 4096).unwrap();
+        builder.write_at(0, b"original").unwrap();
+        let frozen = builder.freeze();
+        drop(pool);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(&*frozen, b"original");
+        drop(frozen);
+    }
+
+    #[test]
+    fn staged_vec_and_default_builder_keep_legacy_content_without_vec_to_arc_copy() {
+        let bytes = b"owned".to_vec();
+        let pointer = bytes.as_ptr();
+        let staged = StagedChunk::new(OperationId::new("vec-owner"), bytes);
+        assert_eq!(staged.bytes().as_ptr(), pointer);
+        let mut builder = ChunkBuilder::default();
+        builder.write_at(3, b"data").unwrap();
+        assert_eq!(builder.as_bytes(), b"\0\0\0data");
+        builder.replace(b"replacement".to_vec());
+        assert_eq!(
+            builder.stage(OperationId::new("legacy")).bytes(),
+            b"replacement"
+        );
+    }
+
+    #[test]
+    fn mutable_overwrite_is_in_place_and_frozen_identity_is_immutable() {
+        let pool = WriteBufferPool::new(8192);
+        let mut builder = ChunkBuilder::with_pool(pool.clone(), 4096).unwrap();
+        builder.write_at(0, b"abcdef").unwrap();
+        let pointer = builder.data_ptr();
+        builder.write_at(2, b"XY").unwrap();
+        assert_eq!(builder.data_ptr(), pointer);
+        let staged = builder.stage(OperationId::new("first"));
+        assert_eq!(staged.bytes(), b"abXYef");
+        let mut patch = ChunkBuilder::with_pool(pool.clone(), 2).unwrap();
+        patch.write_at(0, b"zz").unwrap();
+        assert_eq!(patch.stage(OperationId::new("patch")).bytes(), b"zz");
+        assert_eq!(staged.bytes(), b"abXYef");
+        assert_eq!(pool.snapshot().copied_bytes, 10);
     }
 }

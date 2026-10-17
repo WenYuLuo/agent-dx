@@ -185,3 +185,13 @@ S3 容量查询暂不支持，statfs 明确返回不支持，不能用 Node 空�
 SeaweedFS 等 S3 服务是外部运行依赖，其部署脚本、数据库和测试凭据不进入
 产品仓。连接方式见[部署配置](../docs/deployment/afs.md#dfs-外部-s3-连接)，
 验证边界见[验收说明](../docs/testing/afs.md#dfs-外部-s3-闭环)。
+
+## 原生 DFS 写 buffer
+
+本地 inode owner 的普通 FUSE 写在原有顺序门禁内直接填最终可写 buffer，原提交入口消费冻结并共享
+只读正文，不新增满4MiB提交入口。`dfs_write_buffer_idle_bytes` 默认128MiB，仅限制空闲复用容量，
+不限制 live 正文；最后引用释放才归还，停止清空。Linux Node 默认使用官方 jemalloc，Meta 和其他
+ADX 进程不强制替换。S3 原窗口和预算独立保持，不新增正文 RAM 内容缓存。
+具体一致性、未知提交、一次复制范围、ENOMEM/OOM和验证边界见
+[架构](../docs/architecture/afs.md#dfs-原生写正文所有权)、[配置](../docs/deployment/afs.md#原生写-buffer-与-node-allocator)
+与[测试](../docs/testing/afs.md#原生写-buffer-验证)。减少复制不自动等于性能达标。

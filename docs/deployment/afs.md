@@ -203,3 +203,46 @@ capacity_bytes = 268435456
 有效的版本／布局授权、Node/session及最终期限检查；正常退出等待活动operation结束，
 停止后不接纳fill。可丢弃缓存不要求fsync，成功应用fsync仍依赖原持久副本和Meta屏障。
 本次未启用外部S3后端的Peer缓存协同；该扩展另行验证，不同时配置两种后端缓存。
+
+## 原生写 buffer 与 Node allocator
+
+`dfs_write_buffer_idle_bytes` 为 Node 顶层配置，默认134217728（128MiB），允许0..=1TiB；
+0禁用空闲保留。它只限制池中可复用的空闲实际容量，不预分配，也不是 live、RSS 或进程内存硬上限。
+未命中池时按需申请，最后引用释放才归还，超基线分配释放给 allocator；停止清空池。
+该配置不改变单 inode 原16MiB累计接纳阈值、后台写回或 S3 的任何预算上限。
+多 inode／慢提交可增加 live；明确分配拒绝尽力返回 ENOMEM 或合法短写，Linux OOM 杀进程
+仍按崩溃合同处理，不能保证始终正常返回错误。
+
+Linux Node 默认 feature `node-jemalloc` 安装固定官方 allocator；AFS Meta 和 ADX 其他进程不受强制替换。
+后台线程在初始化后开启，dirty decay1000ms、muzzy decay0，配置失败启动报错。
+`/metrics` 提供写 buffer 与 allocator 的独立统计，allocator每1秒采样；采样失败只使观测无效，
+不改变业务行为。GNU Linux 与 musl 的后台线程支持不同，未验证目标不能继承回收结论。
+
+同机制 system allocator 对照仅用于显式 Linux 验证：
+
+```sh
+cargo build --locked -p afs --release --bin afs-node
+cargo build --locked -p afs --release --no-default-features --features ownerfs,dfs --bin afs-node
+```
+
+必须分开保存并核对两个 ELF，不能用后一次构建覆盖前者身份。统一发行仍沿用 ADX 构建入口。
+空闲容量基线不能直接当作 RSS 验收值；回收窗口、触页峰值和允许偏差需在测前固定。
+
+## 原生读粗粒度诊断
+
+Node 顶层 `dfs_read_diagnostics_enabled` 默认为 `false`。仅在限定诊断轮显式开启：
+
+```toml
+dfs_read_diagnostics_enabled = true
+```
+
+使用节点现有 `rest_listen` 地址读取 `GET /v1/diagnostics/dfs-read-timing`；例如 `afs/examples/node.toml` 示例的
+`http://127.0.0.1:7501/v1/diagnostics/dfs-read-timing`。未开启时路由返回404。
+该入口复用现有管理HTTP监听，不新增鉴权层；监听地址应限于原受控管理网络。
+
+诊断只保留当前进程前256条记录，不轮转、不存正文、路径、inode、用户身份或授权token。
+检查 `schema_version`、`overflow`、`clock_failures` 及每项完成／成功状态后再解释数据；
+溢出或缺失记录不能用于完整归因。根／段区间及临时元数据有固定上限，不增加正文缓存或载荷预算。
+关闭时不分配诊断journal、不采诊断时钟，仍有轻量状态判断及原有指标，不承诺零指令开销。
+正式性能轮关闭该选项，诊断轮单独保存；父子阶段、重叠区间和累计hash耗时不能从E2E直接扣减。
+详细边界见[测试说明](../testing/afs.md#原生读粗粒度诊断)。

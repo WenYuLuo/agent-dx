@@ -918,6 +918,24 @@ impl GrpcDfsMeta {
         }
     }
 
+    // Covers request preparation, caller queue/transport wait, reply decoding
+    // and domain conversion. It is a client adapter interval, not server CPU.
+    fn read_diagnostic<T>(
+        &self,
+        stage: crate::node::read_work::ReadDiagnosticStage,
+        call: impl FnOnce() -> afs_error::Result<T>,
+    ) -> afs_error::Result<T> {
+        let diagnostic = self
+            .read_work
+            .as_ref()
+            .and_then(|metrics| metrics.diagnostic(stage));
+        let result = call();
+        if let Some(diagnostic) = diagnostic {
+            diagnostic.finish(result.is_ok());
+        }
+        result
+    }
+
     fn request_id(&self) -> String {
         format!(
             "{}-dfs-{}",
@@ -990,65 +1008,71 @@ impl GrpcDfsMeta {
         &self,
         request: crate::dfs::ValidateDfsReadGrants,
     ) -> afs_error::Result<Vec<crate::dfs::DfsAuthorizedRead>> {
-        self.record_read_rpc("validate_read_grants");
-        let validations = request
-            .validations
-            .into_iter()
-            .map(|validation| {
-                let grant = validation.grant;
-                afs_protocol::meta::DfsReadValidation {
-                    grant: Some(afs_protocol::meta::DfsReadGrant {
-                        namespace_id: grant.namespace_id.0,
-                        file_version_id: grant.file_version_id.0,
-                        layout_root_id: grant.layout_root_id.0,
-                        caller_node_id: grant.caller_node_id,
-                        caller_node_epoch: grant.caller_node_epoch,
-                        expires_at_unix_ms: grant.expires_at_unix_ms,
-                        fence: grant.fence,
-                        token: grant.token,
-                    }),
-                    chunk_id: validation.chunk_id.0,
-                    copy_id: validation.copy_id.0,
-                    chunk_offset: validation.chunk_offset,
-                    length: validation.length,
-                }
-            })
-            .collect();
-        let reply = self
-            .run(self.client().validate_read_grants(
-                afs_protocol::meta::ValidateDfsReadGrantsRequest {
-                    receiver_node_id: request.receiver_node_id,
-                    receiver_node_epoch: request.receiver_node_epoch,
-                    peer_node_id: request.peer_node_id,
-                    validations,
-                },
-            ))?
-            .into_inner();
-        reply
-            .authorizations
-            .into_iter()
-            .map(|entry| {
-                let validation = required(entry.validation, "ReadAuthorization.validation")?;
-                Ok(crate::dfs::DfsAuthorizedRead {
-                    validation: crate::dfs::DfsReadValidation {
-                        grant: domain_dfs_read_grant(required(
-                            validation.grant,
-                            "ReadAuthorization.grant",
-                        )?),
-                        chunk_id: crate::dfs::ChunkId::new(validation.chunk_id),
-                        copy_id: crate::dfs::CopyId::new(validation.copy_id),
-                        chunk_offset: validation.chunk_offset,
-                        length: validation.length,
-                    },
-                    allowed_ranges: entry
-                        .allowed_ranges
-                        .into_iter()
-                        .map(|range| (range.offset, range.length))
-                        .collect(),
-                    expires_at_unix_ms: entry.expires_at_unix_ms,
-                })
-            })
-            .collect()
+        self.read_diagnostic(
+            crate::node::read_work::ReadDiagnosticStage::MetaValidateReadGrants,
+            || {
+                self.record_read_rpc("validate_read_grants");
+                let validations = request
+                    .validations
+                    .into_iter()
+                    .map(|validation| {
+                        let grant = validation.grant;
+                        afs_protocol::meta::DfsReadValidation {
+                            grant: Some(afs_protocol::meta::DfsReadGrant {
+                                namespace_id: grant.namespace_id.0,
+                                file_version_id: grant.file_version_id.0,
+                                layout_root_id: grant.layout_root_id.0,
+                                caller_node_id: grant.caller_node_id,
+                                caller_node_epoch: grant.caller_node_epoch,
+                                expires_at_unix_ms: grant.expires_at_unix_ms,
+                                fence: grant.fence,
+                                token: grant.token,
+                            }),
+                            chunk_id: validation.chunk_id.0,
+                            copy_id: validation.copy_id.0,
+                            chunk_offset: validation.chunk_offset,
+                            length: validation.length,
+                        }
+                    })
+                    .collect();
+                let reply = self
+                    .run(self.client().validate_read_grants(
+                        afs_protocol::meta::ValidateDfsReadGrantsRequest {
+                            receiver_node_id: request.receiver_node_id,
+                            receiver_node_epoch: request.receiver_node_epoch,
+                            peer_node_id: request.peer_node_id,
+                            validations,
+                        },
+                    ))?
+                    .into_inner();
+                reply
+                    .authorizations
+                    .into_iter()
+                    .map(|entry| {
+                        let validation =
+                            required(entry.validation, "ReadAuthorization.validation")?;
+                        Ok(crate::dfs::DfsAuthorizedRead {
+                            validation: crate::dfs::DfsReadValidation {
+                                grant: domain_dfs_read_grant(required(
+                                    validation.grant,
+                                    "ReadAuthorization.grant",
+                                )?),
+                                chunk_id: crate::dfs::ChunkId::new(validation.chunk_id),
+                                copy_id: crate::dfs::CopyId::new(validation.copy_id),
+                                chunk_offset: validation.chunk_offset,
+                                length: validation.length,
+                            },
+                            allowed_ranges: entry
+                                .allowed_ranges
+                                .into_iter()
+                                .map(|range| (range.offset, range.length))
+                                .collect(),
+                            expires_at_unix_ms: entry.expires_at_unix_ms,
+                        })
+                    })
+                    .collect()
+            },
+        )
     }
 
     pub fn validate_external_read_grants(
@@ -1335,33 +1359,38 @@ impl crate::node::dfs_read::ReadSourceProvider for GrpcDfsMeta {
         &self,
         request: crate::dfs::DfsChunkSourcesRequest,
     ) -> afs_error::Result<crate::dfs::DfsChunkSourcesReply> {
-        self.record_read_rpc("get_chunk_sources");
-        let reply = self
-            .run(
-                self.client()
-                    .get_chunk_sources(afs_tracing::request_with_current_context(
-                        afs_protocol::meta::GetDfsChunkSourcesRequest {
-                            caller_id: request.caller_id,
-                            namespace_id: request.namespace_id.0,
-                            file_version_id: request.file_version_id.0,
-                            layout_root_id: request.layout_root_id.0,
-                            chunk_ids: request
-                                .chunk_ids
-                                .into_iter()
-                                .map(|chunk_id| chunk_id.0)
-                                .collect(),
-                        },
-                    )),
-            )?
-            .into_inner();
-        Ok(crate::dfs::DfsChunkSourcesReply {
-            revision: reply.revision,
-            chunks: reply
-                .chunks
-                .into_iter()
-                .map(domain_dfs_chunk_sources)
-                .collect::<afs_error::Result<Vec<_>>>()?,
-        })
+        self.read_diagnostic(
+            crate::node::read_work::ReadDiagnosticStage::MetaGetChunkSources,
+            || {
+                self.record_read_rpc("get_chunk_sources");
+                let reply = self
+                    .run(
+                        self.client()
+                            .get_chunk_sources(afs_tracing::request_with_current_context(
+                                afs_protocol::meta::GetDfsChunkSourcesRequest {
+                                    caller_id: request.caller_id,
+                                    namespace_id: request.namespace_id.0,
+                                    file_version_id: request.file_version_id.0,
+                                    layout_root_id: request.layout_root_id.0,
+                                    chunk_ids: request
+                                        .chunk_ids
+                                        .into_iter()
+                                        .map(|chunk_id| chunk_id.0)
+                                        .collect(),
+                                },
+                            )),
+                    )?
+                    .into_inner();
+                Ok(crate::dfs::DfsChunkSourcesReply {
+                    revision: reply.revision,
+                    chunks: reply
+                        .chunks
+                        .into_iter()
+                        .map(domain_dfs_chunk_sources)
+                        .collect::<afs_error::Result<Vec<_>>>()?,
+                })
+            },
+        )
     }
 }
 
@@ -1403,19 +1432,24 @@ impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
         parent: &crate::dfs::InodeId,
         name: &[u8],
     ) -> afs_error::Result<Option<crate::dfs::InodeRecord>> {
-        let reply = self
-            .run(self.client().lookup(afs_protocol::meta::DfsLookupRequest {
-                namespace_id: self.namespace_id.0.clone(),
-                parent_inode_id: parent.0.clone(),
-                name: name.to_vec(),
-            }))?
-            .into_inner();
-        if !reply.found {
-            return Ok(None);
-        }
-        required(reply.inode, "DfsLookup.inode")
-            .and_then(domain_dfs_inode)
-            .map(Some)
+        self.read_diagnostic(
+            crate::node::read_work::ReadDiagnosticStage::MetaLookup,
+            || {
+                let reply = self
+                    .run(self.client().lookup(afs_protocol::meta::DfsLookupRequest {
+                        namespace_id: self.namespace_id.0.clone(),
+                        parent_inode_id: parent.0.clone(),
+                        name: name.to_vec(),
+                    }))?
+                    .into_inner();
+                if !reply.found {
+                    return Ok(None);
+                }
+                required(reply.inode, "DfsLookup.inode")
+                    .and_then(domain_dfs_inode)
+                    .map(Some)
+            },
+        )
     }
 
     fn create(
@@ -1737,39 +1771,48 @@ impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
         &self,
         inode_id: &crate::dfs::InodeId,
     ) -> afs_error::Result<crate::dfs::InodeRecord> {
-        self.record_read_rpc("get_inode");
-        let reply = self
-            .run(
-                self.client()
-                    .get_inode(afs_tracing::request_with_current_context(
-                        afs_protocol::meta::GetDfsInodeRequest {
-                            inode_id: inode_id.0.clone(),
-                        },
-                    )),
-            )?
-            .into_inner();
-        required(reply.inode, "GetDfsInode.inode").and_then(domain_dfs_inode)
+        self.read_diagnostic(
+            crate::node::read_work::ReadDiagnosticStage::MetaGetInode,
+            || {
+                self.record_read_rpc("get_inode");
+                let reply = self
+                    .run(
+                        self.client()
+                            .get_inode(afs_tracing::request_with_current_context(
+                                afs_protocol::meta::GetDfsInodeRequest {
+                                    inode_id: inode_id.0.clone(),
+                                },
+                            )),
+                    )?
+                    .into_inner();
+                required(reply.inode, "GetDfsInode.inode").and_then(domain_dfs_inode)
+            },
+        )
     }
 
     fn get_file_version(
         &self,
         version_id: &crate::dfs::FileVersionId,
     ) -> afs_error::Result<(crate::dfs::FileVersion, crate::dfs::LayoutRoot)> {
-        self.record_read_rpc("get_file_version");
-        let reply = self
-            .run(
-                self.client()
-                    .get_file_version(afs_tracing::request_with_current_context(
-                        afs_protocol::meta::GetFileVersionRequest {
-                            version_id: version_id.0.clone(),
-                        },
-                    )),
-            )?
-            .into_inner();
-        Ok((
-            domain_dfs_version(required(reply.version, "GetFileVersion.version")?),
-            domain_dfs_layout(required(reply.layout, "GetFileVersion.layout")?),
-        ))
+        self.read_diagnostic(
+            crate::node::read_work::ReadDiagnosticStage::MetaGetFileVersion,
+            || {
+                self.record_read_rpc("get_file_version");
+                let reply = self
+                    .run(self.client().get_file_version(
+                        afs_tracing::request_with_current_context(
+                            afs_protocol::meta::GetFileVersionRequest {
+                                version_id: version_id.0.clone(),
+                            },
+                        ),
+                    ))?
+                    .into_inner();
+                Ok((
+                    domain_dfs_version(required(reply.version, "GetFileVersion.version")?),
+                    domain_dfs_layout(required(reply.layout, "GetFileVersion.layout")?),
+                ))
+            },
+        )
     }
 
     fn sync_inode_metadata(
@@ -1902,25 +1945,29 @@ impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
         &self,
         node_id: &str,
     ) -> afs_error::Result<Option<crate::node::vfs::dfs::DfsNodeLocation>> {
-        let reply = self
-            .run(
-                self.root_client()
-                    .lookup_node(afs_protocol::meta::LookupNodeRequest {
-                        request_id: self.request_id(),
-                        node_id: node_id.to_owned(),
-                    }),
-            )?
-            .into_inner();
-        if !reply.found {
-            return Ok(None);
-        }
-        let node = required(reply.node, "LookupNode.node")?;
-        let endpoint = required(node.endpoint, "LookupNode.node.endpoint")?;
-        Ok(Some(crate::node::vfs::dfs::DfsNodeLocation {
-            node_id: node.node_id,
-            node_epoch: reply.lease_epoch,
-            data_endpoint: endpoint.data_addr,
-        }))
+        self.read_diagnostic(
+            crate::node::read_work::ReadDiagnosticStage::MetaLookupNodeLocation,
+            || {
+                let reply =
+                    self.run(self.root_client().lookup_node(
+                        afs_protocol::meta::LookupNodeRequest {
+                            request_id: self.request_id(),
+                            node_id: node_id.to_owned(),
+                        },
+                    ))?
+                    .into_inner();
+                if !reply.found {
+                    return Ok(None);
+                }
+                let node = required(reply.node, "LookupNode.node")?;
+                let endpoint = required(node.endpoint, "LookupNode.node.endpoint")?;
+                Ok(Some(crate::node::vfs::dfs::DfsNodeLocation {
+                    node_id: node.node_id,
+                    node_epoch: reply.lease_epoch,
+                    data_endpoint: endpoint.data_addr,
+                }))
+            },
+        )
     }
 
     fn current_node_session(&self, node_id: &str) -> afs_error::Result<Option<String>> {
@@ -3927,6 +3974,75 @@ mod tests {
                 1.0
             };
             assert_eq!(metric.get_counter().get_value(), expected, "{method}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_read_diagnostics_cover_full_failed_meta_calls() {
+        use crate::node::read_work::{ReadDiagnosticStage, ReadWorkMetrics};
+        let (endpoint, server) = hanging_endpoint().await;
+        let registry = afs_metrics::Registry::new();
+        let metrics = ReadWorkMetrics::register(&registry)
+            .unwrap()
+            .with_read_diagnostics(true);
+        let meta =
+            test_meta(&endpoint, Duration::from_millis(30)).with_read_work_metrics(metrics.clone());
+        tokio::task::spawn_blocking(move || {
+            use crate::node::{dfs_read::ReadSourceProvider, vfs::dfs::DfsMeta};
+            assert_eq!(
+                meta.get_inode(&crate::dfs::InodeId::new("missing"))
+                    .unwrap_err()
+                    .code(),
+                afs_error::CLIENT_DEADLINE_EXCEEDED
+            );
+            assert_eq!(
+                meta.get_file_version(&crate::dfs::FileVersionId::new("missing"))
+                    .unwrap_err()
+                    .code(),
+                afs_error::CLIENT_DEADLINE_EXCEEDED
+            );
+            assert!(
+                meta.sources_for(crate::dfs::DfsChunkSourcesRequest {
+                    caller_id: "node-a".into(),
+                    namespace_id: crate::dfs::NamespaceId::new("default"),
+                    file_version_id: crate::dfs::FileVersionId::new("missing"),
+                    layout_root_id: crate::dfs::LayoutRootId::new("missing"),
+                    chunk_ids: Vec::new(),
+                })
+                .is_err()
+            );
+            assert!(
+                meta.validate_read_grants(crate::dfs::ValidateDfsReadGrants {
+                    receiver_node_id: "node-a".into(),
+                    receiver_node_epoch: 1,
+                    peer_node_id: "node-b".into(),
+                    validations: Vec::new(),
+                })
+                .is_err()
+            );
+            assert!(
+                meta.lookup(&crate::dfs::InodeId::new("root"), b"missing")
+                    .is_err()
+            );
+            assert!(meta.lookup_node_location("missing").is_err());
+        })
+        .await
+        .unwrap();
+        server.abort();
+        let snapshot = metrics.diagnostics_snapshot().unwrap();
+        let expected = [
+            ReadDiagnosticStage::MetaGetInode,
+            ReadDiagnosticStage::MetaGetFileVersion,
+            ReadDiagnosticStage::MetaGetChunkSources,
+            ReadDiagnosticStage::MetaValidateReadGrants,
+            ReadDiagnosticStage::MetaLookup,
+            ReadDiagnosticStage::MetaLookupNodeLocation,
+        ];
+        assert_eq!(snapshot.records.len(), expected.len());
+        for (record, stage) in snapshot.records.iter().zip(expected) {
+            assert_eq!(record.stage, stage);
+            assert!(record.completed && !record.success);
+            assert!(record.end_ns > record.start_ns);
         }
     }
 

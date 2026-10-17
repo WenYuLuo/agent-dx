@@ -237,6 +237,9 @@ pub struct Cli {
     pub dfs_read_max_inflight_bytes: Option<u64>,
     #[arg(long)]
     pub dfs_read_source_cache_ttl_ms: Option<u64>,
+    /// Bounded coarse read timing for explicit diagnosis only; disabled by default.
+    #[arg(long)]
+    pub dfs_read_diagnostics_enabled: Option<bool>,
     #[arg(long)]
     pub timeout_ms: Option<u64>,
     #[arg(long)]
@@ -283,6 +286,7 @@ struct FileConfig {
     dfs_mount: Option<PathBuf>,
     dfs_external_backend: Option<DfsExternalBackendConfig>,
     dfs_peer_cache: Option<DfsPeerCacheConfig>,
+    dfs_write_buffer_idle_bytes: Option<u64>,
     dfs_desired_copies: Option<u16>,
     dfs_sync_required_copies: Option<u16>,
     dfs_min_distinct_nodes: Option<u16>,
@@ -291,6 +295,7 @@ struct FileConfig {
     dfs_read_max_ops_per_batch: Option<usize>,
     dfs_read_max_inflight_bytes: Option<u64>,
     dfs_read_source_cache_ttl_ms: Option<u64>,
+    dfs_read_diagnostics_enabled: Option<bool>,
     timeout_ms: Option<u64>,
     log_level: Option<String>,
     trace_enabled: Option<bool>,
@@ -329,6 +334,8 @@ pub struct Config {
     pub dfs_mount: Option<PathBuf>,
     pub dfs_external_backend: Option<DfsExternalBackendConfig>,
     pub dfs_peer_cache: Option<DfsPeerCacheConfig>,
+    /// Reusable idle write-body capacity only, not a live-body quota.
+    pub dfs_write_buffer_idle_bytes: u64,
     pub dfs_desired_copies: u16,
     pub dfs_sync_required_copies: u16,
     pub dfs_min_distinct_nodes: u16,
@@ -337,6 +344,7 @@ pub struct Config {
     pub dfs_read_max_ops_per_batch: usize,
     pub dfs_read_max_inflight_bytes: u64,
     pub dfs_read_source_cache_ttl_ms: u64,
+    pub dfs_read_diagnostics_enabled: bool,
     pub timeout_ms: u64,
     pub log_level: String,
     pub trace_enabled: bool,
@@ -510,6 +518,9 @@ impl Config {
             dfs_mount: cli.dfs_mount.or(file.dfs_mount),
             dfs_external_backend: file.dfs_external_backend,
             dfs_peer_cache: file.dfs_peer_cache,
+            dfs_write_buffer_idle_bytes: file
+                .dfs_write_buffer_idle_bytes
+                .unwrap_or(128 * 1024 * 1024),
             dfs_desired_copies,
             dfs_sync_required_copies,
             dfs_min_distinct_nodes,
@@ -518,6 +529,10 @@ impl Config {
             dfs_read_max_ops_per_batch,
             dfs_read_max_inflight_bytes,
             dfs_read_source_cache_ttl_ms,
+            dfs_read_diagnostics_enabled: cli
+                .dfs_read_diagnostics_enabled
+                .or(file.dfs_read_diagnostics_enabled)
+                .unwrap_or(false),
             timeout_ms: cli.timeout_ms.or(file.timeout_ms).unwrap_or(5000),
             log_level: cli
                 .log_level
@@ -547,6 +562,13 @@ impl Config {
                     "external backend requires DFS with fixed single-copy defaults; Node replication combinations are unsupported",
                 ));
             }
+        }
+        if cfg.dfs_write_buffer_idle_bytes > (1_u64 << 40)
+            || usize::try_from(cfg.dfs_write_buffer_idle_bytes).is_err()
+        {
+            return Err(invalid(
+                "dfs_write_buffer_idle_bytes must be in 0..=1 TiB and fit this platform; it limits idle capacity only",
+            ));
         }
         if let Some(cache) = &cfg.dfs_peer_cache {
             let overlaps = |other: &std::path::Path| {

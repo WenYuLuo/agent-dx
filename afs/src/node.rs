@@ -217,6 +217,8 @@ pub struct Node {
     /// 每次进程启动生成的新会话，旧远端句柄不能跨此边界复用。
     pub session_id: String,
     pub readiness: Arc<NodeReadiness>,
+    #[cfg(feature = "dfs")]
+    pub read_work_metrics: read_work::ReadWorkMetrics,
     #[cfg(feature = "ownerfs")]
     pub ownerfs: Option<Arc<vfs::ownerfs::OwnerFs>>,
     #[cfg(feature = "dfs")]
@@ -1200,7 +1202,8 @@ async fn run_node(
         None
     };
     #[cfg(feature = "dfs")]
-    let dfs_read_work_metrics = read_work::ReadWorkMetrics::register(&obs.registry)?;
+    let dfs_read_work_metrics = read_work::ReadWorkMetrics::register(&obs.registry)?
+        .with_read_diagnostics(cfg.dfs_read_diagnostics_enabled);
     #[cfg(feature = "dfs")]
     let local_chunk_store = if cfg.dfs {
         Some(Arc::new(
@@ -1453,6 +1456,17 @@ async fn run_node(
     #[cfg(feature = "dfs")]
     let mut dfs_peer_cache_for_shutdown: Option<Arc<peer_cache::DiskPeerCache>> = None;
     #[cfg(feature = "dfs")]
+    let dfs_write_buffers = chunk::WriteBufferPool::new(
+        usize::try_from(cfg.dfs_write_buffer_idle_bytes).map_err(|_| {
+            afs_error::Error::coded(
+                afs_error::CONFIG_INVALID,
+                "write buffer idle baseline does not fit this platform",
+            )
+        })?,
+    );
+    #[cfg(feature = "dfs")]
+    dfs_write_buffers.register_metrics(&obs.registry)?;
+    #[cfg(feature = "dfs")]
     let dfs_instance = if cfg.dfs {
         let namespace = crate::dfs::NamespaceId::new("default");
         let meta = dfs_meta
@@ -1569,7 +1583,8 @@ async fn run_node(
                 chunk_store,
                 read_engine,
             )
-            .with_remote_owner_factory(remote_factory),
+            .with_remote_owner_factory(remote_factory)
+            .with_write_buffer_pool(dfs_write_buffers.clone()),
         ))
     } else {
         None
@@ -1616,7 +1631,12 @@ async fn run_node(
     #[cfg(feature = "dfs")]
     let mounted_dfs = match (&cfg.dfs_mount, &dfs_instance) {
         (Some(path), Some(dfs)) => {
-            match fuse::mount_dfs_with_metrics(dfs.clone(), path, fuse_request_metrics.clone()) {
+            match fuse::mount_dfs_with_read_diagnostics(
+                dfs.clone(),
+                path,
+                fuse_request_metrics.clone(),
+                dfs_read_work_metrics.clone(),
+            ) {
                 Ok(session) => Some(session),
                 Err(error) => {
                     #[cfg(feature = "ownerfs")]
@@ -1674,6 +1694,8 @@ async fn run_node(
         observability: obs,
         session_id,
         readiness: readiness.clone(),
+        #[cfg(feature = "dfs")]
+        read_work_metrics: dfs_read_work_metrics,
         #[cfg(feature = "ownerfs")]
         ownerfs: ownerfs_instance,
         #[cfg(feature = "dfs")]
@@ -2355,6 +2377,16 @@ async fn run_node(
                 remember_shutdown_error(&mut shutdown_error, error.into());
             }
         }
+    }
+    #[cfg(feature = "dfs")]
+    {
+        // Stop retaining idle bodies after normal drain. Outstanding owners keep
+        // their allocations alive and release directly when their work ends.
+        dfs_write_buffers.stop();
+        let buffers = dfs_write_buffers.snapshot();
+        afs_logging::info!("dfs.write_buffers_stopped";
+            "live_bytes" => buffers.live_bytes,
+            "idle_bytes" => buffers.idle_bytes);
     }
     match tokio::time::timeout(std::time::Duration::from_secs(10), local.shutdown()).await {
         Ok(Ok(())) => {}

@@ -14,6 +14,16 @@ use std::ffi::OsStr;
 
 use afs_error::{Error, Result};
 
+/// FUSE write admission controls the lifetime of the borrowed request body.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WriteAdmissionMode {
+    /// Preserve worker dispatch; the frontend owns a request-body copy.
+    Queued,
+    /// Complete admission before returning from the FUSE callback, joining the
+    /// same handle FIFO as queued operations without retaining borrowed input.
+    Borrowed,
+}
+
 /// 两种后端接收同一组文件操作；每项默认拒绝，未实现时不得报告成功。
 ///
 /// 这里仅规定入口必须提供的参数与返回值。根授权、文件身份、缓存和持久化
@@ -22,6 +32,14 @@ use afs_error::{Error, Result};
 pub trait Backend: Send + Sync {
     /// 当前 Backend 在本 mount 内的根 inode。它不是 FUSE inode，也不是跨进程身份。
     fn root_inode(&self) -> types::BackendInode;
+
+    /// Select request-body admission for this open handle. Borrowed admission
+    /// can block the receive thread through existing synchronous commit triggers;
+    /// it does not change write completion or persistence semantics. Implementors
+    /// must not retain the borrowed slice after `write_with_options` returns.
+    fn write_admission_mode(&self, _handle: types::FileHandle) -> WriteAdmissionMode {
+        WriteAdmissionMode::Queued
+    }
 
     /// Linux FUSE killpriv v2 is advertised only when the selected backend can
     /// honor explicit kernel kill_suidgid causes on open/create, write and setattr.
@@ -467,6 +485,14 @@ mod tests {
             out[..5].copy_from_slice(b"owned");
             Ok(5)
         }
+    }
+
+    #[test]
+    fn default_write_admission_retains_owned_worker_dispatch() {
+        assert_eq!(
+            DefaultReadOwnedBackend.write_admission_mode(FileHandle(7)),
+            super::WriteAdmissionMode::Queued
+        );
     }
 
     #[test]
