@@ -15,6 +15,7 @@ use std::{
 
 #[derive(Default)]
 struct Backend {
+    prepare_ids: Mutex<Vec<String>>,
     prepare_gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
     prepare_entered: tokio::sync::Notify,
     checkpoint_gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
@@ -44,6 +45,9 @@ impl Backend {
 }
 #[async_trait]
 impl RuntimeDriver for Backend {
+    fn retains_checkpoint_files(&self, runtime_class: &str) -> bool {
+        runtime_class != "runsc"
+    }
     async fn inventory(&self) -> Result<Vec<adxlet::RuntimeObservation>> {
         Ok(self
             .running
@@ -200,7 +204,8 @@ impl CheckpointCooperation for Backend {
         self.workload_request.lock().unwrap().take();
         Ok(())
     }
-    async fn prepare(&self, _: &EnvironmentRecord, _: &str) -> Result<()> {
+    async fn prepare(&self, _: &EnvironmentRecord, operation_id: &str) -> Result<()> {
+        self.prepare_ids.lock().unwrap().push(operation_id.into());
         self.event("prepare");
         self.prepare_entered.notify_one();
         let gate = self.prepare_gate.lock().unwrap().clone();
@@ -1856,5 +1861,140 @@ async fn retired_shared_checkpoint(retained: Option<bool>) {
     assert_eq!(
         store.validate_artifact(&artifact).await.is_ok(),
         retained != Some(false)
+    );
+}
+
+#[tokio::test]
+async fn object_restore_over_quota_releases_runsc_files_and_protects_firecracker() {
+    use adxlet::checkpoint::ObjectCheckpointStore;
+    for runtime_class in ["runsc", "firecracker"] {
+        let (root, backend, _, mut spec, assignment) = fixture();
+        spec.runtime_class = runtime_class.into();
+        let store = Arc::new(
+            ObjectCheckpointStore::new(
+                "shared".into(),
+                Arc::new(object_store::memory::InMemory::new()),
+                "test".into(),
+                root.path().into(),
+                1,
+            )
+            .unwrap()
+            .with_max_entries(1)
+            .unwrap(),
+        );
+        let node = Adxlet::new(
+            "node".into(),
+            backend.clone(),
+            backend.clone(),
+            backend.clone(),
+            backend.clone(),
+        )
+        .with_checkpointing(store.clone(), backend)
+        .unwrap();
+        node.update_capacity(spec.resources, Duration::from_secs(300))
+            .unwrap();
+        let h = node.environment(spec, assignment).unwrap();
+        let created = h.create().await.unwrap();
+        let paused = h.pause(pause(created.record.revision)).await.unwrap();
+        let artifact = &paused.record.checkpoint.as_ref().unwrap().artifact;
+        let restored_path = root.path().join("cache").join(&artifact.location);
+        let running = h.resume(resume(paused.record.revision)).await.unwrap();
+        assert_eq!(running.record.state, EnvironmentState::Running);
+        store.evict_unreferenced(0).await.unwrap();
+        if runtime_class == "runsc" {
+            assert!(
+                !restored_path.exists(),
+                "synchronous runsc restore releases its inputs"
+            );
+        } else {
+            assert!(
+                restored_path.join("memory").exists(),
+                "Firecracker base remains pinned despite quota pressure"
+            );
+        }
+        h.delete().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while restored_path.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn object_pause_seeds_same_node_resume_without_remote_manifest() {
+    use adxlet::checkpoint::ObjectCheckpointStore;
+    use object_store::{ObjectStore, ObjectStoreExt};
+    let (root, backend, _, spec, assignment) = fixture();
+    let remote: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let store = Arc::new(
+        ObjectCheckpointStore::new(
+            "shared".into(),
+            remote.clone(),
+            "test".into(),
+            root.path().into(),
+            1024 * 1024,
+        )
+        .unwrap(),
+    );
+    let node = Adxlet::new(
+        "node".into(),
+        backend.clone(),
+        backend.clone(),
+        backend.clone(),
+        backend.clone(),
+    )
+    .with_checkpointing(store, backend)
+    .unwrap();
+    node.update_capacity(spec.resources, Duration::from_secs(300))
+        .unwrap();
+    let h = node.environment(spec, assignment).unwrap();
+    let created = h.create().await.unwrap();
+    let paused = h.pause(pause(created.record.revision)).await.unwrap();
+    let artifact = &paused.record.checkpoint.as_ref().unwrap().artifact;
+    remote
+        .delete(&object_store::path::Path::from(format!(
+            "test/{}/manifest.json",
+            artifact.location
+        )))
+        .await
+        .unwrap();
+    let running = h.resume(resume(paused.record.revision)).await.unwrap();
+    assert_eq!(running.record.state, EnvironmentState::Running);
+    h.delete().await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn idle_pause_after_aborted_prepare_uses_a_new_operation() {
+    let (_temp, backend, node, mut spec, assignment) = fixture();
+    spec.lifecycle.idle_timeout_seconds = 10;
+    spec.lifecycle.idle_action = adx_core::lifecycle::IdleAction::Pause;
+    let handle = node.environment(spec, assignment).unwrap();
+    handle.create().await.unwrap();
+    *backend.activity.lock().unwrap() = Some((1, 0));
+    *backend.fail_prepare.lock().unwrap() = true;
+    handle.tick().await.unwrap();
+    tokio::time::advance(Duration::from_secs(10)).await;
+    assert!(handle.tick().await.is_err());
+    assert_eq!(
+        handle.sync().await.unwrap().record.state,
+        EnvironmentState::Running
+    );
+    assert!(backend.events.lock().unwrap().iter().any(|e| e == "abort"));
+    *backend.fail_prepare.lock().unwrap() = false;
+    handle.tick().await.unwrap();
+    tokio::time::advance(Duration::from_secs(10)).await;
+    handle.tick().await.unwrap();
+    let ids = backend.prepare_ids.lock().unwrap().clone();
+    assert_eq!(ids.len(), 2);
+    assert_ne!(
+        ids[0], ids[1],
+        "an aborted operation cannot identify a new prepare attempt"
+    );
+    assert_eq!(
+        handle.sync().await.unwrap().record.state,
+        EnvironmentState::Paused
     );
 }

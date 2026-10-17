@@ -114,3 +114,61 @@ fn managed_template_inherits_image_process_without_overrides() {
         assert!(serde_json::from_value::<TemplateVersion>(changed).is_err());
     }
 }
+
+#[test]
+fn template_resource_limits_allow_bursting_and_reject_invalid_budgets() {
+    let mut wire = template();
+    wire["resources"] = json!({"cpu_millis":500,"memory_mib":1024,
+        "cpu_limit_millis":2000,"memory_limit_mib":4096});
+    let t: TemplateVersion = serde_json::from_value(wire.clone()).unwrap();
+    t.validate().unwrap();
+    let execution = adx_agent_core::environment::ExecutionSpec::from(&t);
+    assert_eq!(
+        serde_json::to_value(execution).unwrap()["resources"],
+        wire["resources"]
+    );
+    for (field, invalid) in [
+        ("cpu_limit_millis", 0),
+        ("cpu_limit_millis", 499),
+        ("memory_limit_mib", 0),
+        ("memory_limit_mib", 1023),
+        ("memory_limit_mib", u64::MAX),
+    ] {
+        let mut invalid_wire = wire.clone();
+        invalid_wire["resources"][field] = json!(invalid);
+        let t: TemplateVersion = serde_json::from_value(invalid_wire).unwrap();
+        assert!(t.validate().is_err(), "{field}={invalid}");
+    }
+}
+
+#[test]
+fn template_readiness_probe_is_typed_and_validated() {
+    let mut wire = template();
+    wire["init_timeout_seconds"] = json!(30);
+    wire["readiness_probe"] = json!({
+        "tcp_socket":{"port":18092},
+        "initial_delay_seconds":3,
+        "period_seconds":3,
+        "timeout_seconds":2
+    });
+    let template: TemplateVersion = serde_json::from_value(wire.clone()).unwrap();
+    template.validate().unwrap();
+    assert_eq!(
+        serde_json::to_value(adx_agent_core::environment::ExecutionSpec::from(&template)).unwrap()
+            ["readiness_probe"],
+        wire["readiness_probe"]
+    );
+
+    for invalid in [
+        json!({"tcp_socket":{"port":0}}),
+        json!({"tcp_socket":{"port":18092},"http_get":{"port":18092,"path":"/ready"}}),
+        json!({"http_get":{"port":18092,"path":"ready"}}),
+        json!({"exec":{"command":[]}}),
+        json!({"tcp_socket":{"port":18092},"period_seconds":0}),
+    ] {
+        let mut invalid_wire = wire.clone();
+        invalid_wire["readiness_probe"] = invalid;
+        let template: TemplateVersion = serde_json::from_value(invalid_wire).unwrap();
+        assert!(template.validate().is_err());
+    }
+}

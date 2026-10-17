@@ -131,9 +131,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn embedded_environment_service(
     api: &Arc<Api>,
 ) -> Result<Option<Arc<dyn Environment>>, Box<dyn std::error::Error>> {
+    let Some(path) = std::env::var_os("ADX_AGENT_CONFIG") else {
+        return Ok(None);
+    };
+    let settings: data_plane_gateway::ingress::agent_api::AgentConfig =
+        serde_json::from_slice(&std::fs::read(path)?)?;
+    let Some(embedded) = settings.embedded else {
+        return Ok(None);
+    };
     Ok(Some(Arc::new(LocalEnvironment::new(
         api.environment_service.clone(),
         limits::ENVIRONMENT_REQUEST_TIMEOUT,
+        embedded.sandbox_network,
     )?)))
 }
 

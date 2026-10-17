@@ -482,7 +482,9 @@ impl CoordinatorRpc {
     ) -> std::result::Result<pb::EnvironmentResult, Status> {
         let mut schedule_deadline = None;
         loop {
-            create_deadline.remaining()?;
+            create_deadline.remaining().map_err(|_| {
+                Status::deadline_exceeded("create deadline exceeded during central scheduling")
+            })?;
             let changed = self.0.changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
@@ -571,6 +573,15 @@ impl CoordinatorRpc {
                     ));
                 }
                 if let Some(result) = stored.result {
+                    if result.state == EnvironmentState::Failed {
+                        if let Some(failure) = &result.failure {
+                            if failure.reason == adx_core::RuntimeFailureReason::DeadlineExceeded {
+                                return Err(status(Error::DeadlineExceeded(
+                                    failure.message.clone(),
+                                )));
+                            }
+                        }
+                    }
                     if result.state != EnvironmentState::Running {
                         return Err(Status::failed_precondition(
                             "environment already completed; query its result",
@@ -615,11 +626,16 @@ impl CoordinatorRpc {
                     .endpoint(&node.address)
                     .map_err(|_| Status::invalid_argument("invalid node address"))?
                     .connect_timeout(self.0.timeout.min(create_deadline.remaining()?))
-                    .timeout(create_deadline.remaining()?);
-                let channel = endpoint
-                    .connect()
-                    .await
-                    .map_err(|_| Status::unavailable("node connection unavailable"))?;
+                    .timeout(adx_transport::deadline::create_response_timeout(
+                        create_deadline.remaining()?,
+                    ));
+                let channel = endpoint.connect().await.map_err(|_| {
+                    if create_deadline.remaining().is_err() {
+                        Status::deadline_exceeded("create deadline exceeded during node connection")
+                    } else {
+                        Status::unavailable("node connection unavailable")
+                    }
+                })?;
                 let request = pb::StartAssignedEnvironmentRequest {
                     create_deadline_unix_millis: create_deadline.unix_millis(),
                     snapshot,
@@ -633,7 +649,9 @@ impl CoordinatorRpc {
                     assignment: Some(stored.assignment.clone().try_into().map_err(status)?),
                 };
                 let mut request = adx_observability::trace::inject(request);
-                request.set_timeout(create_deadline.remaining()?);
+                request.set_timeout(adx_transport::deadline::create_response_timeout(
+                    create_deadline.remaining()?,
+                ));
                 let result = match pb::node_service_client::NodeServiceClient::new(
                     self.0.node_tls.wrap(channel),
                 )
@@ -641,7 +659,13 @@ impl CoordinatorRpc {
                 .await
                 {
                     Ok(result) => result.into_inner(),
-                    Err(error) if error.code() == tonic::Code::ResourceExhausted => {
+                    Err(error)
+                        if error.code() == tonic::Code::ResourceExhausted
+                            && error
+                                .metadata()
+                                .get("adx-backend-failure")
+                                .is_none_or(|value| value != "true") =>
+                    {
                         // A node can hold an as-yet unconfirmed local attempt.
                         // Keep this confirmed owner; retry admission after that
                         // attempt resolves, never allocate another generation.

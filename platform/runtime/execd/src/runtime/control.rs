@@ -266,6 +266,11 @@ impl Controller {
             return Err(Error::Invalid("operation id required".into()));
         }
         let operation_id = request.operation_id.clone();
+        execd_info!(
+            "[checkpoint-control] prepare_received operation={} expected_revision={}",
+            operation_id,
+            request.expected_revision
+        );
         let mut changes = self.subscribe();
         {
             let mut state = self.state.lock().unwrap();
@@ -318,8 +323,9 @@ impl Controller {
                     state.reader_running = true;
                     let controller = self.clone();
                     // The accepted operation survives cancellation of the HTTP request.
+                    let reader_operation = operation_id.clone();
                     tokio::spawn(async move {
-                        controller.read_handoff().await;
+                        controller.read_handoff(reader_operation).await;
                     });
                 }
             }
@@ -334,6 +340,12 @@ impl Controller {
                 return Err(Error::Conflict);
             }
             if status.phase != RuntimePhase::Preparing {
+                execd_info!(
+                    "[checkpoint-control] prepare_ack operation={} phase={:?} revision={}",
+                    operation_id,
+                    status.phase,
+                    status.revision
+                );
                 return Ok(status);
             }
             changes
@@ -342,9 +354,31 @@ impl Controller {
                 .map_err(|_| Error::Unavailable("control stopped".into()))?;
         }
     }
-    async fn read_handoff(self: Arc<Self>) {
+    async fn read_handoff(self: Arc<Self>, operation_id: String) {
         let hooks = self.hooks.clone();
-        let opened = tokio::task::spawn_blocking(move || hooks.open()).await;
+        let opening_operation = operation_id.clone();
+        execd_info!(
+            "[checkpoint-control] handoff_task_started operation={}",
+            operation_id
+        );
+        let opened = tokio::task::spawn_blocking(move || {
+            execd_info!(
+                "[checkpoint-control] handoff_open_started operation={}",
+                opening_operation
+            );
+            let result = hooks.open();
+            execd_info!(
+                "[checkpoint-control] handoff_open_completed operation={} success={}",
+                opening_operation,
+                result.is_ok()
+            );
+            result
+        })
+        .await;
+        execd_info!(
+            "[checkpoint-control] handoff_open_joined operation={}",
+            operation_id
+        );
         let reader = match opened {
             Ok(Ok(reader)) => reader,
             error => {
@@ -370,9 +404,23 @@ impl Controller {
                 state.status.phase = RuntimePhase::Prepared;
                 state.status.checkpoint.as_mut().unwrap().phase = CheckpointPhase::Prepared;
                 self.publish(&mut state);
+                execd_info!(
+                    "[checkpoint-control] prepared_published operation={} revision={}",
+                    operation_id,
+                    state.status.revision
+                );
             }
         }
+        execd_info!(
+            "[checkpoint-control] handoff_wait_started operation={}",
+            operation_id
+        );
         let outcome = reader.await;
+        execd_info!(
+            "[checkpoint-control] handoff_wait_completed operation={} outcome={:?}",
+            operation_id,
+            outcome
+        );
         let previous = {
             let mut state = self.state.lock().unwrap();
             state.reader_running = false;

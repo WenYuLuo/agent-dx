@@ -760,7 +760,7 @@ components:
           items:
             type: object
             additionalProperties: false
-            required: [instanceID, requestID, resources, enqueueTimeMs, waitDurationMs]
+            required: [instanceID, requestID, resources, enqueueTimeMs, waitDurationMs, schedulingRequirements]
             properties:
               instanceID: {type: string}
               requestID: {type: string, description: Same stable Environment ID because ADX has no second scheduling-request identity.}
@@ -769,6 +769,15 @@ components:
                 additionalProperties: {oneOf: [{type: string}, {type: number}]}
               enqueueTimeMs: {type: string, pattern: "^[0-9]+$"}
               waitDurationMs: {type: string, pattern: "^[0-9]+$"}
+              schedulingRequirements:
+                type: object
+                additionalProperties: false
+                required: [runtimeClass]
+                properties:
+                  runtimeClass:
+                    type: string
+                    minLength: 1
+                    description: Resolved runtime required by this queued Environment; a node must report this value in its supported runtime classes.
     CreateEnvironmentRequest:
       type: object
       additionalProperties: false
@@ -1160,7 +1169,7 @@ components:
       additionalProperties: false
       required: [reason, exit_code, message]
       properties:
-        reason: {type: string, enum: [OomKilled, Exited, Missing, ProbeFailed]}
+        reason: {type: string, enum: [OomKilled, Exited, Missing, ProbeFailed, DeadlineExceeded]}
         exit_code: {type: [integer, "null"], format: int32}
         message: {type: string}
         probe_failure: {$ref: "#/components/schemas/ProbeFailure"}

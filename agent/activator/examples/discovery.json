@@ -3,7 +3,9 @@
   "redis_url": "redis://127.0.0.1:6379/0",
   "namespace": "adx-environment-local",
   "environment_url": "http://127.0.0.1:8081",
-  "environment_api_key_envs": {"tenant": "ADX_PLATFORM_TENANT_API_KEY"},
+  "environment_api_key_envs": {
+    "tenant": "ADX_PLATFORM_TENANT_API_KEY"
+  },
   "allow_plaintext_transport": true,
   "environment_ca_file": null,
   "request_timeout_seconds": 60,
@@ -16,5 +18,13 @@
     "advertise_url": "http://127.0.0.1:8091",
     "lease_seconds": 15,
     "heartbeat_seconds": 5
+  },
+  "sandbox_network": {
+    "sandbox_cidrs": [
+      "10.233.16.0/20"
+    ],
+    "internal_cidrs": [],
+    "public_egress": true,
+    "egress_allow": []
   }
 }

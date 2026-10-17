@@ -1,5 +1,7 @@
 //! Embedded lifecycle calls must return errors without overflowing a normal worker stack.
 use adx_activator::{local_environment::LocalEnvironment, Activator};
+mod support;
+
 use adx_agent_api::{
     activator::Control, local::LocalControl, managed::ManagedService, request::RequestContext,
 };
@@ -16,6 +18,7 @@ use futures_util::{Stream, StreamExt};
 use serde_json::json;
 use std::pin::Pin;
 use std::sync::Arc;
+use support::network_policy;
 use tonic::{Request, Response, Status};
 
 #[derive(Debug)]
@@ -107,7 +110,11 @@ fn embedded_create_returns_rpc_failure_on_normal_worker_stack() {
             config.runtime_profile = Some(profile);
             let clients = Clients::new(config).unwrap();
             let service = EnvironmentService::new(clients);
-            let adapter = Arc::new(LocalEnvironment::new(service, std::time::Duration::from_secs(60)).unwrap());
+            let adapter = Arc::new(LocalEnvironment::new(
+                service,
+                std::time::Duration::from_secs(60),
+                network_policy(),
+            ).unwrap());
             tokio::time::timeout(std::time::Duration::from_secs(3), async {
                 loop {
                     if matches!(adapter.get("tenant", "embedded-stack").await, Ok(None)) { break; }

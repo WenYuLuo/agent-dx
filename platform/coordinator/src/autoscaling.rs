@@ -199,6 +199,7 @@ fn queue_view(queue: pb::GetSchedulingQueueResponse) -> Value {
             }
             Some(
                 json!({"instanceID": spec.id, "requestID": spec.id, "resources": values,
+            "schedulingRequirements": {"runtimeClass": spec.runtime_class},
             "enqueueTimeMs": pending.enqueue_time_millis.to_string(),
             "waitDurationMs": now.saturating_sub(pending.enqueue_time_millis).to_string()}),
             )

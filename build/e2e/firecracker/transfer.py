@@ -21,6 +21,7 @@ from transfer_contract import verify as verify_transfer
 from demand_contract import verify as verify_demand
 from demand_physical import audit as audit_demand
 from autoscaling_contract import verify as verify_autoscaling
+from cache_contract import verify as verify_cache
 from storage_fixture import public as public_storage
 
 
@@ -39,10 +40,15 @@ def _executable(name, environment=None, cwd=None):
 def main():
     root = Path(sys.argv[1]).resolve()
     suite = os.getenv('ADX_FC_SUITE', 'transfer')
-    if suite not in ('transfer', 'demand', 'autoscaling'):
+    if suite not in ('transfer', 'demand', 'autoscaling', 'cache'):
         raise ValueError('unknown Firecracker suite')
     demand_suite = suite == 'demand'
-    verify = {'transfer': verify_transfer, 'demand': verify_demand, 'autoscaling': verify_autoscaling}[suite]
+    verify = {
+        'transfer': verify_transfer,
+        'demand': verify_demand,
+        'autoscaling': verify_autoscaling,
+        'cache': verify_cache,
+    }[suite]
     sdk_result_name = 'sdk-' + suite + '.json'
     base = Path(os.environ.get('ADX_FC_BASE', '/opt/adx'))
     if root.exists():

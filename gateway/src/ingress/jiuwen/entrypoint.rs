@@ -27,6 +27,7 @@ use tokio_tungstenite::{
     tungstenite::{handshake::server::create_response, protocol::Role},
     WebSocketStream,
 };
+use tracing::Instrument;
 
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -47,6 +48,8 @@ pub struct JiuwenConfig {
     pub download_timeout_seconds: u64,
     #[serde(default = "write_timeout")]
     pub write_timeout_seconds: u64,
+    #[serde(default = "output_queue_timeout")]
+    pub output_queue_timeout_seconds: u64,
     #[serde(default = "idle_timeout")]
     pub idle_timeout_seconds: u64,
     #[serde(default = "ping_interval")]
@@ -63,6 +66,9 @@ fn download_timeout() -> u64 {
 }
 fn write_timeout() -> u64 {
     15
+}
+fn output_queue_timeout() -> u64 {
+    5
 }
 fn idle_timeout() -> u64 {
     90
@@ -98,6 +104,16 @@ impl JiuwenConfig {
             binding_id: format!("jiuwen-{}", hex::encode(Sha256::digest(tuple))),
         })
     }
+    /// Stable workspace identity across template versions and agent types.
+    pub fn parameters(&self, user_id: &str) -> Result<adx_agent_core::mounts::Parameters, Error> {
+        self.scope(user_id)?;
+        let tuple = serde_json::to_vec(&[self.tenant.as_str(), self.template.as_str(), user_id])
+            .map_err(|_| invalid())?;
+        Ok(std::collections::BTreeMap::from([(
+            "workspace".into(),
+            format!("w-{}", hex::encode(Sha256::digest(tuple))),
+        )]))
+    }
     pub fn validate(&self) -> Result<(), Error> {
         self.scope("validation")?
             .validate()
@@ -113,6 +129,7 @@ impl JiuwenConfig {
             self.request_timeout_seconds,
             self.download_timeout_seconds,
             self.write_timeout_seconds,
+            self.output_queue_timeout_seconds,
             self.idle_timeout_seconds,
             self.ping_interval_seconds,
         ] {
@@ -152,6 +169,7 @@ impl JiuwenConfig {
                 busy: 1024,
             },
             write_timeout: Duration::from_secs(self.write_timeout_seconds),
+            output_queue_timeout: Duration::from_secs(self.output_queue_timeout_seconds),
             idle_timeout: Duration::from_secs(self.idle_timeout_seconds),
             ping_interval: Duration::from_secs(self.ping_interval_seconds),
             request_timeout: Duration::from_secs(self.request_timeout_seconds),
@@ -182,8 +200,10 @@ impl JiuwenApi {
             "/ws"
                 | "/file-api/download"
                 | "/file-api/upload"
-                | "/auth/huawei/login"
-                | "/auth/logout"
+                | "/api/v1/auth/huawei/login"
+                | "/api/v1/auth/agc/login"
+                | "/api/v1/auth/logout"
+                | "/api/v1/auth/quota"
         )
     }
     fn admitted(&self, request: &Request<Incoming>) -> bool {
@@ -225,7 +245,10 @@ impl JiuwenApi {
         if !self.admitted(&request) {
             return error(StatusCode::FORBIDDEN, "ACCESS_DENIED");
         }
-        if matches!(request.uri().path(), "/auth/huawei/login" | "/auth/logout") {
+        if matches!(
+            request.uri().path(),
+            "/api/v1/auth/huawei/login" | "/api/v1/auth/agc/login" | "/api/v1/auth/logout"
+        ) {
             return self.auth_request(request).await;
         }
         let token = match accounts::bearer(request.headers()) {
@@ -242,6 +265,31 @@ impl JiuwenApi {
             Ok(Err(e)) => return auth_error(e),
             _ => return auth_error(accounts::Error::Unavailable),
         };
+        if request.uri().path() == "/api/v1/auth/quota" {
+            if request.method() != http::Method::GET {
+                return error(StatusCode::METHOD_NOT_ALLOWED, "METHOD_NOT_ALLOWED");
+            }
+            if request.uri().query().is_some() {
+                return error(StatusCode::BAD_REQUEST, "INVALID_QUERY");
+            }
+            return match tokio::time::timeout(Duration::from_secs(30), self.auth.quota(&principal))
+                .await
+            {
+                Ok(Ok(quota)) => match serde_json::to_vec(&quota) {
+                    Ok(bytes) => Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "application/json")
+                        .header("cache-control", "no-store")
+                        .body(body(Bytes::from(bytes)))
+                        .unwrap_or_else(|_| {
+                            error(StatusCode::INTERNAL_SERVER_ERROR, "RESPONSE_ERROR")
+                        }),
+                    Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "RESPONSE_ERROR"),
+                },
+                Ok(Err(e)) => auth_error(e),
+                Err(_) => auth_error(accounts::Error::Unavailable),
+            };
+        }
         let scope = match self.config.scope(&principal.user_id) {
             Ok(s) => s,
             Err(e) => return agent_error(e),
@@ -293,8 +341,15 @@ impl JiuwenApi {
                     Ok(Err(e)) => return auth_error(e),
                     Err(_) => return auth_error(accounts::Error::Unavailable),
                 };
+                let parameters = match self.config.parameters(&principal.user_id) {
+                    Ok(parameters) => parameters,
+                    Err(e) => return agent_error(e),
+                };
                 if let Err(e) = context
-                    .run(self.managed.prepare_binding(&context, &scope, &launch))
+                    .run(
+                        self.managed
+                            .prepare_binding(&context, &scope, &launch, &parameters),
+                    )
                     .await
                 {
                     return agent_error(e);
@@ -328,7 +383,8 @@ impl JiuwenApi {
         let auth = self.auth.clone();
         let upgrade = hyper::upgrade::on(&mut request);
         let config = self.config.clone();
-        tokio::spawn(async move {
+        let span = tracing::info_span!("jiuwen_ws", connection_id = %uuid::Uuid::new_v4());
+        let task = async move {
             let Ok(Ok(upgraded)) = tokio::time::timeout_at(context.deadline(), upgrade).await
             else {
                 return;
@@ -350,7 +406,8 @@ impl JiuwenApi {
                 guard,
             )
             .await;
-        });
+        };
+        tokio::spawn(task.instrument(span));
         let (parts, _) = response.into_parts();
         Response::from_parts(parts, body(Bytes::new()))
     }
@@ -361,7 +418,7 @@ impl JiuwenApi {
         if request.uri().query().is_some() {
             return error(StatusCode::BAD_REQUEST, "INVALID_QUERY");
         }
-        if request.uri().path() == "/auth/logout" {
+        if request.uri().path() == "/api/v1/auth/logout" {
             let token = match accounts::bearer(request.headers()) {
                 Ok(v) => v,
                 Err(e) => return auth_error(e),
@@ -386,6 +443,7 @@ impl JiuwenApi {
         {
             return error(StatusCode::UNSUPPORTED_MEDIA_TYPE, "JSON_REQUIRED");
         }
+        let agc = request.uri().path() == "/api/v1/auth/agc/login";
         let bytes = match tokio::time::timeout(
             Duration::from_secs(10),
             Limited::new(request.into_body(), 16384).collect(),
@@ -395,12 +453,21 @@ impl JiuwenApi {
             Ok(Ok(v)) => v.to_bytes(),
             _ => return error(StatusCode::BAD_REQUEST, "INVALID_LOGIN_REQUEST"),
         };
-        let input = match serde_json::from_slice(&bytes) {
-            Ok(v) => v,
-            Err(_) => return auth_error(accounts::Error::Invalid),
+        let result = if agc {
+            let input: accounts::AgcLoginRequest = match serde_json::from_slice(&bytes) {
+                Ok(value) => value,
+                Err(_) => return auth_error(accounts::Error::Invalid),
+            };
+            tokio::time::timeout(Duration::from_secs(45), self.auth.agc_login(input)).await
+        } else {
+            let input: accounts::LoginRequest = match serde_json::from_slice(&bytes) {
+                Ok(value) => value,
+                Err(_) => return auth_error(accounts::Error::Invalid),
+            };
+            tokio::time::timeout(Duration::from_secs(45), self.auth.login(input)).await
         };
-        match tokio::time::timeout(Duration::from_secs(45), self.auth.login(input)).await {
-            Ok(Ok(v)) => match serde_json::to_vec(&v) {
+        match result {
+            Ok(Ok(value)) => match serde_json::to_vec(&value) {
                 Ok(bytes) => Response::builder()
                     .status(StatusCode::OK)
                     .header("content-type", "application/json")

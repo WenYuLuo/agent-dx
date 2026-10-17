@@ -1,5 +1,6 @@
 //! Agent-side adapter for a co-located Environment management application.
 use crate::environment_request;
+use adx_agent_core::network::SandboxNetworkPolicy;
 use adx_agent_core::{
     environment::*,
     transport::{capped_deadline, remaining_time},
@@ -31,16 +32,20 @@ pub trait EnvironmentApplication: Send + Sync {
 pub struct LocalEnvironment {
     application: Arc<dyn EnvironmentApplication>,
     timeout: Duration,
+    network: SandboxNetworkPolicy,
 }
 impl LocalEnvironment {
     pub fn new(
         application: Arc<dyn EnvironmentApplication>,
         timeout: Duration,
+        network: SandboxNetworkPolicy,
     ) -> Result<Self, EnvironmentError> {
         environment_request::validate_timeout(timeout)?;
+        environment_request::network_input(&network)?;
         Ok(Self {
             application,
             timeout,
+            network,
         })
     }
 }
@@ -53,7 +58,7 @@ impl Environment for LocalEnvironment {
         &self,
         request: &CreateEnvironment,
     ) -> Result<EnvironmentObservation, EnvironmentError> {
-        let input = environment_request::create_input(request, self.timeout)?;
+        let input = environment_request::create_input(request, self.timeout, &self.network)?;
         let operation_id =
             environment_request::operation_id("create", &request.tenant, &request.id)?;
         let remaining = remaining_time(capped_deadline(request.deadline_unix_ms, self.timeout));

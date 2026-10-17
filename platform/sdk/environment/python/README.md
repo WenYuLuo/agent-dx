@@ -23,11 +23,13 @@ remains visible even when cleanup also fails.
 
 The new Environment backend supports basic lifecycle, on-demand pause/resume, reusable snapshots, grouped placement, idle deletion/pause and restart policy. It requires an image containing the release EXECD at the configured command path; generic `python:3.12-slim` below is only an illustrative image name.
 
-The Environment backend supports S3 rootfs, S3/image mounts, entrypoint inheritance,
+The Environment backend supports S3 rootfs, S3/image/Local mounts, entrypoint inheritance,
 creation and runtime network policy, `extra_config`, `failover=True`, independent
 resource limits, and per-environment data-plane security. Declared user ports use
-Ingress and Relay routing. Public local rootfs paths and host mounts are not a
-tenant-facing contract. `upstream` reverse tunnel uses the published
+Ingress and Relay routing. Public local rootfs paths remain rejected. Local bind
+mounts accept `host_path` (alias `hostPath`), with exactly one mount source and
+pre-existing node-visible directories. Arbitrary host paths require a trusted
+management caller; the API does not enforce per-tenant source-path authorization. `upstream` reverse tunnel uses the published
 `/tunnel/{environment}` route; the legacy `/invoke` fallback remains unavailable. See the
 [current HTTP contract](https://gitcode.com/openJiuwen/agent-dx/blob/refactor/gateway/apiserver/docs/environment-lifecycle-api.md).
 

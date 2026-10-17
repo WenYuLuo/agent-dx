@@ -48,7 +48,7 @@ impl EnvironmentApplication for EnvironmentService {
     ) -> Result<(), EnvironmentError> {
         self.execute(Kind::Delete, id, operation_id, input, &caller(tenant))
             .await
-            .map_err(|error| map_status(error, true))?;
+            .map_err(map_delete_status)?;
         Ok(())
     }
 }
@@ -58,9 +58,19 @@ fn caller(tenant: &str) -> pb::CallerContext {
         administrator: false,
     }
 }
+fn map_delete_status(status: Status) -> EnvironmentError {
+    if status.code() == Code::NotFound {
+        EnvironmentError::NotFound
+    } else {
+        map_status(status, true)
+    }
+}
 fn map_status(status: Status, write: bool) -> EnvironmentError {
     match status.code() {
-        Code::PermissionDenied => EnvironmentError::NotFound,
+        Code::PermissionDenied if !write => EnvironmentError::NotFound,
+        Code::PermissionDenied => {
+            EnvironmentError::Unavailable("API Server permission denied".into())
+        }
         Code::NotFound if !write => EnvironmentError::NotFound,
         Code::InvalidArgument => EnvironmentError::Invalid("API Server rejected request".into()),
         Code::AlreadyExists | Code::FailedPrecondition | Code::Aborted => {
@@ -78,6 +88,21 @@ fn map_status(status: Status, write: bool) -> EnvironmentError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn delete_absence_is_distinct_from_permission_and_unknown_outcomes() {
+        assert_eq!(
+            map_delete_status(Status::not_found("absent")),
+            EnvironmentError::NotFound
+        );
+        assert!(matches!(
+            map_delete_status(Status::permission_denied("private")),
+            EnvironmentError::Unavailable(_)
+        ));
+        assert!(matches!(
+            map_delete_status(Status::unavailable("lost response")),
+            EnvironmentError::OutcomeUnknown(_)
+        ));
+    }
     #[test]
     fn missing_writes_and_private_reads_keep_distinct_errors() {
         assert_eq!(

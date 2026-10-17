@@ -76,17 +76,20 @@ if not (payload['environmentId'] == 't-http-case'):
 code, _ = call('DELETE', '/api/environment/t-http-case', key='b' * 40)
 if not (code == 403):
     raise AssertionError(code)
-# Target Node rechecks tenant ownership; valid deletion then succeeds twice.
-for _ in range(2):
-    code, body = call('DELETE', '/api/environment/t-http-case')
-    if not (code == 200):
-        raise AssertionError((code, body))
+# Target Node rechecks tenant ownership. A successful delete retires the public
+# directory entry, so later requests observe absence.
+code, body = call('DELETE', '/api/environment/t-http-case')
+if code != 200:
+    raise AssertionError((code, body))
+code, body = call('DELETE', '/api/environment/t-http-case')
+if code != 404:
+    raise AssertionError((code, body))
 code, body = call(
     'POST', '/api/environment/v1/environments/t-http-case/pause', {}, extra={'X-ADX-Request-ID': 'pause-http-case'}
 )
-if not (code == 409):
+if not (code == 404):
     raise AssertionError((code, body))
-print(('Public HTTPS create, credential/tenant checks, repeated delete, pause on deleted instance rejected'))
+print(('Public HTTPS create, credential/tenant checks, deletion and retired-instance absence'))
 
 # Real HTTPS -> authenticated API Server -> mTLS Coordinator -> Redis key lifecycle.
 admin = 'd' * 40
@@ -234,7 +237,12 @@ for _ in range(2):
     created.append(json.loads(base64.b64decode(value['data']))['environmentId'])
 if not (created[0] == created[1]):
     raise AssertionError()
-code, _ = call('POST', '/api/environment/v1/environments', dict(request, name='changed'), extra={'X-Request-Id': request_id})
+code, _ = call(
+    'POST',
+    '/api/environment/v1/environments',
+    dict(request, name='changed'),
+    extra={'X-Request-Id': request_id},
+)
 if not (code == 409):
     raise AssertionError(code)
 code, value = call('POST', '/api/environment/v1/environments', request, extra={'X-Request-Id': 'another-request'})
@@ -285,7 +293,10 @@ for request_id, value in [('pause-invalid', {'timeoutSeconds': -1}), ('pause-inv
         raise AssertionError()
 for _ in range(2):
     code, value = call(
-        'POST', pause, {'ttlSeconds': 120, 'timeoutSeconds': 10}, extra={'X-ADX-Request-ID': 'pause-http-positive'}
+        'POST',
+        pause,
+        {'retention': {'kind': 'ttl', 'ttlSeconds': 120}, 'timeoutSeconds': 10},
+        extra={'X-ADX-Request-ID': 'pause-http-positive'},
     )
     if not (code == 200):
         raise AssertionError((code, value))
@@ -335,7 +346,9 @@ if not (call('DELETE', '/api/environment/' + identity)[0] == 200):
     raise AssertionError()
 if not (
     call(
-        'DELETE', '/api/environment/v1/snapshots/' + snapshot, extra={'X-ADX-Request-ID': 'delete-snapshot-http-positive'}
+        'DELETE',
+        f'/api/environment/v1/snapshots/{snapshot}',
+        extra={'X-ADX-Request-ID': 'delete-snapshot-http-positive'},
     )[0]
     == 200
 ):

@@ -44,9 +44,16 @@ prove that the scheduling change failed; query the node again.
 
 The response contains `count` and `instanceInfos`. Each entry has `instanceID`,
 `requestID` (both the Environment ID), `resources`, `enqueueTimeMs` and
-`waitDurationMs`. Times are decimal millisecond strings. Resource strings use
+`waitDurationMs`, plus `schedulingRequirements.runtimeClass`. The runtime class
+is the resolved value in the queued Environment specification, including defaults
+or snapshot inheritance. A candidate node must report that runtime in its
+supported runtime classes. Values are open strings, such as `runc`, `runsc`,
+`firecracker` or `kata`; matching runtime alone does not establish that a node
+satisfies every scheduling constraint.
+
+Times are decimal millisecond strings. Resource strings use
 `cpu` in millicores (`1000m`), `memory` and `Disk` in MiB (`1024Mi`), and optional
-`GPU`/`NPU` card totals. Device models and placement constraints are omitted.
+`GPU`/`NPU` card totals. Device models and other placement constraints are omitted.
 
 Coordinator returns at most 10,000 waiting requests, ordered by enqueue time and
 ID. `count` is the returned entry count, not the complete backlog size. Assigned

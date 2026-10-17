@@ -240,9 +240,9 @@ impl Sandboxd {
                     .insert("ADX_ENV_FILE".into(), info.restore_env_path);
             }
         }
-        Ok(self.request(start_request(
-            spec, runtime_id, generation, devices, &config,
-        )?))
+        let request = start_request(spec, runtime_id, generation, devices, &config)?;
+        crate::managed_mounts::prepare(spec).await?;
+        Ok(self.request(request))
     }
 
     async fn restore_request(
@@ -303,8 +303,11 @@ impl Sandboxd {
         }
         if let Some(deadline) = deadline {
             request.set_timeout(
-                adx_transport::deadline::remaining(deadline, Duration::MAX)
-                    .ok_or_else(|| unavailable("runtime start deadline exceeded"))?,
+                adx_transport::deadline::remaining(deadline, Duration::MAX).ok_or_else(|| {
+                    Error::DeadlineExceeded(
+                        "backend preparation/runtime start deadline exceeded".into(),
+                    )
+                })?,
             );
         }
         *state = StartState::Failed;
@@ -314,7 +317,27 @@ impl Sandboxd {
         tokio::spawn(async move {
             let response = match client.start(request).await {
                 Ok(response) => response.into_inner(),
-                Err(error) => return Err(unavailable(error)),
+                Err(error) => {
+                    if error.code() == Code::DeadlineExceeded
+                        && error
+                            .metadata()
+                            .get("sandboxd-start-failure")
+                            .is_some_and(|value| value == "true")
+                    {
+                        return Err(Error::DeadlineExceeded(format!(
+                            "sandboxd: {}",
+                            error.message()
+                        )));
+                    }
+                    if error.code() == Code::DeadlineExceeded
+                        && deadline.is_some_and(|deadline| deadline <= tokio::time::Instant::now())
+                    {
+                        return Err(Error::DeadlineExceeded(format!(
+                            "sandboxd Start deadline exceeded: {error}"
+                        )));
+                    }
+                    return Err(adx_protocol::backend_error(error));
+                }
             };
             if !response.id.is_empty() {
                 adx_observability::info!(
@@ -984,6 +1007,12 @@ fn runtime_control_peer(config: &Config) -> Result<Option<proto::NetworkEndpoint
 
 #[async_trait]
 impl RuntimeDriver for Sandboxd {
+    fn retains_checkpoint_files(&self, runtime_class: &str) -> bool {
+        // sandboxd completes runsc's synchronous Restore before returning Start.
+        // Firecracker v2 retains its caller-owned incremental memory base.
+        runtime_class != "runsc"
+    }
+
     async fn stats(&self, runtime_id: &str) -> Result<crate::metrics::RuntimeUsage> {
         let value = Sandboxd::stats(self, runtime_id).await?;
         Ok(crate::metrics::RuntimeUsage {

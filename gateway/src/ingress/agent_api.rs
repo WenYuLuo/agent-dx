@@ -43,6 +43,7 @@ pub struct AgentConfig {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EmbeddedActivatorConfig {
+    pub sandbox_network: adx_agent_core::network::SandboxNetworkPolicy,
     pub redis_url: String,
     pub namespace: String,
 }

@@ -12,13 +12,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("cargo:rerun-if-changed={file}");
     }
     println!("cargo:rerun-if-changed=proto/node_control.proto");
-    tonic_prost_build::configure().compile_protos(&files, &["proto"])?;
+    tonic_prost_build::configure()
+        .protoc_arg("--experimental_allow_proto3_optional")
+        .compile_protos(&files, &["proto"])?;
     // The public Rust modules are flat; map imported data authority types to
     // their existing module while generating the control service separately.
     let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR")?);
     let data_out = out_dir.join("data_codegen");
     std::fs::create_dir_all(&data_out)?;
     tonic_prost_build::configure()
+        .protoc_arg("--experimental_allow_proto3_optional")
         .out_dir(&data_out)
         .extern_path(".afs.meta.v1", "crate::meta")
         .boxed(".afs.node.data.v1.DfsPutReplicaHeader.repair_claim")
@@ -33,6 +36,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let control_out = out_dir.join("control_codegen");
     std::fs::create_dir_all(&control_out)?;
     tonic_prost_build::configure()
+        .protoc_arg("--experimental_allow_proto3_optional")
         .out_dir(&control_out)
         .extern_path(".afs.node.data.v1", "crate::node_data")
         .extern_path(".afs.meta.v1", "crate::meta")

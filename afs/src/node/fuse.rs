@@ -1960,9 +1960,17 @@ impl Filesystem for AfsFuse {
         let backend = self.backend.clone();
         let context = Self::metadata_context(req, 0);
         let name = name.to_os_string();
-        self.dispatch.submit(move || {
-            reply_xattr(reply, size, backend.getxattr(&context, inode, &name));
-        });
+        self.dispatch
+            .submit(move || match backend.getxattr(&context, inode, &name) {
+                Ok(data) => reply_xattr(reply, size, Ok(data)),
+                Err(error) => reply.error(fuse_errno(errno_xattr(
+                    error,
+                    "getxattr",
+                    inode.value,
+                    &name,
+                    &context,
+                ))),
+            });
     }
 
     fn listxattr(&self, req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
@@ -2006,7 +2014,7 @@ impl Filesystem for AfsFuse {
                 reply,
                 backend
                     .setxattr(&context, inode, &name, &value, flags)
-                    .map_err(errno),
+                    .map_err(|error| errno_xattr(error, "setxattr", inode.value, &name, &context)),
             );
         });
     }
@@ -2023,7 +2031,11 @@ impl Filesystem for AfsFuse {
         self.dispatch.submit(move || {
             reply_empty(
                 reply,
-                backend.removexattr(&context, inode, &name).map_err(errno),
+                backend
+                    .removexattr(&context, inode, &name)
+                    .map_err(|error| {
+                        errno_xattr(error, "removexattr", inode.value, &name, &context)
+                    }),
             );
         });
     }
@@ -2275,6 +2287,33 @@ fn os_str_bytes(value: &OsStr) -> &[u8] {
 
 fn errno(error: Error) -> i32 {
     afs_logging::error!("FUSE request failed"; "code"=>error.code().raw(), "kind"=>format!("{:?}", error.kind()), "message"=>error.message());
+    crate::error::errno(&error)
+}
+
+/// Enriched failure log for xattr requests. The generic `errno` log carries no
+/// request identity, which makes repeated xattr rejections (for example the
+/// OwnerFs user.*-only policy) impossible to attribute. xattr handlers add the
+/// operation, inode, xattr name and request credentials so the log itself names
+/// the caller without extra tracing.
+fn errno_xattr(
+    error: Error,
+    op: &'static str,
+    ino: u64,
+    name: &OsStr,
+    context: &RequestContext,
+) -> i32 {
+    afs_logging::error!(
+        "FUSE request failed";
+        "code" => error.code().raw(),
+        "kind" => format!("{:?}", error.kind()),
+        "message" => error.message(),
+        "op" => op,
+        "inode" => ino,
+        "name" => name.to_string_lossy().into_owned(),
+        "pid" => context.pid,
+        "uid" => context.uid,
+        "gid" => context.gid,
+    );
     crate::error::errno(&error)
 }
 

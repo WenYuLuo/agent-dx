@@ -72,20 +72,83 @@ async fn cache_budget_evicts_only_unpinned_downloads() {
     for value in [b'1', b'2', b'3'] {
         let staged = store.allocate().await.unwrap();
         std::fs::write(staged.join("memory"), vec![value; 6]).unwrap();
-        artifacts.push(store.publish(&staged).await.unwrap());
+        let artifact = store.publish(&staged).await.unwrap();
+        store.committed(&artifact).await.unwrap();
+        artifacts.push(artifact);
     }
     let first = store.materialize(&artifacts[0]).await.unwrap();
     let second = store.materialize(&artifacts[1]).await.unwrap();
+    let third = store.materialize(&artifacts[2]).await.unwrap();
     assert!(
-        store.materialize(&artifacts[2]).await.is_err(),
-        "pinned content consumes cache budget"
+        third.join("memory").exists(),
+        "cache quota cannot block restore"
     );
     let second_path = second.to_path_buf();
     drop(second);
     let third = store.materialize(&artifacts[2]).await.unwrap();
+    store.evict_unreferenced(0).await.unwrap();
     assert!(!second_path.exists());
     assert!(first.join("memory").exists());
     assert!(third.join("memory").exists());
+}
+
+#[tokio::test]
+async fn committed_pause_seeds_cache_without_an_obs_read() {
+    let remote: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let root = tempfile::tempdir().unwrap();
+    let store = ObjectCheckpointStore::new(
+        "shared".into(),
+        remote.clone(),
+        "test".into(),
+        root.path().into(),
+        1024 * 1024,
+    )
+    .unwrap();
+    let staged = store.allocate().await.unwrap();
+    std::fs::write(staged.join("memory"), b"local-pause").unwrap();
+    let artifact = store.publish(&staged).await.unwrap();
+    store.committed(&artifact).await.unwrap();
+    store.committed(&artifact).await.unwrap();
+    assert!(
+        staged.exists(),
+        "admission reuses the original files without copying"
+    );
+    // Remove the remote commit marker: a hot restore must need neither a
+    // manifest request nor a checkpoint data GET.
+    remote
+        .delete(&ObjectPath::from(format!(
+            "test/{}/manifest.json",
+            artifact.location
+        )))
+        .await
+        .unwrap();
+    let restored = store.materialize(&artifact).await.unwrap();
+    assert_eq!(
+        std::fs::read(restored.join("memory")).unwrap(),
+        b"local-pause"
+    );
+}
+
+#[tokio::test]
+async fn checkpoint_larger_than_cache_still_restores() {
+    let root = tempfile::tempdir().unwrap();
+    let store = ObjectCheckpointStore::new(
+        "shared".into(),
+        Arc::new(InMemory::new()),
+        "test".into(),
+        root.path().into(),
+        1,
+    )
+    .unwrap();
+    let staged = store.allocate().await.unwrap();
+    std::fs::write(staged.join("memory"), b"bigger-than-cache").unwrap();
+    let artifact = store.publish(&staged).await.unwrap();
+    store.committed(&artifact).await.unwrap();
+    let restored = store.materialize(&artifact).await.unwrap();
+    assert_eq!(
+        std::fs::read(restored.join("memory")).unwrap(),
+        b"bigger-than-cache"
+    );
 }
 
 #[tokio::test]
@@ -141,6 +204,7 @@ fn s3_client_and_control_tls_build_in_the_same_process() {
         prefix: "test".into(),
         root: root.path().into(),
         cache_budget_bytes: 1024,
+        cache_max_entries: 500,
     };
     let endpoint = tonic::transport::Endpoint::from_static("https://control.example.invalid")
         .tls_config(tonic::transport::ClientTlsConfig::new().domain_name("adx.internal"));

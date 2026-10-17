@@ -13,8 +13,8 @@ Runtime command and file operations use the separate
 Environment contract. It supports S3 rootfs and mounts, image-backed mounts,
 entrypoint inheritance, `extra_config`, independent resource request/limit
 values, published ports, per-Environment data-plane security, creation/runtime
-network policy, `failover=true`, and reload. Public local rootfs paths and host
-mounts are rejected because node paths are deployment-owned. `upstream` reverse
+network policy, `failover=true`, and reload. Public local rootfs paths remain rejected. Local mounts accept `host_path`
+(or `hostPath`) alongside the existing image/S3 source alternatives. `upstream` reverse
 tunnel is carried by the create contract; the legacy `/invoke` compatibility
 transport remains unavailable.
 Commands/files use Ingress → Relay → EXECD. See
@@ -154,7 +154,15 @@ result; an existing terminal Failed result is not restarted by create replay.
 Clock synchronization is required across processes. Deploy API Server, Coordinator
 and Adxlet together for this internal protocol change. Cleanup and late-runtime
 reconciliation may continue after caller deadline expiry. The default remains
-90 seconds for create and 30 seconds for central scheduling. User commands use the separate EXECD HTTP data path.
+90 seconds for create and 30 seconds for central scheduling. Create responses may
+use up to three additional seconds solely to report a deadline failure; backend
+execution keeps the original absolute deadline. Confirmed failed creates return
+HTTP 504 / `DEADLINE_EXCEEDED`, `retry=never`, `outcome=terminal`, with the phase
+in `message` (backend preparation/runtime start, Execd readiness, or route
+activation). Query and replay retain the failure message. Transport wait expiry
+uses the same timeout code with `outcome=unknown` / `retry=same_operation`;
+disconnections and lost replies retain `OUTCOME_UNKNOWN`. User commands use the
+separate EXECD HTTP data path.
 
 For snapshot creation, omitted/zero resource values inherit the source. Positive CPU/memory/disk values must equal its resource geometry; restoring with larger limits or resizing is rejected. This applies to the new Rust resolver even though the HTTP handler can encode positive overrides.
 
@@ -317,3 +325,29 @@ This option initializes the default directory used by SDK commands. It does not
 change Execd's process cwd or the inherited OCI entrypoint's WORKDIR. Per-command
 cwd overrides remain strict and never create directories implicitly; spawn errors
 use `SPAWN_FAILED` and `error_message`.
+
+## Local mount sources
+
+Each mount requires exactly one nonempty `image_url`, `s3_config`, or `host_path` source. The existing `imageUrl`, `s3Config`, and `hostPath` aliases are accepted. Zero or multiple sources return InvalidArgument (HTTP 400). Local source paths must be absolute without control characters or `.`/`..` components. The public local rootfs restriction is unchanged.
+
+```json
+{"image":"registry.example/app:v1","mounts":[{"type":"bind","host_path":"/mnt/sfs/workspaces/w-user","target":"/home/jiuwen","options":["rw"],"create_if_missing":true}]}
+```
+
+The request maps to `StorageSource::Local`, then sandboxd HostPath, preserving mount options. The source must exist in the runtime's mount namespace with suitable permissions. This endpoint does not mount SFS, create source directories, authorize per-tenant host paths, or coordinate multiple sandboxes using the same directory. Expose arbitrary host-path creation only to trusted management callers until deployment-specific path authorization is provided. User sandboxes do not need CAP_SYS_ADMIN for this node-side operation. Component contract tests do not establish runsc/SFS writeback or SQLite recovery guarantees.
+
+
+`create_if_missing` is an optional boolean on each mount (default `false`). It is
+accepted only for Local bind sources; other sources/types return InvalidArgument.
+Activator forwards it with the rendered path. Environment storage and RPC retain
+it, and adxlet applies it before both sandbox start and restore; sandboxd receives
+the resulting ordinary Local mount. No node directory policy is required.
+
+When enabled, only the final source directory is created (mode 0755 subject to the
+node umask, owned by the node process). Its parents must already exist. All source
+components are opened without following symlinks. Existing directories and their
+ownership are preserved; existing regular files are rejected. I/O failures prevent
+runtime creation. This flag is permission to recreate a missing directory on a
+later request; it is not a data-loss detector or an exclusive-access lock. Deployment
+must provision the shared parent, verify SFS before admission, and restrict Local
+mount APIs to trusted callers. No data is deleted when the sandbox is deleted.

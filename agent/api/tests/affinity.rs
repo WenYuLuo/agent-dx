@@ -50,6 +50,7 @@ async fn handler(
         generation: id,
         environment_id: "environment".into(),
         phase: BindingPhase::Active,
+        parameters: Default::default(),
     };
     if uri.path().ends_with("/delete") {
         Json(serde_json::Value::Null)

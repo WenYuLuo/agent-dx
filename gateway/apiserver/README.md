@@ -4,14 +4,16 @@ Rust public management HTTP service, binary `adx-apiserver`, in the root Cargo w
 
 Requests are converted directly to the generated Environment RPC types. There is no Go adapter, function payload, generic Signal dispatch or legacy protobuf dependency. Public Environment paths and base64 JSON response envelopes remain compatible with the Environment SDK. Existing `functionProxyId` in a resume response is a public compatibility field containing the node ID.
 
-Environment management operations enter through `environment_service::EnvironmentService`; Platform remains the lifecycle authority. HTTP and embedded callers share `prepare_create`/`create_request` for Environment request validation, EnvironmentSpec conversion and deployment runtime injection. Agent-specific `CreateEnvironment`/`ExecutionSpec` conversion lives in `adx_activator::environment_request`, shared by its HTTP and local adapters. The API Server implements the local `EnvironmentApplication` bridge over the same service `Arc`, without HTTP loopback. Ingress Environment v2 and Inline endpoints have been removed. Jiuwen downloads still use the old direct Platform runtime lookup pending a restricted API Server replacement; that lookup cannot read Execd credentials stored only in runtime_profile.env, so live download validation is required before deploying this refactor.
+Environment management operations enter through `environment_service::EnvironmentService`; Platform remains the lifecycle authority. HTTP and embedded callers share `prepare_create`/`create_request` for Environment request validation, EnvironmentSpec conversion and configured runtime injection. Agent-specific `CreateEnvironment`/`ExecutionSpec` conversion lives in `adx_activator::environment_request`, shared by its HTTP and local adapters. The API Server implements the local `EnvironmentApplication` bridge over the same service `Arc`, without HTTP loopback. Ingress Environment v2 and Inline endpoints have been removed. Jiuwen file access uses the shared Ingress Environment directory and data-plane path; Execd credentials remain private to that data plane.
 
 The API Server also owns the legacy-compatible scheduler HTTP paths while
 Coordinator owns their state and decisions. `/global-scheduler/resources` reads the
 watched in-memory node directory and renders the legacy `resource.fragment`
 shape; `/api/environment/v1/resources` keeps the ADX `items` shape. Administrator-only
 `/global-scheduler/scheduling_queue` reads the bounded, memory-only central
-wait queue. `POST /global-scheduler/node/localschedulingstatus?node_id=...`
+wait queue. Each waiting entry includes `schedulingRequirements.runtimeClass`,
+the resolved runtime that a candidate node must support.
+`POST /global-scheduler/node/localschedulingstatus?node_id=...`
 pauses new allocation to a node and `DELETE` removes that pause. Existing
 Environments keep running. The pause is persisted by Coordinator and is not cleared by
 Adxlet heartbeats; local pressure or reconciliation can still keep a
@@ -55,3 +57,5 @@ The API always uses the verified tenant, not tenant fields supplied in a request
 The API Server's legacy `/api/agent` compatibility routes forward to `agent_address` when configured and preserve streaming responses. The separate Agent v2 entrypoint in embedded Ingress may call an in-process Activator; Agent authorization and product rules remain in the Agent layer.
 
 See [HTTP contract](docs/environment-lifecycle-api.md), [failure behavior](docs/environment-runtime-failure.md), [deployment](../../docs/testing/process-deployment.md), and [Rust migration status](../../docs/testing/rust-apiserver.md).
+
+Local bind mounts accept `host_path`/`hostPath` when exactly one source is present; `rw` is preserved. Paths refer to sources visible to the node runtime. Local bind mounts can set `create_if_missing: true` (default false) to create the final directory on the node; parents must already exist and symlinks are rejected during creation. Source-path availability and authorization are caller responsibilities; see the [Local mount contract](docs/environment-lifecycle-api.md#local-mount-sources).

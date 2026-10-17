@@ -1,3 +1,5 @@
+mod support;
+
 use adx_activator::local_environment::{EnvironmentApplication, LocalEnvironment};
 use adx_agent_core::environment::*;
 use async_trait::async_trait;
@@ -6,11 +8,14 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
+use support::network_policy;
 
 #[derive(Default)]
 struct Application {
     creates: Mutex<Vec<(String, Value, String)>>,
     stall: bool,
+    absent: bool,
+    state: Option<&'static str>,
 }
 #[async_trait]
 impl EnvironmentApplication for Application {
@@ -31,7 +36,9 @@ impl EnvironmentApplication for Application {
         }
     }
     async fn instance(&self, _: &str, id: &str) -> Result<Option<Value>, EnvironmentError> {
-        Ok(Some(json!({"id":id,"status":"running"})))
+        Ok(Some(
+            json!({"id":id,"status":self.state.unwrap_or("running")}),
+        ))
     }
     async fn delete_request(
         &self,
@@ -40,7 +47,11 @@ impl EnvironmentApplication for Application {
         _: Value,
         _: &str,
     ) -> Result<(), EnvironmentError> {
-        Err(EnvironmentError::OutcomeUnknown("not confirmed".into()))
+        if self.absent {
+            Err(EnvironmentError::NotFound)
+        } else {
+            Err(EnvironmentError::OutcomeUnknown("not confirmed".into()))
+        }
     }
 }
 fn request() -> CreateEnvironment {
@@ -51,13 +62,14 @@ fn request() -> CreateEnvironment {
 #[tokio::test]
 async fn local_adapter_passes_the_public_request_and_preserves_unknown_delete() {
     let app = Arc::new(Application::default());
-    let environment = LocalEnvironment::new(app.clone(), Duration::from_secs(60)).unwrap();
+    let environment =
+        LocalEnvironment::new(app.clone(), Duration::from_secs(60), network_policy()).unwrap();
     assert!(environment.create(&request()).await.unwrap().ready);
     let calls = app.creates.lock().unwrap().clone();
     assert_eq!(calls[0].0, "tenant");
     assert_eq!(
         calls[0].1,
-        json!({"namespace":"adx","name":"id","image":"app:1","runtime":"runc","inheritEntrypoint":true,"env":{"MODEL_KEY":"test-key"},"cpu":1000,"memory":512,"createTimeoutSeconds":60})
+        json!({"namespace":"adx","name":"id","image":"app:1","runtime":"runc","inheritEntrypoint":true,"env":{"MODEL_KEY":"test-key"},"cpu":1000,"memory":512,"createTimeoutSeconds":60,"ports":[],"network":adx_activator::environment_request::network_input(&network_policy()).unwrap()})
     );
     assert!(calls[0].2.starts_with("activator-create-"));
     assert!(
@@ -79,7 +91,8 @@ async fn expired_calls_are_not_submitted_and_submitted_timeouts_remain_unknown()
         stall: true,
         ..Default::default()
     });
-    let environment = LocalEnvironment::new(app.clone(), Duration::from_secs(60)).unwrap();
+    let environment =
+        LocalEnvironment::new(app.clone(), Duration::from_secs(60), network_policy()).unwrap();
     let mut request = request();
     request.deadline_unix_ms = Some(adx_agent_core::unix_time_millis().saturating_sub(1));
     assert!(matches!(
@@ -93,4 +106,38 @@ async fn expired_calls_are_not_submitted_and_submitted_timeouts_remain_unknown()
         Err(EnvironmentError::OutcomeUnknown(_))
     ));
     assert_eq!(app.creates.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn local_adapter_preserves_explicit_delete_absence() {
+    let app = Arc::new(Application {
+        absent: true,
+        ..Default::default()
+    });
+    let environment =
+        LocalEnvironment::new(app, Duration::from_secs(60), network_policy()).unwrap();
+    assert!(matches!(
+        environment.delete("tenant", "adx-id").await,
+        Err(EnvironmentError::NotFound)
+    ));
+}
+
+#[tokio::test]
+async fn local_adapter_observes_dormancy_without_lifecycle_side_effects() {
+    for (state, phase) in [
+        ("pausing", EnvironmentPhase::Pausing),
+        ("paused", EnvironmentPhase::Paused),
+        ("resuming", EnvironmentPhase::Resuming),
+    ] {
+        let app = Arc::new(Application {
+            state: Some(state),
+            ..Default::default()
+        });
+        let environment =
+            LocalEnvironment::new(app.clone(), Duration::from_secs(1), network_policy()).unwrap();
+        let observed = environment.get("tenant", "adx-id").await.unwrap().unwrap();
+        assert_eq!(observed.phase, phase);
+        assert!(!observed.ready);
+        assert!(app.creates.lock().unwrap().is_empty());
+    }
 }

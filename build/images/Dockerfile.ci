@@ -1,5 +1,5 @@
-# ADX build environment. The final stage deliberately extends the existing
-# Ubuntu 20.04 builder so released GNU binaries retain the focal glibc baseline.
+# ADX build environment bootstrapped from official Ubuntu 20.04.
+# Keep the focal glibc baseline for released GNU binaries.
 ARG BASE
 FROM ${BASE}
 
@@ -10,11 +10,16 @@ RUN sed -i 's|http://mirrors.aliyun.com/ubuntu-ports|https://mirrors.aliyun.com/
     && apt-get -o Acquire::ForceIPv4=true -o Acquire::http::Timeout=30 -o Acquire::Retries=2 update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
        autoconf automake binutils build-essential busybox-static ca-certificates \
-       cmake curl git libssl-dev libtool musl-tools pkg-config python3-venv strace \
+       cmake curl git libssl-dev libtool musl-tools pkg-config strace unzip \
+       libbz2-dev libffi-dev liblzma-dev libreadline-dev libsqlite3-dev zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*
 
 ARG TARGETARCH=amd64
 ARG RUST_VERSION=1.95.0
+ARG RUSTUP_VERSION=1.28.2
+ARG PYTHON_VERSION=3.11.14
+ARG PYTHON_SHA256=8d3ed8ec5c88c1c95f5e558612a725450d2452813ddad5e58fdb1a53b1209b78
+ARG PROTOC_VERSION=25.1
 ARG GO_VERSION=1.25.5
 ARG GO_SHA256=9e9b755d63b36acf30c12a9a3fc379243714c1c6d3dd72861da637f336ebb35b
 RUN case "$TARGETARCH" in amd64|arm64) ;; *) exit 2 ;; esac \
@@ -27,15 +32,42 @@ RUN case "$TARGETARCH" in amd64|arm64) ;; *) exit 2 ;; esac \
 
 ENV GOROOT=/usr/local/go \
     PATH=/opt/adx-build-tools/python/bin:/opt/adx-build-tools/erofs-utils-1.8.10/bin:/usr/local/go/bin:/root/.cargo/bin:/opt/buildtools/protoc/bin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-    GOTOOLCHAIN=local
+    GOTOOLCHAIN=local \
+    RUSTUP_TOOLCHAIN=${RUST_VERSION} \
+    OBS_PYTHON=/opt/adx-build-tools/python/bin/python3
 
-RUN rustup toolchain install "$RUST_VERSION" --profile minimal --component rustfmt,clippy \
+RUN case "$TARGETARCH" in amd64) rust_host=x86_64-unknown-linux-gnu ;; arm64) rust_host=aarch64-unknown-linux-gnu ;; *) exit 2 ;; esac \
+    && curl --fail --location --retry 3 --connect-timeout 20 --max-time 600 \
+      "https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/${rust_host}/rustup-init" -o /tmp/rustup-init \
+    && curl --fail --location --retry 3 --connect-timeout 20 --max-time 600 \
+      "https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/${rust_host}/rustup-init.sha256" -o /tmp/rustup-init.sha256 \
+    && cd /tmp && sha256sum --check rustup-init.sha256 \
+    && chmod 0755 /tmp/rustup-init \
+    && /tmp/rustup-init -y --no-modify-path --profile minimal --default-toolchain "$RUST_VERSION" \
+    && rm /tmp/rustup-init /tmp/rustup-init.sha256 \
+    && rustup toolchain install "$RUST_VERSION" --profile minimal --component rustfmt,clippy \
     && rustup default "$RUST_VERSION" \
     && case "$TARGETARCH" in amd64) target=x86_64-unknown-linux-musl ;; arm64) target=aarch64-unknown-linux-musl ;; esac \
     && rustup target add "$target" \
     && rustup component add rustfmt clippy \
     && GOBIN=/usr/local/bin go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11 \
     && GOBIN=/usr/local/bin go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.6.2
+
+RUN case "$TARGETARCH" in amd64) protoc_arch=x86_64 ;; arm64) protoc_arch=aarch_64 ;; *) exit 2 ;; esac \
+    && curl --fail --location --retry 3 --connect-timeout 20 --max-time 600 \
+      "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-${protoc_arch}.zip" -o /tmp/protoc.zip \
+    && mkdir -p /opt/buildtools/protoc \
+    && unzip -q /tmp/protoc.zip -d /opt/buildtools/protoc \
+    && rm /tmp/protoc.zip
+
+RUN curl --fail --location --retry 3 --connect-timeout 20 --max-time 600 \
+      "https://www.python.org/ftp/python/${PYTHON_VERSION}/Python-${PYTHON_VERSION}.tar.xz" -o /tmp/python.tar.xz \
+    && echo "${PYTHON_SHA256}  /tmp/python.tar.xz" | sha256sum --check \
+    && mkdir /tmp/python \
+    && tar -xJf /tmp/python.tar.xz -C /tmp/python --strip-components=1 \
+    && cd /tmp/python && ./configure --prefix=/usr/local --with-ensurepip=install \
+    && make -j 8 && make install \
+    && rm -rf /tmp/python /tmp/python.tar.xz
 
 COPY build/runtime/erofs-tools.sh /tmp/erofs-tools.sh
 RUN --mount=type=bind,source=build/images/source-cache,target=/tmp/adx-source-cache \

@@ -69,10 +69,34 @@ pub struct Mount {
     #[serde(default)]
     pub options: Vec<String>,
     pub source: StorageSource,
+    #[serde(default)]
+    pub create_if_missing: bool,
 }
 
 impl Mount {
     pub fn validate(&self) -> Result<()> {
+        if self.create_if_missing
+            && (self.kind != "bind" || !matches!(self.source, StorageSource::Local(_)))
+        {
+            return Err(Error::Invalid(
+                "create_if_missing requires a Local bind mount".into(),
+            ));
+        }
+        if self.create_if_missing {
+            if let StorageSource::Local(path) = &self.source {
+                if !path.starts_with('/')
+                    || path.len() <= 1
+                    || path[1..]
+                        .split('/')
+                        .any(|part| matches!(part, "" | "." | ".."))
+                    || path.chars().any(char::is_control)
+                {
+                    return Err(Error::Invalid(
+                        "Local directory creation requires a concrete absolute source path".into(),
+                    ));
+                }
+            }
+        }
         if !matches!(self.kind.as_str(), "bind" | "erofs" | "tmpfs")
             || !self.target.starts_with('/')
             || self.target.contains("/../")

@@ -20,6 +20,7 @@ fn environment_options_roundtrip_preserves_backend_contract() {
             }),
         }),
         mounts: vec![model::Mount {
+            create_if_missing: false,
             kind: "bind".into(),
             target: "/workspace".into(),
             options: vec!["ro".into()],
@@ -164,4 +165,19 @@ fn transport_metadata_cannot_impersonate_a_component() {
             .code(),
         tonic::Code::Unauthenticated
     );
+}
+
+#[test]
+fn local_directory_creation_survives_mount_protocol_roundtrip() {
+    use adx_core::execution as model;
+    let mount = model::Mount {
+        kind: "bind".into(),
+        target: "/data".into(),
+        options: vec!["rw".into()],
+        source: model::StorageSource::Local("/mnt/sfs/workspaces/user".into()),
+        create_if_missing: true,
+    };
+    let wire: adx_protocol::control::MountSpec = mount.clone().into();
+    let restored: model::Mount = wire.try_into().unwrap();
+    assert_eq!(restored, mount);
 }

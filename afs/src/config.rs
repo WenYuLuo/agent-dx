@@ -216,6 +216,10 @@ pub struct Cli {
     /// Experimental OwnerFs workspace bind mount path; default false, not production READY.
     #[arg(long)]
     pub experimental_ownerfs_workspace_bind: Option<bool>,
+    /// Native egress root for OwnerFs workspace bind targets; absolute, outside
+    /// ownerfs_mount and data_dir, required when experimental_ownerfs_workspace_bind.
+    #[arg(long)]
+    pub ownerfs_workspace_egress_root: Option<PathBuf>,
     #[arg(long)]
     pub dfs_mount: Option<PathBuf>,
     /// Filesystem-wide immutable DFS replica target count. Applied by Meta at initialization.
@@ -283,6 +287,7 @@ struct FileConfig {
     native_workspace: Option<NativeWorkspaceConfig>,
     experimental_ownerfs_workspace_bind: Option<bool>,
     ownerfs_workspace_bind: Option<WorkspaceBindConfig>,
+    ownerfs_workspace_egress_root: Option<PathBuf>,
     dfs_mount: Option<PathBuf>,
     dfs_external_backend: Option<DfsExternalBackendConfig>,
     dfs_peer_cache: Option<DfsPeerCacheConfig>,
@@ -331,6 +336,7 @@ pub struct Config {
     pub native_workspace: Option<NativeWorkspaceConfig>,
     pub experimental_ownerfs_workspace_bind: bool,
     pub ownerfs_workspace_bind: Option<WorkspaceBindConfig>,
+    pub ownerfs_workspace_egress_root: Option<PathBuf>,
     pub dfs_mount: Option<PathBuf>,
     pub dfs_external_backend: Option<DfsExternalBackendConfig>,
     pub dfs_peer_cache: Option<DfsPeerCacheConfig>,
@@ -515,6 +521,9 @@ impl Config {
                 .or(file.experimental_ownerfs_workspace_bind)
                 .unwrap_or(false),
             ownerfs_workspace_bind: file.ownerfs_workspace_bind,
+            ownerfs_workspace_egress_root: cli
+                .ownerfs_workspace_egress_root
+                .or(file.ownerfs_workspace_egress_root),
             dfs_mount: cli.dfs_mount.or(file.dfs_mount),
             dfs_external_backend: file.dfs_external_backend,
             dfs_peer_cache: file.dfs_peer_cache,
@@ -645,12 +654,37 @@ impl Config {
                     "experimental_ownerfs_workspace_bind cannot be enabled with experimental_native_workspace",
                 ));
             }
-            let bind = cfg.ownerfs_workspace_bind.as_ref().ok_or_else(|| {
+            // The egress root must exist as a stable, admin-configured native
+            // path: absolute, no parent traversal, and outside both the FUSE
+            // mount and the private data directory so bind targets never cover
+            // the authoritative FUSE tree (D1/D6).
+            let egress_root = cfg.ownerfs_workspace_egress_root.as_ref().ok_or_else(|| {
                 invalid(
-                    "experimental_ownerfs_workspace_bind requires administrator ownerfs_workspace_bind settings",
+                    "experimental_ownerfs_workspace_bind requires ownerfs_workspace_egress_root",
                 )
             })?;
-            validate_ownerfs_workspace_name(&bind.workspace)?;
+            if !egress_root.is_absolute()
+                || egress_root
+                    .components()
+                    .any(|component| matches!(component, Component::ParentDir))
+            {
+                return Err(invalid(
+                    "ownerfs_workspace_egress_root must be absolute and contain no parent traversal",
+                ));
+            }
+            if egress_root.starts_with(cfg.ownerfs_mount.as_ref().expect("mount checked"))
+                || egress_root.starts_with(&cfg.data_dir)
+            {
+                return Err(invalid(
+                    "ownerfs_workspace_egress_root must be outside OwnerFs mount and data directories",
+                ));
+            }
+            // Multi-workspace bindmount is triggered dynamically by mkdir.
+            // The legacy [ownerfs_workspace_bind] section is optional and only
+            // used for pre-declared workspace names if present.
+            if let Some(bind) = cfg.ownerfs_workspace_bind.as_ref() {
+                validate_ownerfs_workspace_name(&bind.workspace)?;
+            }
         }
         if cfg.experimental_native_workspace {
             if role != Role::Node || !cfg.ownerfs || cfg.ownerfs_mount.is_none() {
@@ -658,9 +692,11 @@ impl Config {
                     "experimental_native_workspace requires Node OwnerFs with a mount",
                 ));
             }
-            let native = cfg.native_workspace.as_ref().ok_or_else(|| invalid(
+            let native = cfg.native_workspace.as_ref().ok_or_else(|| {
+                invalid(
                 "experimental_native_workspace requires administrator native_workspace settings"
-            ))?;
+            )
+            })?;
             for path in [&native.control_dir, &native.runtime, &native.rootfs] {
                 if !path.is_absolute()
                     || path

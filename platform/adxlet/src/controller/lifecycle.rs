@@ -342,7 +342,13 @@ impl Controller {
                     .artifact;
                 let path = services.store.materialize(artifact).await?;
                 let rollback = self.restore_execution(&path).await;
-                if self.held {
+                if self.held
+                    && (rollback.is_err()
+                        || self
+                            .services
+                            .runtime
+                            .retains_checkpoint_files(&self.record.spec.runtime_class))
+                {
                     self.recovery_files = Some(path);
                 }
                 if rollback.is_err() && self.record.state != EnvironmentState::Failed {
@@ -485,7 +491,13 @@ impl Controller {
         let services = self.services.checkpoint.clone().ok_or(Error::Conflict)?;
         let path = services.store.materialize(&cp.artifact).await?;
         let restored = self.restore_execution(&path).await;
-        if self.held {
+        if self.held
+            && (restored.is_err()
+                || self
+                    .services
+                    .runtime
+                    .retains_checkpoint_files(&self.record.spec.runtime_class))
+        {
             self.recovery_files = Some(path);
         }
         if let Err(error) = restored {

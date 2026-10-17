@@ -238,6 +238,7 @@ struct Mount {
     s3_config: Option<S3>,
     #[serde(alias = "hostPath")]
     host_path: String,
+    create_if_missing: bool,
 }
 #[derive(Default, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -461,11 +462,25 @@ fn mount(value: Value) -> Result<adx_core::execution::Mount, Status> {
     ) {
         (false, None, true) => StorageSource::Image(value.image_url),
         (true, Some(value), true) => StorageSource::S3(s3(value)?),
-        (true, None, false) => return Err(invalid("public host mounts are not allowed")),
+        (true, None, false) => {
+            if !value.host_path.starts_with('/')
+                || value.host_path.chars().any(char::is_control)
+                || value
+                    .host_path
+                    .split('/')
+                    .any(|part| matches!(part, "." | ".."))
+            {
+                return Err(invalid(
+                    "host_path must be an absolute path without traversal",
+                ));
+            }
+            StorageSource::Local(value.host_path)
+        }
         _ => return Err(invalid("mount requires exactly one source")),
     };
     let result = adx_core::execution::Mount {
         kind: value.r#type,
+        create_if_missing: value.create_if_missing,
         target: value.target,
         options: value.options,
         source,
@@ -1066,7 +1081,7 @@ pub fn resolve_create_timeout(create: i64, schedule: i64, init: i64) -> Result<u
         _ => {
             return Err(invalid(
                 "create budget must reserve at least 30 seconds beyond scheduling",
-            ))
+            ));
         }
     };
     Ok(result as u64)

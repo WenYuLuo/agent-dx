@@ -1214,6 +1214,7 @@ fn scheduling_queue_view(queue: pb::GetSchedulingQueueResponse) -> Value {
                 "instanceID": spec.id,
                 "requestID": spec.id,
                 "resources": public_resources,
+                "schedulingRequirements": {"runtimeClass": spec.runtime_class},
                 "enqueueTimeMs": pending.enqueue_time_millis.to_string(),
                 "waitDurationMs": now.saturating_sub(pending.enqueue_time_millis).to_string(),
             }))
@@ -1499,6 +1500,36 @@ mod error_contract_tests {
     }
 
     #[test]
+    fn scheduling_queue_view_exposes_each_requested_runtime_class() {
+        let runtimes = ["runc", "runsc", "firecracker", "kata", "custom-runtime"];
+        let value = scheduling_queue_view(pb::GetSchedulingQueueResponse {
+            environments: runtimes
+                .iter()
+                .map(|runtime| pb::PendingEnvironment {
+                    spec: Some(pb::EnvironmentSpec {
+                        id: format!("environment-{runtime}"),
+                        runtime_class: (*runtime).into(),
+                        ..Default::default()
+                    }),
+                    enqueue_time_millis: 1,
+                })
+                .collect(),
+        });
+        assert_eq!(value["count"], runtimes.len());
+        for (entry, runtime) in value["instanceInfos"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .zip(runtimes)
+        {
+            assert_eq!(
+                entry["schedulingRequirements"],
+                json!({"runtimeClass": runtime})
+            );
+        }
+    }
+
+    #[test]
     fn scheduling_queue_view_preserves_legacy_shape_and_device_totals() {
         let value = scheduling_queue_view(pb::GetSchedulingQueueResponse {
             environments: vec![pb::PendingEnvironment {
@@ -1547,6 +1578,26 @@ mod error_contract_tests {
         assert_eq!(value["error"]["requestId"], "request-a");
         assert_eq!(value["error"]["operationId"], "pause-a");
         assert_eq!(value["error"]["environmentId"], "instance-a");
+    }
+
+    #[tokio::test]
+    async fn confirmed_create_timeout_serializes_phase_and_terminal_contract() {
+        let message = "create deadline exceeded during Execd readiness";
+        let response = error_response(
+            adx_protocol::status(adx_core::Error::DeadlineExceeded(message.into())),
+            "create-a",
+            None,
+            Some("environment-a"),
+            true,
+        );
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        let value = error_body(response).await;
+        assert_eq!(value["message"], message);
+        assert_eq!(value["error"]["code"], "DEADLINE_EXCEEDED");
+        assert_eq!(value["error"]["retry"], "never");
+        assert_eq!(value["error"]["outcome"], "terminal");
+        assert!(value.get("stage").is_none());
+        assert!(value["error"].get("stage").is_none());
     }
 
     #[tokio::test]
@@ -1646,7 +1697,7 @@ mod error_contract_tests {
                 Code::DeadlineExceeded,
                 true,
                 504,
-                "OUTCOME_UNKNOWN",
+                "DEADLINE_EXCEEDED",
                 "same_operation",
                 "unknown",
             ),

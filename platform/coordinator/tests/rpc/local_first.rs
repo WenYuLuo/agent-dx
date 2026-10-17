@@ -1214,6 +1214,16 @@ async fn local_first_https_directory_round_robin_and_concurrent_creation() {
             .node_id,
         "b"
     );
+    // Check placement while the records exist, then release the executions.
+    // A successful delete retires each record from the authoritative catalog.
+    for id in ["lf-first", "lf-second", "lf-race"] {
+        let record = rig.session.get(id).await.unwrap().result.unwrap();
+        rig.delete(&record.try_into().unwrap()).await;
+        assert!(matches!(
+            rig.session.get(id).await,
+            Err(adx_core::Error::NotFound)
+        ));
+    }
     assert_eq!(
         rig.backends
             .iter()

@@ -109,10 +109,14 @@ impl Controller {
                                             .unwrap_or_default();
                                         self.auto_pause(
                                             crate::checkpoint::PauseRequest {
+                                                // An aborted preparation does not advance the
+                                                // Environment revision. A later idle attempt
+                                                // must not replay that terminal operation.
                                                 operation_id: format!(
-                                                    "idle-{}-{}",
+                                                    "idle-{}-{}-{}",
                                                     self.record.assignment.generation,
-                                                    self.record.revision
+                                                    self.record.revision,
+                                                    uuid::Uuid::new_v4()
                                                 ),
                                                 expected_revision: self.record.revision,
                                                 retention: policy.retention,

@@ -110,3 +110,20 @@ sudo env ADX_FC_BASE=/opt/adx-autoscaling ADX_FC_SUITE=autoscaling \
 
 这是一个 KVM 主机内的双逻辑节点定向验收，不等同于默认 checkpoint 集合、
 跨主机或 Kubernetes 验收。每次必须使用新的运行目录。
+
+
+## 本地 checkpoint LRU 验收
+
+对已准备的专用 KVM 主机、统一发布包、已安装的同版本 Environment SDK、静态 Execd 镜像及固定 sandboxd/FC kit，选择缓存定向集合：
+
+```sh
+sudo env ADX_FC_BASE=/opt/adx-checkpoint-cache ADX_FC_SUITE=cache \
+  python3 -u /opt/adx-checkpoint-cache/e2e/firecracker/transfer.py \
+  /var/lib/adx-checkpoint-cache/run-001
+```
+
+该集合沿用双网络／挂载命名空间的真实 Firecracker、MinIO/S3、Coordinator、Ingress、Relay 和公共 SDK 链路。首先使用生产默认缓存设置（500 条、50 GiB），随后仅重启节点并将测试阈值降低到 2 条和 1 字节，覆盖独立条目淘汰、满缓存回源、超大快照与多个执行引用共存、运行实例重启对账，以及降低条目上限后的 LRU 重建。暖恢复期间用节点命名空间的防火墙阻断 S3，以证明命中本机副本；业务进程 PID、计数器和二进制文件必须保持。生命周期操作走公共 SDK，Redis／文件系统只用于取证，配额修改和进程重启是显式测试故障注入。
+
+`cache_contract.py` 严格要求七项完整证据及实例、本地快照、对象存储和两个物理后端清单归零。结果为 `evidence/sdk-cache.json`；外层 `evidence/result.json` 还要求测试进程和命名空间清理成功。这个集合不填满实际 50 GiB 磁盘，也不等同于 500 份快照的规模测试。
+
+跨节点集合 `ADX_FC_SUITE=transfer` 继续验证共享快照在原节点失联后的恢复。原节点限额内的无执行引用副本可以保留到下次 LRU 或权威对账；该集合在全局删除后额外重启两个 adxlet，并检查本地文件全部回收，证据为 `cache-reconciliation-cleanup.json`。默认单节点 checkpoint 集合的 `restart_paused.py` 则在所有物理后端停止且权威状态为 Paused 时注入本机缓存丢失，继续验证从 S3 恢复。

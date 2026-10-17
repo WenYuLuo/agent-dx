@@ -1586,6 +1586,7 @@ impl LocalChunkStore {
     /// Fill a caller-owned, unpublished range with one complete integrity scan.
     /// The output may be dirtied on failure and must not be returned to a peer
     /// until this operation succeeds. No verified reader or cache is retained.
+    #[cfg(any(feature = "rdma", test))]
     pub(crate) fn read_range_at_uncommitted(
         &self,
         chunk_id: &ChunkId,
@@ -1624,6 +1625,7 @@ impl LocalChunkStore {
 
     /// Admission is immediate. Eviction can reclaim only an unpinned resident
     /// object; payloads held by senders keep their charge until the last drop.
+    #[cfg(any(feature = "rdma", test))]
     pub(crate) fn reserve_peer_read_payload(&self, bytes: usize) -> Result<PeerReadReservation> {
         match self.reserve_peer_read_payload_inner(bytes) {
             Ok(reservation) => Ok(reservation),

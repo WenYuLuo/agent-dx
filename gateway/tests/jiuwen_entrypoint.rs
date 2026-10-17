@@ -31,6 +31,7 @@ fn configuration_rejects_unsafe_origins_and_unbounded_limits() {
         ("allowed_hosts", json!([])),
         ("queue_capacity", json!(0)),
         ("write_timeout_seconds", json!(0)),
+        ("output_queue_timeout_seconds", json!(0)),
         ("idle_timeout_seconds", json!(1)),
     ] {
         let mut value_config = settings();
@@ -64,5 +65,26 @@ fn origin_allowlist_accepts_http_and_https_without_choosing_listener_security() 
         value["allowed_origins"] = json!([origin]);
         let config: JiuwenConfig = serde_json::from_value(value).unwrap();
         assert!(config.validate().is_err(), "{origin}");
+    }
+}
+
+#[test]
+fn workspace_is_stable_across_versions_but_isolates_users_tenants_and_templates() {
+    let config: JiuwenConfig = serde_json::from_value(settings()).unwrap();
+    let parameters = config.parameters("alice").unwrap();
+    assert_eq!(parameters["workspace"].len(), 66);
+    assert!(parameters["workspace"].starts_with("w-"));
+    assert_ne!(parameters, config.parameters("bob").unwrap());
+    for field in ["version", "agent_type"] {
+        let mut value = settings();
+        value[field] = json!("other");
+        let other: JiuwenConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(parameters, other.parameters("alice").unwrap());
+    }
+    for field in ["tenant", "template"] {
+        let mut value = settings();
+        value[field] = json!("other");
+        let other: JiuwenConfig = serde_json::from_value(value).unwrap();
+        assert_ne!(parameters, other.parameters("alice").unwrap());
     }
 }

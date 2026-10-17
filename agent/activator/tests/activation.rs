@@ -273,3 +273,71 @@ async fn delayed_retry_cannot_recreate_or_select_another_generation() {
     );
     assert_eq!(platform.observations.lock().unwrap().len(), 2);
 }
+
+#[tokio::test]
+async fn deleting_absent_environment_removes_binding_and_allows_new_generation() {
+    let state = AgentState::new(Arc::new(MemoryRepository::default()));
+    let platform = Arc::new(Platform::default());
+    let service = Activator::new(state.clone(), platform.clone());
+    service.publish("tenant", &template()).await.unwrap();
+    let scope = scope("missing");
+    let old = service
+        .activate(&scope, None, adx_agent_core::unix_time_millis() + 60_000)
+        .await
+        .unwrap()
+        .binding;
+    platform
+        .observations
+        .lock()
+        .unwrap()
+        .remove(&(scope.tenant.clone(), old.environment_id.clone()));
+    service.delete_binding(&scope).await.unwrap();
+    assert!(matches!(
+        service.binding(&scope).await,
+        Err(Error::NotFound)
+    ));
+    let fresh = service
+        .activate(&scope, None, adx_agent_core::unix_time_millis() + 60_000)
+        .await
+        .unwrap()
+        .binding;
+    assert_ne!(fresh.generation, old.generation);
+    assert_ne!(fresh.environment_id, old.environment_id);
+}
+
+#[tokio::test]
+async fn dormant_bindings_resolve_after_cache_loss_without_recreating_or_waking() {
+    let state = AgentState::new(Arc::new(MemoryRepository::default()));
+    let platform = Arc::new(Platform::default());
+    let service = Activator::new(state.clone(), platform.clone());
+    service.publish("tenant", &template()).await.unwrap();
+    let scope = scope("sleep");
+    let original = service
+        .activate(&scope, None, unix_time_millis() + 60_000)
+        .await
+        .unwrap();
+    for phase in ["pausing", "paused", "resuming"] {
+        let observation: EnvironmentObservation = serde_json::from_value(serde_json::json!({
+            "id":original.binding.environment_id, "tenant":"tenant", "phase":phase,
+            "ready":false, "runtime_id":null, "message":null
+        }))
+        .unwrap();
+        platform.observations.lock().unwrap().insert(
+            ("tenant".into(), original.binding.environment_id.clone()),
+            observation.clone(),
+        );
+        let cold = Activator::new(state.clone(), platform.clone());
+        let target = cold
+            .activate(
+                &scope,
+                Some(&original.binding.generation),
+                unix_time_millis() + 60_000,
+            )
+            .await
+            .unwrap();
+        assert_eq!(target, original);
+        let rows = platform.observations.lock().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows.values().next().unwrap(), &observation);
+    }
+}

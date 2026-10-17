@@ -33,6 +33,7 @@ fn binding_cache_memory_profile() {
                 generation: "g".repeat(36),
                 environment_id: "s".repeat(40),
                 phase: BindingPhase::Active,
+                parameters: Default::default(),
             },
             service: vec![adx_agent_core::Service {
                 protocol: adx_agent_core::Protocol::Http,
