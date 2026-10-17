@@ -315,3 +315,22 @@ RSS允许偏差和观测窗口，完成原提交入口、释放所有引用后�
 校验完成或授权交付。Meta、FUSE及对象父阶段按实际嵌套与重叠核对，不能直接相加；
 consumer线程CPU不含producer或远端CPU。快照不保留正文／路径／授权信息，也不是业务授权来源。
 开启配置及监听范围见[部署说明](../deployment/afs.md#原生读粗粒度诊断)。
+
+## 共用 Node 的受影响验证
+
+默认构建、OwnerFs-only 和 DFS-only 的条件编译需要分别检查；all-features 通过不能代替
+OwnerFs-only 严格 lint。Node allocator 是进程级配置，OwnerFs 库／Peer 测试不能单独证明
+真实 `afs-node` 在 jemalloc 下的挂载、排空或 RSS 行为。受影响时补同一候选的有限读写、
+fsync、重开、卸载与正常退出，并记录 allocator 生效和 RSS；不要求 RSS 精确等于空闲池基线，
+也不把有限运行称为 OwnerFs 性能达标。
+
+```sh
+python3 -m unittest discover -s build/release/tests -v
+cargo clippy --locked -p afs --no-default-features --features ownerfs --all-targets -- -D warnings
+cargo clippy --locked -p afs --no-default-features --features dfs --all-targets -- -D warnings
+```
+
+共用 FUSE 读写路径有常规 tracing spans；`dfs_read_diagnostics_enabled=false` 只关闭额外的
+有界诊断账本，不表示关闭所有 span／时钟／指标。未测量时不宣称这些观测没有性能成本。
+
+Meta 快照增长与版本回滚限制见[部署说明](../deployment/afs.md#meta-快照升级与回滚边界)。

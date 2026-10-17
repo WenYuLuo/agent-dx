@@ -49,6 +49,11 @@ message RegisterNodeReply {
   bool meta_backend_healthy = 5;
   bool meta_persistence_ready = 6;
   string meta_persistence_detail = 7;
+  // Remaining lifetime of this exact persisted lease, measured on Meta after
+  // readiness probing. Clients anchor it to the monotonic request start;
+  // expires_at_unix_ms is diagnostic and must not use the client's wall clock.
+  // Missing/zero lifetime cannot authorize a new or renewed Node session.
+  uint64 lease_remaining_ms = 8;
 }
 
 enum MetaBackendPersistence {

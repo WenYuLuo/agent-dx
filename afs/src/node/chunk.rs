@@ -970,6 +970,7 @@ impl PinnedChunkReader {
     /// uncommitted staging buffer. The staging buffer may be dirtied before an
     /// error is returned; callers must publish it only after the outer read
     /// batch succeeds.
+    #[cfg(any(feature = "dfs", test))]
     pub(crate) fn read_ranges_at_uncommitted(
         &self,
         ranges: &[VerifiedRangeCopy],
@@ -1072,22 +1073,27 @@ impl LocalCatalog {
 /// Shared across the current verified object, in-flight ranges and RDMA packed
 /// payloads. This replaces independent per-request payload allowances; it does
 /// not add a second retained-cache budget.
+#[cfg(any(feature = "dfs", test))]
 pub(crate) const PEER_READ_PAYLOAD_LIMIT: usize = 8 * 1024 * 1024;
+#[cfg(any(feature = "dfs", test))]
 pub(crate) const PEER_READ_OBJECT_LIMIT: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Default)]
+#[cfg(any(feature = "dfs", test))]
 struct PeerReadBudget {
     used: AtomicU64,
     peak: AtomicU64,
 }
 
 #[derive(Debug)]
+#[cfg(any(feature = "dfs", test))]
 pub(crate) struct PeerReadReservation {
     budget: Arc<PeerReadBudget>,
     bytes: u64,
     metrics: Option<super::read_work::ReadWorkMetrics>,
 }
 
+#[cfg(any(feature = "dfs", test))]
 impl PeerReadReservation {
     // Vec::try_reserve_exact normally gives the requested capacity; still
     // account the allocator's actual capacity before handing a payload onward.
@@ -1102,6 +1108,7 @@ impl PeerReadReservation {
     }
 }
 
+#[cfg(any(feature = "dfs", test))]
 impl Drop for PeerReadReservation {
     fn drop(&mut self) {
         self.budget.used.fetch_sub(self.bytes, Ordering::AcqRel);
@@ -1111,6 +1118,7 @@ impl Drop for PeerReadReservation {
     }
 }
 
+#[cfg(any(feature = "dfs", test))]
 fn peer_payload_capacity() -> Error {
     Error::coded(
         afs_error::IO_CAPACITY,
@@ -1118,6 +1126,7 @@ fn peer_payload_capacity() -> Error {
     )
 }
 
+#[cfg(any(feature = "dfs", test))]
 fn reserve_peer_bytes(
     budget: &PeerReadBudget,
     bytes: u64,
@@ -1146,6 +1155,7 @@ fn reserve_peer_bytes(
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(any(feature = "dfs", test))]
 struct PeerFileIdentity {
     length: u64,
     #[cfg(unix)]
@@ -1158,6 +1168,7 @@ struct PeerFileIdentity {
     changed: (i64, i64),
 }
 
+#[cfg(any(feature = "dfs", test))]
 impl PeerFileIdentity {
     fn read(file: &File) -> Result<Self> {
         let metadata = file.metadata().map_err(Error::from)?;
@@ -1178,6 +1189,7 @@ impl PeerFileIdentity {
 }
 
 #[derive(Debug)]
+#[cfg(any(feature = "dfs", test))]
 struct PeerVerifiedObject {
     bytes: Vec<u8>,
     _reservation: PeerReadReservation,
@@ -1188,17 +1200,20 @@ struct PeerVerifiedObject {
 /// A view into an immutable private allocation. Its shared reservation remains
 /// charged even after the single cache slot is replaced or an RPC is cancelled.
 #[derive(Debug)]
+#[cfg(any(feature = "dfs", test))]
 pub(crate) struct PeerReadPayload {
     object: Arc<PeerVerifiedObject>,
     start: usize,
     length: usize,
 }
 
+#[cfg(any(feature = "dfs", test))]
 impl PeerReadPayload {
     pub(crate) fn as_slice(&self) -> &[u8] {
         &self.object.bytes[self.start..self.start + self.length]
     }
 
+    #[cfg(feature = "dfs")]
     pub(crate) fn len(&self) -> usize {
         self.length
     }
@@ -1226,6 +1241,7 @@ impl PeerReadPayload {
     }
 }
 
+#[cfg(any(feature = "dfs", test))]
 impl AsRef<[u8]> for PeerReadPayload {
     fn as_ref(&self) -> &[u8] {
         self.as_slice()
@@ -1245,7 +1261,9 @@ pub struct LocalChunkStore {
     catalog: Mutex<LocalCatalog>,
     next_staging: AtomicU64,
     read_work: Option<super::read_work::ReadWorkMetrics>,
+    #[cfg(any(feature = "dfs", test))]
     peer_read_budget: Arc<PeerReadBudget>,
+    #[cfg(any(feature = "dfs", test))]
     peer_read_cache: Mutex<Option<Arc<PeerVerifiedObject>>>,
 }
 
@@ -1272,13 +1290,16 @@ impl LocalChunkStore {
             catalog: Mutex::new(catalog),
             next_staging: AtomicU64::new(1),
             read_work: None,
+            #[cfg(any(feature = "dfs", test))]
             peer_read_budget: Arc::new(PeerReadBudget::default()),
+            #[cfg(any(feature = "dfs", test))]
             peer_read_cache: Mutex::new(None),
         };
         store.recover()?;
         Ok(store)
     }
 
+    #[cfg(any(feature = "dfs", test))]
     pub(crate) fn with_read_work_metrics(
         mut self,
         metrics: super::read_work::ReadWorkMetrics,
@@ -1287,12 +1308,14 @@ impl LocalChunkStore {
         self
     }
 
+    #[cfg(feature = "dfs")]
     pub(crate) fn record_peer_disk_cache_event(&self, result: &'static str) {
         if let Some(metrics) = &self.read_work {
             metrics.peer_disk_cache_event(result);
         }
     }
 
+    #[cfg(feature = "dfs")]
     pub(crate) fn record_peer_cache_fill_stage(
         &self,
         stage: &'static str,
@@ -1304,6 +1327,7 @@ impl LocalChunkStore {
         }
     }
 
+    #[cfg(feature = "dfs")]
     pub(crate) fn peer_disk_cache_fill_work(
         &self,
         bytes: usize,
@@ -1314,6 +1338,7 @@ impl LocalChunkStore {
             .map(|metrics| metrics.peer_disk_cache_fill_work(bytes, output))
     }
 
+    #[cfg(feature = "dfs")]
     pub(crate) fn peer_disk_cache_stream_work(
         &self,
         output: usize,
@@ -1323,18 +1348,21 @@ impl LocalChunkStore {
             .map(|metrics| metrics.peer_stream_pipeline(output))
     }
 
+    #[cfg(feature = "dfs")]
     pub(crate) fn record_read_hash(&self, stage: &'static str, bytes: u64) {
         if let Some(metrics) = &self.read_work {
             metrics.hash(stage, bytes);
         }
     }
 
+    #[cfg(feature = "dfs")]
     pub(crate) fn record_read_copy(&self, stage: &'static str, bytes: u64) {
         if let Some(metrics) = &self.read_work {
             metrics.copy(stage, bytes);
         }
     }
 
+    #[cfg(feature = "dfs")]
     pub(crate) fn record_peer_read_event(&self, event: &'static str) {
         if let Some(metrics) = &self.read_work {
             metrics.peer_read_event(event);
@@ -1586,7 +1614,7 @@ impl LocalChunkStore {
     /// Fill a caller-owned, unpublished range with one complete integrity scan.
     /// The output may be dirtied on failure and must not be returned to a peer
     /// until this operation succeeds. No verified reader or cache is retained.
-    #[cfg(any(feature = "rdma", test))]
+    #[cfg(any(all(feature = "dfs", feature = "rdma"), test))]
     pub(crate) fn read_range_at_uncommitted(
         &self,
         chunk_id: &ChunkId,
@@ -1613,6 +1641,7 @@ impl LocalChunkStore {
         })
     }
 
+    #[cfg(any(feature = "dfs", test))]
     fn reserve_peer_read_payload_inner(&self, bytes: usize) -> Result<PeerReadReservation> {
         let bytes = u64::try_from(bytes).map_err(|_| peer_payload_capacity())?;
         reserve_peer_bytes(&self.peer_read_budget, bytes, self.read_work.as_ref())?;
@@ -1625,7 +1654,7 @@ impl LocalChunkStore {
 
     /// Admission is immediate. Eviction can reclaim only an unpinned resident
     /// object; payloads held by senders keep their charge until the last drop.
-    #[cfg(any(feature = "rdma", test))]
+    #[cfg(any(all(feature = "dfs", feature = "rdma"), test))]
     pub(crate) fn reserve_peer_read_payload(&self, bytes: usize) -> Result<PeerReadReservation> {
         match self.reserve_peer_read_payload_inner(bytes) {
             Ok(reservation) => Ok(reservation),
@@ -1643,6 +1672,7 @@ impl LocalChunkStore {
         }
     }
 
+    #[cfg(any(feature = "dfs", test))]
     fn peer_catalog_record(&self, chunk_id: &ChunkId) -> Result<LocalChunkRecord> {
         let record = self
             .catalog
@@ -1673,6 +1703,7 @@ impl LocalChunkStore {
     /// Reuse only the currently demanded object, never prefetch a next object.
     /// The slot mutex also supplies singleflight for a complete private fill.
     /// Authorization remains with each caller; this proof is content-only.
+    #[cfg(any(feature = "dfs", test))]
     pub(crate) fn read_peer_range(
         &self,
         chunk_id: &ChunkId,
@@ -1860,6 +1891,7 @@ impl LocalChunkStore {
         }
     }
 
+    #[cfg(any(feature = "dfs", test))]
     pub(crate) fn quarantined_chunks(&self) -> Result<Vec<LocalChunkRecord>> {
         let catalog = self
             .catalog

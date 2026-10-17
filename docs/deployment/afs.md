@@ -213,7 +213,8 @@ capacity_bytes = 268435456
 多 inode／慢提交可增加 live；明确分配拒绝尽力返回 ENOMEM 或合法短写，Linux OOM 杀进程
 仍按崩溃合同处理，不能保证始终正常返回错误。
 
-Linux Node 默认 feature `node-jemalloc` 安装固定官方 allocator；AFS Meta 和 ADX 其他进程不受强制替换。
+Linux Node 默认 feature `node-jemalloc` 安装固定官方 allocator，作用于同一 Node 进程内的 OwnerFs 和 DFS；
+AFS Meta 和 ADX 其他进程不受强制替换。依赖许可随 ON 包中的 `third_party/afs-source/NOTICE` 提供。
 后台线程在初始化后开启，dirty decay1000ms、muzzy decay0，配置失败启动报错。
 `/metrics` 提供写 buffer 与 allocator 的独立统计，allocator每1秒采样；采样失败只使观测无效，
 不改变业务行为。GNU Linux 与 musl 的后台线程支持不同，未验证目标不能继承回收结论。
@@ -246,3 +247,24 @@ dfs_read_diagnostics_enabled = true
 关闭时不分配诊断journal、不采诊断时钟，仍有轻量状态判断及原有指标，不承诺零指令开销。
 正式性能轮关闭该选项，诊断轮单独保存；父子阶段、重叠区间和累计hash耗时不能从E2E直接扣减。
 详细边界见[测试说明](../testing/afs.md#原生读粗粒度诊断)。
+
+## Meta 快照升级与回滚边界
+
+OwnerFs 与 DFS 共享 Meta store 的持久化机制，业务记录分开。当前每个持久化批次保存完整权威快照，
+DFS 状态增长也会增加共用 Meta 的快照处理成本；本次不改变该机制，不承诺增长成本已解决。
+
+本版本新增 DFS durability policy、外部对象回执等持久化表示。旧二进制可能无法解析新快照；
+不能把替换为旧二进制直接当成可用的回滚。升级前应正常停止相关写入、保留并核验原 Meta 和
+数据后端的匹配恢复点及版本身份。回滚只能使用与旧版本匹配的完整恢复点，并明确恢复点之后
+写入的处理；不得把旧 Meta 快照与另一代对象数据混用。本版本不提供快照降级转换。
+
+## Node 注册租约期限
+
+Meta 注册回复提供实际已持久化租约的相对剩余期限 `lease_remaining_ms`；Node 从请求开始的
+单调时刻计算本地截止时间，保守计入建连和应答等待，最长不超过请求的30秒。
+绝对到期时间仍供诊断，不用 Node 与 Meta 的墙钟相减决定读授权。启动与心跳使用同一规则。
+缺失／耗尽期限、已过期的读授权或 epoch 变化不能恢复旧授权；真实 session 失效仍按原策略
+关停 Node，混合模式的 OwnerFs 也会正常排空。本次不引入 DFS 局部故障隔离。
+
+需配套升级 Meta 与 Node。旧 Meta 未返回相对期限时，新 Node 明确拒绝注册授权，
+不回退到跨机墙钟或任意30秒授权。Meta persistence readiness 的判定保持独立。

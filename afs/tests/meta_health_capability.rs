@@ -126,6 +126,8 @@ async fn memory_backend_is_healthy_but_not_persistent_ready() {
     let meta = meta_with_backend(Arc::new(MemoryBackend::default())).await;
 
     let reply = register(meta.clone(), "session-memory").await;
+    assert!(reply.lease_remaining_ms > 0);
+    assert!(reply.lease_remaining_ms <= 30_000);
     assert_eq!(
         MetaBackendPersistence::try_from(reply.meta_backend_persistence).unwrap(),
         MetaBackendPersistence::Volatile
@@ -231,6 +233,7 @@ fn client_normalizes_contradictory_register_readiness_fail_closed() {
             node_id: "node-a".into(),
             lease_epoch: 7,
             expires_at_unix_ms: 123,
+            lease_remaining_ms: 30_000,
             meta_backend_persistence: persistence,
             meta_backend_healthy: healthy,
             meta_persistence_ready: ready,

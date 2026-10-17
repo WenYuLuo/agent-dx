@@ -394,7 +394,6 @@ dependencies = [
 name = "afs"
 version = "0.1.0"
 dependencies = [
- "adx-transport",
  "afs-client",
  "afs-error",
  "afs-logging",
@@ -415,6 +414,7 @@ dependencies = [
  "rayon-core",
  "redis",
  "reqwest 0.13.5",
+ "rustls",
  "serde",
  "serde_json",
  "tempfile",

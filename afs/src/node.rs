@@ -34,8 +34,9 @@ use crate::{
     runtime::{BoxError, Observability, Services, cancelled},
 };
 use rpc::meta::{MetaPersistenceCapability, NodeRegistrationReadiness};
+#[cfg(feature = "ownerfs")]
+use std::collections::HashSet;
 use std::{
-    collections::HashSet,
     future::Future,
     os::unix::ffi::OsStrExt,
     path::{Component, Path, PathBuf},
@@ -332,6 +333,7 @@ pub struct AfsMountIdentity {
 }
 
 impl AfsMountIdentity {
+    #[cfg(any(feature = "ownerfs", feature = "dfs"))]
     fn from_mounted(mounted: &fuse::MountedFuse, expected_source: &str) -> Self {
         let (path, mount_id) = mounted.identity();
         Self {
@@ -1299,7 +1301,7 @@ async fn run_node(
         })?;
         Some(Arc::new(dfs_read::LocalReadAuthority::new(
             registration.lease_epoch,
-            dfs_reader_session_deadline(registration, Instant::now()),
+            registration.session_deadline,
         )))
     } else {
         None
@@ -1776,7 +1778,6 @@ async fn run_node(
                 tokio::select! {
                     _ = &mut shutdown => return Ok(()),
                     _ = tokio::time::sleep(next_delay) => {
-                        let registration_started_at = Instant::now();
                         match rpc::meta::register_node_with_readiness(
                             &endpoint,
                             descriptor.clone(),
@@ -1803,16 +1804,11 @@ async fn run_node(
                                 if let Some(authority) = &read_authority
                                     && let Err(error) = authority.refresh(
                                         registration.lease_epoch,
-                                        dfs_reader_session_deadline(
-                                            &registration,
-                                            registration_started_at,
-                                        ),
+                                        registration.session_deadline,
                                     ) {
                                     authority.stop();
                                     return Err(error.into());
                                 }
-                                #[cfg(not(feature = "dfs"))]
-                                let _ = registration_started_at;
                                 readiness.note_registration_capability(&registration);
                                 last_success = tokio::time::Instant::now();
                                 next_delay = std::time::Duration::from_secs(10);
@@ -2702,27 +2698,6 @@ async fn drain_started_services(
     shutdown_error.expect("startup error is preserved")
 }
 
-/// Conservative local session cutoff. Replies cannot restore an expired local
-/// read authority; each object authorization has its own shorter, fixed cutoff.
-#[cfg(feature = "dfs")]
-fn dfs_reader_session_deadline(
-    registration: &NodeRegistrationReadiness,
-    request_started_at: Instant,
-) -> Instant {
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .min(u64::MAX as u128) as u64;
-    // Registration requests use a 30-second lease. Anchor to request start,
-    // conservatively deducting response latency rather than adding it back.
-    let remaining_ms = registration
-        .expires_at_unix_ms
-        .saturating_sub(now_ms)
-        .min(30_000);
-    request_started_at + Duration::from_millis(remaining_ms)
-}
-
 fn heartbeat_error_is_retryable(error: &afs_error::Error) -> bool {
     !matches!(
         error.kind(),
@@ -2805,24 +2780,18 @@ fn dfs_rdma_startup_device(
 mod shutdown_tests {
     #[cfg(feature = "dfs")]
     #[test]
-    fn dfs_reader_session_cutoff_is_bounded_and_request_anchored() {
-        let mut registration = super::rpc::meta::registration_readiness_from_reply(
-            afs_protocol::meta::RegisterNodeReply {
-                lease_epoch: 7,
-                expires_at_unix_ms: u64::MAX,
-                ..Default::default()
-            },
-        );
-        let sent = std::time::Instant::now() - std::time::Duration::from_secs(2);
-        assert_eq!(
-            super::dfs_reader_session_deadline(&registration, sent),
-            sent + std::time::Duration::from_secs(30),
-        );
-        registration.expires_at_unix_ms = 0;
-        assert_eq!(
-            super::dfs_reader_session_deadline(&registration, sent),
-            sent
-        );
+    fn registration_refresh_preserves_expired_and_changed_epoch_fail_closed() {
+        use super::dfs_read::LocalReadAuthority;
+        use std::time::Instant;
+
+        let now = Instant::now();
+        let expired = LocalReadAuthority::new(7, now);
+        assert!(expired.refresh(7, now + Duration::from_secs(30)).is_err());
+        assert!(expired.refresh(7, now + Duration::from_secs(30)).is_err());
+
+        let current = LocalReadAuthority::new(7, now + Duration::from_secs(30));
+        assert!(current.refresh(8, now + Duration::from_secs(30)).is_err());
+        assert!(current.refresh(7, now + Duration::from_secs(30)).is_err());
     }
 
     use std::time::Duration;

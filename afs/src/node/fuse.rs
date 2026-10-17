@@ -81,11 +81,14 @@ fn backend_read_data(
 // Keep the diagnostic alive through the actual reply operation. Ending it at
 // Filesystem::read return would lose queued worker time and the reply itself.
 fn complete_read_reply(
-    diagnostic: Option<crate::node::read_work::ReadDiagnosticSpan>,
-    success: bool,
+    #[cfg(any(feature = "dfs", test))] diagnostic: Option<
+        crate::node::read_work::ReadDiagnosticSpan,
+    >,
+    #[cfg(any(feature = "dfs", test))] success: bool,
     reply: impl FnOnce(),
 ) {
     reply();
+    #[cfg(any(feature = "dfs", test))]
     if let Some(diagnostic) = diagnostic {
         diagnostic.finish(success);
     }
@@ -261,7 +264,13 @@ impl MountedFuse {
 
 /// 建立真正的内核 FUSE 挂载。一个 session 只绑定一个业务 Backend。
 pub fn mount_dfs(backend: Arc<dyn Backend>, path: &Path) -> Result<MountedFuse> {
-    mount_dfs_inner(backend, path, None, None)
+    mount_dfs_inner(
+        backend,
+        path,
+        None,
+        #[cfg(any(feature = "dfs", test))]
+        None,
+    )
 }
 
 pub fn mount_dfs_with_metrics(
@@ -269,11 +278,18 @@ pub fn mount_dfs_with_metrics(
     path: &Path,
     metrics: FuseRequestMetrics,
 ) -> Result<MountedFuse> {
-    mount_dfs_inner(backend, path, Some(metrics), None)
+    mount_dfs_inner(
+        backend,
+        path,
+        Some(metrics),
+        #[cfg(any(feature = "dfs", test))]
+        None,
+    )
 }
 
 /// The ordinary mount APIs keep detailed read diagnostics disabled. This
 /// opt-in shares a bounded journal with the Node's Meta and Peer adapters.
+#[cfg(feature = "dfs")]
 pub fn mount_dfs_with_read_diagnostics(
     backend: Arc<dyn Backend>,
     path: &Path,
@@ -287,13 +303,16 @@ fn mount_dfs_inner(
     backend: Arc<dyn Backend>,
     path: &Path,
     metrics: Option<FuseRequestMetrics>,
-    read_work: Option<crate::node::read_work::ReadWorkMetrics>,
+    #[cfg(any(feature = "dfs", test))] read_work: Option<crate::node::read_work::ReadWorkMetrics>,
 ) -> Result<MountedFuse> {
     let path = canonical_mount_path(path)?;
     reject_existing_mount(&path)?;
     let mut fs = AfsFuse::new(backend);
     fs.requests = metrics.map(|metrics| (metrics, "dfs"));
-    fs.read_work = read_work;
+    #[cfg(any(feature = "dfs", test))]
+    {
+        fs.read_work = read_work;
+    }
     // Cached write-through sends each syscall write to the inode owner and
     // keeps this mount's pages coherent. Do not enable writeback or KEEP_CACHE:
     // ordinary opens must refresh after another mount's close barrier.
@@ -695,6 +714,7 @@ impl Drop for FuseDispatch {
 }
 
 pub struct AfsFuse {
+    #[cfg(any(feature = "dfs", test))]
     read_work: Option<crate::node::read_work::ReadWorkMetrics>,
     requests: Option<(FuseRequestMetrics, &'static str)>,
     backend: Arc<dyn Backend>,
@@ -716,6 +736,7 @@ impl AfsFuse {
     fn new(backend: Arc<dyn Backend>) -> Self {
         let state = Arc::new(Mutex::new(FuseState::new(backend.root_inode())));
         Self {
+            #[cfg(any(feature = "dfs", test))]
             read_work: None,
             requests: None,
             backend,
@@ -1325,6 +1346,7 @@ impl Filesystem for AfsFuse {
         _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
+        #[cfg(any(feature = "dfs", test))]
         let diagnostic = self.read_work.as_ref().and_then(|metrics| {
             metrics.diagnostic(crate::node::read_work::ReadDiagnosticStage::FuseRead)
         });
@@ -1379,15 +1401,22 @@ impl Filesystem for AfsFuse {
                     }
                 })
             });
+            #[cfg(any(feature = "dfs", test))]
             let success = result.is_ok();
-            complete_read_reply(diagnostic, success, || match result {
-                Ok(data) => {
-                    fuse_span.record("returned_bytes", data.len() as u64);
-                    tracing::info_span!(parent: &request_span, "node.fuse.read.reply", returned_bytes = data.len() as u64)
+            complete_read_reply(
+                #[cfg(any(feature = "dfs", test))]
+                diagnostic,
+                #[cfg(any(feature = "dfs", test))]
+                success,
+                || match result {
+                    Ok(data) => {
+                        fuse_span.record("returned_bytes", data.len() as u64);
+                        tracing::info_span!(parent: &request_span, "node.fuse.read.reply", returned_bytes = data.len() as u64)
                         .in_scope(|| reply.data(&data))
-                }
-                Err(error) => reply.error(fuse_errno(error)),
-            });
+                    }
+                    Err(error) => reply.error(fuse_errno(error)),
+                },
+            );
             return;
         }
         let run = move || {
@@ -1406,15 +1435,22 @@ impl Filesystem for AfsFuse {
                     .map_err(errno)
                 })
             });
+            #[cfg(any(feature = "dfs", test))]
             let success = result.is_ok();
-            complete_read_reply(diagnostic, success, || match result {
-                Ok(data) => {
-                    fuse_span.record("returned_bytes", data.len() as u64);
-                    tracing::info_span!(parent: &request_span, "node.fuse.read.reply", returned_bytes = data.len() as u64)
+            complete_read_reply(
+                #[cfg(any(feature = "dfs", test))]
+                diagnostic,
+                #[cfg(any(feature = "dfs", test))]
+                success,
+                || match result {
+                    Ok(data) => {
+                        fuse_span.record("returned_bytes", data.len() as u64);
+                        tracing::info_span!(parent: &request_span, "node.fuse.read.reply", returned_bytes = data.len() as u64)
                         .in_scope(|| reply.data(&data))
-                }
-                Err(error) => reply.error(fuse_errno(error)),
-            });
+                    }
+                    Err(error) => reply.error(fuse_errno(error)),
+                },
+            );
         };
         self.dispatch.submit_keyed(fh, run);
     }

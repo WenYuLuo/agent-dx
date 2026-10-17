@@ -32,7 +32,7 @@ use std::error::Error as StdError;
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "dfs")]
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 #[cfg(feature = "ownerfs")]
 use tonic::transport::Channel;
 use tonic::transport::Endpoint;
@@ -131,6 +131,78 @@ mod ping_tls_tests {
 
         assert_eq!(error.code(), CLIENT_ARGUMENT_INVALID);
         assert!(error.to_string().contains("server_name"));
+    }
+}
+
+#[cfg(test)]
+mod registration_lease_tests {
+    use super::*;
+    use std::time::Instant;
+
+    fn reply(remaining_ms: u64, absolute_expiry_ms: u64) -> RegisterNodeReply {
+        RegisterNodeReply {
+            lease_epoch: 7,
+            expires_at_unix_ms: absolute_expiry_ms,
+            lease_remaining_ms: remaining_ms,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn registration_lease_ignores_cross_machine_wall_clock_offsets() {
+        let sent = Instant::now();
+        let received = sent + Duration::from_secs(2);
+        for absolute_expiry in [0, 1, u64::MAX] {
+            let registration =
+                checked_registration_readiness(reply(30_000, absolute_expiry), sent, received)
+                    .unwrap();
+            assert_eq!(
+                registration.session_deadline,
+                sent + Duration::from_secs(30)
+            );
+            assert_eq!(
+                registration.session_deadline.duration_since(received),
+                Duration::from_secs(28)
+            );
+        }
+    }
+
+    #[test]
+    fn registration_lease_rejects_missing_ttl_or_zero_epoch() {
+        let sent = Instant::now();
+        assert!(checked_registration_readiness(reply(0, u64::MAX), sent, sent).is_err());
+        let mut missing_epoch = reply(30_000, u64::MAX);
+        missing_epoch.lease_epoch = 0;
+        assert!(checked_registration_readiness(missing_epoch, sent, sent).is_err());
+    }
+
+    #[test]
+    fn registration_lease_deducts_slow_response_and_rejects_exhausted_ttl() {
+        let sent = Instant::now();
+        let deadline = sent + Duration::from_secs(5);
+        let registration = checked_registration_readiness(
+            reply(5_000, u64::MAX),
+            sent,
+            sent + Duration::from_secs(4),
+        )
+        .unwrap();
+        assert_eq!(registration.session_deadline, deadline);
+        for received in [deadline, deadline + Duration::from_secs(1)] {
+            assert!(
+                checked_registration_readiness(reply(5_000, u64::MAX), sent, received).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn registration_lease_does_not_exceed_requested_ttl() {
+        let sent = Instant::now();
+        let registration =
+            checked_registration_readiness(reply(u64::MAX, u64::MAX), sent, sent).unwrap();
+        assert_eq!(
+            registration.session_deadline,
+            sent + Duration::from_secs(30)
+        );
     }
 }
 
@@ -366,6 +438,8 @@ impl From<MetaBackendPersistence> for MetaPersistenceCapability {
 pub struct NodeRegistrationReadiness {
     pub lease_epoch: u64,
     pub expires_at_unix_ms: u64,
+    /// Conservative local cutoff, independent of Node/Meta wall-clock skew.
+    pub session_deadline: Instant,
     pub meta_backend_persistence: MetaPersistenceCapability,
     pub meta_backend_healthy: bool,
     pub meta_persistence_ready: bool,
@@ -373,6 +447,17 @@ pub struct NodeRegistrationReadiness {
 }
 
 pub fn registration_readiness_from_reply(reply: RegisterNodeReply) -> NodeRegistrationReadiness {
+    registration_readiness_from_reply_at(reply, Instant::now())
+}
+
+const NODE_REGISTRATION_LEASE_SECONDS: u64 = 30;
+
+fn registration_readiness_from_reply_at(
+    reply: RegisterNodeReply,
+    request_started_at: Instant,
+) -> NodeRegistrationReadiness {
+    let remaining = Duration::from_millis(reply.lease_remaining_ms)
+        .min(Duration::from_secs(NODE_REGISTRATION_LEASE_SECONDS));
     let persistence = MetaBackendPersistence::try_from(reply.meta_backend_persistence)
         .unwrap_or(MetaBackendPersistence::Unspecified)
         .into();
@@ -382,11 +467,33 @@ pub fn registration_readiness_from_reply(reply: RegisterNodeReply) -> NodeRegist
     NodeRegistrationReadiness {
         lease_epoch: reply.lease_epoch,
         expires_at_unix_ms: reply.expires_at_unix_ms,
+        session_deadline: request_started_at + remaining,
         meta_backend_persistence: persistence,
         meta_backend_healthy: reply.meta_backend_healthy,
         meta_persistence_ready,
         meta_persistence_detail: reply.meta_persistence_detail,
     }
+}
+
+fn checked_registration_readiness(
+    reply: RegisterNodeReply,
+    request_started_at: Instant,
+    received_at: Instant,
+) -> Result<NodeRegistrationReadiness> {
+    if reply.lease_epoch == 0 {
+        return Err(Error::coded(
+            CLIENT_ARGUMENT_INVALID,
+            "Meta returned a zero Node registration epoch",
+        ));
+    }
+    let registration = registration_readiness_from_reply_at(reply, request_started_at);
+    if registration.session_deadline <= received_at {
+        return Err(Error::coded(
+            afs_error::IO_PERMISSION_DENIED,
+            "Meta Node registration lifetime is missing or expired",
+        ));
+    }
+    Ok(registration)
 }
 
 /// 同步 VFS/FUSE 回调的 Meta adapter。调用方必须在 FUSE 线程或
@@ -826,7 +933,8 @@ pub async fn register_node(
 }
 
 /// Registers the Node and returns Meta persistence readiness as observed by the
-/// server. Missing fields from an older Meta decode as unknown/false.
+/// server. Missing persistence fields decode as unknown/false. A missing or
+/// exhausted relative session lifetime fails closed, including on heartbeat.
 pub async fn register_node_with_readiness(
     endpoint: &str,
     node: afs_protocol::meta::NodeDescriptor,
@@ -834,6 +942,9 @@ pub async fn register_node_with_readiness(
     tls: TlsConfig,
 ) -> Result<NodeRegistrationReadiness> {
     static REGISTER_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+    // Include connection setup and the full response in the conservative lease
+    // budget. Both startup and heartbeat consume this exact monotonic cutoff.
+    let request_started_at = Instant::now();
     let config = GrpcConfig {
         connect_timeout: timeout,
         request_timeout: timeout,
@@ -859,18 +970,12 @@ pub async fn register_node_with_readiness(
                 REGISTER_SEQUENCE.fetch_add(1, Ordering::Relaxed),
             ),
             node: Some(node),
-            lease_seconds: 30,
+            lease_seconds: NODE_REGISTRATION_LEASE_SECONDS,
         })
         .await
         .map_err(afs_transport::grpc::error_status::status_to_error)?
         .into_inner();
-    if reply.lease_epoch == 0 {
-        return Err(Error::coded(
-            CLIENT_ARGUMENT_INVALID,
-            "Meta returned a zero Node registration epoch",
-        ));
-    }
-    Ok(registration_readiness_from_reply(reply))
+    checked_registration_readiness(reply, request_started_at, Instant::now())
 }
 
 /// Synchronous adapter used by the DFS Backend on FUSE worker threads.

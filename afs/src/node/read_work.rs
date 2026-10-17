@@ -1,10 +1,16 @@
 //! Fixed-cardinality work counters for immutable DFS reads, never authority or budgets.
+//!
+//! Local integrity scans also serve the diagnostic Chunk store without DFS.
+//! Peer transport, disk-cache and request journals are compiled only for DFS
+//! (or their direct unit tests), without changing that shared verification path.
 
+#[cfg(any(feature = "dfs", test))]
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
 };
 
+#[cfg(any(feature = "dfs", test))]
 const FILL_STAGES: [&str; 7] = [
     "lock_wait",
     "lookup",
@@ -18,12 +24,14 @@ const FILL_STAGES: [&str; 7] = [
 /// Low-frequency synchronous scope clock. CPU belongs only to its calling
 /// thread, not transport workers or remote nodes. Failure never affects reads.
 #[derive(Clone, Copy)]
+#[cfg(any(feature = "dfs", test))]
 pub(crate) struct PeerFillClock {
     wall: std::time::Instant,
     cpu: Option<u64>,
     thread: std::thread::ThreadId,
 }
 
+#[cfg(any(feature = "dfs", test))]
 impl PeerFillClock {
     pub(crate) fn start() -> Self {
         let wall = std::time::Instant::now();
@@ -46,6 +54,7 @@ impl PeerFillClock {
     }
 }
 
+#[cfg(any(feature = "dfs", test))]
 fn thread_cpu_ns() -> Option<u64> {
     let mut value = libc::timespec {
         tv_sec: 0,
@@ -67,34 +76,61 @@ fn thread_cpu_ns() -> Option<u64> {
 pub struct ReadWorkMetrics {
     scan_bytes: afs_metrics::IntCounter,
     hashes: afs_metrics::IntCounterVec,
+    #[cfg(any(feature = "dfs", test))]
     disk_cache_metadata_bytes: afs_metrics::IntGauge,
+    #[cfg(any(feature = "dfs", test))]
     disk_cache_metadata_peak_bytes: afs_metrics::IntGauge,
     scans: afs_metrics::IntCounter,
     copies: afs_metrics::IntCounterVec,
+    #[cfg(any(feature = "dfs", test))]
     peer_payload_bytes: afs_metrics::IntGauge,
+    #[cfg(any(feature = "dfs", test))]
     peer_payload_peak_bytes: afs_metrics::IntGauge,
+    #[cfg(any(feature = "dfs", test))]
     peer_payload_reserved: afs_metrics::IntCounter,
+    #[cfg(any(feature = "dfs", test))]
     peer_payload_released: afs_metrics::IntCounter,
+    #[cfg(any(feature = "dfs", test))]
     peer_object_cache: afs_metrics::IntCounterVec,
+    #[cfg(any(feature = "dfs", test))]
     read_rpc_calls: afs_metrics::IntCounterVec,
+    #[cfg(any(feature = "dfs", test))]
     peer_read_events: afs_metrics::IntCounterVec,
+    #[cfg(feature = "dfs")]
     disk_cache_events: afs_metrics::IntCounterVec,
+    #[cfg(any(feature = "dfs", test))]
     disk_cache_data_reads: afs_metrics::IntCounter,
+    #[cfg(any(feature = "dfs", test))]
     disk_cache_stage_ns: afs_metrics::IntCounterVec,
+    #[cfg(any(feature = "dfs", test))]
     disk_cache_stage_calls: afs_metrics::IntCounterVec,
+    #[cfg(any(feature = "dfs", test))]
     disk_cache_fill_stage_ns: afs_metrics::IntCounterVec,
+    #[cfg(any(feature = "dfs", test))]
     disk_cache_fill_stage_cpu_ns: afs_metrics::IntCounterVec,
+    #[cfg(any(feature = "dfs", test))]
     disk_cache_fill_stage_calls: afs_metrics::IntCounterVec,
+    #[cfg(any(feature = "dfs", test))]
     disk_cache_fill_stage_cpu_calls: afs_metrics::IntCounterVec,
+    #[cfg(any(feature = "dfs", test))]
     disk_cache_fill_bytes: afs_metrics::IntGauge,
+    #[cfg(any(feature = "dfs", test))]
     disk_cache_fill_peak_bytes: afs_metrics::IntGauge,
+    #[cfg(any(feature = "dfs", test))]
     disk_cache_private_peak_bytes: afs_metrics::IntGauge,
+    #[cfg(any(feature = "dfs", test))]
     stream_reserved_bytes: afs_metrics::IntGauge,
+    #[cfg(any(feature = "dfs", test))]
     stream_reserved_peak_bytes: afs_metrics::IntGauge,
+    #[cfg(any(feature = "dfs", test))]
     stream_private_peak_bytes: afs_metrics::IntGauge,
+    #[cfg(any(feature = "dfs", test))]
     stream_frame_bytes: afs_metrics::IntGauge,
+    #[cfg(any(feature = "dfs", test))]
     stream_frame_peak_bytes: afs_metrics::IntGauge,
+    #[cfg(any(feature = "dfs", test))]
     stream_frames: Arc<StreamFrameAccounting>,
+    #[cfg(any(feature = "dfs", test))]
     diagnostics: Option<Arc<ReadDiagnostics>>,
 }
 
@@ -117,16 +153,20 @@ impl ReadWorkMetrics {
                 "root_in_receive", "root_fallback", "segment_index_bytes",
                 "cache_segment_hash", "cache_full_hash",
             ] { hashes.with_label_values(&[stage]); }
+            #[cfg(any(feature = "dfs", test))]
             let disk_cache_metadata_bytes = afs_metrics::IntGauge::new(
                 "afs_dfs_peer_disk_cache_metadata_bytes",
                 "Charged segment digest and file identity metadata; excludes payload and directory bookkeeping.",
             )?;
+            #[cfg(any(feature = "dfs", test))]
             let disk_cache_metadata_peak_bytes = afs_metrics::IntGauge::new(
                 "afs_dfs_peer_disk_cache_metadata_peak_bytes",
                 "Peak charged segment digest and file identity metadata under its independent 1MiB limit.",
             )?;
             afs_metrics::register_collector(registry, &hashes)?;
+            #[cfg(any(feature = "dfs", test))]
             afs_metrics::register_collector(registry, &disk_cache_metadata_bytes)?;
+            #[cfg(any(feature = "dfs", test))]
             afs_metrics::register_collector(registry, &disk_cache_metadata_peak_bytes)?;
             let scans = afs_metrics::IntCounter::new(
                 "afs_dfs_read_scans_total",
@@ -139,22 +179,27 @@ impl ReadWorkMetrics {
                 ),
                 &["stage"],
             )?;
+            #[cfg(any(feature = "dfs", test))]
             let peer_payload_bytes = afs_metrics::IntGauge::new(
                 "afs_dfs_peer_read_payload_bytes",
                 "Charged Peer read payload capacity, including resident and still-pinned objects.",
             )?;
+            #[cfg(any(feature = "dfs", test))]
             let peer_payload_peak_bytes = afs_metrics::IntGauge::new(
                 "afs_dfs_peer_read_payload_peak_bytes",
                 "Peak charged capacity in the shared Peer read payload budget.",
             )?;
+            #[cfg(any(feature = "dfs", test))]
             let peer_payload_reserved = afs_metrics::IntCounter::new(
                 "afs_dfs_peer_read_payload_reserved_bytes_total",
                 "Peer read payload capacity admitted by the shared budget.",
             )?;
+            #[cfg(any(feature = "dfs", test))]
             let peer_payload_released = afs_metrics::IntCounter::new(
                 "afs_dfs_peer_read_payload_released_bytes_total",
                 "Peer read payload capacity released after its final owner drops.",
             )?;
+            #[cfg(any(feature = "dfs", test))]
             let peer_object_cache = afs_metrics::IntCounterVec::new(
                 afs_metrics::Opts::new(
                     "afs_dfs_peer_read_object_cache_total",
@@ -162,6 +207,7 @@ impl ReadWorkMetrics {
                 ),
                 &["result"],
             )?;
+            #[cfg(any(feature = "dfs", test))]
             let read_rpc_calls = afs_metrics::IntCounterVec::new(
                 afs_metrics::Opts::new(
                     "afs_dfs_read_rpc_calls_total",
@@ -169,6 +215,7 @@ impl ReadWorkMetrics {
                 ),
                 &["method"],
             )?;
+            #[cfg(any(feature = "dfs", test))]
             let peer_read_events = afs_metrics::IntCounterVec::new(
                 afs_metrics::Opts::new(
                     "afs_dfs_peer_read_events_total",
@@ -176,13 +223,16 @@ impl ReadWorkMetrics {
                 ),
                 &["event"],
             )?;
+            #[cfg(feature = "dfs")]
             let disk_cache_events = afs_metrics::IntCounterVec::new(
                 afs_metrics::Opts::new("afs_dfs_peer_disk_cache_events_total", "Disposable native Peer disk cache outcomes; no authority or durability."), &["result"],
             )?;
+            #[cfg(any(feature = "dfs", test))]
             let disk_cache_data_reads = afs_metrics::IntCounter::new(
                 "afs_dfs_peer_disk_cache_data_read_calls_total",
                 "Actual cache body-region read attempts, including failed or interrupted attempts; excludes header and trailing EOF probes.",
             )?;
+            #[cfg(any(feature = "dfs", test))]
             let disk_cache_stage_ns = afs_metrics::IntCounterVec::new(
                 afs_metrics::Opts::new(
                     "afs_dfs_peer_disk_cache_stage_nanoseconds_total",
@@ -190,6 +240,7 @@ impl ReadWorkMetrics {
                 ),
                 &["stage"],
             )?;
+            #[cfg(any(feature = "dfs", test))]
             let disk_cache_stage_calls = afs_metrics::IntCounterVec::new(
                 afs_metrics::Opts::new(
                     "afs_dfs_peer_disk_cache_stage_observations_total",
@@ -197,61 +248,96 @@ impl ReadWorkMetrics {
                 ),
                 &["stage"],
             )?;
+            #[cfg(any(feature = "dfs", test))]
             for stage in ["prepare", "data_read", "segment_verify", "stream_read_verify", "finalize"] {
                 disk_cache_stage_ns.with_label_values(&[stage]);
                 disk_cache_stage_calls.with_label_values(&[stage]);
             }
+            #[cfg(any(feature = "dfs", test))]
             afs_metrics::register_collector(registry, &disk_cache_data_reads)?;
+            #[cfg(any(feature = "dfs", test))]
             afs_metrics::register_collector(registry, &disk_cache_stage_ns)?;
+            #[cfg(any(feature = "dfs", test))]
             afs_metrics::register_collector(registry, &disk_cache_stage_calls)?;
+            #[cfg(any(feature = "dfs", test))]
             let disk_cache_fill_stage_ns = afs_metrics::IntCounterVec::new(
                 afs_metrics::Opts::new("afs_dfs_peer_disk_cache_fill_stage_nanoseconds_total", "Whole-object fill wall time by fixed stage, including failures; total is a parent, not an extra exclusive stage."), &["stage"],
             )?;
+            #[cfg(any(feature = "dfs", test))]
             let disk_cache_fill_stage_cpu_ns = afs_metrics::IntCounterVec::new(
                 afs_metrics::Opts::new("afs_dfs_peer_disk_cache_fill_stage_thread_cpu_nanoseconds_total", "Calling-thread CPU for synchronous fill scopes; excludes transport workers and remote CPU, never pure network wait."), &["stage"],
             )?;
+            #[cfg(any(feature = "dfs", test))]
             let disk_cache_fill_stage_calls = afs_metrics::IntCounterVec::new(
                 afs_metrics::Opts::new("afs_dfs_peer_disk_cache_fill_stage_observations_total", "Fill stage observations, including failed work; prepare can contain multiple disjoint scopes per fill."), &["stage"],
             )?;
+            #[cfg(any(feature = "dfs", test))]
             let disk_cache_fill_stage_cpu_calls = afs_metrics::IntCounterVec::new(
                 afs_metrics::Opts::new("afs_dfs_peer_disk_cache_fill_stage_thread_cpu_observations_total", "Fill observations with a valid same-thread CPU sample; missing CPU is not an observed zero."), &["stage"],
             )?;
+            #[cfg(any(feature = "dfs", test))]
             for stage in FILL_STAGES {
                 disk_cache_fill_stage_ns.with_label_values(&[stage]);
                 disk_cache_fill_stage_cpu_ns.with_label_values(&[stage]);
                 disk_cache_fill_stage_calls.with_label_values(&[stage]);
                 disk_cache_fill_stage_cpu_calls.with_label_values(&[stage]);
             }
+            #[cfg(any(feature = "dfs", test))]
             afs_metrics::register_collector(registry, &disk_cache_fill_stage_ns)?;
+            #[cfg(any(feature = "dfs", test))]
             afs_metrics::register_collector(registry, &disk_cache_fill_stage_cpu_ns)?;
+            #[cfg(any(feature = "dfs", test))]
             afs_metrics::register_collector(registry, &disk_cache_fill_stage_calls)?;
+            #[cfg(any(feature = "dfs", test))]
             afs_metrics::register_collector(registry, &disk_cache_fill_stage_cpu_calls)?;
+            #[cfg(any(feature = "dfs", test))]
             let disk_cache_fill_bytes = afs_metrics::IntGauge::new("afs_dfs_peer_disk_cache_fill_bytes", "Temporary complete-object fill bytes, held until the body is dropped; no resident payload cache.")?;
+            #[cfg(any(feature = "dfs", test))]
             let disk_cache_fill_peak_bytes = afs_metrics::IntGauge::new("afs_dfs_peer_disk_cache_fill_peak_bytes", "Peak temporary complete-object fill bytes, serialized by the cache operation guard.")?;
+            #[cfg(any(feature = "dfs", test))]
             let disk_cache_private_peak_bytes = afs_metrics::IntGauge::new("afs_dfs_peer_disk_cache_private_peak_bytes", "Peak complete-object fill plus private output for one native read; not Node RSS.")?;
+            #[cfg(any(feature = "dfs", test))]
             let stream_reserved_bytes = afs_metrics::IntGauge::new("afs_dfs_peer_disk_cache_stream_reserved_bytes", "Conservative same-budget 4MiB streaming fill reservation held until producer and frames drain; not allocated RAM or admission.")?;
+            #[cfg(any(feature = "dfs", test))]
             let stream_reserved_peak_bytes = afs_metrics::IntGauge::new("afs_dfs_peer_disk_cache_stream_reserved_peak_bytes", "Peak conservative streaming fill reservation; mutually exclusive with legacy full-body fill for one cache operation.")?;
+            #[cfg(any(feature = "dfs", test))]
             let stream_private_peak_bytes = afs_metrics::IntGauge::new("afs_dfs_peer_disk_cache_stream_private_peak_bytes", "Peak conservative streaming fill reservation plus private output; not Node RSS.")?;
+            #[cfg(any(feature = "dfs", test))]
             let stream_frame_bytes = afs_metrics::IntGauge::new("afs_dfs_peer_disk_cache_stream_frame_bytes", "Owned reusable payload block capacity through free pool, producer, queue and consumer; excludes bounded control fields and transport buffers.")?;
+            #[cfg(any(feature = "dfs", test))]
             let stream_frame_peak_bytes = afs_metrics::IntGauge::new("afs_dfs_peer_disk_cache_stream_frame_peak_bytes", "Peak owned streaming payload backing capacity; not reservation or total transport RAM.")?;
+            #[cfg(any(feature = "dfs", test))]
             for gauge in [&stream_reserved_bytes, &stream_reserved_peak_bytes, &stream_private_peak_bytes, &stream_frame_bytes, &stream_frame_peak_bytes] {
                 afs_metrics::register_collector(registry, gauge)?;
             }
+            #[cfg(feature = "dfs")]
             for result in ["hit", "miss", "fill", "fill_failed", "corrupt_or_io", "fallback"] { disk_cache_events.with_label_values(&[result]); }
+            #[cfg(feature = "dfs")]
             afs_metrics::register_collector(registry, &disk_cache_events)?;
+            #[cfg(any(feature = "dfs", test))]
             afs_metrics::register_collector(registry, &disk_cache_fill_bytes)?;
+            #[cfg(any(feature = "dfs", test))]
             afs_metrics::register_collector(registry, &disk_cache_fill_peak_bytes)?;
+            #[cfg(any(feature = "dfs", test))]
             afs_metrics::register_collector(registry, &disk_cache_private_peak_bytes)?;
             afs_metrics::register_collector(registry, &scan_bytes)?;
             afs_metrics::register_collector(registry, &scans)?;
             afs_metrics::register_collector(registry, &copies)?;
+            #[cfg(any(feature = "dfs", test))]
             afs_metrics::register_collector(registry, &peer_payload_bytes)?;
+            #[cfg(any(feature = "dfs", test))]
             afs_metrics::register_collector(registry, &peer_payload_peak_bytes)?;
+            #[cfg(any(feature = "dfs", test))]
             afs_metrics::register_collector(registry, &peer_payload_reserved)?;
+            #[cfg(any(feature = "dfs", test))]
             afs_metrics::register_collector(registry, &peer_payload_released)?;
+            #[cfg(any(feature = "dfs", test))]
             afs_metrics::register_collector(registry, &peer_object_cache)?;
+            #[cfg(any(feature = "dfs", test))]
             afs_metrics::register_collector(registry, &read_rpc_calls)?;
+            #[cfg(any(feature = "dfs", test))]
             afs_metrics::register_collector(registry, &peer_read_events)?;
+            #[cfg(any(feature = "dfs", test))]
             for event in [
                 "stream_pipeline",
                 "stream_frame",
@@ -267,6 +353,7 @@ impl ReadWorkMetrics {
             ] {
                 peer_read_events.with_label_values(&[event]);
             }
+            #[cfg(any(feature = "dfs", test))]
             for method in [
                 "get_inode",
                 "get_file_version",
@@ -276,6 +363,7 @@ impl ReadWorkMetrics {
             ] {
                 read_rpc_calls.with_label_values(&[method]);
             }
+            #[cfg(any(feature = "dfs", test))]
             for result in ["hit", "miss"] {
                 peer_object_cache.with_label_values(&[result]);
             }
@@ -294,34 +382,61 @@ impl ReadWorkMetrics {
             Ok(Self {
                 scan_bytes,
                 hashes,
+                #[cfg(any(feature = "dfs", test))]
                 disk_cache_metadata_bytes,
+                #[cfg(any(feature = "dfs", test))]
                 disk_cache_metadata_peak_bytes,
                 scans,
                 copies,
+                #[cfg(any(feature = "dfs", test))]
                 peer_payload_bytes,
+                #[cfg(any(feature = "dfs", test))]
                 peer_payload_peak_bytes,
+                #[cfg(any(feature = "dfs", test))]
                 peer_payload_reserved,
+                #[cfg(any(feature = "dfs", test))]
                 peer_payload_released,
+                #[cfg(any(feature = "dfs", test))]
                 peer_object_cache,
+                #[cfg(any(feature = "dfs", test))]
                 read_rpc_calls,
+                #[cfg(any(feature = "dfs", test))]
                 peer_read_events,
+                #[cfg(feature = "dfs")]
                 disk_cache_events,
+                #[cfg(any(feature = "dfs", test))]
                 disk_cache_data_reads,
+                #[cfg(any(feature = "dfs", test))]
                 disk_cache_stage_ns,
+                #[cfg(any(feature = "dfs", test))]
                 disk_cache_stage_calls,
+                #[cfg(any(feature = "dfs", test))]
                 disk_cache_fill_stage_ns,
+                #[cfg(any(feature = "dfs", test))]
                 disk_cache_fill_stage_cpu_ns,
+                #[cfg(any(feature = "dfs", test))]
                 disk_cache_fill_stage_calls,
+                #[cfg(any(feature = "dfs", test))]
                 disk_cache_fill_stage_cpu_calls,
+                #[cfg(any(feature = "dfs", test))]
                 disk_cache_fill_bytes,
+                #[cfg(any(feature = "dfs", test))]
                 disk_cache_fill_peak_bytes,
+                #[cfg(any(feature = "dfs", test))]
                 disk_cache_private_peak_bytes,
+                #[cfg(any(feature = "dfs", test))]
                 stream_reserved_bytes,
+                #[cfg(any(feature = "dfs", test))]
                 stream_reserved_peak_bytes,
+                #[cfg(any(feature = "dfs", test))]
                 stream_private_peak_bytes,
+                #[cfg(any(feature = "dfs", test))]
                 stream_frame_bytes,
+                #[cfg(any(feature = "dfs", test))]
                 stream_frame_peak_bytes,
+                #[cfg(any(feature = "dfs", test))]
                 stream_frames: Arc::new(StreamFrameAccounting::default()),
+                #[cfg(any(feature = "dfs", test))]
                 diagnostics: None,
             })
         })
@@ -329,6 +444,7 @@ impl ReadWorkMetrics {
 
     /// Enable once before publishing the Node's shared metrics. OFF allocates no
     /// journal and takes no diagnostic clock samples. This never resets a live journal.
+    #[cfg(any(feature = "dfs", test))]
     pub(crate) fn with_read_diagnostics(mut self, enabled: bool) -> Self {
         if enabled && self.diagnostics.is_none() {
             self.diagnostics = Some(Arc::new(ReadDiagnostics::new()));
@@ -336,11 +452,13 @@ impl ReadWorkMetrics {
         self
     }
 
+    #[cfg(any(feature = "dfs", test))]
     pub(crate) fn diagnostic(&self, stage: ReadDiagnosticStage) -> Option<ReadDiagnosticSpan> {
         self.diagnostics.as_ref()?.begin(stage)
     }
 
     /// Read only outside a measured operation; serialization is not on the read path.
+    #[cfg(any(feature = "dfs", test))]
     pub(crate) fn diagnostics_snapshot(&self) -> Option<ReadDiagnosticsSnapshot> {
         self.diagnostics.as_ref().map(|journal| journal.snapshot())
     }
@@ -362,6 +480,7 @@ impl ReadWorkMetrics {
     }
 
     /// Observes the cache's enforcing metadata ledger, never grants admission.
+    #[cfg(any(feature = "dfs", test))]
     pub(crate) fn peer_cache_metadata(&self, current: u64, peak: u64) {
         if let (Ok(current), Ok(peak)) = (i64::try_from(current), i64::try_from(peak)) {
             self.disk_cache_metadata_bytes.set(current);
@@ -369,10 +488,12 @@ impl ReadWorkMetrics {
         }
     }
 
+    #[cfg(any(feature = "dfs", test))]
     pub(crate) fn peer_cache_data_reads(&self, calls: u64) {
         self.disk_cache_data_reads.inc_by(calls);
     }
 
+    #[cfg(any(feature = "dfs", test))]
     pub(crate) fn peer_cache_stage_ns(&self, stage: &'static str, ns: u64) {
         if ns != 0
             && matches!(
@@ -389,6 +510,7 @@ impl ReadWorkMetrics {
         }
     }
 
+    #[cfg(any(feature = "dfs", test))]
     pub(crate) fn peer_cache_fill_stage(
         &self,
         stage: &'static str,
@@ -414,6 +536,7 @@ impl ReadWorkMetrics {
         }
     }
 
+    #[cfg(feature = "dfs")]
     pub(crate) fn peer_disk_cache_event(&self, result: &'static str) {
         if matches!(
             result,
@@ -424,6 +547,7 @@ impl ReadWorkMetrics {
     }
 
     /// Observation only. The cache operation guard and read budget enforce admission.
+    #[cfg(any(feature = "dfs", test))]
     pub(crate) fn peer_disk_cache_fill_work(
         &self,
         bytes: usize,
@@ -449,6 +573,7 @@ impl ReadWorkMetrics {
     }
 
     /// Observation of the existing serialized fill allowance, never admission.
+    #[cfg(any(feature = "dfs", test))]
     pub(crate) fn peer_stream_pipeline(&self, output: usize) -> PeerCacheStreamWork {
         const RESERVED: i64 = 4 * 1024 * 1024;
         self.stream_reserved_bytes.add(RESERVED);
@@ -468,6 +593,7 @@ impl ReadWorkMetrics {
     }
 
     /// Fixed payload owners and control permits enforce bounds; this guard follows ownership.
+    #[cfg(any(feature = "dfs", test))]
     pub(crate) fn peer_stream_frame(&self, backing_bytes: usize) -> PeerStreamFrameWork {
         let bytes = u64::try_from(backing_bytes)
             .ok()
@@ -506,6 +632,7 @@ impl ReadWorkMetrics {
         self.copies.with_label_values(&[stage]).inc_by(bytes);
     }
 
+    #[cfg(any(feature = "dfs", test))]
     pub(crate) fn peer_payload_reserved(&self, bytes: u64, peak_increment: u64) {
         // The enforcing budget admits at most 8MiB. Metrics remain optional
         // observations and cannot grant admission, even for an invalid input.
@@ -517,6 +644,7 @@ impl ReadWorkMetrics {
         }
     }
 
+    #[cfg(any(feature = "dfs", test))]
     pub(crate) fn peer_payload_released(&self, bytes: u64) {
         if let Ok(bytes_i64) = i64::try_from(bytes) {
             self.peer_payload_bytes.sub(bytes_i64);
@@ -524,12 +652,14 @@ impl ReadWorkMetrics {
         }
     }
 
+    #[cfg(any(feature = "dfs", test))]
     pub(crate) fn peer_object_cache(&self, result: &'static str) {
         if matches!(result, "hit" | "miss") {
             self.peer_object_cache.with_label_values(&[result]).inc();
         }
     }
 
+    #[cfg(any(feature = "dfs", test))]
     pub(crate) fn read_rpc(&self, method: &'static str) {
         if matches!(
             method,
@@ -543,6 +673,7 @@ impl ReadWorkMetrics {
         }
     }
 
+    #[cfg(any(feature = "dfs", test))]
     pub(crate) fn peer_read_event(&self, event: &'static str) {
         if matches!(
             event,
@@ -564,26 +695,31 @@ impl ReadWorkMetrics {
 }
 
 #[derive(Debug, Default)]
+#[cfg(any(feature = "dfs", test))]
 struct StreamFrameAccounting {
     current: AtomicU64,
     peak: AtomicU64,
 }
 
+#[cfg(any(feature = "dfs", test))]
 pub(crate) struct PeerCacheStreamWork {
     metrics: ReadWorkMetrics,
 }
 
+#[cfg(any(feature = "dfs", test))]
 impl Drop for PeerCacheStreamWork {
     fn drop(&mut self) {
         self.metrics.stream_reserved_bytes.sub(4 * 1024 * 1024);
     }
 }
 
+#[cfg(any(feature = "dfs", test))]
 pub(crate) struct PeerStreamFrameWork {
     metrics: ReadWorkMetrics,
     bytes: u64,
 }
 
+#[cfg(any(feature = "dfs", test))]
 impl Drop for PeerStreamFrameWork {
     fn drop(&mut self) {
         self.metrics
@@ -594,11 +730,13 @@ impl Drop for PeerStreamFrameWork {
     }
 }
 
+#[cfg(any(feature = "dfs", test))]
 pub(crate) struct PeerCacheFillWork {
     metrics: ReadWorkMetrics,
     bytes: usize,
 }
 
+#[cfg(any(feature = "dfs", test))]
 impl Drop for PeerCacheFillWork {
     fn drop(&mut self) {
         if let Ok(bytes) = i64::try_from(self.bytes) {
@@ -625,12 +763,15 @@ impl Drop for ScanWork<'_> {
 
 // The only retained diagnostic data is this fixed journal. No payload, pathname,
 // inode or user identity is retained. Slots are never recycled during a Node epoch.
+#[cfg(any(feature = "dfs", test))]
 const READ_DIAGNOSTIC_CAPACITY: usize = 256;
+#[cfg(any(feature = "dfs", test))]
 const READ_DIAGNOSTIC_MAX_METADATA_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 #[repr(u64)]
+#[cfg(any(feature = "dfs", test))]
 pub(crate) enum ReadDiagnosticStage {
     FuseRead,
     MetaLookup,
@@ -642,6 +783,7 @@ pub(crate) enum ReadDiagnosticStage {
     PeerObject,
 }
 
+#[cfg(any(feature = "dfs", test))]
 impl ReadDiagnosticStage {
     fn from_raw(raw: u64) -> Self {
         match raw {
@@ -658,6 +800,7 @@ impl ReadDiagnosticStage {
 }
 
 #[derive(Debug, Default)]
+#[cfg(any(feature = "dfs", test))]
 struct ReadDiagnosticSlot {
     stage: AtomicU64,
     start_ns: AtomicU64,
@@ -678,6 +821,7 @@ struct ReadDiagnosticSlot {
 }
 
 #[derive(Debug, Default)]
+#[cfg(any(feature = "dfs", test))]
 struct ReadDiagnosticWorkSlot {
     wall_ns: AtomicU64,
     calls: AtomicU64,
@@ -685,6 +829,7 @@ struct ReadDiagnosticWorkSlot {
 }
 
 #[derive(Clone, Copy, Debug, Default, serde::Serialize)]
+#[cfg(any(feature = "dfs", test))]
 pub(crate) struct ReadDiagnosticWork {
     pub(crate) wall_ns: u64,
     pub(crate) calls: u64,
@@ -694,6 +839,7 @@ pub(crate) struct ReadDiagnosticWork {
 /// Exclusive measured operations inside the synchronous consumer. These are
 /// children of consumer_ns, not extra elapsed time alongside the Peer parent.
 #[derive(Clone, Copy, Debug, Default, serde::Serialize)]
+#[cfg(any(feature = "dfs", test))]
 pub(crate) struct ReadDiagnosticConsumerWork {
     /// Entire sink.write call, including validation and optional cache-failure
     /// fallback; bytes/calls are attempts, not successful disk syscalls or fsync.
@@ -706,6 +852,7 @@ pub(crate) struct ReadDiagnosticConsumerWork {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg(any(feature = "dfs", test))]
 pub(crate) enum ReadDiagnosticConsumerStage {
     SinkWrite,
     RangeExtract,
@@ -713,6 +860,7 @@ pub(crate) enum ReadDiagnosticConsumerStage {
     SegmentBlake3,
 }
 
+#[cfg(any(feature = "dfs", test))]
 impl ReadDiagnosticConsumerWork {
     fn stage_mut(&mut self, stage: ReadDiagnosticConsumerStage) -> &mut ReadDiagnosticWork {
         match stage {
@@ -756,6 +904,7 @@ impl ReadDiagnosticConsumerWork {
 }
 
 #[derive(Debug)]
+#[cfg(any(feature = "dfs", test))]
 struct ReadDiagnostics {
     slots: Box<[ReadDiagnosticSlot; READ_DIAGNOSTIC_CAPACITY]>,
     next: AtomicU64,
@@ -763,6 +912,7 @@ struct ReadDiagnostics {
     clock_failures: AtomicU64,
 }
 
+#[cfg(any(feature = "dfs", test))]
 const _: () = assert!(
     std::mem::size_of::<ReadDiagnosticSlot>() * READ_DIAGNOSTIC_CAPACITY
         + std::mem::size_of::<ReadDiagnostics>()
@@ -771,6 +921,7 @@ const _: () = assert!(
 );
 
 #[derive(Debug, serde::Serialize)]
+#[cfg(any(feature = "dfs", test))]
 pub(crate) struct ReadDiagnosticRecord {
     pub(crate) id: usize,
     pub(crate) stage: ReadDiagnosticStage,
@@ -796,6 +947,7 @@ pub(crate) struct ReadDiagnosticRecord {
 }
 
 #[derive(Debug, serde::Serialize)]
+#[cfg(any(feature = "dfs", test))]
 pub(crate) struct ReadDiagnosticsSnapshot {
     pub(crate) schema_version: u32,
     pub(crate) capacity: usize,
@@ -805,6 +957,7 @@ pub(crate) struct ReadDiagnosticsSnapshot {
     pub(crate) records: Vec<ReadDiagnosticRecord>,
 }
 
+#[cfg(any(feature = "dfs", test))]
 impl ReadDiagnostics {
     fn new() -> Self {
         Self {
@@ -894,6 +1047,7 @@ impl ReadDiagnostics {
     }
 }
 
+#[cfg(any(feature = "dfs", test))]
 fn monotonic_ns() -> Option<u64> {
     let mut value = libc::timespec {
         tv_sec: 0,
@@ -912,28 +1066,33 @@ fn monotonic_ns() -> Option<u64> {
 
 /// Shared slot reference, never an owner of payload, grants or cache state.
 #[derive(Clone)]
+#[cfg(any(feature = "dfs", test))]
 pub(crate) struct ReadDiagnosticToken {
     journal: Arc<ReadDiagnostics>,
     index: usize,
 }
 
+#[cfg(any(feature = "dfs", test))]
 impl ReadDiagnosticToken {
     pub(crate) fn now(&self) -> u64 {
         self.journal.now()
     }
 
+    #[cfg(feature = "dfs")]
     pub(crate) fn body_complete(&self) {
         self.journal.slots[self.index]
             .body_end_ns
             .store(self.now(), Ordering::Release);
     }
 
+    #[cfg(feature = "dfs")]
     pub(crate) fn eof(&self) {
         self.journal.slots[self.index]
             .eof_ns
             .store(self.now(), Ordering::Release);
     }
 
+    #[cfg(feature = "dfs")]
     pub(crate) fn consumer(&self, start_ns: u64) {
         let end_ns = self.now();
         self.consumer_interval(start_ns, end_ns);
@@ -958,9 +1117,11 @@ impl ReadDiagnosticToken {
     }
 }
 
+#[cfg(any(feature = "dfs", test))]
 const READ_DIAGNOSTIC_INTERVAL_CAPACITY: usize = 64;
 
 #[derive(Clone, Copy, Default)]
+#[cfg(any(feature = "dfs", test))]
 struct ReadDiagnosticInterval {
     start: u64,
     end: u64,
@@ -968,6 +1129,7 @@ struct ReadDiagnosticInterval {
 
 /// Diagnostic-only fixed metadata, never a payload queue or retained event journal.
 #[derive(Clone, Copy)]
+#[cfg(any(feature = "dfs", test))]
 pub(crate) struct ReadDiagnosticIntervals {
     intervals: [ReadDiagnosticInterval; READ_DIAGNOSTIC_INTERVAL_CAPACITY],
     length: usize,
@@ -975,6 +1137,7 @@ pub(crate) struct ReadDiagnosticIntervals {
     invalid: bool,
 }
 
+#[cfg(any(feature = "dfs", test))]
 impl Default for ReadDiagnosticIntervals {
     fn default() -> Self {
         Self {
@@ -986,6 +1149,7 @@ impl Default for ReadDiagnosticIntervals {
     }
 }
 
+#[cfg(any(feature = "dfs", test))]
 impl ReadDiagnosticIntervals {
     fn record(&mut self, start: u64, end: u64) {
         if start == 0
@@ -1034,12 +1198,14 @@ impl ReadDiagnosticIntervals {
 
 /// One producer-owned root work ledger; drop publishes aggregates on success,
 /// RPC failure and task cancellation without extending any payload lifetime.
+#[cfg(any(feature = "dfs", test))]
 pub(crate) struct ReadDiagnosticProducer {
     token: ReadDiagnosticToken,
     work: std::cell::Cell<ReadDiagnosticWork>,
     intervals: std::cell::Cell<ReadDiagnosticIntervals>,
 }
 
+#[cfg(any(feature = "dfs", test))]
 impl ReadDiagnosticProducer {
     pub(crate) fn new(token: ReadDiagnosticToken) -> Self {
         Self {
@@ -1066,11 +1232,13 @@ impl ReadDiagnosticProducer {
         result
     }
 
+    #[cfg(feature = "dfs")]
     pub(crate) fn intervals(&self) -> ReadDiagnosticIntervals {
         self.intervals.get()
     }
 }
 
+#[cfg(any(feature = "dfs", test))]
 impl Drop for ReadDiagnosticProducer {
     fn drop(&mut self) {
         let slot = &self.token.journal.slots[self.token.index];
@@ -1089,6 +1257,7 @@ impl Drop for ReadDiagnosticProducer {
     }
 }
 
+#[cfg(feature = "dfs")]
 impl ReadDiagnosticToken {
     pub(crate) fn root_segment_overlap(
         &self,
@@ -1107,12 +1276,14 @@ impl ReadDiagnosticToken {
 
 /// Optional per-object stack aggregate. It never owns payload, grants, sinks or
 /// task handles. The caller drops it after draining, before finishing its parent.
+#[cfg(any(feature = "dfs", test))]
 pub(crate) struct ReadDiagnosticConsumer {
     token: ReadDiagnosticToken,
     work: std::cell::Cell<ReadDiagnosticConsumerWork>,
     segment_intervals: std::cell::Cell<ReadDiagnosticIntervals>,
 }
 
+#[cfg(any(feature = "dfs", test))]
 impl ReadDiagnosticConsumer {
     pub(crate) fn new(token: ReadDiagnosticToken) -> Self {
         Self {
@@ -1147,11 +1318,13 @@ impl ReadDiagnosticConsumer {
         result
     }
 
+    #[cfg(feature = "dfs")]
     pub(crate) fn segment_intervals(&self) -> ReadDiagnosticIntervals {
         self.segment_intervals.get()
     }
 }
 
+#[cfg(any(feature = "dfs", test))]
 impl Drop for ReadDiagnosticConsumer {
     fn drop(&mut self) {
         let slot = &self.token.journal.slots[self.token.index];
@@ -1161,11 +1334,13 @@ impl Drop for ReadDiagnosticConsumer {
     }
 }
 
+#[cfg(any(feature = "dfs", test))]
 pub(crate) struct ReadDiagnosticSpan {
     token: ReadDiagnosticToken,
     finished: bool,
 }
 
+#[cfg(any(feature = "dfs", test))]
 impl ReadDiagnosticSpan {
     pub(crate) fn token(&self) -> ReadDiagnosticToken {
         self.token.clone()
@@ -1186,6 +1361,7 @@ impl ReadDiagnosticSpan {
     }
 }
 
+#[cfg(any(feature = "dfs", test))]
 impl Drop for ReadDiagnosticSpan {
     fn drop(&mut self) {
         self.record(false);

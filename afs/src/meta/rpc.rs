@@ -234,11 +234,13 @@ fn wire_backend_persistence(persistence: BackendPersistence) -> i32 {
 fn register_node_reply(
     session: super::store::NodeSession,
     readiness: BackendReadiness,
+    now_unix_ms: u64,
 ) -> RegisterNodeReply {
     RegisterNodeReply {
         node_id: session.node_id,
         lease_epoch: session.lease_epoch,
         expires_at_unix_ms: session.expires_at_unix_ms,
+        lease_remaining_ms: session.expires_at_unix_ms.saturating_sub(now_unix_ms),
         meta_backend_persistence: wire_backend_persistence(readiness.persistence),
         meta_backend_healthy: readiness.healthy,
         meta_persistence_ready: readiness.persistent_ready,
@@ -411,7 +413,11 @@ impl MetaService for MetaRpc {
             .backend_readiness()
             .await
             .map_err(afs_transport::grpc::error_status::error_to_status)?;
-        Ok(Response::new(register_node_reply(session, readiness)))
+        Ok(Response::new(register_node_reply(
+            session,
+            readiness,
+            super::store::now_unix_ms(),
+        )))
     }
 
     async fn lookup_node(
@@ -2712,6 +2718,32 @@ fn optional_id(value: String) -> Option<String> {
 mod tests {
     use super::*;
     use tonic::Code;
+
+    #[test]
+    fn registration_reply_uses_remaining_actual_lease_after_readiness_probe() {
+        let session = super::super::store::NodeSession {
+            node_id: "node-a".into(),
+            session_id: "session-a".into(),
+            grpc_addr: String::new(),
+            data_addr: String::new(),
+            rest_addr: String::new(),
+            storage_devices: Vec::new(),
+            lease_epoch: 7,
+            expires_at_unix_ms: 60_000,
+        };
+        let readiness = BackendReadiness::observed(BackendPersistence::Persistent, true, "ready");
+        let remaining = register_node_reply(session.clone(), readiness.clone(), 56_000);
+        assert_eq!(remaining.lease_remaining_ms, 4_000);
+        assert_eq!(remaining.expires_at_unix_ms, session.expires_at_unix_ms);
+        assert_eq!(remaining.lease_epoch, session.lease_epoch);
+        // A replay or a slow readiness probe must not fabricate a fresh lease.
+        for now in [60_000, 90_000] {
+            assert_eq!(
+                register_node_reply(session.clone(), readiness.clone(), now).lease_remaining_ms,
+                0
+            );
+        }
+    }
 
     #[test]
     fn chunk_sources_wire_preserves_bounded_grant_ranges() {
