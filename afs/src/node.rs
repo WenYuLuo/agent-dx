@@ -15,9 +15,14 @@ pub mod api;
 pub mod chunk;
 #[cfg(feature = "dfs")]
 pub mod dfs_read;
+#[cfg(feature = "dfs")]
+pub mod external_chunk;
 pub mod fuse;
 #[cfg(feature = "ownerfs")]
 mod native_workspace;
+#[cfg(feature = "dfs")]
+pub mod peer_cache;
+pub mod read_work;
 #[cfg(feature = "dfs")]
 pub mod replication;
 pub mod rpc;
@@ -29,8 +34,9 @@ use crate::{
     runtime::{BoxError, Observability, Services, cancelled},
 };
 use rpc::meta::{MetaPersistenceCapability, NodeRegistrationReadiness};
+#[cfg(feature = "ownerfs")]
+use std::collections::HashSet;
 use std::{
-    collections::HashSet,
     future::Future,
     os::unix::ffi::OsStrExt,
     path::{Component, Path, PathBuf},
@@ -213,6 +219,8 @@ pub struct Node {
     /// 每次进程启动生成的新会话，旧远端句柄不能跨此边界复用。
     pub session_id: String,
     pub readiness: Arc<NodeReadiness>,
+    #[cfg(feature = "dfs")]
+    pub read_work_metrics: read_work::ReadWorkMetrics,
     #[cfg(feature = "ownerfs")]
     pub ownerfs: Option<Arc<vfs::ownerfs::OwnerFs>>,
     #[cfg(feature = "dfs")]
@@ -325,6 +333,7 @@ pub struct AfsMountIdentity {
 }
 
 impl AfsMountIdentity {
+    #[cfg(any(feature = "ownerfs", feature = "dfs"))]
     fn from_mounted(mounted: &fuse::MountedFuse, expected_source: &str) -> Self {
         let (path, mount_id) = mounted.identity();
         Self {
@@ -1196,11 +1205,14 @@ async fn run_node(
         None
     };
     #[cfg(feature = "dfs")]
+    let dfs_read_work_metrics = read_work::ReadWorkMetrics::register(&obs.registry)?
+        .with_read_diagnostics(cfg.dfs_read_diagnostics_enabled);
+    #[cfg(feature = "dfs")]
     let local_chunk_store = if cfg.dfs {
-        Some(Arc::new(chunk::LocalChunkStore::open(
-            cfg.data_dir.join("dfs"),
-            cfg.id.clone(),
-        )?))
+        Some(Arc::new(
+            chunk::LocalChunkStore::open(cfg.data_dir.join("dfs"), cfg.id.clone())?
+                .with_read_work_metrics(dfs_read_work_metrics.clone()),
+        ))
     } else {
         None
     };
@@ -1279,11 +1291,26 @@ async fn run_node(
         } else {
             (0, None, None)
         };
+    #[cfg(feature = "dfs")]
+    let dfs_read_authority = if cfg.dfs {
+        let registration = registered_readiness.as_ref().ok_or_else(|| {
+            afs_error::Error::coded(
+                afs_error::IO_PERMISSION_DENIED,
+                "DFS reads require a registered Node session",
+            )
+        })?;
+        Some(Arc::new(dfs_read::LocalReadAuthority::new(
+            registration.lease_epoch,
+            registration.session_deadline,
+        )))
+    } else {
+        None
+    };
     #[cfg(not(feature = "dfs"))]
     let _ = registered_node_epoch;
 
     #[cfg(any(feature = "ownerfs", feature = "dfs"))]
-    let peer_connections = Arc::new(rpc::peer::PeerConnectionPool::new(
+    let peer_connections = rpc::peer::PeerConnectionPool::new(
         afs_transport::grpc::GrpcConfig {
             connect_timeout: timeout,
             request_timeout: timeout,
@@ -1291,7 +1318,11 @@ async fn run_node(
         },
         cfg.tls_config(),
         64,
-    )?);
+    )?;
+    #[cfg(feature = "dfs")]
+    let peer_connections = peer_connections.with_read_work_metrics(dfs_read_work_metrics.clone());
+    #[cfg(any(feature = "ownerfs", feature = "dfs"))]
+    let peer_connections = Arc::new(peer_connections);
 
     #[cfg(feature = "ownerfs")]
     let mut workspace_bind_root_control = None;
@@ -1414,14 +1445,17 @@ async fn run_node(
 
     #[cfg(feature = "dfs")]
     let dfs_meta = if cfg.dfs {
-        Some(Arc::new(rpc::meta::GrpcDfsMeta::new(
-            meta_endpoint.expect("DFS checked meta_endpoint"),
-            cfg.id.clone(),
-            session_id.clone(),
-            crate::dfs::NamespaceId::new("default"),
-            timeout,
-            cfg.tls_config(),
-        )?))
+        Some(Arc::new(
+            rpc::meta::GrpcDfsMeta::new(
+                meta_endpoint.expect("DFS checked meta_endpoint"),
+                cfg.id.clone(),
+                session_id.clone(),
+                crate::dfs::NamespaceId::new("default"),
+                timeout,
+                cfg.tls_config(),
+            )?
+            .with_read_work_metrics(dfs_read_work_metrics.clone()),
+        ))
     } else {
         None
     };
@@ -1455,6 +1489,21 @@ async fn run_node(
         dfs_rdma_pool.clone(),
     )?;
     #[cfg(feature = "dfs")]
+    let mut dfs_external_store_for_shutdown: Option<Arc<external_chunk::S3ChunkStore>> = None;
+    #[cfg(feature = "dfs")]
+    let mut dfs_peer_cache_for_shutdown: Option<Arc<peer_cache::DiskPeerCache>> = None;
+    #[cfg(feature = "dfs")]
+    let dfs_write_buffers = chunk::WriteBufferPool::new(
+        usize::try_from(cfg.dfs_write_buffer_idle_bytes).map_err(|_| {
+            afs_error::Error::coded(
+                afs_error::CONFIG_INVALID,
+                "write buffer idle baseline does not fit this platform",
+            )
+        })?,
+    );
+    #[cfg(feature = "dfs")]
+    dfs_write_buffers.register_metrics(&obs.registry)?;
+    #[cfg(feature = "dfs")]
     let dfs_instance = if cfg.dfs {
         let namespace = crate::dfs::NamespaceId::new("default");
         let meta = dfs_meta
@@ -1465,20 +1514,60 @@ async fn run_node(
             .as_ref()
             .expect("DFS local ChunkStore was opened before registration")
             .clone();
-        let chunk_store = Arc::new(replication::DfsChunkStore::new_with_epoch(
-            cfg.id.clone(),
-            registered_node_epoch,
-            chunks.clone(),
-            meta.clone(),
-            dfs_replica_plane.clone(),
-        ));
+        // The external backend owns durability. Never request placement or
+        // synthesize local ReplicaAck records for an external object.
+        let external_store = if let Some(backend) = &cfg.dfs_external_backend {
+            let s3_metrics = external_chunk::S3ChunkStoreMetrics::register(&obs.registry)?;
+            let options = external_chunk::S3ChunkStoreOptions {
+                endpoint: backend.endpoint.clone(),
+                bucket: backend.bucket.clone(),
+                region: backend.region.clone(),
+                store_id: backend.store_id.clone(),
+                generation: backend.generation.clone(),
+                allow_http: backend.allow_http,
+                unsigned_payload: backend.unsigned_payload,
+                credentials: backend.credentials_file.clone().map_or(
+                    external_chunk::S3CredentialsSource::Environment,
+                    external_chunk::S3CredentialsSource::File,
+                ),
+                request_timeout: timeout,
+                max_retries: 2,
+                cache: backend
+                    .cache
+                    .as_ref()
+                    .map(|cache| external_chunk::S3ChunkCacheOptions {
+                        directory: cache.directory.clone(),
+                        capacity_bytes: cache.capacity_bytes,
+                        pending_bytes: cache.pending_bytes,
+                        cache_large_write: cache.cache_large_write,
+                    }),
+                metrics: Some(s3_metrics),
+            };
+            Some(Arc::new(
+                tokio::task::spawn_blocking(move || external_chunk::S3ChunkStore::new(options))
+                    .await??,
+            ))
+        } else {
+            None
+        };
+        dfs_external_store_for_shutdown = external_store.clone();
+        let chunk_store: Arc<dyn chunk::ChunkStore> = match &external_store {
+            Some(store) => store.clone(),
+            None => Arc::new(replication::DfsChunkStore::new_with_epoch(
+                cfg.id.clone(),
+                registered_node_epoch,
+                chunks.clone(),
+                meta.clone(),
+                dfs_replica_plane.clone(),
+            )),
+        };
         let read_config = dfs_read::DfsReadConfig {
             max_ops_per_batch: cfg.dfs_read_max_ops_per_batch,
             max_inflight_bytes: cfg.dfs_read_max_inflight_bytes,
             source_cache_ttl: std::time::Duration::from_millis(cfg.dfs_read_source_cache_ttl_ms),
         };
         read_config.validate()?;
-        let read_engine = Arc::new(dfs_read::DfsReadEngine::new(
+        let read_engine = dfs_read::DfsReadEngine::new(
             namespace.clone(),
             cfg.id.clone(),
             chunks,
@@ -1490,7 +1579,34 @@ async fn run_node(
                 dfs_rdma_pool.clone(),
             )?,
             read_config,
-        ));
+        );
+        let read_engine = match &dfs_read_authority {
+            Some(authority) => read_engine.with_read_authority(authority.clone()),
+            None => read_engine,
+        };
+        let read_engine = if let Some(cache) = &cfg.dfs_peer_cache {
+            let options = peer_cache::PeerCacheOptions {
+                directory: cache.directory.clone(),
+                capacity_bytes: cache.capacity_bytes,
+                namespace_id: namespace.clone(),
+            };
+            let cache_metrics = dfs_read_work_metrics.clone();
+            let cache = Arc::new(
+                tokio::task::spawn_blocking(move || {
+                    peer_cache::DiskPeerCache::open(options)
+                        .map(|cache| cache.with_read_work_metrics(cache_metrics))
+                })
+                .await??,
+            );
+            dfs_peer_cache_for_shutdown = Some(cache.clone());
+            read_engine.with_peer_cache(cache)
+        } else {
+            read_engine
+        };
+        let read_engine = Arc::new(match external_store {
+            Some(store) => read_engine.with_external_backend(store, meta.clone()),
+            None => read_engine,
+        });
         let remote_factory = Arc::new(rpc::peer::GrpcDfsOwnerFactory::new(
             peer_connections.clone(),
             timeout,
@@ -1504,7 +1620,8 @@ async fn run_node(
                 chunk_store,
                 read_engine,
             )
-            .with_remote_owner_factory(remote_factory),
+            .with_remote_owner_factory(remote_factory)
+            .with_write_buffer_pool(dfs_write_buffers.clone()),
         ))
     } else {
         None
@@ -1551,7 +1668,12 @@ async fn run_node(
     #[cfg(feature = "dfs")]
     let mounted_dfs = match (&cfg.dfs_mount, &dfs_instance) {
         (Some(path), Some(dfs)) => {
-            match fuse::mount_dfs_with_metrics(dfs.clone(), path, fuse_request_metrics.clone()) {
+            match fuse::mount_dfs_with_read_diagnostics(
+                dfs.clone(),
+                path,
+                fuse_request_metrics.clone(),
+                dfs_read_work_metrics.clone(),
+            ) {
                 Ok(session) => Some(session),
                 Err(error) => {
                     #[cfg(feature = "ownerfs")]
@@ -1609,6 +1731,8 @@ async fn run_node(
         observability: obs,
         session_id,
         readiness: readiness.clone(),
+        #[cfg(feature = "dfs")]
+        read_work_metrics: dfs_read_work_metrics,
         #[cfg(feature = "ownerfs")]
         ownerfs: ownerfs_instance,
         #[cfg(feature = "dfs")]
@@ -1639,6 +1763,8 @@ async fn run_node(
         let tls = cfg.tls_config();
         let stop = services.stop.subscribe();
         let readiness = readiness.clone();
+        #[cfg(feature = "dfs")]
+        let read_authority = dfs_read_authority.clone();
         services.spawn(async move {
             // The Meta lease lasts longer than one refresh interval. A brief
             // Meta restart must not tear down the FUSE mount and all open FDs
@@ -1662,6 +1788,10 @@ async fn run_node(
                         {
                             Ok(registration) => {
                                 if registration.lease_epoch != registered_node_epoch {
+                                    #[cfg(feature = "dfs")]
+                                    if let Some(authority) = &read_authority {
+                                        authority.stop();
+                                    }
                                     readiness.note_registration_failure(
                                         "Node registration epoch changed; the running authority must stop",
                                     );
@@ -1669,6 +1799,15 @@ async fn run_node(
                                         afs_error::IO_PERMISSION_DENIED,
                                         "Node registration epoch changed; the running authority must stop",
                                     ).into());
+                                }
+                                #[cfg(feature = "dfs")]
+                                if let Some(authority) = &read_authority
+                                    && let Err(error) = authority.refresh(
+                                        registration.lease_epoch,
+                                        registration.session_deadline,
+                                    ) {
+                                    authority.stop();
+                                    return Err(error.into());
                                 }
                                 readiness.note_registration_capability(&registration);
                                 last_success = tokio::time::Instant::now();
@@ -1679,6 +1818,10 @@ async fn run_node(
                                 if !heartbeat_error_is_retryable(&error)
                                     || last_success.elapsed() >= std::time::Duration::from_secs(25)
                                 {
+                                    #[cfg(feature = "dfs")]
+                                    if let Some(authority) = &read_authority {
+                                        authority.stop();
+                                    }
                                     return Err(error.into());
                                 }
                                 afs_logging::warn!("node.meta_heartbeat_retry"; "error" => error.to_string());
@@ -1937,7 +2080,11 @@ async fn run_node(
             .map_err(Into::into)
     });
     #[cfg(feature = "dfs")]
-    if let (Some(meta), Some(local)) = (dfs_meta, local_chunk_store) {
+    if let (Some(meta), Some(local), None) = (
+        dfs_meta,
+        local_chunk_store,
+        cfg.dfs_external_backend.as_ref(),
+    ) {
         let worker = Arc::new(replication::ReplicationWorker::new(
             cfg.id.clone(),
             registered_node_epoch,
@@ -2044,6 +2191,15 @@ async fn run_node(
         let stop = services.stop.subscribe();
         services.spawn(run_workspace_bind_root_commands(meta, roots, stop));
     }
+    // Close read admission at the same lifecycle boundary that broadcasts
+    // shutdown. A cached object must not outlive a known Node/session stop.
+    let on_shutdown = || {
+        #[cfg(feature = "dfs")]
+        if let Some(authority) = &dfs_read_authority {
+            authority.stop();
+        }
+        on_shutdown();
+    };
     #[cfg(feature = "ownerfs")]
     let mut shutdown_error = if let Some(error) = native_workspace_startup_error {
         Some(drain_started_services(services, on_shutdown, error).await)
@@ -2181,6 +2337,44 @@ async fn run_node(
                 remember_shutdown_error(&mut shutdown_error, error.into());
             }
         }
+    }
+    #[cfg(feature = "dfs")]
+    if let Some(cache) = dfs_peer_cache_for_shutdown {
+        match tokio::task::spawn_blocking(move || cache.shutdown()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                afs_logging::error!("dfs.peer_cache_shutdown_failed"; "error" => error.to_string());
+                remember_shutdown_error(&mut shutdown_error, error.into());
+            }
+            Err(error) => {
+                afs_logging::error!("dfs.peer_cache_shutdown_failed"; "error" => error.to_string());
+                remember_shutdown_error(&mut shutdown_error, error.into());
+            }
+        }
+    }
+    #[cfg(feature = "dfs")]
+    if let Some(store) = dfs_external_store_for_shutdown {
+        match tokio::task::spawn_blocking(move || store.shutdown_verifier()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                afs_logging::error!("dfs.external_store_shutdown_failed"; "error" => error.to_string());
+                remember_shutdown_error(&mut shutdown_error, error.into());
+            }
+            Err(error) => {
+                afs_logging::error!("dfs.external_store_shutdown_failed"; "error" => error.to_string());
+                remember_shutdown_error(&mut shutdown_error, error.into());
+            }
+        }
+    }
+    #[cfg(feature = "dfs")]
+    {
+        // Stop retaining idle bodies after normal drain. Outstanding owners keep
+        // their allocations alive and release directly when their work ends.
+        dfs_write_buffers.stop();
+        let buffers = dfs_write_buffers.snapshot();
+        afs_logging::info!("dfs.write_buffers_stopped";
+            "live_bytes" => buffers.live_bytes,
+            "idle_bytes" => buffers.idle_bytes);
     }
     match tokio::time::timeout(std::time::Duration::from_secs(10), local.shutdown()).await {
         Ok(Ok(())) => {}
@@ -2584,6 +2778,22 @@ fn dfs_rdma_startup_device(
 
 #[cfg(test)]
 mod shutdown_tests {
+    #[cfg(feature = "dfs")]
+    #[test]
+    fn registration_refresh_preserves_expired_and_changed_epoch_fail_closed() {
+        use super::dfs_read::LocalReadAuthority;
+        use std::time::Instant;
+
+        let now = Instant::now();
+        let expired = LocalReadAuthority::new(7, now);
+        assert!(expired.refresh(7, now + Duration::from_secs(30)).is_err());
+        assert!(expired.refresh(7, now + Duration::from_secs(30)).is_err());
+
+        let current = LocalReadAuthority::new(7, now + Duration::from_secs(30));
+        assert!(current.refresh(8, now + Duration::from_secs(30)).is_err());
+        assert!(current.refresh(7, now + Duration::from_secs(30)).is_err());
+    }
+
     use std::time::Duration;
 
     #[test]

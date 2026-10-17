@@ -27,12 +27,27 @@ use serde_json::{Value, json};
 use std::{sync::Arc, time::Duration};
 
 pub fn router(node: Arc<Node>) -> Router {
-    Router::new()
+    let router = Router::new()
         .route("/health", get(health))
         .route("/v1/ping", get(ping))
         .route("/v1/diagnostics", post(diagnostics))
-        .route("/metrics", get(metrics))
-        .with_state(node)
+        .route("/metrics", get(metrics));
+    #[cfg(feature = "dfs")]
+    let router = if node.config.dfs_read_diagnostics_enabled {
+        router.route("/v1/diagnostics/dfs-read-timing", get(read_timing))
+    } else {
+        router
+    };
+    router.with_state(node)
+}
+/// Read-only fixed-capacity journal. Serialization runs outside measured reads.
+#[cfg(feature = "dfs")]
+async fn read_timing(State(node): State<Arc<Node>>) -> Json<Value> {
+    Json(json!({
+        "clock": "CLOCK_MONOTONIC",
+        "scope": "coarse client intervals; overlap is not additive",
+        "snapshot": node.read_work_metrics.diagnostics_snapshot(),
+    }))
 }
 async fn health(State(node): State<Arc<Node>>) -> (StatusCode, Json<Value>) {
     let report = node_health_report(&node);

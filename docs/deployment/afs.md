@@ -78,3 +78,193 @@ path、mount ID 和 source 同时作为 readiness 身份；挂载被替换时健
 启动前一次性检查二进制身份、配置 SHA、端口、TLS、数据目录、运行目录、日志目录、挂载目录、FUSE 设备、`fusermount3`/`umount`、旧 PID、旧 UDS、旧挂载和磁盘余量。遇到环境阻塞时保存证据并停止受影响项，不把环境修补混入产品结论。
 
 正常停止应记录进程退出状态，确认 FUSE mount 和 bind mount 已卸载，UDS/PID/临时 claim 无遗留。`local-file` Meta 的恢复检查至少要覆盖写入、sync/close、正常停止、重启、重新打开和内容校验；这不等于 crash recovery、HA、多 Meta 或复杂可靠性通过。
+
+## DFS 外部 S3 连接
+
+这是实验接入，先验证小规模发布／回源闭环，尚不承诺性能或完整故障验收。
+在新 Meta 和参与的 Node 中添加相同的身份与后端连接配置；Node 另需凭据。
+保留默认 DFS 单副本计数，任何外部后端与多 Node 副本的组合均在启动前拒绝。
+
+```toml
+[dfs_external_backend]
+store_id = "filesystem-a"
+generation = "generation-1"
+endpoint = "https://s3.example.com"
+bucket = "afs-chunks"
+region = "us-east-1"
+allow_http = false
+unsigned_payload = false
+# Node-only; omit on Meta. Must be absolute, owned by the Node process UID,
+# regular file without symlink, and mode 0600 or stricter.
+credentials_file = "/opt/adx/config/afs/s3-credentials.json"
+```
+
+凭据 JSON 包含 `access_key_id`、`secret_access_key` 和可选 `session_token`。
+不在示例中提供真实凭据，不把秘密直接放 TOML 或命令行。未指定文件的 Node
+显式读取 `AWS_ACCESS_KEY_ID`、`AWS_SECRET_ACCESS_KEY` 和可选
+`AWS_SESSION_TOKEN`；缺失凭据启动失败。`--print-config` 只显示文件路径。
+默认 `unsigned_payload=false`，保留 S3 载荷签名。只有管理员确认后端和安全策略支持时才显式设置 `unsigned_payload=true`；该项仍保留 SigV4 请求
+认证，只省略 SDK 的载荷签名 SHA256，不替代 AFS 完整 BLAKE3／长度检查，也不
+改变成功 fsync 等待对象回执和 Meta 持久确认的要求。它不自动探测 SeaweedFS，
+不因 `allow_http=true` 自动启用；泛 S3 后端和既有配置保持原默认。
+
+默认 HTTPS；`allow_http=true` 仅供隔离测试端点。外部服务的认证、bucket
+权限、数据同步落盘及数据库持久配置由管理员在服务端保证；HTTP 成功本身
+不能证明物理持久性。产品包不部署或打包 SeaweedFS、PostgreSQL 或 JuiceFS。
+
+Meta 的 `meta_store` 是另一项独立配置：程序默认 etcd，现有试用示例明确选择
+local-file。本接入不增加 PostgreSQL Meta，也不改变原默认或后端选择。
+对象 key 身份不允许变更后重新使用同一 Meta 数据目录；配置错误及 GET/PUT
+错误向调用方传播。正常停机仍需先排空工作负载和 FUSE 引用。
+
+S3 适配层共用一个 worker、运行时和客户端，固定最多四个实际 PUT；完整
+4MiB 块可以提前上传，完成后滚动补位。最多32个活动命令和一个排队命令，
+队满等待回压；共享客户端最多保留四个空闲连接。空闲连接池大小本身不是并发限制。
+
+顺序追加以64MiB为一个发布单元，冻结窗口上传期间可按预算余量接纳下一窗口；
+普通 write 返回表示已接纳，中间版本稍后发布。独立只读节点读取已发布版本，
+同挂载和已有 owner 代理的 dirty read 先完成读入口前已接纳序号的有序发布，
+发布失败报错，不能回退旧内容。fsync、fdatasync、可写 flush、同步写
+和必要排空必须等待有效对象回执及 Meta 持久确认，不能仅凭 PUT 成功返回。
+覆盖写、稀疏写和截断先收口相关窗口，再使用原有提交路径。Meta ACK 未知时保留
+原请求身份并阻挡后续 mutation；PUT 失败保留脏数据和可复用的成功回执。
+
+Node 写流水线采用分配前预算：普通数据128MiB，发布保留32MiB，总计160MiB；
+共享内容只计一次，失败、准备提交和未知 ACK 期间仍存活的内容不能提前退账。
+PUT 直接持有已封口的不可变载荷及其预算租约，不再复制整块 HTTP body；
+发布构块使用独立串行保护，仍存活的 transport／retry owner 释放前不得退还额度。
+这项预算与缓存容量、缓存 pending、读取缓冲及进程其它开销分开核算，不能作为
+总 RSS 上限。失败或超时可能留下未引用的不可变对象，不能直接删除可能被引用的对象。
+
+外部模式的当前恢复范围是读取已经发布的版本；写节点重启后重新取得写权
+另行验收。旧写租约有效时，新会话立即复写原文件可能返回 EBUSY，不能将
+“退出后可回源读取”理解为“新会话立即恢复写入”。
+
+### 可选的异步内容缓存
+
+仅在 Node 配置中增加以下子表，省略时保持 cache OFF；Meta 不使用此缓存配置。
+缓存目录必须专用、绝对路径、由 Node 进程用户持有且权限为0700；父目录须已存在。
+不要与 Node 耐久 chunk 目录、源码共享目录或其它服务数据目录混用。
+
+```toml
+[dfs_external_backend.cache]
+directory = "/opt/adx/data/afs/s3-cache"
+capacity_bytes = 268435456
+pending_bytes = 37748736
+cache_large_write = false
+```
+
+`capacity_bytes` 约束当前 store/generation 的 ready 文件及临时文件预留的内容字节，
+非零且不超过1TiB；`pending_bytes` 约束被缓存接纳的排队、正在落盘、单个已验证
+驻留槽及读者仍持有的分配容量，共享分配只计一次，非零且不大于
+capacity。它们不是文件系统配额或进程RSS上限，索引、文件系统块分配、读写工作缓冲
+及其它历史目录需另计环境预算。普通填充资源不足时跳过缓存，不阻塞后端确认。
+
+完整GET校验成功后可异步填充，读取优先复用Node共享的单个已验证对象（最多4MiB），
+再查pending或加载完整缓存文件。驻留不足时回退原路径，不扩充额度。
+外部只读每次 open 在线获取最新版本，版本对象授权可复用最长5秒，同时受
+session／grant 截止限制；每次 read 仍检查合法范围、期限和已知失效。Node
+停止／epoch 变化关闭复用；Meta 断链时新 open、新对象及到期续期正常失败，
+已授权范围只可继续到原截止。未知 Meta 重启不保证瞬时撤销，恢复后重新在线
+准入。此固定上限不是新增配置开关；授权元数据最多128项／1MiB，与载荷分账。
+来自磁盘的新内容仍安全检查并完整BLAKE3校验。RAM命中
+不检查磁盘副本后来发生的变化，下次磁盘加载负责发现损坏并回源。小于4MiB的写入块默认允许填充，完整块
+仅在`cache_large_write=true`时填充；后台写盘可与上传重叠，但不产生持久回执。
+缓存损坏或读取失败回源S3；S3请求、授权和持久提交错误仍向调用者传播。
+正常退出排空并join后台缓存工作，不要求cache fsync。
+
+cache ON 必须按[验收说明](../testing/afs.md#dfs-外部-s3-闭环)登记对应版本的实际 Linux 结果；
+不能由配置可解析或工具就绪推导功能／性能通过。SeaweedFS部署继续归外部测试方案。
+
+## 原生 Peer 可丢弃磁盘读缓存
+
+仅供未配置外部后端的 DFS Node；配置在读者 B 上即可，普通缺省 OFF。
+目录必须是独立绝对路径，与 `data_dir`、FUSE挂载点互不嵌套，不含 `..`，由Node进程
+独占使用；初始化遇到不明文件或不安全身份应报错，不清理其它目录。
+
+```toml
+[dfs_peer_cache]
+directory = "/opt/adx/cache/afs/peer"
+capacity_bytes = 268435456
+```
+
+容量可配置，非零且不超过1TiB；256MiB只是示例。缓存存储不可变对象的临时副本，
+近似LRU自动淘汰，ready文件（正文与header）及临时落盘的实际分配受容量限制，
+目录及marker管理开销另计，条目数量最多4096。分段摘要和文件身份元信息另有1MiB硬上限，不能视为零RAM开销。
+没有RAM正文驻留缓存；同一个cache operation串行限制当前对象的填充。符合multi-thread runtime、
+有界HTTP/2窗口及原读预算条件时，gRPC用单producer／单消费者及两个256KiB固定载荷块，
+按块重叠接收、完整校验和私有文件写入；wire帧仍至多64KiB，块用完归还后才能复用。
+原4MiB填充额度保守覆盖块actual capacity、控制字段及接收缓冲，另加本次私有输出仍不得超过原单批预算。
+不满足条件时沿用至多4MiB完整对象缓冲，不同时持有两种填充额度，不增加配置项或线程池。
+缓存创建／配额／写盘失败继续同次RPC验证并交付授权范围；实际EOF、排空及最终授权通过前不Ready或公开输出。初次获取／重启恢复完整验证可信Meta根并生成1MiB分段摘要；稳定磁盘命中对完整对齐1MiB请求直接读入原私有结果，再完整校验分段；partial／跨段／尾段仍使用64KiB临时scratch完整校验覆盖分段，仍有本地文件IO和校验成本。文件device／inode／length／mtime／ctime变化使证明失效并完整重验；metadata不变的未请求段静默损坏延后到该段读取检测。元信息不足时保守全文扫描。内核pagecache与进程其它缓冲不归此磁盘配额管理。
+
+授权覆盖整个当前chunk时才允许整块Peer回填，否则保留原范围读取；不是预取下一对象。
+缓存不会成为Meta持久副本，不提高可靠性或允许A唯一持久数据被删除。每次命中仍需
+有效的版本／布局授权、Node/session及最终期限检查；正常退出等待活动operation结束，
+停止后不接纳fill。可丢弃缓存不要求fsync，成功应用fsync仍依赖原持久副本和Meta屏障。
+本次未启用外部S3后端的Peer缓存协同；该扩展另行验证，不同时配置两种后端缓存。
+
+## 原生写 buffer 与 Node allocator
+
+`dfs_write_buffer_idle_bytes` 为 Node 顶层配置，默认134217728（128MiB），允许0..=1TiB；
+0禁用空闲保留。它只限制池中可复用的空闲实际容量，不预分配，也不是 live、RSS 或进程内存硬上限。
+未命中池时按需申请，最后引用释放才归还，超基线分配释放给 allocator；停止清空池。
+该配置不改变单 inode 原16MiB累计接纳阈值、后台写回或 S3 的任何预算上限。
+多 inode／慢提交可增加 live；明确分配拒绝尽力返回 ENOMEM 或合法短写，Linux OOM 杀进程
+仍按崩溃合同处理，不能保证始终正常返回错误。
+
+Linux Node 默认 feature `node-jemalloc` 安装固定官方 allocator，作用于同一 Node 进程内的 OwnerFs 和 DFS；
+AFS Meta 和 ADX 其他进程不受强制替换。依赖许可随 ON 包中的 `third_party/afs-source/NOTICE` 提供。
+后台线程在初始化后开启，dirty decay1000ms、muzzy decay0，配置失败启动报错。
+`/metrics` 提供写 buffer 与 allocator 的独立统计，allocator每1秒采样；采样失败只使观测无效，
+不改变业务行为。GNU Linux 与 musl 的后台线程支持不同，未验证目标不能继承回收结论。
+
+同机制 system allocator 对照仅用于显式 Linux 验证：
+
+```sh
+cargo build --locked -p afs --release --bin afs-node
+cargo build --locked -p afs --release --no-default-features --features ownerfs,dfs --bin afs-node
+```
+
+必须分开保存并核对两个 ELF，不能用后一次构建覆盖前者身份。统一发行仍沿用 ADX 构建入口。
+空闲容量基线不能直接当作 RSS 验收值；回收窗口、触页峰值和允许偏差需在测前固定。
+
+## 原生读粗粒度诊断
+
+Node 顶层 `dfs_read_diagnostics_enabled` 默认为 `false`。仅在限定诊断轮显式开启：
+
+```toml
+dfs_read_diagnostics_enabled = true
+```
+
+使用节点现有 `rest_listen` 地址读取 `GET /v1/diagnostics/dfs-read-timing`；例如 `afs/examples/node.toml` 示例的
+`http://127.0.0.1:7501/v1/diagnostics/dfs-read-timing`。未开启时路由返回404。
+该入口复用现有管理HTTP监听，不新增鉴权层；监听地址应限于原受控管理网络。
+
+诊断只保留当前进程前256条记录，不轮转、不存正文、路径、inode、用户身份或授权token。
+检查 `schema_version`、`overflow`、`clock_failures` 及每项完成／成功状态后再解释数据；
+溢出或缺失记录不能用于完整归因。根／段区间及临时元数据有固定上限，不增加正文缓存或载荷预算。
+关闭时不分配诊断journal、不采诊断时钟，仍有轻量状态判断及原有指标，不承诺零指令开销。
+正式性能轮关闭该选项，诊断轮单独保存；父子阶段、重叠区间和累计hash耗时不能从E2E直接扣减。
+详细边界见[测试说明](../testing/afs.md#原生读粗粒度诊断)。
+
+## Meta 快照升级与回滚边界
+
+OwnerFs 与 DFS 共享 Meta store 的持久化机制，业务记录分开。当前每个持久化批次保存完整权威快照，
+DFS 状态增长也会增加共用 Meta 的快照处理成本；本次不改变该机制，不承诺增长成本已解决。
+
+本版本新增 DFS durability policy、外部对象回执等持久化表示。旧二进制可能无法解析新快照；
+不能把替换为旧二进制直接当成可用的回滚。升级前应正常停止相关写入、保留并核验原 Meta 和
+数据后端的匹配恢复点及版本身份。回滚只能使用与旧版本匹配的完整恢复点，并明确恢复点之后
+写入的处理；不得把旧 Meta 快照与另一代对象数据混用。本版本不提供快照降级转换。
+
+## Node 注册租约期限
+
+Meta 注册回复提供实际已持久化租约的相对剩余期限 `lease_remaining_ms`；Node 从请求开始的
+单调时刻计算本地截止时间，保守计入建连和应答等待，最长不超过请求的30秒。
+绝对到期时间仍供诊断，不用 Node 与 Meta 的墙钟相减决定读授权。启动与心跳使用同一规则。
+缺失／耗尽期限、已过期的读授权或 epoch 变化不能恢复旧授权；真实 session 失效仍按原策略
+关停 Node，混合模式的 OwnerFs 也会正常排空。本次不引入 DFS 局部故障隔离。
+
+需配套升级 Meta 与 Node。旧 Meta 未返回相对期限时，新 Node 明确拒绝注册授权，
+不回退到跨机墙钟或任意30秒授权。Meta persistence readiness 的判定保持独立。

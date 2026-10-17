@@ -22,6 +22,7 @@ use std::{
 };
 
 use afs_error::{Error, Result};
+use afs_tracing::tracing;
 use fuser::{
     AccessFlags, BackgroundSession, Config, Errno, FileAttr, FileHandle as FuseFileHandle,
     FileType, Filesystem, FopenFlags, Generation, INodeNo, InitFlags, KernelConfig, LockOwner,
@@ -33,9 +34,9 @@ use fuser::{
 #[cfg(feature = "ownerfs")]
 use crate::node::vfs::ownerfs::OwnerFs;
 use crate::node::vfs::{
-    Backend,
+    Backend, WriteAdmissionMode,
     types::{
-        AttributeChange, BackendInode, DirectoryEntry, Entry, FileAttributes, FileKind,
+        AttributeChange, BackendInode, DirectoryEntry, Entry, FileAttributes, FileHandle, FileKind,
         FileLockOwner, FilesystemCapacity, OpenOptions, ReleaseKind, RenameFlags, RequestContext,
         SetAttrOptions, SpecialFileKind, SyncMode, WriteOptions, is_legacy_privilege_clear,
     },
@@ -65,6 +66,32 @@ fn inline_local_read_data(
     }
     let n = read(&mut scratch[..size])?;
     Ok(Cow::Borrowed(&scratch[..n.min(size)]))
+}
+
+fn backend_read_data(
+    backend: &dyn Backend,
+    ctx: &RequestContext,
+    handle: FileHandle,
+    offset: u64,
+    size: usize,
+) -> Result<Vec<u8>> {
+    backend.read_owned(ctx, handle, offset, size)
+}
+
+// Keep the diagnostic alive through the actual reply operation. Ending it at
+// Filesystem::read return would lose queued worker time and the reply itself.
+fn complete_read_reply(
+    #[cfg(any(feature = "dfs", test))] diagnostic: Option<
+        crate::node::read_work::ReadDiagnosticSpan,
+    >,
+    #[cfg(any(feature = "dfs", test))] success: bool,
+    reply: impl FnOnce(),
+) {
+    reply();
+    #[cfg(any(feature = "dfs", test))]
+    if let Some(diagnostic) = diagnostic {
+        diagnostic.finish(success);
+    }
 }
 
 /// Implemented first-party FUSE callback entries, including failed requests.
@@ -237,7 +264,13 @@ impl MountedFuse {
 
 /// 建立真正的内核 FUSE 挂载。一个 session 只绑定一个业务 Backend。
 pub fn mount_dfs(backend: Arc<dyn Backend>, path: &Path) -> Result<MountedFuse> {
-    mount_dfs_inner(backend, path, None)
+    mount_dfs_inner(
+        backend,
+        path,
+        None,
+        #[cfg(any(feature = "dfs", test))]
+        None,
+    )
 }
 
 pub fn mount_dfs_with_metrics(
@@ -245,18 +278,41 @@ pub fn mount_dfs_with_metrics(
     path: &Path,
     metrics: FuseRequestMetrics,
 ) -> Result<MountedFuse> {
-    mount_dfs_inner(backend, path, Some(metrics))
+    mount_dfs_inner(
+        backend,
+        path,
+        Some(metrics),
+        #[cfg(any(feature = "dfs", test))]
+        None,
+    )
+}
+
+/// The ordinary mount APIs keep detailed read diagnostics disabled. This
+/// opt-in shares a bounded journal with the Node's Meta and Peer adapters.
+#[cfg(feature = "dfs")]
+pub fn mount_dfs_with_read_diagnostics(
+    backend: Arc<dyn Backend>,
+    path: &Path,
+    metrics: FuseRequestMetrics,
+    read_work: crate::node::read_work::ReadWorkMetrics,
+) -> Result<MountedFuse> {
+    mount_dfs_inner(backend, path, Some(metrics), Some(read_work))
 }
 
 fn mount_dfs_inner(
     backend: Arc<dyn Backend>,
     path: &Path,
     metrics: Option<FuseRequestMetrics>,
+    #[cfg(any(feature = "dfs", test))] read_work: Option<crate::node::read_work::ReadWorkMetrics>,
 ) -> Result<MountedFuse> {
     let path = canonical_mount_path(path)?;
     reject_existing_mount(&path)?;
     let mut fs = AfsFuse::new(backend);
     fs.requests = metrics.map(|metrics| (metrics, "dfs"));
+    #[cfg(any(feature = "dfs", test))]
+    {
+        fs.read_work = read_work;
+    }
     // Cached write-through sends each syscall write to the inode owner and
     // keeps this mount's pages coherent. Do not enable writeback or KEEP_CACHE:
     // ordinary opens must refresh after another mount's close barrier.
@@ -434,7 +490,23 @@ mod mount_path_tests {
     }
 }
 
-type FuseJob = Box<dyn FnOnce() + Send + 'static>;
+enum FuseJob {
+    Owned(Box<dyn FnOnce() + Send + 'static>),
+    Borrowed(Arc<(Mutex<bool>, Condvar)>),
+}
+
+// Unlike an owned worker callback, a borrowed callback runs on the receiver.
+// Keep its FIFO slot active until that callback finishes, including unwinding.
+struct BorrowedAdmission<'a> {
+    dispatch: &'a FuseDispatch,
+    key: u64,
+}
+
+impl Drop for BorrowedAdmission<'_> {
+    fn drop(&mut self) {
+        FuseDispatch::finish(&self.dispatch.shared, Some(self.key));
+    }
+}
 
 // fuser dispatches callbacks on one receive thread. Different file handles may
 // run concurrently, but requests for the same handle must remain FIFO so an
@@ -474,7 +546,7 @@ impl FuseDispatch {
                         let (key, job) = {
                             let (queue, wake) = &*shared;
                             let mut queue = queue.lock().unwrap();
-                            while queue.ready.is_empty() && !queue.closed {
+                            while queue.ready.is_empty() && (!queue.closed || queue.jobs != 0) {
                                 queue = wake.wait(queue).unwrap();
                             }
                             let Some(job) = queue.ready.pop_front() else {
@@ -482,24 +554,23 @@ impl FuseDispatch {
                             };
                             job
                         };
-                        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)).is_err() {
-                            afs_logging::error!("FUSE worker callback panicked");
-                        }
-                        let (queue, wake) = &*shared;
-                        let mut queue = queue.lock().unwrap();
-                        queue.jobs -= 1;
-                        if let Some(key) = key {
-                            let next = queue.waiting.get_mut(&key).and_then(VecDeque::pop_front);
-                            if queue.waiting.get(&key).is_some_and(VecDeque::is_empty) {
-                                queue.waiting.remove(&key);
+                        match job {
+                            FuseJob::Owned(job) => {
+                                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(job))
+                                    .is_err()
+                                {
+                                    afs_logging::error!("FUSE worker callback panicked");
+                                }
+                                Self::finish(&shared, key);
                             }
-                            if let Some(next) = next {
-                                queue.ready.push_back((Some(key), next));
-                            } else {
-                                queue.active.remove(&key);
+                            FuseJob::Borrowed(turn) => {
+                                let (started, wake) = &*turn;
+                                *started.lock().expect("borrowed FUSE turn mutex poisoned") = true;
+                                wake.notify_one();
+                                // The receiver retires this slot. Do not occupy a
+                                // worker while it copies or executes a sync trigger.
                             }
                         }
-                        wake.notify_all();
                     }
                 })
                 .expect("FUSE worker thread must start");
@@ -519,7 +590,7 @@ impl FuseDispatch {
             return;
         }
         queue.jobs += 1;
-        queue.ready.push_back((None, Box::new(job)));
+        queue.ready.push_back((None, FuseJob::Owned(Box::new(job))));
         wake.notify_one();
     }
 
@@ -536,15 +607,91 @@ impl FuseDispatch {
         }
         queue.jobs += 1;
         if queue.active.insert(key) {
-            queue.ready.push_back((Some(key), Box::new(job)));
+            queue
+                .ready
+                .push_back((Some(key), FuseJob::Owned(Box::new(job))));
             wake.notify_one();
         } else {
             queue
                 .waiting
                 .entry(key)
                 .or_default()
-                .push_back(Box::new(job));
+                .push_back(FuseJob::Owned(Box::new(job)));
         }
+    }
+
+    fn finish(shared: &Arc<(Mutex<FuseQueue>, Condvar)>, key: Option<u64>) {
+        let (queue, wake) = &**shared;
+        let mut queue = queue
+            .lock()
+            .expect("FUSE queue mutex poisoned at completion");
+        queue.jobs -= 1;
+        if let Some(key) = key {
+            let next = queue.waiting.get_mut(&key).and_then(VecDeque::pop_front);
+            if queue.waiting.get(&key).is_some_and(VecDeque::is_empty) {
+                queue.waiting.remove(&key);
+            }
+            if let Some(next) = next {
+                queue.ready.push_back((Some(key), next));
+            } else {
+                queue.active.remove(&key);
+            }
+        }
+        wake.notify_all();
+    }
+
+    /// Wait for this handle's FIFO turn, then execute without owning or copying
+    /// its input. Only a bounded wakeup marker crosses to a worker. This blocks
+    /// the receive callback, but holds no queue/state lock during backend I/O.
+    fn run_borrowed_keyed(&self, key: u64, job: impl FnOnce()) {
+        let (queue, wake) = &*self.shared;
+        let mut queue = queue
+            .lock()
+            .expect("FUSE queue mutex poisoned at admission");
+        while queue.jobs >= self.capacity && !queue.closed {
+            queue = wake.wait(queue).expect("FUSE admission wait poisoned");
+        }
+        if queue.closed {
+            while queue.jobs != 0 {
+                queue = wake.wait(queue).expect("FUSE drain wait poisoned");
+            }
+            drop(queue);
+            job();
+            return;
+        }
+        queue.jobs += 1;
+        if queue.active.insert(key) {
+            drop(queue);
+            let admission = BorrowedAdmission {
+                dispatch: self,
+                key,
+            };
+            job();
+            drop(admission);
+            return;
+        }
+        let turn = Arc::new((Mutex::new(false), Condvar::new()));
+        queue
+            .waiting
+            .entry(key)
+            .or_default()
+            .push_back(FuseJob::Borrowed(turn.clone()));
+        wake.notify_all();
+        drop(queue);
+        let admission = BorrowedAdmission {
+            dispatch: self,
+            key,
+        };
+        let (started, wake) = &*turn;
+        let mut started = started.lock().expect("borrowed FUSE turn mutex poisoned");
+        while !*started {
+            started = wake
+                .wait(started)
+                .expect("borrowed FUSE turn wait poisoned");
+        }
+        drop(started);
+        job();
+        drop(admission);
     }
 
     fn close_and_drain(&self) {
@@ -552,8 +699,8 @@ impl FuseDispatch {
         let mut state = queue.lock().unwrap();
         state.closed = true;
         wake.notify_all();
-        // Workers retain ownership of accepted callbacks. Wait for their
-        // completion; the Node process deadline covers a blocked callback.
+        // Workers and borrowed receiver admissions retain accepted callbacks.
+        // The Node process deadline covers a blocked callback.
         while state.jobs != 0 {
             state = wake.wait(state).unwrap();
         }
@@ -567,6 +714,8 @@ impl Drop for FuseDispatch {
 }
 
 pub struct AfsFuse {
+    #[cfg(any(feature = "dfs", test))]
+    read_work: Option<crate::node::read_work::ReadWorkMetrics>,
     requests: Option<(FuseRequestMetrics, &'static str)>,
     backend: Arc<dyn Backend>,
     cached_io: bool,
@@ -587,6 +736,8 @@ impl AfsFuse {
     fn new(backend: Arc<dyn Backend>) -> Self {
         let state = Arc::new(Mutex::new(FuseState::new(backend.root_inode())));
         Self {
+            #[cfg(any(feature = "dfs", test))]
+            read_work: None,
             requests: None,
             backend,
             cached_io: false,
@@ -607,6 +758,12 @@ impl AfsFuse {
         if let Some((metrics, filesystem)) = &self.requests {
             metrics.record(filesystem, operation);
         }
+    }
+
+    fn filesystem_label(&self) -> &'static str {
+        self.requests
+            .as_ref()
+            .map_or("unknown", |(_, filesystem)| *filesystem)
     }
 
     fn remember_cached_inode(&self, _inode: BackendInode, ino: u64) {
@@ -1135,12 +1292,23 @@ impl Filesystem for AfsFuse {
         let file_handle_inodes = self.file_handle_inodes.clone();
         let context = Self::context(req, 0);
         let cached_io = self.cached_io;
+        let enqueue_at = std::time::Instant::now();
+        let open_span = tracing::info_span!(
+            "node.fuse.open",
+            ino,
+            flags,
+            queue_wait_us = tracing::field::Empty,
+        );
         #[cfg(feature = "ownerfs")]
         let ownerfs = self.ownerfs.clone();
         let run = move || {
-            let result = backend
-                .open_with_options(&context, inode, flags, options)
-                .map_err(errno);
+            open_span.record("queue_wait_us", enqueue_at.elapsed().as_micros() as u64);
+            let _entered = open_span.enter();
+            let result = tracing::info_span!("node.fuse.open.backend").in_scope(|| {
+                backend
+                    .open_with_options(&context, inode, flags, options)
+                    .map_err(errno)
+            });
             match result {
                 Ok(handle) => {
                     let fh = state
@@ -1178,9 +1346,20 @@ impl Filesystem for AfsFuse {
         _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
+        #[cfg(any(feature = "dfs", test))]
+        let diagnostic = self.read_work.as_ref().and_then(|metrics| {
+            metrics.diagnostic(crate::node::read_work::ReadDiagnosticStage::FuseRead)
+        });
         self.record_request("read");
         let ino = ino.0;
         let fh = fh.0;
+        let request_span = tracing::info_span!(
+            "node.fuse.read.request",
+            ino,
+            fh,
+            offset,
+            requested_bytes = size as u64,
+        );
         let inline_local_read = self
             .state
             .lock()
@@ -1190,45 +1369,88 @@ impl Filesystem for AfsFuse {
         let backend = self.backend.clone();
         let state = self.state.clone();
         let context = Self::context(req, 0);
+        let enqueue_at = std::time::Instant::now();
+        let filesystem = self.filesystem_label();
+        let fuse_span = tracing::info_span!(
+            parent: &request_span,
+            "node.fuse.read",
+            filesystem,
+            ino,
+            fh,
+            offset,
+            requested_bytes = size as u64,
+            queue_wait_us = tracing::field::Empty,
+            returned_bytes = tracing::field::Empty,
+        );
         if inline_local_read {
             let mut scratch = self.inline_local_read_scratch.lock().unwrap();
-            let file = state.lock().unwrap().file_handle(fh);
-            let file = file
-                .ok_or(libc::ESTALE)
-                .and_then(|file| AfsFuse::validate_handle_inode_in(&state, ino).map(|()| file));
-            let result = match file {
-                Ok(file) => inline_local_read_data(&mut scratch, size as usize, |out| {
-                    backend
-                        .read(&context, file.handle, offset, out)
-                        .map_err(errno)
-                }),
-                Err(error) => Err(error),
-            };
-            match result {
-                Ok(data) => reply.data(&data),
-                Err(error) => reply.error(fuse_errno(error)),
-            }
+            let result = fuse_span.in_scope(|| {
+                tracing::info_span!("node.fuse.read.execute").in_scope(|| {
+                    fuse_span.record("queue_wait_us", 0_u64);
+                    let file = state.lock().unwrap().file_handle(fh);
+                    let file = file.ok_or(libc::ESTALE).and_then(|file| {
+                        AfsFuse::validate_handle_inode_in(&state, ino).map(|()| file)
+                    });
+                    match file {
+                        Ok(file) => inline_local_read_data(&mut scratch, size as usize, |out| {
+                            backend
+                                .read(&context, file.handle, offset, out)
+                                .map_err(errno)
+                        }),
+                        Err(error) => Err(error),
+                    }
+                })
+            });
+            #[cfg(any(feature = "dfs", test))]
+            let success = result.is_ok();
+            complete_read_reply(
+                #[cfg(any(feature = "dfs", test))]
+                diagnostic,
+                #[cfg(any(feature = "dfs", test))]
+                success,
+                || match result {
+                    Ok(data) => {
+                        fuse_span.record("returned_bytes", data.len() as u64);
+                        tracing::info_span!(parent: &request_span, "node.fuse.read.reply", returned_bytes = data.len() as u64)
+                        .in_scope(|| reply.data(&data))
+                    }
+                    Err(error) => reply.error(fuse_errno(error)),
+                },
+            );
             return;
         }
         let run = move || {
-            let result = (|| {
-                let file = state.lock().unwrap().file_handle(fh).ok_or(libc::ESTALE)?;
-                AfsFuse::validate_handle_inode_in(&state, ino)?;
-                let mut out = vec![0; size as usize];
-                Ok(backend.as_ref()).and_then(|backend| {
-                    backend
-                        .read(&context, file.handle, offset, &mut out)
-                        .map(|n| {
-                            out.truncate(n);
-                            out
-                        })
-                        .map_err(errno)
+            let result = fuse_span.in_scope(|| {
+                tracing::info_span!("node.fuse.read.execute").in_scope(|| {
+                    fuse_span.record("queue_wait_us", enqueue_at.elapsed().as_micros() as u64);
+                    let file = state.lock().unwrap().file_handle(fh).ok_or(libc::ESTALE)?;
+                    AfsFuse::validate_handle_inode_in(&state, ino)?;
+                    backend_read_data(
+                        backend.as_ref(),
+                        &context,
+                        file.handle,
+                        offset,
+                        size as usize,
+                    )
+                    .map_err(errno)
                 })
-            })();
-            match result {
-                Ok(data) => reply.data(&data),
-                Err(error) => reply.error(fuse_errno(error)),
-            }
+            });
+            #[cfg(any(feature = "dfs", test))]
+            let success = result.is_ok();
+            complete_read_reply(
+                #[cfg(any(feature = "dfs", test))]
+                diagnostic,
+                #[cfg(any(feature = "dfs", test))]
+                success,
+                || match result {
+                    Ok(data) => {
+                        fuse_span.record("returned_bytes", data.len() as u64);
+                        tracing::info_span!(parent: &request_span, "node.fuse.read.reply", returned_bytes = data.len() as u64)
+                        .in_scope(|| reply.data(&data))
+                    }
+                    Err(error) => reply.error(fuse_errno(error)),
+                },
+            );
         };
         self.dispatch.submit_keyed(fh, run);
     }
@@ -1251,28 +1473,89 @@ impl Filesystem for AfsFuse {
         let backend = self.backend.clone();
         let state = self.state.clone();
         let context = Self::context(req, 0);
-        let data = data.to_vec();
+        let request_span = tracing::info_span!(
+            "node.fuse.write.request",
+            ino,
+            fh,
+            offset,
+            requested_bytes = data.len() as u64,
+        );
+        let file = state
+            .lock()
+            .expect("FUSE handle state mutex poisoned")
+            .file_handle(fh);
+        let admission = file.map_or(WriteAdmissionMode::Queued, |file| {
+            backend.write_admission_mode(file.handle)
+        });
+        afs_logging::debug!(
+            "FUSE write admission";
+            "event" => "fuse_write_admission",
+            "ino" => ino,
+            "fh" => fh,
+            "offset" => offset,
+            "requested_bytes" => data.len() as u64,
+            "admission" => match admission {
+                WriteAdmissionMode::Queued => "queued",
+                WriteAdmissionMode::Borrowed => "borrowed",
+            },
+        );
+        let copy_span_parent = request_span.clone();
         let options = WriteOptions {
             kill_suidgid: write_kill_suidgid(write_flags),
         };
-        self.dispatch.submit_keyed(fh, move || {
-            let result = (|| {
-                let file = state.lock().unwrap().file_handle(fh).ok_or(libc::ESTALE)?;
-                AfsFuse::validate_handle_inode_in(&state, ino)?;
-                Ok(backend.as_ref()).and_then(|backend| {
-                    backend
-                        .write_with_options(&context, file.handle, offset, &data, options)
-                        .map_err(errno)
+        let enqueue_at = std::time::Instant::now();
+        let requested_bytes = data.len() as u64;
+        let filesystem = self.filesystem_label();
+        let fuse_span = tracing::info_span!(
+            parent: &request_span,
+            "node.fuse.write",
+            filesystem,
+            ino,
+            fh,
+            offset,
+            requested_bytes,
+            queue_wait_us = tracing::field::Empty,
+            returned_bytes = tracing::field::Empty,
+        );
+        let run = move |data: &[u8]| {
+            let result = fuse_span.in_scope(|| {
+                tracing::info_span!("node.fuse.write.execute").in_scope(|| {
+                    fuse_span.record("queue_wait_us", enqueue_at.elapsed().as_micros() as u64);
+                    let file = state.lock().unwrap().file_handle(fh).ok_or(libc::ESTALE)?;
+                    AfsFuse::validate_handle_inode_in(&state, ino)?;
+                    Ok(backend.as_ref()).and_then(|backend| {
+                        backend
+                            .write_with_options(&context, file.handle, offset, data, options)
+                            .map_err(errno)
+                    })
                 })
-            })();
+            });
             match result {
                 Ok(written) => match u32::try_from(written) {
-                    Ok(written) => reply.written(written),
+                    Ok(written) => {
+                        fuse_span.record("returned_bytes", written as u64);
+                        tracing::info_span!(parent: &request_span, "node.fuse.write.reply", returned_bytes = written as u64)
+                            .in_scope(|| reply.written(written))
+                    }
                     Err(_) => reply.error(fuse_errno(libc::EIO)),
                 },
                 Err(error) => reply.error(fuse_errno(error)),
             }
-        });
+        };
+        match admission {
+            WriteAdmissionMode::Borrowed => {
+                self.dispatch.run_borrowed_keyed(fh, || run(data));
+            }
+            WriteAdmissionMode::Queued => {
+                let data = tracing::info_span!(
+                    parent: &copy_span_parent,
+                    "node.fuse.write.input_copy",
+                    copied_bytes = data.len() as u64,
+                )
+                .in_scope(|| data.to_vec());
+                self.dispatch.submit_keyed(fh, move || run(&data));
+            }
+        }
     }
 
     fn flush(
@@ -2118,6 +2401,86 @@ fn status_groups(status: &str, uid: u32, gid: u32) -> Option<Vec<u32>> {
 #[cfg(test)]
 mod dispatch_tests {
     #[test]
+    fn read_diagnostic_disabled_keeps_reply_behavior() {
+        let registry = afs_metrics::Registry::new();
+        let metrics = crate::node::read_work::ReadWorkMetrics::register(&registry).unwrap();
+        let span = metrics.diagnostic(crate::node::read_work::ReadDiagnosticStage::FuseRead);
+        assert!(span.is_none());
+        let mut replied = false;
+        super::complete_read_reply(span, false, || replied = true);
+        assert!(replied);
+        assert!(metrics.diagnostics_snapshot().is_none());
+    }
+
+    #[test]
+    fn read_diagnostic_covers_async_queue_and_actual_reply_completion() {
+        use crate::node::read_work::{ReadDiagnosticStage, ReadWorkMetrics};
+        let registry = afs_metrics::Registry::new();
+        let metrics = ReadWorkMetrics::register(&registry)
+            .unwrap()
+            .with_read_diagnostics(true);
+        let dispatch = super::FuseDispatch::new(1);
+        let (reply_entered_tx, reply_entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let span = metrics.diagnostic(ReadDiagnosticStage::FuseRead);
+        dispatch.submit_keyed(1, move || {
+            super::complete_read_reply(span, true, || {
+                reply_entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+        });
+        reply_entered_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        let before_reply_return = metrics.diagnostics_snapshot().unwrap();
+        // submit_keyed has returned, but the actual reply is still blocked.
+        let prematurely_completed = before_reply_return
+            .records
+            .iter()
+            .any(|record| record.completed);
+        release_tx.send(()).unwrap();
+        drop(dispatch);
+        assert!(!prematurely_completed);
+        let snapshot = metrics.diagnostics_snapshot().unwrap();
+        assert_eq!(snapshot.records.len(), 1);
+        let record = &snapshot.records[0];
+        assert_eq!(record.stage, ReadDiagnosticStage::FuseRead);
+        assert!(record.completed && record.success);
+        assert!(record.end_ns >= record.start_ns);
+    }
+
+    #[test]
+    fn read_diagnostic_keeps_error_and_unwind_reply_outcomes() {
+        use crate::node::read_work::{ReadDiagnosticStage, ReadWorkMetrics};
+        let registry = afs_metrics::Registry::new();
+        let metrics = ReadWorkMetrics::register(&registry)
+            .unwrap()
+            .with_read_diagnostics(true);
+        let mut reply_errno = 0;
+        super::complete_read_reply(
+            metrics.diagnostic(ReadDiagnosticStage::FuseRead),
+            false,
+            || {
+                reply_errno = libc::ESTALE;
+            },
+        );
+        assert_eq!(reply_errno, libc::ESTALE);
+        let span = metrics.diagnostic(ReadDiagnosticStage::FuseRead);
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            super::complete_read_reply(span, true, || panic!("test reply unwind"));
+        }));
+        assert!(unwound.is_err());
+        let snapshot = metrics.diagnostics_snapshot().unwrap();
+        assert_eq!(snapshot.records.len(), 2);
+        assert!(
+            snapshot
+                .records
+                .iter()
+                .all(|record| record.completed && !record.success)
+        );
+    }
+
+    #[test]
     fn inline_local_read_data_observes_fresh_short_smaller_zero_and_eof_reads() {
         use std::os::unix::fs::FileExt;
 
@@ -2249,6 +2612,121 @@ mod dispatch_tests {
             assert_eq!(scratch.as_ptr(), pointer);
             assert_eq!(scratch, contents);
         }
+    }
+
+    struct OwnedReadBackend {
+        owned: Vec<u8>,
+        buffered: &'static [u8],
+        read_calls: std::sync::atomic::AtomicUsize,
+        read_owned_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl super::Backend for OwnedReadBackend {
+        fn root_inode(&self) -> super::BackendInode {
+            super::BackendInode { value: 1 }
+        }
+
+        fn read_owned(
+            &self,
+            _ctx: &super::RequestContext,
+            handle: super::FileHandle,
+            offset: u64,
+            size: usize,
+        ) -> super::Result<Vec<u8>> {
+            self.read_owned_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(handle, super::FileHandle(9));
+            assert_eq!(offset, 4);
+            assert_eq!(size, 32);
+            Ok(self.owned.clone())
+        }
+
+        fn read(
+            &self,
+            _ctx: &super::RequestContext,
+            handle: super::FileHandle,
+            offset: u64,
+            out: &mut [u8],
+        ) -> super::Result<usize> {
+            self.read_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(handle, super::FileHandle(9));
+            assert_eq!(offset, 4);
+            out[..self.buffered.len()].copy_from_slice(self.buffered);
+            Ok(self.buffered.len())
+        }
+    }
+
+    fn test_context() -> super::RequestContext {
+        super::RequestContext {
+            uid: 1000,
+            gid: 1000,
+            pid: 1234,
+            umask: 0,
+            supplementary_gids: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn backend_read_data_prefers_owned_response_without_buffered_read() {
+        let backend = OwnedReadBackend {
+            owned: b"private".to_vec(),
+            buffered: b"fallback",
+            read_calls: std::sync::atomic::AtomicUsize::new(0),
+            read_owned_calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let data = super::backend_read_data(&backend, &test_context(), super::FileHandle(9), 4, 32)
+            .unwrap();
+        assert_eq!(data, b"private");
+        assert_eq!(
+            backend
+                .read_owned_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            backend.read_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+    }
+
+    #[test]
+    fn backend_read_data_uses_backend_default_owned_fallback() {
+        struct BufferedOnlyBackend {
+            read_calls: std::sync::atomic::AtomicUsize,
+        }
+
+        impl super::Backend for BufferedOnlyBackend {
+            fn root_inode(&self) -> super::BackendInode {
+                super::BackendInode { value: 1 }
+            }
+
+            fn read(
+                &self,
+                _ctx: &super::RequestContext,
+                handle: super::FileHandle,
+                offset: u64,
+                out: &mut [u8],
+            ) -> super::Result<usize> {
+                self.read_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                assert_eq!(handle, super::FileHandle(9));
+                assert_eq!(offset, 4);
+                out[..8].copy_from_slice(b"fallback");
+                Ok(8)
+            }
+        }
+
+        let backend = BufferedOnlyBackend {
+            read_calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let data = super::backend_read_data(&backend, &test_context(), super::FileHandle(9), 4, 32)
+            .unwrap();
+        assert_eq!(data, b"fallback");
+        assert_eq!(
+            backend.read_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
     }
 
     #[test]
@@ -2469,6 +2947,127 @@ mod dispatch_tests {
             first.is_ok() && second.is_ok(),
             "jobs remained serial at FUSE ingress"
         );
+    }
+
+    fn wait_for_admitted_jobs(dispatch: &FuseDispatch, count: usize) {
+        let (queue, wake) = &*dispatch.shared;
+        let state = queue.lock().unwrap();
+        let (state, timeout) = wake
+            .wait_timeout_while(state, Duration::from_secs(1), |state| state.jobs < count)
+            .unwrap();
+        assert!(
+            !timeout.timed_out(),
+            "expected {count} admitted jobs, got {}",
+            state.jobs
+        );
+    }
+
+    #[test]
+    fn borrowed_write_keeps_fifo_and_input_address_without_occupying_worker() {
+        let dispatch = Arc::new(FuseDispatch::new(1));
+        let (events_tx, events_rx) = mpsc::channel();
+        let (first_release_tx, first_release_rx) = mpsc::channel();
+        let (borrowed_release_tx, borrowed_release_rx) = mpsc::channel();
+        let first_tx = events_tx.clone();
+        dispatch.submit_keyed(41, move || {
+            first_tx.send("write:start").unwrap();
+            first_release_rx.recv().unwrap();
+            first_tx.send("write:finish").unwrap();
+        });
+        assert_eq!(
+            events_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            "write:start"
+        );
+        let setattr_tx = events_tx.clone();
+        dispatch.submit_keyed(41, move || setattr_tx.send("resize").unwrap());
+        let input = [7_u8; 32];
+        let input_pointer = input.as_ptr() as usize;
+        std::thread::scope(|scope| {
+            let borrowed_dispatch = dispatch.clone();
+            let borrowed_tx = events_tx.clone();
+            let input = &input;
+            scope.spawn(move || {
+                borrowed_dispatch.run_borrowed_keyed(41, || {
+                    assert_eq!(input.as_ptr() as usize, input_pointer);
+                    assert_eq!(input, &[7_u8; 32]);
+                    borrowed_tx.send("borrowed:start").unwrap();
+                    borrowed_release_rx.recv().unwrap();
+                    borrowed_tx.send("borrowed:finish").unwrap();
+                });
+            });
+            wait_for_admitted_jobs(&dispatch, 3);
+            let sync_tx = events_tx.clone();
+            dispatch.submit_keyed(41, move || sync_tx.send("fsync").unwrap());
+            let close_tx = events_tx.clone();
+            dispatch.submit_keyed(41, move || close_tx.send("close").unwrap());
+            first_release_tx.send(()).unwrap();
+            for expected in ["write:finish", "resize", "borrowed:start"] {
+                assert_eq!(
+                    events_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+                    expected
+                );
+            }
+            let other_tx = events_tx.clone();
+            dispatch.submit_keyed(42, move || other_tx.send("other-handle").unwrap());
+            assert_eq!(
+                events_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+                "other-handle"
+            );
+            borrowed_release_tx.send(()).unwrap();
+            for expected in ["borrowed:finish", "fsync", "close"] {
+                assert_eq!(
+                    events_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+                    expected
+                );
+            }
+        });
+        dispatch.close_and_drain();
+        assert_eq!(dispatch.shared.0.lock().unwrap().jobs, 0);
+    }
+
+    #[test]
+    fn borrowed_callback_panic_retires_fifo_slot() {
+        let dispatch = FuseDispatch::new(1);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            dispatch.run_borrowed_keyed(43, || panic!("injected callback panic"));
+        }));
+        assert!(result.is_err());
+        let (finished_tx, finished_rx) = mpsc::channel();
+        dispatch.submit_keyed(43, move || finished_tx.send(()).unwrap());
+        finished_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        dispatch.close_and_drain();
+        assert_eq!(dispatch.shared.0.lock().unwrap().jobs, 0);
+    }
+
+    #[test]
+    fn drain_waits_for_borrowed_owner_and_queued_successor() {
+        let dispatch = Arc::new(FuseDispatch::new(1));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let borrowed_dispatch = dispatch.clone();
+        let borrower = std::thread::spawn(move || {
+            borrowed_dispatch.run_borrowed_keyed(44, || {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+        });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let (successor_tx, successor_rx) = mpsc::channel();
+        dispatch.submit_keyed(44, move || successor_tx.send(()).unwrap());
+        let drain_dispatch = dispatch.clone();
+        let (drained_tx, drained_rx) = mpsc::channel();
+        let drainer = std::thread::spawn(move || {
+            drain_dispatch.close_and_drain();
+            drained_tx.send(()).unwrap();
+        });
+        let early_drain = drained_rx.recv_timeout(Duration::from_millis(50));
+        release_tx.send(()).unwrap();
+        successor_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        drained_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        borrower.join().unwrap();
+        drainer.join().unwrap();
+        assert!(early_drain.is_err());
+        assert_eq!(dispatch.shared.0.lock().unwrap().jobs, 0);
     }
 
     #[test]

@@ -1,0 +1,1832 @@
+//! Fixed-cardinality work counters for immutable DFS reads, never authority or budgets.
+//!
+//! Local integrity scans also serve the diagnostic Chunk store without DFS.
+//! Peer transport, disk-cache and request journals are compiled only for DFS
+//! (or their direct unit tests), without changing that shared verification path.
+
+#[cfg(any(feature = "dfs", test))]
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
+
+#[cfg(any(feature = "dfs", test))]
+const FILL_STAGES: [&str; 7] = [
+    "lock_wait",
+    "lookup",
+    "prepare",
+    "receive_verify",
+    "store",
+    "deliver",
+    "total",
+];
+
+/// Low-frequency synchronous scope clock. CPU belongs only to its calling
+/// thread, not transport workers or remote nodes. Failure never affects reads.
+#[derive(Clone, Copy)]
+#[cfg(any(feature = "dfs", test))]
+pub(crate) struct PeerFillClock {
+    wall: std::time::Instant,
+    cpu: Option<u64>,
+    thread: std::thread::ThreadId,
+}
+
+#[cfg(any(feature = "dfs", test))]
+impl PeerFillClock {
+    pub(crate) fn start() -> Self {
+        let wall = std::time::Instant::now();
+        Self {
+            wall,
+            cpu: thread_cpu_ns(),
+            thread: std::thread::current().id(),
+        }
+    }
+
+    pub(crate) fn elapsed(&self) -> (u64, Option<u64>) {
+        let cpu = if self.thread == std::thread::current().id() {
+            self.cpu
+                .and_then(|before| thread_cpu_ns()?.checked_sub(before))
+        } else {
+            None
+        };
+        let wall = u64::try_from(self.wall.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        (wall, cpu)
+    }
+}
+
+#[cfg(any(feature = "dfs", test))]
+fn thread_cpu_ns() -> Option<u64> {
+    let mut value = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: value is writable, properly aligned and lives through this call.
+    // CLOCK_THREAD_CPUTIME_ID reads the current thread and retains no pointer.
+    if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut value) } != 0 {
+        return None;
+    }
+    let seconds = u64::try_from(value.tv_sec).ok()?;
+    let nanos = u64::try_from(value.tv_nsec)
+        .ok()
+        .filter(|n| *n < 1_000_000_000)?;
+    seconds.checked_mul(1_000_000_000)?.checked_add(nanos)
+}
+
+#[derive(Clone, Debug)]
+pub struct ReadWorkMetrics {
+    scan_bytes: afs_metrics::IntCounter,
+    hashes: afs_metrics::IntCounterVec,
+    #[cfg(any(feature = "dfs", test))]
+    disk_cache_metadata_bytes: afs_metrics::IntGauge,
+    #[cfg(any(feature = "dfs", test))]
+    disk_cache_metadata_peak_bytes: afs_metrics::IntGauge,
+    scans: afs_metrics::IntCounter,
+    copies: afs_metrics::IntCounterVec,
+    #[cfg(any(feature = "dfs", test))]
+    peer_payload_bytes: afs_metrics::IntGauge,
+    #[cfg(any(feature = "dfs", test))]
+    peer_payload_peak_bytes: afs_metrics::IntGauge,
+    #[cfg(any(feature = "dfs", test))]
+    peer_payload_reserved: afs_metrics::IntCounter,
+    #[cfg(any(feature = "dfs", test))]
+    peer_payload_released: afs_metrics::IntCounter,
+    #[cfg(any(feature = "dfs", test))]
+    peer_object_cache: afs_metrics::IntCounterVec,
+    #[cfg(any(feature = "dfs", test))]
+    read_rpc_calls: afs_metrics::IntCounterVec,
+    #[cfg(any(feature = "dfs", test))]
+    peer_read_events: afs_metrics::IntCounterVec,
+    #[cfg(feature = "dfs")]
+    disk_cache_events: afs_metrics::IntCounterVec,
+    #[cfg(any(feature = "dfs", test))]
+    disk_cache_data_reads: afs_metrics::IntCounter,
+    #[cfg(any(feature = "dfs", test))]
+    disk_cache_stage_ns: afs_metrics::IntCounterVec,
+    #[cfg(any(feature = "dfs", test))]
+    disk_cache_stage_calls: afs_metrics::IntCounterVec,
+    #[cfg(any(feature = "dfs", test))]
+    disk_cache_fill_stage_ns: afs_metrics::IntCounterVec,
+    #[cfg(any(feature = "dfs", test))]
+    disk_cache_fill_stage_cpu_ns: afs_metrics::IntCounterVec,
+    #[cfg(any(feature = "dfs", test))]
+    disk_cache_fill_stage_calls: afs_metrics::IntCounterVec,
+    #[cfg(any(feature = "dfs", test))]
+    disk_cache_fill_stage_cpu_calls: afs_metrics::IntCounterVec,
+    #[cfg(any(feature = "dfs", test))]
+    disk_cache_fill_bytes: afs_metrics::IntGauge,
+    #[cfg(any(feature = "dfs", test))]
+    disk_cache_fill_peak_bytes: afs_metrics::IntGauge,
+    #[cfg(any(feature = "dfs", test))]
+    disk_cache_private_peak_bytes: afs_metrics::IntGauge,
+    #[cfg(any(feature = "dfs", test))]
+    stream_reserved_bytes: afs_metrics::IntGauge,
+    #[cfg(any(feature = "dfs", test))]
+    stream_reserved_peak_bytes: afs_metrics::IntGauge,
+    #[cfg(any(feature = "dfs", test))]
+    stream_private_peak_bytes: afs_metrics::IntGauge,
+    #[cfg(any(feature = "dfs", test))]
+    stream_frame_bytes: afs_metrics::IntGauge,
+    #[cfg(any(feature = "dfs", test))]
+    stream_frame_peak_bytes: afs_metrics::IntGauge,
+    #[cfg(any(feature = "dfs", test))]
+    stream_frames: Arc<StreamFrameAccounting>,
+    #[cfg(any(feature = "dfs", test))]
+    diagnostics: Option<Arc<ReadDiagnostics>>,
+}
+
+impl ReadWorkMetrics {
+    pub fn register(registry: &afs_metrics::Registry) -> Result<Self, afs_metrics::MetricsError> {
+        registry.get_or_register(|registry| {
+            let scan_bytes = afs_metrics::IntCounter::new(
+                "afs_dfs_read_scan_bytes_total",
+                "Logical file bytes read and hashed by complete immutable Chunk verification.",
+            )?;
+            let hashes = afs_metrics::IntCounterVec::new(
+                afs_metrics::Opts::new(
+                    "afs_dfs_read_hash_bytes_total",
+                    "Actual BLAKE3 input bytes by fixed read stage, including failed work; root and segment hashes are separate executions.",
+                ),
+                &["stage"],
+            )?;
+            for stage in [
+                "root_local_scan", "stream_range_hash", "peer_range_in_receive",
+                "root_in_receive", "root_fallback", "segment_index_bytes",
+                "cache_segment_hash", "cache_full_hash",
+            ] { hashes.with_label_values(&[stage]); }
+            #[cfg(any(feature = "dfs", test))]
+            let disk_cache_metadata_bytes = afs_metrics::IntGauge::new(
+                "afs_dfs_peer_disk_cache_metadata_bytes",
+                "Charged segment digest and file identity metadata; excludes payload and directory bookkeeping.",
+            )?;
+            #[cfg(any(feature = "dfs", test))]
+            let disk_cache_metadata_peak_bytes = afs_metrics::IntGauge::new(
+                "afs_dfs_peer_disk_cache_metadata_peak_bytes",
+                "Peak charged segment digest and file identity metadata under its independent 1MiB limit.",
+            )?;
+            afs_metrics::register_collector(registry, &hashes)?;
+            #[cfg(any(feature = "dfs", test))]
+            afs_metrics::register_collector(registry, &disk_cache_metadata_bytes)?;
+            #[cfg(any(feature = "dfs", test))]
+            afs_metrics::register_collector(registry, &disk_cache_metadata_peak_bytes)?;
+            let scans = afs_metrics::IntCounter::new(
+                "afs_dfs_read_scans_total",
+                "Immutable Chunk verification scans, including failed scans.",
+            )?;
+            let copies = afs_metrics::IntCounterVec::new(
+                afs_metrics::Opts::new(
+                    "afs_dfs_read_copy_bytes_total",
+                    "Explicit DFS read payload copies; excludes codec, TLS and kernel copies.",
+                ),
+                &["stage"],
+            )?;
+            #[cfg(any(feature = "dfs", test))]
+            let peer_payload_bytes = afs_metrics::IntGauge::new(
+                "afs_dfs_peer_read_payload_bytes",
+                "Charged Peer read payload capacity, including resident and still-pinned objects.",
+            )?;
+            #[cfg(any(feature = "dfs", test))]
+            let peer_payload_peak_bytes = afs_metrics::IntGauge::new(
+                "afs_dfs_peer_read_payload_peak_bytes",
+                "Peak charged capacity in the shared Peer read payload budget.",
+            )?;
+            #[cfg(any(feature = "dfs", test))]
+            let peer_payload_reserved = afs_metrics::IntCounter::new(
+                "afs_dfs_peer_read_payload_reserved_bytes_total",
+                "Peer read payload capacity admitted by the shared budget.",
+            )?;
+            #[cfg(any(feature = "dfs", test))]
+            let peer_payload_released = afs_metrics::IntCounter::new(
+                "afs_dfs_peer_read_payload_released_bytes_total",
+                "Peer read payload capacity released after its final owner drops.",
+            )?;
+            #[cfg(any(feature = "dfs", test))]
+            let peer_object_cache = afs_metrics::IntCounterVec::new(
+                afs_metrics::Opts::new(
+                    "afs_dfs_peer_read_object_cache_total",
+                    "Current verified-object slot lookups; never a source of read authority.",
+                ),
+                &["result"],
+            )?;
+            #[cfg(any(feature = "dfs", test))]
+            let read_rpc_calls = afs_metrics::IntCounterVec::new(
+                afs_metrics::Opts::new(
+                    "afs_dfs_read_rpc_calls_total",
+                    "Client read RPC invocations, including failures; not server success counts.",
+                ),
+                &["method"],
+            )?;
+            #[cfg(any(feature = "dfs", test))]
+            let peer_read_events = afs_metrics::IntCounterVec::new(
+                afs_metrics::Opts::new(
+                    "afs_dfs_peer_read_events_total",
+                    "Peer read task submissions and body-frame events; not elapsed time or completion counts.",
+                ),
+                &["event"],
+            )?;
+            #[cfg(feature = "dfs")]
+            let disk_cache_events = afs_metrics::IntCounterVec::new(
+                afs_metrics::Opts::new("afs_dfs_peer_disk_cache_events_total", "Disposable native Peer disk cache outcomes; no authority or durability."), &["result"],
+            )?;
+            #[cfg(any(feature = "dfs", test))]
+            let disk_cache_data_reads = afs_metrics::IntCounter::new(
+                "afs_dfs_peer_disk_cache_data_read_calls_total",
+                "Actual cache body-region read attempts, including failed or interrupted attempts; excludes header and trailing EOF probes.",
+            )?;
+            #[cfg(any(feature = "dfs", test))]
+            let disk_cache_stage_ns = afs_metrics::IntCounterVec::new(
+                afs_metrics::Opts::new(
+                    "afs_dfs_peer_disk_cache_stage_nanoseconds_total",
+                    "Aggregated cache read-range wall time by fixed stage; not exclusive Node CPU or full FUSE latency.",
+                ),
+                &["stage"],
+            )?;
+            #[cfg(any(feature = "dfs", test))]
+            let disk_cache_stage_calls = afs_metrics::IntCounterVec::new(
+                afs_metrics::Opts::new(
+                    "afs_dfs_peer_disk_cache_stage_observations_total",
+                    "Cache stage aggregates observed once per cache operation, including failed work.",
+                ),
+                &["stage"],
+            )?;
+            #[cfg(any(feature = "dfs", test))]
+            for stage in ["prepare", "data_read", "segment_verify", "stream_read_verify", "finalize"] {
+                disk_cache_stage_ns.with_label_values(&[stage]);
+                disk_cache_stage_calls.with_label_values(&[stage]);
+            }
+            #[cfg(any(feature = "dfs", test))]
+            afs_metrics::register_collector(registry, &disk_cache_data_reads)?;
+            #[cfg(any(feature = "dfs", test))]
+            afs_metrics::register_collector(registry, &disk_cache_stage_ns)?;
+            #[cfg(any(feature = "dfs", test))]
+            afs_metrics::register_collector(registry, &disk_cache_stage_calls)?;
+            #[cfg(any(feature = "dfs", test))]
+            let disk_cache_fill_stage_ns = afs_metrics::IntCounterVec::new(
+                afs_metrics::Opts::new("afs_dfs_peer_disk_cache_fill_stage_nanoseconds_total", "Whole-object fill wall time by fixed stage, including failures; total is a parent, not an extra exclusive stage."), &["stage"],
+            )?;
+            #[cfg(any(feature = "dfs", test))]
+            let disk_cache_fill_stage_cpu_ns = afs_metrics::IntCounterVec::new(
+                afs_metrics::Opts::new("afs_dfs_peer_disk_cache_fill_stage_thread_cpu_nanoseconds_total", "Calling-thread CPU for synchronous fill scopes; excludes transport workers and remote CPU, never pure network wait."), &["stage"],
+            )?;
+            #[cfg(any(feature = "dfs", test))]
+            let disk_cache_fill_stage_calls = afs_metrics::IntCounterVec::new(
+                afs_metrics::Opts::new("afs_dfs_peer_disk_cache_fill_stage_observations_total", "Fill stage observations, including failed work; prepare can contain multiple disjoint scopes per fill."), &["stage"],
+            )?;
+            #[cfg(any(feature = "dfs", test))]
+            let disk_cache_fill_stage_cpu_calls = afs_metrics::IntCounterVec::new(
+                afs_metrics::Opts::new("afs_dfs_peer_disk_cache_fill_stage_thread_cpu_observations_total", "Fill observations with a valid same-thread CPU sample; missing CPU is not an observed zero."), &["stage"],
+            )?;
+            #[cfg(any(feature = "dfs", test))]
+            for stage in FILL_STAGES {
+                disk_cache_fill_stage_ns.with_label_values(&[stage]);
+                disk_cache_fill_stage_cpu_ns.with_label_values(&[stage]);
+                disk_cache_fill_stage_calls.with_label_values(&[stage]);
+                disk_cache_fill_stage_cpu_calls.with_label_values(&[stage]);
+            }
+            #[cfg(any(feature = "dfs", test))]
+            afs_metrics::register_collector(registry, &disk_cache_fill_stage_ns)?;
+            #[cfg(any(feature = "dfs", test))]
+            afs_metrics::register_collector(registry, &disk_cache_fill_stage_cpu_ns)?;
+            #[cfg(any(feature = "dfs", test))]
+            afs_metrics::register_collector(registry, &disk_cache_fill_stage_calls)?;
+            #[cfg(any(feature = "dfs", test))]
+            afs_metrics::register_collector(registry, &disk_cache_fill_stage_cpu_calls)?;
+            #[cfg(any(feature = "dfs", test))]
+            let disk_cache_fill_bytes = afs_metrics::IntGauge::new("afs_dfs_peer_disk_cache_fill_bytes", "Temporary complete-object fill bytes, held until the body is dropped; no resident payload cache.")?;
+            #[cfg(any(feature = "dfs", test))]
+            let disk_cache_fill_peak_bytes = afs_metrics::IntGauge::new("afs_dfs_peer_disk_cache_fill_peak_bytes", "Peak temporary complete-object fill bytes, serialized by the cache operation guard.")?;
+            #[cfg(any(feature = "dfs", test))]
+            let disk_cache_private_peak_bytes = afs_metrics::IntGauge::new("afs_dfs_peer_disk_cache_private_peak_bytes", "Peak complete-object fill plus private output for one native read; not Node RSS.")?;
+            #[cfg(any(feature = "dfs", test))]
+            let stream_reserved_bytes = afs_metrics::IntGauge::new("afs_dfs_peer_disk_cache_stream_reserved_bytes", "Conservative same-budget 4MiB streaming fill reservation held until producer and frames drain; not allocated RAM or admission.")?;
+            #[cfg(any(feature = "dfs", test))]
+            let stream_reserved_peak_bytes = afs_metrics::IntGauge::new("afs_dfs_peer_disk_cache_stream_reserved_peak_bytes", "Peak conservative streaming fill reservation; mutually exclusive with legacy full-body fill for one cache operation.")?;
+            #[cfg(any(feature = "dfs", test))]
+            let stream_private_peak_bytes = afs_metrics::IntGauge::new("afs_dfs_peer_disk_cache_stream_private_peak_bytes", "Peak conservative streaming fill reservation plus private output; not Node RSS.")?;
+            #[cfg(any(feature = "dfs", test))]
+            let stream_frame_bytes = afs_metrics::IntGauge::new("afs_dfs_peer_disk_cache_stream_frame_bytes", "Owned reusable payload block capacity through free pool, producer, queue and consumer; excludes bounded control fields and transport buffers.")?;
+            #[cfg(any(feature = "dfs", test))]
+            let stream_frame_peak_bytes = afs_metrics::IntGauge::new("afs_dfs_peer_disk_cache_stream_frame_peak_bytes", "Peak owned streaming payload backing capacity; not reservation or total transport RAM.")?;
+            #[cfg(any(feature = "dfs", test))]
+            for gauge in [&stream_reserved_bytes, &stream_reserved_peak_bytes, &stream_private_peak_bytes, &stream_frame_bytes, &stream_frame_peak_bytes] {
+                afs_metrics::register_collector(registry, gauge)?;
+            }
+            #[cfg(feature = "dfs")]
+            for result in ["hit", "miss", "fill", "fill_failed", "corrupt_or_io", "fallback"] { disk_cache_events.with_label_values(&[result]); }
+            #[cfg(feature = "dfs")]
+            afs_metrics::register_collector(registry, &disk_cache_events)?;
+            #[cfg(any(feature = "dfs", test))]
+            afs_metrics::register_collector(registry, &disk_cache_fill_bytes)?;
+            #[cfg(any(feature = "dfs", test))]
+            afs_metrics::register_collector(registry, &disk_cache_fill_peak_bytes)?;
+            #[cfg(any(feature = "dfs", test))]
+            afs_metrics::register_collector(registry, &disk_cache_private_peak_bytes)?;
+            afs_metrics::register_collector(registry, &scan_bytes)?;
+            afs_metrics::register_collector(registry, &scans)?;
+            afs_metrics::register_collector(registry, &copies)?;
+            #[cfg(any(feature = "dfs", test))]
+            afs_metrics::register_collector(registry, &peer_payload_bytes)?;
+            #[cfg(any(feature = "dfs", test))]
+            afs_metrics::register_collector(registry, &peer_payload_peak_bytes)?;
+            #[cfg(any(feature = "dfs", test))]
+            afs_metrics::register_collector(registry, &peer_payload_reserved)?;
+            #[cfg(any(feature = "dfs", test))]
+            afs_metrics::register_collector(registry, &peer_payload_released)?;
+            #[cfg(any(feature = "dfs", test))]
+            afs_metrics::register_collector(registry, &peer_object_cache)?;
+            #[cfg(any(feature = "dfs", test))]
+            afs_metrics::register_collector(registry, &read_rpc_calls)?;
+            #[cfg(any(feature = "dfs", test))]
+            afs_metrics::register_collector(registry, &peer_read_events)?;
+            #[cfg(any(feature = "dfs", test))]
+            for event in [
+                "stream_pipeline",
+                "stream_frame",
+                "stream_block_alloc",
+                "stream_block_handoff",
+                "stream_block_write",
+                "blocking_authorize",
+                "blocking_produce",
+                "blocking_combined",
+                "data_frame",
+                "body_vec_allocation",
+                "shared_frame",
+            ] {
+                peer_read_events.with_label_values(&[event]);
+            }
+            #[cfg(any(feature = "dfs", test))]
+            for method in [
+                "get_inode",
+                "get_file_version",
+                "get_chunk_sources",
+                "validate_read_grants",
+                "peer_read_ranges",
+            ] {
+                read_rpc_calls.with_label_values(&[method]);
+            }
+            #[cfg(any(feature = "dfs", test))]
+            for result in ["hit", "miss"] {
+                peer_object_cache.with_label_values(&[result]);
+            }
+            for stage in [
+                "peer_frame_detach",
+                "peer_frame_to_block",
+                "scan_to_range",
+                "pinned_range_to_output",
+                "range_to_frame",
+                "frame_to_attempt",
+                "attempt_to_staging",
+                "staging_to_output",
+            ] {
+                copies.with_label_values(&[stage]);
+            }
+            Ok(Self {
+                scan_bytes,
+                hashes,
+                #[cfg(any(feature = "dfs", test))]
+                disk_cache_metadata_bytes,
+                #[cfg(any(feature = "dfs", test))]
+                disk_cache_metadata_peak_bytes,
+                scans,
+                copies,
+                #[cfg(any(feature = "dfs", test))]
+                peer_payload_bytes,
+                #[cfg(any(feature = "dfs", test))]
+                peer_payload_peak_bytes,
+                #[cfg(any(feature = "dfs", test))]
+                peer_payload_reserved,
+                #[cfg(any(feature = "dfs", test))]
+                peer_payload_released,
+                #[cfg(any(feature = "dfs", test))]
+                peer_object_cache,
+                #[cfg(any(feature = "dfs", test))]
+                read_rpc_calls,
+                #[cfg(any(feature = "dfs", test))]
+                peer_read_events,
+                #[cfg(feature = "dfs")]
+                disk_cache_events,
+                #[cfg(any(feature = "dfs", test))]
+                disk_cache_data_reads,
+                #[cfg(any(feature = "dfs", test))]
+                disk_cache_stage_ns,
+                #[cfg(any(feature = "dfs", test))]
+                disk_cache_stage_calls,
+                #[cfg(any(feature = "dfs", test))]
+                disk_cache_fill_stage_ns,
+                #[cfg(any(feature = "dfs", test))]
+                disk_cache_fill_stage_cpu_ns,
+                #[cfg(any(feature = "dfs", test))]
+                disk_cache_fill_stage_calls,
+                #[cfg(any(feature = "dfs", test))]
+                disk_cache_fill_stage_cpu_calls,
+                #[cfg(any(feature = "dfs", test))]
+                disk_cache_fill_bytes,
+                #[cfg(any(feature = "dfs", test))]
+                disk_cache_fill_peak_bytes,
+                #[cfg(any(feature = "dfs", test))]
+                disk_cache_private_peak_bytes,
+                #[cfg(any(feature = "dfs", test))]
+                stream_reserved_bytes,
+                #[cfg(any(feature = "dfs", test))]
+                stream_reserved_peak_bytes,
+                #[cfg(any(feature = "dfs", test))]
+                stream_private_peak_bytes,
+                #[cfg(any(feature = "dfs", test))]
+                stream_frame_bytes,
+                #[cfg(any(feature = "dfs", test))]
+                stream_frame_peak_bytes,
+                #[cfg(any(feature = "dfs", test))]
+                stream_frames: Arc::new(StreamFrameAccounting::default()),
+                #[cfg(any(feature = "dfs", test))]
+                diagnostics: None,
+            })
+        })
+    }
+
+    /// Enable once before publishing the Node's shared metrics. OFF allocates no
+    /// journal and takes no diagnostic clock samples. This never resets a live journal.
+    #[cfg(any(feature = "dfs", test))]
+    pub(crate) fn with_read_diagnostics(mut self, enabled: bool) -> Self {
+        if enabled && self.diagnostics.is_none() {
+            self.diagnostics = Some(Arc::new(ReadDiagnostics::new()));
+        }
+        self
+    }
+
+    #[cfg(any(feature = "dfs", test))]
+    pub(crate) fn diagnostic(&self, stage: ReadDiagnosticStage) -> Option<ReadDiagnosticSpan> {
+        self.diagnostics.as_ref()?.begin(stage)
+    }
+
+    /// Read only outside a measured operation; serialization is not on the read path.
+    #[cfg(any(feature = "dfs", test))]
+    pub(crate) fn diagnostics_snapshot(&self) -> Option<ReadDiagnosticsSnapshot> {
+        self.diagnostics.as_ref().map(|journal| journal.snapshot())
+    }
+
+    pub(crate) fn hash(&self, stage: &'static str, bytes: u64) {
+        if matches!(
+            stage,
+            "root_local_scan"
+                | "stream_range_hash"
+                | "peer_range_in_receive"
+                | "root_in_receive"
+                | "root_fallback"
+                | "segment_index_bytes"
+                | "cache_segment_hash"
+                | "cache_full_hash"
+        ) {
+            self.hashes.with_label_values(&[stage]).inc_by(bytes);
+        }
+    }
+
+    /// Observes the cache's enforcing metadata ledger, never grants admission.
+    #[cfg(any(feature = "dfs", test))]
+    pub(crate) fn peer_cache_metadata(&self, current: u64, peak: u64) {
+        if let (Ok(current), Ok(peak)) = (i64::try_from(current), i64::try_from(peak)) {
+            self.disk_cache_metadata_bytes.set(current);
+            self.disk_cache_metadata_peak_bytes.set(peak);
+        }
+    }
+
+    #[cfg(any(feature = "dfs", test))]
+    pub(crate) fn peer_cache_data_reads(&self, calls: u64) {
+        self.disk_cache_data_reads.inc_by(calls);
+    }
+
+    #[cfg(any(feature = "dfs", test))]
+    pub(crate) fn peer_cache_stage_ns(&self, stage: &'static str, ns: u64) {
+        if ns != 0
+            && matches!(
+                stage,
+                "prepare" | "data_read" | "segment_verify" | "stream_read_verify" | "finalize"
+            )
+        {
+            self.disk_cache_stage_ns
+                .with_label_values(&[stage])
+                .inc_by(ns);
+            self.disk_cache_stage_calls
+                .with_label_values(&[stage])
+                .inc();
+        }
+    }
+
+    #[cfg(any(feature = "dfs", test))]
+    pub(crate) fn peer_cache_fill_stage(
+        &self,
+        stage: &'static str,
+        wall_ns: u64,
+        cpu_ns: Option<u64>,
+    ) {
+        if !FILL_STAGES.contains(&stage) {
+            return;
+        }
+        self.disk_cache_fill_stage_ns
+            .with_label_values(&[stage])
+            .inc_by(wall_ns);
+        self.disk_cache_fill_stage_calls
+            .with_label_values(&[stage])
+            .inc();
+        if let Some(cpu_ns) = cpu_ns {
+            self.disk_cache_fill_stage_cpu_ns
+                .with_label_values(&[stage])
+                .inc_by(cpu_ns);
+            self.disk_cache_fill_stage_cpu_calls
+                .with_label_values(&[stage])
+                .inc();
+        }
+    }
+
+    #[cfg(feature = "dfs")]
+    pub(crate) fn peer_disk_cache_event(&self, result: &'static str) {
+        if matches!(
+            result,
+            "hit" | "miss" | "fill" | "fill_failed" | "corrupt_or_io" | "fallback"
+        ) {
+            self.disk_cache_events.with_label_values(&[result]).inc();
+        }
+    }
+
+    /// Observation only. The cache operation guard and read budget enforce admission.
+    #[cfg(any(feature = "dfs", test))]
+    pub(crate) fn peer_disk_cache_fill_work(
+        &self,
+        bytes: usize,
+        output: usize,
+    ) -> PeerCacheFillWork {
+        if let (Ok(bytes), Ok(total)) = (
+            i64::try_from(bytes),
+            i64::try_from(bytes.saturating_add(output)),
+        ) {
+            self.disk_cache_fill_bytes.add(bytes);
+            self.disk_cache_fill_peak_bytes.set(
+                self.disk_cache_fill_peak_bytes
+                    .get()
+                    .max(self.disk_cache_fill_bytes.get()),
+            );
+            self.disk_cache_private_peak_bytes
+                .set(self.disk_cache_private_peak_bytes.get().max(total));
+        }
+        PeerCacheFillWork {
+            metrics: self.clone(),
+            bytes,
+        }
+    }
+
+    /// Observation of the existing serialized fill allowance, never admission.
+    #[cfg(any(feature = "dfs", test))]
+    pub(crate) fn peer_stream_pipeline(&self, output: usize) -> PeerCacheStreamWork {
+        const RESERVED: i64 = 4 * 1024 * 1024;
+        self.stream_reserved_bytes.add(RESERVED);
+        self.stream_reserved_peak_bytes.set(
+            self.stream_reserved_peak_bytes
+                .get()
+                .max(self.stream_reserved_bytes.get()),
+        );
+        let total = i64::try_from(output)
+            .unwrap_or(i64::MAX)
+            .saturating_add(RESERVED);
+        self.stream_private_peak_bytes
+            .set(self.stream_private_peak_bytes.get().max(total));
+        PeerCacheStreamWork {
+            metrics: self.clone(),
+        }
+    }
+
+    /// Fixed payload owners and control permits enforce bounds; this guard follows ownership.
+    #[cfg(any(feature = "dfs", test))]
+    pub(crate) fn peer_stream_frame(&self, backing_bytes: usize) -> PeerStreamFrameWork {
+        let bytes = u64::try_from(backing_bytes)
+            .ok()
+            .filter(|v| *v <= i64::MAX as u64)
+            .unwrap_or(0);
+        let current = self
+            .stream_frames
+            .current
+            .fetch_add(bytes, Ordering::Relaxed)
+            + bytes;
+        self.stream_frame_bytes.add(bytes as i64);
+        let previous = self
+            .stream_frames
+            .peak
+            .fetch_max(current, Ordering::Relaxed);
+        if current > previous {
+            // Commutative increments preserve the peak even when frame owners race.
+            self.stream_frame_peak_bytes
+                .add((current - previous) as i64);
+        }
+        PeerStreamFrameWork {
+            metrics: self.clone(),
+            bytes,
+        }
+    }
+
+    pub(crate) fn scan(&self) -> ScanWork<'_> {
+        ScanWork {
+            metrics: self,
+            bytes: 0,
+            copied: 0,
+        }
+    }
+
+    pub(crate) fn copy(&self, stage: &'static str, bytes: u64) {
+        self.copies.with_label_values(&[stage]).inc_by(bytes);
+    }
+
+    #[cfg(any(feature = "dfs", test))]
+    pub(crate) fn peer_payload_reserved(&self, bytes: u64, peak_increment: u64) {
+        // The enforcing budget admits at most 8MiB. Metrics remain optional
+        // observations and cannot grant admission, even for an invalid input.
+        if let (Ok(bytes_i64), Ok(peak_i64)) = (i64::try_from(bytes), i64::try_from(peak_increment))
+        {
+            self.peer_payload_bytes.add(bytes_i64);
+            self.peer_payload_peak_bytes.add(peak_i64);
+            self.peer_payload_reserved.inc_by(bytes);
+        }
+    }
+
+    #[cfg(any(feature = "dfs", test))]
+    pub(crate) fn peer_payload_released(&self, bytes: u64) {
+        if let Ok(bytes_i64) = i64::try_from(bytes) {
+            self.peer_payload_bytes.sub(bytes_i64);
+            self.peer_payload_released.inc_by(bytes);
+        }
+    }
+
+    #[cfg(any(feature = "dfs", test))]
+    pub(crate) fn peer_object_cache(&self, result: &'static str) {
+        if matches!(result, "hit" | "miss") {
+            self.peer_object_cache.with_label_values(&[result]).inc();
+        }
+    }
+
+    #[cfg(any(feature = "dfs", test))]
+    pub(crate) fn read_rpc(&self, method: &'static str) {
+        if matches!(
+            method,
+            "get_inode"
+                | "get_file_version"
+                | "get_chunk_sources"
+                | "validate_read_grants"
+                | "peer_read_ranges"
+        ) {
+            self.read_rpc_calls.with_label_values(&[method]).inc();
+        }
+    }
+
+    #[cfg(any(feature = "dfs", test))]
+    pub(crate) fn peer_read_event(&self, event: &'static str) {
+        if matches!(
+            event,
+            "stream_pipeline"
+                | "stream_frame"
+                | "stream_block_alloc"
+                | "stream_block_handoff"
+                | "stream_block_write"
+                | "blocking_authorize"
+                | "blocking_produce"
+                | "blocking_combined"
+                | "data_frame"
+                | "body_vec_allocation"
+                | "shared_frame"
+        ) {
+            self.peer_read_events.with_label_values(&[event]).inc();
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+#[cfg(any(feature = "dfs", test))]
+struct StreamFrameAccounting {
+    current: AtomicU64,
+    peak: AtomicU64,
+}
+
+#[cfg(any(feature = "dfs", test))]
+pub(crate) struct PeerCacheStreamWork {
+    metrics: ReadWorkMetrics,
+}
+
+#[cfg(any(feature = "dfs", test))]
+impl Drop for PeerCacheStreamWork {
+    fn drop(&mut self) {
+        self.metrics.stream_reserved_bytes.sub(4 * 1024 * 1024);
+    }
+}
+
+#[cfg(any(feature = "dfs", test))]
+pub(crate) struct PeerStreamFrameWork {
+    metrics: ReadWorkMetrics,
+    bytes: u64,
+}
+
+#[cfg(any(feature = "dfs", test))]
+impl Drop for PeerStreamFrameWork {
+    fn drop(&mut self) {
+        self.metrics
+            .stream_frames
+            .current
+            .fetch_sub(self.bytes, Ordering::Relaxed);
+        self.metrics.stream_frame_bytes.sub(self.bytes as i64);
+    }
+}
+
+#[cfg(any(feature = "dfs", test))]
+pub(crate) struct PeerCacheFillWork {
+    metrics: ReadWorkMetrics,
+    bytes: usize,
+}
+
+#[cfg(any(feature = "dfs", test))]
+impl Drop for PeerCacheFillWork {
+    fn drop(&mut self) {
+        if let Ok(bytes) = i64::try_from(self.bytes) {
+            self.metrics.disk_cache_fill_bytes.sub(bytes);
+        }
+    }
+}
+
+pub(crate) struct ScanWork<'a> {
+    metrics: &'a ReadWorkMetrics,
+    pub(crate) bytes: u64,
+    pub(crate) copied: u64,
+}
+
+impl Drop for ScanWork<'_> {
+    fn drop(&mut self) {
+        // Aggregate once per scan rather than adding atomics to each 64KiB read.
+        self.metrics.scans.inc();
+        self.metrics.scan_bytes.inc_by(self.bytes);
+        self.metrics.hash("root_local_scan", self.bytes);
+        self.metrics.copy("scan_to_range", self.copied);
+    }
+}
+
+// The only retained diagnostic data is this fixed journal. No payload, pathname,
+// inode or user identity is retained. Slots are never recycled during a Node epoch.
+#[cfg(any(feature = "dfs", test))]
+const READ_DIAGNOSTIC_CAPACITY: usize = 256;
+#[cfg(any(feature = "dfs", test))]
+const READ_DIAGNOSTIC_MAX_METADATA_BYTES: usize = 64 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+#[repr(u64)]
+#[cfg(any(feature = "dfs", test))]
+pub(crate) enum ReadDiagnosticStage {
+    FuseRead,
+    MetaLookup,
+    MetaGetInode,
+    MetaGetFileVersion,
+    MetaGetChunkSources,
+    MetaValidateReadGrants,
+    MetaLookupNodeLocation,
+    PeerObject,
+}
+
+#[cfg(any(feature = "dfs", test))]
+impl ReadDiagnosticStage {
+    fn from_raw(raw: u64) -> Self {
+        match raw {
+            1 => Self::MetaLookup,
+            2 => Self::MetaGetInode,
+            3 => Self::MetaGetFileVersion,
+            4 => Self::MetaGetChunkSources,
+            5 => Self::MetaValidateReadGrants,
+            6 => Self::MetaLookupNodeLocation,
+            7 => Self::PeerObject,
+            _ => Self::FuseRead,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+#[cfg(any(feature = "dfs", test))]
+struct ReadDiagnosticSlot {
+    stage: AtomicU64,
+    start_ns: AtomicU64,
+    end_ns: AtomicU64,
+    // 0 = active; 1 = success; 2 = error/cancel/drop. A missing endpoint is not zero work.
+    status: AtomicU64,
+    body_end_ns: AtomicU64,
+    eof_ns: AtomicU64,
+    consumer_ns: AtomicU64,
+    consumer_before_body_ns: AtomicU64,
+    consumer_calls: AtomicU64,
+    consumer_work: [ReadDiagnosticWorkSlot; 4],
+    producer_root_work: ReadDiagnosticWorkSlot,
+    root_segment_overlap_ns: AtomicU64,
+    root_segment_overlap_pairs: AtomicU64,
+    overlap_complete: AtomicU64,
+    interval_overflow: AtomicU64,
+}
+
+#[derive(Debug, Default)]
+#[cfg(any(feature = "dfs", test))]
+struct ReadDiagnosticWorkSlot {
+    wall_ns: AtomicU64,
+    calls: AtomicU64,
+    bytes: AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
+#[cfg(any(feature = "dfs", test))]
+pub(crate) struct ReadDiagnosticWork {
+    pub(crate) wall_ns: u64,
+    pub(crate) calls: u64,
+    pub(crate) bytes: u64,
+}
+
+/// Exclusive measured operations inside the synchronous consumer. These are
+/// children of consumer_ns, not extra elapsed time alongside the Peer parent.
+#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
+#[cfg(any(feature = "dfs", test))]
+pub(crate) struct ReadDiagnosticConsumerWork {
+    /// Entire sink.write call, including validation and optional cache-failure
+    /// fallback; bytes/calls are attempts, not successful disk syscalls or fsync.
+    pub(crate) sink_write: ReadDiagnosticWork,
+    pub(crate) range_extract: ReadDiagnosticWork,
+    /// Whole-root work on legacy synchronous decode only; native pipeline uses
+    /// producer_root_work instead and keeps this field zero.
+    pub(crate) root_blake3: ReadDiagnosticWork,
+    pub(crate) segment_blake3: ReadDiagnosticWork,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg(any(feature = "dfs", test))]
+pub(crate) enum ReadDiagnosticConsumerStage {
+    SinkWrite,
+    RangeExtract,
+    RootBlake3,
+    SegmentBlake3,
+}
+
+#[cfg(any(feature = "dfs", test))]
+impl ReadDiagnosticConsumerWork {
+    fn stage_mut(&mut self, stage: ReadDiagnosticConsumerStage) -> &mut ReadDiagnosticWork {
+        match stage {
+            ReadDiagnosticConsumerStage::SinkWrite => &mut self.sink_write,
+            ReadDiagnosticConsumerStage::RangeExtract => &mut self.range_extract,
+            ReadDiagnosticConsumerStage::RootBlake3 => &mut self.root_blake3,
+            ReadDiagnosticConsumerStage::SegmentBlake3 => &mut self.segment_blake3,
+        }
+    }
+
+    fn from_slots(slots: &[ReadDiagnosticWorkSlot; 4]) -> Self {
+        let values = slots.each_ref().map(|slot| ReadDiagnosticWork {
+            wall_ns: slot.wall_ns.load(Ordering::Relaxed),
+            calls: slot.calls.load(Ordering::Relaxed),
+            bytes: slot.bytes.load(Ordering::Relaxed),
+        });
+        let [sink_write, range_extract, root_blake3, segment_blake3] = values;
+        Self {
+            sink_write,
+            range_extract,
+            root_blake3,
+            segment_blake3,
+        }
+    }
+
+    fn publish(self, slots: &[ReadDiagnosticWorkSlot; 4]) {
+        for (value, slot) in [
+            self.sink_write,
+            self.range_extract,
+            self.root_blake3,
+            self.segment_blake3,
+        ]
+        .into_iter()
+        .zip(slots)
+        {
+            slot.wall_ns.store(value.wall_ns, Ordering::Relaxed);
+            slot.calls.store(value.calls, Ordering::Relaxed);
+            slot.bytes.store(value.bytes, Ordering::Release);
+        }
+    }
+}
+
+#[derive(Debug)]
+#[cfg(any(feature = "dfs", test))]
+struct ReadDiagnostics {
+    slots: Box<[ReadDiagnosticSlot; READ_DIAGNOSTIC_CAPACITY]>,
+    next: AtomicU64,
+    overflow: AtomicU64,
+    clock_failures: AtomicU64,
+}
+
+#[cfg(any(feature = "dfs", test))]
+const _: () = assert!(
+    std::mem::size_of::<ReadDiagnosticSlot>() * READ_DIAGNOSTIC_CAPACITY
+        + std::mem::size_of::<ReadDiagnostics>()
+        + 2 * std::mem::size_of::<ReadDiagnosticIntervals>()
+        <= READ_DIAGNOSTIC_MAX_METADATA_BYTES
+);
+
+#[derive(Debug, serde::Serialize)]
+#[cfg(any(feature = "dfs", test))]
+pub(crate) struct ReadDiagnosticRecord {
+    pub(crate) id: usize,
+    pub(crate) stage: ReadDiagnosticStage,
+    pub(crate) start_ns: u64,
+    pub(crate) end_ns: u64,
+    pub(crate) success: bool,
+    pub(crate) completed: bool,
+    /// Last expected nonempty data frame decoded, before its copy or consumer work.
+    /// Does not imply protocol EOF, verification, authorization or successful output.
+    pub(crate) body_end_ns: u64,
+    pub(crate) eof_ns: u64,
+    /// Synchronous consumer calls only, excluding queue wait and producer work.
+    pub(crate) consumer_ns: u64,
+    /// Consumer interval intersection with [start_ns, body_end_ns]. Not additive
+    /// with the remote parent because producer and consumer can overlap.
+    pub(crate) consumer_before_body_ns: u64,
+    pub(crate) consumer_calls: u64,
+    pub(crate) consumer_work: ReadDiagnosticConsumerWork,
+    pub(crate) producer_root_work: ReadDiagnosticWork,
+    pub(crate) root_segment_overlap_ns: Option<u64>,
+    pub(crate) root_segment_overlap_pairs: u64,
+    pub(crate) interval_overflow: u64,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[cfg(any(feature = "dfs", test))]
+pub(crate) struct ReadDiagnosticsSnapshot {
+    pub(crate) schema_version: u32,
+    pub(crate) capacity: usize,
+    pub(crate) metadata_bytes: usize,
+    pub(crate) overflow: u64,
+    pub(crate) clock_failures: u64,
+    pub(crate) records: Vec<ReadDiagnosticRecord>,
+}
+
+#[cfg(any(feature = "dfs", test))]
+impl ReadDiagnostics {
+    fn new() -> Self {
+        Self {
+            slots: Box::new(std::array::from_fn(|_| ReadDiagnosticSlot::default())),
+            next: AtomicU64::new(0),
+            overflow: AtomicU64::new(0),
+            clock_failures: AtomicU64::new(0),
+        }
+    }
+
+    fn now(&self) -> u64 {
+        match monotonic_ns() {
+            Some(value) => value,
+            None => {
+                self.clock_failures.fetch_add(1, Ordering::Relaxed);
+                0
+            }
+        }
+    }
+
+    fn begin(self: &Arc<Self>, stage: ReadDiagnosticStage) -> Option<ReadDiagnosticSpan> {
+        let index = self.next.fetch_add(1, Ordering::Relaxed);
+        let Some(slot) = usize::try_from(index)
+            .ok()
+            .and_then(|index| self.slots.get(index))
+        else {
+            self.overflow.fetch_add(1, Ordering::Relaxed);
+            return None;
+        };
+        slot.stage.store(stage as u64, Ordering::Relaxed);
+        slot.start_ns.store(self.now(), Ordering::Release);
+        Some(ReadDiagnosticSpan {
+            token: ReadDiagnosticToken {
+                journal: self.clone(),
+                index: index as usize,
+            },
+            finished: false,
+        })
+    }
+
+    fn snapshot(&self) -> ReadDiagnosticsSnapshot {
+        let count = self
+            .next
+            .load(Ordering::Acquire)
+            .min(READ_DIAGNOSTIC_CAPACITY as u64);
+        let records = self.slots[..count as usize]
+            .iter()
+            .enumerate()
+            .map(|(index, slot)| {
+                let status = slot.status.load(Ordering::Acquire);
+                ReadDiagnosticRecord {
+                    id: index + 1,
+                    stage: ReadDiagnosticStage::from_raw(slot.stage.load(Ordering::Relaxed)),
+                    start_ns: slot.start_ns.load(Ordering::Acquire),
+                    end_ns: slot.end_ns.load(Ordering::Relaxed),
+                    success: status == 1,
+                    completed: status != 0,
+                    body_end_ns: slot.body_end_ns.load(Ordering::Acquire),
+                    eof_ns: slot.eof_ns.load(Ordering::Acquire),
+                    consumer_ns: slot.consumer_ns.load(Ordering::Relaxed),
+                    consumer_before_body_ns: slot.consumer_before_body_ns.load(Ordering::Relaxed),
+                    consumer_calls: slot.consumer_calls.load(Ordering::Relaxed),
+                    consumer_work: ReadDiagnosticConsumerWork::from_slots(&slot.consumer_work),
+                    producer_root_work: ReadDiagnosticWork {
+                        wall_ns: slot.producer_root_work.wall_ns.load(Ordering::Relaxed),
+                        calls: slot.producer_root_work.calls.load(Ordering::Relaxed),
+                        bytes: slot.producer_root_work.bytes.load(Ordering::Relaxed),
+                    },
+                    root_segment_overlap_ns: (slot.overlap_complete.load(Ordering::Acquire) != 0)
+                        .then(|| slot.root_segment_overlap_ns.load(Ordering::Relaxed)),
+                    root_segment_overlap_pairs: slot
+                        .root_segment_overlap_pairs
+                        .load(Ordering::Relaxed),
+                    interval_overflow: slot.interval_overflow.load(Ordering::Relaxed),
+                }
+            })
+            .collect();
+        ReadDiagnosticsSnapshot {
+            schema_version: 3,
+            capacity: READ_DIAGNOSTIC_CAPACITY,
+            metadata_bytes: std::mem::size_of::<ReadDiagnosticSlot>() * READ_DIAGNOSTIC_CAPACITY
+                + std::mem::size_of::<ReadDiagnostics>(),
+            overflow: self.overflow.load(Ordering::Acquire),
+            clock_failures: self.clock_failures.load(Ordering::Acquire),
+            records,
+        }
+    }
+}
+
+#[cfg(any(feature = "dfs", test))]
+fn monotonic_ns() -> Option<u64> {
+    let mut value = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: value is a valid writable timespec and clock_gettime retains no pointer.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut value) } != 0 {
+        return None;
+    }
+    let seconds = u64::try_from(value.tv_sec).ok()?;
+    let nanos = u64::try_from(value.tv_nsec)
+        .ok()
+        .filter(|n| *n < 1_000_000_000)?;
+    seconds.checked_mul(1_000_000_000)?.checked_add(nanos)
+}
+
+/// Shared slot reference, never an owner of payload, grants or cache state.
+#[derive(Clone)]
+#[cfg(any(feature = "dfs", test))]
+pub(crate) struct ReadDiagnosticToken {
+    journal: Arc<ReadDiagnostics>,
+    index: usize,
+}
+
+#[cfg(any(feature = "dfs", test))]
+impl ReadDiagnosticToken {
+    pub(crate) fn now(&self) -> u64 {
+        self.journal.now()
+    }
+
+    #[cfg(feature = "dfs")]
+    pub(crate) fn body_complete(&self) {
+        self.journal.slots[self.index]
+            .body_end_ns
+            .store(self.now(), Ordering::Release);
+    }
+
+    #[cfg(feature = "dfs")]
+    pub(crate) fn eof(&self) {
+        self.journal.slots[self.index]
+            .eof_ns
+            .store(self.now(), Ordering::Release);
+    }
+
+    #[cfg(feature = "dfs")]
+    pub(crate) fn consumer(&self, start_ns: u64) {
+        let end_ns = self.now();
+        self.consumer_interval(start_ns, end_ns);
+    }
+
+    fn consumer_interval(&self, start_ns: u64, end_ns: u64) {
+        let slot = &self.journal.slots[self.index];
+        if start_ns == 0 || end_ns < start_ns {
+            return;
+        }
+        let body_end = slot.body_end_ns.load(Ordering::Acquire);
+        let before_end = if body_end == 0 {
+            end_ns
+        } else {
+            end_ns.min(body_end)
+        };
+        slot.consumer_ns
+            .fetch_add(end_ns - start_ns, Ordering::Relaxed);
+        slot.consumer_before_body_ns
+            .fetch_add(before_end.saturating_sub(start_ns), Ordering::Relaxed);
+        slot.consumer_calls.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(any(feature = "dfs", test))]
+const READ_DIAGNOSTIC_INTERVAL_CAPACITY: usize = 64;
+
+#[derive(Clone, Copy, Default)]
+#[cfg(any(feature = "dfs", test))]
+struct ReadDiagnosticInterval {
+    start: u64,
+    end: u64,
+}
+
+/// Diagnostic-only fixed metadata, never a payload queue or retained event journal.
+#[derive(Clone, Copy)]
+#[cfg(any(feature = "dfs", test))]
+pub(crate) struct ReadDiagnosticIntervals {
+    intervals: [ReadDiagnosticInterval; READ_DIAGNOSTIC_INTERVAL_CAPACITY],
+    length: usize,
+    overflow: u64,
+    invalid: bool,
+}
+
+#[cfg(any(feature = "dfs", test))]
+impl Default for ReadDiagnosticIntervals {
+    fn default() -> Self {
+        Self {
+            intervals: [ReadDiagnosticInterval::default(); READ_DIAGNOSTIC_INTERVAL_CAPACITY],
+            length: 0,
+            overflow: 0,
+            invalid: false,
+        }
+    }
+}
+
+#[cfg(any(feature = "dfs", test))]
+impl ReadDiagnosticIntervals {
+    fn record(&mut self, start: u64, end: u64) {
+        if start == 0
+            || end < start
+            || self.length != 0 && start < self.intervals[self.length - 1].end
+        {
+            self.invalid = true;
+            return;
+        }
+        if self.length == self.intervals.len() {
+            self.overflow = self.overflow.saturating_add(1);
+            return;
+        }
+        self.intervals[self.length] = ReadDiagnosticInterval { start, end };
+        self.length += 1;
+    }
+
+    fn intersection(&self, other: &Self) -> Option<(u64, u64)> {
+        if self.length == 0
+            || other.length == 0
+            || self.invalid
+            || other.invalid
+            || self.overflow != 0
+            || other.overflow != 0
+        {
+            return None;
+        }
+        let (mut left, mut right, mut ns, mut pairs) = (0, 0, 0_u64, 0_u64);
+        while left < self.length && right < other.length {
+            let a = self.intervals[left];
+            let b = other.intervals[right];
+            let overlap = a.end.min(b.end).saturating_sub(a.start.max(b.start));
+            if overlap != 0 {
+                ns = ns.saturating_add(overlap);
+                pairs += 1;
+            }
+            if a.end <= b.end {
+                left += 1;
+            } else {
+                right += 1;
+            }
+        }
+        Some((ns, pairs))
+    }
+}
+
+/// One producer-owned root work ledger; drop publishes aggregates on success,
+/// RPC failure and task cancellation without extending any payload lifetime.
+#[cfg(any(feature = "dfs", test))]
+pub(crate) struct ReadDiagnosticProducer {
+    token: ReadDiagnosticToken,
+    work: std::cell::Cell<ReadDiagnosticWork>,
+    intervals: std::cell::Cell<ReadDiagnosticIntervals>,
+}
+
+#[cfg(any(feature = "dfs", test))]
+impl ReadDiagnosticProducer {
+    pub(crate) fn new(token: ReadDiagnosticToken) -> Self {
+        Self {
+            token,
+            work: std::cell::Cell::new(ReadDiagnosticWork::default()),
+            intervals: std::cell::Cell::new(ReadDiagnosticIntervals::default()),
+        }
+    }
+
+    pub(crate) fn measure<T>(&self, bytes: u64, operation: impl FnOnce() -> T) -> T {
+        let start = self.token.now();
+        let result = operation();
+        let end = self.token.now();
+        let mut value = self.work.get();
+        value.calls = value.calls.saturating_add(1);
+        value.bytes = value.bytes.saturating_add(bytes);
+        if start != 0 && end >= start {
+            value.wall_ns = value.wall_ns.saturating_add(end - start);
+        }
+        self.work.set(value);
+        let mut intervals = self.intervals.get();
+        intervals.record(start, end);
+        self.intervals.set(intervals);
+        result
+    }
+
+    #[cfg(feature = "dfs")]
+    pub(crate) fn intervals(&self) -> ReadDiagnosticIntervals {
+        self.intervals.get()
+    }
+}
+
+#[cfg(any(feature = "dfs", test))]
+impl Drop for ReadDiagnosticProducer {
+    fn drop(&mut self) {
+        let slot = &self.token.journal.slots[self.token.index];
+        let value = self.work.get();
+        slot.producer_root_work
+            .wall_ns
+            .store(value.wall_ns, Ordering::Relaxed);
+        slot.producer_root_work
+            .calls
+            .store(value.calls, Ordering::Relaxed);
+        slot.producer_root_work
+            .bytes
+            .store(value.bytes, Ordering::Release);
+        slot.interval_overflow
+            .fetch_add(self.intervals.get().overflow, Ordering::Relaxed);
+    }
+}
+
+#[cfg(feature = "dfs")]
+impl ReadDiagnosticToken {
+    pub(crate) fn root_segment_overlap(
+        &self,
+        root: &ReadDiagnosticIntervals,
+        segment: &ReadDiagnosticIntervals,
+    ) {
+        if let Some((ns, pairs)) = root.intersection(segment) {
+            let slot = &self.journal.slots[self.index];
+            slot.root_segment_overlap_ns.store(ns, Ordering::Relaxed);
+            slot.root_segment_overlap_pairs
+                .store(pairs, Ordering::Relaxed);
+            slot.overlap_complete.store(1, Ordering::Release);
+        }
+    }
+}
+
+/// Optional per-object stack aggregate. It never owns payload, grants, sinks or
+/// task handles. The caller drops it after draining, before finishing its parent.
+#[cfg(any(feature = "dfs", test))]
+pub(crate) struct ReadDiagnosticConsumer {
+    token: ReadDiagnosticToken,
+    work: std::cell::Cell<ReadDiagnosticConsumerWork>,
+    segment_intervals: std::cell::Cell<ReadDiagnosticIntervals>,
+}
+
+#[cfg(any(feature = "dfs", test))]
+impl ReadDiagnosticConsumer {
+    pub(crate) fn new(token: ReadDiagnosticToken) -> Self {
+        Self {
+            token,
+            work: std::cell::Cell::new(ReadDiagnosticConsumerWork::default()),
+            segment_intervals: std::cell::Cell::new(ReadDiagnosticIntervals::default()),
+        }
+    }
+
+    pub(crate) fn measure<T>(
+        &self,
+        stage: ReadDiagnosticConsumerStage,
+        bytes: u64,
+        operation: impl FnOnce() -> T,
+    ) -> T {
+        let start = self.token.now();
+        let result = operation();
+        let end = self.token.now();
+        let mut work = self.work.get();
+        let value = work.stage_mut(stage);
+        value.calls = value.calls.saturating_add(1);
+        value.bytes = value.bytes.saturating_add(bytes);
+        if start != 0 && end >= start {
+            value.wall_ns = value.wall_ns.saturating_add(end - start);
+        }
+        self.work.set(work);
+        if stage == ReadDiagnosticConsumerStage::SegmentBlake3 {
+            let mut intervals = self.segment_intervals.get();
+            intervals.record(start, end);
+            self.segment_intervals.set(intervals);
+        }
+        result
+    }
+
+    #[cfg(feature = "dfs")]
+    pub(crate) fn segment_intervals(&self) -> ReadDiagnosticIntervals {
+        self.segment_intervals.get()
+    }
+}
+
+#[cfg(any(feature = "dfs", test))]
+impl Drop for ReadDiagnosticConsumer {
+    fn drop(&mut self) {
+        let slot = &self.token.journal.slots[self.token.index];
+        self.work.get().publish(&slot.consumer_work);
+        slot.interval_overflow
+            .fetch_add(self.segment_intervals.get().overflow, Ordering::Relaxed);
+    }
+}
+
+#[cfg(any(feature = "dfs", test))]
+pub(crate) struct ReadDiagnosticSpan {
+    token: ReadDiagnosticToken,
+    finished: bool,
+}
+
+#[cfg(any(feature = "dfs", test))]
+impl ReadDiagnosticSpan {
+    pub(crate) fn token(&self) -> ReadDiagnosticToken {
+        self.token.clone()
+    }
+
+    pub(crate) fn finish(mut self, success: bool) {
+        self.record(success);
+    }
+
+    fn record(&mut self, success: bool) {
+        if !self.finished {
+            let slot = &self.token.journal.slots[self.token.index];
+            slot.end_ns.store(self.token.now(), Ordering::Relaxed);
+            slot.status
+                .store(if success { 1 } else { 2 }, Ordering::Release);
+            self.finished = true;
+        }
+    }
+}
+
+#[cfg(any(feature = "dfs", test))]
+impl Drop for ReadDiagnosticSpan {
+    fn drop(&mut self) {
+        self.record(false);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ReadWorkMetrics;
+
+    #[test]
+    fn diagnostic_off_has_no_journal_and_no_scopes() {
+        let registry = afs_metrics::Registry::new();
+        let metrics = ReadWorkMetrics::register(&registry).unwrap();
+        assert!(metrics.diagnostics.is_none());
+        assert!(
+            metrics
+                .diagnostic(super::ReadDiagnosticStage::FuseRead)
+                .is_none()
+        );
+        assert!(metrics.diagnostics_snapshot().is_none());
+        assert!(metrics.with_read_diagnostics(false).diagnostics.is_none());
+    }
+
+    #[test]
+    fn diagnostic_slots_bound_metadata_and_report_overflow_without_recycling() {
+        let registry = afs_metrics::Registry::new();
+        let metrics = ReadWorkMetrics::register(&registry)
+            .unwrap()
+            .with_read_diagnostics(true);
+        for _ in 0..super::READ_DIAGNOSTIC_CAPACITY {
+            metrics
+                .diagnostic(super::ReadDiagnosticStage::FuseRead)
+                .unwrap()
+                .finish(true);
+        }
+        assert!(
+            metrics
+                .diagnostic(super::ReadDiagnosticStage::PeerObject)
+                .is_none()
+        );
+        assert!(
+            metrics
+                .diagnostic(super::ReadDiagnosticStage::MetaLookup)
+                .is_none()
+        );
+        let snapshot = metrics.diagnostics_snapshot().unwrap();
+        assert_eq!(snapshot.records.len(), super::READ_DIAGNOSTIC_CAPACITY);
+        assert_eq!(snapshot.overflow, 2);
+        assert_eq!(snapshot.clock_failures, 0);
+        assert!(snapshot.metadata_bytes <= super::READ_DIAGNOSTIC_MAX_METADATA_BYTES);
+        assert!(
+            snapshot
+                .records
+                .iter()
+                .all(|record| record.success && record.completed)
+        );
+        assert!(
+            snapshot
+                .records
+                .iter()
+                .all(|record| record.start_ns > 0 && record.end_ns >= record.start_ns)
+        );
+        // Enabling again cannot clear evidence or reuse slots while old spans exist.
+        assert_eq!(
+            metrics
+                .with_read_diagnostics(true)
+                .diagnostics_snapshot()
+                .unwrap()
+                .overflow,
+            2
+        );
+    }
+
+    #[test]
+    fn diagnostic_consumer_intersection_is_not_added_to_peer_parent() {
+        let registry = afs_metrics::Registry::new();
+        let metrics = ReadWorkMetrics::register(&registry)
+            .unwrap()
+            .with_read_diagnostics(true);
+        let span = metrics
+            .diagnostic(super::ReadDiagnosticStage::PeerObject)
+            .unwrap();
+        let token = span.token();
+        let base = token.now();
+        token.journal.slots[token.index]
+            .body_end_ns
+            .store(base + 50, std::sync::atomic::Ordering::Release);
+        token.consumer_interval(base, base + 20);
+        token.consumer_interval(base + 40, base + 60);
+        token.consumer_interval(base + 60, base + 90);
+        // Parent has not completed although body reception can have completed.
+        let pending = metrics.diagnostics_snapshot().unwrap();
+        assert!(!pending.records[0].completed);
+        assert_eq!(pending.records[0].consumer_ns, 70);
+        assert_eq!(pending.records[0].consumer_before_body_ns, 30);
+        assert_eq!(pending.records[0].consumer_calls, 3);
+        span.finish(true);
+        assert!(metrics.diagnostics_snapshot().unwrap().records[0].success);
+    }
+
+    #[test]
+    fn diagnostic_consumer_publishes_fixed_work_once_after_error_and_drop() {
+        use super::{ReadDiagnosticConsumer, ReadDiagnosticConsumerStage, ReadDiagnosticStage};
+        let registry = afs_metrics::Registry::new();
+        let metrics = ReadWorkMetrics::register(&registry)
+            .unwrap()
+            .with_read_diagnostics(true);
+        let span = metrics.diagnostic(ReadDiagnosticStage::PeerObject).unwrap();
+        {
+            let work = ReadDiagnosticConsumer::new(span.token());
+            let result: Result<(), u8> =
+                work.measure(ReadDiagnosticConsumerStage::SinkWrite, 19, || Err(7));
+            assert_eq!(result, Err(7), "diagnostics preserve errors unchanged");
+            let result = work.measure(ReadDiagnosticConsumerStage::RangeExtract, 11, || 23);
+            assert_eq!(result, 23);
+            work.measure(ReadDiagnosticConsumerStage::RootBlake3, 31, || {});
+            work.measure(ReadDiagnosticConsumerStage::RootBlake3, 0, || {});
+            work.measure(ReadDiagnosticConsumerStage::SegmentBlake3, 31, || {});
+            // No per-call atomic publication or expanding event list.
+            let pending = metrics.diagnostics_snapshot().unwrap();
+            assert_eq!(pending.records.len(), 1);
+            assert_eq!(pending.records[0].consumer_work.sink_write.calls, 0);
+        }
+        drop(span);
+        let snapshot = metrics.diagnostics_snapshot().unwrap();
+        assert_eq!(snapshot.schema_version, 3);
+        assert!(snapshot.metadata_bytes <= super::READ_DIAGNOSTIC_MAX_METADATA_BYTES);
+        let record = &snapshot.records[0];
+        assert!(record.completed && !record.success);
+        assert_eq!(record.consumer_work.sink_write.calls, 1);
+        assert_eq!(record.consumer_work.sink_write.bytes, 19);
+        assert_eq!(record.consumer_work.range_extract.calls, 1);
+        assert_eq!(record.consumer_work.range_extract.bytes, 11);
+        assert_eq!(record.consumer_work.root_blake3.calls, 2);
+        assert_eq!(record.consumer_work.root_blake3.bytes, 31);
+        assert_eq!(record.consumer_work.segment_blake3.calls, 1);
+        assert_eq!(record.consumer_work.segment_blake3.bytes, 31);
+    }
+
+    #[test]
+    fn diagnostic_root_segment_intersection_preserves_gaps_and_invalidity() {
+        use super::ReadDiagnosticIntervals;
+        let mut root = ReadDiagnosticIntervals::default();
+        root.record(10, 20);
+        root.record(40, 50);
+        let mut segment = ReadDiagnosticIntervals::default();
+        segment.record(15, 45);
+        assert_eq!(
+            root.intersection(&segment),
+            Some((10, 2)),
+            "idle gap20..40 is not overlap"
+        );
+        let mut serial = ReadDiagnosticIntervals::default();
+        serial.record(60, 70);
+        assert_eq!(root.intersection(&serial), Some((0, 0)));
+        assert_eq!(root.intersection(&ReadDiagnosticIntervals::default()), None);
+        let mut overflow = ReadDiagnosticIntervals::default();
+        for i in 0..=super::READ_DIAGNOSTIC_INTERVAL_CAPACITY {
+            overflow.record(1 + i as u64 * 2, 2 + i as u64 * 2);
+        }
+        assert_eq!(overflow.overflow, 1);
+        assert_eq!(root.intersection(&overflow), None);
+        let mut invalid = ReadDiagnosticIntervals::default();
+        invalid.record(0, 5);
+        assert_eq!(root.intersection(&invalid), None);
+    }
+
+    #[test]
+    fn diagnostic_producer_drop_publishes_partial_root_without_consumer_double_count() {
+        use super::{ReadDiagnosticProducer, ReadDiagnosticStage};
+        let registry = afs_metrics::Registry::new();
+        let metrics = ReadWorkMetrics::register(&registry)
+            .unwrap()
+            .with_read_diagnostics(true);
+        let span = metrics.diagnostic(ReadDiagnosticStage::PeerObject).unwrap();
+        {
+            let producer = ReadDiagnosticProducer::new(span.token());
+            assert_eq!(producer.measure(13, || Err::<(), _>(7)), Err(7));
+            producer.measure(0, || {});
+        }
+        drop(span);
+        let snapshot = metrics.diagnostics_snapshot().unwrap();
+        let record = &snapshot.records[0];
+        assert_eq!(record.producer_root_work.bytes, 13);
+        assert_eq!(record.producer_root_work.calls, 2);
+        assert_eq!(record.consumer_work.root_blake3.calls, 0);
+        assert!(!record.success);
+        assert!(record.root_segment_overlap_ns.is_none());
+        assert_eq!(record.interval_overflow, 0);
+        assert!(
+            snapshot.metadata_bytes + 2 * std::mem::size_of::<super::ReadDiagnosticIntervals>()
+                <= super::READ_DIAGNOSTIC_MAX_METADATA_BYTES
+        );
+    }
+
+    #[test]
+    fn diagnostic_concurrent_scopes_remain_distinct_and_drop_is_failure() {
+        let registry = afs_metrics::Registry::new();
+        let metrics = ReadWorkMetrics::register(&registry)
+            .unwrap()
+            .with_read_diagnostics(true);
+        let pending = metrics
+            .diagnostic(super::ReadDiagnosticStage::FuseRead)
+            .unwrap();
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let metrics = metrics.clone();
+                std::thread::spawn(move || {
+                    metrics
+                        .diagnostic(super::ReadDiagnosticStage::MetaGetInode)
+                        .unwrap()
+                        .finish(true);
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        drop(pending);
+        let snapshot = metrics.diagnostics_snapshot().unwrap();
+        assert_eq!(snapshot.records.len(), 9);
+        assert!(snapshot.records[0].completed && !snapshot.records[0].success);
+        assert_eq!(
+            snapshot
+                .records
+                .iter()
+                .filter(|record| record.success)
+                .count(),
+            8
+        );
+        assert_eq!(snapshot.overflow, 0);
+    }
+
+    #[test]
+    fn streaming_work_keeps_last_frame_charged_and_reservation_distinct() {
+        let registry = afs_metrics::Registry::new();
+        let metrics = ReadWorkMetrics::register(&registry).unwrap();
+        let same = ReadWorkMetrics::register(&registry).unwrap();
+        let pipeline = metrics.peer_stream_pipeline(1024 * 1024);
+        let frame = metrics.peer_stream_frame(65536);
+        let queued = same.peer_stream_frame(131072);
+        assert_eq!(same.stream_frame_bytes.get(), 196608);
+        assert_eq!(same.stream_frame_peak_bytes.get(), 196608);
+        assert_eq!(same.stream_reserved_bytes.get(), 4 * 1024 * 1024);
+        assert_eq!(same.stream_private_peak_bytes.get(), 5 * 1024 * 1024);
+        assert_eq!(same.disk_cache_fill_bytes.get(), 0);
+        std::thread::spawn(move || drop(queued)).join().unwrap();
+        assert_eq!(same.stream_frame_bytes.get(), 65536);
+        drop(frame);
+        assert_eq!(same.stream_frame_bytes.get(), 0);
+        assert_eq!(same.stream_frame_peak_bytes.get(), 196608);
+        drop(pipeline);
+        assert_eq!(same.stream_reserved_bytes.get(), 0);
+    }
+
+    #[test]
+    fn fill_stage_metrics_keep_missing_cpu_separate_and_labels_bounded() {
+        let registry = afs_metrics::Registry::new();
+        let metrics = ReadWorkMetrics::register(&registry).unwrap();
+        let same = ReadWorkMetrics::register(&registry).unwrap();
+        metrics.peer_cache_fill_stage("receive_verify", 100, Some(30));
+        metrics.peer_cache_fill_stage("receive_verify", 50, None);
+        metrics.peer_cache_fill_stage("store", 0, Some(0));
+        metrics.peer_cache_fill_stage("chunk-id-must-not-be-a-label", 999, Some(999));
+        assert_eq!(
+            same.disk_cache_fill_stage_ns
+                .with_label_values(&["receive_verify"])
+                .get(),
+            150
+        );
+        assert_eq!(
+            same.disk_cache_fill_stage_cpu_ns
+                .with_label_values(&["receive_verify"])
+                .get(),
+            30
+        );
+        assert_eq!(
+            same.disk_cache_fill_stage_calls
+                .with_label_values(&["receive_verify"])
+                .get(),
+            2
+        );
+        assert_eq!(
+            same.disk_cache_fill_stage_cpu_calls
+                .with_label_values(&["receive_verify"])
+                .get(),
+            1
+        );
+        assert_eq!(
+            same.disk_cache_fill_stage_cpu_calls
+                .with_label_values(&["store"])
+                .get(),
+            1
+        );
+        for family in registry
+            .gather()
+            .into_iter()
+            .filter(|f| f.name().starts_with("afs_dfs_peer_disk_cache_fill_stage_"))
+        {
+            assert_eq!(family.get_metric().len(), 7);
+        }
+    }
+
+    #[test]
+    fn fill_clock_never_subtracts_cpu_from_another_thread() {
+        let clock = super::PeerFillClock::start();
+        let cpu = std::thread::spawn(move || clock.elapsed().1)
+            .join()
+            .unwrap();
+        assert_eq!(cpu, None);
+    }
+
+    #[test]
+    fn disk_read_work_observes_actual_calls_and_fixed_stage_aggregates() {
+        let registry = afs_metrics::Registry::new();
+        let metrics = ReadWorkMetrics::register(&registry).unwrap();
+        let same = ReadWorkMetrics::register(&registry).unwrap();
+        metrics.peer_cache_data_reads(2);
+        metrics.peer_cache_stage_ns("data_read", 100);
+        metrics.peer_cache_stage_ns("data_read", 30);
+        metrics.peer_cache_stage_ns("segment_verify", 40);
+        metrics.peer_cache_stage_ns("chunk-id-must-not-be-a-label", 50);
+        assert_eq!(same.disk_cache_data_reads.get(), 2);
+        assert_eq!(
+            same.disk_cache_stage_ns
+                .with_label_values(&["data_read"])
+                .get(),
+            130
+        );
+        assert_eq!(
+            same.disk_cache_stage_calls
+                .with_label_values(&["data_read"])
+                .get(),
+            2
+        );
+        let stages = registry
+            .gather()
+            .into_iter()
+            .find(|family| family.name() == "afs_dfs_peer_disk_cache_stage_nanoseconds_total")
+            .unwrap();
+        assert_eq!(stages.get_metric().len(), 5);
+    }
+
+    #[test]
+    fn hash_and_metadata_metrics_are_fixed_and_do_not_grant_budget() {
+        let registry = afs_metrics::Registry::new();
+        let metrics = ReadWorkMetrics::register(&registry).unwrap();
+        let same = ReadWorkMetrics::register(&registry).unwrap();
+        metrics.hash("root_in_receive", 4096);
+        metrics.hash("segment_index_bytes", 4096);
+        metrics.hash("request-id-must-not-be-a-label", 1);
+        metrics.peer_cache_metadata(256, 512);
+        assert_eq!(
+            same.hashes.with_label_values(&["root_in_receive"]).get(),
+            4096
+        );
+        assert_eq!(
+            same.hashes
+                .with_label_values(&["segment_index_bytes"])
+                .get(),
+            4096
+        );
+        assert_eq!(
+            same.hashes.with_label_values(&["stream_range_hash"]).get(),
+            0
+        );
+        assert_eq!(same.disk_cache_metadata_bytes.get(), 256);
+        assert_eq!(same.disk_cache_metadata_peak_bytes.get(), 512);
+        let hashes = registry
+            .gather()
+            .into_iter()
+            .find(|family| family.name() == "afs_dfs_read_hash_bytes_total")
+            .unwrap();
+        assert_eq!(hashes.get_metric().len(), 8);
+    }
+
+    #[test]
+    fn peer_disk_fill_observation_releases_only_when_work_guard_drops() {
+        let registry = afs_metrics::Registry::new();
+        let metrics = ReadWorkMetrics::register(&registry).unwrap();
+        {
+            let _work = metrics.peer_disk_cache_fill_work(4 * 1024 * 1024, 1024 * 1024);
+            assert_eq!(metrics.disk_cache_fill_bytes.get(), 4 * 1024 * 1024);
+            assert_eq!(metrics.disk_cache_fill_peak_bytes.get(), 4 * 1024 * 1024);
+            assert_eq!(metrics.disk_cache_private_peak_bytes.get(), 5 * 1024 * 1024);
+        }
+        assert_eq!(metrics.disk_cache_fill_bytes.get(), 0);
+        assert_eq!(metrics.disk_cache_fill_peak_bytes.get(), 4 * 1024 * 1024);
+    }
+
+    #[test]
+    fn peer_read_event_metrics_are_fixed_and_shared() {
+        let registry = afs_metrics::Registry::new();
+        let metrics = ReadWorkMetrics::register(&registry).unwrap();
+        let same = ReadWorkMetrics::register(&registry).unwrap();
+        for event in [
+            "stream_pipeline",
+            "stream_frame",
+            "stream_block_alloc",
+            "stream_block_handoff",
+            "stream_block_write",
+            "blocking_authorize",
+            "blocking_produce",
+            "blocking_combined",
+            "data_frame",
+            "body_vec_allocation",
+            "shared_frame",
+        ] {
+            metrics.peer_read_event(event);
+            assert_eq!(same.peer_read_events.with_label_values(&[event]).get(), 1);
+        }
+        metrics.peer_read_event("inode-or-request-id-must-not-be-a-label");
+        let families = registry.gather();
+        let events = families
+            .iter()
+            .find(|family| family.name() == "afs_dfs_peer_read_events_total")
+            .unwrap();
+        assert_eq!(events.get_metric().len(), 11);
+    }
+
+    #[test]
+    fn native_rpc_metrics_have_fixed_methods_and_shared_registration() {
+        let registry = afs_metrics::Registry::new();
+        let metrics = ReadWorkMetrics::register(&registry).unwrap();
+        let same = ReadWorkMetrics::register(&registry).unwrap();
+        for method in [
+            "get_inode",
+            "get_file_version",
+            "get_chunk_sources",
+            "validate_read_grants",
+            "peer_read_ranges",
+        ] {
+            metrics.read_rpc(method);
+            assert_eq!(same.read_rpc_calls.with_label_values(&[method]).get(), 1);
+        }
+        metrics.read_rpc("inode-id-is-not-a-label");
+        let families = registry.gather();
+        let calls = families
+            .iter()
+            .find(|family| family.name() == "afs_dfs_read_rpc_calls_total")
+            .unwrap();
+        assert_eq!(calls.get_metric().len(), 5);
+    }
+
+    #[test]
+    fn peer_payload_metrics_account_shared_lifetimes_and_reuse_registration() {
+        let registry = afs_metrics::Registry::new();
+        let metrics = ReadWorkMetrics::register(&registry).unwrap();
+        let same = ReadWorkMetrics::register(&registry).unwrap();
+        metrics.peer_payload_reserved(4 * 1024 * 1024, 4 * 1024 * 1024);
+        same.peer_payload_reserved(1024 * 1024, 1024 * 1024);
+        same.peer_payload_released(4 * 1024 * 1024);
+        assert_eq!(metrics.peer_payload_bytes.get(), 1024 * 1024);
+        assert_eq!(metrics.peer_payload_peak_bytes.get(), 5 * 1024 * 1024);
+        metrics.peer_payload_released(1024 * 1024);
+        assert_eq!(same.peer_payload_bytes.get(), 0);
+        assert_eq!(
+            metrics.peer_payload_reserved.get(),
+            metrics.peer_payload_released.get()
+        );
+        metrics.peer_object_cache("hit");
+        metrics.peer_object_cache("miss");
+        metrics.peer_object_cache("unbounded-label");
+        assert_eq!(same.peer_object_cache.with_label_values(&["hit"]).get(), 1);
+        assert_eq!(same.peer_object_cache.with_label_values(&["miss"]).get(), 1);
+    }
+}

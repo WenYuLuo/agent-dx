@@ -10,15 +10,17 @@ use std::{
     collections::{HashMap, HashSet},
     fs::{self, File, OpenOptions},
     io::{BufRead, BufReader, Write},
+    ops::{Bound, Deref, RangeBounds},
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, Weak,
         atomic::{AtomicU64, Ordering},
     },
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use afs_error::{Error, Result};
+use afs_tracing::tracing;
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
@@ -33,31 +35,640 @@ use crate::{
     node::{storage::localfs::capacity_from_statvfs_fd, vfs::types::FilesystemCapacity},
 };
 
+// A generation identifies one checkout, even when jemalloc or the idle pool
+// reuses the same address. It is diagnostic identity, never persistent identity.
+static WRITE_ALLOCATION_GENERATION: AtomicU64 = AtomicU64::new(1);
+const MAX_IDLE_WRITE_BUFFERS: usize = 1024;
+
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub struct WriteBufferPoolStats {
+    pub live_bytes: usize,
+    pub live_buffers: usize,
+    pub live_peak_bytes: usize,
+    pub idle_bytes: usize,
+    pub idle_buffers: usize,
+    pub allocations: u64,
+    pub reuses: u64,
+    pub released_bytes: u64,
+    pub released_buffers: u64,
+    pub copied_bytes: u64,
+    pub copy_operations: u64,
+}
+
 #[derive(Debug, Default)]
-pub struct ChunkBuilder {
+struct WriteBufferPoolState {
+    idle: Vec<Vec<u8>>,
+    stats: WriteBufferPoolStats,
+    stopped: bool,
+    metrics: Option<WriteBufferPoolMetrics>,
+    #[cfg(test)]
+    fail_next_allocation: bool,
+}
+
+#[derive(Debug)]
+struct WriteBufferPoolMetrics {
+    live_bytes: afs_metrics::IntGauge,
+    live_buffers: afs_metrics::IntGauge,
+    live_peak_bytes: afs_metrics::IntGauge,
+    idle_bytes: afs_metrics::IntGauge,
+    idle_buffers: afs_metrics::IntGauge,
+    allocations: afs_metrics::IntCounter,
+    reuses: afs_metrics::IntCounter,
+    released_bytes: afs_metrics::IntCounter,
+    released_buffers: afs_metrics::IntCounter,
+    copied_bytes: afs_metrics::IntCounter,
+    copy_operations: afs_metrics::IntCounter,
+    previous: WriteBufferPoolStats,
+}
+
+impl WriteBufferPoolMetrics {
+    fn register(
+        registry: &afs_metrics::Registry,
+    ) -> std::result::Result<Self, afs_metrics::MetricsError> {
+        let live_bytes = afs_metrics::IntGauge::new(
+            "afs_dfs_write_buffer_live_bytes",
+            "Actual capacity of final write allocations still held by any owner.",
+        )?;
+        let live_buffers = afs_metrics::IntGauge::new(
+            "afs_dfs_write_buffer_live_allocations",
+            "Final write allocations still held by any owner.",
+        )?;
+        let live_peak_bytes = afs_metrics::IntGauge::new(
+            "afs_dfs_write_buffer_live_peak_bytes",
+            "Peak actual live final write allocation capacity.",
+        )?;
+        let idle_bytes = afs_metrics::IntGauge::new(
+            "afs_dfs_write_buffer_idle_bytes",
+            "Actual capacity retained only by the bounded idle list.",
+        )?;
+        let idle_buffers = afs_metrics::IntGauge::new(
+            "afs_dfs_write_buffer_idle_allocations",
+            "Allocations retained only by the bounded idle list.",
+        )?;
+        let allocations = afs_metrics::IntCounter::new(
+            "afs_dfs_write_buffer_allocations_total",
+            "Successful new final write payload allocations.",
+        )?;
+        let reuses = afs_metrics::IntCounter::new(
+            "afs_dfs_write_buffer_reuses_total",
+            "Idle allocations checked out without moving payload storage.",
+        )?;
+        let released_bytes = afs_metrics::IntCounter::new(
+            "afs_dfs_write_buffer_released_bytes_total",
+            "Allocation capacity released from the pool to the allocator, not a physical RSS measurement.",
+        )?;
+        let released_buffers = afs_metrics::IntCounter::new(
+            "afs_dfs_write_buffer_released_allocations_total",
+            "Final write allocations released to the allocator.",
+        )?;
+        let copied_bytes = afs_metrics::IntCounter::new(
+            "afs_dfs_write_buffer_input_copy_bytes_total",
+            "Actual input bytes copied into final mutable write buffers.",
+        )?;
+        let copy_operations = afs_metrics::IntCounter::new(
+            "afs_dfs_write_buffer_input_copies_total",
+            "Actual slice-copy or extend entries into final mutable write buffers.",
+        )?;
+        afs_metrics::register_collector(registry, &live_bytes)?;
+        afs_metrics::register_collector(registry, &live_buffers)?;
+        afs_metrics::register_collector(registry, &live_peak_bytes)?;
+        afs_metrics::register_collector(registry, &idle_bytes)?;
+        afs_metrics::register_collector(registry, &idle_buffers)?;
+        afs_metrics::register_collector(registry, &allocations)?;
+        afs_metrics::register_collector(registry, &reuses)?;
+        afs_metrics::register_collector(registry, &released_bytes)?;
+        afs_metrics::register_collector(registry, &released_buffers)?;
+        afs_metrics::register_collector(registry, &copied_bytes)?;
+        afs_metrics::register_collector(registry, &copy_operations)?;
+        Ok(Self {
+            live_bytes,
+            live_buffers,
+            live_peak_bytes,
+            idle_bytes,
+            idle_buffers,
+            allocations,
+            reuses,
+            released_bytes,
+            released_buffers,
+            copied_bytes,
+            copy_operations,
+            previous: WriteBufferPoolStats::default(),
+        })
+    }
+
+    fn publish(&mut self, stats: WriteBufferPoolStats) {
+        self.live_bytes
+            .set(i64::try_from(stats.live_bytes).unwrap_or(i64::MAX));
+        self.live_buffers
+            .set(i64::try_from(stats.live_buffers).unwrap_or(i64::MAX));
+        self.live_peak_bytes
+            .set(i64::try_from(stats.live_peak_bytes).unwrap_or(i64::MAX));
+        self.idle_bytes
+            .set(i64::try_from(stats.idle_bytes).unwrap_or(i64::MAX));
+        self.idle_buffers
+            .set(i64::try_from(stats.idle_buffers).unwrap_or(i64::MAX));
+        self.allocations
+            .inc_by(stats.allocations.saturating_sub(self.previous.allocations));
+        self.reuses
+            .inc_by(stats.reuses.saturating_sub(self.previous.reuses));
+        self.released_bytes.inc_by(
+            stats
+                .released_bytes
+                .saturating_sub(self.previous.released_bytes),
+        );
+        self.released_buffers.inc_by(
+            stats
+                .released_buffers
+                .saturating_sub(self.previous.released_buffers),
+        );
+        self.copied_bytes.inc_by(
+            stats
+                .copied_bytes
+                .saturating_sub(self.previous.copied_bytes),
+        );
+        self.copy_operations.inc_by(
+            stats
+                .copy_operations
+                .saturating_sub(self.previous.copy_operations),
+        );
+        self.previous = stats;
+    }
+}
+
+impl WriteBufferPoolState {
+    fn publish_metrics(&mut self) {
+        if let Some(metrics) = &mut self.metrics {
+            metrics.publish(self.stats);
+        }
+    }
+}
+
+/// Nonblocking reuse of released write allocations. The baseline bounds only
+/// idle capacity; it never grants, waits for or limits live payload capacity.
+#[derive(Debug)]
+pub struct WriteBufferPool {
+    idle_baseline_bytes: usize,
+    state: Mutex<WriteBufferPoolState>,
+}
+
+impl WriteBufferPool {
+    pub fn new(idle_baseline_bytes: usize) -> Arc<Self> {
+        Arc::new(Self {
+            idle_baseline_bytes,
+            state: Mutex::new(WriteBufferPoolState::default()),
+        })
+    }
+
+    /// Register exact lifecycle counters with the process-owned registry.
+    pub fn register_metrics(
+        &self,
+        registry: &afs_metrics::Registry,
+    ) -> std::result::Result<(), afs_metrics::MetricsError> {
+        let metrics = WriteBufferPoolMetrics::register(registry)?;
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.metrics = Some(metrics);
+        state.publish_metrics();
+        Ok(())
+    }
+
+    pub fn snapshot(&self) -> WriteBufferPoolStats {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.stats
+    }
+
+    /// Release retained idle allocations outside the pool lock. Live owners
+    /// continue to own their allocation; future returns cannot enter the pool.
+    pub fn stop(&self) {
+        let idle = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.stopped = true;
+            state.stats.released_bytes = state
+                .stats
+                .released_bytes
+                .saturating_add(state.stats.idle_bytes as u64);
+            state.stats.released_buffers = state
+                .stats
+                .released_buffers
+                .saturating_add(state.stats.idle_buffers as u64);
+            state.stats.idle_bytes = 0;
+            state.stats.idle_buffers = 0;
+            state.publish_metrics();
+            std::mem::take(&mut state.idle)
+        };
+        drop(idle);
+    }
+
+    fn checkout(self: &Arc<Self>, capacity: usize) -> Result<ChunkBuffer> {
+        {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| invalid("write buffer pool is poisoned"))?;
+            let index = if state.stopped {
+                None
+            } else {
+                state
+                    .idle
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, bytes)| {
+                        bytes.capacity() >= capacity
+                            && bytes.capacity() < capacity.saturating_mul(2)
+                    })
+                    .min_by_key(|(_, bytes)| bytes.capacity())
+                    .map(|(index, _)| index)
+            };
+            if let Some(index) = index {
+                let bytes = state.idle.swap_remove(index);
+                state.stats.idle_bytes -= bytes.capacity();
+                state.stats.idle_buffers -= 1;
+                state.stats.live_bytes += bytes.capacity();
+                state.stats.live_buffers += 1;
+                state.stats.live_peak_bytes =
+                    state.stats.live_peak_bytes.max(state.stats.live_bytes);
+                state.stats.reuses += 1;
+                state.publish_metrics();
+                drop(state);
+                let allocation_id = WRITE_ALLOCATION_GENERATION.fetch_add(1, Ordering::Relaxed);
+                afs_logging::debug!("dfs.write_buffer.checkout";
+                    "event" => "checkout",
+                    "reused" => true,
+                    "allocation_id" => allocation_id,
+                    "capacity" => bytes.capacity() as u64,
+                    "body_pointer" => bytes.as_ptr() as usize,
+                );
+                return Ok(ChunkBuffer {
+                    bytes,
+                    pool: Arc::downgrade(self),
+                    allocation_id,
+                });
+            }
+            #[cfg(test)]
+            if std::mem::take(&mut state.fail_next_allocation) {
+                return Err(write_allocation_error());
+            }
+        }
+        // Only metadata/list lookup is under the lock. Payload allocation and
+        // allocator failure handling happen outside it.
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(capacity)
+            .map_err(|_| write_allocation_error())?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| invalid("write buffer pool is poisoned"))?;
+        state.stats.live_bytes += bytes.capacity();
+        state.stats.live_buffers += 1;
+        state.stats.live_peak_bytes = state.stats.live_peak_bytes.max(state.stats.live_bytes);
+        state.stats.allocations += 1;
+        state.publish_metrics();
+        drop(state);
+        let allocation_id = WRITE_ALLOCATION_GENERATION.fetch_add(1, Ordering::Relaxed);
+        afs_logging::debug!("dfs.write_buffer.checkout";
+            "event" => "checkout",
+            "reused" => false,
+            "allocation_id" => allocation_id,
+            "capacity" => bytes.capacity() as u64,
+            "body_pointer" => bytes.as_ptr() as usize,
+        );
+        Ok(ChunkBuffer {
+            bytes,
+            pool: Arc::downgrade(self),
+            allocation_id,
+        })
+    }
+
+    fn record_copy(&self, bytes: usize) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.stats.copied_bytes = state.stats.copied_bytes.saturating_add(bytes as u64);
+        state.stats.copy_operations = state.stats.copy_operations.saturating_add(1);
+        state.publish_metrics();
+    }
+
+    #[cfg(test)]
+    pub(super) fn fail_next_allocation(&self) {
+        self.state.lock().unwrap().fail_next_allocation = true;
+    }
+}
+
+#[derive(Debug)]
+struct ChunkBuffer {
     bytes: Vec<u8>,
+    pool: Weak<WriteBufferPool>,
+    allocation_id: u64,
+}
+
+impl ChunkBuffer {
+    fn unpooled(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes,
+            pool: Weak::new(),
+            allocation_id: WRITE_ALLOCATION_GENERATION.fetch_add(1, Ordering::Relaxed),
+        }
+    }
+}
+
+impl Drop for ChunkBuffer {
+    fn drop(&mut self) {
+        let capacity = self.bytes.capacity();
+        let body_pointer = self.bytes.as_ptr() as usize;
+        let Some(pool) = self.pool.upgrade() else {
+            let bytes = std::mem::take(&mut self.bytes);
+            drop(bytes);
+            afs_logging::debug!("dfs.write_buffer.last_owner_release";
+                "event" => "last_owner_release",
+                "allocation_id" => self.allocation_id,
+                "capacity" => capacity as u64,
+                "body_pointer" => body_pointer,
+                "reason" => "pool_unavailable",
+            );
+            return;
+        };
+        let mut bytes = std::mem::take(&mut self.bytes);
+        // Clear the initialized logical length. On reuse, resize initializes
+        // each newly exposed byte before any caller can read a previous body.
+        bytes.clear();
+        {
+            let mut state = pool
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.stats.live_bytes -= capacity;
+            state.stats.live_buffers -= 1;
+            if !state.stopped
+                && capacity != 0
+                && state.idle.len() < MAX_IDLE_WRITE_BUFFERS
+                && capacity
+                    <= pool
+                        .idle_baseline_bytes
+                        .saturating_sub(state.stats.idle_bytes)
+            {
+                state.stats.idle_bytes += capacity;
+                state.stats.idle_buffers += 1;
+                state.idle.push(bytes);
+                state.publish_metrics();
+                drop(state);
+                afs_logging::debug!("dfs.write_buffer.last_owner_return";
+                    "event" => "last_owner_return",
+                    "allocation_id" => self.allocation_id,
+                    "capacity" => capacity as u64,
+                    "body_pointer" => body_pointer,
+                );
+                return;
+            }
+            state.stats.released_bytes = state.stats.released_bytes.saturating_add(capacity as u64);
+            state.stats.released_buffers = state.stats.released_buffers.saturating_add(1);
+            state.publish_metrics();
+        }
+        // Ineligible allocations are freed only after releasing the pool lock.
+        drop(bytes);
+        afs_logging::debug!("dfs.write_buffer.last_owner_release";
+            "event" => "last_owner_release",
+            "allocation_id" => self.allocation_id,
+            "capacity" => capacity as u64,
+            "body_pointer" => body_pointer,
+            "reason" => "idle_not_retained",
+        );
+    }
+}
+
+/// Shared immutable view of one final allocation. Cloning or slicing moves
+/// ownership metadata only; the final reference retires the entire allocation.
+#[derive(Clone, Debug)]
+pub struct SharedChunkBytes {
+    buffer: Arc<ChunkBuffer>,
+    start: usize,
+    end: usize,
+}
+
+impl SharedChunkBytes {
+    pub fn from_vec(bytes: Vec<u8>) -> Self {
+        Self::from_buffer(ChunkBuffer::unpooled(bytes))
+    }
+
+    fn from_buffer(buffer: ChunkBuffer) -> Self {
+        let end = buffer.bytes.len();
+        Self {
+            buffer: Arc::new(buffer),
+            start: 0,
+            end,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.end - self.start
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    pub fn as_ptr(&self) -> *const u8 {
+        self.as_ref().as_ptr()
+    }
+    pub fn capacity(&self) -> usize {
+        self.buffer.bytes.capacity()
+    }
+    pub fn allocation_id(&self) -> u64 {
+        self.buffer.allocation_id
+    }
+
+    /// Share a subrange without changing the retained allocation or its charge.
+    ///
+    /// # Panics
+    /// Panics when the requested range is outside this view or overflows usize.
+    pub fn slice(&self, range: impl RangeBounds<usize>) -> Self {
+        let start = match range.start_bound() {
+            Bound::Included(value) => *value,
+            Bound::Excluded(value) => value
+                .checked_add(1)
+                .expect("shared chunk range start overflow"),
+            Bound::Unbounded => 0,
+        };
+        let end = match range.end_bound() {
+            Bound::Included(value) => value
+                .checked_add(1)
+                .expect("shared chunk range end overflow"),
+            Bound::Excluded(value) => *value,
+            Bound::Unbounded => self.len(),
+        };
+        assert!(
+            start <= end && end <= self.len(),
+            "shared chunk range is outside its view"
+        );
+        Self {
+            buffer: self.buffer.clone(),
+            start: self.start + start,
+            end: self.start + end,
+        }
+    }
+}
+
+impl From<Vec<u8>> for SharedChunkBytes {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self::from_vec(bytes)
+    }
+}
+
+impl AsRef<[u8]> for SharedChunkBytes {
+    fn as_ref(&self) -> &[u8] {
+        &self.buffer.bytes[self.start..self.end]
+    }
+}
+
+impl Deref for SharedChunkBytes {
+    type Target = [u8];
+    fn deref(&self) -> &Self::Target {
+        self.as_ref()
+    }
+}
+
+/// One mutable final payload allocation. Pooled builders are fixed capacity;
+/// the legacy Default builder remains fallibly growable for other callers.
+#[derive(Debug)]
+pub struct ChunkBuilder {
+    buffer: ChunkBuffer,
+    fixed_capacity: Option<usize>,
+}
+
+impl Default for ChunkBuilder {
+    fn default() -> Self {
+        Self {
+            buffer: ChunkBuffer::unpooled(Vec::new()),
+            fixed_capacity: None,
+        }
+    }
 }
 
 impl ChunkBuilder {
+    /// Acquire capacity without a live quota. Allocation refusal returns ENOMEM.
+    pub fn with_pool(pool: Arc<WriteBufferPool>, capacity: usize) -> Result<Self> {
+        Ok(Self {
+            buffer: pool.checkout(capacity)?,
+            fixed_capacity: Some(capacity),
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.buffer.bytes.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.buffer.bytes.is_empty()
+    }
+    pub fn capacity(&self) -> usize {
+        self.buffer.bytes.capacity()
+    }
+    /// Usable body limit; actual allocation capacity may be larger on reuse.
+    pub fn writable_capacity(&self) -> usize {
+        self.fixed_capacity.unwrap_or_else(|| self.capacity())
+    }
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.buffer.bytes
+    }
+    pub fn data_ptr(&self) -> *const u8 {
+        self.buffer.bytes.as_ptr()
+    }
+    pub fn allocation_id(&self) -> u64 {
+        self.buffer.allocation_id
+    }
+
+    /// Copy accepted input directly to the final storage. Fixed builders never
+    /// reallocate; allocation errors leave the previous bytes and length intact.
     pub fn write_at(&mut self, offset: u64, data: &[u8]) -> Result<usize> {
+        if data.is_empty() {
+            return Ok(0);
+        }
         let offset = usize::try_from(offset).map_err(|_| invalid("chunk offset is too large"))?;
         let end = offset
             .checked_add(data.len())
             .ok_or_else(|| invalid("chunk write range overflow"))?;
-        if end > self.bytes.len() {
-            self.bytes.resize(end, 0);
+        if self.fixed_capacity.is_some_and(|capacity| end > capacity) {
+            return Err(write_allocation_error());
         }
-        self.bytes[offset..end].copy_from_slice(data);
+        if end > self.buffer.bytes.capacity() {
+            self.buffer
+                .bytes
+                .try_reserve_exact(end - self.buffer.bytes.len())
+                .map_err(|_| write_allocation_error())?;
+        }
+        let old_len = self.buffer.bytes.len();
+        let overwritten = old_len.saturating_sub(offset).min(data.len());
+        if overwritten != 0 {
+            self.buffer.bytes[offset..offset + overwritten].copy_from_slice(&data[..overwritten]);
+            self.record_input_copy(offset, overwritten);
+        }
+        if overwritten < data.len() {
+            if offset > old_len {
+                self.buffer.bytes.resize(offset, 0);
+            }
+            // Capacity has already been proved sufficient, so this extend
+            // initializes only accepted input and cannot move the allocation.
+            self.buffer.bytes.extend_from_slice(&data[overwritten..]);
+            self.record_input_copy(offset + overwritten, data.len() - overwritten);
+        }
         Ok(data.len())
     }
 
+    fn record_input_copy(&self, offset: usize, bytes: usize) {
+        if let Some(pool) = self.buffer.pool.upgrade() {
+            pool.record_copy(bytes);
+        }
+        afs_logging::debug!("dfs.write_buffer.input_copy";
+            "event" => "input_copy",
+            "allocation_id" => self.allocation_id(),
+            "capacity" => self.capacity() as u64,
+            "body_pointer" => self.data_ptr() as usize,
+            "buffer_offset" => offset as u64,
+            "copied_bytes" => bytes as u64,
+        );
+    }
+
+    /// Shrink logical content without releasing or reallocating its storage.
+    pub fn truncate(&mut self, length: usize) {
+        self.buffer.bytes.truncate(length);
+    }
+
+    /// Legacy full-body ownership transfer; pooled builders are not used here.
     pub fn replace(&mut self, bytes: Vec<u8>) {
-        self.bytes = bytes;
+        self.buffer = ChunkBuffer::unpooled(bytes);
+        self.fixed_capacity = None;
+    }
+
+    pub fn freeze(self) -> SharedChunkBytes {
+        let pointer_before = self.data_ptr() as usize;
+        let frozen = SharedChunkBytes::from_buffer(self.buffer);
+        afs_logging::debug!("dfs.write_buffer.freeze";
+            "event" => "freeze",
+            "allocation_id" => frozen.allocation_id(),
+            "capacity" => frozen.capacity() as u64,
+            "body_bytes" => frozen.len() as u64,
+            "pointer_before" => pointer_before,
+            "pointer_after" => frozen.as_ptr() as usize,
+        );
+        frozen
     }
 
     pub fn stage(self, operation_id: OperationId) -> StagedChunk {
-        StagedChunk::new(operation_id, self.bytes)
+        StagedChunk::from_shared(operation_id, self.freeze())
     }
+}
+
+fn write_allocation_error() -> Error {
+    Error::coded(
+        afs_error::IO_OUT_OF_MEMORY,
+        "write buffer capacity allocation refused",
+    )
 }
 
 /// Shared producer/replica budget per immutable staged chunk, never a file limit.
@@ -68,37 +679,194 @@ pub(crate) const MAX_STAGED_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 pub struct StagedChunk {
     pub operation_id: OperationId,
     pub chunk: ChunkObject,
-    bytes: Arc<[u8]>,
+    bytes: SharedChunkBytes,
+    // This private identity is produced only by the complete initial hash. Public
+    // metadata remains compatible with replica callers, but is not itself proof.
+    #[cfg(feature = "dfs")]
+    sealed_chunk: ChunkObject,
+    #[cfg(feature = "dfs")]
+    write_budget: Vec<WriteBudgetReservation>,
 }
 
 impl StagedChunk {
     pub fn new(operation_id: OperationId, bytes: Vec<u8>) -> Self {
-        let bytes: Arc<[u8]> = bytes.into();
-        let content_digest = digest(&bytes);
-        let chunk = ChunkObject {
-            id: ChunkId::new(format!(
-                "blake3-{}-{}",
-                digest_hex(&content_digest),
-                bytes.len()
-            )),
-            length: bytes.len() as u64,
-            content_digest,
-            encoding: ChunkEncoding::Raw,
-        };
-        Self {
+        Self::from_shared(
             operation_id,
-            chunk,
-            bytes,
-        }
+            SharedChunkBytes::from_buffer(ChunkBuffer::unpooled(bytes)),
+        )
+    }
+
+    pub fn from_shared(operation_id: OperationId, bytes: SharedChunkBytes) -> Self {
+        tracing::info_span!(
+            "node.dfs.chunk.stage",
+            operation_id = %operation_id.0,
+            bytes = bytes.len() as u64,
+            allocation_id = bytes.allocation_id(),
+            capacity = bytes.capacity() as u64,
+            body_pointer = bytes.as_ptr() as usize,
+            chunk_id = tracing::field::Empty,
+        )
+        .in_scope(|| {
+            let bytes_len = bytes.len() as u64;
+            let content_digest = tracing::info_span!("node.dfs.chunk.hash", bytes = bytes_len,)
+                .in_scope(|| digest(&bytes));
+            let chunk = ChunkObject {
+                id: ChunkId::new(format!(
+                    "blake3-{}-{}",
+                    digest_hex(&content_digest),
+                    bytes.len()
+                )),
+                length: bytes.len() as u64,
+                content_digest,
+                encoding: ChunkEncoding::Raw,
+            };
+            tracing::Span::current().record("chunk_id", chunk.id.0.as_str());
+            Self {
+                operation_id,
+                #[cfg(feature = "dfs")]
+                sealed_chunk: chunk.clone(),
+                chunk,
+                bytes,
+                #[cfg(feature = "dfs")]
+                write_budget: Vec::new(),
+            }
+        })
     }
 
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }
+
+    /// Content proof only: operation identity, authorization and persistence
+    /// still require their own checks. No mutable payload is exposed.
+    #[cfg(feature = "dfs")]
+    pub(super) fn has_sealed_identity(&self) -> bool {
+        self.chunk == self.sealed_chunk && self.chunk.length == self.bytes.len() as u64
+    }
+
+    #[cfg(feature = "dfs")]
+    pub(super) fn write_budget_reservations(&self) -> &[WriteBudgetReservation] {
+        &self.write_budget
+    }
+
+    #[cfg(feature = "dfs")]
+    pub(super) fn retain_write_budget(&mut self, reservations: &[WriteBudgetReservation]) {
+        self.write_budget.extend_from_slice(reservations);
+    }
+
+    #[cfg(feature = "dfs")]
+    pub(crate) fn shared_bytes(&self) -> SharedChunkBytes {
+        self.bytes.clone()
+    }
+}
+
+#[cfg(feature = "dfs")]
+impl AsRef<[u8]> for StagedChunk {
+    fn as_ref(&self) -> &[u8] {
+        self.bytes()
+    }
+}
+
+// The VFS owns admission limits. These typed leases live beside their immutable
+// payload so HTTP body/retry ownership can outlive a ticket or a dirty window.
+#[cfg(feature = "dfs")]
+#[derive(Debug, Default)]
+pub(super) struct DeferredWriteBudget {
+    pub(super) state: Mutex<DeferredWriteBudgetState>,
+}
+
+#[cfg(feature = "dfs")]
+#[derive(Debug, Default)]
+pub(super) struct DeferredWriteBudgetState {
+    pub(super) normal_bytes: u64,
+    pub(super) publisher_bytes: u64,
+    pub(super) descriptor_bytes: u64,
+    pub(super) descriptors: usize,
+}
+
+#[cfg(feature = "dfs")]
+#[derive(Clone, Debug)]
+pub(super) struct WriteBudgetReservation {
+    _inner: Arc<WriteBudgetReservationInner>,
+}
+
+#[cfg(feature = "dfs")]
+#[derive(Debug)]
+struct WriteBudgetReservationInner {
+    budget: Arc<DeferredWriteBudget>,
+    normal_bytes: u64,
+    publisher_bytes: u64,
+    descriptor_bytes: u64,
+    descriptors: usize,
+}
+
+#[cfg(feature = "dfs")]
+impl WriteBudgetReservation {
+    pub(super) fn reduce_normal_to(&mut self, bytes: u64) -> Result<()> {
+        let inner = Arc::get_mut(&mut self._inner)
+            .ok_or_else(|| invalid("shared payload lease cannot be resized"))?;
+        if bytes > inner.normal_bytes {
+            return Err(invalid("payload lease reduction cannot grow its charge"));
+        }
+        let mut state = inner.budget.state.lock().map_err(|_| {
+            Error::coded(
+                afs_error::NODE_VFS_UNAVAILABLE,
+                "DFS deferred write budget is poisoned",
+            )
+        })?;
+        state.normal_bytes = state
+            .normal_bytes
+            .saturating_sub(inner.normal_bytes - bytes);
+        inner.normal_bytes = bytes;
+        Ok(())
+    }
+
+    pub(super) fn new(
+        budget: Arc<DeferredWriteBudget>,
+        normal_bytes: u64,
+        publisher_bytes: u64,
+        descriptor_bytes: u64,
+        descriptors: usize,
+    ) -> Self {
+        Self {
+            _inner: Arc::new(WriteBudgetReservationInner {
+                budget,
+                normal_bytes,
+                publisher_bytes,
+                descriptor_bytes,
+                descriptors,
+            }),
+        }
+    }
+}
+
+#[cfg(feature = "dfs")]
+impl Drop for WriteBudgetReservationInner {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.budget.state.lock() {
+            state.normal_bytes = state.normal_bytes.saturating_sub(self.normal_bytes);
+            state.publisher_bytes = state.publisher_bytes.saturating_sub(self.publisher_bytes);
+            state.descriptor_bytes = state.descriptor_bytes.saturating_sub(self.descriptor_bytes);
+            state.descriptors = state.descriptors.saturating_sub(self.descriptors);
+        }
+    }
 }
 
 pub trait ChunkStore: Send + Sync {
     fn put_batch(&self, staged: Vec<StagedChunk>) -> Result<Vec<ChunkReceipt>>;
+
+    fn supports_deferred_put(&self) -> bool {
+        false
+    }
+
+    /// Submit owned chunks without waiting for persistence. Unsupported backends
+    /// reject explicitly; callers must check supports_deferred_put first.
+    fn put_batch_deferred(&self, _staged: Vec<StagedChunk>) -> Result<Box<dyn DeferredChunkPut>> {
+        Err(Error::coded(
+            afs_error::NODE_VFS_UNIMPLEMENTED,
+            "deferred chunk PUT is unsupported for this backend",
+        ))
+    }
 
     fn put(&self, staged: StagedChunk) -> Result<ChunkReceipt> {
         self.put_batch(vec![staged])?
@@ -114,6 +882,14 @@ pub trait ChunkStore: Send + Sync {
             "ChunkStore capacity is unsupported for this backend",
         ))
     }
+}
+
+pub trait DeferredChunkPut: Send {
+    fn try_wait(&mut self) -> Result<Option<Vec<ChunkReceipt>>> {
+        Ok(None)
+    }
+
+    fn wait(self: Box<Self>) -> Result<Vec<ChunkReceipt>>;
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -156,6 +932,7 @@ pub struct RecoveryReport {
 pub struct PinnedChunkReader {
     file: File,
     chunk: ChunkObject,
+    read_work: Option<super::read_work::ReadWorkMetrics>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -175,8 +952,17 @@ impl PinnedChunkReader {
         // A pinned descriptor protects identity across rename, not integrity
         // after disk damage. Return the exact bytes covered by this digest,
         // rather than verifying and then issuing another unverified read.
-        let bytes = verified_range(&self.file, &self.chunk, offset, allowed)?;
+        let bytes = verified_range(
+            &self.file,
+            &self.chunk,
+            offset,
+            allowed,
+            self.read_work.as_ref(),
+        )?;
         out[..allowed].copy_from_slice(&bytes);
+        if let Some(metrics) = &self.read_work {
+            metrics.copy("pinned_range_to_output", allowed as u64);
+        }
         Ok(allowed)
     }
 
@@ -184,12 +970,20 @@ impl PinnedChunkReader {
     /// uncommitted staging buffer. The staging buffer may be dirtied before an
     /// error is returned; callers must publish it only after the outer read
     /// batch succeeds.
+    #[cfg(any(feature = "dfs", test))]
     pub(crate) fn read_ranges_at_uncommitted(
         &self,
         ranges: &[VerifiedRangeCopy],
         out: &mut [u8],
     ) -> Result<Vec<usize>> {
-        verified_ranges_into(&self.file, &self.chunk, ranges, out, false)
+        verified_ranges_into(
+            &self.file,
+            &self.chunk,
+            ranges,
+            out,
+            false,
+            self.read_work.as_ref(),
+        )
     }
 }
 
@@ -276,6 +1070,184 @@ impl LocalCatalog {
     }
 }
 
+/// Shared across the current verified object, in-flight ranges and RDMA packed
+/// payloads. This replaces independent per-request payload allowances; it does
+/// not add a second retained-cache budget.
+#[cfg(any(feature = "dfs", test))]
+pub(crate) const PEER_READ_PAYLOAD_LIMIT: usize = 8 * 1024 * 1024;
+#[cfg(any(feature = "dfs", test))]
+pub(crate) const PEER_READ_OBJECT_LIMIT: usize = 4 * 1024 * 1024;
+
+#[derive(Debug, Default)]
+#[cfg(any(feature = "dfs", test))]
+struct PeerReadBudget {
+    used: AtomicU64,
+    peak: AtomicU64,
+}
+
+#[derive(Debug)]
+#[cfg(any(feature = "dfs", test))]
+pub(crate) struct PeerReadReservation {
+    budget: Arc<PeerReadBudget>,
+    bytes: u64,
+    metrics: Option<super::read_work::ReadWorkMetrics>,
+}
+
+#[cfg(any(feature = "dfs", test))]
+impl PeerReadReservation {
+    // Vec::try_reserve_exact normally gives the requested capacity; still
+    // account the allocator's actual capacity before handing a payload onward.
+    pub(crate) fn retain_capacity(&mut self, capacity: usize) -> Result<()> {
+        let capacity = u64::try_from(capacity).map_err(|_| peer_payload_capacity())?;
+        if capacity > self.bytes {
+            let extra = capacity - self.bytes;
+            reserve_peer_bytes(&self.budget, extra, self.metrics.as_ref())?;
+            self.bytes = capacity;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(any(feature = "dfs", test))]
+impl Drop for PeerReadReservation {
+    fn drop(&mut self) {
+        self.budget.used.fetch_sub(self.bytes, Ordering::AcqRel);
+        if let Some(metrics) = &self.metrics {
+            metrics.peer_payload_released(self.bytes);
+        }
+    }
+}
+
+#[cfg(any(feature = "dfs", test))]
+fn peer_payload_capacity() -> Error {
+    Error::coded(
+        afs_error::IO_CAPACITY,
+        "shared Peer read payload budget exhausted",
+    )
+}
+
+#[cfg(any(feature = "dfs", test))]
+fn reserve_peer_bytes(
+    budget: &PeerReadBudget,
+    bytes: u64,
+    metrics: Option<&super::read_work::ReadWorkMetrics>,
+) -> Result<()> {
+    let mut used = budget.used.load(Ordering::Acquire);
+    loop {
+        let next = used
+            .checked_add(bytes)
+            .filter(|next| *next <= PEER_READ_PAYLOAD_LIMIT as u64)
+            .ok_or_else(peer_payload_capacity)?;
+        match budget
+            .used
+            .compare_exchange_weak(used, next, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => {
+                let old_peak = budget.peak.fetch_max(next, Ordering::AcqRel);
+                if let Some(metrics) = metrics {
+                    metrics.peer_payload_reserved(bytes, next.saturating_sub(old_peak));
+                }
+                return Ok(());
+            }
+            Err(actual) => used = actual,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(any(feature = "dfs", test))]
+struct PeerFileIdentity {
+    length: u64,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    modified: (i64, i64),
+    #[cfg(unix)]
+    changed: (i64, i64),
+}
+
+#[cfg(any(feature = "dfs", test))]
+impl PeerFileIdentity {
+    fn read(file: &File) -> Result<Self> {
+        let metadata = file.metadata().map_err(Error::from)?;
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        Ok(Self {
+            length: metadata.len(),
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+            #[cfg(unix)]
+            modified: (metadata.mtime(), metadata.mtime_nsec()),
+            #[cfg(unix)]
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
+        })
+    }
+}
+
+#[derive(Debug)]
+#[cfg(any(feature = "dfs", test))]
+struct PeerVerifiedObject {
+    bytes: Vec<u8>,
+    _reservation: PeerReadReservation,
+    // A range fallback is never resident and needs no reusable identity.
+    identity: Option<(LocalChunkRecord, PeerFileIdentity)>,
+}
+
+/// A view into an immutable private allocation. Its shared reservation remains
+/// charged even after the single cache slot is replaced or an RPC is cancelled.
+#[derive(Debug)]
+#[cfg(any(feature = "dfs", test))]
+pub(crate) struct PeerReadPayload {
+    object: Arc<PeerVerifiedObject>,
+    start: usize,
+    length: usize,
+}
+
+#[cfg(any(feature = "dfs", test))]
+impl PeerReadPayload {
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        &self.object.bytes[self.start..self.start + self.length]
+    }
+
+    #[cfg(feature = "dfs")]
+    pub(crate) fn len(&self) -> usize {
+        self.length
+    }
+
+    /// Content-only proof from the complete verified immutable allocation.
+    /// A subrange or nonresident fallback still needs its own range digest;
+    /// neither transport headers nor callers can manufacture this capability.
+    pub(crate) fn verified_full_object_digest(&self) -> Option<ContentDigest> {
+        let (record, identity) = self.object.identity.as_ref()?;
+        if self.start != 0
+            || self.length != self.object.bytes.len()
+            || self.length as u64 != record.chunk.length
+            || identity.length != record.chunk.length
+            || record.stored_length != record.chunk.length
+            || record.stored_checksum != record.chunk.content_digest
+        {
+            return None;
+        }
+        Some(record.chunk.content_digest.clone())
+    }
+
+    /// Frame slices retain both immutable bytes and their original budget lease.
+    pub(crate) fn into_shared_bytes(self) -> prost::bytes::Bytes {
+        prost::bytes::Bytes::from_owner(self)
+    }
+}
+
+#[cfg(any(feature = "dfs", test))]
+impl AsRef<[u8]> for PeerReadPayload {
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
 #[derive(Debug)]
 pub struct LocalChunkStore {
     node_id: String,
@@ -288,6 +1260,11 @@ pub struct LocalChunkStore {
     catalog_path: PathBuf,
     catalog: Mutex<LocalCatalog>,
     next_staging: AtomicU64,
+    read_work: Option<super::read_work::ReadWorkMetrics>,
+    #[cfg(any(feature = "dfs", test))]
+    peer_read_budget: Arc<PeerReadBudget>,
+    #[cfg(any(feature = "dfs", test))]
+    peer_read_cache: Mutex<Option<Arc<PeerVerifiedObject>>>,
 }
 
 impl LocalChunkStore {
@@ -312,9 +1289,84 @@ impl LocalChunkStore {
             catalog_path,
             catalog: Mutex::new(catalog),
             next_staging: AtomicU64::new(1),
+            read_work: None,
+            #[cfg(any(feature = "dfs", test))]
+            peer_read_budget: Arc::new(PeerReadBudget::default()),
+            #[cfg(any(feature = "dfs", test))]
+            peer_read_cache: Mutex::new(None),
         };
         store.recover()?;
         Ok(store)
+    }
+
+    #[cfg(any(feature = "dfs", test))]
+    pub(crate) fn with_read_work_metrics(
+        mut self,
+        metrics: super::read_work::ReadWorkMetrics,
+    ) -> Self {
+        self.read_work = Some(metrics);
+        self
+    }
+
+    #[cfg(feature = "dfs")]
+    pub(crate) fn record_peer_disk_cache_event(&self, result: &'static str) {
+        if let Some(metrics) = &self.read_work {
+            metrics.peer_disk_cache_event(result);
+        }
+    }
+
+    #[cfg(feature = "dfs")]
+    pub(crate) fn record_peer_cache_fill_stage(
+        &self,
+        stage: &'static str,
+        wall_ns: u64,
+        cpu_ns: Option<u64>,
+    ) {
+        if let Some(metrics) = &self.read_work {
+            metrics.peer_cache_fill_stage(stage, wall_ns, cpu_ns);
+        }
+    }
+
+    #[cfg(feature = "dfs")]
+    pub(crate) fn peer_disk_cache_fill_work(
+        &self,
+        bytes: usize,
+        output: usize,
+    ) -> Option<super::read_work::PeerCacheFillWork> {
+        self.read_work
+            .as_ref()
+            .map(|metrics| metrics.peer_disk_cache_fill_work(bytes, output))
+    }
+
+    #[cfg(feature = "dfs")]
+    pub(crate) fn peer_disk_cache_stream_work(
+        &self,
+        output: usize,
+    ) -> Option<super::read_work::PeerCacheStreamWork> {
+        self.read_work
+            .as_ref()
+            .map(|metrics| metrics.peer_stream_pipeline(output))
+    }
+
+    #[cfg(feature = "dfs")]
+    pub(crate) fn record_read_hash(&self, stage: &'static str, bytes: u64) {
+        if let Some(metrics) = &self.read_work {
+            metrics.hash(stage, bytes);
+        }
+    }
+
+    #[cfg(feature = "dfs")]
+    pub(crate) fn record_read_copy(&self, stage: &'static str, bytes: u64) {
+        if let Some(metrics) = &self.read_work {
+            metrics.copy(stage, bytes);
+        }
+    }
+
+    #[cfg(feature = "dfs")]
+    pub(crate) fn record_peer_read_event(&self, event: &'static str) {
+        if let Some(metrics) = &self.read_work {
+            metrics.peer_read_event(event);
+        }
     }
 
     pub fn capacity(&self) -> Result<FilesystemCapacity> {
@@ -559,7 +1611,69 @@ impl LocalChunkStore {
             })
     }
 
-    pub fn open_verified(&self, chunk_id: &ChunkId) -> Result<PinnedChunkReader> {
+    /// Fill a caller-owned, unpublished range with one complete integrity scan.
+    /// The output may be dirtied on failure and must not be returned to a peer
+    /// until this operation succeeds. No verified reader or cache is retained.
+    #[cfg(any(all(feature = "dfs", feature = "rdma"), test))]
+    pub(crate) fn read_range_at_uncommitted(
+        &self,
+        chunk_id: &ChunkId,
+        offset: u64,
+        out: &mut [u8],
+    ) -> Result<usize> {
+        let reader = self.open_cataloged(chunk_id)?;
+        let result = verified_ranges_into(
+            &reader.file,
+            &reader.chunk,
+            &[VerifiedRangeCopy {
+                chunk_offset: offset,
+                length: out.len(),
+                output_offset: 0,
+            }],
+            out,
+            true,
+            self.read_work.as_ref(),
+        );
+        result.map(|counts| counts[0]).inspect_err(|error| {
+            if verified_copy_is_invalid(error) {
+                self.try_quarantine(chunk_id);
+            }
+        })
+    }
+
+    #[cfg(any(feature = "dfs", test))]
+    fn reserve_peer_read_payload_inner(&self, bytes: usize) -> Result<PeerReadReservation> {
+        let bytes = u64::try_from(bytes).map_err(|_| peer_payload_capacity())?;
+        reserve_peer_bytes(&self.peer_read_budget, bytes, self.read_work.as_ref())?;
+        Ok(PeerReadReservation {
+            budget: self.peer_read_budget.clone(),
+            bytes,
+            metrics: self.read_work.clone(),
+        })
+    }
+
+    /// Admission is immediate. Eviction can reclaim only an unpinned resident
+    /// object; payloads held by senders keep their charge until the last drop.
+    #[cfg(any(all(feature = "dfs", feature = "rdma"), test))]
+    pub(crate) fn reserve_peer_read_payload(&self, bytes: usize) -> Result<PeerReadReservation> {
+        match self.reserve_peer_read_payload_inner(bytes) {
+            Ok(reservation) => Ok(reservation),
+            Err(error) => {
+                if let Ok(mut slot) = self.peer_read_cache.try_lock()
+                    && slot
+                        .as_ref()
+                        .is_some_and(|object| Arc::strong_count(object) == 1)
+                {
+                    slot.take();
+                }
+                self.reserve_peer_read_payload_inner(bytes)
+                    .map_err(|_| error)
+            }
+        }
+    }
+
+    #[cfg(any(feature = "dfs", test))]
+    fn peer_catalog_record(&self, chunk_id: &ChunkId) -> Result<LocalChunkRecord> {
         let record = self
             .catalog
             .lock()
@@ -571,23 +1685,178 @@ impl LocalChunkStore {
         if record.state != LocalChunkState::Durable {
             return Err(corrupt(chunk_id, "local copy is quarantined"));
         }
-        let path = self.path_for_record(&record)?;
-        let file = File::open(path).map_err(Error::from).and_then(|file| {
-            verified_range(&file, &record.chunk, 0, 0)?;
-            Ok(file)
-        });
-        let file = match file {
-            Ok(file) => file,
-            Err(error) => {
-                if verified_copy_is_invalid(&error) {
+        if record.chunk.id != *chunk_id
+            || record.device_id != self.device_id
+            || record.device_epoch != self.device_epoch
+            || record.stored_length != record.chunk.length
+            || record.stored_checksum != record.chunk.content_digest
+            || record.encoding != PhysicalEncoding::Raw
+        {
+            return Err(invalid(
+                "durable local Chunk record is internally inconsistent",
+            ));
+        }
+        self.path_for_record(&record)?;
+        Ok(record)
+    }
+
+    /// Reuse only the currently demanded object, never prefetch a next object.
+    /// The slot mutex also supplies singleflight for a complete private fill.
+    /// Authorization remains with each caller; this proof is content-only.
+    #[cfg(any(feature = "dfs", test))]
+    pub(crate) fn read_peer_range(
+        &self,
+        chunk_id: &ChunkId,
+        offset: u64,
+        length: usize,
+    ) -> Result<PeerReadPayload> {
+        let mut slot = self
+            .peer_read_cache
+            .lock()
+            .map_err(|_| invalid("Peer verified object lock is poisoned"))?;
+        let result = (|| {
+            let record = self.peer_catalog_record(chunk_id)?;
+            let file = File::open(self.path_for_record(&record)?).map_err(Error::from)?;
+            let before = PeerFileIdentity::read(&file)?;
+            if before.length != record.chunk.length {
+                return Err(corrupt(chunk_id, "length mismatch"));
+            }
+            let allowed = usize::try_from(
+                record
+                    .chunk
+                    .length
+                    .saturating_sub(offset)
+                    .min(length as u64),
+            )
+            .map_err(|_| invalid("Chunk read length is too large"))?;
+            if let Some(object) = slot.as_ref()
+                && object.identity.as_ref() == Some(&(record.clone(), before.clone()))
+            {
+                if self.peer_catalog_record(chunk_id)? != record
+                    || PeerFileIdentity::read(&file)? != before
+                {
+                    return Err(corrupt(chunk_id, "identity changed during cached read"));
+                }
+                if let Some(metrics) = &self.read_work {
+                    metrics.peer_object_cache("hit");
+                }
+                return Ok(PeerReadPayload {
+                    object: object.clone(),
+                    start: usize::try_from(offset.min(record.chunk.length))
+                        .map_err(|_| invalid("Chunk offset is too large"))?,
+                    length: allowed,
+                });
+            }
+            // Never retain an unrelated current object while filling another.
+            // Any externally held old allocation stays alive and fully charged.
+            slot.take();
+            if let Some(metrics) = &self.read_work {
+                metrics.peer_object_cache("miss");
+            }
+            let resident = record.chunk.length <= PEER_READ_OBJECT_LIMIT as u64;
+            let allocation = if resident {
+                usize::try_from(record.chunk.length).map_err(|_| peer_payload_capacity())?
+            } else {
+                allowed
+            };
+            let mut reservation = self.reserve_peer_read_payload_inner(allocation)?;
+            let mut bytes = Vec::new();
+            bytes
+                .try_reserve_exact(allocation)
+                .map_err(|_| peer_payload_capacity())?;
+            reservation.retain_capacity(bytes.capacity())?;
+            bytes.resize(allocation, 0);
+            verified_ranges_into(
+                &file,
+                &record.chunk,
+                &[VerifiedRangeCopy {
+                    chunk_offset: if resident { 0 } else { offset },
+                    length: allocation,
+                    output_offset: 0,
+                }],
+                &mut bytes,
+                true,
+                self.read_work.as_ref(),
+            )?;
+            if PeerFileIdentity::read(&file)? != before
+                || self.peer_catalog_record(chunk_id)? != record
+            {
+                return Err(corrupt(chunk_id, "identity changed during verification"));
+            }
+            // Reopen the path as well: a pinned old descriptor must not seed a
+            // cache after another inode has replaced its cataloged pathname.
+            let current = File::open(self.path_for_record(&record)?).map_err(Error::from)?;
+            if PeerFileIdentity::read(&current)? != before {
+                return Err(corrupt(chunk_id, "path changed during verification"));
+            }
+            let object = Arc::new(PeerVerifiedObject {
+                bytes,
+                _reservation: reservation,
+                identity: resident.then_some((record, before)),
+            });
+            if resident {
+                *slot = Some(object.clone());
+            }
+            Ok(PeerReadPayload {
+                object,
+                start: if resident {
+                    usize::try_from(offset.min(allocation as u64))
+                        .map_err(|_| invalid("Chunk offset is too large"))?
+                } else {
+                    0
+                },
+                length: allowed,
+            })
+        })();
+        if result.is_err() {
+            slot.take();
+        }
+        drop(slot);
+        if let Err(error) = &result
+            && verified_copy_is_invalid(error)
+        {
+            self.try_quarantine(chunk_id);
+        }
+        result
+    }
+
+    pub fn open_verified(&self, chunk_id: &ChunkId) -> Result<PinnedChunkReader> {
+        let reader = self.open_cataloged(chunk_id)?;
+        verified_range(&reader.file, &reader.chunk, 0, 0, self.read_work.as_ref()).inspect_err(
+            |error| {
+                if verified_copy_is_invalid(error) {
                     self.try_quarantine(chunk_id);
                 }
-                return Err(error);
-            }
-        };
+            },
+        )?;
+        Ok(reader)
+    }
+
+    // Pin the cataloged inode without claiming its integrity. Both callers
+    // perform a complete scan on this descriptor before returning any bytes.
+    fn open_cataloged(&self, chunk_id: &ChunkId) -> Result<PinnedChunkReader> {
+        let record = self
+            .catalog
+            .lock()
+            .map_err(|_| invalid("local chunk catalog lock is poisoned"))?
+            .records
+            .get(chunk_id)
+            .cloned()
+            .ok_or_else(|| invalid(format!("local Chunk '{}' is not cataloged", chunk_id.0)))?;
+        if record.state != LocalChunkState::Durable {
+            return Err(corrupt(chunk_id, "local copy is quarantined"));
+        }
+        let file = File::open(self.path_for_record(&record)?)
+            .map_err(Error::from)
+            .inspect_err(|error| {
+                if verified_copy_is_invalid(error) {
+                    self.try_quarantine(chunk_id);
+                }
+            })?;
         Ok(PinnedChunkReader {
             file,
             chunk: record.chunk,
+            read_work: self.read_work.clone(),
         })
     }
 
@@ -622,6 +1891,7 @@ impl LocalChunkStore {
         }
     }
 
+    #[cfg(any(feature = "dfs", test))]
     pub(crate) fn quarantined_chunks(&self) -> Result<Vec<LocalChunkRecord>> {
         let catalog = self
             .catalog
@@ -686,6 +1956,7 @@ impl ChunkStore for LocalChunkStore {
             .into_iter()
             .zip(acks)
             .map(|(item, ack)| ChunkReceipt {
+                external_commit: None,
                 operation_id: item.operation_id,
                 chunk: item.chunk,
                 placement_revision: 1,
@@ -764,13 +2035,19 @@ fn open_device_epoch(root: &Path) -> Result<u64> {
 
 fn verify_file(path: &Path, chunk: &ChunkObject) -> Result<()> {
     let file = File::open(path).map_err(Error::from)?;
-    verified_range(&file, chunk, 0, 0).map(|_| ())
+    verified_range(&file, chunk, 0, 0, None).map(|_| ())
 }
 
 /// Hash the pinned file once and retain only the requested overlap. The
 /// temporary range is bounded by the caller's output; scan memory is 64KiB.
 /// Nothing is published to the caller until all content checks pass.
-fn verified_range(file: &File, chunk: &ChunkObject, offset: u64, length: usize) -> Result<Vec<u8>> {
+fn verified_range(
+    file: &File,
+    chunk: &ChunkObject,
+    offset: u64,
+    length: usize,
+    metrics: Option<&super::read_work::ReadWorkMetrics>,
+) -> Result<Vec<u8>> {
     offset
         .checked_add(length as u64)
         .filter(|end| *end <= chunk.length)
@@ -786,6 +2063,7 @@ fn verified_range(file: &File, chunk: &ChunkObject, offset: u64, length: usize) 
         }],
         &mut bytes,
         true,
+        metrics,
     )?;
     Ok(bytes)
 }
@@ -796,6 +2074,7 @@ fn verified_ranges_into(
     ranges: &[VerifiedRangeCopy],
     out: &mut [u8],
     force_scan: bool,
+    metrics: Option<&super::read_work::ReadWorkMetrics>,
 ) -> Result<Vec<usize>> {
     let mut counts = Vec::with_capacity(ranges.len());
     let mut active = Vec::new();
@@ -824,6 +2103,7 @@ fn verified_ranges_into(
     if file.metadata().map_err(Error::from)?.len() != chunk.length {
         return Err(corrupt(&chunk.id, "length mismatch"));
     }
+    let mut work = metrics.map(super::read_work::ReadWorkMetrics::scan);
     let mut scratch = [0; 64 * 1024];
     let mut hasher = blake3::Hasher::new();
     let mut position = 0;
@@ -834,6 +2114,11 @@ fn verified_ranges_into(
             return Err(corrupt(&chunk.id, "ended during verification"));
         }
         hasher.update(&scratch[..count]);
+        if let Some(work) = &mut work {
+            work.bytes += count as u64;
+        }
+        #[cfg(test)]
+        VERIFIED_SCAN_BYTES.with(|bytes| bytes.set(bytes.get() + count as u64));
         let next = position + count as u64;
         for (range, allowed) in &active {
             let range_end = range.chunk_offset + *allowed as u64;
@@ -843,6 +2128,9 @@ fn verified_ranges_into(
                 let output_start =
                     range.output_offset + (overlap_start - range.chunk_offset) as usize;
                 let output_end = range.output_offset + (overlap_end - range.chunk_offset) as usize;
+                if let Some(work) = &mut work {
+                    work.copied += (output_end - output_start) as u64;
+                }
                 out[output_start..output_end].copy_from_slice(
                     &scratch
                         [(overlap_start - position) as usize..(overlap_end - position) as usize],
@@ -904,8 +2192,538 @@ fn invalid(message: impl Into<String>) -> Error {
 }
 
 #[cfg(test)]
+std::thread_local! {
+    static VERIFIED_SCAN_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
 mod replica_replay_tests {
     use super::*;
+
+    #[test]
+    fn peer_object_digest_capability_requires_the_complete_verified_view() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+        let staged = StagedChunk::new(OperationId::new("whole-proof"), vec![37; 150_001]);
+        store.put(staged.clone()).unwrap();
+        VERIFIED_SCAN_BYTES.with(|count| count.set(0));
+        let whole = store
+            .read_peer_range(&staged.chunk.id, 0, staged.bytes().len())
+            .unwrap();
+        assert_eq!(
+            whole.verified_full_object_digest(),
+            Some(staged.chunk.content_digest.clone())
+        );
+        assert!(
+            store
+                .read_peer_range(&staged.chunk.id, 0, staged.bytes().len() - 1)
+                .unwrap()
+                .verified_full_object_digest()
+                .is_none()
+        );
+        assert!(
+            store
+                .read_peer_range(&staged.chunk.id, 1, staged.bytes().len() - 1)
+                .unwrap()
+                .verified_full_object_digest()
+                .is_none()
+        );
+        assert_eq!(
+            VERIFIED_SCAN_BYTES.with(|count| count.get()),
+            staged.chunk.length
+        );
+    }
+
+    #[test]
+    fn peer_object_digest_capability_is_absent_for_full_range_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+        let staged = StagedChunk::new(
+            OperationId::new("fallback-proof"),
+            vec![19; PEER_READ_OBJECT_LIMIT + 1],
+        );
+        store.put(staged.clone()).unwrap();
+        let whole = store
+            .read_peer_range(&staged.chunk.id, 0, staged.bytes().len())
+            .unwrap();
+        assert_eq!(whole.as_slice(), staged.bytes());
+        assert!(whole.object.identity.is_none());
+        assert!(whole.verified_full_object_digest().is_none());
+        assert!(store.peer_read_cache.lock().unwrap().is_none());
+        drop(whole);
+        assert_eq!(store.peer_read_budget.used.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn peer_object_digest_does_not_release_shared_frame_budget_early() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+        let staged = StagedChunk::new(OperationId::new("proof-lease"), vec![29; 150_001]);
+        store.put(staged.clone()).unwrap();
+        let whole = store
+            .read_peer_range(&staged.chunk.id, 0, staged.bytes().len())
+            .unwrap();
+        let digest = whole.verified_full_object_digest().unwrap();
+        let bytes = whole.into_shared_bytes();
+        let frame = bytes.slice(17..100);
+        store.peer_read_cache.lock().unwrap().take();
+        drop(bytes);
+        assert_eq!(
+            store.peer_read_budget.used.load(Ordering::Acquire),
+            staged.chunk.length
+        );
+        assert_eq!(digest, staged.chunk.content_digest);
+        assert_eq!(&frame[..], &[29; 83]);
+        drop(frame);
+        assert_eq!(store.peer_read_budget.used.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn peer_object_reuses_one_complete_scan_for_multiple_ranges() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+        let bytes = vec![37; 4 * 1024 * 1024];
+        let staged = StagedChunk::new(OperationId::new("peer-reuse"), bytes.clone());
+        store.put(staged.clone()).unwrap();
+        VERIFIED_SCAN_BYTES.with(|count| count.set(0));
+        for index in 0..4 {
+            let payload = store
+                .read_peer_range(&staged.chunk.id, index * 1024 * 1024, 1024 * 1024)
+                .unwrap();
+            assert_eq!(payload.as_slice(), &bytes[..1024 * 1024]);
+        }
+        assert_eq!(
+            VERIFIED_SCAN_BYTES.with(|count| count.get()),
+            bytes.len() as u64
+        );
+        assert_eq!(
+            store.peer_read_budget.used.load(Ordering::Acquire),
+            bytes.len() as u64
+        );
+    }
+
+    #[test]
+    fn peer_object_revalidates_replacement_missing_and_quarantined_files() {
+        for change in [
+            "replace",
+            "missing",
+            "quarantine",
+            "corrupt",
+            "epoch",
+            "revision",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+            let bytes = vec![53; 150_001];
+            let staged = StagedChunk::new(OperationId::new("peer-identity"), bytes.clone());
+            store.put(staged.clone()).unwrap();
+            drop(store.read_peer_range(&staged.chunk.id, 3, 19).unwrap());
+            VERIFIED_SCAN_BYTES.with(|count| count.set(0));
+            match change {
+                "replace" => {
+                    let replacement = temp.path().join("replacement");
+                    fs::write(&replacement, &bytes).unwrap();
+                    fs::rename(replacement, store.chunk_path(&staged.chunk.id)).unwrap();
+                }
+                "missing" => fs::remove_file(store.chunk_path(&staged.chunk.id)).unwrap(),
+                "corrupt" => {
+                    fs::write(store.chunk_path(&staged.chunk.id), vec![1; bytes.len()]).unwrap()
+                }
+                _ => {
+                    let mut catalog = store.catalog.lock().unwrap();
+                    let record = catalog.records.get_mut(&staged.chunk.id).unwrap();
+                    match change {
+                        "quarantine" => record.state = LocalChunkState::Quarantined,
+                        "epoch" => record.device_epoch += 1,
+                        "revision" => record.catalog_revision += 1,
+                        _ => unreachable!(),
+                    }
+                }
+            }
+            let result = store.read_peer_range(&staged.chunk.id, 3, 19);
+            if change == "replace" || change == "revision" {
+                assert_eq!(result.unwrap().as_slice(), &bytes[3..22]);
+                assert_eq!(
+                    VERIFIED_SCAN_BYTES.with(|count| count.get()),
+                    bytes.len() as u64
+                );
+            } else {
+                assert!(result.is_err(), "{change} must not reuse a stale proof");
+                assert!(store.peer_read_cache.lock().unwrap().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn peer_object_failed_fill_releases_budget_and_never_publishes() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+        let staged = StagedChunk::new(OperationId::new("peer-failed"), vec![5; 4096]);
+        store.put(staged.clone()).unwrap();
+        fs::write(store.chunk_path(&staged.chunk.id), vec![9; 4096]).unwrap();
+        assert!(store.read_peer_range(&staged.chunk.id, 0, 3).is_err());
+        assert!(store.peer_read_cache.lock().unwrap().is_none());
+        assert_eq!(store.peer_read_budget.used.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn peer_object_evicted_references_and_packed_payload_share_the_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+        let chunks: Vec<_> = (1..=3)
+            .map(|byte| {
+                let chunk = StagedChunk::new(
+                    OperationId::new(format!("peer-budget-{byte}")),
+                    vec![byte; 4 * 1024 * 1024],
+                );
+                store.put(chunk.clone()).unwrap();
+                chunk
+            })
+            .collect();
+        let first = store.read_peer_range(&chunks[0].chunk.id, 0, 1).unwrap();
+        let second = store.read_peer_range(&chunks[1].chunk.id, 0, 1).unwrap();
+        assert_eq!(
+            store.peer_read_budget.used.load(Ordering::Acquire),
+            PEER_READ_PAYLOAD_LIMIT as u64
+        );
+        assert_eq!(
+            store
+                .read_peer_range(&chunks[2].chunk.id, 0, 1)
+                .unwrap_err()
+                .code(),
+            afs_error::IO_CAPACITY
+        );
+        assert_eq!(
+            store.reserve_peer_read_payload(1).unwrap_err().code(),
+            afs_error::IO_CAPACITY
+        );
+        assert_eq!(first.as_slice(), &[1]);
+        drop(first);
+        drop(second);
+        let mut packed = store.reserve_peer_read_payload(4 * 1024 * 1024).unwrap();
+        packed.retain_capacity(4 * 1024 * 1024).unwrap();
+        assert!(store.read_peer_range(&chunks[2].chunk.id, 0, 1).is_ok());
+        assert_eq!(
+            store.peer_read_budget.used.load(Ordering::Acquire),
+            PEER_READ_PAYLOAD_LIMIT as u64
+        );
+        drop(packed);
+        assert_eq!(
+            store.peer_read_budget.used.load(Ordering::Acquire),
+            4 * 1024 * 1024
+        );
+        assert_eq!(
+            store
+                .reserve_peer_read_payload(PEER_READ_PAYLOAD_LIMIT + 1)
+                .unwrap_err()
+                .code(),
+            afs_error::IO_CAPACITY
+        );
+    }
+
+    #[test]
+    fn peer_object_budget_reservation_drop_and_capacity_growth_are_charged() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+        let mut lease = store.reserve_peer_read_payload(19).unwrap();
+        lease.retain_capacity(31).unwrap();
+        assert_eq!(store.peer_read_budget.used.load(Ordering::Acquire), 31);
+        assert!(lease.retain_capacity(PEER_READ_PAYLOAD_LIMIT + 1).is_err());
+        assert_eq!(store.peer_read_budget.used.load(Ordering::Acquire), 31);
+        drop(lease);
+        assert_eq!(store.peer_read_budget.used.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn peer_object_concurrent_ranges_share_the_same_verified_payload() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
+        let staged = StagedChunk::new(
+            OperationId::new("peer-singleflight"),
+            vec![73; 4 * 1024 * 1024],
+        );
+        store.put(staged.clone()).unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                let store = store.clone();
+                let id = staged.chunk.id.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    store.read_peer_range(&id, 0, 19).unwrap()
+                })
+            })
+            .collect();
+        let payloads: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        for payload in &payloads {
+            assert!(Arc::ptr_eq(&payload.object, &payloads[0].object));
+            assert_eq!(payload.as_slice(), &[73; 19]);
+        }
+        assert_eq!(
+            store.peer_read_budget.used.load(Ordering::Acquire),
+            4 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn peer_object_shared_frame_slices_retain_allocation_and_lease() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+        let staged = StagedChunk::new(
+            OperationId::new("shared-frame-owner"),
+            vec![29; 4 * 1024 * 1024],
+        );
+        store.put(staged.clone()).unwrap();
+        let payload = store.read_peer_range(&staged.chunk.id, 17, 128).unwrap();
+        let pointer = payload.as_slice().as_ptr();
+        let bytes = payload.into_shared_bytes();
+        assert_eq!(bytes.as_ptr(), pointer);
+        let frame = bytes.slice(3..67);
+        assert_eq!(frame.as_ptr(), bytes[3..].as_ptr());
+        let retained = frame.clone();
+        drop(frame);
+        drop(bytes);
+        store.peer_read_cache.lock().unwrap().take();
+        assert_eq!(&retained[..], &[29; 64]);
+        assert_eq!(
+            store.peer_read_budget.used.load(Ordering::Acquire),
+            4 * 1024 * 1024
+        );
+        drop(retained);
+        assert_eq!(store.peer_read_budget.used.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn peer_object_oversized_chunk_uses_charged_range_fallback_without_residency() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+        let staged = StagedChunk::new(
+            OperationId::new("peer-fallback"),
+            vec![91; PEER_READ_OBJECT_LIMIT + 1],
+        );
+        store.put(staged.clone()).unwrap();
+        let range = store
+            .read_peer_range(&staged.chunk.id, PEER_READ_OBJECT_LIMIT as u64, 19)
+            .unwrap();
+        assert_eq!(range.as_slice(), &[91]);
+        assert!(store.peer_read_cache.lock().unwrap().is_none());
+        assert_eq!(store.peer_read_budget.used.load(Ordering::Acquire), 1);
+        let pointer = range.as_slice().as_ptr();
+        let bytes = range.into_shared_bytes();
+        assert_eq!(bytes.as_ptr(), pointer);
+        let retained = bytes.slice(..);
+        drop(bytes);
+        assert_eq!(store.peer_read_budget.used.load(Ordering::Acquire), 1);
+        assert_eq!(&retained[..], &[91]);
+        drop(retained);
+        assert_eq!(store.peer_read_budget.used.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn private_range_reads_scan_once_and_copy_only_the_requested_overlap() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+        let bytes: Vec<_> = (0..150_001).map(|index| (index % 251) as u8).collect();
+        let staged = StagedChunk::new(OperationId::new("single-scan"), bytes.clone());
+        store.put(staged.clone()).unwrap();
+        let mut out = [9; 19];
+        VERIFIED_SCAN_BYTES.with(|bytes| bytes.set(0));
+        assert_eq!(
+            store.read_at(&staged.chunk.id, 65_531, &mut out).unwrap(),
+            19
+        );
+        assert_eq!(
+            VERIFIED_SCAN_BYTES.with(|bytes| bytes.get()),
+            2 * bytes.len() as u64
+        );
+        for offset in [65_531, 149_990] {
+            out.fill(9);
+            VERIFIED_SCAN_BYTES.with(|bytes| bytes.set(0));
+            let count = store
+                .read_range_at_uncommitted(&staged.chunk.id, offset, &mut out)
+                .unwrap();
+            let expected = 19.min(bytes.len() - offset as usize);
+            assert_eq!(count, expected);
+            assert_eq!(
+                &out[..count],
+                &bytes[offset as usize..offset as usize + count]
+            );
+            assert!(out[count..].iter().all(|byte| *byte == 9));
+            assert_eq!(
+                VERIFIED_SCAN_BYTES.with(|bytes| bytes.get()),
+                bytes.len() as u64
+            );
+        }
+    }
+
+    #[test]
+    fn private_range_pins_identity_before_its_only_scan() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+        let staged = StagedChunk::new(OperationId::new("single-pin"), b"abcdef".to_vec());
+        store.put(staged.clone()).unwrap();
+        VERIFIED_SCAN_BYTES.with(|bytes| bytes.set(0));
+        let reader = store.open_cataloged(&staged.chunk.id).unwrap();
+        assert_eq!(VERIFIED_SCAN_BYTES.with(|bytes| bytes.get()), 0);
+        let path = temp.path().join("chunks").join(&staged.chunk.id.0);
+        fs::rename(&path, temp.path().join("old-inode")).unwrap();
+        fs::write(&path, b"abXdef").unwrap();
+        let mut private = [9; 3];
+        assert_eq!(
+            reader
+                .read_ranges_at_uncommitted(
+                    &[VerifiedRangeCopy {
+                        chunk_offset: 1,
+                        length: private.len(),
+                        output_offset: 0,
+                    }],
+                    &mut private,
+                )
+                .unwrap(),
+            vec![3]
+        );
+        assert_eq!(&private, b"bcd");
+        assert_eq!(VERIFIED_SCAN_BYTES.with(|bytes| bytes.get()), 6);
+        assert!(
+            store
+                .read_range_at_uncommitted(&staged.chunk.id, 1, &mut private)
+                .is_err()
+        );
+        assert_eq!(store.quarantined_chunks().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn private_range_rejects_outside_damage_and_quarantines_until_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+        let staged = StagedChunk::new(OperationId::new("single-corrupt"), vec![42; 150_001]);
+        store.put(staged.clone()).unwrap();
+        let path = temp.path().join("chunks").join(&staged.chunk.id.0);
+        let mut damaged = staged.bytes().to_vec();
+        damaged[150_000] ^= 1;
+        fs::write(&path, damaged).unwrap();
+        let mut private = [9; 19];
+        assert_eq!(
+            store
+                .read_range_at_uncommitted(&staged.chunk.id, 65_531, &mut private)
+                .unwrap_err()
+                .code(),
+            afs_error::NODE_TRANSFER_CORRUPT_DATA
+        );
+        assert_eq!(store.quarantined_chunks().unwrap().len(), 1);
+        store.put(staged.clone()).unwrap();
+        assert!(store.quarantined_chunks().unwrap().is_empty());
+        assert_eq!(
+            store
+                .read_range_at_uncommitted(&staged.chunk.id, 65_531, &mut private)
+                .unwrap(),
+            private.len()
+        );
+        assert_eq!(private, [42; 19]);
+    }
+
+    #[test]
+    fn private_range_and_verified_open_quarantine_missing_cataloged_files() {
+        for private_read in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+            let staged = StagedChunk::new(OperationId::new("missing-file"), b"abcdef".to_vec());
+            store.put(staged.clone()).unwrap();
+            fs::remove_file(temp.path().join("chunks").join(&staged.chunk.id.0)).unwrap();
+            if private_read {
+                assert!(
+                    store
+                        .read_range_at_uncommitted(&staged.chunk.id, 0, &mut [9; 3])
+                        .is_err()
+                );
+            } else {
+                assert!(store.open_verified(&staged.chunk.id).is_err());
+            }
+            assert_eq!(store.quarantined_chunks().unwrap().len(), 1);
+            store.put(staged.clone()).unwrap();
+            assert!(store.quarantined_chunks().unwrap().is_empty());
+            let mut out = [9; 3];
+            assert_eq!(
+                store
+                    .read_range_at_uncommitted(&staged.chunk.id, 0, &mut out)
+                    .unwrap(),
+                3
+            );
+            assert_eq!(&out, b"abc");
+        }
+    }
+
+    #[test]
+    fn private_range_work_metrics_count_actual_scan_and_copy_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = afs_metrics::Registry::new();
+        let store = LocalChunkStore::open(temp.path(), "node-a")
+            .unwrap()
+            .with_read_work_metrics(
+                super::super::read_work::ReadWorkMetrics::register(&registry).unwrap(),
+            );
+        let staged = StagedChunk::new(OperationId::new("work-counts"), vec![7; 65_537]);
+        store.put(staged.clone()).unwrap();
+        store.read_at(&staged.chunk.id, 0, &mut [0; 3]).unwrap();
+        store
+            .read_range_at_uncommitted(&staged.chunk.id, 0, &mut [0; 3])
+            .unwrap();
+        let text = afs_metrics::encode_text(&registry).unwrap();
+        assert!(text.contains("afs_dfs_read_scans_total 3\n"), "{text}");
+        assert!(
+            text.contains("afs_dfs_read_scan_bytes_total 196611\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("afs_dfs_read_copy_bytes_total{stage=\"scan_to_range\"} 6\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("afs_dfs_read_copy_bytes_total{stage=\"pinned_range_to_output\"} 3\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn private_range_rejects_truncated_files_and_keeps_eof_behavior() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+        let staged = StagedChunk::new(OperationId::new("single-truncate"), b"abcdef".to_vec());
+        store.put(staged.clone()).unwrap();
+        let mut private = [9; 8];
+        assert_eq!(
+            store
+                .read_range_at_uncommitted(&staged.chunk.id, 4, &mut private)
+                .unwrap(),
+            2
+        );
+        assert_eq!(&private, &[b'e', b'f', 9, 9, 9, 9, 9, 9]);
+        assert_eq!(
+            store
+                .read_range_at_uncommitted(&staged.chunk.id, u64::MAX, &mut private)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .read_range_at_uncommitted(&staged.chunk.id, 0, &mut [])
+                .unwrap(),
+            0
+        );
+        fs::write(temp.path().join("chunks").join(&staged.chunk.id.0), b"abc").unwrap();
+        assert_eq!(
+            store
+                .read_range_at_uncommitted(&staged.chunk.id, 0, &mut private)
+                .unwrap_err()
+                .code(),
+            afs_error::NODE_TRANSFER_CORRUPT_DATA
+        );
+        assert_eq!(store.quarantined_chunks().unwrap().len(), 1);
+    }
 
     #[test]
     fn corrupt_cataloged_chunk_is_replaced_by_immutable_retry() {
@@ -1150,5 +2968,278 @@ mod replica_replay_tests {
             recovered.persist(&first, &newer_target, 6, 7).unwrap(),
             floor_ack
         );
+    }
+}
+
+#[cfg(test)]
+mod write_buffer_tests {
+    use super::*;
+
+    #[test]
+    fn writable_capacity_keeps_requested_limit_separate_from_reused_allocation() {
+        let pool = WriteBufferPool::new(8192);
+        drop(ChunkBuilder::with_pool(pool.clone(), 4096).unwrap());
+        let mut builder = ChunkBuilder::with_pool(pool.clone(), 3000).unwrap();
+        assert_eq!(builder.capacity(), 4096);
+        assert_eq!(builder.writable_capacity(), 3000);
+        builder.write_at(2999, &[7]).unwrap();
+        assert_eq!(
+            builder.write_at(3000, &[8]).unwrap_err().code(),
+            afs_error::IO_OUT_OF_MEMORY
+        );
+        assert_eq!(pool.snapshot().live_bytes, 4096);
+    }
+
+    #[test]
+    fn hot_large_allocation_cannot_inflate_a_small_patch() {
+        let pool = WriteBufferPool::new(8 * 1024 * 1024);
+        let large = ChunkBuilder::with_pool(pool.clone(), 4 * 1024 * 1024).unwrap();
+        let large_pointer = large.data_ptr();
+        drop(large);
+        let mut patch = ChunkBuilder::with_pool(pool.clone(), 4096).unwrap();
+        patch.write_at(0, &[3; 4096]).unwrap();
+        assert_eq!(patch.capacity(), 4096);
+        assert_ne!(patch.data_ptr(), large_pointer);
+        assert_eq!(pool.snapshot().live_bytes, 4096);
+        assert_eq!(pool.snapshot().idle_bytes, 4 * 1024 * 1024);
+        assert_eq!(pool.snapshot().allocations, 2);
+        assert_eq!(pool.snapshot().reuses, 0);
+    }
+
+    #[test]
+    fn six_mebibyte_body_uses_two_final_allocations_without_freeze_copy() {
+        const MIB: usize = 1024 * 1024;
+        let pool = WriteBufferPool::new(8 * MIB);
+        let mut first = ChunkBuilder::with_pool(pool.clone(), 4 * MIB).unwrap();
+        let mut tail = ChunkBuilder::with_pool(pool.clone(), 4 * MIB).unwrap();
+        let input = vec![37; MIB];
+        for index in 0..6 {
+            let (builder, offset) = if index < 4 {
+                (&mut first, index * MIB)
+            } else {
+                (&mut tail, (index - 4) * MIB)
+            };
+            builder.write_at(offset as u64, &input).unwrap();
+        }
+        let first_pointer = first.data_ptr();
+        let tail_pointer = tail.data_ptr();
+        let first_generation = first.allocation_id();
+        let tail_generation = tail.allocation_id();
+        let first = first.stage(OperationId::new("four-mib"));
+        let tail = tail.stage(OperationId::new("two-mib"));
+        assert_eq!(first.bytes().len(), 4 * MIB);
+        assert_eq!(tail.bytes().len(), 2 * MIB);
+        assert_eq!(first.bytes().as_ptr(), first_pointer);
+        assert_eq!(tail.bytes().as_ptr(), tail_pointer);
+        assert_eq!(first.bytes.allocation_id(), first_generation);
+        assert_eq!(tail.bytes.allocation_id(), tail_generation);
+        assert!(
+            first
+                .bytes()
+                .iter()
+                .chain(tail.bytes())
+                .all(|byte| *byte == 37)
+        );
+        let stats = pool.snapshot();
+        assert_eq!(stats.live_bytes, 8 * MIB);
+        assert_eq!(stats.copied_bytes, 6 * MIB as u64);
+        assert_eq!(stats.copy_operations, 6);
+        assert_eq!(stats.allocations, 2);
+        drop(first);
+        drop(tail);
+        assert_eq!(pool.snapshot().live_bytes, 0);
+        assert_eq!(pool.snapshot().idle_bytes, 8 * MIB);
+    }
+
+    #[test]
+    fn actual_copy_entries_count_overlap_extension_and_zeroed_holes_separately() {
+        let pool = WriteBufferPool::new(32);
+        let mut builder = ChunkBuilder::with_pool(pool.clone(), 16).unwrap();
+        builder.write_at(0, b"abc").unwrap();
+        builder.write_at(2, b"def").unwrap();
+        builder.write_at(8, b"g").unwrap();
+        assert_eq!(builder.as_bytes(), b"abdef\0\0\0g");
+        assert_eq!(pool.snapshot().copied_bytes, 7);
+        // The extension crossing the initialized tail copies one existing and
+        // one new range; sparse zero initialization is not input copying.
+        assert_eq!(pool.snapshot().copy_operations, 4);
+    }
+
+    #[test]
+    fn exact_metrics_track_last_owner_reuse_and_stop() {
+        let registry = afs_metrics::Registry::new();
+        let pool = WriteBufferPool::new(4096);
+        pool.register_metrics(&registry).unwrap();
+        let mut builder = ChunkBuilder::with_pool(pool.clone(), 4096).unwrap();
+        builder.write_at(0, b"data").unwrap();
+        let frozen = builder.freeze();
+        let delayed = frozen.slice(..);
+        drop(frozen);
+        let before = afs_metrics::encode_text(&registry).unwrap();
+        assert!(
+            before.contains("afs_dfs_write_buffer_live_bytes 4096\n"),
+            "{before}"
+        );
+        assert!(
+            before.contains("afs_dfs_write_buffer_idle_bytes 0\n"),
+            "{before}"
+        );
+        drop(delayed);
+        let reused = ChunkBuilder::with_pool(pool.clone(), 4096).unwrap();
+        drop(reused);
+        pool.stop();
+        let after = afs_metrics::encode_text(&registry).unwrap();
+        for expected in [
+            "afs_dfs_write_buffer_live_bytes 0\n",
+            "afs_dfs_write_buffer_idle_bytes 0\n",
+            "afs_dfs_write_buffer_live_peak_bytes 4096\n",
+            "afs_dfs_write_buffer_allocations_total 1\n",
+            "afs_dfs_write_buffer_reuses_total 1\n",
+            "afs_dfs_write_buffer_released_bytes_total 4096\n",
+            "afs_dfs_write_buffer_input_copy_bytes_total 4\n",
+            "afs_dfs_write_buffer_input_copies_total 1\n",
+        ] {
+            assert!(after.contains(expected), "missing {expected} in {after}");
+        }
+    }
+
+    #[test]
+    fn freeze_and_shared_ranges_keep_allocation_until_last_owner() {
+        let pool = WriteBufferPool::new(8192);
+        let mut builder = ChunkBuilder::with_pool(pool.clone(), 4096).unwrap();
+        builder.write_at(0, b"abcdef").unwrap();
+        let pointer = builder.data_ptr();
+        let generation = builder.allocation_id();
+        let capacity = builder.capacity();
+        let frozen = builder.freeze();
+        assert_eq!(frozen.as_ptr(), pointer);
+        assert_eq!(frozen.allocation_id(), generation);
+        assert_eq!(frozen.capacity(), capacity);
+        let range = frozen.slice(1..4);
+        let staged = StagedChunk::from_shared(OperationId::new("shared-freeze"), range.clone());
+        assert_eq!(staged.bytes(), b"bcd");
+        assert_eq!(staged.bytes().as_ptr(), pointer.wrapping_add(1));
+        assert_eq!(staged.chunk.length, 3);
+        assert_eq!(pool.snapshot().copied_bytes, 6);
+        drop(frozen);
+        drop(range);
+        assert_eq!(pool.snapshot().live_buffers, 1);
+        assert_eq!(pool.snapshot().idle_bytes, 0);
+        drop(staged);
+        assert_eq!(pool.snapshot().live_bytes, 0);
+        assert_eq!(pool.snapshot().idle_bytes, capacity);
+    }
+
+    #[test]
+    fn reuse_has_new_generation_and_never_exposes_old_data() {
+        let pool = WriteBufferPool::new(8192);
+        let mut first = ChunkBuilder::with_pool(pool.clone(), 4096).unwrap();
+        first.write_at(0, &[0xa5; 4096]).unwrap();
+        let pointer = first.data_ptr();
+        let generation = first.allocation_id();
+        drop(first);
+        let mut next = ChunkBuilder::with_pool(pool.clone(), 4096).unwrap();
+        assert_eq!(next.data_ptr(), pointer);
+        assert_ne!(next.allocation_id(), generation);
+        assert_eq!(next.len(), 0);
+        next.write_at(8, &[7]).unwrap();
+        assert_eq!(next.as_bytes(), &[0, 0, 0, 0, 0, 0, 0, 0, 7]);
+        next.truncate(3);
+        next.write_at(8, &[9]).unwrap();
+        assert_eq!(next.as_bytes(), &[0, 0, 0, 0, 0, 0, 0, 0, 9]);
+        assert_eq!(pool.snapshot().allocations, 1);
+        assert_eq!(pool.snapshot().reuses, 1);
+    }
+
+    #[test]
+    fn idle_baseline_does_not_limit_live_and_stop_retires_late_owners() {
+        let pool = WriteBufferPool::new(4096);
+        let mut builders = Vec::new();
+        for _ in 0..3 {
+            let mut builder = ChunkBuilder::with_pool(pool.clone(), 4096).unwrap();
+            builder.write_at(0, &[1; 4096]).unwrap();
+            builders.push(builder);
+        }
+        assert_eq!(pool.snapshot().live_bytes, 3 * 4096);
+        let retained = builders.pop().unwrap().freeze();
+        drop(builders);
+        assert_eq!(pool.snapshot().live_bytes, 4096);
+        assert_eq!(pool.snapshot().idle_bytes, 4096);
+        assert_eq!(pool.snapshot().released_bytes, 4096);
+        pool.stop();
+        assert_eq!(pool.snapshot().idle_bytes, 0);
+        assert_eq!(pool.snapshot().live_bytes, 4096);
+        drop(retained);
+        assert_eq!(pool.snapshot().live_bytes, 0);
+        assert_eq!(pool.snapshot().released_bytes, 3 * 4096);
+        let after_stop = ChunkBuilder::with_pool(pool.clone(), 4096).unwrap();
+        drop(after_stop);
+        assert_eq!(pool.snapshot().idle_bytes, 0);
+    }
+
+    #[test]
+    fn fixed_capacity_failure_keeps_previously_accepted_bytes() {
+        let pool = WriteBufferPool::new(0);
+        let mut builder = ChunkBuilder::with_pool(pool.clone(), 4).unwrap();
+        builder.write_at(0, b"abcd").unwrap();
+        let pointer = builder.data_ptr();
+        let error = builder.write_at(3, b"ef").unwrap_err();
+        assert_eq!(error.code(), afs_error::IO_OUT_OF_MEMORY);
+        assert_eq!(builder.as_bytes(), b"abcd");
+        assert_eq!(builder.data_ptr(), pointer);
+        assert_eq!(pool.snapshot().copied_bytes, 4);
+        assert_eq!(pool.snapshot().copy_operations, 1);
+        pool.fail_next_allocation();
+        assert_eq!(
+            ChunkBuilder::with_pool(pool.clone(), 8).unwrap_err().code(),
+            afs_error::IO_OUT_OF_MEMORY
+        );
+        assert_eq!(pool.snapshot().live_bytes, 4);
+    }
+
+    #[test]
+    fn pooled_builder_cannot_keep_pool_alive_or_modify_a_frozen_chunk() {
+        let pool = WriteBufferPool::new(4096);
+        let weak = Arc::downgrade(&pool);
+        let mut builder = ChunkBuilder::with_pool(pool.clone(), 4096).unwrap();
+        builder.write_at(0, b"original").unwrap();
+        let frozen = builder.freeze();
+        drop(pool);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(&*frozen, b"original");
+        drop(frozen);
+    }
+
+    #[test]
+    fn staged_vec_and_default_builder_keep_legacy_content_without_vec_to_arc_copy() {
+        let bytes = b"owned".to_vec();
+        let pointer = bytes.as_ptr();
+        let staged = StagedChunk::new(OperationId::new("vec-owner"), bytes);
+        assert_eq!(staged.bytes().as_ptr(), pointer);
+        let mut builder = ChunkBuilder::default();
+        builder.write_at(3, b"data").unwrap();
+        assert_eq!(builder.as_bytes(), b"\0\0\0data");
+        builder.replace(b"replacement".to_vec());
+        assert_eq!(
+            builder.stage(OperationId::new("legacy")).bytes(),
+            b"replacement"
+        );
+    }
+
+    #[test]
+    fn mutable_overwrite_is_in_place_and_frozen_identity_is_immutable() {
+        let pool = WriteBufferPool::new(8192);
+        let mut builder = ChunkBuilder::with_pool(pool.clone(), 4096).unwrap();
+        builder.write_at(0, b"abcdef").unwrap();
+        let pointer = builder.data_ptr();
+        builder.write_at(2, b"XY").unwrap();
+        assert_eq!(builder.data_ptr(), pointer);
+        let staged = builder.stage(OperationId::new("first"));
+        assert_eq!(staged.bytes(), b"abXYef");
+        let mut patch = ChunkBuilder::with_pool(pool.clone(), 2).unwrap();
+        patch.write_at(0, b"zz").unwrap();
+        assert_eq!(patch.stage(OperationId::new("patch")).bytes(), b"zz");
+        assert_eq!(staged.bytes(), b"abXYef");
+        assert_eq!(pool.snapshot().copied_bytes, 10);
     }
 }

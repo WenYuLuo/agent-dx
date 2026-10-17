@@ -410,6 +410,191 @@ fn ownerfs_workspace_bind_rejects_simultaneous_native_workspace_mode() {
     );
 }
 
+#[cfg(feature = "dfs")]
+fn external_config(extra: &str) -> afs_error::Result<Config> {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("s3.toml");
+    std::fs::write(&path, format!("fs='dfs'\n{extra}\n[dfs_external_backend]\nstore_id='test-fs'\ngeneration='generation-1'\nendpoint='http://127.0.0.1:8333'\nbucket='afs-test'\nregion='us-east-1'\nallow_http=true\n")).unwrap();
+    Config::resolve(
+        Role::Node,
+        Cli::parse_from(["afs-node", "--config", path.to_str().unwrap()]),
+    )
+}
+
+#[test]
+#[cfg(feature = "dfs")]
+fn external_backend_is_explicit_and_fixed_single_copy() {
+    let config = external_config("").unwrap();
+    let external = config.dfs_external_backend.as_ref().unwrap();
+    assert_eq!(external.store_id, "test-fs");
+    assert_eq!(config.dfs_desired_copies, 1);
+    for counts in [
+        "dfs_desired_copies=3",
+        "dfs_local_copy='none'",
+        "dfs_desired_copies=2\ndfs_sync_required_copies=2",
+    ] {
+        assert!(external_config(counts).is_err(), "must reject {counts}");
+    }
+    let ordinary =
+        Config::resolve(Role::Node, Cli::parse_from(["afs-node", "--fs", "dfs"])).unwrap();
+    assert!(ordinary.dfs_external_backend.is_none());
+}
+
+#[test]
+#[cfg(feature = "dfs")]
+fn external_backend_validates_identity_transport_and_credentials_without_exposing_secrets() {
+    let mut config = external_config("").unwrap();
+    let external = config.dfs_external_backend.as_mut().unwrap();
+    external.generation = "../escape".into();
+    assert!(external.validate().is_err());
+    external.generation = "generation-1".into();
+    external.allow_http = false;
+    assert!(external.validate().is_err());
+    external.allow_http = true;
+    external.credentials_file = Some("relative.json".into());
+    assert!(external.validate().is_err());
+    assert!(
+        !serde_json::to_string(&config)
+            .unwrap()
+            .contains("secret_access_key")
+    );
+}
+
+#[test]
+#[cfg(feature = "dfs")]
+fn external_backend_cache_is_optional_and_rejects_unbounded_or_relative_settings() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cache.toml");
+    let base = "fs='dfs'\n[dfs_external_backend]\nstore_id='test-fs'\ngeneration='1'\nendpoint='http://127.0.0.1:8333'\nbucket='afs-test'\nregion='us-east-1'\nallow_http=true\n";
+    let cache = "[dfs_external_backend.cache]\ndirectory='/var/tmp/afs-content-cache'\ncapacity_bytes=67108864\npending_bytes=8388608\n";
+    std::fs::write(&path, format!("{base}{cache}")).unwrap();
+    let resolve = || {
+        Config::resolve(
+            Role::Node,
+            Cli::parse_from(["afs-node", "--config", path.to_str().unwrap()]),
+        )
+    };
+    assert!(
+        resolve().is_ok(),
+        "explicit bounded cache ON must be accepted"
+    );
+    for bad in [
+        cache.replace("/var/tmp/afs-content-cache", "relative/cache"),
+        cache.replace("capacity_bytes=67108864", "capacity_bytes=0"),
+        cache.replace("pending_bytes=8388608", "pending_bytes=0"),
+        cache.replace("pending_bytes=8388608", "pending_bytes=134217728"),
+    ] {
+        std::fs::write(&path, format!("{base}{bad}")).unwrap();
+        assert!(
+            resolve().is_err(),
+            "invalid cache budget/path must be rejected"
+        );
+    }
+    std::fs::write(&path, base).unwrap();
+    assert!(
+        resolve().is_ok(),
+        "omitting cache preserves OFF configuration"
+    );
+}
+
+#[cfg(feature = "dfs")]
+#[test]
+fn peer_disk_cache_is_opt_in_and_requires_an_isolated_bounded_directory() {
+    let default =
+        Config::resolve(Role::Node, Cli::parse_from(["afs-node", "--fs", "dfs"])).unwrap();
+    assert!(default.dfs_peer_cache.is_none());
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("node.toml");
+    let base = "fs='dfs'\ndata_dir='/srv/afs/data'\ndfs_mount='/mnt/afs'\n[dfs_peer_cache]\ndirectory='/srv/afs/peer-cache'\ncapacity_bytes=268435456\n";
+    std::fs::write(&path, base).unwrap();
+    let resolve = |role| {
+        Config::resolve(
+            role,
+            Cli::parse_from(["afs-node", "--config", path.to_str().unwrap()]),
+        )
+    };
+    let cfg = resolve(Role::Node).unwrap();
+    let cache = cfg.dfs_peer_cache.unwrap();
+    assert_eq!(cache.capacity_bytes, 256 * 1024 * 1024);
+    assert_eq!(cache.directory, std::path::Path::new("/srv/afs/peer-cache"));
+    assert!(resolve(Role::Meta).is_err());
+    for bad in [
+        base.replace("'/srv/afs/peer-cache'", "'relative'"),
+        base.replace("'/srv/afs/peer-cache'", "'/'"),
+        base.replace("'/srv/afs/peer-cache'", "'/srv/../cache'"),
+        base.replace("'/srv/afs/peer-cache'", "'/srv/afs/data/cache'"),
+        base.replace("'/srv/afs/peer-cache'", "'/srv/afs'"),
+        base.replace("'/srv/afs/peer-cache'", "'/mnt/afs/cache'"),
+        base.replace("capacity_bytes=268435456", "capacity_bytes=0"),
+        base.replace("capacity_bytes=268435456", "capacity_bytes=1099511627777"),
+        base.replace(
+            "capacity_bytes=268435456",
+            "capacity_bytes=268435456\nresident_bytes=4194304",
+        ),
+    ] {
+        std::fs::write(&path, bad).unwrap();
+        assert!(resolve(Role::Node).is_err());
+    }
+}
+
+#[test]
+fn native_write_buffer_idle_baseline_is_not_a_live_quota() {
+    let default = Config::resolve(Role::Node, Cli::parse_from(["afs-node"])).unwrap();
+    assert_eq!(
+        serde_json::to_value(default).unwrap()["dfs_write_buffer_idle_bytes"],
+        134_217_728_u64
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("node.toml");
+    for bytes in [0_u64, 4096, 1_u64 << 40] {
+        std::fs::write(&path, format!("dfs_write_buffer_idle_bytes = {bytes}\n")).unwrap();
+        let config = Config::resolve(
+            Role::Node,
+            Cli::parse_from(["afs-node", "--config", path.to_str().unwrap()]),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(config).unwrap()["dfs_write_buffer_idle_bytes"],
+            bytes
+        );
+    }
+    std::fs::write(&path, "dfs_write_buffer_idle_bytes = 1099511627777\n").unwrap();
+    assert!(
+        Config::resolve(
+            Role::Node,
+            Cli::parse_from(["afs-node", "--config", path.to_str().unwrap()])
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn read_diagnostics_default_off_and_explicit_cli_overrides_file() {
+    let default = Config::resolve(Role::Node, Cli::parse_from(["afs-node"])).unwrap();
+    assert!(!default.dfs_read_diagnostics_enabled);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("diagnostic.toml");
+    std::fs::write(&path, "dfs_read_diagnostics_enabled=true\n").unwrap();
+    let from_file = Config::resolve(
+        Role::Node,
+        Cli::parse_from(["afs-node", "--config", path.to_str().unwrap()]),
+    )
+    .unwrap();
+    assert!(from_file.dfs_read_diagnostics_enabled);
+    let from_cli = Config::resolve(
+        Role::Node,
+        Cli::parse_from([
+            "afs-node",
+            "--config",
+            path.to_str().unwrap(),
+            "--dfs-read-diagnostics-enabled",
+            "false",
+        ]),
+    )
+    .unwrap();
+    assert!(!from_cli.dfs_read_diagnostics_enabled);
+}
+
 #[cfg(feature = "ownerfs")]
 #[test]
 fn ownerfs_workspace_bind_requires_isolated_egress_root() {

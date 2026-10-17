@@ -59,6 +59,106 @@ pub struct WorkspaceBindConfig {
     pub workspace: String,
 }
 
+/// External object storage durability. Deployment of the S3 service is external
+/// to AFS. Credentials remain in the process environment or an administrator file.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DfsExternalBackendConfig {
+    pub store_id: String,
+    pub generation: String,
+    pub endpoint: String,
+    pub bucket: String,
+    pub region: String,
+    #[serde(default)]
+    pub allow_http: bool,
+    #[serde(default)]
+    pub unsigned_payload: bool,
+    pub credentials_file: Option<PathBuf>,
+    /// Optional disposable content cache; omission preserves backend-only reads.
+    pub cache: Option<DfsExternalCacheConfig>,
+}
+
+pub(crate) const MAX_DFS_EXTERNAL_CACHE_CAPACITY_BYTES: u64 = 1 << 40;
+
+/// Bounded asynchronous cache. Neither pending nor disk data is a durable replica.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DfsExternalCacheConfig {
+    pub directory: PathBuf,
+    pub capacity_bytes: u64,
+    pub pending_bytes: u64,
+    /// Like JuiceFS cache-large-write: full-sized write chunks are opt-in.
+    #[serde(default)]
+    pub cache_large_write: bool,
+}
+
+/// Optional native Peer read disk cache. It carries no durability or authority.
+/// Payload memory is temporary; there is no resident RAM cache configuration.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DfsPeerCacheConfig {
+    pub directory: PathBuf,
+    pub capacity_bytes: u64,
+}
+
+impl DfsExternalBackendConfig {
+    /// Reject ambiguous namespaces, implicit plaintext and relative secret paths.
+    pub fn validate(&self) -> Result<()> {
+        for value in [&self.store_id, &self.generation, &self.bucket, &self.region] {
+            if value.is_empty()
+                || value.len() > 128
+                || !value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"_-.".contains(&byte))
+                || value == "."
+                || value == ".."
+            {
+                return Err(invalid(
+                    "external backend identity fields require safe non-empty path segments",
+                ));
+            }
+        }
+        let endpoint = tonic::transport::Endpoint::from_shared(self.endpoint.clone())
+            .map_err(|_| invalid("external backend endpoint requires an http(s) URI"))?;
+        let uri = endpoint.uri();
+        if !matches!(uri.scheme_str(), Some("http" | "https"))
+            || uri.host().is_none()
+            || uri
+                .authority()
+                .is_some_and(|authority| authority.as_str().contains('@'))
+            || uri.query().is_some()
+            || !matches!(uri.path(), "" | "/")
+            || (uri.scheme_str() == Some("http") && !self.allow_http)
+        {
+            return Err(invalid(
+                "external backend requires an explicit HTTPS origin, or allow_http=true for an isolated test endpoint",
+            ));
+        }
+        if self
+            .credentials_file
+            .as_ref()
+            .is_some_and(|path| !path.is_absolute())
+        {
+            return Err(invalid(
+                "external backend credentials_file must be absolute",
+            ));
+        }
+        if let Some(cache) = &self.cache
+            && (!cache.directory.is_absolute()
+                || cache.capacity_bytes == 0
+                || cache.pending_bytes == 0
+                || cache.pending_bytes > cache.capacity_bytes
+                || cache.capacity_bytes > MAX_DFS_EXTERNAL_CACHE_CAPACITY_BYTES
+                || usize::try_from(cache.pending_bytes).is_err())
+        {
+            return Err(invalid(
+                "external cache requires an absolute directory, capacity up to 1 TiB and non-zero pending bytes no greater than capacity",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Parser, Default)]
 #[command(version, about = "AFS process foundation")]
 /// 命令行输入层。None 表示用户未传入，因此应继续考虑 TOML 与最终默认值。
@@ -141,6 +241,9 @@ pub struct Cli {
     pub dfs_read_max_inflight_bytes: Option<u64>,
     #[arg(long)]
     pub dfs_read_source_cache_ttl_ms: Option<u64>,
+    /// Bounded coarse read timing for explicit diagnosis only; disabled by default.
+    #[arg(long)]
+    pub dfs_read_diagnostics_enabled: Option<bool>,
     #[arg(long)]
     pub timeout_ms: Option<u64>,
     #[arg(long)]
@@ -186,6 +289,9 @@ struct FileConfig {
     ownerfs_workspace_bind: Option<WorkspaceBindConfig>,
     ownerfs_workspace_egress_root: Option<PathBuf>,
     dfs_mount: Option<PathBuf>,
+    dfs_external_backend: Option<DfsExternalBackendConfig>,
+    dfs_peer_cache: Option<DfsPeerCacheConfig>,
+    dfs_write_buffer_idle_bytes: Option<u64>,
     dfs_desired_copies: Option<u16>,
     dfs_sync_required_copies: Option<u16>,
     dfs_min_distinct_nodes: Option<u16>,
@@ -194,6 +300,7 @@ struct FileConfig {
     dfs_read_max_ops_per_batch: Option<usize>,
     dfs_read_max_inflight_bytes: Option<u64>,
     dfs_read_source_cache_ttl_ms: Option<u64>,
+    dfs_read_diagnostics_enabled: Option<bool>,
     timeout_ms: Option<u64>,
     log_level: Option<String>,
     trace_enabled: Option<bool>,
@@ -231,6 +338,10 @@ pub struct Config {
     pub ownerfs_workspace_bind: Option<WorkspaceBindConfig>,
     pub ownerfs_workspace_egress_root: Option<PathBuf>,
     pub dfs_mount: Option<PathBuf>,
+    pub dfs_external_backend: Option<DfsExternalBackendConfig>,
+    pub dfs_peer_cache: Option<DfsPeerCacheConfig>,
+    /// Reusable idle write-body capacity only, not a live-body quota.
+    pub dfs_write_buffer_idle_bytes: u64,
     pub dfs_desired_copies: u16,
     pub dfs_sync_required_copies: u16,
     pub dfs_min_distinct_nodes: u16,
@@ -239,6 +350,7 @@ pub struct Config {
     pub dfs_read_max_ops_per_batch: usize,
     pub dfs_read_max_inflight_bytes: u64,
     pub dfs_read_source_cache_ttl_ms: u64,
+    pub dfs_read_diagnostics_enabled: bool,
     pub timeout_ms: u64,
     pub log_level: String,
     pub trace_enabled: bool,
@@ -413,6 +525,11 @@ impl Config {
                 .ownerfs_workspace_egress_root
                 .or(file.ownerfs_workspace_egress_root),
             dfs_mount: cli.dfs_mount.or(file.dfs_mount),
+            dfs_external_backend: file.dfs_external_backend,
+            dfs_peer_cache: file.dfs_peer_cache,
+            dfs_write_buffer_idle_bytes: file
+                .dfs_write_buffer_idle_bytes
+                .unwrap_or(128 * 1024 * 1024),
             dfs_desired_copies,
             dfs_sync_required_copies,
             dfs_min_distinct_nodes,
@@ -421,6 +538,10 @@ impl Config {
             dfs_read_max_ops_per_batch,
             dfs_read_max_inflight_bytes,
             dfs_read_source_cache_ttl_ms,
+            dfs_read_diagnostics_enabled: cli
+                .dfs_read_diagnostics_enabled
+                .or(file.dfs_read_diagnostics_enabled)
+                .unwrap_or(false),
             timeout_ms: cli.timeout_ms.or(file.timeout_ms).unwrap_or(5000),
             log_level: cli
                 .log_level
@@ -437,6 +558,55 @@ impl Config {
                 .unwrap_or(0.01),
             print_config: cli.print_config,
         };
+        if let Some(external) = &cfg.dfs_external_backend {
+            external.validate()?;
+            if !cfg.dfs
+                || cfg.dfs_desired_copies != 1
+                || cfg.dfs_sync_required_copies != 1
+                || cfg.dfs_min_distinct_nodes != 1
+                || cfg.dfs_min_distinct_failure_domains != 1
+                || cfg.dfs_local_copy != "required"
+            {
+                return Err(invalid(
+                    "external backend requires DFS with fixed single-copy defaults; Node replication combinations are unsupported",
+                ));
+            }
+        }
+        if cfg.dfs_write_buffer_idle_bytes > (1_u64 << 40)
+            || usize::try_from(cfg.dfs_write_buffer_idle_bytes).is_err()
+        {
+            return Err(invalid(
+                "dfs_write_buffer_idle_bytes must be in 0..=1 TiB and fit this platform; it limits idle capacity only",
+            ));
+        }
+        if let Some(cache) = &cfg.dfs_peer_cache {
+            let overlaps = |other: &std::path::Path| {
+                cache.directory.starts_with(other) || other.starts_with(&cache.directory)
+            };
+            if role != Role::Node
+                || !cfg.dfs
+                || cfg.dfs_external_backend.is_some()
+                || !cache.directory.is_absolute()
+                || cache.directory.parent().is_none()
+                || cache.directory.components().any(|part| {
+                    matches!(
+                        part,
+                        std::path::Component::ParentDir | std::path::Component::CurDir
+                    )
+                })
+                || cache.capacity_bytes == 0
+                || cache.capacity_bytes > MAX_DFS_EXTERNAL_CACHE_CAPACITY_BYTES
+                || overlaps(&cfg.data_dir)
+                || [&cfg.dfs_mount, &cfg.ownerfs_mount]
+                    .into_iter()
+                    .flatten()
+                    .any(|mount| overlaps(mount))
+            {
+                return Err(invalid(
+                    "dfs_peer_cache requires a native DFS Node, a separate absolute directory without traversal, and capacity in 1..=1 TiB; external-backend Peer caching is not enabled",
+                ));
+            }
+        }
         if cfg.timeout_ms == 0 || cfg.timeout_ms > 300_000 {
             return Err(invalid("timeout_ms must be in 1..300000"));
         }
@@ -772,5 +942,33 @@ mod certificate_tests {
                 afs_error::CONFIG_INVALID
             );
         }
+    }
+
+    #[test]
+    fn dfs_external_backend_unsigned_payload_defaults_false_and_accepts_true() {
+        let default: DfsExternalBackendConfig = toml::from_str(
+            r#"
+store_id = "filesystem-a"
+generation = "generation-1"
+endpoint = "https://s3.example.invalid"
+bucket = "chunks"
+region = "us-east-1"
+"#,
+        )
+        .unwrap();
+        assert!(!default.unsigned_payload);
+
+        let explicit: DfsExternalBackendConfig = toml::from_str(
+            r#"
+store_id = "filesystem-a"
+generation = "generation-1"
+endpoint = "https://s3.example.invalid"
+bucket = "chunks"
+region = "us-east-1"
+unsigned_payload = true
+"#,
+        )
+        .unwrap();
+        assert!(explicit.unsigned_payload);
     }
 }

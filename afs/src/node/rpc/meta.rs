@@ -32,8 +32,8 @@ use std::error::Error as StdError;
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "dfs")]
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
-#[cfg(any(feature = "ownerfs", feature = "dfs"))]
+use std::time::{Duration, Instant};
+#[cfg(feature = "ownerfs")]
 use tonic::transport::Channel;
 use tonic::transport::Endpoint;
 
@@ -131,6 +131,78 @@ mod ping_tls_tests {
 
         assert_eq!(error.code(), CLIENT_ARGUMENT_INVALID);
         assert!(error.to_string().contains("server_name"));
+    }
+}
+
+#[cfg(test)]
+mod registration_lease_tests {
+    use super::*;
+    use std::time::Instant;
+
+    fn reply(remaining_ms: u64, absolute_expiry_ms: u64) -> RegisterNodeReply {
+        RegisterNodeReply {
+            lease_epoch: 7,
+            expires_at_unix_ms: absolute_expiry_ms,
+            lease_remaining_ms: remaining_ms,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn registration_lease_ignores_cross_machine_wall_clock_offsets() {
+        let sent = Instant::now();
+        let received = sent + Duration::from_secs(2);
+        for absolute_expiry in [0, 1, u64::MAX] {
+            let registration =
+                checked_registration_readiness(reply(30_000, absolute_expiry), sent, received)
+                    .unwrap();
+            assert_eq!(
+                registration.session_deadline,
+                sent + Duration::from_secs(30)
+            );
+            assert_eq!(
+                registration.session_deadline.duration_since(received),
+                Duration::from_secs(28)
+            );
+        }
+    }
+
+    #[test]
+    fn registration_lease_rejects_missing_ttl_or_zero_epoch() {
+        let sent = Instant::now();
+        assert!(checked_registration_readiness(reply(0, u64::MAX), sent, sent).is_err());
+        let mut missing_epoch = reply(30_000, u64::MAX);
+        missing_epoch.lease_epoch = 0;
+        assert!(checked_registration_readiness(missing_epoch, sent, sent).is_err());
+    }
+
+    #[test]
+    fn registration_lease_deducts_slow_response_and_rejects_exhausted_ttl() {
+        let sent = Instant::now();
+        let deadline = sent + Duration::from_secs(5);
+        let registration = checked_registration_readiness(
+            reply(5_000, u64::MAX),
+            sent,
+            sent + Duration::from_secs(4),
+        )
+        .unwrap();
+        assert_eq!(registration.session_deadline, deadline);
+        for received in [deadline, deadline + Duration::from_secs(1)] {
+            assert!(
+                checked_registration_readiness(reply(5_000, u64::MAX), sent, received).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn registration_lease_does_not_exceed_requested_ttl() {
+        let sent = Instant::now();
+        let registration =
+            checked_registration_readiness(reply(u64::MAX, u64::MAX), sent, sent).unwrap();
+        assert_eq!(
+            registration.session_deadline,
+            sent + Duration::from_secs(30)
+        );
     }
 }
 
@@ -366,6 +438,8 @@ impl From<MetaBackendPersistence> for MetaPersistenceCapability {
 pub struct NodeRegistrationReadiness {
     pub lease_epoch: u64,
     pub expires_at_unix_ms: u64,
+    /// Conservative local cutoff, independent of Node/Meta wall-clock skew.
+    pub session_deadline: Instant,
     pub meta_backend_persistence: MetaPersistenceCapability,
     pub meta_backend_healthy: bool,
     pub meta_persistence_ready: bool,
@@ -373,6 +447,17 @@ pub struct NodeRegistrationReadiness {
 }
 
 pub fn registration_readiness_from_reply(reply: RegisterNodeReply) -> NodeRegistrationReadiness {
+    registration_readiness_from_reply_at(reply, Instant::now())
+}
+
+const NODE_REGISTRATION_LEASE_SECONDS: u64 = 30;
+
+fn registration_readiness_from_reply_at(
+    reply: RegisterNodeReply,
+    request_started_at: Instant,
+) -> NodeRegistrationReadiness {
+    let remaining = Duration::from_millis(reply.lease_remaining_ms)
+        .min(Duration::from_secs(NODE_REGISTRATION_LEASE_SECONDS));
     let persistence = MetaBackendPersistence::try_from(reply.meta_backend_persistence)
         .unwrap_or(MetaBackendPersistence::Unspecified)
         .into();
@@ -382,11 +467,33 @@ pub fn registration_readiness_from_reply(reply: RegisterNodeReply) -> NodeRegist
     NodeRegistrationReadiness {
         lease_epoch: reply.lease_epoch,
         expires_at_unix_ms: reply.expires_at_unix_ms,
+        session_deadline: request_started_at + remaining,
         meta_backend_persistence: persistence,
         meta_backend_healthy: reply.meta_backend_healthy,
         meta_persistence_ready,
         meta_persistence_detail: reply.meta_persistence_detail,
     }
+}
+
+fn checked_registration_readiness(
+    reply: RegisterNodeReply,
+    request_started_at: Instant,
+    received_at: Instant,
+) -> Result<NodeRegistrationReadiness> {
+    if reply.lease_epoch == 0 {
+        return Err(Error::coded(
+            CLIENT_ARGUMENT_INVALID,
+            "Meta returned a zero Node registration epoch",
+        ));
+    }
+    let registration = registration_readiness_from_reply_at(reply, request_started_at);
+    if registration.session_deadline <= received_at {
+        return Err(Error::coded(
+            afs_error::IO_PERMISSION_DENIED,
+            "Meta Node registration lifetime is missing or expired",
+        ));
+    }
+    Ok(registration)
 }
 
 /// 同步 VFS/FUSE 回调的 Meta adapter。调用方必须在 FUSE 线程或
@@ -826,7 +933,8 @@ pub async fn register_node(
 }
 
 /// Registers the Node and returns Meta persistence readiness as observed by the
-/// server. Missing fields from an older Meta decode as unknown/false.
+/// server. Missing persistence fields decode as unknown/false. A missing or
+/// exhausted relative session lifetime fails closed, including on heartbeat.
 pub async fn register_node_with_readiness(
     endpoint: &str,
     node: afs_protocol::meta::NodeDescriptor,
@@ -834,6 +942,9 @@ pub async fn register_node_with_readiness(
     tls: TlsConfig,
 ) -> Result<NodeRegistrationReadiness> {
     static REGISTER_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+    // Include connection setup and the full response in the conservative lease
+    // budget. Both startup and heartbeat consume this exact monotonic cutoff.
+    let request_started_at = Instant::now();
     let config = GrpcConfig {
         connect_timeout: timeout,
         request_timeout: timeout,
@@ -859,24 +970,18 @@ pub async fn register_node_with_readiness(
                 REGISTER_SEQUENCE.fetch_add(1, Ordering::Relaxed),
             ),
             node: Some(node),
-            lease_seconds: 30,
+            lease_seconds: NODE_REGISTRATION_LEASE_SECONDS,
         })
         .await
         .map_err(afs_transport::grpc::error_status::status_to_error)?
         .into_inner();
-    if reply.lease_epoch == 0 {
-        return Err(Error::coded(
-            CLIENT_ARGUMENT_INVALID,
-            "Meta returned a zero Node registration epoch",
-        ));
-    }
-    Ok(registration_readiness_from_reply(reply))
+    checked_registration_readiness(reply, request_started_at, Instant::now())
 }
 
 /// Synchronous adapter used by the DFS Backend on FUSE worker threads.
 #[cfg(feature = "dfs")]
 pub struct GrpcDfsMeta {
-    channel: Channel,
+    channel: afs_tracing::TracedChannel,
     runtime: tokio::runtime::Handle,
     node_id: String,
     session_id: String,
@@ -884,6 +989,7 @@ pub struct GrpcDfsMeta {
     timeout: Duration,
     sequence: AtomicU64,
     placement: Mutex<Option<Arc<crate::dfs::PlacementSnapshot>>>,
+    read_work: Option<crate::node::read_work::ReadWorkMetrics>,
 }
 
 #[cfg(feature = "dfs")]
@@ -910,7 +1016,7 @@ impl GrpcDfsMeta {
             .configure_client(endpoint)
             .map_err(|error| Error::coded(CLIENT_ARGUMENT_INVALID, error.to_string()))?;
         Ok(Self {
-            channel: endpoint.connect_lazy(),
+            channel: afs_tracing::traced_channel(endpoint.connect_lazy()),
             runtime: tokio::runtime::Handle::current(),
             node_id,
             session_id,
@@ -918,7 +1024,40 @@ impl GrpcDfsMeta {
             timeout,
             sequence: AtomicU64::new(1),
             placement: Mutex::new(None),
+            read_work: None,
         })
+    }
+
+    pub(crate) fn with_read_work_metrics(
+        mut self,
+        metrics: crate::node::read_work::ReadWorkMetrics,
+    ) -> Self {
+        self.read_work = Some(metrics);
+        self
+    }
+
+    fn record_read_rpc(&self, method: &'static str) {
+        if let Some(metrics) = &self.read_work {
+            metrics.read_rpc(method);
+        }
+    }
+
+    // Covers request preparation, caller queue/transport wait, reply decoding
+    // and domain conversion. It is a client adapter interval, not server CPU.
+    fn read_diagnostic<T>(
+        &self,
+        stage: crate::node::read_work::ReadDiagnosticStage,
+        call: impl FnOnce() -> afs_error::Result<T>,
+    ) -> afs_error::Result<T> {
+        let diagnostic = self
+            .read_work
+            .as_ref()
+            .and_then(|metrics| metrics.diagnostic(stage));
+        let result = call();
+        if let Some(diagnostic) = diagnostic {
+            diagnostic.finish(result.is_ok());
+        }
+        result
     }
 
     fn request_id(&self) -> String {
@@ -977,11 +1116,15 @@ impl GrpcDfsMeta {
         false
     }
 
-    fn client(&self) -> afs_protocol::meta::dfs_meta_client::DfsMetaClient<Channel> {
+    fn client(
+        &self,
+    ) -> afs_protocol::meta::dfs_meta_client::DfsMetaClient<afs_tracing::TracedChannel> {
         afs_protocol::meta::dfs_meta_client::DfsMetaClient::new(self.channel.clone())
     }
 
-    fn root_client(&self) -> afs_protocol::meta::meta_client::MetaClient<Channel> {
+    fn root_client(
+        &self,
+    ) -> afs_protocol::meta::meta_client::MetaClient<afs_tracing::TracedChannel> {
         afs_protocol::meta::meta_client::MetaClient::new(self.channel.clone())
     }
 
@@ -989,64 +1132,190 @@ impl GrpcDfsMeta {
         &self,
         request: crate::dfs::ValidateDfsReadGrants,
     ) -> afs_error::Result<Vec<crate::dfs::DfsAuthorizedRead>> {
-        let validations = request
-            .validations
-            .into_iter()
-            .map(|validation| {
-                let grant = validation.grant;
-                afs_protocol::meta::DfsReadValidation {
-                    grant: Some(afs_protocol::meta::DfsReadGrant {
-                        namespace_id: grant.namespace_id.0,
-                        file_version_id: grant.file_version_id.0,
-                        layout_root_id: grant.layout_root_id.0,
-                        caller_node_id: grant.caller_node_id,
-                        caller_node_epoch: grant.caller_node_epoch,
-                        expires_at_unix_ms: grant.expires_at_unix_ms,
-                        fence: grant.fence,
-                        token: grant.token,
-                    }),
-                    chunk_id: validation.chunk_id.0,
-                    copy_id: validation.copy_id.0,
-                    chunk_offset: validation.chunk_offset,
-                    length: validation.length,
-                }
-            })
-            .collect();
+        self.read_diagnostic(
+            crate::node::read_work::ReadDiagnosticStage::MetaValidateReadGrants,
+            || {
+                self.record_read_rpc("validate_read_grants");
+                let validations = request
+                    .validations
+                    .into_iter()
+                    .map(|validation| {
+                        let grant = validation.grant;
+                        afs_protocol::meta::DfsReadValidation {
+                            grant: Some(afs_protocol::meta::DfsReadGrant {
+                                namespace_id: grant.namespace_id.0,
+                                file_version_id: grant.file_version_id.0,
+                                layout_root_id: grant.layout_root_id.0,
+                                caller_node_id: grant.caller_node_id,
+                                caller_node_epoch: grant.caller_node_epoch,
+                                expires_at_unix_ms: grant.expires_at_unix_ms,
+                                fence: grant.fence,
+                                token: grant.token,
+                            }),
+                            chunk_id: validation.chunk_id.0,
+                            copy_id: validation.copy_id.0,
+                            chunk_offset: validation.chunk_offset,
+                            length: validation.length,
+                        }
+                    })
+                    .collect();
+                let reply = self
+                    .run(self.client().validate_read_grants(
+                        afs_protocol::meta::ValidateDfsReadGrantsRequest {
+                            receiver_node_id: request.receiver_node_id,
+                            receiver_node_epoch: request.receiver_node_epoch,
+                            peer_node_id: request.peer_node_id,
+                            validations,
+                        },
+                    ))?
+                    .into_inner();
+                reply
+                    .authorizations
+                    .into_iter()
+                    .map(|entry| {
+                        let validation =
+                            required(entry.validation, "ReadAuthorization.validation")?;
+                        Ok(crate::dfs::DfsAuthorizedRead {
+                            validation: crate::dfs::DfsReadValidation {
+                                grant: domain_dfs_read_grant(required(
+                                    validation.grant,
+                                    "ReadAuthorization.grant",
+                                )?),
+                                chunk_id: crate::dfs::ChunkId::new(validation.chunk_id),
+                                copy_id: crate::dfs::CopyId::new(validation.copy_id),
+                                chunk_offset: validation.chunk_offset,
+                                length: validation.length,
+                            },
+                            allowed_ranges: entry
+                                .allowed_ranges
+                                .into_iter()
+                                .map(|range| (range.offset, range.length))
+                                .collect(),
+                            expires_at_unix_ms: entry.expires_at_unix_ms,
+                        })
+                    })
+                    .collect()
+            },
+        )
+    }
+
+    pub fn validate_external_read_grants(
+        &self,
+        request: crate::dfs::ValidateExternalReadGrants,
+    ) -> afs_error::Result<Vec<crate::dfs::DfsExternalAuthorizedRead>> {
         let reply = self
-            .run(self.client().validate_read_grants(
-                afs_protocol::meta::ValidateDfsReadGrantsRequest {
-                    receiver_node_id: request.receiver_node_id,
-                    receiver_node_epoch: request.receiver_node_epoch,
-                    peer_node_id: request.peer_node_id,
-                    validations,
-                },
-            ))?
+            .run(
+                self.client().validate_external_read_grants(
+                    afs_tracing::request_with_current_context(
+                        afs_protocol::meta::ValidateExternalReadGrantsRequest {
+                            caller_id: request.caller_id,
+                            validations: request
+                                .validations
+                                .into_iter()
+                                .map(wire_read_validation)
+                                .collect(),
+                        },
+                    ),
+                ),
+            )?
             .into_inner();
         reply
             .authorizations
             .into_iter()
-            .map(|entry| {
-                let validation = required(entry.validation, "ReadAuthorization.validation")?;
-                Ok(crate::dfs::DfsAuthorizedRead {
-                    validation: crate::dfs::DfsReadValidation {
-                        grant: domain_dfs_read_grant(required(
-                            validation.grant,
-                            "ReadAuthorization.grant",
-                        )?),
-                        chunk_id: crate::dfs::ChunkId::new(validation.chunk_id),
-                        copy_id: crate::dfs::CopyId::new(validation.copy_id),
-                        chunk_offset: validation.chunk_offset,
-                        length: validation.length,
-                    },
-                    allowed_ranges: entry
-                        .allowed_ranges
-                        .into_iter()
-                        .map(|range| (range.offset, range.length))
-                        .collect(),
-                    expires_at_unix_ms: entry.expires_at_unix_ms,
-                })
-            })
+            .map(domain_external_authorized_read)
             .collect()
+    }
+
+    pub fn authorize_current_external_read(
+        &self,
+        request: crate::dfs::AuthorizeCurrentExternalRead,
+    ) -> afs_error::Result<Option<crate::dfs::AuthorizeCurrentExternalReadReply>> {
+        let response = self.runtime.block_on(async {
+            tokio::time::timeout(
+                self.timeout,
+                self.client().authorize_current_external_read(
+                    afs_tracing::request_with_current_context(
+                        afs_protocol::meta::AuthorizeCurrentExternalReadRequest {
+                            caller_id: request.caller_id,
+                            inode_id: request.inode_id.0,
+                            namespace_id: request.namespace_id.0,
+                            expected_head_version_id: request.expected_head_version.0,
+                            layout_root_id: request.layout_root_id.0,
+                            validations: request
+                                .validations
+                                .into_iter()
+                                .map(wire_read_validation)
+                                .collect(),
+                            missing_sources: request
+                                .missing_sources
+                                .into_iter()
+                                .map(|missing| afs_protocol::meta::DfsMissingReadSource {
+                                    chunk_id: missing.chunk_id.0,
+                                    chunk_offset: missing.chunk_offset,
+                                    length: missing.length,
+                                })
+                                .collect(),
+                        },
+                    ),
+                ),
+            )
+            .await
+        });
+        let reply = match response {
+            Err(_) => {
+                return Err(Error::coded(
+                    afs_error::CLIENT_DEADLINE_EXCEEDED,
+                    "DFS Meta request timed out",
+                ));
+            }
+            Ok(Err(status)) if current_external_read_is_unimplemented(&status) => return Ok(None),
+            Ok(Err(status)) => return Err(Self::dfs_meta_status_to_error(status)),
+            Ok(Ok(response)) => response.into_inner(),
+        };
+        domain_authorize_current_external_read_reply(reply).map(Some)
+    }
+
+    pub fn authorize_external_version_read(
+        &self,
+        request: crate::dfs::AuthorizeExternalVersionRead,
+    ) -> afs_error::Result<crate::dfs::AuthorizeExternalVersionReadReply> {
+        let response = self.runtime.block_on(async {
+            tokio::time::timeout(
+                self.timeout,
+                self.client().authorize_external_version_read(
+                    afs_tracing::request_with_current_context(
+                        afs_protocol::meta::AuthorizeExternalVersionReadRequest {
+                            caller_id: request.caller_id,
+                            inode_id: request.inode_id.0,
+                            namespace_id: request.namespace_id.0,
+                            file_version_id: request.file_version_id.0,
+                            layout_root_id: request.layout_root_id.0,
+                            requests: request
+                                .requests
+                                .into_iter()
+                                .map(|request| afs_protocol::meta::DfsMissingReadSource {
+                                    chunk_id: request.chunk_id.0,
+                                    chunk_offset: request.chunk_offset,
+                                    length: request.length,
+                                })
+                                .collect(),
+                        },
+                    ),
+                ),
+            )
+            .await
+        });
+        let reply = match response {
+            Err(_) => {
+                return Err(Error::coded(
+                    afs_error::CLIENT_DEADLINE_EXCEEDED,
+                    "DFS Meta request timed out",
+                ));
+            }
+            Ok(Err(status)) => return Err(Self::dfs_meta_status_to_error(status)),
+            Ok(Ok(response)) => response.into_inner(),
+        };
+        domain_authorize_external_version_read_reply(reply)
     }
 
     pub fn validate_replica_write(
@@ -1214,30 +1483,69 @@ impl crate::node::dfs_read::ReadSourceProvider for GrpcDfsMeta {
         &self,
         request: crate::dfs::DfsChunkSourcesRequest,
     ) -> afs_error::Result<crate::dfs::DfsChunkSourcesReply> {
-        let reply = self
-            .run(
-                self.client()
-                    .get_chunk_sources(afs_protocol::meta::GetDfsChunkSourcesRequest {
-                        caller_id: request.caller_id,
-                        namespace_id: request.namespace_id.0,
-                        file_version_id: request.file_version_id.0,
-                        layout_root_id: request.layout_root_id.0,
-                        chunk_ids: request
-                            .chunk_ids
-                            .into_iter()
-                            .map(|chunk_id| chunk_id.0)
-                            .collect(),
-                    }),
-            )?
-            .into_inner();
-        Ok(crate::dfs::DfsChunkSourcesReply {
-            revision: reply.revision,
-            chunks: reply
-                .chunks
-                .into_iter()
-                .map(domain_dfs_chunk_sources)
-                .collect::<afs_error::Result<Vec<_>>>()?,
-        })
+        self.read_diagnostic(
+            crate::node::read_work::ReadDiagnosticStage::MetaGetChunkSources,
+            || {
+                self.record_read_rpc("get_chunk_sources");
+                let reply = self
+                    .run(
+                        self.client()
+                            .get_chunk_sources(afs_tracing::request_with_current_context(
+                                afs_protocol::meta::GetDfsChunkSourcesRequest {
+                                    caller_id: request.caller_id,
+                                    namespace_id: request.namespace_id.0,
+                                    file_version_id: request.file_version_id.0,
+                                    layout_root_id: request.layout_root_id.0,
+                                    chunk_ids: request
+                                        .chunk_ids
+                                        .into_iter()
+                                        .map(|chunk_id| chunk_id.0)
+                                        .collect(),
+                                },
+                            )),
+                    )?
+                    .into_inner();
+                Ok(crate::dfs::DfsChunkSourcesReply {
+                    revision: reply.revision,
+                    chunks: reply
+                        .chunks
+                        .into_iter()
+                        .map(domain_dfs_chunk_sources)
+                        .collect::<afs_error::Result<Vec<_>>>()?,
+                })
+            },
+        )
+    }
+}
+
+#[cfg(feature = "dfs")]
+impl crate::node::dfs_read::ExternalReadAuthorizer for GrpcDfsMeta {
+    fn authorize_current_external_read(
+        &self,
+        request: crate::dfs::AuthorizeCurrentExternalRead,
+    ) -> afs_error::Result<Option<crate::dfs::AuthorizeCurrentExternalReadReply>> {
+        GrpcDfsMeta::authorize_current_external_read(self, request)
+    }
+
+    fn authorize_external_version_read(
+        &self,
+        request: crate::dfs::AuthorizeExternalVersionRead,
+    ) -> afs_error::Result<Option<crate::dfs::AuthorizeExternalVersionReadReply>> {
+        GrpcDfsMeta::authorize_external_version_read(self, request).map(Some)
+    }
+
+    fn validate_external_read_grants(
+        &self,
+        caller_id: &str,
+        validations: Vec<crate::dfs::DfsReadValidation>,
+    ) -> afs_error::Result<Vec<crate::dfs::DfsExternalAuthorizedRead>> {
+        GrpcDfsMeta::validate_external_read_grants(
+            self,
+            crate::dfs::ValidateExternalReadGrants {
+                caller_id: caller_id.to_owned(),
+                validations,
+            },
+        )
     }
 }
 
@@ -1248,19 +1556,24 @@ impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
         parent: &crate::dfs::InodeId,
         name: &[u8],
     ) -> afs_error::Result<Option<crate::dfs::InodeRecord>> {
-        let reply = self
-            .run(self.client().lookup(afs_protocol::meta::DfsLookupRequest {
-                namespace_id: self.namespace_id.0.clone(),
-                parent_inode_id: parent.0.clone(),
-                name: name.to_vec(),
-            }))?
-            .into_inner();
-        if !reply.found {
-            return Ok(None);
-        }
-        required(reply.inode, "DfsLookup.inode")
-            .and_then(domain_dfs_inode)
-            .map(Some)
+        self.read_diagnostic(
+            crate::node::read_work::ReadDiagnosticStage::MetaLookup,
+            || {
+                let reply = self
+                    .run(self.client().lookup(afs_protocol::meta::DfsLookupRequest {
+                        namespace_id: self.namespace_id.0.clone(),
+                        parent_inode_id: parent.0.clone(),
+                        name: name.to_vec(),
+                    }))?
+                    .into_inner();
+                if !reply.found {
+                    return Ok(None);
+                }
+                required(reply.inode, "DfsLookup.inode")
+                    .and_then(domain_dfs_inode)
+                    .map(Some)
+            },
+        )
     }
 
     fn create(
@@ -1582,33 +1895,48 @@ impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
         &self,
         inode_id: &crate::dfs::InodeId,
     ) -> afs_error::Result<crate::dfs::InodeRecord> {
-        let reply = self
-            .run(
-                self.client()
-                    .get_inode(afs_protocol::meta::GetDfsInodeRequest {
-                        inode_id: inode_id.0.clone(),
-                    }),
-            )?
-            .into_inner();
-        required(reply.inode, "GetDfsInode.inode").and_then(domain_dfs_inode)
+        self.read_diagnostic(
+            crate::node::read_work::ReadDiagnosticStage::MetaGetInode,
+            || {
+                self.record_read_rpc("get_inode");
+                let reply = self
+                    .run(
+                        self.client()
+                            .get_inode(afs_tracing::request_with_current_context(
+                                afs_protocol::meta::GetDfsInodeRequest {
+                                    inode_id: inode_id.0.clone(),
+                                },
+                            )),
+                    )?
+                    .into_inner();
+                required(reply.inode, "GetDfsInode.inode").and_then(domain_dfs_inode)
+            },
+        )
     }
 
     fn get_file_version(
         &self,
         version_id: &crate::dfs::FileVersionId,
     ) -> afs_error::Result<(crate::dfs::FileVersion, crate::dfs::LayoutRoot)> {
-        let reply = self
-            .run(
-                self.client()
-                    .get_file_version(afs_protocol::meta::GetFileVersionRequest {
-                        version_id: version_id.0.clone(),
-                    }),
-            )?
-            .into_inner();
-        Ok((
-            domain_dfs_version(required(reply.version, "GetFileVersion.version")?),
-            domain_dfs_layout(required(reply.layout, "GetFileVersion.layout")?),
-        ))
+        self.read_diagnostic(
+            crate::node::read_work::ReadDiagnosticStage::MetaGetFileVersion,
+            || {
+                self.record_read_rpc("get_file_version");
+                let reply = self
+                    .run(self.client().get_file_version(
+                        afs_tracing::request_with_current_context(
+                            afs_protocol::meta::GetFileVersionRequest {
+                                version_id: version_id.0.clone(),
+                            },
+                        ),
+                    ))?
+                    .into_inner();
+                Ok((
+                    domain_dfs_version(required(reply.version, "GetFileVersion.version")?),
+                    domain_dfs_layout(required(reply.layout, "GetFileVersion.layout")?),
+                ))
+            },
+        )
     }
 
     fn sync_inode_metadata(
@@ -1741,25 +2069,29 @@ impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
         &self,
         node_id: &str,
     ) -> afs_error::Result<Option<crate::node::vfs::dfs::DfsNodeLocation>> {
-        let reply = self
-            .run(
-                self.root_client()
-                    .lookup_node(afs_protocol::meta::LookupNodeRequest {
-                        request_id: self.request_id(),
-                        node_id: node_id.to_owned(),
-                    }),
-            )?
-            .into_inner();
-        if !reply.found {
-            return Ok(None);
-        }
-        let node = required(reply.node, "LookupNode.node")?;
-        let endpoint = required(node.endpoint, "LookupNode.node.endpoint")?;
-        Ok(Some(crate::node::vfs::dfs::DfsNodeLocation {
-            node_id: node.node_id,
-            node_epoch: reply.lease_epoch,
-            data_endpoint: endpoint.data_addr,
-        }))
+        self.read_diagnostic(
+            crate::node::read_work::ReadDiagnosticStage::MetaLookupNodeLocation,
+            || {
+                let reply =
+                    self.run(self.root_client().lookup_node(
+                        afs_protocol::meta::LookupNodeRequest {
+                            request_id: self.request_id(),
+                            node_id: node_id.to_owned(),
+                        },
+                    ))?
+                    .into_inner();
+                if !reply.found {
+                    return Ok(None);
+                }
+                let node = required(reply.node, "LookupNode.node")?;
+                let endpoint = required(node.endpoint, "LookupNode.node.endpoint")?;
+                Ok(Some(crate::node::vfs::dfs::DfsNodeLocation {
+                    node_id: node.node_id,
+                    node_epoch: reply.lease_epoch,
+                    data_endpoint: endpoint.data_addr,
+                }))
+            },
+        )
     }
 
     fn current_node_session(&self, node_id: &str) -> afs_error::Result<Option<String>> {
@@ -1809,24 +2141,26 @@ impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
         let reply = self
             .run_with_timeout(
                 self.client()
-                    .commit_file_version(afs_protocol::meta::CommitFileVersionRequest {
-                        caller_id: self.node_id.clone(),
-                        operation_id: commit.operation_id.0,
-                        inode_id: commit.inode_id.0,
-                        write_lease: Some(wire_dfs_write_lease(commit.write_lease)),
-                        expected_inode_revision: commit.expected_inode_revision,
-                        expected_head_version_id: commit
-                            .expected_head_version
-                            .map_or_else(String::new, |id| id.0),
-                        version: Some(wire_dfs_version(commit.file_version)),
-                        layout: Some(wire_dfs_layout(commit.layout_root)),
-                        chunk_receipts: commit
-                            .chunk_receipts
-                            .into_iter()
-                            .map(wire_chunk_receipt)
-                            .collect(),
-                        metadata_delta: Some(wire_dfs_metadata_delta(commit.metadata_delta)),
-                    }),
+                    .commit_file_version(afs_tracing::request_with_current_context(
+                        afs_protocol::meta::CommitFileVersionRequest {
+                            caller_id: self.node_id.clone(),
+                            operation_id: commit.operation_id.0,
+                            inode_id: commit.inode_id.0,
+                            write_lease: Some(wire_dfs_write_lease(commit.write_lease)),
+                            expected_inode_revision: commit.expected_inode_revision,
+                            expected_head_version_id: commit
+                                .expected_head_version
+                                .map_or_else(String::new, |id| id.0),
+                            version: Some(wire_dfs_version(commit.file_version)),
+                            layout: Some(wire_dfs_layout(commit.layout_root)),
+                            chunk_receipts: commit
+                                .chunk_receipts
+                                .into_iter()
+                                .map(wire_chunk_receipt)
+                                .collect(),
+                            metadata_delta: Some(wire_dfs_metadata_delta(commit.metadata_delta)),
+                        },
+                    )),
                 timeout,
             )?
             .into_inner();
@@ -2126,6 +2460,18 @@ fn wire_chunk_receipt(receipt: crate::dfs::ChunkReceipt) -> afs_protocol::meta::
         placement_revision: receipt.placement_revision,
         placement_epoch: receipt.placement_epoch,
         replica_group_id: receipt.replica_group_id.0,
+        external_commit: receipt.external_commit.map(|external| {
+            afs_protocol::meta::DfsExternalCommitReceipt {
+                store_id: external.store_id,
+                generation: external.generation,
+                object_key: external.object_key,
+                persisted_bytes: external.persisted_bytes,
+                verified_digest: external.verified_digest.bytes.to_vec(),
+                verified_digest_algorithm: wire_digest_algorithm(
+                    external.verified_digest.algorithm,
+                ),
+            }
+        }),
         durable_acks: receipt
             .durable_acks
             .into_iter()
@@ -2481,16 +2827,185 @@ fn domain_placement_snapshot(
 }
 
 #[cfg(feature = "dfs")]
+fn wire_read_validation(
+    validation: crate::dfs::DfsReadValidation,
+) -> afs_protocol::meta::DfsReadValidation {
+    let grant = validation.grant;
+    afs_protocol::meta::DfsReadValidation {
+        grant: Some(afs_protocol::meta::DfsReadGrant {
+            namespace_id: grant.namespace_id.0,
+            file_version_id: grant.file_version_id.0,
+            layout_root_id: grant.layout_root_id.0,
+            caller_node_id: grant.caller_node_id,
+            caller_node_epoch: grant.caller_node_epoch,
+            expires_at_unix_ms: grant.expires_at_unix_ms,
+            fence: grant.fence,
+            token: grant.token,
+        }),
+        chunk_id: validation.chunk_id.0,
+        copy_id: validation.copy_id.0,
+        chunk_offset: validation.chunk_offset,
+        length: validation.length,
+    }
+}
+
+#[cfg(feature = "dfs")]
+fn current_external_read_is_unimplemented(status: &tonic::Status) -> bool {
+    status.code() == tonic::Code::Unimplemented
+}
+
+#[cfg(feature = "dfs")]
+fn domain_authorize_current_external_read_reply(
+    reply: afs_protocol::meta::AuthorizeCurrentExternalReadReply,
+) -> afs_error::Result<crate::dfs::AuthorizeCurrentExternalReadReply> {
+    let inode = domain_dfs_inode(required(reply.inode, "AuthorizeCurrentExternalRead.inode")?)?;
+    if reply.head_changed {
+        if !reply.authorizations.is_empty() {
+            return Err(Error::coded(
+                CLIENT_PROTOCOL_VIOLATION,
+                "head-changed current external read must not include authorizations",
+            ));
+        }
+        return Ok(crate::dfs::AuthorizeCurrentExternalReadReply::HeadChanged(
+            inode,
+        ));
+    }
+    let authorizations = reply
+        .authorizations
+        .into_iter()
+        .map(domain_external_authorized_read)
+        .collect::<afs_error::Result<Vec<_>>>()?;
+    Ok(crate::dfs::AuthorizeCurrentExternalReadReply::Authorized {
+        inode,
+        authorizations,
+    })
+}
+
+#[cfg(feature = "dfs")]
+fn domain_authorize_external_version_read_reply(
+    reply: afs_protocol::meta::AuthorizeExternalVersionReadReply,
+) -> afs_error::Result<crate::dfs::AuthorizeExternalVersionReadReply> {
+    let authorizations = reply
+        .authorizations
+        .into_iter()
+        .map(domain_external_authorized_read)
+        .collect::<afs_error::Result<Vec<_>>>()?;
+    if !authorizations.is_empty() && reply.remaining_validity_ms == 0 {
+        return Err(Error::coded(
+            CLIENT_PROTOCOL_VIOLATION,
+            "external version read authorization must include a positive remaining validity",
+        ));
+    }
+    if reply.remaining_validity_ms > 5_000 {
+        return Err(Error::coded(
+            CLIENT_PROTOCOL_VIOLATION,
+            "external version read validity exceeds the supported bound",
+        ));
+    }
+    Ok(crate::dfs::AuthorizeExternalVersionReadReply {
+        authorizations,
+        remaining_validity_ms: reply.remaining_validity_ms,
+    })
+}
+
+#[cfg(feature = "dfs")]
+fn domain_external_authorized_read(
+    entry: afs_protocol::meta::DfsExternalAuthorizedRead,
+) -> afs_error::Result<crate::dfs::DfsExternalAuthorizedRead> {
+    let authorized = required(entry.authorized, "ExternalReadAuthorization.authorized")?;
+    let validation = required(
+        authorized.validation,
+        "ExternalReadAuthorization.validation",
+    )?;
+    let chunk = domain_chunk_object(required(entry.chunk, "ExternalReadAuthorization.chunk")?)?;
+    let location = domain_dfs_copy_location(required(
+        entry.location,
+        "ExternalReadAuthorization.location",
+    )?)?;
+    let crate::dfs::CopyLocation::External {
+        store_id,
+        object_key,
+        object_revision,
+    } = &location
+    else {
+        return Err(Error::coded(
+            CLIENT_PROTOCOL_VIOLATION,
+            "external authorization requires external location",
+        ));
+    };
+    let expected_key = crate::dfs::external_object_key(store_id, object_revision, &chunk.id)
+        .map_err(|error| Error::coded(CLIENT_PROTOCOL_VIOLATION, error.to_string()))?;
+    if chunk.id.0 != validation.chunk_id || *object_key != expected_key {
+        return Err(Error::coded(
+            CLIENT_PROTOCOL_VIOLATION,
+            "external authorization identity mismatch",
+        ));
+    }
+    Ok(crate::dfs::DfsExternalAuthorizedRead {
+        authorized: crate::dfs::DfsAuthorizedRead {
+            validation: crate::dfs::DfsReadValidation {
+                grant: domain_dfs_read_grant(required(
+                    validation.grant,
+                    "ExternalReadAuthorization.grant",
+                )?),
+                chunk_id: crate::dfs::ChunkId::new(validation.chunk_id),
+                copy_id: crate::dfs::CopyId::new(validation.copy_id),
+                chunk_offset: validation.chunk_offset,
+                length: validation.length,
+            },
+            allowed_ranges: authorized
+                .allowed_ranges
+                .into_iter()
+                .map(|range| (range.offset, range.length))
+                .collect(),
+            expires_at_unix_ms: authorized.expires_at_unix_ms,
+        },
+        chunk,
+        location,
+    })
+}
+
+#[cfg(feature = "dfs")]
 fn domain_dfs_chunk_sources(
     value: afs_protocol::meta::DfsChunkSources,
 ) -> afs_error::Result<crate::dfs::ChunkSources> {
+    let chunk_id = crate::dfs::ChunkId::new(value.chunk_id);
+    let chunk = value.chunk.map(domain_chunk_object).transpose()?;
+    if chunk.as_ref().is_some_and(|object| object.id != chunk_id) {
+        return Err(Error::coded(
+            CLIENT_PROTOCOL_VIOLATION,
+            "chunk source object identity mismatch",
+        ));
+    }
+    if value.allowed_ranges.len() > 128
+        || value.allowed_ranges.iter().any(|range| {
+            range.length == 0
+                || chunk.as_ref().is_none_or(|object| {
+                    range
+                        .offset
+                        .checked_add(range.length)
+                        .is_none_or(|end| end > object.length)
+                })
+        })
+    {
+        return Err(Error::coded(
+            CLIENT_PROTOCOL_VIOLATION,
+            "chunk source grant ranges exceed the bounded object identity",
+        ));
+    }
     Ok(crate::dfs::ChunkSources {
-        chunk_id: crate::dfs::ChunkId::new(value.chunk_id),
+        chunk_id,
+        chunk,
         sources: value
             .sources
             .into_iter()
             .map(domain_dfs_source_candidate)
             .collect::<afs_error::Result<Vec<_>>>()?,
+        allowed_ranges: value
+            .allowed_ranges
+            .into_iter()
+            .map(|range| (range.offset, range.length))
+            .collect(),
     })
 }
 
@@ -3220,6 +3735,284 @@ mod n2b2_root_command_batch_tests {
 mod tests {
     use super::*;
     use crate::node::vfs::dfs::DfsMeta;
+
+    #[test]
+    fn chunk_source_ranges_wire_roundtrip_and_legacy_fallback() {
+        use prost::Message;
+
+        let chunk = current_read_authorization().chunk.unwrap();
+        let wire = afs_protocol::meta::DfsChunkSources {
+            chunk_id: chunk.chunk_id.clone(),
+            chunk: Some(chunk),
+            sources: Vec::new(),
+            allowed_ranges: vec![afs_protocol::meta::dfs_authorized_read::Range {
+                offset: 1,
+                length: 2,
+            }],
+        };
+        let decoded =
+            afs_protocol::meta::DfsChunkSources::decode(wire.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(decoded, wire);
+        assert_eq!(
+            domain_dfs_chunk_sources(decoded).unwrap().allowed_ranges,
+            vec![(1, 2)]
+        );
+
+        let mut legacy_wire = wire;
+        legacy_wire.allowed_ranges.clear();
+        let legacy =
+            afs_protocol::meta::DfsChunkSources::decode(legacy_wire.encode_to_vec().as_slice())
+                .unwrap();
+        assert!(
+            domain_dfs_chunk_sources(legacy)
+                .unwrap()
+                .allowed_ranges
+                .is_empty()
+        );
+        let old_json = serde_json::json!({ "chunk_id": "legacy", "chunk": null, "sources": [] });
+        let legacy: crate::dfs::ChunkSources = serde_json::from_value(old_json).unwrap();
+        assert!(legacy.allowed_ranges.is_empty());
+    }
+
+    #[test]
+    fn chunk_source_ranges_wire_rejects_unbounded_or_invalid_hints() {
+        let chunk = current_read_authorization().chunk.unwrap();
+        let range =
+            |offset, length| afs_protocol::meta::dfs_authorized_read::Range { offset, length };
+        for allowed_ranges in [
+            vec![range(0, 1); 129],
+            vec![range(0, 0)],
+            vec![range(u64::MAX, 1)],
+            vec![range(3, 2)],
+        ] {
+            let error = domain_dfs_chunk_sources(afs_protocol::meta::DfsChunkSources {
+                chunk_id: chunk.chunk_id.clone(),
+                chunk: Some(chunk.clone()),
+                sources: Vec::new(),
+                allowed_ranges,
+            })
+            .unwrap_err();
+            assert_eq!(error.code(), CLIENT_PROTOCOL_VIOLATION);
+        }
+        assert!(
+            domain_dfs_chunk_sources(afs_protocol::meta::DfsChunkSources {
+                chunk_id: chunk.chunk_id,
+                chunk: None,
+                sources: Vec::new(),
+                allowed_ranges: vec![range(0, 1)],
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn external_authorization_wire_rejects_node_receiver_and_changed_object_key() {
+        let chunk_id = crate::dfs::ChunkId::new(format!("blake3-{}-4", "a".repeat(64)));
+        let key = crate::dfs::external_object_key("filesystem", "g1", &chunk_id).unwrap();
+        let valid = afs_protocol::meta::DfsExternalAuthorizedRead {
+            authorized: Some(afs_protocol::meta::DfsAuthorizedRead {
+                validation: Some(afs_protocol::meta::DfsReadValidation {
+                    grant: Some(afs_protocol::meta::DfsReadGrant::default()),
+                    chunk_id: chunk_id.0.clone(),
+                    copy_id: "external-copy".into(),
+                    chunk_offset: 0,
+                    length: 4,
+                }),
+                allowed_ranges: vec![afs_protocol::meta::dfs_authorized_read::Range {
+                    offset: 0,
+                    length: 4,
+                }],
+                expires_at_unix_ms: 10,
+            }),
+            chunk: Some(afs_protocol::meta::DfsChunkObject {
+                chunk_id: chunk_id.0,
+                length: 4,
+                content_digest: vec![0xaa; 32],
+                content_digest_algorithm: afs_protocol::meta::DfsDigestAlgorithm::Blake3 as i32,
+            }),
+            location: Some(afs_protocol::meta::DfsCopyLocation {
+                location: Some(afs_protocol::meta::dfs_copy_location::Location::External(
+                    afs_protocol::meta::dfs_copy_location::External {
+                        store_id: "filesystem".into(),
+                        object_key: key,
+                        object_revision: "g1".into(),
+                    },
+                )),
+            }),
+        };
+        assert!(domain_external_authorized_read(valid.clone()).is_ok());
+        let mut missing_identity = valid.clone();
+        missing_identity.chunk = None;
+        assert!(domain_external_authorized_read(missing_identity).is_err());
+        let mut wrong_key = valid.clone();
+        if let Some(afs_protocol::meta::dfs_copy_location::Location::External(external)) =
+            wrong_key.location.as_mut().unwrap().location.as_mut()
+        {
+            external.object_key.push_str("-alias");
+        }
+        assert!(domain_external_authorized_read(wrong_key).is_err());
+        let mut node_receiver = valid;
+        node_receiver.location = Some(afs_protocol::meta::DfsCopyLocation {
+            location: Some(afs_protocol::meta::dfs_copy_location::Location::Node(
+                afs_protocol::meta::dfs_copy_location::Node::default(),
+            )),
+        });
+        assert!(domain_external_authorized_read(node_receiver).is_err());
+    }
+
+    fn current_read_inode(head: &str) -> afs_protocol::meta::DfsInodeRecord {
+        afs_protocol::meta::DfsInodeRecord {
+            namespace_id: "default".into(),
+            inode_id: "inode:test".into(),
+            kind: afs_protocol::meta::DfsInodeKind::Regular as i32,
+            attributes: Some(afs_protocol::meta::DfsInodeAttributes {
+                mode: 0o640,
+                uid: 1000,
+                gid: 1000,
+                nlink: 1,
+                atime_unix_ms: 1,
+                mtime_unix_ms: 1,
+                ctime_unix_ms: 1,
+            }),
+            head_version_id: head.into(),
+            revision: 1,
+            symlink_target: Vec::new(),
+            xattrs: Vec::new(),
+            special_node: None,
+        }
+    }
+
+    fn current_read_authorization() -> afs_protocol::meta::DfsExternalAuthorizedRead {
+        let chunk_id = crate::dfs::ChunkId::new(format!("blake3-{}-4", "b".repeat(64)));
+        let key = crate::dfs::external_object_key("filesystem", "g1", &chunk_id).unwrap();
+        afs_protocol::meta::DfsExternalAuthorizedRead {
+            authorized: Some(afs_protocol::meta::DfsAuthorizedRead {
+                validation: Some(afs_protocol::meta::DfsReadValidation {
+                    grant: Some(afs_protocol::meta::DfsReadGrant::default()),
+                    chunk_id: chunk_id.0.clone(),
+                    copy_id: "external-copy".into(),
+                    chunk_offset: 0,
+                    length: 4,
+                }),
+                allowed_ranges: vec![afs_protocol::meta::dfs_authorized_read::Range {
+                    offset: 0,
+                    length: 4,
+                }],
+                expires_at_unix_ms: 10,
+            }),
+            chunk: Some(afs_protocol::meta::DfsChunkObject {
+                chunk_id: chunk_id.0,
+                length: 4,
+                content_digest: vec![0xbb; 32],
+                content_digest_algorithm: afs_protocol::meta::DfsDigestAlgorithm::Blake3 as i32,
+            }),
+            location: Some(afs_protocol::meta::DfsCopyLocation {
+                location: Some(afs_protocol::meta::dfs_copy_location::Location::External(
+                    afs_protocol::meta::dfs_copy_location::External {
+                        store_id: "filesystem".into(),
+                        object_key: key,
+                        object_revision: "g1".into(),
+                    },
+                )),
+            }),
+        }
+    }
+
+    #[test]
+    fn current_external_reply_rejects_head_changed_authorizations() {
+        let reply = afs_protocol::meta::AuthorizeCurrentExternalReadReply {
+            inode: Some(current_read_inode("next")),
+            head_changed: true,
+            authorizations: vec![current_read_authorization()],
+        };
+        assert_eq!(
+            domain_authorize_current_external_read_reply(reply)
+                .unwrap_err()
+                .code(),
+            CLIENT_PROTOCOL_VIOLATION
+        );
+    }
+
+    #[test]
+    fn current_external_reply_requires_inode() {
+        let reply = afs_protocol::meta::AuthorizeCurrentExternalReadReply {
+            inode: None,
+            head_changed: false,
+            authorizations: Vec::new(),
+        };
+        assert_eq!(
+            domain_authorize_current_external_read_reply(reply)
+                .unwrap_err()
+                .code(),
+            CLIENT_PROTOCOL_VIOLATION
+        );
+    }
+
+    #[test]
+    fn current_external_reply_decodes_authorized_and_head_changed_shapes() {
+        let authorized = afs_protocol::meta::AuthorizeCurrentExternalReadReply {
+            inode: Some(current_read_inode("version")),
+            head_changed: false,
+            authorizations: vec![current_read_authorization()],
+        };
+        assert!(matches!(
+            domain_authorize_current_external_read_reply(authorized).unwrap(),
+            crate::dfs::AuthorizeCurrentExternalReadReply::Authorized { authorizations, .. }
+                if authorizations.len() == 1
+        ));
+
+        let head_changed = afs_protocol::meta::AuthorizeCurrentExternalReadReply {
+            inode: Some(current_read_inode("next")),
+            head_changed: true,
+            authorizations: Vec::new(),
+        };
+        assert!(matches!(
+            domain_authorize_current_external_read_reply(head_changed).unwrap(),
+            crate::dfs::AuthorizeCurrentExternalReadReply::HeadChanged(inode)
+                if inode.head_version == Some(crate::dfs::FileVersionId::new("next"))
+        ));
+    }
+
+    #[test]
+    fn external_version_reply_requires_bounded_positive_validity() {
+        let valid = afs_protocol::meta::AuthorizeExternalVersionReadReply {
+            authorizations: vec![current_read_authorization()],
+            remaining_validity_ms: 5_000,
+        };
+        assert!(matches!(
+            domain_authorize_external_version_read_reply(valid).unwrap(),
+            crate::dfs::AuthorizeExternalVersionReadReply {
+                authorizations,
+                remaining_validity_ms: 5_000
+            } if authorizations.len() == 1
+        ));
+        for remaining_validity_ms in [0, 5_001] {
+            let reply = afs_protocol::meta::AuthorizeExternalVersionReadReply {
+                authorizations: vec![current_read_authorization()],
+                remaining_validity_ms,
+            };
+            assert_eq!(
+                domain_authorize_external_version_read_reply(reply)
+                    .unwrap_err()
+                    .code(),
+                CLIENT_PROTOCOL_VIOLATION
+            );
+        }
+    }
+
+    #[test]
+    fn current_external_unsupported_filter_is_exact_tonic_unimplemented() {
+        assert!(current_external_read_is_unimplemented(
+            &tonic::Status::unimplemented("old meta")
+        ));
+        assert!(!current_external_read_is_unimplemented(
+            &tonic::Status::permission_denied("no")
+        ));
+        assert!(!current_external_read_is_unimplemented(
+            &tonic::Status::deadline_exceeded("slow")
+        ));
+    }
+
     use std::time::Instant;
     use tokio::net::TcpListener;
 
@@ -3245,6 +4038,136 @@ mod tests {
             TlsConfig::Disabled,
         )
         .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_rpc_metrics_count_real_adapter_invocations_even_on_failure() {
+        let (endpoint, server) = hanging_endpoint().await;
+        let registry = afs_metrics::Registry::new();
+        let metrics = crate::node::read_work::ReadWorkMetrics::register(&registry).unwrap();
+        let meta = test_meta(&endpoint, Duration::from_millis(30)).with_read_work_metrics(metrics);
+        tokio::task::spawn_blocking(move || {
+            use crate::node::{dfs_read::ReadSourceProvider, vfs::dfs::DfsMeta};
+            assert!(
+                meta.get_inode(&crate::dfs::InodeId::new("missing"))
+                    .is_err()
+            );
+            assert!(
+                meta.get_file_version(&crate::dfs::FileVersionId::new("missing"))
+                    .is_err()
+            );
+            assert!(
+                meta.sources_for(crate::dfs::DfsChunkSourcesRequest {
+                    caller_id: "node-a".into(),
+                    namespace_id: crate::dfs::NamespaceId::new("default"),
+                    file_version_id: crate::dfs::FileVersionId::new("missing"),
+                    layout_root_id: crate::dfs::LayoutRootId::new("missing"),
+                    chunk_ids: Vec::new(),
+                })
+                .is_err()
+            );
+            assert!(
+                meta.validate_read_grants(crate::dfs::ValidateDfsReadGrants {
+                    receiver_node_id: "node-a".into(),
+                    receiver_node_epoch: 1,
+                    peer_node_id: "node-b".into(),
+                    validations: Vec::new(),
+                })
+                .is_err()
+            );
+        })
+        .await
+        .unwrap();
+        server.abort();
+        let families = registry.gather();
+        let calls = families
+            .iter()
+            .find(|family| family.name() == "afs_dfs_read_rpc_calls_total")
+            .unwrap();
+        assert_eq!(calls.get_metric().len(), 5);
+        for metric in calls.get_metric() {
+            let method = metric
+                .get_label()
+                .iter()
+                .find(|label| label.name() == "method")
+                .unwrap()
+                .value();
+            let expected = if method == "peer_read_ranges" {
+                0.0
+            } else {
+                1.0
+            };
+            assert_eq!(metric.get_counter().get_value(), expected, "{method}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_read_diagnostics_cover_full_failed_meta_calls() {
+        use crate::node::read_work::{ReadDiagnosticStage, ReadWorkMetrics};
+        let (endpoint, server) = hanging_endpoint().await;
+        let registry = afs_metrics::Registry::new();
+        let metrics = ReadWorkMetrics::register(&registry)
+            .unwrap()
+            .with_read_diagnostics(true);
+        let meta =
+            test_meta(&endpoint, Duration::from_millis(30)).with_read_work_metrics(metrics.clone());
+        tokio::task::spawn_blocking(move || {
+            use crate::node::{dfs_read::ReadSourceProvider, vfs::dfs::DfsMeta};
+            assert_eq!(
+                meta.get_inode(&crate::dfs::InodeId::new("missing"))
+                    .unwrap_err()
+                    .code(),
+                afs_error::CLIENT_DEADLINE_EXCEEDED
+            );
+            assert_eq!(
+                meta.get_file_version(&crate::dfs::FileVersionId::new("missing"))
+                    .unwrap_err()
+                    .code(),
+                afs_error::CLIENT_DEADLINE_EXCEEDED
+            );
+            assert!(
+                meta.sources_for(crate::dfs::DfsChunkSourcesRequest {
+                    caller_id: "node-a".into(),
+                    namespace_id: crate::dfs::NamespaceId::new("default"),
+                    file_version_id: crate::dfs::FileVersionId::new("missing"),
+                    layout_root_id: crate::dfs::LayoutRootId::new("missing"),
+                    chunk_ids: Vec::new(),
+                })
+                .is_err()
+            );
+            assert!(
+                meta.validate_read_grants(crate::dfs::ValidateDfsReadGrants {
+                    receiver_node_id: "node-a".into(),
+                    receiver_node_epoch: 1,
+                    peer_node_id: "node-b".into(),
+                    validations: Vec::new(),
+                })
+                .is_err()
+            );
+            assert!(
+                meta.lookup(&crate::dfs::InodeId::new("root"), b"missing")
+                    .is_err()
+            );
+            assert!(meta.lookup_node_location("missing").is_err());
+        })
+        .await
+        .unwrap();
+        server.abort();
+        let snapshot = metrics.diagnostics_snapshot().unwrap();
+        let expected = [
+            ReadDiagnosticStage::MetaGetInode,
+            ReadDiagnosticStage::MetaGetFileVersion,
+            ReadDiagnosticStage::MetaGetChunkSources,
+            ReadDiagnosticStage::MetaValidateReadGrants,
+            ReadDiagnosticStage::MetaLookup,
+            ReadDiagnosticStage::MetaLookupNodeLocation,
+        ];
+        assert_eq!(snapshot.records.len(), expected.len());
+        for (record, stage) in snapshot.records.iter().zip(expected) {
+            assert_eq!(record.stage, stage);
+            assert!(record.completed && !record.success);
+            assert!(record.end_ns > record.start_ns);
+        }
     }
 
     fn test_lease() -> crate::dfs::WriteLease {

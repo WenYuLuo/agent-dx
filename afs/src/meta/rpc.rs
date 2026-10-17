@@ -234,11 +234,13 @@ fn wire_backend_persistence(persistence: BackendPersistence) -> i32 {
 fn register_node_reply(
     session: super::store::NodeSession,
     readiness: BackendReadiness,
+    now_unix_ms: u64,
 ) -> RegisterNodeReply {
     RegisterNodeReply {
         node_id: session.node_id,
         lease_epoch: session.lease_epoch,
         expires_at_unix_ms: session.expires_at_unix_ms,
+        lease_remaining_ms: session.expires_at_unix_ms.saturating_sub(now_unix_ms),
         meta_backend_persistence: wire_backend_persistence(readiness.persistence),
         meta_backend_healthy: readiness.healthy,
         meta_persistence_ready: readiness.persistent_ready,
@@ -411,7 +413,11 @@ impl MetaService for MetaRpc {
             .backend_readiness()
             .await
             .map_err(afs_transport::grpc::error_status::error_to_status)?;
-        Ok(Response::new(register_node_reply(session, readiness)))
+        Ok(Response::new(register_node_reply(
+            session,
+            readiness,
+            super::store::now_unix_ms(),
+        )))
     }
 
     async fn lookup_node(
@@ -1660,6 +1666,152 @@ impl DfsMetaService for DfsMetaRpc {
         ))
     }
 
+    async fn validate_external_read_grants(
+        &self,
+        request: Request<afs_protocol::meta::ValidateExternalReadGrantsRequest>,
+    ) -> Result<Response<afs_protocol::meta::ValidateExternalReadGrantsReply>, Status> {
+        let authenticated = authenticated_node_id(&self.0, &request)?;
+        let request = request.into_inner();
+        validate_caller(authenticated.as_deref(), &request.caller_id)?;
+        let validations = request
+            .validations
+            .into_iter()
+            .map(domain_read_validation)
+            .collect::<Result<Vec<_>, Status>>()?;
+        let authorizations = dfs_service(&self.0)?
+            .validate_external_read_grants(request.caller_id, validations)
+            .await
+            .map_err(afs_transport::grpc::error_status::error_to_status)?;
+        Ok(Response::new(
+            afs_protocol::meta::ValidateExternalReadGrantsReply {
+                authorizations: authorizations
+                    .into_iter()
+                    .map(|entry| afs_protocol::meta::DfsExternalAuthorizedRead {
+                        authorized: Some(wire_authorized_read(entry.authorized)),
+                        chunk: Some(wire_chunk_object(entry.chunk)),
+                        location: Some(wire_copy_location(entry.location)),
+                    })
+                    .collect(),
+            },
+        ))
+    }
+
+    async fn authorize_current_external_read(
+        &self,
+        request: Request<afs_protocol::meta::AuthorizeCurrentExternalReadRequest>,
+    ) -> Result<Response<afs_protocol::meta::AuthorizeCurrentExternalReadReply>, Status> {
+        let authenticated = authenticated_node_id(&self.0, &request)?;
+        let request = request.into_inner();
+        validate_caller(authenticated.as_deref(), &request.caller_id)?;
+        for (value, field) in [
+            (&request.caller_id, "caller_id"),
+            (&request.inode_id, "inode_id"),
+            (&request.namespace_id, "namespace_id"),
+            (
+                &request.expected_head_version_id,
+                "expected_head_version_id",
+            ),
+            (&request.layout_root_id, "layout_root_id"),
+        ] {
+            require_text(value, field)?;
+        }
+        let validations = request
+            .validations
+            .into_iter()
+            .map(domain_read_validation)
+            .collect::<Result<Vec<_>, Status>>()?;
+        let missing_sources = request
+            .missing_sources
+            .into_iter()
+            .map(domain_missing_read_source)
+            .collect::<Result<Vec<_>, Status>>()?;
+        let reply = dfs_service(&self.0)?
+            .authorize_current_external_read(crate::dfs::AuthorizeCurrentExternalRead {
+                caller_id: request.caller_id,
+                inode_id: crate::dfs::InodeId::new(request.inode_id),
+                namespace_id: crate::dfs::NamespaceId::new(request.namespace_id),
+                expected_head_version: crate::dfs::FileVersionId::new(
+                    request.expected_head_version_id,
+                ),
+                layout_root_id: crate::dfs::LayoutRootId::new(request.layout_root_id),
+                validations,
+                missing_sources,
+            })
+            .await
+            .map_err(afs_transport::grpc::error_status::error_to_status)?;
+        let (inode, head_changed, authorizations) = match reply {
+            crate::dfs::AuthorizeCurrentExternalReadReply::Authorized {
+                inode,
+                authorizations,
+            } => (inode, false, authorizations),
+            crate::dfs::AuthorizeCurrentExternalReadReply::HeadChanged(inode) => {
+                (inode, true, Vec::new())
+            }
+        };
+        Ok(Response::new(
+            afs_protocol::meta::AuthorizeCurrentExternalReadReply {
+                inode: Some(wire_dfs_inode(inode)),
+                head_changed,
+                authorizations: authorizations
+                    .into_iter()
+                    .map(|entry| afs_protocol::meta::DfsExternalAuthorizedRead {
+                        authorized: Some(wire_authorized_read(entry.authorized)),
+                        chunk: Some(wire_chunk_object(entry.chunk)),
+                        location: Some(wire_copy_location(entry.location)),
+                    })
+                    .collect(),
+            },
+        ))
+    }
+
+    async fn authorize_external_version_read(
+        &self,
+        request: Request<afs_protocol::meta::AuthorizeExternalVersionReadRequest>,
+    ) -> Result<Response<afs_protocol::meta::AuthorizeExternalVersionReadReply>, Status> {
+        let authenticated = authenticated_node_id(&self.0, &request)?;
+        let request = request.into_inner();
+        validate_caller(authenticated.as_deref(), &request.caller_id)?;
+        for (value, field) in [
+            (&request.caller_id, "caller_id"),
+            (&request.inode_id, "inode_id"),
+            (&request.namespace_id, "namespace_id"),
+            (&request.file_version_id, "file_version_id"),
+            (&request.layout_root_id, "layout_root_id"),
+        ] {
+            require_text(value, field)?;
+        }
+        let requests = request
+            .requests
+            .into_iter()
+            .map(domain_missing_read_source)
+            .collect::<Result<Vec<_>, Status>>()?;
+        let reply = dfs_service(&self.0)?
+            .authorize_external_version_read(crate::dfs::AuthorizeExternalVersionRead {
+                caller_id: request.caller_id,
+                inode_id: crate::dfs::InodeId::new(request.inode_id),
+                namespace_id: crate::dfs::NamespaceId::new(request.namespace_id),
+                file_version_id: crate::dfs::FileVersionId::new(request.file_version_id),
+                layout_root_id: crate::dfs::LayoutRootId::new(request.layout_root_id),
+                requests,
+            })
+            .await
+            .map_err(afs_transport::grpc::error_status::error_to_status)?;
+        Ok(Response::new(
+            afs_protocol::meta::AuthorizeExternalVersionReadReply {
+                authorizations: reply
+                    .authorizations
+                    .into_iter()
+                    .map(|entry| afs_protocol::meta::DfsExternalAuthorizedRead {
+                        authorized: Some(wire_authorized_read(entry.authorized)),
+                        chunk: Some(wire_chunk_object(entry.chunk)),
+                        location: Some(wire_copy_location(entry.location)),
+                    })
+                    .collect(),
+                remaining_validity_ms: reply.remaining_validity_ms,
+            },
+        ))
+    }
+
     async fn get_chunk_sources(
         &self,
         request: Request<GetDfsChunkSourcesRequest>,
@@ -2101,10 +2253,21 @@ fn wire_chunk_sources_reply(
             .into_iter()
             .map(|chunk| afs_protocol::meta::DfsChunkSources {
                 chunk_id: chunk.chunk_id.0,
+                chunk: chunk.chunk.map(wire_chunk_object),
                 sources: chunk
                     .sources
                     .into_iter()
                     .map(wire_source_candidate)
+                    .collect(),
+                allowed_ranges: chunk
+                    .allowed_ranges
+                    .into_iter()
+                    .map(
+                        |(offset, length)| afs_protocol::meta::dfs_authorized_read::Range {
+                            offset,
+                            length,
+                        },
+                    )
                     .collect(),
             })
             .collect(),
@@ -2418,6 +2581,88 @@ fn domain_replica_target(
     })
 }
 
+fn domain_missing_read_source(
+    missing: afs_protocol::meta::DfsMissingReadSource,
+) -> Result<crate::dfs::DfsMissingReadSource, Status> {
+    require_text(&missing.chunk_id, "missing_source.chunk_id")?;
+    Ok(crate::dfs::DfsMissingReadSource {
+        chunk_id: crate::dfs::ChunkId::new(missing.chunk_id),
+        chunk_offset: missing.chunk_offset,
+        length: missing.length,
+    })
+}
+
+fn domain_read_validation(
+    validation: afs_protocol::meta::DfsReadValidation,
+) -> Result<crate::dfs::DfsReadValidation, Status> {
+    let grant = validation
+        .grant
+        .ok_or_else(|| invalid("read validation grant is missing"))?;
+    Ok(crate::dfs::DfsReadValidation {
+        grant: crate::dfs::DfsReadGrant {
+            namespace_id: crate::dfs::NamespaceId::new(grant.namespace_id),
+            file_version_id: crate::dfs::FileVersionId::new(grant.file_version_id),
+            layout_root_id: crate::dfs::LayoutRootId::new(grant.layout_root_id),
+            caller_node_id: grant.caller_node_id,
+            caller_node_epoch: grant.caller_node_epoch,
+            expires_at_unix_ms: grant.expires_at_unix_ms,
+            fence: grant.fence,
+            token: grant.token,
+        },
+        chunk_id: crate::dfs::ChunkId::new(validation.chunk_id),
+        copy_id: crate::dfs::CopyId::new(validation.copy_id),
+        chunk_offset: validation.chunk_offset,
+        length: validation.length,
+    })
+}
+
+fn wire_authorized_read(
+    entry: crate::dfs::DfsAuthorizedRead,
+) -> afs_protocol::meta::DfsAuthorizedRead {
+    let validation = entry.validation;
+    afs_protocol::meta::DfsAuthorizedRead {
+        validation: Some(afs_protocol::meta::DfsReadValidation {
+            grant: Some(wire_read_grant(validation.grant)),
+            chunk_id: validation.chunk_id.0,
+            copy_id: validation.copy_id.0,
+            chunk_offset: validation.chunk_offset,
+            length: validation.length,
+        }),
+        allowed_ranges: entry
+            .allowed_ranges
+            .into_iter()
+            .map(
+                |(offset, length)| afs_protocol::meta::dfs_authorized_read::Range {
+                    offset,
+                    length,
+                },
+            )
+            .collect(),
+        expires_at_unix_ms: entry.expires_at_unix_ms,
+    }
+}
+
+fn domain_external_commit(
+    receipt: afs_protocol::meta::DfsExternalCommitReceipt,
+) -> Result<crate::dfs::ExternalCommitReceipt, Status> {
+    crate::dfs::validate_external_store_identity(&receipt.store_id, &receipt.generation)
+        .map_err(afs_transport::grpc::error_status::error_to_status)?;
+    let digest = receipt
+        .verified_digest
+        .try_into()
+        .map_err(|_| invalid("external digest must contain 32 bytes"))?;
+    Ok(crate::dfs::ExternalCommitReceipt {
+        store_id: receipt.store_id,
+        generation: receipt.generation,
+        object_key: receipt.object_key,
+        persisted_bytes: receipt.persisted_bytes,
+        verified_digest: crate::dfs::ContentDigest {
+            algorithm: domain_digest_algorithm(receipt.verified_digest_algorithm)?,
+            bytes: digest,
+        },
+    })
+}
+
 fn domain_chunk_receipt(
     receipt: afs_protocol::meta::DfsChunkReceipt,
 ) -> Result<crate::dfs::ChunkReceipt, Status> {
@@ -2447,6 +2692,10 @@ fn domain_chunk_receipt(
         placement_epoch: receipt.placement_epoch,
         replica_group_id: crate::dfs::ReplicaGroupId::new(receipt.replica_group_id),
         durable_acks,
+        external_commit: receipt
+            .external_commit
+            .map(domain_external_commit)
+            .transpose()?,
     })
 }
 
@@ -2469,6 +2718,83 @@ fn optional_id(value: String) -> Option<String> {
 mod tests {
     use super::*;
     use tonic::Code;
+
+    #[test]
+    fn registration_reply_uses_remaining_actual_lease_after_readiness_probe() {
+        let session = super::super::store::NodeSession {
+            node_id: "node-a".into(),
+            session_id: "session-a".into(),
+            grpc_addr: String::new(),
+            data_addr: String::new(),
+            rest_addr: String::new(),
+            storage_devices: Vec::new(),
+            lease_epoch: 7,
+            expires_at_unix_ms: 60_000,
+        };
+        let readiness = BackendReadiness::observed(BackendPersistence::Persistent, true, "ready");
+        let remaining = register_node_reply(session.clone(), readiness.clone(), 56_000);
+        assert_eq!(remaining.lease_remaining_ms, 4_000);
+        assert_eq!(remaining.expires_at_unix_ms, session.expires_at_unix_ms);
+        assert_eq!(remaining.lease_epoch, session.lease_epoch);
+        // A replay or a slow readiness probe must not fabricate a fresh lease.
+        for now in [60_000, 90_000] {
+            assert_eq!(
+                register_node_reply(session.clone(), readiness.clone(), now).lease_remaining_ms,
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn chunk_sources_wire_preserves_bounded_grant_ranges() {
+        use prost::Message;
+
+        let chunk = crate::node::chunk::StagedChunk::new(
+            crate::dfs::OperationId::new("source-range-codec"),
+            b"data".to_vec(),
+        )
+        .chunk;
+        let encoded = wire_chunk_sources_reply(crate::dfs::DfsChunkSourcesReply {
+            revision: 9,
+            chunks: vec![crate::dfs::ChunkSources {
+                chunk_id: chunk.id.clone(),
+                chunk: Some(chunk),
+                sources: Vec::new(),
+                allowed_ranges: vec![(1, 2)],
+            }],
+        });
+        let decoded =
+            afs_protocol::meta::GetDfsChunkSourcesReply::decode(encoded.encode_to_vec().as_slice())
+                .unwrap();
+        assert_eq!(decoded, encoded);
+        assert_eq!(decoded.revision, 9);
+        assert_eq!(decoded.chunks[0].allowed_ranges.len(), 1);
+        assert_eq!(decoded.chunks[0].allowed_ranges[0].offset, 1);
+        assert_eq!(decoded.chunks[0].allowed_ranges[0].length, 2);
+    }
+
+    #[test]
+    fn external_commit_boundary_requires_explicit_digest_and_safe_identity() {
+        let valid = afs_protocol::meta::DfsExternalCommitReceipt {
+            store_id: "filesystem".into(),
+            generation: "g1".into(),
+            object_key: "immutable-key".into(),
+            persisted_bytes: 4,
+            verified_digest: vec![7; 32],
+            verified_digest_algorithm: afs_protocol::meta::DfsDigestAlgorithm::Blake3 as i32,
+        };
+        let decoded = domain_external_commit(valid.clone()).unwrap();
+        assert_eq!(decoded.generation, "g1");
+        let mut invalid_digest = valid.clone();
+        invalid_digest.verified_digest.pop();
+        assert!(domain_external_commit(invalid_digest).is_err());
+        let mut invalid_algorithm = valid.clone();
+        invalid_algorithm.verified_digest_algorithm = 0;
+        assert!(domain_external_commit(invalid_algorithm).is_err());
+        let mut invalid_identity = valid;
+        invalid_identity.generation = "../other".into();
+        assert!(domain_external_commit(invalid_identity).is_err());
+    }
 
     fn presented_access() -> PresentedRootAccess {
         PresentedRootAccess {
