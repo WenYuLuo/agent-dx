@@ -1480,6 +1480,78 @@ fn stream_dfs_ranges(
         let diagnostic =
             local.read_diagnostic(crate::node::read_work::ReadDiagnosticStage::PeerServe);
         let diagnostic_token = diagnostic.as_ref().map(|span| span.token());
+        // Sidecars bind every streamed coverage group to the catalog's
+        // standard root. There is no whole-object body allocation or pre-scan.
+        // Legacy, partial and proof-capacity fallbacks retain the path below.
+        if request.include_blake3_outboard
+            && let Some(mut groups) = local
+                .open_peer_group_stream(
+                    &crate::dfs::ChunkId::new(op.chunk_id.clone()),
+                    op.chunk_offset,
+                    op.length as usize,
+                )
+                .map_err(error_to_status)?
+        {
+            let check_caller = || {
+                if sender.is_closed() {
+                    return Err(afs_transport::grpc::error_status::status_to_error(
+                        Status::cancelled("DFS range consumer disconnected"),
+                    ));
+                }
+                validate_dfs_read_request(request)
+                    .map_err(afs_transport::grpc::error_status::status_to_error)
+            };
+            check_caller().map_err(error_to_status)?;
+            local.ensure_peer_serve_open().map_err(error_to_status)?;
+            send(dfs_read_ranges_frame::Body::Header(DfsReadRangesHeader {
+                read_id: request.read_id.clone(),
+                attempt_id: request.attempt_id.clone(),
+                operation_index: op.operation_index,
+                chunk_id: op.chunk_id.clone(),
+                chunk_offset: op.chunk_offset,
+                length: op.length,
+                source_copy_id: op.source_copy_id.clone(),
+                blake3_outboard: prost::bytes::Bytes::from_owner(PeerOutboardOwner(
+                    groups.outboard(),
+                )),
+            }))?;
+            let mut first = true;
+            while let Some(data) = groups.next_group(check_caller).map_err(error_to_status)? {
+                let length = data.len();
+                let first_enqueue = first
+                    .then(|| local.coarse_diagnostic("peer_first_frame_enqueue", length as u64));
+                send(dfs_read_ranges_frame::Body::Data(data))?;
+                drop(first_enqueue);
+                if first && let Some(token) = &diagnostic_token {
+                    token.first_data();
+                }
+                first = false;
+                local.record_peer_read_event("data_frame");
+                local.record_peer_read_event("shared_frame");
+                if let Some(metrics) = metrics {
+                    metrics.record("grpc", "send", "read", length as u64);
+                }
+            }
+            // next_group(None) has checked the current path, catalog and grant
+            // after the last group. B still verifies the complete object before
+            // installing it; a partial prefix is never an object publication.
+            send(dfs_read_ranges_frame::Body::Completion(
+                DfsReadRangesCompletion {
+                    read_id: request.read_id.clone(),
+                    attempt_id: request.attempt_id.clone(),
+                    operation_index: op.operation_index,
+                    source_copy_id: op.source_copy_id.clone(),
+                    transferred_bytes: op.length,
+                    range_checksum: groups.digest().bytes.to_vec(),
+                    range_checksum_algorithm: afs_protocol::node_data::DfsDigestAlgorithm::Blake3
+                        as i32,
+                },
+            ))?;
+            if let Some(diagnostic) = diagnostic {
+                diagnostic.finish(true);
+            }
+            continue;
+        }
         // Authorization has already succeeded for this request. Reuse only
         // verified immutable bytes, with the shared payload lease held by
         // every queued frame. No separate range or frame body is allocated.
@@ -7047,6 +7119,97 @@ mod tests {
 
     #[cfg(feature = "dfs")]
     #[test]
+    fn p2_r4_verified_prefix_precedes_later_corruption_without_completion() {
+        use crate::node::chunk::StagedChunk;
+        let temp = tempfile::tempdir().unwrap();
+        let local = LocalChunkStore::open(temp.path(), "node").unwrap();
+        let body = vec![42; 3 * 32 * 1024];
+        let staged = StagedChunk::new(
+            crate::dfs::OperationId::new("r4-late-corrupt"),
+            body.clone(),
+        );
+        local.put(staged.clone()).unwrap();
+        // Persist a valid standard-root sidecar before corrupting only the last
+        // group. Healthy earlier groups must not wait for a whole-object scan.
+        drop(local.open_verified(&staged.chunk.id).unwrap());
+        let mut damaged = body.clone();
+        *damaged.last_mut().unwrap() ^= 1;
+        std::fs::write(temp.path().join("chunks").join(&staged.chunk.id.0), damaged).unwrap();
+        let mut request = dfs_read_request(staged.chunk.id.0.clone(), body.len() as u64);
+        request.include_blake3_outboard = true;
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(8);
+        let result = std::thread::scope(|scope| {
+            let producer = scope.spawn(|| stream_dfs_ranges(&local, &request, &sender, None));
+            let mut received = Vec::new();
+            let mut completed = false;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !producer.is_finished() || !receiver.is_empty() {
+                if std::time::Instant::now() >= deadline {
+                    receiver.close();
+                    panic!("bounded verified-prefix producer did not finish");
+                }
+                match receiver.try_recv() {
+                    Ok(Ok(frame)) => match frame.body.unwrap() {
+                        dfs_read_ranges_frame::Body::Data(data) => {
+                            received.extend_from_slice(&data)
+                        }
+                        dfs_read_ranges_frame::Body::Completion(_) => completed = true,
+                        dfs_read_ranges_frame::Body::Header(header) => {
+                            assert!(!header.blake3_outboard.is_empty())
+                        }
+                    },
+                    Ok(Err(error)) => panic!("direct producer must return its error: {error}"),
+                    Err(_) => std::thread::yield_now(),
+                }
+            }
+            (producer.join().unwrap(), received, completed)
+        });
+        assert_eq!(result.0.unwrap_err().code(), tonic::Code::DataLoss);
+        assert_eq!(
+            result.1.len(),
+            2 * 32 * 1024,
+            "only completely verified prefix groups may leave A"
+        );
+        assert!(result.1 == body[..result.1.len()]);
+        assert!(!result.2, "a partial stream must never publish Completion");
+        assert_eq!(local.quarantined_chunks().unwrap().len(), 1);
+    }
+
+    #[cfg(feature = "dfs")]
+    #[test]
+    fn p2_r4_corrupt_first_group_sends_no_unverified_data() {
+        use crate::node::chunk::StagedChunk;
+        let temp = tempfile::tempdir().unwrap();
+        let local = LocalChunkStore::open(temp.path(), "node").unwrap();
+        let staged = StagedChunk::new(
+            crate::dfs::OperationId::new("r4-first-corrupt"),
+            vec![42; 3 * 32 * 1024],
+        );
+        local.put(staged.clone()).unwrap();
+        drop(local.open_verified(&staged.chunk.id).unwrap());
+        let mut damaged = staged.bytes().to_vec();
+        damaged[0] ^= 1;
+        std::fs::write(temp.path().join("chunks").join(&staged.chunk.id.0), damaged).unwrap();
+        let mut request = dfs_read_request(staged.chunk.id.0.clone(), staged.chunk.length);
+        request.include_blake3_outboard = true;
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(8);
+        assert_eq!(
+            stream_dfs_ranges(&local, &request, &sender, None)
+                .unwrap_err()
+                .code(),
+            tonic::Code::DataLoss
+        );
+        while let Ok(frame) = receiver.try_recv() {
+            assert!(matches!(
+                frame.unwrap().body.unwrap(),
+                dfs_read_ranges_frame::Body::Header(_)
+            ));
+        }
+        assert_eq!(local.quarantined_chunks().unwrap().len(), 1);
+    }
+
+    #[cfg(feature = "dfs")]
+    #[test]
     fn dfs_stream_whole_digest_reuse_preserves_wire_and_partial_hash_work() {
         use crate::node::chunk::StagedChunk;
         let temp = tempfile::tempdir().unwrap();
@@ -7085,53 +7248,59 @@ mod tests {
             request.include_blake3_outboard = want_proof;
             request.operations[0].chunk_offset = offset as u64;
             let (sender, mut receiver) = tokio::sync::mpsc::channel(8);
-            stream_dfs_ranges(&local, &request, &sender, None).unwrap();
-            drop(sender);
-            let mut received = Vec::new();
-            let mut header_count = 0;
-            let mut completions = 0;
-            while let Ok(frame) = receiver.try_recv() {
-                match frame.unwrap().body.unwrap() {
-                    dfs_read_ranges_frame::Body::Header(header) => {
-                        header_count += 1;
-                        assert_eq!(header.chunk_offset, offset as u64);
-                        assert_eq!(header.length, length as u64);
-                        if want_proof && offset == 0 {
-                            assert!(!header.blake3_outboard.is_empty());
-                            crate::node::chunk::outboard::ChunkOutboard::validate_encoded_shape(
+            std::thread::scope(|scope| {
+                let producer = scope.spawn(|| {
+                    let result = stream_dfs_ranges(&local, &request, &sender, None);
+                    drop(sender);
+                    result
+                });
+                let mut received = Vec::new();
+                let mut header_count = 0;
+                let mut completions = 0;
+                while let Some(frame) = receiver.blocking_recv() {
+                    match frame.unwrap().body.unwrap() {
+                        dfs_read_ranges_frame::Body::Header(header) => {
+                            header_count += 1;
+                            assert_eq!(header.chunk_offset, offset as u64);
+                            assert_eq!(header.length, length as u64);
+                            if want_proof && offset == 0 {
+                                assert!(!header.blake3_outboard.is_empty());
+                                crate::node::chunk::outboard::ChunkOutboard::validate_encoded_shape(
                                 &staged.chunk,
                                 &header.blake3_outboard,
                             )
                             .unwrap();
-                        } else {
-                            assert!(
-                                header.blake3_outboard.is_empty(),
-                                "ordinary/partial reads keep their original wire contract"
+                            } else {
+                                assert!(
+                                    header.blake3_outboard.is_empty(),
+                                    "ordinary/partial reads keep their original wire contract"
+                                );
+                            }
+                        }
+                        dfs_read_ranges_frame::Body::Data(data) => received.extend(data),
+                        dfs_read_ranges_frame::Body::Completion(completion) => {
+                            completions += 1;
+                            assert_eq!(completion.transferred_bytes, length as u64);
+                            assert_eq!(
+                                completion.range_checksum_algorithm,
+                                afs_protocol::node_data::DfsDigestAlgorithm::Blake3 as i32
+                            );
+                            assert_eq!(
+                                completion.range_checksum,
+                                blake3::hash(&received).as_bytes().to_vec()
                             );
                         }
                     }
-                    dfs_read_ranges_frame::Body::Data(data) => received.extend(data),
-                    dfs_read_ranges_frame::Body::Completion(completion) => {
-                        completions += 1;
-                        assert_eq!(completion.transferred_bytes, length as u64);
-                        assert_eq!(
-                            completion.range_checksum_algorithm,
-                            afs_protocol::node_data::DfsDigestAlgorithm::Blake3 as i32
-                        );
-                        assert_eq!(
-                            completion.range_checksum,
-                            blake3::hash(&received).as_bytes().to_vec()
-                        );
-                    }
                 }
-            }
-            assert_eq!(header_count, 1);
-            assert_eq!(completions, 1);
-            assert_eq!(received, bytes[offset..offset + length]);
-            assert_eq!(
-                hash_bytes() - before,
-                if offset == 0 { 0 } else { length as u64 }
-            );
+                assert_eq!(header_count, 1);
+                assert_eq!(completions, 1);
+                assert_eq!(received, bytes[offset..offset + length]);
+                assert_eq!(
+                    hash_bytes() - before,
+                    if offset == 0 { 0 } else { length as u64 }
+                );
+                producer.join().unwrap().unwrap();
+            });
         }
         assert_eq!(dfs_reuse_scan_bytes(&registry), bytes.len() as u64);
         let diagnostic = metrics.diagnostics_snapshot().unwrap();

@@ -600,3 +600,22 @@ cargo clippy --locked -p afs --no-default-features --features dfs --all-targets 
 有界诊断账本，不表示关闭所有 span／时钟／指标。未测量时不宣称这些观测没有性能成本。
 
 Meta 快照增长与版本回滚限制见[部署说明](../deployment/afs.md#meta-快照升级与回滚边界)。
+
+## Peer 覆盖组发送回归
+
+健康sidecar整对象请求使用两块32KiB最终帧交替读取及标准根验证。针对性入口：
+
+```sh
+cargo test --locked -p afs --lib p2_r4_
+cargo test --locked -p afs --lib dfs_stream_whole_digest_reuse_preserves_wire_and_partial_hash_work
+cargo test --locked -p afs --lib peer_read_event_metrics_are_fixed_and_shared
+```
+
+覆盖损坏首组零正文、损坏后组只有已验证前缀且无Completion、慢消费者两帧真实背压、
+Bytes末引用与预算退账、stop／调用者失效退出、catalog／路径置换、可选proof损坏退休及
+缺proof／容量不足的Header前回退。正常完整流不先做整对象扫描，B整对象核根保持。
+固定事件`stream_verified_group`、`stream_group_corrupt`、`stream_proof_retired`只累计次数；
+`data_frame`按实际帧计，64MiB全部走该路径时为2048个32KiB帧，不能复用旧1024帧假设。
+`peer_read_verify`粗聚合为实际组读／验证，未含全部回压／身份核查，不能冒充整个Peer父项；
+新路径不产生旧整对象私有读取compact记录，缺失不解释为耗时零。正常性能关闭额外诊断，
+独立诊断的组工作与发送父项会交叠，完整E2E按同条件实测。

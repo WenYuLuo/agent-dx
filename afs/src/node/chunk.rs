@@ -1674,6 +1674,207 @@ impl AsRef<[u8]> for PeerReadPayload {
     }
 }
 
+// A stream owns only two coverage-group allocations. Returning a frame to
+// tonic does not return its block: Bytes' last reference performs the return.
+#[cfg(feature = "dfs")]
+struct PeerStreamBlock {
+    bytes: Vec<u8>,
+    _reservation: PeerReadReservation,
+}
+
+#[cfg(feature = "dfs")]
+struct PeerStreamPool {
+    free: Mutex<[Option<PeerStreamBlock>; 2]>,
+    changed: Condvar,
+    _control: PeerControlLease,
+}
+
+#[cfg(feature = "dfs")]
+struct PeerStreamFrame {
+    block: Option<PeerStreamBlock>,
+    pool: Arc<PeerStreamPool>,
+}
+
+#[cfg(feature = "dfs")]
+impl AsRef<[u8]> for PeerStreamFrame {
+    fn as_ref(&self) -> &[u8] {
+        self.block.as_ref().map_or(&[], |block| &block.bytes)
+    }
+}
+
+#[cfg(feature = "dfs")]
+impl Drop for PeerStreamFrame {
+    fn drop(&mut self) {
+        let Some(block) = self.block.take() else {
+            return;
+        };
+        // Poisoning cannot allow early budget release or abandon a waiter.
+        // These slots only move owners; no user callback runs under this lock.
+        let mut free = self
+            .pool
+            .free
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(slot) = free.iter_mut().find(|slot| slot.is_none()) {
+            *slot = Some(block);
+        }
+        self.pool.changed.notify_one();
+    }
+}
+
+/// Pinned immutable object, root-bound proof, and two budgeted frame buffers.
+/// Each stream verifies independently; no resident body cache is populated.
+#[cfg(feature = "dfs")]
+pub(crate) struct PeerGroupReader<'a> {
+    store: &'a LocalChunkStore,
+    reader: PinnedChunkReader,
+    record: LocalChunkRecord,
+    identity: PeerFileIdentity,
+    proof: SharedOutboard,
+    pool: Arc<PeerStreamPool>,
+    offset: u64,
+    _reader: PeerServeReadGuard<'a>,
+}
+
+#[cfg(feature = "dfs")]
+impl PeerGroupReader<'_> {
+    pub(crate) fn outboard(&self) -> SharedOutboard {
+        self.proof.clone()
+    }
+
+    pub(crate) fn digest(&self) -> ContentDigest {
+        self.record.chunk.content_digest.clone()
+    }
+
+    fn check_identity(&self, check_path: bool) -> Result<()> {
+        self.store.ensure_peer_serve_open()?;
+        if self.store.peer_catalog_record(&self.record.chunk.id)? != self.record
+            || PeerFileIdentity::read(&self.reader.file)? != self.identity
+        {
+            return Err(corrupt(
+                &self.record.chunk.id,
+                "identity changed during group stream",
+            ));
+        }
+        // The same descriptor supplies root-verified bytes throughout. Opening
+        // the pathname per group adds no integrity: check it at stream entry
+        // and before Completion, and reject a replaced path at that boundary.
+        if check_path {
+            let current =
+                File::open(self.store.path_for_record(&self.record)?).map_err(Error::from)?;
+            if PeerFileIdentity::read(&current)? != self.identity {
+                return Err(corrupt(
+                    &self.record.chunk.id,
+                    "path changed during group stream",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn retire_failed_proof(&self) {
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        self.reader.outboard_path.hash(&mut hash);
+        let index = (hash.finish() % OUTBOARD_REPAIR_SHARDS as u64) as usize;
+        let Ok(_repair) = self.reader.outboard_repairs[index].lock() else {
+            return;
+        };
+        // Disposable proof damage must not poison every future stream. Remove
+        // only our observed bytes under the existing installer/repair gate;
+        // never remove a newer repaired proof or the immutable body/catalog.
+        if outboard_file_matches(&self.reader.outboard_path, &self.proof).unwrap_or(false)
+            && fs::remove_file(&self.reader.outboard_path).is_ok()
+        {
+            self.store.record_peer_read_event("stream_proof_retired");
+        }
+    }
+
+    /// Cancellation, expiry and stop are checked even while both output blocks
+    /// are retained downstream. No body is freed/refunded to unblock a writer.
+    pub(crate) fn next_group(
+        &mut self,
+        check_caller: impl Fn() -> Result<()>,
+    ) -> Result<Option<prost::bytes::Bytes>> {
+        check_caller()?;
+        self.check_identity(self.offset == 0 || self.offset == self.record.chunk.length)?;
+        if self.offset == self.record.chunk.length {
+            return Ok(None);
+        }
+        let mut block = loop {
+            check_caller()?;
+            self.store.ensure_peer_serve_open()?;
+            let mut free = self
+                .pool
+                .free
+                .lock()
+                .map_err(|_| peer_serve_unavailable("Peer stream pool poisoned"))?;
+            if let Some(block) = free.iter_mut().find_map(Option::take) {
+                break block;
+            }
+            let (guard, _) = self
+                .pool
+                .changed
+                .wait_timeout(free, Duration::from_millis(20))
+                .map_err(|_| peer_serve_unavailable("Peer stream pool poisoned"))?;
+            drop(guard);
+        };
+        let length = usize::try_from(
+            (self.record.chunk.length - self.offset).min(outboard::OUTBOARD_GROUP_BYTES as u64),
+        )
+        .map_err(|_| peer_payload_capacity())?;
+        block.bytes.resize(length, 0);
+        let mut work = OutboardReadWork::default();
+        let read_verify = self
+            .store
+            .coarse_diagnostic("peer_read_verify", length as u64);
+        let result = self.proof.read_ranges_into_with_work(
+            &self.reader.file,
+            0,
+            &self.record.chunk,
+            &[VerifiedRangeCopy {
+                chunk_offset: self.offset,
+                length,
+                output_offset: 0,
+            }],
+            &mut block.bytes,
+            &mut work,
+        );
+        drop(read_verify);
+        #[cfg(test)]
+        VERIFIED_SCAN_BYTES.with(|count| count.set(count.get() + work.hash_bytes));
+        if let Some(metrics) = &self.store.read_work {
+            metrics.hash("outboard_body_hash", work.hash_bytes);
+            metrics.hash("outboard_parent_hash", work.parent_hash_bytes);
+            metrics.copy("outboard_range_delivery", work.copied_bytes);
+        }
+        // Failed/unverified bytes remain private and cannot enter the channel.
+        let checked = result.and_then(|counts| {
+            if counts != [length] {
+                return Err(corrupt(
+                    &self.record.chunk.id,
+                    "group ended before expected length",
+                ));
+            }
+            check_caller()?;
+            self.check_identity(false)
+        });
+        if let Err(error) = checked {
+            if verified_copy_is_invalid(&error) {
+                self.store.record_peer_read_event("stream_group_corrupt");
+                self.retire_failed_proof();
+                self.store.try_quarantine(&self.record.chunk.id);
+            }
+            return Err(error);
+        }
+        self.offset += length as u64;
+        self.store.record_peer_read_event("stream_verified_group");
+        Ok(Some(prost::bytes::Bytes::from_owner(PeerStreamFrame {
+            block: Some(block),
+            pool: self.pool.clone(),
+        })))
+    }
+}
+
 const SIDECAR_INSTALL_LIMIT: usize = 64;
 const SIDECAR_INSTALL_BATCH: usize = 32;
 const SIDECAR_STOP_WAIT: Duration = Duration::from_secs(10);
@@ -3108,6 +3309,98 @@ impl LocalChunkStore {
             ));
         }
         Ok(record)
+    }
+
+    /// Enter streaming only before any header is sent. Missing/legacy proofs
+    /// or unavailable optional working capacity preserve the full-scan path.
+    #[cfg(feature = "dfs")]
+    pub(crate) fn open_peer_group_stream(
+        &self,
+        chunk_id: &ChunkId,
+        offset: u64,
+        length: usize,
+    ) -> Result<Option<PeerGroupReader<'_>>> {
+        let guard = self.begin_peer_serve_read()?;
+        let record = self.peer_catalog_record(chunk_id)?;
+        if offset != 0
+            || length as u64 != record.chunk.length
+            || record.chunk.length == 0
+            || record.chunk.length > PEER_READ_OBJECT_LIMIT as u64
+            || ChunkObject::from_content_addressed_id(chunk_id).as_ref() != Some(&record.chunk)
+        {
+            return Ok(None);
+        }
+        let reader = self.open_cataloged(chunk_id)?;
+        let Some(working) = self.outboard_budget.reserve_range_work(
+            &[VerifiedRangeCopy {
+                chunk_offset: 0,
+                length: length.min(outboard::OUTBOARD_GROUP_BYTES),
+                output_offset: 0,
+            }],
+            record.chunk.length,
+        ) else {
+            return Ok(None);
+        };
+        let proof = match reader.load_outboard() {
+            Ok(Some(proof)) => proof,
+            Ok(None) => return Ok(None),
+            Err(error) if error.code() == afs_error::IO_CAPACITY => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        drop(working);
+        let PhysicalLocation::PerChunkFile { relative_path } = &record.location;
+        let control_bytes = std::mem::size_of::<PeerGroupReader<'_>>()
+            + std::mem::size_of::<PeerStreamPool>()
+            + 2 * std::mem::size_of::<PeerStreamFrame>()
+            + 256
+            + record.chunk.id.0.capacity()
+            + record.device_id.capacity()
+            + relative_path.capacity()
+            + reader.chunk.id.0.capacity()
+            + reader.outboard_path.capacity();
+        let control = match self.reserve_peer_control(control_bytes) {
+            Ok(control) => control,
+            Err(error) if error.code() == afs_error::IO_CAPACITY => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let allocate = || -> Result<PeerStreamBlock> {
+            let mut reservation =
+                self.reserve_peer_read_payload_inner(outboard::OUTBOARD_GROUP_BYTES)?;
+            let mut bytes = Vec::new();
+            bytes
+                .try_reserve_exact(outboard::OUTBOARD_GROUP_BYTES)
+                .map_err(|_| peer_payload_capacity())?;
+            reservation.retain_capacity(bytes.capacity())?;
+            Ok(PeerStreamBlock {
+                bytes,
+                _reservation: reservation,
+            })
+        };
+        let blocks = match (|| Ok::<_, Error>([Some(allocate()?), Some(allocate()?)]))() {
+            Ok(blocks) => blocks,
+            Err(error) if error.code() == afs_error::IO_CAPACITY => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let identity = PeerFileIdentity::read(&reader.file)?;
+        if identity.length != record.chunk.length {
+            return Err(corrupt(chunk_id, "length mismatch"));
+        }
+        let stream = PeerGroupReader {
+            store: self,
+            reader,
+            record,
+            identity,
+            proof,
+            pool: Arc::new(PeerStreamPool {
+                free: Mutex::new(blocks),
+                changed: Condvar::new(),
+                _control: control,
+            }),
+            offset: 0,
+            _reader: guard,
+        };
+        stream.check_identity(true)?;
+        Ok(Some(stream))
     }
 
     /// Object singleflight shares only immutable content, never read authority.
@@ -5492,6 +5785,327 @@ mod replica_replay_tests {
             assert_eq!(recovered.read_at(&item.chunk.id, 3, &mut out).unwrap(), 17);
             assert_eq!(out, item.bytes()[3..20]);
         }
+    }
+
+    #[cfg(feature = "dfs")]
+    #[test]
+    fn p2_r4_two_frames_hold_exact_budget_until_last_reference() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+        let staged = StagedChunk::new(OperationId::new("r4-frame-leases"), vec![37; 3 * 32768]);
+        store.put(staged.clone()).unwrap();
+        drop(store.open_verified(&staged.chunk.id).unwrap());
+        let mut stream = store
+            .open_peer_group_stream(&staged.chunk.id, 0, staged.bytes().len())
+            .unwrap()
+            .unwrap();
+        let first = stream.next_group(|| Ok(())).unwrap().unwrap();
+        let second = stream.next_group(|| Ok(())).unwrap().unwrap();
+        assert_eq!(first.len(), 32768);
+        assert_eq!(second.len(), 32768);
+        let retained = first.slice(17..29);
+        assert_eq!(store.peer_read_budget.used.load(Ordering::Acquire), 65536);
+        drop(stream);
+        drop(first);
+        assert_eq!(store.peer_read_budget.used.load(Ordering::Acquire), 65536);
+        drop(second);
+        assert_eq!(
+            store.peer_read_budget.used.load(Ordering::Acquire),
+            65536,
+            "the surviving sliced frame still owns the two-block pool"
+        );
+        assert_eq!(retained.as_ref(), &[37; 12]);
+        drop(retained);
+        assert_eq!(store.peer_read_budget.used.load(Ordering::Acquire), 0);
+        assert_eq!(
+            store.peer_read_budget.control_used.load(Ordering::Acquire),
+            0
+        );
+        assert!(
+            store
+                .peer_read_cache
+                .lock()
+                .unwrap()
+                .residents
+                .iter()
+                .all(Option::is_none)
+        );
+    }
+
+    #[cfg(feature = "dfs")]
+    #[test]
+    fn p2_r4_retained_frames_backpressure_without_early_refund() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+        let staged = StagedChunk::new(OperationId::new("r4-backpressure"), vec![37; 4 * 32768]);
+        store.put(staged.clone()).unwrap();
+        drop(store.open_verified(&staged.chunk.id).unwrap());
+        let mut stream = store
+            .open_peer_group_stream(&staged.chunk.id, 0, staged.bytes().len())
+            .unwrap()
+            .unwrap();
+        let first = stream.next_group(|| Ok(())).unwrap().unwrap();
+        let second = stream.next_group(|| Ok(())).unwrap().unwrap();
+        let (entered, observed) = std::sync::mpsc::channel();
+        let (done, received) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let producer = scope.spawn(|| {
+                // Repeated checks prove we reached the no-free-block wait,
+                // rather than inferring blocking from scheduler delays.
+                let calls = std::cell::Cell::new(0);
+                let third = stream
+                    .next_group(|| {
+                        calls.set(calls.get() + 1);
+                        if calls.get() == 3 {
+                            entered.send(()).unwrap();
+                        }
+                        Ok(())
+                    })
+                    .unwrap()
+                    .unwrap();
+                done.send(third).unwrap();
+            });
+            observed.recv_timeout(Duration::from_secs(3)).unwrap();
+            assert!(received.try_recv().is_err());
+            assert_eq!(store.peer_read_budget.used.load(Ordering::Acquire), 65536);
+            drop(first);
+            let third = received.recv_timeout(Duration::from_secs(3)).unwrap();
+            assert_eq!(third.as_ref(), &[37; 32768]);
+            drop(third);
+            producer.join().unwrap();
+        });
+        drop(second);
+        drop(stream);
+        assert_eq!(store.peer_read_budget.used.load(Ordering::Acquire), 0);
+    }
+
+    #[cfg(feature = "dfs")]
+    #[test]
+    fn p2_r4_stop_and_caller_failure_interrupt_retained_frame_wait() {
+        for stop_node in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+            let staged = StagedChunk::new(OperationId::new("r4-wait-cancel"), vec![37; 4 * 32768]);
+            store.put(staged.clone()).unwrap();
+            drop(store.open_verified(&staged.chunk.id).unwrap());
+            let mut stream = store
+                .open_peer_group_stream(&staged.chunk.id, 0, staged.bytes().len())
+                .unwrap()
+                .unwrap();
+            let first = stream.next_group(|| Ok(())).unwrap().unwrap();
+            let second = stream.next_group(|| Ok(())).unwrap().unwrap();
+            let valid = std::sync::atomic::AtomicBool::new(true);
+            let (entered, observed) = std::sync::mpsc::channel();
+            std::thread::scope(|scope| {
+                let producer = scope.spawn(|| {
+                    let calls = std::cell::Cell::new(0);
+                    stream.next_group(|| {
+                        calls.set(calls.get() + 1);
+                        if calls.get() == 3 {
+                            entered.send(()).unwrap();
+                        }
+                        if valid.load(Ordering::Acquire) {
+                            Ok(())
+                        } else {
+                            Err(Error::coded(
+                                afs_error::IO_PERMISSION_DENIED,
+                                "caller revoked",
+                            ))
+                        }
+                    })
+                });
+                observed.recv_timeout(Duration::from_secs(3)).unwrap();
+                if stop_node {
+                    store.close_peer_serve_admission();
+                } else {
+                    valid.store(false, Ordering::Release);
+                }
+                let error = producer.join().unwrap().unwrap_err();
+                assert_eq!(
+                    error.code(),
+                    if stop_node {
+                        afs_error::IO_UNAVAILABLE
+                    } else {
+                        afs_error::IO_PERMISSION_DENIED
+                    }
+                );
+            });
+            drop(stream);
+            assert_eq!(store.peer_read_budget.used.load(Ordering::Acquire), 65536);
+            drop(first);
+            drop(second);
+            assert_eq!(store.peer_read_budget.used.load(Ordering::Acquire), 0);
+        }
+    }
+
+    #[cfg(feature = "dfs")]
+    #[test]
+    fn p2_r4_stream_reuses_two_addresses_and_checks_each_group_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+        let body: Vec<_> = (0..150_001).map(|n| (n % 251) as u8).collect();
+        let staged = StagedChunk::new(OperationId::new("r4-reuse"), body.clone());
+        store.put(staged.clone()).unwrap();
+        drop(store.open_verified(&staged.chunk.id).unwrap());
+        VERIFIED_SCAN_BYTES.with(|count| count.set(0));
+        let mut stream = store
+            .open_peer_group_stream(&staged.chunk.id, 0, body.len())
+            .unwrap()
+            .unwrap();
+        let mut received = Vec::new();
+        let mut addresses = HashSet::new();
+        while let Some(group) = stream.next_group(|| Ok(())).unwrap() {
+            addresses.insert(group.as_ptr());
+            received.extend_from_slice(&group);
+            assert!(store.peer_read_budget.used.load(Ordering::Acquire) <= 65536);
+        }
+        assert_eq!(received, body);
+        assert!(addresses.len() <= 2);
+        assert_eq!(
+            VERIFIED_SCAN_BYTES.with(|count| count.get()),
+            body.len() as u64
+        );
+        drop(stream);
+        assert_eq!(store.peer_read_budget.used.load(Ordering::Acquire), 0);
+    }
+
+    #[cfg(feature = "dfs")]
+    #[test]
+    fn p2_r4_path_replacement_and_catalog_change_cannot_complete_stream() {
+        for replace_path in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+            let staged =
+                StagedChunk::new(OperationId::new("r4-stream-identity"), vec![37; 3 * 32768]);
+            store.put(staged.clone()).unwrap();
+            drop(store.open_verified(&staged.chunk.id).unwrap());
+            let mut stream = store
+                .open_peer_group_stream(&staged.chunk.id, 0, staged.bytes().len())
+                .unwrap()
+                .unwrap();
+            drop(stream.next_group(|| Ok(())).unwrap().unwrap());
+            if replace_path {
+                let replacement = temp.path().join("replacement");
+                fs::write(&replacement, staged.bytes()).unwrap();
+                fs::rename(replacement, store.chunk_path(&staged.chunk.id)).unwrap();
+            } else {
+                store
+                    .catalog
+                    .lock()
+                    .unwrap()
+                    .records
+                    .get_mut(&staged.chunk.id)
+                    .unwrap()
+                    .catalog_revision += 1;
+            }
+            let result = loop {
+                match stream.next_group(|| Ok(())) {
+                    Ok(Some(bytes)) => drop(bytes),
+                    other => break other,
+                }
+            };
+            assert_eq!(
+                result.unwrap_err().code(),
+                afs_error::NODE_TRANSFER_CORRUPT_DATA
+            );
+            drop(stream);
+            assert_eq!(store.peer_read_budget.used.load(Ordering::Acquire), 0);
+        }
+    }
+
+    #[cfg(feature = "dfs")]
+    #[test]
+    fn p2_r4_bad_sidecar_is_retired_without_quarantining_valid_body() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+        let staged = StagedChunk::new(
+            OperationId::new("r4-stream-proof-damage"),
+            vec![37; 3 * 32768],
+        );
+        store.put(staged.clone()).unwrap();
+        drop(store.open_verified(&staged.chunk.id).unwrap());
+        let path = store
+            .outboards
+            .join(format!("{}.bao", safe_id(&staged.chunk.id.0)));
+        let mut damaged = fs::read(&path).unwrap();
+        *damaged.last_mut().unwrap() ^= 1;
+        fs::write(&path, damaged).unwrap();
+        let mut stream = store
+            .open_peer_group_stream(&staged.chunk.id, 0, staged.bytes().len())
+            .unwrap()
+            .unwrap();
+        let error = loop {
+            match stream.next_group(|| Ok(())) {
+                Ok(Some(bytes)) => drop(bytes),
+                Ok(None) => panic!("damaged proof must not complete"),
+                Err(error) => break error,
+            }
+        };
+        assert!(verified_copy_is_invalid(&error));
+        assert!(
+            !path.exists(),
+            "only the observed bad optional proof is retired"
+        );
+        assert!(
+            store.quarantined_chunks().unwrap().is_empty(),
+            "valid body is not quarantined for proof metadata damage"
+        );
+        drop(stream);
+        assert!(
+            store
+                .open_peer_group_stream(&staged.chunk.id, 0, staged.bytes().len())
+                .unwrap()
+                .is_none()
+        );
+        let recovered = store
+            .read_peer_range(&staged.chunk.id, 0, staged.bytes().len())
+            .unwrap();
+        assert_eq!(recovered.as_slice(), staged.bytes());
+    }
+
+    #[cfg(feature = "dfs")]
+    #[test]
+    fn p2_r4_absent_proof_and_optional_capacity_fall_back_before_header() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+        let staged = StagedChunk::new(OperationId::new("r4-fallback"), vec![37; 3 * 32768]);
+        store.put(staged.clone()).unwrap();
+        drop(store.open_verified(&staged.chunk.id).unwrap());
+        let lease = store
+            .reserve_peer_read_payload(PEER_READ_PAYLOAD_LIMIT - 32768)
+            .unwrap();
+        assert!(
+            store
+                .open_peer_group_stream(&staged.chunk.id, 0, staged.bytes().len())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store.peer_read_budget.used.load(Ordering::Acquire),
+            (PEER_READ_PAYLOAD_LIMIT - 32768) as u64
+        );
+        drop(lease);
+        assert_eq!(store.peer_read_budget.used.load(Ordering::Acquire), 0);
+        fs::remove_file(
+            store
+                .outboards
+                .join(format!("{}.bao", safe_id(&staged.chunk.id.0))),
+        )
+        .unwrap();
+        assert!(
+            store
+                .open_peer_group_stream(&staged.chunk.id, 0, staged.bytes().len())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(store.peer_read_budget.used.load(Ordering::Acquire), 0);
+        assert_eq!(
+            store
+                .read_peer_range(&staged.chunk.id, 0, staged.bytes().len())
+                .unwrap()
+                .as_slice(),
+            staged.bytes()
+        );
     }
 
     #[test]

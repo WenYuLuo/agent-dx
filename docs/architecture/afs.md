@@ -125,7 +125,7 @@ resident条目上限不是全部活跃FD、载荷或进程RSS上限。
 候选；legacy未排序或重叠extent保持原序和溢出检查，不改变序列化格式。
 条目上限不等于字节预算，在途Arc及其索引不因淘汰提前释放；mutable dirty布局仍走原路径。
 
-A端完整BLAKE3通过后按对象单飞共享不可变正文，默认最多2个LRU驻留对象，
+对未进入覆盖组流式发送的请求，A端完整BLAKE3通过后按对象单飞共享不可变正文，默认最多2个LRU驻留对象，
 每对象最多4MiB。短表锁只管理身份、pin、LRU和最多8个active key；填充、扫描、
 sidecar访问及等待均在锁外。完整对象的等待者复用同一次填充，各请求仍独立授权；
 partial／无完整对象结果保持各自范围读取，不承诺这些请求也只扫描一次。
@@ -248,7 +248,17 @@ B缓存退休proof后，若已无完整FileIdentity，仍使用完整根扫描�
 ready文件的4096B header、正文、trailer与staging实际分配计入磁盘容量；目录、marker等
 管理开销另列。近似LRU只淘汰专属可丢弃缓存，不增加持久副本数。
 
-原生gRPC的64KiB正文帧仍以Bytes共享已验证对象的合法范围；A附带proof也以Bytes
+健康sidecar、标准内容ID、请求携带proof能力且读取完整对象时，A端按32KiB覆盖组读入
+最终帧、校验到catalog锚定的标准根，再发送；不先扫描完整对象。每个stream最多两个
+32KiB缓冲，按实际capacity计入原A正文额度，归还池／排队／tonic编码期间都由同一租约
+持有；最后一个Bytes切片释放后才可复用，流结束且所有帧释放后退账，不形成正文驻留cache。
+逐组保留catalog／fd身份、grant期限及停止检查，首尾核对路径，完整成功才发送Completion；
+后段损坏只可能留下已验证前缀，B仍要求完整对象核根、Completion和EOF后才发布。
+缺sidecar、legacy、partial、未请求proof或发送Header前可选准入不足时保留原完整校验路径；
+Header后失败中止，不切换来源或伪造完成。观察到的坏可选sidecar在既有修复锁下精确退休，
+不删除更新后的proof或健康正文。组读验仍可能与发送和回压交叠，不以累计时长承诺性能收益。
+
+其余原生gRPC路径的64KiB正文帧以Bytes共享已验证对象的合法范围；A附带proof也以Bytes
 共享原proof owner，B仅在同ledger准入后复制小proof元数据。生成的Rust API中
 `DfsReadRangesHeader.blake3_outboard`与`DfsPutReplicaFrame.data`均使用`Bytes`；这属于
 源码API变化，不改变既有wire tag，不能宣称完全无兼容变化。载荷、proof及各自租约

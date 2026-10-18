@@ -431,6 +431,9 @@ impl ReadWorkMetrics {
                 "body_vec_allocation",
                 "shared_frame",
                 "root_fallback",
+                "stream_verified_group",
+                "stream_group_corrupt",
+                "stream_proof_retired",
             ] {
                 peer_read_events.with_label_values(&[event]);
             }
@@ -958,6 +961,9 @@ impl ReadWorkMetrics {
                 | "body_vec_allocation"
                 | "shared_frame"
                 | "root_fallback"
+                | "stream_verified_group"
+                | "stream_group_corrupt"
+                | "stream_proof_retired"
         ) {
             self.peer_read_events.with_label_values(&[event]).inc();
         }
@@ -2484,6 +2490,9 @@ mod tests {
             "body_vec_allocation",
             "shared_frame",
             "root_fallback",
+            "stream_verified_group",
+            "stream_group_corrupt",
+            "stream_proof_retired",
         ] {
             metrics.peer_read_event(event);
             assert_eq!(same.peer_read_events.with_label_values(&[event]).get(), 1);
@@ -2494,7 +2503,7 @@ mod tests {
             .iter()
             .find(|family| family.name() == "afs_dfs_peer_read_events_total")
             .unwrap();
-        assert_eq!(events.get_metric().len(), 12);
+        assert_eq!(events.get_metric().len(), 15);
     }
 
     #[test]
