@@ -20,7 +20,9 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+mod catalog_commit;
 pub mod outboard;
+use catalog_commit::CatalogCommitter;
 pub use outboard::OutboardBudget;
 use outboard::{
     ChunkOutboard, DEFAULT_OUTBOARD_BUDGET_BYTES, MAX_ENCODED_OUTBOARD_BYTES, OutboardBuilder,
@@ -1238,6 +1240,7 @@ struct CatalogTxn {
 }
 
 impl CatalogTxn {
+    #[cfg(test)]
     fn new(revision: u64, records: Vec<LocalChunkRecord>) -> Result<Self> {
         let checksum = catalog_checksum(revision, &records)?;
         Ok(Self {
@@ -2756,6 +2759,51 @@ impl SidecarInstallTestControl {
 }
 
 #[cfg(test)]
+#[derive(Debug, Default)]
+struct CatalogCommitTestControl {
+    ready: Mutex<Option<Arc<std::sync::Barrier>>>,
+    before_prepare: Mutex<Option<PeerFillTestBlock>>,
+    before_wal: Mutex<VecDeque<PeerFillTestBlock>>,
+    fail_wal_step: std::sync::atomic::AtomicUsize,
+    fail_chunks_dir: std::sync::atomic::AtomicBool,
+    fail_prepare_after: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+impl CatalogCommitTestControl {
+    fn before_group(&self) {
+        let barrier = self.ready.lock().unwrap().clone();
+        if let Some(barrier) = barrier {
+            barrier.wait();
+        }
+    }
+
+    fn pause_prepare(&self) -> Result<()> {
+        let remaining = self.fail_prepare_after.load(Ordering::Acquire);
+        if remaining != 0 && self.fail_prepare_after.fetch_sub(1, Ordering::AcqRel) == 1 {
+            return Err(Error::coded(
+                afs_error::IO_OTHER,
+                "injected later body preparation failure",
+            ));
+        }
+        let block = self.before_prepare.lock().unwrap().take();
+        if let Some((entered, release)) = block {
+            let _ = entered.send(());
+            let _ = release.recv();
+        }
+        Ok(())
+    }
+
+    fn pause_wal(&self) {
+        let block = self.before_wal.lock().unwrap().pop_front();
+        if let Some((entered, release)) = block {
+            let _ = entered.send(());
+            let _ = release.recv();
+        }
+    }
+}
+
+#[cfg(test)]
 type PeerFillTestBlock = (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
 
 #[derive(Debug)]
@@ -2772,9 +2820,12 @@ pub struct LocalChunkStore {
     outboard_repairs: Arc<OutboardRepairGates>,
     catalog_path: PathBuf,
     catalog: Mutex<LocalCatalog>,
+    catalog_committer: CatalogCommitter,
     next_staging: AtomicU64,
     read_work: Option<super::read_work::ReadWorkMetrics>,
     sidecar_installer: SidecarInstaller,
+    #[cfg(test)]
+    catalog_commit_test: CatalogCommitTestControl,
     #[cfg(test)]
     sidecar_install_test: Arc<SidecarInstallTestControl>,
     #[cfg(test)]
@@ -2797,13 +2848,41 @@ impl LocalChunkStore {
         let chunks = root.join("chunks");
         let staging = root.join("staging");
         let outboards = root.join("outboards");
+        let mut new_ancestors = Vec::new();
+        let mut ancestor = root.as_path();
+        while !ancestor.as_os_str().is_empty() && !ancestor.exists() {
+            if let Some(parent) = ancestor.parent() {
+                new_ancestors.push(if parent.as_os_str().is_empty() {
+                    PathBuf::from(".")
+                } else {
+                    parent.to_path_buf()
+                });
+                ancestor = parent;
+            } else {
+                break;
+            }
+        }
         fs::create_dir_all(&outboards).map_err(Error::from)?;
         fs::create_dir_all(&chunks).map_err(Error::from)?;
         fs::create_dir_all(&staging).map_err(Error::from)?;
+        // Also repair a previous process's unconfirmed rename before healthy
+        // replay can ACK it. A same-OS reopen is not itself a directory barrier.
+        sync_store_directory(&chunks)?;
+        sync_store_directory(&root)?;
+        for parent in new_ancestors {
+            sync_store_directory(&parent)?;
+        }
         let device_epoch = open_device_epoch(&root)?;
         let root_dir = File::open(&root).map_err(Error::from)?;
         let catalog_path = root.join("catalog.wal");
         let catalog = LocalCatalog::recover(&catalog_path)?;
+        // A prior failed sync may have left a complete transaction in the OS
+        // cache. Validate first, then persist both WAL and its name before a
+        // reopened store may issue a healthy replay ACK.
+        if catalog_path.exists() {
+            sync_store_catalog(&catalog_path)?;
+            sync_store_directory(&root)?;
+        }
         let store = Self {
             node_id: node_id.into(),
             device_id: "local-0".into(),
@@ -2817,9 +2896,12 @@ impl LocalChunkStore {
             outboard_repairs: Arc::new(std::array::from_fn(|_| Mutex::new(()))),
             catalog_path,
             catalog: Mutex::new(catalog),
+            catalog_committer: CatalogCommitter::default(),
             next_staging: AtomicU64::new(1),
             read_work: None,
             sidecar_installer: SidecarInstaller::default(),
+            #[cfg(test)]
+            catalog_commit_test: CatalogCommitTestControl::default(),
             #[cfg(test)]
             sidecar_install_test: Arc::new(SidecarInstallTestControl::default()),
             #[cfg(test)]
@@ -3164,6 +3246,7 @@ impl LocalChunkStore {
         mut self,
         metrics: super::read_work::ReadWorkMetrics,
     ) -> Self {
+        self.catalog_committer.set_metrics(metrics.clone());
         self.read_work = Some(metrics);
         self.sidecar_installer.metrics = self.read_work.clone();
         if let Ok(state) = self.peer_read_cache.lock() {
@@ -3208,6 +3291,28 @@ impl LocalChunkStore {
     #[cfg(feature = "dfs")]
     pub(crate) fn shutdown_sidecar_installer(&self) -> Result<()> {
         self.sidecar_installer.shutdown()
+    }
+
+    #[cfg(any(feature = "dfs", test))]
+    pub(crate) fn with_catalog_commit_queue(mut self, limit: usize) -> Result<Self> {
+        self.catalog_committer.configure(limit)?;
+        Ok(self)
+    }
+
+    #[cfg(any(feature = "dfs", test))]
+    pub(crate) fn note_catalog_stop(&self) {
+        self.catalog_committer
+            .note_stop(Instant::now() + SIDECAR_STOP_WAIT);
+    }
+
+    #[cfg(any(feature = "dfs", test))]
+    pub(crate) fn shutdown_catalog_committer(&self) -> Result<()> {
+        self.catalog_committer.shutdown()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn catalog_commit_stats(&self) -> catalog_commit::CatalogCommitStats {
+        self.catalog_committer.stats()
     }
 
     pub(super) fn coarse_diagnostic(
@@ -3324,7 +3429,9 @@ impl LocalChunkStore {
                 fs::remove_file(entry.path()).map_err(Error::from)?;
             }
         }
-        let mut catalog = self
+        // Preserve the original startup metadata scan without cloning the whole
+        // historical catalog. Hashing/quarantine/WAL work below runs after unlock.
+        let catalog = self
             .catalog
             .lock()
             .map_err(|_| invalid("local chunk catalog lock is poisoned"))?;
@@ -3354,13 +3461,20 @@ impl LocalChunkStore {
                 Err(error) => return Err(Error::from(error)),
             }
         }
-        if !damaged.is_empty() {
-            self.quarantine_records(&mut catalog, damaged)?;
+        drop(catalog);
+        for record in damaged {
+            self.quarantine_if_invalid(&record.chunk.id)?;
         }
         for entry in fs::read_dir(&self.chunks).map_err(Error::from)? {
             let entry = entry.map_err(Error::from)?;
             let id = ChunkId::new(entry.file_name().to_string_lossy().into_owned());
-            if !catalog.records.contains_key(&id) {
+            if !self
+                .catalog
+                .lock()
+                .map_err(|_| invalid("local chunk catalog lock is poisoned"))?
+                .records
+                .contains_key(&id)
+            {
                 report.orphan_files = report.orphan_files.saturating_add(1);
             }
         }
@@ -3405,136 +3519,167 @@ impl LocalChunkStore {
                 "replica target does not identify this local chunk store",
             ));
         }
-        let mut catalog = self
-            .catalog
-            .lock()
-            .map_err(|_| invalid("local chunk catalog lock is poisoned"))?;
-        if catalog.revision < target.device.catalog_revision {
-            return Err(invalid(
-                "local catalog is older than the placement revision floor",
-            ));
-        }
+        let admission = self.admit_catalog(staged)?;
+        let result = (|| -> Result<Vec<ReplicaAck>> {
+            if self
+                .catalog
+                .lock()
+                .map_err(|_| invalid("local chunk catalog lock is poisoned"))?
+                .revision
+                < target.device.catalog_revision
+            {
+                return Err(invalid(
+                    "local catalog is older than the placement revision floor",
+                ));
+            }
 
-        let mut new_chunks = Vec::new();
-        let mut installed_chunk_ids = HashSet::new();
-        for item in staged {
-            let mut replace_existing = false;
-            if let Some(existing) = catalog.records.get(&item.chunk.id) {
-                if existing.chunk != item.chunk {
-                    return Err(invalid(
-                        "immutable Chunk ID collides with another local record",
-                    ));
-                }
-                if existing.state == LocalChunkState::Quarantined {
-                    replace_existing = true;
-                } else {
-                    match verify_file(&self.path_for_record(existing)?, &item.chunk) {
-                        Ok(()) => continue,
-                        Err(error) if verified_copy_is_invalid(&error) => replace_existing = true,
-                        Err(error) => return Err(error),
+            let mut records = Vec::new();
+            let mut installed_chunk_ids = HashSet::new();
+            for item in staged {
+                let mut replace_existing = false;
+                let existing = self
+                    .catalog
+                    .lock()
+                    .map_err(|_| invalid("local chunk catalog lock is poisoned"))?
+                    .records
+                    .get(&item.chunk.id)
+                    .cloned();
+                let set_capacity = installed_chunk_ids.capacity()
+                    * (std::mem::size_of::<ChunkId>() + std::mem::size_of::<usize>() + 1)
+                    * 2
+                    + installed_chunk_ids
+                        .iter()
+                        .map(|id: &ChunkId| id.0.capacity())
+                        .sum::<usize>();
+                self.observe_catalog_preparing(
+                    &admission,
+                    catalog_commit::record_capacity(&records)
+                        + set_capacity
+                        + existing
+                            .as_ref()
+                            .map_or(0, catalog_commit::record_allocation),
+                )?;
+                #[cfg(test)]
+                self.catalog_commit_test.pause_prepare()?;
+                if let Some(existing) = existing.as_ref() {
+                    if existing.chunk != item.chunk {
+                        return Err(invalid(
+                            "immutable Chunk ID collides with another local record",
+                        ));
+                    }
+                    if existing.state == LocalChunkState::Quarantined {
+                        replace_existing = true;
+                    } else {
+                        match verify_file(&self.path_for_record(existing)?, &item.chunk) {
+                            Ok(()) => continue,
+                            Err(error) if verified_copy_is_invalid(&error) => {
+                                replace_existing = true
+                            }
+                            Err(error) => return Err(error),
+                        }
                     }
                 }
-            }
-            let temp_path = self.staging.join(format!(
-                "{}.{}.tmp",
-                safe_id(&item.operation_id.0),
-                self.next_staging.fetch_add(1, Ordering::Relaxed)
-            ));
-            let mut file = OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&temp_path)
-                .map_err(Error::from)?;
-            {
-                let _diagnostic = self.coarse_diagnostic("persist_body_write", item.chunk.length);
-                file.write_all(item.bytes()).map_err(Error::from)?;
-            }
-            {
-                let _diagnostic = self.coarse_diagnostic("persist_body_sync", item.chunk.length);
-                file.sync_all().map_err(Error::from)?;
-            }
-            let final_path = self.chunk_path(&item.chunk.id);
-            if replace_existing {
-                // Publish a new inode; never truncate a file held by readers.
-                // Its immutable content identity is unchanged. Directory and
-                // catalog barriers below still precede the durable ACK.
-                fs::rename(&temp_path, &final_path).map_err(Error::from)?;
-            } else {
-                match fs::hard_link(&temp_path, &final_path) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                        verify_file(&final_path, &item.chunk)?;
-                    }
-                    Err(error) => return Err(Error::from(error)),
-                }
-                fs::remove_file(&temp_path).map_err(Error::from)?;
-            }
-            if installed_chunk_ids.insert(item.chunk.id.clone()) {
-                new_chunks.push(item.chunk.clone());
-            }
-        }
-
-        if !new_chunks.is_empty() {
-            {
-                let _diagnostic = self.coarse_diagnostic("persist_chunks_dir_sync", 0);
-                File::open(&self.chunks)
-                    .and_then(|directory| directory.sync_all())
+                let temp_path = self.staging.join(format!(
+                    "{}.{}.tmp",
+                    safe_id(&item.operation_id.0),
+                    self.next_staging.fetch_add(1, Ordering::Relaxed)
+                ));
+                let mut file = OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(&temp_path)
                     .map_err(Error::from)?;
+                {
+                    let _diagnostic =
+                        self.coarse_diagnostic("persist_body_write", item.chunk.length);
+                    file.write_all(item.bytes()).map_err(Error::from)?;
+                }
+                {
+                    let _diagnostic =
+                        self.coarse_diagnostic("persist_body_sync", item.chunk.length);
+                    file.sync_all().map_err(Error::from)?;
+                }
+                let final_path = self.chunk_path(&item.chunk.id);
+                if replace_existing {
+                    // Publish a new inode; never truncate a file held by readers.
+                    // Its immutable content identity is unchanged. Directory and
+                    // catalog barriers below still precede the durable ACK.
+                    fs::rename(&temp_path, &final_path).map_err(Error::from)?;
+                    admission.namespace_changed();
+                } else {
+                    match fs::hard_link(&temp_path, &final_path) {
+                        Ok(()) => admission.namespace_changed(),
+                        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                            verify_file(&final_path, &item.chunk)?;
+                        }
+                        Err(error) => return Err(Error::from(error)),
+                    }
+                    fs::remove_file(&temp_path).map_err(Error::from)?;
+                }
+                if installed_chunk_ids.insert(item.chunk.id.clone()) {
+                    records.push(LocalChunkRecord {
+                        location: PhysicalLocation::PerChunkFile {
+                            relative_path: format!("chunks/{}", item.chunk.id.0),
+                        },
+                        stored_length: item.chunk.length,
+                        stored_checksum: item.chunk.content_digest.clone(),
+                        device_id: self.device_id.clone(),
+                        device_epoch: self.device_epoch,
+                        chunk: item.chunk.clone(),
+                        encoding: PhysicalEncoding::Raw,
+                        state: LocalChunkState::Durable,
+                        catalog_revision: 0,
+                    });
+                }
+                let set_capacity = installed_chunk_ids.capacity()
+                    * (std::mem::size_of::<ChunkId>() + std::mem::size_of::<usize>() + 1)
+                    * 2
+                    + installed_chunk_ids
+                        .iter()
+                        .map(|id| id.0.capacity())
+                        .sum::<usize>();
+                self.observe_catalog_preparing(
+                    &admission,
+                    catalog_commit::record_capacity(&records)
+                        + set_capacity
+                        + temp_path.capacity()
+                        + final_path.capacity()
+                        + existing
+                            .as_ref()
+                            .map_or(0, catalog_commit::record_allocation),
+                )?;
             }
-            let revision = catalog.revision.saturating_add(1);
-            let records = new_chunks
-                .into_iter()
-                .map(|chunk| LocalChunkRecord {
-                    location: PhysicalLocation::PerChunkFile {
-                        relative_path: format!("chunks/{}", chunk.id.0),
-                    },
-                    stored_length: chunk.length,
-                    stored_checksum: chunk.content_digest.clone(),
-                    device_id: self.device_id.clone(),
-                    device_epoch: self.device_epoch,
-                    chunk,
-                    encoding: PhysicalEncoding::Raw,
-                    state: LocalChunkState::Durable,
-                    catalog_revision: revision,
+            drop(installed_chunk_ids);
+            let catalog_revision = self.commit_catalog(&admission, records)?;
+            admission.confirm();
+            // Optional proof installation remains after every required durability barrier.
+            self.sidecar_installer.enqueue_batch(self, staged);
+            let acks = staged
+                .iter()
+                .map(|item| ReplicaAck {
+                    operation_id: item.operation_id.clone(),
+                    chunk_id: item.chunk.id.clone(),
+                    placement_revision,
+                    placement_epoch,
+                    node_id: target.node_id.clone(),
+                    node_epoch: target.node_epoch,
+                    device_id: target.device.device_id.clone(),
+                    device_epoch: target.device.device_epoch,
+                    catalog_revision,
+                    persisted_bytes: item.chunk.length,
+                    verified_digest: item.chunk.content_digest.clone(),
                 })
-                .collect::<Vec<_>>();
-            append_catalog_txn(
-                &self.catalog_path,
-                &CatalogTxn::new(revision, records.clone())?,
-                self.read_work.as_ref(),
-            )?;
-            for record in records {
-                catalog.records.insert(record.chunk.id.clone(), record);
+                .collect();
+            #[cfg(any(feature = "dfs", test))]
+            if let Some(diagnostic) = batch_diagnostic {
+                diagnostic.finish(true);
             }
-            catalog.revision = revision;
+            Ok(acks)
+        })();
+        if let Err(error) = &result {
+            admission.fail_if_unconfirmed(error.clone());
         }
-        let catalog_revision = catalog.revision;
-        // The required body, chunk-directory and catalog barriers above are
-        // unchanged. Optional proof work must neither hold this lock nor gate
-        // the durable ACK (including exact replay of already-durable chunks).
-        drop(catalog);
-        self.sidecar_installer.enqueue_batch(self, staged);
-        let acks = staged
-            .iter()
-            .map(|item| ReplicaAck {
-                operation_id: item.operation_id.clone(),
-                chunk_id: item.chunk.id.clone(),
-                placement_revision,
-                placement_epoch,
-                node_id: target.node_id.clone(),
-                node_epoch: target.node_epoch,
-                device_id: target.device.device_id.clone(),
-                device_epoch: target.device.device_epoch,
-                catalog_revision,
-                persisted_bytes: item.chunk.length,
-                verified_digest: item.chunk.content_digest.clone(),
-            })
-            .collect();
-        #[cfg(any(feature = "dfs", test))]
-        if let Some(diagnostic) = batch_diagnostic {
-            diagnostic.finish(true);
-        }
-        Ok(acks)
+        result
     }
 
     pub fn persist(
@@ -4393,14 +4538,21 @@ impl LocalChunkStore {
         })
     }
 
-    /// Recheck the current physical file under the publication lock. An old
-    /// failed reader must not quarantine a healthy replacement inode.
+    /// Serialize with installation, then verify outside the publication lock.
+    /// An old failed reader must not quarantine a healthy replacement inode.
     pub(crate) fn quarantine_if_invalid(&self, chunk_id: &ChunkId) -> Result<()> {
-        let mut catalog = self
+        let admission = self.catalog_committer.admit(
+            std::iter::once(chunk_id),
+            catalog_commit::charge_for(std::iter::once(chunk_id), &self.device_id),
+        )?;
+        let record = self
             .catalog
             .lock()
-            .map_err(|_| invalid("local chunk catalog lock is poisoned"))?;
-        let Some(record) = catalog.records.get(chunk_id).cloned() else {
+            .map_err(|_| invalid("local chunk catalog lock is poisoned"))?
+            .records
+            .get(chunk_id)
+            .cloned();
+        let Some(mut record) = record else {
             return Ok(());
         };
         if record.state == LocalChunkState::Quarantined {
@@ -4409,7 +4561,8 @@ impl LocalChunkStore {
         match verify_file(&self.path_for_record(&record)?, &record.chunk) {
             Ok(()) => Ok(()),
             Err(error) if verified_copy_is_invalid(&error) => {
-                self.quarantine_records(&mut catalog, vec![record])
+                record.state = LocalChunkState::Quarantined;
+                self.commit_catalog(&admission, vec![record]).map(|_| ())
             }
             Err(error) => Err(error),
         }
@@ -4440,31 +4593,6 @@ impl LocalChunkStore {
             (left.catalog_revision, &left.chunk.id).cmp(&(right.catalog_revision, &right.chunk.id))
         });
         Ok(records)
-    }
-
-    fn quarantine_records(
-        &self,
-        catalog: &mut LocalCatalog,
-        mut records: Vec<LocalChunkRecord>,
-    ) -> Result<()> {
-        let revision = catalog
-            .revision
-            .checked_add(1)
-            .ok_or_else(|| invalid("local catalog revision exhausted"))?;
-        for record in &mut records {
-            record.state = LocalChunkState::Quarantined;
-            record.catalog_revision = revision;
-        }
-        append_catalog_txn(
-            &self.catalog_path,
-            &CatalogTxn::new(revision, records.clone())?,
-            self.read_work.as_ref(),
-        )?;
-        for record in records {
-            catalog.records.insert(record.chunk.id.clone(), record);
-        }
-        catalog.revision = revision;
-        Ok(())
     }
 }
 
@@ -4638,14 +4766,27 @@ impl ChunkStore for LocalChunkStore {
     }
 }
 
+#[cfg(test)]
 fn append_catalog_txn(
     path: &Path,
     txn: &CatalogTxn,
     metrics: Option<&super::read_work::ReadWorkMetrics>,
 ) -> Result<()> {
+    append_catalog_txn_observed(path, txn, metrics, |_| Ok(()))
+}
+
+fn append_catalog_txn_observed(
+    path: &Path,
+    txn: &CatalogTxn,
+    metrics: Option<&super::read_work::ReadWorkMetrics>,
+    observe_capacity: impl FnOnce(usize) -> Result<()>,
+) -> Result<()> {
     let mut encoded = serde_json::to_vec(txn)
         .map_err(|error| invalid(format!("cannot encode local chunk catalog: {error}")))?;
     encoded.push(b'\n');
+    // Reserve room for the optional separator before measuring actual capacity.
+    encoded.reserve(1);
+    observe_capacity(encoded.capacity())?;
     let mut file = OpenOptions::new()
         .create(true)
         .read(true)
@@ -4690,6 +4831,46 @@ fn catalog_checksum(revision: u64, records: &[LocalChunkRecord]) -> Result<Strin
     let encoded = serde_json::to_vec(&(revision, records))
         .map_err(|error| invalid(format!("cannot checksum local chunk catalog: {error}")))?;
     Ok(blake3::hash(&encoded).to_hex().to_string())
+}
+
+fn sync_store_catalog(path: &Path) -> Result<()> {
+    #[cfg(test)]
+    if FAIL_STORE_CATALOG_SYNC.with(|fail| fail.replace(false)) {
+        return Err(Error::coded(
+            afs_error::IO_OTHER,
+            "injected startup catalog file barrier failure",
+        ));
+    }
+    File::open(path)
+        .and_then(|file| file.sync_all())
+        .map_err(Error::from)?;
+    #[cfg(test)]
+    STORE_CATALOG_SYNCS.with(|syncs| {
+        if let Some(syncs) = syncs.borrow_mut().as_mut() {
+            syncs.push(path.to_path_buf());
+        }
+    });
+    Ok(())
+}
+
+fn sync_store_directory(path: &Path) -> Result<()> {
+    #[cfg(test)]
+    if FAIL_STORE_DIRECTORY_SYNC.with(|fail| fail.replace(false)) {
+        return Err(Error::coded(
+            afs_error::IO_OTHER,
+            "injected startup directory barrier failure",
+        ));
+    }
+    File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(Error::from)?;
+    #[cfg(test)]
+    STORE_DIRECTORY_SYNCS.with(|syncs| {
+        if let Some(syncs) = syncs.borrow_mut().as_mut() {
+            syncs.push(path.to_path_buf());
+        }
+    });
+    Ok(())
 }
 
 fn open_device_epoch(root: &Path) -> Result<u64> {
@@ -4913,6 +5094,10 @@ fn invalid(message: impl Into<String>) -> Error {
 
 #[cfg(test)]
 std::thread_local! {
+    static FAIL_STORE_CATALOG_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static STORE_CATALOG_SYNCS: std::cell::RefCell<Option<Vec<PathBuf>>> = const { std::cell::RefCell::new(None) };
+    static FAIL_STORE_DIRECTORY_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static STORE_DIRECTORY_SYNCS: std::cell::RefCell<Option<Vec<PathBuf>>> = const { std::cell::RefCell::new(None) };
     static VERIFIED_SCAN_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static OUTBOARD_PERSIST_IO: std::cell::RefCell<OutboardPersistIo> = const {
         std::cell::RefCell::new(OutboardPersistIo {
@@ -4943,6 +5128,656 @@ struct OutboardPersistIo {
 #[cfg(test)]
 mod replica_replay_tests {
     use super::*;
+
+    #[test]
+    fn p2_w3_sixteen_ready_requests_share_one_durable_group() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = afs_metrics::Registry::new();
+        let metrics = super::super::read_work::ReadWorkMetrics::register(&registry)
+            .unwrap()
+            .with_read_diagnostics(true);
+        let store = Arc::new(
+            LocalChunkStore::open(temp.path(), "node-a")
+                .unwrap()
+                .with_read_work_metrics(metrics.clone()),
+        );
+        *store.catalog_commit_test.ready.lock().unwrap() =
+            Some(Arc::new(std::sync::Barrier::new(16)));
+        let staged: Vec<_> = (0..16)
+            .map(|index| {
+                StagedChunk::new(OperationId::new(format!("group-{index}")), vec![index; 64])
+            })
+            .collect();
+        let workers: Vec<_> = staged
+            .iter()
+            .cloned()
+            .map(|item| {
+                let store = store.clone();
+                std::thread::spawn(move || store.put(item))
+            })
+            .collect();
+        let receipts: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap().unwrap())
+            .collect();
+        let snapshot = metrics.diagnostics_snapshot().unwrap();
+        for phase in [
+            "persist_chunks_dir_sync",
+            "persist_catalog_write",
+            "persist_catalog_sync",
+            "persist_catalog_parent_sync",
+        ] {
+            assert_eq!(
+                snapshot
+                    .coarse_phases
+                    .iter()
+                    .find(|item| item.phase == phase)
+                    .unwrap()
+                    .calls,
+                1,
+                "{phase}: all sixteen requests were ready before taking the group"
+            );
+        }
+        assert_eq!(
+            snapshot
+                .coarse_phases
+                .iter()
+                .find(|item| item.phase == "persist_body_sync")
+                .unwrap()
+                .calls,
+            16
+        );
+        for receipt in &receipts {
+            assert_eq!(receipt.durable_acks[0].catalog_revision, 1);
+        }
+        *store.catalog_commit_test.ready.lock().unwrap() = None;
+        let stats = store.catalog_commit_stats();
+        assert_eq!(stats.requests, 0);
+        assert_eq!(stats.ready, 0);
+        assert_eq!(stats.waiters, 0);
+        assert!(!stats.writer && !stats.failed && !stats.exclusive);
+        assert_eq!(stats.groups, 1);
+        assert_eq!(stats.max_group, 16);
+        assert!(stats.reserved_bytes <= stats.peak_reserved_bytes);
+        assert!(stats.actual_peak_bytes <= stats.peak_reserved_bytes);
+        assert!(stats.peak_reserved_bytes <= 1024 * 1024);
+        drop(store);
+        let recovered = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+        for item in staged {
+            let mut output = [0; 64];
+            assert_eq!(
+                recovered.read_at(&item.chunk.id, 0, &mut output).unwrap(),
+                64
+            );
+            assert_eq!(output.as_slice(), item.bytes());
+        }
+    }
+
+    fn p2_w3_block() -> (
+        PeerFillTestBlock,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (entered, observed) = std::sync::mpsc::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        ((entered, wait), observed, release)
+    }
+
+    fn p2_w3_wait(
+        store: &LocalChunkStore,
+        predicate: impl Fn(catalog_commit::CatalogCommitStats) -> bool,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !predicate(store.catalog_commit_stats()) {
+            assert!(
+                Instant::now() < deadline,
+                "catalog condition did not become ready"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn p2_w3_prepare_does_not_hold_catalog_or_block_a_different_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
+        let (block, observed, release) = p2_w3_block();
+        *store.catalog_commit_test.before_prepare.lock().unwrap() = Some(block);
+        let first_store = store.clone();
+        let first = std::thread::spawn(move || {
+            first_store.put(StagedChunk::new(
+                OperationId::new("blocked-prepare"),
+                b"first".to_vec(),
+            ))
+        });
+        observed.recv_timeout(Duration::from_secs(3)).unwrap();
+        let other_store = store.clone();
+        let (done, completion) = std::sync::mpsc::channel();
+        let second = std::thread::spawn(move || {
+            let result = other_store.device_descriptor().and_then(|_| {
+                other_store.put(StagedChunk::new(
+                    OperationId::new("independent"),
+                    b"second".to_vec(),
+                ))
+            });
+            done.send(result).unwrap();
+        });
+        let while_blocked = completion.recv_timeout(Duration::from_secs(1));
+        release.send(()).unwrap();
+        assert!(first.join().unwrap().is_ok());
+        second.join().unwrap();
+        assert!(
+            while_blocked.unwrap().is_ok(),
+            "different object must progress while preparation is blocked"
+        );
+    }
+
+    #[test]
+    fn p2_w3_same_id_replay_and_quarantine_wait_for_the_install_flight() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
+        let staged = StagedChunk::new(OperationId::new("same-flight"), b"same".to_vec());
+        let (block, observed, release) = p2_w3_block();
+        store
+            .catalog_commit_test
+            .before_wal
+            .lock()
+            .unwrap()
+            .push_back(block);
+        let first_store = store.clone();
+        let first_item = staged.clone();
+        let first = std::thread::spawn(move || first_store.put(first_item));
+        observed.recv_timeout(Duration::from_secs(3)).unwrap();
+        let replay_store = store.clone();
+        let replay_item = staged.clone();
+        let replay = std::thread::spawn(move || replay_store.put(replay_item));
+        let quarantine_store = store.clone();
+        let id = staged.chunk.id.clone();
+        let quarantine = std::thread::spawn(move || quarantine_store.quarantine_if_invalid(&id));
+        p2_w3_wait(&store, |stats| stats.waiters == 2);
+        release.send(()).unwrap();
+        let ack = first.join().unwrap().unwrap();
+        let replay_ack = replay.join().unwrap().unwrap();
+        assert_eq!(
+            ack.durable_acks[0].catalog_revision,
+            replay_ack.durable_acks[0].catalog_revision
+        );
+        assert!(quarantine.join().unwrap().is_ok());
+        assert!(store.quarantined_chunks().unwrap().is_empty());
+        assert_eq!(store.catalog_commit_stats().groups, 1);
+    }
+
+    #[test]
+    fn p2_w3_first_group_ack_does_not_wait_for_a_blocked_following_group() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
+        let (block1, observed1, release1) = p2_w3_block();
+        let (block2, observed2, release2) = p2_w3_block();
+        store
+            .catalog_commit_test
+            .before_wal
+            .lock()
+            .unwrap()
+            .extend([block1, block2]);
+        let first_store = store.clone();
+        let (done, completion) = std::sync::mpsc::channel();
+        let first = std::thread::spawn(move || {
+            done.send(first_store.put(StagedChunk::new(
+                OperationId::new("first-group"),
+                b"first".to_vec(),
+            )))
+            .unwrap()
+        });
+        observed1.recv_timeout(Duration::from_secs(3)).unwrap();
+        let second_store = store.clone();
+        let second = std::thread::spawn(move || {
+            second_store.put(StagedChunk::new(
+                OperationId::new("second-group"),
+                b"second".to_vec(),
+            ))
+        });
+        p2_w3_wait(&store, |stats| stats.ready == 1);
+        release1.send(()).unwrap();
+        observed2.recv_timeout(Duration::from_secs(3)).unwrap();
+        let first_ack = completion.recv_timeout(Duration::from_secs(1));
+        release2.send(()).unwrap();
+        first.join().unwrap();
+        assert!(second.join().unwrap().is_ok());
+        assert!(
+            first_ack.unwrap().is_ok(),
+            "first ACK must not be held by continuously arriving later groups"
+        );
+        assert_eq!(store.catalog_commit_stats().groups, 2);
+    }
+
+    #[test]
+    fn p2_w3_oversized_batch_progresses_as_one_exclusive_original_transaction() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            LocalChunkStore::open(temp.path(), "node-a")
+                .unwrap()
+                .with_catalog_commit_queue(1)
+                .unwrap(),
+        );
+        let staged: Vec<_> = (0..80)
+            .map(|index| {
+                StagedChunk::new(OperationId::new(format!("large-{index}")), vec![index; 64])
+            })
+            .collect();
+        let (block, observed, release) = p2_w3_block();
+        store
+            .catalog_commit_test
+            .before_wal
+            .lock()
+            .unwrap()
+            .push_back(block);
+        let worker_store = store.clone();
+        let worker = std::thread::spawn(move || worker_store.put_batch(staged));
+        observed.recv_timeout(Duration::from_secs(3)).unwrap();
+        let held = store.catalog_commit_stats();
+        assert!(held.exclusive);
+        assert_eq!(
+            held.requests, 0,
+            "large original metadata must not enter the bounded new queue"
+        );
+        release.send(()).unwrap();
+        let receipts = worker.join().unwrap().unwrap();
+        assert_eq!(receipts.len(), 80);
+        assert!(
+            receipts
+                .iter()
+                .all(|receipt| receipt.durable_acks[0].catalog_revision == 1)
+        );
+        assert_eq!(store.catalog_commit_stats().groups, 1);
+        assert!(!store.catalog_commit_stats().exclusive);
+        drop(store);
+        let recovered = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+        assert_eq!(recovered.recover().unwrap().durable_chunks, 80);
+    }
+
+    #[test]
+    fn p2_w3_partial_write_sync_and_parent_failures_prevent_every_later_append() {
+        for step in [1, 2, 3] {
+            let temp = tempfile::tempdir().unwrap();
+            let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+            let healthy = StagedChunk::new(OperationId::new("healthy"), b"healthy".to_vec());
+            store.put(healthy.clone()).unwrap();
+            store
+                .catalog_commit_test
+                .fail_wal_step
+                .store(step, Ordering::Release);
+            assert!(
+                store
+                    .put(StagedChunk::new(
+                        OperationId::new("failed-group"),
+                        b"failed".to_vec()
+                    ))
+                    .is_err()
+            );
+            let failed_bytes = fs::read(&store.catalog_path).unwrap();
+            assert!(store.catalog_commit_stats().failed);
+            assert!(store.put(healthy.clone()).is_err());
+            fs::write(store.chunk_path(&healthy.chunk.id), b"damaged").unwrap();
+            assert!(store.quarantine_if_invalid(&healthy.chunk.id).is_err());
+            assert!(
+                store
+                    .put(StagedChunk::new(
+                        OperationId::new("later"),
+                        b"later".to_vec()
+                    ))
+                    .is_err()
+            );
+            assert_eq!(fs::read(&store.catalog_path).unwrap(), failed_bytes);
+            drop(store);
+            let recovered = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+            assert!(recovered.put(healthy).is_ok());
+        }
+    }
+
+    #[test]
+    fn p2_w3_stop_waits_for_owned_io_and_keeps_the_final_drain_commit() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            LocalChunkStore::open(temp.path(), "node-a")
+                .unwrap()
+                .with_catalog_commit_queue(1)
+                .unwrap(),
+        );
+        store.note_catalog_stop();
+        // The existing DFS drain invokes persist after the stop notification.
+        assert!(
+            store
+                .put(StagedChunk::new(
+                    OperationId::new("final-drain"),
+                    b"drain".to_vec()
+                ))
+                .is_ok()
+        );
+        let (block, observed, release) = p2_w3_block();
+        store
+            .catalog_commit_test
+            .before_wal
+            .lock()
+            .unwrap()
+            .push_back(block);
+        let worker_store = store.clone();
+        let worker = std::thread::spawn(move || {
+            worker_store.put(StagedChunk::new(
+                OperationId::new("owned-io"),
+                b"owned".to_vec(),
+            ))
+        });
+        observed.recv_timeout(Duration::from_secs(3)).unwrap();
+        let waiting_store = store.clone();
+        let waiter = std::thread::spawn(move || {
+            waiting_store.put(StagedChunk::new(
+                OperationId::new("queued"),
+                b"queued".to_vec(),
+            ))
+        });
+        p2_w3_wait(&store, |stats| stats.waiters == 1);
+        let stopping_store = store.clone();
+        let (done, stopped) = std::sync::mpsc::channel();
+        let stopping = std::thread::spawn(move || {
+            done.send(stopping_store.shutdown_catalog_committer())
+                .unwrap()
+        });
+        p2_w3_wait(&store, |stats| stats.closed);
+        let still_owned = stopped.recv_timeout(Duration::from_millis(30)).is_err();
+        release.send(()).unwrap();
+        assert!(worker.join().unwrap().is_ok());
+        assert!(waiter.join().unwrap().is_err());
+        assert!(
+            stopped
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap()
+                .is_ok()
+        );
+        stopping.join().unwrap();
+        assert!(still_owned, "stop must not detach active I/O");
+        assert_eq!(store.catalog_commit_stats().requests, 0);
+        assert!(
+            store
+                .put(StagedChunk::new(
+                    OperationId::new("after-close"),
+                    b"no".to_vec()
+                ))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn p2_w3_unconfirmed_replacement_cannot_replay_until_a_reopen_directory_barrier() {
+        for later_prepare_failure in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+            let healthy =
+                StagedChunk::new(OperationId::new("healthy-replace"), b"healthy".to_vec());
+            store.put(healthy.clone()).unwrap();
+            fs::write(store.chunk_path(&healthy.chunk.id), b"BROKEN!").unwrap();
+            if later_prepare_failure {
+                store
+                    .catalog_commit_test
+                    .fail_prepare_after
+                    .store(2, Ordering::Release);
+            } else {
+                store
+                    .catalog_commit_test
+                    .fail_chunks_dir
+                    .store(true, Ordering::Release);
+            }
+            let mut staged = vec![healthy.clone()];
+            if later_prepare_failure {
+                staged.push(StagedChunk::new(
+                    OperationId::new("second-body"),
+                    b"second".to_vec(),
+                ));
+            }
+            assert!(store.put_batch(staged).is_err());
+            assert_eq!(
+                fs::read(store.chunk_path(&healthy.chunk.id)).unwrap(),
+                b"healthy"
+            );
+            assert!(store.catalog_commit_stats().failed);
+            let wal = fs::read(&store.catalog_path).unwrap();
+            assert!(
+                store.put(healthy.clone()).is_err(),
+                "unconfirmed rename cannot gain a healthy replay ACK"
+            );
+            assert_eq!(fs::read(&store.catalog_path).unwrap(), wal);
+            drop(store);
+            FAIL_STORE_DIRECTORY_SYNC.with(|fail| fail.set(true));
+            assert!(
+                LocalChunkStore::open(temp.path(), "node-a").is_err(),
+                "reopen must complete its chunks namespace barrier"
+            );
+            STORE_DIRECTORY_SYNCS.with(|syncs| *syncs.borrow_mut() = Some(Vec::new()));
+            let recovered = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+            let syncs = STORE_DIRECTORY_SYNCS.with(|syncs| syncs.borrow_mut().take().unwrap());
+            assert_eq!(syncs.first(), Some(&temp.path().join("chunks")));
+            assert!(syncs.contains(&temp.path().to_path_buf()));
+            assert!(recovered.put(healthy).is_ok());
+            assert_eq!(
+                recovered.catalog_commit_stats().groups,
+                0,
+                "healthy replay uses the proven startup barriers"
+            );
+        }
+    }
+
+    #[test]
+    fn p2_w3_multi_key_requests_do_not_deadlock_and_owner_drop_releases_admission() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
+        let a = StagedChunk::new(OperationId::new("key-a"), b"a".to_vec());
+        let b = StagedChunk::new(OperationId::new("key-b"), b"b".to_vec());
+        let cancelled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _admission = store.admit_catalog(&[a.clone(), b.clone()]).unwrap();
+            panic!("test-owned caller unwind before I/O");
+        }));
+        assert!(cancelled.is_err());
+        assert_eq!(store.catalog_commit_stats().requests, 0);
+        let first_store = store.clone();
+        let forward = vec![a.clone(), b.clone()];
+        let first = std::thread::spawn(move || first_store.put_batch(forward));
+        let second_store = store.clone();
+        let second = std::thread::spawn(move || second_store.put_batch(vec![b, a]));
+        assert_eq!(first.join().unwrap().unwrap().len(), 2);
+        assert_eq!(second.join().unwrap().unwrap().len(), 2);
+        assert_eq!(store.catalog_commit_stats().groups, 1);
+    }
+
+    #[test]
+    fn p2_w3_shared_group_failure_wakes_every_waiter_without_ack() {
+        for step in [2, 3] {
+            let temp = tempfile::tempdir().unwrap();
+            let store = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
+            let healthy = StagedChunk::new(
+                OperationId::new("previously-confirmed"),
+                b"confirmed".to_vec(),
+            );
+            store.put(healthy.clone()).unwrap();
+            *store.catalog_commit_test.ready.lock().unwrap() =
+                Some(Arc::new(std::sync::Barrier::new(16)));
+            store
+                .catalog_commit_test
+                .fail_wal_step
+                .store(step, Ordering::Release);
+            let workers: Vec<_> = (0..16)
+                .map(|index| {
+                    let store = store.clone();
+                    std::thread::spawn(move || {
+                        store.put(StagedChunk::new(
+                            OperationId::new(format!("shared-error-{index}")),
+                            vec![index; 64],
+                        ))
+                    })
+                })
+                .collect();
+            let errors: Vec<_> = workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap().unwrap_err())
+                .collect();
+            assert_eq!(errors.len(), 16);
+            assert!(
+                errors.iter().all(|error| error == &errors[0]),
+                "every failed group member must observe the same structured error"
+            );
+            *store.catalog_commit_test.ready.lock().unwrap() = None;
+            let stats = store.catalog_commit_stats();
+            assert!(stats.failed);
+            assert_eq!(stats.requests, 0);
+            assert_eq!(
+                stats.groups, 1,
+                "only the previous confirmed request may count as a successful group"
+            );
+            assert_eq!(stats.max_group, 16);
+            let bytes = fs::read(&store.catalog_path).unwrap();
+            assert!(store.put(healthy.clone()).is_err());
+            assert!(store.quarantine_if_invalid(&healthy.chunk.id).is_err());
+            assert!(
+                store
+                    .put(StagedChunk::new(
+                        OperationId::new("after-shared-failure"),
+                        b"later".to_vec()
+                    ))
+                    .is_err()
+            );
+            assert_eq!(
+                fs::read(&store.catalog_path).unwrap(),
+                bytes,
+                "failed group cannot be followed by another append"
+            );
+            drop(store);
+            let recovered = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+            let mut output = [0; 9];
+            assert_eq!(
+                recovered
+                    .read_at(&healthy.chunk.id, 0, &mut output)
+                    .unwrap(),
+                9
+            );
+            assert_eq!(&output, b"confirmed");
+        }
+    }
+
+    #[test]
+    fn p2_w3_reopen_syncs_complete_unsynced_wal_before_replay_ack() {
+        for newline in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+            assert!(
+                !store.catalog_path.exists(),
+                "empty startup must not invent a WAL file"
+            );
+            let healthy =
+                StagedChunk::new(OperationId::new("previous-confirmed"), b"previous".to_vec());
+            store.put(healthy).unwrap();
+            let unconfirmed = StagedChunk::new(
+                OperationId::new("complete-unsynced"),
+                b"unconfirmed".to_vec(),
+            );
+            let mut body = File::create(store.chunk_path(&unconfirmed.chunk.id)).unwrap();
+            body.write_all(unconfirmed.bytes()).unwrap();
+            body.sync_all().unwrap();
+            let record = LocalChunkRecord {
+                chunk: unconfirmed.chunk.clone(),
+                stored_length: unconfirmed.chunk.length,
+                stored_checksum: unconfirmed.chunk.content_digest.clone(),
+                device_id: store.device_id.clone(),
+                device_epoch: store.device_epoch,
+                location: PhysicalLocation::PerChunkFile {
+                    relative_path: format!("chunks/{}", unconfirmed.chunk.id.0),
+                },
+                encoding: PhysicalEncoding::Raw,
+                state: LocalChunkState::Durable,
+                catalog_revision: 2,
+            };
+            let mut encoded =
+                serde_json::to_vec(&CatalogTxn::new(2, vec![record]).unwrap()).unwrap();
+            if newline {
+                encoded.push(b'\n');
+            }
+            // Deliberately omit sync_all: complete bytes are visible in the same
+            // OS but must not be mistaken for a completed durability barrier.
+            OpenOptions::new()
+                .append(true)
+                .open(&store.catalog_path)
+                .unwrap()
+                .write_all(&encoded)
+                .unwrap();
+            let wal = fs::read(&store.catalog_path).unwrap();
+            drop(store);
+            FAIL_STORE_CATALOG_SYNC.with(|fail| fail.set(true));
+            assert!(LocalChunkStore::open(temp.path(), "node-a").is_err());
+            STORE_CATALOG_SYNCS.with(|syncs| *syncs.borrow_mut() = Some(Vec::new()));
+            let recovered = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+            let syncs = STORE_CATALOG_SYNCS.with(|syncs| syncs.borrow_mut().take().unwrap());
+            assert_eq!(syncs, vec![temp.path().join("catalog.wal")]);
+            assert_eq!(
+                fs::read(&recovered.catalog_path).unwrap(),
+                wal,
+                "valid full transaction bytes are preserved"
+            );
+            let receipt = recovered.put(unconfirmed).unwrap();
+            assert_eq!(receipt.durable_acks[0].catalog_revision, 2);
+            assert_eq!(recovered.catalog_commit_stats().groups, 0);
+            drop(recovered);
+            // Complete malformed content remains a validation error, never a
+            // recovery-sync fast path that silently accepts it.
+            OpenOptions::new()
+                .append(true)
+                .open(temp.path().join("catalog.wal"))
+                .unwrap()
+                .write_all(b"\n{}\n")
+                .unwrap();
+            STORE_CATALOG_SYNCS.with(|syncs| *syncs.borrow_mut() = Some(Vec::new()));
+            assert!(LocalChunkStore::open(temp.path(), "node-a").is_err());
+            assert!(
+                STORE_CATALOG_SYNCS
+                    .with(|syncs| syncs.borrow_mut().take().unwrap())
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn p2_w3_catalog_failure_latches_until_reopen() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+        let healthy = StagedChunk::new(OperationId::new("healthy"), b"healthy".to_vec());
+        store.put(healthy.clone()).unwrap();
+        let backup = temp.path().join("catalog-backup.wal");
+        fs::rename(&store.catalog_path, &backup).unwrap();
+        fs::create_dir(&store.catalog_path).unwrap();
+        assert!(
+            store
+                .put(StagedChunk::new(
+                    OperationId::new("failed"),
+                    b"failed".to_vec()
+                ))
+                .is_err()
+        );
+        fs::remove_dir(&store.catalog_path).unwrap();
+        fs::rename(&backup, &store.catalog_path).unwrap();
+        let bytes = fs::read(&store.catalog_path).unwrap();
+        assert!(
+            store.put(healthy.clone()).is_err(),
+            "a failed catalog cannot issue a later successful replay ACK"
+        );
+        assert!(
+            store
+                .put(StagedChunk::new(
+                    OperationId::new("later"),
+                    b"later".to_vec()
+                ))
+                .is_err()
+        );
+        assert_eq!(fs::read(&store.catalog_path).unwrap(), bytes);
+        drop(store);
+        let recovered = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+        assert!(recovered.put(healthy).is_ok());
+    }
 
     #[test]
     fn p2_w0_blocked_installer_does_not_delay_durable_ack() {

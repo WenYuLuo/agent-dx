@@ -32,6 +32,8 @@ uds_path = "/opt/adx/run/afs/node-a.sock"
 # dfs_outboard_work_wait_ms = 2
 # Optional proof installs, queued plus active; valid range 1..=64.
 # Body/catalog durability never waits for this background queue.
+# Catalog request count; a separate 1MiB control bound also applies.
+dfs_catalog_commit_queue = 256
 # dfs_sidecar_install_queue = 64
 # Bounded native cache flight records, valid range 1..=8.
 # This does not enable multiple body fills or object prefetch.

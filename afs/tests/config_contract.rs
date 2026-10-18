@@ -115,6 +115,56 @@ fn p2_r5_flight_limit_is_bounded_and_file_cli_defaults_agree() {
 }
 
 #[test]
+fn p2_w3_catalog_queue_bounds_and_cli_precedence() {
+    assert_eq!(
+        Config::resolve(Role::Node, Cli::parse_from(["afs-node"]))
+            .unwrap()
+            .dfs_catalog_commit_queue,
+        256
+    );
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("node.toml");
+    for limit in [1, 16, 256] {
+        std::fs::write(&path, format!("dfs_catalog_commit_queue={limit}\n")).unwrap();
+        let config = Config::resolve(
+            Role::Node,
+            Cli::parse_from(["afs-node", "--config", path.to_str().unwrap()]),
+        )
+        .unwrap();
+        assert_eq!(config.dfs_catalog_commit_queue, limit);
+        let config = Config::resolve(
+            Role::Node,
+            Cli::parse_from([
+                "afs-node",
+                "--config",
+                path.to_str().unwrap(),
+                "--dfs-catalog-commit-queue",
+                "2",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(config.dfs_catalog_commit_queue, 2);
+    }
+    for limit in [0, 257] {
+        std::fs::write(&path, format!("dfs_catalog_commit_queue={limit}\n")).unwrap();
+        assert!(
+            Config::resolve(
+                Role::Node,
+                Cli::parse_from(["afs-node", "--config", path.to_str().unwrap()])
+            )
+            .is_err()
+        );
+        assert!(
+            Config::resolve(
+                Role::Node,
+                Cli::parse_from(["afs-node", "--dfs-catalog-commit-queue", &limit.to_string()])
+            )
+            .is_err()
+        );
+    }
+}
+
+#[test]
 fn p2_w0_sidecar_queue_is_bounded_and_file_cli_defaults_agree() {
     assert_eq!(
         Config::resolve(Role::Node, Cli::parse_from(["afs-node"]))

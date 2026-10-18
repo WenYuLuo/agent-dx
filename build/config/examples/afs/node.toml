@@ -96,3 +96,6 @@ node-a = "/opt/adx/config/afs/tls/node-a.pem"
 # capacity_bytes = 268435456
 # pending_bytes = 37748736
 # cache_large_write = false
+
+# Catalog request count, independent of body/proof budgets.
+dfs_catalog_commit_queue = 256

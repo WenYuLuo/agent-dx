@@ -686,8 +686,29 @@ cargo test --locked -p afs --lib --all-features catalog_tail_recovery_tests
 
 覆盖事务头、记录中部、记录间及checksum尾截断；部分多字节UTF-8与真正非法字节分别
 处理，并核对完整无换行→append→restart。复用原ACK／persist／精确重放回归，证明
-正文／目录／catalog屏障和未知Meta提交阻挡后续修改未降低。此项仅是W-3恢复前置，
-`CatalogCommitter`、跨请求组提交及锁外catalog I/O尚未实现，不以尾恢复通过宣布写侧完成。
+正文／目录／catalog屏障和未知Meta提交阻挡后续修改未降低。尾恢复只是恢复前置，
+不能替代组提交、停止排空或性能验收。
+
+### 原生持久化组提交回归
+
+```sh
+cargo test --locked -p afs --lib --all-features p2_w3_ -- --test-threads=1
+cargo test --locked -p afs --lib --all-features p2_w0_
+cargo test --locked -p afs --lib --all-features immutable_chunk_retry_
+```
+
+受控同批须让16个单对象请求在取批前都完成正文持久化，再证明共享一次目录／WAL及父目录
+屏障、同一提交revision，且屏障前无ACK；非受控并发只报告真实批数，不要求恰好一组。
+同ID安装／重放／quarantine与旧reader、新inode替换交错必须安全；阻塞磁盘I/O时其他
+catalog元数据操作仍能进展。首组ACK不依赖后续请求全部耗尽。
+
+队列检查queued加active，1MiB控制账在真实引用释放前不退；超过额度的原大批保持整批
+独占fallback，不永等不可能满足的许可。失败注入分别核验WAL／同步／父目录屏障前无
+成功ACK、失败锁存后健康重放也报错且不新增WAL字节、重开后按原尾恢复合同处理。
+还须覆盖修复rename后目录失败、同批后续正文失败和正常drop／重开，证明健康重放
+不能跳过目录屏障。完整且checksum有效的WAL（含无末换行）重开时也必须执行文件
+同步，失败拒绝open；完整损坏仍先拒绝，不走同步成功快路。停止必须允许最后dirty提交，再关闭准入并唤醒／排空等待者。计数和软件回归不替代实际
+Node生命周期、RSS、完整E2E或性能门槛；未运行的场景须单独保留待验收。
 
 ## Native Peer 准入等待回归
 

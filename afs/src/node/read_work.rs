@@ -74,6 +74,7 @@ fn thread_cpu_ns() -> Option<u64> {
 
 #[derive(Clone, Debug)]
 pub struct ReadWorkMetrics {
+    catalog_commit_resources: afs_metrics::IntGaugeVec,
     scan_bytes: afs_metrics::IntCounter,
     hashes: afs_metrics::IntCounterVec,
     outboard_total_bytes: afs_metrics::IntGauge,
@@ -154,6 +155,14 @@ pub struct ReadWorkMetrics {
 impl ReadWorkMetrics {
     pub fn register(registry: &afs_metrics::Registry) -> Result<Self, afs_metrics::MetricsError> {
         registry.get_or_register(|registry| {
+            let catalog_commit_resources = afs_metrics::IntGaugeVec::new(
+                afs_metrics::Opts::new("afs_dfs_catalog_commit_resources", "Catalog control capacity and completed groups; excludes caller-owned bodies and the existing oversized-batch path."),
+                &["resource"],
+            )?;
+            for resource in ["requests", "reserved_bytes", "peak_reserved_bytes", "actual_peak_bytes", "control_limit_bytes", "groups", "max_group", "failed", "exclusive"] {
+                catalog_commit_resources.with_label_values(&[resource]);
+            }
+            afs_metrics::register_collector(registry, &catalog_commit_resources)?;
             let scan_bytes = afs_metrics::IntCounter::new(
                 "afs_dfs_read_scan_bytes_total",
                 "Logical file bytes read and hashed by complete immutable Chunk verification.",
@@ -488,6 +497,7 @@ impl ReadWorkMetrics {
                 copies.with_label_values(&[stage]);
             }
             Ok(Self {
+                catalog_commit_resources,
                 scan_bytes,
                 hashes,
                 outboard_total_bytes,
@@ -885,6 +895,28 @@ impl ReadWorkMetrics {
                 | "sidecar_install_failed"
         ) {
             self.outboard_events.with_label_values(&[event]).inc();
+        }
+    }
+
+    pub(crate) fn catalog_commit_resources(&self, values: &[(&str, u64)]) {
+        for (resource, value) in values {
+            if matches!(
+                *resource,
+                "requests"
+                    | "reserved_bytes"
+                    | "peak_reserved_bytes"
+                    | "actual_peak_bytes"
+                    | "control_limit_bytes"
+                    | "groups"
+                    | "max_group"
+                    | "failed"
+                    | "exclusive"
+            ) && let Ok(value) = i64::try_from(*value)
+            {
+                self.catalog_commit_resources
+                    .with_label_values(&[resource])
+                    .set(value);
+            }
         }
     }
 

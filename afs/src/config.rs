@@ -251,6 +251,9 @@ pub struct Cli {
     /// Maximum shared outboard range-work admission wait (0..=50 ms).
     #[arg(long)]
     pub dfs_outboard_work_wait_ms: Option<u64>,
+    /// Queued plus active catalog commit requests (1..=256), with a separate 1MiB control bound.
+    #[arg(long)]
+    pub dfs_catalog_commit_queue: Option<usize>,
     /// Queued plus active optional sidecar installs (1..=64).
     #[arg(long)]
     pub dfs_sidecar_install_queue: Option<usize>,
@@ -350,6 +353,7 @@ struct FileConfig {
     dfs_version_cache_entries: Option<usize>,
     dfs_version_cache_bytes: Option<u64>,
     dfs_outboard_work_wait_ms: Option<u64>,
+    dfs_catalog_commit_queue: Option<usize>,
     dfs_sidecar_install_queue: Option<usize>,
     dfs_fetch_max_inflight_objects: Option<usize>,
     dfs_readahead_max_bytes: Option<u64>,
@@ -417,6 +421,7 @@ pub struct Config {
     pub dfs_version_cache_entries: usize,
     pub dfs_version_cache_bytes: u64,
     pub dfs_outboard_work_wait_ms: u64,
+    pub dfs_catalog_commit_queue: usize,
     pub dfs_sidecar_install_queue: usize,
     pub dfs_fetch_max_inflight_objects: usize,
     pub dfs_readahead_max_bytes: u64,
@@ -627,6 +632,13 @@ impl Config {
         if dfs_outboard_work_wait_ms > 50 {
             return Err(invalid("DFS outboard work wait must be 0..=50 ms"));
         }
+        let dfs_catalog_commit_queue = cli
+            .dfs_catalog_commit_queue
+            .or(file.dfs_catalog_commit_queue)
+            .unwrap_or(256);
+        if !(1..=256).contains(&dfs_catalog_commit_queue) {
+            return Err(invalid("DFS catalog commit queue must be 1..=256"));
+        }
         let dfs_sidecar_install_queue = cli
             .dfs_sidecar_install_queue
             .or(file.dfs_sidecar_install_queue)
@@ -739,6 +751,7 @@ impl Config {
             dfs_version_cache_entries,
             dfs_version_cache_bytes,
             dfs_outboard_work_wait_ms,
+            dfs_catalog_commit_queue,
             dfs_sidecar_install_queue,
             dfs_fetch_max_inflight_objects,
             dfs_readahead_max_bytes,

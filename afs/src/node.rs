@@ -1229,7 +1229,8 @@ async fn run_node(
                 )?
                 .with_peer_serve_wait(std::time::Duration::from_millis(cfg.dfs_peer_serve_wait_ms))?
                 .with_read_work_metrics(dfs_read_work_metrics.clone())
-                .with_sidecar_install_queue(cfg.dfs_sidecar_install_queue)?,
+                .with_sidecar_install_queue(cfg.dfs_sidecar_install_queue)?
+                .with_catalog_commit_queue(cfg.dfs_catalog_commit_queue)?,
         ))
     } else {
         None
@@ -2238,6 +2239,8 @@ async fn run_node(
     let on_shutdown = || {
         #[cfg(feature = "dfs")]
         if let Some(store) = &dfs_sidecar_store_for_shutdown {
+            // Keep catalog admission available for the existing DFS drain below.
+            store.note_catalog_stop();
             store.stop_sidecar_installation();
             store.close_peer_serve_admission();
         }
@@ -2400,6 +2403,7 @@ async fn run_node(
         match tokio::task::spawn_blocking(move || {
             // Attempt both drains even if the first one reports a failure.
             (
+                store.shutdown_catalog_committer(),
                 store.shutdown_peer_serve(),
                 store.shutdown_sidecar_installer(),
             )
@@ -2407,7 +2411,7 @@ async fn run_node(
         .await
         {
             Ok(results) => {
-                for result in [results.0, results.1] {
+                for result in [results.0, results.1, results.2] {
                     if let Err(error) = result {
                         remember_shutdown_error(&mut shutdown_error, error.into());
                     }

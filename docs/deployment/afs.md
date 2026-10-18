@@ -461,8 +461,22 @@ DFS 状态增长也会增加共用 Meta 的快照处理成本；本次不改变�
 原生Node的`catalog.wal`另有有限尾恢复：只截断物理EOF处无换行的JSON不完整尾部，
 保留并同步已核验前缀；完整损坏、非法UTF-8字节、checksum或revision错误仍拒绝启动。
 完整无换行事务不在恢复时改写，后续追加补分隔符；不清理目录中的正文孤儿。截断／sync
-失败继续报错，不能手工删WAL绕过。本项没有启用组提交或锁外catalog I/O，也不改变
-原正文／目录／catalog ACK屏障、未知Meta结果精确重放或后续修改不能越过的要求。
+失败继续报错，不能手工删WAL绕过。原生本地持久请求可合并为一条原格式多记录事务，
+校验和磁盘I/O在catalog锁外完成；所有正文、chunks目录、WAL和catalog父目录的必需
+屏障成功后才返回各自ACK。同ChunkId的安装／重放／隔离互斥，替换使用新inode。
+
+`dfs_catalog_commit_queue = 256`（CLI `--dfs-catalog-commit-queue`）允许1..=256个
+排队加活跃请求。新增committer控制元数据上限1MiB，包含活跃组与未释放flight，不含
+正文、既有持久catalog、调用者原有批次或大批独占fallback的原临时元数据；超大原请求
+等待排空后整批串行处理，不拆事务、不改变回执。此上限不是全部Node内存或RSS承诺。
+`afs_dfs_catalog_commit_resources{resource="requests|reserved_bytes|peak_reserved_bytes|actual_peak_bytes|control_limit_bytes|groups|max_group|failed|exclusive"}`
+分别报告请求、控制预留／观测峰值、成功组及失败／独占状态；各指标存在包含关系，不求和。
+正式名字已变化、必需屏障未确认后的失败，以及WAL／父目录持久化失败，都会锁存
+首个错误到store重开；后续请求不能假成功或继续追加。重开先完成chunks目录屏障，
+并在严格恢复后同步已有WAL文件及其父目录；这些屏障失败就拒绝打开store。防止同一
+系统内重开后用健康重放跳过未同步的rename或完整但尚未确认同步的WAL。
+停止时先完成DFS dirty drain，再关闭committer并等待真实I/O／持有者结束；原进程watchdog
+边界保持。成功fsync、未知Meta精确重放及后续修改不能越过的要求不变。
 
 ## Node 注册租约期限
 
