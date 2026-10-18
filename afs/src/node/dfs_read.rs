@@ -3306,6 +3306,17 @@ impl DfsReadEngine {
         out: &mut [u8],
         final_owned: bool,
     ) -> Result<bool> {
+        self.read_native_peer_cache_mode(batch, sources, out, final_owned, false)
+    }
+
+    fn read_native_peer_cache_mode(
+        &self,
+        batch: &ReadBatch,
+        sources: &[ChunkSources],
+        out: &mut [u8],
+        final_owned: bool,
+        stream_only: bool,
+    ) -> Result<bool> {
         let Some(cache) = &self.peer_cache else {
             return Ok(false);
         };
@@ -3447,6 +3458,10 @@ impl DfsReadEngine {
                 && (crate::node::chunk::MAX_STAGED_CHUNK_BYTES as u64)
                     .checked_add(out.len() as u64)
                     .is_some_and(|bytes| bytes <= self.config.max_inflight_bytes);
+            if stream_only && !use_stream {
+                leader.finish(crate::node::peer_cache::FillOutcome::Uncached);
+                return Ok(false);
+            }
             if use_stream {
                 operation.acquire_stream_fill(|| {
                     self.check_peer_cache_authority(batch, source, &authority)
@@ -3527,6 +3542,10 @@ impl DfsReadEngine {
                     // The adapter's Node-shared session owns transport work until
                     // its producers and every handed-off frame have drained.
                     let mut sink = operation.begin_stream(chunk)?;
+                    if stream_only && !sink.is_caching() {
+                        leader.finish(crate::node::peer_cache::FillOutcome::Uncached);
+                        return Ok(false);
+                    }
                     let output_pointer = out[start..end].as_ptr() as usize;
                     let output_length = end - start;
                     let prepare_elapsed = preparation.as_ref().map(|stage| stage.clock.elapsed());
@@ -3612,6 +3631,13 @@ impl DfsReadEngine {
                             continue;
                         }
                     }
+                }
+                // A parallel child may never switch to the old full-body or
+                // range transport. Its batch owner joins every child and drops
+                // all fragment scratch before the original serial fallback.
+                if stream_only {
+                    leader.finish(crate::node::peer_cache::FillOutcome::Uncached);
+                    return Ok(false);
                 }
                 // The unsupported sink and its pipeline allowance have dropped
                 // before the original complete-object Vec is admitted.
@@ -4038,6 +4064,31 @@ impl DfsReadEngine {
         if batch.ops.len() < 2 || batch.ops.iter().any(|op| op.length == 0) {
             return Ok(false);
         }
+        // Static rejection avoids dispatching obviously unsupported objects;
+        // the child also enforces stream-only execution for dynamic decline.
+        if !self.transfer.supports_verified_object_sink()
+            || batch.ops.iter().any(|op| {
+                let Some(set) = sources.iter().find(|set| set.chunk_id == op.chunk_id) else {
+                    return true;
+                };
+                let Some(chunk) = &set.chunk else {
+                    return true;
+                };
+                chunk.id != op.chunk_id
+                    || chunk.length == 0
+                    || chunk.length > crate::node::chunk::MAX_STAGED_CHUNK_BYTES as u64
+                    || !range_covered(&set.allowed_ranges, 0, chunk.length)
+                    || (crate::node::chunk::MAX_STAGED_CHUNK_BYTES as u64)
+                        .checked_add(op.length)
+                        .is_none_or(|bytes| bytes > self.config.max_inflight_bytes)
+                    || !set
+                        .sources
+                        .iter()
+                        .any(|source| self.peer_cache_source_eligible(batch, chunk, source))
+            })
+        {
+            return Ok(false);
+        }
         // Completed handles retain only request scratch or a bounded 512-byte
         // failure until this group joins them. Charge their vector/control too.
         let Some(_group_metadata) = cache
@@ -4139,8 +4190,17 @@ impl DfsReadEngine {
             let length = op.length as usize; // ReadBatch validated against usize and the 8MiB limit.
             tasks.push(fetcher.spawn_foreground(permit, move || {
                 let mut scratch = vec![0; length];
-                reader.read_remote_batch(&batch, &[selected], &mut scratch, true, deadline)?;
-                Ok(scratch)
+                if reader.read_native_peer_cache_mode(
+                    &batch,
+                    &[selected],
+                    &mut scratch,
+                    true,
+                    true,
+                )? {
+                    Ok(Some(scratch))
+                } else {
+                    Ok(None)
+                }
             }));
         }
         // Join every task, including after the first failure. No partial result
@@ -4149,7 +4209,8 @@ impl DfsReadEngine {
         let mut failure = None;
         for task in tasks {
             match fetcher.block_on(task) {
-                Ok(Ok(bytes)) => results.push(bytes),
+                Ok(Ok(Some(bytes))) => results.push(bytes),
+                Ok(Ok(None)) => fallback = true,
                 Ok(Err(error)) => {
                     if failure.is_none() {
                         failure = Some(error);
@@ -4166,6 +4227,7 @@ impl DfsReadEngine {
             return Err(error);
         }
         if fallback {
+            drop(results);
             return Ok(false);
         }
         self.check_native_read_authority(&authority)?;
@@ -7626,15 +7688,31 @@ mod tests {
             release: Mutex<mpsc::Receiver<()>>,
         }
         impl ChunkTransfer for GatedTransfer {
-            fn read_ranges(&self, batch: &PeerReadBatch, out: &mut [u8]) -> Result<()> {
-                self.inner.read_ranges(batch, out)?;
+            fn read_ranges(&self, _: &PeerReadBatch, _: &mut [u8]) -> Result<()> {
+                panic!("the queued fanout object must use the controlled stream");
+            }
+            fn supports_verified_object_sink(&self) -> bool {
+                true
+            }
+            fn read_verified_object_to_sink<'output>(
+                &self,
+                _: &PeerReadBatch,
+                chunk: &ChunkObject,
+                offset: u64,
+                out: &'output mut [u8],
+                sink: &mut PeerStreamSink<'_>,
+            ) -> Result<Option<CompletedPeerDiskRead<'output>>> {
+                let bytes = self.inner.bytes.lock().unwrap();
+                let completed = crate::node::rpc::peer::complete_peer_disk_read_for_test(
+                    chunk, &bytes, offset, out, sink,
+                )?;
                 self.entered.send(()).unwrap();
                 self.release
                     .lock()
                     .unwrap()
                     .recv_timeout(Duration::from_secs(5))
                     .unwrap();
-                Ok(())
+                Ok(Some(completed))
             }
         }
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -7700,10 +7778,11 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let fixture = {
+        let mut fixture = {
             let _entered = runtime.enter();
             NativeCacheFixture::new(MAX_DFS_READ_BYTES, vec![(0, 64 * 1024)], Duration::ZERO)
         };
+        fixture.engine.transfer = streaming_cache_transfer(&fixture);
         let engine = Arc::new(fixture.engine);
         let fetcher = engine.object_fetcher().unwrap();
         let permits: Vec<_> = (0..8)
@@ -7732,6 +7811,284 @@ mod tests {
             Some((true, [91; 4])),
             "an expired queued grant must fail without waiting for a fetch slot or changing private output"
         );
+    }
+
+    #[test]
+    fn r7_fanout_degradation_uses_only_foreground_serial_range_fallback() {
+        use std::sync::{
+            Condvar,
+            atomic::{AtomicU64, AtomicUsize},
+            mpsc,
+        };
+        struct FallbackTransfer {
+            mode: &'static str,
+            bodies: BTreeMap<ChunkId, Vec<u8>>,
+            foreground: Mutex<Option<std::thread::ThreadId>>,
+            child_range: AtomicBool,
+            range_calls: AtomicUsize,
+            range_bytes: AtomicU64,
+            active: AtomicUsize,
+            peak_active: AtomicUsize,
+            entered: mpsc::Sender<()>,
+            stream_entered: mpsc::Sender<()>,
+            release: Arc<(Mutex<bool>, Condvar)>,
+        }
+        impl ChunkTransfer for FallbackTransfer {
+            fn read_ranges(&self, batch: &PeerReadBatch, out: &mut [u8]) -> Result<()> {
+                batch.validate(out.len())?;
+                if self.foreground.lock().unwrap().as_ref() != Some(&std::thread::current().id()) {
+                    self.child_range.store(true, Ordering::SeqCst);
+                }
+                self.range_calls.fetch_add(1, Ordering::SeqCst);
+                self.range_bytes.fetch_add(
+                    batch.operations.iter().map(|item| item.op.length).sum(),
+                    Ordering::SeqCst,
+                );
+                let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+                self.peak_active.fetch_max(active, Ordering::SeqCst);
+                let _ = self.entered.send(());
+                let (lock, changed) = &*self.release;
+                let released = lock.lock().unwrap();
+                let _released = changed
+                    .wait_timeout_while(released, Duration::from_secs(5), |released| !*released)
+                    .unwrap();
+                for item in &batch.operations {
+                    let body = &self.bodies[&item.op.chunk_id];
+                    let start = item.op.chunk_offset as usize;
+                    let length = item.op.length as usize;
+                    out[item.op.output_offset..item.op.output_offset + length]
+                        .copy_from_slice(&body[start..start + length]);
+                }
+                self.active.fetch_sub(1, Ordering::SeqCst);
+                Ok(())
+            }
+            fn supports_verified_object_sink(&self) -> bool {
+                self.mode != "unsupported"
+            }
+            fn read_verified_object_to_sink<'output>(
+                &self,
+                _: &PeerReadBatch,
+                chunk: &ChunkObject,
+                offset: u64,
+                out: &'output mut [u8],
+                sink: &mut PeerStreamSink<'_>,
+            ) -> Result<Option<CompletedPeerDiskRead<'output>>> {
+                if self.mode == "sink_none"
+                    || (self.mode == "sink_mixed" && self.bodies[&chunk.id][0] == 29)
+                {
+                    return Ok(None);
+                }
+                let completed = crate::node::rpc::peer::complete_peer_disk_read_for_test(
+                    chunk,
+                    &self.bodies[&chunk.id],
+                    offset,
+                    out,
+                    sink,
+                )?;
+                if matches!(self.mode, "sink_mixed" | "commit_failure") {
+                    let _ = self.stream_entered.send(());
+                    let (lock, changed) = &*self.release;
+                    let released = lock.lock().unwrap();
+                    let _released = changed
+                        .wait_timeout_while(released, Duration::from_secs(5), |released| !*released)
+                        .unwrap();
+                }
+                Ok(Some(completed))
+            }
+        }
+        for mode in [
+            "partial",
+            "chunk_none",
+            "unsupported",
+            "sink_none",
+            "capacity",
+            "sink_mixed",
+            "commit_failure",
+        ] {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            let temp = tempfile::tempdir().unwrap();
+            let chunks = [
+                StagedChunk::new(OperationId::new("r7-fallback-first"), vec![17; 64 * 1024]),
+                StagedChunk::new(OperationId::new("r7-fallback-second"), vec![29; 64 * 1024]),
+            ];
+            let cache = Arc::new(
+                crate::node::peer_cache::DiskPeerCache::open(
+                    crate::node::peer_cache::PeerCacheOptions {
+                        directory: temp.path().join("cache"),
+                        capacity_bytes: if mode == "capacity" {
+                            8192
+                        } else {
+                            1024 * 1024
+                        },
+                        namespace_id: crate::dfs::NamespaceId::new("default"),
+                    },
+                )
+                .unwrap(),
+            );
+            let provider = Arc::new(StaticSources::new(DfsChunkSourcesReply {
+                revision: 1,
+                chunks: chunks
+                    .iter()
+                    .enumerate()
+                    .map(|(index, staged)| ChunkSources {
+                        chunk_id: staged.chunk.id.clone(),
+                        chunk: if mode == "chunk_none" {
+                            None
+                        } else {
+                            Some(staged.chunk.clone())
+                        },
+                        allowed_ranges: vec![(
+                            0,
+                            if mode == "partial" {
+                                8
+                            } else {
+                                staged.chunk.length
+                            },
+                        )],
+                        sources: vec![source(
+                            if index == 0 { "copy-b" } else { "copy-c" },
+                            &staged.chunk.id,
+                            if index == 0 { "node-b" } else { "node-c" },
+                        )],
+                    })
+                    .collect(),
+            }));
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (stream_tx, stream_rx) = mpsc::channel();
+            let release = Arc::new((Mutex::new(false), Condvar::new()));
+            let transfer = Arc::new(FallbackTransfer {
+                mode,
+                bodies: chunks
+                    .iter()
+                    .map(|staged| (staged.chunk.id.clone(), staged.bytes().to_vec()))
+                    .collect(),
+                foreground: Mutex::new(None),
+                child_range: AtomicBool::new(false),
+                range_calls: AtomicUsize::new(0),
+                range_bytes: AtomicU64::new(0),
+                active: AtomicUsize::new(0),
+                peak_active: AtomicUsize::new(0),
+                entered: entered_tx,
+                stream_entered: stream_tx,
+                release: release.clone(),
+            });
+            let engine = {
+                let _entered = runtime.enter();
+                Arc::new(
+                    DfsReadEngine::new(
+                        crate::dfs::NamespaceId::new("default"),
+                        "node-a".into(),
+                        Arc::new(
+                            LocalChunkStore::open(temp.path().join("local"), "node-a").unwrap(),
+                        ),
+                        provider,
+                        transfer.clone(),
+                        DfsReadConfig::default(),
+                    )
+                    .with_read_authority(Arc::new(LocalReadAuthority::new(
+                        1,
+                        Instant::now() + Duration::from_secs(30),
+                    )))
+                    .with_peer_cache(cache),
+                )
+            };
+            let fetcher = engine.object_fetcher().unwrap();
+            let batch = ReadBatch {
+                file_version_id: Some(FileVersionId::new("version")),
+                layout_root_id: LayoutRootId::new("layout"),
+                lookahead: Vec::new(),
+                ops: chunks
+                    .iter()
+                    .enumerate()
+                    .map(|(index, staged)| ChunkReadOp {
+                        chunk_id: staged.chunk.id.clone(),
+                        chunk_offset: 0,
+                        length: 8,
+                        output_offset: index * 8,
+                    })
+                    .collect(),
+            };
+            let driver_transfer = transfer.clone();
+            let reading = std::thread::spawn(move || {
+                *driver_transfer.foreground.lock().unwrap() = Some(std::thread::current().id());
+                let mut out = [91; 16];
+                let result = engine.read_batch_native_into_private(&batch, &mut out);
+                (result, out)
+            });
+            let (first_entered, second_before_release) =
+                if matches!(mode, "sink_mixed" | "commit_failure") {
+                    let needed = if mode == "commit_failure" { 2 } else { 1 };
+                    let entered =
+                        (0..needed).all(|_| stream_rx.recv_timeout(Duration::from_secs(2)).is_ok());
+                    if mode == "commit_failure" && entered {
+                        // Both bodies/proofs are complete. Remove only this test's
+                        // owned pending paths before commit, leaving the pinned
+                        // verified body valid while forcing cache installation Err.
+                        for entry in std::fs::read_dir(temp.path().join("cache")).unwrap() {
+                            let entry = entry.unwrap();
+                            if entry
+                                .file_name()
+                                .to_str()
+                                .is_some_and(|name| name.starts_with(".afs-peer-cache.pending-"))
+                            {
+                                std::fs::remove_file(entry.path()).unwrap();
+                            }
+                        }
+                    }
+                    (
+                        entered,
+                        entered_rx.recv_timeout(Duration::from_millis(100)).is_ok(),
+                    )
+                } else {
+                    (
+                        entered_rx.recv_timeout(Duration::from_secs(2)).is_ok(),
+                        entered_rx.recv_timeout(Duration::from_millis(100)).is_ok(),
+                    )
+                };
+            *release.0.lock().unwrap() = true;
+            release.1.notify_all();
+            let (result, out) = reading.join().unwrap();
+            runtime.block_on(fetcher.shutdown()).unwrap();
+            result.unwrap();
+            assert_eq!(&out[..8], &[17; 8]);
+            assert_eq!(&out[8..], &[29; 8]);
+            assert!(
+                first_entered,
+                "{mode}: a controlled operation must actually begin"
+            );
+            assert!(
+                !second_before_release,
+                "{mode}: different peer ranges cannot bypass the shared stream boundary in parallel"
+            );
+            assert!(
+                !transfer.child_range.load(Ordering::SeqCst),
+                "{mode}: no fanout child may issue a range or legacy-body RPC"
+            );
+            assert_eq!(
+                transfer.peak_active.load(Ordering::SeqCst),
+                usize::from(mode != "commit_failure"),
+                "{mode}"
+            );
+            assert_eq!(
+                transfer.range_calls.load(Ordering::SeqCst),
+                if mode == "commit_failure" { 0 } else { 2 },
+                "{mode}"
+            );
+            assert_eq!(
+                transfer.range_bytes.load(Ordering::SeqCst),
+                if mode == "commit_failure" { 0 } else { 16 },
+                "{mode}: fallback cannot fetch complete legacy bodies in children"
+            );
+            assert_eq!(
+                transfer.active.load(Ordering::SeqCst),
+                0,
+                "{mode}: every range owner must drain"
+            );
+        }
     }
 
     #[test]
