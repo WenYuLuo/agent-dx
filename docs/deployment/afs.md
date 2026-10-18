@@ -194,6 +194,7 @@ cache ON 必须按[验收说明](../testing/afs.md#dfs-外部-s3-闭环)登记�
 | `dfs_outboard_work_wait_ms` | `2` | `0..=50`，共享 proof 工作额度不足时的最长准入等待；0 表示不等待，仍保留完整校验和原全扫回退 |
 | `dfs_peer_serve_resident_objects` | `2` | `1..=16`，A端已验证完整对象的LRU条目上限，每对象至多4MiB |
 | `dfs_peer_serve_payload_bytes` | `16777216`（16MiB） | `4194304..=67108864`，A端驻留、填充、退役pin及packed/RDMA共用的实际正文capacity上限 |
+| `dfs_peer_serve_wait_ms` | `20` | `0..=50`，native gRPC 单入口准入等待期限；0不等待，不增正文或窗口额度 |
 | `dfs_source_cache_max_ms` | `5000` | `0..=60000`，源元数据缓存的最长保留时间，另受grant安全截止约束；0不保留且不前瞻 |
 | `dfs_source_lookahead_chunks` | `64` | `0..=128`，仅后续源元数据；与mandatory合并请求至多128项；0仅关闭前瞻 |
 | `dfs_source_cache_bytes` | `4194304`（4MiB） | `0..=4194304`，最多1024条源元数据的保留估算上限；0不保留且不前瞻 |
@@ -432,3 +433,11 @@ Meta 注册回复提供实际已持久化租约的相对剩余期限 `lease_rema
 
 需配套升级 Meta 与 Node。旧 Meta 未返回相对期限时，新 Node 明确拒绝注册授权，
 不回退到跨机墙钟或任意30秒授权。Meta persistence readiness 的判定保持独立。
+
+### Native Peer 准入等待
+
+`dfs_peer_serve_wait_ms`在同一native gRPC请求入口确定一次截止，覆盖RPC槽、
+对象flight、控制与正文额度；不是额外传输超时。0不排队，临时压力到期仍返回
+resource_exhausted，停止后不允许等待结果生成新的响应。RPC许可等待在原配置期限
+内复查stop，预算／flight等待由通知唤醒。该参数不增加容量，不延长授权，不改变
+已发送Header后的错误传播和末引用退账；大窗口／多连接没有因此启用。

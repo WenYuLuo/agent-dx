@@ -1225,6 +1225,7 @@ async fn run_node(
                     cfg.dfs_peer_serve_resident_objects,
                     cfg.dfs_peer_serve_payload_bytes,
                 )?
+                .with_peer_serve_wait(std::time::Duration::from_millis(cfg.dfs_peer_serve_wait_ms))?
                 .with_read_work_metrics(dfs_read_work_metrics.clone())
                 .with_sidecar_install_queue(cfg.dfs_sidecar_install_queue)?,
         ))

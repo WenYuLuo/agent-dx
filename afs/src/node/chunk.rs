@@ -1557,6 +1557,14 @@ struct PeerReadBudget {
     limit: u64,
     control_used: AtomicU64,
     control_peak: AtomicU64,
+    // This lock only pairs admission predicates with release notifications.
+    // Never acquire the serve table or destroy charged owners while holding it.
+    admission: Mutex<()>,
+    changed: Condvar,
+    stopped: std::sync::atomic::AtomicBool,
+    wait: Duration,
+    #[cfg(test)]
+    before_wait: Mutex<Option<PeerFillTestBlock>>,
 }
 
 #[cfg(any(feature = "dfs", test))]
@@ -1568,6 +1576,12 @@ impl Default for PeerReadBudget {
             limit: PEER_READ_PAYLOAD_LIMIT as u64,
             control_used: AtomicU64::new(0),
             control_peak: AtomicU64::new(0),
+            admission: Mutex::new(()),
+            changed: Condvar::new(),
+            stopped: std::sync::atomic::AtomicBool::new(false),
+            wait: Duration::from_millis(20),
+            #[cfg(test)]
+            before_wait: Mutex::new(None),
         }
     }
 }
@@ -1602,12 +1616,18 @@ struct PeerControlLease {
 #[cfg(any(feature = "dfs", test))]
 impl Drop for PeerControlLease {
     fn drop(&mut self) {
+        let _admission = self
+            .budget
+            .admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.budget
             .control_used
             .fetch_sub(self.bytes, Ordering::AcqRel);
         if let Some(metrics) = &self.metrics {
             metrics.peer_serve_control(-(self.bytes as i64), 0);
         }
+        self.budget.changed.notify_all();
     }
 }
 
@@ -1773,10 +1793,16 @@ impl PeerReadReservation {
 #[cfg(any(feature = "dfs", test))]
 impl Drop for PeerReadReservation {
     fn drop(&mut self) {
+        let _admission = self
+            .budget
+            .admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.budget.used.fetch_sub(self.bytes, Ordering::AcqRel);
         if let Some(metrics) = &self.metrics {
             metrics.peer_payload_released(self.bytes);
         }
+        self.budget.changed.notify_all();
     }
 }
 
@@ -1799,6 +1825,22 @@ fn reserve_peer_bytes(
     bytes: u64,
     metrics: Option<&super::read_work::ReadWorkMetrics>,
 ) -> Result<()> {
+    let _admission = budget
+        .admission
+        .lock()
+        .map_err(|_| peer_serve_unavailable("Peer budget admission poisoned"))?;
+    reserve_peer_bytes_locked(budget, bytes, metrics)
+}
+
+#[cfg(any(feature = "dfs", test))]
+fn reserve_peer_bytes_locked(
+    budget: &PeerReadBudget,
+    bytes: u64,
+    metrics: Option<&super::read_work::ReadWorkMetrics>,
+) -> Result<()> {
+    if budget.stopped.load(Ordering::Acquire) {
+        return Err(peer_serve_unavailable("Peer serve is stopped"));
+    }
     let mut used = budget.used.load(Ordering::Acquire);
     loop {
         let next = used
@@ -2817,6 +2859,41 @@ impl LocalChunkStore {
         Ok(self)
     }
 
+    /// Admission waits share one fixed entry deadline. This does not limit
+    /// active I/O, a shared object's completion, or downstream frame lifetime.
+    #[cfg(any(feature = "dfs", test))]
+    pub(crate) fn with_peer_serve_wait(mut self, wait: Duration) -> Result<Self> {
+        if wait > Duration::from_millis(50) {
+            return Err(invalid("Peer serve admission wait must be 0..=50 ms"));
+        }
+        let state = self
+            .peer_read_cache
+            .get_mut()
+            .map_err(|_| peer_serve_unavailable("Peer serve state poisoned"))?;
+        if state.closed
+            || state.readers != 0
+            || state.flights.iter().any(Option::is_some)
+            || state.residents.iter().any(Option::is_some)
+        {
+            return Err(invalid("cannot reconfigure active Peer serve owners"));
+        }
+        let budget = Arc::get_mut(&mut self.peer_read_budget)
+            .ok_or_else(|| invalid("Peer serve budget still has owners"))?;
+        if budget.used.load(Ordering::Acquire) != 0
+            || budget.control_used.load(Ordering::Acquire) != 0
+            || budget.stopped.load(Ordering::Acquire)
+        {
+            return Err(invalid("cannot reconfigure charged Peer serve budget"));
+        }
+        budget.wait = wait;
+        Ok(self)
+    }
+
+    #[cfg(any(feature = "dfs", test))]
+    pub(crate) fn peer_serve_deadline(&self) -> Instant {
+        Instant::now() + self.peer_read_budget.wait
+    }
+
     #[cfg(any(feature = "dfs", test))]
     fn observe_peer_serve(&self, state: &PeerServeState) {
         if let Some(metrics) = &self.read_work {
@@ -2830,17 +2907,37 @@ impl LocalChunkStore {
         }
     }
 
-    #[cfg(any(feature = "dfs", test))]
+    #[cfg(test)]
     fn reserve_peer_control(&self, bytes: usize) -> Result<PeerControlLease> {
+        self.reserve_peer_control_until(bytes, Instant::now())
+    }
+
+    #[cfg(any(feature = "dfs", test))]
+    fn reserve_peer_control_until(
+        &self,
+        bytes: usize,
+        deadline: Instant,
+    ) -> Result<PeerControlLease> {
         let fixed = peer_serve_fixed_control_bytes();
         let limit = PEER_SERVE_CONTROL_LIMIT.saturating_sub(fixed) as u64;
         let bytes = u64::try_from(bytes).map_err(|_| peer_payload_capacity())?;
-        let mut used = self.peer_read_budget.control_used.load(Ordering::Acquire);
+        if bytes > limit {
+            return Err(peer_payload_capacity());
+        }
+        let mut admission = self
+            .peer_read_budget
+            .admission
+            .lock()
+            .map_err(|_| peer_serve_unavailable("Peer budget admission poisoned"))?;
         loop {
-            let next = used
-                .checked_add(bytes)
-                .filter(|next| *next <= limit)
-                .ok_or_else(peer_payload_capacity)?;
+            if self.peer_read_budget.stopped.load(Ordering::Acquire) {
+                return Err(peer_serve_unavailable("Peer serve is stopped"));
+            }
+            let used = self.peer_read_budget.control_used.load(Ordering::Acquire);
+            let Some(next) = used.checked_add(bytes).filter(|next| *next <= limit) else {
+                admission = self.wait_peer_budget(admission, deadline)?;
+                continue;
+            };
             match self.peer_read_budget.control_used.compare_exchange_weak(
                 used,
                 next,
@@ -2861,20 +2958,27 @@ impl LocalChunkStore {
                         metrics: self.read_work.clone(),
                     });
                 }
-                Err(actual) => used = actual,
+                Err(_) => continue,
             }
         }
     }
 
     #[cfg(any(feature = "dfs", test))]
-    fn peer_object_control(&self, record: Option<&LocalChunkRecord>) -> Result<PeerControlLease> {
+    fn peer_object_control(
+        &self,
+        record: Option<&LocalChunkRecord>,
+        deadline: Instant,
+    ) -> Result<PeerControlLease> {
         // Includes Arc headers, field owners and conservative allocator padding;
         // body Vec capacity and shared proof allocation are charged separately.
         let strings = record.map_or(0, |record| {
             let PhysicalLocation::PerChunkFile { relative_path } = &record.location;
             record.chunk.id.0.capacity() + record.device_id.capacity() + relative_path.capacity()
         });
-        self.reserve_peer_control(std::mem::size_of::<PeerVerifiedObject>() + 128 + strings)
+        self.reserve_peer_control_until(
+            std::mem::size_of::<PeerVerifiedObject>() + 128 + strings,
+            deadline,
+        )
     }
 
     #[cfg(test)]
@@ -2966,6 +3070,17 @@ impl LocalChunkStore {
 
     #[cfg(any(feature = "dfs", test))]
     pub(crate) fn close_peer_serve_admission(&self) {
+        // Do not nest this lock with the serve table: a last charged owner can
+        // be dropped while metadata is retired by another thread.
+        {
+            let _admission = self
+                .peer_read_budget
+                .admission
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.peer_read_budget.stopped.store(true, Ordering::Release);
+            self.peer_read_budget.changed.notify_all();
+        }
         let residents = if let Ok(mut state) = self.peer_read_cache.lock() {
             state.closed = true;
             state
@@ -3462,11 +3577,58 @@ impl LocalChunkStore {
         })
     }
 
-    #[cfg(any(feature = "dfs", test))]
+    #[cfg(any(all(feature = "dfs", feature = "rdma"), test))]
     fn reserve_peer_read_payload_inner(&self, bytes: usize) -> Result<PeerReadReservation> {
+        self.reserve_peer_read_payload_until(bytes, Instant::now())
+    }
+
+    #[cfg(any(feature = "dfs", test))]
+    fn wait_peer_budget<'a>(
+        &'a self,
+        admission: std::sync::MutexGuard<'a, ()>,
+        deadline: Instant,
+    ) -> Result<std::sync::MutexGuard<'a, ()>> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(peer_payload_capacity());
+        }
+        #[cfg(test)]
+        {
+            let block = self.peer_read_budget.before_wait.lock().unwrap().take();
+            if let Some((entered, release)) = block {
+                entered.send(()).unwrap();
+                release.recv_timeout(Duration::from_secs(3)).unwrap();
+            }
+        }
+        // Predicate and release notifications use this same mutex. The wait
+        // atomically releases it, so release cannot fall into a check/wait gap.
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(peer_payload_capacity());
+        }
+        let _wait = self.coarse_diagnostic("peer_slot_wait", 0);
+        self.peer_read_budget
+            .changed
+            .wait_timeout(admission, remaining)
+            .map(|(guard, _)| guard)
+            .map_err(|_| peer_serve_unavailable("Peer budget admission wait poisoned"))
+    }
+
+    #[cfg(any(feature = "dfs", test))]
+    fn reserve_peer_read_payload_until(
+        &self,
+        bytes: usize,
+        deadline: Instant,
+    ) -> Result<PeerReadReservation> {
         let bytes = u64::try_from(bytes).map_err(|_| peer_payload_capacity())?;
+        if bytes > self.peer_read_budget.limit {
+            return Err(peer_payload_capacity());
+        }
         let mut result = reserve_peer_bytes(&self.peer_read_budget, bytes, self.read_work.as_ref());
-        while result.is_err() {
+        while result
+            .as_ref()
+            .is_err_and(|error| error.code() == afs_error::IO_CAPACITY)
+        {
             // Remove only a genuinely unpinned LRU; actual destruction and
             // ledger release happen outside the table lock.
             let victim = {
@@ -3483,12 +3645,30 @@ impl LocalChunkStore {
                 self.observe_peer_serve(&state);
                 victim
             };
-            if victim.is_none() {
-                return Err(peer_payload_capacity());
+            if victim.is_some() {
+                drop(victim);
+                result = reserve_peer_bytes(&self.peer_read_budget, bytes, self.read_work.as_ref());
+                continue;
             }
-            drop(victim);
-            result = reserve_peer_bytes(&self.peer_read_budget, bytes, self.read_work.as_ref());
+            let admission = self
+                .peer_read_budget
+                .admission
+                .lock()
+                .map_err(|_| peer_serve_unavailable("Peer budget admission poisoned"))?;
+            // Another last-reference release may have happened during LRU
+            // inspection. Recheck the pure atomic budget while holding the
+            // notification mutex; never acquire the LRU table from this scope.
+            result =
+                reserve_peer_bytes_locked(&self.peer_read_budget, bytes, self.read_work.as_ref());
+            if result
+                .as_ref()
+                .is_err_and(|error| error.code() == afs_error::IO_CAPACITY)
+            {
+                drop(self.wait_peer_budget(admission, deadline)?);
+                result = reserve_peer_bytes(&self.peer_read_budget, bytes, self.read_work.as_ref());
+            }
         }
+        result?;
         Ok(PeerReadReservation {
             budget: self.peer_read_budget.clone(),
             bytes,
@@ -3549,12 +3729,23 @@ impl LocalChunkStore {
 
     /// Enter streaming only before any header is sent. Missing/legacy proofs
     /// or unavailable optional working capacity preserve the full-scan path.
-    #[cfg(feature = "dfs")]
+    #[cfg(all(feature = "dfs", test))]
     pub(crate) fn open_peer_group_stream(
         &self,
         chunk_id: &ChunkId,
         offset: u64,
         length: usize,
+    ) -> Result<Option<PeerGroupReader<'_>>> {
+        self.open_peer_group_stream_until(chunk_id, offset, length, self.peer_serve_deadline())
+    }
+
+    #[cfg(feature = "dfs")]
+    pub(crate) fn open_peer_group_stream_until(
+        &self,
+        chunk_id: &ChunkId,
+        offset: u64,
+        length: usize,
+        deadline: Instant,
     ) -> Result<Option<PeerGroupReader<'_>>> {
         let guard = self.begin_peer_serve_read()?;
         let record = self.peer_catalog_record(chunk_id)?;
@@ -3594,14 +3785,14 @@ impl LocalChunkStore {
             + relative_path.capacity()
             + reader.chunk.id.0.capacity()
             + reader.outboard_path.capacity();
-        let control = match self.reserve_peer_control(control_bytes) {
+        let control = match self.reserve_peer_control_until(control_bytes, deadline) {
             Ok(control) => control,
             Err(error) if error.code() == afs_error::IO_CAPACITY => return Ok(None),
             Err(error) => return Err(error),
         };
         let allocate = || -> Result<PeerStreamBlock> {
             let mut reservation =
-                self.reserve_peer_read_payload_inner(outboard::OUTBOARD_GROUP_BYTES)?;
+                self.reserve_peer_read_payload_until(outboard::OUTBOARD_GROUP_BYTES, deadline)?;
             let mut bytes = Vec::new();
             bytes
                 .try_reserve_exact(outboard::OUTBOARD_GROUP_BYTES)
@@ -3640,19 +3831,30 @@ impl LocalChunkStore {
     }
 
     /// Object singleflight shares only immutable content, never read authority.
-    #[cfg(any(feature = "dfs", test))]
+    #[cfg(test)]
     pub(crate) fn read_peer_range(
         &self,
         chunk_id: &ChunkId,
         offset: u64,
         length: usize,
     ) -> Result<PeerReadPayload> {
+        self.read_peer_range_until(chunk_id, offset, length, self.peer_serve_deadline())
+    }
+
+    #[cfg(any(feature = "dfs", test))]
+    pub(crate) fn read_peer_range_until(
+        &self,
+        chunk_id: &ChunkId,
+        offset: u64,
+        length: usize,
+        deadline: Instant,
+    ) -> Result<PeerReadPayload> {
         let _reader = self.begin_peer_serve_read()?;
         // Legacy long identities remain readable, but are not retained as keys.
         let cacheable = chunk_id.0.len() <= PEER_SERVE_ID_LIMIT;
         if !cacheable {
             let payload =
-                self.read_peer_range_private(chunk_id, offset, length, &mut None, false)?;
+                self.read_peer_range_private(chunk_id, offset, length, &mut None, false, deadline)?;
             self.ensure_peer_serve_open()?;
             return Ok(payload);
         }
@@ -3673,10 +3875,14 @@ impl LocalChunkStore {
         } else {
             // Fixed slots bound table storage. Charge keys/terminal error and Arc
             // allocation before retention; no proof-ledger or body-budget loan.
-            let id = chunk_id.clone();
-            let control = self.reserve_peer_control(
-                std::mem::size_of::<PeerServeFlight>() + id.0.capacity() + 512 + 128,
+            let control = self.reserve_peer_control_until(
+                std::mem::size_of::<PeerServeFlight>() + PEER_SERVE_ID_LIMIT + 512 + 128,
+                deadline,
             )?;
+            let id = chunk_id.clone();
+            if id.0.capacity() > PEER_SERVE_ID_LIMIT {
+                return Err(peer_payload_capacity());
+            }
             let candidate = Arc::new(PeerServeFlight {
                 chunk_id: id,
                 result: Mutex::new(None),
@@ -3687,28 +3893,36 @@ impl LocalChunkStore {
                 .peer_read_cache
                 .lock()
                 .map_err(|_| peer_serve_unavailable("Peer serve state poisoned"))?;
-            if state.closed {
-                return Err(peer_serve_unavailable("Peer serve is stopped"));
-            }
-            if let Some(flight) = state
-                .flights
-                .iter()
-                .flatten()
-                .find(|flight| flight.chunk_id == *chunk_id)
-                .cloned()
-            {
-                drop(state);
-                drop(candidate);
-                (flight, false)
-            } else {
-                let free = state
+            loop {
+                if state.closed {
+                    return Err(peer_serve_unavailable("Peer serve is stopped"));
+                }
+                if let Some(flight) = state
                     .flights
-                    .iter_mut()
-                    .find(|flight| flight.is_none())
-                    .ok_or_else(peer_payload_capacity)?;
-                *free = Some(candidate.clone());
-                self.observe_peer_serve(&state);
-                (candidate, true)
+                    .iter()
+                    .flatten()
+                    .find(|flight| flight.chunk_id == *chunk_id)
+                    .cloned()
+                {
+                    drop(state);
+                    drop(candidate);
+                    break (flight, false);
+                }
+                if let Some(free) = state.flights.iter_mut().find(|flight| flight.is_none()) {
+                    *free = Some(candidate.clone());
+                    self.observe_peer_serve(&state);
+                    break (candidate, true);
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(peer_payload_capacity());
+                }
+                let _wait = self.coarse_diagnostic("peer_slot_wait", 0);
+                state = self
+                    .peer_serve_changed
+                    .wait_timeout(state, remaining)
+                    .map_err(|_| peer_serve_unavailable("Peer serve admission wait poisoned"))?
+                    .0;
             }
         };
         if !leading {
@@ -3742,7 +3956,7 @@ impl LocalChunkStore {
             }
             let mut slot = ready;
             let payload =
-                self.read_peer_range_private(chunk_id, offset, length, &mut slot, true)?;
+                self.read_peer_range_private(chunk_id, offset, length, &mut slot, true, deadline)?;
             self.ensure_peer_serve_open()?;
             return Ok(payload);
         }
@@ -3758,7 +3972,8 @@ impl LocalChunkStore {
                 .map_err(|_| peer_serve_unavailable("Peer serve state poisoned"))?;
             state.resident(chunk_id)
         };
-        let result = self.read_peer_range_private(chunk_id, offset, length, &mut slot, true);
+        let result =
+            self.read_peer_range_private(chunk_id, offset, length, &mut slot, true, deadline);
         let ready = result.as_ref().ok().and_then(|payload| {
             payload
                 .object
@@ -3834,6 +4049,7 @@ impl LocalChunkStore {
         length: usize,
         slot: &mut Option<Arc<PeerVerifiedObject>>,
         cacheable: bool,
+        deadline: Instant,
     ) -> Result<PeerReadPayload> {
         // Includes catalog/file identity work and actual read/verification;
         // excludes slot acquisition and the optional sidecar repair below.
@@ -3922,22 +4138,23 @@ impl LocalChunkStore {
                     .and_then(|working| reader.load_outboard().map(|proof| (proof, working)));
                 match loaded {
                     Ok((Some(proof), working)) => {
-                        let mut reservation = match self.reserve_peer_read_payload_inner(allowed) {
-                            Ok(reservation) => reservation,
-                            Err(error) => {
-                                // An unrelated slot is retained for ordinary range
-                                // reads, but may be reclaimed when admission needs
-                                // its genuinely unpinned body capacity.
-                                if slot
-                                    .as_ref()
-                                    .is_some_and(|object| Arc::strong_count(object) == 1)
-                                {
-                                    slot.take();
+                        let mut reservation =
+                            match self.reserve_peer_read_payload_until(allowed, deadline) {
+                                Ok(reservation) => reservation,
+                                Err(error) => {
+                                    // An unrelated slot is retained for ordinary range
+                                    // reads, but may be reclaimed when admission needs
+                                    // its genuinely unpinned body capacity.
+                                    if slot
+                                        .as_ref()
+                                        .is_some_and(|object| Arc::strong_count(object) == 1)
+                                    {
+                                        slot.take();
+                                    }
+                                    self.reserve_peer_read_payload_until(allowed, deadline)
+                                        .map_err(|_| error)?
                                 }
-                                self.reserve_peer_read_payload_inner(allowed)
-                                    .map_err(|_| error)?
-                            }
-                        };
+                            };
                         let mut bytes = Vec::new();
                         bytes
                             .try_reserve_exact(allowed)
@@ -3977,7 +4194,7 @@ impl LocalChunkStore {
                                     outboard: None,
                                     _reservation: reservation,
                                     identity: None,
-                                    _control: self.peer_object_control(None)?,
+                                    _control: self.peer_object_control(None, deadline)?,
                                 }),
                                 start: 0,
                                 length: allowed,
@@ -4007,7 +4224,7 @@ impl LocalChunkStore {
             } else {
                 allowed
             };
-            let mut reservation = self.reserve_peer_read_payload_inner(allocation)?;
+            let mut reservation = self.reserve_peer_read_payload_until(allocation, deadline)?;
             let mut bytes = Vec::new();
             bytes
                 .try_reserve_exact(allocation)
@@ -4049,7 +4266,7 @@ impl LocalChunkStore {
             // allocation/ledger. Refusal keeps the complete-root body result.
             repair_proof = outboard.as_ref().map(Arc::clone);
             let outboard = outboard.filter(|proof| proof.try_mark_resident());
-            let control = self.peer_object_control(resident.then_some(&record))?;
+            let control = self.peer_object_control(resident.then_some(&record), deadline)?;
             let object = Arc::new(PeerVerifiedObject {
                 bytes,
                 outboard,
@@ -6034,6 +6251,223 @@ mod replica_replay_tests {
             assert_eq!(recovered.read_at(&item.chunk.id, 3, &mut out).unwrap(), 17);
             assert_eq!(out, item.bytes()[3..20]);
         }
+    }
+
+    fn t1_pause_budget_wait(
+        store: &LocalChunkStore,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (entered, observed) = std::sync::mpsc::channel();
+        let (release, waiting) = std::sync::mpsc::channel();
+        *store.peer_read_budget.before_wait.lock().unwrap() = Some((entered, waiting));
+        (observed, release)
+    }
+
+    #[test]
+    fn p2_t1_last_lease_release_cannot_be_lost_before_wait() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = LocalChunkStore::open(temp.path(), "node-a")
+            .unwrap()
+            .with_peer_serve_wait(Duration::from_millis(50))
+            .unwrap();
+        let held = store
+            .reserve_peer_read_payload(PEER_READ_PAYLOAD_LIMIT)
+            .unwrap();
+        let (observed, release) = t1_pause_budget_wait(&store);
+        std::thread::scope(|scope| {
+            let reader = scope
+                .spawn(|| store.reserve_peer_read_payload_until(17, store.peer_serve_deadline()));
+            observed.recv_timeout(Duration::from_secs(3)).unwrap();
+            // The waiter holds the predicate mutex here. A releaser racing this
+            // gap must synchronize before refunding and notifying it.
+            let (started, starting) = std::sync::mpsc::channel();
+            let returning = scope.spawn(move || {
+                started.send(()).unwrap();
+                drop(held);
+            });
+            starting.recv_timeout(Duration::from_secs(3)).unwrap();
+            release.send(()).unwrap();
+            returning.join().unwrap();
+            let admitted = reader.join().unwrap().unwrap();
+            assert_eq!(store.peer_read_budget.used.load(Ordering::Acquire), 17);
+            drop(admitted);
+        });
+        assert_eq!(store.peer_read_budget.used.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn p2_t1_control_release_and_stop_wake_budget_waiters() {
+        for stop in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let store = LocalChunkStore::open(temp.path(), "node-a")
+                .unwrap()
+                .with_peer_serve_wait(Duration::from_millis(50))
+                .unwrap();
+            let limit = PEER_SERVE_CONTROL_LIMIT - peer_serve_fixed_control_bytes();
+            let held = store.reserve_peer_control(limit).unwrap();
+            let (observed, release) = t1_pause_budget_wait(&store);
+            std::thread::scope(|scope| {
+                let reader = scope
+                    .spawn(|| store.reserve_peer_control_until(17, store.peer_serve_deadline()));
+                observed.recv_timeout(Duration::from_secs(3)).unwrap();
+                release.send(()).unwrap();
+                if stop {
+                    store.close_peer_serve_admission();
+                    assert_eq!(
+                        reader.join().unwrap().unwrap_err().code(),
+                        afs_error::IO_UNAVAILABLE
+                    );
+                    assert_eq!(
+                        store.peer_read_budget.control_used.load(Ordering::Acquire),
+                        limit as u64
+                    );
+                    drop(held);
+                } else {
+                    drop(held);
+                    let admitted = reader.join().unwrap().unwrap();
+                    assert_eq!(
+                        store.peer_read_budget.control_used.load(Ordering::Acquire),
+                        17
+                    );
+                    drop(admitted);
+                }
+            });
+            assert_eq!(
+                store.peer_read_budget.control_used.load(Ordering::Acquire),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn p2_t1_zero_wait_and_expired_entry_deadline_never_enter_wait() {
+        for wait in [Duration::ZERO, Duration::from_millis(20)] {
+            let temp = tempfile::tempdir().unwrap();
+            let store = LocalChunkStore::open(temp.path(), "node-a")
+                .unwrap()
+                .with_peer_serve_wait(wait)
+                .unwrap();
+            let held = store
+                .reserve_peer_read_payload(PEER_READ_PAYLOAD_LIMIT)
+                .unwrap();
+            let (_observed, _release) = t1_pause_budget_wait(&store);
+            assert_eq!(
+                store
+                    .reserve_peer_read_payload_until(1, Instant::now())
+                    .unwrap_err()
+                    .code(),
+                afs_error::IO_CAPACITY
+            );
+            assert!(
+                store.peer_read_budget.before_wait.lock().unwrap().is_some(),
+                "expired/zero allowance cannot be renewed at inner admission"
+            );
+            drop(held);
+            let immediate = store
+                .reserve_peer_read_payload_until(1, Instant::now())
+                .unwrap();
+            drop(immediate);
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+        assert_eq!(store.peer_read_budget.wait, Duration::from_millis(20));
+        assert!(
+            store
+                .with_peer_serve_wait(Duration::from_millis(51))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn p2_t1_notifications_do_not_renew_the_entry_deadline() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+        let held = store
+            .reserve_peer_read_payload(PEER_READ_PAYLOAD_LIMIT)
+            .unwrap();
+        let notifying = std::sync::atomic::AtomicBool::new(true);
+        let (done, completed) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let reader = scope.spawn(|| {
+                done.send(
+                    store
+                        .reserve_peer_read_payload_until(1, store.peer_serve_deadline())
+                        .map(drop),
+                )
+                .unwrap();
+            });
+            let notifier = scope.spawn(|| {
+                while notifying.load(Ordering::Acquire) {
+                    store.peer_read_budget.changed.notify_all();
+                    std::thread::yield_now();
+                }
+            });
+            // This generous bound checks termination, not a performance claim.
+            // Continual spurious notifications must not restart a 20ms wait.
+            let result = completed.recv_timeout(Duration::from_secs(1));
+            notifying.store(false, Ordering::Release);
+            if result.is_err() {
+                store.close_peer_serve_admission();
+            }
+            notifier.join().unwrap();
+            reader.join().unwrap();
+            assert_eq!(result.unwrap().unwrap_err().code(), afs_error::IO_CAPACITY);
+        });
+        assert_eq!(
+            store.peer_read_budget.used.load(Ordering::Acquire),
+            PEER_READ_PAYLOAD_LIMIT as u64
+        );
+        drop(held);
+    }
+
+    #[cfg(feature = "dfs")]
+    #[test]
+    fn p2_t1_last_stream_slice_keeps_capacity_until_its_release() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = LocalChunkStore::open(temp.path(), "node-a")
+            .unwrap()
+            .with_peer_serve_wait(Duration::from_millis(50))
+            .unwrap();
+        let staged = StagedChunk::new(OperationId::new("t1-pinned-frame"), vec![37; 3 * 32768]);
+        store.put(staged.clone()).unwrap();
+        drop(store.open_verified(&staged.chunk.id).unwrap());
+        let mut stream = store
+            .open_peer_group_stream(&staged.chunk.id, 0, staged.bytes().len())
+            .unwrap()
+            .unwrap();
+        let first = stream.next_group(|| Ok(())).unwrap().unwrap();
+        let retained = first.slice(3..11);
+        let second = stream.next_group(|| Ok(())).unwrap().unwrap();
+        drop(stream);
+        drop(first);
+        drop(second);
+        let held = store
+            .reserve_peer_read_payload(PEER_READ_PAYLOAD_LIMIT - 65536)
+            .unwrap();
+        assert_eq!(
+            store.peer_read_budget.used.load(Ordering::Acquire),
+            PEER_READ_PAYLOAD_LIMIT as u64
+        );
+        let (observed, release) = t1_pause_budget_wait(&store);
+        std::thread::scope(|scope| {
+            let reader = scope
+                .spawn(|| store.reserve_peer_read_payload_until(17, store.peer_serve_deadline()));
+            observed.recv_timeout(Duration::from_secs(3)).unwrap();
+            assert_eq!(retained.as_ref(), &[37; 8]);
+            assert_eq!(
+                store.peer_read_budget.used.load(Ordering::Acquire),
+                PEER_READ_PAYLOAD_LIMIT as u64
+            );
+            release.send(()).unwrap();
+            drop(retained);
+            let admitted = reader.join().unwrap().unwrap();
+            assert_eq!(
+                store.peer_read_budget.used.load(Ordering::Acquire),
+                (PEER_READ_PAYLOAD_LIMIT - 65536 + 17) as u64
+            );
+            drop(admitted);
+        });
+        drop(held);
+        assert_eq!(store.peer_read_budget.used.load(Ordering::Acquire), 0);
     }
 
     #[cfg(feature = "dfs")]

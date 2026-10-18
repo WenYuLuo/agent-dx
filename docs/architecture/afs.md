@@ -457,3 +457,12 @@ OwnerFs workspace bind mount 是当前实际试用场景的优先能力，默认
 仍持自己的租约。32MiB publisher 仅预留 Vec→Arc 的瞬时转换峰值，不能长期
 借给下一窗口。额度在分配前取得、最后一个持有者释放后归还；descriptor
 维持独立1MiB／32项上限，缓存 pending36MiB不混用。
+
+## Native Peer 有界准入等待
+
+Native gRPC read在入口固定一次`dfs_peer_serve_wait_ms`截止，RPC槽、flight和
+control/payload不足共用该期限，不按重试或Header前回退重新计时。默认20ms、0禁等，
+过期只禁止继续等待，现成容量仍可立即取得；已开始的I/O、同flight结果和R-4帧背压
+继续受原授权／stop／传输合同约束。budget独立通知锁不嵌套获取cache表锁，最后
+真实owner释放才扣款唤醒；停止先关闭准入再排空。RDMA packed保持原立即准入，
+不增加连接窗口、正文或proof额度。

@@ -263,6 +263,9 @@ pub struct Cli {
     /// Shared Peer resident, in-flight and retained frame bytes (4..=64 MiB).
     #[arg(long)]
     pub dfs_peer_serve_payload_bytes: Option<u64>,
+    /// One native Peer admission wait deadline (0..=50 ms); zero never waits.
+    #[arg(long)]
+    pub dfs_peer_serve_wait_ms: Option<u64>,
     /// Filesystem-wide immutable DFS replica target count. Applied by Meta at initialization.
     #[arg(long)]
     pub dfs_desired_copies: Option<u16>,
@@ -348,6 +351,7 @@ struct FileConfig {
     dfs_fetch_max_inflight_objects: Option<usize>,
     dfs_peer_serve_resident_objects: Option<usize>,
     dfs_peer_serve_payload_bytes: Option<u64>,
+    dfs_peer_serve_wait_ms: Option<u64>,
     dfs_external_backend: Option<DfsExternalBackendConfig>,
     dfs_peer_cache: Option<DfsPeerCacheConfig>,
     dfs_write_buffer_idle_bytes: Option<u64>,
@@ -413,6 +417,7 @@ pub struct Config {
     pub dfs_fetch_max_inflight_objects: usize,
     pub dfs_peer_serve_resident_objects: usize,
     pub dfs_peer_serve_payload_bytes: u64,
+    pub dfs_peer_serve_wait_ms: u64,
     pub dfs_external_backend: Option<DfsExternalBackendConfig>,
     pub dfs_peer_cache: Option<DfsPeerCacheConfig>,
     /// Reusable idle write-body capacity only, not a live-body quota.
@@ -645,6 +650,13 @@ impl Config {
         if !(4 * 1024 * 1024..=64 * 1024 * 1024).contains(&dfs_peer_serve_payload_bytes) {
             return Err(invalid("DFS Peer serve payload bytes must be 4..=64 MiB"));
         }
+        let dfs_peer_serve_wait_ms = cli
+            .dfs_peer_serve_wait_ms
+            .or(file.dfs_peer_serve_wait_ms)
+            .unwrap_or(20);
+        if dfs_peer_serve_wait_ms > 50 {
+            return Err(invalid("DFS Peer serve wait must be 0..=50 ms"));
+        }
         let cfg = Self {
             grpc_listen: cli.grpc_listen.or(file.grpc_listen).unwrap_or_else(|| {
                 ([127, 0, 0, 1], if role == Role::Meta { 7400 } else { 7500 }).into()
@@ -719,6 +731,7 @@ impl Config {
             dfs_fetch_max_inflight_objects,
             dfs_peer_serve_resident_objects,
             dfs_peer_serve_payload_bytes,
+            dfs_peer_serve_wait_ms,
             dfs_external_backend: file.dfs_external_backend,
             dfs_peer_cache: file.dfs_peer_cache,
             dfs_write_buffer_idle_bytes: file

@@ -40,6 +40,8 @@ uds_path = "/opt/adx/run/afs/node-a.sock"
 # Payload range 4..=64MiB; eviction does not refund still-referenced data.
 # dfs_peer_serve_resident_objects = 2
 # dfs_peer_serve_payload_bytes = 16777216
+# One native admission deadline; 0 disables waiting, maximum 50ms.
+# dfs_peer_serve_wait_ms = 20
 # Metadata-only source lookahead; no object/body prefetch. Zero max/bytes disables retention.
 # dfs_source_cache_max_ms = 5000
 # dfs_source_lookahead_chunks = 64

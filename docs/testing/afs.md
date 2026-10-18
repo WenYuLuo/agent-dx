@@ -624,3 +624,11 @@ Bytes末引用与预算退账、stop／调用者失效退出、catalog／路径�
 `peer_read_verify`粗聚合为实际组读／验证，未含全部回压／身份核查，不能冒充整个Peer父项；
 新路径不产生旧整对象私有读取compact记录，缺失不解释为耗时零。正常性能关闭额外诊断，
 独立诊断的组工作与发送父项会交叠，完整E2E按同条件实测。
+
+## Native Peer 准入等待回归
+
+`cargo test --locked -p afs --lib --all-features p2_t1_`覆盖8个真实RPC槽已占满时
+首次poll等待、释放后真实流完成、0禁等、固定期限／spurious通知、排队后grant到期、
+stop及最后Bytes切片释放。预算check/wait之间的交错用屏障验证，不能只凭睡眠猜测；
+配置合同另核对默认20ms、CLI/TOML优先级和0..50ms范围。R-4、native Peer和RDMA
+packed软件回归保留；单元RPC不等于FUSE／多VM性能或真实verbs验收。

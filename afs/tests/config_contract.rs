@@ -1238,6 +1238,64 @@ fn p2_r6_serve_defaults_match_approved_capacity() {
 }
 
 #[test]
+fn p2_t1_serve_wait_default_and_file_cli_share_one_bound() {
+    let parsed = Cli::try_parse_from(["afs-node", "--dfs-peer-serve-wait-ms", "0"]).unwrap();
+    assert_eq!(
+        Config::resolve(Role::Node, parsed)
+            .unwrap()
+            .dfs_peer_serve_wait_ms,
+        0
+    );
+    let defaults = Config::resolve(Role::Node, Cli::default()).unwrap();
+    assert_eq!(defaults.dfs_peer_serve_wait_ms, 20);
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("node.toml");
+    for wait in [0, 1, 20, 50] {
+        std::fs::write(&path, format!("dfs_peer_serve_wait_ms={wait}\n")).unwrap();
+        let file = Config::resolve(
+            Role::Node,
+            Cli {
+                config: Some(path.clone()),
+                ..Cli::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(file.dfs_peer_serve_wait_ms, wait);
+        let cli = Config::resolve(
+            Role::Node,
+            Cli {
+                config: Some(path.clone()),
+                dfs_peer_serve_wait_ms: Some(0),
+                ..Cli::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(cli.dfs_peer_serve_wait_ms, 0);
+    }
+    std::fs::write(&path, "dfs_peer_serve_wait_ms=51\n").unwrap();
+    assert!(
+        Config::resolve(
+            Role::Node,
+            Cli {
+                config: Some(path),
+                ..Cli::default()
+            }
+        )
+        .is_err()
+    );
+    assert!(
+        Config::resolve(
+            Role::Node,
+            Cli {
+                dfs_peer_serve_wait_ms: Some(51),
+                ..Cli::default()
+            }
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn p2_r6_serve_file_cli_capacity_is_bounded() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("node.toml");

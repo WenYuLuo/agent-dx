@@ -1205,6 +1205,10 @@ impl DfsChunks for DfsChunksService {
         &self,
         request: Request<DfsReadRangesRequest>,
     ) -> Result<Response<Self::ReadRangesStream>, Status> {
+        let admission_deadline = self
+            .local_chunks
+            .as_ref()
+            .map_or_else(std::time::Instant::now, |local| local.peer_serve_deadline());
         let authenticated_peer = authenticate_peer(self.authenticator.as_ref(), &request)?;
         let request = request.into_inner();
         validate_dfs_read_request(&request)?;
@@ -1219,11 +1223,37 @@ impl DfsChunks for DfsChunksService {
                 ));
             }
         }
-        let permit = self
-            .read_permits
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| Status::resource_exhausted("DFS peer read slots are full"))?;
+        if let Some(local) = &self.local_chunks {
+            local.ensure_peer_serve_open().map_err(error_to_status)?;
+        }
+        let permit = match self.read_permits.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                if admission_deadline <= std::time::Instant::now() {
+                    return Err(Status::resource_exhausted("DFS peer read slots are full"));
+                }
+                // Keep one future and one absolute deadline. Queueing cannot
+                // renew grants or start another 20ms payload/flight budget.
+                let _wait = self
+                    .local_chunks
+                    .as_ref()
+                    .and_then(|local| local.coarse_diagnostic("peer_slot_wait", 0));
+                let admitted = tokio::time::timeout_at(
+                    tokio::time::Instant::from_std(admission_deadline),
+                    self.read_permits.clone().acquire_owned(),
+                )
+                .await;
+                if let Some(local) = &self.local_chunks {
+                    local.ensure_peer_serve_open().map_err(error_to_status)?;
+                }
+                admitted
+                    .map_err(|_| {
+                        Status::resource_exhausted("DFS peer read admission deadline exceeded")
+                    })?
+                    .map_err(|_| Status::unavailable("DFS peer read admission is closed"))?
+            }
+        };
+        validate_dfs_read_request(&request)?;
         let authorizer = self.authorizer.clone();
         let local = self.local_chunks.clone();
         // Keep the response boundary after authorization while doing both
@@ -1259,7 +1289,13 @@ impl DfsChunks for DfsChunksService {
             if authorized.send(Ok(())).is_err() || sender.is_closed() {
                 return;
             }
-            if let Err(error) = stream_dfs_ranges(&local, &request, &sender, metrics.as_ref()) {
+            if let Err(error) = stream_dfs_ranges_until(
+                &local,
+                &request,
+                &sender,
+                metrics.as_ref(),
+                admission_deadline,
+            ) {
                 let _ = sender.blocking_send(Err(error));
             }
         });
@@ -1461,12 +1497,23 @@ impl AsRef<[u8]> for PeerOutboardOwner {
     }
 }
 
-#[cfg(feature = "dfs")]
+#[cfg(all(feature = "dfs", test))]
 fn stream_dfs_ranges(
     local: &LocalChunkStore,
     request: &DfsReadRangesRequest,
     sender: &tokio::sync::mpsc::Sender<Result<DfsReadRangesFrame, Status>>,
     metrics: Option<&DfsPayloadMetrics>,
+) -> Result<(), Status> {
+    stream_dfs_ranges_until(local, request, sender, metrics, local.peer_serve_deadline())
+}
+
+#[cfg(feature = "dfs")]
+fn stream_dfs_ranges_until(
+    local: &LocalChunkStore,
+    request: &DfsReadRangesRequest,
+    sender: &tokio::sync::mpsc::Sender<Result<DfsReadRangesFrame, Status>>,
+    metrics: Option<&DfsPayloadMetrics>,
+    admission_deadline: std::time::Instant,
 ) -> Result<(), Status> {
     let send = |body| {
         sender
@@ -1485,10 +1532,11 @@ fn stream_dfs_ranges(
         // Legacy, partial and proof-capacity fallbacks retain the path below.
         if request.include_blake3_outboard
             && let Some(mut groups) = local
-                .open_peer_group_stream(
+                .open_peer_group_stream_until(
                     &crate::dfs::ChunkId::new(op.chunk_id.clone()),
                     op.chunk_offset,
                     op.length as usize,
+                    admission_deadline,
                 )
                 .map_err(error_to_status)?
         {
@@ -1556,10 +1604,11 @@ fn stream_dfs_ranges(
         // verified immutable bytes, with the shared payload lease held by
         // every queued frame. No separate range or frame body is allocated.
         let verified = local
-            .read_peer_range(
+            .read_peer_range_until(
                 &crate::dfs::ChunkId::new(op.chunk_id.clone()),
                 op.chunk_offset,
                 op.length as usize,
+                admission_deadline,
             )
             .map_err(error_to_status)?;
         if verified.len() != op.length as usize {
@@ -7352,6 +7401,156 @@ mod tests {
             .unwrap()
             .parse()
             .unwrap()
+    }
+
+    #[cfg(feature = "dfs")]
+    #[tokio::test]
+    async fn p2_t1_native_read_waits_for_an_existing_rpc_slot() {
+        use crate::node::chunk::StagedChunk;
+        use std::{future::Future, task::Poll};
+        use tokio_stream::StreamExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let local = Arc::new(LocalChunkStore::open(temp.path(), "node").unwrap());
+        let staged = StagedChunk::new(
+            crate::dfs::OperationId::new("t1-rpc-admission"),
+            vec![37; 65536],
+        );
+        local.put(staged.clone()).unwrap();
+        let service = dfs_reuse_test_service(local, Arc::new(AllowDfsTestGrant));
+        let held = service
+            .read_permits
+            .clone()
+            .acquire_many_owned(8)
+            .await
+            .unwrap();
+        let request = dfs_read_request(staged.chunk.id.0.clone(), staged.chunk.length);
+        let mut pending = Box::pin(service.read_ranges(Request::new(request)));
+        // Poll exactly once while all eight real slots are held. This tests
+        // admission behavior without inferring it from scheduler/timing noise.
+        let waiting =
+            std::future::poll_fn(|cx| Poll::Ready(pending.as_mut().poll(cx).is_pending())).await;
+        assert!(
+            waiting,
+            "temporary slot pressure must wait within the fixed admission deadline"
+        );
+        drop(held);
+        let mut stream = pending.await.unwrap().into_inner();
+        let mut received = Vec::new();
+        let mut completions = 0;
+        while let Some(frame) = stream.next().await {
+            match frame.unwrap().body.unwrap() {
+                dfs_read_ranges_frame::Body::Data(data) => received.extend(data),
+                dfs_read_ranges_frame::Body::Completion(_) => completions += 1,
+                dfs_read_ranges_frame::Body::Header(_) => {}
+            }
+        }
+        assert_eq!(received, staged.bytes());
+        assert_eq!(completions, 1);
+        assert_eq!(service.read_permits.available_permits(), 8);
+    }
+
+    #[cfg(feature = "dfs")]
+    #[tokio::test]
+    async fn p2_t1_zero_wait_rpc_slots_fail_without_queueing() {
+        use std::{future::Future, task::Poll};
+        let temp = tempfile::tempdir().unwrap();
+        let local = Arc::new(
+            LocalChunkStore::open(temp.path(), "node")
+                .unwrap()
+                .with_peer_serve_wait(std::time::Duration::ZERO)
+                .unwrap(),
+        );
+        let service = dfs_reuse_test_service(local, Arc::new(AllowDfsTestGrant));
+        let _held = service
+            .read_permits
+            .clone()
+            .acquire_many_owned(8)
+            .await
+            .unwrap();
+        let mut pending =
+            Box::pin(service.read_ranges(Request::new(dfs_read_request("chunk".into(), 1))));
+        let result = std::future::poll_fn(|cx| Poll::Ready(pending.as_mut().poll(cx))).await;
+        match result {
+            Poll::Ready(Err(error)) => assert_eq!(error.code(), tonic::Code::ResourceExhausted),
+            _ => panic!("zero admission allowance must not queue behind occupied RPC slots"),
+        }
+    }
+
+    #[cfg(feature = "dfs")]
+    #[tokio::test]
+    async fn p2_t1_rpc_slot_timeout_and_node_stop_return_no_stream() {
+        use std::{future::Future, task::Poll};
+        for stop in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let local = Arc::new(LocalChunkStore::open(temp.path(), "node").unwrap());
+            let service = dfs_reuse_test_service(local.clone(), Arc::new(AllowDfsTestGrant));
+            let _held = service
+                .read_permits
+                .clone()
+                .acquire_many_owned(8)
+                .await
+                .unwrap();
+            let mut pending =
+                Box::pin(service.read_ranges(Request::new(dfs_read_request("chunk".into(), 1))));
+            assert!(
+                std::future::poll_fn(|cx| Poll::Ready(pending.as_mut().poll(cx).is_pending()))
+                    .await
+            );
+            if stop {
+                local.close_peer_serve_admission();
+            }
+            let error = pending.await.err().unwrap();
+            assert_eq!(
+                error.code(),
+                if stop {
+                    tonic::Code::Unavailable
+                } else {
+                    tonic::Code::ResourceExhausted
+                }
+            );
+        }
+    }
+
+    #[cfg(feature = "dfs")]
+    #[tokio::test]
+    async fn p2_t1_grant_expiry_is_rechecked_after_rpc_queue() {
+        use std::{future::Future, task::Poll};
+        let temp = tempfile::tempdir().unwrap();
+        let local = Arc::new(
+            LocalChunkStore::open(temp.path(), "node")
+                .unwrap()
+                .with_peer_serve_wait(std::time::Duration::from_millis(50))
+                .unwrap(),
+        );
+        let service = dfs_reuse_test_service(local, Arc::new(AllowDfsTestGrant));
+        let held = service
+            .read_permits
+            .clone()
+            .acquire_many_owned(8)
+            .await
+            .unwrap();
+        let mut request = dfs_read_request("chunk".into(), 1);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        request.operations[0]
+            .grant
+            .as_mut()
+            .unwrap()
+            .expires_at_unix_ms = now + 10;
+        let mut pending = Box::pin(service.read_ranges(Request::new(request)));
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(pending.as_mut().poll(cx).is_pending())).await
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        drop(held);
+        assert_eq!(
+            pending.await.err().unwrap().code(),
+            tonic::Code::PermissionDenied
+        );
+        assert_eq!(service.read_permits.available_permits(), 8);
     }
 
     #[cfg(feature = "dfs")]
