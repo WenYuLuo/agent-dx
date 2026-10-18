@@ -271,8 +271,18 @@ Node，再按专属缓存目录的清理合同退休可丢弃条目，或配置�
 
 `dfs_fetch_max_inflight_objects`默认8，范围1..=8，可由CLI覆盖TOML；仅限制原生Peer
 磁盘缓存的metadata flights，不适用于S3，也不是正文并发数。一个active fill仍共用原
-4MiB逻辑额度；不同缓存hit与fill可并行，冷对象之间仍受该单fill限制。表内indexed、
-retired与删除中条目合计最多4096，实际文件删除前磁盘占用不退还；被pin的退休条目
+4MiB逻辑额度；不同缓存hit与fill可并行，冷对象之间仍受该单fill限制。这个4MiB
+是准入和观测的保守包络，不是常驻正文内存或Node RSS上限。流式分支的两个256KiB
+载荷块、解码／控制帧和私有输出须按各自所有权分别核算，不能把它们重复相加为
+额外可用额度；legacy完整对象缓冲受同一fill许可约束，单批仍校验原读取预算。
+
+原生回填只有一个固定pending路径和一份文件身份／磁盘预留；ready和pending实际
+分配共同受`capacity_bytes`约束。外部S3缓存示例的`pending_bytes = 37748736`
+（36MiB）仅属于外部缓存，不是原生Peer已有额度，不能用来开启多对象并发回填。
+后续若支持并发回填或预读，须先明确原生总字节准入、逐flight临时文件及身份、
+私有输出和在途帧的实际capacity与最后引用退账；当前不新增配置、额度或多fill能力。
+
+表内indexed、retired与删除中条目合计最多4096，实际文件删除前磁盘占用不退还；被pin的退休条目
 也占容量，同key不能在旧文件仍被使用时重建。容量或控制元数据不足保留安全回退。
 
 索引、entry及proof使用同一原proof ledger的resident子限；每个operation的8KiB
