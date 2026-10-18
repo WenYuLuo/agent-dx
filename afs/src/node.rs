@@ -1207,10 +1207,18 @@ async fn run_node(
     #[cfg(feature = "dfs")]
     let dfs_read_work_metrics = read_work::ReadWorkMetrics::register(&obs.registry)?
         .with_read_diagnostics(cfg.dfs_read_diagnostics_enabled);
+    // A single metadata ledger follows outboards across builders, local
+    // readers, Peer frames and the disposable disk cache. Payload and existing
+    // transport windows remain separately bounded by their original limits.
+    #[cfg(feature = "dfs")]
+    let dfs_outboard_budget = chunk::outboard::OutboardBudget::new(usize::try_from(
+        peer_cache::MAX_PEER_CACHE_PROOF_BYTES,
+    )?);
     #[cfg(feature = "dfs")]
     let local_chunk_store = if cfg.dfs {
         Some(Arc::new(
             chunk::LocalChunkStore::open(cfg.data_dir.join("dfs"), cfg.id.clone())?
+                .with_outboard_budget(dfs_outboard_budget.clone())
                 .with_read_work_metrics(dfs_read_work_metrics.clone()),
         ))
     } else {
@@ -1493,14 +1501,23 @@ async fn run_node(
     #[cfg(feature = "dfs")]
     let mut dfs_peer_cache_for_shutdown: Option<Arc<peer_cache::DiskPeerCache>> = None;
     #[cfg(feature = "dfs")]
-    let dfs_write_buffers = chunk::WriteBufferPool::new(
+    let dfs_write_buffer_idle_bytes =
         usize::try_from(cfg.dfs_write_buffer_idle_bytes).map_err(|_| {
             afs_error::Error::coded(
                 afs_error::CONFIG_INVALID,
                 "write buffer idle baseline does not fit this platform",
             )
-        })?,
-    );
+        })?;
+    #[cfg(feature = "dfs")]
+    let dfs_write_buffers = if cfg.dfs_external_backend.is_some() {
+        // S3 keeps its existing sealed-body and bounded-window pipeline.
+        chunk::WriteBufferPool::new(dfs_write_buffer_idle_bytes)
+    } else {
+        chunk::WriteBufferPool::new_with_outboard_budget(
+            dfs_write_buffer_idle_bytes,
+            dfs_outboard_budget.clone(),
+        )
+    };
     #[cfg(feature = "dfs")]
     dfs_write_buffers.register_metrics(&obs.registry)?;
     #[cfg(feature = "dfs")]
@@ -1591,9 +1608,10 @@ async fn run_node(
                 namespace_id: namespace.clone(),
             };
             let cache_metrics = dfs_read_work_metrics.clone();
+            let outboard_budget = dfs_outboard_budget.clone();
             let cache = Arc::new(
                 tokio::task::spawn_blocking(move || {
-                    peer_cache::DiskPeerCache::open(options)
+                    peer_cache::DiskPeerCache::open_with_outboard_budget(options, outboard_budget)
                         .map(|cache| cache.with_read_work_metrics(cache_metrics))
                 })
                 .await??,
@@ -1621,6 +1639,7 @@ async fn run_node(
                 read_engine,
             )
             .with_remote_owner_factory(remote_factory)
+            .with_version_cache_capacity(cfg.dfs_version_cache_entries)
             .with_write_buffer_pool(dfs_write_buffers.clone()),
         ))
     } else {
@@ -1643,10 +1662,11 @@ async fn run_node(
 
     #[cfg(feature = "ownerfs")]
     let mounted_ownerfs = match (&cfg.ownerfs_mount, &ownerfs_instance) {
-        (Some(path), Some(ownerfs)) => match fuse::mount_ownerfs_with_metrics(
+        (Some(path), Some(ownerfs)) => match fuse::mount_ownerfs_with_metrics_and_options(
             ownerfs.clone(),
             path,
             fuse_request_metrics.clone(),
+            fuse::FuseMountOptions::from(&cfg),
         ) {
             Ok(session) => Some(session),
             Err(error) => {
@@ -1668,11 +1688,12 @@ async fn run_node(
     #[cfg(feature = "dfs")]
     let mounted_dfs = match (&cfg.dfs_mount, &dfs_instance) {
         (Some(path), Some(dfs)) => {
-            match fuse::mount_dfs_with_read_diagnostics(
+            match fuse::mount_dfs_with_read_diagnostics_and_options(
                 dfs.clone(),
                 path,
                 fuse_request_metrics.clone(),
                 dfs_read_work_metrics.clone(),
+                fuse::FuseMountOptions::from(&cfg),
             ) {
                 Ok(session) => Some(session),
                 Err(error) => {

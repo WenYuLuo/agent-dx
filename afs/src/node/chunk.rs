@@ -19,6 +19,13 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+pub mod outboard;
+pub use outboard::OutboardBudget;
+use outboard::{
+    ChunkOutboard, DEFAULT_OUTBOARD_BUDGET_BYTES, MAX_ENCODED_OUTBOARD_BYTES, OutboardBuilder,
+    OutboardReadWork, SharedOutboard,
+};
+
 use afs_error::{Error, Result};
 use afs_tracing::tracing;
 use serde::{Deserialize, Serialize};
@@ -208,6 +215,7 @@ impl WriteBufferPoolState {
 #[derive(Debug)]
 pub struct WriteBufferPool {
     idle_baseline_bytes: usize,
+    outboard_budget: Option<Arc<OutboardBudget>>,
     state: Mutex<WriteBufferPoolState>,
 }
 
@@ -215,6 +223,19 @@ impl WriteBufferPool {
     pub fn new(idle_baseline_bytes: usize) -> Arc<Self> {
         Arc::new(Self {
             idle_baseline_bytes,
+            outboard_budget: None,
+            state: Mutex::new(WriteBufferPoolState::default()),
+        })
+    }
+
+    #[cfg(any(feature = "dfs", test))]
+    pub(crate) fn new_with_outboard_budget(
+        idle_baseline_bytes: usize,
+        outboard_budget: Arc<OutboardBudget>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            idle_baseline_bytes,
+            outboard_budget: Some(outboard_budget),
             state: Mutex::new(WriteBufferPoolState::default()),
         })
     }
@@ -680,6 +701,7 @@ pub struct StagedChunk {
     pub operation_id: OperationId,
     pub chunk: ChunkObject,
     bytes: SharedChunkBytes,
+    outboard: Option<SharedOutboard>,
     // This private identity is produced only by the complete initial hash. Public
     // metadata remains compatible with replica callers, but is not itself proof.
     #[cfg(feature = "dfs")]
@@ -708,8 +730,23 @@ impl StagedChunk {
         )
         .in_scope(|| {
             let bytes_len = bytes.len() as u64;
-            let content_digest = tracing::info_span!("node.dfs.chunk.hash", bytes = bytes_len,)
-                .in_scope(|| digest(&bytes));
+            let built = bytes
+                .buffer
+                .pool
+                .upgrade()
+                .and_then(|pool| pool.outboard_budget.clone())
+                .map(|budget| {
+                    tracing::info_span!("node.dfs.chunk.hash", bytes = bytes_len,)
+                        .in_scope(|| outboard::build_borrowed(&bytes, &budget))
+                });
+            let content_digest = built
+                .as_ref()
+                .map(|built| built.digest.clone())
+                .unwrap_or_else(|| {
+                    tracing::info_span!("node.dfs.chunk.hash", bytes = bytes_len,)
+                        .in_scope(|| digest(&bytes))
+                });
+            let outboard = built.and_then(|built| built.outboard);
             let chunk = ChunkObject {
                 id: ChunkId::new(format!(
                     "blake3-{}-{}",
@@ -727,6 +764,7 @@ impl StagedChunk {
                 sealed_chunk: chunk.clone(),
                 chunk,
                 bytes,
+                outboard,
                 #[cfg(feature = "dfs")]
                 write_budget: Vec::new(),
             }
@@ -932,6 +970,10 @@ pub struct RecoveryReport {
 pub struct PinnedChunkReader {
     file: File,
     chunk: ChunkObject,
+    outboard_path: PathBuf,
+    outboard_budget: Arc<OutboardBudget>,
+    outboard: Mutex<Option<SharedOutboard>>,
+    proof_identity: Mutex<PeerFileIdentity>,
     read_work: Option<super::read_work::ReadWorkMetrics>,
 }
 
@@ -943,6 +985,112 @@ pub(crate) struct VerifiedRangeCopy {
 }
 
 impl PinnedChunkReader {
+    #[cfg(feature = "dfs")]
+    pub(crate) fn chunk(&self) -> &ChunkObject {
+        &self.chunk
+    }
+
+    fn load_outboard(&self) -> Option<SharedOutboard> {
+        if self.chunk.length > 4 * 1024 * 1024 {
+            return None;
+        }
+        // Canonical IDs anchor this optional optimization. Legacy IDs keep the
+        // original complete-root path until explicitly migrated.
+        match ChunkObject::from_content_addressed_id(&self.chunk.id) {
+            Some(expected) if expected == self.chunk => {}
+            _ => return None,
+        }
+        let mut cached = self.outboard.lock().ok()?;
+        if let Some(proof) = cached.as_ref() {
+            return Some(proof.clone());
+        }
+        let proof =
+            load_outboard_file(&self.outboard_path, &self.chunk, &self.outboard_budget).ok()?;
+        *cached = Some(proof.clone());
+        Some(proof)
+    }
+
+    fn remember_outboard(&self, proof: Option<SharedOutboard>) {
+        if let Some(proof) = proof {
+            let _ = persist_outboard_file(&self.outboard_path, &proof);
+            if let Ok(mut cached) = self.outboard.lock() {
+                *cached = Some(proof);
+            }
+        }
+    }
+
+    fn full_scan(
+        &self,
+        ranges: &[VerifiedRangeCopy],
+        out: &mut [u8],
+        force: bool,
+    ) -> Result<Vec<usize>> {
+        let before = PeerFileIdentity::read(&self.file)?;
+        let builder = (ChunkObject::from_content_addressed_id(&self.chunk.id).as_ref()
+            == Some(&self.chunk))
+        .then(|| OutboardBuilder::new(self.chunk.length, self.outboard_budget.clone()));
+        let (counts, proof) = verified_ranges_into_building(
+            &self.file,
+            &self.chunk,
+            ranges,
+            out,
+            force,
+            self.read_work.as_ref(),
+            builder,
+        )?;
+        if PeerFileIdentity::read(&self.file)? != before {
+            return Err(corrupt(
+                &self.chunk.id,
+                "identity changed during full verification",
+            ));
+        }
+        *self
+            .proof_identity
+            .lock()
+            .map_err(|_| invalid("pinned proof identity lock poisoned"))? = before;
+        self.remember_outboard(proof);
+        Ok(counts)
+    }
+
+    fn verify_full_and_build(&self) -> Result<()> {
+        self.full_scan(&[], &mut [], true).map(|_| ())
+    }
+
+    fn outboard_ranges(
+        &self,
+        ranges: &[VerifiedRangeCopy],
+        out: &mut [u8],
+    ) -> Option<Result<Vec<usize>>> {
+        let before = PeerFileIdentity::read(&self.file).ok()?;
+        if self.proof_identity.lock().ok().as_deref() != Some(&before) {
+            return None;
+        }
+        let proof = self.load_outboard()?;
+        let mut work = OutboardReadWork::default();
+        let result =
+            proof.read_ranges_into_with_work(&self.file, 0, &self.chunk, ranges, out, &mut work);
+        #[cfg(test)]
+        VERIFIED_SCAN_BYTES.with(|count| count.set(count.get() + work.hash_bytes));
+        if let Some(metrics) = &self.read_work {
+            metrics.hash("outboard_body_hash", work.hash_bytes);
+            metrics.hash("outboard_parent_hash", work.parent_hash_bytes);
+            metrics.copy("outboard_range_delivery", work.copied_bytes);
+        }
+        match result {
+            Ok(counts) if PeerFileIdentity::read(&self.file).ok().as_ref() == Some(&before) => {
+                Some(Ok(counts))
+            }
+            _ => {
+                // Proof metadata is optional. Authenticate the same private
+                // result with the old full root, and rebuild only after success.
+                if let Ok(mut cached) = self.outboard.lock() {
+                    cached.take();
+                }
+                None
+            }
+        }
+    }
+
     pub fn read_at(&self, offset: u64, out: &mut [u8]) -> Result<usize> {
         if offset >= self.chunk.length || out.is_empty() {
             return Ok(0);
@@ -952,13 +1100,17 @@ impl PinnedChunkReader {
         // A pinned descriptor protects identity across rename, not integrity
         // after disk damage. Return the exact bytes covered by this digest,
         // rather than verifying and then issuing another unverified read.
-        let bytes = verified_range(
-            &self.file,
-            &self.chunk,
-            offset,
-            allowed,
-            self.read_work.as_ref(),
-        )?;
+        let mut bytes = vec![0; allowed];
+        let ranges = [VerifiedRangeCopy {
+            chunk_offset: offset,
+            length: allowed,
+            output_offset: 0,
+        }];
+        if let Some(result) = self.outboard_ranges(&ranges, &mut bytes) {
+            result?;
+        } else {
+            self.full_scan(&ranges, &mut bytes, true)?;
+        }
         out[..allowed].copy_from_slice(&bytes);
         if let Some(metrics) = &self.read_work {
             metrics.copy("pinned_range_to_output", allowed as u64);
@@ -972,6 +1124,18 @@ impl PinnedChunkReader {
     /// batch succeeds.
     #[cfg(any(feature = "dfs", test))]
     pub(crate) fn read_ranges_at_uncommitted(
+        &self,
+        ranges: &[VerifiedRangeCopy],
+        out: &mut [u8],
+    ) -> Result<Vec<usize>> {
+        if let Some(result) = self.outboard_ranges(ranges, out) {
+            return result;
+        }
+        self.full_scan(ranges, out, false)
+    }
+
+    #[cfg(feature = "dfs")]
+    pub(crate) fn read_ranges_at_uncommitted_fullscan(
         &self,
         ranges: &[VerifiedRangeCopy],
         out: &mut [u8],
@@ -1155,7 +1319,6 @@ fn reserve_peer_bytes(
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[cfg(any(feature = "dfs", test))]
 struct PeerFileIdentity {
     length: u64,
     #[cfg(unix)]
@@ -1168,7 +1331,6 @@ struct PeerFileIdentity {
     changed: (i64, i64),
 }
 
-#[cfg(any(feature = "dfs", test))]
 impl PeerFileIdentity {
     fn read(file: &File) -> Result<Self> {
         let metadata = file.metadata().map_err(Error::from)?;
@@ -1192,6 +1354,7 @@ impl PeerFileIdentity {
 #[cfg(any(feature = "dfs", test))]
 struct PeerVerifiedObject {
     bytes: Vec<u8>,
+    outboard: Option<SharedOutboard>,
     _reservation: PeerReadReservation,
     // A range fallback is never resident and needs no reusable identity.
     identity: Option<(LocalChunkRecord, PeerFileIdentity)>,
@@ -1235,6 +1398,11 @@ impl PeerReadPayload {
         Some(record.chunk.content_digest.clone())
     }
 
+    pub(crate) fn outboard(&self) -> Option<SharedOutboard> {
+        self.verified_full_object_digest()?;
+        self.object.outboard.clone()
+    }
+
     /// Frame slices retain both immutable bytes and their original budget lease.
     pub(crate) fn into_shared_bytes(self) -> prost::bytes::Bytes {
         prost::bytes::Bytes::from_owner(self)
@@ -1257,6 +1425,8 @@ pub struct LocalChunkStore {
     root_dir: File,
     chunks: PathBuf,
     staging: PathBuf,
+    outboards: PathBuf,
+    outboard_budget: Arc<OutboardBudget>,
     catalog_path: PathBuf,
     catalog: Mutex<LocalCatalog>,
     next_staging: AtomicU64,
@@ -1272,6 +1442,8 @@ impl LocalChunkStore {
         let root = root.as_ref().to_path_buf();
         let chunks = root.join("chunks");
         let staging = root.join("staging");
+        let outboards = root.join("outboards");
+        fs::create_dir_all(&outboards).map_err(Error::from)?;
         fs::create_dir_all(&chunks).map_err(Error::from)?;
         fs::create_dir_all(&staging).map_err(Error::from)?;
         let device_epoch = open_device_epoch(&root)?;
@@ -1286,6 +1458,8 @@ impl LocalChunkStore {
             root_dir,
             chunks,
             staging,
+            outboards,
+            outboard_budget: OutboardBudget::new(DEFAULT_OUTBOARD_BUDGET_BYTES),
             catalog_path,
             catalog: Mutex::new(catalog),
             next_staging: AtomicU64::new(1),
@@ -1297,6 +1471,12 @@ impl LocalChunkStore {
         };
         store.recover()?;
         Ok(store)
+    }
+
+    #[cfg(any(feature = "dfs", test))]
+    pub(crate) fn with_outboard_budget(mut self, budget: Arc<OutboardBudget>) -> Self {
+        self.outboard_budget = budget;
+        self
     }
 
     #[cfg(any(feature = "dfs", test))]
@@ -1393,6 +1573,14 @@ impl LocalChunkStore {
             if entry.file_type().map_err(Error::from)?.is_file() {
                 fs::remove_file(entry.path()).map_err(Error::from)?;
                 report.removed_staging_files = report.removed_staging_files.saturating_add(1);
+            }
+        }
+        for entry in fs::read_dir(&self.outboards).map_err(Error::from)? {
+            let entry = entry.map_err(Error::from)?;
+            if entry.file_type().map_err(Error::from)?.is_file()
+                && entry.file_name().to_string_lossy().ends_with(".tmp")
+            {
+                fs::remove_file(entry.path()).map_err(Error::from)?;
             }
         }
         let mut catalog = self
@@ -1566,6 +1754,32 @@ impl LocalChunkStore {
             catalog.revision = revision;
         }
         let catalog_revision = catalog.revision;
+        let mut seen_outboards = HashSet::new();
+        let mut sync_outboards = false;
+        for item in staged {
+            if let Some(proof) = &item.outboard
+                && proof.uses_budget(&self.outboard_budget)
+                && seen_outboards.insert(&item.chunk.id)
+            {
+                let path = self
+                    .outboards
+                    .join(format!("{}.bao", safe_id(&item.chunk.id.0)));
+                // Compare every byte against the proof minted from this staged
+                // body; a matching header alone does not validate the CVs.
+                // Reused files still cross a file barrier, including after a
+                // previous optional directory-sync failure.
+                if sync_matching_outboard_file(&path, proof).unwrap_or(false)
+                    || install_outboard_file(&path, proof).is_ok()
+                {
+                    sync_outboards = true;
+                }
+            }
+        }
+        if sync_outboards {
+            // Proof metadata remains optional, but all successful installs and
+            // reuses cross this batch's directory barrier before its ACKs.
+            let _ = sync_outboard_directory(&self.outboards);
+        }
         Ok(staged
             .iter()
             .map(|item| ReplicaAck {
@@ -1697,6 +1911,14 @@ impl LocalChunkStore {
             ));
         }
         self.path_for_record(&record)?;
+        if let Some(expected) = ChunkObject::from_content_addressed_id(chunk_id)
+            && expected != record.chunk
+        {
+            return Err(corrupt(
+                chunk_id,
+                "catalog differs from content-addressed identity",
+            ));
+        }
         Ok(record)
     }
 
@@ -1747,11 +1969,73 @@ impl LocalChunkStore {
                     length: allowed,
                 });
             }
+            // A changed identity for the same formerly verified object must
+            // re-establish its complete root before any proof can be reused.
+            let invalidated_current = slot.as_ref().is_some_and(|object| {
+                object
+                    .identity
+                    .as_ref()
+                    .is_some_and(|(old, _)| old.chunk.id == *chunk_id)
+            });
             // Never retain an unrelated current object while filling another.
             // Any externally held old allocation stays alive and fully charged.
             slot.take();
             if let Some(metrics) = &self.read_work {
                 metrics.peer_object_cache("miss");
+            }
+            if !invalidated_current
+                && (offset != 0 || allowed as u64 != record.chunk.length)
+                && ChunkObject::from_content_addressed_id(chunk_id).as_ref() == Some(&record.chunk)
+            {
+                let reader = self.open_cataloged(chunk_id)?;
+                if let Some(proof) = reader.load_outboard() {
+                    let mut reservation = self.reserve_peer_read_payload_inner(allowed)?;
+                    let mut bytes = Vec::new();
+                    bytes
+                        .try_reserve_exact(allowed)
+                        .map_err(|_| peer_payload_capacity())?;
+                    reservation.retain_capacity(bytes.capacity())?;
+                    bytes.resize(allowed, 0);
+                    let mut work = OutboardReadWork::default();
+                    let verified = proof.read_ranges_into_with_work(
+                        &file,
+                        0,
+                        &record.chunk,
+                        &[VerifiedRangeCopy {
+                            chunk_offset: offset,
+                            length: allowed,
+                            output_offset: 0,
+                        }],
+                        &mut bytes,
+                        &mut work,
+                    );
+                    #[cfg(test)]
+                    VERIFIED_SCAN_BYTES.with(|count| count.set(count.get() + work.hash_bytes));
+                    if let Some(metrics) = &self.read_work {
+                        metrics.hash("outboard_body_hash", work.hash_bytes);
+                        metrics.hash("outboard_parent_hash", work.parent_hash_bytes);
+                        metrics.copy("outboard_range_delivery", work.copied_bytes);
+                    }
+                    if verified.is_ok()
+                        && PeerFileIdentity::read(&file)? == before
+                        && self.peer_catalog_record(chunk_id)? == record
+                    {
+                        return Ok(PeerReadPayload {
+                            object: Arc::new(PeerVerifiedObject {
+                                bytes,
+                                outboard: None,
+                                _reservation: reservation,
+                                identity: None,
+                            }),
+                            start: 0,
+                            length: allowed,
+                        });
+                    }
+                    // Drop the exact-range private allocation before the old
+                    // full-root fallback attempts its original body admission.
+                    drop(bytes);
+                    drop(reservation);
+                }
             }
             let resident = record.chunk.length <= PEER_READ_OBJECT_LIMIT as u64;
             let allocation = if resident {
@@ -1766,7 +2050,10 @@ impl LocalChunkStore {
                 .map_err(|_| peer_payload_capacity())?;
             reservation.retain_capacity(bytes.capacity())?;
             bytes.resize(allocation, 0);
-            verified_ranges_into(
+            let builder = (ChunkObject::from_content_addressed_id(chunk_id).as_ref()
+                == Some(&record.chunk))
+            .then(|| OutboardBuilder::new(record.chunk.length, self.outboard_budget.clone()));
+            let (_, outboard) = verified_ranges_into_building(
                 &file,
                 &record.chunk,
                 &[VerifiedRangeCopy {
@@ -1777,6 +2064,7 @@ impl LocalChunkStore {
                 &mut bytes,
                 true,
                 self.read_work.as_ref(),
+                builder,
             )?;
             if PeerFileIdentity::read(&file)? != before
                 || self.peer_catalog_record(chunk_id)? != record
@@ -1789,8 +2077,17 @@ impl LocalChunkStore {
             if PeerFileIdentity::read(&current)? != before {
                 return Err(corrupt(chunk_id, "path changed during verification"));
             }
+            if let Some(proof) = &outboard {
+                let _ = persist_outboard_file(
+                    &self
+                        .outboards
+                        .join(format!("{}.bao", safe_id(&record.chunk.id.0))),
+                    proof,
+                );
+            }
             let object = Arc::new(PeerVerifiedObject {
                 bytes,
+                outboard,
                 _reservation: reservation,
                 identity: resident.then_some((record, before)),
             });
@@ -1822,13 +2119,11 @@ impl LocalChunkStore {
 
     pub fn open_verified(&self, chunk_id: &ChunkId) -> Result<PinnedChunkReader> {
         let reader = self.open_cataloged(chunk_id)?;
-        verified_range(&reader.file, &reader.chunk, 0, 0, self.read_work.as_ref()).inspect_err(
-            |error| {
-                if verified_copy_is_invalid(error) {
-                    self.try_quarantine(chunk_id);
-                }
-            },
-        )?;
+        reader.verify_full_and_build().inspect_err(|error| {
+            if verified_copy_is_invalid(error) {
+                self.try_quarantine(chunk_id);
+            }
+        })?;
         Ok(reader)
     }
 
@@ -1853,8 +2148,23 @@ impl LocalChunkStore {
                     self.try_quarantine(chunk_id);
                 }
             })?;
+        if let Some(expected) = ChunkObject::from_content_addressed_id(chunk_id)
+            && expected != record.chunk
+        {
+            return Err(corrupt(
+                chunk_id,
+                "catalog differs from content-addressed identity",
+            ));
+        }
+        let proof_identity = Mutex::new(PeerFileIdentity::read(&file)?);
         Ok(PinnedChunkReader {
             file,
+            proof_identity,
+            outboard_path: self
+                .outboards
+                .join(format!("{}.bao", safe_id(&record.chunk.id.0))),
+            outboard_budget: self.outboard_budget.clone(),
+            outboard: Mutex::new(None),
             chunk: record.chunk,
             read_work: self.read_work.clone(),
         })
@@ -1932,6 +2242,112 @@ impl LocalChunkStore {
         catalog.revision = revision;
         Ok(())
     }
+}
+
+static OUTBOARD_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+fn load_outboard_file(
+    path: &Path,
+    chunk: &ChunkObject,
+    budget: &Arc<OutboardBudget>,
+) -> Result<SharedOutboard> {
+    use std::io::Read;
+    let mut file = File::open(path).map_err(Error::from)?;
+    let length = usize::try_from(file.metadata().map_err(Error::from)?.len())
+        .map_err(|_| invalid("outboard file length too large"))?;
+    if length > MAX_ENCODED_OUTBOARD_BYTES {
+        return Err(corrupt(&chunk.id, "oversized outboard"));
+    }
+    let lease = budget
+        .try_reserve(ChunkOutboard::resident_charge(MAX_ENCODED_OUTBOARD_BYTES)?)
+        .ok_or_else(|| {
+            Error::coded(afs_error::IO_CAPACITY, "outboard metadata budget exhausted")
+        })?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(length)
+        .map_err(|_| Error::coded(afs_error::IO_CAPACITY, "outboard allocation refused"))?;
+    bytes.resize(length, 0);
+    file.read_exact(&mut bytes).map_err(Error::from)?;
+    if file.metadata().map_err(Error::from)?.len() != length as u64 {
+        return Err(corrupt(&chunk.id, "outboard length changed"));
+    }
+    ChunkOutboard::from_encoded(chunk, bytes, lease)
+}
+fn persist_outboard_file(path: &Path, proof: &SharedOutboard) -> Result<()> {
+    install_outboard_file(path, proof)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| invalid("outboard path has no parent"))?;
+    sync_outboard_directory(parent)
+}
+
+fn sync_matching_outboard_file(path: &Path, proof: &SharedOutboard) -> Result<bool> {
+    use std::io::Read;
+    let mut file = File::open(path).map_err(Error::from)?;
+    let metadata = file.metadata().map_err(Error::from)?;
+    if !metadata.is_file() || metadata.len() != proof.encoded().len() as u64 {
+        return Ok(false);
+    }
+    // Bounded stack scratch avoids a second proof allocation or metadata lease.
+    let mut scratch = [0; 1024];
+    for expected in proof.encoded().chunks(scratch.len()) {
+        let observed = &mut scratch[..expected.len()];
+        file.read_exact(observed).map_err(Error::from)?;
+        if observed != expected {
+            return Ok(false);
+        }
+    }
+    if file.metadata().map_err(Error::from)?.len() != proof.encoded().len() as u64 {
+        return Ok(false);
+    }
+    file.sync_all().map_err(Error::from)?;
+    #[cfg(test)]
+    OUTBOARD_PERSIST_IO.with(|counts| counts.borrow_mut().file_syncs += 1);
+    Ok(true)
+}
+
+fn install_outboard_file(path: &Path, proof: &SharedOutboard) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| invalid("outboard path has no parent"))?;
+    let sequence = OUTBOARD_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temp = parent.join(format!(".{}.{}.tmp", std::process::id(), sequence));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+            .map_err(Error::from)?;
+        file.write_all(proof.encoded()).map_err(Error::from)?;
+        #[cfg(test)]
+        OUTBOARD_PERSIST_IO.with(|counts| counts.borrow_mut().writes += 1);
+        file.sync_all().map_err(Error::from)?;
+        #[cfg(test)]
+        OUTBOARD_PERSIST_IO.with(|counts| counts.borrow_mut().file_syncs += 1);
+        fs::rename(&temp, path).map_err(Error::from)?;
+        #[cfg(test)]
+        OUTBOARD_PERSIST_IO.with(|counts| counts.borrow_mut().renames += 1);
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
+}
+
+fn sync_outboard_directory(path: &Path) -> Result<()> {
+    #[cfg(test)]
+    if FAIL_OUTBOARD_DIRECTORY_SYNC.with(|fail| fail.replace(false)) {
+        return Err(Error::from(std::io::Error::other(
+            "injected outboard directory-sync failure",
+        )));
+    }
+    File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(Error::from)?;
+    #[cfg(test)]
+    OUTBOARD_PERSIST_IO.with(|counts| counts.borrow_mut().directory_syncs += 1);
+    Ok(())
 }
 
 fn verified_copy_is_invalid(error: &Error) -> bool {
@@ -2076,6 +2492,19 @@ fn verified_ranges_into(
     force_scan: bool,
     metrics: Option<&super::read_work::ReadWorkMetrics>,
 ) -> Result<Vec<usize>> {
+    verified_ranges_into_building(file, chunk, ranges, out, force_scan, metrics, None)
+        .map(|(counts, _)| counts)
+}
+
+fn verified_ranges_into_building(
+    file: &File,
+    chunk: &ChunkObject,
+    ranges: &[VerifiedRangeCopy],
+    out: &mut [u8],
+    force_scan: bool,
+    metrics: Option<&super::read_work::ReadWorkMetrics>,
+    mut builder: Option<OutboardBuilder>,
+) -> Result<(Vec<usize>, Option<SharedOutboard>)> {
     let mut counts = Vec::with_capacity(ranges.len());
     let mut active = Vec::new();
     for range in ranges.iter().copied() {
@@ -2098,7 +2527,7 @@ fn verified_ranges_into(
         }
     }
     if active.is_empty() && !force_scan {
-        return Ok(counts);
+        return Ok((counts, None));
     }
     if file.metadata().map_err(Error::from)?.len() != chunk.length {
         return Err(corrupt(&chunk.id, "length mismatch"));
@@ -2113,7 +2542,11 @@ fn verified_ranges_into(
         if count == 0 {
             return Err(corrupt(&chunk.id, "ended during verification"));
         }
-        hasher.update(&scratch[..count]);
+        if let Some(builder) = &mut builder {
+            builder.update(&scratch[..count])?;
+        } else {
+            hasher.update(&scratch[..count]);
+        }
         if let Some(work) = &mut work {
             work.bytes += count as u64;
         }
@@ -2142,14 +2575,26 @@ fn verified_ranges_into(
     if file.metadata().map_err(Error::from)?.len() != chunk.length {
         return Err(corrupt(&chunk.id, "length changed during verification"));
     }
-    let actual = ContentDigest {
-        algorithm: DigestAlgorithm::Blake3,
-        bytes: *hasher.finalize().as_bytes(),
+    let (actual, proof) = if let Some(builder) = builder {
+        let built = builder.finish()?;
+        debug_assert_eq!(built.hash_body_bytes, position);
+        if let Some(metrics) = metrics {
+            metrics.hash("outboard_parent_hash", built.parent_hash_bytes);
+        }
+        (built.digest, built.outboard)
+    } else {
+        (
+            ContentDigest {
+                algorithm: DigestAlgorithm::Blake3,
+                bytes: *hasher.finalize().as_bytes(),
+            },
+            None,
+        )
     };
     if actual != chunk.content_digest {
         return Err(corrupt(&chunk.id, "digest mismatch"));
     }
-    Ok(counts)
+    Ok((counts, proof))
 }
 
 fn digest(bytes: &[u8]) -> ContentDigest {
@@ -2194,11 +2639,230 @@ fn invalid(message: impl Into<String>) -> Error {
 #[cfg(test)]
 std::thread_local! {
     static VERIFIED_SCAN_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static OUTBOARD_PERSIST_IO: std::cell::RefCell<OutboardPersistIo> = const {
+        std::cell::RefCell::new(OutboardPersistIo {
+            writes: 0,
+            file_syncs: 0,
+            renames: 0,
+            directory_syncs: 0,
+        })
+    };
+    static FAIL_OUTBOARD_DIRECTORY_SYNC: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+// Count only successful real I/O operations; injected failures do not count.
+struct OutboardPersistIo {
+    writes: usize,
+    file_syncs: usize,
+    renames: usize,
+    directory_syncs: usize,
 }
 
 #[cfg(test)]
 mod replica_replay_tests {
     use super::*;
+
+    fn pooled_outboard_chunks(
+        budget: &Arc<OutboardBudget>,
+        count: usize,
+        length: usize,
+    ) -> Vec<StagedChunk> {
+        let pool = WriteBufferPool::new_with_outboard_budget(count * length, budget.clone());
+        (0..count)
+            .map(|index| {
+                let mut builder = ChunkBuilder::with_pool(pool.clone(), length).unwrap();
+                builder.write_at(0, &vec![index as u8; length]).unwrap();
+                let staged = builder.stage(OperationId::new(format!("batch-proof-{index}")));
+                assert!(staged.outboard.as_ref().unwrap().uses_budget(budget));
+                staged
+            })
+            .collect()
+    }
+
+    fn take_outboard_persist_io() -> OutboardPersistIo {
+        OUTBOARD_PERSIST_IO.with(|counts| std::mem::take(&mut *counts.borrow_mut()))
+    }
+
+    #[test]
+    fn wi6_outboard_batch_syncs_directory_once_and_replay_skips_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let budget = OutboardBudget::new(DEFAULT_OUTBOARD_BUDGET_BYTES);
+        let staged = pooled_outboard_chunks(&budget, 16, 4 * 1024 * 1024);
+        let store = LocalChunkStore::open(temp.path(), "node-a")
+            .unwrap()
+            .with_outboard_budget(budget);
+        take_outboard_persist_io();
+        let receipts = store.put_batch(staged.clone()).unwrap();
+        assert_eq!(receipts.len(), 16);
+        assert_eq!(
+            take_outboard_persist_io(),
+            OutboardPersistIo {
+                writes: 16,
+                file_syncs: 16,
+                renames: 16,
+                directory_syncs: 1,
+            }
+        );
+        for item in &staged {
+            let path = store
+                .outboards
+                .join(format!("{}.bao", safe_id(&item.chunk.id.0)));
+            assert_eq!(
+                fs::read(path).unwrap(),
+                item.outboard.as_ref().unwrap().encoded()
+            );
+        }
+        let revision = store.device_descriptor().unwrap().catalog_revision;
+        let mut replay = staged.clone();
+        replay.extend(staged);
+        assert_eq!(store.put_batch(replay).unwrap().len(), 32);
+        assert_eq!(
+            store.device_descriptor().unwrap().catalog_revision,
+            revision
+        );
+        assert_eq!(
+            take_outboard_persist_io(),
+            OutboardPersistIo {
+                writes: 0,
+                file_syncs: 16,
+                renames: 0,
+                directory_syncs: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn wi6_outboard_batch_deduplicates_installs_and_tracks_actual_batches() {
+        let temp = tempfile::tempdir().unwrap();
+        let budget = OutboardBudget::new(DEFAULT_OUTBOARD_BUDGET_BYTES);
+        let staged = pooled_outboard_chunks(&budget, 4, 128 * 1024);
+        let store = LocalChunkStore::open(temp.path(), "node-a")
+            .unwrap()
+            .with_outboard_budget(budget);
+        take_outboard_persist_io();
+        for pair in staged.chunks(2) {
+            let mut batch = pair.to_vec();
+            batch.extend_from_slice(pair);
+            assert_eq!(store.put_batch(batch).unwrap().len(), 4);
+        }
+        assert_eq!(
+            take_outboard_persist_io(),
+            OutboardPersistIo {
+                writes: 4,
+                file_syncs: 4,
+                renames: 4,
+                directory_syncs: 2,
+            }
+        );
+        store.put_batch(Vec::new()).unwrap();
+        store
+            .put(StagedChunk::new(
+                OperationId::new("no-proof"),
+                vec![8; 4096],
+            ))
+            .unwrap();
+        assert_eq!(take_outboard_persist_io(), OutboardPersistIo::default());
+    }
+
+    #[test]
+    fn wi6_outboard_batch_repairs_corrupt_cv_even_with_matching_header() {
+        let temp = tempfile::tempdir().unwrap();
+        let budget = OutboardBudget::new(DEFAULT_OUTBOARD_BUDGET_BYTES);
+        let staged = pooled_outboard_chunks(&budget, 1, 128 * 1024)
+            .pop()
+            .unwrap();
+        let store = LocalChunkStore::open(temp.path(), "node-a")
+            .unwrap()
+            .with_outboard_budget(budget);
+        store.put(staged.clone()).unwrap();
+        let path = store
+            .outboards
+            .join(format!("{}.bao", safe_id(&staged.chunk.id.0)));
+        let mut corrupt = fs::read(&path).unwrap();
+        corrupt[64] ^= 1;
+        ChunkOutboard::validate_encoded_shape(&staged.chunk, &corrupt).unwrap();
+        fs::write(&path, corrupt).unwrap();
+        take_outboard_persist_io();
+        store.put(staged.clone()).unwrap();
+        assert_eq!(
+            fs::read(path).unwrap(),
+            staged.outboard.as_ref().unwrap().encoded()
+        );
+        assert_eq!(
+            take_outboard_persist_io(),
+            OutboardPersistIo {
+                writes: 1,
+                file_syncs: 1,
+                renames: 1,
+                directory_syncs: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn wi6_outboard_batch_optional_failures_keep_acks_and_retry_barriers() {
+        let temp = tempfile::tempdir().unwrap();
+        let budget = OutboardBudget::new(DEFAULT_OUTBOARD_BUDGET_BYTES);
+        let staged = pooled_outboard_chunks(&budget, 2, 128 * 1024);
+        let store = LocalChunkStore::open(temp.path(), "node-a")
+            .unwrap()
+            .with_outboard_budget(budget);
+        let blocked = store
+            .outboards
+            .join(format!("{}.bao", safe_id(&staged[0].chunk.id.0)));
+        fs::create_dir(&blocked).unwrap();
+        take_outboard_persist_io();
+        assert_eq!(store.put_batch(staged.clone()).unwrap().len(), 2);
+        assert_eq!(
+            take_outboard_persist_io(),
+            OutboardPersistIo {
+                writes: 2,
+                file_syncs: 2,
+                renames: 1,
+                directory_syncs: 1,
+            }
+        );
+        assert!(fs::read_dir(&store.outboards).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp")
+        }));
+        fs::remove_dir(blocked).unwrap();
+        FAIL_OUTBOARD_DIRECTORY_SYNC.with(|fail| fail.set(true));
+        assert_eq!(store.put_batch(staged.clone()).unwrap().len(), 2);
+        assert_eq!(
+            take_outboard_persist_io(),
+            OutboardPersistIo {
+                writes: 1,
+                file_syncs: 2,
+                renames: 1,
+                directory_syncs: 0,
+            }
+        );
+        assert_eq!(store.put_batch(staged.clone()).unwrap().len(), 2);
+        assert_eq!(
+            take_outboard_persist_io(),
+            OutboardPersistIo {
+                writes: 0,
+                file_syncs: 2,
+                renames: 0,
+                directory_syncs: 1,
+            }
+        );
+        drop(store);
+        let recovered = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+        for item in staged {
+            let mut out = [0; 17];
+            assert_eq!(recovered.read_at(&item.chunk.id, 3, &mut out).unwrap(), 17);
+            assert_eq!(out, item.bytes()[3..20]);
+        }
+    }
 
     #[test]
     fn peer_object_digest_capability_requires_the_complete_verified_view() {
@@ -2275,6 +2939,187 @@ mod replica_replay_tests {
         assert_eq!(digest, staged.chunk.content_digest);
         assert_eq!(&frame[..], &[29; 83]);
         drop(frame);
+        assert_eq!(store.peer_read_budget.used.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn wi6_pinned_small_reads_do_not_repeat_complete_object_scans() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+        let staged = StagedChunk::new(
+            OperationId::new("outboard-old-copy"),
+            vec![19; 4 * 1024 * 1024],
+        );
+        store.put(staged.clone()).unwrap();
+        let reader = store.open_verified(&staged.chunk.id).unwrap();
+        VERIFIED_SCAN_BYTES.with(|count| count.set(0));
+        for offset in [3, 32771] {
+            let mut bytes = [0; 17];
+            assert_eq!(reader.read_at(offset, &mut bytes).unwrap(), 17);
+            assert_eq!(bytes, [19; 17]);
+        }
+        let scanned = VERIFIED_SCAN_BYTES.with(|count| count.get());
+        assert!(
+            scanned <= 2 * 32768,
+            "two small ranges scanned {scanned} bytes"
+        );
+    }
+
+    #[test]
+    fn wi6_legacy_and_half_sidecars_recover_without_rewriting_body_or_catalog() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+        let staged = StagedChunk::new(OperationId::new("outboard-recovery"), vec![23; 150_001]);
+        store.put(staged.clone()).unwrap();
+        let original_revision = store.device_descriptor().unwrap().catalog_revision;
+        let body_path = store.chunk_path(&staged.chunk.id);
+        let identity = PeerFileIdentity::read(&File::open(&body_path).unwrap()).unwrap();
+        let proof_path = store
+            .outboards
+            .join(format!("{}.bao", safe_id(&staged.chunk.id.0)));
+        assert!(
+            !proof_path.exists(),
+            "unpooled writes retain old root-only behavior"
+        );
+        let mut permissions = fs::metadata(&body_path).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&body_path, permissions).unwrap();
+        // chmod changes ctime, record the identity after restricting the body.
+        let identity = PeerFileIdentity::read(&File::open(&body_path).unwrap()).unwrap_or(identity);
+        fs::write(&proof_path, b"partial").unwrap();
+        fs::write(store.outboards.join(".abandoned.tmp"), b"partial").unwrap();
+        drop(store);
+        let recovered = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+        assert!(!recovered.outboards.join(".abandoned.tmp").exists());
+        let reader = recovered.open_verified(&staged.chunk.id).unwrap();
+        assert_eq!(
+            PeerFileIdentity::read(&File::open(&body_path).unwrap()).unwrap(),
+            identity
+        );
+        assert_eq!(
+            recovered.device_descriptor().unwrap().catalog_revision,
+            original_revision
+        );
+        let encoded = fs::read(&proof_path).unwrap();
+        ChunkOutboard::validate_encoded_shape(&staged.chunk, &encoded).unwrap();
+        let mut out = [0; 19];
+        assert_eq!(reader.read_at(3, &mut out).unwrap(), 19);
+        assert_eq!(out, [23; 19]);
+        assert!(fs::read_dir(&recovered.outboards).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp")
+        }));
+        let empty_budget = OutboardBudget::new(0);
+        let constrained = LocalChunkStore::open(temp.path(), "node-a")
+            .unwrap()
+            .with_outboard_budget(empty_budget.clone());
+        let mut out = [0; 19];
+        assert_eq!(
+            constrained.read_at(&staged.chunk.id, 3, &mut out).unwrap(),
+            19
+        );
+        assert_eq!(out, [23; 19]);
+        assert_eq!(empty_budget.used(), 0);
+    }
+
+    #[test]
+    fn wi6_canonical_catalog_mismatch_cannot_replace_the_trusted_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+        let staged = StagedChunk::new(OperationId::new("canonical-anchor"), vec![3; 150_001]);
+        store.put(staged.clone()).unwrap();
+        let forged = StagedChunk::new(OperationId::new("forged-catalog"), vec![7; 150_001]);
+        fs::write(store.chunk_path(&staged.chunk.id), forged.bytes()).unwrap();
+        {
+            let mut catalog = store.catalog.lock().unwrap();
+            let record = catalog.records.get_mut(&staged.chunk.id).unwrap();
+            record.chunk.content_digest = forged.chunk.content_digest.clone();
+            record.stored_checksum = forged.chunk.content_digest.clone();
+        }
+        for error in [
+            store.open_verified(&staged.chunk.id).unwrap_err(),
+            store.read_peer_range(&staged.chunk.id, 3, 17).unwrap_err(),
+        ] {
+            assert_eq!(error.code(), afs_error::NODE_TRANSFER_CORRUPT_DATA);
+        }
+    }
+
+    #[test]
+    fn wi6_range_work_budget_pressure_falls_back_to_complete_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let budget = OutboardBudget::new(16 * 1024);
+        let store = LocalChunkStore::open(temp.path(), "node-a")
+            .unwrap()
+            .with_outboard_budget(budget.clone());
+        let staged = StagedChunk::new(OperationId::new("work-budget-fallback"), vec![5; 150_001]);
+        store.put(staged.clone()).unwrap();
+        let reader = store.open_verified(&staged.chunk.id).unwrap();
+        assert!(reader.load_outboard().is_some());
+        let before = budget.used();
+        VERIFIED_SCAN_BYTES.with(|count| count.set(0));
+        let mut out = [0; 17];
+        assert_eq!(reader.read_at(3, &mut out).unwrap(), 17);
+        assert_eq!(out, [5; 17]);
+        assert_eq!(VERIFIED_SCAN_BYTES.with(|count| count.get()), 150_001);
+        assert_eq!(budget.used(), before);
+    }
+
+    #[test]
+    fn wi6_pooled_stage_keeps_body_address_and_persists_optional_same_budget_proof() {
+        let temp = tempfile::tempdir().unwrap();
+        let budget = OutboardBudget::new(DEFAULT_OUTBOARD_BUDGET_BYTES);
+        let pool = WriteBufferPool::new_with_outboard_budget(32768, budget.clone());
+        let mut builder = ChunkBuilder::with_pool(pool.clone(), 32768).unwrap();
+        builder.write_at(0, &vec![7; 32768]).unwrap();
+        let frozen = builder.freeze();
+        let pointer = frozen.as_ptr();
+        let staged = StagedChunk::from_shared(OperationId::new("outboard-pooled"), frozen);
+        assert_eq!(staged.bytes().as_ptr(), pointer);
+        assert!(staged.outboard.as_ref().unwrap().uses_budget(&budget));
+        assert_eq!(pool.snapshot().copied_bytes, 32768);
+        let store = LocalChunkStore::open(temp.path(), "node-a")
+            .unwrap()
+            .with_outboard_budget(budget.clone());
+        store.put(staged.clone()).unwrap();
+        let proof_path = store
+            .outboards
+            .join(format!("{}.bao", safe_id(&staged.chunk.id.0)));
+        ChunkOutboard::validate_encoded_shape(&staged.chunk, &fs::read(proof_path).unwrap())
+            .unwrap();
+        let plain_pool = WriteBufferPool::new(32768);
+        let mut plain = ChunkBuilder::with_pool(plain_pool, 32768).unwrap();
+        plain.write_at(0, b"plain").unwrap();
+        assert!(
+            plain
+                .stage(OperationId::new("root-only"))
+                .outboard
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn wi6_peer_partial_uses_covering_groups_and_exact_payload_lease() {
+        let temp = tempfile::tempdir().unwrap();
+        let budget = OutboardBudget::new(DEFAULT_OUTBOARD_BUDGET_BYTES);
+        let pool = WriteBufferPool::new_with_outboard_budget(4 * 1024 * 1024, budget.clone());
+        let mut builder = ChunkBuilder::with_pool(pool.clone(), 4 * 1024 * 1024).unwrap();
+        builder.write_at(0, &vec![11; 4 * 1024 * 1024]).unwrap();
+        let staged = builder.stage(OperationId::new("outboard-partial"));
+        let store = LocalChunkStore::open(temp.path(), "node-a")
+            .unwrap()
+            .with_outboard_budget(budget);
+        store.put(staged.clone()).unwrap();
+        VERIFIED_SCAN_BYTES.with(|count| count.set(0));
+        let payload = store.read_peer_range(&staged.chunk.id, 3, 17).unwrap();
+        assert_eq!(payload.as_slice(), &[11; 17]);
+        assert!(payload.verified_full_object_digest().is_none());
+        assert!(payload.outboard().is_none());
+        assert_eq!(VERIFIED_SCAN_BYTES.with(|count| count.get()), 32768);
+        assert_eq!(store.peer_read_budget.used.load(Ordering::Acquire), 17);
+        drop(payload);
         assert_eq!(store.peer_read_budget.used.load(Ordering::Acquire), 0);
     }
 
@@ -2538,7 +3383,7 @@ mod replica_replay_tests {
         );
         assert_eq!(
             VERIFIED_SCAN_BYTES.with(|bytes| bytes.get()),
-            2 * bytes.len() as u64
+            bytes.len() as u64 + 2 * outboard::OUTBOARD_GROUP_BYTES as u64
         );
         for offset in [65_531, 149_990] {
             out.fill(9);
@@ -2673,17 +3518,25 @@ mod replica_replay_tests {
             .read_range_at_uncommitted(&staged.chunk.id, 0, &mut [0; 3])
             .unwrap();
         let text = afs_metrics::encode_text(&registry).unwrap();
-        assert!(text.contains("afs_dfs_read_scans_total 3\n"), "{text}");
+        assert!(text.contains("afs_dfs_read_scans_total 2\n"), "{text}");
         assert!(
-            text.contains("afs_dfs_read_scan_bytes_total 196611\n"),
+            text.contains("afs_dfs_read_scan_bytes_total 131074\n"),
             "{text}"
         );
         assert!(
-            text.contains("afs_dfs_read_copy_bytes_total{stage=\"scan_to_range\"} 6\n"),
+            text.contains("afs_dfs_read_copy_bytes_total{stage=\"scan_to_range\"} 3\n"),
             "{text}"
         );
         assert!(
             text.contains("afs_dfs_read_copy_bytes_total{stage=\"pinned_range_to_output\"} 3\n"),
+            "{text}"
+        );
+        // The verified range passes through the official Bao codec before
+        // exact extraction: two full covering-group copies plus three bytes.
+        assert!(
+            text.contains(
+                "afs_dfs_read_copy_bytes_total{stage=\"outboard_range_delivery\"} 65539\n"
+            ),
             "{text}"
         );
     }

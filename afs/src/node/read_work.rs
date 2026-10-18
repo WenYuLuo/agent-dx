@@ -144,24 +144,25 @@ impl ReadWorkMetrics {
             let hashes = afs_metrics::IntCounterVec::new(
                 afs_metrics::Opts::new(
                     "afs_dfs_read_hash_bytes_total",
-                    "Actual BLAKE3 input bytes by fixed read stage, including failed work; root and segment hashes are separate executions.",
+                    "Actual BLAKE3 input bytes by fixed read stage, including failed work; root, outboard and legacy segment hashes are separate executions.",
                 ),
                 &["stage"],
             )?;
             for stage in [
                 "root_local_scan", "stream_range_hash", "peer_range_in_receive",
                 "root_in_receive", "root_fallback", "segment_index_bytes",
-                "cache_segment_hash", "cache_full_hash",
+                "cache_segment_hash", "cache_full_hash", "outboard_body_hash",
+                "outboard_parent_hash",
             ] { hashes.with_label_values(&[stage]); }
             #[cfg(any(feature = "dfs", test))]
             let disk_cache_metadata_bytes = afs_metrics::IntGauge::new(
                 "afs_dfs_peer_disk_cache_metadata_bytes",
-                "Charged segment digest and file identity metadata; excludes payload and directory bookkeeping.",
+                "Resident cache proof and identity charges; the shared Node ledger also covers in-flight outboards and proof work. Excludes payload and directory bookkeeping.",
             )?;
             #[cfg(any(feature = "dfs", test))]
             let disk_cache_metadata_peak_bytes = afs_metrics::IntGauge::new(
                 "afs_dfs_peer_disk_cache_metadata_peak_bytes",
-                "Peak charged segment digest and file identity metadata under its independent 1MiB limit.",
+                "Peak resident cache proof and identity charges within the shared Node outboard budget.",
             )?;
             afs_metrics::register_collector(registry, &hashes)?;
             #[cfg(any(feature = "dfs", test))]
@@ -175,7 +176,7 @@ impl ReadWorkMetrics {
             let copies = afs_metrics::IntCounterVec::new(
                 afs_metrics::Opts::new(
                     "afs_dfs_read_copy_bytes_total",
-                    "Explicit DFS read payload copies; excludes codec, TLS and kernel copies.",
+                    "Explicit DFS read user-space copies by payload or proof-metadata stage, including local Bao verification copies; excludes transport codec, TLS and kernel copies.",
                 ),
                 &["stage"],
             )?;
@@ -376,6 +377,8 @@ impl ReadWorkMetrics {
                 "frame_to_attempt",
                 "attempt_to_staging",
                 "staging_to_output",
+                "peer_outboard_metadata",
+                "outboard_range_delivery",
             ] {
                 copies.with_label_values(&[stage]);
             }
@@ -474,6 +477,8 @@ impl ReadWorkMetrics {
                 | "segment_index_bytes"
                 | "cache_segment_hash"
                 | "cache_full_hash"
+                | "outboard_body_hash"
+                | "outboard_parent_hash"
         ) {
             self.hashes.with_label_values(&[stage]).inc_by(bytes);
         }
@@ -1713,6 +1718,8 @@ mod tests {
         let same = ReadWorkMetrics::register(&registry).unwrap();
         metrics.hash("root_in_receive", 4096);
         metrics.hash("segment_index_bytes", 4096);
+        metrics.hash("outboard_body_hash", 8192);
+        metrics.hash("outboard_parent_hash", 64);
         metrics.hash("request-id-must-not-be-a-label", 1);
         metrics.peer_cache_metadata(256, 512);
         assert_eq!(
@@ -1731,12 +1738,22 @@ mod tests {
         );
         assert_eq!(same.disk_cache_metadata_bytes.get(), 256);
         assert_eq!(same.disk_cache_metadata_peak_bytes.get(), 512);
+        assert_eq!(
+            same.hashes.with_label_values(&["outboard_body_hash"]).get(),
+            8192
+        );
+        assert_eq!(
+            same.hashes
+                .with_label_values(&["outboard_parent_hash"])
+                .get(),
+            64
+        );
         let hashes = registry
             .gather()
             .into_iter()
             .find(|family| family.name() == "afs_dfs_read_hash_bytes_total")
             .unwrap();
-        assert_eq!(hashes.get_metric().len(), 8);
+        assert_eq!(hashes.get_metric().len(), 10);
     }
 
     #[test]

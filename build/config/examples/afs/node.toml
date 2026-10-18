@@ -9,6 +9,20 @@ data_dir = "/opt/adx/data/afs/node-a"
 uds_path = "/opt/adx/run/afs/node-a.sock"
 # ownerfs_mount = "/mnt/adx/ownerfs"
 # dfs_mount = "/mnt/adx/dfs"
+# FUSE receive/executor settings shared by OwnerFs and DFS.
+# fuse_threads = 4
+# fuse_clone_fd = true
+# fuse_workers = 32
+# Native DFS page reuse requires the exact fresh committed version and length.
+# Zero TTLs preserve strict close-to-open; positive TTLs explicitly relax it.
+# dfs_fuse_keep_cache = true
+# dfs_fuse_entry_ttl_ms = 0
+# dfs_fuse_attr_ttl_ms = 0
+# Requested DFS kernel read-ahead limit; record the negotiated value in tests.
+# This does not enable next-object prefetch or change OwnerFs cache policy.
+# fuse_max_readahead_bytes = 1048576
+# Resident immutable metadata entries, not a byte or authorization budget.
+# dfs_version_cache_entries = 4096
 timeout_ms = 5000
 log_level = "info"
 trace_enabled = false

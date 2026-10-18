@@ -641,3 +641,137 @@ fn ownerfs_workspace_bind_requires_isolated_egress_root() {
         Some(std::path::Path::new("/srv/egress"))
     );
 }
+
+#[test]
+fn fuse_execution_and_dfs_cache_defaults_are_explicit() {
+    let cfg = Config::resolve(Role::Node, Cli::default()).unwrap();
+    let value = serde_json::to_value(cfg).unwrap();
+    for (key, expected) in [
+        ("fuse_threads", serde_json::json!(4)),
+        ("fuse_clone_fd", serde_json::json!(true)),
+        ("fuse_workers", serde_json::json!(32)),
+        ("dfs_fuse_keep_cache", serde_json::json!(true)),
+        ("dfs_fuse_entry_ttl_ms", serde_json::json!(0)),
+        ("dfs_fuse_attr_ttl_ms", serde_json::json!(0)),
+        ("fuse_max_readahead_bytes", serde_json::json!(1048576)),
+    ] {
+        assert_eq!(value.get(key), Some(&expected), "missing/wrong {key}");
+    }
+}
+
+#[test]
+fn fuse_execution_settings_merge_file_cli_and_validate_boundaries() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("node.toml");
+    std::fs::write(
+        &path,
+        "fuse_threads=1\nfuse_clone_fd=false\nfuse_workers=1\ndfs_fuse_keep_cache=false\ndfs_fuse_entry_ttl_ms=60000\ndfs_fuse_attr_ttl_ms=60000\nfuse_max_readahead_bytes=16777216\n",
+    ).unwrap();
+    let cfg = Config::resolve(
+        Role::Node,
+        Cli::try_parse_from([
+            "afs-node",
+            "--config",
+            path.to_str().unwrap(),
+            "--fuse-threads",
+            "64",
+            "--fuse-workers",
+            "1024",
+            "--dfs-fuse-entry-ttl-ms",
+            "0",
+        ])
+        .expect("public FUSE options must be recognized"),
+    )
+    .unwrap();
+    let value = serde_json::to_value(cfg).unwrap();
+    assert_eq!(value["fuse_threads"], 64);
+    assert_eq!(value["fuse_workers"], 1024);
+    assert_eq!(value["fuse_clone_fd"], false);
+    assert_eq!(value["dfs_fuse_keep_cache"], false);
+    assert_eq!(value["dfs_fuse_entry_ttl_ms"], 0);
+    assert_eq!(value["dfs_fuse_attr_ttl_ms"], 60000);
+    assert_eq!(value["fuse_max_readahead_bytes"], 16777216);
+}
+
+#[test]
+fn fuse_execution_settings_reject_out_of_range_values_before_startup() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("node.toml");
+    for (key, number) in [
+        ("fuse_threads", 0),
+        ("fuse_threads", 65),
+        ("fuse_workers", 0),
+        ("fuse_workers", 1025),
+        ("dfs_fuse_entry_ttl_ms", 60001),
+        ("dfs_fuse_attr_ttl_ms", 60001),
+        ("fuse_max_readahead_bytes", 16777217),
+    ] {
+        std::fs::write(&path, format!("{key}={number}\n")).unwrap();
+        let error = Config::resolve(
+            Role::Node,
+            Cli {
+                config: Some(path.clone()),
+                ..Cli::default()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), afs_error::CONFIG_INVALID);
+        assert!(
+            error.to_string().contains("FUSE"),
+            "wrong range failure: {error}"
+        );
+    }
+}
+
+#[test]
+fn dfs_version_cache_capacity_has_bounded_file_cli_configuration() {
+    let defaults =
+        serde_json::to_value(Config::resolve(Role::Node, Cli::default()).unwrap()).unwrap();
+    assert_eq!(defaults["dfs_version_cache_entries"], 4096);
+
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("node.toml");
+    std::fs::write(&path, "dfs_version_cache_entries=7\n").unwrap();
+    let file_config = Config::resolve(
+        Role::Node,
+        Cli {
+            config: Some(path.clone()),
+            ..Cli::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(file_config).unwrap()["dfs_version_cache_entries"],
+        7
+    );
+    let cli_config = Config::resolve(
+        Role::Node,
+        Cli::try_parse_from([
+            "afs-node",
+            "--config",
+            path.to_str().unwrap(),
+            "--dfs-version-cache-entries",
+            "1",
+        ])
+        .expect("the version cache capacity is a public Node option"),
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(cli_config).unwrap()["dfs_version_cache_entries"],
+        1
+    );
+
+    for capacity in [0, 65537] {
+        std::fs::write(&path, format!("dfs_version_cache_entries={capacity}\n")).unwrap();
+        let error = Config::resolve(
+            Role::Node,
+            Cli {
+                config: Some(path.clone()),
+                ..Cli::default()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), afs_error::CONFIG_INVALID);
+        assert!(error.to_string().contains("version cache"), "{error}");
+    }
+}

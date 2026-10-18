@@ -24,6 +24,14 @@ pub enum WriteAdmissionMode {
     Borrowed,
 }
 
+/// Exact committed content identity used only for kernel page reuse at open.
+/// It neither grants access nor pins a snapshot for the lifetime of a handle.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PageCacheIdentity {
+    pub version_id: Option<String>,
+    pub length: u64,
+}
+
 /// 两种后端接收同一组文件操作；每项默认拒绝，未实现时不得报告成功。
 ///
 /// 这里仅规定入口必须提供的参数与返回值。根授权、文件身份、缓存和持久化
@@ -39,6 +47,19 @@ pub trait Backend: Send + Sync {
     /// must not retain the borrowed slice after `write_with_options` returns.
     fn write_admission_mode(&self, _handle: types::FileHandle) -> WriteAdmissionMode {
         WriteAdmissionMode::Queued
+    }
+
+    /// Local capability query after a successful fresh open. `None` requires
+    /// discarding pages; implementations must not perform RPCs from this hook.
+    fn page_cache_identity(&self, _handle: types::FileHandle) -> Option<PageCacheIdentity> {
+        None
+    }
+
+    /// Permit concurrent reads only when the backend preserves per-operation
+    /// version, authority and deadline checks. The frontend still orders reads
+    /// against write/resize/sync/release barriers on the same handle.
+    fn supports_parallel_reads(&self, _handle: types::FileHandle) -> bool {
+        false
     }
 
     /// Linux FUSE killpriv v2 is advertised only when the selected backend can
@@ -493,6 +514,16 @@ mod tests {
             DefaultReadOwnedBackend.write_admission_mode(FileHandle(7)),
             super::WriteAdmissionMode::Queued
         );
+    }
+
+    #[test]
+    fn default_backend_never_opts_into_kernel_page_reuse_or_parallel_reads() {
+        assert!(
+            DefaultReadOwnedBackend
+                .page_cache_identity(FileHandle(7))
+                .is_none()
+        );
+        assert!(!DefaultReadOwnedBackend.supports_parallel_reads(FileHandle(7)));
     }
 
     #[test]

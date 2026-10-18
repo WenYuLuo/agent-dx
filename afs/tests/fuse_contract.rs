@@ -4,7 +4,7 @@ use std::{
     io::{self, Read, Seek, Write},
     os::unix::fs::FileExt,
     sync::{
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
         atomic::{AtomicU64, Ordering},
         mpsc,
     },
@@ -14,7 +14,7 @@ use std::{
 use afs::node::{
     fuse,
     vfs::{
-        Backend,
+        Backend, PageCacheIdentity,
         locks::{LockRequest, LockWaiterId},
         types::{
             BackendInode, CreatedFile, DirectoryEntry, DirectoryHandle, Entry, FileAttributes,
@@ -671,6 +671,512 @@ impl MountedTestBackend {
             mount,
             session: Some(session),
         }
+    }
+
+    fn mount_dfs(backend: Arc<dyn Backend>, mount: std::path::PathBuf) -> Self {
+        Self::mount_dfs_with_options(backend, mount, fuse::FuseMountOptions::default())
+    }
+
+    fn mount_dfs_with_options(
+        backend: Arc<dyn Backend>,
+        mount: std::path::PathBuf,
+        options: fuse::FuseMountOptions,
+    ) -> Self {
+        let session = fuse::mount_dfs_with_options(backend, &mount, options).unwrap();
+        wait_until_mounted(&mount).unwrap();
+        eprintln!(
+            "DFS readahead requested_bytes={} kernel_kb={}",
+            options.fuse_max_readahead_bytes,
+            dfs_read_ahead_kb(&mount)
+        );
+        Self {
+            mount,
+            session: Some(session),
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires Linux /dev/fuse and fusermount3"]
+fn dfs_buffered_reopen_keeps_pages_only_for_the_exact_committed_version() {
+    let temp = tempfile::tempdir().unwrap();
+    let mount = temp.path().join("mnt");
+    std::fs::create_dir(&mount).unwrap();
+    let data = vec![b'a'; 65536];
+    let backend = Arc::new(VersionedReadBackend::new("version-one", data.clone()));
+    let _session = MountedTestBackend::mount_dfs(backend.clone(), mount.clone());
+    let path = mount.join("file");
+
+    assert_eq!(std::fs::read(&path).unwrap(), data);
+    let first_reads = backend.read_calls.load(Ordering::SeqCst);
+    assert!(first_reads > 0, "initial data did not reach the backend");
+    assert_eq!(std::fs::read(&path).unwrap(), data);
+    assert_eq!(
+        backend.read_calls.load(Ordering::SeqCst),
+        first_reads,
+        "unchanged read-only reopen discarded verified kernel pages"
+    );
+
+    let changed = vec![b'b'; data.len()];
+    backend.publish("version-two", changed.clone());
+    assert_eq!(std::fs::read(&path).unwrap(), changed);
+    assert!(backend.read_calls.load(Ordering::SeqCst) > first_reads);
+}
+
+#[test]
+#[ignore = "requires Linux /dev/fuse and fusermount3"]
+fn dfs_buffered_reopen_refreshes_growth_and_truncation_with_new_heads() {
+    let temp = tempfile::tempdir().unwrap();
+    let mount = temp.path().join("mnt");
+    std::fs::create_dir(&mount).unwrap();
+    let backend = Arc::new(VersionedReadBackend::new("small", b"old".to_vec()));
+    let _session = MountedTestBackend::mount_dfs_with_options(
+        backend.clone(),
+        mount.clone(),
+        fuse::FuseMountOptions {
+            fuse_max_readahead_bytes: 0,
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        dfs_read_ahead_kb(&mount),
+        0,
+        "zero request must disable whole-page readahead"
+    );
+    let path = mount.join("file");
+    assert_eq!(std::fs::read(&path).unwrap(), b"old");
+
+    let grown = vec![b'g'; 131072];
+    backend.publish("grown", grown.clone());
+    assert_eq!(std::fs::read(&path).unwrap(), grown);
+    backend.publish("truncated", b"new".to_vec());
+    assert_eq!(std::fs::read(&path).unwrap(), b"new");
+    backend.publish("empty", Vec::new());
+    assert!(std::fs::read(&path).unwrap().is_empty());
+}
+
+fn dfs_read_ahead_kb(mount: &std::path::Path) -> u64 {
+    use std::os::unix::fs::MetadataExt as _;
+    let device = mount.metadata().unwrap().dev();
+    std::fs::read_to_string(format!(
+        "/sys/class/bdi/{}:{}/read_ahead_kb",
+        libc::major(device),
+        libc::minor(device)
+    ))
+    .unwrap()
+    .trim()
+    .parse()
+    .unwrap()
+}
+
+#[test]
+#[ignore = "requires Linux /dev/fuse and fusermount3"]
+fn dfs_buffered_open_after_old_lookup_size_reads_fresh_length_without_fstat() {
+    let temp = tempfile::tempdir().unwrap();
+    let mount = temp.path().join("mnt");
+    std::fs::create_dir(&mount).unwrap();
+    let backend = Arc::new(VersionedReadBackend::new("old", b"old".to_vec()));
+    let _session = MountedTestBackend::mount_dfs(backend.clone(), mount.clone());
+    let grown = vec![b'n'; 8192];
+    backend.publish_during_next_open("after-lookup", grown.clone());
+
+    // File::open followed by read_exact does not issue an application fstat.
+    // The backend changes head inside OPEN, after LOOKUP returned the old size.
+    let mut file = std::fs::File::open(mount.join("file")).unwrap();
+    assert_eq!(backend.lookup_size_at_publication.load(Ordering::SeqCst), 3);
+    let mut observed = vec![0; grown.len()];
+    file.read_exact(&mut observed).unwrap();
+    assert_eq!(observed, grown);
+    assert_eq!(file.read(&mut [0; 1]).unwrap(), 0);
+}
+
+#[test]
+#[ignore = "requires Linux /dev/fuse and fusermount3"]
+fn dfs_buffered_new_open_cannot_reuse_an_old_inflight_read_result() {
+    for workers in [1, 2] {
+        assert_dfs_open_fences_inflight_read(workers);
+    }
+}
+
+#[test]
+#[ignore = "requires Linux /dev/fuse and fusermount3"]
+fn dfs_buffered_same_descriptor_reads_enter_backend_concurrently() {
+    let temp = tempfile::tempdir().unwrap();
+    let mount = temp.path().join("mnt");
+    std::fs::create_dir(&mount).unwrap();
+    let data = [vec![b'a'; 4096], vec![b'b'; 4096]].concat();
+    let backend = Arc::new(VersionedReadBackend::new("parallel", data));
+    let probe = Arc::new(ParallelReadProbe::default());
+    *backend.parallel_read_probe.lock().unwrap() = Some(probe.clone());
+    let _session = MountedTestBackend::mount_dfs_with_options(
+        backend,
+        mount.clone(),
+        fuse::FuseMountOptions {
+            fuse_workers: 2,
+            fuse_max_readahead_bytes: 0,
+            ..Default::default()
+        },
+    );
+    let file = Arc::new(std::fs::File::open(mount.join("file")).unwrap());
+    let start = Arc::new(std::sync::Barrier::new(3));
+    let mut reads = Vec::new();
+    for offset in [0, 4096] {
+        let file = file.clone();
+        let start = start.clone();
+        reads.push(std::thread::spawn(move || {
+            let mut bytes = vec![0; 4096];
+            start.wait();
+            let count = file.read_at(&mut bytes, offset)?;
+            io::Result::Ok((count, bytes))
+        }));
+    }
+    start.wait();
+    for (index, read) in reads.into_iter().enumerate() {
+        let (count, bytes) = read.join().unwrap().unwrap();
+        assert_eq!(count, 4096);
+        assert!(
+            bytes
+                .iter()
+                .all(|byte| *byte == if index == 0 { b'a' } else { b'b' })
+        );
+    }
+    assert!(
+        probe.peak.load(Ordering::SeqCst) >= 2,
+        "same fd READ callbacks remained serial despite kernel ASYNC_READ"
+    );
+}
+
+#[derive(Default)]
+struct ParallelReadProbe {
+    active: AtomicU64,
+    peak: AtomicU64,
+    arrived: Mutex<u64>,
+    changed: Condvar,
+}
+
+impl ParallelReadProbe {
+    fn enter(&self) -> ParallelReadGuard<'_> {
+        let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak.fetch_max(active, Ordering::SeqCst);
+        let mut arrived = self.arrived.lock().unwrap();
+        *arrived += 1;
+        self.changed.notify_all();
+        drop(
+            self.changed
+                .wait_timeout_while(arrived, Duration::from_millis(500), |value| *value < 2)
+                .unwrap(),
+        );
+        ParallelReadGuard(self)
+    }
+}
+
+struct ParallelReadGuard<'a>(&'a ParallelReadProbe);
+
+impl Drop for ParallelReadGuard<'_> {
+    fn drop(&mut self) {
+        self.0.active.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+fn assert_dfs_open_fences_inflight_read(workers: u16) {
+    let temp = tempfile::tempdir().unwrap();
+    let mount = temp.path().join("mnt");
+    std::fs::create_dir(&mount).unwrap();
+    let old = vec![b'o'; 65536];
+    let new = vec![b'n'; old.len()];
+    let backend = Arc::new(VersionedReadBackend::new("old-inflight", old.clone()));
+    let registry = afs_metrics::Registry::new();
+    let metrics = fuse::FuseRequestMetrics::register(&registry).unwrap();
+    let _session = MountedTestBackend {
+        mount: mount.clone(),
+        session: Some(
+            fuse::mount_dfs_with_metrics_and_options(
+                backend.clone(),
+                &mount,
+                metrics,
+                fuse::FuseMountOptions {
+                    fuse_workers: workers,
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        ),
+    };
+    wait_until_mounted(&mount).unwrap();
+    let path = mount.join("file");
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    *backend.read_blocker.lock().unwrap() = Some(WriteBlocker {
+        entered: entered_tx,
+        release: release_rx,
+    });
+    let first_path = path.clone();
+    let first = std::thread::spawn(move || {
+        let mut file = std::fs::File::open(first_path)?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        io::Result::Ok((file, bytes))
+    });
+    let read_entered = entered_rx.recv_timeout(Duration::from_secs(5));
+    backend.publish("new-inflight", new.clone());
+    let (opened_tx, opened_rx) = mpsc::channel();
+    let next_path = path.clone();
+    let next = std::thread::spawn(move || {
+        let mut file = std::fs::File::open(next_path)?;
+        let _ = opened_tx.send(());
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        io::Result::Ok(bytes)
+    });
+    // With one worker even the competing LOOKUP must queue behind the old
+    // READ. With two, require OPEN itself to reach the frontend before release.
+    // Neither case requires the backend OPEN to bypass a correct local fence.
+    let competing_operation = if workers == 1 { "lookup" } else { "open" };
+    let operation_label = format!("operation=\"{competing_operation}\"");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let new_open_received = loop {
+        let metrics = afs_metrics::encode_text(&registry).unwrap();
+        if metrics.lines().any(|line| {
+            line.starts_with("afs_fuse_callbacks_total{")
+                && line.contains("filesystem=\"dfs\"")
+                && line.contains(&operation_label)
+                && line
+                    .split_whitespace()
+                    .last()
+                    .unwrap()
+                    .parse::<u64>()
+                    .unwrap()
+                    >= 2
+        }) {
+            break true;
+        }
+        if std::time::Instant::now() >= deadline {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    // Give a non-barrier implementation the chance to reply before the old
+    // body is released. A correct barrier may keep this OPEN pending.
+    let _ = opened_rx.recv_timeout(Duration::from_millis(100));
+    let _ = release_tx.send(());
+    let first_result = first.join().unwrap();
+    let next_result = next.join().unwrap();
+    assert!(
+        read_entered.is_ok(),
+        "old READ did not reach its body barrier"
+    );
+    assert!(new_open_received, "competing open path did not enter FUSE");
+    // An existing descriptor is not promised a whole-file snapshot.
+    let (mut old_file, first_bytes) = first_result.unwrap();
+    assert_eq!(first_bytes.len(), old.len());
+    assert!(
+        next_result.unwrap() == new,
+        "new OPEN reused an old in-flight body"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), new);
+    old_file.rewind().unwrap();
+    let mut old_handle_after_open = vec![0; new.len()];
+    old_file.read_exact(&mut old_handle_after_open).unwrap();
+    assert!(
+        old_handle_after_open == new,
+        "an old descriptor restored obsolete pages after fresh open"
+    );
+}
+
+struct VersionedContent {
+    identity: PageCacheIdentity,
+    bytes: Vec<u8>,
+}
+
+struct VersionedReadState {
+    current: Arc<VersionedContent>,
+    next_open: Option<Arc<VersionedContent>>,
+    handles: HashMap<u64, Arc<VersionedContent>>,
+    next_handle: u64,
+}
+
+struct VersionedReadBackend {
+    state: Mutex<VersionedReadState>,
+    read_calls: AtomicU64,
+    last_lookup_size: AtomicU64,
+    lookup_size_at_publication: AtomicU64,
+    read_blocker: Mutex<Option<WriteBlocker>>,
+    parallel_read_probe: Mutex<Option<Arc<ParallelReadProbe>>>,
+}
+
+impl VersionedReadBackend {
+    fn content(version: &str, bytes: Vec<u8>) -> Arc<VersionedContent> {
+        Arc::new(VersionedContent {
+            identity: PageCacheIdentity {
+                version_id: Some(version.to_owned()),
+                length: bytes.len() as u64,
+            },
+            bytes,
+        })
+    }
+
+    fn new(version: &str, bytes: Vec<u8>) -> Self {
+        Self {
+            state: Mutex::new(VersionedReadState {
+                current: Self::content(version, bytes),
+                next_open: None,
+                handles: HashMap::new(),
+                next_handle: 1,
+            }),
+            read_calls: AtomicU64::new(0),
+            last_lookup_size: AtomicU64::new(u64::MAX),
+            lookup_size_at_publication: AtomicU64::new(u64::MAX),
+            read_blocker: Mutex::new(None),
+            parallel_read_probe: Mutex::new(None),
+        }
+    }
+
+    fn publish(&self, version: &str, bytes: Vec<u8>) {
+        self.state.lock().unwrap().current = Self::content(version, bytes);
+    }
+
+    fn publish_during_next_open(&self, version: &str, bytes: Vec<u8>) {
+        self.state.lock().unwrap().next_open = Some(Self::content(version, bytes));
+    }
+}
+
+impl Backend for VersionedReadBackend {
+    fn root_inode(&self) -> BackendInode {
+        backend_inode(1)
+    }
+
+    fn lookup(
+        &self,
+        _: &RequestContext,
+        parent: BackendInode,
+        name: &OsStr,
+    ) -> afs_error::Result<Entry> {
+        if parent.value != 1 || name != OsStr::new("file") {
+            return Err(not_found());
+        }
+        let size = self.state.lock().unwrap().current.identity.length;
+        self.last_lookup_size.store(size, Ordering::SeqCst);
+        Ok(Entry {
+            inode: backend_inode(2),
+            attributes: attributes(FileKind::Regular, size),
+        })
+    }
+
+    fn getattr(
+        &self,
+        _: &RequestContext,
+        inode: BackendInode,
+        handle: Option<FileHandle>,
+    ) -> afs_error::Result<FileAttributes> {
+        if inode.value == 1 {
+            return Ok(attributes(FileKind::Directory, 0));
+        }
+        if inode.value != 2 {
+            return Err(not_found());
+        }
+        let state = self.state.lock().unwrap();
+        let content = handle
+            .and_then(|handle| state.handles.get(&handle.0))
+            .unwrap_or(&state.current);
+        Ok(attributes(FileKind::Regular, content.identity.length))
+    }
+
+    fn open(
+        &self,
+        _: &RequestContext,
+        inode: BackendInode,
+        _: i32,
+    ) -> afs_error::Result<FileHandle> {
+        if inode.value != 2 {
+            return Err(not_found());
+        }
+        let mut state = self.state.lock().unwrap();
+        if let Some(next) = state.next_open.take() {
+            self.lookup_size_at_publication.store(
+                self.last_lookup_size.load(Ordering::SeqCst),
+                Ordering::SeqCst,
+            );
+            state.current = next;
+        }
+        let handle = state.next_handle;
+        state.next_handle += 1;
+        let current = state.current.clone();
+        // Native DFS fresh open invalidates existing handle views. Model the
+        // resulting next-read refresh, without pinning old descriptors forever.
+        // A READ that already captured its Arc still owns its prior version.
+        for opened in state.handles.values_mut() {
+            *opened = current.clone();
+        }
+        state.handles.insert(handle, current);
+        Ok(FileHandle(handle))
+    }
+
+    fn page_cache_identity(&self, handle: FileHandle) -> Option<PageCacheIdentity> {
+        self.state
+            .lock()
+            .unwrap()
+            .handles
+            .get(&handle.0)
+            .map(|content| content.identity.clone())
+    }
+
+    fn supports_parallel_reads(&self, handle: FileHandle) -> bool {
+        self.state.lock().unwrap().handles.contains_key(&handle.0)
+    }
+
+    fn read(
+        &self,
+        _: &RequestContext,
+        handle: FileHandle,
+        offset: u64,
+        out: &mut [u8],
+    ) -> afs_error::Result<usize> {
+        self.read_calls.fetch_add(1, Ordering::SeqCst);
+        let content = self
+            .state
+            .lock()
+            .unwrap()
+            .handles
+            .get(&handle.0)
+            .cloned()
+            .ok_or_else(not_found)?;
+        let probe = self.parallel_read_probe.lock().unwrap().clone();
+        let _active = probe.as_ref().map(|probe| probe.enter());
+        if let Some(blocker) = self.read_blocker.lock().unwrap().take() {
+            blocker.entered.send(()).unwrap();
+            blocker.release.recv().unwrap();
+        }
+        let start = usize::try_from(offset).unwrap().min(content.bytes.len());
+        let count = out.len().min(content.bytes.len() - start);
+        out[..count].copy_from_slice(&content.bytes[start..start + count]);
+        Ok(count)
+    }
+
+    fn flush(&self, _: &RequestContext, _: FileHandle) -> afs_error::Result<()> {
+        Ok(())
+    }
+
+    fn release(&self, _: &RequestContext, handle: FileHandle) -> afs_error::Result<()> {
+        self.state.lock().unwrap().handles.remove(&handle.0);
+        Ok(())
+    }
+
+    fn opendir(&self, _: &RequestContext, _: BackendInode) -> afs_error::Result<DirectoryHandle> {
+        Ok(DirectoryHandle(1))
+    }
+
+    fn readdir(
+        &self,
+        _: &RequestContext,
+        _: DirectoryHandle,
+        _: u64,
+        _: usize,
+    ) -> afs_error::Result<Vec<DirectoryEntry>> {
+        Ok(Vec::new())
+    }
+
+    fn releasedir(&self, _: &RequestContext, _: DirectoryHandle) -> afs_error::Result<()> {
+        Ok(())
     }
 }
 

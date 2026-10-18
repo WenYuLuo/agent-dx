@@ -222,6 +222,29 @@ pub struct Cli {
     pub ownerfs_workspace_egress_root: Option<PathBuf>,
     #[arg(long)]
     pub dfs_mount: Option<PathBuf>,
+    /// FUSE receive threads shared by OwnerFs and DFS (1..=64).
+    #[arg(long)]
+    pub fuse_threads: Option<u16>,
+    /// Clone the FUSE descriptor only when multiple receive threads are used.
+    #[arg(long)]
+    pub fuse_clone_fd: Option<bool>,
+    /// Bounded callback executor worker count (1..=1024).
+    #[arg(long)]
+    pub fuse_workers: Option<u16>,
+    /// Keep DFS kernel pages only across opens of the exact committed version.
+    #[arg(long)]
+    pub dfs_fuse_keep_cache: Option<bool>,
+    /// Zero preserves strict path freshness; positive values opt into relaxed caching.
+    #[arg(long)]
+    pub dfs_fuse_entry_ttl_ms: Option<u32>,
+    #[arg(long)]
+    pub dfs_fuse_attr_ttl_ms: Option<u32>,
+    /// Kernel read-ahead limit, independent of the DFS object prefetch budget.
+    #[arg(long)]
+    pub fuse_max_readahead_bytes: Option<u32>,
+    /// Maximum cached immutable DFS version/layout entries (1..=65536).
+    #[arg(long)]
+    pub dfs_version_cache_entries: Option<usize>,
     /// Filesystem-wide immutable DFS replica target count. Applied by Meta at initialization.
     #[arg(long)]
     pub dfs_desired_copies: Option<u16>,
@@ -289,6 +312,14 @@ struct FileConfig {
     ownerfs_workspace_bind: Option<WorkspaceBindConfig>,
     ownerfs_workspace_egress_root: Option<PathBuf>,
     dfs_mount: Option<PathBuf>,
+    fuse_threads: Option<u16>,
+    fuse_clone_fd: Option<bool>,
+    fuse_workers: Option<u16>,
+    dfs_fuse_keep_cache: Option<bool>,
+    dfs_fuse_entry_ttl_ms: Option<u32>,
+    dfs_fuse_attr_ttl_ms: Option<u32>,
+    fuse_max_readahead_bytes: Option<u32>,
+    dfs_version_cache_entries: Option<usize>,
     dfs_external_backend: Option<DfsExternalBackendConfig>,
     dfs_peer_cache: Option<DfsPeerCacheConfig>,
     dfs_write_buffer_idle_bytes: Option<u64>,
@@ -338,6 +369,14 @@ pub struct Config {
     pub ownerfs_workspace_bind: Option<WorkspaceBindConfig>,
     pub ownerfs_workspace_egress_root: Option<PathBuf>,
     pub dfs_mount: Option<PathBuf>,
+    pub fuse_threads: u16,
+    pub fuse_clone_fd: bool,
+    pub fuse_workers: u16,
+    pub dfs_fuse_keep_cache: bool,
+    pub dfs_fuse_entry_ttl_ms: u32,
+    pub dfs_fuse_attr_ttl_ms: u32,
+    pub fuse_max_readahead_bytes: u32,
+    pub dfs_version_cache_entries: usize,
     pub dfs_external_backend: Option<DfsExternalBackendConfig>,
     pub dfs_peer_cache: Option<DfsPeerCacheConfig>,
     /// Reusable idle write-body capacity only, not a live-body quota.
@@ -468,6 +507,37 @@ impl Config {
                 "DFS read budgets must be non-zero and source cache TTL must be <= 60000 ms",
             ));
         }
+        let fuse_threads = cli.fuse_threads.or(file.fuse_threads).unwrap_or(4);
+        let fuse_workers = cli.fuse_workers.or(file.fuse_workers).unwrap_or(32);
+        let dfs_fuse_entry_ttl_ms = cli
+            .dfs_fuse_entry_ttl_ms
+            .or(file.dfs_fuse_entry_ttl_ms)
+            .unwrap_or(0);
+        let dfs_fuse_attr_ttl_ms = cli
+            .dfs_fuse_attr_ttl_ms
+            .or(file.dfs_fuse_attr_ttl_ms)
+            .unwrap_or(0);
+        let fuse_max_readahead_bytes = cli
+            .fuse_max_readahead_bytes
+            .or(file.fuse_max_readahead_bytes)
+            .unwrap_or(1024 * 1024);
+        if !(1..=64).contains(&fuse_threads)
+            || !(1..=1024).contains(&fuse_workers)
+            || dfs_fuse_entry_ttl_ms > 60_000
+            || dfs_fuse_attr_ttl_ms > 60_000
+            || fuse_max_readahead_bytes > 16 * 1024 * 1024
+        {
+            return Err(invalid(
+                "FUSE threads must be 1..=64, workers 1..=1024, DFS TTLs <= 60000 ms and read-ahead <= 16 MiB",
+            ));
+        }
+        let dfs_version_cache_entries = cli
+            .dfs_version_cache_entries
+            .or(file.dfs_version_cache_entries)
+            .unwrap_or(4096);
+        if !(1..=65536).contains(&dfs_version_cache_entries) {
+            return Err(invalid("DFS version cache entries must be 1..=65536"));
+        }
         let cfg = Self {
             grpc_listen: cli.grpc_listen.or(file.grpc_listen).unwrap_or_else(|| {
                 ([127, 0, 0, 1], if role == Role::Meta { 7400 } else { 7500 }).into()
@@ -525,6 +595,17 @@ impl Config {
                 .ownerfs_workspace_egress_root
                 .or(file.ownerfs_workspace_egress_root),
             dfs_mount: cli.dfs_mount.or(file.dfs_mount),
+            fuse_threads,
+            fuse_clone_fd: cli.fuse_clone_fd.or(file.fuse_clone_fd).unwrap_or(true),
+            fuse_workers,
+            dfs_fuse_keep_cache: cli
+                .dfs_fuse_keep_cache
+                .or(file.dfs_fuse_keep_cache)
+                .unwrap_or(true),
+            dfs_fuse_entry_ttl_ms,
+            dfs_fuse_attr_ttl_ms,
+            fuse_max_readahead_bytes,
+            dfs_version_cache_entries,
             dfs_external_backend: file.dfs_external_backend,
             dfs_peer_cache: file.dfs_peer_cache,
             dfs_write_buffer_idle_bytes: file
