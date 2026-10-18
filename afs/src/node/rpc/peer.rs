@@ -843,6 +843,8 @@ pub struct PeerConnectionPool {
     security: afs_transport::SecurityManager,
     capacity: usize,
     state: tokio::sync::Mutex<PeerPoolState>,
+    #[cfg(feature = "dfs")]
+    stream_work: Arc<PeerStreamWorkPool>,
 }
 
 #[derive(Default)]
@@ -877,6 +879,8 @@ impl PeerConnectionPool {
             security,
             capacity,
             state: tokio::sync::Mutex::new(PeerPoolState::default()),
+            #[cfg(feature = "dfs")]
+            stream_work: Arc::new(PeerStreamWorkPool::default()),
             #[cfg(feature = "dfs")]
             read_work_metrics: None,
         })
@@ -946,6 +950,20 @@ impl PeerConnectionPool {
             owner_files,
         );
         let mut state = self.state.lock().await;
+        self.channel_locked(&mut state, &key, request_timeout)
+    }
+
+    // Both callers already hold the connection metadata lock. Stream admission
+    // also holds its own short lock, so channel creation cannot race active work.
+    fn channel_locked(
+        &self,
+        state: &mut PeerPoolState,
+        key: &PeerChannelKey,
+        request_timeout: bool,
+    ) -> afs_error::Result<Channel> {
+        let (node_id, node_epoch, endpoint, owner_files) = key;
+        let node_epoch = *node_epoch;
+        let owner_files = *owner_files;
         if state
             .high_water_epochs
             .get(node_id)
@@ -956,7 +974,7 @@ impl PeerConnectionPool {
                 "peer candidate has an older Node epoch than the connection pool",
             ));
         }
-        if request_timeout && let Some(entry) = state.channels.get_mut(&key) {
+        if request_timeout && let Some(entry) = state.channels.get_mut(key) {
             entry.touched = std::time::Instant::now();
             return Ok(entry.channel.clone());
         }
@@ -980,11 +998,93 @@ impl PeerConnectionPool {
         })?;
         let channel = endpoint.connect_lazy();
         if request_timeout {
-            self.publish_channel(&mut state, key, channel.clone());
+            self.publish_channel(state, key.clone(), channel.clone());
         } else {
-            self.publish_epoch(&mut state, node_id, node_epoch);
+            self.publish_epoch(state, node_id, node_epoch);
         }
         Ok(channel)
+    }
+
+    #[cfg(feature = "dfs")]
+    async fn acquire_stream_work(
+        &self,
+        node_id: &str,
+        node_epoch: u64,
+        endpoint: &str,
+    ) -> afs_error::Result<Arc<PeerStreamActive>> {
+        if node_id.is_empty()
+            || node_epoch == 0
+            || endpoint.is_empty()
+            || node_id.len().saturating_add(endpoint.len()) > STREAM_KEY_BYTES
+        {
+            return Err(dfs_protocol_error(
+                "Peer stream connection identity exceeds its bound",
+            ));
+        }
+        let key = (node_id.to_owned(), node_epoch, endpoint.to_owned(), false);
+        if key.0.capacity().saturating_add(key.2.capacity()) > STREAM_KEY_BYTES {
+            return Err(dfs_protocol_error(
+                "Peer stream connection key allocation exceeds its bound",
+            ));
+        }
+        loop {
+            // Register before checking admission, so the last drop cannot be lost.
+            let changed = self.stream_work.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            // Fence and select under the connection metadata lock. Never ask
+            // the LRU for a replacement while another Channel is active.
+            let mut channels = self.state.lock().await;
+            if channels
+                .high_water_epochs
+                .get(node_id)
+                .is_some_and(|epoch| node_epoch < *epoch)
+            {
+                return Err(afs_error::Error::coded(
+                    afs_error::NODE_TRANSFER_UNAVAILABLE,
+                    "peer candidate has an older Node epoch than the connection pool",
+                ));
+            }
+            {
+                let mut state = self
+                    .stream_work
+                    .state
+                    .lock()
+                    .map_err(|_| dfs_protocol_error("Peer stream admission lock poisoned"))?;
+                if state.active == 0 {
+                    let candidate = self.channel_locked(&mut channels, &key, true)?;
+                    let mut blocks = Vec::with_capacity(2);
+                    for _ in 0..2 {
+                        blocks.push(PeerStreamBlock::new(self.read_work_metrics.as_ref())?);
+                    }
+                    state.session = Some(Arc::new(PeerStreamSession {
+                        key: key.clone(),
+                        channel: candidate,
+                        blocks: std::sync::Mutex::new(blocks),
+                        available: tokio::sync::Notify::new(),
+                        controls: Arc::new(tokio::sync::Semaphore::new(STREAM_FRAME_BACKING_BYTES)),
+                        _work: std::sync::Mutex::new(
+                            self.read_work_metrics
+                                .as_ref()
+                                .map(|metrics| metrics.peer_stream_pipeline(0)),
+                        ),
+                    }));
+                }
+                if let Some(session) = &state.session
+                    && state.active < 2
+                    && session.key == key
+                {
+                    let session = session.clone();
+                    state.active += 1;
+                    return Ok(Arc::new(PeerStreamActive {
+                        pool: self.stream_work.clone(),
+                        session,
+                    }));
+                }
+            }
+            drop(channels);
+            changed.await;
+        }
     }
 
     fn publish_epoch(&self, state: &mut PeerPoolState, node_id: &str, node_epoch: u64) {
@@ -1146,18 +1246,24 @@ const STREAM_MESSAGE_BYTES: usize = 128 * 1024;
 const STREAM_DATA_BYTES: usize = 64 * 1024;
 #[cfg(feature = "dfs")]
 const STREAM_FRAME_BACKING_BYTES: usize = 256 * 1024;
+#[cfg(feature = "dfs")]
+const STREAM_KEY_BYTES: usize = 8 * 1024;
+#[cfg(feature = "dfs")]
+const STREAM_REQUEST_METADATA_BYTES: usize = 32 * 1024;
 
 #[cfg(feature = "dfs")]
 struct PeerStreamBlock {
     // Drop the actual allocation before retiring its accounting lease.
     bytes: Vec<u8>,
     offset: usize,
-    _work: Option<crate::node::read_work::PeerStreamFrameWork>,
+    // Two small accounting owners are allocated once per shared session,
+    // then move with the same blocks; handing off a block allocates nothing.
+    _work: Option<Box<crate::node::read_work::PeerStreamFrameWork>>,
 }
 
 #[cfg(feature = "dfs")]
 impl PeerStreamBlock {
-    fn new(metrics: Option<&ReadWorkMetrics>) -> afs_error::Result<Box<Self>> {
+    fn new(metrics: Option<&ReadWorkMetrics>) -> afs_error::Result<Self> {
         let bytes = Vec::with_capacity(STREAM_FRAME_BACKING_BYTES);
         if bytes.capacity() > STREAM_FRAME_BACKING_BYTES {
             return Err(dfs_protocol_error(
@@ -1166,13 +1272,149 @@ impl PeerStreamBlock {
         }
         let work = metrics.map(|metrics| {
             metrics.peer_read_event("stream_block_alloc");
-            metrics.peer_stream_frame(bytes.capacity())
+            Box::new(metrics.peer_stream_frame(bytes.capacity()))
         });
-        Ok(Box::new(Self {
+        Ok(Self {
             bytes,
             offset: 0,
             _work: work,
-        }))
+        })
+    }
+}
+
+// One Node owns the original two payload allocations and control allowance.
+// Active operations pin one exact Channel, even if the connection LRU evicts it.
+// Thus two streams share one <=2MiB connection window; a different connection
+// waits. Two bounded decoders add <=256KiB: 2MiB + 512KiB + 256KiB + 256KiB
+// plus <=256KiB bounded request/key/fixed metadata remains below the original
+// 4MiB transport envelope (private output/proof separate). A key owns <=8KiB;
+// each operation retains two <=32KiB request representations. The cache/pool
+// guards admit only two operations and one shared session.
+#[cfg(feature = "dfs")]
+#[derive(Default)]
+struct PeerStreamWorkPool {
+    state: std::sync::Mutex<PeerStreamWorkState>,
+    changed: tokio::sync::Notify,
+}
+#[cfg(feature = "dfs")]
+#[derive(Default)]
+struct PeerStreamWorkState {
+    active: usize,
+    session: Option<Arc<PeerStreamSession>>,
+}
+#[cfg(feature = "dfs")]
+struct PeerStreamSession {
+    key: PeerChannelKey,
+    channel: Channel,
+    blocks: std::sync::Mutex<Vec<PeerStreamBlock>>,
+    available: tokio::sync::Notify,
+    controls: Arc<tokio::sync::Semaphore>,
+    // Fields drop in order: all payload owners precede this shared observation.
+    _work: std::sync::Mutex<Option<crate::node::read_work::PeerCacheStreamWork>>,
+}
+#[cfg(feature = "dfs")]
+struct PeerStreamActive {
+    pool: Arc<PeerStreamWorkPool>,
+    session: Arc<PeerStreamSession>,
+}
+#[cfg(feature = "dfs")]
+impl PeerStreamActive {
+    async fn block(self: &Arc<Self>) -> afs_error::Result<PeerStreamBlockLease> {
+        loop {
+            let available = self.session.available.notified();
+            tokio::pin!(available);
+            available.as_mut().enable();
+            if let Some(block) = self
+                .session
+                .blocks
+                .lock()
+                .map_err(|_| dfs_protocol_error("Peer stream block lock poisoned"))?
+                .pop()
+            {
+                return Ok(PeerStreamBlockLease {
+                    block,
+                    active: self.clone(),
+                });
+            }
+            available.await;
+        }
+    }
+}
+#[cfg(feature = "dfs")]
+impl Drop for PeerStreamActive {
+    fn drop(&mut self) {
+        let retired = {
+            let mut state = self
+                .pool
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if state.active == 1 {
+                // Retire the actual allocations and observation before publishing
+                // zero. Waking another admission before our Arc fields drop could
+                // otherwise overlap the old two blocks with two new allocations.
+                self.session
+                    .blocks
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .clear();
+                drop(
+                    self.session
+                        ._work
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .take(),
+                );
+            }
+            state.active = state.active.saturating_sub(1);
+            if state.active == 0 {
+                state.session.take()
+            } else {
+                None
+            }
+        };
+        // Last operation/producer/frame drops before its ticket. Idle blocks are
+        // destroyed here, never kept as a permanent 512KiB Node allocation.
+        drop(retired);
+        self.pool.changed.notify_waiters();
+    }
+}
+#[cfg(feature = "dfs")]
+struct PeerStreamBlockLease {
+    block: PeerStreamBlock,
+    active: Arc<PeerStreamActive>,
+}
+#[cfg(feature = "dfs")]
+impl std::ops::Deref for PeerStreamBlockLease {
+    type Target = PeerStreamBlock;
+    fn deref(&self) -> &Self::Target {
+        &self.block
+    }
+}
+#[cfg(feature = "dfs")]
+impl std::ops::DerefMut for PeerStreamBlockLease {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.block
+    }
+}
+#[cfg(feature = "dfs")]
+impl Drop for PeerStreamBlockLease {
+    fn drop(&mut self) {
+        // Move the existing allocation/lease back without allocating a new body,
+        // including on producer cancellation, failed send and consumer errors.
+        let mut block = PeerStreamBlock {
+            bytes: std::mem::take(&mut self.block.bytes),
+            offset: 0,
+            _work: self.block._work.take(),
+        };
+        block.bytes.clear();
+        self.active
+            .session
+            .blocks
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(block);
+        self.active.session.available.notify_waiters();
     }
 }
 
@@ -1187,7 +1429,7 @@ struct OwnedPeerStreamControl {
 #[cfg(feature = "dfs")]
 enum OwnedPeerStreamMessage {
     Control(Box<OwnedPeerStreamControl>),
-    Block(Box<PeerStreamBlock>),
+    Block(PeerStreamBlockLease),
 }
 
 #[cfg(feature = "dfs")]
@@ -1475,7 +1717,7 @@ impl PeerRootProducer {
 
 #[cfg(feature = "dfs")]
 async fn send_peer_stream_block(
-    current: &mut Option<Box<PeerStreamBlock>>,
+    current: &mut Option<PeerStreamBlockLease>,
     sender: &tokio::sync::mpsc::Sender<afs_error::Result<OwnedPeerStreamMessage>>,
     metrics: Option<&ReadWorkMetrics>,
     root: &mut PeerRootProducer,
@@ -1505,7 +1747,7 @@ async fn send_peer_stream_block(
 #[cfg(feature = "dfs")]
 async fn send_peer_stream_control(
     mut frame: afs_protocol::node_data::DfsReadRangesFrame,
-    current: &mut Option<Box<PeerStreamBlock>>,
+    current: &mut Option<PeerStreamBlockLease>,
     sender: &tokio::sync::mpsc::Sender<afs_error::Result<OwnedPeerStreamMessage>>,
     controls: &Arc<tokio::sync::Semaphore>,
     metrics: Option<&ReadWorkMetrics>,
@@ -1732,12 +1974,37 @@ impl GrpcChunkTransfer {
         else {
             return Err(dfs_protocol_error("Peer stream source is not a Node"));
         };
-        let node_id = node_id.clone();
-        let node_epoch = *node_epoch;
         let endpoint = source
             .node_data_endpoint()
-            .ok_or_else(|| dfs_protocol_error("Peer stream source endpoint is missing"))?
-            .to_owned();
+            .ok_or_else(|| dfs_protocol_error("Peer stream source endpoint is missing"))?;
+        let grant = &source.read_grant;
+        let metadata = [
+            node_id.as_str(),
+            endpoint,
+            batch.file_version_id.0.as_str(),
+            batch.layout_root_id.0.as_str(),
+            chunk.id.0.as_str(),
+            source.copy_id.0.as_str(),
+            grant.namespace_id.0.as_str(),
+            grant.file_version_id.0.as_str(),
+            grant.layout_root_id.0.as_str(),
+            grant.caller_node_id.as_str(),
+            grant.caller_node_id.as_str(),
+            grant.token.as_str(),
+            node_id.as_str(),
+        ]
+        .iter()
+        .fold(0usize, |total, value| total.saturating_add(value.len()));
+        if metadata > STREAM_REQUEST_METADATA_BYTES / 2
+            || node_id.len().saturating_add(endpoint.len()) > STREAM_KEY_BYTES
+        {
+            // Unsupported before cloning metadata or issuing an RPC; the caller
+            // drains this sink and acquires the original exclusive legacy fill.
+            return Ok(None);
+        }
+        let node_id = node_id.clone();
+        let node_epoch = *node_epoch;
+        let endpoint = endpoint.to_owned();
         let sequence = self
             .next_read
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1760,6 +2027,23 @@ impl GrpcChunkTransfer {
                 grant: Some(wire_dfs_read_grant(&source.read_grant)),
             }],
         };
+        let op = &request.operations[0];
+        let request_capacity = request.read_id.capacity()
+            + request.attempt_id.capacity()
+            + request.file_version_id.capacity()
+            + request.layout_root_id.capacity()
+            + op.chunk_id.capacity()
+            + op.source_copy_id.capacity()
+            + op.grant.as_ref().map_or(0, |grant| {
+                grant.namespace_id.capacity()
+                    + grant.file_version_id.capacity()
+                    + grant.layout_root_id.capacity()
+                    + grant.caller_node_id.capacity()
+                    + grant.token.capacity()
+            });
+        if request_capacity > STREAM_REQUEST_METADATA_BYTES {
+            return Ok(None);
+        }
         let handle = match &self.runtime {
             PeerRuntime::Existing(handle) => handle.clone(),
             PeerRuntime::Owned(runtime) => runtime.handle().clone(),
@@ -1771,15 +2055,26 @@ impl GrpcChunkTransfer {
         // Capture tracing metadata on the caller before crossing the task boundary.
         let mut producer_request = request_with_current_context(request.clone());
         producer_request.set_timeout(timeout);
-        // Exactly two reusable payload owners across producer, queue and consumer.
-        // All queued control fields share a separate 256KiB allowance. The current
-        // decoded wire message stays within the existing decoder reservation.
-        let controls = Arc::new(tokio::sync::Semaphore::new(STREAM_FRAME_BACKING_BYTES));
-        let (returned, mut available) = tokio::sync::mpsc::channel::<Box<PeerStreamBlock>>(2);
-        for _ in 0..2 {
-            returned
-                .try_send(PeerStreamBlock::new(self.peers.read_work_metrics.as_ref())?)
-                .map_err(|_| dfs_protocol_error("Peer stream block pool initialization failed"))?;
+        // Acquire before spawning, and retain through producer join and all
+        // queued/consumer blocks. Every block also pins this operation ticket.
+        let active = self.runtime.block_on(async {
+            tokio::time::timeout_at(
+                tokio::time::Instant::from_std(deadline),
+                self.peers
+                    .acquire_stream_work(&node_id, node_epoch, &endpoint),
+            )
+            .await
+            .map_err(|_| {
+                afs_error::Error::coded(
+                    afs_error::CLIENT_DEADLINE_EXCEEDED,
+                    "Peer stream admission deadline exceeded",
+                )
+            })?
+        })?;
+        let controls = active.session.controls.clone();
+        let producer_active = active.clone();
+        if let Some(metrics) = &self.peers.read_work_metrics {
+            metrics.peer_stream_private_output(out.len());
         }
         let (sender, mut receiver) =
             tokio::sync::mpsc::channel::<afs_error::Result<OwnedPeerStreamMessage>>(1);
@@ -1802,8 +2097,7 @@ impl GrpcChunkTransfer {
         let producer = handle.spawn(async move {
             let result: afs_error::Result<PeerRootReceipt> =
                 tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
-                    let channel = peers.channel(&node_id, node_epoch, &endpoint).await?;
-                    let mut client = DfsChunksClient::new(channel)
+                    let mut client = DfsChunksClient::new(producer_active.session.channel.clone())
                         .max_encoding_message_size(peers.config.max_encoding_message_bytes)
                         .max_decoding_message_size(
                             peers
@@ -1827,7 +2121,7 @@ impl GrpcChunkTransfer {
                         deadline,
                     )
                     .with_outboard_context(producer_chunk, producer_proof_budget);
-                    let mut current: Option<Box<PeerStreamBlock>> = None;
+                    let mut current: Option<PeerStreamBlockLease> = None;
                     let mut received_bytes = 0usize;
                     while let Some(frame) = stream.next().await {
                         let frame =
@@ -1910,9 +2204,7 @@ impl GrpcChunkTransfer {
                                         peers.read_work_metrics.as_ref().and_then(|metrics| {
                                             metrics.coarse_diagnostic("peer_block_wait", 0)
                                         });
-                                    let mut block = available.recv().await.ok_or_else(|| {
-                                        dfs_protocol_error("Peer stream block admission stopped")
-                                    })?;
+                                    let mut block = producer_active.block().await?;
                                     drop(wait);
                                     block.bytes.clear();
                                     block.offset = received_bytes;
@@ -2052,23 +2344,14 @@ impl GrpcChunkTransfer {
                             diagnostic.consumer(start);
                         }
                         result?;
-                        // Only two owners exist, so returning one cannot fill a live
-                        // pool. Closed means the producer has already drained/ended.
-                        match returned.try_send(block) {
-                            Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
-                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                                return Err(dfs_protocol_error(
-                                    "Peer stream block pool ownership mismatch",
-                                ));
-                            }
-                        }
+                        // RAII returns the shared block on success and every error.
+                        drop(block);
                     }
                 }
             }
             Ok(decoder)
         })();
         drop(receiver);
-        drop(returned);
         if received.is_err() {
             producer.abort();
         }
@@ -8748,6 +9031,133 @@ mod tests {
                 assert_eq!(error.code(), afs_error::CLIENT_PROTOCOL_VIOLATION);
             }
         }
+    }
+
+    #[cfg(feature = "dfs")]
+    #[tokio::test]
+    async fn peer_stream_shared_work_pins_one_channel_and_drains_after_last_block() {
+        let registry = afs_metrics::Registry::new();
+        let metrics = ReadWorkMetrics::register(&registry).unwrap();
+        let pool = PeerConnectionPool::new(
+            afs_transport::GrpcConfig::default(),
+            afs_transport::TlsConfig::Disabled,
+            1,
+        )
+        .unwrap()
+        .with_read_work_metrics(metrics.clone());
+        let endpoint = "http://127.0.0.1:9";
+        let first = pool.acquire_stream_work("a", 1, endpoint).await.unwrap();
+        let second = pool.acquire_stream_work("a", 1, endpoint).await.unwrap();
+        assert!(Arc::ptr_eq(&first.session, &second.session));
+        assert_eq!(first.session.blocks.lock().unwrap().len(), 2);
+        let gauge = |name: &str| {
+            let families = registry.gather();
+            families
+                .iter()
+                .find(|family| family.name() == name)
+                .unwrap()
+                .get_metric()[0]
+                .get_gauge()
+                .get_value()
+        };
+        assert_eq!(
+            gauge("afs_dfs_peer_disk_cache_stream_reserved_bytes"),
+            (4 * 1024 * 1024) as f64
+        );
+        assert_eq!(
+            gauge("afs_dfs_peer_disk_cache_stream_frame_bytes"),
+            (2 * STREAM_FRAME_BACKING_BYTES) as f64
+        );
+        assert_eq!(
+            first.session.controls.available_permits(),
+            STREAM_FRAME_BACKING_BYTES
+        );
+        metrics.peer_stream_private_output(32 * 1024);
+        assert_eq!(
+            gauge("afs_dfs_peer_disk_cache_stream_reserved_bytes"),
+            (4 * 1024 * 1024) as f64
+        );
+        assert!(
+            pool.acquire_stream_work(&"a".repeat(STREAM_KEY_BYTES + 1), 1, endpoint)
+                .await
+                .is_err()
+        );
+        let controls = first
+            .session
+            .controls
+            .clone()
+            .acquire_many_owned(u32::try_from(STREAM_FRAME_BACKING_BYTES).unwrap())
+            .await
+            .unwrap();
+        assert!(second.session.controls.clone().try_acquire_owned().is_err());
+        drop(controls);
+        let wait = Duration::from_millis(30);
+        assert!(
+            tokio::time::timeout(wait, pool.acquire_stream_work("a", 1, endpoint))
+                .await
+                .is_err()
+        );
+        // Even LRU eviction must not let a same-key replacement Channel enter
+        // while the old connection still has active streams.
+        pool.channel("b", 1, endpoint).await.unwrap();
+        assert!(
+            tokio::time::timeout(wait, pool.acquire_stream_work("b", 1, endpoint))
+                .await
+                .is_err()
+        );
+        let first_block = first.block().await.unwrap();
+        let second_block = second.block().await.unwrap();
+        assert_eq!(first.session.blocks.lock().unwrap().len(), 0);
+        let waiting = tokio::spawn({
+            let first = first.clone();
+            async move { first.block().await }
+        });
+        tokio::task::yield_now().await;
+        waiting.abort();
+        assert!(waiting.await.is_err());
+        let retired_session = first.session.clone();
+        drop(first);
+        drop(second);
+        assert_eq!(
+            pool.stream_work.state.lock().unwrap().active,
+            2,
+            "consumer-held blocks retain both operation tickets"
+        );
+        drop(first_block);
+        assert_eq!(pool.stream_work.state.lock().unwrap().active, 1);
+        drop(second_block);
+        {
+            let state = pool.stream_work.state.lock().unwrap();
+            assert_eq!(state.active, 0);
+            assert!(
+                state.session.is_none(),
+                "idle body allocations must be destroyed"
+            );
+        }
+        assert!(
+            retired_session.blocks.lock().unwrap().is_empty(),
+            "actual buffers retire before zero admission, even while the session Arc is retained"
+        );
+        assert!(retired_session._work.lock().unwrap().is_none());
+        for name in [
+            "afs_dfs_peer_disk_cache_stream_frame_bytes",
+            "afs_dfs_peer_disk_cache_stream_reserved_bytes",
+        ] {
+            let families = registry.gather();
+            let family = families
+                .iter()
+                .find(|family| family.name() == name)
+                .unwrap();
+            assert_eq!(
+                family.get_metric()[0].get_gauge().get_value(),
+                0.0,
+                "{name}"
+            );
+        }
+        let next = pool.acquire_stream_work("b", 1, endpoint).await.unwrap();
+        assert_eq!(next.session.blocks.lock().unwrap().len(), 2);
+        drop(next);
+        assert!(pool.stream_work.state.lock().unwrap().session.is_none());
     }
 
     #[cfg(feature = "ownerfs")]

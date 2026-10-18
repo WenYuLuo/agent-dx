@@ -196,8 +196,11 @@ B的`dfs_peer_cache`默认OFF，只存可丢弃磁盘副本，不写入LocalChun
 
 同对象miss通过有界FillFlight共享填充工作，flight只持有控制信息和结果，不持有正文或
 授权成功结论。默认最多8个metadata flight，可用`dfs_fetch_max_inflight_objects`设为1..=8；
-这不表示8路正文填充。原生Peer仍只有一个active fill，共享原4MiB逻辑额度；两个256KiB
-载荷块与legacy完整对象回退互斥，独立hit可与fill并行，不借用S3 pending额度。
+这不表示8路正文填充。原生Peer最多两个stream fill共享原4MiB transport包络：
+整个Node只有两个256KiB载荷块、一份256KiB控制额度及一个活动Channel，其他连接身份
+等待当前会话排空；legacy完整对象回退与stream fill互斥。独立hit可与fill并行，
+不借用S3 pending额度。逐代pending文件分别保留身份、磁盘及元数据收费，失败删除
+不提前退账；最后一个活动持有者释放后销毁共享载荷块，不形成正文RAM缓存。
 每个等待者检查自己的授权与期限；提交前已知拒绝不安装Ready。leader个体权限失效不
 撤销其他合法请求，缓存错误仍安全回源，真实Peer／授权错误正常传播。正常停止先关闭
 准入、唤醒等待者再排空实际持有者，保留健康磁盘条目供恢复；不能把停止成功等同于

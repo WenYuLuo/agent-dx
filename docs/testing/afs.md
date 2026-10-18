@@ -457,8 +457,13 @@ proof与资源gauge在同一短表锁内发布，操作hash／read／copy统计�
 `fill_stage_thread_cpu_nanoseconds_total`及对应observations只含同步consumer线程，
 不含远端、producer及h2／TLS后台线程；wall减threadCPU不能命名成网络／磁盘等待。
 
-原`stream_reserved_bytes`／`stream_reserved_peak_bytes`继续观察4MiB流式额度，
-`stream_private_peak_bytes`另含私有输出；`stream_frame_bytes`／`stream_frame_peak_bytes`
+并发回填以确定性屏障验证两个不同对象可同时进入独立pending、同对象只填充一次、
+legacy独占、超限及取消不泄漏。实际RPC回归检查活动流固定复用同一Channel、两个块
+总capacity为512KiB、控制额度为256KiB；连接LRU淘汰不能另开活动会话。最后块仍被持有
+时reservation不能归零；最后释放后旧会话即使还有测试引用也不能保留载荷分配。
+原`stream_reserved_bytes`／`stream_reserved_peak_bytes`按共享会话观察一次4MiB流式额度，
+不按并发请求重复增加；`stream_private_peak_bytes`为单操作私有输出加包络的峰值观察，
+不是Node并发输出总量或RSS上限。`stream_frame_bytes`／`stream_frame_peak_bytes`
 只观察两个块的真实capacity，归还池仍占账，最后owner销毁才释放。控制余量与transport
 分别核算，指标不执行准入。旧完整Vec的fill_bytes与流式reservation互斥，不合并为同次峰值。
 `peer_frame_to_block`是帧到块复制，`fill_to_output`是请求区间提取；没有完整Vec不等于零复制。

@@ -731,7 +731,7 @@ impl ReadWorkMetrics {
         }
     }
 
-    /// Observation of the existing serialized fill allowance, never admission.
+    /// Observation owned once by the shared stream session, never admission.
     #[cfg(any(feature = "dfs", test))]
     pub(crate) fn peer_stream_pipeline(&self, output: usize) -> PeerCacheStreamWork {
         const RESERVED: i64 = 4 * 1024 * 1024;
@@ -741,14 +741,21 @@ impl ReadWorkMetrics {
                 .get()
                 .max(self.stream_reserved_bytes.get()),
         );
-        let total = i64::try_from(output)
-            .unwrap_or(i64::MAX)
-            .saturating_add(RESERVED);
-        self.stream_private_peak_bytes
-            .set(self.stream_private_peak_bytes.get().max(total));
+        self.peer_stream_private_output(output);
         PeerCacheStreamWork {
             metrics: self.clone(),
         }
+    }
+
+    /// Per-operation output peak; only the shared stream session owns the
+    /// conservative reservation. Concurrent outputs are not a Node RSS bound.
+    #[cfg(any(feature = "dfs", test))]
+    pub(crate) fn peer_stream_private_output(&self, output: usize) {
+        let total = i64::try_from(output)
+            .unwrap_or(i64::MAX)
+            .saturating_add(4 * 1024 * 1024);
+        self.stream_private_peak_bytes
+            .set(self.stream_private_peak_bytes.get().max(total));
     }
 
     /// Fixed payload owners and control permits enforce bounds; this guard follows ownership.
@@ -2315,6 +2322,14 @@ mod tests {
         assert_eq!(same.stream_frame_peak_bytes.get(), 196608);
         assert_eq!(same.stream_reserved_bytes.get(), 4 * 1024 * 1024);
         assert_eq!(same.stream_private_peak_bytes.get(), 5 * 1024 * 1024);
+        metrics.peer_stream_private_output(4 * 1024 * 1024);
+        same.peer_stream_private_output(2 * 1024 * 1024);
+        assert_eq!(
+            same.stream_reserved_bytes.get(),
+            4 * 1024 * 1024,
+            "per-request private observations cannot duplicate the shared reservation"
+        );
+        assert_eq!(same.stream_private_peak_bytes.get(), 8 * 1024 * 1024);
         assert_eq!(same.disk_cache_fill_bytes.get(), 0);
         std::thread::spawn(move || drop(queued)).join().unwrap();
         assert_eq!(same.stream_frame_bytes.get(), 65536);

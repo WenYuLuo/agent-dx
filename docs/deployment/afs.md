@@ -274,18 +274,19 @@ Bao outboard trailer。ready与pending实际分配受磁盘容量限制，目录
 Node，再按专属缓存目录的清理合同退休可丢弃条目，或配置新的空缓存目录／禁用可选缓存。
 此操作仅针对B的可再生缓存，不得清理A的持久副本、catalog或Meta数据。
 
-`dfs_fetch_max_inflight_objects`默认8，范围1..=8，可由CLI覆盖TOML；仅限制原生Peer
-磁盘缓存的metadata flights，不适用于S3，也不是正文并发数。一个active fill仍共用原
-4MiB逻辑额度；不同缓存hit与fill可并行，冷对象之间仍受该单fill限制。这个4MiB
-是准入和观测的保守包络，不是常驻正文内存或Node RSS上限。流式分支的两个256KiB
-载荷块、解码／控制帧和私有输出须按各自所有权分别核算，不能把它们重复相加为
-额外可用额度；legacy完整对象缓冲受同一fill许可约束，单批仍校验原读取预算。
+`dfs_fetch_max_inflight_objects`默认8，范围1..=8，可由CLI覆盖TOML；限制原生Peer
+磁盘缓存的metadata flights，不适用于S3，也不代表8路正文。当前最多两个流式fill
+共享原4MiB逻辑transport包络；legacy完整对象fill保持独占，不与流式fill并存。
+Node总共只有两个256KiB载荷块、256KiB控制额度；两个流固定复用同一Channel，
+其connection/stream窗口仍不超过2MiB，解码消息仍限128KiB。不同连接身份等旧会话
+真实排空，不能每流再申请两块缓冲或另开一个连接窗口。私有结果按原每操作读取预算
+另计，4MiB不是Node总RSS上限；proof沿用原账本，不新增额度。
 
-原生回填只有一个固定pending路径和一份文件身份／磁盘预留；ready和pending实际
-分配共同受`capacity_bytes`约束。外部S3缓存示例的`pending_bytes = 37748736`
-（36MiB）仅属于外部缓存，不是原生Peer已有额度，不能用来开启多对象并发回填。
-后续若支持并发回填或预读，须先明确原生总字节准入、逐flight临时文件及身份、
-私有输出和在途帧的实际capacity与最后引用退账；当前不新增配置、额度或多fill能力。
+每次回填有独立代际pending路径、文件身份、元数据和磁盘预留；ready、retired与pending
+实际分配共同受`capacity_bytes`约束。失败删除或外来替换继续收费，不触碰其他活动文件。
+最后一个生产者、块或请求释放后才销毁共享缓冲、退还观测reservation；空闲会话不常驻
+512KiB正文。外部S3的`pending_bytes = 37748736`仍只属于外部缓存，不可转用。
+这里只实现有界并发回填底座，尚不表示自适应预读或完整R-7已验收。
 
 表内indexed、retired与删除中条目合计最多4096，实际文件删除前磁盘占用不退还；被pin的退休条目
 也占容量，同key不能在旧文件仍被使用时重建。容量或控制元数据不足保留安全回退。

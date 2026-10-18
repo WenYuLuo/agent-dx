@@ -3333,8 +3333,18 @@ impl DfsReadEngine {
             }
         };
         let result = (|| {
-            operation
-                .acquire_fill(|| self.check_peer_cache_authority(batch, source, &authority))?;
+            let mut use_stream = self.transfer.supports_verified_object_sink()
+                && (crate::node::chunk::MAX_STAGED_CHUNK_BYTES as u64)
+                    .checked_add(out.len() as u64)
+                    .is_some_and(|bytes| bytes <= self.config.max_inflight_bytes);
+            if use_stream {
+                operation.acquire_stream_fill(|| {
+                    self.check_peer_cache_authority(batch, source, &authority)
+                })?;
+            } else {
+                operation
+                    .acquire_fill(|| self.check_peer_cache_authority(batch, source, &authority))?;
+            }
             // A completed earlier fill may have become Ready while this leader
             // waited for the global body allowance. Recheck before any allocation.
             #[cfg(test)]
@@ -3369,10 +3379,6 @@ impl DfsReadEngine {
             // Only an unsupported streaming adapter allocates the legacy body.
             // After that decision, retries keep the old mechanism rather than hold
             // a full Vec alongside a new streaming pipeline reservation.
-            let mut use_stream = self.transfer.supports_verified_object_sink()
-                && (crate::node::chunk::MAX_STAGED_CHUNK_BYTES as u64)
-                    .checked_add(out.len() as u64)
-                    .is_some_and(|bytes| bytes <= self.config.max_inflight_bytes);
             let mut _legacy_fill_work = None;
             let mut body = Vec::new();
             let version = batch
@@ -3408,10 +3414,8 @@ impl DfsReadEngine {
                     }],
                 };
                 if use_stream {
-                    // Declare the allowance first: a failed or cancelled transfer
-                    // must drain its producer and release sink/proof/frame owners
-                    // before the conservative pipeline reservation is returned.
-                    let _stream_work = self.local.peer_disk_cache_stream_work(out.len());
+                    // The adapter's Node-shared session owns transport work until
+                    // its producers and every handed-off frame have drained.
                     let mut sink = operation.begin_stream(chunk)?;
                     let output_pointer = out[start..end].as_ptr() as usize;
                     let output_length = end - start;
@@ -3502,6 +3506,13 @@ impl DfsReadEngine {
                 // The unsupported sink and its pipeline allowance have dropped
                 // before the original complete-object Vec is admitted.
                 if body.is_empty() {
+                    // The streaming adapter and sink have drained before changing
+                    // admission modes. Legacy owns the original exclusive body
+                    // permit, so its full Vec never coexists with another stream.
+                    operation.release_fill();
+                    operation.acquire_fill(|| {
+                        self.check_peer_cache_authority(batch, source, &authority)
+                    })?;
                     _legacy_fill_work = self.local.peer_disk_cache_fill_work(length, out.len());
                     body.resize(length, 0);
                 }

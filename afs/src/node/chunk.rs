@@ -2879,16 +2879,6 @@ impl LocalChunkStore {
     }
 
     #[cfg(feature = "dfs")]
-    pub(crate) fn peer_disk_cache_stream_work(
-        &self,
-        output: usize,
-    ) -> Option<super::read_work::PeerCacheStreamWork> {
-        self.read_work
-            .as_ref()
-            .map(|metrics| metrics.peer_stream_pipeline(output))
-    }
-
-    #[cfg(feature = "dfs")]
     pub(crate) fn record_source_cache_resources(
         &self,
         entries: usize,

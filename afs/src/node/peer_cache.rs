@@ -1,6 +1,6 @@
 //! Disposable native Peer object cache, never replicas or read authority.
 //!
-//! One explicit fill allowance admits a bounded stream or complete-object fill.
+//! Two streaming fills share Node transport work; a legacy body is exclusive.
 //! Metadata locks never cover runtime disk I/O, verification or Peer waits.
 //! Ready bodies live only on disk. Hits verify complete requested 32 KiB coverage
 //! groups against the trusted standard BLAKE3 root. Changed identity requires a root scan.
@@ -204,6 +204,7 @@ pub struct PeerStreamSink<'a> {
     header_length: u64,
     file: Option<File>,
     pending_identity: Option<(u64, u64)>,
+    pending_generation: u64,
     owns_pending: bool,
     committed: bool,
     prepare_error: Option<Error>,
@@ -243,13 +244,7 @@ impl PeerStreamSink<'_> {
 
     fn prepare(&mut self) -> Result<()> {
         self.cache.check_root()?;
-        let (pending_charge, identity) = {
-            let state = self.cache.lock_state()?;
-            (state.pending_charge, state.pending_identity)
-        };
-        if pending_charge != 0 {
-            self.cache.clear_pending(identity)?;
-        }
+        self.cache.cleanup_pending()?;
         self.header_length = MAX_HEADER_BYTES as u64;
         let unit = self
             .cache
@@ -270,8 +265,13 @@ impl PeerStreamSink<'_> {
         if self.entry_lease.is_none() {
             return Ok(());
         }
-        self.cache.lock_state()?.pending_metadata_charge = metadata_charge;
-        if !self.cache.reserve_pending(&self.key, reservation)? {
+        if !self.cache.reserve_pending(
+            &self.key,
+            self.pending_generation,
+            reservation,
+            metadata_charge,
+            &mut self.entry_lease,
+        )? {
             return Ok(());
         }
         let opened = OpenOptions::new()
@@ -279,14 +279,13 @@ impl PeerStreamSink<'_> {
             .create_new(true)
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(self.cache.directory().join(PENDING));
+            .open(self.cache.pending_path(self.pending_generation));
         let file = match opened {
             Ok(file) => file,
             Err(error) => {
                 // No file was created by this attempt; retain any foreign file.
                 let mut state = self.cache.lock_state()?;
-                state.used_bytes = state.used_bytes.saturating_sub(state.pending_charge);
-                state.pending_charge = 0;
+                remove_pending_charge(&mut state, self.pending_generation);
                 return Err(Error::from(error));
             }
         };
@@ -302,7 +301,14 @@ impl PeerStreamSink<'_> {
             .ok_or_else(|| unavailable("Peer stream file was not opened"))?;
         let metadata = file.metadata().map_err(Error::from)?;
         self.pending_identity = Some((metadata.dev(), metadata.ino()));
-        self.cache.lock_state()?.pending_identity = self.pending_identity;
+        if let Some(pending) = self
+            .cache
+            .lock_state()?
+            .pending
+            .get_mut(&self.pending_generation)
+        {
+            pending.identity = self.pending_identity;
+        }
         write_header(
             file,
             &Header {
@@ -316,12 +322,14 @@ impl PeerStreamSink<'_> {
     }
 
     fn abort_pending(&mut self) -> Result<()> {
-        drop(self.file.take());
+        // Pin the inode until identity checking and unlink finish, so close
+        // cannot open an inode-reuse gap while deciding which path is owned.
+        let _file = self.file.take();
         if !self.owns_pending {
             return Ok(());
         }
         self.cache.check_root()?;
-        match fs::symlink_metadata(self.cache.directory().join(PENDING)) {
+        match fs::symlink_metadata(self.cache.pending_path(self.pending_generation)) {
             Ok(metadata) if Some((metadata.dev(), metadata.ino())) == self.pending_identity => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             _ => {
@@ -330,7 +338,8 @@ impl PeerStreamSink<'_> {
                 ));
             }
         }
-        self.cache.clear_pending(self.pending_identity)?;
+        self.cache
+            .clear_pending(self.pending_generation, self.pending_identity)?;
         self.owns_pending = false;
         Ok(())
     }
@@ -417,8 +426,8 @@ impl PeerStreamSink<'_> {
             let metadata = file.metadata().map_err(Error::from)?;
             validate_private_file(&metadata)?;
             self.cache.check_root()?;
-            let current =
-                fs::symlink_metadata(self.cache.directory().join(PENDING)).map_err(Error::from)?;
+            let current = fs::symlink_metadata(self.cache.pending_path(self.pending_generation))
+                .map_err(Error::from)?;
             if metadata.len()
                 != self.header_length
                     + self.chunk.length
@@ -433,7 +442,10 @@ impl PeerStreamSink<'_> {
                 ));
             }
             let charge = allocated(&metadata)?;
-            if self.cache.account_pending_growth(charge)? {
+            if self
+                .cache
+                .account_pending_growth(self.pending_generation, charge)?
+            {
                 return Err(unavailable(
                     "Peer stream allocation exceeds reservation before seal",
                 ));
@@ -471,8 +483,8 @@ impl PeerStreamSink<'_> {
         self.cache.check_root()?;
         let metadata = file.metadata().map_err(Error::from)?;
         validate_private_file(&metadata)?;
-        let current =
-            fs::symlink_metadata(self.cache.directory().join(PENDING)).map_err(Error::from)?;
+        let current = fs::symlink_metadata(self.cache.pending_path(self.pending_generation))
+            .map_err(Error::from)?;
         if completed.file_identity != Some(file_identity(&metadata))
             || file_identity(&metadata) != file_identity(&current)
         {
@@ -481,7 +493,10 @@ impl PeerStreamSink<'_> {
             ));
         }
         let charge = allocated(&metadata)?;
-        if self.cache.account_pending_growth(charge)? {
+        if self
+            .cache
+            .account_pending_growth(self.pending_generation, charge)?
+        {
             return Err(unavailable(
                 "Peer stream allocation exceeds reserved blocks",
             ));
@@ -492,7 +507,7 @@ impl PeerStreamSink<'_> {
             Err(error) => return Err(Error::from(error)),
         }
         fs::rename(
-            self.cache.directory().join(PENDING),
+            self.cache.pending_path(self.pending_generation),
             self.cache.path(&self.key),
         )
         .map_err(Error::from)?;
@@ -503,7 +518,7 @@ impl PeerStreamSink<'_> {
             .ok()
             .map(|metadata| file_identity(&metadata));
         self.cache.publish_entry(
-            self.key.clone(),
+            (self.pending_generation, self.key.clone()),
             self.chunk.clone(),
             charge,
             published.unwrap_or_else(|| file_identity(&metadata)),
@@ -526,8 +541,10 @@ impl Drop for PeerStreamSink<'_> {
             afs_logging::warn!("dfs.peer_stream_drop_cleanup_failed"; "error" => error.to_string());
         }
         drop(self.entry_lease.take());
-        if let Ok(mut state) = self.cache.state.lock() {
-            state.pending_metadata_charge = 0;
+        if let Ok(mut state) = self.cache.state.lock()
+            && let Some(pending) = state.pending.get_mut(&self.pending_generation)
+        {
+            pending.active = false;
         }
         self.cache.report_resources();
     }
@@ -610,6 +627,9 @@ struct CacheState {
     entries: BTreeMap<String, Entry>,
     retired: BTreeMap<String, RetiredEntry>,
     fill_active: bool,
+    stream_active: usize,
+    next_pending_generation: u64,
+    pending: BTreeMap<u64, PendingEntry>,
     operations: usize,
     flights: BTreeMap<String, Arc<FillFlight>>,
     flight_live: usize,
@@ -620,7 +640,6 @@ struct CacheState {
     index_lease: Option<OutboardLease>,
     used_bytes: u64,
     pending_charge: u64,
-    pending_identity: Option<(u64, u64)>,
     pending_metadata_charge: usize,
     operation_metadata_bytes: usize,
     entry_metadata_bytes: usize,
@@ -694,6 +713,26 @@ struct EntryPin<'a> {
 
 struct FillPermit<'a> {
     cache: &'a DiskPeerCache,
+    streaming: bool,
+}
+
+#[derive(Debug)]
+struct PendingEntry {
+    charge: u64,
+    identity: Option<(u64, u64)>,
+    active: bool,
+    metadata_charge: usize,
+    _metadata: Option<OutboardLease>,
+}
+
+fn remove_pending_charge(state: &mut CacheState, generation: u64) -> Option<PendingEntry> {
+    let pending = state.pending.remove(&generation)?;
+    state.used_bytes = state.used_bytes.saturating_sub(pending.charge);
+    state.pending_charge = state.pending_charge.saturating_sub(pending.charge);
+    state.pending_metadata_charge = state
+        .pending_metadata_charge
+        .saturating_sub(pending.metadata_charge);
+    Some(pending)
 }
 
 #[derive(Clone, Debug)]
@@ -736,6 +775,9 @@ impl CacheState {
             entries: BTreeMap::new(),
             retired: BTreeMap::new(),
             fill_active: false,
+            stream_active: 0,
+            next_pending_generation: 1,
+            pending: BTreeMap::new(),
             operations: 0,
             flights: BTreeMap::new(),
             flight_live: 0,
@@ -744,7 +786,6 @@ impl CacheState {
             index_lease: None,
             used_bytes: 0,
             pending_charge: 0,
-            pending_identity: None,
             pending_metadata_charge: 0,
             operation_metadata_bytes: 0,
             entry_metadata_bytes: 0,
@@ -775,6 +816,9 @@ impl CacheState {
             entries: BTreeMap::new(),
             retired: BTreeMap::new(),
             fill_active: false,
+            stream_active: 0,
+            next_pending_generation: 1,
+            pending: BTreeMap::new(),
             operations: 0,
             flights: BTreeMap::new(),
             flight_live: 0,
@@ -782,7 +826,6 @@ impl CacheState {
             local_index_available: false,
             used_bytes: 0,
             pending_charge: 0,
-            pending_identity: None,
             pending_metadata_charge: 0,
             operation_metadata_bytes: 0,
             entry_metadata_bytes: 0,
@@ -1009,6 +1052,7 @@ impl DiskPeerCache {
             .map_err(|_| unavailable("Peer cache lock poisoned"))?;
         while state.operations != 0
             || state.fill_active
+            || state.stream_active != 0
             || state.flight_live != 0
             || state.deleting_slots != 0
             || state.retired.values().any(|retired| retired.deleting)
@@ -1084,6 +1128,11 @@ impl DiskPeerCache {
         self.started.elapsed().as_secs()
     }
 
+    fn pending_path(&self, generation: u64) -> PathBuf {
+        self.directory()
+            .join(format!("{PENDING}-{generation:016x}"))
+    }
+
     fn path(&self, key: &str) -> PathBuf {
         self.directory().join(format!("{key}.ready"))
     }
@@ -1095,7 +1144,7 @@ impl DiskPeerCache {
             .map_err(|_| unavailable("Peer cache lock poisoned"))?;
         // Preflight bounded names and allocated space before any private cleanup.
         let mut ready = Vec::new();
-        let mut pending = None;
+        let mut pending = Vec::new();
         let mut total = 0_u64;
         for entry in fs::read_dir(self.directory()).map_err(Error::from)? {
             let entry = entry.map_err(Error::from)?;
@@ -1112,8 +1161,8 @@ impl DiskPeerCache {
             total = total
                 .checked_add(charge)
                 .ok_or_else(|| invalid("Peer cache size overflow"))?;
-            if name == PENDING {
-                pending = Some(charge);
+            if name == PENDING || valid_pending_name(name) {
+                pending.push((entry.path(), charge));
             } else if valid_ready_name(name) {
                 ready.push((name.trim_end_matches(".ready").to_owned(), metadata));
             } else {
@@ -1121,15 +1170,18 @@ impl DiskPeerCache {
                     "Peer cache contains foreign files; preserved without cleanup",
                 ));
             }
-            if ready.len() > MAX_PEER_CACHE_ENTRIES || total > self.options.capacity_bytes {
+            if ready.len() + pending.len() > MAX_PEER_CACHE_ENTRIES
+                || total > self.options.capacity_bytes
+            {
                 return Err(invalid("Peer cache recovery exceeds disk or index budget"));
             }
         }
         state.used_bytes = total;
         state.stats.disk_peak_bytes = state.stats.disk_peak_bytes.max(total);
-        state.pending_charge = pending.unwrap_or(0);
-        if pending.is_some() {
-            self.bootstrap_remove_pending(&mut state)?;
+        for (path, charge) in pending {
+            // Startup is exclusive; every accepted private file was preflighted.
+            fs::remove_file(path).map_err(Error::from)?;
+            state.used_bytes = state.used_bytes.saturating_sub(charge);
         }
         for (key, metadata) in ready {
             let (mut file, _) = open_private(&self.path(&key))?;
@@ -1263,25 +1315,6 @@ impl DiskPeerCache {
         }
         Ok(())
     }
-
-    fn bootstrap_remove_pending(&self, state: &mut CacheState) -> Result<()> {
-        self.check_root()?;
-        #[cfg(test)]
-        if state.fail_remove {
-            return Err(unavailable("injected Peer cache cleanup failure"));
-        }
-        match fs::symlink_metadata(self.directory().join(PENDING)) {
-            Ok(metadata) => {
-                validate_private_file(&metadata)?;
-                fs::remove_file(self.directory().join(PENDING)).map_err(Error::from)?;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(Error::from(error)),
-        }
-        state.used_bytes = state.used_bytes.saturating_sub(state.pending_charge);
-        state.pending_charge = 0;
-        Ok(())
-    }
 }
 
 impl DiskPeerCache {
@@ -1308,7 +1341,7 @@ impl DiskPeerCache {
             ("flights", state.flight_live as u64),
             (
                 "fill_body_bytes",
-                if state.fill_active {
+                if state.fill_active || state.stream_active != 0 {
                     MAX_OBJECT_BYTES
                 } else {
                     0
@@ -1478,25 +1511,46 @@ impl DiskPeerCache {
         }
     }
 
-    fn reserve_pending(&self, key: &str, charge: u64) -> Result<bool> {
+    fn reserve_pending(
+        &self,
+        key: &str,
+        generation: u64,
+        charge: u64,
+        metadata_charge: usize,
+        metadata: &mut Option<OutboardLease>,
+    ) -> Result<bool> {
         self.retire(key, None, false)?;
         loop {
             self.cleanup_retired()?;
             let victim = {
                 let mut state = self.lock_state()?;
                 if state.closed
-                    || state.pending_charge != 0
                     || state.retired.contains_key(key)
                     || charge > self.options.capacity_bytes
+                    || state.pending.len() >= self.max_flights
                 {
                     return Ok(false);
                 }
                 if state.used_bytes.saturating_add(charge) <= self.options.capacity_bytes
-                    && state.entries.len() + state.retired.len() + state.deleting_slots
+                    && state.entries.len()
+                        + state.retired.len()
+                        + state.deleting_slots
+                        + state.pending.len()
                         < MAX_PEER_CACHE_ENTRIES
                 {
                     state.used_bytes += charge;
-                    state.pending_charge = charge;
+                    state.pending_charge += charge;
+                    state.pending_metadata_charge += metadata_charge;
+                    state.pending.insert(
+                        generation,
+                        PendingEntry {
+                            charge,
+                            identity: None,
+                            active: true,
+                            metadata_charge,
+                            _metadata: metadata.take(),
+                        },
+                    );
                     state.stats.disk_peak_bytes = state.stats.disk_peak_bytes.max(state.used_bytes);
                     return Ok(true);
                 }
@@ -1513,14 +1567,33 @@ impl DiskPeerCache {
         }
     }
 
-    // Only the holder of the unique fill permit may invoke this at runtime.
-    fn clear_pending(&self, expected: Option<(u64, u64)>) -> Result<()> {
+    fn cleanup_pending(&self) -> Result<()> {
+        // Only inactive owned generations are eligible. An active stream's file
+        // and an unidentified/replaced file are never another fill's cleanup.
+        let retired: Vec<_> = self
+            .lock_state()?
+            .pending
+            .iter()
+            .filter(|(_, entry)| !entry.active)
+            .map(|(generation, entry)| (*generation, entry.identity))
+            .collect();
+        for (generation, identity) in retired {
+            if let Err(error) = self.clear_pending(generation, identity) {
+                // Its full charge and metadata lease remain in the bounded table.
+                // Another object may still fit without touching this generation.
+                afs_logging::warn!("dfs.peer_pending_cleanup_failed"; "error" => error.to_string());
+            }
+        }
+        Ok(())
+    }
+
+    fn clear_pending(&self, generation: u64, expected: Option<(u64, u64)>) -> Result<()> {
         self.check_root()?;
         #[cfg(test)]
         if self.lock_state()?.fail_remove {
             return Err(unavailable("injected Peer cache cleanup failure"));
         }
-        match fs::symlink_metadata(self.directory().join(PENDING)) {
+        match fs::symlink_metadata(self.pending_path(generation)) {
             Ok(metadata) => {
                 validate_private_file(&metadata)?;
                 if expected.is_none_or(|identity| identity != (metadata.dev(), metadata.ino())) {
@@ -1528,40 +1601,54 @@ impl DiskPeerCache {
                         "Peer cache cleanup refuses an unowned pending file",
                     ));
                 }
-                fs::remove_file(self.directory().join(PENDING)).map_err(Error::from)?;
+                fs::remove_file(self.pending_path(generation)).map_err(Error::from)?;
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(Error::from(error)),
         }
-        let mut state = self.lock_state()?;
-        state.used_bytes = state.used_bytes.saturating_sub(state.pending_charge);
-        state.pending_charge = 0;
-        state.pending_identity = None;
+        let removed = {
+            let mut state = self.lock_state()?;
+            remove_pending_charge(&mut state, generation)
+        };
+        drop(removed);
         Ok(())
     }
 
-    fn account_pending_growth(&self, charge: u64) -> Result<bool> {
+    fn account_pending_growth(&self, generation: u64, charge: u64) -> Result<bool> {
         let mut state = self.lock_state()?;
-        if charge <= state.pending_charge {
+        let pending = state
+            .pending
+            .get_mut(&generation)
+            .ok_or_else(|| unavailable("Peer pending reservation missing"))?;
+        if charge <= pending.charge {
             return Ok(false);
         }
-        state.used_bytes = state
-            .used_bytes
-            .saturating_add(charge - state.pending_charge);
-        state.pending_charge = charge;
+        let extra = charge - pending.charge;
+        pending.charge = charge;
+        state.used_bytes = state.used_bytes.saturating_add(extra);
+        state.pending_charge = state.pending_charge.saturating_add(extra);
         state.stats.disk_peak_bytes = state.stats.disk_peak_bytes.max(state.used_bytes);
         Ok(true)
     }
 
     fn publish_entry(
         &self,
-        key: String,
+        pending_key: (u64, String),
         chunk: ChunkObject,
         charge: u64,
         identity: FileIdentity,
         proof: Option<SharedOutboard>,
         metadata: Option<OutboardLease>,
     ) -> Result<()> {
+        let (generation, key) = pending_key;
+        let metadata = {
+            let mut state = self.lock_state()?;
+            state
+                .pending
+                .get_mut(&generation)
+                .and_then(|entry| entry._metadata.take())
+                .or(metadata)
+        };
         let mut local = CacheState::new_local(self.proof_budget());
         {
             let state = self.lock_state()?;
@@ -1591,12 +1678,11 @@ impl DiskPeerCache {
             .remove(&key)
             .ok_or_else(|| unavailable("Peer cache entry missing"))?;
         let mut state = self.lock_state()?;
-        state.used_bytes = state.used_bytes - state.pending_charge + charge;
-        state.pending_charge = 0;
-        state.pending_identity = None;
+        let removed = remove_pending_charge(&mut state, generation);
+        state.used_bytes += charge;
+        drop(removed);
         state.entry_metadata_bytes += entry_metadata_charge(&key, &entry.chunk);
         state.entries.insert(key, entry);
-        state.pending_metadata_charge = 0;
         refresh_metadata(&mut state);
         drop(state);
         self.report_resources();
@@ -1751,7 +1837,11 @@ impl Drop for FillLeader<'_> {
 impl Drop for FillPermit<'_> {
     fn drop(&mut self) {
         if let Ok(mut state) = self.cache.state.lock() {
-            state.fill_active = false;
+            if self.streaming {
+                state.stream_active = state.stream_active.saturating_sub(1);
+            } else {
+                state.fill_active = false;
+            }
         }
         self.cache.changed.notify_all();
         self.cache.report_resources();
@@ -1773,8 +1863,25 @@ impl PeerCacheOperation<'_> {
     }
 
     pub(crate) fn acquire_fill(&mut self, check: impl Fn() -> Result<()>) -> Result<()> {
-        if self.fill.is_some() {
-            return Ok(());
+        self.acquire_fill_mode(false, check)
+    }
+
+    pub(crate) fn acquire_stream_fill(&mut self, check: impl Fn() -> Result<()>) -> Result<()> {
+        self.acquire_fill_mode(true, check)
+    }
+
+    pub(crate) fn release_fill(&mut self) {
+        drop(self.fill.take());
+    }
+
+    fn acquire_fill_mode(&mut self, streaming: bool, check: impl Fn() -> Result<()>) -> Result<()> {
+        if let Some(fill) = &self.fill {
+            if fill.streaming == streaming || !fill.streaming {
+                return Ok(());
+            }
+            return Err(invalid(
+                "legacy fill requires releasing the stream allowance",
+            ));
         }
         loop {
             check()?;
@@ -1782,9 +1889,22 @@ impl PeerCacheOperation<'_> {
             if state.closed {
                 return Err(unavailable("Peer cache is stopped"));
             }
-            if !state.fill_active {
-                state.fill_active = true;
-                self.fill = Some(FillPermit { cache: self.cache });
+            if !state.fill_active
+                && if streaming {
+                    state.stream_active < 2
+                } else {
+                    state.stream_active == 0
+                }
+            {
+                if streaming {
+                    state.stream_active += 1;
+                } else {
+                    state.fill_active = true;
+                }
+                self.fill = Some(FillPermit {
+                    cache: self.cache,
+                    streaming,
+                });
                 drop(state);
                 self.cache.report_resources();
                 return Ok(());
@@ -1811,8 +1931,16 @@ impl PeerCacheOperation<'_> {
         if chunk.length > MAX_OBJECT_BYTES {
             return Err(invalid("Peer stream object exceeds bound"));
         }
-        self.acquire_fill(|| Ok(()))?;
+        self.acquire_stream_fill(|| Ok(()))?;
         let key = self.cache.key(chunk)?;
+        let generation = {
+            let mut state = self.cache.lock_state()?;
+            let generation = state.next_pending_generation;
+            state.next_pending_generation = generation
+                .checked_add(1)
+                .ok_or_else(|| unavailable("Peer pending generation exhausted"))?;
+            generation
+        };
         let mut sink = PeerStreamSink {
             cache: self.cache,
             _fill: self
@@ -1825,6 +1953,7 @@ impl PeerCacheOperation<'_> {
             header_length: 0,
             file: None,
             pending_identity: None,
+            pending_generation: generation,
             owns_pending: false,
             committed: false,
             prepare_error: None,
@@ -2185,6 +2314,7 @@ impl PeerCacheOperation<'_> {
         if verified.chunk.length > MAX_OBJECT_BYTES {
             return Ok(false);
         }
+        self.acquire_fill(|| Ok(()))?;
         let mut sink = self.begin_stream(verified.chunk)?;
         if let Some(error) = sink.prepare_error.take() {
             return Err(error);
@@ -2217,15 +2347,18 @@ impl PeerCacheOperation<'_> {
             sink.cache.check_root()?;
             let before = file.metadata().map_err(Error::from)?;
             validate_private_file(&before)?;
-            let current =
-                fs::symlink_metadata(sink.cache.directory().join(PENDING)).map_err(Error::from)?;
+            let current = fs::symlink_metadata(sink.cache.pending_path(sink.pending_generation))
+                .map_err(Error::from)?;
             if sink.pending_identity != Some((before.dev(), before.ino()))
                 || file_identity(&before) != file_identity(&current)
             {
                 return Err(corrupt("Peer cache staging identity changed"));
             }
             let charge = allocated(&before)?;
-            if sink.cache.account_pending_growth(charge)? {
+            if sink
+                .cache
+                .account_pending_growth(sink.pending_generation, charge)?
+            {
                 return Err(unavailable("Peer cache allocation exceeds reserved blocks"));
             }
             match fs::symlink_metadata(sink.cache.path(&sink.key)) {
@@ -2234,7 +2367,7 @@ impl PeerCacheOperation<'_> {
                 Err(error) => return Err(Error::from(error)),
             }
             fs::rename(
-                sink.cache.directory().join(PENDING),
+                sink.cache.pending_path(sink.pending_generation),
                 sink.cache.path(&sink.key),
             )
             .map_err(Error::from)?;
@@ -2245,7 +2378,7 @@ impl PeerCacheOperation<'_> {
                 .ok()
                 .map(|metadata| file_identity(&metadata));
             sink.cache.publish_entry(
-                sink.key.clone(),
+                (sink.pending_generation, sink.key.clone()),
                 verified.chunk.clone(),
                 charge,
                 published.unwrap_or_else(|| file_identity(&before)),
@@ -2821,6 +2954,16 @@ fn file_identity(metadata: &fs::Metadata) -> (u64, u64, u64, i64, i64, i64, i64)
     )
 }
 
+fn valid_pending_name(name: &str) -> bool {
+    name.strip_prefix(&format!("{PENDING}-"))
+        .is_some_and(|suffix| {
+            suffix.len() == 16
+                && suffix
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+}
+
 fn valid_ready_name(name: &str) -> bool {
     name.strip_suffix(".ready").is_some_and(|key| {
         key.len() == 64
@@ -2854,6 +2997,18 @@ mod tests {
         }
     }
 
+    fn pending_files(cache: &DiskPeerCache) -> Vec<PathBuf> {
+        fs::read_dir(cache.directory())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(valid_pending_name)
+            })
+            .collect()
+    }
+
     fn fill(cache: &DiskPeerCache, staged: &StagedChunk) -> Result<bool> {
         cache
             .operation()?
@@ -2862,6 +3017,288 @@ mod tests {
                 staged.bytes(),
                 cache.proof_budget(),
             )?)
+    }
+
+    #[test]
+    fn disk_peer_cache_different_object_stream_fills_overlap_without_sharing_pending() {
+        use std::{sync::mpsc, thread, time::Duration};
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = options(temp.path().join("cache"));
+        config.capacity_bytes = 1024 * 1024;
+        let cache = DiskPeerCache::open(config).unwrap();
+        let first = StagedChunk::new(OperationId::new("f2-first"), vec![17; 64 * 1024]);
+        let second = StagedChunk::new(OperationId::new("f2-second"), vec![29; 64 * 1024]);
+        let (first_ready_tx, first_ready_rx) = mpsc::channel();
+        let (release_first_tx, release_first_rx) = mpsc::channel();
+        let (second_ready_tx, second_ready_rx) = mpsc::channel();
+        let (release_second_tx, release_second_rx) = mpsc::channel();
+        let deadline = Duration::from_secs(5);
+        let overlapped = thread::scope(|scope| {
+            let cache_ref = &cache;
+            let first = &first;
+            let first_task = scope.spawn(move || {
+                let mut operation = cache_ref.operation().unwrap();
+                let mut sink = operation.begin_stream(&first.chunk).unwrap();
+                assert!(sink.file.is_some());
+                first_ready_tx.send(()).unwrap();
+                release_first_rx.recv_timeout(deadline).unwrap();
+                let mut out = [0; 8];
+                let proof = crate::node::rpc::peer::complete_peer_disk_read_for_test(
+                    &first.chunk,
+                    first.bytes(),
+                    0,
+                    &mut out,
+                    &mut sink,
+                )
+                .unwrap();
+                assert!(sink.commit(proof).unwrap());
+            });
+            first_ready_rx.recv_timeout(deadline).unwrap();
+            let cache_ref = &cache;
+            let second = &second;
+            let second_task = scope.spawn(move || {
+                let mut operation = cache_ref.operation().unwrap();
+                let mut sink = operation.begin_stream(&second.chunk).unwrap();
+                assert!(sink.file.is_some());
+                second_ready_tx.send(()).unwrap();
+                release_second_rx.recv_timeout(deadline).unwrap();
+                let mut out = [0; 8];
+                let proof = crate::node::rpc::peer::complete_peer_disk_read_for_test(
+                    &second.chunk,
+                    second.bytes(),
+                    0,
+                    &mut out,
+                    &mut sink,
+                )
+                .unwrap();
+                assert!(sink.commit(proof).unwrap());
+            });
+            // Always release and join before asserting: the old single allowance
+            // fails this progress contract without leaving a blocked test thread.
+            let overlapped = second_ready_rx.recv_timeout(Duration::from_secs(2)).is_ok();
+            release_first_tx.send(()).unwrap();
+            if !overlapped {
+                second_ready_rx.recv_timeout(deadline).unwrap();
+            }
+            release_second_tx.send(()).unwrap();
+            first_task.join().unwrap();
+            second_task.join().unwrap();
+            overlapped
+        });
+        assert_eq!(cache.stats().unwrap().entries, 2);
+        assert!(
+            overlapped,
+            "different-object stream fills waited for one global fill"
+        );
+        for (staged, byte) in [(&first, 17), (&second, 29)] {
+            let mut out = [0; 8];
+            assert!(
+                cache
+                    .operation()
+                    .unwrap()
+                    .read_range(&staged.chunk, 0, &mut out)
+                    .unwrap()
+            );
+            assert_eq!(out, [byte; 8]);
+        }
+    }
+
+    #[test]
+    fn disk_peer_cache_same_object_follower_waits_for_its_single_flight() {
+        use std::{sync::mpsc, thread, time::Duration};
+
+        let temp = tempfile::tempdir().unwrap();
+        let cache = DiskPeerCache::open(options(temp.path().join("cache"))).unwrap();
+        let staged = StagedChunk::new(OperationId::new("f2-same"), vec![17; 64 * 1024]);
+        let FillRole::Leader(mut leader) = cache.fill_flight(&staged.chunk, || Ok(())).unwrap()
+        else {
+            panic!("first request must lead");
+        };
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        thread::scope(|scope| {
+            let follower = scope.spawn(|| {
+                let outcome = cache
+                    .fill_flight(&staged.chunk, || {
+                        let _ = entered_tx.send(());
+                        Ok(())
+                    })
+                    .unwrap();
+                assert!(matches!(outcome, FillRole::Finished(FillOutcome::Uncached)));
+                done_tx.send(()).unwrap();
+            });
+            entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(done_rx.try_recv().is_err());
+            assert_eq!(cache.state.lock().unwrap().flight_live, 1);
+            leader.finish(FillOutcome::Uncached);
+            done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            follower.join().unwrap();
+        });
+        drop(leader);
+        assert_eq!(cache.state.lock().unwrap().flight_live, 0);
+    }
+
+    #[test]
+    fn disk_peer_cache_stream_limit_cancel_and_legacy_exclusivity() {
+        use std::{sync::mpsc, thread};
+        let temp = tempfile::tempdir().unwrap();
+        let cache = DiskPeerCache::open(options(temp.path().join("cache"))).unwrap();
+        let mut first = cache.operation().unwrap();
+        let mut second = cache.operation().unwrap();
+        first.acquire_stream_fill(|| Ok(())).unwrap();
+        second.acquire_stream_fill(|| Ok(())).unwrap();
+        let deadline = Instant::now() + Duration::from_millis(30);
+        let mut third = cache.operation().unwrap();
+        assert!(
+            third
+                .acquire_stream_fill(|| {
+                    if Instant::now() >= deadline {
+                        Err(unavailable("cancelled third stream"))
+                    } else {
+                        Ok(())
+                    }
+                })
+                .is_err()
+        );
+        assert_eq!(cache.state.lock().unwrap().stream_active, 2);
+        let (checked_tx, checked_rx) = mpsc::channel();
+        let (admitted_tx, admitted_rx) = mpsc::channel();
+        thread::scope(|scope| {
+            let cache_ref = &cache;
+            let legacy = scope.spawn(move || {
+                let mut operation = cache_ref.operation().unwrap();
+                operation
+                    .acquire_fill(|| {
+                        let _ = checked_tx.send(());
+                        Ok(())
+                    })
+                    .unwrap();
+                admitted_tx.send(()).unwrap();
+            });
+            checked_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            drop(first);
+            assert!(
+                admitted_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+                "legacy must wait for the final streaming owner"
+            );
+            drop(second);
+            admitted_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            legacy.join().unwrap();
+        });
+        assert_eq!(cache.state.lock().unwrap().stream_active, 0);
+        let mut legacy = cache.operation().unwrap();
+        legacy.acquire_fill(|| Ok(())).unwrap();
+        let deadline = Instant::now() + Duration::from_millis(30);
+        assert!(
+            third
+                .acquire_stream_fill(|| {
+                    if Instant::now() >= deadline {
+                        Err(unavailable("cancelled behind legacy"))
+                    } else {
+                        Ok(())
+                    }
+                })
+                .is_err()
+        );
+        assert!(cache.state.lock().unwrap().fill_active);
+        cache.close_admission();
+        assert!(third.acquire_stream_fill(|| Ok(())).is_err());
+        drop(legacy);
+        assert!(!cache.state.lock().unwrap().fill_active);
+    }
+
+    #[test]
+    fn disk_peer_cache_pending_generations_keep_failed_charge_and_other_fill_private() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = options(temp.path().join("cache"));
+        config.capacity_bytes = 512 * 1024;
+        let cache = DiskPeerCache::open(config).unwrap();
+        let first = StagedChunk::new(OperationId::new("f2-retained"), vec![17; 64 * 1024]);
+        let second = StagedChunk::new(OperationId::new("f2-isolated"), vec![29; 64 * 1024]);
+        let mut first_op = cache.operation().unwrap();
+        let first_sink = first_op.begin_stream(&first.chunk).unwrap();
+        let first_path = cache.pending_path(first_sink.pending_generation);
+        let first_charge =
+            cache.state.lock().unwrap().pending[&first_sink.pending_generation].charge;
+        let mut second_op = cache.operation().unwrap();
+        let mut second_sink = second_op.begin_stream(&second.chunk).unwrap();
+        let second_path = cache.pending_path(second_sink.pending_generation);
+        assert_ne!(first_path, second_path);
+        assert!(first_path.exists() && second_path.exists());
+        assert_eq!(cache.state.lock().unwrap().pending.len(), 2);
+        assert!(cache.stats().unwrap().disk_bytes <= cache.options.capacity_bytes);
+        cache.state.lock().unwrap().fail_remove = true;
+        drop(first_sink);
+        drop(first_op);
+        cache.state.lock().unwrap().fail_remove = false;
+        assert!(first_path.exists());
+        let mut out = [0; 8];
+        let proof = crate::node::rpc::peer::complete_peer_disk_read_for_test(
+            &second.chunk,
+            second.bytes(),
+            0,
+            &mut out,
+            &mut second_sink,
+        )
+        .unwrap();
+        assert!(second_sink.commit(proof).unwrap());
+        drop(second_sink);
+        drop(second_op);
+        let state = cache.state.lock().unwrap();
+        assert_eq!(state.pending_charge, first_charge);
+        assert_eq!(state.pending.len(), 1);
+        assert!(
+            state.pending_metadata_charge > 0,
+            "failed deletion retains its metadata lease"
+        );
+        assert_eq!(
+            state.used_bytes,
+            first_charge
+                + state
+                    .entries
+                    .values()
+                    .map(|entry| entry.charge)
+                    .sum::<u64>()
+        );
+        drop(state);
+        assert!(first_path.exists());
+        assert!(!second_path.exists());
+        cache.cleanup_pending().unwrap();
+        assert!(!first_path.exists());
+        assert_eq!(cache.state.lock().unwrap().pending_charge, 0);
+    }
+
+    #[test]
+    fn disk_peer_cache_replaced_pending_is_preserved_without_touching_another_fill() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = options(temp.path().join("cache"));
+        config.capacity_bytes = 512 * 1024;
+        let cache = DiskPeerCache::open(config).unwrap();
+        let first = StagedChunk::new(OperationId::new("f2-replaced"), vec![17; 64 * 1024]);
+        let second = StagedChunk::new(OperationId::new("f2-preserved"), vec![29; 64 * 1024]);
+        let mut first_op = cache.operation().unwrap();
+        let first_sink = first_op.begin_stream(&first.chunk).unwrap();
+        let first_path = cache.pending_path(first_sink.pending_generation);
+        let mut second_op = cache.operation().unwrap();
+        let second_sink = second_op.begin_stream(&second.chunk).unwrap();
+        let second_path = cache.pending_path(second_sink.pending_generation);
+        fs::remove_file(&first_path).unwrap();
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&first_path)
+            .unwrap()
+            .write_all(b"foreign replacement")
+            .unwrap();
+        drop(first_sink);
+        assert_eq!(fs::read(&first_path).unwrap(), b"foreign replacement");
+        assert!(second_path.exists());
+        assert!(cache.state.lock().unwrap().pending_charge > 0);
+        drop(second_sink);
+        assert!(!second_path.exists());
+        assert_eq!(fs::read(&first_path).unwrap(), b"foreign replacement");
     }
 
     #[test]
@@ -3621,7 +4058,7 @@ mod tests {
         let state = cache.state.lock().unwrap();
         assert!(state.pending_charge > 0);
         assert_eq!(state.used_bytes, state.pending_charge);
-        assert!(cache.directory().join(PENDING).exists());
+        assert_eq!(pending_files(&cache).len(), 1);
     }
 
     #[test]
@@ -3644,14 +4081,22 @@ mod tests {
             .unwrap();
             actual = allocated(&sink.file.as_ref().unwrap().metadata().unwrap()).unwrap();
             cache.state.lock().unwrap().used_bytes = actual - 512;
-            cache.state.lock().unwrap().pending_charge = actual - 512;
+            {
+                let mut state = cache.state.lock().unwrap();
+                state.pending_charge = actual - 512;
+                state
+                    .pending
+                    .get_mut(&sink.pending_generation)
+                    .unwrap()
+                    .charge = actual - 512;
+            }
             cache.state.lock().unwrap().fail_remove = true;
             assert!(sink.commit(proof).is_err());
             assert_eq!(cache.state.lock().unwrap().used_bytes, actual);
             assert_eq!(cache.state.lock().unwrap().pending_charge, actual);
         }
         assert_eq!(cache.state.lock().unwrap().used_bytes, actual);
-        assert!(cache.directory().join(PENDING).exists());
+        assert_eq!(pending_files(&cache).len(), 1);
     }
 
     #[test]
@@ -4104,7 +4549,7 @@ mod tests {
         let stats = cache.stats().unwrap();
         assert!(stats.disk_bytes >= staged.chunk.length);
         assert!(stats.disk_bytes <= cache.options.capacity_bytes);
-        assert!(cache.options.directory.join(PENDING).exists());
+        assert_eq!(pending_files(&cache).len(), 1);
         assert_eq!(
             fs::read(&foreign).unwrap(),
             b"preserve foreign publication target"
@@ -4112,7 +4557,7 @@ mod tests {
         cache.state.lock().unwrap().fail_remove = false;
         fs::remove_file(foreign).unwrap();
         assert!(fill(&cache, &staged).unwrap());
-        assert!(!cache.options.directory.join(PENDING).exists());
+        assert!(pending_files(&cache).is_empty());
     }
 
     #[test]
