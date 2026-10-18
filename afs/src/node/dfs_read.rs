@@ -16,6 +16,8 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+pub use super::dfs_fetch::PrefetchControl;
+
 use afs_error::{Error, Result};
 use afs_tracing::tracing;
 
@@ -53,6 +55,8 @@ pub struct DfsReadConfig {
     pub source_cache_ttl: Duration,
     pub source_lookahead_chunks: usize,
     pub source_cache_bytes: usize,
+    /// Object scheduling distance, not additional resident or transport bytes.
+    pub readahead_max_bytes: u64,
 }
 
 impl Default for DfsReadConfig {
@@ -63,6 +67,7 @@ impl Default for DfsReadConfig {
             source_cache_ttl: Duration::from_millis(5_000),
             source_lookahead_chunks: 64,
             source_cache_bytes: MAX_SOURCE_CACHE_BYTES,
+            readahead_max_bytes: 0,
         }
     }
 }
@@ -76,6 +81,7 @@ impl DfsReadConfig {
             || self.max_inflight_bytes > MAX_DFS_READ_BYTES
             || self.source_lookahead_chunks > MAX_DFS_READ_OPS
             || self.source_cache_bytes > MAX_SOURCE_CACHE_BYTES
+            || self.readahead_max_bytes > 32 * 1024 * 1024
             || self.source_cache_ttl > Duration::from_millis(60_000)
         {
             return Err(invalid(format!(
@@ -99,7 +105,8 @@ pub struct ReadBatch {
     pub file_version_id: Option<FileVersionId>,
     pub layout_root_id: LayoutRootId,
     pub ops: Vec<ChunkReadOp>,
-    /// Advisory metadata only; never converted to transfer operations.
+    /// Advisory source hints, excluded from foreground output operations.
+    /// Optional prefetch independently validates cached full-object grants.
     pub lookahead: Vec<ChunkId>,
 }
 
@@ -506,6 +513,20 @@ pub trait ChunkTransfer: Send + Sync {
         _requested_offset: u64,
         _private_out: &'output mut [u8],
         _sink: &mut PeerStreamSink<'_>,
+    ) -> Result<Option<CompletedPeerDiskRead<'output>>> {
+        Ok(None)
+    }
+
+    /// Speculative reads never wait for transport admission and never use the
+    /// legacy complete-body fallback. The default starts no RPC.
+    fn try_read_verified_object_to_sink<'output>(
+        &self,
+        _batch: &PeerReadBatch,
+        _chunk: &ChunkObject,
+        _requested_offset: u64,
+        _private_out: &'output mut [u8],
+        _sink: &mut PeerStreamSink<'_>,
+        _control: &PrefetchControl,
     ) -> Result<Option<CompletedPeerDiskRead<'output>>> {
         Ok(None)
     }
@@ -1054,9 +1075,15 @@ pub struct DfsReadEngine {
     local_reader_install_barrier: Mutex<Option<Arc<std::sync::Barrier>>>,
     #[cfg(test)]
     peer_cache_recheck_hook: Mutex<Option<PeerCacheRecheckHook>>,
-    source_cache: Mutex<SourceCache>,
+    #[cfg(test)]
+    prefetch_attempt_hook: Mutex<Option<PrefetchAttemptHook>>,
+    source_cache: Arc<Mutex<SourceCache>>,
+    fetcher: Option<Arc<super::dfs_fetch::ObjectFetcher>>,
     external_authority_cache: Mutex<ExternalAuthorityCache>,
 }
+
+#[cfg(test)]
+type PrefetchAttemptHook = Arc<dyn Fn(usize, &ChunkId) + Send + Sync>;
 
 #[cfg(test)]
 struct PeerCacheRecheckHook {
@@ -1341,7 +1368,12 @@ impl SourceCache {
 
 impl Drop for DfsReadEngine {
     fn drop(&mut self) {
-        let cache = match self.source_cache.get_mut() {
+        // Task readers share this cache. Dropping one reader must not revoke
+        // another active task's scope or clear its resident grants.
+        let Some(cache) = Arc::get_mut(&mut self.source_cache) else {
+            return;
+        };
+        let cache = match cache.get_mut() {
             Ok(cache) => cache,
             Err(poisoned) => poisoned.into_inner(),
         };
@@ -1397,6 +1429,15 @@ impl ExternalReadSelection {
     }
 }
 
+struct CachedFetchContext {
+    batch: ReadBatch,
+    sources: ChunkSources,
+    generation: Option<u64>,
+    expires_at: Instant,
+    authority: NativeReadAuthoritySnapshot,
+    scope_check: Arc<dyn Fn() -> Result<()> + Send + Sync>,
+}
+
 impl DfsReadEngine {
     pub(super) fn publication_diagnostic(&self) -> Option<super::read_work::ReadDiagnosticSpan> {
         self.local
@@ -1437,7 +1478,10 @@ impl DfsReadEngine {
             local_reader_install_barrier: Mutex::new(None),
             #[cfg(test)]
             peer_cache_recheck_hook: Mutex::new(None),
-            source_cache: Mutex::new(source_cache),
+            #[cfg(test)]
+            prefetch_attempt_hook: Mutex::new(None),
+            source_cache: Arc::new(Mutex::new(source_cache)),
+            fetcher: None,
             external_authority_cache: Mutex::new(ExternalAuthorityCache::default()),
         }
     }
@@ -1456,8 +1500,55 @@ impl DfsReadEngine {
     /// Disposable local storage for already verified native Peer objects.
     /// Cache contents never supply grant, Node/session or file-view authority.
     pub(super) fn with_peer_cache(mut self, cache: Arc<DiskPeerCache>) -> Self {
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            self.fetcher = match super::dfs_fetch::ObjectFetcher::new(
+                runtime,
+                cache.proof_budget(),
+                cache.max_inflight_objects(),
+                self.transfer.verification_metrics().cloned(),
+            ) {
+                Ok(fetcher) => fetcher,
+                Err(error) => {
+                    afs_logging::warn!("dfs.fetcher_unavailable"; "error" => error.to_string());
+                    None
+                }
+            };
+        }
         self.peer_cache = Some(cache);
         self
+    }
+
+    pub(super) fn object_fetcher(&self) -> Option<Arc<super::dfs_fetch::ObjectFetcher>> {
+        self.fetcher.clone()
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_prefetch_attempt_hook_for_test(&self, hook: PrefetchAttemptHook) {
+        *self.prefetch_attempt_hook.lock().unwrap() = Some(hook);
+    }
+
+    fn task_reader(&self) -> Self {
+        Self {
+            namespace_id: self.namespace_id.clone(),
+            local_node_id: self.local_node_id.clone(),
+            local: self.local.clone(),
+            source_provider: self.source_provider.clone(),
+            transfer: self.transfer.clone(),
+            config: self.config.clone(),
+            external_backend: None,
+            peer_cache: self.peer_cache.clone(),
+            read_authority: self.read_authority.clone(),
+            readers: Mutex::new(BoundedLru::new(0)),
+            #[cfg(test)]
+            local_reader_install_barrier: Mutex::new(None),
+            #[cfg(test)]
+            peer_cache_recheck_hook: Mutex::new(None),
+            #[cfg(test)]
+            prefetch_attempt_hook: Mutex::new(None),
+            source_cache: self.source_cache.clone(),
+            fetcher: None,
+            external_authority_cache: Mutex::new(ExternalAuthorityCache::default()),
+        }
     }
 
     pub(super) fn with_read_authority(mut self, authority: Arc<LocalReadAuthority>) -> Self {
@@ -1513,6 +1604,15 @@ impl DfsReadEngine {
         batch: &ReadBatch,
         out: &mut [u8],
     ) -> Result<()> {
+        self.read_batch_native_into_private_before(batch, out, None)
+    }
+
+    pub(super) fn read_batch_native_into_private_before(
+        &self,
+        batch: &ReadBatch,
+        out: &mut [u8],
+        deadline: Option<Instant>,
+    ) -> Result<()> {
         self.validate_native_read_size(out.len())?;
         batch.validate_for_output(out.len(), &self.config)?;
         if self.external_backend.is_some() {
@@ -1537,7 +1637,7 @@ impl DfsReadEngine {
             }
         }
         let authority = self.capture_native_read_authority()?;
-        self.read_batch_into_private(batch, out, true)
+        self.read_batch_into_private(batch, out, true, deadline)
             .inspect_err(|error| {
                 self.invalidate_native_batch_on_error(batch, error);
             })?;
@@ -1625,6 +1725,15 @@ impl DfsReadEngine {
         batch: &ReadBatch,
         output_len: usize,
     ) -> Result<Option<Vec<u8>>> {
+        self.read_batch_native_owned_before(batch, output_len, None)
+    }
+
+    pub(super) fn read_batch_native_owned_before(
+        &self,
+        batch: &ReadBatch,
+        output_len: usize,
+        deadline: Option<Instant>,
+    ) -> Result<Option<Vec<u8>>> {
         if output_len as u64 > self.config.max_inflight_bytes {
             return Err(invalid("DFS owned read exceeds inflight byte budget"));
         }
@@ -1647,7 +1756,7 @@ impl DfsReadEngine {
         let _entered = span.enter();
         let authority = self.capture_native_read_authority()?;
         let mut result = vec![0; output_len];
-        self.read_batch_into_private(batch, &mut result, true)
+        self.read_batch_into_private(batch, &mut result, true, deadline)
             .inspect_err(|error| {
                 self.invalidate_native_batch_on_error(batch, error);
             })?;
@@ -2641,7 +2750,7 @@ impl DfsReadEngine {
     }
 
     fn read_batch_into(&self, batch: &ReadBatch, out: &mut [u8]) -> Result<()> {
-        self.read_batch_into_private(batch, out, false)
+        self.read_batch_into_private(batch, out, false, None)
     }
 
     fn read_batch_into_private(
@@ -2649,6 +2758,7 @@ impl DfsReadEngine {
         batch: &ReadBatch,
         out: &mut [u8],
         final_owned: bool,
+        deadline: Option<Instant>,
     ) -> Result<()> {
         let mut groups: Vec<(ChunkId, Vec<usize>)> = Vec::new();
         let mut positions: HashMap<ChunkId, usize> = HashMap::new();
@@ -2757,7 +2867,7 @@ impl DfsReadEngine {
                 "DFS source caller epoch differs from the registered session",
             ));
         }
-        self.read_remote_batch(&remote_batch, &sources, out, final_owned)?;
+        self.read_remote_batch(&remote_batch, &sources, out, final_owned, deadline)?;
         Ok(())
     }
 
@@ -3607,13 +3717,498 @@ impl DfsReadEngine {
         result
     }
 
+    pub(super) fn readahead_object_limit(&self) -> usize {
+        if self.external_backend.is_some() {
+            return 0;
+        }
+        (self.config.readahead_max_bytes / crate::node::chunk::MAX_STAGED_CHUNK_BYTES as u64).min(8)
+            as usize
+    }
+
+    fn check_cached_fetch(&self, context: &CachedFetchContext) -> Result<()> {
+        (context.scope_check)()?;
+        self.check_native_read_authority(&context.authority)?;
+        if context.expires_at <= Instant::now() {
+            return Err(external_denied("DFS prefetch grant expired"));
+        }
+        let version = context
+            .batch
+            .file_version_id
+            .as_ref()
+            .ok_or_else(|| invalid("DFS prefetch requires a fixed version"))?;
+        let key = (
+            version.clone(),
+            context.batch.layout_root_id.clone(),
+            context.sources.chunk_id.clone(),
+        );
+        let mut cache = self
+            .source_cache
+            .lock()
+            .map_err(|_| unavailable("DFS source cache poisoned"))?;
+        if context.generation.is_none() || cache.generation != context.generation {
+            return Err(external_denied("DFS prefetch source generation changed"));
+        }
+        let Some(entry) = cache.get(&key) else {
+            return Err(external_denied("DFS prefetch grant is no longer cached"));
+        };
+        if entry.expires_at <= Instant::now() || entry.sources != context.sources {
+            return Err(external_denied("DFS prefetch cached grant changed"));
+        }
+        if !context.sources.sources.iter().any(|source| {
+            self.source_matches(&context.batch, source)
+                && (context.authority.epoch == 0
+                    || source.read_grant.caller_node_epoch == context.authority.epoch)
+        }) {
+            return Err(external_denied("DFS prefetch has no valid caller grant"));
+        }
+        Ok(())
+    }
+
+    /// Scheduling consumes only already-resident R-1 grants. It never resolves
+    /// metadata, queues for body quota or makes prefetch failure a read failure.
+    pub(super) fn prefetch_cached(
+        &self,
+        batch: &ReadBatch,
+        window: usize,
+        scope_check: Arc<dyn Fn() -> Result<()> + Send + Sync>,
+    ) {
+        let limit = self.readahead_object_limit().min(window);
+        if limit == 0 {
+            return;
+        }
+        let (Some(fetcher), Some(cache), Some(version)) =
+            (&self.fetcher, &self.peer_cache, &batch.file_version_id)
+        else {
+            return;
+        };
+        if !self.transfer.supports_verified_object_sink() {
+            fetcher.event("skip_busy");
+            return;
+        }
+        for chunk_id in batch.lookahead.iter().take(limit) {
+            let result: Result<()> = (|| {
+                (scope_check)()?;
+                // Bound and charge lookup-key clones before constructing them.
+                let key_bytes = version
+                    .0
+                    .capacity()
+                    .saturating_add(batch.layout_root_id.0.capacity())
+                    .saturating_add(chunk_id.0.capacity());
+                if key_bytes > 16 * 1024 {
+                    fetcher.event("skip_budget");
+                    return Ok(());
+                }
+                let Some(_probe_metadata) = cache.proof_budget().try_reserve(key_bytes * 4 + 1024)
+                else {
+                    fetcher.event("skip_budget");
+                    return Ok(());
+                };
+                let key = (
+                    version.clone(),
+                    batch.layout_root_id.clone(),
+                    chunk_id.clone(),
+                );
+                let (generation, expires_at, charge, chunk) = {
+                    let mut sources = match self.source_cache.try_lock() {
+                        Ok(sources) => sources,
+                        Err(std::sync::TryLockError::WouldBlock) => {
+                            fetcher.event("skip_busy");
+                            return Ok(());
+                        }
+                        Err(std::sync::TryLockError::Poisoned(_)) => {
+                            return Err(unavailable("DFS source cache poisoned"));
+                        }
+                    };
+                    let generation = sources.generation;
+                    if generation.is_none() {
+                        fetcher.event("skip_grant");
+                        return Ok(());
+                    }
+                    let Some(entry) = sources.get(&key) else {
+                        fetcher.event("skip_grant");
+                        return Ok(());
+                    };
+                    let Some(chunk) = &entry.sources.chunk else {
+                        fetcher.event("skip_grant");
+                        return Ok(());
+                    };
+                    if chunk.id != entry.sources.chunk_id
+                        || chunk.id.0.is_empty()
+                        || chunk.id.0.len() > 512
+                        || chunk.length == 0
+                        || chunk.length > crate::node::chunk::MAX_STAGED_CHUNK_BYTES as u64
+                        || chunk.encoding != crate::dfs::ChunkEncoding::Raw
+                        || chunk.content_digest.algorithm != crate::dfs::DigestAlgorithm::Blake3
+                        || entry.expires_at <= Instant::now()
+                        || !range_covered(&entry.sources.allowed_ranges, 0, chunk.length)
+                        || !entry
+                            .sources
+                            .sources
+                            .iter()
+                            .any(|source| self.peer_cache_source_eligible(batch, chunk, source))
+                    {
+                        fetcher.event("skip_grant");
+                        return Ok(());
+                    }
+                    let charge = SourceCache::retained_bytes(&key, &entry.sources)
+                        .saturating_mul(2)
+                        .saturating_add(
+                            std::mem::size_of::<Self>()
+                                + std::mem::size_of::<CachedFetchContext>()
+                                + 64 * 1024,
+                        )
+                        .saturating_add(
+                            key_bytes * 4
+                                + self.namespace_id.0.capacity()
+                                + self.local_node_id.capacity(),
+                        );
+                    (generation, entry.expires_at, charge, chunk.clone())
+                };
+                if cache.try_contains_ready(&chunk)? != Some(false) {
+                    return Ok(());
+                }
+                let Some(permit) = fetcher.try_reserve_background(charge)? else {
+                    fetcher.event("skip_budget");
+                    return Ok(());
+                };
+                let Some(leader) = cache.try_fill_flight(&chunk)? else {
+                    fetcher.event("skip_busy");
+                    return Ok(());
+                };
+                let authority = self.capture_native_read_authority()?;
+                let selected = {
+                    let mut sources = match self.source_cache.try_lock() {
+                        Ok(sources) => sources,
+                        Err(std::sync::TryLockError::WouldBlock) => {
+                            fetcher.event("skip_busy");
+                            return Ok(());
+                        }
+                        Err(std::sync::TryLockError::Poisoned(_)) => {
+                            return Err(unavailable("DFS source cache poisoned"));
+                        }
+                    };
+                    if sources.generation != generation {
+                        fetcher.event("skip_grant");
+                        return Ok(());
+                    }
+                    let Some(entry) = sources.get(&key) else {
+                        fetcher.event("skip_grant");
+                        return Ok(());
+                    };
+                    if entry.expires_at != expires_at || entry.expires_at <= Instant::now() {
+                        fetcher.event("skip_grant");
+                        return Ok(());
+                    }
+                    entry.sources.clone()
+                };
+                let context = Arc::new(CachedFetchContext {
+                    batch: ReadBatch {
+                        file_version_id: Some(version.clone()),
+                        layout_root_id: batch.layout_root_id.clone(),
+                        ops: Vec::new(),
+                        lookahead: Vec::new(),
+                    },
+                    sources: selected,
+                    generation,
+                    expires_at,
+                    authority,
+                    scope_check: scope_check.clone(),
+                });
+                let reader = Arc::new(self.task_reader());
+                let control = {
+                    let reader = reader.clone();
+                    let context = context.clone();
+                    PrefetchControl::new(fetcher.cancellation(), move || {
+                        reader.check_cached_fetch(&context)
+                    })
+                };
+                fetcher.spawn_background(permit, move || {
+                    reader.prefetch_one(&context, &control, leader)
+                })?;
+                fetcher.event("scheduled");
+                Ok(())
+            })();
+            if let Err(error) = result {
+                fetcher.event("failed");
+                afs_logging::warn!("dfs.prefetch_skipped"; "error" => error.to_string());
+            }
+            #[cfg(test)]
+            {
+                let hook = self.prefetch_attempt_hook.lock().unwrap().clone();
+                if let Some(hook) = hook {
+                    hook(window, chunk_id);
+                }
+            }
+        }
+    }
+
+    fn prefetch_one(
+        &self,
+        context: &CachedFetchContext,
+        control: &PrefetchControl,
+        mut leader: super::peer_cache::OwnedFillLeader,
+    ) -> Result<()> {
+        control.check()?;
+        let cache = self
+            .peer_cache
+            .as_ref()
+            .ok_or_else(|| unavailable("DFS prefetch cache missing"))?;
+        let chunk = context
+            .sources
+            .chunk
+            .as_ref()
+            .ok_or_else(|| invalid("DFS prefetch object missing"))?;
+        match cache.try_contains_ready(chunk)? {
+            Some(false) => {}
+            ready => {
+                leader.finish(if ready == Some(true) {
+                    super::peer_cache::FillOutcome::Ready
+                } else {
+                    super::peer_cache::FillOutcome::Uncached
+                });
+                return Ok(());
+            }
+        }
+        let Some(mut operation) = cache.try_operation()? else {
+            leader.finish(super::peer_cache::FillOutcome::Uncached);
+            return Ok(());
+        };
+        let Some(mut sink) = operation.try_begin_stream(chunk)? else {
+            leader.finish(super::peer_cache::FillOutcome::Uncached);
+            return Ok(());
+        };
+        if !sink.is_caching() {
+            leader.finish(super::peer_cache::FillOutcome::Uncached);
+            return Ok(());
+        }
+        let Some(source) = context
+            .sources
+            .sources
+            .iter()
+            .find(|source| self.peer_cache_source_eligible(&context.batch, chunk, source))
+        else {
+            return Err(external_denied("DFS prefetch source expired"));
+        };
+        control.check()?;
+        let batch = PeerReadBatch {
+            file_version_id: context
+                .batch
+                .file_version_id
+                .clone()
+                .ok_or_else(|| invalid("DFS prefetch version missing"))?,
+            layout_root_id: context.batch.layout_root_id.clone(),
+            operations: vec![ResolvedReadOp {
+                op: ChunkReadOp {
+                    chunk_id: chunk.id.clone(),
+                    chunk_offset: 0,
+                    length: chunk.length,
+                    output_offset: 0,
+                },
+                source: source.clone(),
+            }],
+        };
+        let mut empty = [];
+        let Some(completed) = self
+            .transfer
+            .try_read_verified_object_to_sink(&batch, chunk, 0, &mut empty, &mut sink, control)?
+        else {
+            leader.finish(super::peer_cache::FillOutcome::Uncached);
+            return Ok(());
+        };
+        control.check()?;
+        let stored = sink.commit(completed)?;
+        leader.finish(if stored {
+            super::peer_cache::FillOutcome::Ready
+        } else {
+            super::peer_cache::FillOutcome::Uncached
+        });
+        Ok(())
+    }
+
+    fn fanout_private_objects(
+        &self,
+        batch: &ReadBatch,
+        sources: &[ChunkSources],
+        out: &mut [u8],
+        context_deadline: Option<Instant>,
+    ) -> Result<bool> {
+        let (Some(fetcher), Some(cache)) = (&self.fetcher, &self.peer_cache) else {
+            return Ok(false);
+        };
+        if batch.ops.len() < 2 || batch.ops.iter().any(|op| op.length == 0) {
+            return Ok(false);
+        }
+        // Completed handles retain only request scratch or a bounded 512-byte
+        // failure until this group joins them. Charge their vector/control too.
+        let Some(_group_metadata) = cache
+            .proof_budget()
+            .try_reserve(batch.ops.len() * 1024 + 4096)
+        else {
+            fetcher.event("skip_budget");
+            return Ok(false);
+        };
+        let authority = self.capture_native_read_authority()?;
+        // Convert the original grants once; waking or advancing to another
+        // object must never restart this batch's admission lifetime.
+        let admitted_at = Instant::now();
+        let admitted_wall = now_unix_ms();
+        let deadline = sources
+            .iter()
+            .flat_map(|set| &set.sources)
+            .filter(|source| self.source_matches(batch, source))
+            .filter_map(|source| {
+                admitted_at.checked_add(Duration::from_millis(
+                    source
+                        .read_grant
+                        .expires_at_unix_ms
+                        .saturating_sub(admitted_wall),
+                ))
+            })
+            .chain(authority.expires_at())
+            .chain(context_deadline)
+            .min();
+        let generation = self
+            .source_cache
+            .lock()
+            .map_err(|_| unavailable("DFS source cache poisoned"))?
+            .generation;
+        let mut tasks = Vec::with_capacity(batch.ops.len());
+        let mut fallback = false;
+        let mut admission_failure = None;
+        for op in &batch.ops {
+            let Some(set) = sources.iter().find(|set| set.chunk_id == op.chunk_id) else {
+                fallback = true;
+                break;
+            };
+            let Some(version) = batch.file_version_id.as_ref() else {
+                fallback = true;
+                break;
+            };
+            let empty_key = (
+                FileVersionId::new(""),
+                LayoutRootId::new(""),
+                ChunkId::new(""),
+            );
+            let charge = SourceCache::retained_bytes(&empty_key, set)
+                .saturating_mul(2)
+                .saturating_add(
+                    4 * (version.0.capacity()
+                        + batch.layout_root_id.0.capacity()
+                        + op.chunk_id.0.capacity()),
+                )
+                .saturating_add(
+                    std::mem::size_of::<Self>() + std::mem::size_of::<ReadBatch>() + 64 * 1024,
+                )
+                .saturating_add(self.namespace_id.0.capacity() + self.local_node_id.capacity());
+            let permit = match fetcher.reserve_foreground(charge, deadline, || {
+                self.check_native_read_authority(&authority)?;
+                if sources.iter().any(|set| {
+                    !set.sources.iter().any(|source| {
+                        self.source_matches(batch, source)
+                            && (authority.epoch == 0
+                                || source.read_grant.caller_node_epoch == authority.epoch)
+                    })
+                }) {
+                    return Err(external_denied("DFS queued fetch grant expired"));
+                }
+                Ok(())
+            }) {
+                Ok(Some(permit)) => permit,
+                Ok(None) => {
+                    fetcher.event("skip_budget");
+                    fallback = true;
+                    break;
+                }
+                Err(error) => {
+                    admission_failure = Some(error);
+                    break;
+                }
+            };
+            let reader = self.task_reader();
+            let selected = set.clone();
+            let mut operation = op.clone();
+            operation.output_offset = 0;
+            let batch = ReadBatch {
+                file_version_id: Some(version.clone()),
+                layout_root_id: batch.layout_root_id.clone(),
+                ops: vec![operation],
+                lookahead: Vec::new(),
+            };
+            // Same two representations as the existing complex-batch fallback:
+            // private final response plus total requested bytes of attempt scratch.
+            let length = op.length as usize; // ReadBatch validated against usize and the 8MiB limit.
+            tasks.push(fetcher.spawn_foreground(permit, move || {
+                let mut scratch = vec![0; length];
+                reader.read_remote_batch(&batch, &[selected], &mut scratch, true, deadline)?;
+                Ok(scratch)
+            }));
+        }
+        // Join every task, including after the first failure. No partial result
+        // reaches the caller's final buffer until all joins and checks succeed.
+        let mut results = Vec::with_capacity(tasks.len());
+        let mut failure = None;
+        for task in tasks {
+            match fetcher.block_on(task) {
+                Ok(Ok(bytes)) => results.push(bytes),
+                Ok(Err(error)) => {
+                    if failure.is_none() {
+                        failure = Some(error);
+                    }
+                }
+                Err(error) => {
+                    if failure.is_none() {
+                        failure = Some(unavailable(format!("DFS fetch task failed: {error}")));
+                    }
+                }
+            }
+        }
+        if let Some(error) = failure.or(admission_failure) {
+            return Err(error);
+        }
+        if fallback {
+            return Ok(false);
+        }
+        self.check_native_read_authority(&authority)?;
+        if self
+            .source_cache
+            .lock()
+            .map_err(|_| unavailable("DFS source cache poisoned"))?
+            .generation
+            != generation
+        {
+            return Err(unavailable(
+                "DFS fetch source context changed before delivery",
+            ));
+        }
+        for set in sources {
+            if !set
+                .sources
+                .iter()
+                .any(|source| self.source_matches(batch, source))
+            {
+                return Err(external_denied("DFS fetch grant expired before delivery"));
+            }
+        }
+        for (op, bytes) in batch.ops.iter().zip(results) {
+            let end = op.output_offset + bytes.len();
+            out[op.output_offset..end].copy_from_slice(&bytes);
+            self.local.record_read_copy("attempt_to_staging", op.length);
+        }
+        fetcher.event("joined");
+        Ok(true)
+    }
+
     fn read_remote_batch(
         &self,
         batch: &ReadBatch,
         sources: &[ChunkSources],
         out: &mut [u8],
         final_owned: bool,
+        deadline: Option<Instant>,
     ) -> Result<()> {
+        if final_owned && self.fanout_private_objects(batch, sources, out, deadline)? {
+            return Ok(());
+        }
         if self.read_native_peer_cache(batch, sources, out, final_owned)? {
             return Ok(());
         }
@@ -5013,6 +5608,11 @@ mod tests {
             cache.record(&engine.local);
         }
         let peak = gauge("peak_bytes");
+        let generation = engine.source_cache.lock().unwrap().generation;
+        let retained_entries = gauge("entries");
+        drop(engine.task_reader());
+        assert_eq!(engine.source_cache.lock().unwrap().generation, generation);
+        assert_eq!(gauge("entries"), retained_entries);
         drop(engine);
         assert_eq!(gauge("entries"), 0);
         assert_eq!(gauge("bytes"), 0);
@@ -6790,6 +7390,492 @@ mod tests {
             deny_first: false,
             stop_after_completion: None,
         })
+    }
+
+    #[test]
+    fn r7_prefetch_busy_source_lock_skips_without_queue_or_rpc() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut fixture = {
+            let _entered = runtime.enter();
+            NativeCacheFixture::new(MAX_DFS_READ_BYTES, vec![(0, 64 * 1024)], Duration::ZERO)
+        };
+        fixture.engine.config.readahead_max_bytes = 4 * 1024 * 1024;
+        fixture.engine.sources_for(&fixture.batch).unwrap();
+        let registry = afs_metrics::Registry::new();
+        let metrics = crate::node::read_work::ReadWorkMetrics::register(&registry).unwrap();
+        fixture.engine.fetcher = super::super::dfs_fetch::ObjectFetcher::new(
+            runtime.handle().clone(),
+            fixture.cache.proof_budget(),
+            8,
+            Some(metrics),
+        )
+        .unwrap();
+        let transfer = streaming_cache_transfer(&fixture);
+        fixture.engine.transfer = transfer.clone();
+        fixture.batch.lookahead = vec![fixture.chunk.id.clone()];
+        fixture.batch.ops.clear();
+        // The same thread owns the source lock. A blocking background lookup
+        // would deadlock; try-only admission must finish with a busy event.
+        let sources = fixture.engine.source_cache.lock().unwrap();
+        fixture
+            .engine
+            .prefetch_cached(&fixture.batch, 1, Arc::new(|| Ok(())));
+        drop(sources);
+        assert!(!fixture.cache.has_fill_flight_for_test());
+        assert_eq!(transfer.streamed_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(fixture.cache.stats().unwrap().entries, 0);
+        assert_eq!(*fixture.sources.calls.lock().unwrap(), 1);
+        let text = afs_metrics::encode_text(&registry).unwrap();
+        assert!(
+            text.contains("afs_dfs_fetch_events_total{event=\"skip_busy\"} 1\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("afs_dfs_fetch_events_total{event=\"scheduled\"} 0\n"),
+            "{text}"
+        );
+        runtime
+            .block_on(fixture.engine.object_fetcher().unwrap().shutdown())
+            .unwrap();
+    }
+
+    #[test]
+    fn r7_dropping_a_task_reader_keeps_other_readers_source_scope_live() {
+        let fixture =
+            NativeCacheFixture::new(MAX_DFS_READ_BYTES, vec![(0, 64 * 1024)], Duration::ZERO);
+        fixture.engine.sources_for(&fixture.batch).unwrap();
+        let generation = fixture.engine.source_cache.lock().unwrap().generation;
+        drop(fixture.engine.task_reader());
+        let cache = fixture.engine.source_cache.lock().unwrap();
+        assert_eq!(cache.generation, generation);
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn r7_prefetch_missing_partial_and_expired_cached_grants_do_no_work() {
+        for mode in ["missing", "partial", "expired"] {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            let ranges = if mode == "partial" {
+                vec![(1, 2)]
+            } else {
+                vec![(0, 64 * 1024)]
+            };
+            let mut fixture = {
+                let _entered = runtime.enter();
+                NativeCacheFixture::new(MAX_DFS_READ_BYTES, ranges, Duration::ZERO)
+            };
+            fixture.engine.config.readahead_max_bytes = 4 * 1024 * 1024;
+            if mode != "missing" {
+                fixture.engine.sources_for(&fixture.batch).unwrap();
+            }
+            if mode == "expired" {
+                fixture
+                    .engine
+                    .source_cache
+                    .lock()
+                    .unwrap()
+                    .entries
+                    .retain(|_, entry| {
+                        entry.value.expires_at = Instant::now();
+                        true
+                    });
+            }
+            let transfer = streaming_cache_transfer(&fixture);
+            fixture.engine.transfer = transfer.clone();
+            fixture.batch.lookahead = vec![fixture.chunk.id.clone()];
+            fixture.batch.ops.clear();
+            fixture
+                .engine
+                .prefetch_cached(&fixture.batch, 1, Arc::new(|| Ok(())));
+            assert!(
+                !fixture.cache.has_fill_flight_for_test(),
+                "{mode}: no optional task may be admitted"
+            );
+            runtime
+                .block_on(fixture.engine.object_fetcher().unwrap().shutdown())
+                .unwrap();
+            assert!(!fixture.cache.has_fill_flight_for_test());
+            assert_eq!(transfer.streamed_calls.load(Ordering::Relaxed), 0);
+            assert_eq!(fixture.cache.stats().unwrap().entries, 0);
+            assert_eq!(
+                *fixture.sources.calls.lock().unwrap(),
+                u64::from(mode != "missing")
+            );
+        }
+    }
+
+    #[test]
+    fn r7_prefetch_rechecks_generation_scope_and_stop_after_verified_completion() {
+        struct BeforeCommitTransfer {
+            inner: Arc<NativeCacheTransfer>,
+            invalidate: Arc<dyn Fn() + Send + Sync>,
+            completed: Arc<AtomicBool>,
+        }
+        impl ChunkTransfer for BeforeCommitTransfer {
+            fn read_ranges(&self, _: &PeerReadBatch, _: &mut [u8]) -> Result<()> {
+                panic!("prefetch cannot fall back to a body Vec")
+            }
+            fn supports_verified_object_sink(&self) -> bool {
+                true
+            }
+            fn try_read_verified_object_to_sink<'output>(
+                &self,
+                _: &PeerReadBatch,
+                chunk: &ChunkObject,
+                offset: u64,
+                out: &'output mut [u8],
+                sink: &mut PeerStreamSink<'_>,
+                control: &PrefetchControl,
+            ) -> Result<Option<CompletedPeerDiskRead<'output>>> {
+                control.check()?;
+                assert!(out.is_empty());
+                let bytes = self.inner.bytes.lock().unwrap();
+                let receipt = crate::node::rpc::peer::complete_peer_disk_read_for_test(
+                    chunk, &bytes, offset, out, sink,
+                )?;
+                (self.invalidate)();
+                self.completed.store(true, Ordering::Release);
+                Ok(Some(receipt))
+            }
+        }
+        for action in ["generation", "scope", "stop"] {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            let mut fixture = {
+                let _entered = runtime.enter();
+                NativeCacheFixture::new(MAX_DFS_READ_BYTES, vec![(0, 64 * 1024)], Duration::ZERO)
+            };
+            fixture.engine.config.readahead_max_bytes = 4 * 1024 * 1024;
+            fixture.engine.sources_for(&fixture.batch).unwrap();
+            let valid = Arc::new(AtomicBool::new(true));
+            let completed = Arc::new(AtomicBool::new(false));
+            let cache = fixture.engine.source_cache.clone();
+            let batch = fixture.batch.clone();
+            let authority = fixture.engine.read_authority.clone();
+            let invalid_scope = valid.clone();
+            let invalidate = Arc::new(move || match action {
+                "generation" => cache.lock().unwrap().invalidate_scope(
+                    batch.file_version_id.as_ref().unwrap(),
+                    &batch.layout_root_id,
+                ),
+                "scope" => invalid_scope.store(false, Ordering::Release),
+                "stop" => authority.stop(),
+                _ => unreachable!(),
+            });
+            fixture.engine.transfer = Arc::new(BeforeCommitTransfer {
+                inner: fixture.transfer.clone(),
+                invalidate,
+                completed: completed.clone(),
+            });
+            fixture.batch.lookahead = vec![fixture.chunk.id.clone()];
+            fixture.batch.ops.clear();
+            fixture.engine.prefetch_cached(
+                &fixture.batch,
+                1,
+                Arc::new(move || {
+                    if valid.load(Ordering::Acquire) {
+                        Ok(())
+                    } else {
+                        Err(unavailable("known handle denial"))
+                    }
+                }),
+            );
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while (!completed.load(Ordering::Acquire) || fixture.cache.has_fill_flight_for_test())
+                && Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(
+                completed.load(Ordering::Acquire),
+                "{action}: verified completion must reach the invalidation barrier"
+            );
+            assert!(
+                !fixture.cache.has_fill_flight_for_test(),
+                "{action}: task must finish before close"
+            );
+            assert_eq!(
+                fixture.cache.stats().unwrap().entries,
+                0,
+                "{action}: last authorization check must prevent Ready"
+            );
+            runtime
+                .block_on(fixture.engine.object_fetcher().unwrap().shutdown())
+                .unwrap();
+            assert_eq!(*fixture.sources.calls.lock().unwrap(), 1);
+        }
+    }
+
+    #[test]
+    fn r7_expired_queue_joins_an_already_started_object_before_returning() {
+        use std::sync::mpsc;
+        struct GatedTransfer {
+            inner: Arc<NativeCacheTransfer>,
+            entered: mpsc::Sender<()>,
+            release: Mutex<mpsc::Receiver<()>>,
+        }
+        impl ChunkTransfer for GatedTransfer {
+            fn read_ranges(&self, batch: &PeerReadBatch, out: &mut [u8]) -> Result<()> {
+                self.inner.read_ranges(batch, out)?;
+                self.entered.send(()).unwrap();
+                self.release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+                Ok(())
+            }
+        }
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut fixture = {
+            let _entered = runtime.enter();
+            NativeCacheFixture::new(MAX_DFS_READ_BYTES, vec![(0, 64 * 1024)], Duration::ZERO)
+        };
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        fixture.engine.transfer = Arc::new(GatedTransfer {
+            inner: fixture.transfer.clone(),
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+        });
+        let engine = Arc::new(fixture.engine);
+        let fetcher = engine.object_fetcher().unwrap();
+        let permits: Vec<_> = (0..7)
+            .map(|_| fetcher.try_reserve_background(1).unwrap().unwrap())
+            .collect();
+        let mut batch = fixture.batch;
+        let mut second = batch.ops[0].clone();
+        second.output_offset = 2;
+        batch.ops.push(second);
+        let sources = fixture.sources.reply.lock().unwrap().chunks.clone();
+        let deadline = Instant::now() + Duration::from_millis(200);
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let reading = std::thread::spawn(move || {
+            let mut out = [91; 4];
+            let result = engine.fanout_private_objects(&batch, &sources, &mut out, Some(deadline));
+            finished_tx.send((result.is_err(), out)).unwrap();
+        });
+        let entered = entered_rx.recv_timeout(Duration::from_secs(2)).is_ok();
+        std::thread::sleep(
+            deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(50),
+        );
+        let returned_before_join = finished_rx.try_recv().ok();
+        let _ = release_tx.send(());
+        drop(permits);
+        reading.join().unwrap();
+        let finished =
+            returned_before_join.or_else(|| finished_rx.recv_timeout(Duration::from_secs(2)).ok());
+        runtime.block_on(fetcher.shutdown()).unwrap();
+        assert!(
+            entered,
+            "one object must actually begin before queue expiry"
+        );
+        assert!(
+            returned_before_join.is_none(),
+            "deadline failure cannot detach the first object"
+        );
+        assert_eq!(finished, Some((true, [91; 4])));
+    }
+
+    #[test]
+    fn r7_saturated_foreground_queue_stops_at_the_original_grant_deadline() {
+        use std::sync::mpsc;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let fixture = {
+            let _entered = runtime.enter();
+            NativeCacheFixture::new(MAX_DFS_READ_BYTES, vec![(0, 64 * 1024)], Duration::ZERO)
+        };
+        let engine = Arc::new(fixture.engine);
+        let fetcher = engine.object_fetcher().unwrap();
+        let permits: Vec<_> = (0..8)
+            .map(|_| fetcher.try_reserve_background(1).unwrap().unwrap())
+            .collect();
+        let mut batch = fixture.batch;
+        let mut second = batch.ops[0].clone();
+        second.chunk_offset = 8;
+        second.output_offset = 2;
+        batch.ops.push(second);
+        let mut sources = fixture.sources.reply.lock().unwrap().chunks.clone();
+        sources[0].sources[0].read_grant.expires_at_unix_ms = now_unix_ms().saturating_add(75);
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let reading = std::thread::spawn(move || {
+            let mut out = [91; 4];
+            let result = engine.fanout_private_objects(&batch, &sources, &mut out, None);
+            finished_tx.send((result.is_err(), out)).unwrap();
+        });
+        // Always release the original eight owners and join, even on RED.
+        let expired_while_saturated = finished_rx.recv_timeout(Duration::from_secs(2)).ok();
+        drop(permits);
+        reading.join().unwrap();
+        runtime.block_on(fetcher.shutdown()).unwrap();
+        assert_eq!(
+            expired_while_saturated,
+            Some((true, [91; 4])),
+            "an expired queued grant must fail without waiting for a fetch slot or changing private output"
+        );
+    }
+
+    #[test]
+    fn r7_cross_object_private_read_overlaps_two_sink_fills_and_joins_before_delivery() {
+        use std::sync::{Condvar, mpsc};
+        struct CrossObjectTransfer {
+            bodies: BTreeMap<ChunkId, Vec<u8>>,
+            entered: mpsc::Sender<ChunkId>,
+            released: Arc<(Mutex<bool>, Condvar)>,
+        }
+        impl ChunkTransfer for CrossObjectTransfer {
+            fn read_ranges(&self, batch: &PeerReadBatch, out: &mut [u8]) -> Result<()> {
+                for item in &batch.operations {
+                    let body = &self.bodies[&item.op.chunk_id];
+                    let start = item.op.chunk_offset as usize;
+                    let length = item.op.length as usize;
+                    out[item.op.output_offset..item.op.output_offset + length]
+                        .copy_from_slice(&body[start..start + length]);
+                }
+                Ok(())
+            }
+            fn supports_verified_object_sink(&self) -> bool {
+                true
+            }
+            fn read_verified_object_to_sink<'output>(
+                &self,
+                _batch: &PeerReadBatch,
+                chunk: &ChunkObject,
+                offset: u64,
+                out: &'output mut [u8],
+                sink: &mut PeerStreamSink<'_>,
+            ) -> Result<Option<CompletedPeerDiskRead<'output>>> {
+                self.entered.send(chunk.id.clone()).unwrap();
+                let (lock, changed) = &*self.released;
+                let release = lock.lock().unwrap();
+                let _release = changed
+                    .wait_timeout_while(release, Duration::from_secs(5), |release| !*release)
+                    .unwrap();
+                crate::node::rpc::peer::complete_peer_disk_read_for_test(
+                    chunk,
+                    &self.bodies[&chunk.id],
+                    offset,
+                    out,
+                    sink,
+                )
+                .map(Some)
+            }
+        }
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let chunks = [
+            StagedChunk::new(OperationId::new("r7-cross-first"), vec![17; 64 * 1024]),
+            StagedChunk::new(OperationId::new("r7-cross-second"), vec![29; 64 * 1024]),
+        ];
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let released = Arc::new((Mutex::new(false), Condvar::new()));
+        let cache = Arc::new(
+            crate::node::peer_cache::DiskPeerCache::open(
+                crate::node::peer_cache::PeerCacheOptions {
+                    directory: temp.path().join("cache"),
+                    capacity_bytes: 1024 * 1024,
+                    namespace_id: crate::dfs::NamespaceId::new("default"),
+                },
+            )
+            .unwrap(),
+        );
+        let provider = Arc::new(StaticSources::new(DfsChunkSourcesReply {
+            revision: 1,
+            chunks: chunks
+                .iter()
+                .map(|chunk| ChunkSources {
+                    chunk: Some(chunk.chunk.clone()),
+                    chunk_id: chunk.chunk.id.clone(),
+                    allowed_ranges: vec![(0, chunk.chunk.length)],
+                    sources: vec![source("b", &chunk.chunk.id, "node-b")],
+                })
+                .collect(),
+        }));
+        let transfer = Arc::new(CrossObjectTransfer {
+            bodies: chunks
+                .iter()
+                .map(|chunk| (chunk.chunk.id.clone(), chunk.bytes().to_vec()))
+                .collect(),
+            entered: entered_tx,
+            released: released.clone(),
+        });
+        let engine = {
+            let _entered = runtime.enter();
+            DfsReadEngine::new(
+                crate::dfs::NamespaceId::new("default"),
+                "node-a".into(),
+                Arc::new(LocalChunkStore::open(temp.path().join("local"), "node-a").unwrap()),
+                provider,
+                transfer,
+                DfsReadConfig::default(),
+            )
+            .with_read_authority(Arc::new(LocalReadAuthority::new(
+                1,
+                Instant::now() + Duration::from_secs(30),
+            )))
+            .with_peer_cache(cache.clone())
+        };
+        let batch = ReadBatch {
+            lookahead: Vec::new(),
+            file_version_id: Some(FileVersionId::new("version")),
+            layout_root_id: LayoutRootId::new("layout"),
+            ops: chunks
+                .iter()
+                .enumerate()
+                .map(|(index, chunk)| ChunkReadOp {
+                    chunk_id: chunk.chunk.id.clone(),
+                    chunk_offset: if index == 0 {
+                        chunk.chunk.length - 8
+                    } else {
+                        0
+                    },
+                    length: 8,
+                    output_offset: index * 8,
+                })
+                .collect(),
+        };
+        let reading = std::thread::spawn(move || {
+            let mut out = [0; 16];
+            engine
+                .read_batch_native_into_private(&batch, &mut out)
+                .unwrap();
+            out
+        });
+        let first = entered_rx.recv_timeout(Duration::from_secs(2)).ok();
+        let second = entered_rx.recv_timeout(Duration::from_secs(2)).ok();
+        *released.0.lock().unwrap() = true;
+        released.1.notify_all();
+        let out = reading.join().unwrap();
+        assert!(
+            first.is_some() && second.is_some() && first != second,
+            "two objects in one private read must overlap their sink fills"
+        );
+        assert_eq!(&out[..8], &[17; 8]);
+        assert_eq!(&out[8..], &[29; 8]);
+        assert_eq!(cache.stats().unwrap().entries, 2);
     }
 
     #[test]

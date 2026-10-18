@@ -174,9 +174,16 @@ worker与读修复共用原修复gate及完整字节健康检查；健康文件�
 S3写路径不生成这份原生写proof，
 原外部窗口、载荷／descriptor预算和有序发布合同独立保持。
 
+本地`catalog.wal`恢复仅丢弃物理EOF处、无换行且JSON确实不完整的尾事务，保留之前
+逐条核验的有效字节前缀并同步截断。完整事务即使没有末尾换行也原样接受，下一次追加
+补充分隔符；完整语法、UTF-8非法字节、checksum或revision损坏仍拒绝启动，不删除
+未入catalog的正文孤儿。这只是后续组提交的恢复前置；当前未实现`CatalogCommitter`、
+跨请求组屏障或将catalog I/O移出锁，不能据此宣称写侧组提交完成。Meta提交结果未知时
+仍先按原OperationId、精确请求、正文和回执幂等确认，后续修改不得越过。
+
 本机和A端完整扫描后也可能修复缺失／损坏的可选sidecar。在固定共享修复分片锁内做
 不带sync的完整字节比较，健康文件不重写、不rename、不做文件或目录sync；仅缺坏文件
-才安装。已验证Peer正文单槽命中不再访问sidecar。修复可能产生文件与目录sync，但不持有Peer正文单槽锁；原正文填充
+才安装。已验证Peer正文LRU命中不再访问sidecar。修复可能产生文件与目录sync，但不持有Peer正文表锁；原正文填充
 singleflight与额度不变。容量不足不当作损坏，不丢弃健康证明后重建／落盘；安全完整根
 扫描仍保留。修复失败只放弃可选优化，不削弱正文／catalog／receipt持久屏障。
 固定修复锁及reader结构属于有界运行时开销，不宣称被proof额度覆盖全部Node内存。
@@ -197,8 +204,9 @@ B的`dfs_peer_cache`默认OFF，只存可丢弃磁盘副本，不写入LocalChun
 同对象miss通过有界FillFlight共享填充工作，flight只持有控制信息和结果，不持有正文或
 授权成功结论。默认最多8个metadata flight，可用`dfs_fetch_max_inflight_objects`设为1..=8；
 这不表示8路正文填充。原生Peer最多两个stream fill共享原4MiB transport包络：
-整个Node只有两个256KiB载荷块、一份256KiB控制额度及一个活动Channel，其他连接身份
-等待当前会话排空；legacy完整对象回退与stream fill互斥。独立hit可与fill并行，
+整个Node只有两个256KiB载荷块、一份256KiB控制额度及一个活动Channel；两个流共享
+该Channel不超过2MiB的connection窗口，每流窗口也不超过2MiB，解码消息仍限128KiB。
+其他连接身份等待当前会话排空；legacy完整对象回退与stream fill互斥。独立hit可与fill并行，
 不借用S3 pending额度。逐代pending文件分别保留身份、磁盘及元数据收费，失败删除
 不提前退账；最后一个活动持有者释放后销毁共享载荷块，不形成正文RAM缓存。
 每个等待者检查自己的授权与期限；提交前已知拒绝不安装Ready。leader个体权限失效不
@@ -213,6 +221,21 @@ Meta的ChunkSources可附带当前授权视图中的合法区间；提示缺失�
 不制造B端完整对象证明，也不扩大grant。partial由A核对可信根覆盖组，B保留原range checksum，
 不宣称B独立完成根证明。旧Peer不支持新字段时保留完整根安全回退；
 未知格式、超限、截断或标准根／对象身份绑定错误明确拒绝。
+
+`dfs_fetch::ObjectFetcher`以既有runtime阻塞任务调度前台分片及可选预读，复用唯一
+FillFlight表；任务上限沿用1..=8，后台无额度即放弃，前台等待者优先。原生只读句柄
+固定大小的顺序提示产生1／2／4窗口；`dfs_readahead_max_bytes`默认0，contract保持0，
+product可显式设为8388608（8MiB），最多32MiB调度距离；0不建后台任务。
+这不扩大预算：两流仍共享同一实际Channel、两块载荷
+及控制额度，proof账本覆盖固定状态及按实际capacity估算的任务元数据；后台结果只进入
+可丢弃磁盘缓存，不新增正文RAM缓存。
+后台以空输出绑定接收完整对象，禁止完整Vec回退；前台多对象分片总长仅复用原复杂batch
+scratch，全部join和最终核权成功后才复制输出，失败／回退先释放所有分片。
+
+预读只使用当前缓存的未过期完整对象grant；每帧和提交前重查来源generation、句柄
+scope／已知拒绝及Node生命周期。停止取消静默网络等待并join实际producer及fetch任务。
+最后核权与磁盘rename沿用既有非原子边界，不建立全局撤销协议；Ready是可丢弃条目，
+后续公开输出独立核权。调度计数及元数据峰值为观测，不作为硬准入证明。
 
 满足原窗口及multi-thread runtime条件时，gRPC用既有runtime单producer接收当前对象，
 全链仅两个256KiB独占载荷块，wire帧至多64KiB、交接队列至多一项。Header中的proof先
@@ -234,7 +257,7 @@ consumer收到Completion仍不能产生完成凭证；实际EOF和producer成功
 A store、原生写pool与B cache在同一Node共用原1MiB proof ledger，不各自新增额度。
 其内计入outboard实际capacity、Arc／包装、构建与编码／解码临时工作，以及缓存证明
 索引（当前64位构建中4096个指针占32KiB）。共享引用直到最后owner释放才退账；
-其中常驻保留最多使用总额一半（默认512KiB），A pinned reader、Peer单槽proof和B
+其中常驻保留最多使用总额一半（默认512KiB），A pinned reader、Peer正文proof和B
 proof／索引／包装共用该子限；不是新增一套内存池。已标记常驻的分配直到最后引用释放
 才退还总账与子限，淘汰条目不能提前退账。在途工作、writer与验证者仍竞争原总账，
 不保证32个并发请求全部取得快路径。对齐单范围工作票预留36KiB（32KiB scratch加
@@ -465,4 +488,5 @@ control/payload不足共用该期限，不按重试或Header前回退重新计�
 过期只禁止继续等待，现成容量仍可立即取得；已开始的I/O、同flight结果和R-4帧背压
 继续受原授权／stop／传输合同约束。budget独立通知锁不嵌套获取cache表锁，最后
 真实owner释放才扣款唤醒；停止先关闭准入再排空。RDMA packed保持原立即准入，
-不增加连接窗口、正文或proof额度。
+不增加连接窗口、正文或proof额度。原预算下的两流共享Channel不等于多连接；16MiB
+connection／4MiB stream等大窗口方案继续后置，不能移除现有≤2MiB的流水线准入条件。

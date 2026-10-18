@@ -14,6 +14,8 @@
 pub mod api;
 pub mod chunk;
 #[cfg(feature = "dfs")]
+mod dfs_fetch;
+#[cfg(feature = "dfs")]
 pub mod dfs_read;
 #[cfg(feature = "dfs")]
 pub mod external_chunk;
@@ -1511,6 +1513,8 @@ async fn run_node(
     #[cfg(feature = "dfs")]
     let mut dfs_peer_cache_for_shutdown: Option<Arc<peer_cache::DiskPeerCache>> = None;
     #[cfg(feature = "dfs")]
+    let mut dfs_fetcher_for_shutdown: Option<Arc<dfs_fetch::ObjectFetcher>> = None;
+    #[cfg(feature = "dfs")]
     let dfs_write_buffer_idle_bytes =
         usize::try_from(cfg.dfs_write_buffer_idle_bytes).map_err(|_| {
             afs_error::Error::coded(
@@ -1594,6 +1598,7 @@ async fn run_node(
             source_cache_ttl: std::time::Duration::from_millis(cfg.dfs_source_cache_max_ms),
             source_lookahead_chunks: cfg.dfs_source_lookahead_chunks,
             source_cache_bytes: cfg.dfs_source_cache_bytes,
+            readahead_max_bytes: cfg.dfs_readahead_max_bytes,
         };
         read_config.validate()?;
         let read_engine = dfs_read::DfsReadEngine::new(
@@ -1639,6 +1644,7 @@ async fn run_node(
             Some(store) => read_engine.with_external_backend(store, meta.clone()),
             None => read_engine,
         });
+        dfs_fetcher_for_shutdown = read_engine.object_fetcher();
         let remote_factory = Arc::new(rpc::peer::GrpcDfsOwnerFactory::new(
             peer_connections.clone(),
             timeout,
@@ -2245,6 +2251,10 @@ async fn run_node(
         if let Some(cache) = &dfs_peer_cache_for_shutdown {
             cache.close_admission();
         }
+        #[cfg(feature = "dfs")]
+        if let Some(fetcher) = &dfs_fetcher_for_shutdown {
+            fetcher.close();
+        }
         on_shutdown();
     };
     #[cfg(feature = "ownerfs")]
@@ -2405,6 +2415,12 @@ async fn run_node(
             }
             Err(error) => remember_shutdown_error(&mut shutdown_error, error.into()),
         }
+    }
+    #[cfg(feature = "dfs")]
+    if let Some(fetcher) = dfs_fetcher_for_shutdown
+        && let Err(error) = fetcher.shutdown().await
+    {
+        remember_shutdown_error(&mut shutdown_error, error.into());
     }
     #[cfg(feature = "dfs")]
     if let Some(cache) = dfs_peer_cache_for_shutdown {

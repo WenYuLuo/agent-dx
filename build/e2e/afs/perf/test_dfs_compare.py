@@ -56,6 +56,17 @@ class Configuration(unittest.TestCase):
         cfg['labels']['afs-baseline']['metric_profile'] = 'typo'
         with self.assertRaises(ValueError): driver.validate_config(cfg)
 
+    def test_r7_fetch_profile_is_explicit_and_needs_p2_endpoints(self):
+        cfg = fixture(); label = cfg['labels']['afs-baseline']
+        label['fetch_metric_profile'] = 'r7'
+        with self.assertRaisesRegex(ValueError, 'p2 A/B endpoints'): driver.validate_config(cfg)
+        label['metric_profile'] = 'p2'
+        label['metrics'] = [{'node': node, 'name': 'node-' + node,
+                             'url': 'http://127.0.0.1:9000/metrics'} for node in ['a', 'b']]
+        driver.validate_config(cfg)
+        label['fetch_metric_profile'] = 'typo'
+        with self.assertRaisesRegex(ValueError, 'fetch metric profile'): driver.validate_config(cfg)
+
     def test_explicit_driver_memory_admission(self):
         cfg = fixture(); cfg['nodes']['a']['min_available_memory_bytes'] = 3 * 1024**3
         driver.validate_config(cfg)
@@ -165,6 +176,26 @@ class Accounting(unittest.TestCase):
         self.assertEqual(result['endpoints']['node-a']['node'], 'a')
         self.assertEqual(result['endpoints']['node-a']['snapshots']['before']['outboard_gauges'][name], 50)
         self.assertEqual(result['endpoints']['node-a']['snapshots']['after_first']['outboard_gauges'][name], 0)
+
+    def test_r7_fetch_fixed_events_and_gauges_are_required_only_when_opted_in(self):
+        label, snapshots = self.p2_samples()
+        self.assertTrue(driver.metric_evidence(label, snapshots)['complete'])
+        label['fetch_metric_profile'] = 'r7'
+        incomplete = driver.metric_evidence(label, snapshots)
+        self.assertFalse(incomplete['complete'])
+        self.assertEqual(len(incomplete['missing']), 3 * len(driver.fetch_required_metrics()))
+        for phase in driver.METRIC_PHASES:
+            snapshots[phase]['node-b']['text'] += '\n' + '\n'.join(
+                name + ' 0' for name in driver.fetch_required_metrics())
+        complete = driver.metric_evidence(label, snapshots)
+        self.assertTrue(complete['complete'])
+        self.assertEqual(complete['endpoints']['node-b']['snapshots']['before']['fetch_gauges'],
+                         {name: 0 for name in driver.FETCH_GAUGES})
+        snapshots['after_first']['node-b']['text'] = snapshots['after_first']['node-b']['text'].replace(
+            'afs_dfs_fetch_events_total{event="scheduled"} 0', '')
+        missing = driver.metric_evidence(label, snapshots)['missing']
+        self.assertEqual(missing, [{'endpoint': 'node-b', 'node': 'b', 'phase': 'after_first',
+                                   'metric': 'afs_dfs_fetch_events_total{event="scheduled"}'}])
 
     def test_each_missing_required_metric_is_incomplete_not_zero(self):
         label, snapshots = self.p2_samples()

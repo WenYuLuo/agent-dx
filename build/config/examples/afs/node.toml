@@ -29,6 +29,9 @@ uds_path = "/opt/adx/run/afs/node-a.sock"
 # Bounded native cache flight records, valid range 1..=8.
 # This does not enable multiple body fills or object prefetch.
 # dfs_fetch_max_inflight_objects = 8
+# Native body readahead is opt-in; product profiles may explicitly use 8388608.
+# This is scheduling distance, sharing the existing proof/stream/disk budgets.
+# dfs_readahead_max_bytes = 0
 # A-side verified Peer payloads: 2 resident objects, sharing 16MiB with live frames.
 # Payload range 4..=64MiB; eviction does not refund still-referenced data.
 # dfs_peer_serve_resident_objects = 2

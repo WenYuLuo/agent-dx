@@ -198,6 +198,7 @@ cache ON 必须按[验收说明](../testing/afs.md#dfs-外部-s3-闭环)登记�
 | `dfs_source_cache_max_ms` | `5000` | `0..=60000`，源元数据缓存的最长保留时间，另受grant安全截止约束；0不保留且不前瞻 |
 | `dfs_source_lookahead_chunks` | `64` | `0..=128`，仅后续源元数据；与mandatory合并请求至多128项；0仅关闭前瞻 |
 | `dfs_source_cache_bytes` | `4194304`（4MiB） | `0..=4194304`，最多1024条源元数据的保留估算上限；0不保留且不前瞻 |
+| `dfs_readahead_max_bytes` | `0` | `0..=33554432`；0不创建后台fetch任务；product可显式设8388608。这是对象调度距离，未新增正文、proof、连接或磁盘额度 |
 
 TTL均保持0才属于严格路径新鲜度配置；正值是显式宽松模式，rename替换等路径
 可能在TTL内继续解析为旧inode，不能宣传严格close-to-open。OwnerFs原Home缓存、TTL、
@@ -279,7 +280,8 @@ Node，再按专属缓存目录的清理合同退休可丢弃条目，或配置�
 磁盘缓存的metadata flights，不适用于S3，也不代表8路正文。当前最多两个流式fill
 共享原4MiB逻辑transport包络；legacy完整对象fill保持独占，不与流式fill并存。
 Node总共只有两个256KiB载荷块、256KiB控制额度；两个流固定复用同一Channel，
-其connection/stream窗口仍不超过2MiB，解码消息仍限128KiB。不同连接身份等旧会话
+两个流共享不超过2MiB的connection窗口，每流窗口也不超过2MiB，解码消息仍限128KiB。
+不同连接身份等旧会话
 真实排空，不能每流再申请两块缓冲或另开一个连接窗口。私有结果按原每操作读取预算
 另计，4MiB不是Node总RSS上限；proof沿用原账本，不新增额度。
 
@@ -287,7 +289,39 @@ Node总共只有两个256KiB载荷块、256KiB控制额度；两个流固定复�
 实际分配共同受`capacity_bytes`约束。失败删除或外来替换继续收费，不触碰其他活动文件。
 最后一个生产者、块或请求释放后才销毁共享缓冲、退还观测reservation；空闲会话不常驻
 512KiB正文。外部S3的`pending_bytes = 37748736`仍只属于外部缓存，不可转用。
-这里只实现有界并发回填底座，尚不表示自适应预读或完整R-7已验收。
+原生只读句柄在成功交付后检测固定版本上的顺序访问，允许距上次结尾至多1MiB，窗口按
+1、2、4逐步增长；随机跳转清零，版本改变重新开始。对象数按每对象4MiB保守折算到
+上述距离并封顶8。后台只消费已缓存且未过期的完整对象grant，不查询Meta，不等待
+正文、proof、任务或连接额度，前台等待者优先；未命中可用额度直接放弃。外部S3、
+dirty和owner代理读取沿用原路径。可丢弃cache须启用，transport还须满足原小窗口限制。
+
+后台只写磁盘sink，以空输出绑定进行完整校验，不申请假4MiB输出；固定控制结构、任务
+上下文、字符串capacity与flight继续从原proof账本收费。前台跨对象任务复用原复杂batch
+的请求总长scratch，全部join并核权后才复制到私有最终结果；回退前先释放分片scratch。
+停止先取消再真实join producer及fetch任务，不以丢弃JoinHandle冒充排空。提交前重查
+grant、来源generation、句柄已知拒绝和Node停止；最后检查与rename之间沿用既有极窄
+窗口，未引入全局撤销锁；任何后续公开读取仍独立授权，不从Ready继承读取权限。
+
+当前原生读的资源边界如下。重叠包络不能简单相加，配置上限不是实测RSS；实际分配、
+在途引用和最后引用退账还须在独立资源诊断中核对。
+
+| 资源 | 当前额度／范围 | 归属与释放 |
+| --- | --- | --- |
+| A正文 | 默认16MiB，4..64MiB；默认2个resident | 填充、resident、退役pin及packed共用；末正文引用释放 |
+| A控制元数据 | 固定64KiB | 有界服务状态与ID，不挪用proof或S3额度 |
+| B共享流式包络 | 逻辑4MiB，最多2流、1个实际Channel | 两个256KiB块、256KiB控制额度及原transport积压共享；实际最后owner结束后退账 |
+| B前台私有输出／分片 | 原单批最多8MiB，非Node总上限 | 分片合计复用原请求scratch，失败先join和销毁再回退 |
+| B后台预读正文 | 不保留完整正文或伪输出 | 仅原共享块到磁盘sink，正常EOF／完整核根后才可安装Ready |
+| proof及任务元数据 | 原总账1MiB，resident子限512KiB | A／写pool／B索引、proof、fetch固定状态及任务capacity共用；不是新增两池 |
+| fetch任务／对象flight | 默认8，配置1..8 | 唯一FillFlight对象表，任务只有控制和结果；任务数不等于正文并发数 |
+| B磁盘 | `capacity_bytes`，示例256MiB | ready、pending、retired及deleting实际分配共同计费，真实删除前不退账 |
+| 源／版本元数据缓存 | 默认4MiB／32MiB | 与上述正文分账；当前reply、在途clone及allocator另计 |
+
+要在product测量中启用对象预读，应在Node顶层显式配置
+`dfs_readahead_max_bytes = 8388608`，先启用上述专属磁盘cache并用实际二进制
+`--config /absolute/node.toml --print-config`确认A/B有效值与配置SHA。contract固定0。
+不添加字段时保持默认OFF，不能将旧配置的“AFS prefetch=0”收据作为ON证据。具体
+测试启停、参数冻结和结果归档见[验收说明](../testing/afs.md#原生对象调度与磁盘预读回归)。
 
 表内indexed、retired与删除中条目合计最多4096，实际文件删除前磁盘占用不退还；被pin的退休条目
 也占容量，同key不能在旧文件仍被使用时重建。容量或控制元数据不足保留安全回退。
@@ -302,11 +336,12 @@ Node总共只有两个256KiB载荷块、256KiB控制额度；两个流固定复�
 原1MiB proof ledger由同一Node的A store、原生写pool和B cache共用；计入proof实际
 capacity、Arc／包装、构建／encode／decode临时分配及证明索引（当前64位构建为32KiB），
 在途引用直到最后owner释放才退账。总额的一半（默认512KiB）作为常驻保留子限，
-A pinned／Peer单槽和B proof／索引包装共同受限；不是额外额度或另一池。条目淘汰但
+A pinned／Peer正文proof和B proof／索引包装共同受限；不是额外额度或另一池。条目淘汰但
 引用仍活跃时不能提前退账。临时验证／写入builder共享剩余总账，超过可用额度允许安全
 回退，不保证默认32 workers都取得快路径。容量不足不能当作健康proof损坏并触发反复
 重建或写盘；对应准入失败、原生写无proof和范围全扫回退需要分别观察。不挪用正文额度。它不代表进程总RAM；codec、TLS、HTTP/2及内核pagecache
-仍按原独立预算核算。这里没有新增正文RAM驻留缓存或预取。
+仍按原独立预算核算。这里没有新增正文RAM驻留缓存；可选正文预取仅写入上述磁盘缓存，
+须显式开启且继续使用原额度。
 
 本机读、A端Peer范围服务及B磁盘命中统一使用标准BLAKE3根与32KiB覆盖组outboard。
 proof包含64B格式／长度／根header和parent CV，4MiB对象最多8192B；命中仍读取、
@@ -329,8 +364,8 @@ proof引用和控制容器／ID／路径容量都计入原1MiB ledger，控制�
 报告可选工作处置事件，不表示写入持久化失败或精确对象完成数。
 读侧也可同步修复缺失／损坏的sidecar，安装可能产生文件与目录sync。健康sidecar仅
 在固定共享修复锁内比较而不write／rename／sync，避免同对象重复安装；已验证Peer正文
-单槽命中不再访问sidecar。修复不持
-Peer正文单槽锁；这条读修复仍同步执行，与写ACK后的可选installer区分。缺容量时走完整根安全读取，不能借修复改变
+LRU命中不再访问sidecar。修复不持
+Peer正文表锁；这条读修复仍同步执行，与写ACK后的可选installer区分。缺容量时走完整根安全读取，不能借修复改变
 原正文、catalog或成功fsync合同。
 
 并发范围验证的快路径受原proof总账约束：对齐单范围工作票据36KiB（32KiB scratch
@@ -423,6 +458,12 @@ DFS 状态增长也会增加共用 Meta 的快照处理成本；本次不改变�
 数据后端的匹配恢复点及版本身份。回滚只能使用与旧版本匹配的完整恢复点，并明确恢复点之后
 写入的处理；不得把旧 Meta 快照与另一代对象数据混用。本版本不提供快照降级转换。
 
+原生Node的`catalog.wal`另有有限尾恢复：只截断物理EOF处无换行的JSON不完整尾部，
+保留并同步已核验前缀；完整损坏、非法UTF-8字节、checksum或revision错误仍拒绝启动。
+完整无换行事务不在恢复时改写，后续追加补分隔符；不清理目录中的正文孤儿。截断／sync
+失败继续报错，不能手工删WAL绕过。本项没有启用组提交或锁外catalog I/O，也不改变
+原正文／目录／catalog ACK屏障、未知Meta结果精确重放或后续修改不能越过的要求。
+
 ## Node 注册租约期限
 
 Meta 注册回复提供实际已持久化租约的相对剩余期限 `lease_remaining_ms`；Node 从请求开始的
@@ -440,4 +481,6 @@ Meta 注册回复提供实际已持久化租约的相对剩余期限 `lease_rema
 对象flight、控制与正文额度；不是额外传输超时。0不排队，临时压力到期仍返回
 resource_exhausted，停止后不允许等待结果生成新的响应。RPC许可等待在原配置期限
 内复查stop，预算／flight等待由通知唤醒。该参数不增加容量，不延长授权，不改变
-已发送Header后的错误传播和末引用退账；大窗口／多连接没有因此启用。
+已发送Header后的错误传播和末引用退账。同一截止不因重试、Header前回退或伪唤醒
+重置，也不作为已开始I/O、同flight结果或双帧背压的完成时限；原授权／stop／传输期限
+继续约束这些工作。大窗口／多连接后置，没有因此启用或扩大共享2MiB窗口。

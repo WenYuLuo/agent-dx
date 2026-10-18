@@ -257,6 +257,9 @@ pub struct Cli {
     /// Concurrent native cache fill-flight records (1..=8), not active body transfers.
     #[arg(long)]
     pub dfs_fetch_max_inflight_objects: Option<usize>,
+    /// Native object lookahead distance (0..=32MiB); 0 disables background fetch.
+    #[arg(long)]
+    pub dfs_readahead_max_bytes: Option<u64>,
     /// Verified Peer resident objects (1..=16), sharing the payload byte limit.
     #[arg(long)]
     pub dfs_peer_serve_resident_objects: Option<usize>,
@@ -349,6 +352,7 @@ struct FileConfig {
     dfs_outboard_work_wait_ms: Option<u64>,
     dfs_sidecar_install_queue: Option<usize>,
     dfs_fetch_max_inflight_objects: Option<usize>,
+    dfs_readahead_max_bytes: Option<u64>,
     dfs_peer_serve_resident_objects: Option<usize>,
     dfs_peer_serve_payload_bytes: Option<u64>,
     dfs_peer_serve_wait_ms: Option<u64>,
@@ -415,6 +419,7 @@ pub struct Config {
     pub dfs_outboard_work_wait_ms: u64,
     pub dfs_sidecar_install_queue: usize,
     pub dfs_fetch_max_inflight_objects: usize,
+    pub dfs_readahead_max_bytes: u64,
     pub dfs_peer_serve_resident_objects: usize,
     pub dfs_peer_serve_payload_bytes: u64,
     pub dfs_peer_serve_wait_ms: u64,
@@ -636,6 +641,13 @@ impl Config {
         if !(1..=8).contains(&dfs_fetch_max_inflight_objects) {
             return Err(invalid("DFS fetch inflight objects must be 1..=8"));
         }
+        let dfs_readahead_max_bytes = cli
+            .dfs_readahead_max_bytes
+            .or(file.dfs_readahead_max_bytes)
+            .unwrap_or(0);
+        if dfs_readahead_max_bytes > 32 * 1024 * 1024 {
+            return Err(invalid("DFS readahead distance must be 0..=32MiB"));
+        }
         let dfs_peer_serve_resident_objects = cli
             .dfs_peer_serve_resident_objects
             .or(file.dfs_peer_serve_resident_objects)
@@ -729,6 +741,7 @@ impl Config {
             dfs_outboard_work_wait_ms,
             dfs_sidecar_install_queue,
             dfs_fetch_max_inflight_objects,
+            dfs_readahead_max_bytes,
             dfs_peer_serve_resident_objects,
             dfs_peer_serve_payload_bytes,
             dfs_peer_serve_wait_ms,

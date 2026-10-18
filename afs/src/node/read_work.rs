@@ -143,6 +143,10 @@ pub struct ReadWorkMetrics {
     stream_frame_peak_bytes: afs_metrics::IntGauge,
     #[cfg(any(feature = "dfs", test))]
     stream_frames: Arc<StreamFrameAccounting>,
+    #[cfg(feature = "dfs")]
+    fetch_events: afs_metrics::IntCounterVec,
+    #[cfg(feature = "dfs")]
+    fetch_resources: afs_metrics::IntGaugeVec,
     #[cfg(any(feature = "dfs", test))]
     diagnostics: Option<Arc<ReadDiagnostics>>,
 }
@@ -382,6 +386,24 @@ impl ReadWorkMetrics {
             let stream_reserved_peak_bytes = afs_metrics::IntGauge::new("afs_dfs_peer_disk_cache_stream_reserved_peak_bytes", "Peak conservative streaming fill reservation; mutually exclusive with legacy full-body fill for one cache operation.")?;
             #[cfg(any(feature = "dfs", test))]
             let stream_private_peak_bytes = afs_metrics::IntGauge::new("afs_dfs_peer_disk_cache_stream_private_peak_bytes", "Peak conservative streaming fill reservation plus private output; not Node RSS.")?;
+            #[cfg(feature = "dfs")]
+            let fetch_events = afs_metrics::IntCounterVec::new(afs_metrics::Opts::new(
+                "afs_dfs_fetch_events_total", "Bounded native object fetch scheduling outcomes."), &["event"])?;
+            #[cfg(feature = "dfs")]
+            let fetch_resources = afs_metrics::IntGaugeVec::new(afs_metrics::Opts::new(
+                "afs_dfs_fetch_resources", "Fetch tasks and actual metadata charges in the existing proof ledger; no body quota."), &["resource"])?;
+            #[cfg(feature = "dfs")]
+            for event in ["scheduled", "skip_disabled", "skip_budget", "skip_grant", "skip_busy", "joined", "cancelled", "failed"] {
+                fetch_events.with_label_values(&[event]);
+            }
+            #[cfg(feature = "dfs")]
+            for resource in ["jobs", "metadata_bytes", "metadata_peak_bytes", "job_limit"] {
+                fetch_resources.with_label_values(&[resource]);
+            }
+            #[cfg(feature = "dfs")]
+            afs_metrics::register_collector(registry, &fetch_events)?;
+            #[cfg(feature = "dfs")]
+            afs_metrics::register_collector(registry, &fetch_resources)?;
             #[cfg(any(feature = "dfs", test))]
             let stream_frame_bytes = afs_metrics::IntGauge::new("afs_dfs_peer_disk_cache_stream_frame_bytes", "Owned reusable payload block capacity through free pool, producer, queue and consumer; excludes bounded control fields and transport buffers.")?;
             #[cfg(any(feature = "dfs", test))]
@@ -535,6 +557,10 @@ impl ReadWorkMetrics {
                 stream_frame_peak_bytes,
                 #[cfg(any(feature = "dfs", test))]
                 stream_frames: Arc::new(StreamFrameAccounting::default()),
+                #[cfg(feature = "dfs")]
+                fetch_events,
+                #[cfg(feature = "dfs")]
+                fetch_resources,
                 #[cfg(any(feature = "dfs", test))]
                 diagnostics: None,
             })
@@ -623,6 +649,39 @@ impl ReadWorkMetrics {
         if let (Ok(current), Ok(peak)) = (i64::try_from(current), i64::try_from(peak)) {
             self.disk_cache_metadata_bytes.set(current);
             self.disk_cache_metadata_peak_bytes.set(peak);
+        }
+    }
+
+    #[cfg(feature = "dfs")]
+    pub(crate) fn fetch_event(&self, event: &'static str) {
+        if matches!(
+            event,
+            "scheduled"
+                | "skip_disabled"
+                | "skip_budget"
+                | "skip_grant"
+                | "skip_busy"
+                | "joined"
+                | "cancelled"
+                | "failed"
+        ) {
+            self.fetch_events.with_label_values(&[event]).inc();
+        }
+    }
+
+    #[cfg(feature = "dfs")]
+    pub(crate) fn fetch_resources(&self, jobs: usize, bytes: usize, peak: usize, limit: usize) {
+        for (resource, value) in [
+            ("jobs", jobs),
+            ("metadata_bytes", bytes),
+            ("metadata_peak_bytes", peak),
+            ("job_limit", limit),
+        ] {
+            if let Ok(value) = i64::try_from(value) {
+                self.fetch_resources
+                    .with_label_values(&[resource])
+                    .set(value);
+            }
         }
     }
 

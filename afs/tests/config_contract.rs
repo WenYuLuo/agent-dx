@@ -2,6 +2,46 @@ use afs::config::{Cli, Config, MetaStoreBackend, Role};
 use clap::Parser;
 
 #[test]
+fn p2_r7_readahead_is_opt_in_and_only_a_bounded_distance() {
+    assert_eq!(
+        Config::resolve(Role::Node, Cli::parse_from(["afs-node"]))
+            .unwrap()
+            .dfs_readahead_max_bytes,
+        0
+    );
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("node.toml");
+    for distance in [0, 8 * 1024 * 1024, 32 * 1024 * 1024] {
+        std::fs::write(&path, format!("dfs_readahead_max_bytes={distance}\n")).unwrap();
+        let file = Config::resolve(
+            Role::Node,
+            Cli::parse_from(["afs-node", "--config", path.to_str().unwrap()]),
+        )
+        .unwrap();
+        assert_eq!(file.dfs_readahead_max_bytes, distance);
+        let cli = Config::resolve(
+            Role::Node,
+            Cli::parse_from([
+                "afs-node",
+                "--config",
+                path.to_str().unwrap(),
+                "--dfs-readahead-max-bytes",
+                "0",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(cli.dfs_readahead_max_bytes, 0);
+    }
+    assert!(
+        Config::resolve(
+            Role::Node,
+            Cli::parse_from(["afs-node", "--dfs-readahead-max-bytes", "33554433"])
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn p2_r5_flight_limit_cli_is_exposed() {
     assert!(
         Cli::try_parse_from(["afs-node", "--dfs-fetch-max-inflight-objects", "8"]).is_ok(),

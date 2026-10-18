@@ -1012,6 +1012,24 @@ impl PeerConnectionPool {
         node_epoch: u64,
         endpoint: &str,
     ) -> afs_error::Result<Arc<PeerStreamActive>> {
+        self.acquire_stream_work_mode(node_id, node_epoch, endpoint, false)
+            .await?
+            .ok_or_else(|| dfs_protocol_error("Peer foreground stream admission stopped"))
+    }
+
+    #[cfg(feature = "dfs")]
+    async fn acquire_stream_work_mode(
+        &self,
+        node_id: &str,
+        node_epoch: u64,
+        endpoint: &str,
+        background: bool,
+    ) -> afs_error::Result<Option<Arc<PeerStreamActive>>> {
+        let _waiting = if background {
+            None
+        } else {
+            Some(PeerStreamWaiter::new(self.stream_work.clone())?)
+        };
         if node_id.is_empty()
             || node_epoch == 0
             || endpoint.is_empty()
@@ -1034,7 +1052,14 @@ impl PeerConnectionPool {
             changed.as_mut().enable();
             // Fence and select under the connection metadata lock. Never ask
             // the LRU for a replacement while another Channel is active.
-            let mut channels = self.state.lock().await;
+            let mut channels = if background {
+                match self.state.try_lock() {
+                    Ok(channels) => channels,
+                    Err(_) => return Ok(None),
+                }
+            } else {
+                self.state.lock().await
+            };
             if channels
                 .high_water_epochs
                 .get(node_id)
@@ -1046,11 +1071,23 @@ impl PeerConnectionPool {
                 ));
             }
             {
-                let mut state = self
-                    .stream_work
-                    .state
-                    .lock()
-                    .map_err(|_| dfs_protocol_error("Peer stream admission lock poisoned"))?;
+                let mut state = if background {
+                    match self.stream_work.state.try_lock() {
+                        Ok(state) => state,
+                        Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+                        Err(std::sync::TryLockError::Poisoned(_)) => {
+                            return Err(dfs_protocol_error("Peer stream admission lock poisoned"));
+                        }
+                    }
+                } else {
+                    self.stream_work
+                        .state
+                        .lock()
+                        .map_err(|_| dfs_protocol_error("Peer stream admission lock poisoned"))?
+                };
+                if background && state.foreground_waiters != 0 {
+                    return Ok(None);
+                }
                 if state.active == 0 {
                     let candidate = self.channel_locked(&mut channels, &key, true)?;
                     let mut blocks = Vec::with_capacity(2);
@@ -1076,13 +1113,16 @@ impl PeerConnectionPool {
                 {
                     let session = session.clone();
                     state.active += 1;
-                    return Ok(Arc::new(PeerStreamActive {
+                    return Ok(Some(Arc::new(PeerStreamActive {
                         pool: self.stream_work.clone(),
                         session,
-                    }));
+                    })));
                 }
             }
             drop(channels);
+            if background {
+                return Ok(None);
+            }
             changed.await;
         }
     }
@@ -1300,8 +1340,33 @@ struct PeerStreamWorkPool {
 #[derive(Default)]
 struct PeerStreamWorkState {
     active: usize,
+    foreground_waiters: usize,
     session: Option<Arc<PeerStreamSession>>,
 }
+#[cfg(feature = "dfs")]
+struct PeerStreamWaiter {
+    pool: Arc<PeerStreamWorkPool>,
+}
+#[cfg(feature = "dfs")]
+impl PeerStreamWaiter {
+    fn new(pool: Arc<PeerStreamWorkPool>) -> afs_error::Result<Self> {
+        pool.state
+            .lock()
+            .map_err(|_| dfs_protocol_error("Peer stream wait lock poisoned"))?
+            .foreground_waiters += 1;
+        Ok(Self { pool })
+    }
+}
+#[cfg(feature = "dfs")]
+impl Drop for PeerStreamWaiter {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.pool.state.lock() {
+            state.foreground_waiters = state.foreground_waiters.saturating_sub(1);
+        }
+        self.pool.changed.notify_waiters();
+    }
+}
+
 #[cfg(feature = "dfs")]
 struct PeerStreamSession {
     key: PeerChannelKey,
@@ -1943,6 +2008,7 @@ impl GrpcChunkTransfer {
         requested_offset: u64,
         out: &'output mut [u8],
         sink: &mut PeerStreamSink<'_>,
+        prefetch: Option<&crate::node::dfs_read::PrefetchControl>,
     ) -> afs_error::Result<Option<CompletedPeerDiskRead<'output>>> {
         if !self.stream_sink_supported()
             || out
@@ -2057,20 +2123,30 @@ impl GrpcChunkTransfer {
         producer_request.set_timeout(timeout);
         // Acquire before spawning, and retain through producer join and all
         // queued/consumer blocks. Every block also pins this operation ticket.
+        if let Some(control) = prefetch {
+            control.check()?;
+        }
         let active = self.runtime.block_on(async {
-            tokio::time::timeout_at(
-                tokio::time::Instant::from_std(deadline),
-                self.peers
-                    .acquire_stream_work(&node_id, node_epoch, &endpoint),
-            )
-            .await
-            .map_err(|_| {
-                afs_error::Error::coded(
-                    afs_error::CLIENT_DEADLINE_EXCEEDED,
-                    "Peer stream admission deadline exceeded",
-                )
-            })?
+            let admit = async {
+                tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
+                    if prefetch.is_some() {
+                        self.peers.acquire_stream_work_mode(&node_id, node_epoch, &endpoint, true).await
+                    } else {
+                        self.peers.acquire_stream_work(&node_id, node_epoch, &endpoint).await.map(Some)
+                    }
+                }).await.map_err(|_| afs_error::Error::coded(afs_error::CLIENT_DEADLINE_EXCEEDED,
+                    "Peer stream admission deadline exceeded"))?
+            };
+            if let Some(control) = prefetch {
+                tokio::select! {
+                    result = admit => result,
+                    _ = control.cancelled() => Err(afs_error::Error::coded(afs_error::IO_UNAVAILABLE, "Peer prefetch cancelled before admission")),
+                }
+            } else { admit.await }
         })?;
+        let Some(active) = active else {
+            return Ok(None);
+        };
         let controls = active.session.controls.clone();
         let producer_active = active.clone();
         if let Some(metrics) = &self.peers.read_work_metrics {
@@ -2094,9 +2170,11 @@ impl GrpcChunkTransfer {
         let producer_chunk = chunk.clone();
         let producer_proof_budget = sink.proof_budget();
         let producer_binding = output_binding.clone();
+        let producer_control = prefetch.cloned();
         let producer = handle.spawn(async move {
-            let result: afs_error::Result<PeerRootReceipt> =
+            let receive = async {
                 tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
+                    if let Some(control) = &producer_control { control.check()?; }
                     let mut client = DfsChunksClient::new(producer_active.session.channel.clone())
                         .max_encoding_message_size(peers.config.max_encoding_message_bytes)
                         .max_decoding_message_size(
@@ -2124,6 +2202,7 @@ impl GrpcChunkTransfer {
                     let mut current: Option<PeerStreamBlockLease> = None;
                     let mut received_bytes = 0usize;
                     while let Some(frame) = stream.next().await {
+                        if let Some(control) = &producer_control { control.check()?; }
                         let frame =
                             frame.map_err(afs_transport::grpc::error_status::status_to_error)?;
                         if let Some(metrics) = &peers.read_work_metrics {
@@ -2274,9 +2353,19 @@ impl GrpcChunkTransfer {
                         afs_error::CLIENT_DEADLINE_EXCEEDED,
                         "Peer stream producer deadline exceeded",
                     )
-                })?;
+                })?
+            };
+            let result: afs_error::Result<PeerRootReceipt> = if let Some(control) = &producer_control {
+                tokio::select! {
+                    result = receive => result,
+                    _ = control.cancelled() => Err(afs_error::Error::coded(afs_error::IO_UNAVAILABLE, "Peer prefetch cancelled")),
+                }
+            } else { receive.await };
             if let Err(error) = &result {
-                let _ = sender.send(Err(error.clone())).await;
+                // The joined producer result carries the same failure. Never
+                // wait again outside its deadline/cancellation boundary merely
+                // to notify a consumer whose bounded queue may already be full.
+                let _ = sender.try_send(Err(error.clone()));
             }
             result
         });
@@ -2289,6 +2378,9 @@ impl GrpcChunkTransfer {
             let mut decoder = ReadFrameDecoder::for_producer_object(&request, chunk)?;
             decoder.stream_binding = Some(output_binding);
             while let Some(message) = receiver.blocking_recv() {
+                if let Some(control) = prefetch {
+                    control.check()?;
+                }
                 match message? {
                     OwnedPeerStreamMessage::Control(control) => {
                         let OwnedPeerStreamControl {
@@ -2391,6 +2483,9 @@ impl GrpcChunkTransfer {
         }
         let proof = proof?;
         peer_stream_deadline(deadline)?;
+        if let Some(control) = prefetch {
+            control.check()?;
+        }
         let result = sink.seal_completed(proof, requested_offset, out).map(Some);
         if let Some(diagnostic) = diagnostic {
             diagnostic.finish(result.is_ok());
@@ -2413,7 +2508,26 @@ impl crate::node::dfs_read::ChunkTransfer for GrpcChunkTransfer {
         private_out: &'output mut [u8],
         sink: &mut PeerStreamSink<'_>,
     ) -> afs_error::Result<Option<CompletedPeerDiskRead<'output>>> {
-        self.read_object_to_sink(batch, chunk, requested_offset, private_out, sink)
+        self.read_object_to_sink(batch, chunk, requested_offset, private_out, sink, None)
+    }
+
+    fn try_read_verified_object_to_sink<'output>(
+        &self,
+        batch: &crate::node::dfs_read::PeerReadBatch,
+        chunk: &ChunkObject,
+        requested_offset: u64,
+        private_out: &'output mut [u8],
+        sink: &mut PeerStreamSink<'_>,
+        control: &crate::node::dfs_read::PrefetchControl,
+    ) -> afs_error::Result<Option<CompletedPeerDiskRead<'output>>> {
+        self.read_object_to_sink(
+            batch,
+            chunk,
+            requested_offset,
+            private_out,
+            sink,
+            Some(control),
+        )
     }
 
     fn verification_metrics(&self) -> Option<&ReadWorkMetrics> {
@@ -6579,12 +6693,83 @@ mod tests {
     use tonic::{Request, Response, Status, transport::Server};
 
     #[cfg(feature = "dfs")]
+    type FetchFixtureObjects = std::collections::BTreeMap<String, (ChunkObject, Vec<u8>)>;
+
+    #[cfg(feature = "dfs")]
     #[derive(Clone)]
     struct DiskStreamFixture {
         chunk: ChunkObject,
         body: Arc<Vec<u8>>,
         mode: u8,
         calls: Arc<std::sync::atomic::AtomicUsize>,
+        fetch_objects: Option<Arc<FetchFixtureObjects>>,
+        fetch_gate: Option<(String, Arc<FetchRpcGate>)>,
+    }
+
+    #[cfg(feature = "dfs")]
+    #[derive(Default)]
+    struct FetchRpcGate {
+        entered: std::sync::atomic::AtomicUsize,
+        release: std::sync::atomic::AtomicBool,
+        changed: tokio::sync::Notify,
+    }
+
+    #[cfg(feature = "dfs")]
+    fn fetch_fixture_frames(
+        request: &DfsReadRangesRequest,
+        objects: &FetchFixtureObjects,
+    ) -> Result<Vec<afs_protocol::node_data::DfsReadRangesFrame>, Status> {
+        use afs_protocol::node_data::{
+            DfsReadRangesCompletion, DfsReadRangesFrame, DfsReadRangesHeader,
+        };
+        let mut frames = Vec::new();
+        for operation in &request.operations {
+            let (chunk, body) = objects
+                .get(&operation.chunk_id)
+                .ok_or_else(|| Status::not_found("fixture object"))?;
+            let start = operation.chunk_offset as usize;
+            let end = start + operation.length as usize;
+            let range = body
+                .get(start..end)
+                .ok_or_else(|| Status::invalid_argument("fixture range"))?;
+            let full = start == 0 && operation.length == chunk.length;
+            frames.push(DfsReadRangesFrame {
+                body: Some(dfs_read_ranges_frame::Body::Header(DfsReadRangesHeader {
+                    read_id: request.read_id.clone(),
+                    attempt_id: request.attempt_id.clone(),
+                    operation_index: operation.operation_index,
+                    chunk_id: operation.chunk_id.clone(),
+                    chunk_offset: operation.chunk_offset,
+                    length: operation.length,
+                    source_copy_id: operation.source_copy_id.clone(),
+                    blake3_outboard: if full && request.include_blake3_outboard {
+                        wi6_encoded_outboard(body).into()
+                    } else {
+                        Default::default()
+                    },
+                })),
+            });
+            for data in range.chunks(STREAM_DATA_BYTES) {
+                frames.push(DfsReadRangesFrame {
+                    body: Some(dfs_read_ranges_frame::Body::Data(data.to_vec().into())),
+                });
+            }
+            frames.push(DfsReadRangesFrame {
+                body: Some(dfs_read_ranges_frame::Body::Completion(
+                    DfsReadRangesCompletion {
+                        read_id: request.read_id.clone(),
+                        attempt_id: request.attempt_id.clone(),
+                        operation_index: operation.operation_index,
+                        source_copy_id: operation.source_copy_id.clone(),
+                        transferred_bytes: operation.length,
+                        range_checksum: blake3::hash(range).as_bytes().to_vec(),
+                        range_checksum_algorithm:
+                            afs_protocol::node_data::DfsDigestAlgorithm::Blake3 as i32,
+                    },
+                )),
+            });
+        }
+        Ok(frames)
     }
 
     #[cfg(feature = "dfs")]
@@ -6639,6 +6824,34 @@ mod tests {
         ) -> Result<Response<Self::ReadRangesStream>, Status> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let request = request.into_inner();
+            if let Some(objects) = &self.fetch_objects {
+                if let Some((target, gate)) = &self.fetch_gate
+                    && request.operations.iter().any(|operation| {
+                        (target.is_empty() || &operation.chunk_id == target)
+                            && objects.get(&operation.chunk_id).is_some_and(|(chunk, _)| {
+                                operation.chunk_offset == 0 && operation.length == chunk.length
+                            })
+                    })
+                {
+                    gate.entered
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    gate.changed.notify_waiters();
+                    loop {
+                        let changed = gate.changed.notified();
+                        tokio::pin!(changed);
+                        changed.as_mut().enable();
+                        if gate.release.load(std::sync::atomic::Ordering::Acquire) {
+                            break;
+                        }
+                        changed.await;
+                    }
+                }
+                let frames = fetch_fixture_frames(&request, objects)?;
+                return Ok(Response::new(Box::pin(tokio_stream::iter(
+                    frames.into_iter().map(Ok),
+                ))));
+            }
+
             let mut body = self.body.as_ref().clone();
             if matches!(self.mode, 3 | 11) {
                 body[0] ^= 1;
@@ -6744,6 +6957,382 @@ mod tests {
     }
 
     #[cfg(feature = "dfs")]
+    struct FetchRpcCase {
+        _temp: tempfile::TempDir,
+        engine: Arc<crate::node::dfs_read::DfsReadEngine>,
+        cache: Arc<crate::node::peer_cache::DiskPeerCache>,
+        chunks: Vec<ChunkObject>,
+        gate: Arc<FetchRpcGate>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        source_calls: Arc<std::sync::atomic::AtomicUsize>,
+        registry: afs_metrics::Registry,
+        server: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+    }
+
+    #[cfg(feature = "dfs")]
+    async fn fetch_rpc_case(readahead: u64, gate_all: bool) -> FetchRpcCase {
+        use crate::node::dfs_read::{DfsReadConfig, DfsReadEngine, ReadSourceProvider};
+        struct Sources {
+            reply: crate::dfs::DfsChunkSourcesReply,
+            calls: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl ReadSourceProvider for Sources {
+            fn sources_for(
+                &self,
+                request: crate::dfs::DfsChunkSourcesRequest,
+            ) -> afs_error::Result<crate::dfs::DfsChunkSourcesReply> {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(crate::dfs::DfsChunkSourcesReply {
+                    revision: 1,
+                    chunks: self
+                        .reply
+                        .chunks
+                        .iter()
+                        .filter(|chunk| request.chunk_ids.contains(&chunk.chunk_id))
+                        .cloned()
+                        .collect(),
+                })
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let objects: std::collections::BTreeMap<_, _> = [17, 29]
+            .into_iter()
+            .map(|byte| {
+                let staged = crate::node::chunk::StagedChunk::new(
+                    crate::dfs::OperationId::new(format!("r7-rpc-{byte}")),
+                    vec![byte; 64 * 1024],
+                );
+                (
+                    staged.chunk.id.0.clone(),
+                    (staged.chunk.clone(), staged.bytes().to_vec()),
+                )
+            })
+            .collect();
+        let chunks: Vec<_> = [17, 29]
+            .into_iter()
+            .map(|byte| {
+                objects
+                    .values()
+                    .find(|(_, body)| body[0] == byte)
+                    .unwrap()
+                    .0
+                    .clone()
+            })
+            .collect();
+        let objects = Arc::new(objects);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let gate = Arc::new(FetchRpcGate::default());
+        let service = DiskStreamFixture {
+            chunk: chunks[0].clone(),
+            body: Arc::new(objects[&chunks[0].id.0].1.clone()),
+            mode: 0,
+            calls: calls.clone(),
+            fetch_objects: Some(objects),
+            fetch_gate: Some((
+                if gate_all {
+                    String::new()
+                } else {
+                    chunks[1].id.0.clone()
+                },
+                gate.clone(),
+            )),
+        };
+        let server = tokio::spawn(
+            Server::builder()
+                .add_service(
+                    afs_protocol::node_data::dfs_chunks_server::DfsChunksServer::new(service),
+                )
+                .serve_with_incoming(TcpListenerStream::new(listener)),
+        );
+        let registry = afs_metrics::Registry::new();
+        let metrics = ReadWorkMetrics::register(&registry).unwrap();
+        let pool = Arc::new(
+            PeerConnectionPool::new(
+                afs_transport::GrpcConfig::default(),
+                afs_transport::TlsConfig::Disabled,
+                1,
+            )
+            .unwrap()
+            .with_read_work_metrics(metrics),
+        );
+        let transfer = Arc::new(GrpcChunkTransfer::new(pool, Duration::from_secs(5)).unwrap());
+        let source_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sources = Sources {
+            calls: source_calls.clone(),
+            reply: crate::dfs::DfsChunkSourcesReply {
+                revision: 1,
+                chunks: chunks
+                    .iter()
+                    .map(|chunk| crate::dfs::ChunkSources {
+                        chunk_id: chunk.id.clone(),
+                        chunk: Some(chunk.clone()),
+                        allowed_ranges: vec![(0, chunk.length)],
+                        sources: vec![
+                            disk_stream_batch(chunk, endpoint.clone()).operations[0]
+                                .source
+                                .clone(),
+                        ],
+                    })
+                    .collect(),
+            },
+        };
+        let cache = Arc::new(
+            crate::node::peer_cache::DiskPeerCache::open(
+                crate::node::peer_cache::PeerCacheOptions {
+                    directory: temp.path().join("cache"),
+                    capacity_bytes: 1024 * 1024,
+                    namespace_id: crate::dfs::NamespaceId::new("test"),
+                },
+            )
+            .unwrap(),
+        );
+        let engine = Arc::new(
+            DfsReadEngine::new(
+                crate::dfs::NamespaceId::new("test"),
+                "reader".into(),
+                Arc::new(
+                    crate::node::chunk::LocalChunkStore::open(temp.path().join("local"), "reader")
+                        .unwrap(),
+                ),
+                Arc::new(sources),
+                transfer,
+                DfsReadConfig {
+                    readahead_max_bytes: readahead,
+                    ..DfsReadConfig::default()
+                },
+            )
+            .with_read_authority(Arc::new(crate::node::dfs_read::LocalReadAuthority::new(
+                1,
+                std::time::Instant::now() + Duration::from_secs(30),
+            )))
+            .with_peer_cache(cache.clone()),
+        );
+        FetchRpcCase {
+            _temp: temp,
+            engine,
+            cache,
+            chunks,
+            gate,
+            calls,
+            source_calls,
+            registry,
+            server,
+        }
+    }
+
+    #[cfg(feature = "dfs")]
+    fn fetch_case_batch(case: &FetchRpcCase, cross: bool) -> crate::node::dfs_read::ReadBatch {
+        use crate::node::dfs_read::{ChunkReadOp, ReadBatch};
+        ReadBatch {
+            file_version_id: Some(crate::dfs::FileVersionId::new("version")),
+            layout_root_id: crate::dfs::LayoutRootId::new("layout"),
+            lookahead: if cross {
+                Vec::new()
+            } else {
+                vec![case.chunks[1].id.clone()]
+            },
+            ops: if cross {
+                case.chunks
+                    .iter()
+                    .enumerate()
+                    .map(|(index, chunk)| ChunkReadOp {
+                        chunk_id: chunk.id.clone(),
+                        chunk_offset: if index == 0 { chunk.length - 8 } else { 0 },
+                        length: 8,
+                        output_offset: index * 8,
+                    })
+                    .collect()
+            } else {
+                vec![ChunkReadOp {
+                    chunk_id: case.chunks[0].id.clone(),
+                    chunk_offset: 0,
+                    length: 8,
+                    output_offset: 0,
+                }]
+            },
+        }
+    }
+
+    #[cfg(feature = "dfs")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn r7_actual_rpc_cross_object_read_overlaps_and_keeps_output_atomic() {
+        let mut case = fetch_rpc_case(0, true).await;
+        let batch = fetch_case_batch(&case, true);
+        let engine = case.engine.clone();
+        let reading = tokio::task::spawn_blocking(move || {
+            let mut out = [0; 16];
+            engine
+                .read_batch_native_into_private(&batch, &mut out)
+                .map(|()| out)
+        });
+        let overlapped = tokio::time::timeout(Duration::from_secs(3), async {
+            while case.gate.entered.load(std::sync::atomic::Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .is_ok();
+        let while_active = afs_metrics::encode_text(&case.registry).unwrap();
+        case.gate
+            .release
+            .store(true, std::sync::atomic::Ordering::Release);
+        case.gate.changed.notify_waiters();
+        let output = reading.await.unwrap().unwrap();
+        assert!(
+            overlapped,
+            "both full-object RPCs must enter before either is released"
+        );
+        assert!(
+            while_active.contains("afs_dfs_peer_disk_cache_stream_reserved_bytes 4194304\n"),
+            "{while_active}"
+        );
+        assert!(
+            while_active.contains("afs_dfs_peer_disk_cache_stream_frame_bytes 524288\n"),
+            "{while_active}"
+        );
+        assert_eq!(&output[..8], &[17; 8]);
+        assert_eq!(&output[8..], &[29; 8]);
+        assert_eq!(case.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(case.cache.stats().unwrap().entries, 2);
+        case.engine
+            .object_fetcher()
+            .unwrap()
+            .shutdown()
+            .await
+            .unwrap();
+        case.server.abort();
+        let _ = (&mut case.server).await;
+    }
+
+    #[cfg(feature = "dfs")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn r7_actual_rpc_prefetch_is_sink_only_and_cancel_really_joins() {
+        for mode in ["success", "global", "scope", "expiry"] {
+            let mut case = fetch_rpc_case(8 * 1024 * 1024, false).await;
+            let batch = fetch_case_batch(&case, false);
+            let engine = case.engine.clone();
+            let read_batch = batch.clone();
+            assert_eq!(
+                tokio::task::spawn_blocking(move || engine.read_batch_native_owned(&read_batch, 8))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap(),
+                [17; 8]
+            );
+            let engine = case.engine.clone();
+            let valid = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let scope_valid = valid.clone();
+            let original_deadline = std::time::Instant::now() + Duration::from_millis(500);
+            tokio::task::spawn_blocking(move || {
+                engine.prefetch_cached(
+                    &batch,
+                    1,
+                    Arc::new(move || {
+                        if !scope_valid.load(std::sync::atomic::Ordering::Acquire)
+                            || (mode == "expiry" && std::time::Instant::now() >= original_deadline)
+                        {
+                            return Err(afs_error::Error::coded(
+                                afs_error::IO_UNAVAILABLE,
+                                "test handle scope or original deadline retired",
+                            ));
+                        }
+                        Ok(())
+                    }),
+                )
+            })
+            .await
+            .unwrap();
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while case.gate.entered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+            if mode == "global" {
+                case.engine.object_fetcher().unwrap().close();
+            } else if mode == "success" {
+                case.gate
+                    .release
+                    .store(true, std::sync::atomic::Ordering::Release);
+                case.gate.changed.notify_waiters();
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    while case.cache.stats().unwrap().entries < 2 {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .unwrap();
+            }
+            if mode == "scope" {
+                valid.store(false, std::sync::atomic::Ordering::Release);
+            }
+            // Do not call global shutdown to make scope/expiry cancellation
+            // pass. The quiet server remains gated until this job really ends.
+            let retired_without_shutdown = if matches!(mode, "scope" | "expiry") {
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while case.cache.has_fill_flight_for_test() {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .is_ok()
+            } else {
+                true
+            };
+            if !retired_without_shutdown {
+                case.gate
+                    .release
+                    .store(true, std::sync::atomic::Ordering::Release);
+                case.gate.changed.notify_waiters();
+            }
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                case.engine.object_fetcher().unwrap().shutdown(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                case.cache.stats().unwrap().entries,
+                if mode == "success" { 2 } else { 1 }
+            );
+            assert_eq!(case.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+            assert_eq!(
+                case.source_calls.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "prefetch must use the first R-1 lookup only"
+            );
+            let text = afs_metrics::encode_text(&case.registry).unwrap();
+            assert!(
+                text.contains("afs_dfs_peer_disk_cache_stream_reserved_bytes 0\n"),
+                "{text}"
+            );
+            assert!(
+                text.contains("afs_dfs_peer_disk_cache_stream_frame_bytes 0\n"),
+                "{text}"
+            );
+            assert!(
+                text.contains("afs_dfs_fetch_resources{resource=\"jobs\"} 0\n"),
+                "{text}"
+            );
+            case.gate
+                .release
+                .store(true, std::sync::atomic::Ordering::Release);
+            case.gate.changed.notify_waiters();
+            case.server.abort();
+            let _ = (&mut case.server).await;
+            assert!(
+                retired_without_shutdown,
+                "{mode}: quiet RPC must join before global shutdown"
+            );
+        }
+    }
+
+    #[cfg(feature = "dfs")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn peer_stream_actual_rpc_seals_only_after_eof_and_drains_on_failure() {
         use crate::node::{
@@ -6777,6 +7366,8 @@ mod tests {
                 body: Arc::new(staged.bytes().to_vec()),
                 mode,
                 calls: calls.clone(),
+                fetch_objects: None,
+                fetch_gate: None,
             };
             let server = tokio::spawn(
                 Server::builder()
@@ -7188,6 +7779,46 @@ mod tests {
             complete.finish_after_eof().is_err(),
             "expired deadline cannot mint a complete receipt"
         );
+    }
+
+    #[cfg(feature = "dfs")]
+    #[tokio::test]
+    async fn r7_background_admission_first_poll_never_waits_for_metadata_locks() {
+        struct Wake;
+        impl std::task::Wake for Wake {
+            fn wake(self: Arc<Self>) {}
+        }
+        let waker = std::task::Waker::from(Arc::new(Wake));
+        let mut context = std::task::Context::from_waker(&waker);
+        let pool = PeerConnectionPool::new(
+            afs_transport::GrpcConfig::default(),
+            afs_transport::TlsConfig::Disabled,
+            1,
+        )
+        .unwrap();
+        let channels = pool.state.lock().await;
+        let mut background =
+            Box::pin(pool.acquire_stream_work_mode("peer", 1, "http://127.0.0.1:9", true));
+        assert!(matches!(
+            std::future::Future::poll(background.as_mut(), &mut context),
+            std::task::Poll::Ready(Ok(None))
+        ));
+        drop(background);
+        let mut foreground =
+            Box::pin(pool.acquire_stream_work_mode("peer", 1, "http://127.0.0.1:9", false));
+        assert!(std::future::Future::poll(foreground.as_mut(), &mut context).is_pending());
+        drop(channels);
+        let active = foreground.await.unwrap().unwrap();
+        drop(active);
+        let admission = pool.stream_work.state.lock().unwrap();
+        let mut background =
+            Box::pin(pool.acquire_stream_work_mode("peer", 1, "http://127.0.0.1:9", true));
+        assert!(matches!(
+            std::future::Future::poll(background.as_mut(), &mut context),
+            std::task::Poll::Ready(Ok(None))
+        ));
+        drop(background);
+        drop(admission);
     }
 
     #[cfg(feature = "dfs")]

@@ -8,7 +8,8 @@
 
 - `contract`：双方 `O_RDONLY | O_DIRECT`，记录并核对 `read_ahead_kb=0`、
   `prefetch=0`。用于自身读引擎的同条件比较。
-- `product`：双方 `O_RDONLY`，使用各自真实默认缓存/预读配置并记录具体值。
+- `product`：双方 `O_RDONLY`，使用测前固定的真实缓存/预读配置并记录具体值；
+  如启用候选新增预读，须显式配置和验明生效，不能以旧默认冒充开启。
   单独报告页缓存收益，不能用于声称历史 O_DIRECT 路径提速。
 - A 提前准备相同内容及 SHA-256；A/B 控制进程和 TCP 通道提前建立；两条等待连接在 GO 前通过 Linux pidfd 阻塞，
   GO 后不启动 SSH/Lima/Python 轮询或主动采集。ready 并预备完成后，
@@ -64,6 +65,15 @@ cache_to_output 初始统计，不能假定未配置此缓存的场景也存在�
 三次边界采样不是持续峰值采样，不替代资源诊断 run。完整性通过也不等于 G-P2-6 的
 机制门槛通过，不能从聚合计数自行推断各阶段都在关键路径上。
 
+R-7 候选可另外设置 `fetch_metric_profile="r7"`，必须同时选择 `metric_profile="p2"`。
+此时 B 的三个快照还须存在 `afs_dfs_fetch_events_total` 的全部固定 event：
+`scheduled`、`skip_disabled`、`skip_budget`、`skip_grant`、`skip_busy`、`joined`、
+`cancelled`、`failed`，以及 `afs_dfs_fetch_resources` 的 `jobs`、`metadata_bytes`、
+`metadata_peak_bytes`、`job_limit` 四个 resource。前者单位为事件次数，不保证每种分支
+都会发生；后者分别是任务数、字节、字节、任务上限。原始 gauge 单独保留，不做计数差分，
+三个快照不构成任务峰值或准入正确性的证明。未创建调度器时 `job_limit` 可以是实测0。
+缺少任何固定 label 使证据不完整，不能补零。旧 P1M 不选择该 opt-in，不强求新指标。
+
 ## 使用
 
 复制 [config.example.json](config.example.json)，填入当前环境的固定二进制 SHA、
@@ -107,6 +117,7 @@ JSON 字段如下：
 | `labels.*.external_backend` | 外部 S3/Meta 版本与连接配置身份；认证仅引用外部私密配置文件 |
 | `labels.*.metrics` | `{node:a或b,name,url}`，节点回环 HTTP `/metrics` 地址；保留原文和差分 |
 | `labels.*.metric_profile` | 可选 `p2`，启用上述逐节点、逐快照完整性检查；JuiceFS 留空 |
+| `labels.*.fetch_metric_profile` | 可选 `r7`，仅在 `metric_profile=p2` 时启用 B 调度事件及资源快照完整性检查；旧基线留空 |
 | `labels.*.metric_counter_patterns` | 可选，单调计数器名称匹配，默认 `_total/_bucket/_sum/_count`；原始 gauge 不做工作量差分 |
 | `labels.*.hooks` | 下列六组顺序命令。每条为 `{node:a/b/c/controller,argv:[...]}` |
 
@@ -115,6 +126,10 @@ JSON 字段如下：
 1. `preflight`：只读核对候选身份、配置、目录空白、实际挂载/资源/端口和环境占用；输出紧凑 JSON。
 2. `start`：只启动该 run 的 AFS 或 JuiceFS 客户端和必要的自有 Meta，不能部署/修改第三方后端。
 3. `ready`：输出单一 JSON `{ "ready": true, "effective_settings": { ... } }`，有效配置必须匹配配置文件。
+   AFS `prefetch` 的0/1必须由候选实际解析的对象预读配置导出，不能固定写0或仅回显
+   期望值；启用时还须在fixture证据保留确切字节距离、A/B配置摘要和实际ELF身份。
+   contract必须确认真实OFF，product启用须测前显式冻结。具体Node配置写入由外部
+   fixture负责，通用驱动不生成TOML或部署产品。
 4. `stop`：正常停止本 run。`{successful}` 为 `true` 时可先在挂载仍有效时删除 `test.bin` 并 fsync
    父目录，再卸载/排空；为 `false` 时保留复现数据。不得停止共享服务或按名称全局 kill。
 5. `cleanup`：仅在测量及正常停止成功时调用，清理本 run 的可再生数据。S3 对象/collection 只经

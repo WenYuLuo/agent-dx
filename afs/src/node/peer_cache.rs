@@ -208,6 +208,7 @@ pub struct PeerStreamSink<'a> {
     owns_pending: bool,
     committed: bool,
     prepare_error: Option<Error>,
+    allow_eviction: bool,
     entry_lease: Option<OutboardLease>,
     identity: Arc<()>,
     #[cfg(test)]
@@ -215,6 +216,9 @@ pub struct PeerStreamSink<'a> {
 }
 
 impl PeerStreamSink<'_> {
+    pub(crate) fn is_caching(&self) -> bool {
+        self.file.is_some()
+    }
     pub(in crate::node) fn proof_budget(&self) -> Arc<OutboardBudget> {
         self.cache.proof_budget()
     }
@@ -244,7 +248,9 @@ impl PeerStreamSink<'_> {
 
     fn prepare(&mut self) -> Result<()> {
         self.cache.check_root()?;
-        self.cache.cleanup_pending()?;
+        if self.allow_eviction {
+            self.cache.cleanup_pending()?;
+        }
         self.header_length = MAX_HEADER_BYTES as u64;
         let unit = self
             .cache
@@ -261,7 +267,13 @@ impl PeerStreamSink<'_> {
             .and_then(|blocks| blocks.checked_mul(unit))
             .ok_or_else(|| invalid("Peer stream reservation overflow"))?;
         let metadata_charge = entry_metadata_charge(&self.key, &self.chunk);
-        self.entry_lease = self.cache.reserve_entry_metadata(metadata_charge)?;
+        self.entry_lease = if self.allow_eviction {
+            self.cache.reserve_entry_metadata(metadata_charge)?
+        } else {
+            self.cache
+                .proof_budget
+                .try_reserve_resident(metadata_charge)
+        };
         if self.entry_lease.is_none() {
             return Ok(());
         }
@@ -271,6 +283,7 @@ impl PeerStreamSink<'_> {
             reservation,
             metadata_charge,
             &mut self.entry_lease,
+            self.allow_eviction,
         )? {
             return Ok(());
         }
@@ -628,6 +641,7 @@ struct CacheState {
     retired: BTreeMap<String, RetiredEntry>,
     fill_active: bool,
     stream_active: usize,
+    foreground_waiters: usize,
     next_pending_generation: u64,
     pending: BTreeMap<u64, PendingEntry>,
     operations: usize,
@@ -756,6 +770,13 @@ pub(crate) struct FillLeader<'a> {
     completed: bool,
 }
 
+pub(crate) struct OwnedFillLeader {
+    cache: Arc<DiskPeerCache>,
+    key: String,
+    flight: Option<Arc<FillFlight>>,
+    completed: bool,
+}
+
 pub(crate) enum FillRole<'a> {
     Leader(FillLeader<'a>),
     Finished(FillOutcome),
@@ -776,6 +797,7 @@ impl CacheState {
             retired: BTreeMap::new(),
             fill_active: false,
             stream_active: 0,
+            foreground_waiters: 0,
             next_pending_generation: 1,
             pending: BTreeMap::new(),
             operations: 0,
@@ -817,6 +839,7 @@ impl CacheState {
             retired: BTreeMap::new(),
             fill_active: false,
             stream_active: 0,
+            foreground_waiters: 0,
             next_pending_generation: 1,
             pending: BTreeMap::new(),
             operations: 0,
@@ -954,6 +977,17 @@ impl DiskPeerCache {
         Ok(cache)
     }
 
+    pub(crate) fn max_inflight_objects(&self) -> usize {
+        self.max_flights
+    }
+
+    pub(crate) fn try_contains_ready(&self, chunk: &ChunkObject) -> Result<Option<bool>> {
+        let key = self.key(chunk)?;
+        Ok(self
+            .try_lock_state()?
+            .map(|state| state.entries.contains_key(&key)))
+    }
+
     pub(crate) fn proof_budget(&self) -> Arc<OutboardBudget> {
         self.proof_budget.clone()
     }
@@ -996,23 +1030,42 @@ impl DiskPeerCache {
     }
 
     pub fn operation(&self) -> Result<PeerCacheOperation<'_>> {
+        self.operation_mode(false)?
+            .ok_or_else(|| unavailable("Peer cache operation unavailable"))
+    }
+
+    pub(crate) fn try_operation(&self) -> Result<Option<PeerCacheOperation<'_>>> {
+        self.operation_mode(true)
+    }
+
+    fn operation_mode(&self, background: bool) -> Result<Option<PeerCacheOperation<'_>>> {
         self.check_root()?;
         let wait = self
             .read_work
             .as_ref()
             .and_then(|metrics| metrics.coarse_diagnostic("cache_lock_wait", 0));
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| unavailable("Peer cache lock poisoned"))?;
+        let mut state = if background {
+            let Some(state) = self.try_lock_state()? else {
+                return Ok(None);
+            };
+            state
+        } else {
+            self.lock_state()?
+        };
         drop(wait);
         // Bound operation-local entry/proof snapshots independently of workers.
         if state.closed || state.operations >= 128 {
+            if background {
+                return Ok(None);
+            }
             return Err(unavailable(
                 "Peer cache is stopped or operation slots are full",
             ));
         }
         let metadata = self.proof_budget.try_reserve(8192);
+        if background && (metadata.is_none() || state.foreground_waiters != 0) {
+            return Ok(None);
+        }
         state.operations += 1;
         if metadata.is_some() {
             state.operation_metadata_bytes += 8192;
@@ -1024,13 +1077,15 @@ impl DiskPeerCache {
             local.proof_limit = state.proof_limit;
         }
         drop(state);
-        self.report_resources();
-        Ok(PeerCacheOperation {
+        if !background {
+            self.report_resources();
+        }
+        Ok(Some(PeerCacheOperation {
             cache: self,
             state: local,
             fill: None,
             _metadata: metadata,
-        })
+        }))
     }
 
     pub(crate) fn close_admission(&self) {
@@ -1386,6 +1441,16 @@ impl DiskPeerCache {
             .map_err(|_| unavailable("Peer cache lock poisoned"))
     }
 
+    fn try_lock_state(&self) -> Result<Option<std::sync::MutexGuard<'_, CacheState>>> {
+        match self.state.try_lock() {
+            Ok(state) => Ok(Some(state)),
+            Err(std::sync::TryLockError::WouldBlock) => Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                Err(unavailable("Peer cache lock poisoned"))
+            }
+        }
+    }
+
     fn cleanup_retired(&self) -> Result<()> {
         loop {
             let ticket = {
@@ -1518,7 +1583,42 @@ impl DiskPeerCache {
         charge: u64,
         metadata_charge: usize,
         metadata: &mut Option<OutboardLease>,
+        allow_eviction: bool,
     ) -> Result<bool> {
+        if !allow_eviction {
+            let Some(mut state) = self.try_lock_state()? else {
+                return Ok(false);
+            };
+            if state.closed
+                || state.foreground_waiters != 0
+                || state.entries.contains_key(key)
+                || state.retired.contains_key(key)
+                || state.pending.len() >= self.max_flights
+                || state.used_bytes.saturating_add(charge) > self.options.capacity_bytes
+                || state.entries.len()
+                    + state.retired.len()
+                    + state.deleting_slots
+                    + state.pending.len()
+                    >= MAX_PEER_CACHE_ENTRIES
+            {
+                return Ok(false);
+            }
+            state.used_bytes += charge;
+            state.pending_charge += charge;
+            state.pending_metadata_charge += metadata_charge;
+            state.pending.insert(
+                generation,
+                PendingEntry {
+                    charge,
+                    identity: None,
+                    active: true,
+                    metadata_charge,
+                    _metadata: metadata.take(),
+                },
+            );
+            state.stats.disk_peak_bytes = state.stats.disk_peak_bytes.max(state.used_bytes);
+            return Ok(true);
+        }
         self.retire(key, None, false)?;
         loop {
             self.cleanup_retired()?;
@@ -1760,6 +1860,42 @@ impl DiskPeerCache {
         outcome.map(FillRole::Finished)
     }
 
+    pub(crate) fn try_fill_flight(
+        self: &Arc<Self>,
+        chunk: &ChunkObject,
+    ) -> Result<Option<OwnedFillLeader>> {
+        let key = self.key(chunk)?;
+        let Some(mut state) = self.try_lock_state()? else {
+            return Ok(None);
+        };
+        if state.closed
+            || state.foreground_waiters != 0
+            || state.flights.contains_key(&key)
+            || state.flight_live >= self.max_flights
+        {
+            return Ok(None);
+        }
+        let charge = std::mem::size_of::<FillFlight>() + 512 + key.capacity() + 256;
+        let Some(metadata) = self.proof_budget.try_reserve(charge) else {
+            return Ok(None);
+        };
+        let flight = Arc::new(FillFlight {
+            result: Mutex::new(None),
+            changed: Condvar::new(),
+            _metadata: metadata,
+        });
+        state.flights.insert(key.clone(), flight.clone());
+        state.flight_live += 1;
+        state.flight_metadata_bytes += charge;
+        drop(state);
+        Ok(Some(OwnedFillLeader {
+            cache: self.clone(),
+            key,
+            flight: Some(flight),
+            completed: false,
+        }))
+    }
+
     fn release_flight(&self, key: &str, flight: Arc<FillFlight>) {
         let removed = if let Ok(mut state) = self.state.lock() {
             let same = state
@@ -1793,32 +1929,51 @@ impl DiskPeerCache {
     }
 }
 
+fn finish_flight(flight: &Option<Arc<FillFlight>>, completed: &mut bool, outcome: FillOutcome) {
+    if *completed {
+        return;
+    }
+    let outcome = match outcome {
+        FillOutcome::Failed(error) if error.message().len() > 512 => {
+            afs_logging::warn!("dfs.peer_fill_shared_error_truncated"; "code" => error.code().to_string());
+            let mut boundary = 512;
+            while !error.message().is_char_boundary(boundary) {
+                boundary -= 1;
+            }
+            FillOutcome::Failed(Error::new(
+                error.code(),
+                error.kind(),
+                &error.message()[..boundary],
+            ))
+        }
+        outcome => outcome,
+    };
+    if let Some(flight) = flight
+        && let Ok(mut result) = flight.result.lock()
+    {
+        *result = Some(outcome);
+        *completed = true;
+        flight.changed.notify_all();
+    }
+}
+
 impl FillLeader<'_> {
     pub(crate) fn finish(&mut self, outcome: FillOutcome) {
-        if self.completed {
-            return;
-        }
-        let outcome = match outcome {
-            FillOutcome::Failed(error) if error.message().len() > 512 => {
-                afs_logging::warn!("dfs.peer_fill_shared_error_truncated"; "code" => error.code().to_string());
-                let mut boundary = 512;
-                while !error.message().is_char_boundary(boundary) {
-                    boundary -= 1;
-                }
-                FillOutcome::Failed(Error::new(
-                    error.code(),
-                    error.kind(),
-                    &error.message()[..boundary],
-                ))
-            }
-            outcome => outcome,
-        };
-        if let Some(flight) = &self.flight
-            && let Ok(mut result) = flight.result.lock()
-        {
-            *result = Some(outcome);
-            self.completed = true;
-            flight.changed.notify_all();
+        finish_flight(&self.flight, &mut self.completed, outcome);
+    }
+}
+impl OwnedFillLeader {
+    pub(crate) fn finish(&mut self, outcome: FillOutcome) {
+        finish_flight(&self.flight, &mut self.completed, outcome);
+    }
+}
+impl Drop for OwnedFillLeader {
+    fn drop(&mut self) {
+        self.finish(FillOutcome::Failed(unavailable(
+            "Peer prefetch stopped before completion",
+        )));
+        if let Some(flight) = self.flight.take() {
+            self.cache.release_flight(&self.key, flight);
         }
     }
 }
@@ -1831,6 +1986,22 @@ impl Drop for FillLeader<'_> {
         if let Some(flight) = self.flight.take() {
             self.cache.release_flight(&self.key, flight);
         }
+    }
+}
+
+struct FillWaiter<'a>(&'a DiskPeerCache);
+impl<'a> FillWaiter<'a> {
+    fn new(cache: &'a DiskPeerCache) -> Result<Self> {
+        cache.lock_state()?.foreground_waiters += 1;
+        Ok(Self(cache))
+    }
+}
+impl Drop for FillWaiter<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.0.state.lock() {
+            state.foreground_waiters = state.foreground_waiters.saturating_sub(1);
+        }
+        self.0.changed.notify_all();
     }
 }
 
@@ -1870,6 +2041,29 @@ impl PeerCacheOperation<'_> {
         self.acquire_fill_mode(true, check)
     }
 
+    pub(crate) fn try_acquire_stream_fill(&mut self) -> Result<bool> {
+        if self.fill.is_some() {
+            return Ok(true);
+        }
+        let Some(mut state) = self.cache.try_lock_state()? else {
+            return Ok(false);
+        };
+        if state.closed
+            || state.foreground_waiters != 0
+            || state.fill_active
+            || state.stream_active >= 2
+        {
+            return Ok(false);
+        }
+        state.stream_active += 1;
+        self.fill = Some(FillPermit {
+            cache: self.cache,
+            streaming: true,
+        });
+        drop(state);
+        Ok(true)
+    }
+
     pub(crate) fn release_fill(&mut self) {
         drop(self.fill.take());
     }
@@ -1883,6 +2077,7 @@ impl PeerCacheOperation<'_> {
                 "legacy fill requires releasing the stream allowance",
             ));
         }
+        let _waiting = FillWaiter::new(self.cache)?;
         loop {
             check()?;
             let mut state = self.cache.lock_state()?;
@@ -1927,13 +2122,44 @@ impl PeerCacheOperation<'_> {
         &'operation mut self,
         chunk: &ChunkObject,
     ) -> Result<PeerStreamSink<'operation>> {
+        self.acquire_stream_fill(|| Ok(()))?;
+        self.start_stream(chunk, true, None)
+    }
+
+    pub(crate) fn try_begin_stream<'operation>(
+        &'operation mut self,
+        chunk: &ChunkObject,
+    ) -> Result<Option<PeerStreamSink<'operation>>> {
+        if !self.try_acquire_stream_fill()? {
+            return Ok(None);
+        }
+        let generation = {
+            let Some(mut state) = self.cache.try_lock_state()? else {
+                return Ok(None);
+            };
+            let generation = state.next_pending_generation;
+            state.next_pending_generation = generation
+                .checked_add(1)
+                .ok_or_else(|| unavailable("Peer pending generation exhausted"))?;
+            generation
+        };
+        self.start_stream(chunk, false, Some(generation)).map(Some)
+    }
+
+    fn start_stream<'operation>(
+        &'operation mut self,
+        chunk: &ChunkObject,
+        allow_eviction: bool,
+        reserved_generation: Option<u64>,
+    ) -> Result<PeerStreamSink<'operation>> {
         validate_chunk(chunk)?;
         if chunk.length > MAX_OBJECT_BYTES {
             return Err(invalid("Peer stream object exceeds bound"));
         }
-        self.acquire_stream_fill(|| Ok(()))?;
         let key = self.cache.key(chunk)?;
-        let generation = {
+        let generation = if let Some(generation) = reserved_generation {
+            generation
+        } else {
             let mut state = self.cache.lock_state()?;
             let generation = state.next_pending_generation;
             state.next_pending_generation = generation
@@ -1957,6 +2183,7 @@ impl PeerCacheOperation<'_> {
             owns_pending: false,
             committed: false,
             prepare_error: None,
+            allow_eviction,
             entry_lease: None,
             identity: Arc::new(()),
             #[cfg(test)]
@@ -3017,6 +3244,37 @@ mod tests {
                 staged.bytes(),
                 cache.proof_budget(),
             )?)
+    }
+
+    #[test]
+    fn r7_background_cache_admission_does_not_wait_or_evict_for_space() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = Arc::new(DiskPeerCache::open(options(temp.path().join("cache"))).unwrap());
+        let staged = StagedChunk::new(OperationId::new("r7-background"), vec![17; 64 * 1024]);
+        let mut operation = cache.operation().unwrap();
+        let state = cache.state.lock().unwrap();
+        assert!(cache.try_operation().unwrap().is_none());
+        assert!(cache.try_fill_flight(&staged.chunk).unwrap().is_none());
+        assert!(!operation.try_acquire_stream_fill().unwrap());
+        drop(state);
+        let waiting = FillWaiter::new(&cache).unwrap();
+        assert!(cache.try_operation().unwrap().is_none());
+        assert!(cache.try_fill_flight(&staged.chunk).unwrap().is_none());
+        assert!(!operation.try_acquire_stream_fill().unwrap());
+        drop(waiting);
+        drop(operation);
+        assert!(fill(&cache, &staged).unwrap());
+        let used = cache.state.lock().unwrap().used_bytes;
+        // A different object cannot evict this healthy entry to run ahead.
+        let next = StagedChunk::new(OperationId::new("r7-next"), vec![29; 256 * 1024]);
+        let mut operation = cache.try_operation().unwrap().unwrap();
+        let sink = operation.try_begin_stream(&next.chunk).unwrap().unwrap();
+        assert!(!sink.is_caching());
+        drop(sink);
+        drop(operation);
+        assert_eq!(cache.try_contains_ready(&staged.chunk).unwrap(), Some(true));
+        assert_eq!(cache.state.lock().unwrap().used_bytes, used);
+        assert!(pending_files(&cache).is_empty());
     }
 
     #[test]

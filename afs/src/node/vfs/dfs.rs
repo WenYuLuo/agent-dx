@@ -672,6 +672,7 @@ struct HandleMut {
     // Accepted/synced sequences and the observed error cursor change after open.
     write_session: Option<DfsRemoteWriteSession>,
     refresh: Option<Arc<NativeReadRefresh>>,
+    read_sequence: crate::node::dfs_fetch::ReadSequence,
 }
 
 type NativeReadRefreshResult = Result<(Arc<InodeRecord>, NativeReadView)>;
@@ -738,6 +739,7 @@ impl From<DfsFileHandle> for DfsHandle {
                 native_denial_serial: opened.native_denial_serial,
                 write_session: opened.write_session,
                 refresh: None,
+                read_sequence: crate::node::dfs_fetch::ReadSequence::default(),
             }),
             closed: AtomicBool::new(false),
             dynamic_read_route: AtomicBool::new(false),
@@ -3056,6 +3058,8 @@ impl DistributedFs {
             return Err(unavailable("DFS native read denial serial exhausted"));
         }
         let operation = self.capture_native_read_view()?;
+        let mut fetch_hint = None;
+        let mut fetched_deadline = None;
         let result = (|| {
             if snapshot.handle.dynamic_read_route.load(Ordering::Acquire)
                 && let Some(remote) = self.remote_provider_visible_for_reads(&snapshot.inode_id)?
@@ -3077,7 +3081,14 @@ impl DistributedFs {
                 return Ok(out);
             }
             let (inode, view) = self.native_inode_for_read(handle, snapshot)?;
-            let out = self.read_committed_inode_owned(&inode, offset, size)?;
+            let out = self.read_committed_inode_owned_hint(
+                &inode,
+                offset,
+                size,
+                &mut fetch_hint,
+                Some(operation.deadline.min(view.deadline)),
+            )?;
+            fetched_deadline = Some(view.deadline);
             #[cfg(test)]
             {
                 let hook = self.native_read_after_committed.lock().unwrap().take();
@@ -3108,7 +3119,7 @@ impl DistributedFs {
         if snapshot.handle.closed.load(Ordering::Acquire) {
             return Err(stale("DFS file handle is no longer open"));
         }
-        let current = snapshot
+        let mut current = snapshot
             .handle
             .state
             .lock()
@@ -3117,6 +3128,55 @@ impl DistributedFs {
             return Err(unavailable(
                 "DFS native read authorization changed before delivery",
             ));
+        }
+        let hint = fetch_hint.and_then(|batch: ReadBatch| {
+            let version = batch.file_version_id.as_ref()?;
+            let mut hash = blake3::Hasher::new();
+            hash.update(&(version.0.len() as u64).to_le_bytes());
+            hash.update(version.0.as_bytes());
+            hash.update(batch.layout_root_id.0.as_bytes());
+            let window = current.read_sequence.record(
+                *hash.finalize().as_bytes(),
+                offset,
+                result.len(),
+                self.read_engine.readahead_object_limit(),
+            );
+            Some((
+                batch,
+                window,
+                current.read_sequence.generation(),
+                current.native_read_generation,
+            ))
+        });
+        drop(current);
+        if let Some((batch, window, sequence, view_generation)) = hint {
+            let handle = Arc::downgrade(&snapshot.handle);
+            let denial_serial = snapshot.native_denial_serial;
+            let deadline = fetched_deadline.unwrap_or(operation.deadline);
+            // No handle table/mutable state lock is held while scheduling work.
+            self.read_engine.prefetch_cached(
+                &batch,
+                window,
+                Arc::new(move || {
+                    let handle = handle
+                        .upgrade()
+                        .ok_or_else(|| stale("DFS prefetch handle closed"))?;
+                    if handle.closed.load(Ordering::Acquire) || Instant::now() >= deadline {
+                        return Err(stale("DFS prefetch handle view retired"));
+                    }
+                    let state = handle
+                        .state
+                        .lock()
+                        .map_err(|_| unavailable("DFS prefetch handle state poisoned"))?;
+                    if state.native_denial_serial != denial_serial
+                        || state.native_read_generation != view_generation
+                        || state.read_sequence.generation() != sequence
+                    {
+                        return Err(unavailable("DFS prefetch handle scope changed"));
+                    }
+                    Ok(())
+                }),
+            );
         }
         Ok(result)
     }
@@ -3233,11 +3293,23 @@ impl DistributedFs {
         Ok(count)
     }
 
+    #[cfg(test)]
     fn read_committed_inode_owned(
         &self,
         inode: &InodeRecord,
         offset: u64,
         size: usize,
+    ) -> Result<Vec<u8>> {
+        self.read_committed_inode_owned_hint(inode, offset, size, &mut None, None)
+    }
+
+    fn read_committed_inode_owned_hint(
+        &self,
+        inode: &InodeRecord,
+        offset: u64,
+        size: usize,
+        hint: &mut Option<ReadBatch>,
+        deadline: Option<Instant>,
     ) -> Result<Vec<u8>> {
         let cached = self.readonly_version_for_inode(inode)?;
         let length = cached.layout.file_length;
@@ -3247,12 +3319,21 @@ impl DistributedFs {
         let count = usize::try_from((length - offset).min(size as u64))
             .map_err(|_| invalid("read length is too large"))?;
         let batch = cached.read_batch(offset, count, self.read_engine.source_lookahead_chunks())?;
-        if let Some(result) = self.read_engine.read_batch_native_owned(&batch, count)? {
+        if let Some(result) = self
+            .read_engine
+            .read_batch_native_owned_before(&batch, count, deadline)?
+        {
+            if self.read_engine.readahead_object_limit() != 0 {
+                *hint = Some(batch);
+            }
             return Ok(result);
         }
         let mut result = vec![0; count];
         self.read_engine
-            .read_batch_native_into_private(&batch, &mut result)?;
+            .read_batch_native_into_private_before(&batch, &mut result, deadline)?;
+        if self.read_engine.readahead_object_limit() != 0 {
+            *hint = Some(batch);
+        }
         Ok(result)
     }
 
@@ -21132,6 +21213,275 @@ mod tests {
             fs.flush(&context(), writer).unwrap();
             fs.release(&context(), reader).unwrap();
             fs.release(&context(), writer).unwrap();
+        }
+    }
+
+    #[test]
+    fn r7_product_sequential_reads_schedule_one_two_four_objects_and_zero_stays_idle() {
+        use crate::{
+            dfs::*,
+            node::{
+                dfs_read::{
+                    ChunkTransfer, DfsReadConfig, LocalReadAuthority, PeerReadBatch,
+                    PrefetchControl, ReadSourceProvider,
+                },
+                peer_cache::{
+                    CompletedPeerDiskRead, DiskPeerCache, PeerCacheOptions, PeerStreamSink,
+                },
+            },
+        };
+        struct Fixture {
+            chunks: Vec<(ChunkObject, Vec<u8>)>,
+            lookups: AtomicUsize,
+            background: AtomicUsize,
+        }
+        impl ReadSourceProvider for Fixture {
+            fn sources_for(&self, request: DfsChunkSourcesRequest) -> Result<DfsChunkSourcesReply> {
+                self.lookups.fetch_add(1, Ordering::SeqCst);
+                Ok(DfsChunkSourcesReply {
+                    revision: 1,
+                    chunks: self
+                        .chunks
+                        .iter()
+                        .filter(|(chunk, _)| request.chunk_ids.contains(&chunk.id))
+                        .map(|(chunk, _)| ChunkSources {
+                            chunk_id: chunk.id.clone(),
+                            chunk: Some(chunk.clone()),
+                            allowed_ranges: vec![(0, chunk.length)],
+                            sources: vec![SourceCandidate {
+                                chunk_id: chunk.id.clone(),
+                                copy_id: CopyId::new("copy"),
+                                role: CopyRole::DurableReplica,
+                                state: CopyState::Ready,
+                                location: CopyLocation::Node {
+                                    node_id: "node-b".into(),
+                                    node_epoch: 1,
+                                    device_id: "local-0".into(),
+                                    device_epoch: 1,
+                                    catalog_revision: 1,
+                                },
+                                data_endpoint: Some("http://node-b".into()),
+                                load_hint: 0,
+                                read_grant: DfsReadGrant {
+                                    namespace_id: request.namespace_id.clone(),
+                                    file_version_id: request.file_version_id.clone(),
+                                    layout_root_id: request.layout_root_id.clone(),
+                                    caller_node_id: request.caller_id.clone(),
+                                    caller_node_epoch: 1,
+                                    expires_at_unix_ms: u64::MAX,
+                                    fence: 1,
+                                    token: "test-token".into(),
+                                },
+                            }],
+                        })
+                        .collect(),
+                })
+            }
+        }
+        impl ChunkTransfer for Fixture {
+            fn read_ranges(&self, _: &PeerReadBatch, _: &mut [u8]) -> Result<()> {
+                Err(unavailable("R7 fixture must use the verified sink"))
+            }
+            fn supports_verified_object_sink(&self) -> bool {
+                true
+            }
+            fn read_verified_object_to_sink<'output>(
+                &self,
+                _: &PeerReadBatch,
+                chunk: &ChunkObject,
+                offset: u64,
+                out: &'output mut [u8],
+                sink: &mut PeerStreamSink<'_>,
+            ) -> Result<Option<CompletedPeerDiskRead<'output>>> {
+                let body = &self
+                    .chunks
+                    .iter()
+                    .find(|(object, _)| object == chunk)
+                    .unwrap()
+                    .1;
+                crate::node::rpc::peer::complete_peer_disk_read_for_test(
+                    chunk, body, offset, out, sink,
+                )
+                .map(Some)
+            }
+            fn try_read_verified_object_to_sink<'output>(
+                &self,
+                batch: &PeerReadBatch,
+                chunk: &ChunkObject,
+                offset: u64,
+                out: &'output mut [u8],
+                sink: &mut PeerStreamSink<'_>,
+                control: &PrefetchControl,
+            ) -> Result<Option<CompletedPeerDiskRead<'output>>> {
+                assert!(
+                    out.is_empty(),
+                    "background read cannot allocate a fake private object"
+                );
+                control.check()?;
+                self.background.fetch_add(1, Ordering::SeqCst);
+                self.read_verified_object_to_sink(batch, chunk, offset, out, sink)
+            }
+        }
+        for maximum in [0, 32 * 1024 * 1024] {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            let temp = tempfile::tempdir().unwrap();
+            let local =
+                Arc::new(LocalChunkStore::open(temp.path().join("local"), "node-a").unwrap());
+            let fixture = Arc::new(Fixture {
+                chunks: (1..=5)
+                    .map(|byte| {
+                        let staged = StagedChunk::new(
+                            OperationId::new(format!("r7-sequence-{byte}")),
+                            vec![byte; 64 * 1024],
+                        );
+                        (staged.chunk.clone(), staged.bytes().to_vec())
+                    })
+                    .collect(),
+                lookups: AtomicUsize::new(0),
+                background: AtomicUsize::new(0),
+            });
+            let cache = Arc::new(
+                DiskPeerCache::open(PeerCacheOptions {
+                    directory: temp.path().join("cache"),
+                    capacity_bytes: 2 * 1024 * 1024,
+                    namespace_id: NamespaceId::new("default"),
+                })
+                .unwrap(),
+            );
+            let engine = {
+                let _entered = runtime.enter();
+                Arc::new(
+                    DfsReadEngine::new(
+                        NamespaceId::new("default"),
+                        "node-a".into(),
+                        local.clone(),
+                        fixture.clone(),
+                        fixture.clone(),
+                        DfsReadConfig {
+                            readahead_max_bytes: maximum,
+                            ..DfsReadConfig::default()
+                        },
+                    )
+                    .with_read_authority(Arc::new(LocalReadAuthority::new(
+                        1,
+                        Instant::now() + Duration::from_secs(30),
+                    )))
+                    .with_peer_cache(cache.clone()),
+                )
+            };
+            // Window selection and best-effort body admission are separate
+            // contracts. Join each test attempt before the next one so that
+            // the successful 1/2/4 case does not race its own metadata locks.
+            // Production and the real-RPC overlap tests have no such hook.
+            let attempts = Arc::new(Mutex::new(Vec::new()));
+            let attempt_windows = attempts.clone();
+            let fetcher = engine.object_fetcher().unwrap();
+            engine.set_prefetch_attempt_hook_for_test(Arc::new(move |window, _| {
+                attempt_windows.lock().unwrap().push(window);
+                fetcher.join_background_for_test().unwrap();
+            }));
+            let meta = Arc::new(RecordingMeta::new());
+            meta.publish_external_version_with_receipts(
+                5 * 64 * 1024,
+                fixture
+                    .chunks
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (chunk, _))| Extent {
+                        file_offset: index as u64 * 64 * 1024,
+                        length: chunk.length,
+                        chunk_id: chunk.id.clone(),
+                        chunk_offset: 0,
+                    })
+                    .collect(),
+                Vec::new(),
+            );
+            let fs = Arc::new(DistributedFs::new(
+                NamespaceId::new("default"),
+                "node-a",
+                "session-a",
+                meta.clone(),
+                local,
+                engine.clone(),
+            ));
+            let inode = fs
+                .backend_inode(&meta.inode.lock().unwrap().inode_id)
+                .unwrap();
+            let reader = fs.open(&context(), inode, libc::O_RDONLY).unwrap();
+            for (index, expected_entries) in [2, 3, 5].into_iter().enumerate() {
+                assert_eq!(
+                    fs.read_owned(&context(), reader, index as u64 * 8, 8)
+                        .unwrap(),
+                    [1; 8]
+                );
+                if maximum != 0 {
+                    assert_eq!(cache.stats().unwrap().entries, expected_entries);
+                }
+            }
+            assert_eq!(
+                *attempts.lock().unwrap(),
+                if maximum == 0 {
+                    Vec::new()
+                } else {
+                    vec![1, 2, 2, 4, 4, 4, 4]
+                }
+            );
+            if maximum == 0 {
+                // Exercise the public borrowed-output boundary with all fetch
+                // slots held. Preserve this existing handle deadline; the
+                // engine must not start a fresh five-second view while queued.
+                let fetcher = engine.object_fetcher().unwrap();
+                let permits: Vec<_> = (0..8)
+                    .map(|_| fetcher.try_reserve_background(1).unwrap().unwrap())
+                    .collect();
+                {
+                    let opened = fs.handles.get(reader.0).unwrap().unwrap();
+                    opened
+                        .state
+                        .lock()
+                        .unwrap()
+                        .native_read_view
+                        .as_mut()
+                        .unwrap()
+                        .deadline = Instant::now() + Duration::from_secs(1);
+                }
+                let reading_fs = fs.clone();
+                let (done_tx, done_rx) = std::sync::mpsc::channel();
+                let reading = std::thread::spawn(move || {
+                    let mut output = [91; 16];
+                    let result = reading_fs.read(&context(), reader, 64 * 1024 - 8, &mut output);
+                    done_tx.send((result.is_err(), output)).unwrap();
+                });
+                let before_slot_release = done_rx.recv_timeout(Duration::from_secs(2)).ok();
+                drop(permits);
+                reading.join().unwrap();
+                assert_eq!(
+                    before_slot_release,
+                    Some((true, [91; 16])),
+                    "the original VFS view must expire in queue without changing public output"
+                );
+            }
+            fs.release(&context(), reader).unwrap();
+            runtime
+                .block_on(engine.object_fetcher().unwrap().shutdown())
+                .unwrap();
+            assert_eq!(
+                fixture.background.load(Ordering::SeqCst),
+                if maximum == 0 { 0 } else { 4 }
+            );
+            assert_eq!(
+                cache.stats().unwrap().entries,
+                if maximum == 0 { 1 } else { 5 }
+            );
+            assert_eq!(
+                fixture.lookups.load(Ordering::SeqCst),
+                1,
+                "background work cannot query Meta"
+            );
         }
     }
 

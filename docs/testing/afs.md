@@ -49,7 +49,7 @@ AFS 产品二进制只支持 ARM64，也不代表 x86_64 包或定向 Linux driv
 
 时延必须先固定操作范围、计时边界和判定分位数，记录 p50/p95/p99。不得成绩出来后选择有利指标，也不得由吞吐反推时延。不具备同条件对照的结果只能作为摸底。
 
-## DFS 双口径测量与 P1 定向回归
+## DFS 双口径测量与定向回归
 
 维护入口为[双口径驱动](../../build/e2e/afs/perf/README.md)，由仓外fixture提供固定候选、
 挂载、身份及已有后端；该驱动不部署SeaweedFS、PostgreSQL或VM。
@@ -273,8 +273,8 @@ dev/ino/size/mtime/ctime，变化则失效重验。命中交付的是已验证�
 
 A端每个LocalChunkStore默认共用16MiB Peer正文额度、2个LRU条目，每个驻留对象最多4MiB；
 这是已批准的原8MiB额度调整。填充、驻留、淘汰后仍被发送流持有的对象、范围回退正文和
-RDMA packed正文，均按实际capacity计费至最后一个载荷所有者释放；额度不足立即报容量
-错误。单飞表最多8个active key，完整对象可共享一次填充；partial／无完整Ready结果不承诺
+RDMA packed正文，均按实际capacity计费至最后一个载荷所有者释放；native gRPC额度不足
+按入口固定的`dfs_peer_serve_wait_ms`有界等待，默认20ms，0禁等；RDMA packed仍立即准入。单飞表最多8个active key，完整对象可共享一次填充；partial／无完整Ready结果不承诺
 只扫描一次。原8个read slots、每流4个64KiB待发送帧及扫描scratch仍受原上限约束，
 需单独计入进程资源预算；16MiB不是总RSS，也不是每个请求额外获得16MiB。大于4MiB对象
 保留范围读取，协议最大请求不代表当前额度一定能准入。fsync与持久提交路径不变。
@@ -356,7 +356,7 @@ legacy ID保持全扫；核对无新增Meta RPC。原生写ACK只等待原正文
 绝对截止、真实join及watchdog失败需分别证明。optional失败不降低正文／catalog barrier、
 receipt或fsync持久性。
 读侧另测健康sidecar的多对象Peer／Pinned读取：write、rename、file sync、directory sync
-均为0；热Peer单槽命中不访问／修复sidecar，逐出后完整扫描才按需修复；
+均为0；热Peer正文LRU命中不访问／修复sidecar，逐出后完整扫描才按需修复；
 多个独立reader面对同对象缺失／损坏，只作有界共享修复，并证明修复期间Peer
 正文slot已释放。不得把写批次必要file sync一起删掉。读侧容量错误保留健康proof，
 安全全扫不触发proof重建或持久化；缺坏修复仍不得改写正文／catalog。
@@ -469,7 +469,8 @@ legacy独占、超限及取消不泄漏。实际RPC回归检查活动流固定�
 `peer_frame_to_block`是帧到块复制，`fill_to_output`是请求区间提取；没有完整Vec不等于零复制。
 `afs_dfs_peer_read_events_total`的stream_frame包含控制帧，stream_block_alloc记录实际分配，
 stream_block_handoff／stream_block_write记录块交接／sink调用，不等于物理write或成功落盘。
-64MiB完整4MiB对象的预期1024个Data帧、256次块交接仍须以实际回调与尾块记录核对。
+旧64KiB Data分支中，64MiB完整4MiB对象的预期1024帧、256次块交接仍须以实际
+回调与尾块核对。R-4健康proof分支采用32KiB已验证帧，预期2048帧，不能混用两条路径。
 
 功能检查后再固定数据、并发、cache容量、双方预读0、持久屏障及repeat间隔做分时性能
 对照。诊断轮与正式轮分开；若两读间未采样，只报告合计工作。首次回源、稳定磁盘命中、
@@ -497,6 +498,53 @@ R-1只前瞻源元数据，双方关闭正文预读的contract配置仍有效。
 逐before／after_first／after_repeat检查四个series存在及实际值；漏采是证据不完整，
 不补0。B首读`get_chunk_sources≤1`、1秒复读0和A授权防回退分别核对；单测计数不代替
 真实FUSE计数，次数减少不等于控制关键路径或完整E2E已经改善。
+
+## 原生对象调度与磁盘预读回归
+
+`dfs_readahead_max_bytes`默认0，范围0..33554432；0不创建后台任务，contract固定0。
+product如需验证ON，测前显式设为8388608并由实际ELF的`--print-config`确认；A/B有效
+值、配置和二进制SHA都要留证。原生只读句柄按固定版本上的顺序访问增长1／2／4窗口，
+距上次结尾至多1MiB，随机跳转清零；对象数按4MiB保守折算并封顶8。页缓存、内核
+read-ahead、源元数据lookahead与正文预读分别记录，不能用“配置请求ON”冒充真实后台工作。
+
+`dfs_fetch::ObjectFetcher`的前台分片及后台任务复用唯一FillFlight对象表，不另建正文
+对象缓存。必要的Linux回归包括：
+
+- 同对象前后台单飞、不同对象实际sink重叠；跨对象请求仍保持失败不公开部分结果，所有
+  分片必须join并最终核权后才复制输出，回退前释放旧scratch，不多持一整份正文。
+- 默认0的后台任务／Peer调用严格为0；ON按顺序窗口实际填入可丢弃磁盘缓存，缺失、
+  partial、过期或失效grant不查询Meta、不取得flight、不读正文；随机和版本变化使旧scope失效。
+- 后台首次poll遇cache、Channel、stream状态锁或任务／proof／磁盘容量不足立即放弃，
+  不等待、不驱逐健康条目争空间；前台等待者优先。前台排队使用原读截止和原授权，不能续时。
+- 正文只用共享两块256KiB，最多两个流复用同一Channel和connection≤2MiB窗口，
+  每流窗口≤2MiB、解码消息≤128KiB；私有输出沿原单批预算，后台空输出绑定不申请假4MiB。
+- 每帧、consumer和磁盘commit前重查来源generation、句柄scope、已知拒绝及Node停止；
+  receipt已完成后再失效也不得安装Ready。最后核权与rename沿用既有非原子边界，不承诺
+  新的全局撤销协议；缓存后续交付仍独立授权。
+- 静默网络、块／控制等待和慢消费者期间取消能唤醒并真实join；先drop receiver、取消／
+  结束producer，再join实际任务，不能detach或提前退账。取消不能中断已进入内核的磁盘I/O。
+- 固定状态、handle容器、任务上下文和字符串实际capacity从原proof总账／resident子限收费，
+  额度不足安全降级，最后持有者释放前不退账。S3 pending36MiB不得挪用。
+
+针对性入口按受影响范围选择，不把命令列出等同于已经通过：
+
+```sh
+cargo test --locked -p afs --lib --all-features r7_
+cargo test --locked -p afs --lib --all-features node::dfs_fetch::tests::
+cargo test --locked -p afs --test config_contract --all-features
+```
+
+正常测量采集`afs_dfs_fetch_events_total{event}`的scheduled、skip_disabled、skip_budget、
+skip_grant、skip_busy、joined、cancelled、failed，单位是事件次数；
+`afs_dfs_fetch_resources{resource}`的jobs／job_limit是数量，metadata_bytes／
+metadata_peak_bytes是原账本内的当前／高水位字节，不是新增额度或RSS。实际构造前
+job_limit可能为0。任务数不等于正文并发，指标本身不执行准入，也不证明持续峰值。
+
+新候选可在[双口径驱动](../../build/e2e/afs/perf/README.md)上显式选择
+`fetch_metric_profile="r7"`并保留`metric_profile="p2"`，逐B端before／after_first／
+after_repeat核对全部固定标签；漏采、非有限值或缺快照为证据不完整，不补0。旧P1M
+不强求新字段。先形成Linux回归，再以单独候选身份做有限FUSE及分时contract／product
+测试；局部并发证明、默认OFF或ON工具接线不替代正式读侧验收与性能目标。
 
 ## 原生写 buffer 验证
 
@@ -625,6 +673,22 @@ Bytes末引用与预算退账、stop／调用者失效退出、catalog／路径�
 新路径不产生旧整对象私有读取compact记录，缺失不解释为耗时零。正常性能关闭额外诊断，
 独立诊断的组工作与发送父项会交叠，完整E2E按同条件实测。
 
+## 原生 catalog 尾事务恢复回归
+
+`LocalCatalog::recover`只处理物理EOF处无换行且JSON解析为不完整的尾事务：保留此前
+有效前缀，截断并同步后可重新追加和恢复。完整JSON无末尾换行仍原样接受，后续追加
+补分隔符；非法UTF-8、完整语法／字段、checksum、revision以及带换行的不完整记录
+都应拒绝启动。恢复不删除正文孤儿，截断或sync失败明确报错。
+
+```sh
+cargo test --locked -p afs --lib --all-features catalog_tail_recovery_tests
+```
+
+覆盖事务头、记录中部、记录间及checksum尾截断；部分多字节UTF-8与真正非法字节分别
+处理，并核对完整无换行→append→restart。复用原ACK／persist／精确重放回归，证明
+正文／目录／catalog屏障和未知Meta提交阻挡后续修改未降低。此项仅是W-3恢复前置，
+`CatalogCommitter`、跨请求组提交及锁外catalog I/O尚未实现，不以尾恢复通过宣布写侧完成。
+
 ## Native Peer 准入等待回归
 
 `cargo test --locked -p afs --lib --all-features p2_t1_`覆盖8个真实RPC槽已占满时
@@ -632,3 +696,7 @@ Bytes末引用与预算退账、stop／调用者失效退出、catalog／路径�
 stop及最后Bytes切片释放。预算check/wait之间的交错用屏障验证，不能只凭睡眠猜测；
 配置合同另核对默认20ms、CLI/TOML优先级和0..50ms范围。R-4、native Peer和RDMA
 packed软件回归保留；单元RPC不等于FUSE／多VM性能或真实verbs验收。
+同一入口的RPC槽、flight和control/payload共享原deadline，重试／Header前回退不重赠
+20ms；已开始的I/O、同flight结果和R-4双帧背压受原授权／stop／传输合同约束。
+大窗口和多连接仍后置；当前两个流共享一个Channel及原≤2MiB connection窗口，
+不能把小窗口等待通过宣传成16MiB connection／4MiB stream或多连接验收。

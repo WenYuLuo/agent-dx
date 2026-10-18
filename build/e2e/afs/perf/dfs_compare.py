@@ -37,6 +37,15 @@ SHA256 = re.compile(r'[a-f0-9]{64}')
 METRIC_PHASES = ('before', 'after_first', 'after_repeat')
 OUTBOARD_GAUGES = ('afs_dfs_outboard_metadata_bytes', 'afs_dfs_outboard_resident_bytes',
                    'afs_dfs_outboard_metadata_limit_bytes', 'afs_dfs_outboard_resident_limit_bytes')
+FETCH_EVENTS = ('scheduled', 'skip_disabled', 'skip_budget', 'skip_grant', 'skip_busy',
+                'joined', 'cancelled', 'failed')
+FETCH_GAUGES = tuple('afs_dfs_fetch_resources{resource="' + resource + '"}'
+                     for resource in ('jobs', 'metadata_bytes', 'metadata_peak_bytes', 'job_limit'))
+
+
+def fetch_required_metrics():
+    return list(FETCH_GAUGES) + ['afs_dfs_fetch_events_total{event="' + event + '"}'
+                                 for event in FETCH_EVENTS]
 
 
 def workload_settings(config):
@@ -81,6 +90,8 @@ def metric_evidence(label, snapshots):
               'endpoints': {}, 'missing': []}
     for item in label.get('metrics', []):
         required = p2_required_metrics(item['node']) if label.get('metric_profile') == 'p2' else []
+        if label.get('fetch_metric_profile') == 'r7' and item['node'] == 'b':
+            required += fetch_required_metrics()
         endpoint = {'node': item['node'], 'snapshots': {}}
         result['endpoints'][item['name']] = endpoint
         for phase in METRIC_PHASES:
@@ -89,7 +100,8 @@ def metric_evidence(label, snapshots):
             endpoint['snapshots'][phase] = {
                 'required_values': {name: values[name] for name in required if name in values},
                 'outboard_gauges': {name: value for name, value in values.items()
-                                    if name in OUTBOARD_GAUGES}}
+                                    if name in OUTBOARD_GAUGES},
+                'fetch_gauges': {name: value for name, value in values.items() if name in FETCH_GAUGES}}
             for name in required:
                 if name not in values:
                     result['missing'].append({'endpoint': item['name'], 'node': item['node'],
@@ -189,6 +201,10 @@ def validate_config(config):
         if not IDENTIFIER.fullmatch(name): raise ValueError('invalid label')
         if label.get('metric_profile') not in (None, 'p2'):
             raise ValueError('unknown metric profile')
+        if label.get('fetch_metric_profile') not in (None, 'r7'):
+            raise ValueError('unknown fetch metric profile')
+        if label.get('fetch_metric_profile') == 'r7' and label.get('metric_profile') != 'p2':
+            raise ValueError('r7 fetch metrics require explicit p2 A/B endpoints')
         if label.get('metric_profile') == 'p2' and any(
                 sum(item.get('node') == node for item in label.get('metrics', [])) != 1
                 for node in ['a', 'b']):
