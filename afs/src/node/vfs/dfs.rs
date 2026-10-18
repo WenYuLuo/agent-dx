@@ -2003,11 +2003,17 @@ impl NativeMetadataBudget {
 
 impl NativeMetadataLease {
     fn set_actual(&mut self, actual: usize) -> Result<()> {
-        let mut state = self
-            .budget
+        let budget = self.budget.clone();
+        let mut state = budget
             .state
             .lock()
             .map_err(|_| unavailable("native metadata budget is poisoned"))?;
+        self.set_actual_locked(actual, &mut state)
+    }
+
+    // Caller has already separated a structural lock failure from an
+    // owner-scoped capacity refusal. The arithmetic and limits stay shared.
+    fn set_actual_locked(&mut self, actual: usize, state: &mut NativeMetadataState) -> Result<()> {
         if self.descriptor {
             let reserved = self.bytes.max(actual.saturating_mul(4));
             if reserved - self.bytes
@@ -2900,7 +2906,7 @@ impl DistributedFs {
             if pipeline.closed.load(Ordering::Acquire) {
                 return Err(unavailable("native write admission is closed"));
             }
-            self.poll_native_uploads()?;
+            let _ = self.poll_native_uploads()?;
             self.observe_handle_error(handle)?;
             let (position, selection, capacity, generation, seq, owner) = {
                 let state = cell
@@ -3060,7 +3066,7 @@ impl DistributedFs {
                             .budget
                             .wait_for_change(epoch, Duration::from_millis(10));
                     }
-                    self.poll_native_uploads()?;
+                    let _ = self.poll_native_uploads()?;
                     self.observe_handle_error(handle)?;
                 }
             }
@@ -3359,7 +3365,9 @@ impl DistributedFs {
                     Ok(receipts.remove(0))
                 });
             drop(permit);
-            self.install_native_receipt(upload, result)?;
+            if let Some(error) = self.install_native_receipt(upload, result)? {
+                return Err(error);
+            }
         }
         Ok(true)
     }
@@ -3368,36 +3376,46 @@ impl DistributedFs {
         &self,
         upload: &Arc<NativeUpload>,
         result: Result<NativeChunkReceipt>,
-    ) -> Result<()> {
+    ) -> Result<Option<Error>> {
         let pipeline = self
             .native_pipeline
             .as_ref()
             .ok_or_else(|| unavailable("native write pipeline is missing"))?;
-        let result = result.and_then(|receipt| {
-            if receipt.receipt.operation_id != upload.operation_id
-                || receipt.receipt.chunk != upload.chunk
-            {
-                return Err(invalid("native receipt differs from its immutable upload"));
-            }
-            let actual = std::mem::size_of::<NativeUpload>()
-                + std::mem::size_of::<Mutex<NativeMetadataLease>>()
-                + 4 * std::mem::size_of::<usize>()
-                + upload.operation_id.0.capacity()
-                + upload.chunk.id.0.capacity()
-                + native_receipt_heap(&receipt.receipt);
-            upload
-                ._descriptor
-                .lock()
-                .map_err(|_| unavailable("native descriptor reservation is poisoned"))?
-                .set_actual(actual)?;
+        let result = match result {
             Ok(receipt)
-        });
+                if receipt.receipt.operation_id != upload.operation_id
+                    || receipt.receipt.chunk != upload.chunk =>
+            {
+                Err(invalid("native receipt differs from its immutable upload"))
+            }
+            Ok(receipt) => {
+                let actual = std::mem::size_of::<NativeUpload>()
+                    + std::mem::size_of::<Mutex<NativeMetadataLease>>()
+                    + 4 * std::mem::size_of::<usize>()
+                    + upload.operation_id.0.capacity()
+                    + upload.chunk.id.0.capacity()
+                    + native_receipt_heap(&receipt.receipt);
+                let mut descriptor = upload
+                    ._descriptor
+                    .lock()
+                    .map_err(|_| unavailable("native descriptor reservation is poisoned"))?;
+                let budget = descriptor.budget.clone();
+                let mut metadata = budget
+                    .state
+                    .lock()
+                    .map_err(|_| unavailable("native metadata budget is poisoned"))?;
+                descriptor
+                    .set_actual_locked(actual, &mut metadata)
+                    .map(|()| receipt)
+            }
+            Err(error) => Err(error),
+        };
         let mut state = upload
             .state
             .lock()
             .map_err(|_| unavailable("native upload state is poisoned"))?;
         state.joining = false;
-        match result {
+        let failure = match result {
             Ok(receipt) => {
                 if receipt.local_required_and_durable {
                     state.body = None;
@@ -3409,6 +3427,7 @@ impl DistributedFs {
                     .lock()
                     .map_err(|_| unavailable("native metadata budget is poisoned"))?
                     .completed += 1;
+                None
             }
             Err(error) => {
                 state.error = Some(error.clone());
@@ -3418,18 +3437,19 @@ impl DistributedFs {
                     .lock()
                     .map_err(|_| unavailable("native metadata budget is poisoned"))?
                     .failed += 1;
-                upload.cv.notify_all();
-                return Err(error);
+                Some(error)
             }
-        }
+        };
         upload.cv.notify_all();
-        pipeline.notify.notify_one();
-        Ok(())
+        if failure.is_none() {
+            pipeline.notify.notify_one();
+        }
+        Ok(failure)
     }
 
-    fn poll_native_uploads(&self) -> Result<()> {
+    fn poll_native_uploads(&self) -> Result<Option<Error>> {
         let Some(pipeline) = &self.native_pipeline else {
-            return Ok(());
+            return Ok(None);
         };
         let tasks: [Option<Arc<NativeUpload>>; 8] = {
             let tasks = pipeline
@@ -3460,13 +3480,13 @@ impl DistributedFs {
                     .block_on(task)
                     .map_err(|error| unavailable(format!("native upload worker failed: {error}")))
                     .and_then(|result| result);
-                let installed = self.install_native_receipt(&upload, result);
+                let installed = self.install_native_receipt(&upload, result)?;
                 pipeline
                     .tasks
                     .lock()
                     .map_err(|_| unavailable("native upload task table is poisoned"))?
                     .retain(|other| !Arc::ptr_eq(other, &upload));
-                if let Err(error) = installed {
+                if let Some(error) = installed {
                     if let Some(cell) = upload.owner.upgrade() {
                         let mut state = cell
                             .lock()
@@ -3486,10 +3506,9 @@ impl DistributedFs {
             }
         }
         self.observe_native_resources();
-        if let Some(error) = first_error {
-            return Err(error);
-        }
-        Ok(())
+        // Business failures belong to their inode. A caller may have harvested
+        // another inode's task; only drain consumes this Node-wide summary.
+        Ok(first_error)
     }
 
     fn start_native_uploads(&self) -> Result<()> {
@@ -3503,7 +3522,7 @@ impl DistributedFs {
 
     fn wait_native_upload(&self, upload: &Arc<NativeUpload>) -> Result<ChunkReceipt> {
         loop {
-            self.poll_native_uploads()?;
+            let _ = self.poll_native_uploads()?;
             {
                 let mut state = upload
                     .state
@@ -3553,7 +3572,7 @@ impl DistributedFs {
         if self.native_pipeline.is_none() {
             return Ok(0);
         }
-        self.poll_native_uploads()?;
+        let _ = self.poll_native_uploads()?;
         self.start_native_uploads()?;
         let mut committed = 0;
         for (inode, cell) in self.inode_writes.snapshot()? {
@@ -8398,10 +8417,35 @@ impl DistributedFs {
         Ok(())
     }
 
+    fn join_native_uploads_for_drain(&self) -> Result<Option<Error>> {
+        let Some(pipeline) = &self.native_pipeline else {
+            return Ok(None);
+        };
+        let mut first_error = None;
+        loop {
+            if let Some(error) = self.poll_native_uploads()? {
+                first_error.get_or_insert(error);
+            }
+            if pipeline
+                .tasks
+                .lock()
+                .map_err(|_| unavailable("native upload task table is poisoned"))?
+                .is_empty()
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        Ok(first_error)
+    }
+
     /// Best-effort graceful drain. It gives a clean Node shutdown a chance to
     /// publish dirty state, while an abrupt crash is still allowed to recover
     /// only the last committed FileVersion.
     pub fn drain(&self) -> Result<usize> {
+        // Harvest existing Node-wide tasks before per-inode preparation can
+        // consume a different owner's error. Node shutdown has closed admission.
+        let mut join_error = self.join_native_uploads_for_drain()?;
         let result = (|| -> Result<usize> {
             let inode_ids = self.inode_writes.keys_snapshot()?;
             let mut committed = 0;
@@ -8446,22 +8490,8 @@ impl DistributedFs {
             }
             Ok(committed)
         })();
-        let mut join_error = None;
-        if let Some(pipeline) = &self.native_pipeline {
-            loop {
-                if let Err(error) = self.poll_native_uploads() {
-                    join_error.get_or_insert(error);
-                }
-                let tasks = pipeline
-                    .tasks
-                    .lock()
-                    .map_err(|_| unavailable("native upload task table is poisoned"))?
-                    .len();
-                if tasks == 0 {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(1));
-            }
+        if let Some(error) = self.join_native_uploads_for_drain()? {
+            join_error.get_or_insert(error);
         }
         match result {
             Err(error) => Err(error),
@@ -17291,6 +17321,141 @@ mod tests {
         assert_eq!(pipeline.metadata.state.lock().unwrap().descriptors, 0);
         first.release(&context(), a.handle).unwrap();
         second.release(&context(), b.handle).unwrap();
+    }
+
+    #[test]
+    fn p2_w2_upload_error_is_owned_by_its_inode_while_drain_still_aggregates() {
+        let (_a_temp, a_meta, a_fs, _a_runtime, a_store) =
+            native_pipeline_fixture(false, 16 * 1024 * 1024, 8);
+        let (_b_temp, b_meta, mut b_fs, _b_runtime, _b_store) =
+            native_pipeline_fixture(false, 16 * 1024 * 1024, 8);
+        b_meta.inode.lock().unwrap().inode_id = InodeId::new("inode:unrelated-b");
+        b_meta.lease.lock().unwrap().inode_id = InodeId::new("inode:unrelated-b");
+        b_fs.native_pipeline = a_fs.native_pipeline.clone();
+        b_fs.next_operation.store(10_000, Ordering::SeqCst);
+        let a = a_fs
+            .create(
+                &context(),
+                a_fs.root_inode(),
+                OsStr::new("failure-owner-a"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        let b = b_fs
+            .create(
+                &context(),
+                b_fs.root_inode(),
+                OsStr::new("healthy-owner-b"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        let pipeline = a_fs.native_pipeline.as_ref().unwrap();
+        let a_cell = a_fs
+            .write_state(&a_fs.inode_id(a.entry.inode).unwrap())
+            .unwrap()
+            .unwrap();
+        let b_cell = b_fs
+            .write_state(&b_fs.inode_id(b.entry.inode).unwrap())
+            .unwrap()
+            .unwrap();
+        let body = vec![0x64; 4 * 1024 * 1024];
+        a_store.fail_next.store(true, Ordering::SeqCst);
+        assert_eq!(
+            a_fs.write(&context(), a.handle, 0, &body).unwrap(),
+            body.len()
+        );
+        let upload = pipeline.tasks.lock().unwrap()[0].clone();
+        let operation = upload.operation_id.clone();
+        let chunk = upload.chunk.clone();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !upload
+            .state
+            .lock()
+            .unwrap()
+            .task
+            .as_ref()
+            .unwrap()
+            .is_finished()
+        {
+            assert!(
+                Instant::now() < deadline,
+                "injected upload failure did not complete"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            a_cell.lock().unwrap().background_error.is_none(),
+            "no caller has polled the completed task yet"
+        );
+        assert_eq!(
+            b_fs.write(&context(), b.handle, 0, b"healthy").unwrap(),
+            7,
+            "polling another inode's failed upload must not fail an unrelated ordinary write"
+        );
+        b_fs.fsync(&context(), b.handle, SyncMode::Full).unwrap();
+        assert_eq!(b_meta.commits.lock().unwrap().len(), 1);
+        assert!(
+            b_cell.lock().unwrap().background_error.is_none(),
+            "A's failure must never be relabelled as B's error"
+        );
+        assert!(a_fs.fsync(&context(), a.handle, SyncMode::Full).is_err());
+        assert!(
+            a_meta.commits.lock().unwrap().is_empty(),
+            "the failed owner may not publish"
+        );
+        {
+            let state = upload.state.lock().unwrap();
+            assert_eq!(upload.operation_id, operation);
+            assert_eq!(upload.chunk, chunk);
+            assert!(
+                state.body.as_ref().unwrap().as_ref() == body.as_slice(),
+                "owner body changed after failed upload"
+            );
+        }
+        // The owner cursor and that upload's retained attempt error are
+        // separately observed; retry still uses the same immutable object.
+        assert!(a_fs.fsync(&context(), a.handle, SyncMode::Full).is_err());
+        a_fs.fsync(&context(), a.handle, SyncMode::Full).unwrap();
+        {
+            let commits = a_meta.commits.lock().unwrap();
+            assert_eq!(commits.len(), 1);
+            assert_eq!(commits[0].operation_id, operation);
+            assert_eq!(commits[0].chunk_receipts[0].chunk, chunk);
+        }
+        drop(upload);
+        // B has its own unpublished tail. Drain must publish B successfully,
+        // but retain A's error even if B's preparation would harvest that task.
+        b_fs.write(&context(), b.handle, 7, b"!").unwrap();
+        a_store.fail_next.store(true, Ordering::SeqCst);
+        a_fs.write(&context(), a.handle, body.len() as u64, &body)
+            .unwrap();
+        let failed = pipeline.tasks.lock().unwrap()[0].clone();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !failed
+            .state
+            .lock()
+            .unwrap()
+            .task
+            .as_ref()
+            .unwrap()
+            .is_finished()
+        {
+            assert!(Instant::now() < deadline, "drain fault did not complete");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let error = b_fs.drain().unwrap_err();
+        assert!(error.to_string().contains("injected native upload failure"));
+        assert!(
+            pipeline.tasks.lock().unwrap().is_empty(),
+            "failed tasks must still be joined"
+        );
+        assert!(a_cell.lock().unwrap().background_error.is_some());
+        assert!(b_cell.lock().unwrap().background_error.is_none());
+        assert_eq!(a_meta.commits.lock().unwrap().len(), 1);
+        assert_eq!(b_meta.commits.lock().unwrap().len(), 2);
+        assert_eq!(b_meta.commits.lock().unwrap()[1].file_version.length, 8);
     }
 
     // W-2 changes version publication, not merely a dirty-budget constant.
