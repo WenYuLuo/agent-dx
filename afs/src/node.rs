@@ -1650,20 +1650,39 @@ async fn run_node(
             peer_connections.clone(),
             timeout,
         ));
-        Some(Arc::new(
-            vfs::dfs::DistributedFs::new(
-                namespace,
-                cfg.id.clone(),
-                session_id.clone(),
-                meta,
-                chunk_store,
-                read_engine,
-            )
-            .with_remote_owner_factory(remote_factory)
-            .with_version_cache_capacity(cfg.dfs_version_cache_entries)
-            .with_version_cache_bytes(cfg.dfs_version_cache_bytes)
-            .with_write_buffer_pool(dfs_write_buffers.clone()),
-        ))
+        let fs = vfs::dfs::DistributedFs::new(
+            namespace,
+            cfg.id.clone(),
+            session_id.clone(),
+            meta,
+            chunk_store,
+            read_engine,
+        )
+        .with_remote_owner_factory(remote_factory)
+        .with_version_cache_capacity(cfg.dfs_version_cache_entries)
+        .with_version_cache_bytes(cfg.dfs_version_cache_bytes)
+        .with_write_buffer_pool(dfs_write_buffers.clone());
+        let fs = if cfg.dfs_external_backend.is_none() {
+            fs.with_native_write_pipeline(
+                chunk::NativeWriteBudget::new(
+                    usize::try_from(cfg.dfs_dirty_budget_bytes).map_err(|_| {
+                        afs_error::Error::coded(
+                            afs_error::CONFIG_INVALID,
+                            "native dirty budget does not fit this platform",
+                        )
+                    })?,
+                ),
+                vfs::dfs::NativeWriteConfig {
+                    unpublished_descriptors: cfg.dfs_unpublished_descriptors,
+                    upload_inflight_chunks: cfg.dfs_upload_inflight_chunks,
+                },
+                tokio::runtime::Handle::current(),
+                Some(dfs_read_work_metrics.clone()),
+            )?
+        } else {
+            fs
+        };
+        Some(Arc::new(fs))
     } else {
         None
     };
@@ -1910,25 +1929,59 @@ async fn run_node(
     #[cfg(feature = "dfs")]
     if let Some(dfs) = state.dfs.clone() {
         let stop = services.stop.subscribe();
+        let native_notify = dfs.native_writeback_notify();
+        let native_commit_period = std::time::Duration::from_millis(cfg.dfs_background_commit_ms);
         services.spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
             tick.tick().await;
+            let mut native_tick = tokio::time::interval(native_commit_period);
+            native_tick.tick().await;
+            let has_native_pipeline = native_notify.is_some();
             let shutdown = cancelled(stop);
             tokio::pin!(shutdown);
             loop {
                 tokio::select! {
                     _ = &mut shutdown => return Ok(()),
+                    due = async {
+                        match native_notify.as_ref() {
+                            Some(notify) => tokio::select! {
+                                _ = notify.notified() => false,
+                                _ = native_tick.tick() => true,
+                            },
+                            None => std::future::pending::<bool>().await,
+                        }
+                    }, if has_native_pipeline => {
+                        let fs = dfs.clone();
+                        match tokio::task::spawn_blocking(move || {
+                            if due {
+                                fs.writeback_pending()
+                            } else {
+                                fs.progress_native_writeback()
+                            }
+                        }).await {
+                            Ok(Ok(count)) if count > 0 => {
+                                afs_logging::debug!("dfs.native_write_progress"; "count" => count, "timer_due" => due);
+                            }
+                            Ok(Ok(_)) => {}
+                            Ok(Err(error)) => {
+                                afs_logging::warn!("dfs.native_write_retry"; "error" => error.to_string());
+                            }
+                            Err(error) => {
+                                afs_logging::warn!("dfs.native_write_worker_failed"; "error" => error.to_string());
+                            }
+                        }
+                    }
                     _ = tick.tick() => {
                         let fs = dfs.clone();
                         match tokio::task::spawn_blocking(move || {
                             let mut first_error = None;
-                            let committed = match fs.writeback_pending() {
+                            let committed = if has_native_pipeline { 0 } else { match fs.writeback_pending() {
                                 Ok(count) => count,
                                 Err(error) => {
                                     first_error.get_or_insert(error);
                                     0
                                 }
-                            };
+                            }};
                             let remote_releases = match fs.retry_pending_remote_releases() {
                                 Ok(count) => count,
                                 Err(error) => {
@@ -2237,6 +2290,10 @@ async fn run_node(
     // Close read admission at the same lifecycle boundary that broadcasts
     // shutdown. A cached object must not outlive a known Node/session stop.
     let on_shutdown = || {
+        #[cfg(feature = "dfs")]
+        if let Some(dfs) = &state.dfs {
+            dfs.close_native_write_admission();
+        }
         #[cfg(feature = "dfs")]
         if let Some(store) = &dfs_sidecar_store_for_shutdown {
             // Keep catalog admission available for the existing DFS drain below.

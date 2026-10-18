@@ -21,8 +21,18 @@ use std::{
 };
 
 mod catalog_commit;
+#[cfg(any(feature = "dfs", test))]
+mod native_live;
+#[cfg(test)]
+mod native_live_tests;
 pub mod outboard;
 use catalog_commit::CatalogCommitter;
+#[cfg(feature = "dfs")]
+pub(crate) use native_live::NativeWriteBudgetSnapshot;
+#[cfg(any(feature = "dfs", test))]
+pub(crate) use native_live::{
+    NativeWriteAdmission, NativeWriteBudget, NativeWriteLease, NativeWriteOwner,
+};
 pub use outboard::OutboardBudget;
 use outboard::{
     ChunkOutboard, DEFAULT_OUTBOARD_BUDGET_BYTES, MAX_ENCODED_OUTBOARD_BYTES, OutboardBuilder,
@@ -75,6 +85,8 @@ struct WriteBufferPoolState {
     metrics: Option<WriteBufferPoolMetrics>,
     #[cfg(test)]
     fail_next_allocation: bool,
+    #[cfg(test)]
+    next_allocation_capacity: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -294,6 +306,30 @@ impl WriteBufferPool {
     }
 
     fn checkout(self: &Arc<Self>, capacity: usize) -> Result<ChunkBuffer> {
+        #[cfg(any(feature = "dfs", test))]
+        {
+            self.checkout_with_native_lease(capacity, None)
+        }
+        #[cfg(not(any(feature = "dfs", test)))]
+        {
+            self.checkout_with_native_lease(capacity)
+        }
+    }
+
+    fn checkout_with_native_lease(
+        self: &Arc<Self>,
+        capacity: usize,
+        #[cfg(any(feature = "dfs", test))] mut native_live_lease: Option<NativeWriteLease>,
+    ) -> Result<ChunkBuffer> {
+        #[cfg(any(feature = "dfs", test))]
+        if native_live_lease
+            .as_ref()
+            .is_some_and(|lease| lease.charged_bytes() < capacity)
+        {
+            return Err(invalid(
+                "native write lease does not cover requested capacity",
+            ));
+        }
         {
             let mut state = self
                 .state
@@ -309,6 +345,18 @@ impl WriteBufferPool {
                     .filter(|(_, bytes)| {
                         bytes.capacity() >= capacity
                             && bytes.capacity() < capacity.saturating_mul(2)
+                            && {
+                                #[cfg(any(feature = "dfs", test))]
+                                {
+                                    native_live_lease.as_ref().is_none_or(|lease| {
+                                        bytes.capacity() <= lease.charged_bytes()
+                                    })
+                                }
+                                #[cfg(not(any(feature = "dfs", test)))]
+                                {
+                                    true
+                                }
+                            }
                     })
                     .min_by_key(|(_, bytes)| bytes.capacity())
                     .map(|(index, _)| index)
@@ -324,6 +372,10 @@ impl WriteBufferPool {
                 state.stats.reuses += 1;
                 state.publish_metrics();
                 drop(state);
+                #[cfg(any(feature = "dfs", test))]
+                if let Some(lease) = &mut native_live_lease {
+                    lease.shrink_to(bytes.capacity());
+                }
                 let allocation_id = WRITE_ALLOCATION_GENERATION.fetch_add(1, Ordering::Relaxed);
                 afs_logging::debug!("dfs.write_buffer.checkout";
                     "event" => "checkout",
@@ -336,6 +388,8 @@ impl WriteBufferPool {
                     bytes,
                     pool: Arc::downgrade(self),
                     allocation_id,
+                    #[cfg(any(feature = "dfs", test))]
+                    native_live_lease,
                 });
             }
             #[cfg(test)]
@@ -346,9 +400,32 @@ impl WriteBufferPool {
         // Only metadata/list lookup is under the lock. Payload allocation and
         // allocator failure handling happen outside it.
         let mut bytes = Vec::new();
+        #[cfg(test)]
+        let allocation_capacity = self
+            .state
+            .lock()
+            .map_err(|_| invalid("write buffer pool is poisoned"))?
+            .next_allocation_capacity
+            .take()
+            .unwrap_or(capacity);
+        #[cfg(not(test))]
+        let allocation_capacity = capacity;
         bytes
-            .try_reserve_exact(capacity)
+            .try_reserve_exact(allocation_capacity)
             .map_err(|_| write_allocation_error())?;
+        #[cfg(any(feature = "dfs", test))]
+        if let Some(lease) = &mut native_live_lease {
+            // Vec may expose more actual capacity than requested. Complete the
+            // old owner's charge without waiting, before publishing the buffer.
+            if !lease.try_grow_to(bytes.capacity())? {
+                drop(bytes);
+                return Err(Error::coded(
+                    afs_error::IO_WOULD_BLOCK,
+                    "native actual allocation capacity needs additional admission",
+                ));
+            }
+            lease.shrink_to(bytes.capacity());
+        }
         let mut state = self
             .state
             .lock()
@@ -371,6 +448,8 @@ impl WriteBufferPool {
             bytes,
             pool: Arc::downgrade(self),
             allocation_id,
+            #[cfg(any(feature = "dfs", test))]
+            native_live_lease,
         })
     }
 
@@ -395,6 +474,10 @@ struct ChunkBuffer {
     bytes: Vec<u8>,
     pool: Weak<WriteBufferPool>,
     allocation_id: u64,
+    // Drops after the body is returned to idle or really freed in Drop. Every
+    // SharedChunkBytes slice keeps this same single allocation owner alive.
+    #[cfg(any(feature = "dfs", test))]
+    native_live_lease: Option<NativeWriteLease>,
 }
 
 impl ChunkBuffer {
@@ -403,6 +486,8 @@ impl ChunkBuffer {
             bytes,
             pool: Weak::new(),
             allocation_id: WRITE_ALLOCATION_GENERATION.fetch_add(1, Ordering::Relaxed),
+            #[cfg(any(feature = "dfs", test))]
+            native_live_lease: None,
         }
     }
 }
@@ -410,6 +495,12 @@ impl ChunkBuffer {
 impl Drop for ChunkBuffer {
     fn drop(&mut self) {
         let capacity = self.bytes.capacity();
+        #[cfg(any(feature = "dfs", test))]
+        debug_assert!(
+            self.native_live_lease
+                .as_ref()
+                .is_none_or(|lease| lease.charged_bytes() == capacity)
+        );
         let body_pointer = self.bytes.as_ptr() as usize;
         let Some(pool) = self.pool.upgrade() else {
             let bytes = std::mem::take(&mut self.bytes);
@@ -582,6 +673,21 @@ impl ChunkBuilder {
     pub fn with_pool(pool: Arc<WriteBufferPool>, capacity: usize) -> Result<Self> {
         Ok(Self {
             buffer: pool.checkout(capacity)?,
+            fixed_capacity: Some(capacity),
+        })
+    }
+
+    /// Consume admission already obtained outside inode and operation locks.
+    /// No wait occurs here. ENOMEM means allocator refusal; WOULD_BLOCK means
+    /// actual capacity requires new admission. Both failures retire this lease.
+    #[cfg(any(feature = "dfs", test))]
+    pub(crate) fn with_native_lease(
+        pool: Arc<WriteBufferPool>,
+        capacity: usize,
+        lease: NativeWriteLease,
+    ) -> Result<Self> {
+        Ok(Self {
+            buffer: pool.checkout_with_native_lease(capacity, Some(lease))?,
             fixed_capacity: Some(capacity),
         })
     }
@@ -805,6 +911,23 @@ impl StagedChunk {
     pub(crate) fn shared_bytes(&self) -> SharedChunkBytes {
         self.bytes.clone()
     }
+
+    /// Heap capacity owned by the staged metadata, excluding the separately
+    /// charged final body, shared outboard and shared budget owners. Callers
+    /// account for the inline StagedChunk/container storage themselves.
+    #[cfg(feature = "dfs")]
+    pub(crate) fn native_retained_metadata_bytes(&self) -> usize {
+        self.operation_id
+            .0
+            .capacity()
+            .saturating_add(self.chunk.id.0.capacity())
+            .saturating_add(self.sealed_chunk.id.0.capacity())
+            .saturating_add(
+                self.write_budget
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<WriteBudgetReservation>()),
+            )
+    }
 }
 
 #[cfg(feature = "dfs")]
@@ -899,8 +1022,58 @@ impl Drop for WriteBudgetReservationInner {
     }
 }
 
+/// A native persistence receipt with an explicit, conservative local release
+/// decision. Only the native replication implementation may establish Required
+/// policy and the matching local durable ACK; the default never grants it.
+#[derive(Clone, Debug)]
+pub struct NativeChunkReceipt {
+    pub receipt: ChunkReceipt,
+    pub local_required_and_durable: bool,
+}
+
 pub trait ChunkStore: Send + Sync {
     fn put_batch(&self, staged: Vec<StagedChunk>) -> Result<Vec<ChunkReceipt>>;
+
+    /// Reserve native control metadata before accepting a body. Production
+    /// replication overrides this from its cached authoritative placement.
+    /// The fallback is only a conservative allowance for small custom stores:
+    /// retained actual capacity must still be checked against that allowance.
+    fn native_descriptor_reservation_bytes(&self, operation_id: &OperationId) -> Result<usize> {
+        const FALLBACK_BYTES: usize = 16 * 1024;
+        if operation_id.0.capacity() > FALLBACK_BYTES / 4 {
+            return Err(Error::coded(
+                afs_error::IO_CAPACITY,
+                "native operation metadata exceeds the custom-store reservation allowance",
+            ));
+        }
+        Ok(FALLBACK_BYTES)
+    }
+
+    fn put_native_batch(&self, staged: Vec<StagedChunk>) -> Result<Vec<NativeChunkReceipt>> {
+        self.put_batch(staged).map(|receipts| {
+            receipts
+                .into_iter()
+                .map(|receipt| NativeChunkReceipt {
+                    receipt,
+                    local_required_and_durable: false,
+                })
+                .collect()
+        })
+    }
+
+    /// Read an unpublished native object anchored by its validated receipt.
+    /// Unsupported stores must keep the original body until publication.
+    fn read_native_uploaded_at(
+        &self,
+        _receipt: &ChunkReceipt,
+        _offset: u64,
+        _out: &mut [u8],
+    ) -> Result<usize> {
+        Err(Error::coded(
+            afs_error::NODE_VFS_UNIMPLEMENTED,
+            "native uploaded local read is unsupported for this backend",
+        ))
+    }
 
     fn supports_deferred_put(&self) -> bool {
         false
@@ -4494,8 +4667,23 @@ impl LocalChunkStore {
         Ok(reader)
     }
 
-    // Pin the cataloged inode without claiming its integrity. Both callers
-    // perform a complete scan on this descriptor before returning any bytes.
+    /// Pin the exact receipt object without an eager full scan. Returning this
+    /// descriptor is not an integrity claim: read_at/read_ranges still validate
+    /// the delivered coverage groups or use the existing full-scan fallback.
+    #[cfg(any(feature = "dfs", test))]
+    pub(crate) fn open_receipt_reader(&self, expected: &ChunkObject) -> Result<PinnedChunkReader> {
+        let reader = self.open_cataloged(&expected.id)?;
+        if reader.chunk != *expected {
+            return Err(corrupt(
+                &expected.id,
+                "catalog differs from native receipt object",
+            ));
+        }
+        Ok(reader)
+    }
+
+    // Pin the cataloged inode without claiming its integrity. Callers must
+    // verify requested coverage groups or the complete object before delivery.
     fn open_cataloged(&self, chunk_id: &ChunkId) -> Result<PinnedChunkReader> {
         let record = self
             .catalog

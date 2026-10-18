@@ -2,6 +2,166 @@ use afs::config::{Cli, Config, MetaStoreBackend, Role};
 use clap::Parser;
 
 #[test]
+fn p2_w2_native_write_limits_use_cli_file_defaults_and_bounded_resources() {
+    fn limits(config: &Config) -> (u64, usize, usize, u64) {
+        (
+            config.dfs_dirty_budget_bytes,
+            config.dfs_unpublished_descriptors,
+            config.dfs_upload_inflight_chunks,
+            config.dfs_background_commit_ms,
+        )
+    }
+    let defaults = (64 * 1024 * 1024, 1024, 8, 5000);
+    assert_eq!(
+        limits(&Config::resolve(Role::Node, Cli::parse_from(["afs-node"])).unwrap()),
+        defaults
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("native-write.toml");
+    for values in [
+        (4 * 1024 * 1024, 1, 1, 1),
+        defaults,
+        (16 * 1024 * 1024, 32, 4, 60000),
+    ] {
+        std::fs::write(&path, format!(
+            "dfs_dirty_budget_bytes={}\ndfs_unpublished_descriptors={}\ndfs_upload_inflight_chunks={}\ndfs_background_commit_ms={}\n",
+            values.0, values.1, values.2, values.3,
+        )).unwrap();
+        let file = Config::resolve(
+            Role::Node,
+            Cli::parse_from(["afs-node", "--config", path.to_str().unwrap()]),
+        )
+        .unwrap();
+        assert_eq!(limits(&file), values);
+        let cli = Config::resolve(
+            Role::Node,
+            Cli::parse_from([
+                "afs-node",
+                "--config",
+                path.to_str().unwrap(),
+                "--dfs-dirty-budget-bytes",
+                "67108864",
+                "--dfs-unpublished-descriptors",
+                "1024",
+                "--dfs-upload-inflight-chunks",
+                "8",
+                "--dfs-background-commit-ms",
+                "5000",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(limits(&cli), defaults);
+    }
+}
+
+#[test]
+fn p2_w2_complete_node_examples_resolve_top_level_write_limits() {
+    for (name, contents) in [
+        ("component", include_str!("../examples/node.toml")),
+        (
+            "deployment",
+            include_str!("../../build/config/examples/afs/node.toml"),
+        ),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("node.toml");
+        std::fs::write(&path, contents).unwrap();
+        let config = Config::resolve(
+            Role::Node,
+            Cli::parse_from(["afs-node", "--config", path.to_str().unwrap()]),
+        )
+        .unwrap_or_else(|error| panic!("{name} complete example does not resolve: {error}"));
+        assert_eq!(config.dfs_dirty_budget_bytes, 64 * 1024 * 1024, "{name}");
+        assert_eq!(config.dfs_unpublished_descriptors, 1024, "{name}");
+        assert_eq!(config.dfs_upload_inflight_chunks, 8, "{name}");
+        assert_eq!(config.dfs_background_commit_ms, 5000, "{name}");
+        assert_eq!(config.dfs_catalog_commit_queue, 256, "{name}");
+        assert_eq!(config.trusted_node_certs.len(), 1, "{name}");
+        assert!(config.trusted_node_certs.contains_key("node-a"), "{name}");
+    }
+}
+
+#[test]
+fn p2_w2_invalid_native_limits_are_not_silently_replaced() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("native-write.toml");
+    for (key, flag, value) in [
+        ("dfs_dirty_budget_bytes", "--dfs-dirty-budget-bytes", "0"),
+        (
+            "dfs_dirty_budget_bytes",
+            "--dfs-dirty-budget-bytes",
+            "4194303",
+        ),
+        (
+            "dfs_dirty_budget_bytes",
+            "--dfs-dirty-budget-bytes",
+            "67108865",
+        ),
+        (
+            "dfs_unpublished_descriptors",
+            "--dfs-unpublished-descriptors",
+            "0",
+        ),
+        (
+            "dfs_unpublished_descriptors",
+            "--dfs-unpublished-descriptors",
+            "1025",
+        ),
+        (
+            "dfs_upload_inflight_chunks",
+            "--dfs-upload-inflight-chunks",
+            "0",
+        ),
+        (
+            "dfs_upload_inflight_chunks",
+            "--dfs-upload-inflight-chunks",
+            "9",
+        ),
+        (
+            "dfs_background_commit_ms",
+            "--dfs-background-commit-ms",
+            "0",
+        ),
+        (
+            "dfs_background_commit_ms",
+            "--dfs-background-commit-ms",
+            "60001",
+        ),
+    ] {
+        std::fs::write(&path, format!("{key}={value}\n")).unwrap();
+        let error = Config::resolve(
+            Role::Node,
+            Cli::parse_from(["afs-node", "--config", path.to_str().unwrap()]),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), afs_error::CONFIG_INVALID, "{key}={value}");
+        let error =
+            Config::resolve(Role::Node, Cli::parse_from(["afs-node", flag, value])).unwrap_err();
+        assert_eq!(error.code(), afs_error::CONFIG_INVALID, "{flag} {value}");
+        assert!(
+            Config::resolve(
+                Role::Node,
+                Cli::parse_from([
+                    "afs-node",
+                    "--config",
+                    path.to_str().unwrap(),
+                    "--dfs-dirty-budget-bytes",
+                    "67108864",
+                    "--dfs-unpublished-descriptors",
+                    "1024",
+                    "--dfs-upload-inflight-chunks",
+                    "8",
+                    "--dfs-background-commit-ms",
+                    "5000",
+                ])
+            )
+            .is_ok(),
+            "CLI must override the invalid file field: {key}"
+        );
+    }
+}
+
+#[test]
 fn p2_r7_readahead_is_opt_in_and_only_a_bounded_distance() {
     assert_eq!(
         Config::resolve(Role::Node, Cli::parse_from(["afs-node"]))

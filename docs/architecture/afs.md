@@ -47,26 +47,38 @@ Node 的 Meta、peer control 和 data 诊断请求复用生产 TLS 配置，诊�
 
 ## DFS 原生写正文所有权
 
-普通 FUSE 到本地 inode owner 的 NodeReplicated 写入在同句柄 FIFO 和 inode 门禁内接纳借用输入，
-直接复制到最终 `ChunkBuilder` 分配。顺序写优先使用4MiB容量块；满块只切换下一块，
-仍可原地覆盖，不新增冻结、下盘或发布入口。已提交内容的小覆盖使用普通小 Chunk，
-大写不强制按4KiB切分。远端 owner、OwnerFs 和 S3 保留各自调度与正文账本。
+普通 FUSE 到本地 inode owner 的 NodeReplicated 写入按 inode FIFO 接纳借用输入，
+直接复制到最终 `ChunkBuilder` 分配。正文准入等待不持 inode 锁或 operation 门禁，
+重新取得短操作门禁后复核 generation、序号、位置和 builder，避免等待期间后台提交造成错接。
+顺序写优先使用4MiB容量块；满块冻结原分配并排队预上传，不触发 Meta 发布。
+提交前仍可原地覆盖可写 builder；已冻结／已提交内容的小覆盖形成普通小 Chunk，
+大写不强制按4KiB切分。不拼接正文，也不将 Vec 复制成 Arc 切片。
 
-原 sync/fdatasync、同步标志、累计接纳16MiB（包括覆盖）、后台写回、FUSE flush 和排空入口
-消费可写 builder，将同一 Vec 分配移入共享只读 owner；planner 按最终有效来源范围形成 Chunk，
-不拼接正文或将 Vec 搬成 Arc 切片。冻结不计算新的可见性保证；成功 fsync 仍等待原持久屏障和
-Meta 确认。未知提交保留原 OperationId、精确请求、正文和回执，后续修改不能越过；准备失败
-恢复的正文保持不可变，不能在仍有异步引用时重新变成可写。活动 dirty 读取在 inode 锁内形成
-本次读取范围的只读快照，其读复制单独统计。
+原生 Node 分开维护 live 正文、未发布描述符和真实在途上传三本账，默认分别为64MiB、
+最多1024项且控制元数据总4MiB、8个上传任务。元数据上限含64KiB FIFO／进展预留，
+其余容量在接纳前同时覆盖描述符和新增发布工作区；实际保留容量与预留分别观测。
+4MiB约束新增W2控制结构，不给既有完整文件布局／标准RPC缓冲增加文件大小硬上限；
+已有布局并存份数不增加，其capacity与transport临时分配仍须另行计量，不能宣称全部Node元数据受此限制。
+空闲池默认128MiB，独立于 live，不能借作额外接纳额度。共享范围按父分配实际 capacity
+计费一次，最后一个读者、上传／复制／RDMA或冻结提交持有者释放后才退账。
 
-原生 dirty 区间按文件偏移保留不重叠的最终范围，使用有序索引查找覆盖段；builder 追加索引
-仍按原创建顺序选择可写 owner。区间拆分保留原正文可复用终点和 write_seq，截断裁剪该终点，
-避免仅因后续覆盖把一次输入复制拆成多次。提交失败恢复和快照继续共享不可变 owner，不能
-提前回收。S3／legacy 保留原 extent 日志及其预算语义，本项不改变提交时机或正文分块策略。
+每一代在首次接纳时固定 OperationId，按 `through_seq` 冻结提交；准备旧代上传时可接纳
+下一代。进入 File／Metadata 或结果未知阶段后，新的 mutation 不能越过；保留原请求、
+OperationId、正文与回执，精确重放后才继续。普通 write 可以先报告已接纳；发布入口是
+fsync／fdatasync、同步写、可写 flush／close、最后写者退出、后台调度、批准的压力以及
+停止排空。原16MiB累计接纳发布阈值退出原生路径，4MiB满块不是发布入口。
+后台默认5s是调度周期，busy时延后补做，不承诺严格可见期限。成功 fsync 仍等待此前
+已接纳序号所需的持久对象回执和 Meta 确认，错误原样传播。
 
-Node 写 buffer 池限制的是可复用空闲容量，默认128MiB、最多1024条，不限制 live 正文，
-不增加全局配额等待或压力提交。共享范围按父分配实际 capacity 计费一次；最后持有者释放后
-才能归池或释放。停止清空空闲列表，迟到引用结束后直接释放；池不延长 Node 生命周期。
+Required 策略且同一权威 placement 的实际本机持久 ACK 已验证时，上传后可释放正文，
+未发布的本机读取用本地 store 并对照回执根校验；本机无可靠副本时正文保留至发布，
+仍有引用不能退账。只有描述符额度压力，或无本机副本导致 live 满时，才提前后台发布。
+原生 dirty 区间仍只保留不重叠的最终范围；截断、覆盖和准备失败恢复保持引用安全。
+停止先关闭新接纳并唤醒等待者，排空已接纳上传及有序发布，再关闭 catalog 和空闲池。
+远端 owner、OwnerFs 和 S3 保留各自调度，S3 的窗口和载荷／描述符预算独立不变。
+Node负责运行时和后台调度；独立构造的 `DistributedFs` 需外部驱动既有写回入口。
+没有运行时／外部驱动且当前请求无法释放live或描述符额度时，返回结构化错误，不以永久等待冒充背压。
+
 Linux `afs-node` 默认使用官方 jemalloc：后台回收开启、dirty decay1000ms、muzzy decay0。
 AFS live/idle、allocator allocated/active/resident/retained 与进程 RSS 是不同指标，
 保留虚拟映射不等于保留同量物理页。S3 原有窗口、正文和 descriptor 预算独立保持，

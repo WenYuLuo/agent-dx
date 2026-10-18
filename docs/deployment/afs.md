@@ -409,11 +409,33 @@ fsync依赖原持久副本与Meta屏障。S3原有窗口、载荷／descriptor�
 `dfs_write_buffer_idle_bytes` 为 Node 顶层配置，默认134217728（128MiB），允许0..=1TiB；
 0禁用空闲保留。它只限制池中可复用的空闲实际容量，不预分配，也不是 live、RSS 或进程内存硬上限。
 未命中池时按需申请，最后引用释放才归还，超基线分配释放给 allocator；停止清空池。
-该配置不改变单 inode 原16MiB累计接纳阈值、后台写回或 S3 的任何预算上限。
-原生区间索引仅保留最终可见范围，不保留每次覆盖的历史记录；累计接纳量仍包括重复覆盖，
-不能用当前可见字节替代。索引化没有新增配置、正文缓存或内存额度，S3／legacy 仍沿用原日志。
-多 inode／慢提交可增加 live；明确分配拒绝尽力返回 ENOMEM 或合法短写，Linux OOM 杀进程
-仍按崩溃合同处理，不能保证始终正常返回错误。
+空闲池不改变 S3 的任何预算。原生写入另用下表的 Node live／描述符／上传三账，
+原16MiB累计接纳发布阈值退出原生路径；4MiB满块只冻结并排队上传。
+原生区间索引仅保留最终可见范围，不保留每次覆盖的历史记录；S3／legacy 仍沿用原日志。
+明确分配拒绝尽力返回 ENOMEM 或合法短写，Linux OOM 杀进程仍按崩溃合同处理，
+不能保证始终正常返回错误。
+
+| 原生 DFS 参数（CLI 将下划线改为连字符） | 默认 | 合法范围／含义 |
+| --- | ---: | --- |
+| `dfs_dirty_budget_bytes` | `67108864` | 4..64MiB，Node实际live正文capacity，含仍被持有的已上传正文 |
+| `dfs_unpublished_descriptors` | `1024` | 1..1024，且受固定4MiB元数据总额限制，不能靠增大计数绕过字节上限 |
+| `dfs_upload_inflight_chunks` | `8` | 1..8，整个Node的真实任务上限，共享live正文 |
+| `dfs_background_commit_ms` | `5000` | 1..60000ms，后台发布调度周期，非严格可见时间 |
+
+优先级 CLI＞TOML＞默认，非法值启动报错；仅无外部后端的 DFS 接入此流水线。
+固定4MiB元数据内预留64KiB给FIFO和进展，其余在接纳前覆盖描述符和新增发布工作区；
+每项实际保留与保守预留分列，字节满可能早于1024项。压力发布只用于描述符额度满，
+或本机没有持久副本、必须保留正文而使live满；不得借压力跳过未知提交精确重放。
+只有Required策略与实际本机持久ACK核验成功才能退休未发布正文并从本地store按回执根读；
+否则保留正文至发布且最后持有者释放。普通write接纳成功不等同已发布，成功fsync、
+同步写、可写close/flush和排空仍等待所需对象与Meta持久屏障。
+
+`afs_dfs_native_write_resources{resource="..."}`分别报告live／峰值／等待、descriptor实际／
+预留、publication scratch预留、control、upload和压力事件；不带inode标签。
+这些项存在包含或预留关系，不直接相加；4MiB限新增W2结构，不含P1M既有完整文件布局、
+标准RPC、空闲池、allocator或RSS，不因此拒绝原可提交的大文件。已有完整布局并存份数
+保持或减少，旧成本及transport临时分配另测；不能把旧布局排除解释成允许增加未计账副本。
+RSS另测，不因gauge存在而判资源通过。
 
 Linux Node 默认 feature `node-jemalloc` 安装固定官方 allocator，作用于同一 Node 进程内的 OwnerFs 和 DFS；
 AFS Meta 和 ADX 其他进程不受强制替换。依赖许可随 ON 包中的 `third_party/afs-source/NOTICE` 提供。

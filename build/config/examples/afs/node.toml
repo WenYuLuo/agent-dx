@@ -69,7 +69,17 @@ tls_identity_certificate = "/opt/adx/config/afs/tls/node-a.pem"
 tls_identity_private_key = "/opt/adx/config/afs/tls/node-a-key.pem"
 tls_server_name = "afs-cluster"
 
-# Native DFS write-body reuse: maximum idle capacity; live bodies are not capped.
+# Catalog request count, independent of body/proof budgets.
+dfs_catalog_commit_queue = 256
+
+# Native DFS live uploads and unpublished metadata. S3 keeps its separate budgets.
+dfs_dirty_budget_bytes = 67108864
+dfs_unpublished_descriptors = 1024
+dfs_upload_inflight_chunks = 8
+# Scheduling period, not a guaranteed publication deadline.
+dfs_background_commit_ms = 5000
+
+# Write-body pool idle capacity is independent of the native live limit above.
 # Zero disables idle retention. This does not change S3 pipeline budgets.
 dfs_write_buffer_idle_bytes = 134217728
 
@@ -96,6 +106,3 @@ node-a = "/opt/adx/config/afs/tls/node-a.pem"
 # capacity_bytes = 268435456
 # pending_bytes = 37748736
 # cache_large_write = false
-
-# Catalog request count, independent of body/proof budgets.
-dfs_catalog_commit_queue = 256

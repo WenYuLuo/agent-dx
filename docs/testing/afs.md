@@ -568,9 +568,10 @@ write_seq、Chunk 划分及实际输入复制次数；另测16MiB中十万次对
 其预算与恢复须由受影响的`deferred_publication_`回归单独核对。
 
 真实 FUSE 使用本地 owner、NodeReplicated R1、无 S3：六次应用1MiB写入合计6MiB，记录内核实际
-回调大小和中途提交轨迹；同批原提交入口冻结4MiB＋2MiB有效正文，复制入口合计6MiB、地址保持，
+回调大小和中途提交轨迹；满4MiB块先冻结预上传，2MiB尾块在原生发布入口冻结，
+无中途发布时同一版本包含4MiB＋2MiB有效正文。复制入口合计6MiB、冻结地址保持，
 远端重新打开核对 SHA／长度／EOF。随后偏移8192覆盖4KiB，验证小 Chunk、新布局和旧 Chunk 不变；
-另验证未冻结时同位置原地覆盖。若后台中途提交，功能结果与“同批两正文”结构验收必须分开登记。
+另验证未冻结时同位置原地覆盖。若后台中途发布，功能结果与“同批两正文”结构验收必须分开登记。
 
 `afs_dfs_write_buffer_*` 记录实际 live/idle/peak capacity、分配、复用、释放和输入 copy；
 `input_copy_bytes_total`／`input_copies_total` 来自实际 slice-copy/extend 入口，不能当端到端总复制。
@@ -727,3 +728,23 @@ packed软件回归保留；单元RPC不等于FUSE／多VM性能或真实verbs验
 20ms；已开始的I/O、同flight结果和R-4双帧背压受原授权／stop／传输合同约束。
 大窗口和多连接仍后置；当前两个流共享一个Channel及原≤2MiB connection窗口，
 不能把小窗口等待通过宣传成16MiB connection／4MiB stream或多连接验收。
+
+## 原生写入准入、预上传与有序发布回归
+
+原生路径与 S3 原预算分别验证；不能用参数存在、基元单测或编译成功代替整组运行通过。
+保留原16MiB提交阈值tests-only RED，后续核对普通write不触发该旧入口、满4MiB只预上传，
+成功fsync覆盖先前接纳的所有序号。一次提交只等已冻结的 `through_seq`，持续生产不使
+旧提交无限等待；未知结果用原OperationId／精确请求重放，write／resize／setattr不能越过。
+
+分别覆盖本机Required且实际持久ACK验证后的 Uploaded 回读，以及无本机副本时正文
+保留至发布；按根完整校验，失败不交付部分输出。慢上传、读快照、冻结请求和最后共享
+slice期间不得提前退live，实际capacity、空闲池、元数据actual／reserved和RSS分列。
+另用已有大base布局加一次小覆盖，核对不会把原可提交文件变成4MiB元数据门槛错误；
+记录既有完整layout/domain并存份数不增加。新增描述符与工作区受限，不冒称全部布局／RPC受限。
+冷池／热池、FIFO取消／并发顺序、预算等待不持inode锁、描述符压力、无副本live压力、
+定时busy补做、stop唤醒与真实任务join都须有针对性证据。连续超过预算的写入须证明
+能推进，不能只测试不满预算的64MiB；S3有界窗口、OwnerFs和RDMA受影响范围另登记。
+
+正式功能核对需记录真实FUSE callback大小、6MiB的4＋2MiB几何、正文输入复制、
+冻结前后地址／capacity／代际、提交后4KiB覆盖、提交前原地覆盖，以及远端重开SHA／
+长度／EOF。正式性能与诊断分开，保留固定计时和缓存条件；未运行的资源与性能项继续待验收。

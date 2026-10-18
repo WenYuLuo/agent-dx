@@ -72,8 +72,39 @@ fn thread_cpu_ns() -> Option<u64> {
     seconds.checked_mul(1_000_000_000)?.checked_add(nanos)
 }
 
+#[cfg(feature = "dfs")]
+const NATIVE_WRITE_RESOURCES: &[&str] = &[
+    "live_bytes",
+    "live_peak_bytes",
+    "live_limit_bytes",
+    "live_leases",
+    "live_waiters",
+    "stopped",
+    "descriptor_bytes",
+    "descriptor_peak_bytes",
+    "descriptors",
+    "descriptor_peak_count",
+    "descriptor_reserved_bytes",
+    "publication_scratch_reserved_bytes",
+    "control_bytes",
+    "control_peak_bytes",
+    "control_reserve_bytes",
+    "upload_inflight",
+    "upload_peak",
+    "upload_limit",
+    "pending_generations",
+    "pressure_descriptor",
+    "pressure_live",
+    "completed_uploads",
+    "failed_uploads",
+    "metadata_limit_bytes",
+    "descriptor_limit_bytes",
+];
+
 #[derive(Clone, Debug)]
 pub struct ReadWorkMetrics {
+    #[cfg(feature = "dfs")]
+    native_write_resources: afs_metrics::IntGaugeVec,
     catalog_commit_resources: afs_metrics::IntGaugeVec,
     scan_bytes: afs_metrics::IntCounter,
     hashes: afs_metrics::IntCounterVec,
@@ -155,6 +186,21 @@ pub struct ReadWorkMetrics {
 impl ReadWorkMetrics {
     pub fn register(registry: &afs_metrics::Registry) -> Result<Self, afs_metrics::MetricsError> {
         registry.get_or_register(|registry| {
+            #[cfg(feature = "dfs")]
+            let native_write_resources = {
+                let metric = afs_metrics::IntGaugeVec::new(
+                    afs_metrics::Opts::new(
+                        "afs_dfs_native_write_resources",
+                        "Native live, upload and unpublished control capacity with lifetime peaks and cumulative events; excludes S3, idle pool, allocator and RSS.",
+                    ),
+                    &["resource"],
+                )?;
+                for resource in NATIVE_WRITE_RESOURCES {
+                    metric.with_label_values(&[resource]);
+                }
+                afs_metrics::register_collector(registry, &metric)?;
+                metric
+            };
             let catalog_commit_resources = afs_metrics::IntGaugeVec::new(
                 afs_metrics::Opts::new("afs_dfs_catalog_commit_resources", "Catalog control capacity and completed groups; excludes caller-owned bodies and the existing oversized-batch path."),
                 &["resource"],
@@ -497,6 +543,8 @@ impl ReadWorkMetrics {
                 copies.with_label_values(&[stage]);
             }
             Ok(Self {
+                #[cfg(feature = "dfs")]
+                native_write_resources,
                 catalog_commit_resources,
                 scan_bytes,
                 hashes,
@@ -895,6 +943,31 @@ impl ReadWorkMetrics {
                 | "sidecar_install_failed"
         ) {
             self.outboard_events.with_label_values(&[event]).inc();
+        }
+    }
+
+    #[cfg(feature = "dfs")]
+    pub(crate) fn native_write_live(&self, state: &crate::node::chunk::NativeWriteBudgetSnapshot) {
+        self.native_write_resources(&[
+            ("live_bytes", state.live_bytes as u64),
+            ("live_peak_bytes", state.live_peak_bytes as u64),
+            ("live_limit_bytes", state.limit as u64),
+            ("live_leases", state.leases as u64),
+            ("live_waiters", state.waiters as u64),
+            ("stopped", u64::from(state.stopped)),
+        ]);
+    }
+
+    #[cfg(feature = "dfs")]
+    pub(crate) fn native_write_resources(&self, values: &[(&str, u64)]) {
+        for (resource, value) in values {
+            if NATIVE_WRITE_RESOURCES.contains(resource)
+                && let Ok(value) = i64::try_from(*value)
+            {
+                self.native_write_resources
+                    .with_label_values(&[resource])
+                    .set(value);
+            }
         }
     }
 

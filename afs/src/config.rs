@@ -254,6 +254,18 @@ pub struct Cli {
     /// Queued plus active catalog commit requests (1..=256), with a separate 1MiB control bound.
     #[arg(long)]
     pub dfs_catalog_commit_queue: Option<usize>,
+    /// Native Node live write-body capacity (4..=64MiB); S3 budgets are separate.
+    #[arg(long)]
+    pub dfs_dirty_budget_bytes: Option<u64>,
+    /// Native uploaded but unpublished objects (1..=1024), within 4MiB metadata.
+    #[arg(long)]
+    pub dfs_unpublished_descriptors: Option<usize>,
+    /// Native Node upload tasks (1..=8), sharing the live-body budget.
+    #[arg(long)]
+    pub dfs_upload_inflight_chunks: Option<usize>,
+    /// Native background commit scheduling period (1..=60000ms), not a deadline.
+    #[arg(long)]
+    pub dfs_background_commit_ms: Option<u64>,
     /// Queued plus active optional sidecar installs (1..=64).
     #[arg(long)]
     pub dfs_sidecar_install_queue: Option<usize>,
@@ -354,6 +366,10 @@ struct FileConfig {
     dfs_version_cache_bytes: Option<u64>,
     dfs_outboard_work_wait_ms: Option<u64>,
     dfs_catalog_commit_queue: Option<usize>,
+    dfs_dirty_budget_bytes: Option<u64>,
+    dfs_unpublished_descriptors: Option<usize>,
+    dfs_upload_inflight_chunks: Option<usize>,
+    dfs_background_commit_ms: Option<u64>,
     dfs_sidecar_install_queue: Option<usize>,
     dfs_fetch_max_inflight_objects: Option<usize>,
     dfs_readahead_max_bytes: Option<u64>,
@@ -422,6 +438,10 @@ pub struct Config {
     pub dfs_version_cache_bytes: u64,
     pub dfs_outboard_work_wait_ms: u64,
     pub dfs_catalog_commit_queue: usize,
+    pub dfs_dirty_budget_bytes: u64,
+    pub dfs_unpublished_descriptors: usize,
+    pub dfs_upload_inflight_chunks: usize,
+    pub dfs_background_commit_ms: u64,
     pub dfs_sidecar_install_queue: usize,
     pub dfs_fetch_max_inflight_objects: usize,
     pub dfs_readahead_max_bytes: u64,
@@ -639,6 +659,36 @@ impl Config {
         if !(1..=256).contains(&dfs_catalog_commit_queue) {
             return Err(invalid("DFS catalog commit queue must be 1..=256"));
         }
+        let dfs_dirty_budget_bytes = cli
+            .dfs_dirty_budget_bytes
+            .or(file.dfs_dirty_budget_bytes)
+            .unwrap_or(64 * 1024 * 1024);
+        if !(4 * 1024 * 1024..=64 * 1024 * 1024).contains(&dfs_dirty_budget_bytes) {
+            return Err(invalid("DFS native dirty budget bytes must be 4..=64MiB"));
+        }
+        let dfs_unpublished_descriptors = cli
+            .dfs_unpublished_descriptors
+            .or(file.dfs_unpublished_descriptors)
+            .unwrap_or(1024);
+        if !(1..=1024).contains(&dfs_unpublished_descriptors) {
+            return Err(invalid("DFS unpublished descriptors must be 1..=1024"));
+        }
+        let dfs_upload_inflight_chunks = cli
+            .dfs_upload_inflight_chunks
+            .or(file.dfs_upload_inflight_chunks)
+            .unwrap_or(8);
+        if !(1..=8).contains(&dfs_upload_inflight_chunks) {
+            return Err(invalid("DFS native upload inflight chunks must be 1..=8"));
+        }
+        let dfs_background_commit_ms = cli
+            .dfs_background_commit_ms
+            .or(file.dfs_background_commit_ms)
+            .unwrap_or(5000);
+        if !(1..=60000).contains(&dfs_background_commit_ms) {
+            return Err(invalid(
+                "DFS native background commit period must be 1..=60000ms",
+            ));
+        }
         let dfs_sidecar_install_queue = cli
             .dfs_sidecar_install_queue
             .or(file.dfs_sidecar_install_queue)
@@ -752,6 +802,10 @@ impl Config {
             dfs_version_cache_bytes,
             dfs_outboard_work_wait_ms,
             dfs_catalog_commit_queue,
+            dfs_dirty_budget_bytes,
+            dfs_unpublished_descriptors,
+            dfs_upload_inflight_chunks,
+            dfs_background_commit_ms,
             dfs_sidecar_install_queue,
             dfs_fetch_max_inflight_objects,
             dfs_readahead_max_bytes,
