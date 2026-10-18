@@ -5318,6 +5318,344 @@ mod replica_replay_tests {
     use super::*;
 
     #[test]
+    fn p2_w3_uncontrolled_sixteen_requests_report_actual_groups_and_barriers() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = afs_metrics::Registry::new();
+        let metrics = super::super::read_work::ReadWorkMetrics::register(&registry)
+            .unwrap()
+            .with_read_diagnostics(true);
+        let store = Arc::new(
+            LocalChunkStore::open(temp.path(), "node-a")
+                .unwrap()
+                .with_read_work_metrics(metrics.clone()),
+        );
+        assert!(store.catalog_commit_test.ready.lock().unwrap().is_none());
+        let start = Arc::new(std::sync::Barrier::new(17));
+        let staged: Vec<_> = (0..16)
+            .map(|index| {
+                StagedChunk::new(
+                    OperationId::new(format!("uncontrolled-{index}")),
+                    vec![index; 64],
+                )
+            })
+            .collect();
+        let workers: Vec<_> = staged
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, item)| {
+                let store = store.clone();
+                let start = start.clone();
+                std::thread::spawn(move || {
+                    start.wait(); // Entry only: no ready / batch-taking barrier.
+                    (index, store.put(item).unwrap())
+                })
+            })
+            .collect();
+        start.wait();
+        let receipts: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+        let wal = fs::read(&store.catalog_path).unwrap();
+        let transactions: Vec<CatalogTxn> = wal
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).unwrap())
+            .collect();
+        let stats = store.catalog_commit_stats();
+        assert!((1..=16).contains(&transactions.len()));
+        assert_eq!(stats.groups, transactions.len() as u64);
+        assert_eq!(
+            transactions
+                .iter()
+                .map(|txn| txn.records.len())
+                .sum::<usize>(),
+            16
+        );
+        assert_eq!(
+            stats.max_group,
+            transactions
+                .iter()
+                .map(|txn| txn.records.len())
+                .max()
+                .unwrap()
+        );
+        assert_eq!((stats.requests, stats.ready, stats.waiters), (0, 0, 0));
+        assert!(!stats.writer && !stats.failed);
+        for (index, txn) in transactions.iter().enumerate() {
+            assert_eq!(txn.revision, index as u64 + 1);
+            assert_eq!(
+                catalog_checksum(txn.revision, &txn.records).unwrap(),
+                txn.checksum
+            );
+            assert!(
+                txn.records
+                    .iter()
+                    .all(|record| record.catalog_revision == txn.revision)
+            );
+        }
+        let snapshot = metrics.diagnostics_snapshot().unwrap();
+        let calls = |phase: &str| {
+            snapshot
+                .coarse_phases
+                .iter()
+                .find(|item| item.phase == phase)
+                .map_or(0, |item| item.calls)
+        };
+        for phase in [
+            "persist_chunks_dir_sync",
+            "persist_catalog_write",
+            "persist_catalog_sync",
+            "persist_catalog_parent_sync",
+        ] {
+            assert_eq!(
+                calls(phase),
+                stats.groups,
+                "actual successful {phase} must match WAL groups"
+            );
+        }
+        assert_eq!(calls("persist_body_sync"), 16);
+        for (index, receipt) in &receipts {
+            assert_eq!(receipt.operation_id, staged[*index].operation_id);
+            assert_eq!(receipt.chunk, staged[*index].chunk);
+            assert_eq!(receipt.durable_acks.len(), 1);
+            let revision = receipt.durable_acks[0].catalog_revision;
+            let txn = transactions
+                .iter()
+                .find(|txn| txn.revision == revision)
+                .unwrap();
+            assert!(
+                txn.records
+                    .iter()
+                    .any(|record| record.chunk == receipt.chunk)
+            );
+        }
+        eprintln!(
+            "W3_UNCONTROLLED_LEDGER {}",
+            serde_json::json!({
+                "requests": receipts.iter().map(|(index, receipt)| serde_json::json!({
+                    "request": index, "operation_id": receipt.operation_id.0,
+                    "chunk_id": receipt.chunk.id.0, "revision": receipt.durable_acks[0].catalog_revision,
+                })).collect::<Vec<_>>(),
+                "groups": transactions.iter().map(|txn| serde_json::json!({
+                    "revision": txn.revision, "records": txn.records.len(),
+                })).collect::<Vec<_>>(),
+                "barriers": {
+                    "body_sync": calls("persist_body_sync"),
+                    "chunks_dir_sync": calls("persist_chunks_dir_sync"),
+                    "wal_write": calls("persist_catalog_write"),
+                    "wal_sync": calls("persist_catalog_sync"),
+                    "catalog_parent_sync": calls("persist_catalog_parent_sync"),
+                },
+            })
+        );
+        drop(store);
+        let recovered = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+        for item in staged {
+            let mut output = [0; 65];
+            assert_eq!(
+                recovered.read_at(&item.chunk.id, 0, &mut output).unwrap(),
+                64
+            );
+            assert_eq!(&output[..64], item.bytes());
+            assert_eq!(output[64], 0);
+        }
+    }
+
+    fn p2_w3_pre_ack_chunks() -> Vec<StagedChunk> {
+        (0..4)
+            .map(|index| {
+                StagedChunk::new(
+                    OperationId::new(format!("pre-ack-{index}")),
+                    vec![51 + index; 97],
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    #[ignore = "child process only; parent executes both bounded pre-ACK crash modes"]
+    fn p2_w3_pre_ack_child() {
+        let Some(root) = std::env::var_os("AFS_TEST_W3_PRE_ACK_ROOT") else {
+            return;
+        };
+        let mode = std::env::var("AFS_TEST_W3_PRE_ACK_MODE").unwrap();
+        let registry = afs_metrics::Registry::new();
+        let metrics = super::super::read_work::ReadWorkMetrics::register(&registry)
+            .unwrap()
+            .with_read_diagnostics(true);
+        let store = Arc::new(
+            LocalChunkStore::open(root, "node-a")
+                .unwrap()
+                .with_read_work_metrics(metrics.clone()),
+        );
+        if mode == "before-wal" {
+            let (block, entered, _release) = p2_w3_block();
+            store
+                .catalog_commit_test
+                .before_wal
+                .lock()
+                .unwrap()
+                .push_back(block);
+            let worker_store = store.clone();
+            let _blocked_worker = std::thread::spawn(move || {
+                worker_store.put_batch(p2_w3_pre_ack_chunks()).unwrap();
+                panic!("pre-ACK worker unexpectedly returned a successful receipt");
+            });
+            entered.recv_timeout(Duration::from_secs(5)).unwrap();
+            let snapshot = metrics.diagnostics_snapshot().unwrap();
+            let calls = |phase: &str| {
+                snapshot
+                    .coarse_phases
+                    .iter()
+                    .find(|item| item.phase == phase)
+                    .map_or(0, |item| item.calls)
+            };
+            assert_eq!(calls("persist_body_sync"), 4);
+            assert_eq!(calls("persist_chunks_dir_sync"), 1);
+            assert_eq!(calls("persist_catalog_write"), 0);
+            eprintln!(
+                "W3_PRE_ACK before-wal body_sync=4 chunks_dir_sync=1 wal_write=0 successful_ack=0"
+            );
+            // No unwinding or store Drop: the writer is still blocked before WAL.
+            std::process::exit(74);
+        }
+        assert_eq!(mode, "half-wal");
+        store
+            .catalog_commit_test
+            .fail_wal_step
+            .store(1, Ordering::Release);
+        assert!(store.put_batch(p2_w3_pre_ack_chunks()).is_err());
+        assert!(store.catalog_commit_stats().failed);
+        eprintln!("W3_PRE_ACK half-wal real_partial_write=true successful_ack=0");
+        // Existing test hook writes a real partial multi-record transaction;
+        // it does not emulate physical fsync EIO or loss of OS page cache.
+        std::process::exit(75);
+    }
+
+    fn p2_w3_run_pre_ack_child(root: &Path, mode: &str) {
+        let log = root.join(format!("pre-ack-{mode}.log"));
+        let output = File::create(&log).unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "node::chunk::replica_replay_tests::p2_w3_pre_ack_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("AFS_TEST_W3_PRE_ACK_ROOT", root)
+            .env("AFS_TEST_W3_PRE_ACK_MODE", mode)
+            .stdout(output.try_clone().unwrap())
+            .stderr(output)
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
+                failure => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!(
+                        "pre-ACK child timeout / wait error {failure:?}: {}",
+                        fs::read_to_string(&log).unwrap_or_default()
+                    );
+                }
+            }
+        };
+        assert_eq!(
+            status.code(),
+            Some(if mode == "before-wal" { 74 } else { 75 }),
+            "{}",
+            fs::read_to_string(&log).unwrap()
+        );
+        eprintln!("{}", fs::read_to_string(log).unwrap());
+    }
+
+    #[test]
+    fn p2_w3_pre_ack_process_exits_keep_prefix_orphans_and_exact_retry() {
+        for mode in ["before-wal", "half-wal"] {
+            let temp = tempfile::tempdir().unwrap();
+            let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+            let prefix = StagedChunk::new(
+                OperationId::new("already-acked-prefix"),
+                b"prefix-durable".to_vec(),
+            );
+            let prefix_ack = store.put(prefix.clone()).unwrap();
+            assert_eq!(prefix_ack.durable_acks[0].catalog_revision, 1);
+            let prefix_wal = fs::read(&store.catalog_path).unwrap();
+            drop(store);
+            p2_w3_run_pre_ack_child(temp.path(), mode);
+            let expected = p2_w3_pre_ack_chunks();
+            let original_files: Vec<_> = expected
+                .iter()
+                .map(|item| {
+                    let path = temp.path().join("chunks").join(&item.chunk.id.0);
+                    let body = fs::read(&path).unwrap();
+                    assert_eq!(body, item.bytes());
+                    (path, body)
+                })
+                .collect();
+            let crash_wal = fs::read(temp.path().join("catalog.wal")).unwrap();
+            assert!(crash_wal.starts_with(&prefix_wal));
+            if mode == "before-wal" {
+                assert_eq!(crash_wal, prefix_wal);
+            } else {
+                assert!(crash_wal.len() > prefix_wal.len());
+                let error = serde_json::from_slice::<CatalogTxn>(&crash_wal[prefix_wal.len()..])
+                    .unwrap_err();
+                assert!(
+                    error.is_eof(),
+                    "partial final multi-record transaction: {error}"
+                );
+            }
+            let recovered = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+            assert_eq!(fs::read(&recovered.catalog_path).unwrap(), prefix_wal);
+            let report = recovered.recover().unwrap();
+            assert_eq!(report.durable_chunks, 1);
+            assert_eq!(report.orphan_files, 4);
+            let mut output = [9; 14];
+            assert_eq!(
+                recovered.read_at(&prefix.chunk.id, 0, &mut output).unwrap(),
+                prefix.bytes().len()
+            );
+            assert_eq!(&output[..prefix.bytes().len()], prefix.bytes());
+            for (path, body) in &original_files {
+                assert_eq!(
+                    &fs::read(path).unwrap(),
+                    body,
+                    "orphan bytes must not be deleted or rewritten on recovery"
+                );
+            }
+            let retried = recovered.put_batch(expected.clone()).unwrap();
+            assert_eq!(retried.len(), 4);
+            for (receipt, item) in retried.iter().zip(&expected) {
+                assert_eq!(receipt.operation_id, item.operation_id);
+                assert_eq!(receipt.chunk, item.chunk);
+                assert_eq!(receipt.durable_acks[0].catalog_revision, 2);
+            }
+            assert_eq!(recovered.recover().unwrap().orphan_files, 0);
+            drop(recovered);
+            let reopened = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+            assert_eq!(reopened.recover().unwrap().durable_chunks, 5);
+            for item in &expected {
+                let mut body = [0; 98];
+                assert_eq!(reopened.read_at(&item.chunk.id, 0, &mut body).unwrap(), 97);
+                assert_eq!(&body[..97], item.bytes());
+                assert_eq!(body[97], 0);
+            }
+            eprintln!(
+                "W3_PRE_ACK_RECOVERY mode={mode} acked_prefix=1 orphans_preserved=4 retry_records=4 retry_revision=2 restart_durable=5"
+            );
+        }
+    }
+
+    #[test]
     fn p2_w3_sixteen_ready_requests_share_one_durable_group() {
         let temp = tempfile::tempdir().unwrap();
         let registry = afs_metrics::Registry::new();
