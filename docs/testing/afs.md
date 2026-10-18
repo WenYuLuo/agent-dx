@@ -82,6 +82,25 @@ cargo test --locked -p afs --all-features --lib node::dfs_read::tests
 及共享指针断言分别说明其范围，不能冒充全链仅两把锁、跨VM文件I/O或已达性能门槛。
 新版本不自动继承旧候选性能；BLAKE3、权限、fsync和close-to-open合同继续独立验证。
 
+### 已知验证欠账与测量边界
+
+真实DFS跨句柄V1场景已有一次仓外driver运行证据：H1部分读v1，A成功fsync发布v2，
+H2重开读v2，H1读取未缓存尾页，H2全量prime后H3全读v2且正文READ增量0。
+该场景尚未沉淀为仓内可重复的真实DFS回归，属于明确欠账；现有mock／其他FUSE
+合同不能替代它。此次workload使用uid0，不覆盖非root权限拒绝或撤销；READ零增量
+仅支持KEEP行为，没有直接采集FOPEN flag，也不承诺旧句柄固定快照。
+
+V1挂载显式配置`fuse_max_readahead_bytes=0`以隔离可见性，属于功能诊断，不是product
+默认预读性能样本。16MiB校验阶段约4097次READ不能据此判断“1MiB预读或max_pages失效”。
+下一轮product测量前仍须记录应用read／pread大小、实际FUSE回调大小与次数、内核
+read_ahead_kb、协商max_pages及挂载参数；不从配置或一次功能测试推断真实请求粒度。
+
+生产默认32worker已有有限合同回归，但真实Node中FUSE／Peer／私有结果同时活跃峰值
+仍未知。32应用线程RSS观察不等于32个后端请求同时运行，也不证明整个Node内存上限
+或峰值后回收。既有运行漏采新增全局proof total／resident gauges；cache局部metadata
+不能代替全账。后续性能工作须采集下文全账指标及容量全扫事件，记录并发下实际退化
+比例，区分配置估算、局部单测和运行峰值，不将历史通过默认扩展到这些缺口。
+
 ## 当前候选版本工程验收
 
 每个准备交付的 AFS 候选版本至少核对：
@@ -324,10 +343,18 @@ cache局部metadata指标不能替代全账。当前用量／限额是
 `write_without_proof`、`range_fullscan_fallback`与`range_fullscan_unretained`。最后一项包括
 B退休proof后失去完整文件身份的安全全扫，不能误判为容量错误触发修复。
 proof ledger不等于RSS，原codec／TLS／网络envelope及磁盘配额分别核算。
+resident接近512KiB时，每张76KiB工作票据使剩余额度约支持6路同时验证（不计其他临时
+占用）；这只是量级估算，不是固定并发门槛。更多重叠请求可能走整块扫描，小范围读
+因此产生正文I/O／hash放大；后续性能采集须按相同请求窗口记录
+`afs_dfs_outboard_events_total{event="range_fullscan_fallback"}`增量及范围读尝试数，
+说明计数边界后再计算退化比例，不能从32个worker配置推断实际退化率。
 
 版本cache验证entries和保留bytes双上限、碎片化大layout、extent／index／ID字符串的
 capacity、同key替换及LRU；不能只按len估算。超大版本经真实加载可读但不进入缓存；
-淘汰后的活跃Arc正确性保持，不将cache账本下降当成所有内存释放。
+淘汰后的活跃Arc正确性保持，不将cache账本下降当成所有内存释放。现有超大版本用例
+证明可用性而非低成本；未缓存版本的重复Meta全布局RPC和索引重建仍是已知限制。
+entries和bytes组合不足容器保守开销时可能完全无法接纳条目，配置关系见部署说明，
+不能以参数各自合法推断缓存已启用或有效命中。
 
 
 协议回归检查request tag7 `include_blake3_outboard`默认false、header tag8只在显式请求
