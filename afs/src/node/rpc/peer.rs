@@ -1298,6 +1298,22 @@ enum PeerRootMode {
 }
 
 #[cfg(feature = "dfs")]
+impl PeerRootMode {
+    /// Fix one complete-root owner before any body byte is accepted. A locally
+    /// built charged tree is sufficient; optional peer CVs are not required.
+    fn select(builder: &mut Option<OutboardBuilder>) -> Self {
+        if builder.as_ref().is_some_and(OutboardBuilder::has_tree) {
+            Self::ConsumerTree
+        } else {
+            // A root-only builder would hash the same body as the plain root
+            // owner, but cannot install an outboard. Retire it before input.
+            builder.take();
+            Self::Producer
+        }
+    }
+}
+
+#[cfg(feature = "dfs")]
 #[derive(Clone, Copy, Debug)]
 enum PeerRootDigest {
     Producer([u8; 32]),
@@ -1376,17 +1392,12 @@ impl PeerRootProducer {
             }
             self.outboard_builder =
                 peer_outboard_builder(chunk, encoded, self.proof_budget.clone(), metrics)?;
-            // Some(builder) also covers legacy empty proofs and root-only budget
-            // fallbacks. Only a prepared, charged peer tree replaces producer hash.
-            self.root_mode = if self
-                .outboard_builder
-                .as_ref()
-                .is_some_and(OutboardBuilder::has_peer_tree)
+            self.root_mode = PeerRootMode::select(&mut self.outboard_builder);
+            if self.root_mode == PeerRootMode::Producer
+                && let Some(metrics) = metrics
             {
-                PeerRootMode::ConsumerTree
-            } else {
-                PeerRootMode::Producer
-            };
+                metrics.peer_read_event("root_fallback");
+            }
         } else if !encoded.is_empty() {
             return Err(dfs_protocol_error("Peer outboard lacks a trusted object"));
         }
@@ -1476,10 +1487,14 @@ async fn send_peer_stream_block(
         // Check transport order/length before handoff. Hash here only when the
         // header selected the legacy producer-root fallback.
         root.update(block.offset, &block.bytes, metrics)?;
+        let handoff_wait = metrics.and_then(|metrics| {
+            metrics.coarse_diagnostic("peer_block_handoff_wait", block.bytes.len() as u64)
+        });
         sender
             .send(Ok(OwnedPeerStreamMessage::Block(block)))
             .await
             .map_err(|_| dfs_protocol_error("Peer stream consumer stopped"))?;
+        drop(handoff_wait);
         if let Some(metrics) = metrics {
             metrics.peer_read_event("stream_block_handoff");
         }
@@ -1604,11 +1619,8 @@ fn consume_peer_input_into_sink(
             "Peer stream changed sink or private output during decoding",
         ));
     }
-    let data_length = match &input {
-        PeerSinkInput::Frame(frame) => match &frame.body {
-            Some(dfs_read_ranges_frame::Body::Data(data)) => data.len(),
-            _ => 0,
-        },
+    match &input {
+        PeerSinkInput::Frame(_) => {}
         PeerSinkInput::Block { offset, bytes } => {
             if bytes.is_empty()
                 || bytes.len() > STREAM_FRAME_BACKING_BYTES
@@ -1621,9 +1633,8 @@ fn consume_peer_input_into_sink(
                     "Peer stream block offset/order/length mismatch",
                 ));
             }
-            bytes.len()
         }
-    };
+    }
     let block_write = matches!(&input, PeerSinkInput::Block { .. });
     let full_length = decoder
         .verified_object
@@ -1667,11 +1678,6 @@ fn consume_peer_input_into_sink(
             decoder.accept_into(frame, full_length, write, observation)?
         }
         PeerSinkInput::Block { bytes, .. } => decoder.accept_data(bytes, write, observation)?,
-    }
-    if let Some(metrics) = metrics
-        && !decoder.producer_root_pending
-    {
-        metrics.hash("root_in_receive", data_length as u64);
     }
     peer_stream_deadline(deadline)
 }
@@ -1872,6 +1878,10 @@ impl GrpcChunkTransfer {
                                     .await?;
                                     continue;
                                 }
+                                if let Some(diagnostic) = &producer_diagnostic {
+                                    // First nonempty decoded body, before staging/copy/hash.
+                                    diagnostic.first_data();
+                                }
                                 // The transport endpoint is decoded body completion,
                                 // before frame-to-block copying, hashing or cache writes.
                                 // EOF and trusted proof remain separate later events.
@@ -1896,9 +1906,14 @@ impl GrpcChunkTransfer {
                                     .await?;
                                 }
                                 if current.is_none() {
+                                    let wait =
+                                        peers.read_work_metrics.as_ref().and_then(|metrics| {
+                                            metrics.coarse_diagnostic("peer_block_wait", 0)
+                                        });
                                     let mut block = available.recv().await.ok_or_else(|| {
                                         dfs_protocol_error("Peer stream block admission stopped")
                                     })?;
+                                    drop(wait);
                                     block.bytes.clear();
                                     block.offset = received_bytes;
                                     current = Some(block);
@@ -1906,7 +1921,16 @@ impl GrpcChunkTransfer {
                                 let block = current.as_mut().ok_or_else(|| {
                                     dfs_protocol_error("Peer stream block is missing")
                                 })?;
-                                block.bytes.extend_from_slice(&data);
+                                {
+                                    let _copy =
+                                        peers.read_work_metrics.as_ref().and_then(|metrics| {
+                                            metrics.coarse_diagnostic(
+                                                "peer_frame_handoff_copy",
+                                                data.len() as u64,
+                                            )
+                                        });
+                                    block.bytes.extend_from_slice(&data);
+                                }
                                 received_bytes =
                                     received_bytes.checked_add(data.len()).ok_or_else(|| {
                                         dfs_protocol_error("Peer stream byte count overflow")
@@ -2303,11 +2327,6 @@ where
         decoder.accept(frame, out)?;
         if let Some(metrics) = metrics {
             metrics.copy("frame_to_attempt", copied);
-            if chunk.is_some() {
-                metrics.hash("root_in_receive", copied);
-            } else {
-                metrics.hash("peer_range_in_receive", copied);
-            }
         }
     }
     // EOF, including a possible late gRPC Status, precedes proof creation.
@@ -2438,7 +2457,7 @@ impl<'a> ReadFrameDecoder<'a> {
 
     fn install_producer_outboard(
         &mut self,
-        builder: Option<OutboardBuilder>,
+        mut builder: Option<OutboardBuilder>,
     ) -> afs_error::Result<()> {
         if !self.producer_root_pending || self.active.is_some() || self.producer_outboard_installed
         {
@@ -2453,11 +2472,7 @@ impl<'a> ReadFrameDecoder<'a> {
         if object.outboard_builder.is_some() {
             return Err(dfs_protocol_error("outboard work was already handed off"));
         }
-        self.root_mode = if builder.as_ref().is_some_and(OutboardBuilder::has_peer_tree) {
-            PeerRootMode::ConsumerTree
-        } else {
-            PeerRootMode::Producer
-        };
+        self.root_mode = PeerRootMode::select(&mut builder);
         object.outboard_builder = builder;
         self.producer_outboard_installed = true;
         Ok(())
@@ -2500,8 +2515,10 @@ impl<'a> ReadFrameDecoder<'a> {
             (PeerRootMode::Producer, PeerRootDigest::Producer(digest))
                 if digest == object.expected_root && Some(digest) == object.actual_root =>
             {
-                if let Some(object) = &mut self.verified_object {
-                    let _ = object.finish_outboard(observation)?;
+                if object.outboard_builder.is_some() {
+                    return Err(dfs_protocol_error(
+                        "producer root retained duplicate consumer root work",
+                    ));
                 }
             }
             (PeerRootMode::ConsumerTree, PeerRootDigest::ConsumerTree) => {
@@ -2605,6 +2622,12 @@ impl<'a> ReadFrameDecoder<'a> {
                             object.proof_budget.clone(),
                             observation.metrics,
                         )?;
+                        self.root_mode = PeerRootMode::select(&mut object.outboard_builder);
+                        if self.root_mode == PeerRootMode::Producer
+                            && let Some(metrics) = observation.metrics
+                        {
+                            metrics.peer_read_event("root_fallback");
+                        }
                     }
                 } else if !header.blake3_outboard.is_empty() {
                     return Err(dfs_protocol_error(
@@ -2624,7 +2647,9 @@ impl<'a> ReadFrameDecoder<'a> {
                     start,
                     end,
                     cursor: start,
-                    checksum: (!self.producer_root_pending).then(blake3::Hasher::new),
+                    checksum: (!self.producer_root_pending
+                        && self.root_mode == PeerRootMode::Producer)
+                        .then(blake3::Hasher::new),
                 });
             }
             Some(dfs_read_ranges_frame::Body::Data(data)) => {
@@ -2649,21 +2674,29 @@ impl<'a> ReadFrameDecoder<'a> {
                         "peer read completion identity/length mismatch",
                     ));
                 }
-                let digest = if self.producer_root_pending {
-                    blake3::Hash::from(
-                        <[u8; 32]>::try_from(completion.range_checksum.as_slice()).map_err(
-                            |_| dfs_corrupt_error("peer read completion checksum mismatch"),
-                        )?,
-                    )
-                } else {
-                    let checksum = active
-                        .checksum
-                        .as_ref()
-                        .ok_or_else(|| dfs_protocol_error("Peer consumer root state is missing"))?;
-                    observation.measure(ReadDiagnosticConsumerStage::RootBlake3, 0, || {
-                        checksum.finalize()
-                    })
-                };
+                let digest =
+                    if self.producer_root_pending {
+                        blake3::Hash::from(
+                            <[u8; 32]>::try_from(completion.range_checksum.as_slice()).map_err(
+                                |_| dfs_corrupt_error("peer read completion checksum mismatch"),
+                            )?,
+                        )
+                    } else if self.root_mode == PeerRootMode::ConsumerTree {
+                        let object = self.verified_object.as_mut().ok_or_else(|| {
+                            dfs_protocol_error("consumer tree lacks trusted object")
+                        })?;
+                        let root = object.finish_outboard(observation)?.ok_or_else(|| {
+                            dfs_protocol_error("consumer tree root was not completed")
+                        })?;
+                        blake3::Hash::from(root)
+                    } else {
+                        let checksum = active.checksum.as_ref().ok_or_else(|| {
+                            dfs_protocol_error("Peer consumer root state is missing")
+                        })?;
+                        observation.measure(ReadDiagnosticConsumerStage::RootBlake3, 0, || {
+                            checksum.finalize()
+                        })
+                    };
                 if completion.range_checksum.as_slice() != digest.as_bytes() {
                     return Err(dfs_corrupt_error("peer read completion checksum mismatch"));
                 }
@@ -2672,9 +2705,6 @@ impl<'a> ReadFrameDecoder<'a> {
                         return Err(dfs_corrupt_error(
                             "peer read object differs from trusted Meta root",
                         ));
-                    }
-                    if !self.producer_root_pending {
-                        let _ = object.finish_outboard(observation)?;
                     }
                     object.actual_root = Some(*digest.as_bytes());
                 }
@@ -2709,6 +2739,16 @@ impl<'a> ReadFrameDecoder<'a> {
                     checksum.update(data);
                 },
             );
+            if let Some(metrics) = observation.metrics {
+                metrics.hash(
+                    if self.verified_object.is_some() {
+                        "root_in_receive"
+                    } else {
+                        "peer_range_in_receive"
+                    },
+                    data.len() as u64,
+                );
+            }
         }
         if let Some(object) = &mut self.verified_object
             && let Some(builder) = &mut object.outboard_builder
@@ -6368,7 +6408,7 @@ mod tests {
                 });
             }
             let mut frames: Vec<_> = frames.into_iter().map(Ok).collect();
-            if matches!(self.mode, 2 | 12) {
+            if matches!(self.mode, 2 | 12 | 16) {
                 frames.push(Err(Status::unavailable("late status after completion")));
             }
             Ok(Response::new(Box::pin(tokio_stream::iter(frames))))
@@ -6427,11 +6467,12 @@ mod tests {
             dfs_read::ChunkTransfer,
             peer_cache::{DiskPeerCache, PeerCacheOptions},
         };
-        // 9/10: consumer root, including disabled disk cache; 11: wrong body;
-        // 12: late transport error; 13: missing Completion; 14: false wire root.
-        for mode in 0..15 {
-            let success = matches!(mode, 0 | 1 | 5 | 9 | 10);
-            let consumer_root = mode >= 9;
+        // 9/10: peer proof, including disabled disk cache; 11: wrong body;
+        // 12: late transport error; 13: missing Completion; 14: false wire root;
+        // 15/16: exhausted proof budget, with success/late transport failure.
+        for mode in 0..17 {
+            let success = matches!(mode, 0 | 1 | 5 | 9 | 10 | 15);
+            let consumer_root = mode < 15;
             let staged = crate::node::chunk::StagedChunk::new(
                 crate::dfs::OperationId::new("actual-stream"),
                 vec![
@@ -6485,11 +6526,14 @@ mod tests {
             tokio::task::spawn_blocking(move || {
                 assert!(transfer.supports_verified_object_sink());
                 let directory = tempfile::tempdir().unwrap();
-                let cache = DiskPeerCache::open(PeerCacheOptions {
-                    directory: directory.path().join("cache"),
-                    capacity_bytes: if matches!(mode, 1 | 10) { 4096 } else { 8 * 1024 * 1024 },
-                    namespace_id: crate::dfs::NamespaceId::new("test"),
-                })
+                let cache = DiskPeerCache::open_with_outboard_budget(
+                    PeerCacheOptions {
+                        directory: directory.path().join("cache"),
+                        capacity_bytes: if matches!(mode, 1 | 10) { 4096 } else { 8 * 1024 * 1024 },
+                        namespace_id: crate::dfs::NamespaceId::new("test"),
+                    },
+                    OutboardBudget::new(if consumer_root { 1024 * 1024 } else { 0 }),
+                )
                 .unwrap();
                 let mut out = vec![0; 32 * 1024];
                 {
@@ -6508,7 +6552,14 @@ mod tests {
                     if success {
                         let proof = result.unwrap().unwrap();
                         assert!(proof.private_output().iter().all(|byte| *byte == 37));
-                        assert_eq!(sink.commit(proof).unwrap(), !matches!(mode, 1 | 10));
+                        // A zero metadata ledger cannot retain even the cache
+                        // index/entry controls. The same RPC still completes
+                        // full-root verification and private range delivery.
+                        assert_eq!(
+                            sink.commit(proof).unwrap(),
+                            !matches!(mode, 1 | 10 | 15),
+                            "optional cache installation, mode {mode}"
+                        );
                     } else {
                         assert!(
                             result.is_err(),
@@ -6518,8 +6569,13 @@ mod tests {
                 }
                 assert_eq!(
                     cache.stats().unwrap().entries,
-                    usize::from(matches!(mode, 0 | 5 | 9))
+                    usize::from(matches!(mode, 0 | 5 | 9)),
+                    "only budget-admitted healthy entries are retained, mode {mode}"
                 );
+                if mode >= 15 {
+                    assert_eq!(cache.proof_budget().used(), 0);
+                    assert_eq!(cache.proof_budget().resident_used(), 0);
+                }
                 assert_eq!(
                     calls.load(std::sync::atomic::Ordering::SeqCst),
                     1,
@@ -6536,6 +6592,8 @@ mod tests {
                 assert!(record.end_ns >= record.start_ns);
                 assert!(record.consumer_before_body_ns <= record.consumer_ns);
                 if record.success {
+                    assert!(record.first_data_ns >= record.start_ns);
+                    assert!(record.body_end_ns >= record.first_data_ns);
                     assert!(record.body_end_ns >= record.start_ns);
                     assert!(record.eof_ns >= record.body_end_ns);
                     assert!(record.end_ns >= record.eof_ns);
@@ -6556,16 +6614,12 @@ mod tests {
                     assert_eq!(record.producer_root_work.calls, if consumer_root { 0 } else { blocks + 1 });
                     assert_eq!(record.producer_root_work.bytes, if consumer_root { 0 } else { staged.bytes().len() as u64 });
                     assert_eq!(record.interval_overflow, 0);
-                    if consumer_root {
-                        assert!(
-                            record.root_segment_overlap_ns.is_none(),
-                            "no producer root intervals means overlap is inapplicable, not zero"
-                        );
-                    } else {
-                        assert!(record.root_segment_overlap_ns.is_some());
-                    }
-                    assert_eq!(work.segment_blake3.bytes, staged.bytes().len() as u64);
-                    assert_eq!(work.segment_blake3.calls, blocks + 1);
+                    assert!(
+                        record.root_segment_overlap_ns.is_none(),
+                        "one root owner leaves no duplicate producer/consumer root overlap"
+                    );
+                    assert_eq!(work.segment_blake3.bytes, if consumer_root { staged.bytes().len() as u64 } else { 0 });
+                    assert_eq!(work.segment_blake3.calls, if consumer_root { blocks + 1 } else { 0 });
                     let measured = work.sink_write.wall_ns
                         + work.range_extract.wall_ns
                         + work.root_blake3.wall_ns
@@ -6594,6 +6648,7 @@ mod tests {
                             .map(|metric| metric.get_counter().get_value())
                             .sum::<f64>()
                     };
+                    assert_eq!(event_count("root_fallback"), if consumer_root { 0.0 } else { 1.0 });
                     assert_eq!(
                         event_count("stream_frame"),
                         (staged.bytes().len().div_ceil(STREAM_DATA_BYTES) + 2) as f64,
@@ -8270,7 +8325,7 @@ mod tests {
                 .accept_outboard_header(header, Some(&metrics))
                 .unwrap();
             producer.update(0, &body, Some(&metrics)).unwrap();
-            let expected = if mode == 0 { 0 } else { body.len() };
+            let expected = if mode <= 1 { 0 } else { body.len() };
             let text = afs_metrics::encode_text(&registry).unwrap();
             assert!(
                 text.contains(&format!(
@@ -8324,6 +8379,134 @@ mod tests {
                     .into_iter()
                     .try_for_each(|frame| decoder.accept(frame, &mut output))
                     .is_err()
+            );
+        }
+    }
+
+    #[cfg(feature = "dfs")]
+    async fn r3_assert_legacy_complete_stream_hashes_body_once(budget_limit: usize) {
+        let body: Vec<u8> = (0..(2 * STREAM_FRAME_BACKING_BYTES + 17))
+            .map(|index| (index % 251) as u8)
+            .collect();
+        let (chunk, request, frames) = verified_object_frames(&body);
+        assert!(matches!(
+            &frames[0].body,
+            Some(dfs_read_ranges_frame::Body::Header(header))
+                if header.blake3_outboard.is_empty()
+        ));
+        assert!(matches!(
+            &frames.last().unwrap().body,
+            Some(dfs_read_ranges_frame::Body::Completion(_))
+        ));
+        let registry = afs_metrics::Registry::new();
+        let metrics = ReadWorkMetrics::register(&registry).unwrap();
+        let budget = OutboardBudget::new(budget_limit);
+        let mut out = vec![0xa5; body.len()];
+        // Reuse the complete stream decoder, including Header/body/Completion
+        // and real iterator EOF. This is not producer-only prefix accounting.
+        let verified = consume_peer_read_stream(
+            &request,
+            Some(&chunk),
+            &mut out,
+            tokio_stream::iter(frames.into_iter().map(Ok)),
+            Some(&metrics),
+            Some(budget.clone()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(verified.bytes(), body);
+        assert_eq!(verified.chunk(), &chunk);
+        if budget_limit == 0 {
+            assert_eq!(budget.used(), 0, "root-only fallback needs no proof lease");
+        } else {
+            assert!(budget.used() > 0, "legacy body built a charged cache tree");
+        }
+        let text = afs_metrics::encode_text(&registry).unwrap();
+        let hash_bytes = |stage: &str| {
+            let prefix = format!("afs_dfs_read_hash_bytes_total{{stage=\"{stage}\"}} ");
+            text.lines()
+                .find_map(|line| line.strip_prefix(&prefix))
+                .unwrap()
+                .parse::<u64>()
+                .unwrap()
+        };
+        let plain = hash_bytes("root_in_receive");
+        let builder = hash_bytes("outboard_body_hash");
+        drop(verified);
+        assert_eq!(budget.used(), 0, "last proof holder releases its charge");
+        assert_eq!(
+            plain + builder,
+            body.len() as u64,
+            "legacy complete stream scanned body twice: plain={plain}, builder={builder}, budget={budget_limit}"
+        );
+        assert_eq!(
+            plain,
+            if budget_limit == 0 {
+                body.len() as u64
+            } else {
+                0
+            }
+        );
+        assert_eq!(
+            builder,
+            if budget_limit == 0 {
+                0
+            } else {
+                body.len() as u64
+            }
+        );
+        let fallback_prefix = "afs_dfs_peer_read_events_total{event=\"root_fallback\"} ";
+        let fallbacks: u64 = text
+            .lines()
+            .find_map(|line| line.strip_prefix(fallback_prefix))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(fallbacks, u64::from(budget_limit == 0));
+    }
+
+    #[cfg(feature = "dfs")]
+    #[tokio::test]
+    async fn r3_legacy_complete_stream_with_charged_tree_hashes_body_once() {
+        r3_assert_legacy_complete_stream_hashes_body_once(1024 * 1024).await;
+    }
+
+    #[cfg(feature = "dfs")]
+    #[tokio::test]
+    async fn r3_legacy_complete_stream_with_root_only_budget_hashes_body_once() {
+        r3_assert_legacy_complete_stream_hashes_body_once(0).await;
+    }
+
+    #[cfg(feature = "dfs")]
+    #[tokio::test]
+    async fn r3_legacy_tree_and_plain_roots_cannot_publish_before_real_eof() {
+        let body = vec![29; 2 * STREAM_FRAME_BACKING_BYTES + 17];
+        for budget_limit in [0, 1024 * 1024] {
+            let (chunk, request, frames) = verified_object_frames(&body);
+            let mut stream: Vec<_> = frames.into_iter().map(Ok).collect();
+            stream.push(Err(Status::unavailable(
+                "late status after complete legacy body",
+            )));
+            let budget = OutboardBudget::new(budget_limit);
+            let mut private = vec![0xa5; body.len()];
+            assert!(
+                consume_peer_read_stream(
+                    &request,
+                    Some(&chunk),
+                    &mut private,
+                    tokio_stream::iter(stream),
+                    None,
+                    Some(budget.clone()),
+                )
+                .await
+                .is_err(),
+                "Completion alone cannot return a verified object"
+            );
+            assert_eq!(
+                budget.used(),
+                0,
+                "late failure retires all optional proof owners"
             );
         }
     }

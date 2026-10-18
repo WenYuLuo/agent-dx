@@ -34,6 +34,68 @@ HOOKS = ('preflight', 'start', 'ready', 'stop', 'cleanup', 'verify_clean')
 PLACEHOLDERS = {'run_id', 'label', 'series', 'round', 'run_root', 'mount', 'size_bytes', 'successful', 'diagnostic'}
 IDENTIFIER = re.compile(r'[A-Za-z0-9][A-Za-z0-9_-]{0,63}')
 SHA256 = re.compile(r'[a-f0-9]{64}')
+METRIC_PHASES = ('before', 'after_first', 'after_repeat')
+OUTBOARD_GAUGES = ('afs_dfs_outboard_metadata_bytes', 'afs_dfs_outboard_resident_bytes',
+                   'afs_dfs_outboard_metadata_limit_bytes', 'afs_dfs_outboard_resident_limit_bytes')
+
+
+def workload_settings(config):
+    scene = config.get('scene', 'e2e')
+    if scene not in ('e2e', 'cold-read-1g', 'write-1g'):
+        raise ValueError('unknown workload scene')
+    if scene != 'e2e' and config['size_bytes'] != 1024**3:
+        raise ValueError('explicit 1GiB scenes require exactly 1GiB')
+    size = config.get('write_block_bytes', 1024**2 if scene == 'write-1g' else worker.BLOCK)
+    positive_int(size, 'write_block_bytes', worker.BLOCK)
+    if size % 4096 or (scene == 'write-1g' and size != 1024**2):
+        raise ValueError('write blocks must be 4096-aligned; write-1g requires 1MiB')
+    return {'scene': scene, 'write_block_bytes': size, 'read_block_bytes': worker.BLOCK,
+            'driver_prepared_payload_bytes': config['size_bytes'],
+            'driver_payload_budget_scope': 'A workload process, separate from product Node budgets',
+            'first_read_state': 'fresh per-run namespace; fixture must attest cache state'}
+
+
+def p2_required_metrics(node):
+    common = list(OUTBOARD_GAUGES) + [
+        'afs_dfs_outboard_events_total{event="' + event + '"}' for event in (
+            'reserve_total_failed', 'reserve_resident_failed', 'write_without_proof',
+            'range_fullscan_fallback', 'range_fullscan_unretained')]
+    if node == 'a':
+        return common + ['afs_dfs_read_rpc_calls_total{method="validate_read_grants"}']
+    return common + ['afs_dfs_read_rpc_calls_total{method="get_chunk_sources"}',
+        'afs_dfs_peer_disk_cache_data_read_calls_total',
+        'afs_dfs_read_copy_bytes_total{stage="cache_to_output"}',
+        'afs_fuse_callbacks_total{filesystem="dfs",operation="read"}'] + [
+        'afs_dfs_read_hash_bytes_total{stage="' + stage + '"}' for stage in (
+            'root_in_receive', 'root_fallback', 'outboard_body_hash', 'outboard_parent_hash',
+            'cache_segment_hash', 'cache_full_hash')]
+
+
+def metric_evidence(label, snapshots):
+    """Validate each node and snapshot independently; missing is never observed zero.
+
+    Outboard gauges are retained as values, not counter deltas or measured peaks.
+    This is evidence completeness, not a G-P2-6 performance verdict.
+    """
+    result = {'profile': label.get('metric_profile'), 'complete': True,
+              'endpoints': {}, 'missing': []}
+    for item in label.get('metrics', []):
+        required = p2_required_metrics(item['node']) if label.get('metric_profile') == 'p2' else []
+        endpoint = {'node': item['node'], 'snapshots': {}}
+        result['endpoints'][item['name']] = endpoint
+        for phase in METRIC_PHASES:
+            raw = snapshots.get(phase, {}).get(item['name'], {})
+            values = parse_metrics(raw.get('text', ''))
+            endpoint['snapshots'][phase] = {
+                'required_values': {name: values[name] for name in required if name in values},
+                'outboard_gauges': {name: value for name, value in values.items()
+                                    if name in OUTBOARD_GAUGES}}
+            for name in required:
+                if name not in values:
+                    result['missing'].append({'endpoint': item['name'], 'node': item['node'],
+                                              'phase': phase, 'metric': name})
+    result['complete'] = not result['missing']
+    return result
 
 
 def read_flags(series):
@@ -73,6 +135,7 @@ def validate_config(config):
     positive_int(config.get('size_bytes'), 'size_bytes', 1024**3)
     if config['size_bytes'] % 4096:
         raise ValueError('O_DIRECT datasets must be multiples of 4096 bytes')
+    workload_settings(config)
     positive_int(config.get('rounds', 3), 'rounds', 3)
     if config.get('ready_wait_seconds', 30) != 30 or config.get('repeat_gap_seconds', 1) != 1:
         raise ValueError('ready wait and repeat gap must be 30s and 1s')
@@ -89,6 +152,8 @@ def validate_config(config):
     for node in config['nodes'].values():
         safe_guest_path(node.get('root', ''))
         positive_int(node.get('min_free_bytes'), 'min_free_bytes')
+        if 'min_available_memory_bytes' in node:
+            positive_int(node['min_available_memory_bytes'], 'min_available_memory_bytes')
         argv = node.get('transport')
         if (not isinstance(argv, list) or not argv or
                 Path(argv[0]).name not in ('ssh', 'limactl') or
@@ -122,6 +187,12 @@ def validate_config(config):
                 raise ValueError('every order must contain all configured labels exactly once')
     for name, label in config['labels'].items():
         if not IDENTIFIER.fullmatch(name): raise ValueError('invalid label')
+        if label.get('metric_profile') not in (None, 'p2'):
+            raise ValueError('unknown metric profile')
+        if label.get('metric_profile') == 'p2' and any(
+                sum(item.get('node') == node for item in label.get('metrics', [])) != 1
+                for node in ['a', 'b']):
+            raise ValueError('p2 metrics require one explicit A and one explicit B endpoint')
         for node in ['a', 'b']:
             value = label.get('mounts', {}).get(node, '')
             validate_template(value)
@@ -334,6 +405,7 @@ def run_round(config, series, label_name, number, output):
               'size_bytes': config['size_bytes'], 'admission': {},
               'identity': label.get('identity', {}),
               'external_backend': label.get('external_backend', {})}
+    result['workload'] = workload_settings(config)
     token = secrets.token_hex(32)
     try:
         # All independent nodes are checked before any lifecycle mutation.
@@ -362,6 +434,7 @@ def run_round(config, series, label_name, number, output):
                 raise ValueError('workload mount and control root must be disjoint')
             worker_config = {'run_root': run_root, 'run_id': run_id, 'role': role,
                              'series': series, 'size_bytes': config['size_bytes'],
+                             'write_block_bytes': result['workload']['write_block_bytes'],
                              'salt': number, 'path': mount + '/test.bin', 'control': config['control'],
                              'timeout_seconds': config.get('timeout_seconds', 180),
                              'metrics': [item for item in label.get('metrics', []) if item['node'] == name]}
@@ -402,12 +475,17 @@ def run_round(config, series, label_name, number, output):
                              'repeat_ns': writer_result['repeat']['full_read_ns'],
                              'e2e_ns': writer_result['e2e_ns'],
                              'total_with_repeat_ns': writer_result['total_with_repeat_ns']}
+        if 'write_and_fsync_ns' in writer_result['publish']:
+            result['timings']['write_and_fsync_ns'] = writer_result['publish']['write_and_fsync_ns']
         result['metric_deltas'] = {}
         result['metric_window_boundaries'] = metric_window_boundaries(label.get('metrics', []))
         snapshots = {'before': {}, 'after_first': {}, 'after_repeat': {}}
         for role_result in [writer_result, reader_result]:
             for phase in snapshots:
                 snapshots[phase].update(role_result['metrics'][phase])
+        result['metric_evidence'] = metric_evidence(label, snapshots)
+        if not result['metric_evidence']['complete']:
+            raise RuntimeError('evidence incomplete: required node/phase metrics missing')
         for metric_name, before in snapshots['before'].items():
             result['metric_deltas'][metric_name] = {}
             for phase, left, right in [('first', 'before', 'after_first'), ('repeat', 'after_first', 'after_repeat')]:
@@ -501,6 +579,9 @@ def run(config, series_list, labels):
             result['summary'][series + '/' + label] = {
                 name: summarize([item['timings'][name] for item in selected]) for name in
                 ['publish_ns', 'first_ns', 'repeat_ns', 'e2e_ns', 'total_with_repeat_ns']}
+            if all('write_and_fsync_ns' in item['timings'] for item in selected):
+                result['summary'][series + '/' + label]['write_and_fsync_ns'] = summarize(
+                    [item['timings']['write_and_fsync_ns'] for item in selected])
     result['completed'] = True
     result['stable'] = all(metric['stable'] for group in result['summary'].values()
                            for name, metric in group.items() if name != 'total_with_repeat_ns')

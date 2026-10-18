@@ -304,16 +304,26 @@ struct ReadOnlyVersionCache {
     entry_count: usize,
 }
 
+fn version_cache_table_bytes(capacity: usize) -> Option<usize> {
+    // Preserve the runtime estimate: permit hash-table growth/control storage
+    // and sparsely occupied BTree nodes; key buffers are charged per value.
+    let table_slot = std::mem::size_of::<(FileVersionId, CachedReadOnlyVersion, u64)>()
+        .checked_add(std::mem::size_of::<(u64, FileVersionId)>())?
+        .checked_mul(4)?
+        .checked_add(64)?;
+    capacity.checked_mul(table_slot)?.checked_add(2048)
+}
+
+/// Startup floor for the table and one value's fixed fields/Arc header. This
+/// makes no assumption about identifier lengths or layout cardinality: actual
+/// String/Vec capacities are charged on admission and can still exceed it.
+pub(crate) fn version_cache_minimum_bytes(capacity: usize) -> Option<usize> {
+    version_cache_table_bytes(capacity)?.checked_add(ReadOnlyVersion::fixed_retained_bytes())
+}
+
 impl ReadOnlyVersionCache {
     fn new(capacity: usize, byte_limit: usize) -> Self {
-        // Four times each slot permits hash-table growth/control storage and
-        // sparsely occupied BTree nodes; the base covers small-table/node
-        // allocations. Charge both key buffers separately in each value.
-        let table_slot = std::mem::size_of::<(FileVersionId, CachedReadOnlyVersion, u64)>()
-            .saturating_add(std::mem::size_of::<(u64, FileVersionId)>())
-            .saturating_mul(4)
-            .saturating_add(64);
-        let table_bytes = capacity.saturating_mul(table_slot).saturating_add(2048);
+        let table_bytes = version_cache_table_bytes(capacity).unwrap_or(usize::MAX);
         Self {
             entries: BoundedLru::new(capacity),
             capacity,
@@ -373,6 +383,10 @@ impl ReadOnlyVersionCache {
 }
 
 impl ReadOnlyVersion {
+    fn fixed_retained_bytes() -> usize {
+        std::mem::size_of::<Self>().saturating_add(2 * std::mem::size_of::<usize>())
+    }
+
     fn cache_retained_bytes(&self, key: &FileVersionId) -> usize {
         // The hash table and recency tree each own a key. Counting the source
         // capacity twice conservatively covers the cloned key's allocation.
@@ -385,8 +399,7 @@ impl ReadOnlyVersion {
                 capacity.saturating_add(2 * std::mem::size_of::<usize>())
             }
         };
-        let mut bytes = std::mem::size_of::<Self>()
-            .saturating_add(2 * std::mem::size_of::<usize>())
+        let mut bytes = Self::fixed_retained_bytes()
             .saturating_add(heap(key.0.capacity()).saturating_mul(2))
             .saturating_add(heap(self.layout.id.0.capacity()))
             .saturating_add(heap(
@@ -455,6 +468,57 @@ impl ReadOnlyVersion {
     fn ops(&self, offset: u64, length: usize) -> Result<Vec<ChunkReadOp>> {
         self.index.ops(&self.layout, offset, length)
     }
+
+    fn read_batch(&self, offset: u64, length: usize, lookahead: usize) -> Result<ReadBatch> {
+        let ops = self.ops(offset, length)?;
+        let end = offset
+            .checked_add(length as u64)
+            .ok_or_else(|| invalid("read range overflow"))?;
+        let next = self
+            .index
+            .entries
+            .partition_point(|entry| self.layout.inline_extents[entry.original].file_offset < end);
+        Ok(ReadBatch {
+            lookahead: source_lookahead_ids(
+                self.index.entries[next..]
+                    .iter()
+                    .map(|entry| &self.layout.inline_extents[entry.original]),
+                &ops,
+                lookahead,
+            ),
+            file_version_id: self.version.as_ref().map(|version| version.id.clone()),
+            layout_root_id: self.layout.id.clone(),
+            ops,
+        })
+    }
+}
+
+/// Metadata only. These IDs never enter body operations or expand ranges.
+fn source_lookahead_ids<'a>(
+    extents: impl Iterator<Item = &'a Extent>,
+    ops: &[ChunkReadOp],
+    limit: usize,
+) -> Vec<crate::dfs::ChunkId> {
+    let mut ids = Vec::new();
+    let limit = limit.min(crate::node::dfs_read::MAX_DFS_READ_OPS);
+    if limit == 0 || ops.is_empty() {
+        return ids;
+    }
+    for extent in extents {
+        if extent.length == 0
+            || extent.chunk_id.0.is_empty()
+            || extent.chunk_id.0.len() > crate::node::dfs_read::MAX_SOURCE_LOOKAHEAD_ID_BYTES
+            || ops.iter().any(|op| op.chunk_id == extent.chunk_id)
+            || ids.contains(&extent.chunk_id)
+        {
+            continue;
+        }
+        ids.push(extent.chunk_id.clone());
+        if ids.len() == limit {
+            break;
+        }
+    }
+    ids
 }
 
 struct IndexedExtent {
@@ -3159,11 +3223,7 @@ impl DistributedFs {
         let count = usize::try_from((length - offset).min(out.len() as u64))
             .map_err(|_| invalid("read length is too large"))?;
         out[..count].fill(0);
-        let batch = ReadBatch {
-            file_version_id: cached.version.as_ref().map(|version| version.id.clone()),
-            layout_root_id: cached.layout.id.clone(),
-            ops: cached.ops(offset, count)?,
-        };
+        let batch = cached.read_batch(offset, count, self.read_engine.source_lookahead_chunks())?;
         if self.read_engine.has_external_backend() {
             self.read_engine.read_batch(&batch, &mut out[..count])?;
         } else {
@@ -3186,11 +3246,7 @@ impl DistributedFs {
         }
         let count = usize::try_from((length - offset).min(size as u64))
             .map_err(|_| invalid("read length is too large"))?;
-        let batch = ReadBatch {
-            file_version_id: cached.version.as_ref().map(|version| version.id.clone()),
-            layout_root_id: cached.layout.id.clone(),
-            ops: cached.ops(offset, count)?,
-        };
+        let batch = cached.read_batch(offset, count, self.read_engine.source_lookahead_chunks())?;
         if let Some(result) = self.read_engine.read_batch_native_owned(&batch, count)? {
             return Ok(result);
         }
@@ -3331,6 +3387,7 @@ impl DistributedFs {
         self.read_engine.read_batch_external_version(
             inode_id,
             &ReadBatch {
+                lookahead: Vec::new(),
                 file_version_id: Some(committed.clone()),
                 layout_root_id: cached.layout.id.clone(),
                 ops,
@@ -3354,6 +3411,7 @@ impl DistributedFs {
         self.read_engine.read_batch_external_version_owned(
             inode_id,
             &ReadBatch {
+                lookahead: Vec::new(),
                 file_version_id: Some(committed.clone()),
                 layout_root_id: cached.layout.id.clone(),
                 ops,
@@ -3370,7 +3428,22 @@ impl DistributedFs {
         out: &mut [u8],
     ) -> Result<()> {
         let ops = self.layout_read_ops(layout, offset, out.len())?;
+        let end = offset
+            .checked_add(out.len() as u64)
+            .ok_or_else(|| invalid("read range overflow"))?;
         let batch = ReadBatch {
+            lookahead: if committed.is_some() {
+                source_lookahead_ids(
+                    layout
+                        .inline_extents
+                        .iter()
+                        .filter(|extent| extent.file_offset >= end),
+                    &ops,
+                    self.read_engine.source_lookahead_chunks(),
+                )
+            } else {
+                Vec::new()
+            },
             file_version_id: committed.cloned(),
             layout_root_id: layout.id.clone(),
             ops,
@@ -3800,12 +3873,18 @@ impl DistributedFs {
                     );
                     let rpc_started = Instant::now();
                     let updated = self.validate_inode(publish_span.in_scope(|| {
-                    if let Some(timeout) = timeout {
+                    let publication_diagnostic = self.read_engine.publication_diagnostic();
+                    let _coarse = self.read_engine.publication_coarse_diagnostic();
+                    let result = if let Some(timeout) = timeout {
                         self.meta
                             .commit_file_version_with_timeout(pending.batch.commit.clone(), timeout)
                     } else {
                         self.meta.commit_file_version(pending.batch.commit.clone())
+                    };
+                    if let Some(diagnostic) = publication_diagnostic {
+                        diagnostic.finish(result.is_ok());
                     }
+                    result
                 }).inspect_err(|error| {
                     afs_logging::warn!("dfs.commit_rpc_failed";
                         "method" => "commit_file_version",
@@ -21506,6 +21585,55 @@ mod tests {
         fs.release(&context(), reader).unwrap();
     }
 
+    #[test]
+    fn c1b_version_cache_estimate_shares_runtime_floor_and_checks_overflow() {
+        let slot = (std::mem::size_of::<(FileVersionId, CachedReadOnlyVersion, u64)>()
+            + std::mem::size_of::<(u64, FileVersionId)>())
+            * 4
+            + 64;
+        let fixed = std::mem::size_of::<ReadOnlyVersion>() + 2 * std::mem::size_of::<usize>();
+        for entries in [1_usize, 4096, 65536] {
+            let table = entries * slot + 2048;
+            let minimum = version_cache_minimum_bytes(entries).unwrap();
+            assert_eq!(
+                ReadOnlyVersionCache::new(entries, minimum).table_bytes,
+                table
+            );
+            assert_eq!(minimum, table + fixed);
+        }
+        assert!(version_cache_table_bytes(usize::MAX).is_none());
+        assert!(version_cache_minimum_bytes(usize::MAX).is_none());
+        let last_fitting = (usize::MAX - 2048 - fixed) / slot;
+        assert!(version_cache_minimum_bytes(last_fitting).is_some());
+        assert!(version_cache_minimum_bytes(last_fitting + 1).is_none());
+        assert_eq!(
+            ReadOnlyVersionCache::new(usize::MAX, 1).table_bytes,
+            usize::MAX
+        );
+    }
+
+    #[test]
+    fn c1b_version_cache_floor_does_not_exempt_actual_identifier_capacity() {
+        let value = p2_byte_cache_version("nonempty-version", 0);
+        let key = value.version.as_ref().unwrap().id.clone();
+        let minimum = version_cache_minimum_bytes(1).unwrap();
+        let table = version_cache_table_bytes(1).unwrap();
+        let retained = value.cache_retained_bytes(&key);
+        assert!(retained > ReadOnlyVersion::fixed_retained_bytes());
+        let mut cache = ReadOnlyVersionCache::new(1, minimum);
+        cache.insert(key.clone(), value.clone());
+        assert_eq!(
+            cache.len(),
+            0,
+            "startup floor does not waive actual heap charges"
+        );
+        assert_eq!(cache.value_bytes, 0);
+        let mut cache = ReadOnlyVersionCache::new(1, table + retained);
+        cache.insert(key.clone(), value);
+        assert!(cache.get(&key).is_some());
+        assert_eq!(cache.table_bytes + cache.value_bytes, table + retained);
+    }
+
     fn p2_byte_cache_version(name: &str, extent_count: usize) -> Arc<ReadOnlyVersion> {
         let id = FileVersionId::new(name);
         let layout_id = LayoutRootId::new(format!("{name}-layout"));
@@ -21532,6 +21660,104 @@ mod tests {
             created_at_unix_ms: 0,
         };
         Arc::new(ReadOnlyVersion::checked(&id, version, layout).unwrap())
+    }
+
+    #[test]
+    fn p2_r1_version_layout_batch_looks_ahead_without_changing_requested_ranges() {
+        const CHUNK: u64 = 4 * 1024 * 1024;
+        let id = FileVersionId::new("r1-fixed-version");
+        let layout_id = LayoutRootId::new("r1-fixed-layout");
+        // Deliberately reversed serialization order: the existing index must
+        // select later logical offsets without rebuilding or loading a layout.
+        let layout = LayoutRoot {
+            id: layout_id.clone(),
+            file_length: 16 * CHUNK,
+            inline_extents: (0..16)
+                .rev()
+                .map(|index| Extent {
+                    file_offset: index * CHUNK,
+                    length: CHUNK,
+                    chunk_id: crate::dfs::ChunkId::new(format!("r1-object-{index}")),
+                    chunk_offset: 0,
+                })
+                .collect(),
+        };
+        let version = FileVersion {
+            id: id.clone(),
+            inode_id: InodeId::new("r1-inode"),
+            parent_version: None,
+            length: layout.file_length,
+            layout_root: layout_id,
+            created_at_unix_ms: 0,
+        };
+        let cached = ReadOnlyVersion::checked(&id, version, layout).unwrap();
+        let batch = cached.read_batch(0, 128 * 1024, 64).unwrap();
+        assert_eq!(batch.ops.len(), 1);
+        assert_eq!(batch.ops[0].length, 128 * 1024);
+        assert_eq!(batch.ops[0].chunk_id.0, "r1-object-0");
+        assert_eq!(batch.lookahead.len(), 15);
+        assert_eq!(batch.lookahead[0].0, "r1-object-1");
+        assert_eq!(batch.lookahead[14].0, "r1-object-15");
+        assert_eq!(batch.file_version_id.as_ref(), Some(&id));
+        assert!(
+            cached
+                .read_batch(15 * CHUNK, 128 * 1024, 64)
+                .unwrap()
+                .lookahead
+                .is_empty()
+        );
+        assert!(
+            cached
+                .read_batch(0, 128 * 1024, 0)
+                .unwrap()
+                .lookahead
+                .is_empty()
+        );
+        let capped = cached.read_batch(0, 128 * 1024, 2).unwrap();
+        assert_eq!(capped.ops, batch.ops);
+        assert_eq!(capped.lookahead.len(), 2);
+    }
+
+    #[test]
+    fn p2_r1_lookahead_deduplicates_fragmented_layout_without_widening_body() {
+        let current = crate::dfs::ChunkId::new("current");
+        let next = crate::dfs::ChunkId::new("next");
+        let extents = [
+            Extent {
+                file_offset: 1,
+                length: 1,
+                chunk_id: current.clone(),
+                chunk_offset: 1,
+            },
+            Extent {
+                file_offset: 1,
+                length: 1,
+                chunk_id: crate::dfs::ChunkId::new(
+                    "x".repeat(crate::node::dfs_read::MAX_SOURCE_LOOKAHEAD_ID_BYTES + 1),
+                ),
+                chunk_offset: 0,
+            },
+            Extent {
+                file_offset: 2,
+                length: 1,
+                chunk_id: next.clone(),
+                chunk_offset: 0,
+            },
+            Extent {
+                file_offset: 3,
+                length: 1,
+                chunk_id: next.clone(),
+                chunk_offset: 1,
+            },
+        ];
+        let ops = [ChunkReadOp {
+            chunk_id: current,
+            chunk_offset: 0,
+            length: 1,
+            output_offset: 0,
+        }];
+        assert_eq!(source_lookahead_ids(extents.iter(), &ops, 64), vec![next]);
+        assert_eq!(ops[0].length, 1);
     }
 
     #[test]

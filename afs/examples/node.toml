@@ -25,7 +25,25 @@ uds_path = "/opt/adx/run/afs/node-a.sock"
 # dfs_version_cache_entries = 4096
 # Cache-retained metadata estimate; active reader Arcs and Node RSS are separate.
 # Includes layout/index capacities, ID buffers and conservative cache-table overhead.
+# A DFS-capable Node rejects combinations below the table plus fixed value floor.
+# Larger layouts remain uncached when their actual retained size exceeds this limit.
 # dfs_version_cache_bytes = 33554432
+# Shared proof work admission wait, 0..=50ms; 0 disables waiting, not validation.
+# dfs_outboard_work_wait_ms = 2
+# Optional proof installs, queued plus active; valid range 1..=64.
+# Body/catalog durability never waits for this background queue.
+# dfs_sidecar_install_queue = 64
+# Bounded native cache flight records, valid range 1..=8.
+# This does not enable multiple body fills or object prefetch.
+# dfs_fetch_max_inflight_objects = 8
+# A-side verified Peer payloads: 2 resident objects, sharing 16MiB with live frames.
+# Payload range 4..=64MiB; eviction does not refund still-referenced data.
+# dfs_peer_serve_resident_objects = 2
+# dfs_peer_serve_payload_bytes = 16777216
+# Metadata-only source lookahead; no object/body prefetch. Zero max/bytes disables retention.
+# dfs_source_cache_max_ms = 5000
+# dfs_source_lookahead_chunks = 64
+# dfs_source_cache_bytes = 4194304
 timeout_ms = 5000
 log_level = "info"
 trace_enabled = false

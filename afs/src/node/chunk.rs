@@ -7,24 +7,24 @@
 //! in a `ReplicaAck`.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fs::{self, File, OpenOptions},
     hash::{Hash, Hasher},
     io::{BufRead, BufReader, Write},
     ops::{Bound, Deref, RangeBounds},
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex, Weak,
+        Arc, Condvar, Mutex, Weak,
         atomic::{AtomicU64, Ordering},
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 pub mod outboard;
 pub use outboard::OutboardBudget;
 use outboard::{
     ChunkOutboard, DEFAULT_OUTBOARD_BUDGET_BYTES, MAX_ENCODED_OUTBOARD_BYTES, OutboardBuilder,
-    OutboardReadContext, OutboardReadWork, SharedOutboard,
+    OutboardLease, OutboardReadContext, OutboardReadWork, SharedOutboard, SidecarOutboard,
 };
 
 use afs_error::{Error, Result};
@@ -1090,7 +1090,10 @@ impl PinnedChunkReader {
         }
         // Reserve once before loading a resident proof; transfer the same work
         // lease into validation so resident growth cannot steal its scratch.
-        let Some(working) = self.outboard_budget.try_reserve_range_work() else {
+        let Some(working) = self
+            .outboard_budget
+            .reserve_range_work(ranges, self.chunk.length)
+        else {
             return Some(Err(outboard_capacity()));
         };
         let proof = match self.load_outboard() {
@@ -1296,15 +1299,206 @@ impl LocalCatalog {
 /// payloads. This replaces independent per-request payload allowances; it does
 /// not add a second retained-cache budget.
 #[cfg(any(feature = "dfs", test))]
-pub(crate) const PEER_READ_PAYLOAD_LIMIT: usize = 8 * 1024 * 1024;
+pub(crate) const PEER_READ_PAYLOAD_LIMIT: usize = 16 * 1024 * 1024;
 #[cfg(any(feature = "dfs", test))]
 pub(crate) const PEER_READ_OBJECT_LIMIT: usize = 4 * 1024 * 1024;
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 #[cfg(any(feature = "dfs", test))]
 struct PeerReadBudget {
     used: AtomicU64,
     peak: AtomicU64,
+    limit: u64,
+    control_used: AtomicU64,
+    control_peak: AtomicU64,
+}
+
+#[cfg(any(feature = "dfs", test))]
+impl Default for PeerReadBudget {
+    fn default() -> Self {
+        Self {
+            used: AtomicU64::new(0),
+            peak: AtomicU64::new(0),
+            limit: PEER_READ_PAYLOAD_LIMIT as u64,
+            control_used: AtomicU64::new(0),
+            control_peak: AtomicU64::new(0),
+        }
+    }
+}
+
+// This is the bounded envelope of control allocations, not a second body pool.
+// Fixed inline slots plus actual retained key/error/Arc capacities fit in 64KiB.
+#[cfg(any(feature = "dfs", test))]
+const PEER_SERVE_CONTROL_LIMIT: usize = 64 * 1024;
+#[cfg(any(feature = "dfs", test))]
+const PEER_SERVE_MAX_RESIDENTS: usize = 16;
+#[cfg(any(feature = "dfs", test))]
+const PEER_SERVE_MAX_FLIGHTS: usize = 8;
+#[cfg(any(feature = "dfs", test))]
+const PEER_SERVE_ID_LIMIT: usize = 512;
+
+#[cfg(any(feature = "dfs", test))]
+fn peer_serve_fixed_control_bytes() -> usize {
+    std::mem::size_of::<Mutex<PeerServeState>>()
+        + std::mem::size_of::<PeerReadBudget>()
+        + std::mem::size_of::<Condvar>()
+        + 64
+}
+
+#[derive(Debug)]
+#[cfg(any(feature = "dfs", test))]
+struct PeerControlLease {
+    budget: Arc<PeerReadBudget>,
+    bytes: u64,
+    metrics: Option<super::read_work::ReadWorkMetrics>,
+}
+
+#[cfg(any(feature = "dfs", test))]
+impl Drop for PeerControlLease {
+    fn drop(&mut self) {
+        self.budget
+            .control_used
+            .fetch_sub(self.bytes, Ordering::AcqRel);
+        if let Some(metrics) = &self.metrics {
+            metrics.peer_serve_control(-(self.bytes as i64), 0);
+        }
+    }
+}
+
+#[cfg(any(feature = "dfs", test))]
+type PeerServeResult = Result<Option<Arc<PeerVerifiedObject>>>;
+
+#[derive(Debug)]
+#[cfg(any(feature = "dfs", test))]
+struct PeerServeFlight {
+    chunk_id: ChunkId,
+    result: Mutex<Option<PeerServeResult>>,
+    changed: Condvar,
+    _control: PeerControlLease,
+}
+
+#[derive(Debug)]
+#[cfg(any(feature = "dfs", test))]
+struct PeerServeState {
+    resident_limit: usize,
+    residents: [Option<Arc<PeerVerifiedObject>>; PEER_SERVE_MAX_RESIDENTS],
+    flights: [Option<Arc<PeerServeFlight>>; PEER_SERVE_MAX_FLIGHTS],
+    readers: usize,
+    closed: bool,
+    stop_deadline: Option<Instant>,
+}
+
+#[cfg(any(feature = "dfs", test))]
+impl Default for PeerServeState {
+    fn default() -> Self {
+        Self {
+            resident_limit: 2,
+            residents: std::array::from_fn(|_| None),
+            flights: std::array::from_fn(|_| None),
+            readers: 0,
+            closed: false,
+            stop_deadline: None,
+        }
+    }
+}
+
+#[cfg(any(feature = "dfs", test))]
+impl PeerServeState {
+    fn resident(&self, chunk_id: &ChunkId) -> Option<Arc<PeerVerifiedObject>> {
+        self.residents
+            .iter()
+            .flatten()
+            .find(|object| {
+                object
+                    .identity
+                    .as_ref()
+                    .is_some_and(|(record, _)| record.chunk.id == *chunk_id)
+            })
+            .cloned()
+    }
+
+    fn take_resident(&mut self, index: usize) -> Option<Arc<PeerVerifiedObject>> {
+        let removed = self.residents[index].take();
+        for position in index..PEER_SERVE_MAX_RESIDENTS - 1 {
+            self.residents[position] = self.residents[position + 1].take();
+        }
+        removed
+    }
+
+    fn remove_resident(&mut self, chunk_id: &ChunkId) -> Option<Arc<PeerVerifiedObject>> {
+        let index = self.residents.iter().position(|object| {
+            object.as_ref().is_some_and(|object| {
+                object
+                    .identity
+                    .as_ref()
+                    .is_some_and(|(record, _)| record.chunk.id == *chunk_id)
+            })
+        })?;
+        self.take_resident(index)
+    }
+
+    fn install(&mut self, object: Arc<PeerVerifiedObject>) -> Option<Arc<PeerVerifiedObject>> {
+        let victim = self.residents[self.resident_limit - 1].take();
+        for position in (1..self.resident_limit).rev() {
+            self.residents[position] = self.residents[position - 1].take();
+        }
+        self.residents[0] = Some(object);
+        victim
+    }
+}
+
+#[cfg(any(feature = "dfs", test))]
+struct PeerServeReadGuard<'a>(&'a LocalChunkStore);
+#[cfg(any(feature = "dfs", test))]
+impl Drop for PeerServeReadGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.0.peer_read_cache.lock() {
+            state.readers = state.readers.saturating_sub(1);
+            self.0.observe_peer_serve(&state);
+        }
+        self.0.peer_serve_changed.notify_all();
+    }
+}
+
+#[cfg(any(feature = "dfs", test))]
+struct PeerServeLeader<'a> {
+    store: &'a LocalChunkStore,
+    flight: Arc<PeerServeFlight>,
+    finished: bool,
+}
+#[cfg(any(feature = "dfs", test))]
+impl PeerServeLeader<'_> {
+    fn finish(&mut self, outcome: PeerServeResult) {
+        if !self.finished
+            && let Ok(mut result) = self.flight.result.lock()
+        {
+            *result = Some(outcome);
+            self.finished = true;
+            self.flight.changed.notify_all();
+        }
+    }
+}
+#[cfg(any(feature = "dfs", test))]
+impl Drop for PeerServeLeader<'_> {
+    fn drop(&mut self) {
+        self.finish(Err(peer_serve_unavailable(
+            "Peer object fill ended before completion",
+        )));
+        let removed = if let Ok(mut state) = self.store.peer_read_cache.lock() {
+            let index = state.flights.iter().position(|flight| {
+                flight
+                    .as_ref()
+                    .is_some_and(|flight| Arc::ptr_eq(flight, &self.flight))
+            });
+            let removed = index.and_then(|index| state.flights[index].take());
+            self.store.observe_peer_serve(&state);
+            removed
+        } else {
+            None
+        };
+        drop(removed);
+        self.store.peer_serve_changed.notify_all();
+    }
 }
 
 #[derive(Debug)]
@@ -1349,6 +1543,11 @@ fn peer_payload_capacity() -> Error {
 }
 
 #[cfg(any(feature = "dfs", test))]
+fn peer_serve_unavailable(message: &str) -> Error {
+    Error::coded(afs_error::IO_UNAVAILABLE, message)
+}
+
+#[cfg(any(feature = "dfs", test))]
 fn reserve_peer_bytes(
     budget: &PeerReadBudget,
     bytes: u64,
@@ -1358,7 +1557,7 @@ fn reserve_peer_bytes(
     loop {
         let next = used
             .checked_add(bytes)
-            .filter(|next| *next <= PEER_READ_PAYLOAD_LIMIT as u64)
+            .filter(|next| *next <= budget.limit)
             .ok_or_else(peer_payload_capacity)?;
         match budget
             .used
@@ -1416,10 +1615,11 @@ struct PeerVerifiedObject {
     _reservation: PeerReadReservation,
     // A range fallback is never resident and needs no reusable identity.
     identity: Option<(LocalChunkRecord, PeerFileIdentity)>,
+    _control: PeerControlLease,
 }
 
 /// A view into an immutable private allocation. Its shared reservation remains
-/// charged even after the single cache slot is replaced or an RPC is cancelled.
+/// charged even after its LRU entry is retired or an RPC is cancelled.
 #[derive(Debug)]
 #[cfg(any(feature = "dfs", test))]
 pub(crate) struct PeerReadPayload {
@@ -1474,6 +1674,584 @@ impl AsRef<[u8]> for PeerReadPayload {
     }
 }
 
+const SIDECAR_INSTALL_LIMIT: usize = 64;
+const SIDECAR_INSTALL_BATCH: usize = 32;
+const SIDECAR_STOP_WAIT: Duration = Duration::from_secs(10);
+const SIDECAR_ID_CAPACITY: usize = 96;
+
+#[derive(Debug)]
+struct SidecarInstallItem {
+    chunk_id: ChunkId,
+    proof: SidecarOutboard,
+}
+
+#[derive(Debug, Default)]
+struct SidecarInstallState {
+    pending: VecDeque<SidecarInstallItem>,
+    unfinished: HashSet<ChunkId>,
+    active: usize,
+    deadline: Option<Instant>,
+    control: Option<OutboardLease>,
+    control_bytes: usize,
+    directory_capacity: usize,
+}
+
+#[derive(Debug, Default)]
+struct SidecarInstallQueue {
+    state: Mutex<SidecarInstallState>,
+    changed: Condvar,
+}
+
+#[derive(Debug)]
+struct SidecarInstaller {
+    limit: usize,
+    queue: Arc<SidecarInstallQueue>,
+    worker: Mutex<Option<std::thread::JoinHandle<()>>>,
+    joining: Mutex<()>,
+    metrics: Option<super::read_work::ReadWorkMetrics>,
+}
+
+#[derive(Clone, Debug)]
+struct SidecarInstallContext {
+    directory: PathBuf,
+    repairs: Arc<OutboardRepairGates>,
+    budget: Arc<OutboardBudget>,
+    metrics: Option<super::read_work::ReadWorkMetrics>,
+    #[cfg(test)]
+    test: Arc<SidecarInstallTestControl>,
+}
+
+// Fields are deliberately dropped before lease: optional metadata failure must
+// free the actual backing capacities before refunding the shared ledger.
+struct SidecarControlBuffers {
+    pending: VecDeque<SidecarInstallItem>,
+    unfinished: HashSet<ChunkId>,
+    lease: OutboardLease,
+    bytes: usize,
+}
+
+fn sidecar_control_bytes(
+    queue_capacity: usize,
+    hash_capacity: usize,
+    limit: usize,
+    path_capacity: usize,
+) -> Option<usize> {
+    // std HashSet reports usable entries, not buckets. Rounding up bounds its
+    // backing key/control table; 4KiB covers fixed queue/context/Arc metadata.
+    let buckets = hash_capacity.max(1).checked_next_power_of_two()?;
+    queue_capacity
+        .checked_mul(std::mem::size_of::<SidecarInstallItem>())?
+        .checked_add(buckets.checked_mul(std::mem::size_of::<ChunkId>() + 1)?)?
+        .checked_add(limit.checked_mul(2 * SIDECAR_ID_CAPACITY)?)?
+        .checked_add(sidecar_path_bytes(path_capacity)?)?
+        .checked_add(4096)
+}
+
+fn sidecar_path_bytes(directory_capacity: usize) -> Option<usize> {
+    // Include the retained worker directory and the temporary formal/tmp
+    // joins and ID formatting used during optional installation. Joins may
+    // grow their backing buffers; this is deliberately conservative.
+    directory_capacity
+        .checked_add(SIDECAR_ID_CAPACITY)?
+        .checked_add(128)?
+        .checked_mul(8)
+}
+
+fn prepare_sidecar_control(store: &LocalChunkStore, limit: usize) -> Option<SidecarControlBuffers> {
+    // HashSet's smallest allocation can hold three entries even for limit=1.
+    // A minimum of four buckets and two per allowed entry bounds that case.
+    let hash_bound = limit.checked_mul(2)?.max(4).checked_next_power_of_two()?;
+    let bytes = sidecar_control_bytes(limit, hash_bound, limit, store.outboards.as_os_str().len())?;
+    let lease = store.outboard_budget.try_reserve_sidecar_control(bytes)?;
+    let mut pending = VecDeque::new();
+    pending.try_reserve_exact(limit).ok()?;
+    let mut unfinished = HashSet::new();
+    unfinished.try_reserve(limit).ok()?;
+    let observed = sidecar_control_bytes(
+        pending.capacity(),
+        unfinished.capacity(),
+        limit,
+        store.outboards.as_os_str().len(),
+    )?;
+    if observed > bytes {
+        // Never keep a container whose real retained capacity exceeds its
+        // conservative ticket; failed optional admission does not affect ACK.
+        return None;
+    }
+    Some(SidecarControlBuffers {
+        pending,
+        unfinished,
+        lease,
+        bytes,
+    })
+}
+
+fn sidecar_chunk_id(id: &ChunkId) -> Option<ChunkId> {
+    if id.0.len() > SIDECAR_ID_CAPACITY {
+        return None;
+    }
+    let mut copied = String::new();
+    copied.try_reserve_exact(id.0.len()).ok()?;
+    copied.push_str(&id.0);
+    (copied.capacity() <= SIDECAR_ID_CAPACITY).then(|| ChunkId::new(copied))
+}
+
+impl Default for SidecarInstaller {
+    fn default() -> Self {
+        Self {
+            limit: SIDECAR_INSTALL_LIMIT,
+            queue: Arc::new(SidecarInstallQueue::default()),
+            worker: Mutex::new(None),
+            joining: Mutex::new(()),
+            metrics: None,
+        }
+    }
+}
+
+impl SidecarInstaller {
+    fn observe(&self, state: &SidecarInstallState) {
+        if let Some(metrics) = &self.metrics {
+            metrics.sidecar_install_counts(
+                state.pending.len(),
+                state.active,
+                self.limit,
+                state.control_bytes,
+            );
+        }
+    }
+
+    fn enqueue_batch(&self, store: &LocalChunkStore, staged: &[StagedChunk]) {
+        if !staged.iter().any(|item| item.outboard.is_some()) {
+            return;
+        }
+        let Ok(mut worker) = self.worker.lock() else {
+            store
+                .outboard_budget
+                .sidecar_event("sidecar_install_dropped");
+            return;
+        };
+        let Ok(mut state) = self.queue.state.lock() else {
+            store
+                .outboard_budget
+                .sidecar_event("sidecar_install_dropped");
+            return;
+        };
+        if state.deadline.is_some() {
+            for item in staged {
+                if item.outboard.is_some() {
+                    store
+                        .outboard_budget
+                        .sidecar_event("sidecar_install_dropped");
+                }
+            }
+            return;
+        }
+        if state.control.is_none() {
+            drop(state);
+            let Some(buffers) = prepare_sidecar_control(store, self.limit) else {
+                store
+                    .outboard_budget
+                    .sidecar_event("sidecar_install_dropped");
+                return;
+            };
+            state = self
+                .queue
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if state.deadline.is_some() {
+                drop(state);
+                drop(buffers);
+                store
+                    .outboard_budget
+                    .sidecar_event("sidecar_install_dropped");
+                return;
+            }
+            let SidecarControlBuffers {
+                pending,
+                unfinished,
+                lease,
+                bytes,
+            } = buffers;
+            state.pending = pending;
+            state.unfinished = unfinished;
+            state.control = Some(lease);
+            state.control_bytes = bytes;
+            self.observe(&state);
+        }
+        if worker.is_none() && state.deadline.is_none() {
+            #[cfg(test)]
+            if store
+                .sidecar_install_test
+                .fail_worker_start
+                .swap(false, Ordering::Relaxed)
+            {
+                store
+                    .outboard_budget
+                    .sidecar_event("sidecar_install_failed");
+                store
+                    .outboard_budget
+                    .sidecar_event("sidecar_install_dropped");
+                return;
+            }
+            let mut directory = PathBuf::new();
+            if directory
+                .try_reserve_exact(store.outboards.as_os_str().len())
+                .is_err()
+            {
+                store
+                    .outboard_budget
+                    .sidecar_event("sidecar_install_dropped");
+                return;
+            }
+            directory.push(&store.outboards);
+            if sidecar_control_bytes(
+                state.pending.capacity(),
+                state.unfinished.capacity(),
+                self.limit,
+                directory.capacity(),
+            )
+            .is_none_or(|observed| observed > state.control_bytes)
+            {
+                store
+                    .outboard_budget
+                    .sidecar_event("sidecar_install_dropped");
+                return;
+            }
+            state.directory_capacity = directory.capacity();
+            let context = SidecarInstallContext {
+                directory,
+                repairs: store.outboard_repairs.clone(),
+                budget: store.outboard_budget.clone(),
+                metrics: store.read_work.clone(),
+                #[cfg(test)]
+                test: store.sidecar_install_test.clone(),
+            };
+            let queue = self.queue.clone();
+            let limit = self.limit;
+            match std::thread::Builder::new()
+                .name("afs-sidecar-install".into())
+                .spawn(move || {
+                    run_sidecar_installer(queue, context, limit);
+                }) {
+                Ok(handle) => *worker = Some(handle),
+                Err(_) => {
+                    store
+                        .outboard_budget
+                        .sidecar_event("sidecar_install_failed");
+                    store
+                        .outboard_budget
+                        .sidecar_event("sidecar_install_dropped");
+                    return;
+                }
+            }
+        }
+        for item in staged {
+            let Some(proof) = &item.outboard else {
+                continue;
+            };
+            if state.unfinished.contains(&item.chunk.id) {
+                continue;
+            }
+            if state.deadline.is_some()
+                || state.unfinished.len() >= self.limit
+                || ChunkObject::from_content_addressed_id(&item.chunk.id).as_ref()
+                    != Some(&item.chunk)
+                || ChunkOutboard::validate_encoded_shape(&item.chunk, proof.encoded()).is_err()
+            {
+                store
+                    .outboard_budget
+                    .sidecar_event("sidecar_install_dropped");
+                continue;
+            }
+            let Some(proof) = store.outboard_budget.pin_sidecar(proof) else {
+                store
+                    .outboard_budget
+                    .sidecar_event("sidecar_install_dropped");
+                continue;
+            };
+            let Some(key) = sidecar_chunk_id(&item.chunk.id) else {
+                drop(state);
+                drop(proof);
+                self.queue.changed.notify_all();
+                store
+                    .outboard_budget
+                    .sidecar_event("sidecar_install_dropped");
+                return;
+            };
+            let Some(queued_id) = sidecar_chunk_id(&item.chunk.id) else {
+                drop(state);
+                drop(proof);
+                self.queue.changed.notify_all();
+                store
+                    .outboard_budget
+                    .sidecar_event("sidecar_install_dropped");
+                return;
+            };
+            state.unfinished.insert(key);
+            state.pending.push_back(SidecarInstallItem {
+                chunk_id: queued_id,
+                proof,
+            });
+        }
+        self.observe(&state);
+        self.queue.changed.notify_all();
+    }
+
+    fn close(&self, deadline: Instant) {
+        let mut state = self
+            .queue
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        // Repeated stop requests can shorten, never renew, the first deadline.
+        state.deadline = Some(state.deadline.map_or(deadline, |old| old.min(deadline)));
+        self.queue.changed.notify_all();
+    }
+
+    fn shutdown(&self) -> Result<()> {
+        self.close(Instant::now() + SIDECAR_STOP_WAIT);
+        let _joining = self
+            .joining
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let handle = self
+            .worker
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        let result = if let Some(handle) = handle {
+            // A synchronous filesystem operation cannot safely be cancelled.
+            // Keep owning it and its proof; the existing process watchdog is
+            // the final bound, never detach or report a clean incomplete stop.
+            handle
+                .join()
+                .map_err(|_| invalid("sidecar installer worker failed"))
+        } else {
+            Ok(())
+        };
+        let (pending, unfinished, control) = {
+            let mut state = self
+                .queue
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            state.active = 0;
+            (
+                std::mem::take(&mut state.pending),
+                std::mem::take(&mut state.unfinished),
+                state.control.take(),
+            )
+        };
+        // The worker's owned directory has already been freed by join. Free
+        // every retained container/string before refunding its metadata lease.
+        drop(pending);
+        drop(unfinished);
+        drop(control);
+        let mut state = self
+            .queue
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.control_bytes = 0;
+        state.directory_capacity = 0;
+        self.observe(&state);
+        result
+    }
+
+    #[cfg(test)]
+    fn wait_idle(&self) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut state = self.queue.state.lock().unwrap();
+        while !state.unfinished.is_empty() {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .expect("sidecar installer did not become idle");
+            state = self.queue.changed.wait_timeout(state, remaining).unwrap().0;
+        }
+    }
+}
+
+impl Drop for SidecarInstaller {
+    fn drop(&mut self) {
+        self.close(Instant::now());
+        let _ = self.shutdown();
+    }
+}
+
+fn run_sidecar_installer(
+    queue: Arc<SidecarInstallQueue>,
+    context: SidecarInstallContext,
+    limit: usize,
+) {
+    loop {
+        let mut state = queue
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        while state.pending.is_empty() && state.deadline.is_none() {
+            state = queue
+                .changed
+                .wait(state)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+        if state.pending.is_empty() {
+            return;
+        }
+        let count = state.pending.len().min(SIDECAR_INSTALL_BATCH);
+        let mut batch: [Option<SidecarInstallItem>; SIDECAR_INSTALL_BATCH] =
+            std::array::from_fn(|_| None);
+        for slot in batch.iter_mut().take(count) {
+            *slot = state.pending.pop_front();
+        }
+        state.active += count;
+        if let Some(metrics) = &context.metrics {
+            metrics.sidecar_install_counts(
+                state.pending.len(),
+                state.active,
+                limit,
+                state.control_bytes,
+            );
+        }
+        drop(state);
+        let mut installed_items = 0usize;
+        for item in batch.iter().flatten() {
+            let expired = queue
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .deadline
+                .is_some_and(|deadline| Instant::now() >= deadline);
+            if expired {
+                context.budget.sidecar_event("sidecar_install_dropped");
+                continue;
+            }
+            #[cfg(test)]
+            context.test.pause_if_requested();
+            let path = context
+                .directory
+                .join(format!("{}.bao", safe_id(&item.chunk_id.0)));
+            let _diagnostic = context.metrics.as_ref().and_then(|metrics| {
+                metrics.coarse_diagnostic(
+                    "persist_proof_install_sync",
+                    item.proof.proof().encoded().len() as u64,
+                )
+            });
+            let mut hash = std::collections::hash_map::DefaultHasher::new();
+            path.hash(&mut hash);
+            let index = (hash.finish() % OUTBOARD_REPAIR_SHARDS as u64) as usize;
+            let installed = context.repairs[index]
+                .lock()
+                .map_err(|_| invalid("sidecar repair gate poisoned"))
+                .and_then(|_repair| {
+                    if !outboard_file_matches(&path, item.proof.proof()).unwrap_or(false) {
+                        install_outboard_file(&path, item.proof.proof())?;
+                    }
+                    Ok(())
+                });
+            if installed.is_ok() {
+                installed_items += 1;
+            } else {
+                context.budget.sidecar_event("sidecar_install_failed");
+            }
+        }
+        #[cfg(test)]
+        if installed_items != 0 {
+            context.test.pause_before_directory_sync();
+        }
+        let directory_expired = queue
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline);
+        if installed_items != 0 && directory_expired {
+            // Files already installed remain optional and may be repaired on
+            // a later read. Do not begin another filesystem barrier after the
+            // absolute stop decision; active references retire only below.
+            for _ in 0..installed_items {
+                context.budget.sidecar_event("sidecar_install_dropped");
+            }
+        } else if installed_items != 0 {
+            let _diagnostic = context
+                .metrics
+                .as_ref()
+                .and_then(|metrics| metrics.coarse_diagnostic("persist_proof_dir_sync", 0));
+            #[cfg(test)]
+            let fail_directory = context
+                .test
+                .fail_directory_sync
+                .swap(false, Ordering::Relaxed);
+            #[cfg(not(test))]
+            let fail_directory = false;
+            if fail_directory || sync_outboard_directory(&context.directory).is_err() {
+                context.budget.sidecar_event("sidecar_install_failed");
+            }
+        }
+        #[cfg(test)]
+        {
+            let io = OUTBOARD_PERSIST_IO.with(|counts| std::mem::take(&mut *counts.borrow_mut()));
+            let mut total = context.test.optional_io.lock().unwrap();
+            total.writes += io.writes;
+            total.file_syncs += io.file_syncs;
+            total.renames += io.renames;
+            total.directory_syncs += io.directory_syncs;
+        }
+        for item in batch.into_iter().flatten() {
+            let SidecarInstallItem { chunk_id, proof } = item;
+            // Never drop a charged proof while holding the queue mutex.
+            drop(proof);
+            let mut state = queue
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            state.unfinished.remove(&chunk_id);
+            state.active -= 1;
+            if let Some(metrics) = &context.metrics {
+                metrics.sidecar_install_counts(
+                    state.pending.len(),
+                    state.active,
+                    limit,
+                    state.control_bytes,
+                );
+            }
+            queue.changed.notify_all();
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct SidecarInstallTestControl {
+    block: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+    before_directory_sync:
+        Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+    optional_io: Mutex<OutboardPersistIo>,
+    fail_directory_sync: std::sync::atomic::AtomicBool,
+    fail_worker_start: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(test)]
+impl SidecarInstallTestControl {
+    fn pause_if_requested(&self) {
+        let block = self.block.lock().unwrap().take();
+        if let Some((entered, release)) = block {
+            let _ = entered.send(());
+            let _ = release.recv();
+        }
+    }
+    fn pause_before_directory_sync(&self) {
+        let block = self.before_directory_sync.lock().unwrap().take();
+        if let Some((entered, release)) = block {
+            let _ = entered.send(());
+            let _ = release.recv();
+        }
+    }
+}
+
+#[cfg(test)]
+type PeerFillTestBlock = (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
+
 #[derive(Debug)]
 pub struct LocalChunkStore {
     node_id: String,
@@ -1490,10 +2268,21 @@ pub struct LocalChunkStore {
     catalog: Mutex<LocalCatalog>,
     next_staging: AtomicU64,
     read_work: Option<super::read_work::ReadWorkMetrics>,
+    sidecar_installer: SidecarInstaller,
+    #[cfg(test)]
+    sidecar_install_test: Arc<SidecarInstallTestControl>,
+    #[cfg(test)]
+    peer_fill_test_blocks: Mutex<HashMap<ChunkId, PeerFillTestBlock>>,
+    #[cfg(test)]
+    peer_ready_test_block: Mutex<Option<PeerFillTestBlock>>,
+    #[cfg(test)]
+    peer_payload_test_block: Mutex<Option<PeerFillTestBlock>>,
     #[cfg(any(feature = "dfs", test))]
     peer_read_budget: Arc<PeerReadBudget>,
     #[cfg(any(feature = "dfs", test))]
-    peer_read_cache: Mutex<Option<Arc<PeerVerifiedObject>>>,
+    peer_read_cache: Mutex<PeerServeState>,
+    #[cfg(any(feature = "dfs", test))]
+    peer_serve_changed: Condvar,
 }
 
 impl LocalChunkStore {
@@ -1524,13 +2313,265 @@ impl LocalChunkStore {
             catalog: Mutex::new(catalog),
             next_staging: AtomicU64::new(1),
             read_work: None,
+            sidecar_installer: SidecarInstaller::default(),
+            #[cfg(test)]
+            sidecar_install_test: Arc::new(SidecarInstallTestControl::default()),
+            #[cfg(test)]
+            peer_fill_test_blocks: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            peer_ready_test_block: Mutex::new(None),
+            #[cfg(test)]
+            peer_payload_test_block: Mutex::new(None),
             #[cfg(any(feature = "dfs", test))]
             peer_read_budget: Arc::new(PeerReadBudget::default()),
             #[cfg(any(feature = "dfs", test))]
-            peer_read_cache: Mutex::new(None),
+            peer_read_cache: Mutex::new(PeerServeState::default()),
+            #[cfg(any(feature = "dfs", test))]
+            peer_serve_changed: Condvar::new(),
         };
         store.recover()?;
         Ok(store)
+    }
+
+    #[cfg(any(feature = "dfs", test))]
+    pub(crate) fn with_peer_serve_config(
+        mut self,
+        resident_objects: usize,
+        payload_bytes: u64,
+    ) -> Result<Self> {
+        if !(1..=PEER_SERVE_MAX_RESIDENTS).contains(&resident_objects)
+            || !(4 * 1024 * 1024..=64 * 1024 * 1024).contains(&payload_bytes)
+        {
+            return Err(invalid(
+                "Peer serve requires 1..=16 residents and 4..=64MiB payload",
+            ));
+        }
+        let state = self
+            .peer_read_cache
+            .get_mut()
+            .map_err(|_| peer_serve_unavailable("Peer serve state poisoned"))?;
+        if state.closed
+            || state.readers != 0
+            || state.flights.iter().any(Option::is_some)
+            || state.residents.iter().any(Option::is_some)
+            || Arc::strong_count(&self.peer_read_budget) != 1
+        {
+            return Err(invalid("cannot reconfigure active Peer serve owners"));
+        }
+        let budget = Arc::get_mut(&mut self.peer_read_budget)
+            .ok_or_else(|| invalid("Peer serve budget still has owners"))?;
+        if budget.used.load(Ordering::Acquire) != 0
+            || budget.control_used.load(Ordering::Acquire) != 0
+        {
+            return Err(invalid("cannot reconfigure charged Peer serve budget"));
+        }
+        budget.limit = payload_bytes;
+        state.resident_limit = resident_objects;
+        Ok(self)
+    }
+
+    #[cfg(any(feature = "dfs", test))]
+    fn observe_peer_serve(&self, state: &PeerServeState) {
+        if let Some(metrics) = &self.read_work {
+            metrics.peer_serve_resources(
+                state.residents.iter().flatten().count(),
+                state.flights.iter().flatten().count(),
+                state.readers,
+                self.peer_read_budget.limit,
+                peer_serve_fixed_control_bytes(),
+            );
+        }
+    }
+
+    #[cfg(any(feature = "dfs", test))]
+    fn reserve_peer_control(&self, bytes: usize) -> Result<PeerControlLease> {
+        let fixed = peer_serve_fixed_control_bytes();
+        let limit = PEER_SERVE_CONTROL_LIMIT.saturating_sub(fixed) as u64;
+        let bytes = u64::try_from(bytes).map_err(|_| peer_payload_capacity())?;
+        let mut used = self.peer_read_budget.control_used.load(Ordering::Acquire);
+        loop {
+            let next = used
+                .checked_add(bytes)
+                .filter(|next| *next <= limit)
+                .ok_or_else(peer_payload_capacity)?;
+            match self.peer_read_budget.control_used.compare_exchange_weak(
+                used,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    let peak = self
+                        .peer_read_budget
+                        .control_peak
+                        .fetch_max(next, Ordering::AcqRel);
+                    if let Some(metrics) = &self.read_work {
+                        metrics.peer_serve_control(bytes as i64, next.saturating_sub(peak));
+                    }
+                    return Ok(PeerControlLease {
+                        budget: self.peer_read_budget.clone(),
+                        bytes,
+                        metrics: self.read_work.clone(),
+                    });
+                }
+                Err(actual) => used = actual,
+            }
+        }
+    }
+
+    #[cfg(any(feature = "dfs", test))]
+    fn peer_object_control(&self, record: Option<&LocalChunkRecord>) -> Result<PeerControlLease> {
+        // Includes Arc headers, field owners and conservative allocator padding;
+        // body Vec capacity and shared proof allocation are charged separately.
+        let strings = record.map_or(0, |record| {
+            let PhysicalLocation::PerChunkFile { relative_path } = &record.location;
+            record.chunk.id.0.capacity() + record.device_id.capacity() + relative_path.capacity()
+        });
+        self.reserve_peer_control(std::mem::size_of::<PeerVerifiedObject>() + 128 + strings)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn waiting_peer_fill_readers_for_test(&self) -> usize {
+        self.peer_read_cache
+            .lock()
+            .unwrap()
+            .flights
+            .iter()
+            .flatten()
+            .map(|flight| Arc::strong_count(flight).saturating_sub(2))
+            .sum()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_next_peer_fill_for_test(
+        &self,
+        chunk_id: ChunkId,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (entered, observed) = std::sync::mpsc::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        self.peer_fill_test_blocks
+            .lock()
+            .unwrap()
+            .insert(chunk_id, (entered, wait));
+        (observed, release)
+    }
+
+    #[cfg(test)]
+    fn clear_peer_residents_for_test(&self) {
+        let residents = {
+            let mut state = self.peer_read_cache.lock().unwrap();
+            std::mem::replace(&mut state.residents, std::array::from_fn(|_| None))
+        };
+        drop(residents);
+    }
+
+    #[cfg(any(feature = "dfs", test))]
+    fn begin_peer_serve_read(&self) -> Result<PeerServeReadGuard<'_>> {
+        let mut state = self
+            .peer_read_cache
+            .lock()
+            .map_err(|_| peer_serve_unavailable("Peer serve state poisoned"))?;
+        if state.closed {
+            return Err(peer_serve_unavailable("Peer serve is stopped"));
+        }
+        state.readers = state
+            .readers
+            .checked_add(1)
+            .ok_or_else(peer_payload_capacity)?;
+        self.observe_peer_serve(&state);
+        Ok(PeerServeReadGuard(self))
+    }
+
+    // A stale Ready holder may observe another physical inode after a newer
+    // flight has installed a healthy resident. Retire only our observed Arc.
+    #[cfg(any(feature = "dfs", test))]
+    fn retire_observed_peer_resident(&self, observed: Option<&Arc<PeerVerifiedObject>>) {
+        let Some(observed) = observed else {
+            return;
+        };
+        let retired = if let Ok(mut state) = self.peer_read_cache.lock() {
+            let index = state.residents.iter().position(|current| {
+                current
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, observed))
+            });
+            let retired = index.and_then(|index| state.take_resident(index));
+            self.observe_peer_serve(&state);
+            retired
+        } else {
+            None
+        };
+        drop(retired);
+    }
+
+    #[cfg(any(feature = "dfs", test))]
+    pub(crate) fn ensure_peer_serve_open(&self) -> Result<()> {
+        let state = self
+            .peer_read_cache
+            .lock()
+            .map_err(|_| peer_serve_unavailable("Peer serve state poisoned"))?;
+        if state.closed {
+            Err(peer_serve_unavailable("Peer serve is stopped"))
+        } else {
+            Ok(())
+        }
+    }
+
+    #[cfg(any(feature = "dfs", test))]
+    pub(crate) fn close_peer_serve_admission(&self) {
+        let residents = if let Ok(mut state) = self.peer_read_cache.lock() {
+            state.closed = true;
+            state
+                .stop_deadline
+                .get_or_insert_with(|| Instant::now() + Duration::from_secs(10));
+            for flight in state.flights.iter().flatten() {
+                flight.changed.notify_all();
+            }
+            let residents = std::mem::replace(&mut state.residents, std::array::from_fn(|_| None));
+            self.observe_peer_serve(&state);
+            residents
+        } else {
+            std::array::from_fn(|_| None)
+        };
+        drop(residents);
+        self.peer_serve_changed.notify_all();
+    }
+
+    #[cfg(any(feature = "dfs", test))]
+    pub(crate) fn shutdown_peer_serve(&self) -> Result<()> {
+        self.close_peer_serve_admission();
+        let mut state = self
+            .peer_read_cache
+            .lock()
+            .map_err(|_| peer_serve_unavailable("Peer serve state poisoned"))?;
+        let deadline = state
+            .stop_deadline
+            .ok_or_else(|| peer_serve_unavailable("Peer serve stop deadline missing"))?;
+        loop {
+            if state.readers == 0
+                && state.flights.iter().all(Option::is_none)
+                && self.peer_read_budget.used.load(Ordering::Acquire) == 0
+                && self.peer_read_budget.control_used.load(Ordering::Acquire) == 0
+                // A zero-byte lease still owns the right to retain capacity.
+                // All aliases are private real owners (or test observations).
+                && Arc::strong_count(&self.peer_read_budget) == 1
+            {
+                self.observe_peer_serve(&state);
+                return Ok(());
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(Error::coded(
+                    afs_error::IO_TIMEOUT,
+                    "Peer serve drain deadline exceeded",
+                ));
+            }
+            state = self
+                .peer_serve_changed
+                .wait_timeout(state, remaining.min(Duration::from_millis(25)))
+                .map_err(|_| peer_serve_unavailable("Peer serve drain state poisoned"))?
+                .0;
+        }
     }
 
     #[cfg(any(feature = "dfs", test))]
@@ -1545,7 +2586,65 @@ impl LocalChunkStore {
         metrics: super::read_work::ReadWorkMetrics,
     ) -> Self {
         self.read_work = Some(metrics);
+        self.sidecar_installer.metrics = self.read_work.clone();
+        if let Ok(state) = self.peer_read_cache.lock() {
+            self.observe_peer_serve(&state);
+        }
+        {
+            let state = self
+                .sidecar_installer
+                .queue
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            self.sidecar_installer.observe(&state);
+        }
         self
+    }
+
+    #[cfg(any(feature = "dfs", test))]
+    pub(crate) fn with_sidecar_install_queue(mut self, limit: usize) -> Result<Self> {
+        if !(1..=SIDECAR_INSTALL_LIMIT).contains(&limit) {
+            return Err(invalid("sidecar install queue must be 1..=64"));
+        }
+        self.sidecar_installer.limit = limit;
+        {
+            let state = self
+                .sidecar_installer
+                .queue
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            self.sidecar_installer.observe(&state);
+        }
+        Ok(self)
+    }
+
+    #[cfg(feature = "dfs")]
+    pub(crate) fn stop_sidecar_installation(&self) {
+        self.sidecar_installer
+            .close(Instant::now() + SIDECAR_STOP_WAIT);
+    }
+
+    #[cfg(feature = "dfs")]
+    pub(crate) fn shutdown_sidecar_installer(&self) -> Result<()> {
+        self.sidecar_installer.shutdown()
+    }
+
+    pub(super) fn coarse_diagnostic(
+        &self,
+        phase: &'static str,
+        bytes: u64,
+    ) -> Option<super::read_work::ReadCoarseDiagnosticSpan> {
+        self.read_work.as_ref()?.coarse_diagnostic(phase, bytes)
+    }
+
+    #[cfg(any(feature = "dfs", test))]
+    pub(super) fn read_diagnostic(
+        &self,
+        stage: super::read_work::ReadDiagnosticStage,
+    ) -> Option<super::read_work::ReadDiagnosticSpan> {
+        self.read_work.as_ref()?.diagnostic(stage)
     }
 
     #[cfg(feature = "dfs")]
@@ -1586,6 +2685,19 @@ impl LocalChunkStore {
         self.read_work
             .as_ref()
             .map(|metrics| metrics.peer_stream_pipeline(output))
+    }
+
+    #[cfg(feature = "dfs")]
+    pub(crate) fn record_source_cache_resources(
+        &self,
+        entries: usize,
+        bytes: usize,
+        peak: usize,
+        limit: usize,
+    ) {
+        if let Some(metrics) = &self.read_work {
+            metrics.source_cache_resources(entries, bytes, peak, limit);
+        }
     }
 
     #[cfg(feature = "dfs")]
@@ -1712,6 +2824,10 @@ impl LocalChunkStore {
         placement_revision: u64,
         placement_epoch: u64,
     ) -> Result<Vec<ReplicaAck>> {
+        let _diagnostic = self.coarse_diagnostic("persist_batch", 0);
+        #[cfg(any(feature = "dfs", test))]
+        let batch_diagnostic =
+            self.read_diagnostic(super::read_work::ReadDiagnosticStage::PersistBatch);
         if target.node_id != self.node_id
             || target.device.device_id != self.device_id
             || target.device.device_epoch != self.device_epoch
@@ -1760,8 +2876,14 @@ impl LocalChunkStore {
                 .write(true)
                 .open(&temp_path)
                 .map_err(Error::from)?;
-            file.write_all(item.bytes()).map_err(Error::from)?;
-            file.sync_all().map_err(Error::from)?;
+            {
+                let _diagnostic = self.coarse_diagnostic("persist_body_write", item.chunk.length);
+                file.write_all(item.bytes()).map_err(Error::from)?;
+            }
+            {
+                let _diagnostic = self.coarse_diagnostic("persist_body_sync", item.chunk.length);
+                file.sync_all().map_err(Error::from)?;
+            }
             let final_path = self.chunk_path(&item.chunk.id);
             if replace_existing {
                 // Publish a new inode; never truncate a file held by readers.
@@ -1784,9 +2906,12 @@ impl LocalChunkStore {
         }
 
         if !new_chunks.is_empty() {
-            File::open(&self.chunks)
-                .and_then(|directory| directory.sync_all())
-                .map_err(Error::from)?;
+            {
+                let _diagnostic = self.coarse_diagnostic("persist_chunks_dir_sync", 0);
+                File::open(&self.chunks)
+                    .and_then(|directory| directory.sync_all())
+                    .map_err(Error::from)?;
+            }
             let revision = catalog.revision.saturating_add(1);
             let records = new_chunks
                 .into_iter()
@@ -1807,6 +2932,7 @@ impl LocalChunkStore {
             append_catalog_txn(
                 &self.catalog_path,
                 &CatalogTxn::new(revision, records.clone())?,
+                self.read_work.as_ref(),
             )?;
             for record in records {
                 catalog.records.insert(record.chunk.id.clone(), record);
@@ -1814,33 +2940,12 @@ impl LocalChunkStore {
             catalog.revision = revision;
         }
         let catalog_revision = catalog.revision;
-        let mut seen_outboards = HashSet::new();
-        let mut sync_outboards = false;
-        for item in staged {
-            if let Some(proof) = &item.outboard
-                && proof.uses_budget(&self.outboard_budget)
-                && seen_outboards.insert(&item.chunk.id)
-            {
-                let path = self
-                    .outboards
-                    .join(format!("{}.bao", safe_id(&item.chunk.id.0)));
-                // Compare every byte against the proof minted from this staged
-                // body; a matching header alone does not validate the CVs.
-                // Reused files still cross a file barrier, including after a
-                // previous optional directory-sync failure.
-                if sync_matching_outboard_file(&path, proof).unwrap_or(false)
-                    || install_outboard_file(&path, proof).is_ok()
-                {
-                    sync_outboards = true;
-                }
-            }
-        }
-        if sync_outboards {
-            // Proof metadata remains optional, but all successful installs and
-            // reuses cross this batch's directory barrier before its ACKs.
-            let _ = sync_outboard_directory(&self.outboards);
-        }
-        Ok(staged
+        // The required body, chunk-directory and catalog barriers above are
+        // unchanged. Optional proof work must neither hold this lock nor gate
+        // the durable ACK (including exact replay of already-durable chunks).
+        drop(catalog);
+        self.sidecar_installer.enqueue_batch(self, staged);
+        let acks = staged
             .iter()
             .map(|item| ReplicaAck {
                 operation_id: item.operation_id.clone(),
@@ -1855,7 +2960,12 @@ impl LocalChunkStore {
                 persisted_bytes: item.chunk.length,
                 verified_digest: item.chunk.content_digest.clone(),
             })
-            .collect())
+            .collect();
+        #[cfg(any(feature = "dfs", test))]
+        if let Some(diagnostic) = batch_diagnostic {
+            diagnostic.finish(true);
+        }
+        Ok(acks)
     }
 
     pub fn persist(
@@ -1918,7 +3028,30 @@ impl LocalChunkStore {
     #[cfg(any(feature = "dfs", test))]
     fn reserve_peer_read_payload_inner(&self, bytes: usize) -> Result<PeerReadReservation> {
         let bytes = u64::try_from(bytes).map_err(|_| peer_payload_capacity())?;
-        reserve_peer_bytes(&self.peer_read_budget, bytes, self.read_work.as_ref())?;
+        let mut result = reserve_peer_bytes(&self.peer_read_budget, bytes, self.read_work.as_ref());
+        while result.is_err() {
+            // Remove only a genuinely unpinned LRU; actual destruction and
+            // ledger release happen outside the table lock.
+            let victim = {
+                let mut state = self
+                    .peer_read_cache
+                    .lock()
+                    .map_err(|_| peer_serve_unavailable("Peer serve state poisoned"))?;
+                let index = state.residents.iter().rposition(|object| {
+                    object
+                        .as_ref()
+                        .is_some_and(|object| Arc::strong_count(object) == 1)
+                });
+                let victim = index.and_then(|index| state.take_resident(index));
+                self.observe_peer_serve(&state);
+                victim
+            };
+            if victim.is_none() {
+                return Err(peer_payload_capacity());
+            }
+            drop(victim);
+            result = reserve_peer_bytes(&self.peer_read_budget, bytes, self.read_work.as_ref());
+        }
         Ok(PeerReadReservation {
             budget: self.peer_read_budget.clone(),
             bytes,
@@ -1926,24 +3059,19 @@ impl LocalChunkStore {
         })
     }
 
-    /// Admission is immediate. Eviction can reclaim only an unpinned resident
-    /// object; payloads held by senders keep their charge until the last drop.
+    /// RDMA packed and object payloads share one configured actual-capacity ledger.
     #[cfg(any(all(feature = "dfs", feature = "rdma"), test))]
     pub(crate) fn reserve_peer_read_payload(&self, bytes: usize) -> Result<PeerReadReservation> {
-        match self.reserve_peer_read_payload_inner(bytes) {
-            Ok(reservation) => Ok(reservation),
-            Err(error) => {
-                if let Ok(mut slot) = self.peer_read_cache.try_lock()
-                    && slot
-                        .as_ref()
-                        .is_some_and(|object| Arc::strong_count(object) == 1)
-                {
-                    slot.take();
-                }
-                self.reserve_peer_read_payload_inner(bytes)
-                    .map_err(|_| error)
+        let _reader = self.begin_peer_serve_read()?;
+        #[cfg(test)]
+        {
+            let block = self.peer_payload_test_block.lock().unwrap().take();
+            if let Some((entered, release)) = block {
+                entered.send(()).unwrap();
+                release.recv_timeout(Duration::from_secs(5)).unwrap();
             }
         }
+        self.reserve_peer_read_payload_inner(bytes)
     }
 
     #[cfg(any(feature = "dfs", test))]
@@ -1982,10 +3110,7 @@ impl LocalChunkStore {
         Ok(record)
     }
 
-    /// Reuse only the currently demanded object, never prefetch a next object.
-    /// The slot mutex supplies singleflight only for the complete private body
-    /// fill; optional sidecar repair uses separate bounded shared gates.
-    /// Authorization remains with each caller; this proof is content-only.
+    /// Object singleflight shares only immutable content, never read authority.
     #[cfg(any(feature = "dfs", test))]
     pub(crate) fn read_peer_range(
         &self,
@@ -1993,10 +3118,197 @@ impl LocalChunkStore {
         offset: u64,
         length: usize,
     ) -> Result<PeerReadPayload> {
-        let mut slot = self
-            .peer_read_cache
-            .lock()
-            .map_err(|_| invalid("Peer verified object lock is poisoned"))?;
+        let _reader = self.begin_peer_serve_read()?;
+        // Legacy long identities remain readable, but are not retained as keys.
+        let cacheable = chunk_id.0.len() <= PEER_SERVE_ID_LIMIT;
+        if !cacheable {
+            let payload =
+                self.read_peer_range_private(chunk_id, offset, length, &mut None, false)?;
+            self.ensure_peer_serve_open()?;
+            return Ok(payload);
+        }
+        let existing = {
+            let state = self
+                .peer_read_cache
+                .lock()
+                .map_err(|_| peer_serve_unavailable("Peer serve state poisoned"))?;
+            state
+                .flights
+                .iter()
+                .flatten()
+                .find(|flight| flight.chunk_id == *chunk_id)
+                .cloned()
+        };
+        let (flight, leading) = if let Some(flight) = existing {
+            (flight, false)
+        } else {
+            // Fixed slots bound table storage. Charge keys/terminal error and Arc
+            // allocation before retention; no proof-ledger or body-budget loan.
+            let id = chunk_id.clone();
+            let control = self.reserve_peer_control(
+                std::mem::size_of::<PeerServeFlight>() + id.0.capacity() + 512 + 128,
+            )?;
+            let candidate = Arc::new(PeerServeFlight {
+                chunk_id: id,
+                result: Mutex::new(None),
+                changed: Condvar::new(),
+                _control: control,
+            });
+            let mut state = self
+                .peer_read_cache
+                .lock()
+                .map_err(|_| peer_serve_unavailable("Peer serve state poisoned"))?;
+            if state.closed {
+                return Err(peer_serve_unavailable("Peer serve is stopped"));
+            }
+            if let Some(flight) = state
+                .flights
+                .iter()
+                .flatten()
+                .find(|flight| flight.chunk_id == *chunk_id)
+                .cloned()
+            {
+                drop(state);
+                drop(candidate);
+                (flight, false)
+            } else {
+                let free = state
+                    .flights
+                    .iter_mut()
+                    .find(|flight| flight.is_none())
+                    .ok_or_else(peer_payload_capacity)?;
+                *free = Some(candidate.clone());
+                self.observe_peer_serve(&state);
+                (candidate, true)
+            }
+        };
+        if !leading {
+            let waited = self.coarse_diagnostic("peer_slot_wait", 0);
+            let ready = loop {
+                self.ensure_peer_serve_open()?;
+                let outcome = flight
+                    .result
+                    .lock()
+                    .map_err(|_| peer_serve_unavailable("Peer object flight poisoned"))?;
+                if let Some(outcome) = outcome.as_ref() {
+                    break outcome.clone()?;
+                }
+                drop(
+                    flight
+                        .changed
+                        .wait_timeout(outcome, Duration::from_millis(25))
+                        .map_err(|_| peer_serve_unavailable("Peer object flight wait poisoned"))?,
+                );
+            };
+            drop(waited);
+            // A full immutable object can serve all ranges after the existing
+            // catalog/file checks. Exact partial results remain request-private.
+            #[cfg(test)]
+            {
+                let block = self.peer_ready_test_block.lock().unwrap().take();
+                if let Some((entered, release)) = block {
+                    entered.send(()).unwrap();
+                    release.recv_timeout(Duration::from_secs(5)).unwrap();
+                }
+            }
+            let mut slot = ready;
+            let payload =
+                self.read_peer_range_private(chunk_id, offset, length, &mut slot, true)?;
+            self.ensure_peer_serve_open()?;
+            return Ok(payload);
+        }
+        let mut leader = PeerServeLeader {
+            store: self,
+            flight,
+            finished: false,
+        };
+        let mut slot = {
+            let state = self
+                .peer_read_cache
+                .lock()
+                .map_err(|_| peer_serve_unavailable("Peer serve state poisoned"))?;
+            state.resident(chunk_id)
+        };
+        let result = self.read_peer_range_private(chunk_id, offset, length, &mut slot, true);
+        let ready = result.as_ref().ok().and_then(|payload| {
+            payload
+                .object
+                .identity
+                .as_ref()
+                .filter(|(record, _)| {
+                    payload.object.bytes.len() as u64 == record.chunk.length
+                        && record.chunk.length <= PEER_READ_OBJECT_LIMIT as u64
+                })
+                .map(|_| payload.object.clone())
+        });
+        if let Some(object) = ready.as_ref() {
+            // Catalog→table is the only nested metadata-lock order. File I/O and
+            // hash are already complete; stale/closed flights cannot install.
+            let catalog = self
+                .catalog
+                .lock()
+                .map_err(|_| invalid("local chunk catalog lock is poisoned"))?;
+            let current = object
+                .identity
+                .as_ref()
+                .is_some_and(|(record, _)| catalog.records.get(chunk_id) == Some(record));
+            let retired = {
+                let mut state = self
+                    .peer_read_cache
+                    .lock()
+                    .map_err(|_| peer_serve_unavailable("Peer serve state poisoned"))?;
+                if state.closed || !current {
+                    drop(state);
+                    drop(catalog);
+                    leader.finish(Err(peer_serve_unavailable(
+                        "Peer object identity or serve admission changed before publication",
+                    )));
+                    return Err(peer_serve_unavailable(
+                        "Peer object identity or serve admission changed before publication",
+                    ));
+                }
+                let old = state.remove_resident(chunk_id);
+                let victim = state.install(object.clone());
+                self.observe_peer_serve(&state);
+                (old, victim)
+            };
+            drop(catalog);
+            drop(retired);
+        } else if result.is_ok() {
+            self.ensure_peer_serve_open()?;
+        }
+        let shared = match &result {
+            Ok(_) => Ok(ready),
+            Err(error) => {
+                let mut end = error.message().len().min(512);
+                while !error.message().is_char_boundary(end) {
+                    end -= 1;
+                }
+                Err(Error::new(
+                    error.code(),
+                    error.kind(),
+                    &error.message()[..end],
+                ))
+            }
+        };
+        leader.finish(shared);
+        result
+    }
+
+    /// The private fill works without the shared table lock. Optional proof
+    /// repair keeps its existing shared gates, outside that lock as well.
+    #[cfg(any(feature = "dfs", test))]
+    fn read_peer_range_private(
+        &self,
+        chunk_id: &ChunkId,
+        offset: u64,
+        length: usize,
+        slot: &mut Option<Arc<PeerVerifiedObject>>,
+        cacheable: bool,
+    ) -> Result<PeerReadPayload> {
+        // Includes catalog/file identity work and actual read/verification;
+        // excludes slot acquisition and the optional sidecar repair below.
+        let read_verify = self.coarse_diagnostic("peer_read_verify", length as u64);
         let mut repair_proof = None;
         let result = (|| {
             let record = self.peer_catalog_record(chunk_id)?;
@@ -2039,8 +3351,21 @@ impl LocalChunkStore {
                     .as_ref()
                     .is_some_and(|(old, _)| old.chunk.id == *chunk_id)
             });
+            if invalidated_current {
+                self.retire_observed_peer_resident(slot.as_ref());
+            }
             if let Some(metrics) = &self.read_work {
                 metrics.peer_object_cache("miss");
+            }
+            #[cfg(test)]
+            {
+                // Remove the hook under its own mutex, then wait without that
+                // mutex: it must not introduce serialization of its own.
+                let block = self.peer_fill_test_blocks.lock().unwrap().remove(chunk_id);
+                if let Some((entered, release)) = block {
+                    entered.send(()).unwrap();
+                    release.recv_timeout(Duration::from_secs(5)).unwrap();
+                }
             }
             let mut capacity_fallback = false;
             if !invalidated_current
@@ -2050,7 +3375,14 @@ impl LocalChunkStore {
                 let reader = self.open_cataloged(chunk_id)?;
                 let loaded = self
                     .outboard_budget
-                    .try_reserve_range_work()
+                    .reserve_range_work(
+                        &[VerifiedRangeCopy {
+                            chunk_offset: offset,
+                            length: allowed,
+                            output_offset: 0,
+                        }],
+                        record.chunk.length,
+                    )
                     .ok_or_else(outboard_capacity)
                     .and_then(|working| reader.load_outboard().map(|proof| (proof, working)));
                 match loaded {
@@ -2110,6 +3442,7 @@ impl LocalChunkStore {
                                     outboard: None,
                                     _reservation: reservation,
                                     identity: None,
+                                    _control: self.peer_object_control(None)?,
                                 }),
                                 start: 0,
                                 length: allowed,
@@ -2133,7 +3466,7 @@ impl LocalChunkStore {
             // partial range above must not evict an unrelated healthy object.
             // Externally held old allocations remain charged until last drop.
             slot.take();
-            let resident = record.chunk.length <= PEER_READ_OBJECT_LIMIT as u64;
+            let resident = cacheable && record.chunk.length <= PEER_READ_OBJECT_LIMIT as u64;
             let allocation = if resident {
                 usize::try_from(record.chunk.length).map_err(|_| peer_payload_capacity())?
             } else {
@@ -2181,11 +3514,13 @@ impl LocalChunkStore {
             // allocation/ledger. Refusal keeps the complete-root body result.
             repair_proof = outboard.as_ref().map(Arc::clone);
             let outboard = outboard.filter(|proof| proof.try_mark_resident());
+            let control = self.peer_object_control(resident.then_some(&record))?;
             let object = Arc::new(PeerVerifiedObject {
                 bytes,
                 outboard,
                 _reservation: reservation,
                 identity: resident.then_some((record, before)),
+                _control: control,
             });
             if resident {
                 *slot = Some(object.clone());
@@ -2209,12 +3544,12 @@ impl LocalChunkStore {
                     .is_some_and(|(record, _)| record.chunk.id == *chunk_id)
             })
         {
+            self.retire_observed_peer_resident(slot.as_ref());
             slot.take();
         }
-        drop(slot);
-        // Keep the existing body-fill singleflight above. Optional proof I/O
-        // runs only after the global body-cache lock is released, using a
-        // bounded shared repair gate and a second read-only health comparison.
+        drop(read_verify);
+        // Optional proof I/O never holds the serve table; reads and the W-0
+        // installer share bounded repair gates and a read-only health comparison.
         if result.is_ok()
             && let Some(proof) = repair_proof.as_ref()
         {
@@ -2351,6 +3686,7 @@ impl LocalChunkStore {
         append_catalog_txn(
             &self.catalog_path,
             &CatalogTxn::new(revision, records.clone())?,
+            self.read_work.as_ref(),
         )?;
         for record in records {
             catalog.records.insert(record.chunk.id.clone(), record);
@@ -2396,8 +3732,8 @@ fn outboard_capacity() -> Error {
     )
 }
 
-// Read-only comparison is deliberately separate from sync_matching_outboard_file:
-// the latter is a write-publication barrier and must still sync on replay.
+// A healthy sidecar is disposable metadata: compare every byte before reuse,
+// without adding its optional file barrier back to a durable body ACK.
 fn outboard_file_matches(path: &Path, proof: &SharedOutboard) -> Result<bool> {
     use std::io::Read;
     let mut file = File::open(path).map_err(Error::from)?;
@@ -2436,31 +3772,6 @@ fn persist_outboard_file(path: &Path, proof: &SharedOutboard) -> Result<()> {
         .parent()
         .ok_or_else(|| invalid("outboard path has no parent"))?;
     sync_outboard_directory(parent)
-}
-
-fn sync_matching_outboard_file(path: &Path, proof: &SharedOutboard) -> Result<bool> {
-    use std::io::Read;
-    let mut file = File::open(path).map_err(Error::from)?;
-    let metadata = file.metadata().map_err(Error::from)?;
-    if !metadata.is_file() || metadata.len() != proof.encoded().len() as u64 {
-        return Ok(false);
-    }
-    // Bounded stack scratch avoids a second proof allocation or metadata lease.
-    let mut scratch = [0; 1024];
-    for expected in proof.encoded().chunks(scratch.len()) {
-        let observed = &mut scratch[..expected.len()];
-        file.read_exact(observed).map_err(Error::from)?;
-        if observed != expected {
-            return Ok(false);
-        }
-    }
-    if file.metadata().map_err(Error::from)?.len() != proof.encoded().len() as u64 {
-        return Ok(false);
-    }
-    file.sync_all().map_err(Error::from)?;
-    #[cfg(test)]
-    OUTBOARD_PERSIST_IO.with(|counts| counts.borrow_mut().file_syncs += 1);
-    Ok(true)
 }
 
 fn install_outboard_file(path: &Path, proof: &SharedOutboard) -> Result<()> {
@@ -2555,7 +3866,11 @@ impl ChunkStore for LocalChunkStore {
     }
 }
 
-fn append_catalog_txn(path: &Path, txn: &CatalogTxn) -> Result<()> {
+fn append_catalog_txn(
+    path: &Path,
+    txn: &CatalogTxn,
+    metrics: Option<&super::read_work::ReadWorkMetrics>,
+) -> Result<()> {
     let mut encoded = serde_json::to_vec(txn)
         .map_err(|error| invalid(format!("cannot encode local chunk catalog: {error}")))?;
     encoded.push(b'\n');
@@ -2564,11 +3879,23 @@ fn append_catalog_txn(path: &Path, txn: &CatalogTxn) -> Result<()> {
         .append(true)
         .open(path)
         .map_err(Error::from)?;
-    file.write_all(&encoded).map_err(Error::from)?;
-    file.sync_all().map_err(Error::from)?;
+    {
+        let _diagnostic = metrics.and_then(|metrics| {
+            metrics.coarse_diagnostic("persist_catalog_write", encoded.len() as u64)
+        });
+        file.write_all(&encoded).map_err(Error::from)?;
+    }
+    {
+        let _diagnostic = metrics.and_then(|metrics| {
+            metrics.coarse_diagnostic("persist_catalog_sync", encoded.len() as u64)
+        });
+        file.sync_all().map_err(Error::from)?;
+    }
     let parent = path
         .parent()
         .ok_or_else(|| invalid("local chunk catalog has no parent directory"))?;
+    let _diagnostic =
+        metrics.and_then(|metrics| metrics.coarse_diagnostic("persist_catalog_parent_sync", 0));
     File::open(parent)
         .and_then(|directory| directory.sync_all())
         .map_err(Error::from)
@@ -2832,6 +4159,637 @@ struct OutboardPersistIo {
 mod replica_replay_tests {
     use super::*;
 
+    #[test]
+    fn p2_w0_blocked_installer_does_not_delay_durable_ack() {
+        use std::{sync::mpsc, thread, time::Duration};
+        let temp = tempfile::tempdir().unwrap();
+        let budget = OutboardBudget::new(DEFAULT_OUTBOARD_BUDGET_BYTES);
+        let staged = pooled_outboard_chunks(&budget, 1, 128 * 1024)
+            .pop()
+            .unwrap();
+        let store = Arc::new(
+            LocalChunkStore::open(temp.path(), "node-a")
+                .unwrap()
+                .with_outboard_budget(budget),
+        );
+        let (entered, entered_rx) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel();
+        *store.sidecar_install_test.block.lock().unwrap() = Some((entered, release_rx));
+        let worker_store = store.clone();
+        let worker_staged = staged.clone();
+        let (completed, completed_rx) = mpsc::channel();
+        let writer = thread::spawn(move || {
+            completed.send(worker_store.put(worker_staged)).unwrap();
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        // This is an explicit in-installer barrier, not a file-presence race.
+        // The required body/catalog transaction has completed, while optional
+        // sidecar installation remains blocked on the test-owned receiver.
+        assert_eq!(
+            fs::read(store.chunk_path(&staged.chunk.id)).unwrap(),
+            staged.bytes()
+        );
+        assert!(!fs::read(&store.catalog_path).unwrap().is_empty());
+        let while_blocked = completed_rx.recv_timeout(Duration::from_millis(100));
+        release.send(()).unwrap();
+        writer.join().unwrap();
+        assert!(
+            while_blocked.is_ok(),
+            "durable persist ACK was blocked by the optional sidecar installer"
+        );
+        let receipt = while_blocked.unwrap().unwrap();
+        assert_eq!(receipt.chunk, staged.chunk);
+        assert_eq!(receipt.durable_acks.len(), 1);
+        let ack = &receipt.durable_acks[0];
+        assert_eq!(ack.chunk_id, staged.chunk.id);
+        assert_eq!(ack.persisted_bytes, staged.chunk.length);
+        assert_eq!(ack.verified_digest, staged.chunk.content_digest);
+    }
+
+    fn block_next_sidecar_install(
+        store: &LocalChunkStore,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (entered, entered_rx) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        *store.sidecar_install_test.block.lock().unwrap() = Some((entered, release_rx));
+        (entered_rx, release)
+    }
+
+    #[test]
+    fn p2_w0_required_barriers_precede_ack_while_optional_installer_is_blocked() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = afs_metrics::Registry::new();
+        let metrics = super::super::read_work::ReadWorkMetrics::register(&registry)
+            .unwrap()
+            .with_read_diagnostics(true);
+        let budget = OutboardBudget::new(DEFAULT_OUTBOARD_BUDGET_BYTES);
+        let staged = pooled_outboard_chunks(&budget, 1, 128 * 1024)
+            .pop()
+            .unwrap();
+        let store = LocalChunkStore::open(temp.path(), "node-a")
+            .unwrap()
+            .with_outboard_budget(budget)
+            .with_read_work_metrics(metrics.clone());
+        let (entered, release) = block_next_sidecar_install(&store);
+        let receipt = store.put(staged.clone()).unwrap();
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        let snapshot = metrics.diagnostics_snapshot().unwrap();
+        let mut previous_end = 0;
+        for name in [
+            "persist_body_write",
+            "persist_body_sync",
+            "persist_chunks_dir_sync",
+            "persist_catalog_write",
+            "persist_catalog_sync",
+            "persist_catalog_parent_sync",
+        ] {
+            let phase = snapshot
+                .coarse_phases
+                .iter()
+                .find(|phase| phase.phase == name)
+                .unwrap();
+            assert_eq!(phase.calls, 1, "{name}");
+            assert!(
+                phase.first_start_ns >= previous_end,
+                "required barrier order changed at {name}"
+            );
+            previous_end = phase.last_end_ns;
+        }
+        for name in ["persist_proof_install_sync", "persist_proof_dir_sync"] {
+            assert_eq!(
+                snapshot
+                    .coarse_phases
+                    .iter()
+                    .find(|phase| phase.phase == name)
+                    .unwrap()
+                    .calls,
+                0
+            );
+        }
+        assert_eq!(receipt.durable_acks.len(), 1);
+        assert_eq!(
+            *store.sidecar_install_test.optional_io.lock().unwrap(),
+            OutboardPersistIo::default()
+        );
+        release.send(()).unwrap();
+        store.sidecar_installer.wait_idle();
+    }
+
+    #[test]
+    fn p2_w0_queue_limit_includes_active_and_releases_only_its_own_proof_refs() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = afs_metrics::Registry::new();
+        let metrics = super::super::read_work::ReadWorkMetrics::register(&registry).unwrap();
+        let budget =
+            OutboardBudget::new_with_metrics(DEFAULT_OUTBOARD_BUDGET_BYTES, metrics.clone());
+        let staged = pooled_outboard_chunks(&budget, 65, 4096);
+        let store = LocalChunkStore::open(temp.path(), "node-a")
+            .unwrap()
+            .with_outboard_budget(budget.clone())
+            .with_read_work_metrics(metrics);
+        let (entered, release) = block_next_sidecar_install(&store);
+        store.put(staged[0].clone()).unwrap();
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(store.put_batch(staged[1..].to_vec()).unwrap().len(), 64);
+        {
+            let state = store.sidecar_installer.queue.state.lock().unwrap();
+            assert_eq!(
+                (state.pending.len(), state.active, state.unfinished.len()),
+                (63, 1, 64)
+            );
+            let actual_bound = sidecar_control_bytes(
+                state.pending.capacity(),
+                state.unfinished.capacity(),
+                store.sidecar_installer.limit,
+                state.directory_capacity,
+            )
+            .unwrap();
+            assert!(actual_bound <= state.control_bytes);
+            assert!(state.control_bytes > 0);
+        }
+        let charged = budget.used();
+        assert!(charged > 0 && charged <= budget.limit());
+        assert_eq!(budget.resident_used(), 0);
+        assert!(
+            afs_metrics::encode_text(&registry)
+                .unwrap()
+                .contains("afs_dfs_outboard_events_total{event=\"sidecar_install_dropped\"} 1\n")
+        );
+        release.send(()).unwrap();
+        store.sidecar_installer.wait_idle();
+        assert_eq!(
+            budget.used(),
+            charged,
+            "staged owners still retain every proof allocation"
+        );
+        let io = *store.sidecar_install_test.optional_io.lock().unwrap();
+        assert_eq!(
+            (io.writes, io.file_syncs, io.renames, io.directory_syncs),
+            (64, 64, 64, 3)
+        );
+        let retained = staged[0].outboard.clone();
+        drop(staged);
+        assert!(
+            budget.used() > 0,
+            "last independent holder must keep its charge"
+        );
+        drop(retained);
+        let idle_control = store
+            .sidecar_installer
+            .queue
+            .state
+            .lock()
+            .unwrap()
+            .control_bytes;
+        assert_eq!(
+            budget.used(),
+            idle_control,
+            "bounded idle control capacity must remain charged"
+        );
+        store.sidecar_installer.shutdown().unwrap();
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn p2_w0_installer_failure_keeps_ack_and_safe_read_repairs_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = afs_metrics::Registry::new();
+        let metrics = super::super::read_work::ReadWorkMetrics::register(&registry).unwrap();
+        let budget =
+            OutboardBudget::new_with_metrics(DEFAULT_OUTBOARD_BUDGET_BYTES, metrics.clone());
+        let staged = pooled_outboard_chunks(&budget, 1, 128 * 1024)
+            .pop()
+            .unwrap();
+        let store = LocalChunkStore::open(temp.path(), "node-a")
+            .unwrap()
+            .with_outboard_budget(budget)
+            .with_read_work_metrics(metrics);
+        let path = store
+            .outboards
+            .join(format!("{}.bao", safe_id(&staged.chunk.id.0)));
+        fs::create_dir(&path).unwrap();
+        let receipt = store.put(staged.clone()).unwrap();
+        store.sidecar_installer.wait_idle();
+        assert_eq!(receipt.chunk, staged.chunk);
+        assert!(
+            afs_metrics::encode_text(&registry)
+                .unwrap()
+                .contains("afs_dfs_outboard_events_total{event=\"sidecar_install_failed\"} 1\n")
+        );
+        fs::remove_dir(&path).unwrap();
+        let catalog = fs::read(&store.catalog_path).unwrap();
+        take_outboard_persist_io();
+        for _ in 0..2 {
+            let reader = store.open_verified(&staged.chunk.id).unwrap();
+            let mut out = [0; 19];
+            assert_eq!(reader.read_at(3, &mut out).unwrap(), out.len());
+            assert_eq!(out, staged.bytes()[3..22]);
+        }
+        assert_eq!(take_outboard_persist_io().writes, 1);
+        assert_eq!(fs::read(&store.catalog_path).unwrap(), catalog);
+        assert_eq!(
+            fs::read(path).unwrap(),
+            staged.outboard.as_ref().unwrap().encoded()
+        );
+    }
+
+    #[test]
+    fn p2_w0_ack_before_sidecar_keeps_verified_full_scan_fallback_and_repair() {
+        let temp = tempfile::tempdir().unwrap();
+        let budget = OutboardBudget::new(DEFAULT_OUTBOARD_BUDGET_BYTES);
+        let staged = pooled_outboard_chunks(&budget, 1, 4 * 1024 * 1024)
+            .pop()
+            .unwrap();
+        let store = LocalChunkStore::open(temp.path(), "node-a")
+            .unwrap()
+            .with_outboard_budget(budget);
+        let (entered, release) = block_next_sidecar_install(&store);
+        let receipt = store.put(staged.clone()).unwrap();
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        let path = store
+            .outboards
+            .join(format!("{}.bao", safe_id(&staged.chunk.id.0)));
+        assert!(
+            !path.exists(),
+            "installer is explicitly blocked before sidecar installation"
+        );
+        let catalog = fs::read(&store.catalog_path).unwrap();
+        VERIFIED_SCAN_BYTES.with(|count| count.set(0));
+        take_outboard_persist_io();
+        let payload = store.read_peer_range(&staged.chunk.id, 3, 17).unwrap();
+        assert_eq!(payload.as_slice(), &staged.bytes()[3..20]);
+        assert_eq!(
+            VERIFIED_SCAN_BYTES.with(|count| count.get()),
+            staged.chunk.length
+        );
+        assert_eq!(
+            take_outboard_persist_io().writes,
+            1,
+            "missing optional proof is safely repaired once"
+        );
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            staged.outboard.as_ref().unwrap().encoded()
+        );
+        assert_eq!(fs::read(&store.catalog_path).unwrap(), catalog);
+        assert_eq!(receipt.chunk, staged.chunk);
+        release.send(()).unwrap();
+        store.sidecar_installer.wait_idle();
+        assert_eq!(
+            store
+                .sidecar_install_test
+                .optional_io
+                .lock()
+                .unwrap()
+                .writes,
+            0,
+            "installer rechecks the sidecar repaired by the verified read"
+        );
+    }
+
+    #[test]
+    fn p2_w0_control_metadata_admission_failure_drops_optional_work_not_ack() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = afs_metrics::Registry::new();
+        let metrics = super::super::read_work::ReadWorkMetrics::register(&registry).unwrap();
+        let budget =
+            OutboardBudget::new_with_metrics(DEFAULT_OUTBOARD_BUDGET_BYTES, metrics.clone());
+        let staged = pooled_outboard_chunks(&budget, 1, 128 * 1024)
+            .pop()
+            .unwrap();
+        let store = LocalChunkStore::open(temp.path(), "node-a")
+            .unwrap()
+            .with_outboard_budget(budget.clone())
+            .with_read_work_metrics(metrics);
+        let pressure = budget
+            .try_reserve(budget.limit() - budget.used() - 1)
+            .unwrap();
+        let before = budget.used();
+        let receipt = store.put(staged.clone()).unwrap();
+        assert_eq!(receipt.chunk, staged.chunk);
+        assert_eq!(budget.used(), before);
+        assert_eq!(
+            store
+                .sidecar_installer
+                .queue
+                .state
+                .lock()
+                .unwrap()
+                .control_bytes,
+            0
+        );
+        assert!(store.sidecar_installer.worker.lock().unwrap().is_none());
+        assert!(
+            afs_metrics::encode_text(&registry)
+                .unwrap()
+                .contains("afs_dfs_outboard_events_total{event=\"sidecar_install_dropped\"} 1\n")
+        );
+        drop(pressure);
+        take_outboard_persist_io();
+        drop(store.open_verified(&staged.chunk.id).unwrap());
+        assert_eq!(take_outboard_persist_io().writes, 1);
+    }
+
+    #[test]
+    fn p2_w0_control_charge_is_observed_before_optional_worker_start_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = afs_metrics::Registry::new();
+        let metrics = super::super::read_work::ReadWorkMetrics::register(&registry).unwrap();
+        let budget =
+            OutboardBudget::new_with_metrics(DEFAULT_OUTBOARD_BUDGET_BYTES, metrics.clone());
+        let staged = pooled_outboard_chunks(&budget, 1, 128 * 1024)
+            .pop()
+            .unwrap();
+        let store = LocalChunkStore::open(temp.path(), "node-a")
+            .unwrap()
+            .with_outboard_budget(budget.clone())
+            .with_read_work_metrics(metrics)
+            .with_sidecar_install_queue(2)
+            .unwrap();
+        assert!(
+            afs_metrics::encode_text(&registry)
+                .unwrap()
+                .contains("afs_dfs_sidecar_install_items{state=\"limit\"} 2\n")
+        );
+        store
+            .sidecar_install_test
+            .fail_worker_start
+            .store(true, Ordering::Relaxed);
+        let receipt = store.put(staged.clone()).unwrap();
+        assert_eq!(receipt.chunk, staged.chunk);
+        let control_bytes = store
+            .sidecar_installer
+            .queue
+            .state
+            .lock()
+            .unwrap()
+            .control_bytes;
+        assert!(control_bytes > 0);
+        let text = afs_metrics::encode_text(&registry).unwrap();
+        assert!(
+            text.contains(&format!(
+                "afs_dfs_sidecar_install_control_bytes {control_bytes}\n"
+            )),
+            "{text}"
+        );
+        assert!(
+            text.contains("afs_dfs_outboard_events_total{event=\"sidecar_install_failed\"} 1\n")
+        );
+        assert!(store.sidecar_installer.worker.lock().unwrap().is_none());
+        drop(staged);
+        assert_eq!(budget.used(), control_bytes);
+        store.sidecar_installer.shutdown().unwrap();
+        assert_eq!(budget.used(), 0);
+        assert!(
+            afs_metrics::encode_text(&registry)
+                .unwrap()
+                .contains("afs_dfs_sidecar_install_control_bytes 0\n")
+        );
+    }
+
+    #[test]
+    fn p2_w0_deadline_between_install_and_directory_barrier_skips_new_sync() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = afs_metrics::Registry::new();
+        let metrics = super::super::read_work::ReadWorkMetrics::register(&registry).unwrap();
+        let budget =
+            OutboardBudget::new_with_metrics(DEFAULT_OUTBOARD_BUDGET_BYTES, metrics.clone());
+        let staged = pooled_outboard_chunks(&budget, 1, 128 * 1024)
+            .pop()
+            .unwrap();
+        let store = LocalChunkStore::open(temp.path(), "node-a")
+            .unwrap()
+            .with_outboard_budget(budget)
+            .with_read_work_metrics(metrics);
+        let (entered, entered_rx) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        *store
+            .sidecar_install_test
+            .before_directory_sync
+            .lock()
+            .unwrap() = Some((entered, release_rx));
+        let receipt = store.put(staged.clone()).unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            fs::read(
+                store
+                    .outboards
+                    .join(format!("{}.bao", safe_id(&staged.chunk.id.0)))
+            )
+            .unwrap(),
+            staged.outboard.as_ref().unwrap().encoded()
+        );
+        store.sidecar_installer.close(Instant::now());
+        release.send(()).unwrap();
+        store.sidecar_installer.wait_idle();
+        let io = *store.sidecar_install_test.optional_io.lock().unwrap();
+        assert_eq!(
+            (io.writes, io.file_syncs, io.renames, io.directory_syncs),
+            (1, 1, 1, 0)
+        );
+        assert!(
+            afs_metrics::encode_text(&registry)
+                .unwrap()
+                .contains("afs_dfs_outboard_events_total{event=\"sidecar_install_dropped\"} 1\n")
+        );
+        assert_eq!(receipt.chunk, staged.chunk);
+        assert_eq!(
+            fs::read(store.chunk_path(&staged.chunk.id)).unwrap(),
+            staged.bytes()
+        );
+        store.sidecar_installer.shutdown().unwrap();
+    }
+
+    #[test]
+    fn p2_w0_all_configured_queue_sizes_can_admit_real_sidecars() {
+        for limit in [1, 32, 64] {
+            let temp = tempfile::tempdir().unwrap();
+            let budget = OutboardBudget::new(DEFAULT_OUTBOARD_BUDGET_BYTES);
+            let staged = pooled_outboard_chunks(&budget, 1, 128 * 1024)
+                .pop()
+                .unwrap();
+            let store = LocalChunkStore::open(temp.path(), "node-a")
+                .unwrap()
+                .with_outboard_budget(budget.clone())
+                .with_sidecar_install_queue(limit)
+                .unwrap();
+            store.put(staged.clone()).unwrap();
+            store.sidecar_installer.wait_idle();
+            assert_eq!(
+                fs::read(
+                    store
+                        .outboards
+                        .join(format!("{}.bao", safe_id(&staged.chunk.id.0)))
+                )
+                .unwrap(),
+                staged.outboard.as_ref().unwrap().encoded(),
+                "queue limit={limit}"
+            );
+            drop(staged);
+            store.sidecar_installer.shutdown().unwrap();
+            assert_eq!(budget.used(), 0, "queue limit={limit}");
+        }
+    }
+
+    #[test]
+    fn p2_w0_control_path_allowance_covers_long_lengths_and_checks_overflow() {
+        for length in [0, 64, 1024, 4095] {
+            let allowance = sidecar_path_bytes(length).unwrap();
+            let directory = length;
+            let formal_join = 2 * (length + SIDECAR_ID_CAPACITY);
+            let temporary_join = 2 * (length + 128);
+            assert!(
+                allowance >= directory + formal_join + temporary_join + SIDECAR_ID_CAPACITY + 128
+            );
+            assert!(sidecar_control_bytes(64, 112, 64, length).unwrap() >= allowance);
+        }
+        assert!(sidecar_path_bytes(usize::MAX).is_none());
+        assert!(sidecar_control_bytes(usize::MAX, 112, 64, 4095).is_none());
+    }
+
+    #[test]
+    fn p2_w0_stop_rejects_new_items_discards_pending_and_keeps_active_owned() {
+        let temp = tempfile::tempdir().unwrap();
+        let budget = OutboardBudget::new(DEFAULT_OUTBOARD_BUDGET_BYTES);
+        let staged = pooled_outboard_chunks(&budget, 3, 4096);
+        let store = LocalChunkStore::open(temp.path(), "node-a")
+            .unwrap()
+            .with_outboard_budget(budget.clone());
+        let (entered, release) = block_next_sidecar_install(&store);
+        store.put(staged[0].clone()).unwrap();
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        store.put(staged[1].clone()).unwrap();
+        store.sidecar_installer.close(Instant::now());
+        let deadline = store.sidecar_installer.queue.state.lock().unwrap().deadline;
+        store
+            .sidecar_installer
+            .close(Instant::now() + Duration::from_secs(1));
+        assert_eq!(
+            store.sidecar_installer.queue.state.lock().unwrap().deadline,
+            deadline
+        );
+        store.put(staged[2].clone()).unwrap();
+        assert!(budget.used() > 0);
+        release.send(()).unwrap();
+        store.sidecar_installer.shutdown().unwrap();
+        let state = store.sidecar_installer.queue.state.lock().unwrap();
+        assert_eq!(
+            (state.pending.len(), state.active, state.unfinished.len()),
+            (0, 0, 0)
+        );
+        drop(state);
+        for item in &staged[1..] {
+            assert!(
+                !store
+                    .outboards
+                    .join(format!("{}.bao", safe_id(&item.chunk.id.0)))
+                    .exists()
+            );
+        }
+        assert!(budget.used() > 0);
+        drop(staged);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    #[ignore = "child process only; invoked by the bounded crash-recovery test"]
+    fn p2_w0_crash_after_ack_child() {
+        let Ok(root) = std::env::var("AFS_TEST_SIDECAR_CRASH_ROOT") else {
+            return;
+        };
+        let budget = OutboardBudget::new(DEFAULT_OUTBOARD_BUDGET_BYTES);
+        let staged = pooled_outboard_chunks(&budget, 1, 128 * 1024)
+            .pop()
+            .unwrap();
+        let store = LocalChunkStore::open(root, "node-a")
+            .unwrap()
+            .with_outboard_budget(budget);
+        let (entered, _release) = block_next_sidecar_install(&store);
+        store.put(staged).unwrap();
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        std::process::exit(73);
+    }
+
+    #[test]
+    fn p2_w0_crash_after_ack_recovers_body_and_repairs_sidecar_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "node::chunk::replica_replay_tests::p2_w0_crash_after_ack_child",
+                "--nocapture",
+            ])
+            .env("AFS_TEST_SIDECAR_CRASH_ROOT", temp.path())
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(73),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let staged = StagedChunk::new(OperationId::new("expected"), vec![0; 128 * 1024]);
+        let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+        let catalog = fs::read(&store.catalog_path).unwrap();
+        take_outboard_persist_io();
+        for _ in 0..2 {
+            let reader = store.open_verified(&staged.chunk.id).unwrap();
+            let mut out = vec![0xa5; staged.bytes().len() + 1];
+            assert_eq!(reader.read_at(0, &mut out).unwrap(), staged.bytes().len());
+            assert_eq!(&out[..staged.bytes().len()], staged.bytes());
+            assert_eq!(out[staged.bytes().len()], 0xa5);
+            assert_eq!(reader.read_at(staged.chunk.length, &mut [0; 1]).unwrap(), 0);
+        }
+        assert_eq!(take_outboard_persist_io().writes, 1);
+        assert_eq!(fs::read(&store.catalog_path).unwrap(), catalog);
+    }
+
+    #[test]
+    #[ignore = "child process only; invoked by the blocked-worker watchdog test"]
+    fn p2_w0_blocked_worker_watchdog_child() {
+        if std::env::var_os("AFS_TEST_SIDECAR_WATCHDOG").is_none() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let budget = OutboardBudget::new(DEFAULT_OUTBOARD_BUDGET_BYTES);
+        let staged = pooled_outboard_chunks(&budget, 1, 128 * 1024)
+            .pop()
+            .unwrap();
+        let store = LocalChunkStore::open(temp.path(), "node-a")
+            .unwrap()
+            .with_outboard_budget(budget);
+        let (entered, _release) = block_next_sidecar_install(&store);
+        store.put(staged).unwrap();
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        let watchdog = crate::runtime::ShutdownDeadline::new(Duration::from_millis(100)).unwrap();
+        watchdog.trigger().arm();
+        // Joining must keep ownership of this blocked worker. Only the
+        // independent process watchdog is allowed to end this failure case.
+        store.sidecar_installer.shutdown().unwrap();
+        watchdog.complete();
+    }
+
+    #[test]
+    fn p2_w0_blocked_worker_uses_existing_failure_watchdog_not_detach() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "node::chunk::replica_replay_tests::p2_w0_blocked_worker_watchdog_child",
+                "--nocapture",
+            ])
+            .env("AFS_TEST_SIDECAR_WATCHDOG", "1")
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(124),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     fn pooled_outboard_chunks(
         budget: &Arc<OutboardBudget>,
         count: usize,
@@ -2853,6 +4811,91 @@ mod replica_replay_tests {
         OUTBOARD_PERSIST_IO.with(|counts| std::mem::take(&mut *counts.borrow_mut()))
     }
 
+    fn take_store_outboard_persist_io(store: &LocalChunkStore) -> OutboardPersistIo {
+        store.sidecar_installer.wait_idle();
+        let mut io = take_outboard_persist_io();
+        let background =
+            std::mem::take(&mut *store.sidecar_install_test.optional_io.lock().unwrap());
+        io.writes += background.writes;
+        io.file_syncs += background.file_syncs;
+        io.renames += background.renames;
+        io.directory_syncs += background.directory_syncs;
+        io
+    }
+
+    #[test]
+    fn coarse_persist_diagnostics_preserve_body_proof_barriers_and_receipts() {
+        for enabled in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let registry = afs_metrics::Registry::new();
+            let metrics = super::super::read_work::ReadWorkMetrics::register(&registry)
+                .unwrap()
+                .with_read_diagnostics(enabled);
+            let budget = OutboardBudget::new(DEFAULT_OUTBOARD_BUDGET_BYTES);
+            let staged = pooled_outboard_chunks(&budget, 2, 128 * 1024);
+            let store = LocalChunkStore::open(temp.path(), "node-a")
+                .unwrap()
+                .with_outboard_budget(budget)
+                .with_read_work_metrics(metrics.clone());
+            take_store_outboard_persist_io(&store);
+            let receipts = store.put_batch(staged.clone()).unwrap();
+            store.sidecar_installer.wait_idle();
+            assert_eq!(receipts.len(), 2);
+            assert_eq!(
+                take_store_outboard_persist_io(&store),
+                OutboardPersistIo {
+                    writes: 2,
+                    file_syncs: 2,
+                    renames: 2,
+                    directory_syncs: 1,
+                }
+            );
+            for (receipt, item) in receipts.iter().zip(&staged) {
+                assert_eq!(receipt.chunk, item.chunk);
+                assert_eq!(
+                    receipt.durable_acks[0].verified_digest,
+                    item.chunk.content_digest
+                );
+                assert_eq!(
+                    fs::read(store.chunk_path(&item.chunk.id)).unwrap(),
+                    item.bytes()
+                );
+            }
+            match metrics.diagnostics_snapshot() {
+                None => assert!(!enabled),
+                Some(snapshot) => {
+                    assert!(enabled);
+                    assert_eq!(snapshot.records.len(), 1);
+                    assert_eq!(
+                        snapshot.records[0].stage,
+                        super::super::read_work::ReadDiagnosticStage::PersistBatch
+                    );
+                    assert!(snapshot.records[0].success);
+                    assert_eq!(snapshot.overflow, 0);
+                    for (name, calls) in [
+                        ("persist_batch", 1),
+                        ("persist_body_write", 2),
+                        ("persist_body_sync", 2),
+                        ("persist_chunks_dir_sync", 1),
+                        ("persist_catalog_write", 1),
+                        ("persist_catalog_sync", 1),
+                        ("persist_catalog_parent_sync", 1),
+                        ("persist_proof_install_sync", 2),
+                        ("persist_proof_dir_sync", 1),
+                    ] {
+                        let phase = snapshot
+                            .coarse_phases
+                            .iter()
+                            .find(|phase| phase.phase == name)
+                            .unwrap();
+                        assert_eq!(phase.calls, calls, "{name}");
+                        assert!(phase.last_end_ns >= phase.first_start_ns, "{name}");
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn pr60_healthy_sidecars_are_read_only_across_peer_objects_and_pinned_opens() {
         let temp = tempfile::tempdir().unwrap();
@@ -2862,6 +4905,7 @@ mod replica_replay_tests {
             .unwrap()
             .with_outboard_budget(budget);
         store.put_batch(staged.clone()).unwrap();
+        store.sidecar_installer.wait_idle();
         let catalog = fs::read(&store.catalog_path).unwrap();
         let catalog_identity =
             PeerFileIdentity::read(&File::open(&store.catalog_path).unwrap()).unwrap();
@@ -2875,7 +4919,7 @@ mod replica_replay_tests {
                 )
             })
             .collect::<Vec<_>>();
-        take_outboard_persist_io();
+        take_store_outboard_persist_io(&store);
         for item in &staged {
             let payload = store
                 .read_peer_range(&item.chunk.id, 0, item.bytes().len())
@@ -2888,7 +4932,7 @@ mod replica_replay_tests {
             assert_eq!(&out, &item.bytes()[7..30]);
         }
         assert_eq!(
-            take_outboard_persist_io(),
+            take_store_outboard_persist_io(&store),
             OutboardPersistIo::default(),
             "healthy read paths must not write or fsync sidecars"
         );
@@ -2920,6 +4964,7 @@ mod replica_replay_tests {
                 .with_outboard_budget(budget),
         );
         store.put(staged.clone()).unwrap();
+        store.sidecar_installer.wait_idle();
         let proof_path = store
             .outboards
             .join(format!("{}.bao", safe_id(&staged.chunk.id.0)));
@@ -2983,6 +5028,7 @@ mod replica_replay_tests {
                 .with_outboard_budget(budget),
         );
         store.put(staged.clone()).unwrap();
+        store.sidecar_installer.wait_idle();
         fs::remove_file(
             store
                 .outboards
@@ -3027,6 +5073,7 @@ mod replica_replay_tests {
             .unwrap()
             .with_outboard_budget(budget);
         store.put(staged.clone()).unwrap();
+        store.sidecar_installer.wait_idle();
         let path = store
             .outboards
             .join(format!("{}.bao", safe_id(&staged.chunk.id.0)));
@@ -3034,12 +5081,12 @@ mod replica_replay_tests {
         bytes[64] ^= 1;
         fs::write(&path, bytes).unwrap();
         let catalog = fs::read(&store.catalog_path).unwrap();
-        take_outboard_persist_io();
+        take_store_outboard_persist_io(&store);
         for _ in 0..2 {
             drop(store.open_verified(&staged.chunk.id).unwrap());
         }
         assert_eq!(
-            take_outboard_persist_io(),
+            take_store_outboard_persist_io(&store),
             OutboardPersistIo {
                 writes: 1,
                 file_syncs: 1,
@@ -3069,12 +5116,13 @@ mod replica_replay_tests {
             .unwrap()
             .with_outboard_budget(budget.clone());
         store.put(staged.clone()).unwrap();
+        store.sidecar_installer.wait_idle();
         let reader = store.open_verified(&staged.chunk.id).unwrap();
         let proof = reader.load_outboard().unwrap().unwrap();
         let sidecar = fs::read(&reader.outboard_path).unwrap();
         let before = budget.used();
         let held = budget.try_reserve(budget.limit() - budget.used()).unwrap();
-        take_outboard_persist_io();
+        take_store_outboard_persist_io(&store);
         let mut out = [0xa5; 23];
         assert_eq!(reader.read_at(3, &mut out).unwrap(), out.len());
         assert_eq!(&out, &staged.bytes()[3..26]);
@@ -3082,7 +5130,10 @@ mod replica_replay_tests {
             reader.outboard.lock().unwrap().as_ref().unwrap(),
             &proof
         ));
-        assert_eq!(take_outboard_persist_io(), OutboardPersistIo::default());
+        assert_eq!(
+            take_store_outboard_persist_io(&store),
+            OutboardPersistIo::default()
+        );
         assert_eq!(fs::read(&reader.outboard_path).unwrap(), sidecar);
         drop(held);
         assert_eq!(budget.used(), before);
@@ -3110,6 +5161,7 @@ mod replica_replay_tests {
             .unwrap()
             .with_outboard_budget(budget);
         store.put(staged.clone()).unwrap();
+        store.sidecar_installer.wait_idle();
         let cached = store
             .read_peer_range(&staged.chunk.id, 0, staged.bytes().len())
             .unwrap();
@@ -3121,7 +5173,7 @@ mod replica_replay_tests {
             .outboards
             .join(format!("{}.bao", safe_id(&staged.chunk.id.0)));
         fs::remove_file(&path).unwrap();
-        take_outboard_persist_io();
+        take_store_outboard_persist_io(&store);
         let hit = store.read_peer_range(&staged.chunk.id, 3, 17).unwrap();
         assert_eq!(hit.as_slice(), &staged.bytes()[3..20]);
         assert!(Arc::ptr_eq(&hit.object, &cached.object));
@@ -3129,10 +5181,13 @@ mod replica_replay_tests {
             !path.exists(),
             "a verified hot hit must not recreate an optional sidecar"
         );
-        assert_eq!(take_outboard_persist_io(), OutboardPersistIo::default());
+        assert_eq!(
+            take_store_outboard_persist_io(&store),
+            OutboardPersistIo::default()
+        );
         // Retain the old payload to prove slot eviction does not retire an
         // active allocation, while the next miss independently repairs proof.
-        store.peer_read_cache.lock().unwrap().take();
+        store.clear_peer_residents_for_test();
         let miss = store
             .read_peer_range(&staged.chunk.id, 0, staged.bytes().len())
             .unwrap();
@@ -3144,7 +5199,7 @@ mod replica_replay_tests {
             staged.outboard.as_ref().unwrap().encoded()
         );
         assert_eq!(
-            take_outboard_persist_io(),
+            take_store_outboard_persist_io(&store),
             OutboardPersistIo {
                 writes: 1,
                 file_syncs: 1,
@@ -3163,13 +5218,16 @@ mod replica_replay_tests {
             .unwrap()
             .with_outboard_budget(budget);
         store.put_batch(staged.clone()).unwrap();
+        store.sidecar_installer.wait_idle();
         let cached = store
             .read_peer_range(&staged[0].chunk.id, 0, staged[0].bytes().len())
             .unwrap();
         let range = store.read_peer_range(&staged[1].chunk.id, 3, 17).unwrap();
         assert_eq!(range.as_slice(), &staged[1].bytes()[3..20]);
         assert!(Arc::ptr_eq(
-            store.peer_read_cache.lock().unwrap().as_ref().unwrap(),
+            store.peer_read_cache.lock().unwrap().residents[0]
+                .as_ref()
+                .unwrap(),
             &cached.object
         ));
         assert!(
@@ -3178,7 +5236,9 @@ mod replica_replay_tests {
                 .is_err()
         );
         assert!(Arc::ptr_eq(
-            store.peer_read_cache.lock().unwrap().as_ref().unwrap(),
+            store.peer_read_cache.lock().unwrap().residents[0]
+                .as_ref()
+                .unwrap(),
             &cached.object
         ));
     }
@@ -3204,6 +5264,7 @@ mod replica_replay_tests {
             );
             let id = staged.chunk.id.clone();
             store.put(staged).unwrap();
+            store.sidecar_installer.wait_idle();
             let reader = store.open_verified(&id).unwrap();
             let mut out = [0; 8];
             VERIFIED_SCAN_BYTES.with(|count| count.set(0));
@@ -3218,8 +5279,21 @@ mod replica_replay_tests {
             assert!(budget.used() <= budget.limit());
             assert!(budget.resident_used() <= budget.resident_limit());
         }
-        assert!(budget.try_reserve_range_work().is_some());
+        assert!(
+            budget
+                .reserve_range_work(
+                    &[VerifiedRangeCopy {
+                        chunk_offset: 0,
+                        length: 8,
+                        output_offset: 0,
+                    }],
+                    body.len() as u64,
+                )
+                .is_some()
+        );
         drop(readers);
+        store.sidecar_installer.wait_idle();
+        store.sidecar_installer.shutdown().unwrap();
         assert_eq!(budget.used(), 0);
     }
 
@@ -3231,11 +5305,12 @@ mod replica_replay_tests {
         let store = LocalChunkStore::open(temp.path(), "node-a")
             .unwrap()
             .with_outboard_budget(budget);
-        take_outboard_persist_io();
+        take_store_outboard_persist_io(&store);
         let receipts = store.put_batch(staged.clone()).unwrap();
+        store.sidecar_installer.wait_idle();
         assert_eq!(receipts.len(), 16);
         assert_eq!(
-            take_outboard_persist_io(),
+            take_store_outboard_persist_io(&store),
             OutboardPersistIo {
                 writes: 16,
                 file_syncs: 16,
@@ -3261,10 +5336,10 @@ mod replica_replay_tests {
             revision
         );
         assert_eq!(
-            take_outboard_persist_io(),
+            take_store_outboard_persist_io(&store),
             OutboardPersistIo {
                 writes: 0,
-                file_syncs: 16,
+                file_syncs: 0,
                 renames: 0,
                 directory_syncs: 1,
             }
@@ -3279,14 +5354,15 @@ mod replica_replay_tests {
         let store = LocalChunkStore::open(temp.path(), "node-a")
             .unwrap()
             .with_outboard_budget(budget);
-        take_outboard_persist_io();
+        take_store_outboard_persist_io(&store);
         for pair in staged.chunks(2) {
             let mut batch = pair.to_vec();
             batch.extend_from_slice(pair);
             assert_eq!(store.put_batch(batch).unwrap().len(), 4);
+            store.sidecar_installer.wait_idle();
         }
         assert_eq!(
-            take_outboard_persist_io(),
+            take_store_outboard_persist_io(&store),
             OutboardPersistIo {
                 writes: 4,
                 file_syncs: 4,
@@ -3295,13 +5371,17 @@ mod replica_replay_tests {
             }
         );
         store.put_batch(Vec::new()).unwrap();
+        store.sidecar_installer.wait_idle();
         store
             .put(StagedChunk::new(
                 OperationId::new("no-proof"),
                 vec![8; 4096],
             ))
             .unwrap();
-        assert_eq!(take_outboard_persist_io(), OutboardPersistIo::default());
+        assert_eq!(
+            take_store_outboard_persist_io(&store),
+            OutboardPersistIo::default()
+        );
     }
 
     #[test]
@@ -3315,6 +5395,7 @@ mod replica_replay_tests {
             .unwrap()
             .with_outboard_budget(budget);
         store.put(staged.clone()).unwrap();
+        store.sidecar_installer.wait_idle();
         let path = store
             .outboards
             .join(format!("{}.bao", safe_id(&staged.chunk.id.0)));
@@ -3322,14 +5403,15 @@ mod replica_replay_tests {
         corrupt[64] ^= 1;
         ChunkOutboard::validate_encoded_shape(&staged.chunk, &corrupt).unwrap();
         fs::write(&path, corrupt).unwrap();
-        take_outboard_persist_io();
+        take_store_outboard_persist_io(&store);
         store.put(staged.clone()).unwrap();
+        store.sidecar_installer.wait_idle();
         assert_eq!(
             fs::read(path).unwrap(),
             staged.outboard.as_ref().unwrap().encoded()
         );
         assert_eq!(
-            take_outboard_persist_io(),
+            take_store_outboard_persist_io(&store),
             OutboardPersistIo {
                 writes: 1,
                 file_syncs: 1,
@@ -3351,10 +5433,10 @@ mod replica_replay_tests {
             .outboards
             .join(format!("{}.bao", safe_id(&staged[0].chunk.id.0)));
         fs::create_dir(&blocked).unwrap();
-        take_outboard_persist_io();
+        take_store_outboard_persist_io(&store);
         assert_eq!(store.put_batch(staged.clone()).unwrap().len(), 2);
         assert_eq!(
-            take_outboard_persist_io(),
+            take_store_outboard_persist_io(&store),
             OutboardPersistIo {
                 writes: 2,
                 file_syncs: 2,
@@ -3370,23 +5452,26 @@ mod replica_replay_tests {
                 .ends_with(".tmp")
         }));
         fs::remove_dir(blocked).unwrap();
-        FAIL_OUTBOARD_DIRECTORY_SYNC.with(|fail| fail.set(true));
+        store
+            .sidecar_install_test
+            .fail_directory_sync
+            .store(true, Ordering::Relaxed);
         assert_eq!(store.put_batch(staged.clone()).unwrap().len(), 2);
         assert_eq!(
-            take_outboard_persist_io(),
+            take_store_outboard_persist_io(&store),
             OutboardPersistIo {
                 writes: 1,
-                file_syncs: 2,
+                file_syncs: 1,
                 renames: 1,
                 directory_syncs: 0,
             }
         );
         assert_eq!(store.put_batch(staged.clone()).unwrap().len(), 2);
         assert_eq!(
-            take_outboard_persist_io(),
+            take_store_outboard_persist_io(&store),
             OutboardPersistIo {
                 writes: 0,
-                file_syncs: 2,
+                file_syncs: 0,
                 renames: 0,
                 directory_syncs: 1,
             }
@@ -3449,7 +5534,15 @@ mod replica_replay_tests {
         assert_eq!(whole.as_slice(), staged.bytes());
         assert!(whole.object.identity.is_none());
         assert!(whole.verified_full_object_digest().is_none());
-        assert!(store.peer_read_cache.lock().unwrap().is_none());
+        assert!(
+            store
+                .peer_read_cache
+                .lock()
+                .unwrap()
+                .residents
+                .iter()
+                .all(Option::is_none)
+        );
         drop(whole);
         assert_eq!(store.peer_read_budget.used.load(Ordering::Acquire), 0);
     }
@@ -3466,7 +5559,7 @@ mod replica_replay_tests {
         let digest = whole.verified_full_object_digest().unwrap();
         let bytes = whole.into_shared_bytes();
         let frame = bytes.slice(17..100);
-        store.peer_read_cache.lock().unwrap().take();
+        store.clear_peer_residents_for_test();
         drop(bytes);
         assert_eq!(
             store.peer_read_budget.used.load(Ordering::Acquire),
@@ -3620,6 +5713,9 @@ mod replica_replay_tests {
             .unwrap()
             .with_outboard_budget(budget.clone());
         store.put(staged.clone()).unwrap();
+        // This assertion is specifically about a completed optional install,
+        // not the earlier durable body/catalog ACK.
+        store.sidecar_installer.wait_idle();
         let proof_path = store
             .outboards
             .join(format!("{}.bao", safe_id(&staged.chunk.id.0)));
@@ -3648,6 +5744,9 @@ mod replica_replay_tests {
             .unwrap()
             .with_outboard_budget(budget);
         store.put(staged.clone()).unwrap();
+        // Measure the proof-ready range path. An ACK-before-sidecar read may
+        // legitimately verify the full object, covered separately above.
+        store.sidecar_installer.wait_idle();
         VERIFIED_SCAN_BYTES.with(|count| count.set(0));
         let payload = store.read_peer_range(&staged.chunk.id, 3, 17).unwrap();
         assert_eq!(payload.as_slice(), &[11; 17]);
@@ -3730,7 +5829,15 @@ mod replica_replay_tests {
                 );
             } else {
                 assert!(result.is_err(), "{change} must not reuse a stale proof");
-                assert!(store.peer_read_cache.lock().unwrap().is_none());
+                assert!(
+                    store
+                        .peer_read_cache
+                        .lock()
+                        .unwrap()
+                        .residents
+                        .iter()
+                        .all(Option::is_none)
+                );
             }
         }
     }
@@ -3743,14 +5850,26 @@ mod replica_replay_tests {
         store.put(staged.clone()).unwrap();
         fs::write(store.chunk_path(&staged.chunk.id), vec![9; 4096]).unwrap();
         assert!(store.read_peer_range(&staged.chunk.id, 0, 3).is_err());
-        assert!(store.peer_read_cache.lock().unwrap().is_none());
+        assert!(
+            store
+                .peer_read_cache
+                .lock()
+                .unwrap()
+                .residents
+                .iter()
+                .all(Option::is_none)
+        );
         assert_eq!(store.peer_read_budget.used.load(Ordering::Acquire), 0);
     }
 
     #[test]
     fn peer_object_evicted_references_and_packed_payload_share_the_limit() {
         let temp = tempfile::tempdir().unwrap();
-        let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+        let payload_limit = 8 * 1024 * 1024;
+        let store = LocalChunkStore::open(temp.path(), "node-a")
+            .unwrap()
+            .with_peer_serve_config(1, payload_limit as u64)
+            .unwrap();
         let chunks: Vec<_> = (1..=3)
             .map(|byte| {
                 let chunk = StagedChunk::new(
@@ -3765,7 +5884,7 @@ mod replica_replay_tests {
         let second = store.read_peer_range(&chunks[1].chunk.id, 0, 1).unwrap();
         assert_eq!(
             store.peer_read_budget.used.load(Ordering::Acquire),
-            PEER_READ_PAYLOAD_LIMIT as u64
+            payload_limit as u64
         );
         assert_eq!(
             store
@@ -3786,7 +5905,7 @@ mod replica_replay_tests {
         assert!(store.read_peer_range(&chunks[2].chunk.id, 0, 1).is_ok());
         assert_eq!(
             store.peer_read_budget.used.load(Ordering::Acquire),
-            PEER_READ_PAYLOAD_LIMIT as u64
+            payload_limit as u64
         );
         drop(packed);
         assert_eq!(
@@ -3795,7 +5914,7 @@ mod replica_replay_tests {
         );
         assert_eq!(
             store
-                .reserve_peer_read_payload(PEER_READ_PAYLOAD_LIMIT + 1)
+                .reserve_peer_read_payload(payload_limit + 1)
                 .unwrap_err()
                 .code(),
             afs_error::IO_CAPACITY
@@ -3816,6 +5935,428 @@ mod replica_replay_tests {
     }
 
     #[test]
+    fn p2_r6_default_lru_and_control_owners_release_only_after_last_frame() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = afs_metrics::Registry::new();
+        let store = LocalChunkStore::open(temp.path(), "node-a")
+            .unwrap()
+            .with_read_work_metrics(
+                super::super::read_work::ReadWorkMetrics::register(&registry).unwrap(),
+            );
+        println!(
+            "R6_CONTROL fixed={} object={} flight={} cap={}",
+            peer_serve_fixed_control_bytes(),
+            std::mem::size_of::<PeerVerifiedObject>(),
+            std::mem::size_of::<PeerServeFlight>(),
+            PEER_SERVE_CONTROL_LIMIT
+        );
+        assert_eq!(store.peer_read_budget.limit, 16 * 1024 * 1024);
+        assert_eq!(store.peer_read_cache.lock().unwrap().resident_limit, 2);
+        let chunks: Vec<_> = (1..=3)
+            .map(|byte| {
+                StagedChunk::new(
+                    OperationId::new(format!("r6-lru-{byte}")),
+                    vec![byte; 64 * 1024],
+                )
+            })
+            .collect();
+        store.put_batch(chunks.clone()).unwrap();
+        drop(
+            store
+                .read_peer_range(&chunks[0].chunk.id, 0, 64 * 1024)
+                .unwrap(),
+        );
+        drop(
+            store
+                .read_peer_range(&chunks[1].chunk.id, 0, 64 * 1024)
+                .unwrap(),
+        );
+        // Refresh first, then third must evict second.
+        drop(
+            store
+                .read_peer_range(&chunks[0].chunk.id, 0, 64 * 1024)
+                .unwrap(),
+        );
+        let third = store
+            .read_peer_range(&chunks[2].chunk.id, 0, 64 * 1024)
+            .unwrap();
+        {
+            let state = store.peer_read_cache.lock().unwrap();
+            assert!(state.resident(&chunks[0].chunk.id).is_some());
+            assert!(state.resident(&chunks[1].chunk.id).is_none());
+            assert!(state.resident(&chunks[2].chunk.id).is_some());
+            assert_eq!(state.residents.iter().flatten().count(), 2);
+        }
+        let bytes = third.into_shared_bytes();
+        let frame = bytes.slice(17..100);
+        drop(bytes);
+        store.clear_peer_residents_for_test();
+        assert_eq!(
+            store.peer_read_budget.used.load(Ordering::Acquire),
+            64 * 1024
+        );
+        assert!(store.peer_read_budget.control_used.load(Ordering::Acquire) > 0);
+        assert!(
+            store.peer_read_budget.control_peak.load(Ordering::Acquire) as usize
+                + peer_serve_fixed_control_bytes()
+                <= PEER_SERVE_CONTROL_LIMIT
+        );
+        store.close_peer_serve_admission();
+        assert!(store.read_peer_range(&chunks[0].chunk.id, 0, 1).is_err());
+        assert_eq!(&frame[..], &[3; 83]);
+        assert_eq!(
+            store.peer_read_budget.used.load(Ordering::Acquire),
+            64 * 1024
+        );
+        drop(frame);
+        assert_eq!(store.peer_read_budget.used.load(Ordering::Acquire), 0);
+        assert_eq!(
+            store.peer_read_budget.control_used.load(Ordering::Acquire),
+            0
+        );
+        store.shutdown_peer_serve().unwrap();
+        let text = afs_metrics::encode_text(&registry).unwrap();
+        assert!(text.contains("afs_dfs_peer_serve_resources{resource=\"control_bytes\"} 0\n"));
+    }
+
+    #[test]
+    fn p2_r6_eight_keys_are_bounded_and_stop_does_not_release_active_flights() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+        let chunks: Vec<_> = (0..9)
+            .map(|index| {
+                StagedChunk::new(
+                    OperationId::new(format!("r6-keys-{index}")),
+                    vec![index; 64 * 1024],
+                )
+            })
+            .collect();
+        store.put_batch(chunks.clone()).unwrap();
+        let mut blocks = Vec::new();
+        for chunk in &chunks[..8] {
+            blocks.push(store.pause_next_peer_fill_for_test(chunk.chunk.id.clone()));
+        }
+        std::thread::scope(|scope| {
+            let mut readers = Vec::new();
+            for chunk in &chunks[..8] {
+                readers.push(scope.spawn(|| store.read_peer_range(&chunk.chunk.id, 0, 64 * 1024)));
+            }
+            for (entered, _) in &blocks {
+                entered.recv_timeout(Duration::from_secs(3)).unwrap();
+            }
+            {
+                let state = store.peer_read_cache.lock().unwrap();
+                assert_eq!(state.flights.iter().flatten().count(), 8);
+                assert_eq!(state.readers, 8);
+            }
+            assert_eq!(
+                store
+                    .read_peer_range(&chunks[8].chunk.id, 0, 64 * 1024)
+                    .unwrap_err()
+                    .code(),
+                afs_error::IO_CAPACITY
+            );
+            let charged = store.peer_read_budget.control_used.load(Ordering::Acquire);
+            store.close_peer_serve_admission();
+            let deadline = store.peer_read_cache.lock().unwrap().stop_deadline;
+            store.close_peer_serve_admission();
+            assert_eq!(
+                store.peer_read_cache.lock().unwrap().stop_deadline,
+                deadline
+            );
+            assert_eq!(
+                store.peer_read_budget.control_used.load(Ordering::Acquire),
+                charged
+            );
+            for (_, release) in &blocks {
+                release.send(()).unwrap();
+            }
+            for reader in readers {
+                assert!(reader.join().unwrap().is_err());
+            }
+        });
+        assert_eq!(store.peer_read_budget.used.load(Ordering::Acquire), 0);
+        assert_eq!(
+            store.peer_read_budget.control_used.load(Ordering::Acquire),
+            0
+        );
+        store.shutdown_peer_serve().unwrap();
+        let state = store.peer_read_cache.lock().unwrap();
+        assert_eq!(state.readers, 0);
+        assert!(state.flights.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn p2_r6_live_owner_blocks_reconfiguration_and_control_pressure_is_bounded() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+        let chunk = StagedChunk::new(OperationId::new("r6-reconfigure"), vec![91; 64 * 1024]);
+        store.put(chunk.clone()).unwrap();
+        let payload = store
+            .read_peer_range(&chunk.chunk.id, 0, 64 * 1024)
+            .unwrap();
+        let bytes = payload.into_shared_bytes();
+        store.clear_peer_residents_for_test();
+        assert!(store.with_peer_serve_config(1, 4 * 1024 * 1024).is_err());
+        assert_eq!(bytes[17], 91);
+        drop(bytes);
+
+        let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+        let control = store
+            .reserve_peer_control(PEER_SERVE_CONTROL_LIMIT - peer_serve_fixed_control_bytes())
+            .unwrap();
+        assert_eq!(
+            store
+                .read_peer_range(&chunk.chunk.id, 0, 64 * 1024)
+                .unwrap_err()
+                .code(),
+            afs_error::IO_CAPACITY
+        );
+        assert_eq!(store.peer_read_budget.used.load(Ordering::Acquire), 0);
+        drop(control);
+        let payload = store
+            .read_peer_range(&chunk.chunk.id, 0, 64 * 1024)
+            .unwrap();
+        assert_eq!(payload.as_slice(), chunk.bytes());
+        drop(payload);
+        store.shutdown_peer_serve().unwrap();
+    }
+
+    #[test]
+    fn p2_r6_bad_fill_shares_one_failure_and_never_installs_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+        let chunk = StagedChunk::new(OperationId::new("r6-bad-flight"), vec![13; 64 * 1024]);
+        store.put(chunk.clone()).unwrap();
+        let (entered, release) = store.pause_next_peer_fill_for_test(chunk.chunk.id.clone());
+        std::thread::scope(|scope| {
+            let leader = scope.spawn(|| store.read_peer_range(&chunk.chunk.id, 0, 64 * 1024));
+            entered.recv_timeout(Duration::from_secs(3)).unwrap();
+            let followers: Vec<_> = (0..7)
+                .map(|_| scope.spawn(|| store.read_peer_range(&chunk.chunk.id, 0, 64 * 1024)))
+                .collect();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while store.waiting_peer_fill_readers_for_test() < 7 {
+                assert!(
+                    Instant::now() < deadline,
+                    "followers did not join the blocked fill"
+                );
+                std::thread::yield_now();
+            }
+            fs::write(store.chunk_path(&chunk.chunk.id), vec![17; 64 * 1024]).unwrap();
+            release.send(()).unwrap();
+            let error = leader.join().unwrap().unwrap_err();
+            for follower in followers {
+                let failure = follower.join().unwrap().unwrap_err();
+                assert_eq!(
+                    (failure.code(), failure.kind()),
+                    (error.code(), error.kind())
+                );
+            }
+        });
+        assert!(
+            store
+                .peer_read_cache
+                .lock()
+                .unwrap()
+                .residents
+                .iter()
+                .all(Option::is_none)
+        );
+        assert_eq!(store.peer_read_budget.used.load(Ordering::Acquire), 0);
+        assert_eq!(
+            store.peer_read_budget.control_used.load(Ordering::Acquire),
+            0
+        );
+        store.shutdown_peer_serve().unwrap();
+    }
+
+    #[test]
+    fn p2_r6_zero_byte_lease_is_a_real_owner_until_its_last_drop() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+        let mut lease = store.reserve_peer_read_payload(0).unwrap();
+        assert_eq!(store.peer_read_budget.used.load(Ordering::Acquire), 0);
+        assert_eq!(Arc::strong_count(&store.peer_read_budget), 2);
+        store.close_peer_serve_admission();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let stopping = scope.spawn(|| {
+                started_tx.send(()).unwrap();
+                let result = store.shutdown_peer_serve();
+                done_tx.send(()).unwrap();
+                result
+            });
+            started_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            assert!(done_rx.recv_timeout(Duration::from_millis(100)).is_err());
+            // A pre-existing owner can retain capacity; shutdown must still see
+            // that real ownership even when its initial byte charge was zero.
+            lease.retain_capacity(31).unwrap();
+            assert_eq!(store.peer_read_budget.used.load(Ordering::Acquire), 31);
+            drop(lease);
+            stopping.join().unwrap().unwrap();
+        });
+        assert_eq!(Arc::strong_count(&store.peer_read_budget), 1);
+        assert_eq!(store.peer_read_budget.used.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn p2_r6_packed_admission_cannot_reopen_budget_after_shutdown() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (drained_tx, drained_rx) = std::sync::mpsc::channel();
+        *store.peer_payload_test_block.lock().unwrap() = Some((entered_tx, release_rx));
+        let drained = std::sync::atomic::AtomicBool::new(false);
+        let (premature, admitted_after_drain) = std::thread::scope(|scope| {
+            let allocating = scope.spawn(|| {
+                let lease = store.reserve_peer_read_payload(64 * 1024);
+                let late = lease.is_ok() && drained.load(Ordering::Acquire);
+                drop(lease);
+                late
+            });
+            entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            store.close_peer_serve_admission();
+            let stopping = scope.spawn(|| {
+                let result = store.shutdown_peer_serve();
+                drained.store(true, Ordering::Release);
+                drained_tx.send(()).unwrap();
+                result
+            });
+            // Both accepted I/O and rejected old admission are legal. Returning
+            // successful shutdown while admission is still paused is not.
+            let premature = drained_rx.recv_timeout(Duration::from_secs(2)).is_ok();
+            release_tx.send(()).unwrap();
+            let late = allocating.join().unwrap();
+            stopping.join().unwrap().unwrap();
+            (premature, late)
+        });
+        assert!(
+            !premature && !admitted_after_drain,
+            "packed admission acquired a new payload after shutdown had declared the budget drained"
+        );
+        assert_eq!(store.peer_read_budget.used.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn p2_r6_old_ready_follower_cannot_retire_a_new_healthy_resident() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+        let chunk = StagedChunk::new(OperationId::new("r6-old-ready"), vec![73; 64 * 1024]);
+        store.put(chunk.clone()).unwrap();
+        let (fill_entered, fill_release) =
+            store.pause_next_peer_fill_for_test(chunk.chunk.id.clone());
+        let (ready_entered, ready_observed) = std::sync::mpsc::channel();
+        let (ready_release, ready_wait) = std::sync::mpsc::channel();
+        *store.peer_ready_test_block.lock().unwrap() = Some((ready_entered, ready_wait));
+        std::thread::scope(|scope| {
+            let first = scope.spawn(|| store.read_peer_range(&chunk.chunk.id, 0, 64 * 1024));
+            fill_entered.recv_timeout(Duration::from_secs(3)).unwrap();
+            let old_follower = scope.spawn(|| store.read_peer_range(&chunk.chunk.id, 0, 64 * 1024));
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while store.waiting_peer_fill_readers_for_test() == 0 {
+                assert!(
+                    Instant::now() < deadline,
+                    "old follower did not join first fill"
+                );
+                std::thread::yield_now();
+            }
+            fill_release.send(()).unwrap();
+            ready_observed.recv_timeout(Duration::from_secs(3)).unwrap();
+            let old = first.join().unwrap().unwrap();
+            let path = store.chunk_path(&chunk.chunk.id);
+            fs::rename(&path, temp.path().join("old-healthy-inode")).unwrap();
+            fs::write(&path, chunk.bytes()).unwrap();
+            let replacement = store
+                .read_peer_range(&chunk.chunk.id, 0, 64 * 1024)
+                .unwrap();
+            assert!(!Arc::ptr_eq(&old.object, &replacement.object));
+            assert!(Arc::ptr_eq(
+                &store
+                    .peer_read_cache
+                    .lock()
+                    .unwrap()
+                    .resident(&chunk.chunk.id)
+                    .unwrap(),
+                &replacement.object
+            ));
+            ready_release.send(()).unwrap();
+            assert_eq!(
+                old_follower.join().unwrap().unwrap().as_slice(),
+                chunk.bytes()
+            );
+            let indexed = store
+                .peer_read_cache
+                .lock()
+                .unwrap()
+                .resident(&chunk.chunk.id);
+            assert!(
+                indexed
+                    .as_ref()
+                    .is_some_and(|object| Arc::ptr_eq(object, &replacement.object)),
+                "old Ready follower retired the newer healthy resident"
+            );
+            assert!(store.quarantined_chunks().unwrap().is_empty());
+        });
+        store.shutdown_peer_serve().unwrap();
+    }
+
+    #[test]
+    fn p2_r6_different_objects_fill_outside_shared_table_lock() {
+        use std::sync::mpsc;
+        let temp = tempfile::tempdir().unwrap();
+        let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+        let first = StagedChunk::new(OperationId::new("r6-fill-first"), vec![31; 64 * 1024]);
+        let second = StagedChunk::new(OperationId::new("r6-fill-second"), vec![47; 64 * 1024]);
+        store
+            .put_batch(vec![first.clone(), second.clone()])
+            .unwrap();
+        let (first_entered_tx, first_entered_rx) = mpsc::channel();
+        let (first_release_tx, first_release_rx) = mpsc::channel();
+        let (second_entered_tx, second_entered_rx) = mpsc::channel();
+        let (second_release_tx, second_release_rx) = mpsc::channel();
+        {
+            let mut blocks = store.peer_fill_test_blocks.lock().unwrap();
+            blocks.insert(first.chunk.id.clone(), (first_entered_tx, first_release_rx));
+            blocks.insert(
+                second.chunk.id.clone(),
+                (second_entered_tx, second_release_rx),
+            );
+        }
+        let concurrent = std::thread::scope(|scope| {
+            let first_read =
+                scope.spawn(|| store.read_peer_range(&first.chunk.id, 0, first.bytes().len()));
+            first_entered_rx
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap();
+            let second_read =
+                scope.spawn(|| store.read_peer_range(&second.chunk.id, 0, second.bytes().len()));
+            // A bounded progress assertion, not a performance threshold. Always
+            // release both workers and join before reporting the old slot bug.
+            let concurrent = second_entered_rx
+                .recv_timeout(Duration::from_secs(2))
+                .is_ok();
+            first_release_tx.send(()).unwrap();
+            second_release_tx.send(()).unwrap();
+            assert_eq!(
+                first_read.join().unwrap().unwrap().as_slice(),
+                first.bytes()
+            );
+            assert_eq!(
+                second_read.join().unwrap().unwrap().as_slice(),
+                second.bytes()
+            );
+            concurrent
+        });
+        assert!(
+            concurrent,
+            "an unrelated Peer fill remained behind the global object slot"
+        );
+    }
+
+    #[test]
     fn peer_object_concurrent_ranges_share_the_same_verified_payload() {
         let temp = tempfile::tempdir().unwrap();
         let store = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
@@ -3824,15 +6365,17 @@ mod replica_replay_tests {
             vec![73; 4 * 1024 * 1024],
         );
         store.put(staged.clone()).unwrap();
-        let barrier = Arc::new(std::sync::Barrier::new(4));
-        let threads: Vec<_> = (0..4)
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let threads: Vec<_> = (0..8)
             .map(|_| {
                 let store = store.clone();
                 let id = staged.chunk.id.clone();
                 let barrier = barrier.clone();
                 std::thread::spawn(move || {
                     barrier.wait();
-                    store.read_peer_range(&id, 0, 19).unwrap()
+                    VERIFIED_SCAN_BYTES.with(|count| count.set(0));
+                    let payload = store.read_peer_range(&id, 0, 4 * 1024 * 1024).unwrap();
+                    (payload, VERIFIED_SCAN_BYTES.with(|count| count.get()))
                 })
             })
             .collect();
@@ -3840,9 +6383,13 @@ mod replica_replay_tests {
             .into_iter()
             .map(|thread| thread.join().unwrap())
             .collect();
-        for payload in &payloads {
-            assert!(Arc::ptr_eq(&payload.object, &payloads[0].object));
-            assert_eq!(payload.as_slice(), &[73; 19]);
+        assert_eq!(
+            payloads.iter().map(|(_, scanned)| *scanned).sum::<u64>(),
+            staged.chunk.length
+        );
+        for (payload, _) in &payloads {
+            assert!(Arc::ptr_eq(&payload.object, &payloads[0].0.object));
+            assert_eq!(payload.as_slice(), staged.bytes());
         }
         assert_eq!(
             store.peer_read_budget.used.load(Ordering::Acquire),
@@ -3868,7 +6415,7 @@ mod replica_replay_tests {
         let retained = frame.clone();
         drop(frame);
         drop(bytes);
-        store.peer_read_cache.lock().unwrap().take();
+        store.clear_peer_residents_for_test();
         assert_eq!(&retained[..], &[29; 64]);
         assert_eq!(
             store.peer_read_budget.used.load(Ordering::Acquire),
@@ -3891,7 +6438,15 @@ mod replica_replay_tests {
             .read_peer_range(&staged.chunk.id, PEER_READ_OBJECT_LIMIT as u64, 19)
             .unwrap();
         assert_eq!(range.as_slice(), &[91]);
-        assert!(store.peer_read_cache.lock().unwrap().is_none());
+        assert!(
+            store
+                .peer_read_cache
+                .lock()
+                .unwrap()
+                .residents
+                .iter()
+                .all(Option::is_none)
+        );
         assert_eq!(store.peer_read_budget.used.load(Ordering::Acquire), 1);
         let pointer = range.as_slice().as_ptr();
         let bytes = range.into_shared_bytes();

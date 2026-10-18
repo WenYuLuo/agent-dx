@@ -2,6 +2,175 @@ use afs::config::{Cli, Config, MetaStoreBackend, Role};
 use clap::Parser;
 
 #[test]
+fn p2_r5_flight_limit_cli_is_exposed() {
+    assert!(
+        Cli::try_parse_from(["afs-node", "--dfs-fetch-max-inflight-objects", "8"]).is_ok(),
+        "the bounded native fill-flight limit must be accepted by the public CLI"
+    );
+}
+
+#[test]
+fn p2_r5_flight_limit_is_bounded_and_file_cli_defaults_agree() {
+    assert_eq!(
+        Config::resolve(Role::Node, Cli::parse_from(["afs-node"]))
+            .unwrap()
+            .dfs_fetch_max_inflight_objects,
+        8
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("node.toml");
+    for limit in [1, 4, 8] {
+        std::fs::write(&path, format!("dfs_fetch_max_inflight_objects={limit}\n")).unwrap();
+        let file = Config::resolve(
+            Role::Node,
+            Cli::parse_from(["afs-node", "--config", path.to_str().unwrap()]),
+        )
+        .unwrap();
+        assert_eq!(file.dfs_fetch_max_inflight_objects, limit);
+        let cli = Config::resolve(
+            Role::Node,
+            Cli::parse_from([
+                "afs-node",
+                "--config",
+                path.to_str().unwrap(),
+                "--dfs-fetch-max-inflight-objects",
+                "2",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(cli.dfs_fetch_max_inflight_objects, 2);
+    }
+    for limit in [0, 9] {
+        std::fs::write(&path, format!("dfs_fetch_max_inflight_objects={limit}\n")).unwrap();
+        let error = Config::resolve(
+            Role::Node,
+            Cli::parse_from(["afs-node", "--config", path.to_str().unwrap()]),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("1..=8"));
+        assert!(
+            Config::resolve(
+                Role::Node,
+                Cli::parse_from([
+                    "afs-node",
+                    "--dfs-fetch-max-inflight-objects",
+                    &limit.to_string(),
+                ]),
+            )
+            .is_err()
+        );
+        let overridden = Config::resolve(
+            Role::Node,
+            Cli::parse_from([
+                "afs-node",
+                "--config",
+                path.to_str().unwrap(),
+                "--dfs-fetch-max-inflight-objects",
+                "2",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(overridden.dfs_fetch_max_inflight_objects, 2);
+    }
+}
+
+#[test]
+fn p2_w0_sidecar_queue_is_bounded_and_file_cli_defaults_agree() {
+    assert_eq!(
+        Config::resolve(Role::Node, Cli::parse_from(["afs-node"]))
+            .unwrap()
+            .dfs_sidecar_install_queue,
+        64
+    );
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("node.toml");
+    for limit in [1, 32, 64] {
+        std::fs::write(&path, format!("dfs_sidecar_install_queue={limit}\n")).unwrap();
+        let file = Config::resolve(
+            Role::Node,
+            Cli::parse_from(["afs-node", "--config", path.to_str().unwrap()]),
+        )
+        .unwrap();
+        assert_eq!(file.dfs_sidecar_install_queue, limit);
+        let cli = Config::resolve(
+            Role::Node,
+            Cli::parse_from([
+                "afs-node",
+                "--config",
+                path.to_str().unwrap(),
+                "--dfs-sidecar-install-queue",
+                "2",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(cli.dfs_sidecar_install_queue, 2);
+    }
+    for limit in [0, 65] {
+        std::fs::write(&path, format!("dfs_sidecar_install_queue={limit}\n")).unwrap();
+        let error = Config::resolve(
+            Role::Node,
+            Cli::parse_from(["afs-node", "--config", path.to_str().unwrap()]),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("1..=64"));
+        assert!(
+            Config::resolve(
+                Role::Node,
+                Cli::parse_from([
+                    "afs-node",
+                    "--dfs-sidecar-install-queue",
+                    &limit.to_string()
+                ])
+            )
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn p2_c1a_outboard_wait_defaults_and_file_cli_boundaries() {
+    let defaults = Config::resolve(Role::Node, Cli::parse_from(["afs-node"])).unwrap();
+    assert_eq!(defaults.dfs_outboard_work_wait_ms, 2);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("node.toml");
+    for wait in [0, 2, 50] {
+        std::fs::write(&path, format!("dfs_outboard_work_wait_ms={wait}\n")).unwrap();
+        let file = Config::resolve(
+            Role::Node,
+            Cli::parse_from(["afs-node", "--config", path.to_str().unwrap()]),
+        )
+        .unwrap();
+        assert_eq!(file.dfs_outboard_work_wait_ms, wait);
+        let cli = Config::resolve(
+            Role::Node,
+            Cli::parse_from([
+                "afs-node",
+                "--config",
+                path.to_str().unwrap(),
+                "--dfs-outboard-work-wait-ms",
+                "1",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(cli.dfs_outboard_work_wait_ms, 1);
+    }
+    std::fs::write(&path, "dfs_outboard_work_wait_ms=51\n").unwrap();
+    let error = Config::resolve(
+        Role::Node,
+        Cli::parse_from(["afs-node", "--config", path.to_str().unwrap()]),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("0..=50"));
+    assert!(
+        Config::resolve(
+            Role::Node,
+            Cli::parse_from(["afs-node", "--dfs-outboard-work-wait-ms", "51",])
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn shipped_examples_resolve_with_mutual_tls_and_node_identity_binding() {
     let examples = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
     let meta_path = examples.join("meta.toml");
@@ -769,7 +938,7 @@ fn p2_dfs_version_cache_bytes_cli_overrides_file() {
 fn p2_dfs_version_cache_bytes_configuration_bounds() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("node.toml");
-    for bytes in [1_u64, 1024 * 1024 * 1024] {
+    for bytes in [32_u64 * 1024 * 1024, 1024 * 1024 * 1024] {
         std::fs::write(&path, format!("dfs_version_cache_bytes={bytes}\n")).unwrap();
         let config = Config::resolve(
             Role::Node,
@@ -805,6 +974,190 @@ fn p2_dfs_version_cache_bytes_configuration_bounds() {
             afs_error::CONFIG_INVALID
         );
     }
+}
+
+#[cfg(feature = "dfs")]
+#[test]
+fn c1b_version_cache_rejects_one_byte_before_node_start() {
+    let error = Config::resolve(
+        Role::Node,
+        Cli::try_parse_from(["afs-node", "--dfs-version-cache-bytes", "1"]).unwrap(),
+    )
+    .unwrap_err();
+    assert_eq!(error.code(), afs_error::CONFIG_INVALID);
+    assert!(error.to_string().contains("version cache"), "{error}");
+    assert!(error.to_string().contains("minimum"), "{error}");
+}
+
+#[cfg(feature = "dfs")]
+#[test]
+fn c1b_version_cache_rejects_table_larger_than_byte_limit() {
+    let error = Config::resolve(
+        Role::Node,
+        Cli::try_parse_from([
+            "afs-node",
+            "--dfs-version-cache-entries",
+            "65536",
+            "--dfs-version-cache-bytes",
+            "4194304",
+        ])
+        .unwrap(),
+    )
+    .unwrap_err();
+    assert_eq!(error.code(), afs_error::CONFIG_INVALID);
+    assert!(error.to_string().contains("minimum"), "{error}");
+}
+
+#[cfg(feature = "dfs")]
+#[test]
+fn c1b_version_cache_checks_file_bytes_with_cli_entry_override() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("node.toml");
+    std::fs::write(
+        &path,
+        "dfs_version_cache_entries=1\ndfs_version_cache_bytes=4194304\n",
+    )
+    .unwrap();
+    let error = Config::resolve(
+        Role::Node,
+        Cli::try_parse_from([
+            "afs-node",
+            "--config",
+            path.to_str().unwrap(),
+            "--dfs-version-cache-entries",
+            "65536",
+        ])
+        .unwrap(),
+    )
+    .unwrap_err();
+    assert_eq!(error.code(), afs_error::CONFIG_INVALID);
+}
+
+#[cfg(feature = "dfs")]
+#[test]
+fn c1b_version_cache_checks_file_entries_with_cli_byte_override() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("node.toml");
+    std::fs::write(
+        &path,
+        "dfs_version_cache_entries=65536\ndfs_version_cache_bytes=33554432\n",
+    )
+    .unwrap();
+    let error = Config::resolve(
+        Role::Node,
+        Cli::try_parse_from([
+            "afs-node",
+            "--config",
+            path.to_str().unwrap(),
+            "--dfs-version-cache-bytes",
+            "4194304",
+        ])
+        .unwrap(),
+    )
+    .unwrap_err();
+    assert_eq!(error.code(), afs_error::CONFIG_INVALID);
+}
+
+#[cfg(feature = "dfs")]
+#[test]
+fn c1b_version_cache_cli_can_repair_invalid_file_combination() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("node.toml");
+    std::fs::write(
+        &path,
+        "dfs_version_cache_entries=65536\ndfs_version_cache_bytes=4194304\n",
+    )
+    .unwrap();
+    for override_args in [
+        ["--dfs-version-cache-entries", "1"],
+        ["--dfs-version-cache-bytes", "33554432"],
+    ] {
+        let cli = Cli::try_parse_from([
+            "afs-node",
+            "--config",
+            path.to_str().unwrap(),
+            override_args[0],
+            override_args[1],
+        ])
+        .unwrap();
+        Config::resolve(Role::Node, cli).unwrap();
+    }
+}
+
+#[cfg(feature = "dfs")]
+#[test]
+fn c1b_version_cache_accepts_exact_reported_floor_and_rejects_one_less() {
+    let mut previous_minimum = 0;
+    for entries in [1_usize, 4096, 65536] {
+        let entries = entries.to_string();
+        let error = Config::resolve(
+            Role::Node,
+            Cli::try_parse_from([
+                "afs-node",
+                "--dfs-version-cache-entries",
+                &entries,
+                "--dfs-version-cache-bytes",
+                "1",
+            ])
+            .unwrap(),
+        )
+        .unwrap_err();
+        let message = error.to_string();
+        let minimum: u64 = message
+            .split("minimum ")
+            .nth(1)
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(minimum > previous_minimum);
+        assert!(minimum <= 32 * 1024 * 1024);
+        previous_minimum = minimum;
+        eprintln!("version cache entries={entries} minimum_bytes={minimum}");
+        for bytes in [minimum - 1, minimum, minimum + 1] {
+            let bytes_arg = bytes.to_string();
+            let result = Config::resolve(
+                Role::Node,
+                Cli::try_parse_from([
+                    "afs-node",
+                    "--dfs-version-cache-entries",
+                    &entries,
+                    "--dfs-version-cache-bytes",
+                    &bytes_arg,
+                ])
+                .unwrap(),
+            );
+            if bytes < minimum {
+                assert_eq!(result.unwrap_err().code(), afs_error::CONFIG_INVALID);
+            } else {
+                assert_eq!(result.unwrap().dfs_version_cache_bytes, bytes);
+            }
+        }
+    }
+}
+
+#[cfg(all(not(feature = "dfs"), feature = "ownerfs"))]
+#[test]
+fn c1b_owner_only_build_does_not_require_dfs_version_cache_storage() {
+    let config = Config::resolve(
+        Role::Node,
+        Cli::try_parse_from(["afs-node", "--dfs-version-cache-bytes", "1"]).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(config.dfs_version_cache_bytes, 1);
+}
+
+#[cfg(feature = "dfs")]
+#[test]
+fn c1b_meta_role_does_not_allocate_the_node_version_cache() {
+    let config = Config::resolve(
+        Role::Meta,
+        Cli::try_parse_from(["afs-meta", "--dfs-version-cache-bytes", "1"]).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(config.dfs_version_cache_bytes, 1);
 }
 
 #[test]
@@ -858,4 +1211,237 @@ fn dfs_version_cache_capacity_has_bounded_file_cli_configuration() {
         assert_eq!(error.code(), afs_error::CONFIG_INVALID);
         assert!(error.to_string().contains("version cache"), "{error}");
     }
+}
+
+#[test]
+fn p2_r6_serve_capacity_options_are_exposed() {
+    let parsed = Cli::try_parse_from([
+        "afs-node",
+        "--dfs-peer-serve-resident-objects",
+        "2",
+        "--dfs-peer-serve-payload-bytes",
+        "16777216",
+    ]);
+    assert!(
+        parsed.is_ok(),
+        "public serve configuration: {:?}",
+        parsed.err()
+    );
+}
+
+#[test]
+fn p2_r6_serve_defaults_match_approved_capacity() {
+    let config =
+        serde_json::to_value(Config::resolve(Role::Node, Cli::default()).unwrap()).unwrap();
+    assert_eq!(config["dfs_peer_serve_resident_objects"], 2);
+    assert_eq!(config["dfs_peer_serve_payload_bytes"], 16 * 1024 * 1024);
+}
+
+#[test]
+fn p2_r6_serve_file_cli_capacity_is_bounded() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("node.toml");
+    let resolve_file = || {
+        Config::resolve(
+            Role::Node,
+            Cli {
+                config: Some(path.clone()),
+                ..Cli::default()
+            },
+        )
+    };
+    for (objects, bytes) in [
+        (1, 4 * 1024 * 1024),
+        (2, 16 * 1024 * 1024),
+        (16, 64 * 1024 * 1024),
+    ] {
+        std::fs::write(
+            &path,
+            format!(
+                "dfs_peer_serve_resident_objects={objects}\ndfs_peer_serve_payload_bytes={bytes}\n"
+            ),
+        )
+        .unwrap();
+        let config = resolve_file().unwrap();
+        assert_eq!(config.dfs_peer_serve_resident_objects, objects);
+        assert_eq!(config.dfs_peer_serve_payload_bytes, bytes);
+    }
+    for (objects, bytes) in [
+        (0, 16777216_u64),
+        (17, 16777216),
+        (2, 0),
+        (2, 4194303),
+        (2, 67108865),
+    ] {
+        std::fs::write(
+            &path,
+            format!(
+                "dfs_peer_serve_resident_objects={objects}\ndfs_peer_serve_payload_bytes={bytes}\n"
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_file().unwrap_err().code(),
+            afs_error::CONFIG_INVALID
+        );
+        let error = Config::resolve(
+            Role::Node,
+            Cli::try_parse_from([
+                "afs-node",
+                "--dfs-peer-serve-resident-objects",
+                &objects.to_string(),
+                "--dfs-peer-serve-payload-bytes",
+                &bytes.to_string(),
+            ])
+            .unwrap(),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), afs_error::CONFIG_INVALID);
+        let overridden = Config::resolve(
+            Role::Node,
+            Cli::try_parse_from([
+                "afs-node",
+                "--config",
+                path.to_str().unwrap(),
+                "--dfs-peer-serve-resident-objects",
+                "2",
+                "--dfs-peer-serve-payload-bytes",
+                "8388608",
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(overridden.dfs_peer_serve_resident_objects, 2);
+        assert_eq!(overridden.dfs_peer_serve_payload_bytes, 8 * 1024 * 1024);
+    }
+}
+
+#[test]
+fn p2_r1_source_cache_options_are_exposed() {
+    let parsed = Cli::try_parse_from([
+        "afs-node",
+        "--dfs-source-cache-max-ms",
+        "5000",
+        "--dfs-source-lookahead-chunks",
+        "64",
+        "--dfs-source-cache-bytes",
+        "4194304",
+    ]);
+    assert!(
+        parsed.is_ok(),
+        "public source cache configuration: {:?}",
+        parsed.err()
+    );
+}
+
+#[test]
+fn p2_r1_source_cache_defaults_match_bounded_reuse() {
+    let config =
+        serde_json::to_value(Config::resolve(Role::Node, Cli::default()).unwrap()).unwrap();
+    assert_eq!(config["dfs_source_cache_max_ms"], 5000);
+    assert_eq!(config["dfs_source_lookahead_chunks"], 64);
+    assert_eq!(config["dfs_source_cache_bytes"], 4 * 1024 * 1024);
+    assert!(config.get("dfs_read_source_cache_ttl_ms").is_none());
+}
+
+#[test]
+fn p2_r1_source_cache_limits_resolve_after_cli_overrides() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("source-cache.toml");
+    for (max_ms, chunks, bytes) in [(0, 0, 0), (5000, 64, 4194304), (60000, 128, 4194304)] {
+        std::fs::write(&path, format!(
+            "dfs_source_cache_max_ms={max_ms}\ndfs_source_lookahead_chunks={chunks}\ndfs_source_cache_bytes={bytes}\n"
+        )).unwrap();
+        let config = Config::resolve(
+            Role::Node,
+            Cli {
+                config: Some(path.clone()),
+                ..Cli::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                config.dfs_source_cache_max_ms,
+                config.dfs_source_lookahead_chunks,
+                config.dfs_source_cache_bytes
+            ),
+            (max_ms, chunks, bytes)
+        );
+    }
+    for (max_ms, chunks, bytes) in [
+        (60001, 64, 4194304),
+        (5000, 129, 4194304),
+        (5000, 64, 4194305),
+    ] {
+        std::fs::write(&path, format!(
+            "dfs_source_cache_max_ms={max_ms}\ndfs_source_lookahead_chunks={chunks}\ndfs_source_cache_bytes={bytes}\n"
+        )).unwrap();
+        let error = Config::resolve(
+            Role::Node,
+            Cli {
+                config: Some(path.clone()),
+                ..Cli::default()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), afs_error::CONFIG_INVALID);
+        let overridden = Config::resolve(
+            Role::Node,
+            Cli::try_parse_from([
+                "afs-node",
+                "--config",
+                path.to_str().unwrap(),
+                "--dfs-source-cache-max-ms",
+                "5000",
+                "--dfs-source-lookahead-chunks",
+                "64",
+                "--dfs-source-cache-bytes",
+                "4194304",
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                overridden.dfs_source_cache_max_ms,
+                overridden.dfs_source_lookahead_chunks,
+                overridden.dfs_source_cache_bytes
+            ),
+            (5000, 64, 4194304)
+        );
+        let error = Config::resolve(
+            Role::Node,
+            Cli::try_parse_from([
+                "afs-node",
+                "--dfs-source-cache-max-ms",
+                &max_ms.to_string(),
+                "--dfs-source-lookahead-chunks",
+                &chunks.to_string(),
+                "--dfs-source-cache-bytes",
+                &bytes.to_string(),
+            ])
+            .unwrap(),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), afs_error::CONFIG_INVALID);
+    }
+}
+
+#[test]
+fn p2_r1_replaced_source_cache_name_is_rejected_explicitly() {
+    assert!(Cli::try_parse_from(["afs-node", "--dfs-read-source-cache-ttl-ms", "500"]).is_err());
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("old-source-cache.toml");
+    std::fs::write(&path, "dfs_read_source_cache_ttl_ms=500\n").unwrap();
+    let error = Config::resolve(
+        Role::Node,
+        Cli {
+            config: Some(path),
+            ..Cli::default()
+        },
+    )
+    .unwrap_err();
+    assert_eq!(error.code(), afs_error::CONFIG_INVALID);
+    assert!(error.to_string().contains("dfs_read_source_cache_ttl_ms"));
 }

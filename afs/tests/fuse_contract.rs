@@ -857,8 +857,8 @@ fn assert_dfs_same_descriptor_parallel_reads(workers: u16, readers: usize) {
 }
 
 #[test]
-#[ignore = "requires Linux /dev/fuse and fusermount3; bounded bucket contention diagnostic"]
-fn dfs_same_cache_bucket_open_waits_for_another_inode_read_on_this_linux() {
+#[ignore = "requires Linux /dev/fuse and fusermount3"]
+fn dfs_same_cache_bucket_open_does_not_wait_for_another_inode_read() {
     use std::os::unix::fs::MetadataExt as _;
 
     let temp = tempfile::tempdir().unwrap();
@@ -945,7 +945,7 @@ fn dfs_same_cache_bucket_open_waits_for_another_inode_read_on_this_linux() {
         }
         std::thread::sleep(Duration::from_millis(1));
     };
-    let completed_while_read_held = opened_rx.recv_timeout(Duration::from_millis(100)).is_ok();
+    let completed_while_read_held = opened_rx.recv_timeout(Duration::from_secs(5)).is_ok();
     // Always release and join both requests before asserting diagnostics, so a
     // failed assertion cannot strand a callback during normal mount teardown.
     let _ = release_tx.send(());
@@ -955,8 +955,8 @@ fn dfs_same_cache_bucket_open_waits_for_another_inode_read_on_this_linux() {
     assert_eq!(count, 4096);
     assert_eq!(bytes, [b'b'; 4096]);
     assert!(
-        !completed_while_read_held,
-        "same-bucket OPEN bypassed the active READ fence"
+        completed_while_read_held,
+        "another inode OPEN did not complete while same-bucket READ remained blocked"
     );
     eprintln!(
         "bucket contention diagnostic inode_a={} inode_b={} open_wait_us={} workers={}",
@@ -965,9 +965,8 @@ fn dfs_same_cache_bucket_open_waits_for_another_inode_read_on_this_linux() {
         elapsed.as_micros(),
         fuse::FuseMountOptions::default().fuse_workers
     );
-    // This records this Linux implementation's cross-inode bucket wait. It
-    // does not claim std::sync::RwLock writer priority on other platforms, or
-    // that a future queued writer must precede every newly arriving reader.
+    // The blocked READ is the correctness barrier, independent of the elapsed
+    // OPEN diagnostic. Same-inode OPEN fencing has its own retained contract.
     drop(other_file);
     session.session.take().unwrap().join().unwrap();
 }
@@ -1761,5 +1760,303 @@ fn request_context() -> RequestContext {
         pid: 0,
         umask: 0,
         supplementary_gids: Vec::new(),
+    }
+}
+
+/// Real product Nodes are provisioned by the existing external finite scenario.
+/// These tests do not deploy services or assume a particular VM manager.
+#[cfg(feature = "dfs")]
+mod real_dfs_keep_cache_contract {
+    use std::{
+        ffi::OsString,
+        fs::{File, OpenOptions, Permissions},
+        io::{self, Read, Seek, SeekFrom, Write},
+        net::SocketAddr,
+        os::unix::fs::{FileExt, MetadataExt, PermissionsExt},
+        path::{Path, PathBuf},
+        time::Duration,
+    };
+
+    const FILE_BYTES: usize = 16 * 1024 * 1024;
+    const PAGE_BYTES: usize = 4096;
+    const TAIL_OFFSET: u64 = 12 * 1024 * 1024;
+
+    fn required_value(name: &str, value: Option<OsString>) -> io::Result<OsString> {
+        value.filter(|value| !value.is_empty()).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("required external real-DFS fixture parameter {name} is missing"),
+            )
+        })
+    }
+
+    fn real_dfs_mount(name: &str) -> io::Result<PathBuf> {
+        let path = PathBuf::from(required_value(name, std::env::var_os(name))?);
+        if !path.is_absolute() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "mount must be absolute",
+            ));
+        }
+        let path = path.canonicalize()?;
+        let output = std::process::Command::new("findmnt")
+            .args(["--json", "--target"])
+            .arg(&path)
+            .args(["--output", "TARGET,SOURCE,FSTYPE"])
+            .output()?;
+        if !output.status.success() {
+            return Err(io::Error::other(format!(
+                "{name} is not inside a mounted filesystem"
+            )));
+        }
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        let mounts = value["filesystems"].as_array().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "findmnt did not return filesystems",
+            )
+        })?;
+        if mounts.len() != 1
+            || mounts[0]["source"].as_str() != Some("afs-dfs")
+            || !mounts[0]["fstype"]
+                .as_str()
+                .is_some_and(|kind| kind.starts_with("fuse"))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "expected one real afs-dfs FUSE mount",
+            ));
+        }
+        Ok(path)
+    }
+
+    fn dfs_read_callbacks(text: &str) -> io::Result<u64> {
+        let mut result = None;
+        for line in text.lines() {
+            let Some((labels, value)) = line.rsplit_once(' ') else {
+                continue;
+            };
+            if labels.starts_with("afs_fuse_callbacks_total{")
+                && labels.contains("filesystem=\"dfs\"")
+                && labels.contains("operation=\"read\"")
+            {
+                let count = value.parse().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid DFS READ counter")
+                })?;
+                if result.replace(count).is_some() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "duplicate DFS READ counter",
+                    ));
+                }
+            }
+        }
+        result.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "DFS READ counter is missing")
+        })
+    }
+
+    fn read_counter(address: SocketAddr) -> io::Result<u64> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        runtime.block_on(async {
+            // Match the repository's selected provider when constructing the
+            // client. An already-installed provider remains unchanged.
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .map_err(io::Error::other)?;
+            let mut response = client
+                .get(format!("http://{address}/metrics"))
+                .send()
+                .await
+                .map_err(io::Error::other)?
+                .error_for_status()
+                .map_err(io::Error::other)?;
+            let mut body = Vec::new();
+            while let Some(chunk) = response.chunk().await.map_err(io::Error::other)? {
+                if body.len().saturating_add(chunk.len()) > 2 * 1024 * 1024 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "metrics response exceeds 2MiB",
+                    ));
+                }
+                body.extend_from_slice(&chunk);
+            }
+            let text = std::str::from_utf8(&body)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            dfs_read_callbacks(text)
+        })
+    }
+
+    fn assert_full_read(reader: &mut impl Read, expected: &[u8]) -> io::Result<blake3::Hash> {
+        let mut actual = vec![0; expected.len()];
+        reader.read_exact(&mut actual)?;
+        let mut eof = [0; 1];
+        if reader.read(&mut eof)? != 0 || actual != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "full read length, content or EOF differs",
+            ));
+        }
+        let root = blake3::hash(&actual);
+        if root != blake3::hash(expected) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "full read BLAKE3 root differs",
+            ));
+        }
+        Ok(root)
+    }
+
+    fn durable_write(path: &Path, payload: &[u8], create: bool) -> io::Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(create)
+            .open(path)?;
+        file.write_all(payload)?;
+        file.sync_all()?;
+        if create {
+            File::open(
+                path.parent()
+                    .ok_or_else(|| io::Error::other("test file has no parent"))?,
+            )?
+            .sync_all()?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires external real DFS A/B mounts and B metrics on one Linux host; run as non-root"]
+    fn dfs_real_nodes_cross_handle_keep_cache_and_permission() -> io::Result<()> {
+        // SAFETY: geteuid only reads this process's effective identity; the test
+        // never changes credentials in the multithreaded libtest process.
+        let uid = unsafe { libc::geteuid() };
+        assert_ne!(uid, 0, "run this whole test as a non-root fixture user");
+        let writer = real_dfs_mount("AFS_DFS_FUSE_WRITER_MOUNT")?;
+        let reader = real_dfs_mount("AFS_DFS_FUSE_READER_MOUNT")?;
+        let metrics = required_value(
+            "AFS_DFS_FUSE_READER_METRICS",
+            std::env::var_os("AFS_DFS_FUSE_READER_METRICS"),
+        )?
+        .into_string()
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "metrics SocketAddr must be UTF-8",
+            )
+        })?
+        .parse::<SocketAddr>()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        assert_ne!(
+            writer.metadata()?.dev(),
+            reader.metadata()?.dev(),
+            "A and B must be distinct FUSE mounts"
+        );
+        assert_eq!(
+            super::dfs_read_ahead_kb(&reader),
+            0,
+            "fixture must disable B readahead"
+        );
+        // Fresh, caller-owned directory prevents an existing page-cache entry
+        // from satisfying H1, and prevents this workload changing other files.
+        let directory = tempfile::Builder::new()
+            .prefix("afs-h123-")
+            .tempdir_in(&writer)?;
+        assert_eq!(directory.path().metadata()?.uid(), uid);
+        let relative = directory
+            .path()
+            .file_name()
+            .ok_or_else(|| io::Error::other("test directory has no name"))?;
+        let path_a = directory.path().join("visibility.bin");
+        let path_b = reader.join(relative).join("visibility.bin");
+        let mut expected: Vec<u8> = (0..FILE_BYTES).map(|index| index as u8).collect();
+        durable_write(&path_a, &expected, true)?;
+        let inode = path_a.metadata()?.ino();
+        let mut h1 = File::open(&path_b)?;
+        let mut page = [0; PAGE_BYTES];
+        h1.read_exact(&mut page)?;
+        assert_eq!(page, expected[..PAGE_BYTES]);
+        let before_v2 = read_counter(metrics)?;
+        for byte in &mut expected {
+            *byte = 255 - *byte;
+        }
+        // No truncate/recreate: publish V2 over the exact same inode.
+        durable_write(&path_a, &expected, false)?;
+        assert_eq!(path_a.metadata()?.ino(), inode);
+        let mut h2 = File::open(&path_b)?;
+        h2.read_exact(&mut page)?;
+        assert_eq!(page, expected[..PAGE_BYTES]);
+        let after_h2 = read_counter(metrics)?;
+        assert!(after_h2 > before_v2, "H2 reused V1's cached page");
+        h1.read_exact_at(&mut page, TAIL_OFFSET)?;
+        assert_eq!(
+            page,
+            expected[TAIL_OFFSET as usize..TAIL_OFFSET as usize + PAGE_BYTES]
+        );
+        let after_h1 = read_counter(metrics)?;
+        assert!(after_h1 > after_h2, "H1 uncached tail did not enter FUSE");
+        h2.seek(SeekFrom::Start(0))?;
+        let root = assert_full_read(&mut h2, &expected)?;
+        let before_h3 = read_counter(metrics)?;
+        let mut h3 = File::open(&path_b)?;
+        assert_eq!(assert_full_read(&mut h3, &expected)?, root);
+        let after_h3 = read_counter(metrics)?;
+        assert_eq!(
+            after_h3, before_h3,
+            "H3 discarded same-version cached pages"
+        );
+        // New OPEN must enforce changed permissions. Existing handles are not
+        // used to claim immediate revocation of already granted access.
+        std::fs::set_permissions(&path_a, Permissions::from_mode(0o000))?;
+        let denied = File::open(&path_b);
+        std::fs::set_permissions(&path_a, Permissions::from_mode(0o600))?;
+        assert!(
+            matches!(denied, Err(ref error) if error.raw_os_error() == Some(libc::EACCES)),
+            "mode 000 must deny a new non-root OPEN"
+        );
+        let mut restored = File::open(&path_b)?;
+        assert_eq!(assert_full_read(&mut restored, &expected)?, root);
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "case": "real-dfs-h1-h2-h3", "uid": uid, "bytes": expected.len(),
+                "blake3": root.to_hex().to_string(), "eof": true,
+                "read_callbacks": {"before_v2": before_v2, "after_h2": after_h2,
+                    "after_h1_tail": after_h1, "before_h3": before_h3, "after_h3": after_h3},
+                "new_open_mode_000_denied": true, "old_handle_snapshot_promised": false,
+                "topology": "one Linux host, two real Nodes, external local-file Meta fixture",
+                "performance_claim": false
+            })
+        );
+        drop((h1, h2, h3, restored));
+        directory.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn real_dfs_contract_helpers_fail_on_missing_or_invalid_evidence() {
+        assert!(required_value("mount", None).is_err());
+        assert!(required_value("mount", Some(OsString::new())).is_err());
+        assert!(dfs_read_callbacks("# no metrics\n").is_err());
+        assert!(
+            dfs_read_callbacks(
+                "afs_fuse_callbacks_total{filesystem=\"ownerfs\",operation=\"read\"} 2\n"
+            )
+            .is_err()
+        );
+        let metric = "afs_fuse_callbacks_total{filesystem=\"dfs\",operation=\"read\"}";
+        assert_eq!(dfs_read_callbacks(&format!("{metric} 7\n")).unwrap(), 7);
+        assert!(dfs_read_callbacks(&format!("{metric} invalid\n")).is_err());
+        assert!(dfs_read_callbacks(&format!("{metric} 7\n{metric} 8\n")).is_err());
+        assert!(assert_full_read(&mut &b"abc"[..], b"abcd").is_err());
+        assert!(assert_full_read(&mut &b"abcde"[..], b"abcd").is_err());
+        assert!(assert_full_read(&mut &b"abce"[..], b"abcd").is_err());
+        assert_eq!(
+            assert_full_read(&mut &b"abcd"[..], b"abcd").unwrap(),
+            blake3::hash(b"abcd")
+        );
     }
 }

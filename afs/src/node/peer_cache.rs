@@ -1,6 +1,7 @@
 //! Disposable native Peer object cache, never replicas or read authority.
 //!
-//! One serialized operation admits a bounded stream or complete-object fill.
+//! One explicit fill allowance admits a bounded stream or complete-object fill.
+//! Metadata locks never cover runtime disk I/O, verification or Peer waits.
 //! Ready bodies live only on disk. Hits verify complete requested 32 KiB coverage
 //! groups against the trusted standard BLAKE3 root. Changed identity requires a root scan.
 //! Callers must discard private output on a miss or error.
@@ -14,8 +15,8 @@ use std::{
         unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
     },
     path::{Component, Path, PathBuf},
-    sync::{Arc, Mutex, MutexGuard},
-    time::Instant,
+    sync::{Arc, Condvar, Mutex},
+    time::{Duration, Instant},
 };
 
 use afs_error::{Error, Result};
@@ -192,11 +193,11 @@ impl<'output> CompletedPeerDiskRead<'output> {
     }
 }
 
-/// The synchronous operation retains its existing mutex and disk accounting.
+/// Private staging borrows the unique native fill allowance, not a table lock.
 /// Cache failures disable this sink; they never stop the same RPC verification.
 pub struct PeerStreamSink<'a> {
     cache: &'a DiskPeerCache,
-    state: &'a mut CacheState,
+    _fill: &'a FillPermit<'a>,
     chunk: ChunkObject,
     key: String,
     received: u64,
@@ -205,6 +206,8 @@ pub struct PeerStreamSink<'a> {
     pending_identity: Option<(u64, u64)>,
     owns_pending: bool,
     committed: bool,
+    prepare_error: Option<Error>,
+    entry_lease: Option<OutboardLease>,
     identity: Arc<()>,
     #[cfg(test)]
     write_delay: std::time::Duration,
@@ -240,19 +243,14 @@ impl PeerStreamSink<'_> {
 
     fn prepare(&mut self) -> Result<()> {
         self.cache.check_root()?;
-        if self.state.pending_charge != 0 {
-            self.cache.remove_pending(self.state)?;
-        }
-        if self.state.entries.contains_key(&self.key) {
-            self.cache.remove_entry(self.state, &self.key, false)?;
+        let (pending_charge, identity) = {
+            let state = self.cache.lock_state()?;
+            (state.pending_charge, state.pending_identity)
+        };
+        if pending_charge != 0 {
+            self.cache.clear_pending(identity)?;
         }
         self.header_length = MAX_HEADER_BYTES as u64;
-        // The final outboard is bounded and part of the disposable disk charge.
-        let length = self
-            .header_length
-            .checked_add(self.chunk.length)
-            .and_then(|length| length.checked_add(MAX_OUTBOARD_BYTES as u64))
-            .ok_or_else(|| invalid("Peer stream file size overflow"))?;
         let unit = self
             .cache
             .root
@@ -260,40 +258,51 @@ impl PeerStreamSink<'_> {
             .map_err(Error::from)?
             .blksize()
             .max(512);
+        let length = self.header_length + self.chunk.length + MAX_OUTBOARD_BYTES as u64;
         let reservation = length
             .checked_add(unit - 1)
             .and_then(|size| size.checked_div(unit))
             .and_then(|blocks| blocks.checked_add(2))
             .and_then(|blocks| blocks.checked_mul(unit))
             .ok_or_else(|| invalid("Peer stream reservation overflow"))?;
-        if !self.cache.admit_space(self.state, reservation)? {
+        let metadata_charge = entry_metadata_charge(&self.key, &self.chunk);
+        self.entry_lease = self.cache.reserve_entry_metadata(metadata_charge)?;
+        if self.entry_lease.is_none() {
             return Ok(());
         }
-        let file = OpenOptions::new()
+        self.cache.lock_state()?.pending_metadata_charge = metadata_charge;
+        if !self.cache.reserve_pending(&self.key, reservation)? {
+            return Ok(());
+        }
+        let opened = OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(self.cache.directory().join(PENDING))
-            .map_err(Error::from)?;
-        // Charge ownership immediately after creation, before metadata/header
-        // I/O can fail. Unidentifiable files remain charged and are not unlinked.
+            .open(self.cache.directory().join(PENDING));
+        let file = match opened {
+            Ok(file) => file,
+            Err(error) => {
+                // No file was created by this attempt; retain any foreign file.
+                let mut state = self.cache.lock_state()?;
+                state.used_bytes = state.used_bytes.saturating_sub(state.pending_charge);
+                state.pending_charge = 0;
+                return Err(Error::from(error));
+            }
+        };
         self.file = Some(file);
         self.owns_pending = true;
-        self.state.used_bytes += reservation;
-        self.state.pending_charge = reservation;
-        self.state.stats.disk_peak_bytes =
-            self.state.stats.disk_peak_bytes.max(self.state.used_bytes);
+        #[cfg(test)]
+        if self.cache.lock_state()?.fail_stream_metadata {
+            return Err(unavailable("injected pending descriptor metadata failure"));
+        }
         let file = self
             .file
             .as_mut()
             .ok_or_else(|| unavailable("Peer stream file was not opened"))?;
-        #[cfg(test)]
-        if self.state.fail_stream_metadata {
-            return Err(unavailable("injected pending descriptor metadata failure"));
-        }
         let metadata = file.metadata().map_err(Error::from)?;
         self.pending_identity = Some((metadata.dev(), metadata.ino()));
+        self.cache.lock_state()?.pending_identity = self.pending_identity;
         write_header(
             file,
             &Header {
@@ -321,7 +330,7 @@ impl PeerStreamSink<'_> {
                 ));
             }
         }
-        self.cache.remove_pending(self.state)?;
+        self.cache.clear_pending(self.pending_identity)?;
         self.owns_pending = false;
         Ok(())
     }
@@ -350,7 +359,7 @@ impl PeerStreamSink<'_> {
         #[cfg(test)]
         std::thread::sleep(self.write_delay);
         #[cfg(test)]
-        if self.state.fail_stream_write {
+        if self.cache.lock_state()?.fail_stream_write {
             self.disable(&unavailable("injected stream cache write failure"));
         }
         if let Some(file) = &mut self.file
@@ -424,14 +433,7 @@ impl PeerStreamSink<'_> {
                 ));
             }
             let charge = allocated(&metadata)?;
-            if charge > self.state.pending_charge {
-                self.state.used_bytes = self
-                    .state
-                    .used_bytes
-                    .saturating_add(charge - self.state.pending_charge);
-                self.state.pending_charge = charge;
-                self.state.stats.disk_peak_bytes =
-                    self.state.stats.disk_peak_bytes.max(self.state.used_bytes);
+            if self.cache.account_pending_growth(charge)? {
                 return Err(unavailable(
                     "Peer stream allocation exceeds reservation before seal",
                 ));
@@ -479,12 +481,7 @@ impl PeerStreamSink<'_> {
             ));
         }
         let charge = allocated(&metadata)?;
-        let reservation = self.state.pending_charge;
-        if charge > reservation {
-            self.state.used_bytes = self.state.used_bytes.saturating_add(charge - reservation);
-            self.state.pending_charge = charge;
-            self.state.stats.disk_peak_bytes =
-                self.state.stats.disk_peak_bytes.max(self.state.used_bytes);
+        if self.cache.account_pending_growth(charge)? {
             return Err(unavailable(
                 "Peer stream allocation exceeds reserved blocks",
             ));
@@ -501,29 +498,22 @@ impl PeerStreamSink<'_> {
         .map_err(Error::from)?;
         self.committed = true;
         self.owns_pending = false;
-        self.state.used_bytes = self.state.used_bytes - reservation + charge;
-        self.state.pending_charge = 0;
-        self.state.entries.insert(
+        let published = file
+            .metadata()
+            .ok()
+            .map(|metadata| file_identity(&metadata));
+        self.cache.publish_entry(
             self.key.clone(),
-            Entry {
-                chunk: self.chunk.clone(),
-                charge,
-                identity: (metadata.dev(), metadata.ino()),
-                touched: self.cache.bucket(),
-                proof: None,
-                #[cfg(test)]
-                drop_observation: None,
+            self.chunk.clone(),
+            charge,
+            published.unwrap_or_else(|| file_identity(&metadata)),
+            if published.is_some() {
+                completed.outboard
+            } else {
+                None
             },
-        );
-        refresh_metadata(self.state);
-        if let Ok(published) = file.metadata() {
-            install_proof(
-                self.state,
-                &self.key,
-                file_identity(&published),
-                completed.outboard,
-            );
-        }
+            self.entry_lease.take(),
+        )?;
         Ok(true)
     }
 }
@@ -535,6 +525,11 @@ impl Drop for PeerStreamSink<'_> {
         {
             afs_logging::warn!("dfs.peer_stream_drop_cleanup_failed"; "error" => error.to_string());
         }
+        drop(self.entry_lease.take());
+        if let Ok(mut state) = self.cache.state.lock() {
+            state.pending_metadata_charge = 0;
+        }
+        self.cache.report_resources();
     }
 }
 
@@ -602,6 +597,8 @@ pub struct DiskPeerCache {
     _marker: File,
     started: Instant,
     state: Mutex<CacheState>,
+    changed: Condvar,
+    max_flights: usize,
     read_work: Option<super::read_work::ReadWorkMetrics>,
     proof_budget: Arc<OutboardBudget>,
 }
@@ -611,11 +608,24 @@ struct CacheState {
     budget: Arc<OutboardBudget>,
     closed: bool,
     entries: BTreeMap<String, Entry>,
+    retired: BTreeMap<String, RetiredEntry>,
+    fill_active: bool,
+    operations: usize,
+    flights: BTreeMap<String, Arc<FillFlight>>,
+    flight_live: usize,
+    deleting_slots: usize,
+    local_index_available: bool,
     // Rust drops fields in declaration order: entries and their proof wrappers
     // must release before the reservation covering their pointer slots.
     index_lease: Option<OutboardLease>,
     used_bytes: u64,
     pending_charge: u64,
+    pending_identity: Option<(u64, u64)>,
+    pending_metadata_charge: usize,
+    operation_metadata_bytes: usize,
+    entry_metadata_bytes: usize,
+    retired_disk_bytes: u64,
+    flight_metadata_bytes: usize,
     stats: PeerCacheStats,
     #[cfg(test)]
     fail_remove: bool,
@@ -633,7 +643,9 @@ struct Entry {
     charge: u64,
     identity: (u64, u64),
     touched: u64,
-    proof: Option<Box<VerifiedDiskOutboard>>,
+    proof: Option<Arc<VerifiedDiskOutboard>>,
+    generation: Arc<()>,
+    _metadata: Option<OutboardLease>,
     #[cfg(test)]
     drop_observation: Option<DropObservation>,
 }
@@ -663,14 +675,93 @@ struct Header {
 
 pub struct PeerCacheOperation<'a> {
     cache: &'a DiskPeerCache,
-    state: MutexGuard<'a, CacheState>,
-    initial_work: PeerCacheHashWork,
-    initial_reads: u64,
-    initial_copies: u64,
-    initial_stages: PeerCacheReadStages,
+    // Per-operation work only, never a MutexGuard or a body allocation.
+    state: CacheState,
+    fill: Option<FillPermit<'a>>,
+    _metadata: Option<OutboardLease>,
+}
+
+#[derive(Debug)]
+struct RetiredEntry {
+    entry: Entry,
+    deleting: bool,
+}
+
+struct EntryPin<'a> {
+    cache: &'a DiskPeerCache,
+    generation: Option<Arc<()>>,
+}
+
+struct FillPermit<'a> {
+    cache: &'a DiskPeerCache,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum FillOutcome {
+    Ready,
+    Uncached,
+    Failed(Error),
+}
+
+#[derive(Debug)]
+struct FillFlight {
+    result: Mutex<Option<FillOutcome>>,
+    changed: Condvar,
+    _metadata: OutboardLease,
+}
+
+pub(crate) struct FillLeader<'a> {
+    cache: &'a DiskPeerCache,
+    key: String,
+    flight: Option<Arc<FillFlight>>,
+    completed: bool,
+}
+
+pub(crate) enum FillRole<'a> {
+    Leader(FillLeader<'a>),
+    Finished(FillOutcome),
 }
 
 impl CacheState {
+    fn new_local(budget: Arc<OutboardBudget>) -> Self {
+        let mut state = Self::new_without_index(budget);
+        state.local_index_available = true;
+        state
+    }
+
+    fn new_without_index(budget: Arc<OutboardBudget>) -> Self {
+        Self {
+            budget,
+            closed: false,
+            entries: BTreeMap::new(),
+            retired: BTreeMap::new(),
+            fill_active: false,
+            operations: 0,
+            flights: BTreeMap::new(),
+            flight_live: 0,
+            deleting_slots: 0,
+            local_index_available: false,
+            index_lease: None,
+            used_bytes: 0,
+            pending_charge: 0,
+            pending_identity: None,
+            pending_metadata_charge: 0,
+            operation_metadata_bytes: 0,
+            entry_metadata_bytes: 0,
+            retired_disk_bytes: 0,
+            flight_metadata_bytes: 0,
+            stats: PeerCacheStats::default(),
+            #[cfg(test)]
+            fail_remove: false,
+            #[cfg(test)]
+            fail_stream_write: false,
+            #[cfg(test)]
+            fail_stream_metadata: false,
+            #[cfg(test)]
+            proof_limit: None,
+        }
+    }
+
     fn new(budget: Arc<OutboardBudget>) -> Self {
         // All optional proof slots are bounded up front. A small shared budget
         // can disable proof acceleration without disabling complete verification.
@@ -682,8 +773,21 @@ impl CacheState {
             index_lease,
             closed: false,
             entries: BTreeMap::new(),
+            retired: BTreeMap::new(),
+            fill_active: false,
+            operations: 0,
+            flights: BTreeMap::new(),
+            flight_live: 0,
+            deleting_slots: 0,
+            local_index_available: false,
             used_bytes: 0,
             pending_charge: 0,
+            pending_identity: None,
+            pending_metadata_charge: 0,
+            operation_metadata_bytes: 0,
+            entry_metadata_bytes: 0,
+            retired_disk_bytes: 0,
+            flight_metadata_bytes: 0,
             stats: PeerCacheStats::default(),
             #[cfg(test)]
             fail_remove: false,
@@ -798,6 +902,8 @@ impl DiskPeerCache {
             _marker: marker,
             started: Instant::now(),
             state: Mutex::new(CacheState::new(proof_budget.clone())),
+            changed: Condvar::new(),
+            max_flights: 8,
             proof_budget,
             read_work: None,
         };
@@ -836,41 +942,104 @@ impl DiskPeerCache {
         self
     }
 
-    pub fn operation(&self) -> Result<PeerCacheOperation<'_>> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| unavailable("Peer cache lock poisoned"))?;
-        if state.closed {
-            return Err(unavailable("Peer cache is stopped"));
+    pub(crate) fn with_max_inflight_objects(mut self, maximum: usize) -> Result<Self> {
+        if !(1..=8).contains(&maximum) {
+            return Err(invalid(
+                "Peer cache metadata flights must be between one and eight",
+            ));
         }
-        self.check_root()?;
-        let initial_work = state.stats.hash_work;
-        let initial_reads = state.stats.data_read_calls;
-        let initial_copies = state.stats.copied_bytes_total;
-        let initial_stages = state.stats.read_stages;
-        Ok(PeerCacheOperation {
-            cache: self,
-            state,
-            initial_work,
-            initial_reads,
-            initial_copies,
-            initial_stages,
-        })
+        self.max_flights = maximum;
+        Ok(self)
     }
 
-    pub fn shutdown(&self) -> Result<()> {
+    pub fn operation(&self) -> Result<PeerCacheOperation<'_>> {
+        self.check_root()?;
+        let wait = self
+            .read_work
+            .as_ref()
+            .and_then(|metrics| metrics.coarse_diagnostic("cache_lock_wait", 0));
         let mut state = self
             .state
             .lock()
             .map_err(|_| unavailable("Peer cache lock poisoned"))?;
-        state.closed = true;
-        state.entries.clear();
-        state.index_lease = None;
-        refresh_metadata(&mut state);
-        if let Some(metrics) = &self.read_work {
-            metrics.peer_cache_metadata(0, state.stats.proof_metadata_peak_bytes);
+        drop(wait);
+        // Bound operation-local entry/proof snapshots independently of workers.
+        if state.closed || state.operations >= 128 {
+            return Err(unavailable(
+                "Peer cache is stopped or operation slots are full",
+            ));
         }
+        let metadata = self.proof_budget.try_reserve(8192);
+        state.operations += 1;
+        if metadata.is_some() {
+            state.operation_metadata_bytes += 8192;
+        }
+        let mut local = CacheState::new_local(self.proof_budget());
+        local.local_index_available = state.index_lease.is_some();
+        #[cfg(test)]
+        {
+            local.proof_limit = state.proof_limit;
+        }
+        drop(state);
+        self.report_resources();
+        Ok(PeerCacheOperation {
+            cache: self,
+            state: local,
+            fill: None,
+            _metadata: metadata,
+        })
+    }
+
+    pub(crate) fn close_admission(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.closed = true;
+            self.changed.notify_all();
+            for flight in state.flights.values() {
+                flight.changed.notify_all();
+            }
+        }
+    }
+
+    pub fn shutdown(&self) -> Result<()> {
+        self.close_admission();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| unavailable("Peer cache lock poisoned"))?;
+        while state.operations != 0
+            || state.fill_active
+            || state.flight_live != 0
+            || state.deleting_slots != 0
+            || state.retired.values().any(|retired| retired.deleting)
+        {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(unavailable("Peer cache drain deadline exceeded"));
+            }
+            state = self
+                .changed
+                .wait_timeout(state, remaining)
+                .map_err(|_| unavailable("Peer cache drain lock poisoned"))?
+                .0;
+        }
+        // Preserve healthy disk entries for startup recovery. Charges and proof
+        // owners leave the lock before final destruction.
+        let entries = std::mem::take(&mut state.entries);
+        let released_entry_metadata: usize = entries
+            .iter()
+            .map(|(key, entry)| entry_metadata_charge(key, &entry.chunk))
+            .sum();
+        state.entry_metadata_bytes = state
+            .entry_metadata_bytes
+            .saturating_sub(released_entry_metadata);
+        refresh_metadata(&mut state);
+        drop(state);
+        drop(entries);
+        self.cleanup_retired()?;
+        let index = self.lock_state()?.index_lease.take();
+        drop(index);
+        self.report_resources();
         Ok(())
     }
 
@@ -960,7 +1129,7 @@ impl DiskPeerCache {
         state.stats.disk_peak_bytes = state.stats.disk_peak_bytes.max(total);
         state.pending_charge = pending.unwrap_or(0);
         if pending.is_some() {
-            self.remove_pending(&mut state)?;
+            self.bootstrap_remove_pending(&mut state)?;
         }
         for (key, metadata) in ready {
             let (mut file, _) = open_private(&self.path(&key))?;
@@ -973,6 +1142,28 @@ impl DiskPeerCache {
             {
                 return Err(invalid("Peer cache ready identity is foreign; preserved"));
             }
+            // Recovery is single-threaded before this cache is published.
+            // Make room by retiring optional summaries, never healthy bodies.
+            let metadata_lease = loop {
+                if let Some(lease) = self
+                    .proof_budget
+                    .try_reserve_resident(entry_metadata_charge(&key, &header.chunk))
+                {
+                    break lease;
+                }
+                let Some(entry) = state
+                    .entries
+                    .values_mut()
+                    .filter(|entry| entry.proof.is_some())
+                    .min_by_key(|entry| entry.touched)
+                else {
+                    return Err(unavailable(
+                        "Peer cache recovery metadata capacity exceeded",
+                    ));
+                };
+                entry.proof = None;
+                refresh_metadata(&mut state);
+            };
             state.entries.insert(
                 key.clone(),
                 Entry {
@@ -981,16 +1172,19 @@ impl DiskPeerCache {
                     identity: (metadata.dev(), metadata.ino()),
                     touched: 0,
                     proof: None,
+                    generation: Arc::new(()),
+                    _metadata: Some(metadata_lease),
                     #[cfg(test)]
                     drop_observation: None,
                 },
             );
+            state.entry_metadata_bytes += entry_metadata_charge(&key, &header.chunk);
             refresh_metadata(&mut state);
             if header.version == 1 {
                 // This directory is explicitly disposable. Retire only recognized
                 // old cache objects; authoritative LocalChunkStore is elsewhere.
                 drop(file);
-                self.remove_entry(&mut state, &key, false)?;
+                self.bootstrap_remove_entry(&mut state, &key, false)?;
                 continue;
             }
             let before = file.metadata().map_err(Error::from)?;
@@ -1026,14 +1220,19 @@ impl DiskPeerCache {
                 Err(_) => {
                     state.stats.corruptions = state.stats.corruptions.saturating_add(1);
                     drop(file);
-                    self.remove_entry(&mut state, &key, false)?;
+                    self.bootstrap_remove_entry(&mut state, &key, false)?;
                 }
             }
         }
         Ok(())
     }
 
-    fn remove_entry(&self, state: &mut CacheState, key: &str, eviction: bool) -> Result<()> {
+    fn bootstrap_remove_entry(
+        &self,
+        state: &mut CacheState,
+        key: &str,
+        eviction: bool,
+    ) -> Result<()> {
         self.check_root()?;
         let Some(entry) = state.entries.get(key) else {
             return Ok(());
@@ -1054,6 +1253,8 @@ impl DiskPeerCache {
             Err(error) => return Err(Error::from(error)),
         }
         let charge = entry.charge;
+        let metadata_charge = entry_metadata_charge(key, &entry.chunk);
+        state.entry_metadata_bytes = state.entry_metadata_bytes.saturating_sub(metadata_charge);
         state.entries.remove(key);
         refresh_metadata(state);
         state.used_bytes = state.used_bytes.saturating_sub(charge);
@@ -1063,7 +1264,7 @@ impl DiskPeerCache {
         Ok(())
     }
 
-    fn remove_pending(&self, state: &mut CacheState) -> Result<()> {
+    fn bootstrap_remove_pending(&self, state: &mut CacheState) -> Result<()> {
         self.check_root()?;
         #[cfg(test)]
         if state.fail_remove {
@@ -1081,30 +1282,522 @@ impl DiskPeerCache {
         state.pending_charge = 0;
         Ok(())
     }
+}
 
-    fn admit_space(&self, state: &mut CacheState, charge: u64) -> Result<bool> {
-        if charge > self.options.capacity_bytes {
-            return Ok(false);
+impl DiskPeerCache {
+    fn report_resources(&self) {
+        let Some(metrics) = &self.read_work else {
+            return;
+        };
+        let Ok(state) = self.state.lock() else {
+            return;
+        };
+        let index = if state.index_lease.is_some() {
+            MAX_PEER_CACHE_ENTRIES * std::mem::size_of::<Option<Arc<VerifiedDiskOutboard>>>()
+        } else {
+            0
+        };
+        // Fixed pre-registered in-memory gauges publish under the short metadata
+        // lock: no stale snapshot can overwrite a newer resource observation.
+        metrics.peer_cache_metadata(
+            state.stats.proof_metadata_bytes,
+            state.stats.proof_metadata_peak_bytes,
+        );
+        metrics.peer_cache_resources(&[
+            ("operations", state.operations as u64),
+            ("flights", state.flight_live as u64),
+            (
+                "fill_body_bytes",
+                if state.fill_active {
+                    MAX_OBJECT_BYTES
+                } else {
+                    0
+                },
+            ),
+            ("indexed_entries", state.entries.len() as u64),
+            (
+                "retired_entries",
+                (state.retired.len() + state.deleting_slots) as u64,
+            ),
+            ("retired_disk_bytes", state.retired_disk_bytes),
+            (
+                "control_bytes",
+                (state.entry_metadata_bytes
+                    + state.flight_metadata_bytes
+                    + state.operation_metadata_bytes
+                    + state.pending_metadata_charge
+                    + index) as u64,
+            ),
+        ]);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_fill_flight_for_test(&self) -> bool {
+        !self.state.lock().unwrap().flights.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn waiting_fill_readers_for_test(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap()
+            .flights
+            .values()
+            .map(|flight| Arc::strong_count(flight).saturating_sub(2))
+            .sum()
+    }
+
+    fn lock_state(&self) -> Result<std::sync::MutexGuard<'_, CacheState>> {
+        self.state
+            .lock()
+            .map_err(|_| unavailable("Peer cache lock poisoned"))
+    }
+
+    fn cleanup_retired(&self) -> Result<()> {
+        loop {
+            let ticket = {
+                let mut state = self.lock_state()?;
+                let Some((key, retired)) = state.retired.iter_mut().find(|(_, retired)| {
+                    !retired.deleting && Arc::strong_count(&retired.entry.generation) == 1
+                }) else {
+                    return Ok(());
+                };
+                retired.deleting = true;
+                (
+                    key.clone(),
+                    retired.entry.generation.clone(),
+                    retired.entry.identity,
+                )
+            };
+            let (key, generation, identity) = ticket;
+            let result = (|| {
+                self.check_root()?;
+                #[cfg(test)]
+                if self.lock_state()?.fail_remove {
+                    return Err(unavailable("injected Peer cache cleanup failure"));
+                }
+                match fs::symlink_metadata(self.path(&key)) {
+                    Ok(metadata) => {
+                        validate_private_file(&metadata)?;
+                        if (metadata.dev(), metadata.ino()) != identity {
+                            return Err(invalid("Peer cache cleanup refuses a replaced file"));
+                        }
+                        fs::remove_file(self.path(&key)).map_err(Error::from)
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(error) => Err(Error::from(error)),
+                }
+            })();
+            let removed = {
+                let mut state = self.lock_state()?;
+                if let Some(retired) = state.retired.get_mut(&key)
+                    && Arc::ptr_eq(&generation, &retired.entry.generation)
+                {
+                    retired.deleting = false;
+                    if result.is_ok() {
+                        let removed = state.retired.remove(&key);
+                        if let Some(retired) = &removed {
+                            state.used_bytes =
+                                state.used_bytes.saturating_sub(retired.entry.charge);
+                            state.retired_disk_bytes = state
+                                .retired_disk_bytes
+                                .saturating_sub(retired.entry.charge);
+                            state.deleting_slots += 1;
+                        }
+                        refresh_metadata(&mut state);
+                        removed
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            };
+            let metadata_charge = removed
+                .as_ref()
+                .map(|retired| entry_metadata_charge(&key, &retired.entry.chunk));
+            drop(removed);
+            if let Some(charge) = metadata_charge {
+                let mut state = self.lock_state()?;
+                state.entry_metadata_bytes = state.entry_metadata_bytes.saturating_sub(charge);
+                state.deleting_slots = state.deleting_slots.saturating_sub(1);
+            }
+            self.changed.notify_all();
+            self.report_resources();
+            result?;
         }
-        while state.used_bytes.saturating_add(charge) > self.options.capacity_bytes
-            || state.entries.len() >= MAX_PEER_CACHE_ENTRIES
+    }
+
+    fn retire(&self, key: &str, generation: Option<&Arc<()>>, eviction: bool) -> Result<()> {
         {
-            // Whole-second buckets, bounded by 4096 entries; no append history.
-            let Some(key) = state
-                .entries
-                .iter()
-                .min_by_key(|(_, entry)| entry.touched)
-                .map(|(key, _)| key.clone())
-            else {
+            let mut state = self.lock_state()?;
+            let eligible = state.entries.get(key).is_some_and(|entry| {
+                generation.is_none_or(|generation| Arc::ptr_eq(generation, &entry.generation))
+            });
+            if eligible && let Some(entry) = state.entries.remove(key) {
+                state.retired_disk_bytes = state.retired_disk_bytes.saturating_add(entry.charge);
+                state.retired.insert(
+                    key.to_owned(),
+                    RetiredEntry {
+                        entry,
+                        deleting: false,
+                    },
+                );
+                if eviction {
+                    state.stats.evictions = state.stats.evictions.saturating_add(1);
+                }
+                refresh_metadata(&mut state);
+            }
+        }
+        self.cleanup_retired()
+    }
+
+    fn reserve_entry_metadata(&self, charge: usize) -> Result<Option<OutboardLease>> {
+        loop {
+            if let Some(lease) = self.proof_budget.try_reserve_resident(charge) {
+                return Ok(Some(lease));
+            }
+            // Retire acceleration metadata, never a healthy body or its trust
+            // identity. Existing readers keep the wrapper's actual lease alive.
+            let old = {
+                let mut state = self.lock_state()?;
+                let victim = state
+                    .entries
+                    .values_mut()
+                    .filter(|entry| entry.proof.is_some())
+                    .min_by_key(|entry| entry.touched);
+                let old = victim.and_then(|entry| entry.proof.take());
+                refresh_metadata(&mut state);
+                old
+            };
+            let released = old.is_some();
+            drop(old);
+            if !released {
+                return Ok(None);
+            }
+        }
+    }
+
+    fn reserve_pending(&self, key: &str, charge: u64) -> Result<bool> {
+        self.retire(key, None, false)?;
+        loop {
+            self.cleanup_retired()?;
+            let victim = {
+                let mut state = self.lock_state()?;
+                if state.closed
+                    || state.pending_charge != 0
+                    || state.retired.contains_key(key)
+                    || charge > self.options.capacity_bytes
+                {
+                    return Ok(false);
+                }
+                if state.used_bytes.saturating_add(charge) <= self.options.capacity_bytes
+                    && state.entries.len() + state.retired.len() + state.deleting_slots
+                        < MAX_PEER_CACHE_ENTRIES
+                {
+                    state.used_bytes += charge;
+                    state.pending_charge = charge;
+                    state.stats.disk_peak_bytes = state.stats.disk_peak_bytes.max(state.used_bytes);
+                    return Ok(true);
+                }
+                state
+                    .entries
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.touched)
+                    .map(|(key, _)| key.clone())
+            };
+            let Some(victim) = victim else {
                 return Ok(false);
             };
-            self.remove_entry(state, &key, true)?;
+            self.retire(&victim, None, true)?;
         }
+    }
+
+    // Only the holder of the unique fill permit may invoke this at runtime.
+    fn clear_pending(&self, expected: Option<(u64, u64)>) -> Result<()> {
+        self.check_root()?;
+        #[cfg(test)]
+        if self.lock_state()?.fail_remove {
+            return Err(unavailable("injected Peer cache cleanup failure"));
+        }
+        match fs::symlink_metadata(self.directory().join(PENDING)) {
+            Ok(metadata) => {
+                validate_private_file(&metadata)?;
+                if expected.is_none_or(|identity| identity != (metadata.dev(), metadata.ino())) {
+                    return Err(invalid(
+                        "Peer cache cleanup refuses an unowned pending file",
+                    ));
+                }
+                fs::remove_file(self.directory().join(PENDING)).map_err(Error::from)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(Error::from(error)),
+        }
+        let mut state = self.lock_state()?;
+        state.used_bytes = state.used_bytes.saturating_sub(state.pending_charge);
+        state.pending_charge = 0;
+        state.pending_identity = None;
+        Ok(())
+    }
+
+    fn account_pending_growth(&self, charge: u64) -> Result<bool> {
+        let mut state = self.lock_state()?;
+        if charge <= state.pending_charge {
+            return Ok(false);
+        }
+        state.used_bytes = state
+            .used_bytes
+            .saturating_add(charge - state.pending_charge);
+        state.pending_charge = charge;
+        state.stats.disk_peak_bytes = state.stats.disk_peak_bytes.max(state.used_bytes);
         Ok(true)
+    }
+
+    fn publish_entry(
+        &self,
+        key: String,
+        chunk: ChunkObject,
+        charge: u64,
+        identity: FileIdentity,
+        proof: Option<SharedOutboard>,
+        metadata: Option<OutboardLease>,
+    ) -> Result<()> {
+        let mut local = CacheState::new_local(self.proof_budget());
+        {
+            let state = self.lock_state()?;
+            local.local_index_available = state.index_lease.is_some();
+            #[cfg(test)]
+            {
+                local.proof_limit = state.proof_limit;
+            }
+        }
+        local.entries.insert(
+            key.clone(),
+            Entry {
+                chunk,
+                charge,
+                identity: (identity.0, identity.1),
+                touched: self.bucket(),
+                proof: None,
+                generation: Arc::new(()),
+                _metadata: metadata,
+                #[cfg(test)]
+                drop_observation: None,
+            },
+        );
+        install_proof(&mut local, &key, identity, proof);
+        let entry = local
+            .entries
+            .remove(&key)
+            .ok_or_else(|| unavailable("Peer cache entry missing"))?;
+        let mut state = self.lock_state()?;
+        state.used_bytes = state.used_bytes - state.pending_charge + charge;
+        state.pending_charge = 0;
+        state.pending_identity = None;
+        state.entry_metadata_bytes += entry_metadata_charge(&key, &entry.chunk);
+        state.entries.insert(key, entry);
+        state.pending_metadata_charge = 0;
+        refresh_metadata(&mut state);
+        drop(state);
+        self.report_resources();
+        Ok(())
+    }
+
+    pub(crate) fn fill_flight<'a>(
+        &'a self,
+        chunk: &ChunkObject,
+        check: impl Fn() -> Result<()>,
+    ) -> Result<FillRole<'a>> {
+        let key = self.key(chunk)?;
+        let (flight, leader) = loop {
+            check()?;
+            let mut state = self.lock_state()?;
+            if state.closed {
+                return Err(unavailable("Peer cache is stopped"));
+            }
+            if let Some(flight) = state.flights.get(&key) {
+                break (flight.clone(), false);
+            }
+            if state.flight_live < self.max_flights {
+                let Some(metadata) = self
+                    .proof_budget
+                    .try_reserve(std::mem::size_of::<FillFlight>() + 512 + key.capacity() + 256)
+                else {
+                    return Ok(FillRole::Finished(FillOutcome::Uncached));
+                };
+                let flight = Arc::new(FillFlight {
+                    result: Mutex::new(None),
+                    changed: Condvar::new(),
+                    _metadata: metadata,
+                });
+                state.flights.insert(key.clone(), flight.clone());
+                state.flight_live += 1;
+                state.flight_metadata_bytes +=
+                    std::mem::size_of::<FillFlight>() + 512 + key.capacity() + 256;
+                break (flight, true);
+            }
+            drop(
+                self.changed
+                    .wait_timeout(state, Duration::from_millis(25))
+                    .map_err(|_| unavailable("Peer flight admission lock poisoned"))?,
+            );
+        };
+        if leader {
+            self.report_resources();
+            return Ok(FillRole::Leader(FillLeader {
+                cache: self,
+                key,
+                flight: Some(flight),
+                completed: false,
+            }));
+        }
+        let outcome = (|| loop {
+            check()?;
+            if self.lock_state()?.closed {
+                return Err(unavailable("Peer cache is stopped"));
+            }
+            let result = flight
+                .result
+                .lock()
+                .map_err(|_| unavailable("Peer flight lock poisoned"))?;
+            if let Some(outcome) = &*result {
+                return Ok(outcome.clone());
+            }
+            drop(
+                flight
+                    .changed
+                    .wait_timeout(result, Duration::from_millis(25))
+                    .map_err(|_| unavailable("Peer flight wait lock poisoned"))?,
+            );
+        })();
+        self.release_flight(&key, flight);
+        outcome.map(FillRole::Finished)
+    }
+
+    fn release_flight(&self, key: &str, flight: Arc<FillFlight>) {
+        let removed = if let Ok(mut state) = self.state.lock() {
+            let same = state
+                .flights
+                .get(key)
+                .is_some_and(|current| Arc::ptr_eq(current, &flight));
+            drop(flight);
+            if same
+                && state
+                    .flights
+                    .get(key)
+                    .is_some_and(|current| Arc::strong_count(current) == 1)
+            {
+                state.flights.remove(key)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let released = removed.is_some();
+        drop(removed);
+        if released && let Ok(mut state) = self.state.lock() {
+            state.flight_live = state.flight_live.saturating_sub(1);
+            state.flight_metadata_bytes = state
+                .flight_metadata_bytes
+                .saturating_sub(std::mem::size_of::<FillFlight>() + 512 + key.len() + 256);
+        }
+        self.changed.notify_all();
+        self.report_resources();
+    }
+}
+
+impl FillLeader<'_> {
+    pub(crate) fn finish(&mut self, outcome: FillOutcome) {
+        if self.completed {
+            return;
+        }
+        let outcome = match outcome {
+            FillOutcome::Failed(error) if error.message().len() > 512 => {
+                afs_logging::warn!("dfs.peer_fill_shared_error_truncated"; "code" => error.code().to_string());
+                let mut boundary = 512;
+                while !error.message().is_char_boundary(boundary) {
+                    boundary -= 1;
+                }
+                FillOutcome::Failed(Error::new(
+                    error.code(),
+                    error.kind(),
+                    &error.message()[..boundary],
+                ))
+            }
+            outcome => outcome,
+        };
+        if let Some(flight) = &self.flight
+            && let Ok(mut result) = flight.result.lock()
+        {
+            *result = Some(outcome);
+            self.completed = true;
+            flight.changed.notify_all();
+        }
+    }
+}
+
+impl Drop for FillLeader<'_> {
+    fn drop(&mut self) {
+        self.finish(FillOutcome::Failed(unavailable(
+            "Peer fill leader stopped before completion",
+        )));
+        if let Some(flight) = self.flight.take() {
+            self.cache.release_flight(&self.key, flight);
+        }
+    }
+}
+
+impl Drop for FillPermit<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.cache.state.lock() {
+            state.fill_active = false;
+        }
+        self.cache.changed.notify_all();
+        self.cache.report_resources();
+    }
+}
+
+impl Drop for EntryPin<'_> {
+    fn drop(&mut self) {
+        drop(self.generation.take());
+        if let Err(error) = self.cache.cleanup_retired() {
+            afs_logging::warn!("dfs.peer_cache_retired_cleanup_failed"; "error" => error.to_string());
+        }
     }
 }
 
 impl PeerCacheOperation<'_> {
+    pub(crate) fn has_control_capacity(&self) -> bool {
+        self._metadata.is_some()
+    }
+
+    pub(crate) fn acquire_fill(&mut self, check: impl Fn() -> Result<()>) -> Result<()> {
+        if self.fill.is_some() {
+            return Ok(());
+        }
+        loop {
+            check()?;
+            let mut state = self.cache.lock_state()?;
+            if state.closed {
+                return Err(unavailable("Peer cache is stopped"));
+            }
+            if !state.fill_active {
+                state.fill_active = true;
+                self.fill = Some(FillPermit { cache: self.cache });
+                drop(state);
+                self.cache.report_resources();
+                return Ok(());
+            }
+            drop(
+                self.cache
+                    .changed
+                    .wait_timeout(state, Duration::from_millis(25))
+                    .map_err(|_| unavailable("Peer fill admission lock poisoned"))?,
+            );
+        }
+    }
+
     pub fn hash_work(&self) -> PeerCacheHashWork {
         self.state.stats.hash_work
     }
@@ -1118,10 +1811,14 @@ impl PeerCacheOperation<'_> {
         if chunk.length > MAX_OBJECT_BYTES {
             return Err(invalid("Peer stream object exceeds bound"));
         }
+        self.acquire_fill(|| Ok(()))?;
         let key = self.cache.key(chunk)?;
         let mut sink = PeerStreamSink {
             cache: self.cache,
-            state: &mut self.state,
+            _fill: self
+                .fill
+                .as_ref()
+                .ok_or_else(|| unavailable("Peer fill allowance missing"))?,
             chunk: chunk.clone(),
             key,
             received: 0,
@@ -1130,17 +1827,23 @@ impl PeerCacheOperation<'_> {
             pending_identity: None,
             owns_pending: false,
             committed: false,
+            prepare_error: None,
+            entry_lease: None,
             identity: Arc::new(()),
             #[cfg(test)]
             write_delay: std::time::Duration::ZERO,
         };
         if let Err(error) = sink.prepare() {
+            sink.prepare_error = Some(error.clone());
             sink.disable(&error);
         }
         Ok(sink)
     }
 
     pub fn read_range(&mut self, chunk: &ChunkObject, offset: u64, out: &mut [u8]) -> Result<bool> {
+        if self._metadata.is_none() {
+            return self.read_range_root_fallback(chunk, offset, out);
+        }
         let prepare_started = Instant::now();
         let selected = (|| {
             self.cache.check_root()?;
@@ -1152,16 +1855,47 @@ impl PeerCacheOperation<'_> {
                 return Err(invalid("Peer cache range exceeds immutable object"));
             }
             let key = self.cache.key(chunk)?;
-            let Some(entry) = self.state.entries.get(&key) else {
+            let selected = {
+                let state = self.cache.lock_state()?;
+                state.entries.get(&key).map(|entry| {
+                    (
+                        entry.chunk.clone(),
+                        entry.charge,
+                        entry.identity,
+                        entry.touched,
+                        entry.proof.clone(),
+                        entry.generation.clone(),
+                    )
+                })
+            };
+            let Some((object, charge, identity, touched, proof, generation)) = selected else {
                 self.state.stats.misses = self.state.stats.misses.saturating_add(1);
                 return Ok(None);
             };
-            if entry.chunk != *chunk {
+            if object != *chunk {
                 return Err(invalid("Peer cache index identity differs"));
             }
-            Ok(Some((key, entry.identity)))
+            let pin = EntryPin {
+                cache: self.cache,
+                generation: Some(generation),
+            };
+            self.state.entries.insert(
+                key.clone(),
+                Entry {
+                    chunk: object,
+                    charge,
+                    identity,
+                    touched,
+                    proof,
+                    generation: Arc::new(()),
+                    _metadata: None,
+                    #[cfg(test)]
+                    drop_observation: None,
+                },
+            );
+            Ok(Some((key, identity, pin)))
         })();
-        let (key, expected) = match selected {
+        let (key, expected, pin) = match selected {
             Ok(Some(selected)) => selected,
             early => {
                 self.state.stats.read_stages.prepare_ns = self
@@ -1173,6 +1907,11 @@ impl PeerCacheOperation<'_> {
                 return early.map(|_| false);
             }
         };
+        // Only indexed hit attempts: misses above do not count as disk hits.
+        // Includes opening/header/identity/range verification and finalization.
+        let _diagnostic = self.cache.read_work.as_ref().and_then(|metrics| {
+            metrics.coarse_diagnostic("cache_hit_read_verify", out.len() as u64)
+        });
         let path = self.cache.path(&key);
         let mut finalize_started = None;
         let result = (|| {
@@ -1302,7 +2041,7 @@ impl PeerCacheOperation<'_> {
             {
                 self.state.stats.corruptions = self.state.stats.corruptions.saturating_add(1);
                 self.state.stats.misses = self.state.stats.misses.saturating_add(1);
-                self.cache.remove_entry(&mut self.state, &key, false)?;
+                self.cache.retire(&key, pin.generation.as_ref(), false)?;
                 Ok(false)
             }
             Err(error) => Err(error),
@@ -1313,127 +2052,197 @@ impl PeerCacheOperation<'_> {
             .read_stages
             .finalize_ns
             .saturating_add(elapsed_ns(finalize_started));
+        let local_entry = self.state.entries.remove(&key);
+        let old_proof = if outcome.as_ref().is_ok_and(|hit| *hit) {
+            let mut state = self.cache.lock_state()?;
+            if let Some(entry) = state.entries.get_mut(&key)
+                && pin
+                    .generation
+                    .as_ref()
+                    .is_some_and(|generation| Arc::ptr_eq(generation, &entry.generation))
+            {
+                entry.touched = self.cache.bucket();
+                let previous = entry.proof.take();
+                entry.proof = local_entry.as_ref().and_then(|entry| entry.proof.clone());
+                refresh_metadata(&mut state);
+                previous
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        drop(old_proof);
+        drop(local_entry);
+        drop(pin);
         outcome
+    }
+
+    fn read_range_root_fallback(
+        &mut self,
+        chunk: &ChunkObject,
+        offset: u64,
+        out: &mut [u8],
+    ) -> Result<bool> {
+        self.cache.check_root()?;
+        validate_chunk(chunk)?;
+        if offset
+            .checked_add(out.len() as u64)
+            .is_none_or(|end| end > chunk.length)
+        {
+            return Err(invalid("Peer cache range exceeds immutable object"));
+        }
+        let key = self.cache.key(chunk)?;
+        let selected = {
+            let state = self.cache.lock_state()?;
+            state
+                .entries
+                .get(&key)
+                .map(|entry| (entry.identity, entry.generation.clone()))
+        };
+        let Some((expected, generation)) = selected else {
+            self.state.stats.misses += 1;
+            return Ok(false);
+        };
+        let pin = EntryPin {
+            cache: self.cache,
+            generation: Some(generation),
+        };
+        let result = (|| {
+            let (mut file, before) = open_private(&self.cache.path(&key))?;
+            if (before.dev(), before.ino()) != expected {
+                return Err(invalid("Peer cache ready file was replaced"));
+            }
+            let (header, body_start) = read_header(&mut file)?;
+            if header.version != 2
+                || header.namespace_id != self.cache.options.namespace_id
+                || header.chunk != *chunk
+            {
+                return Err(corrupt("Peer cache header identity differs"));
+            }
+            validate_file_length(&header, &before)?;
+            self.cache.proof_budget.record_range_fullscan_fallback();
+            let started = Instant::now();
+            let scanned = scan_body(
+                &mut file,
+                body_start,
+                chunk,
+                offset,
+                out,
+                &mut self.state.stats,
+                None,
+            );
+            self.state.stats.read_stages.stream_read_verify_ns += elapsed_ns(started);
+            scanned?;
+            let after = file.metadata().map_err(Error::from)?;
+            let current = fs::symlink_metadata(self.cache.path(&key)).map_err(Error::from)?;
+            if file_identity(&before) != file_identity(&after)
+                || file_identity(&after) != file_identity(&current)
+            {
+                return Err(corrupt("Peer cache file changed during verified read"));
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.state.stats.hits += 1;
+                Ok(true)
+            }
+            Err(error)
+                if error.code() == afs_error::NODE_TRANSFER_CORRUPT_DATA
+                    || error.kind() == afs_error::ErrorKind::NotFound =>
+            {
+                self.state.stats.corruptions += 1;
+                self.state.stats.misses += 1;
+                self.cache.retire(&key, pin.generation.as_ref(), false)?;
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Only borrowed typed proof is admitted; this method does not hash again.
     pub fn store_verified(&mut self, verified: &VerifiedPeerChunk<'_>) -> Result<bool> {
-        let chunk = verified.chunk;
-        if chunk.length > MAX_OBJECT_BYTES {
+        if verified.chunk.length > MAX_OBJECT_BYTES {
             return Ok(false);
         }
-        self.cache.check_root()?;
-        if self.state.pending_charge != 0 {
-            self.cache.remove_pending(&mut self.state)?;
+        let mut sink = self.begin_stream(verified.chunk)?;
+        if let Some(error) = sink.prepare_error.take() {
+            return Err(error);
         }
-        let key = self.cache.key(chunk)?;
-        if self.state.entries.contains_key(&key) {
-            self.cache.remove_entry(&mut self.state, &key, false)?;
-        }
+        sink.write(0, verified.bytes)?;
+        let Some(mut file) = sink.file.take() else {
+            return Ok(false);
+        };
         let outboard = verified
             .outboard
             .as_ref()
-            .filter(|proof| proof.uses_budget(&self.cache.proof_budget));
+            .filter(|proof| proof.uses_budget(&sink.cache.proof_budget));
         let trailer = outboard.map_or(&[][..], |proof| proof.encoded());
         if let Some(proof) = outboard {
-            validate_outboard(chunk, proof)?;
+            validate_outboard(verified.chunk, proof)?;
         }
-        let header = Header {
-            version: 2,
-            namespace_id: self.cache.options.namespace_id.clone(),
-            chunk: chunk.clone(),
-            outboard_length: trailer.len() as u32,
-        };
-        let length = MAX_HEADER_BYTES as u64 + chunk.length + trailer.len() as u64;
-        // Reserve staging rounding plus two filesystem units; actual stat.blocks
-        // replaces this conservative charge only after atomic publication.
-        let unit = self
-            .cache
-            .root
-            .metadata()
-            .map_err(Error::from)?
-            .blksize()
-            .max(512);
-        let reservation = length
-            .checked_add(unit - 1)
-            .and_then(|size| size.checked_div(unit))
-            .and_then(|blocks| blocks.checked_add(2))
-            .and_then(|blocks| blocks.checked_mul(unit))
-            .ok_or_else(|| invalid("Peer cache staging size overflow"))?;
-        if !self.cache.admit_space(&mut self.state, reservation)? {
-            return Ok(false);
-        }
-        let path = self.cache.directory().join(PENDING);
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&path)
-            .map_err(Error::from)?;
-        self.state.used_bytes += reservation;
-        self.state.stats.disk_peak_bytes =
-            self.state.stats.disk_peak_bytes.max(self.state.used_bytes);
-        self.state.pending_charge = reservation;
-        let written = (|| {
-            write_header(&mut file, &header)?;
-            file.write_all(verified.bytes).map_err(Error::from)?;
+        let result = (|| {
             file.write_all(trailer).map_err(Error::from)?;
+            file.seek(SeekFrom::Start(0)).map_err(Error::from)?;
+            write_header(
+                &mut file,
+                &Header {
+                    version: 2,
+                    namespace_id: sink.cache.options.namespace_id.clone(),
+                    chunk: verified.chunk.clone(),
+                    outboard_length: trailer.len() as u32,
+                },
+            )?;
             file.flush().map_err(Error::from)?;
-            let metadata = file.metadata().map_err(Error::from)?;
-            validate_private_file(&metadata)?;
-            let charge = allocated(&metadata)?;
-            if charge > reservation {
-                self.state.used_bytes = self.state.used_bytes.saturating_add(charge - reservation);
-                self.state.pending_charge = charge;
-                self.state.stats.disk_peak_bytes =
-                    self.state.stats.disk_peak_bytes.max(self.state.used_bytes);
+            sink.cache.check_root()?;
+            let before = file.metadata().map_err(Error::from)?;
+            validate_private_file(&before)?;
+            let current =
+                fs::symlink_metadata(sink.cache.directory().join(PENDING)).map_err(Error::from)?;
+            if sink.pending_identity != Some((before.dev(), before.ino()))
+                || file_identity(&before) != file_identity(&current)
+            {
+                return Err(corrupt("Peer cache staging identity changed"));
+            }
+            let charge = allocated(&before)?;
+            if sink.cache.account_pending_growth(charge)? {
                 return Err(unavailable("Peer cache allocation exceeds reserved blocks"));
             }
-            match fs::symlink_metadata(self.cache.path(&key)) {
+            match fs::symlink_metadata(sink.cache.path(&sink.key)) {
                 Ok(_) => return Err(invalid("Peer cache publication refuses an untracked file")),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(Error::from(error)),
             }
-            self.cache.check_root()?;
-            fs::rename(&path, self.cache.path(&key)).map_err(Error::from)?;
-            // Renaming may change ctime. Bind summaries to post-publication
-            // identity; inability to inspect it leaves a safe full-scan entry.
+            fs::rename(
+                sink.cache.directory().join(PENDING),
+                sink.cache.path(&sink.key),
+            )
+            .map_err(Error::from)?;
+            sink.committed = true;
+            sink.owns_pending = false;
             let published = file
                 .metadata()
                 .ok()
                 .map(|metadata| file_identity(&metadata));
-            Ok((charge, (metadata.dev(), metadata.ino()), published))
+            sink.cache.publish_entry(
+                sink.key.clone(),
+                verified.chunk.clone(),
+                charge,
+                published.unwrap_or_else(|| file_identity(&before)),
+                if published.is_some() {
+                    outboard.cloned()
+                } else {
+                    None
+                },
+                sink.entry_lease.take(),
+            )?;
+            Ok(true)
         })();
         drop(file);
-        match written {
-            Ok((charge, identity, published)) => {
-                self.state.used_bytes = self.state.used_bytes - reservation + charge;
-                self.state.pending_charge = 0;
-                self.state.entries.insert(
-                    key.clone(),
-                    Entry {
-                        chunk: chunk.clone(),
-                        charge,
-                        identity,
-                        touched: self.cache.bucket(),
-                        proof: None,
-                        #[cfg(test)]
-                        drop_observation: None,
-                    },
-                );
-                refresh_metadata(&mut self.state);
-                if let Some(identity) = published {
-                    install_proof(&mut self.state, &key, identity, outboard.cloned());
-                }
-                Ok(true)
-            }
-            Err(error) => {
-                // Failed cleanup remains charged and blocks future admission.
-                self.cache.remove_pending(&mut self.state)?;
-                Err(error)
-            }
-        }
+        // Sink Drop performs identity-bound cleanup; keep I/O errors visible to
+        // the caller, which retains the original verified private output.
+        result
     }
 }
 
@@ -1577,11 +2386,20 @@ fn copy_overlap(position: u64, bytes: &[u8], offset: u64, out: &mut [u8]) -> u64
     }
 }
 
+fn entry_metadata_charge(key: &str, chunk: &ChunkObject) -> usize {
+    // Chunk IDs are bounded to 512 bytes. Two entry slots per live item cover
+    // B-tree node occupancy; the fixed index reservation also covers sparse
+    // roots in the indexed/retired maps. The charge survives generation pins.
+    2 * (std::mem::size_of::<Entry>() + key.len() + chunk.id.0.capacity() + 256)
+}
+
 fn refresh_metadata(state: &mut CacheState) {
-    let pointers = state.entries.len() * std::mem::size_of::<Option<Box<VerifiedDiskOutboard>>>();
+    let pointers = (state.entries.len() + state.retired.len())
+        * std::mem::size_of::<Option<Box<VerifiedDiskOutboard>>>();
     let proofs: usize = state
         .entries
         .values()
+        .chain(state.retired.values().map(|retired| &retired.entry))
         .filter_map(|entry| entry.proof.as_ref())
         .map(|proof| proof.outboard.charged_bytes() + proof_allocation_charge() as usize)
         .sum();
@@ -1605,7 +2423,7 @@ fn proof_can_fit(state: &CacheState) -> bool {
     }) {
         return false;
     }
-    state.index_lease.is_some()
+    state.index_lease.is_some() || state.local_index_available
 }
 
 fn proof_allocation_charge() -> u64 {
@@ -1638,7 +2456,7 @@ fn install_proof(
             && outboard.try_mark_resident()
         {
             if let Some(entry) = state.entries.get_mut(key) {
-                entry.proof = Some(Box::new(VerifiedDiskOutboard {
+                entry.proof = Some(Arc::new(VerifiedDiskOutboard {
                     identity,
                     outboard,
                     _lease: lease,
@@ -1798,28 +2616,59 @@ fn report_stages(
 
 impl Drop for PeerCacheOperation<'_> {
     fn drop(&mut self) {
+        self.state.entries.clear();
+        // Explicitly release the real fill allowance after all sink borrowers
+        // have ended and before announcing this operation's drain completion.
+        drop(self.fill.take());
+        let had_metadata = self._metadata.is_some();
+        drop(self._metadata.take());
+        if let Ok(mut state) = self.cache.state.lock() {
+            add_stats(&mut state.stats, &self.state.stats);
+            state.operations = state.operations.saturating_sub(1);
+            if had_metadata {
+                state.operation_metadata_bytes =
+                    state.operation_metadata_bytes.saturating_sub(8192);
+            }
+        }
+        self.cache.changed.notify_all();
+        self.cache.report_resources();
         if let Some(metrics) = &self.cache.read_work {
-            report_work(metrics, self.state.stats.hash_work, self.initial_work);
-            metrics.peer_cache_data_reads(
-                self.state
-                    .stats
-                    .data_read_calls
-                    .saturating_sub(self.initial_reads),
+            report_work(
+                metrics,
+                self.state.stats.hash_work,
+                PeerCacheHashWork::default(),
             );
-            metrics.copy(
-                "cache_to_output",
-                self.state
-                    .stats
-                    .copied_bytes_total
-                    .saturating_sub(self.initial_copies),
-            );
-            report_stages(metrics, self.state.stats.read_stages, self.initial_stages);
-            metrics.peer_cache_metadata(
-                self.state.stats.proof_metadata_bytes,
-                self.state.stats.proof_metadata_peak_bytes,
+            metrics.peer_cache_data_reads(self.state.stats.data_read_calls);
+            metrics.copy("cache_to_output", self.state.stats.copied_bytes_total);
+            report_stages(
+                metrics,
+                self.state.stats.read_stages,
+                PeerCacheReadStages::default(),
             );
         }
     }
+}
+
+fn add_stats(total: &mut PeerCacheStats, local: &PeerCacheStats) {
+    macro_rules! add { ($($field:ident),* $(,)?) => { $(total.$field = total.$field.saturating_add(local.$field);)* }; }
+    add!(
+        hits,
+        misses,
+        corruptions,
+        hash_bytes_total,
+        data_read_calls,
+        copied_bytes_total
+    );
+    total.scratch_peak_bytes = total.scratch_peak_bytes.max(local.scratch_peak_bytes);
+    total.hash_work.cache_segment_bytes += local.hash_work.cache_segment_bytes;
+    total.hash_work.cache_fullscan_bytes += local.hash_work.cache_fullscan_bytes;
+    total.hash_work.segment_index_bytes += local.hash_work.segment_index_bytes;
+    total.hash_work.outboard_parent_bytes += local.hash_work.outboard_parent_bytes;
+    total.read_stages.prepare_ns += local.read_stages.prepare_ns;
+    total.read_stages.data_read_ns += local.read_stages.data_read_ns;
+    total.read_stages.segment_verify_ns += local.read_stages.segment_verify_ns;
+    total.read_stages.stream_read_verify_ns += local.read_stages.stream_read_verify_ns;
+    total.read_stages.finalize_ns += local.read_stages.finalize_ns;
 }
 
 impl Drop for DiskPeerCache {
@@ -1994,6 +2843,302 @@ mod tests {
                 staged.bytes(),
                 cache.proof_budget(),
             )?)
+    }
+
+    #[test]
+    fn disk_peer_cache_blocked_fill_does_not_block_another_cached_hit() {
+        use std::{sync::mpsc, thread, time::Duration};
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = options(temp.path().join("cache"));
+        config.capacity_bytes = 1024 * 1024;
+        let cache = DiskPeerCache::open(config).unwrap();
+        let cached = StagedChunk::new(OperationId::new("r5-cached-hit"), vec![73; 64 * 1024]);
+        let incoming = StagedChunk::new(OperationId::new("r5-blocked-fill"), vec![91; 64 * 1024]);
+        assert!(fill(&cache, &cached).unwrap());
+        let (fill_ready_tx, fill_ready_rx) = mpsc::channel();
+        let (release_fill_tx, release_fill_rx) = mpsc::channel();
+        let (hit_started_tx, hit_started_rx) = mpsc::channel();
+        let (hit_finished_tx, hit_finished_rx) = mpsc::channel();
+        let deadline = Duration::from_secs(5);
+
+        let hit_completed_before_release = thread::scope(|scope| {
+            let cache_ref = &cache;
+            let incoming_ref = &incoming;
+            let fill_thread = scope.spawn(move || {
+                let mut operation = cache_ref.operation().unwrap();
+                let mut sink = operation.begin_stream(&incoming_ref.chunk).unwrap();
+                assert!(
+                    sink.file.is_some(),
+                    "fixture must own an actual pending file"
+                );
+                fill_ready_tx.send(()).unwrap();
+                // Model a Peer response paused before its body arrives. Keep the
+                // real prepared sink alive, rather than duplicating cache locks.
+                release_fill_rx.recv_timeout(deadline).unwrap();
+                let mut output = [0; 8];
+                let proof = crate::node::rpc::peer::complete_peer_disk_read_for_test(
+                    &incoming_ref.chunk,
+                    incoming_ref.bytes(),
+                    0,
+                    &mut output,
+                    &mut sink,
+                )
+                .unwrap();
+                assert_eq!(proof.private_output(), &[91; 8]);
+                assert!(sink.commit(proof).unwrap());
+            });
+            fill_ready_rx.recv_timeout(deadline).unwrap();
+
+            let cache_ref = &cache;
+            let cached_ref = &cached;
+            let hit_thread = scope.spawn(move || {
+                hit_started_tx.send(()).unwrap();
+                let mut output = [0; 4096];
+                assert!(
+                    cache_ref
+                        .operation()
+                        .unwrap()
+                        .read_range(&cached_ref.chunk, 4096, &mut output)
+                        .unwrap()
+                );
+                assert_eq!(output, [73; 4096]);
+                hit_finished_tx.send(()).unwrap();
+            });
+            hit_started_rx.recv_timeout(deadline).unwrap();
+            // This timeout is a bounded progress assertion, not a latency gate.
+            // Release and join both threads before reporting the old lock bug.
+            let completed = hit_finished_rx.recv_timeout(Duration::from_secs(2)).is_ok();
+            release_fill_tx.send(()).unwrap();
+            fill_thread.join().unwrap();
+            hit_thread.join().unwrap();
+            completed
+        });
+        assert_eq!(cache.stats().unwrap().entries, 2);
+        assert!(
+            hit_completed_before_release,
+            "another object's cached hit waited for an unrelated in-flight fill"
+        );
+    }
+
+    #[test]
+    fn disk_peer_cache_retired_pin_keeps_disk_charge_and_blocks_same_key_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = DiskPeerCache::open(options(temp.path().join("cache"))).unwrap();
+        let staged = StagedChunk::new(OperationId::new("r5-retired-pin"), vec![73; 64 * 1024]);
+        assert!(fill(&cache, &staged).unwrap());
+        let key = cache.key(&staged.chunk).unwrap();
+        let generation = cache
+            .state
+            .lock()
+            .unwrap()
+            .entries
+            .get(&key)
+            .unwrap()
+            .generation
+            .clone();
+        let pin = EntryPin {
+            cache: &cache,
+            generation: Some(generation),
+        };
+        let (mut file, before) = open_private(&cache.path(&key)).unwrap();
+        let (_, body_start) = read_header(&mut file).unwrap();
+        let charged = cache.stats().unwrap().disk_bytes;
+        cache.retire(&key, pin.generation.as_ref(), true).unwrap();
+        assert_eq!(cache.stats().unwrap().entries, 0);
+        assert_eq!(cache.stats().unwrap().disk_bytes, charged);
+        assert!(
+            !fill(&cache, &staged).unwrap(),
+            "cannot reuse a pinned generation's ready path"
+        );
+        let mut out = [0; 4096];
+        scan_body(
+            &mut file,
+            body_start,
+            &staged.chunk,
+            0,
+            &mut out,
+            &mut PeerCacheStats::default(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(out, [73; 4096]);
+        assert_eq!(
+            file_identity(&before),
+            file_identity(&file.metadata().unwrap())
+        );
+        drop(file);
+        drop(pin);
+        assert!(!cache.path(&key).exists());
+        assert_eq!(cache.stats().unwrap().disk_bytes, 0);
+        assert!(cache.state.lock().unwrap().retired.is_empty());
+        assert!(fill(&cache, &staged).unwrap());
+    }
+
+    #[test]
+    fn disk_peer_cache_close_wakes_fill_waiter_without_refunding_active_fill() {
+        use std::{sync::mpsc, thread, time::Duration};
+        let temp = tempfile::tempdir().unwrap();
+        let cache = DiskPeerCache::open(options(temp.path().join("cache"))).unwrap();
+        let mut owner = cache.operation().unwrap();
+        owner.acquire_fill(|| Ok(())).unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        thread::scope(|scope| {
+            let waiter = scope.spawn(|| {
+                let mut operation = cache.operation().unwrap();
+                started_tx.send(()).unwrap();
+                operation.acquire_fill(|| Ok(()))
+            });
+            started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            cache.close_admission();
+            assert!(waiter.join().unwrap().is_err());
+            assert!(cache.state.lock().unwrap().fill_active);
+        });
+        drop(owner);
+        assert!(!cache.state.lock().unwrap().fill_active);
+        cache.shutdown().unwrap();
+        let state = cache.state.lock().unwrap();
+        assert_eq!(state.operations, 0);
+        assert!(state.flights.is_empty());
+    }
+
+    #[test]
+    fn disk_peer_cache_flight_drop_and_repeated_rounds_leave_no_slots() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = DiskPeerCache::open(options(temp.path().join("cache"))).unwrap();
+        let staged = StagedChunk::new(OperationId::new("r5-flight-drop"), vec![73; 64 * 1024]);
+        for _ in 0..32 {
+            let FillRole::Leader(mut leader) = cache.fill_flight(&staged.chunk, || Ok(())).unwrap()
+            else {
+                panic!("fresh flight must have one leader");
+            };
+            leader.finish(FillOutcome::Failed(unavailable("bounded shared failure")));
+            let mut checks = 0;
+            // Same-thread follower observes the terminal data outcome, while
+            // retaining a separate authorization callback.
+            let check_count = std::cell::Cell::new(0);
+            match cache
+                .fill_flight(&staged.chunk, || {
+                    check_count.set(check_count.get() + 1);
+                    Ok(())
+                })
+                .unwrap()
+            {
+                FillRole::Finished(FillOutcome::Failed(error)) => {
+                    assert_eq!(error, unavailable("bounded shared failure"));
+                    checks += check_count.get();
+                }
+                _ => panic!("follower must observe the same shared data failure"),
+            }
+            assert!(checks >= 2);
+            drop(leader);
+            let state = cache.state.lock().unwrap();
+            assert_eq!(state.flight_live, 0);
+            assert!(state.flights.is_empty());
+        }
+        let leader = cache.fill_flight(&staged.chunk, || Ok(())).unwrap();
+        drop(leader);
+        assert_eq!(cache.state.lock().unwrap().flight_live, 0);
+    }
+
+    #[test]
+    fn disk_peer_cache_failed_retired_delete_preserves_slots_and_index_until_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = DiskPeerCache::open(options(temp.path().join("cache"))).unwrap();
+        let staged = StagedChunk::new(
+            OperationId::new("r5-stop-delete-failure"),
+            vec![73; 64 * 1024],
+        );
+        assert!(fill(&cache, &staged).unwrap());
+        let key = cache.key(&staged.chunk).unwrap();
+        let before = cache.stats().unwrap().disk_bytes;
+        cache.state.lock().unwrap().fail_remove = true;
+        assert!(cache.retire(&key, None, true).is_err());
+        assert!(cache.shutdown().is_err());
+        {
+            let state = cache.state.lock().unwrap();
+            assert!(state.index_lease.is_some());
+            assert_eq!(state.retired.len(), 1);
+            assert_eq!(state.retired_disk_bytes, before);
+            assert_eq!(state.used_bytes, before);
+        }
+        cache.state.lock().unwrap().fail_remove = false;
+        cache.shutdown().unwrap();
+        let state = cache.state.lock().unwrap();
+        assert!(state.retired.is_empty());
+        assert!(state.index_lease.is_none());
+        assert_eq!(state.retired_disk_bytes, 0);
+        assert_eq!(state.entry_metadata_bytes, 0);
+        assert_eq!(state.used_bytes, 0);
+    }
+
+    #[test]
+    fn disk_peer_cache_pinned_foreign_replacement_is_never_unlinked_or_refunded() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = DiskPeerCache::open(options(temp.path().join("cache"))).unwrap();
+        let staged = StagedChunk::new(OperationId::new("r5-foreign-retired"), vec![73; 64 * 1024]);
+        assert!(fill(&cache, &staged).unwrap());
+        let key = cache.key(&staged.chunk).unwrap();
+        let generation = cache
+            .state
+            .lock()
+            .unwrap()
+            .entries
+            .get(&key)
+            .unwrap()
+            .generation
+            .clone();
+        let pin = EntryPin {
+            cache: &cache,
+            generation: Some(generation),
+        };
+        let before = cache.stats().unwrap().disk_bytes;
+        cache.retire(&key, pin.generation.as_ref(), true).unwrap();
+        let original = temp.path().join("retired-original");
+        fs::rename(cache.path(&key), &original).unwrap();
+        fs::write(cache.path(&key), b"foreign replacement").unwrap();
+        drop(pin);
+        assert_eq!(fs::read(cache.path(&key)).unwrap(), b"foreign replacement");
+        assert_eq!(cache.stats().unwrap().disk_bytes, before);
+        assert_eq!(cache.state.lock().unwrap().retired.len(), 1);
+        fs::remove_file(cache.path(&key)).unwrap();
+        fs::rename(original, cache.path(&key)).unwrap();
+        cache.cleanup_retired().unwrap();
+        assert_eq!(cache.stats().unwrap().disk_bytes, 0);
+    }
+
+    #[test]
+    fn disk_peer_cache_flights_are_transient_bounded_and_close_wakes_admission() {
+        use std::{sync::mpsc, thread, time::Duration};
+        let temp = tempfile::tempdir().unwrap();
+        let cache = DiskPeerCache::open(options(temp.path().join("cache"))).unwrap();
+        let resident_before = cache.proof_budget.resident_used();
+        let mut leaders = Vec::new();
+        for index in 0..8 {
+            let staged = StagedChunk::new(
+                OperationId::new(format!("r5-flight-{index}")),
+                vec![index; 64],
+            );
+            leaders.push(cache.fill_flight(&staged.chunk, || Ok(())).unwrap());
+        }
+        assert_eq!(cache.state.lock().unwrap().flight_live, 8);
+        assert_eq!(cache.proof_budget.resident_used(), resident_before);
+        let ninth = StagedChunk::new(OperationId::new("r5-flight-ninth"), vec![91; 64]);
+        let (started_tx, started_rx) = mpsc::channel();
+        thread::scope(|scope| {
+            let waiting = scope.spawn(|| {
+                cache.fill_flight(&ninth.chunk, || {
+                    started_tx.send(()).unwrap();
+                    Ok(())
+                })
+            });
+            started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            cache.close_admission();
+            assert!(waiting.join().unwrap().is_err());
+        });
+        drop(leaders);
+        cache.shutdown().unwrap();
+        assert_eq!(cache.proof_budget.used(), 0);
     }
 
     #[test]
@@ -2344,12 +3489,12 @@ mod tests {
         let mut operation = cache.operation().unwrap();
         let mut sink = operation.begin_stream(&staged.chunk).unwrap();
         assert!(
-            sink.state.pending_charge > 0,
+            cache.state.lock().unwrap().pending_charge > 0,
             "private stream file must hold its disk reservation before body receipt"
         );
         sink.write(0, staged.bytes()).unwrap();
         assert!(
-            sink.state.entries.is_empty(),
+            cache.state.lock().unwrap().entries.is_empty(),
             "body completion alone cannot publish Ready"
         );
     }
@@ -2372,7 +3517,7 @@ mod tests {
             )
             .unwrap();
             assert_eq!(proof.private_output(), &[37; 19]);
-            assert!(sink.state.entries.is_empty());
+            assert!(cache.state.lock().unwrap().entries.is_empty());
             assert!(sink.commit(proof).unwrap());
         }
         assert_eq!(out, [37; 19]);
@@ -2407,7 +3552,7 @@ mod tests {
         .unwrap();
         sink_b.write(0, staged.bytes()).unwrap();
         assert!(sink_b.commit(proof).is_err());
-        assert!(sink_b.state.entries.is_empty());
+        assert!(cache_b.state.lock().unwrap().entries.is_empty());
     }
 
     #[test]
@@ -2423,7 +3568,7 @@ mod tests {
             let mut out = [0; 31];
             {
                 let mut operation = cache.operation().unwrap();
-                operation.state.fail_stream_write = write_failure;
+                cache.state.lock().unwrap().fail_stream_write = write_failure;
                 let mut sink = operation.begin_stream(&staged.chunk).unwrap();
                 let proof = crate::node::rpc::peer::complete_peer_disk_read_for_test(
                     &staged.chunk,
@@ -2449,10 +3594,10 @@ mod tests {
         let staged = StagedChunk::new(OperationId::new("stream-unidentified"), vec![19; 64 * 1024]);
         {
             let mut operation = cache.operation().unwrap();
-            operation.state.fail_stream_metadata = true;
+            cache.state.lock().unwrap().fail_stream_metadata = true;
             let sink = operation.begin_stream(&staged.chunk).unwrap();
             assert!(sink.file.is_none());
-            assert!(sink.state.pending_charge > 0);
+            assert!(cache.state.lock().unwrap().pending_charge > 0);
         }
         let state = cache.state.lock().unwrap();
         assert!(state.pending_charge > 0);
@@ -2479,15 +3624,62 @@ mod tests {
             )
             .unwrap();
             actual = allocated(&sink.file.as_ref().unwrap().metadata().unwrap()).unwrap();
-            sink.state.used_bytes = actual - 512;
-            sink.state.pending_charge = actual - 512;
-            sink.state.fail_remove = true;
+            cache.state.lock().unwrap().used_bytes = actual - 512;
+            cache.state.lock().unwrap().pending_charge = actual - 512;
+            cache.state.lock().unwrap().fail_remove = true;
             assert!(sink.commit(proof).is_err());
-            assert_eq!(sink.state.used_bytes, actual);
-            assert_eq!(sink.state.pending_charge, actual);
+            assert_eq!(cache.state.lock().unwrap().used_bytes, actual);
+            assert_eq!(cache.state.lock().unwrap().pending_charge, actual);
         }
         assert_eq!(cache.state.lock().unwrap().used_bytes, actual);
         assert!(cache.directory().join(PENDING).exists());
+    }
+
+    #[test]
+    fn coarse_cache_diagnostics_separate_misses_from_verified_hit_attempts() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = afs_metrics::Registry::new();
+        let metrics = super::super::read_work::ReadWorkMetrics::register(&registry)
+            .unwrap()
+            .with_read_diagnostics(true);
+        let cache = DiskPeerCache::open(options(temp.path().join("cache")))
+            .unwrap()
+            .with_read_work_metrics(metrics.clone());
+        let staged = StagedChunk::new(OperationId::new("diagnostic-hit"), vec![37; 64 * 1024]);
+        let mut out = [9; 19];
+        assert!(
+            !cache
+                .operation()
+                .unwrap()
+                .read_range(&staged.chunk, 63, &mut out)
+                .unwrap()
+        );
+        assert_eq!(out, [9; 19]);
+        assert!(fill(&cache, &staged).unwrap());
+        assert!(
+            cache
+                .operation()
+                .unwrap()
+                .read_range(&staged.chunk, 63, &mut out)
+                .unwrap()
+        );
+        assert_eq!(out, [37; 19]);
+        let snapshot = metrics.diagnostics_snapshot().unwrap();
+        assert!(snapshot.records.is_empty());
+        assert_eq!(snapshot.overflow, 0);
+        let lock = snapshot
+            .coarse_phases
+            .iter()
+            .find(|phase| phase.phase == "cache_lock_wait")
+            .unwrap();
+        assert_eq!(lock.calls, 3);
+        let hit = snapshot
+            .coarse_phases
+            .iter()
+            .find(|phase| phase.phase == "cache_hit_read_verify")
+            .unwrap();
+        assert_eq!(hit.calls, 1);
+        assert_eq!(hit.bytes, out.len() as u64);
     }
 
     #[test]
@@ -2613,6 +3805,7 @@ mod tests {
             .unwrap()
             .proof
             .as_mut()
+            .map(|proof| Arc::get_mut(proof).unwrap())
             .unwrap()
             .identity = file_identity(&fs::metadata(&path).unwrap());
         let before = cache.stats().unwrap();
@@ -3064,6 +4257,7 @@ mod tests {
             .unwrap()
             .proof
             .as_mut()
+            .map(|proof| Arc::get_mut(proof).unwrap())
             .unwrap()
             .identity = file_identity(&fs::metadata(&path).unwrap());
         let mut first = [0; 19];
@@ -3272,8 +4466,34 @@ mod tests {
         let current = cache.stats().unwrap().proof_metadata_bytes;
         assert!(encoded.contains(&format!("afs_dfs_peer_disk_cache_metadata_bytes {current}")));
         cache.shutdown().unwrap();
+        assert_eq!(
+            cache.proof_budget.used(),
+            0,
+            "shutdown must release actual metadata leases"
+        );
+        assert_eq!(cache.proof_budget.resident_used(), 0);
+        {
+            let state = cache.state.lock().unwrap();
+            assert!(state.entries.is_empty() && state.retired.is_empty());
+            assert!(state.flights.is_empty() && state.index_lease.is_none());
+            assert_eq!(
+                state.operations + state.flight_live + state.deleting_slots,
+                0
+            );
+            assert!(!state.fill_active);
+            assert_eq!(
+                state.operation_metadata_bytes
+                    + state.entry_metadata_bytes
+                    + state.flight_metadata_bytes
+                    + state.pending_metadata_charge,
+                0
+            );
+        }
         let encoded = afs_metrics::encode_text(&registry).unwrap();
         assert!(encoded.contains("afs_dfs_peer_disk_cache_metadata_bytes 0"));
+        assert!(
+            encoded.contains("afs_dfs_peer_disk_cache_resources{resource=\"control_bytes\"} 0")
+        );
         assert!(encoded.contains(&format!(
             "afs_dfs_peer_disk_cache_metadata_peak_bytes {current}"
         )));

@@ -1211,20 +1211,28 @@ async fn run_node(
     // readers, Peer frames and the disposable disk cache. Payload and existing
     // transport windows remain separately bounded by their original limits.
     #[cfg(feature = "dfs")]
-    let dfs_outboard_budget = chunk::outboard::OutboardBudget::new_with_metrics(
+    let dfs_outboard_budget = chunk::outboard::OutboardBudget::new_with_metrics_and_work_wait(
         usize::try_from(peer_cache::MAX_PEER_CACHE_PROOF_BYTES)?,
         dfs_read_work_metrics.clone(),
+        std::time::Duration::from_millis(cfg.dfs_outboard_work_wait_ms),
     );
     #[cfg(feature = "dfs")]
     let local_chunk_store = if cfg.dfs {
         Some(Arc::new(
             chunk::LocalChunkStore::open(cfg.data_dir.join("dfs"), cfg.id.clone())?
                 .with_outboard_budget(dfs_outboard_budget.clone())
-                .with_read_work_metrics(dfs_read_work_metrics.clone()),
+                .with_peer_serve_config(
+                    cfg.dfs_peer_serve_resident_objects,
+                    cfg.dfs_peer_serve_payload_bytes,
+                )?
+                .with_read_work_metrics(dfs_read_work_metrics.clone())
+                .with_sidecar_install_queue(cfg.dfs_sidecar_install_queue)?,
         ))
     } else {
         None
     };
+    #[cfg(feature = "dfs")]
+    let dfs_sidecar_store_for_shutdown = local_chunk_store.clone();
     let node_descriptor = meta_endpoint.map(|endpoint| {
         let advertised = advertised
             .clone()
@@ -1582,7 +1590,9 @@ async fn run_node(
         let read_config = dfs_read::DfsReadConfig {
             max_ops_per_batch: cfg.dfs_read_max_ops_per_batch,
             max_inflight_bytes: cfg.dfs_read_max_inflight_bytes,
-            source_cache_ttl: std::time::Duration::from_millis(cfg.dfs_read_source_cache_ttl_ms),
+            source_cache_ttl: std::time::Duration::from_millis(cfg.dfs_source_cache_max_ms),
+            source_lookahead_chunks: cfg.dfs_source_lookahead_chunks,
+            source_cache_bytes: cfg.dfs_source_cache_bytes,
         };
         read_config.validate()?;
         let read_engine = dfs_read::DfsReadEngine::new(
@@ -1610,9 +1620,11 @@ async fn run_node(
             };
             let cache_metrics = dfs_read_work_metrics.clone();
             let outboard_budget = dfs_outboard_budget.clone();
+            let max_inflight_objects = cfg.dfs_fetch_max_inflight_objects;
             let cache = Arc::new(
                 tokio::task::spawn_blocking(move || {
                     peer_cache::DiskPeerCache::open_with_outboard_budget(options, outboard_budget)
+                        .and_then(|cache| cache.with_max_inflight_objects(max_inflight_objects))
                         .map(|cache| cache.with_read_work_metrics(cache_metrics))
                 })
                 .await??,
@@ -2218,8 +2230,19 @@ async fn run_node(
     // shutdown. A cached object must not outlive a known Node/session stop.
     let on_shutdown = || {
         #[cfg(feature = "dfs")]
+        if let Some(store) = &dfs_sidecar_store_for_shutdown {
+            store.stop_sidecar_installation();
+            store.close_peer_serve_admission();
+        }
+        #[cfg(feature = "dfs")]
+        dfs_outboard_budget.stop_range_work();
+        #[cfg(feature = "dfs")]
         if let Some(authority) = &dfs_read_authority {
             authority.stop();
+        }
+        #[cfg(feature = "dfs")]
+        if let Some(cache) = &dfs_peer_cache_for_shutdown {
+            cache.close_admission();
         }
         on_shutdown();
     };
@@ -2359,6 +2382,27 @@ async fn run_node(
                 afs_logging::error!("dfs.node_drain_worker_failed"; "error" => error.to_string());
                 remember_shutdown_error(&mut shutdown_error, error.into());
             }
+        }
+    }
+    #[cfg(feature = "dfs")]
+    if let Some(store) = dfs_sidecar_store_for_shutdown {
+        match tokio::task::spawn_blocking(move || {
+            // Attempt both drains even if the first one reports a failure.
+            (
+                store.shutdown_peer_serve(),
+                store.shutdown_sidecar_installer(),
+            )
+        })
+        .await
+        {
+            Ok(results) => {
+                for result in [results.0, results.1] {
+                    if let Err(error) = result {
+                        remember_shutdown_error(&mut shutdown_error, error.into());
+                    }
+                }
+            }
+            Err(error) => remember_shutdown_error(&mut shutdown_error, error.into()),
         }
     }
     #[cfg(feature = "dfs")]

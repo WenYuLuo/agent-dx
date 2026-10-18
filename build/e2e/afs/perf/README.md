@@ -13,7 +13,8 @@
 - A 提前准备相同内容及 SHA-256；A/B 控制进程和 TCP 通道提前建立；两条等待连接在 GO 前通过 Linux pidfd 阻塞，
   GO 后不启动 SSH/Lima/Python 轮询或主动采集。ready 并预备完成后，
   一律静置 30 秒；读取前的指标快照在 A 创建文件之前完成。
-- A 按 4MiB 调用写入，执行文件 `fsync → close → rename → 父目录 fsync` 后通知 B。
+- A 默认按 4MiB 调用写入，可通过固定的 `write_block_bytes` 调整；`write-1g` 场景必须为 1MiB。
+  执行文件 `fsync → close → rename → 父目录 fsync` 后通知 B。
   B 每次重新打开，以 4MiB `readv` 读到 EOF，并核对长度及完整 SHA-256。
 - 主 E2E 是 **A 创建开始到 A 核验 B 首读 SHA/EOF ACK**，由 A 单一单调时钟直接测量。
   `total_with_repeat_ns` 另列，包含固定一秒复读等待。二者都不做阶段求和或 S3 扣减。
@@ -24,6 +25,44 @@
   B 是 BEGIN 至首读 ACK，均不是严格隔离的单次 read；repeat 区间也包含固定等待，不能据此把写入 RPC 归因成读 RPC。
 - 每种系列、每个标签恰好三轮，串行执行；默认测前固定顺序 AB/BA/AB。原始值、中位数、max/min 全部保留；
   稳定性门槛为 `max/min <= 1.10`，不满足时不追加样本。`completed` 与 `stable` 分别登记。
+
+## 1GiB 场景与写入边界
+
+`scene` 默认 `e2e`，沿用已有 64MiB 等规模的数据和完整流程。`cold-read-1g`、
+`write-1g` 要求 `size_bytes=1073741824`；两者仍完成写入发布、首次读和复读，
+不会为了取得局部带宽取消内容、长度或 EOF 核对。冷读场景以首次读为判据，
+冷缓存状态仍由外部 fixture 的全新命名空间及挂载证明，场景名称不等于冷缓存证明。
+
+`write-1g` 固定 `write_block_bytes=1048576`。`writer.publish.write_and_fsync_ns`
+使用一次单调时钟区间：打开文件后、第一次写循环之前，至成功文件 fsync 返回。
+区间包括写循环、回压和文件 fsync，排除 open、close、rename、目录 fsync。
+原 `publish_ns` 和完整 E2E 保持原边界。输出同时保留 open 完成、写起点、文件 fsync
+完成及整个发布完成的时间点、应用块大小和真实 `os.write` 次数；短写重试单独计入次数。
+这些是应用调用，不代表 FUSE 回调的尺寸或次数。与本地盘分母比较时必须使用相同边界。
+
+写端在计时前准备一整份数据：1GiB 场景会由测试进程持有 1GiB 正文，独立于 Node 产品预算，
+还需计入客户端、页缓存及其它服务。`workload.driver_prepared_payload_bytes` 明确记录该项。
+可用 `nodes.*.min_available_memory_bytes` 在所有节点启动前检查 Linux `MemAvailable`；
+它只是准入下限，不会调整任何内存上限，也不能替代 fixture 对启动后峰值的预算核验。
+
+## P2 必需指标
+
+仅 AFS label 配置 `metric_profile="p2"`，并提供各一个 A、B metrics endpoint。
+JuiceFS label 不配置该字段，不要求其导出 AFS 指标。每个节点分别核对 before、
+after_first、after_repeat 三个快照，不允许 B 的指标补足 A 的缺项。
+必需项覆盖 G-P2-6 的 A 授权次数、B 拿源次数、producer/consumer/覆盖组校验字节、
+cache_to_output、cache 正文读取次数及 FUSE read 次数；正常与回退所需原始 hash stage
+分别保留。outboard 的四个 ledger gauge 和五类事件也须实际存在。
+
+`metric_evidence` 输出节点、各快照必需值、原始 outboard gauge 和逐项缺失清单。
+缺失、非有限值或缺失快照均为“证据不完整”，使本轮失败；已完成的应用结果及原始快照
+仍保留，正常停止并核对清洁状态，保留失败数据，不自动重试。观察到的 0 才是 0；
+不会用缺失的 label 构造 0。P1M 的 `PeerDiskCache::with_read_work_metrics` 会发布实际的
+cache_to_output 初始统计，不能假定未配置此缓存的场景也存在该值。
+
+原文保留全部 outboard 指标，四个 gauge 另按采样点提取；可下降的 gauge 不做计数差分。
+三次边界采样不是持续峰值采样，不替代资源诊断 run。完整性通过也不等于 G-P2-6 的
+机制门槛通过，不能从聚合计数自行推断各阶段都在关键路径上。
 
 ## 使用
 
@@ -47,12 +86,15 @@ JSON 字段如下：
 | 字段 | 要求 |
 |---|---|
 | `orders` | 可选，每轮完整 label 排列；默认 AB/BA/AB，执行前固定，不按结果调整 |
+| `scene` | `e2e`（默认）、`cold-read-1g`、`write-1g`；后两项固定 1GiB |
+| `write_block_bytes` | 默认 4MiB；正数、4096 对齐、至多 4MiB；`write-1g` 固定 1MiB |
 | `run_id` | 无路径分隔符的独立标识。实际每轮为 `<run_id>-<series>-<label>-<round>` |
 | `output` | 源码树外绝对路径，必须不存在或为空；失败不覆盖旧结果 |
 | `nodes.a/b/c.transport` | `ssh` 或 `limactl shell VM --` 的 argv。SSH 逐参数 shell quoting，无模板 eval |
 | `nodes.*.command_prefix` | 默认空；仅允许显式 `["sudo", "-n"]`，用于固定为与 FUSE 挂载相同的 root 测试身份 |
 | `nodes.*.root` | Linux 上独立控制根；每轮创建其下唯一目录，与挂载数据目录分离 |
 | `nodes.*.min_free_bytes` | 启动前最低容量。必须计入正文、副本、缓存和临时产物 |
+| `nodes.*.min_available_memory_bytes` | 可选，启动 fixture 前的 Linux `MemAvailable` 下限；1GiB 写端须额外计入测试正文 |
 | `nodes.*.dependencies` | 预检查的可执行文件名 |
 | `nodes.*.ports/process_names` | 不能已被使用的端口及精确进程 comm 名称；不得列入共享后端进程 |
 | `nodes.*.binaries` | `{path,sha256}` 数组；启动前完整校验。客户端、Meta、参考版本由配置提供 |
@@ -64,6 +106,7 @@ JSON 字段如下：
 | `labels.*.page_cache_initial_state` | 初始页缓存状态及清场方式，不能笼统写“冷缓存” |
 | `labels.*.external_backend` | 外部 S3/Meta 版本与连接配置身份；认证仅引用外部私密配置文件 |
 | `labels.*.metrics` | `{node:a或b,name,url}`，节点回环 HTTP `/metrics` 地址；保留原文和差分 |
+| `labels.*.metric_profile` | 可选 `p2`，启用上述逐节点、逐快照完整性检查；JuiceFS 留空 |
 | `labels.*.metric_counter_patterns` | 可选，单调计数器名称匹配，默认 `_total/_bucket/_sum/_count`；原始 gauge 不做工作量差分 |
 | `labels.*.hooks` | 下列六组顺序命令。每条为 `{node:a/b/c/controller,argv:[...]}` |
 

@@ -82,10 +82,25 @@ AFS live/idle、allocator allocated/active/resident/retained 与进程 RSS 是�
 保留规则，不因视图复用扩展GC或文件描述符生命周期。
 
 版本新鲜度和授权独立。Node注册、心跳、epoch变化和停止接入同一有界读取授权，
-read开始与私有结果交付前检查；source缓存仍为500ms，A端grant缓存仍最多5秒，
-原grant有效期不延长。普通Meta断链只允许继续已获且未到期的上下文；新open、
+read开始与私有结果交付前检查；源元数据缓存默认最多5秒，并受原grant到期减1秒
+安全余量约束；A端grant缓存仍最多5秒。源缓存不延长任何grant或已捕获Node／读视图期限。
+普通Meta断链只允许继续已获且未到期的上下文；新open、
 head/source/授权刷新需要Meta时失败即报错。读取拒绝失效对应上下文，Node级
 拒绝或epoch变化才停止共享授权，不能由单个grant到期停止所有合法句柄。
+
+B首次缺源时可从同一已核对版本／布局前瞻最多64个后续chunk ID，与当前mandatory ID
+合并为至多128项的已有Meta请求。只拿源元数据和grant，不生成正文ops、不预读对象；
+512B以上的可选ID跳过，当前mandatory／本机读行为不因此改变。源缓存仍最多1024项，
+另以默认4MiB的保守实际保留估算限制两份key、String／Vec capacity及索引表包络；
+当前RPC回复／读取clone另计，不能称为Node RSS上限。命中不续期，慢Meta回复消耗从
+发送时开始的期限；外部存储的源准入还夹紧原授权截止，不在安装时重新赠送缓存时间。
+
+明确拒绝清除对应version／layout的预装源；观察到同一远端Node／device的epoch变化，
+退休相关旧条目，其他peer／scope不误清。已失效前发出的迟回复及其旧命中克隆不能恢复
+缓存或直接交付：最多重新请求一次全部当前mandatory授权，持续变化则报Unavailable。
+这不是主动撤销协议；尚未知晓的变化仍受既定期限约束。可选批量请求只有精确的
+Meta catalog invalid-request错误才允许一次mandatory-only重新验证，权限、认证、冲突及
+传输错误原样传播。最终授权、完整根校验、fsync及close-to-open合同保持。
 
 句柄表和五个按 inode 热状态表使用64分片；句柄状态独立加锁，读取快照共享
 `Arc<InodeRecord>`。反向索引只定位目标 inode 的句柄；表锁不跨Meta或Peer RPC。
@@ -97,7 +112,9 @@ head/source/授权刷新需要Meta时失败即报错。读取拒绝失效对应�
 resident条目上限不是全部活跃FD、载荷或进程RSS上限。
 
 不可变版本／布局另按完整版本ID缓存`Arc`，默认4096项及32MiB保守保留字节预算，
-两项均可配置；超大版本可被当前操作使用但不进入缓存。计入版本、布局／索引的
+两项均可配置；具备DFS能力的Node启动时按最终配置检查表开销加最小结构字段／Arc头，
+低于该下界时拒绝启动并给出minimum。此下界不假定ID长度，不能替代真实单项的容量计费。
+超大版本可被当前操作使用但不进入缓存。计入版本、布局／索引的
 容器capacity、重复ID字符串capacity及缓存容器包装估算；逐出后活跃Arc另行核算，
 该预算不是整个Node RSS或加载时峰值上限。首次加载核对
 版本、布局和长度，在使用inode时再核对归属。并发miss在锁外查询和建索引，安装时
@@ -108,10 +125,21 @@ resident条目上限不是全部活跃FD、载荷或进程RSS上限。
 候选；legacy未排序或重叠extent保持原序和溢出检查，不改变序列化格式。
 条目上限不等于字节预算，在途Arc及其索引不因淘汰提前释放；mutable dirty布局仍走原路径。
 
-A端完整BLAKE3通过后可复用当前不可变对象，单槽最多4MiB；填充、驻留、退役
-但仍被流持有的载荷、range回退与RDMA packed共用原8MiB容量。catalog及物理身份
-变化使其失效重验；保留逐range授权和返回范围的checksum，不预读下一对象。
-这份正文额度与B磁盘填充、帧、扫描scratch及进程其它开销分别核算，不是Node总RSS。
+A端完整BLAKE3通过后按对象单飞共享不可变正文，默认最多2个LRU驻留对象，
+每对象最多4MiB。短表锁只管理身份、pin、LRU和最多8个active key；填充、扫描、
+sidecar访问及等待均在锁外。完整对象的等待者复用同一次填充，各请求仍独立授权；
+partial／无完整对象结果保持各自范围读取，不承诺这些请求也只扫描一次。
+`dfs_peer_serve_payload_bytes`默认16MiB（原8MiB的显式容量调整），填充、驻留、
+退役但仍被流持有的正文、range回退与RDMA packed按实际capacity共用此额度，
+最后引用释放才退账。catalog及物理身份变化使旧代失效重验，旧持有者不能移除新代
+健康驻留；保留逐range授权和返回范围的checksum，不预读下一对象。
+
+单飞／驻留控制分配另受固定64KiB包络约束：内联固定槽、实际ID／record字符串capacity、
+有界终态错误及Arc包装计入当前／峰值，最后控制持有者释放才退账；不借proof ledger或S3预算。
+停止先关闭新准入、唤醒等待者并退休LRU，按首次关闭起的绝对10秒期限等待真实I/O、
+正文／控制owner及packed lease；超时报错，不detach。等待后、Header前复核本请求grant
+到期和已知停止，不共享授权成功或增加A→Meta授权RPC。
+这份A端正文额度与B磁盘填充、帧、扫描scratch及进程其它开销分别核算，不是Node总RSS。
 
 ### 标准根与覆盖组校验
 
@@ -120,18 +148,30 @@ A端完整BLAKE3通过后可复用当前不可变对象，单槽最多4MiB；填
 格式／长度／标准根header及parent CV；4MiB对象最多8192B。结构与根绑定检查不等于
 正文已验证，覆盖组读取仍须校验相关路径并仅向私有结果复制请求区间；实际组读取、
 hash和交付复制分别计量。连续覆盖组对齐范围直接读入私有结果，借用结果交官方
-range validator核对标准根，保留其32KiB scratch复制；非对齐／多范围沿用原编解码路径，
-不宣称直读零复制。未请求组的静默损坏到读取
+range validator核对标准根，保留其32KiB scratch复制。含完整中部的非对齐／多范围，
+在至多128个无源／目标别名范围下，先一次读入各请求的私有结果，再由借用视图向
+同一官方validator提供这些字节；覆盖组的未请求边界直接补读到其32KiB scratch，
+完整覆盖组与标准根仍必须全部验证。原非对齐工作票不增；源或目标重叠、范围过多、
+不含完整中部的小读保持原codec，不更改覆盖组写入顺序。不宣称零复制或新增正文缓存。
+未请求组的静默损坏到读取
 该组时检测；文件device／inode／length／mtime／ctime改变使已有证明失效。
 
 本机持久副本的规范内容寻址ChunkId由Meta布局选定的对象提供标准根及长度锚，
 再与catalog的ChunkObject核对，不新增Meta RPC，也不信任Peer自报新根。
 legacy ID、旧数据、缺失／损坏sidecar或proof预算不足时保留原完整根扫描；
 sidecar只帮助校验，不授予权限，不可让损坏正文通过。NodeReplicated写冻结时可
-复用同预算内已计算的outboard；可选sidecar持久化在原ACK返回前执行额外文件sync、
-rename，同一实际持久化批次合并目录sync。健康proof逐字节匹配后避免重写／rename，
-仍保留文件与批次目录屏障；它可能增加成本。sidecar失败不改变原正文／catalog持久化屏障、
-receipt或错误传播合同；后续读退回完整根扫描。S3写路径不生成这份原生写proof，
+复用同预算内已计算的outboard。正文sync、chunks目录sync、catalog追加和sync仍先于
+ACK完成；可选sidecar安装在这组屏障后非阻塞入队，由独立worker处理，不等待文件或
+目录sync。`dfs_sidecar_install_queue`默认64，范围1..=64，queued与active合计受限；
+每批最多32项。队满、元数据不足或安装失败仅放弃可选优化，不改变ACK／receipt。
+proof和有界控制容器共用原1MiB ledger；queue持有原proof引用且禁止其晋升resident，
+不复制正文。控制容量空闲时继续计费，shutdown真实释放后才退账；它不等于全部Node内存。
+入队时为四张最大范围工作票保留瞬时余量，不给之后的builder承诺永久分区。
+worker与读修复共用原修复gate及完整字节健康检查；健康文件不重写／rename／file sync，
+批末目录sync独立处理。停止时关闭入队、固定10秒截止；过期不新发可选目录sync，
+已开始的I/O仍由worker持有并join，不能提前退账或detach伪造正常退出；外层15秒
+进程watchdog仍以124报告失败。安装前的读可完整核根并按需修复，不能假定ACK时proof已存在。
+S3写路径不生成这份原生写proof，
 原外部窗口、载荷／descriptor预算和有序发布合同独立保持。
 
 本机和A端完整扫描后也可能修复缺失／损坏的可选sidecar。在固定共享修复分片锁内做
@@ -148,6 +188,20 @@ B的`dfs_peer_cache`默认OFF，只存可丢弃磁盘副本，不写入LocalChun
 （最多8192B）；body offset固定，不把proof写进正文。旧v1缓存条目可在专属缓存目录
 退休并重建，不迁移或删除持久副本。缓存仍按namespace及完整ChunkObject隔离，
 命中与交付前校验授权、Node/session及期限；close-to-open仍由新open的fresh视图保证。
+
+运行时缓存表锁只保护索引、generation pin、退休、准入与统计；磁盘I/O、校验、Peer调用及
+等待在锁外执行。启动恢复在对象发布前独占运行，不将其与运行时并发锁边界混淆。
+被pin条目可先摘索引，文件、proof及收费保留到末pin释放；退休删除核对私有文件身份，
+失败或外来替换不删除、不退账，旧key退休完成前不复用ready路径。
+
+同对象miss通过有界FillFlight共享填充工作，flight只持有控制信息和结果，不持有正文或
+授权成功结论。默认最多8个metadata flight，可用`dfs_fetch_max_inflight_objects`设为1..=8；
+这不表示8路正文填充。原生Peer仍只有一个active fill，共享原4MiB逻辑额度；两个256KiB
+载荷块与legacy完整对象回退互斥，独立hit可与fill并行，不借用S3 pending额度。
+每个等待者检查自己的授权与期限；提交前已知拒绝不安装Ready。leader个体权限失效不
+撤销其他合法请求，缓存错误仍安全回源，真实Peer／授权错误正常传播。正常停止先关闭
+准入、唤醒等待者再排空实际持有者，保留健康磁盘条目供恢复；不能把停止成功等同于
+全部失败pending已删除，此类可丢弃残留仍由下次独占恢复核验处理。
 
 Meta的ChunkSources可附带当前授权视图中的合法区间；提示缺失或超过128段时保守
 沿用原范围读取。只有当前整个对象获授权、填充与私有输出满足原单批预算时，B才
@@ -171,7 +225,7 @@ Meta的ChunkSources可附带当前授权视图中的合法区间；提示缺失�
 缓存创建／配额／写盘失败只禁用可选sink，同次RPC继续完整验证和提取，不重复回源。
 consumer收到Completion仍不能产生完成凭证；实际EOF和producer成功join后，内部回执
 必须匹配Completion长度／摘要及私有sink／输出绑定；consumer模式还须用实际计算根
-同时匹配Meta锚定的整对象根和Completion，fallback保留producer完整根与consumer核验。之后引擎最终授权通过才可rename为Ready及公开输出。late Status、期限、校验、
+同时匹配Meta锚定的整对象根和Completion，fallback保留producer唯一完整根；consumer不再另建root-only正文hasher。之后引擎最终授权通过才可rename为Ready及公开输出。late Status、期限、校验、
 授权失败不放行；取消仍关闭接收端并真实join，不能提前释放块或proof租约。
 
 A store、原生写pool与B cache在同一Node共用原1MiB proof ledger，不各自新增额度。
@@ -180,10 +234,12 @@ A store、原生写pool与B cache在同一Node共用原1MiB proof ledger，不�
 其中常驻保留最多使用总额一半（默认512KiB），A pinned reader、Peer单槽proof和B
 proof／索引／包装共用该子限；不是新增一套内存池。已标记常驻的分配直到最后引用释放
 才退还总账与子限，淘汰条目不能提前退账。在途工作、writer与验证者仍竞争原总账，
-不保证32个并发请求全部取得快路径；额度不足保守回退。范围验证每张工作票据预留
-76KiB（2×32KiB＋8KiB＋4KiB）。resident接近512KiB且无其他临时占用时，剩余额度
-约容纳6张并存票据；实际准入还取决于proof加载、writer等占用和请求重叠，不是固定
-第7路必退化。未取得票据的范围读可退回完整根扫描：例如4MiB对象的128KiB小读，
+不保证32个并发请求全部取得快路径。对齐单范围工作票预留36KiB（32KiB scratch加
+4KiB元数据余量）；非对齐／多范围仍预留76KiB（2×32KiB＋8KiB＋4KiB）。resident
+接近512KiB且无其他临时占用时，剩余额度分别约容纳14张／6张票据，实际准入仍取决于
+proof加载、writer与请求重叠。范围工作额度不足时按入口固定截止有界等待，默认2ms、
+可配0..=50ms；释放与停止通过同一协调锁唤醒等待者，伪唤醒不延期，已持引用不提前退账。
+builder／resident准入保持非阻塞。到期未取得票据时保留完整根扫描：例如4MiB对象的128KiB小读，
 正文读取／hash可放大至32倍；降级不丢健康proof，也不重建或持久化sidecar。
 保留／工作准入失败、原生写没有生成proof及范围验证退回全扫分别计数。该预算不等于整个Node RSS，
 codec／TLS／网络编码拷贝仍属于原transport envelope，不冒称已由proof ledger覆盖。
@@ -221,8 +277,10 @@ DFS普通I/O沿用cached write-through，不启用writeback。默认entry/attr T
 成功数据修改撤销该inode的复用资格。身份表最多65536项、版本字符串合计1MiB，另计表结构，
 不占用磁盘cache的proof额度，也不保存正文。
 
-固定64个本地inode分片读写锁覆盖READ实际回复完成和OPEN fresh观察至回复完成，避免
-旧READ在新OPEN清页后重新填入旧正文。它不是跨节点读许可或撤销协议。内核已收到的页面
+64个短表锁管理每inode独立的本地读写锁，覆盖READ实际回复完成和OPEN fresh观察至
+回复完成，避免旧READ在新OPEN清页后重新填入旧正文；不同inode不共用读写锁。
+表锁不跨后端I/O或等待读写锁，最后引用释放时在表锁内回收条目，避免并发获取时分裂锁身份。
+它不是跨节点读许可或撤销协议。内核已收到的页面
 没有再次进入用户态授权检查的机会，不能宣传为可立即撤回的载荷；新open和用户态交付
 仍遵循权限与授权合同。正TTL是明确的宽松路径模式，不满足严格close-to-open。
 

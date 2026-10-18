@@ -28,6 +28,40 @@ def fixture():
 
 
 class Configuration(unittest.TestCase):
+    def test_explicit_gib_scenes_and_write_sizes(self):
+        cfg = fixture()
+        self.assertEqual(driver.workload_settings(cfg)['write_block_bytes'], 4 * 1024**2)
+        for scene in ['cold-read-1g', 'write-1g']:
+            cfg.update(scene=scene, size_bytes=1024**3)
+            driver.validate_config(cfg)
+        self.assertEqual(driver.workload_settings(cfg)['write_block_bytes'], 1024**2)
+        cfg['size_bytes'] = 64 * 1024**2
+        with self.assertRaises(ValueError): driver.validate_config(cfg)
+
+    def test_scene_write_size_must_match_frozen_contract(self):
+        for size in [0, True, 4097, 8 * 1024**2]:
+            cfg = fixture(); cfg['write_block_bytes'] = size
+            with self.subTest(size=size), self.assertRaises(ValueError): driver.validate_config(cfg)
+        cfg = fixture(); cfg.update(scene='write-1g', size_bytes=1024**3,
+                                    write_block_bytes=4 * 1024**2)
+        with self.assertRaises(ValueError): driver.validate_config(cfg)
+
+    def test_p2_profile_requires_separate_node_endpoints(self):
+        cfg = fixture(); cfg['labels']['afs-baseline']['metric_profile'] = 'p2'
+        with self.assertRaises(ValueError): driver.validate_config(cfg)
+        cfg['labels']['afs-baseline']['metrics'] = [
+            {'node': node, 'name': 'node-' + node, 'url': 'http://127.0.0.1:9000/metrics'}
+            for node in ['a', 'b']]
+        driver.validate_config(cfg)
+        cfg['labels']['afs-baseline']['metric_profile'] = 'typo'
+        with self.assertRaises(ValueError): driver.validate_config(cfg)
+
+    def test_explicit_driver_memory_admission(self):
+        cfg = fixture(); cfg['nodes']['a']['min_available_memory_bytes'] = 3 * 1024**3
+        driver.validate_config(cfg)
+        cfg['nodes']['a']['min_available_memory_bytes'] = True
+        with self.assertRaises(ValueError): driver.validate_config(cfg)
+
     def test_valid_dual_modes(self):
         driver.validate_config(fixture())
         self.assertEqual(driver.read_flags('contract'), ['O_RDONLY', 'O_DIRECT'])
@@ -84,6 +118,19 @@ class Configuration(unittest.TestCase):
 
 
 class Admission(unittest.TestCase):
+    def test_memory_admission_retains_requirement_and_does_not_mutate_limits(self):
+        with mock.patch.object(Path, 'read_text', return_value='MemAvailable: 3145728 kB\n'):
+            result = driver.worker.memory_admission({'min_available_memory_bytes': 3 * 1024**3})
+        self.assertEqual(result['available_bytes'], 3 * 1024**3)
+        self.assertEqual(result['required_bytes'], 3 * 1024**3)
+        with mock.patch.object(Path, 'read_text', return_value='MemAvailable: 1024 kB\n'):
+            with self.assertRaises(RuntimeError):
+                driver.worker.memory_admission({'min_available_memory_bytes': 3 * 1024**3})
+        with mock.patch.object(Path, 'read_text', return_value='MemTotal: 4194304 kB\n'):
+            with self.assertRaises(RuntimeError):
+                driver.worker.memory_admission({'min_available_memory_bytes': 1})
+        self.assertIsNone(driver.worker.memory_admission({}))
+
     def test_reject_nonempty_directory(self):
         with tempfile.TemporaryDirectory() as tmp:
             (Path(tmp) / 'keep').write_text('asset')
@@ -100,6 +147,51 @@ class Admission(unittest.TestCase):
 
 
 class Accounting(unittest.TestCase):
+    def p2_samples(self):
+        items = [{'node': node, 'name': 'node-' + node} for node in ['a', 'b']]
+        snapshots = {phase: {item['name']: {'text': '\n'.join(
+            name + ' 0' for name in driver.p2_required_metrics(item['node']))}
+                            for item in items}
+                     for phase in driver.METRIC_PHASES}
+        return {'metric_profile': 'p2', 'metrics': items}, snapshots
+
+    def test_p2_metric_evidence_retains_zero_and_raw_gauges(self):
+        label, snapshots = self.p2_samples()
+        name = 'afs_dfs_outboard_metadata_bytes'
+        snapshots['before']['node-a']['text'] = snapshots['before']['node-a']['text'].replace(
+            name + ' 0', name + ' 50')
+        result = driver.metric_evidence(label, snapshots)
+        self.assertTrue(result['complete'])
+        self.assertEqual(result['endpoints']['node-a']['node'], 'a')
+        self.assertEqual(result['endpoints']['node-a']['snapshots']['before']['outboard_gauges'][name], 50)
+        self.assertEqual(result['endpoints']['node-a']['snapshots']['after_first']['outboard_gauges'][name], 0)
+
+    def test_each_missing_required_metric_is_incomplete_not_zero(self):
+        label, snapshots = self.p2_samples()
+        for node in ['a', 'b']:
+            for phase in driver.METRIC_PHASES:
+                for name in driver.p2_required_metrics(node):
+                    with self.subTest(node=node, phase=phase, metric=name):
+                        saved = snapshots[phase]['node-' + node]['text']
+                        snapshots[phase]['node-' + node]['text'] = '\n'.join(
+                            line for line in saved.splitlines() if not line.startswith(name + ' '))
+                        result = driver.metric_evidence(label, snapshots)
+                        self.assertFalse(result['complete'])
+                        self.assertIn({'endpoint': 'node-' + node, 'node': node,
+                                       'phase': phase, 'metric': name}, result['missing'])
+                        snapshots[phase]['node-' + node]['text'] = saved
+
+    def test_b_metric_cannot_satisfy_a_requirement(self):
+        label, snapshots = self.p2_samples()
+        name = 'afs_dfs_read_rpc_calls_total{method="validate_read_grants"}'
+        snapshots['after_first']['node-b']['text'] += '\n' + name + ' 16'
+        snapshots['after_first']['node-a']['text'] = snapshots['after_first']['node-a']['text'].replace(
+            name + ' 0', '')
+        self.assertFalse(driver.metric_evidence(label, snapshots)['complete'])
+
+    def test_jfs_does_not_require_afs_metrics(self):
+        self.assertTrue(driver.metric_evidence({'metrics': []}, {})['complete'])
+
     def test_median_stability_no_cherry_pick(self):
         result = driver.summarize([100, 110, 105])
         self.assertEqual(result['median_ns'], 105)
@@ -127,6 +219,24 @@ class Accounting(unittest.TestCase):
 
 
 class MetricsSampling(unittest.TestCase):
+    def test_configured_write_syscalls_and_separate_fsync_boundary(self):
+        data = bytearray(3 * 1024**2)
+        with tempfile.TemporaryDirectory() as tmp:
+            original_write = driver.worker.os.write
+            lengths = []
+            def write(fd, payload):
+                lengths.append(len(payload))
+                return original_write(fd, payload)
+            with mock.patch.object(driver.worker.os, 'write', side_effect=write):
+                result = driver.worker.write_prepared(Path(tmp) / 'test.bin', data, 'digest', 1024**2)
+        self.assertEqual(lengths, [1024**2] * 3)
+        self.assertEqual(result['write_syscalls'], 3)
+        self.assertEqual(result['write_block_bytes'], 1024**2)
+        self.assertGreater(result['write_and_fsync_ns'], 0)
+        self.assertLessEqual(result['write_and_fsync_ns'], result['publish_ns'])
+        self.assertLessEqual(result['open_end_monotonic_ns'], result['write_start_monotonic_ns'])
+        self.assertLessEqual(result['file_fsync_end_monotonic_ns'], result['end_monotonic_ns'])
+
     def test_between_snapshot_records_raw_duration_for_both_roles(self):
         for role in ['reader', 'writer']:
             with self.subTest(role=role), \
@@ -204,8 +314,12 @@ class ControlProtocol(unittest.TestCase):
 
 
 class FailureLifecycle(unittest.TestCase):
-    def exercise(self, fail_workload=False, fail_stop=False):
+    def exercise(self, fail_workload=False, fail_stop=False, missing_metrics=False):
         cfg = fixture()
+        if missing_metrics:
+            cfg['labels']['afs-baseline'].update(metric_profile='p2', metrics=[
+                {'node': node, 'name': 'node-' + node, 'url': 'http://127.0.0.1:9000/metrics'}
+                for node in ['a', 'b']])
         calls = []
         transport = mock.Mock()
         transport.remote.return_value = {}
@@ -246,6 +360,16 @@ class FailureLifecycle(unittest.TestCase):
         result, calls = self.exercise()
         self.assertTrue(result['completed'])
         self.assertEqual(calls[-3:], [('stop', 'true'), ('cleanup', 'true'), ('verify_clean', 'true')])
+
+    def test_missing_metrics_preserve_completed_workload_and_stop_normally(self):
+        result, calls = self.exercise(missing_metrics=True)
+        self.assertFalse(result['completed'])
+        self.assertTrue(result['writer']['completed'])
+        self.assertTrue(result['reader']['completed'])
+        self.assertFalse(result['metric_evidence']['complete'])
+        self.assertIn('evidence incomplete', result['failure']['message'])
+        self.assertNotIn('cleanup', [name for name, _ in calls])
+        self.assertEqual(calls[-2:], [('stop', 'false'), ('verify_clean', 'false')])
 
     def test_failed_workload_preserves_payload_and_diagnostics(self):
         result, calls = self.exercise(fail_workload=True)

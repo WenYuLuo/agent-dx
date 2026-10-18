@@ -81,10 +81,14 @@ pub struct ReadWorkMetrics {
     outboard_total_limit: afs_metrics::IntGauge,
     outboard_resident_limit: afs_metrics::IntGauge,
     outboard_events: afs_metrics::IntCounterVec,
+    sidecar_install_items: afs_metrics::IntGaugeVec,
+    sidecar_install_control_bytes: afs_metrics::IntGauge,
     #[cfg(any(feature = "dfs", test))]
     disk_cache_metadata_bytes: afs_metrics::IntGauge,
     #[cfg(any(feature = "dfs", test))]
     disk_cache_metadata_peak_bytes: afs_metrics::IntGauge,
+    #[cfg(feature = "dfs")]
+    disk_cache_resources: afs_metrics::IntGaugeVec,
     scans: afs_metrics::IntCounter,
     copies: afs_metrics::IntCounterVec,
     #[cfg(any(feature = "dfs", test))]
@@ -97,6 +101,10 @@ pub struct ReadWorkMetrics {
     peer_payload_released: afs_metrics::IntCounter,
     #[cfg(any(feature = "dfs", test))]
     peer_object_cache: afs_metrics::IntCounterVec,
+    #[cfg(any(feature = "dfs", test))]
+    peer_serve_resources: afs_metrics::IntGaugeVec,
+    #[cfg(feature = "dfs")]
+    source_cache_resources: afs_metrics::IntGaugeVec,
     #[cfg(any(feature = "dfs", test))]
     read_rpc_calls: afs_metrics::IntCounterVec,
     #[cfg(any(feature = "dfs", test))]
@@ -174,6 +182,18 @@ impl ReadWorkMetrics {
             afs_metrics::register_collector(registry, &disk_cache_metadata_bytes)?;
             #[cfg(any(feature = "dfs", test))]
             afs_metrics::register_collector(registry, &disk_cache_metadata_peak_bytes)?;
+            #[cfg(feature = "dfs")]
+            let disk_cache_resources = afs_metrics::IntGaugeVec::new(
+                afs_metrics::Opts::new("afs_dfs_peer_disk_cache_resources",
+                    "Bounded native Peer cache resources; body_bytes is logical admission, control_bytes is charged metadata, neither is RSS."),
+                &["resource"],
+            )?;
+            #[cfg(feature = "dfs")]
+            for resource in ["operations", "flights", "fill_body_bytes", "indexed_entries", "retired_entries", "retired_disk_bytes", "control_bytes"] {
+                disk_cache_resources.with_label_values(&[resource]);
+            }
+            #[cfg(feature = "dfs")]
+            afs_metrics::register_collector(registry, &disk_cache_resources)?;
             let outboard_total_bytes = afs_metrics::IntGauge::new(
                 "afs_dfs_outboard_metadata_bytes", "All live Node outboard ledger charges, including resident and working metadata; not RSS.")?;
             let outboard_resident_bytes = afs_metrics::IntGauge::new(
@@ -185,9 +205,20 @@ impl ReadWorkMetrics {
             let outboard_events = afs_metrics::IntCounterVec::new(
                 afs_metrics::Opts::new("afs_dfs_outboard_events_total",
                     "Bounded outboard admission failures and actual native write/range fallback events."), &["event"])?;
-            for event in ["reserve_total_failed", "reserve_resident_failed", "write_without_proof", "range_fullscan_fallback", "range_fullscan_unretained"] {
+            for event in ["reserve_total_failed", "reserve_resident_failed", "write_without_proof", "range_fullscan_fallback", "range_fullscan_unretained", "sidecar_install_dropped", "sidecar_install_failed"] {
                 outboard_events.with_label_values(&[event]);
             }
+            let sidecar_install_items = afs_metrics::IntGaugeVec::new(
+                afs_metrics::Opts::new("afs_dfs_sidecar_install_items", "Bounded optional sidecar items; queued plus active never exceeds limit."),
+                &["state"],
+            )?;
+            for state in ["queued", "active", "limit"] {
+                sidecar_install_items.with_label_values(&[state]);
+            }
+            afs_metrics::register_collector(registry, &sidecar_install_items)?;
+            let sidecar_install_control_bytes = afs_metrics::IntGauge::new(
+                "afs_dfs_sidecar_install_control_bytes", "Conservative same-ledger capacity charge for sidecar control containers, ID buffers and worker path; retained while idle until shutdown.")?;
+            afs_metrics::register_collector(registry, &sidecar_install_control_bytes)?;
             for gauge in [&outboard_total_bytes, &outboard_resident_bytes, &outboard_total_limit, &outboard_resident_limit] {
                 afs_metrics::register_collector(registry, gauge)?;
             }
@@ -224,13 +255,38 @@ impl ReadWorkMetrics {
                 "Peer read payload capacity released after its final owner drops.",
             )?;
             #[cfg(any(feature = "dfs", test))]
+            let peer_serve_resources = afs_metrics::IntGaugeVec::new(
+                afs_metrics::Opts::new("afs_dfs_peer_serve_resources", "Bounded serve control owners and configured body limit; control allocations are not body or proof capacity."),
+                &["resource"],
+            )?;
+            #[cfg(any(feature = "dfs", test))]
+            for resource in ["residents", "flights", "readers", "payload_limit_bytes", "fixed_control_bytes", "control_bytes", "control_peak_bytes", "control_limit_bytes"] {
+                peer_serve_resources.with_label_values(&[resource]);
+            }
+            #[cfg(any(feature = "dfs", test))]
+            afs_metrics::register_collector(registry, &peer_serve_resources)?;
+            #[cfg(any(feature = "dfs", test))]
             let peer_object_cache = afs_metrics::IntCounterVec::new(
                 afs_metrics::Opts::new(
                     "afs_dfs_peer_read_object_cache_total",
-                    "Current verified-object slot lookups; never a source of read authority.",
+                    "Verified-object LRU lookups; never a source of read authority.",
                 ),
                 &["result"],
             )?;
+            #[cfg(feature = "dfs")]
+            let source_cache_resources = afs_metrics::IntGaugeVec::new(
+                afs_metrics::Opts::new(
+                    "afs_dfs_source_cache_resources",
+                    "Retained source metadata estimates; excludes caller-owned replies, payload and other authorization caches.",
+                ),
+                &["resource"],
+            )?;
+            #[cfg(feature = "dfs")]
+            for resource in ["entries", "bytes", "peak_bytes", "limit_bytes"] {
+                source_cache_resources.with_label_values(&[resource]);
+            }
+            #[cfg(feature = "dfs")]
+            afs_metrics::register_collector(registry, &source_cache_resources)?;
             #[cfg(any(feature = "dfs", test))]
             let read_rpc_calls = afs_metrics::IntCounterVec::new(
                 afs_metrics::Opts::new(
@@ -374,6 +430,7 @@ impl ReadWorkMetrics {
                 "data_frame",
                 "body_vec_allocation",
                 "shared_frame",
+                "root_fallback",
             ] {
                 peer_read_events.with_label_values(&[event]);
             }
@@ -413,10 +470,14 @@ impl ReadWorkMetrics {
                 outboard_total_limit,
                 outboard_resident_limit,
                 outboard_events,
+                sidecar_install_items,
+                sidecar_install_control_bytes,
                 #[cfg(any(feature = "dfs", test))]
                 disk_cache_metadata_bytes,
                 #[cfg(any(feature = "dfs", test))]
                 disk_cache_metadata_peak_bytes,
+                #[cfg(feature = "dfs")]
+                disk_cache_resources,
                 scans,
                 copies,
                 #[cfg(any(feature = "dfs", test))]
@@ -429,6 +490,10 @@ impl ReadWorkMetrics {
                 peer_payload_released,
                 #[cfg(any(feature = "dfs", test))]
                 peer_object_cache,
+                #[cfg(any(feature = "dfs", test))]
+                peer_serve_resources,
+                #[cfg(feature = "dfs")]
+                source_cache_resources,
                 #[cfg(any(feature = "dfs", test))]
                 read_rpc_calls,
                 #[cfg(any(feature = "dfs", test))]
@@ -488,6 +553,32 @@ impl ReadWorkMetrics {
         self.diagnostics.as_ref()?.begin(stage)
     }
 
+    /// Fixed phase totals for diagnostic runs only. OFF returns before sampling a
+    /// clock or cloning the journal. Timings are attempted work, can overlap,
+    /// and must never be added to their enclosing request as extra elapsed time.
+    pub(crate) fn coarse_diagnostic(
+        &self,
+        phase: &'static str,
+        bytes: u64,
+    ) -> Option<ReadCoarseDiagnosticSpan> {
+        #[cfg(any(feature = "dfs", test))]
+        {
+            let journal = self.diagnostics.as_ref()?;
+            let index = READ_COARSE_PHASES.iter().position(|name| *name == phase)?;
+            Some(ReadCoarseDiagnosticSpan {
+                journal: journal.clone(),
+                index,
+                start_ns: journal.now(),
+                bytes,
+            })
+        }
+        #[cfg(not(any(feature = "dfs", test)))]
+        {
+            let _ = (phase, bytes);
+            None
+        }
+    }
+
     /// Read only outside a measured operation; serialization is not on the read path.
     #[cfg(any(feature = "dfs", test))]
     pub(crate) fn diagnostics_snapshot(&self) -> Option<ReadDiagnosticsSnapshot> {
@@ -518,6 +609,27 @@ impl ReadWorkMetrics {
         if let (Ok(current), Ok(peak)) = (i64::try_from(current), i64::try_from(peak)) {
             self.disk_cache_metadata_bytes.set(current);
             self.disk_cache_metadata_peak_bytes.set(peak);
+        }
+    }
+
+    #[cfg(feature = "dfs")]
+    pub(crate) fn peer_cache_resources(&self, resources: &[(&'static str, u64)]) {
+        for &(resource, value) in resources {
+            if matches!(
+                resource,
+                "operations"
+                    | "flights"
+                    | "fill_body_bytes"
+                    | "indexed_entries"
+                    | "retired_entries"
+                    | "retired_disk_bytes"
+                    | "control_bytes"
+            ) && let Ok(value) = i64::try_from(value)
+            {
+                self.disk_cache_resources
+                    .with_label_values(&[resource])
+                    .set(value);
+            }
         }
     }
 
@@ -689,8 +801,29 @@ impl ReadWorkMetrics {
                 | "write_without_proof"
                 | "range_fullscan_fallback"
                 | "range_fullscan_unretained"
+                | "sidecar_install_dropped"
+                | "sidecar_install_failed"
         ) {
             self.outboard_events.with_label_values(&[event]).inc();
+        }
+    }
+
+    pub(crate) fn sidecar_install_counts(
+        &self,
+        queued: usize,
+        active: usize,
+        limit: usize,
+        control_bytes: usize,
+    ) {
+        for (state, count) in [("queued", queued), ("active", active), ("limit", limit)] {
+            if let Ok(count) = i64::try_from(count) {
+                self.sidecar_install_items
+                    .with_label_values(&[state])
+                    .set(count);
+            }
+        }
+        if let Ok(bytes) = i64::try_from(control_bytes) {
+            self.sidecar_install_control_bytes.set(bytes);
         }
     }
 
@@ -699,8 +832,67 @@ impl ReadWorkMetrics {
     }
 
     #[cfg(any(feature = "dfs", test))]
+    pub(crate) fn peer_serve_resources(
+        &self,
+        residents: usize,
+        flights: usize,
+        readers: usize,
+        payload_limit: u64,
+        fixed_control: usize,
+    ) {
+        for (resource, value) in [
+            ("residents", residents as u64),
+            ("flights", flights as u64),
+            ("readers", readers as u64),
+            ("payload_limit_bytes", payload_limit),
+            ("fixed_control_bytes", fixed_control as u64),
+            ("control_limit_bytes", 64 * 1024),
+        ] {
+            if let Ok(value) = i64::try_from(value) {
+                self.peer_serve_resources
+                    .with_label_values(&[resource])
+                    .set(value);
+            }
+        }
+    }
+
+    #[cfg(any(feature = "dfs", test))]
+    pub(crate) fn peer_serve_control(&self, delta: i64, peak_increment: u64) {
+        self.peer_serve_resources
+            .with_label_values(&["control_bytes"])
+            .add(delta);
+        if let Ok(peak) = i64::try_from(peak_increment) {
+            self.peer_serve_resources
+                .with_label_values(&["control_peak_bytes"])
+                .add(peak);
+        }
+    }
+
+    #[cfg(feature = "dfs")]
+    pub(crate) fn source_cache_resources(
+        &self,
+        entries: usize,
+        bytes: usize,
+        peak: usize,
+        limit: usize,
+    ) {
+        for (resource, value) in [
+            ("entries", entries),
+            ("bytes", bytes),
+            ("peak_bytes", peak),
+            ("limit_bytes", limit),
+        ] {
+            if let Ok(value) = i64::try_from(value) {
+                self.source_cache_resources
+                    .with_label_values(&[resource])
+                    .set(value);
+            }
+        }
+    }
+
+    #[cfg(any(feature = "dfs", test))]
     pub(crate) fn peer_payload_reserved(&self, bytes: u64, peak_increment: u64) {
-        // The enforcing budget admits at most 8MiB. Metrics remain optional
+        // The enforcing budget has a configurable 4..=64MiB limit. Metrics remain optional
         // observations and cannot grant admission, even for an invalid input.
         if let (Ok(bytes_i64), Ok(peak_i64)) = (i64::try_from(bytes), i64::try_from(peak_increment))
         {
@@ -754,6 +946,7 @@ impl ReadWorkMetrics {
                 | "data_frame"
                 | "body_vec_allocation"
                 | "shared_frame"
+                | "root_fallback"
         ) {
             self.peer_read_events.with_label_values(&[event]).inc();
         }
@@ -847,6 +1040,15 @@ pub(crate) enum ReadDiagnosticStage {
     MetaValidateReadGrants,
     MetaLookupNodeLocation,
     PeerObject,
+    PeerServe,
+    PersistBatch,
+    MetaCommitFileVersion,
+    MetaPlacementSnapshot,
+    MetaCreate,
+    MetaOpenWrite,
+    MetaResolveWriteAuthority,
+    MetaRenewWriteLease,
+    MetaSyncInodeMetadata,
 }
 
 #[cfg(any(feature = "dfs", test))]
@@ -860,6 +1062,15 @@ impl ReadDiagnosticStage {
             5 => Self::MetaValidateReadGrants,
             6 => Self::MetaLookupNodeLocation,
             7 => Self::PeerObject,
+            8 => Self::PeerServe,
+            9 => Self::PersistBatch,
+            10 => Self::MetaCommitFileVersion,
+            11 => Self::MetaPlacementSnapshot,
+            12 => Self::MetaCreate,
+            13 => Self::MetaOpenWrite,
+            14 => Self::MetaResolveWriteAuthority,
+            15 => Self::MetaRenewWriteLease,
+            16 => Self::MetaSyncInodeMetadata,
             _ => Self::FuseRead,
         }
     }
@@ -873,6 +1084,7 @@ struct ReadDiagnosticSlot {
     end_ns: AtomicU64,
     // 0 = active; 1 = success; 2 = error/cancel/drop. A missing endpoint is not zero work.
     status: AtomicU64,
+    first_data_ns: AtomicU64,
     body_end_ns: AtomicU64,
     eof_ns: AtomicU64,
     consumer_ns: AtomicU64,
@@ -969,10 +1181,100 @@ impl ReadDiagnosticConsumerWork {
     }
 }
 
+// One fixed entry per phase, not one event per frame or syscall. First/last
+// endpoints describe the aggregate envelope, not a contiguous critical path.
+#[cfg(any(feature = "dfs", test))]
+const READ_COARSE_PHASES: [&str; 24] = [
+    "peer_slot_wait",
+    "peer_read_verify",
+    "peer_first_frame_enqueue",
+    "cache_lock_wait",
+    "cache_hit_read_verify",
+    "peer_block_wait",
+    "peer_frame_handoff_copy",
+    "peer_block_handoff_wait",
+    "persist_batch",
+    "persist_body_write",
+    "persist_body_sync",
+    "persist_chunks_dir_sync",
+    "persist_catalog_write",
+    "persist_catalog_sync",
+    "persist_catalog_parent_sync",
+    "persist_proof_install_sync",
+    "persist_proof_dir_sync",
+    "meta_publish_rpc",
+    "meta_placement_rpc",
+    "meta_create_rpc",
+    "meta_open_write_rpc",
+    "meta_resolve_write_rpc",
+    "meta_renew_write_lease_rpc",
+    "meta_sync_inode_metadata_rpc",
+];
+
+#[derive(Debug, Default)]
+#[cfg(any(feature = "dfs", test))]
+struct ReadCoarseDiagnosticSlot {
+    first_start_ns: AtomicU64,
+    last_end_ns: AtomicU64,
+    wall_ns: AtomicU64,
+    calls: AtomicU64,
+    bytes: AtomicU64,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[cfg(any(feature = "dfs", test))]
+pub(crate) struct ReadCoarseDiagnosticRecord {
+    pub(crate) phase: &'static str,
+    pub(crate) first_start_ns: u64,
+    pub(crate) last_end_ns: u64,
+    pub(crate) wall_ns: u64,
+    pub(crate) calls: u64,
+    pub(crate) bytes: u64,
+}
+
+/// Owns diagnostic metadata only. Dropping a guard records attempted work even
+/// on error; it never catches, substitutes or changes an operation's result.
+pub(crate) struct ReadCoarseDiagnosticSpan {
+    #[cfg(any(feature = "dfs", test))]
+    journal: Arc<ReadDiagnostics>,
+    #[cfg(any(feature = "dfs", test))]
+    index: usize,
+    #[cfg(any(feature = "dfs", test))]
+    start_ns: u64,
+    #[cfg(any(feature = "dfs", test))]
+    bytes: u64,
+}
+
+#[cfg(any(feature = "dfs", test))]
+impl Drop for ReadCoarseDiagnosticSpan {
+    fn drop(&mut self) {
+        let end_ns = self.journal.now();
+        if self.start_ns == 0 || end_ns < self.start_ns {
+            return;
+        }
+        let slot = &self.journal.coarse[self.index];
+        // Ignore the initial zero when finding the first measured endpoint.
+        let _ = slot.first_start_ns.compare_exchange(
+            0,
+            self.start_ns,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+        slot.first_start_ns
+            .fetch_min(self.start_ns, Ordering::Relaxed);
+        slot.last_end_ns.fetch_max(end_ns, Ordering::Relaxed);
+        slot.wall_ns
+            .fetch_add(end_ns - self.start_ns, Ordering::Relaxed);
+        slot.bytes.fetch_add(self.bytes, Ordering::Relaxed);
+        slot.calls.fetch_add(1, Ordering::Release);
+    }
+}
+
 #[derive(Debug)]
 #[cfg(any(feature = "dfs", test))]
 struct ReadDiagnostics {
     slots: Box<[ReadDiagnosticSlot; READ_DIAGNOSTIC_CAPACITY]>,
+    coarse: [ReadCoarseDiagnosticSlot; READ_COARSE_PHASES.len()],
     next: AtomicU64,
     overflow: AtomicU64,
     clock_failures: AtomicU64,
@@ -995,6 +1297,9 @@ pub(crate) struct ReadDiagnosticRecord {
     pub(crate) end_ns: u64,
     pub(crate) success: bool,
     pub(crate) completed: bool,
+    /// B: first nonempty decoded frame, before staging/hash. A PeerServe:
+    /// first data frame accepted by the local channel, not on-wire delivery.
+    pub(crate) first_data_ns: u64,
     /// Last expected nonempty data frame decoded, before its copy or consumer work.
     /// Does not imply protocol EOF, verification, authorization or successful output.
     pub(crate) body_end_ns: u64,
@@ -1021,6 +1326,7 @@ pub(crate) struct ReadDiagnosticsSnapshot {
     pub(crate) overflow: u64,
     pub(crate) clock_failures: u64,
     pub(crate) records: Vec<ReadDiagnosticRecord>,
+    pub(crate) coarse_phases: Vec<ReadCoarseDiagnosticRecord>,
 }
 
 #[cfg(any(feature = "dfs", test))]
@@ -1028,6 +1334,7 @@ impl ReadDiagnostics {
     fn new() -> Self {
         Self {
             slots: Box::new(std::array::from_fn(|_| ReadDiagnosticSlot::default())),
+            coarse: std::array::from_fn(|_| ReadCoarseDiagnosticSlot::default()),
             next: AtomicU64::new(0),
             overflow: AtomicU64::new(0),
             clock_failures: AtomicU64::new(0),
@@ -1081,6 +1388,7 @@ impl ReadDiagnostics {
                     end_ns: slot.end_ns.load(Ordering::Relaxed),
                     success: status == 1,
                     completed: status != 0,
+                    first_data_ns: slot.first_data_ns.load(Ordering::Acquire),
                     body_end_ns: slot.body_end_ns.load(Ordering::Acquire),
                     eof_ns: slot.eof_ns.load(Ordering::Acquire),
                     consumer_ns: slot.consumer_ns.load(Ordering::Relaxed),
@@ -1102,13 +1410,28 @@ impl ReadDiagnostics {
             })
             .collect();
         ReadDiagnosticsSnapshot {
-            schema_version: 3,
+            schema_version: 4,
             capacity: READ_DIAGNOSTIC_CAPACITY,
             metadata_bytes: std::mem::size_of::<ReadDiagnosticSlot>() * READ_DIAGNOSTIC_CAPACITY
                 + std::mem::size_of::<ReadDiagnostics>(),
             overflow: self.overflow.load(Ordering::Acquire),
             clock_failures: self.clock_failures.load(Ordering::Acquire),
             records,
+            coarse_phases: READ_COARSE_PHASES
+                .iter()
+                .zip(&self.coarse)
+                .map(|(phase, slot)| {
+                    let calls = slot.calls.load(Ordering::Acquire);
+                    ReadCoarseDiagnosticRecord {
+                        phase,
+                        first_start_ns: slot.first_start_ns.load(Ordering::Relaxed),
+                        last_end_ns: slot.last_end_ns.load(Ordering::Relaxed),
+                        wall_ns: slot.wall_ns.load(Ordering::Relaxed),
+                        calls,
+                        bytes: slot.bytes.load(Ordering::Relaxed),
+                    }
+                })
+                .collect(),
         }
     }
 }
@@ -1142,6 +1465,18 @@ pub(crate) struct ReadDiagnosticToken {
 impl ReadDiagnosticToken {
     pub(crate) fn now(&self) -> u64 {
         self.journal.now()
+    }
+
+    pub(crate) fn first_data(&self) {
+        let slot = &self.journal.slots[self.index];
+        if slot.first_data_ns.load(Ordering::Relaxed) == 0 {
+            let _ = slot.first_data_ns.compare_exchange(
+                0,
+                self.now(),
+                Ordering::Release,
+                Ordering::Relaxed,
+            );
+        }
     }
 
     #[cfg(feature = "dfs")]
@@ -1448,8 +1783,76 @@ mod tests {
                 .diagnostic(super::ReadDiagnosticStage::FuseRead)
                 .is_none()
         );
+        assert!(metrics.coarse_diagnostic("persist_body_sync", 1).is_none());
         assert!(metrics.diagnostics_snapshot().is_none());
         assert!(metrics.with_read_diagnostics(false).diagnostics.is_none());
+    }
+
+    #[test]
+    fn coarse_diagnostics_are_bounded_without_consuming_request_slots() {
+        let registry = afs_metrics::Registry::new();
+        let metrics = ReadWorkMetrics::register(&registry)
+            .unwrap()
+            .with_read_diagnostics(true);
+        assert!(metrics.coarse_diagnostic("unknown_phase", 7).is_none());
+        for _ in 0..1024 {
+            let _guard = metrics
+                .coarse_diagnostic("persist_body_sync", 4096)
+                .unwrap();
+        }
+        let span = metrics
+            .diagnostic(super::ReadDiagnosticStage::PeerServe)
+            .unwrap();
+        let token = span.token();
+        token.first_data();
+        let first = metrics.diagnostics_snapshot().unwrap().records[0].first_data_ns;
+        token.first_data();
+        span.finish(true);
+        let snapshot = metrics.diagnostics_snapshot().unwrap();
+        assert_eq!(snapshot.schema_version, 4);
+        assert_eq!(snapshot.records.len(), 1);
+        assert_eq!(snapshot.records[0].first_data_ns, first);
+        assert!(first >= snapshot.records[0].start_ns);
+        assert!(first <= snapshot.records[0].end_ns);
+        let phase = snapshot
+            .coarse_phases
+            .iter()
+            .find(|phase| phase.phase == "persist_body_sync")
+            .unwrap();
+        assert_eq!(phase.calls, 1024);
+        assert_eq!(phase.bytes, 1024 * 4096);
+        assert!(phase.first_start_ns > 0);
+        assert!(phase.last_end_ns >= phase.first_start_ns);
+        assert!(
+            snapshot.metadata_bytes + 2 * std::mem::size_of::<super::ReadDiagnosticIntervals>()
+                <= super::READ_DIAGNOSTIC_MAX_METADATA_BYTES
+        );
+        assert_eq!(snapshot.overflow, 0);
+    }
+
+    #[test]
+    fn coarse_diagnostic_error_drop_preserves_error_and_request_failure() {
+        let registry = afs_metrics::Registry::new();
+        let metrics = ReadWorkMetrics::register(&registry)
+            .unwrap()
+            .with_read_diagnostics(true);
+        let result: Result<(), u32> = (|| {
+            let _span = metrics.diagnostic(super::ReadDiagnosticStage::PersistBatch);
+            let _phase = metrics.coarse_diagnostic("persist_body_write", 4096);
+            Err::<(), u32>(73)?;
+            Ok(())
+        })();
+        assert_eq!(result, Err(73));
+        let snapshot = metrics.diagnostics_snapshot().unwrap();
+        assert_eq!(snapshot.records.len(), 1);
+        assert!(snapshot.records[0].completed && !snapshot.records[0].success);
+        let phase = snapshot
+            .coarse_phases
+            .iter()
+            .find(|phase| phase.phase == "persist_body_write")
+            .unwrap();
+        assert_eq!(phase.calls, 1);
+        assert_eq!(phase.bytes, 4096);
     }
 
     #[test]
@@ -1554,7 +1957,7 @@ mod tests {
         }
         drop(span);
         let snapshot = metrics.diagnostics_snapshot().unwrap();
-        assert_eq!(snapshot.schema_version, 3);
+        assert_eq!(snapshot.schema_version, 4);
         assert!(snapshot.metadata_bytes <= super::READ_DIAGNOSTIC_MAX_METADATA_BYTES);
         let record = &snapshot.records[0];
         assert!(record.completed && !record.success);
@@ -1848,6 +2251,7 @@ mod tests {
             "data_frame",
             "body_vec_allocation",
             "shared_frame",
+            "root_fallback",
         ] {
             metrics.peer_read_event(event);
             assert_eq!(same.peer_read_events.with_label_values(&[event]).get(), 1);
@@ -1858,7 +2262,7 @@ mod tests {
             .iter()
             .find(|family| family.name() == "afs_dfs_peer_read_events_total")
             .unwrap();
-        assert_eq!(events.get_metric().len(), 11);
+        assert_eq!(events.get_metric().len(), 12);
     }
 
     #[test]

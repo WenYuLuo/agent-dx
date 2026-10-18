@@ -18,10 +18,10 @@ use std::{
     fs::File,
     io,
     sync::{
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 pub(crate) const DEFAULT_OUTBOARD_BUDGET_BYTES: usize = 1024 * 1024;
@@ -29,6 +29,20 @@ pub(crate) const OUTBOARD_GROUP_BYTES: usize = 32 * 1024;
 pub(crate) const MAX_ENCODED_OUTBOARD_BYTES: usize = 8192;
 
 const RANGE_WORKING_BYTES: usize = 2 * OUTBOARD_GROUP_BYTES + MAX_ENCODED_OUTBOARD_BYTES + 4096;
+const ALIGNED_RANGE_WORKING_BYTES: usize = OUTBOARD_GROUP_BYTES + 4096;
+const DEFAULT_RANGE_WORK_WAIT: Duration = Duration::from_millis(2);
+
+#[derive(Debug, Default)]
+struct RangeWorkState {
+    stopped: bool,
+    #[cfg(test)]
+    waiters: usize,
+    #[cfg(test)]
+    before_wait: Option<(
+        std::sync::mpsc::SyncSender<()>,
+        std::sync::mpsc::Receiver<()>,
+    )>,
+}
 
 #[derive(Debug)]
 pub struct OutboardBudget {
@@ -37,21 +51,33 @@ pub struct OutboardBudget {
     resident_limit: usize,
     resident_used: AtomicUsize,
     metrics: Option<super::super::read_work::ReadWorkMetrics>,
+    work_wait: Duration,
+    work_state: Mutex<RangeWorkState>,
+    work_changed: Condvar,
 }
 impl OutboardBudget {
     pub fn new(limit: usize) -> Arc<Self> {
-        Self::create(limit, None)
+        Self::create(limit, None, DEFAULT_RANGE_WORK_WAIT)
     }
-    #[cfg(any(feature = "dfs", test))]
+    #[cfg(test)]
     pub(crate) fn new_with_metrics(
         limit: usize,
         metrics: super::super::read_work::ReadWorkMetrics,
     ) -> Arc<Self> {
-        Self::create(limit, Some(metrics))
+        Self::create(limit, Some(metrics), DEFAULT_RANGE_WORK_WAIT)
+    }
+    #[cfg(feature = "dfs")]
+    pub(crate) fn new_with_metrics_and_work_wait(
+        limit: usize,
+        metrics: super::super::read_work::ReadWorkMetrics,
+        work_wait: Duration,
+    ) -> Arc<Self> {
+        Self::create(limit, Some(metrics), work_wait)
     }
     fn create(
         limit: usize,
         metrics: Option<super::super::read_work::ReadWorkMetrics>,
+        work_wait: Duration,
     ) -> Arc<Self> {
         if let Some(metrics) = &metrics {
             metrics.outboard_limits(limit, limit / 2);
@@ -62,6 +88,9 @@ impl OutboardBudget {
             resident_limit: limit / 2,
             resident_used: AtomicUsize::new(0),
             metrics,
+            work_wait,
+            work_state: Mutex::new(RangeWorkState::default()),
+            work_changed: Condvar::new(),
         })
     }
     pub fn limit(&self) -> usize {
@@ -109,7 +138,7 @@ impl OutboardBudget {
                     return Some(OutboardLease {
                         budget: self.clone(),
                         bytes,
-                        resident: Mutex::new(false),
+                        resident: Mutex::new(OutboardResidence::default()),
                     });
                 }
                 Err(actual) => used = actual,
@@ -120,8 +149,95 @@ impl OutboardBudget {
         let lease = self.try_reserve(bytes)?;
         lease.try_mark_resident().then_some(lease)
     }
-    pub(crate) fn try_reserve_range_work(self: &Arc<Self>) -> Option<OutboardLease> {
-        self.try_reserve(RANGE_WORKING_BYTES)
+    #[cfg(test)]
+    fn try_reserve_range_work(self: &Arc<Self>) -> Option<OutboardLease> {
+        self.reserve_work_until_deadline(RANGE_WORKING_BYTES)
+    }
+    pub(crate) fn reserve_range_work(
+        self: &Arc<Self>,
+        ranges: &[VerifiedRangeCopy],
+        object_length: u64,
+    ) -> Option<OutboardLease> {
+        self.reserve_work_until_deadline(range_working_bytes(ranges, object_length))
+    }
+    pub(crate) fn pin_sidecar(self: &Arc<Self>, proof: &SharedOutboard) -> Option<SidecarOutboard> {
+        if !proof.uses_budget(self) {
+            return None;
+        }
+        let mut residence = proof.lease.resident.lock().ok()?;
+        if residence.resident || self.limit.saturating_sub(self.used()) < 4 * RANGE_WORKING_BYTES {
+            return None;
+        }
+        residence.sidecar_pins = residence.sidecar_pins.checked_add(1)?;
+        // No new allocation or ledger charge: the original proof remains
+        // transient until every sidecar pin is gone. The headroom check above
+        // is instantaneous, not a permanent partition from builder admission.
+        Some(SidecarOutboard {
+            proof: proof.clone(),
+        })
+    }
+    pub(crate) fn try_reserve_sidecar_control(
+        self: &Arc<Self>,
+        bytes: usize,
+    ) -> Option<OutboardLease> {
+        let lease = self.try_reserve(bytes)?;
+        if self.limit.saturating_sub(self.used()) < 4 * RANGE_WORKING_BYTES {
+            drop(lease);
+            return None;
+        }
+        Some(lease)
+    }
+    pub(crate) fn sidecar_event(&self, event: &'static str) {
+        self.event(event);
+    }
+    fn reserve_work_until_deadline(self: &Arc<Self>, bytes: usize) -> Option<OutboardLease> {
+        // Start before taking the coordination lock: contention and spurious
+        // wakeups cannot silently give a request a fresh waiting interval.
+        let deadline = Instant::now().checked_add(self.work_wait)?;
+        let mut state = self.work_state.lock().ok()?;
+        if state.stopped || (!self.work_wait.is_zero() && Instant::now() >= deadline) {
+            return None;
+        }
+        if let Some(lease) = self.try_reserve(bytes) {
+            return Some(lease);
+        }
+        loop {
+            #[cfg(test)]
+            if let Some((checked, resume)) = state.before_wait.take() {
+                checked.send(()).ok()?;
+                resume.recv().ok()?;
+            }
+            let remaining = deadline.checked_duration_since(Instant::now())?;
+            #[cfg(test)]
+            {
+                state.waiters += 1;
+            }
+            // release/stop take this same mutex. They cannot notify between
+            // our capacity check and the atomic unlock-and-wait operation.
+            let (next, _) = self.work_changed.wait_timeout(state, remaining).ok()?;
+            state = next;
+            #[cfg(test)]
+            {
+                state.waiters -= 1;
+            }
+            if state.stopped || Instant::now() >= deadline {
+                return None;
+            }
+            if let Some(lease) = self.try_reserve(bytes) {
+                return Some(lease);
+            }
+        }
+    }
+    /// Stop only range-work admission; existing holders retain their charges
+    /// until destruction and callers retain their original full-scan fallback.
+    #[cfg(any(feature = "dfs", test))]
+    pub(crate) fn stop_range_work(&self) {
+        let mut state = self
+            .work_state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.stopped = true;
+        self.work_changed.notify_all();
     }
     fn admit_resident(&self, bytes: usize) -> bool {
         let mut used = self.resident_used();
@@ -150,6 +266,13 @@ impl OutboardBudget {
         }
     }
     fn release(&self, resident: bool, bytes: usize) {
+        // Only total bytes unblock range work. The same mutex orders the
+        // capacity change against the waiter's check-and-wait boundary.
+        let _state = (!resident).then(|| {
+            self.work_state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+        });
         let counter = if resident {
             &self.resident_used
         } else {
@@ -159,7 +282,33 @@ impl OutboardBudget {
         if let Some(metrics) = &self.metrics {
             metrics.outboard_adjust(resident, bytes, false);
         }
+        if !resident && bytes != 0 {
+            self.work_changed.notify_all();
+        }
     }
+}
+
+fn range_working_bytes(ranges: &[VerifiedRangeCopy], object_length: u64) -> usize {
+    if let [range] = ranges {
+        let allowed = object_length
+            .saturating_sub(range.chunk_offset)
+            .min(range.length as u64);
+        let stop = range.chunk_offset.saturating_add(allowed);
+        if allowed != 0
+            && range
+                .chunk_offset
+                .is_multiple_of(OUTBOARD_GROUP_BYTES as u64)
+            && (stop.is_multiple_of(OUTBOARD_GROUP_BYTES as u64) || stop == object_length)
+        {
+            // BorrowedRange needs one Bao coverage-group scratch and retains
+            // the original 4KiB metadata allowance (including result counts).
+            // No encoded response or decode leaf lives in this branch.
+            return ALIGNED_RANGE_WORKING_BYTES;
+        }
+    }
+    // Partial/multiple ranges own an encoded response and decoded leaf at the
+    // same time. They must not borrow the aligned branch's smaller charge.
+    RANGE_WORKING_BYTES
 }
 
 #[derive(Debug)]
@@ -168,24 +317,54 @@ pub(crate) struct OutboardLease {
     bytes: usize,
     // This mutex only serializes the one-way admission of this exact allocation.
     // It never protects I/O. Arc clones share one admission until final drop.
-    resident: Mutex<bool>,
+    resident: Mutex<OutboardResidence>,
+}
+#[derive(Debug, Default)]
+struct OutboardResidence {
+    resident: bool,
+    sidecar_pins: usize,
+}
+#[derive(Debug)]
+pub(crate) struct SidecarOutboard {
+    proof: SharedOutboard,
+}
+impl SidecarOutboard {
+    pub(crate) fn proof(&self) -> &SharedOutboard {
+        &self.proof
+    }
+}
+impl Drop for SidecarOutboard {
+    fn drop(&mut self) {
+        let mut residence = self
+            .proof
+            .lease
+            .resident
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        residence.sidecar_pins -= 1;
+        // Dropping this guard only releases its own Arc. Other staged/Peer or
+        // unknown-commit holders keep the original allocation and charge live.
+    }
 }
 impl OutboardLease {
     fn try_mark_resident(&self) -> bool {
         let Ok(mut retained) = self.resident.lock() else {
             return false;
         };
-        if *retained {
+        if retained.resident {
             return true;
+        }
+        if retained.sidecar_pins != 0 {
+            return false;
         }
         if !self.budget.admit_resident(self.bytes) {
             return false;
         }
-        *retained = true;
+        retained.resident = true;
         true
     }
     pub(crate) fn retain_capacity(&mut self, bytes: usize) -> Result<()> {
-        let retained = *self.resident.get_mut().map_err(|_| capacity())?;
+        let retained = self.resident.get_mut().map_err(|_| capacity())?.resident;
         if bytes > self.bytes {
             let mut extra = if retained {
                 self.budget.try_reserve_resident(bytes - self.bytes)
@@ -209,8 +388,8 @@ impl Drop for OutboardLease {
     fn drop(&mut self) {
         // Poisoning cannot erase a successfully admitted resident reservation.
         let retained = match self.resident.get_mut() {
-            Ok(value) => *value,
-            Err(error) => **error.get_ref(),
+            Ok(value) => value.resident,
+            Err(error) => error.get_ref().resident,
         };
         if retained {
             self.budget.release(true, self.bytes);
@@ -324,7 +503,7 @@ impl ChunkOutboard {
         let empty = OutboardLease {
             budget: owned.lease.budget.clone(),
             bytes: 0,
-            resident: Mutex::new(false),
+            resident: Mutex::new(OutboardResidence::default()),
         };
         let lease = std::mem::replace(&mut owned.lease, empty);
         Ok(Arc::new(Self {
@@ -365,7 +544,7 @@ impl ChunkOutboard {
         let working = self
             .lease
             .budget
-            .try_reserve_range_work()
+            .reserve_range_work(ranges, expected.length)
             .ok_or_else(capacity)?;
         self.read_ranges_into_with_reserved_work(
             file,
@@ -390,9 +569,9 @@ impl ChunkOutboard {
         if self.length != expected.length || self.digest != expected.content_digest {
             return Err(super::corrupt(&expected.id, "outboard identity differs"));
         }
-        let retained = *working.resident.lock().map_err(|_| capacity())?;
+        let retained = working.resident.lock().map_err(|_| capacity())?.resident;
         if !Arc::ptr_eq(&working.budget, &self.lease.budget)
-            || working.bytes < RANGE_WORKING_BYTES
+            || working.bytes < range_working_bytes(ranges, expected.length)
             || retained
         {
             return Err(capacity());
@@ -489,6 +668,78 @@ impl ChunkOutboard {
                 work.add(&observed.into_inner());
                 return result.map(|()| counts);
             }
+        }
+        if ranges.len() <= groups.len()
+            && nonaliased_ranges(ranges, &counts)
+            && ranges.iter().zip(&counts).any(|(range, allowed)| {
+                *allowed != 0
+                    && range.chunk_offset.div_ceil(OUTBOARD_GROUP_BYTES as u64)
+                        < range.chunk_offset.saturating_add(*allowed as u64)
+                            / OUTBOARD_GROUP_BYTES as u64
+            })
+        {
+            // Fill only the requested bytes, once per contiguous range. The
+            // validator borrows those exact private results; uncovered edge
+            // bytes go straight from the file into its existing group scratch.
+            // Tiny edge-only reads and aliasing destinations/sources retain the
+            // original codec; the metadata walk is bounded to 128 ranges.
+            let result = (|| {
+                for (range, allowed) in ranges.iter().zip(&counts) {
+                    if *allowed != 0 {
+                        source
+                            .read_exact_at(
+                                range.chunk_offset,
+                                &mut out[range.output_offset..range.output_offset + *allowed],
+                            )
+                            .map_err(Error::from)?;
+                    }
+                }
+                observed.borrow_mut().scratch_peak = OUTBOARD_GROUP_BYTES;
+                let mut group = 0;
+                while group < groups.len() {
+                    if !groups[group] {
+                        group += 1;
+                        continue;
+                    }
+                    let first = group;
+                    while group < groups.len() && groups[group] {
+                        group += 1;
+                    }
+                    let start = first as u64 * OUTBOARD_GROUP_BYTES as u64;
+                    let stop = (group as u64 * OUTBOARD_GROUP_BYTES as u64).min(self.length);
+                    let query = ChunkRanges::from(ChunkNum(start / 1024)..ChunkNum::chunks(stop));
+                    let checked = ObservedOutboard {
+                        inner: PreOrderMemOutboard {
+                            root,
+                            tree: tree(self.length),
+                            data: self.raw_cv_bytes(),
+                        },
+                        work: &observed,
+                    };
+                    let input = PrivateRanges {
+                        source: &source,
+                        bytes: out,
+                        ranges,
+                        counts: &counts,
+                    };
+                    let verify_started = Instant::now();
+                    let verified = bao_tree::io::sync::encode_ranges_validated(
+                        input,
+                        checked,
+                        &query,
+                        io::sink(),
+                    )
+                    .map_err(|error| match error {
+                        bao_tree::io::EncodeError::Io(error) => Error::from(error),
+                        other => bad_proof(&format!("Bao range verification failed: {other}")),
+                    });
+                    observed.borrow_mut().verify_ns += nanos(verify_started);
+                    verified?;
+                }
+                Ok(counts)
+            })();
+            work.add(&observed.into_inner());
+            return result;
         }
         let mut encoded = Vec::new();
         encoded
@@ -592,6 +843,78 @@ impl ReadAt for BorrowedRange<'_> {
         // subtree hash. This is still a user-space copy, not zero-copy hashing.
         work.copied_bytes += count as u64;
         work.hash_bytes += count as u64;
+        Ok(count)
+    }
+}
+
+fn nonaliased_ranges(ranges: &[VerifiedRangeCopy], counts: &[usize]) -> bool {
+    for (index, (range, allowed)) in ranges.iter().zip(counts).enumerate() {
+        if *allowed == 0 {
+            continue;
+        }
+        let end = range.output_offset.saturating_add(*allowed);
+        for (other, count) in ranges[index + 1..].iter().zip(&counts[index + 1..]) {
+            if *count != 0
+                && ((range.output_offset < other.output_offset.saturating_add(*count)
+                    && other.output_offset < end)
+                    || (range.chunk_offset < other.chunk_offset.saturating_add(*count as u64)
+                        && other.chunk_offset < range.chunk_offset.saturating_add(*allowed as u64)))
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+// A bounded view, not another payload owner. The official validator authenticates
+// all selected coverage groups, including bytes outside the requested intervals.
+struct PrivateRanges<'view, 'file> {
+    source: &'view OffsetFile<'file>,
+    bytes: &'view [u8],
+    ranges: &'view [VerifiedRangeCopy],
+    counts: &'view [usize],
+}
+
+impl ReadAt for PrivateRanges<'_, '_> {
+    fn read_at(&self, offset: u64, out: &mut [u8]) -> io::Result<usize> {
+        let count = self
+            .source
+            .length
+            .saturating_sub(offset)
+            .min(out.len() as u64) as usize;
+        let mut filled = 0;
+        while filled < count {
+            let position = offset + filled as u64;
+            let mut next = offset + count as u64;
+            let mut covered = None;
+            for (range, allowed) in self.ranges.iter().zip(self.counts) {
+                if *allowed == 0 {
+                    continue;
+                }
+                let end = range.chunk_offset.saturating_add(*allowed as u64);
+                if range.chunk_offset <= position && position < end {
+                    let length = (end.min(next) - position) as usize;
+                    let start = range.output_offset + (position - range.chunk_offset) as usize;
+                    covered = Some((start, length));
+                    break;
+                }
+                if range.chunk_offset > position {
+                    next = next.min(range.chunk_offset);
+                }
+            }
+            if let Some((start, length)) = covered {
+                out[filled..filled + length].copy_from_slice(&self.bytes[start..start + length]);
+                self.source.work.borrow_mut().copied_bytes += length as u64;
+                filled += length;
+            } else {
+                let length = (next - position) as usize;
+                self.source
+                    .read_exact_at(position, &mut out[filled..filled + length])?;
+                filled += length;
+            }
+        }
+        self.source.work.borrow_mut().hash_bytes += count as u64;
         Ok(count)
     }
 }
@@ -781,12 +1104,21 @@ impl TreeBuilder {
 impl OutboardBuilder {
     /// Construction-time eligibility only, never proof that body bytes have
     /// been verified. The consumer fixes its complete-root mode before input.
-    #[cfg(any(feature = "dfs", test))]
+    #[cfg(test)]
     pub(crate) fn has_peer_tree(&self) -> bool {
         self.seen == 0
             && !self.invalid_peer
             && self.error.is_none()
             && matches!(&self.state, BuildState::Tree(builder) if builder.peer.is_some())
+    }
+    /// Header-time eligibility for one standard-root builder, including a
+    /// locally generated tree. This cannot change modes after body input.
+    #[cfg(any(feature = "dfs", test))]
+    pub(crate) fn has_tree(&self) -> bool {
+        self.seen == 0
+            && !self.invalid_peer
+            && self.error.is_none()
+            && matches!(&self.state, BuildState::Tree(_))
     }
 
     pub(crate) fn new(length: u64, budget: Arc<OutboardBudget>) -> Self {
@@ -979,7 +1311,7 @@ impl OutboardBuilder {
                 let replacement = OutboardLease {
                     budget: builder.lease.budget.clone(),
                     bytes: 0,
-                    resident: Mutex::new(false),
+                    resident: Mutex::new(OutboardResidence::default()),
                 };
                 let lease = std::mem::replace(&mut builder.lease, replacement);
                 let proof = Arc::new(ChunkOutboard {
@@ -1052,6 +1384,352 @@ fn drop_event(event: &'static str, used: usize) {
 mod tests {
     use super::*;
     use bao_tree::{BlockSize, io::outboard::PreOrderMemOutboard};
+
+    #[test]
+    fn p2_w0_sidecar_headroom_is_instantaneous_and_uses_largest_work_ticket() {
+        let budget = OutboardBudget::new(DEFAULT_OUTBOARD_BUDGET_BYTES);
+        let proof = build_borrowed(&vec![37; 128 * 1024], &budget)
+            .outboard
+            .unwrap();
+        let pressure = budget
+            .try_reserve(budget.limit() - budget.used() - 4 * RANGE_WORKING_BYTES)
+            .unwrap();
+        let before = budget.used();
+        let pin = budget.pin_sidecar(&proof).unwrap();
+        assert_eq!(
+            budget.used(),
+            before,
+            "Arc pin cannot add another proof byte charge"
+        );
+        assert!(std::ptr::eq(
+            proof.encoded().as_ptr(),
+            pin.proof().encoded().as_ptr()
+        ));
+        // Original builder admission remains nonblocking and can consume this
+        // headroom later; the queue never claims a permanent new partition.
+        let extra = budget.try_reserve(1).unwrap();
+        assert!(budget.pin_sidecar(&proof).is_none());
+        drop(extra);
+        assert!(budget.pin_sidecar(&proof).is_some());
+        drop(pin);
+        drop(pressure);
+        drop(proof);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn p2_w0_sidecar_pins_keep_shared_allocation_transient_until_last_pin() {
+        let budget = OutboardBudget::new(DEFAULT_OUTBOARD_BUDGET_BYTES);
+        let proof = build_borrowed(&vec![31; 128 * 1024], &budget)
+            .outboard
+            .unwrap();
+        let charge = proof.charged_bytes();
+        let first = budget.pin_sidecar(&proof).unwrap();
+        let second = budget.pin_sidecar(&proof).unwrap();
+        assert!(!proof.try_mark_resident());
+        assert_eq!((budget.used(), budget.resident_used()), (charge, 0));
+        drop(first);
+        assert!(!proof.try_mark_resident());
+        drop(second);
+        assert!(proof.try_mark_resident());
+        assert!(
+            budget.pin_sidecar(&proof).is_none(),
+            "resident ownership must never be demoted for the queue"
+        );
+        assert_eq!((budget.used(), budget.resident_used()), (charge, charge));
+        drop(proof);
+        assert_eq!((budget.used(), budget.resident_used()), (0, 0));
+    }
+
+    #[test]
+    fn p2_w0_sidecar_rejects_foreign_ledger_and_retains_original_last_owner() {
+        let budget = OutboardBudget::new(DEFAULT_OUTBOARD_BUDGET_BYTES);
+        let foreign = OutboardBudget::new(DEFAULT_OUTBOARD_BUDGET_BYTES);
+        let proof = build_borrowed(&vec![13; 128 * 1024], &budget)
+            .outboard
+            .unwrap();
+        assert!(foreign.pin_sidecar(&proof).is_none());
+        let pin = budget.pin_sidecar(&proof).unwrap();
+        let independent = proof.clone();
+        drop(proof);
+        drop(pin);
+        assert!(budget.used() > 0);
+        assert_eq!(foreign.used(), 0);
+        drop(independent);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn p2_r3_header_tree_eligibility_includes_local_tree_without_peer_proof() {
+        let budget = OutboardBudget::new(DEFAULT_OUTBOARD_BUDGET_BYTES);
+        let mut local = OutboardBuilder::new(128 * 1024, budget);
+        assert!(local.has_tree());
+        assert!(!local.has_peer_tree());
+        local.update(&[37]).unwrap();
+        assert!(!local.has_tree());
+        assert!(!OutboardBuilder::new(128 * 1024, OutboardBudget::new(0)).has_tree());
+    }
+
+    #[test]
+    fn p2_c1a_default_range_admission_waits_until_original_deadline() {
+        let budget = OutboardBudget::new(RANGE_WORKING_BYTES);
+        let occupied = budget.try_reserve(RANGE_WORKING_BYTES).unwrap();
+        let entered = Instant::now();
+        assert!(budget.try_reserve_range_work().is_none());
+        let returned_after = entered.elapsed();
+        eprintln!("range-work default exhausted return delay: {returned_after:?}");
+        assert!(
+            returned_after >= std::time::Duration::from_millis(2),
+            "default range-work wait must use the original 2ms deadline"
+        );
+        assert_eq!(budget.used(), RANGE_WORKING_BYTES);
+        drop(occupied);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn p2_c1a_last_holder_release_wakes_range_admission_without_early_refund() {
+        use std::{sync::mpsc, thread};
+        let budget = OutboardBudget::create(RANGE_WORKING_BYTES, None, Duration::from_millis(50));
+        let occupied = Arc::new(budget.try_reserve(RANGE_WORKING_BYTES).unwrap());
+        let last = occupied.clone();
+        drop(occupied);
+        assert_eq!(budget.used(), RANGE_WORKING_BYTES);
+        let (checked, checked_rx) = mpsc::sync_channel(0);
+        let (resume, resume_rx) = mpsc::sync_channel(0);
+        budget.work_state.lock().unwrap().before_wait = Some((checked, resume_rx));
+        let waiting_budget = budget.clone();
+        let waiter = thread::spawn(move || waiting_budget.try_reserve_range_work());
+        checked_rx.recv().unwrap();
+        // Capacity was checked while holding work_state. Start the final
+        // release at that exact check/wait boundary; its lock must serialize
+        // with the waiter's atomic unlock-and-wait, so no notification is lost.
+        let (releasing, releasing_rx) = mpsc::sync_channel(0);
+        let releaser = thread::spawn(move || {
+            releasing.send(()).unwrap();
+            drop(last);
+        });
+        releasing_rx.recv().unwrap();
+        assert_eq!(budget.used(), RANGE_WORKING_BYTES);
+        resume.send(()).unwrap();
+        let ticket = waiter.join().unwrap();
+        releaser.join().unwrap();
+        assert!(
+            ticket.is_some(),
+            "boundary release must wake range admission"
+        );
+        assert_eq!(budget.used(), RANGE_WORKING_BYTES);
+        drop(ticket);
+        assert_eq!(budget.used(), 0);
+    }
+
+    fn c1a_wait_for_waiters(budget: &OutboardBudget, count: usize) {
+        let guard = Instant::now() + Duration::from_secs(2);
+        loop {
+            if budget.work_state.lock().unwrap().waiters == count {
+                return;
+            }
+            assert!(
+                Instant::now() < guard,
+                "expected {count} parked range waiters"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn p2_c1a_zero_wait_and_builder_resident_remain_nonblocking() {
+        let budget = OutboardBudget::create(RANGE_WORKING_BYTES, None, Duration::ZERO);
+        let held = budget.try_reserve(RANGE_WORKING_BYTES).unwrap();
+        assert!(budget.try_reserve_range_work().is_none());
+        assert_eq!(budget.work_state.lock().unwrap().waiters, 0);
+        assert!(budget.try_reserve(1).is_none());
+        assert!(budget.try_reserve_resident(1).is_none());
+        drop(held);
+        assert!(budget.try_reserve_range_work().is_some());
+    }
+
+    #[test]
+    fn p2_c1a_stop_wakes_all_waiters_without_refunding_held_tickets() {
+        let budget = OutboardBudget::create(RANGE_WORKING_BYTES, None, Duration::from_millis(50));
+        let held = budget.try_reserve(RANGE_WORKING_BYTES).unwrap();
+        let waiters: Vec<_> = (0..8)
+            .map(|_| {
+                let budget = budget.clone();
+                std::thread::spawn(move || budget.try_reserve_range_work().is_none())
+            })
+            .collect();
+        c1a_wait_for_waiters(&budget, 8);
+        budget.stop_range_work();
+        for waiter in waiters {
+            assert!(waiter.join().unwrap());
+        }
+        assert_eq!(budget.used(), RANGE_WORKING_BYTES);
+        drop(held);
+        assert_eq!(budget.used(), 0);
+        assert!(budget.try_reserve_range_work().is_none());
+        // Stop affects range workers, not the builder/resident admission API.
+        assert!(budget.try_reserve(1).is_some());
+    }
+
+    #[test]
+    fn p2_c1a_spurious_notifications_do_not_extend_entry_deadline() {
+        let budget = OutboardBudget::create(RANGE_WORKING_BYTES, None, Duration::from_millis(5));
+        let held = budget.try_reserve(RANGE_WORKING_BYTES).unwrap();
+        let waiting = budget.clone();
+        let waiter = std::thread::spawn(move || {
+            let entered = Instant::now();
+            let result = waiting.try_reserve_range_work();
+            (result.is_none(), entered.elapsed())
+        });
+        c1a_wait_for_waiters(&budget, 1);
+        // Keep waking while capacity remains unavailable. Completion must not
+        // depend on the notifications ending or the held allocation retiring.
+        let notify_until = Instant::now() + Duration::from_millis(500);
+        while !waiter.is_finished() && Instant::now() < notify_until {
+            budget.work_changed.notify_all();
+            std::thread::yield_now();
+        }
+        assert!(
+            waiter.is_finished(),
+            "spurious wakeups renewed the waiting interval"
+        );
+        let (rejected, elapsed) = waiter.join().unwrap();
+        assert!(rejected);
+        eprintln!("5ms entry deadline under spurious wakeups: returned after {elapsed:?}");
+        assert_eq!(budget.used(), RANGE_WORKING_BYTES);
+        drop(held);
+    }
+
+    #[test]
+    fn p2_c1a_expired_check_wait_boundary_does_not_start_another_wait() {
+        use std::sync::mpsc;
+        let budget = OutboardBudget::create(RANGE_WORKING_BYTES, None, Duration::from_millis(2));
+        let held = budget.try_reserve(RANGE_WORKING_BYTES).unwrap();
+        let (checked, checked_rx) = mpsc::sync_channel(0);
+        let (resume, resume_rx) = mpsc::sync_channel(0);
+        budget.work_state.lock().unwrap().before_wait = Some((checked, resume_rx));
+        let waiting = budget.clone();
+        let waiter = std::thread::spawn(move || waiting.try_reserve_range_work().is_none());
+        checked_rx.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        resume.send(()).unwrap();
+        assert!(waiter.join().unwrap());
+        assert_eq!(budget.work_state.lock().unwrap().waiters, 0);
+        assert_eq!(budget.used(), RANGE_WORKING_BYTES);
+        drop(held);
+    }
+
+    #[test]
+    fn p2_c1a_aligned_and_partial_work_account_their_real_lifetimes() {
+        let aligned = [VerifiedRangeCopy {
+            chunk_offset: 0,
+            length: 128 * 1024,
+            output_offset: 0,
+        }];
+        let partial = [VerifiedRangeCopy {
+            chunk_offset: 1,
+            length: 128 * 1024,
+            output_offset: 0,
+        }];
+        assert_eq!(
+            range_working_bytes(&aligned, 4 * 1024 * 1024),
+            ALIGNED_RANGE_WORKING_BYTES
+        );
+        assert_eq!(
+            range_working_bytes(&partial, 4 * 1024 * 1024),
+            RANGE_WORKING_BYTES
+        );
+        let budget = OutboardBudget::new(ALIGNED_RANGE_WORKING_BYTES);
+        let lease = budget
+            .reserve_range_work(&aligned, 4 * 1024 * 1024)
+            .unwrap();
+        assert_eq!(budget.used(), ALIGNED_RANGE_WORKING_BYTES);
+        drop(lease);
+        assert_eq!(budget.used(), 0);
+        assert!(
+            budget
+                .reserve_range_work(&partial, 4 * 1024 * 1024)
+                .is_none()
+        );
+    }
+
+    #[test]
+    #[ignore = "fixed resource acceptance: run with --release and --ignored; debug timings are not performance criteria"]
+    fn p2_c1a_32_threads_hot_object_with_resident_sublimit_full() {
+        use std::{
+            os::unix::fs::FileExt,
+            sync::{Barrier, atomic::AtomicUsize},
+        };
+        let body = vec![59; 4 * 1024 * 1024];
+        let chunk = expected(&body);
+        let budget = OutboardBudget::new(DEFAULT_OUTBOARD_BUDGET_BYTES);
+        let proofs: Vec<_> = (0..60)
+            .map(|_| {
+                let proof = build_borrowed(&body, &budget).outboard.unwrap();
+                assert!(proof.try_mark_resident());
+                proof
+            })
+            .collect();
+        let remaining = budget.resident_limit() - budget.resident_used();
+        let resident_padding = budget.try_reserve_resident(remaining).unwrap();
+        assert_eq!(budget.resident_used(), budget.resident_limit());
+        let file = tempfile::tempfile().unwrap();
+        file.write_all_at(&body, 0).unwrap();
+        let start = Arc::new(Barrier::new(32));
+        let fallbacks = AtomicUsize::new(0);
+        let started = Instant::now();
+        std::thread::scope(|scope| {
+            for worker in 0..32 {
+                let (proof, file, chunk, start, fallbacks) =
+                    (&proofs[0], &file, &chunk, &start, &fallbacks);
+                scope.spawn(move || {
+                    let mut out = vec![0; 128 * 1024];
+                    start.wait();
+                    for iteration in 0..1000 {
+                        let offset = ((worker + iteration) % 32) * out.len();
+                        let result = proof.read_ranges_into_with_work(
+                            file,
+                            0,
+                            chunk,
+                            &[VerifiedRangeCopy {
+                                chunk_offset: offset as u64,
+                                length: out.len(),
+                                output_offset: 0,
+                            }],
+                            &mut out,
+                            &mut OutboardReadWork::default(),
+                        );
+                        match result {
+                            Ok(counts) => {
+                                assert_eq!(counts, vec![out.len()]);
+                                assert!(out.iter().all(|byte| *byte == 59));
+                            }
+                            Err(error) => {
+                                assert_eq!(error.code(), afs_error::IO_CAPACITY);
+                                fallbacks.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        let count = fallbacks.load(Ordering::Relaxed);
+        eprintln!(
+            "C-1a fixed hot range load: reads=32000 capacity_fallbacks={count} elapsed={:?} resident={} total={}",
+            started.elapsed(),
+            budget.resident_used(),
+            budget.used()
+        );
+        assert!(
+            count * 100 < 32000 * 5,
+            "range full-scan fallback must be below 5%"
+        );
+        assert_eq!(budget.used(), budget.resident_used());
+        drop(resident_padding);
+        drop(proofs);
+        assert_eq!((budget.used(), budget.resident_used()), (0, 0));
+    }
 
     #[test]
     fn wi6_borrowed_builder_matches_official_standard_root_and_outboard() {
@@ -1526,6 +2204,330 @@ mod tests {
     }
 
     #[test]
+    fn r8_unaligned_mebibyte_reads_middle_once_with_bounded_edges() {
+        use std::io::Write;
+        let body: Vec<u8> = (0..4 * 1024 * 1024).map(|n| (n % 251) as u8).collect();
+        let chunk = expected(&body);
+        let budget = OutboardBudget::new(DEFAULT_OUTBOARD_BUDGET_BYTES);
+        let proof = build_borrowed(&body, &budget).outboard.unwrap();
+        let retained = budget.used();
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&[0xa5; 4096]).unwrap();
+        file.write_all(&body).unwrap();
+        let length = 1024 * 1024;
+        let mut out = vec![0xa5; length + 14];
+        let mut work = OutboardReadWork::default();
+        assert_eq!(
+            proof
+                .read_ranges_into_with_work(
+                    &file,
+                    4096,
+                    &chunk,
+                    &[VerifiedRangeCopy {
+                        chunk_offset: 7,
+                        length,
+                        output_offset: 7
+                    }],
+                    &mut out,
+                    &mut work,
+                )
+                .unwrap(),
+            vec![length]
+        );
+        assert_eq!(&out[7..7 + length], &body[7..7 + length]);
+        assert!(
+            out[..7]
+                .iter()
+                .chain(out[7 + length..].iter())
+                .all(|byte| *byte == 0xa5)
+        );
+        let covered = (length + OUTBOARD_GROUP_BYTES) as u64;
+        assert_eq!(
+            work.hash_bytes, covered,
+            "both partial edge groups still authenticate completely"
+        );
+        assert_eq!(
+            budget.used(),
+            retained,
+            "range scratch retires before return"
+        );
+        eprintln!(
+            "R8 unaligned: reads={} hash={} copy={} scratch={}",
+            work.read_calls, work.hash_bytes, work.copied_bytes, work.scratch_peak
+        );
+        assert!(
+            work.read_calls <= 3,
+            "one middle read plus at most two edge reads"
+        );
+        assert!(
+            work.copied_bytes <= covered + (2 * OUTBOARD_GROUP_BYTES) as u64,
+            "codec encode/decode cannot add two complete coverage copies"
+        );
+        assert!(work.scratch_peak <= RANGE_WORKING_BYTES);
+    }
+
+    #[test]
+    fn r8_noncontiguous_large_interiors_scale_reads_with_ranges_not_groups() {
+        use std::io::Write;
+        let body: Vec<u8> = (0..4 * 1024 * 1024).map(|n| (n % 251) as u8).collect();
+        let chunk = expected(&body);
+        let budget = OutboardBudget::new(DEFAULT_OUTBOARD_BUDGET_BYTES);
+        let proof = build_borrowed(&body, &budget).outboard.unwrap();
+        let retained = budget.used();
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&body).unwrap();
+        let length = 512 * 1024;
+        let second_source = 2 * 1024 * 1024 + 11;
+        let second_output = length + 19;
+        let ranges = [
+            VerifiedRangeCopy {
+                chunk_offset: 7,
+                length,
+                output_offset: 7,
+            },
+            VerifiedRangeCopy {
+                chunk_offset: second_source as u64,
+                length,
+                output_offset: second_output,
+            },
+        ];
+        let mut out = vec![0xa5; second_output + length + 7];
+        let mut work = OutboardReadWork::default();
+        assert_eq!(
+            proof
+                .read_ranges_into_with_work(&file, 0, &chunk, &ranges, &mut out, &mut work,)
+                .unwrap(),
+            vec![length, length]
+        );
+        assert_eq!(&out[7..7 + length], &body[7..7 + length]);
+        assert_eq!(
+            &out[second_output..second_output + length],
+            &body[second_source..second_source + length]
+        );
+        assert!(
+            out[..7]
+                .iter()
+                .chain(out[7 + length..second_output].iter())
+                .chain(out[second_output + length..].iter())
+                .all(|byte| *byte == 0xa5)
+        );
+        let covered = (2 * (length + OUTBOARD_GROUP_BYTES)) as u64;
+        assert_eq!(work.hash_bytes, covered);
+        assert_eq!(budget.used(), retained);
+        eprintln!(
+            "R8 multi-range: reads={} hash={} copy={} scratch={}",
+            work.read_calls, work.hash_bytes, work.copied_bytes, work.scratch_peak
+        );
+        assert!(
+            work.read_calls <= 6,
+            "two middle reads plus at most four edge reads"
+        );
+        assert!(work.copied_bytes <= covered + (4 * OUTBOARD_GROUP_BYTES) as u64);
+        assert!(work.scratch_peak <= RANGE_WORKING_BYTES);
+    }
+
+    #[test]
+    fn r8_aliasing_outputs_preserve_coverage_group_write_order() {
+        use std::io::Write;
+        let body: Vec<u8> = (0..4 * OUTBOARD_GROUP_BYTES + 17)
+            .map(|n| (n % 251) as u8)
+            .collect();
+        let chunk = expected(&body);
+        let budget = OutboardBudget::new(DEFAULT_OUTBOARD_BUDGET_BYTES);
+        let proof = build_borrowed(&body, &budget).outboard.unwrap();
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&body).unwrap();
+        let ranges = [
+            VerifiedRangeCopy {
+                chunk_offset: (OUTBOARD_GROUP_BYTES + 1) as u64,
+                length: OUTBOARD_GROUP_BYTES,
+                output_offset: 7,
+            },
+            VerifiedRangeCopy {
+                chunk_offset: 3,
+                length: OUTBOARD_GROUP_BYTES / 2,
+                output_offset: 7,
+            },
+        ];
+        let mut out = vec![0xa5; OUTBOARD_GROUP_BYTES + 14];
+        let mut work = OutboardReadWork::default();
+        assert_eq!(
+            proof
+                .read_ranges_into_with_work(&file, 0, &chunk, &ranges, &mut out, &mut work,)
+                .unwrap(),
+            vec![OUTBOARD_GROUP_BYTES, OUTBOARD_GROUP_BYTES / 2]
+        );
+        // Group 0 writes the second mapping first. Groups 1/2 overwrite it
+        // with the first mapping, despite the second mapping's later position.
+        assert_eq!(
+            &out[7..7 + OUTBOARD_GROUP_BYTES],
+            &body[OUTBOARD_GROUP_BYTES + 1..2 * OUTBOARD_GROUP_BYTES + 1]
+        );
+        assert!(
+            out[..7]
+                .iter()
+                .chain(out[7 + OUTBOARD_GROUP_BYTES..].iter())
+                .all(|byte| *byte == 0xa5)
+        );
+        assert_eq!(work.hash_bytes, (3 * OUTBOARD_GROUP_BYTES) as u64);
+        assert!(work.scratch_peak <= RANGE_WORKING_BYTES);
+    }
+
+    #[test]
+    fn r8_private_edges_authenticate_padding_and_bound_short_tail_before_delivery() {
+        use std::{io::Write, os::unix::fs::FileExt};
+        let body: Vec<u8> = (0..3 * OUTBOARD_GROUP_BYTES + 37)
+            .map(|n| (n % 251) as u8)
+            .collect();
+        let chunk = expected(&body);
+        let budget = OutboardBudget::new(DEFAULT_OUTBOARD_BUDGET_BYTES);
+        let proof = build_borrowed(&body, &budget).outboard.unwrap();
+        let retained = budget.used();
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&body).unwrap();
+        let length = 2 * OUTBOARD_GROUP_BYTES + 23;
+        for corrupt_offset in [0, OUTBOARD_GROUP_BYTES + 17, 2 * OUTBOARD_GROUP_BYTES + 31] {
+            file.write_all_at(&body, 0).unwrap();
+            file.write_all_at(&[body[corrupt_offset] ^ 1], corrupt_offset as u64)
+                .unwrap();
+            let mut private = vec![0xa5; length + 14];
+            let error = proof
+                .read_ranges_into_with_work(
+                    &file,
+                    0,
+                    &chunk,
+                    &[VerifiedRangeCopy {
+                        chunk_offset: 7,
+                        length,
+                        output_offset: 7,
+                    }],
+                    &mut private,
+                    &mut OutboardReadWork::default(),
+                )
+                .unwrap_err();
+            assert_eq!(error.code(), afs_error::NODE_TRANSFER_CORRUPT_DATA);
+            assert!(
+                private[..7]
+                    .iter()
+                    .chain(private[7 + length..].iter())
+                    .all(|byte| *byte == 0xa5)
+            );
+            assert_eq!(budget.used(), retained);
+        }
+        file.write_all_at(&body, 0).unwrap();
+        let tail_offset = 3;
+        let allowed = body.len() - tail_offset;
+        let mut private = vec![0xa5; allowed + 14];
+        let mut work = OutboardReadWork::default();
+        assert_eq!(
+            proof
+                .read_ranges_into_with_work(
+                    &file,
+                    0,
+                    &chunk,
+                    &[VerifiedRangeCopy {
+                        chunk_offset: tail_offset as u64,
+                        length: 4 * OUTBOARD_GROUP_BYTES,
+                        output_offset: 7
+                    }],
+                    &mut private,
+                    &mut work,
+                )
+                .unwrap(),
+            vec![allowed]
+        );
+        assert_eq!(&private[7..7 + allowed], &body[tail_offset..]);
+        assert!(
+            private[..7]
+                .iter()
+                .chain(private[7 + allowed..].iter())
+                .all(|byte| *byte == 0xa5)
+        );
+        assert_eq!(
+            work.hash_bytes,
+            body.len() as u64,
+            "the short final coverage group remains complete after a long interior"
+        );
+        assert!(work.read_calls <= 2);
+        assert!(work.scratch_peak <= RANGE_WORKING_BYTES);
+        let mut rejected = vec![0xa5; allowed];
+        let mut work = OutboardReadWork::default();
+        assert!(
+            proof
+                .read_ranges_into_with_work(
+                    &file,
+                    0,
+                    &chunk,
+                    &[VerifiedRangeCopy {
+                        chunk_offset: tail_offset as u64,
+                        length: 4 * OUTBOARD_GROUP_BYTES,
+                        output_offset: 1
+                    }],
+                    &mut rejected,
+                    &mut work,
+                )
+                .is_err()
+        );
+        assert_eq!(work.read_calls, 0);
+        assert!(rejected.iter().all(|byte| *byte == 0xa5));
+        assert_eq!(budget.used(), retained);
+    }
+
+    #[test]
+    fn r8_source_aliases_keep_codec_verification_for_each_destination() {
+        use std::io::Write;
+        let body: Vec<u8> = (0..4 * OUTBOARD_GROUP_BYTES)
+            .map(|n| (n % 251) as u8)
+            .collect();
+        let chunk = expected(&body);
+        let budget = OutboardBudget::new(DEFAULT_OUTBOARD_BUDGET_BYTES);
+        let proof = build_borrowed(&body, &budget).outboard.unwrap();
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&body).unwrap();
+        let second_output = OUTBOARD_GROUP_BYTES + 32;
+        let ranges = [
+            VerifiedRangeCopy {
+                chunk_offset: 7,
+                length: OUTBOARD_GROUP_BYTES + 17,
+                output_offset: 0,
+            },
+            VerifiedRangeCopy {
+                chunk_offset: (OUTBOARD_GROUP_BYTES / 2) as u64,
+                length: OUTBOARD_GROUP_BYTES,
+                output_offset: second_output,
+            },
+        ];
+        let mut out = vec![0xa5; second_output + OUTBOARD_GROUP_BYTES + 7];
+        let mut work = OutboardReadWork::default();
+        assert_eq!(
+            proof
+                .read_ranges_into_with_work(&file, 0, &chunk, &ranges, &mut out, &mut work,)
+                .unwrap(),
+            vec![OUTBOARD_GROUP_BYTES + 17, OUTBOARD_GROUP_BYTES]
+        );
+        assert_eq!(
+            &out[..OUTBOARD_GROUP_BYTES + 17],
+            &body[7..OUTBOARD_GROUP_BYTES + 24]
+        );
+        assert_eq!(
+            &out[second_output..second_output + OUTBOARD_GROUP_BYTES],
+            &body[OUTBOARD_GROUP_BYTES / 2..3 * OUTBOARD_GROUP_BYTES / 2]
+        );
+        assert!(
+            out[OUTBOARD_GROUP_BYTES + 17..second_output]
+                .iter()
+                .chain(out[second_output + OUTBOARD_GROUP_BYTES..].iter())
+                .all(|byte| *byte == 0xa5)
+        );
+        assert_eq!(
+            work.read_calls, 2,
+            "shared source groups remain deduplicated"
+        );
+        assert_eq!(work.hash_bytes, (2 * OUTBOARD_GROUP_BYTES) as u64);
+        assert!(work.scratch_peak <= RANGE_WORKING_BYTES);
+    }
+
+    #[test]
     fn wi6_peer_tree_eligibility_is_frozen_before_any_body_and_rejects_root_fallback() {
         let body = vec![37; 2 * OUTBOARD_GROUP_BYTES];
         let chunk = expected(&body);
@@ -1639,7 +2641,7 @@ mod tests {
         }];
         let mut out = vec![0; OUTBOARD_GROUP_BYTES];
         let foreign = OutboardBudget::new(DEFAULT_OUTBOARD_BUDGET_BYTES);
-        let work = foreign.try_reserve_range_work().unwrap();
+        let work = foreign.reserve_range_work(&range, chunk.length).unwrap();
         let mut observed = OutboardReadWork::default();
         assert!(
             proof
@@ -1674,7 +2676,8 @@ mod tests {
                 )
                 .is_err()
         );
-        let ticket = budget.try_reserve_range_work().unwrap();
+        let ticket = budget.reserve_range_work(&range, chunk.length).unwrap();
+        assert_eq!(ticket.bytes, ALIGNED_RANGE_WORKING_BYTES);
         let pressure = budget.try_reserve(budget.limit() - budget.used()).unwrap();
         assert_eq!(budget.used(), budget.limit());
         proof
