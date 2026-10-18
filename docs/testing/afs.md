@@ -434,7 +434,10 @@ header和尾部EOF探测。`stage_nanoseconds_total`／`stage_observations_total
 低频计时／计数也有成本，不从完整E2E扣减，不把两读合计伪拆为每次读。
 
 R-5并发回归用屏障证明阻塞fill不阻塞独立hit、四个同对象请求只填充一次、每请求最终
-授权独立、leader个体失效不撤销合法follower；同时覆盖pin退休／同key替换、外来文件、
+授权独立、leader个体失效不撤销合法follower。共享flight失败不能替代另一请求的授权、
+期限或source结论；合法follower经既有有界范围读独立回源并完整校验，不重新加入仍被
+引用的终态flight。另测leader异常drop／请求级超时／另一source损坏后的独立读取，以及
+follower自身停止时不得重试或交付；同时覆盖pin退休／同key替换、外来文件、
 删除失败、flight上限及停止唤醒。Ready等待后的复查和取得fill许可后的复查遇到可选缓存
 I/O错误时均应安全回源，不能吞掉真正Peer／授权错误。shutdown指标归零须同时检查
 实际ledger used/resident及活动持有者，不能只将gauge写成0。

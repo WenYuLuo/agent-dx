@@ -3320,7 +3320,15 @@ impl DfsReadEngine {
                         return Ok(hit);
                     }
                     crate::node::peer_cache::FillOutcome::Uncached => return Ok(false),
-                    crate::node::peer_cache::FillOutcome::Failed(error) => return Err(error),
+                    crate::node::peer_cache::FillOutcome::Failed(_) => {
+                        // A flight is shared by object, not by source, grant or
+                        // deadline. Its leader's failure cannot decide another
+                        // caller's read, including source-specific corruption.
+                        // Continue once through the existing bounded range path;
+                        // do not rejoin this still-retained terminal flight.
+                        self.local.record_peer_disk_cache_event("fallback");
+                        return Ok(false);
+                    }
                 }
             }
         };
@@ -6518,6 +6526,82 @@ mod tests {
         let calls = fixture.transfer.batches.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].operations[0].op.length, 64 * 1024);
+    }
+
+    #[test]
+    fn native_peer_disk_cache_failed_leader_does_not_fail_valid_follower() {
+        for failure in [
+            None,
+            Some(unavailable(
+                "another caller exhausted its transfer deadline",
+            )),
+            Some(corrupt("another caller's selected source was corrupt")),
+        ] {
+            let fixture =
+                NativeCacheFixture::new(MAX_DFS_READ_BYTES, vec![(0, 64 * 1024)], Duration::ZERO);
+            let crate::node::peer_cache::FillRole::Leader(mut leader) = fixture
+                .cache
+                .fill_flight(&fixture.chunk, || Ok(()))
+                .unwrap()
+            else {
+                panic!("manual flight must be the first leader");
+            };
+            std::thread::scope(|scope| {
+                let following =
+                    scope.spawn(|| fixture.engine.read_batch_native_owned(&fixture.batch, 2));
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while fixture.cache.waiting_fill_readers_for_test() == 0 {
+                    assert!(Instant::now() < deadline, "reader did not join the flight");
+                    std::thread::yield_now();
+                }
+                if let Some(error) = failure {
+                    // Keep the completed leader alive: the follower must not
+                    // rejoin this terminal flight or inherit its source error.
+                    leader.finish(crate::node::peer_cache::FillOutcome::Failed(error));
+                } else {
+                    drop(leader);
+                }
+                assert_eq!(following.join().unwrap().unwrap().unwrap(), [1, 2]);
+            });
+            let calls = fixture.transfer.batches.lock().unwrap();
+            assert_eq!(
+                calls.len(),
+                1,
+                "one bounded independently verified fallback"
+            );
+            assert_eq!(calls[0].operations[0].op.chunk_offset, 1);
+            assert_eq!(calls[0].operations[0].op.length, 2);
+            assert_eq!(fixture.cache.stats().unwrap().entries, 0);
+        }
+    }
+
+    #[test]
+    fn native_peer_disk_cache_failed_leader_cannot_bypass_follower_stop() {
+        let fixture =
+            NativeCacheFixture::new(MAX_DFS_READ_BYTES, vec![(0, 64 * 1024)], Duration::ZERO);
+        let crate::node::peer_cache::FillRole::Leader(mut leader) = fixture
+            .cache
+            .fill_flight(&fixture.chunk, || Ok(()))
+            .unwrap()
+        else {
+            panic!("manual flight must be the first leader");
+        };
+        std::thread::scope(|scope| {
+            let following =
+                scope.spawn(|| fixture.engine.read_batch_native_owned(&fixture.batch, 2));
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while fixture.cache.waiting_fill_readers_for_test() == 0 {
+                assert!(Instant::now() < deadline, "reader did not join the flight");
+                std::thread::yield_now();
+            }
+            fixture.engine.read_authority.stop();
+            leader.finish(crate::node::peer_cache::FillOutcome::Failed(unavailable(
+                "leader timed out",
+            )));
+            assert!(following.join().unwrap().is_err());
+        });
+        assert!(fixture.transfer.batches.lock().unwrap().is_empty());
+        assert_eq!(fixture.cache.stats().unwrap().entries, 0);
     }
 
     #[test]
