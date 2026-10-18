@@ -394,6 +394,43 @@ pub struct ChunkObject {
     pub encoding: ChunkEncoding,
 }
 
+impl ChunkObject {
+    /// Recover the standard root and length committed by a canonical ChunkId.
+    /// Other historical IDs have no content-addressed authority; callers must
+    /// retain their complete verification fallback rather than infer a root.
+    pub fn from_content_addressed_id(chunk_id: &ChunkId) -> Option<Self> {
+        let (hex, length) = content_addressed_parts(chunk_id)?;
+        let mut bytes = [0; 32];
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16).ok()?;
+        }
+        Some(Self {
+            id: chunk_id.clone(),
+            length,
+            content_digest: ContentDigest {
+                algorithm: DigestAlgorithm::Blake3,
+                bytes,
+            },
+            encoding: ChunkEncoding::Raw,
+        })
+    }
+}
+
+fn content_addressed_parts(chunk_id: &ChunkId) -> Option<(&str, u64)> {
+    let content = chunk_id.0.strip_prefix("blake3-")?;
+    let (digest, length) = content.split_once('-')?;
+    let parsed_length = length.parse::<u64>().ok()?;
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || parsed_length.to_string() != length
+    {
+        return None;
+    }
+    Some((digest, parsed_length))
+}
+
 /// Immutable durability contract; external storage never counts as a Node replica.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub enum DfsDurabilityPolicy {
@@ -449,17 +486,7 @@ pub fn external_object_key(
             "invalid external chunk identity",
         )
     };
-    let content = chunk_id.0.strip_prefix("blake3-").ok_or_else(invalid)?;
-    let (digest, length) = content.split_once('-').ok_or_else(invalid)?;
-    let parsed_length = length.parse::<u64>().map_err(|_| invalid())?;
-    if digest.len() != 64
-        || !digest
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        || parsed_length.to_string() != length
-    {
-        return Err(invalid());
-    }
+    let (digest, _) = content_addressed_parts(chunk_id).ok_or_else(invalid)?;
     Ok(format!(
         "afs/v1/{store_id}/{generation}/chunks/{}/{}",
         &digest[..2],
@@ -995,6 +1022,28 @@ pub struct SyncInodeMetadata {
 #[cfg(test)]
 mod external_identity_tests {
     use super::*;
+
+    #[test]
+    fn committed_content_addressed_id_anchors_standard_root_and_length() {
+        for body in [Vec::new(), vec![19; 32_769]] {
+            let root = blake3::hash(&body);
+            let id = ChunkId::new(format!("blake3-{}-{}", root.to_hex(), body.len()));
+            let chunk = ChunkObject::from_content_addressed_id(&id).unwrap();
+            assert_eq!(chunk.id, id);
+            assert_eq!(chunk.length, body.len() as u64);
+            assert_eq!(chunk.content_digest.bytes, *root.as_bytes());
+            assert_eq!(chunk.encoding, ChunkEncoding::Raw);
+        }
+        for id in [
+            "legacy-object".to_owned(),
+            format!("blake3-{}-01", "a".repeat(64)),
+            format!("blake3-{}-1", "A".repeat(64)),
+            format!("blake3-{}-18446744073709551616", "a".repeat(64)),
+            format!("blake3-{}-1", "é".repeat(32)),
+        ] {
+            assert!(ChunkObject::from_content_addressed_id(&ChunkId::new(id)).is_none());
+        }
+    }
 
     #[test]
     fn node_receipt_preserves_pre_external_exact_replay_digest() {

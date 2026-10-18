@@ -76,6 +76,11 @@ fn thread_cpu_ns() -> Option<u64> {
 pub struct ReadWorkMetrics {
     scan_bytes: afs_metrics::IntCounter,
     hashes: afs_metrics::IntCounterVec,
+    outboard_total_bytes: afs_metrics::IntGauge,
+    outboard_resident_bytes: afs_metrics::IntGauge,
+    outboard_total_limit: afs_metrics::IntGauge,
+    outboard_resident_limit: afs_metrics::IntGauge,
+    outboard_events: afs_metrics::IntCounterVec,
     #[cfg(any(feature = "dfs", test))]
     disk_cache_metadata_bytes: afs_metrics::IntGauge,
     #[cfg(any(feature = "dfs", test))]
@@ -144,30 +149,49 @@ impl ReadWorkMetrics {
             let hashes = afs_metrics::IntCounterVec::new(
                 afs_metrics::Opts::new(
                     "afs_dfs_read_hash_bytes_total",
-                    "Actual BLAKE3 input bytes by fixed read stage, including failed work; root and segment hashes are separate executions.",
+                    "Actual BLAKE3 input bytes by fixed read stage, including failed work; root, outboard and legacy segment hashes are separate executions.",
                 ),
                 &["stage"],
             )?;
             for stage in [
                 "root_local_scan", "stream_range_hash", "peer_range_in_receive",
                 "root_in_receive", "root_fallback", "segment_index_bytes",
-                "cache_segment_hash", "cache_full_hash",
+                "cache_segment_hash", "cache_full_hash", "outboard_body_hash",
+                "outboard_parent_hash",
             ] { hashes.with_label_values(&[stage]); }
             #[cfg(any(feature = "dfs", test))]
             let disk_cache_metadata_bytes = afs_metrics::IntGauge::new(
                 "afs_dfs_peer_disk_cache_metadata_bytes",
-                "Charged segment digest and file identity metadata; excludes payload and directory bookkeeping.",
+                "Resident cache proof and identity charges; the shared Node ledger also covers in-flight outboards and proof work. Excludes payload and directory bookkeeping.",
             )?;
             #[cfg(any(feature = "dfs", test))]
             let disk_cache_metadata_peak_bytes = afs_metrics::IntGauge::new(
                 "afs_dfs_peer_disk_cache_metadata_peak_bytes",
-                "Peak charged segment digest and file identity metadata under its independent 1MiB limit.",
+                "Peak resident cache proof and identity charges within the shared Node outboard budget.",
             )?;
             afs_metrics::register_collector(registry, &hashes)?;
             #[cfg(any(feature = "dfs", test))]
             afs_metrics::register_collector(registry, &disk_cache_metadata_bytes)?;
             #[cfg(any(feature = "dfs", test))]
             afs_metrics::register_collector(registry, &disk_cache_metadata_peak_bytes)?;
+            let outboard_total_bytes = afs_metrics::IntGauge::new(
+                "afs_dfs_outboard_metadata_bytes", "All live Node outboard ledger charges, including resident and working metadata; not RSS.")?;
+            let outboard_resident_bytes = afs_metrics::IntGauge::new(
+                "afs_dfs_outboard_resident_bytes", "Resident subset of the same Node outboard ledger, retained until the last allocation owner releases.")?;
+            let outboard_total_limit = afs_metrics::IntGauge::new(
+                "afs_dfs_outboard_metadata_limit_bytes", "Shared Node outboard ledger limit; resident is a subset, not another pool.")?;
+            let outboard_resident_limit = afs_metrics::IntGauge::new(
+                "afs_dfs_outboard_resident_limit_bytes", "Resident admission sublimit within the shared Node outboard ledger.")?;
+            let outboard_events = afs_metrics::IntCounterVec::new(
+                afs_metrics::Opts::new("afs_dfs_outboard_events_total",
+                    "Bounded outboard admission failures and actual native write/range fallback events."), &["event"])?;
+            for event in ["reserve_total_failed", "reserve_resident_failed", "write_without_proof", "range_fullscan_fallback", "range_fullscan_unretained"] {
+                outboard_events.with_label_values(&[event]);
+            }
+            for gauge in [&outboard_total_bytes, &outboard_resident_bytes, &outboard_total_limit, &outboard_resident_limit] {
+                afs_metrics::register_collector(registry, gauge)?;
+            }
+            afs_metrics::register_collector(registry, &outboard_events)?;
             let scans = afs_metrics::IntCounter::new(
                 "afs_dfs_read_scans_total",
                 "Immutable Chunk verification scans, including failed scans.",
@@ -175,7 +199,7 @@ impl ReadWorkMetrics {
             let copies = afs_metrics::IntCounterVec::new(
                 afs_metrics::Opts::new(
                     "afs_dfs_read_copy_bytes_total",
-                    "Explicit DFS read payload copies; excludes codec, TLS and kernel copies.",
+                    "Explicit DFS read user-space copies by payload or proof-metadata stage, including local Bao verification copies; excludes transport codec, TLS and kernel copies.",
                 ),
                 &["stage"],
             )?;
@@ -376,12 +400,19 @@ impl ReadWorkMetrics {
                 "frame_to_attempt",
                 "attempt_to_staging",
                 "staging_to_output",
+                "peer_outboard_metadata",
+                "outboard_range_delivery",
             ] {
                 copies.with_label_values(&[stage]);
             }
             Ok(Self {
                 scan_bytes,
                 hashes,
+                outboard_total_bytes,
+                outboard_resident_bytes,
+                outboard_total_limit,
+                outboard_resident_limit,
+                outboard_events,
                 #[cfg(any(feature = "dfs", test))]
                 disk_cache_metadata_bytes,
                 #[cfg(any(feature = "dfs", test))]
@@ -474,6 +505,8 @@ impl ReadWorkMetrics {
                 | "segment_index_bytes"
                 | "cache_segment_hash"
                 | "cache_full_hash"
+                | "outboard_body_hash"
+                | "outboard_parent_hash"
         ) {
             self.hashes.with_label_values(&[stage]).inc_by(bytes);
         }
@@ -625,6 +658,39 @@ impl ReadWorkMetrics {
             metrics: self,
             bytes: 0,
             copied: 0,
+        }
+    }
+
+    pub(crate) fn outboard_limits(&self, total: usize, resident: usize) {
+        if let (Ok(total), Ok(resident)) = (i64::try_from(total), i64::try_from(resident)) {
+            self.outboard_total_limit.set(total);
+            self.outboard_resident_limit.set(resident);
+        }
+    }
+    pub(crate) fn outboard_adjust(&self, resident: bool, bytes: usize, add: bool) {
+        if let Ok(bytes) = i64::try_from(bytes) {
+            let gauge = if resident {
+                &self.outboard_resident_bytes
+            } else {
+                &self.outboard_total_bytes
+            };
+            if add {
+                gauge.add(bytes);
+            } else {
+                gauge.sub(bytes);
+            }
+        }
+    }
+    pub(crate) fn outboard_event(&self, event: &'static str) {
+        if matches!(
+            event,
+            "reserve_total_failed"
+                | "reserve_resident_failed"
+                | "write_without_proof"
+                | "range_fullscan_fallback"
+                | "range_fullscan_unretained"
+        ) {
+            self.outboard_events.with_label_values(&[event]).inc();
         }
     }
 
@@ -1713,6 +1779,8 @@ mod tests {
         let same = ReadWorkMetrics::register(&registry).unwrap();
         metrics.hash("root_in_receive", 4096);
         metrics.hash("segment_index_bytes", 4096);
+        metrics.hash("outboard_body_hash", 8192);
+        metrics.hash("outboard_parent_hash", 64);
         metrics.hash("request-id-must-not-be-a-label", 1);
         metrics.peer_cache_metadata(256, 512);
         assert_eq!(
@@ -1731,12 +1799,22 @@ mod tests {
         );
         assert_eq!(same.disk_cache_metadata_bytes.get(), 256);
         assert_eq!(same.disk_cache_metadata_peak_bytes.get(), 512);
+        assert_eq!(
+            same.hashes.with_label_values(&["outboard_body_hash"]).get(),
+            8192
+        );
+        assert_eq!(
+            same.hashes
+                .with_label_values(&["outboard_parent_hash"])
+                .get(),
+            64
+        );
         let hashes = registry
             .gather()
             .into_iter()
             .find(|family| family.name() == "afs_dfs_read_hash_bytes_total")
             .unwrap();
-        assert_eq!(hashes.get_metric().len(), 8);
+        assert_eq!(hashes.get_metric().len(), 10);
     }
 
     #[test]

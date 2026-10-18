@@ -1,8 +1,8 @@
 //! Disposable native Peer object cache, never replicas or read authority.
 //!
 //! One serialized operation admits a bounded stream or complete-object fill.
-//! Ready bodies live only on disk. Hits verify complete requested 1 MiB segments;
-//! aligned private reads are direct, other ranges use bounded scratch. Changed identity requires a root scan.
+//! Ready bodies live only on disk. Hits verify complete requested 32 KiB coverage
+//! groups against the trusted standard BLAKE3 root. Changed identity requires a root scan.
 //! Callers must discard private output on a miss or error.
 
 use std::{
@@ -11,7 +11,7 @@ use std::{
     io::{Read, Seek, SeekFrom, Write},
     os::{
         fd::AsRawFd,
-        unix::fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt},
+        unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
     },
     path::{Component, Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
@@ -21,18 +21,31 @@ use std::{
 use afs_error::{Error, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::dfs::{ChunkEncoding, ChunkObject, DigestAlgorithm, NamespaceId};
+use crate::{
+    dfs::{ChunkEncoding, ChunkObject, DigestAlgorithm, NamespaceId},
+    node::chunk::{
+        VerifiedRangeCopy,
+        outboard::{
+            ChunkOutboard, OutboardBudget, OutboardBuilder, OutboardLease, OutboardReadWork,
+            SharedOutboard, build_borrowed,
+        },
+    },
+};
 
 pub const MAX_PEER_CACHE_ENTRIES: usize = 4096;
 const MAX_OBJECT_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_HEADER_BYTES: usize = 4096;
 const SCRATCH_BYTES: usize = 64 * 1024;
-pub(in crate::node) const PEER_CACHE_SEGMENT_BYTES: usize = 1024 * 1024;
+#[cfg(test)]
+const PEER_CACHE_SEGMENT_BYTES: usize = 1024 * 1024;
 pub const MAX_PEER_CACHE_PROOF_BYTES: u64 = 1024 * 1024;
-const MAX_SEGMENTS: usize = 4;
+#[cfg(test)]
+const COVERAGE_GROUP_BYTES: usize = 32 * 1024;
+const MAX_OUTBOARD_BYTES: usize = 8192;
 const MARKER: &str = ".afs-peer-cache-v1";
 const PENDING: &str = ".afs-peer-cache.pending";
-const MAGIC: &[u8; 8] = b"AFSPC001";
+const MAGIC: &[u8; 8] = b"AFSPC002";
+const OLD_MAGIC: &[u8; 8] = b"AFSPC001";
 
 #[derive(Clone, Debug)]
 pub struct PeerCacheOptions {
@@ -47,31 +60,45 @@ pub struct PeerCacheOptions {
 pub struct VerifiedPeerChunk<'a> {
     chunk: &'a ChunkObject,
     bytes: &'a [u8],
-    segments: SegmentDigests,
+    outboard: Option<SharedOutboard>,
     stream_origin: bool,
 }
 
 impl<'a> VerifiedPeerChunk<'a> {
-    pub fn verify(chunk: &'a ChunkObject, bytes: &'a [u8]) -> Result<Self> {
+    pub fn verify(
+        chunk: &'a ChunkObject,
+        bytes: &'a [u8],
+        budget: Arc<OutboardBudget>,
+    ) -> Result<Self> {
         validate_chunk(chunk)?;
-        if bytes.len() as u64 != chunk.length
-            || blake3::hash(bytes).as_bytes() != &chunk.content_digest.bytes
-        {
+        if bytes.len() as u64 != chunk.length {
+            return Err(corrupt(
+                "Peer cache fill differs from trusted object length",
+            ));
+        }
+        if chunk.length > MAX_OBJECT_BYTES {
+            if blake3::hash(bytes).as_bytes() != &chunk.content_digest.bytes {
+                return Err(corrupt(
+                    "Peer cache fill differs from trusted object identity",
+                ));
+            }
+            return Ok(Self {
+                chunk,
+                bytes,
+                outboard: None,
+                stream_origin: false,
+            });
+        }
+        let built = build_borrowed(bytes, &budget);
+        if built.digest != chunk.content_digest {
             return Err(corrupt(
                 "Peer cache fill differs from trusted object identity",
             ));
         }
-        let mut segments = SegmentDigests::default();
-        if bytes.len() <= MAX_OBJECT_BYTES as usize {
-            for (index, segment) in bytes.chunks(PEER_CACHE_SEGMENT_BYTES).enumerate() {
-                segments.digests[index] = *blake3::hash(segment).as_bytes();
-                segments.count += 1;
-            }
-        }
         Ok(Self {
             chunk,
             bytes,
-            segments,
+            outboard: built.outboard,
             stream_origin: false,
         })
     }
@@ -82,25 +109,22 @@ impl<'a> VerifiedPeerChunk<'a> {
         proof: crate::node::rpc::peer::CompletedPeerObjectProof<'a>,
     ) -> Result<Self> {
         validate_chunk(chunk)?;
-        let count = bytes.len().div_ceil(PEER_CACHE_SEGMENT_BYTES);
         if bytes.len() as u64 != chunk.length
-            || count == 0
-            || count > MAX_SEGMENTS
             || !std::ptr::eq(bytes, proof.bytes())
             || proof.root_digest() != &chunk.content_digest.bytes
-            || proof.segment_digests().len() != count
         {
             return Err(corrupt(
                 "Peer completed stream proof differs from trusted object",
             ));
         }
-        let mut segments = SegmentDigests::default();
-        segments.digests[..count].copy_from_slice(proof.segment_digests());
-        segments.count = count as u8;
+        let outboard = proof.into_outboard();
+        if let Some(proof) = &outboard {
+            validate_outboard(chunk, proof)?;
+        }
         Ok(Self {
             chunk,
             bytes,
-            segments,
+            outboard,
             stream_origin: true,
         })
     }
@@ -142,7 +166,7 @@ pub struct CompletedPeerDiskRead<'output> {
     requested_offset: u64,
     output: &'output [u8],
     root_digest: [u8; 32],
-    segments: SegmentDigests,
+    outboard: Option<SharedOutboard>,
     file_identity: Option<FileIdentity>,
     binding: PeerStreamBinding,
 }
@@ -187,6 +211,10 @@ pub struct PeerStreamSink<'a> {
 }
 
 impl PeerStreamSink<'_> {
+    pub(in crate::node) fn proof_budget(&self) -> Arc<OutboardBudget> {
+        self.cache.proof_budget()
+    }
+
     pub(in crate::node) fn bind_output(
         &self,
         offset: u64,
@@ -218,19 +246,12 @@ impl PeerStreamSink<'_> {
         if self.state.entries.contains_key(&self.key) {
             self.cache.remove_entry(self.state, &self.key, false)?;
         }
-        let header = serde_json::to_vec(&Header {
-            version: 1,
-            namespace_id: self.cache.options.namespace_id.clone(),
-            chunk: self.chunk.clone(),
-        })
-        .map_err(|_| invalid("Peer stream cache header cannot be encoded"))?;
-        if header.len() > MAX_HEADER_BYTES {
-            return Err(invalid("Peer stream cache header exceeds bound"));
-        }
-        self.header_length = (MAGIC.len() + 4 + header.len()) as u64;
+        self.header_length = MAX_HEADER_BYTES as u64;
+        // The final outboard is bounded and part of the disposable disk charge.
         let length = self
             .header_length
             .checked_add(self.chunk.length)
+            .and_then(|length| length.checked_add(MAX_OUTBOARD_BYTES as u64))
             .ok_or_else(|| invalid("Peer stream file size overflow"))?;
         let unit = self
             .cache
@@ -273,10 +294,15 @@ impl PeerStreamSink<'_> {
         }
         let metadata = file.metadata().map_err(Error::from)?;
         self.pending_identity = Some((metadata.dev(), metadata.ino()));
-        file.write_all(MAGIC).map_err(Error::from)?;
-        file.write_all(&(header.len() as u32).to_le_bytes())
-            .map_err(Error::from)?;
-        file.write_all(&header).map_err(Error::from)?;
+        write_header(
+            file,
+            &Header {
+                version: 2,
+                namespace_id: self.cache.options.namespace_id.clone(),
+                chunk: self.chunk.clone(),
+                outboard_length: 0,
+            },
+        )?;
         Ok(())
     }
 
@@ -349,24 +375,47 @@ impl PeerStreamSink<'_> {
             || requested_offset
                 .checked_add(output.len() as u64)
                 .is_none_or(|end| end > self.chunk.length)
-            || proof.segment_digests().len()
-                != (self.chunk.length as usize).div_ceil(PEER_CACHE_SEGMENT_BYTES)
         {
             return Err(corrupt(
                 "Peer stream completion differs from the sink object",
             ));
         }
+        let binding = proof.binding().clone();
+        let root_digest = *proof.root_digest();
+        let outboard = proof
+            .into_outboard()
+            .filter(|proof| proof.uses_budget(&self.cache.proof_budget));
+        if let Some(proof) = &outboard {
+            validate_outboard(&self.chunk, proof)?;
+        }
         let checked = (|| {
             let Some(file) = &mut self.file else {
                 return Ok(None);
             };
+            let trailer = outboard.as_ref().map_or(&[][..], |proof| proof.encoded());
+            file.write_all(trailer).map_err(Error::from)?;
+            file.seek(SeekFrom::Start(0)).map_err(Error::from)?;
+            write_header(
+                file,
+                &Header {
+                    version: 2,
+                    namespace_id: self.cache.options.namespace_id.clone(),
+                    chunk: self.chunk.clone(),
+                    outboard_length: trailer.len() as u32,
+                },
+            )?;
             file.flush().map_err(Error::from)?;
             let metadata = file.metadata().map_err(Error::from)?;
             validate_private_file(&metadata)?;
             self.cache.check_root()?;
             let current =
                 fs::symlink_metadata(self.cache.directory().join(PENDING)).map_err(Error::from)?;
-            if metadata.len() != self.header_length + self.chunk.length
+            if metadata.len()
+                != self.header_length
+                    + self.chunk.length
+                    + outboard
+                        .as_ref()
+                        .map_or(0, |proof| proof.encoded().len() as u64)
                 || Some((metadata.dev(), metadata.ino())) != self.pending_identity
                 || file_identity(&metadata) != file_identity(&current)
             {
@@ -396,19 +445,14 @@ impl PeerStreamSink<'_> {
                 None
             }
         };
-        let mut segments = SegmentDigests {
-            count: proof.segment_digests().len() as u8,
-            ..SegmentDigests::default()
-        };
-        segments.digests[..usize::from(segments.count)].copy_from_slice(proof.segment_digests());
         Ok(CompletedPeerDiskRead {
             chunk: self.chunk.clone(),
             requested_offset,
             output,
-            root_digest: *proof.root_digest(),
-            segments,
+            root_digest,
+            outboard,
             file_identity,
-            binding: proof.binding().clone(),
+            binding,
         })
     }
 
@@ -467,6 +511,8 @@ impl PeerStreamSink<'_> {
                 identity: (metadata.dev(), metadata.ino()),
                 touched: self.cache.bucket(),
                 proof: None,
+                #[cfg(test)]
+                drop_observation: None,
             },
         );
         refresh_metadata(self.state);
@@ -475,7 +521,7 @@ impl PeerStreamSink<'_> {
                 self.state,
                 &self.key,
                 file_identity(&published),
-                completed.segments,
+                completed.outboard,
             );
         }
         Ok(true)
@@ -492,18 +538,14 @@ impl Drop for PeerStreamSink<'_> {
     }
 }
 
-#[derive(Clone, Debug, Default)]
-struct SegmentDigests {
-    digests: [[u8; 32]; MAX_SEGMENTS],
-    count: u8,
-}
-
 type FileIdentity = (u64, u64, u64, i64, i64, i64, i64);
 
 #[derive(Debug)]
-struct VerifiedDiskSegments {
+struct VerifiedDiskOutboard {
     identity: FileIdentity,
-    segments: SegmentDigests,
+    outboard: SharedOutboard,
+    // The Arc owns encoded storage; this lease charges only our binding wrapper.
+    _lease: OutboardLease,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -511,11 +553,15 @@ pub struct PeerCacheHashWork {
     pub cache_segment_bytes: u64,
     pub cache_fullscan_bytes: u64,
     pub segment_index_bytes: u64,
+    /// Metadata CV inputs hashed while authenticating covered groups.
+    pub outboard_parent_bytes: u64,
 }
 
 /// Low-frequency aggregate wall time inside read_range only. Admission lock,
 /// operation root checks, Meta, final engine authority and metric emission are
-/// outside these boundaries. Streaming fallback cannot separate read and hash.
+/// outside these boundaries. `stream_read_verify_ns` is the inclusive local
+/// operation; data_read/segment_verify are child intervals and must not be
+/// added to it. Complete-root fallback cannot separate read and hash.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PeerCacheReadStages {
     pub prepare_ns: u64,
@@ -534,7 +580,9 @@ pub struct PeerCacheStats {
     pub hash_bytes_total: u64,
     /// Actual body-read attempts, excluding header and metadata reads.
     pub data_read_calls: u64,
-    /// Explicit scratch-to-private-output copies, including failed reads.
+    /// Explicit local cache body copies, including Bao encode/decode and
+    /// final private-output copies, including failed reads. The historical
+    /// metric label is `cache_to_output`; it is not just final delivery bytes.
     pub copied_bytes_total: u64,
     pub disk_bytes: u64,
     /// Peak charged ready and temporary blocks, including conservative reservations.
@@ -555,12 +603,17 @@ pub struct DiskPeerCache {
     started: Instant,
     state: Mutex<CacheState>,
     read_work: Option<super::read_work::ReadWorkMetrics>,
+    proof_budget: Arc<OutboardBudget>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct CacheState {
+    budget: Arc<OutboardBudget>,
     closed: bool,
     entries: BTreeMap<String, Entry>,
+    // Rust drops fields in declaration order: entries and their proof wrappers
+    // must release before the reservation covering their pointer slots.
+    index_lease: Option<OutboardLease>,
     used_bytes: u64,
     pending_charge: u64,
     stats: PeerCacheStats,
@@ -580,7 +633,23 @@ struct Entry {
     charge: u64,
     identity: (u64, u64),
     touched: u64,
-    proof: Option<Box<VerifiedDiskSegments>>,
+    proof: Option<Box<VerifiedDiskOutboard>>,
+    #[cfg(test)]
+    drop_observation: Option<DropObservation>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct DropObservation {
+    budget: Arc<OutboardBudget>,
+    observed: Arc<std::sync::atomic::AtomicUsize>,
+}
+#[cfg(test)]
+impl Drop for DropObservation {
+    fn drop(&mut self) {
+        self.observed
+            .store(self.budget.used(), std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -588,6 +657,8 @@ struct Header {
     version: u32,
     namespace_id: NamespaceId,
     chunk: ChunkObject,
+    #[serde(default)]
+    outboard_length: u32,
 }
 
 pub struct PeerCacheOperation<'a> {
@@ -599,8 +670,45 @@ pub struct PeerCacheOperation<'a> {
     initial_stages: PeerCacheReadStages,
 }
 
+impl CacheState {
+    fn new(budget: Arc<OutboardBudget>) -> Self {
+        // All optional proof slots are bounded up front. A small shared budget
+        // can disable proof acceleration without disabling complete verification.
+        let index_lease = budget.try_reserve_resident(
+            MAX_PEER_CACHE_ENTRIES * std::mem::size_of::<Option<Box<VerifiedDiskOutboard>>>(),
+        );
+        Self {
+            budget,
+            index_lease,
+            closed: false,
+            entries: BTreeMap::new(),
+            used_bytes: 0,
+            pending_charge: 0,
+            stats: PeerCacheStats::default(),
+            #[cfg(test)]
+            fail_remove: false,
+            #[cfg(test)]
+            fail_stream_write: false,
+            #[cfg(test)]
+            fail_stream_metadata: false,
+            #[cfg(test)]
+            proof_limit: None,
+        }
+    }
+}
+
 impl DiskPeerCache {
     pub fn open(options: PeerCacheOptions) -> Result<Self> {
+        Self::open_with_outboard_budget(
+            options,
+            OutboardBudget::new(MAX_PEER_CACHE_PROOF_BYTES as usize),
+        )
+    }
+
+    pub(crate) fn open_with_outboard_budget(
+        options: PeerCacheOptions,
+        proof_budget: Arc<OutboardBudget>,
+    ) -> Result<Self> {
         if !options.directory.is_absolute()
             || options.capacity_bytes == 0
             || options.namespace_id.0.is_empty()
@@ -689,11 +797,16 @@ impl DiskPeerCache {
             root,
             _marker: marker,
             started: Instant::now(),
-            state: Mutex::new(CacheState::default()),
+            state: Mutex::new(CacheState::new(proof_budget.clone())),
+            proof_budget,
             read_work: None,
         };
         cache.recover()?;
         Ok(cache)
+    }
+
+    pub(crate) fn proof_budget(&self) -> Arc<OutboardBudget> {
+        self.proof_budget.clone()
     }
 
     pub fn namespace_id(&self) -> &NamespaceId {
@@ -753,6 +866,7 @@ impl DiskPeerCache {
             .map_err(|_| unavailable("Peer cache lock poisoned"))?;
         state.closed = true;
         state.entries.clear();
+        state.index_lease = None;
         refresh_metadata(&mut state);
         if let Some(metrics) = &self.read_work {
             metrics.peer_cache_metadata(0, state.stats.proof_metadata_peak_bytes);
@@ -850,9 +964,9 @@ impl DiskPeerCache {
         }
         for (key, metadata) in ready {
             let (mut file, _) = open_private(&self.path(&key))?;
-            let (header, _) = read_header(&mut file)?;
+            let (header, body_start) = read_header(&mut file)?;
             validate_chunk(&header.chunk)?;
-            if header.version != 1
+            if !matches!(header.version, 1 | 2)
                 || header.namespace_id != self.options.namespace_id
                 || self.key(&header.chunk)? != key
                 || header.chunk.length > MAX_OBJECT_BYTES
@@ -867,21 +981,39 @@ impl DiskPeerCache {
                     identity: (metadata.dev(), metadata.ino()),
                     touched: 0,
                     proof: None,
+                    #[cfg(test)]
+                    drop_observation: None,
                 },
             );
             refresh_metadata(&mut state);
+            if header.version == 1 {
+                // This directory is explicitly disposable. Retire only recognized
+                // old cache objects; authoritative LocalChunkStore is elsewhere.
+                drop(file);
+                self.remove_entry(&mut state, &key, false)?;
+                continue;
+            }
             let before = file.metadata().map_err(Error::from)?;
-            let index = proof_can_fit(&state);
-            let result = scan_body(
-                &mut file,
-                &header.chunk,
-                0,
-                &mut [],
-                &mut state.stats,
-                index,
-            );
+            let result = (|| {
+                validate_file_length(&header, &before)?;
+                let index = proof_can_fit(&state);
+                let peer = if index {
+                    read_disk_outboard(&mut file, &header, &state.budget)?
+                } else {
+                    None
+                };
+                scan_body(
+                    &mut file,
+                    body_start,
+                    &header.chunk,
+                    0,
+                    &mut [],
+                    &mut state.stats,
+                    index.then(|| (self.proof_budget(), peer)),
+                )
+            })();
             match result {
-                Ok(segments) => {
+                Ok(outboard) => {
                     let after = file.metadata().map_err(Error::from)?;
                     let current = fs::symlink_metadata(self.path(&key)).map_err(Error::from)?;
                     if file_identity(&before) != file_identity(&after)
@@ -889,9 +1021,7 @@ impl DiskPeerCache {
                     {
                         return Err(corrupt("Peer cache file changed during recovery"));
                     }
-                    if let Some(segments) = segments {
-                        install_proof(&mut state, &key, file_identity(&after), segments);
-                    }
+                    install_proof(&mut state, &key, file_identity(&after), outboard);
                 }
                 Err(_) => {
                     state.stats.corruptions = state.stats.corruptions.saturating_add(1);
@@ -1052,21 +1182,22 @@ impl PeerCacheOperation<'_> {
                     return Err(invalid("Peer cache ready file was replaced"));
                 }
                 let (header, body_start) = read_header(&mut file)?;
-                if header.version != 1
+                if header.version != 2
                     || header.namespace_id != self.cache.options.namespace_id
                     || header.chunk != *chunk
                 {
                     return Err(corrupt("Peer cache header identity differs"));
                 }
+                validate_file_length(&header, &before)?;
                 let identity = file_identity(&before);
                 let reusable = self.state.entries.get(&key).and_then(|entry| {
                     entry
                         .proof
                         .as_ref()
                         .filter(|proof| proof.identity == identity)
-                        .map(|proof| proof.segments.clone())
+                        .map(|proof| proof.outboard.clone())
                 });
-                Ok((file, before, body_start, reusable))
+                Ok((file, before, body_start, header, reusable))
             })();
             self.state.stats.read_stages.prepare_ns = self
                 .state
@@ -1074,18 +1205,42 @@ impl PeerCacheOperation<'_> {
                 .read_stages
                 .prepare_ns
                 .saturating_add(elapsed_ns(prepare_started));
-            let (mut file, before, body_start, reusable) = prepared?;
-            let fresh = if let Some(segments) = reusable {
-                scan_segments(
-                    &mut file,
+            let (mut file, before, body_start, header, reusable) = prepared?;
+            let fresh = if let Some(outboard) = reusable {
+                match scan_outboard(
+                    &file,
                     body_start,
                     chunk,
                     offset,
                     out,
-                    &segments,
+                    &outboard,
                     &mut self.state.stats,
-                )?;
-                None
+                ) {
+                    Ok(()) => None,
+                    Err(error) if error.code() == afs_error::IO_CAPACITY => {
+                        self.state.budget.record_range_fullscan_fallback();
+                        // Optional proof work must not create a new read failure
+                        // when another live proof temporarily holds the ledger.
+                        let started = Instant::now();
+                        let result = scan_body(
+                            &mut file,
+                            body_start,
+                            chunk,
+                            offset,
+                            out,
+                            &mut self.state.stats,
+                            None,
+                        );
+                        self.state.stats.read_stages.stream_read_verify_ns = self
+                            .state
+                            .stats
+                            .read_stages
+                            .stream_read_verify_ns
+                            .saturating_add(elapsed_ns(started));
+                        result?
+                    }
+                    Err(error) => return Err(error),
+                }
             } else {
                 // Metadata changes invalidate old summaries before a complete root scan.
                 let started = Instant::now();
@@ -1094,7 +1249,23 @@ impl PeerCacheOperation<'_> {
                 }
                 refresh_metadata(&mut self.state);
                 let index = proof_can_fit(&self.state);
-                let result = scan_body(&mut file, chunk, offset, out, &mut self.state.stats, index);
+                let peer = if index {
+                    read_disk_outboard(&mut file, &header, &self.state.budget)?
+                } else {
+                    None
+                };
+                // Without the retained complete FileIdentity we cannot claim
+                // unchanged bytes merely because a trailer is well shaped.
+                self.state.budget.record_range_fullscan_unretained();
+                let result = scan_body(
+                    &mut file,
+                    body_start,
+                    chunk,
+                    offset,
+                    out,
+                    &mut self.state.stats,
+                    index.then(|| (self.cache.proof_budget(), peer)),
+                );
                 self.state.stats.read_stages.stream_read_verify_ns = self
                     .state
                     .stats
@@ -1111,8 +1282,8 @@ impl PeerCacheOperation<'_> {
             {
                 return Err(corrupt("Peer cache file changed during verified read"));
             }
-            if let Some(segments) = fresh {
-                install_proof(&mut self.state, &key, file_identity(&after), segments);
+            if fresh.is_some() {
+                install_proof(&mut self.state, &key, file_identity(&after), fresh);
             }
             Ok(())
         })();
@@ -1159,16 +1330,21 @@ impl PeerCacheOperation<'_> {
         if self.state.entries.contains_key(&key) {
             self.cache.remove_entry(&mut self.state, &key, false)?;
         }
-        let header = serde_json::to_vec(&Header {
-            version: 1,
+        let outboard = verified
+            .outboard
+            .as_ref()
+            .filter(|proof| proof.uses_budget(&self.cache.proof_budget));
+        let trailer = outboard.map_or(&[][..], |proof| proof.encoded());
+        if let Some(proof) = outboard {
+            validate_outboard(chunk, proof)?;
+        }
+        let header = Header {
+            version: 2,
             namespace_id: self.cache.options.namespace_id.clone(),
             chunk: chunk.clone(),
-        })
-        .map_err(|_| invalid("Peer cache header cannot be encoded"))?;
-        if header.len() > MAX_HEADER_BYTES {
-            return Err(invalid("Peer cache header exceeds bound"));
-        }
-        let length = (MAGIC.len() + 4 + header.len()) as u64 + chunk.length;
+            outboard_length: trailer.len() as u32,
+        };
+        let length = MAX_HEADER_BYTES as u64 + chunk.length + trailer.len() as u64;
         // Reserve staging rounding plus two filesystem units; actual stat.blocks
         // replaces this conservative charge only after atomic publication.
         let unit = self
@@ -1200,11 +1376,9 @@ impl PeerCacheOperation<'_> {
             self.state.stats.disk_peak_bytes.max(self.state.used_bytes);
         self.state.pending_charge = reservation;
         let written = (|| {
-            file.write_all(MAGIC).map_err(Error::from)?;
-            file.write_all(&(header.len() as u32).to_le_bytes())
-                .map_err(Error::from)?;
-            file.write_all(&header).map_err(Error::from)?;
+            write_header(&mut file, &header)?;
             file.write_all(verified.bytes).map_err(Error::from)?;
+            file.write_all(trailer).map_err(Error::from)?;
             file.flush().map_err(Error::from)?;
             let metadata = file.metadata().map_err(Error::from)?;
             validate_private_file(&metadata)?;
@@ -1244,11 +1418,13 @@ impl PeerCacheOperation<'_> {
                         identity,
                         touched: self.cache.bucket(),
                         proof: None,
+                        #[cfg(test)]
+                        drop_observation: None,
                     },
                 );
                 refresh_metadata(&mut self.state);
                 if let Some(identity) = published {
-                    install_proof(&mut self.state, &key, identity, verified.segments.clone());
+                    install_proof(&mut self.state, &key, identity, outboard.cloned());
                 }
                 Ok(true)
             }
@@ -1263,41 +1439,45 @@ impl PeerCacheOperation<'_> {
 
 fn scan_body(
     file: &mut File,
+    body_start: u64,
     chunk: &ChunkObject,
     offset: u64,
     out: &mut [u8],
     stats: &mut PeerCacheStats,
-    index_segments: bool,
-) -> Result<Option<SegmentDigests>> {
+    proof: Option<(Arc<OutboardBudget>, Option<SharedOutboard>)>,
+) -> Result<Option<SharedOutboard>> {
+    file.seek(SeekFrom::Start(body_start))
+        .map_err(Error::from)?;
     let mut scratch = [0_u8; SCRATCH_BYTES];
     stats.scratch_peak_bytes = stats.scratch_peak_bytes.max(SCRATCH_BYTES as u64);
+    let mut builder = proof.map(|(budget, peer)| match peer {
+        Some(peer) => OutboardBuilder::validating(chunk.clone(), peer, budget),
+        None => OutboardBuilder::new(chunk.length, budget),
+    });
     let mut hash = blake3::Hasher::new();
-    let mut segment = blake3::Hasher::new();
-    let mut segments = SegmentDigests::default();
     let mut position = 0_u64;
     while position < chunk.length {
-        let segment_remaining =
-            PEER_CACHE_SEGMENT_BYTES as u64 - position % PEER_CACHE_SEGMENT_BYTES as u64;
-        let requested = (chunk.length - position)
-            .min(SCRATCH_BYTES as u64)
-            .min(segment_remaining) as usize;
+        let requested = (chunk.length - position).min(SCRATCH_BYTES as u64) as usize;
         stats.data_read_calls = stats.data_read_calls.saturating_add(1);
         let read = file.read(&mut scratch[..requested]).map_err(Error::from)?;
         if read == 0 {
             return Err(corrupt("Peer cache body is truncated"));
         }
-        hash.update(&scratch[..read]);
         stats.hash_bytes_total = stats.hash_bytes_total.saturating_add(read as u64);
         stats.hash_work.cache_fullscan_bytes = stats
             .hash_work
             .cache_fullscan_bytes
             .saturating_add(read as u64);
-        if index_segments {
-            segment.update(&scratch[..read]);
-            stats.hash_work.segment_index_bytes = stats
-                .hash_work
-                .segment_index_bytes
-                .saturating_add(read as u64);
+        if let Some(builder) = &mut builder {
+            builder.update(&scratch[..read]).map_err(|error| {
+                if error.code() == afs_error::IO_CAPACITY {
+                    error
+                } else {
+                    corrupt("Peer cache outboard differs from complete body")
+                }
+            })?;
+        } else {
+            hash.update(&scratch[..read]);
         }
         stats.copied_bytes_total = stats.copied_bytes_total.saturating_add(copy_overlap(
             position,
@@ -1306,140 +1486,83 @@ fn scan_body(
             out,
         ));
         position += read as u64;
-        if index_segments
-            && (position.is_multiple_of(PEER_CACHE_SEGMENT_BYTES as u64)
-                || position == chunk.length)
-        {
-            let index = usize::from(segments.count);
-            if index >= MAX_SEGMENTS {
-                return Err(invalid("Peer cache segment count exceeds bound"));
+    }
+    if let Some(builder) = builder {
+        let built = builder.finish().map_err(|error| {
+            if error.code() == afs_error::IO_CAPACITY {
+                error
+            } else {
+                corrupt("Peer cache outboard or root differs from complete body")
             }
-            segments.digests[index] = *segment.finalize().as_bytes();
-            segments.count += 1;
-            segment = blake3::Hasher::new();
+        })?;
+        if built.digest != chunk.content_digest {
+            return Err(corrupt("Peer cache complete body digest differs"));
         }
+        stats.hash_work.outboard_parent_bytes = stats
+            .hash_work
+            .outboard_parent_bytes
+            .saturating_add(built.parent_hash_bytes);
+        Ok(built.outboard)
+    } else if hash.finalize().as_bytes() != &chunk.content_digest.bytes {
+        Err(corrupt("Peer cache complete body digest differs"))
+    } else {
+        Ok(None)
     }
-    if file.read(&mut scratch[..1]).map_err(Error::from)? != 0
-        || hash.finalize().as_bytes() != &chunk.content_digest.bytes
-    {
-        return Err(corrupt("Peer cache complete body digest or length differs"));
-    }
-    Ok(index_segments.then_some(segments))
 }
 
-fn scan_segments(
-    file: &mut File,
+fn scan_outboard(
+    file: &File,
     body_start: u64,
     chunk: &ChunkObject,
     offset: u64,
     out: &mut [u8],
-    segments: &SegmentDigests,
+    proof: &SharedOutboard,
     stats: &mut PeerCacheStats,
 ) -> Result<()> {
-    let count = (chunk.length as usize).div_ceil(PEER_CACHE_SEGMENT_BYTES);
-    if count != usize::from(segments.count) || count > MAX_SEGMENTS {
-        return Err(corrupt("Peer cache segment proof has invalid coverage"));
-    }
-    if out.len() == PEER_CACHE_SEGMENT_BYTES
-        && offset.is_multiple_of(PEER_CACHE_SEGMENT_BYTES as u64)
-    {
-        let index = offset as usize / PEER_CACHE_SEGMENT_BYTES;
-        return read_private_segment(
-            file,
-            body_start + offset,
-            out,
-            &segments.digests[index],
-            stats,
-        );
-    }
+    validate_outboard(chunk, proof)?;
+    let mut work = OutboardReadWork::default();
     let started = Instant::now();
-    let result =
-        (|| {
-            let mut scratch = [0_u8; SCRATCH_BYTES];
-            stats.scratch_peak_bytes = stats.scratch_peak_bytes.max(SCRATCH_BYTES as u64);
-            let first = offset as usize / PEER_CACHE_SEGMENT_BYTES;
-            let last = (offset as usize + out.len()).div_ceil(PEER_CACHE_SEGMENT_BYTES);
-            for index in first..last {
-                let start = (index * PEER_CACHE_SEGMENT_BYTES) as u64;
-                let stop = chunk.length.min(start + PEER_CACHE_SEGMENT_BYTES as u64);
-                file.seek(SeekFrom::Start(body_start + start))
-                    .map_err(Error::from)?;
-                let mut position = start;
-                let mut hash = blake3::Hasher::new();
-                while position < stop {
-                    let requested = (stop - position).min(SCRATCH_BYTES as u64) as usize;
-                    stats.data_read_calls = stats.data_read_calls.saturating_add(1);
-                    let read = file.read(&mut scratch[..requested]).map_err(Error::from)?;
-                    if read == 0 {
-                        return Err(corrupt("Peer cache segment is truncated"));
-                    }
-                    hash.update(&scratch[..read]);
-                    stats.hash_bytes_total = stats.hash_bytes_total.saturating_add(read as u64);
-                    stats.hash_work.cache_segment_bytes = stats
-                        .hash_work
-                        .cache_segment_bytes
-                        .saturating_add(read as u64);
-                    stats.copied_bytes_total = stats
-                        .copied_bytes_total
-                        .saturating_add(copy_overlap(position, &scratch[..read], offset, out));
-                    position += read as u64;
-                }
-                if hash.finalize().as_bytes() != &segments.digests[index] {
-                    return Err(corrupt("Peer cache segment digest differs"));
-                }
-            }
-            Ok(())
-        })();
+    let result = proof.read_ranges_into_with_work(
+        file,
+        body_start,
+        chunk,
+        &[VerifiedRangeCopy {
+            chunk_offset: offset,
+            output_offset: 0,
+            length: out.len(),
+        }],
+        out,
+        &mut work,
+    );
+    stats.hash_bytes_total = stats.hash_bytes_total.saturating_add(work.hash_bytes);
+    stats.hash_work.cache_segment_bytes = stats
+        .hash_work
+        .cache_segment_bytes
+        .saturating_add(work.hash_bytes);
+    stats.hash_work.outboard_parent_bytes = stats
+        .hash_work
+        .outboard_parent_bytes
+        .saturating_add(work.parent_hash_bytes);
+    stats.data_read_calls = stats.data_read_calls.saturating_add(work.read_calls);
+    stats.copied_bytes_total = stats.copied_bytes_total.saturating_add(work.copied_bytes);
+    stats.scratch_peak_bytes = stats.scratch_peak_bytes.max(work.scratch_peak as u64);
+    stats.read_stages.data_read_ns = stats.read_stages.data_read_ns.saturating_add(work.read_ns);
+    stats.read_stages.segment_verify_ns = stats
+        .read_stages
+        .segment_verify_ns
+        .saturating_add(work.verify_ns);
+    // End-to-end overlap is measured separately; this is one local operation.
     stats.read_stages.stream_read_verify_ns = stats
         .read_stages
         .stream_read_verify_ns
         .saturating_add(elapsed_ns(started));
-    result
-}
-
-fn read_private_segment(
-    file: &File,
-    position: u64,
-    out: &mut [u8],
-    expected: &[u8; 32],
-    stats: &mut PeerCacheStats,
-) -> Result<()> {
-    // The original final result is private until integrity and late authority
-    // checks succeed. Failed/partial reads may dirty it, never publish it.
-    let started = Instant::now();
-    let read_result = (|| {
-        let mut cursor = 0;
-        while cursor < out.len() {
-            stats.data_read_calls = stats.data_read_calls.saturating_add(1);
-            match file.read_at(&mut out[cursor..], position + cursor as u64) {
-                Ok(0) => return Err(corrupt("Peer cache private segment is truncated")),
-                Ok(read) => cursor += read,
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(error) => return Err(Error::from(error)),
-            }
+    result.map(|_| ()).map_err(|error| {
+        if error.code() == afs_error::IO_INVALID {
+            corrupt("Peer cache coverage proof differs from trusted object")
+        } else {
+            error
         }
-        Ok(())
-    })();
-    stats.read_stages.data_read_ns = stats
-        .read_stages
-        .data_read_ns
-        .saturating_add(elapsed_ns(started));
-    read_result?;
-    let started = Instant::now();
-    let digest = blake3::hash(out);
-    stats.hash_bytes_total = stats.hash_bytes_total.saturating_add(out.len() as u64);
-    stats.hash_work.cache_segment_bytes = stats
-        .hash_work
-        .cache_segment_bytes
-        .saturating_add(out.len() as u64);
-    stats.read_stages.segment_verify_ns = stats
-        .read_stages
-        .segment_verify_ns
-        .saturating_add(elapsed_ns(started));
-    if digest.as_bytes() != expected {
-        return Err(corrupt("Peer cache private segment digest differs"));
-    }
-    Ok(())
+    })
 }
 
 fn copy_overlap(position: u64, bytes: &[u8], offset: u64, out: &mut [u8]) -> u64 {
@@ -1455,13 +1578,15 @@ fn copy_overlap(position: u64, bytes: &[u8], offset: u64, out: &mut [u8]) -> u64
 }
 
 fn refresh_metadata(state: &mut CacheState) {
-    let pointers = state.entries.len() * std::mem::size_of::<Option<Box<VerifiedDiskSegments>>>();
-    let proofs = state
+    let pointers = state.entries.len() * std::mem::size_of::<Option<Box<VerifiedDiskOutboard>>>();
+    let proofs: usize = state
         .entries
         .values()
-        .filter(|entry| entry.proof.is_some())
-        .count()
-        * proof_allocation_charge() as usize;
+        .filter_map(|entry| entry.proof.as_ref())
+        .map(|proof| proof.outboard.charged_bytes() + proof_allocation_charge() as usize)
+        .sum();
+    // Resident cache ownership only; shared budget.used() also includes local
+    // readers and in-flight Arc holders after an entry has been evicted.
     state.stats.proof_metadata_bytes = (pointers + proofs) as u64;
     state.stats.proof_metadata_peak_bytes = state
         .stats
@@ -1471,26 +1596,20 @@ fn refresh_metadata(state: &mut CacheState) {
 
 fn proof_can_fit(state: &CacheState) -> bool {
     #[cfg(test)]
-    let limit = state.proof_limit.unwrap_or(MAX_PEER_CACHE_PROOF_BYTES);
-    #[cfg(not(test))]
-    let limit = MAX_PEER_CACHE_PROOF_BYTES;
-    let existing_pointers =
-        (state.entries.len() * std::mem::size_of::<Option<Box<VerifiedDiskSegments>>>()) as u64;
-    let all_pointers =
-        (MAX_PEER_CACHE_ENTRIES * std::mem::size_of::<Option<Box<VerifiedDiskSegments>>>()) as u64;
-    state
-        .stats
-        .proof_metadata_bytes
-        .saturating_sub(existing_pointers)
-        .saturating_add(all_pointers)
-        .saturating_add(proof_allocation_charge())
-        <= limit
+    if state.proof_limit.is_some_and(|limit| {
+        state
+            .stats
+            .proof_metadata_bytes
+            .saturating_add(proof_allocation_charge())
+            > limit
+    }) {
+        return false;
+    }
+    state.index_lease.is_some()
 }
 
 fn proof_allocation_charge() -> u64 {
-    // Conservatively round each allocation and include allocator bookkeeping.
-    // This is an admission ledger, not an assertion about process RSS.
-    let logical = std::mem::size_of::<VerifiedDiskSegments>() as u64;
+    let logical = std::mem::size_of::<VerifiedDiskOutboard>() as u64;
     logical.div_ceil(64) * 64 + 64
 }
 
@@ -1498,18 +1617,121 @@ fn install_proof(
     state: &mut CacheState,
     key: &str,
     identity: FileIdentity,
-    segments: SegmentDigests,
+    outboard: Option<SharedOutboard>,
 ) {
     if let Some(entry) = state.entries.get_mut(key) {
         entry.proof = None;
     }
     refresh_metadata(state);
-    if proof_can_fit(state)
-        && let Some(entry) = state.entries.get_mut(key)
-    {
-        entry.proof = Some(Box::new(VerifiedDiskSegments { identity, segments }));
+    if !proof_can_fit(state) {
+        return;
+    }
+    let Some(outboard) = outboard.filter(|proof| proof.uses_budget(&state.budget)) else {
+        return;
+    };
+    loop {
+        // The pointer index, identity wrapper and shared proof all use the same
+        // resident sublimit. This promotion never charges the proof twice total.
+        if let Some(lease) = state
+            .budget
+            .try_reserve_resident(proof_allocation_charge() as usize)
+            && outboard.try_mark_resident()
+        {
+            if let Some(entry) = state.entries.get_mut(key) {
+                entry.proof = Some(Box::new(VerifiedDiskOutboard {
+                    identity,
+                    outboard,
+                    _lease: lease,
+                }));
+            }
+            break;
+        }
+        // Retire only old proof ownership. Healthy body entries remain usable;
+        // outside Arc holders keep their own resident charge until last drop.
+        let victim = state
+            .entries
+            .values_mut()
+            .filter(|entry| entry.proof.is_some())
+            .min_by_key(|entry| entry.touched);
+        let Some(entry) = victim else {
+            break;
+        };
+        entry.proof = None;
+        refresh_metadata(state);
     }
     refresh_metadata(state);
+}
+
+fn validate_outboard(chunk: &ChunkObject, proof: &ChunkOutboard) -> Result<()> {
+    if proof.object_length() != chunk.length || proof.digest() != &chunk.content_digest {
+        return Err(corrupt("Peer outboard differs from trusted Meta object"));
+    }
+    Ok(())
+}
+
+fn validate_file_length(header: &Header, metadata: &fs::Metadata) -> Result<()> {
+    let expected = (MAX_HEADER_BYTES as u64)
+        .checked_add(header.chunk.length)
+        .and_then(|length| length.checked_add(u64::from(header.outboard_length)))
+        .ok_or_else(|| corrupt("Peer cache file length overflow"))?;
+    if header.outboard_length as usize > MAX_OUTBOARD_BYTES || metadata.len() != expected {
+        return Err(corrupt(
+            "Peer cache body or outboard trailer length differs",
+        ));
+    }
+    Ok(())
+}
+
+fn read_disk_outboard(
+    file: &mut File,
+    header: &Header,
+    budget: &Arc<OutboardBudget>,
+) -> Result<Option<SharedOutboard>> {
+    let length = header.outboard_length as usize;
+    if length == 0 {
+        return Ok(None);
+    }
+    if !(64..=MAX_OUTBOARD_BYTES).contains(&length) {
+        return Err(corrupt("Peer cache outboard trailer exceeds bound"));
+    }
+    let Some(mut lease) = budget.try_reserve(ChunkOutboard::resident_charge(length)?) else {
+        return Ok(None);
+    };
+    let mut encoded = Vec::new();
+    if encoded.try_reserve_exact(length).is_err() {
+        return Ok(None);
+    }
+    if lease
+        .retain_capacity(ChunkOutboard::resident_charge(encoded.capacity())?)
+        .is_err()
+    {
+        return Ok(None);
+    }
+    encoded.resize(length, 0);
+    file.seek(SeekFrom::Start(
+        MAX_HEADER_BYTES as u64 + header.chunk.length,
+    ))
+    .map_err(Error::from)?;
+    file.read_exact(&mut encoded)
+        .map_err(|_| corrupt("Peer cache outboard trailer is truncated"))?;
+    match ChunkOutboard::from_encoded(&header.chunk, encoded, lease) {
+        Ok(proof) => Ok(Some(proof)),
+        Err(error) if error.code() == afs_error::IO_CAPACITY => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn write_header(file: &mut File, header: &Header) -> Result<()> {
+    let encoded =
+        serde_json::to_vec(header).map_err(|_| invalid("Peer cache header cannot be encoded"))?;
+    if encoded.len() > MAX_HEADER_BYTES - 12 {
+        return Err(invalid("Peer cache header exceeds bound"));
+    }
+    let mut block = [0_u8; MAX_HEADER_BYTES];
+    block[..8].copy_from_slice(MAGIC);
+    block[8..12].copy_from_slice(&(encoded.len() as u32).to_le_bytes());
+    block[12..12 + encoded.len()].copy_from_slice(&encoded);
+    file.write_all(&block).map_err(Error::from)
 }
 
 fn report_work(
@@ -1528,6 +1750,12 @@ fn report_work(
         current
             .cache_fullscan_bytes
             .saturating_sub(before.cache_fullscan_bytes),
+    );
+    metrics.hash(
+        "outboard_parent_hash",
+        current
+            .outboard_parent_bytes
+            .saturating_sub(before.outboard_parent_bytes),
     );
     metrics.hash(
         "segment_index_bytes",
@@ -1608,7 +1836,7 @@ fn read_header(file: &mut File) -> Result<(Header, u64)> {
     let mut prefix = [0_u8; 12];
     file.read_exact(&mut prefix)
         .map_err(|_| corrupt("Peer cache header is truncated"))?;
-    if &prefix[..8] != MAGIC {
+    if &prefix[..8] != MAGIC && &prefix[..8] != OLD_MAGIC {
         return Err(corrupt("Peer cache header magic differs"));
     }
     let count = u32::from_le_bytes([prefix[8], prefix[9], prefix[10], prefix[11]]) as usize;
@@ -1618,9 +1846,25 @@ fn read_header(file: &mut File) -> Result<(Header, u64)> {
     let mut header = vec![0; count];
     file.read_exact(&mut header)
         .map_err(|_| corrupt("Peer cache header is truncated"))?;
-    let header =
+    let header: Header =
         serde_json::from_slice(&header).map_err(|_| corrupt("Peer cache header is invalid"))?;
-    Ok((header, 12 + count as u64))
+    if &prefix[..8] == MAGIC {
+        if header.version != 2 || count > MAX_HEADER_BYTES - 12 {
+            return Err(corrupt("Peer cache v2 header shape differs"));
+        }
+        let mut padding = [0_u8; MAX_HEADER_BYTES];
+        let padding = &mut padding[..MAX_HEADER_BYTES - 12 - count];
+        file.read_exact(padding)
+            .map_err(|_| corrupt("Peer cache header padding is truncated"))?;
+        if padding.iter().any(|byte| *byte != 0) {
+            return Err(corrupt("Peer cache header padding differs"));
+        }
+        Ok((header, MAX_HEADER_BYTES as u64))
+    } else if header.version == 1 {
+        Ok((header, 12 + count as u64))
+    } else {
+        Err(corrupt("Peer cache legacy header shape differs"))
+    }
 }
 
 fn validate_chunk(chunk: &ChunkObject) -> Result<()> {
@@ -1745,7 +1989,351 @@ mod tests {
     fn fill(cache: &DiskPeerCache, staged: &StagedChunk) -> Result<bool> {
         cache
             .operation()?
-            .store_verified(&VerifiedPeerChunk::verify(&staged.chunk, staged.bytes())?)
+            .store_verified(&VerifiedPeerChunk::verify(
+                &staged.chunk,
+                staged.bytes(),
+                cache.proof_budget(),
+            )?)
+    }
+
+    #[test]
+    fn disk_peer_cache_small_hit_verifies_only_32k_coverage_group() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = options(temp.path().join("cache"));
+        config.capacity_bytes = 8 * 1024 * 1024;
+        let cache = DiskPeerCache::open(config).unwrap();
+        let staged = StagedChunk::new(
+            OperationId::new("outboard-small-hit"),
+            vec![73; 4 * 1024 * 1024],
+        );
+        assert!(fill(&cache, &staged).unwrap());
+        let before = cache.stats().unwrap();
+        let mut out = [0; 4096];
+        assert!(
+            cache
+                .operation()
+                .unwrap()
+                .read_range(&staged.chunk, 4096, &mut out)
+                .unwrap()
+        );
+        let after = cache.stats().unwrap();
+        assert_eq!(out, [73; 4096]);
+        assert_eq!(after.hash_bytes_total - before.hash_bytes_total, 32 * 1024);
+        assert_eq!(
+            after.hash_work.cache_fullscan_bytes,
+            before.hash_work.cache_fullscan_bytes
+        );
+    }
+
+    #[test]
+    fn disk_peer_cache_v2_body_has_fixed_offset_and_trailer() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = DiskPeerCache::open(options(temp.path().join("cache"))).unwrap();
+        let staged = StagedChunk::new(OperationId::new("outboard-format"), vec![39; 64 * 1024]);
+        assert!(fill(&cache, &staged).unwrap());
+        let bytes = fs::read(cache.path(&cache.key(&staged.chunk).unwrap())).unwrap();
+        assert_eq!(&bytes[..8], b"AFSPC002");
+        assert_eq!(&bytes[4096..4096 + staged.bytes().len()], staged.bytes());
+        assert!(bytes.len() >= 4096 + staged.bytes().len() + 64);
+    }
+
+    #[test]
+    fn disk_peer_cache_rejects_half_or_forged_outboard_trailer() {
+        for truncated in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let cache = DiskPeerCache::open(options(temp.path().join("cache"))).unwrap();
+            let staged =
+                StagedChunk::new(OperationId::new("outboard-corrupt"), vec![47; 64 * 1024]);
+            assert!(fill(&cache, &staged).unwrap());
+            let path = cache.path(&cache.key(&staged.chunk).unwrap());
+            let before = file_identity(&fs::metadata(&path).unwrap());
+            let mut bytes = fs::read(&path).unwrap();
+            if truncated {
+                bytes.truncate(bytes.len() - 16);
+            } else {
+                *bytes.last_mut().unwrap() ^= 1;
+            }
+            fs::write(&path, bytes).unwrap();
+            // Cached proof reuse is valid until file identity changes. Make
+            // trailer revalidation explicit instead of relying on tick timing.
+            File::open(&path)
+                .unwrap()
+                .set_modified(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap();
+            assert_ne!(before, file_identity(&fs::metadata(&path).unwrap()));
+            let mut out = [0; 19];
+            assert!(
+                !cache
+                    .operation()
+                    .unwrap()
+                    .read_range(&staged.chunk, 0, &mut out)
+                    .unwrap()
+            );
+            assert!(!path.exists());
+            assert_eq!(cache.stats().unwrap().entries, 0);
+        }
+    }
+
+    #[test]
+    fn disk_peer_cache_outboard_never_replaces_trusted_meta_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = DiskPeerCache::open(options(temp.path().join("cache"))).unwrap();
+        let staged = StagedChunk::new(OperationId::new("outboard-meta-root"), vec![49; 64 * 1024]);
+        assert!(fill(&cache, &staged).unwrap());
+        let held = cache
+            .state
+            .lock()
+            .unwrap()
+            .entries
+            .values()
+            .next()
+            .unwrap()
+            .proof
+            .as_ref()
+            .unwrap()
+            .outboard
+            .clone();
+        let mut changed = staged.chunk.clone();
+        changed.content_digest.bytes[0] ^= 1;
+        assert!(validate_outboard(&changed, &held).is_err());
+        let mut output = [0; 19];
+        assert!(
+            !cache
+                .operation()
+                .unwrap()
+                .read_range(&changed, 0, &mut output)
+                .unwrap()
+        );
+        assert_eq!(output, [0; 19]);
+    }
+
+    #[test]
+    fn disk_peer_cache_drop_releases_entries_before_index_reservation() {
+        let temp = tempfile::tempdir().unwrap();
+        let budget = OutboardBudget::new(MAX_PEER_CACHE_PROOF_BYTES as usize);
+        let observed = Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX));
+        let cache = DiskPeerCache::open_with_outboard_budget(
+            options(temp.path().join("cache")),
+            budget.clone(),
+        )
+        .unwrap();
+        let staged = StagedChunk::new(OperationId::new("outboard-drop-order"), vec![79; 64 * 1024]);
+        assert!(fill(&cache, &staged).unwrap());
+        cache
+            .state
+            .lock()
+            .unwrap()
+            .entries
+            .values_mut()
+            .next()
+            .unwrap()
+            .drop_observation = Some(DropObservation {
+            budget: budget.clone(),
+            observed: observed.clone(),
+        });
+        drop(cache);
+        let pointers =
+            MAX_PEER_CACHE_ENTRIES * std::mem::size_of::<Option<Box<VerifiedDiskOutboard>>>();
+        assert_eq!(
+            observed.load(std::sync::atomic::Ordering::SeqCst),
+            pointers,
+            "entry destructor must still observe its pointer-index reservation"
+        );
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn disk_peer_cache_shared_budget_pressure_falls_back_without_changing_read_result() {
+        let temp = tempfile::tempdir().unwrap();
+        let budget = OutboardBudget::new(MAX_PEER_CACHE_PROOF_BYTES as usize);
+        let cache = DiskPeerCache::open_with_outboard_budget(
+            options(temp.path().join("cache")),
+            budget.clone(),
+        )
+        .unwrap();
+        let staged = StagedChunk::new(OperationId::new("outboard-pressure"), vec![67; 64 * 1024]);
+        assert!(fill(&cache, &staged).unwrap());
+        let held = budget.try_reserve(budget.limit() - budget.used()).unwrap();
+        let mut out = [0; 19];
+        assert!(
+            cache
+                .operation()
+                .unwrap()
+                .read_range(&staged.chunk, 0, &mut out)
+                .unwrap()
+        );
+        assert_eq!(out, [67; 19]);
+        assert_eq!(
+            cache.stats().unwrap().hash_work.cache_fullscan_bytes,
+            staged.chunk.length
+        );
+        assert_eq!(budget.used(), budget.limit());
+        drop(held);
+    }
+
+    #[test]
+    fn pr60_natural_resident_pressure_preserves_shared_working_headroom() {
+        use std::sync::{
+            Barrier,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let budget = OutboardBudget::new(MAX_PEER_CACHE_PROOF_BYTES as usize);
+        let mut config = options(temp.path().join("cache"));
+        config.capacity_bytes = 64 * 1024 * 1024;
+        let cache = DiskPeerCache::open_with_outboard_budget(config, budget.clone()).unwrap();
+        let index_charge = budget.used();
+        let first = StagedChunk::new(OperationId::new("resident-first"), vec![0; 4096]);
+        assert!(fill(&cache, &first).unwrap());
+        let one_proof = budget.used() - index_charge;
+        assert!(one_proof > 0);
+        // Use actual natural proof ownership, not an injected global reservation.
+        // Unique 4KiB objects keep real body data below 16MiB / 4096 entries.
+        let objects = (budget.limit() / 2) / one_proof + 16;
+        assert!(objects < MAX_PEER_CACHE_ENTRIES);
+        for index in 1..objects {
+            let mut bytes = vec![0; 4096];
+            bytes[..8].copy_from_slice(&(index as u64).to_le_bytes());
+            let staged = StagedChunk::new(OperationId::new(format!("resident-{index}")), bytes);
+            assert!(fill(&cache, &staged).unwrap());
+        }
+        assert_eq!(
+            cache.stats().unwrap().entries,
+            objects,
+            "proof retention may retire metadata, never healthy body entries"
+        );
+        assert!(
+            budget.used() <= budget.limit() / 2,
+            "natural resident proofs consumed the working half: used={} total={}",
+            budget.used(),
+            budget.limit()
+        );
+
+        let ready = Arc::new(Barrier::new(9));
+        let release = Arc::new(Barrier::new(9));
+        let peak = Arc::new(AtomicUsize::new(budget.used()));
+        let mut threads = Vec::new();
+        for _ in 0..8 {
+            let (budget, ready, release, peak) =
+                (budget.clone(), ready.clone(), release.clone(), peak.clone());
+            threads.push(std::thread::spawn(move || {
+                let work = budget.try_reserve(64 * 1024);
+                peak.fetch_max(budget.used(), Ordering::AcqRel);
+                ready.wait();
+                release.wait();
+                work.is_some()
+            }));
+        }
+        ready.wait();
+        release.wait();
+        let admitted: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        assert!(
+            admitted.into_iter().all(|value| value),
+            "bounded 512KiB working admission must remain available after resident pressure"
+        );
+        assert!(peak.load(Ordering::Acquire) <= budget.limit());
+        assert!(budget.used() <= budget.limit() / 2);
+        let mut output = [99; 19];
+        assert!(
+            cache
+                .operation()
+                .unwrap()
+                .read_range(&first.chunk, 0, &mut output)
+                .unwrap()
+        );
+        assert_eq!(output, [0; 19]);
+        cache.shutdown().unwrap();
+        assert_eq!(
+            budget.used(),
+            0,
+            "resident and working ownership must both retire"
+        );
+    }
+
+    #[test]
+    fn disk_peer_cache_only_retires_recognized_legacy_disposable_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = options(temp.path().join("cache"));
+        let staged = StagedChunk::new(OperationId::new("legacy-cache"), vec![51; 64 * 1024]);
+        let cache = DiskPeerCache::open(config.clone()).unwrap();
+        let key = cache.key(&staged.chunk).unwrap();
+        let path = cache.path(&key);
+        let header = serde_json::to_vec(&Header {
+            version: 1,
+            namespace_id: config.namespace_id.clone(),
+            chunk: staged.chunk.clone(),
+            outboard_length: 0,
+        })
+        .unwrap();
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        file.write_all(OLD_MAGIC).unwrap();
+        file.write_all(&(header.len() as u32).to_le_bytes())
+            .unwrap();
+        file.write_all(&header).unwrap();
+        file.write_all(staged.bytes()).unwrap();
+        drop(file);
+        let persistent = temp.path().join("authoritative-chunk");
+        fs::write(&persistent, staged.bytes()).unwrap();
+        drop(cache);
+        let cache = DiskPeerCache::open(config).unwrap();
+        assert_eq!(cache.stats().unwrap().entries, 0);
+        assert!(!cache.path(&key).exists());
+        assert_eq!(fs::read(persistent).unwrap(), staged.bytes());
+    }
+
+    #[test]
+    fn disk_peer_cache_foreign_ledger_proof_cannot_bypass_node_budget() {
+        let temp = tempfile::tempdir().unwrap();
+        let budget = OutboardBudget::new(MAX_PEER_CACHE_PROOF_BYTES as usize);
+        let cache = DiskPeerCache::open_with_outboard_budget(
+            options(temp.path().join("cache")),
+            budget.clone(),
+        )
+        .unwrap();
+        let staged = StagedChunk::new(
+            OperationId::new("outboard-other-ledger"),
+            vec![41; 64 * 1024],
+        );
+        let foreign = OutboardBudget::new(MAX_PEER_CACHE_PROOF_BYTES as usize);
+        let verified = VerifiedPeerChunk::verify(&staged.chunk, staged.bytes(), foreign).unwrap();
+        assert!(
+            cache
+                .operation()
+                .unwrap()
+                .store_verified(&verified)
+                .unwrap()
+        );
+        assert!(
+            cache
+                .state
+                .lock()
+                .unwrap()
+                .entries
+                .values()
+                .all(|entry| entry.proof.is_none())
+        );
+        let mut out = [0; 9];
+        assert!(
+            cache
+                .operation()
+                .unwrap()
+                .read_range(&staged.chunk, 0, &mut out)
+                .unwrap()
+        );
+        assert_eq!(out, [41; 9]);
+        assert_eq!(
+            cache.stats().unwrap().hash_work.cache_fullscan_bytes,
+            staged.chunk.length
+        );
+        assert!(budget.used() <= budget.limit());
     }
 
     #[test]
@@ -1918,14 +2506,14 @@ mod tests {
         );
         assert_eq!(out, [37; 19]);
         let stats = cache.stats().unwrap();
-        assert_eq!(stats.hash_bytes_total, staged.chunk.length);
-        assert_eq!(stats.scratch_peak_bytes, 64 * 1024);
+        assert_eq!(stats.hash_bytes_total, COVERAGE_GROUP_BYTES as u64);
+        assert!(stats.scratch_peak_bytes <= (2 * COVERAGE_GROUP_BYTES + MAX_OUTBOARD_BYTES) as u64);
         assert_eq!(stats.entries, 1);
         assert!(stats.disk_bytes >= staged.chunk.length);
     }
 
     #[test]
-    fn disk_peer_cache_complete_aligned_segment_reads_directly_without_payload_copy() {
+    fn disk_peer_cache_aligned_range_reports_private_range_validator_work() {
         let temp = tempfile::tempdir().unwrap();
         let mut config = options(temp.path().join("cache"));
         config.capacity_bytes = 8 * 1024 * 1024;
@@ -1951,7 +2539,9 @@ mod tests {
                 after.copied_bytes_total - before.copied_bytes_total,
                 after.data_read_calls - before.data_read_calls
             ),
-            (0, 1),
+            // One aligned body read plus one copy into the official validator's
+            // scratch; unaligned ranges retain the separate codec fallback.
+            (PEER_CACHE_SEGMENT_BYTES as u64, 1),
         );
         assert_eq!(
             after.hash_bytes_total - before.hash_bytes_total,
@@ -1961,30 +2551,38 @@ mod tests {
         assert!(after.read_stages.data_read_ns > before.read_stages.data_read_ns);
         assert!(after.read_stages.segment_verify_ns > before.read_stages.segment_verify_ns);
         assert!(after.read_stages.finalize_ns > before.read_stages.finalize_ns);
-        assert_eq!(
-            after.read_stages.stream_read_verify_ns,
-            before.read_stages.stream_read_verify_ns
-        );
+        assert!(after.read_stages.stream_read_verify_ns > before.read_stages.stream_read_verify_ns);
     }
 
     #[test]
-    fn disk_peer_cache_direct_private_short_file_returns_error_before_hashing() {
+    fn disk_peer_cache_short_file_fails_preflight_without_body_io_or_hashing() {
         let mut file = tempfile::tempfile().unwrap();
         file.write_all(&[79; 17]).unwrap();
         let mut private = vec![0; PEER_CACHE_SEGMENT_BYTES];
         let mut stats = PeerCacheStats::default();
 
-        let error = read_private_segment(&file, 0, &mut private, &[0; 32], &mut stats).unwrap_err();
+        let staged = StagedChunk::new(
+            OperationId::new("outboard-short-file"),
+            vec![79; PEER_CACHE_SEGMENT_BYTES],
+        );
+        let proof = build_borrowed(
+            staged.bytes(),
+            &OutboardBudget::new(MAX_PEER_CACHE_PROOF_BYTES as usize),
+        )
+        .outboard
+        .unwrap();
+        let error = scan_outboard(&file, 0, &staged.chunk, 0, &mut private, &proof, &mut stats)
+            .unwrap_err();
 
         assert_eq!(error.code(), afs_error::NODE_TRANSFER_CORRUPT_DATA);
-        assert!(stats.data_read_calls >= 2);
+        // Metadata proves the body shorter than the trusted object before the
+        // official codec is entered. No positioned body-read attempt is made.
+        assert_eq!(stats.data_read_calls, 0);
+        assert_eq!(stats.copied_bytes_total, 0);
+        assert_eq!(private, vec![0; PEER_CACHE_SEGMENT_BYTES]);
         assert_eq!(stats.hash_bytes_total, 0);
         assert_eq!(stats.hash_work.cache_segment_bytes, 0);
         assert_eq!(stats.read_stages.segment_verify_ns, 0);
-        // A failed direct read can dirty private output; it is not a result
-        // callers may publish, even though the available prefix was read.
-        assert_eq!(&private[..17], &[79; 17]);
-        assert!(private[17..].iter().all(|byte| *byte == 0));
     }
 
     #[test]
@@ -2001,7 +2599,7 @@ mod tests {
         let key = cache.key(&staged.chunk).unwrap();
         let path = cache.path(&key);
         let mut bytes = fs::read(&path).unwrap();
-        let body_start = bytes.len() - staged.bytes().len();
+        let body_start = MAX_HEADER_BYTES;
         bytes[body_start + PEER_CACHE_SEGMENT_BYTES + 17] ^= 1;
         fs::write(&path, bytes).unwrap();
         // Preserve trusted old digests while simulating an unobserved stat
@@ -2028,11 +2626,13 @@ mod tests {
         );
         assert_ne!(private[17], 74);
         let after = cache.stats().unwrap();
-        assert_eq!(after.copied_bytes_total - before.copied_bytes_total, 0);
+        assert!(
+            after.copied_bytes_total - before.copied_bytes_total <= 3 * COVERAGE_GROUP_BYTES as u64
+        );
         assert_eq!(after.data_read_calls - before.data_read_calls, 1);
         assert_eq!(
             after.hash_bytes_total - before.hash_bytes_total,
-            PEER_CACHE_SEGMENT_BYTES as u64
+            COVERAGE_GROUP_BYTES as u64
         );
         assert_eq!(after.corruptions, 1);
         assert_eq!(after.proof_metadata_bytes, 0);
@@ -2085,7 +2685,7 @@ mod tests {
         assert_eq!(cache.stats().unwrap().entries, 1);
         assert_eq!(
             cache.stats().unwrap().hash_bytes_total,
-            2 * staged.chunk.length
+            staged.chunk.length + COVERAGE_GROUP_BYTES as u64
         );
     }
 
@@ -2097,13 +2697,25 @@ mod tests {
             let staged = StagedChunk::new(OperationId::new("cache-corrupt"), vec![33; 64 * 1024]);
             assert!(fill(&cache, &staged).unwrap());
             let path = cache.path(&cache.key(&staged.chunk).unwrap());
+            let previous_identity = file_identity(&fs::metadata(&path).unwrap());
             let mut bytes = fs::read(&path).unwrap();
             if truncate {
                 bytes.pop();
             } else {
-                *bytes.last_mut().unwrap() ^= 1;
+                bytes[MAX_HEADER_BYTES + staged.bytes().len() - 1] ^= 1;
             }
             fs::write(&path, bytes).unwrap();
+            // Timestamp granularity can make a same-jiffy write appear unchanged.
+            // This test is specifically the changed-identity full-root contract;
+            // the separate unobserved-damage test covers an unchanged identity.
+            File::open(&path)
+                .unwrap()
+                .set_modified(std::time::UNIX_EPOCH)
+                .unwrap();
+            assert_ne!(
+                previous_identity,
+                file_identity(&fs::metadata(&path).unwrap())
+            );
             let mut private = [0; 19];
             assert!(
                 !cache
@@ -2123,8 +2735,11 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let cache = DiskPeerCache::open(options(temp.path().join("cache"))).unwrap();
         let staged = StagedChunk::new(OperationId::new("bad-proof"), vec![21; 64 * 1024]);
-        assert!(VerifiedPeerChunk::verify(&staged.chunk, &[0; 64 * 1024]).is_err());
-        assert!(VerifiedPeerChunk::verify(&staged.chunk, &[]).is_err());
+        assert!(
+            VerifiedPeerChunk::verify(&staged.chunk, &[0; 64 * 1024], cache.proof_budget())
+                .is_err()
+        );
+        assert!(VerifiedPeerChunk::verify(&staged.chunk, &[], cache.proof_budget()).is_err());
         let large = StagedChunk::new(
             OperationId::new("oversize"),
             vec![44; MAX_OBJECT_BYTES as usize + 1],
@@ -2208,7 +2823,7 @@ mod tests {
                 .join(format!("{}.ready", cache.key(&staged.chunk).unwrap()));
         }
         let mut bytes = fs::read(&path).unwrap();
-        *bytes.last_mut().unwrap() ^= 1;
+        bytes[MAX_HEADER_BYTES + staged.bytes().len() - 1] ^= 1;
         fs::write(&path, bytes).unwrap();
         let pending = config.directory.join(PENDING);
         OpenOptions::new()
@@ -2325,7 +2940,10 @@ mod tests {
         assert!(operation.read_range(&staged.chunk, 0, &mut [0; 1]).is_err());
         assert!(
             operation
-                .store_verified(&VerifiedPeerChunk::verify(&staged.chunk, staged.bytes()).unwrap())
+                .store_verified(
+                    &VerifiedPeerChunk::verify(&staged.chunk, staged.bytes(), cache.proof_budget())
+                        .unwrap()
+                )
                 .is_err()
         );
         // Even stale child paths still resolve to the originally pinned root.
@@ -2371,15 +2989,18 @@ mod tests {
         let stats = cache.stats().unwrap();
         assert_eq!(
             stats.hash_work.cache_segment_bytes,
-            (2 * PEER_CACHE_SEGMENT_BYTES + 17) as u64
+            (2 * COVERAGE_GROUP_BYTES + 17) as u64
         );
         assert_eq!(stats.hash_work.cache_fullscan_bytes, 0);
         assert_eq!(stats.hash_work.segment_index_bytes, 0);
-        assert_eq!(stats.copied_bytes_total, 33);
-        assert_eq!(stats.data_read_calls, 33);
+        assert_eq!(
+            stats.copied_bytes_total,
+            2 * (2 * COVERAGE_GROUP_BYTES as u64 + 17) + 33
+        );
+        assert_eq!(stats.data_read_calls, 3);
         assert!(stats.read_stages.stream_read_verify_ns > 0);
-        assert_eq!(stats.read_stages.data_read_ns, 0);
-        assert_eq!(stats.read_stages.segment_verify_ns, 0);
+        assert!(stats.read_stages.data_read_ns > 0);
+        assert!(stats.read_stages.segment_verify_ns > 0);
     }
 
     #[test]
@@ -2395,7 +3016,7 @@ mod tests {
         assert!(fill(&cache, &staged).unwrap());
         let path = cache.path(&cache.key(&staged.chunk).unwrap());
         let mut bytes = fs::read(&path).unwrap();
-        *bytes.last_mut().unwrap() ^= 1;
+        bytes[MAX_HEADER_BYTES + staged.bytes().len() - 1] ^= 1;
         fs::write(&path, bytes).unwrap();
         File::open(&path)
             .unwrap()
@@ -2430,7 +3051,7 @@ mod tests {
         let key = cache.key(&staged.chunk).unwrap();
         let path = cache.path(&key);
         let mut bytes = fs::read(&path).unwrap();
-        *bytes.last_mut().unwrap() ^= 1;
+        bytes[MAX_HEADER_BYTES + staged.bytes().len() - 1] ^= 1;
         fs::write(&path, bytes).unwrap();
         // Fault injection: model a disk-sector change with no observable stat
         // change. Preserve the trusted old digests, adjust only the observation.
@@ -2472,7 +3093,7 @@ mod tests {
         let mut config = options(temp.path().join("cache"));
         config.capacity_bytes = 8 * 1024 * 1024;
         let cache = DiskPeerCache::open(config).unwrap();
-        let limit = std::mem::size_of::<Option<Box<VerifiedDiskSegments>>>() as u64;
+        let limit = std::mem::size_of::<Option<Box<VerifiedDiskOutboard>>>() as u64;
         cache.state.lock().unwrap().proof_limit = Some(limit);
         let staged = StagedChunk::new(
             OperationId::new("metadata-quota"),
@@ -2515,7 +3136,7 @@ mod tests {
             recovered.hash_work.cache_fullscan_bytes,
             staged.chunk.length
         );
-        assert_eq!(recovered.hash_work.segment_index_bytes, staged.chunk.length);
+        assert_eq!(recovered.hash_work.segment_index_bytes, 0);
         let mut out = [0; 19];
         assert!(
             cache
@@ -2530,7 +3151,7 @@ mod tests {
         );
         assert_eq!(
             cache.stats().unwrap().hash_work.cache_segment_bytes,
-            PEER_CACHE_SEGMENT_BYTES as u64
+            COVERAGE_GROUP_BYTES as u64
         );
         assert!(cache.stats().unwrap().proof_metadata_bytes <= MAX_PEER_CACHE_PROOF_BYTES);
     }
@@ -2558,33 +3179,41 @@ mod tests {
 
     #[test]
     fn disk_peer_cache_proof_quota_reserves_future_entry_pointers() {
-        let staged = StagedChunk::new(OperationId::new("ledger-proof"), vec![3; 1]);
-        let verified = VerifiedPeerChunk::verify(&staged.chunk, staged.bytes()).unwrap();
-        let mut state = CacheState::default();
-        for index in 0..MAX_PEER_CACHE_ENTRIES {
-            let key = index.to_string();
-            state.entries.insert(
-                key.clone(),
-                Entry {
-                    chunk: staged.chunk.clone(),
-                    charge: 0,
-                    identity: (0, 0),
-                    touched: 0,
-                    proof: None,
-                },
-            );
-            refresh_metadata(&mut state);
-            install_proof(
-                &mut state,
-                &key,
-                (0, 0, 1, 0, 0, 0, 0),
-                verified.segments.clone(),
-            );
-            assert!(state.stats.proof_metadata_bytes <= MAX_PEER_CACHE_PROOF_BYTES);
-        }
-        assert!(state.entries.values().any(|entry| entry.proof.is_none()));
-        assert!(state.entries.values().any(|entry| entry.proof.is_some()));
-        assert!(state.stats.proof_metadata_peak_bytes <= MAX_PEER_CACHE_PROOF_BYTES);
+        let temp = tempfile::tempdir().unwrap();
+        let budget = OutboardBudget::new(MAX_PEER_CACHE_PROOF_BYTES as usize);
+        let cache = DiskPeerCache::open_with_outboard_budget(
+            options(temp.path().join("cache")),
+            budget.clone(),
+        )
+        .unwrap();
+        let pointers =
+            MAX_PEER_CACHE_ENTRIES * std::mem::size_of::<Option<Box<VerifiedDiskOutboard>>>();
+        assert_eq!(budget.used(), pointers);
+        let staged = StagedChunk::new(OperationId::new("ledger-proof"), vec![3; 64 * 1024]);
+        assert!(fill(&cache, &staged).unwrap());
+        let held = cache
+            .state
+            .lock()
+            .unwrap()
+            .entries
+            .values()
+            .next()
+            .unwrap()
+            .proof
+            .as_ref()
+            .unwrap()
+            .outboard
+            .clone();
+        let charged = held.charged_bytes();
+        cache.shutdown().unwrap();
+        assert_eq!(cache.stats().unwrap().proof_metadata_bytes, 0);
+        assert_eq!(
+            budget.used(),
+            charged,
+            "eviction must retain the shared allocation charge until the final Arc drops"
+        );
+        drop(held);
+        assert_eq!(budget.used(), 0);
     }
 
     #[test]
@@ -2611,11 +3240,11 @@ mod tests {
         );
         let encoded = afs_metrics::encode_text(&registry).unwrap();
         assert!(
-            encoded.contains("afs_dfs_read_hash_bytes_total{stage=\"cache_segment_hash\"} 1048576")
+            encoded.contains("afs_dfs_read_hash_bytes_total{stage=\"cache_segment_hash\"} 32768")
         );
         assert!(encoded.contains("afs_dfs_read_hash_bytes_total{stage=\"cache_full_hash\"} 0"));
-        assert!(encoded.contains("afs_dfs_peer_disk_cache_data_read_calls_total 16"));
-        assert!(encoded.contains("afs_dfs_read_copy_bytes_total{stage=\"cache_to_output\"} 19"));
+        assert!(encoded.contains("afs_dfs_peer_disk_cache_data_read_calls_total 1"));
+        assert!(encoded.contains("afs_dfs_read_copy_bytes_total{stage=\"cache_to_output\"} 65555"));
         assert!(encoded.contains(
             "afs_dfs_peer_disk_cache_stage_observations_total{stage=\"stream_read_verify\"} 1"
         ));
@@ -2628,15 +3257,17 @@ mod tests {
                 .unwrap()
         );
         let encoded = afs_metrics::encode_text(&registry).unwrap();
-        assert!(encoded.contains("afs_dfs_peer_disk_cache_data_read_calls_total 17"));
-        assert!(encoded.contains("afs_dfs_read_copy_bytes_total{stage=\"cache_to_output\"} 19"));
+        assert!(encoded.contains("afs_dfs_peer_disk_cache_data_read_calls_total 2"));
+        assert!(
+            encoded.contains("afs_dfs_read_copy_bytes_total{stage=\"cache_to_output\"} 1114131")
+        );
         assert!(
             encoded.contains(
-                "afs_dfs_peer_disk_cache_stage_observations_total{stage=\"data_read\"} 1"
+                "afs_dfs_peer_disk_cache_stage_observations_total{stage=\"data_read\"} 2"
             )
         );
         assert!(encoded.contains(
-            "afs_dfs_peer_disk_cache_stage_observations_total{stage=\"segment_verify\"} 1"
+            "afs_dfs_peer_disk_cache_stage_observations_total{stage=\"segment_verify\"} 2"
         ));
         let current = cache.stats().unwrap().proof_metadata_bytes;
         assert!(encoded.contains(&format!("afs_dfs_peer_disk_cache_metadata_bytes {current}")));

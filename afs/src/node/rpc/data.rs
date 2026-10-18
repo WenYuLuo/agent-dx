@@ -1450,6 +1450,17 @@ fn validate_dfs_read_request(request: &DfsReadRangesRequest) -> Result<(), Statu
     Ok(())
 }
 
+/// Owns metadata only; body frames keep their separate payload lease.
+#[cfg(feature = "dfs")]
+struct PeerOutboardOwner(crate::node::chunk::outboard::SharedOutboard);
+
+#[cfg(feature = "dfs")]
+impl AsRef<[u8]> for PeerOutboardOwner {
+    fn as_ref(&self) -> &[u8] {
+        self.0.encoded()
+    }
+}
+
 #[cfg(feature = "dfs")]
 fn stream_dfs_ranges(
     local: &LocalChunkStore,
@@ -1486,6 +1497,17 @@ fn stream_dfs_ranges(
         // against the local catalog. Partial/fallback views keep hashing the
         // actual range; no request or self-reported header supplies the proof.
         let whole_digest = verified.verified_full_object_digest();
+        // The Bytes owner retains the same budgeted proof allocation through
+        // queueing and tonic encoding. Codec/network buffers retain their
+        // existing transport budget; they are not charged to this proof lease.
+        let blake3_outboard = if request.include_blake3_outboard {
+            verified
+                .outboard()
+                .map(|proof| prost::bytes::Bytes::from_owner(PeerOutboardOwner(proof)))
+                .unwrap_or_default()
+        } else {
+            Default::default()
+        };
         let verified = verified.into_shared_bytes();
         send(dfs_read_ranges_frame::Body::Header(DfsReadRangesHeader {
             read_id: request.read_id.clone(),
@@ -1495,6 +1517,7 @@ fn stream_dfs_ranges(
             chunk_offset: op.chunk_offset,
             length: op.length,
             source_copy_id: op.source_copy_id.clone(),
+            blake3_outboard,
         }))?;
         let mut offset = 0;
         let mut checksum = blake3::Hasher::new();
@@ -4095,6 +4118,88 @@ mod tests {
     use tokio_stream::wrappers::TcpListenerStream;
     use tonic::transport::Server;
 
+    #[cfg(feature = "dfs")]
+    #[test]
+    fn wi6_outboard_header_shares_owner_and_preserves_legacy_wire_fields() {
+        use crate::node::chunk::outboard::{OutboardBudget, build_borrowed};
+        use prost::Message;
+        let body = vec![39; 96 * 1024 + 17];
+        let budget = OutboardBudget::new(1024 * 1024);
+        let proof = build_borrowed(&body, &budget).outboard.unwrap();
+        let encoded = proof.encoded().to_vec();
+        let address = proof.encoded().as_ptr();
+        let bytes = prost::bytes::Bytes::from_owner(PeerOutboardOwner(proof.clone()));
+        assert_eq!(
+            bytes.as_ptr(),
+            address,
+            "A must not copy proof metadata into the header"
+        );
+        let header = DfsReadRangesHeader {
+            read_id: "read".into(),
+            attempt_id: "attempt".into(),
+            operation_index: 3,
+            chunk_id: "chunk".into(),
+            chunk_offset: 0,
+            length: body.len() as u64,
+            source_copy_id: "copy".into(),
+            blake3_outboard: bytes,
+        };
+        let queued = header.clone();
+        drop(proof);
+        drop(header);
+        assert!(
+            budget.used() > 0,
+            "queued header retains the original proof lease"
+        );
+        // Older readers ignore the new optional tag. Existing identity, range
+        // and Completion fields retain their numbers and semantics.
+        #[derive(Clone, PartialEq, prost::Message)]
+        struct LegacyHeader {
+            #[prost(string, tag = "1")]
+            read_id: String,
+            #[prost(string, tag = "2")]
+            attempt_id: String,
+            #[prost(uint32, tag = "3")]
+            operation_index: u32,
+            #[prost(string, tag = "4")]
+            chunk_id: String,
+            #[prost(uint64, tag = "5")]
+            chunk_offset: u64,
+            #[prost(uint64, tag = "6")]
+            length: u64,
+            #[prost(string, tag = "7")]
+            source_copy_id: String,
+        }
+        let wire = queued.encode_to_vec();
+        let old = LegacyHeader::decode(wire.as_slice()).unwrap();
+        assert_eq!(old.read_id, queued.read_id);
+        assert_eq!(old.length, queued.length);
+        let decoded = DfsReadRangesHeader::decode(wire.as_slice()).unwrap();
+        assert_eq!(decoded.blake3_outboard.as_ref(), encoded);
+        let from_old = DfsReadRangesHeader::decode(old.encode_to_vec().as_slice()).unwrap();
+        assert!(from_old.blake3_outboard.is_empty());
+        let capability = DfsReadRangesRequest {
+            include_blake3_outboard: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            capability.encode_to_vec(),
+            [0x38, 0x01],
+            "new capability is only tag 7"
+        );
+        assert!(
+            !DfsReadRangesRequest::decode(&[][..])
+                .unwrap()
+                .include_blake3_outboard
+        );
+        drop(queued);
+        assert_eq!(
+            budget.used(),
+            0,
+            "codec output is separate transport ownership"
+        );
+    }
+
     #[tokio::test]
     async fn grpc_inline_write_then_read_uses_storage() {
         let temp = tempfile::tempdir().unwrap();
@@ -4776,7 +4881,7 @@ mod tests {
             }];
             result.extend(staged.bytes().chunks(DFS_REPLICA_FRAME_BYTES).map(|data| {
                 DfsPutReplicaFrame {
-                    body: Some(Body::Data(data.to_vec())),
+                    body: Some(Body::Data(data.to_vec().into())),
                 }
             }));
             result
@@ -4799,7 +4904,9 @@ mod tests {
         );
         let mut bad = frames();
         if let Some(Body::Data(bytes)) = &mut bad[1].body {
-            bytes[0] ^= 1;
+            let mut corrupt = bytes.to_vec();
+            corrupt[0] ^= 1;
+            *bytes = corrupt.into();
         }
         assert_eq!(
             client
@@ -5845,6 +5952,7 @@ mod tests {
         let source = &sources.chunks[0].sources[0];
         let grant = &source.read_grant;
         let request = DfsReadRangesRequest {
+            include_blake3_outboard: false,
             read_id: "read".into(),
             attempt_id: "attempt".into(),
             file_version_id: "version".into(),
@@ -6826,6 +6934,7 @@ mod tests {
     #[cfg(feature = "dfs")]
     fn dfs_read_request(chunk_id: String, length: u64) -> DfsReadRangesRequest {
         DfsReadRangesRequest {
+            include_blake3_outboard: false,
             read_id: "read".into(),
             attempt_id: "attempt".into(),
             file_version_id: "version".into(),
@@ -6928,9 +7037,15 @@ mod tests {
                 .parse::<u64>()
                 .unwrap()
         };
-        for (offset, length) in [(0, bytes.len()), (1, 75_000)] {
+        for (offset, length, want_proof) in [
+            (0, bytes.len(), false),
+            (0, bytes.len(), true),
+            (1, 75_000, false),
+            (1, 75_000, true),
+        ] {
             let before = hash_bytes();
             let mut request = dfs_read_request(staged.chunk.id.0.clone(), length as u64);
+            request.include_blake3_outboard = want_proof;
             request.operations[0].chunk_offset = offset as u64;
             let (sender, mut receiver) = tokio::sync::mpsc::channel(8);
             stream_dfs_ranges(&local, &request, &sender, None).unwrap();
@@ -6944,6 +7059,19 @@ mod tests {
                         header_count += 1;
                         assert_eq!(header.chunk_offset, offset as u64);
                         assert_eq!(header.length, length as u64);
+                        if want_proof && offset == 0 {
+                            assert!(!header.blake3_outboard.is_empty());
+                            crate::node::chunk::outboard::ChunkOutboard::validate_encoded_shape(
+                                &staged.chunk,
+                                &header.blake3_outboard,
+                            )
+                            .unwrap();
+                        } else {
+                            assert!(
+                                header.blake3_outboard.is_empty(),
+                                "ordinary/partial reads keep their original wire contract"
+                            );
+                        }
                     }
                     dfs_read_ranges_frame::Body::Data(data) => received.extend(data),
                     dfs_read_ranges_frame::Body::Completion(completion) => {

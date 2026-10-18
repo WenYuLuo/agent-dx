@@ -176,6 +176,50 @@ session／grant 截止限制；每次 read 仍检查合法范围、期限和已�
 cache ON 必须按[验收说明](../testing/afs.md#dfs-外部-s3-闭环)登记对应版本的实际 Linux 结果；
 不能由配置可解析或工具就绪推导功能／性能通过。SeaweedFS部署继续归外部测试方案。
 
+## FUSE 接收与 DFS 页缓存配置
+
+以下是Node顶层TOML键，也可通过同名连字符CLI选项覆盖；Meta不使用这些挂载参数。
+
+| 参数 | 默认 | 范围与作用 |
+| --- | --- | --- |
+| `fuse_threads` | `4` | `1..=64`，OwnerFs／DFS接收线程 |
+| `fuse_clone_fd` | `true` | 仅多接收线程时生效 |
+| `fuse_workers` | `32` | `1..=1024`，有界callback executor，队列容量为worker数×8 |
+| `dfs_fuse_keep_cache` | `true` | 仅原生DFS只读、已核对提交身份的open允许保留页面 |
+| `dfs_fuse_entry_ttl_ms` | `0` | `0..=60000`，路径entry TTL |
+| `dfs_fuse_attr_ttl_ms` | `0` | `0..=60000`，属性TTL；CREATE的单TTL回复取两者较小值 |
+| `fuse_max_readahead_bytes` | `1048576` | `0..=16777216`，仅DFS的内核read-ahead请求上限，实际值受协商限制 |
+| `dfs_version_cache_entries` | `4096` | `1..=65536`，不可变版本／布局的resident元数据条目数 |
+| `dfs_version_cache_bytes` | `33554432`（32MiB） | `1..=1073741824`，不可变版本缓存的保守保留字节预算；同时受entries约束 |
+
+TTL均保持0才属于严格路径新鲜度配置；正值是显式宽松模式，rename替换等路径
+可能在TTL内继续解析为旧inode，不能宣传严格close-to-open。OwnerFs原Home缓存、TTL、
+direct-I/O与mmap策略不由上述DFS参数覆盖。read-ahead不等于对象预取；测试必须
+记录有效`read_ahead_kb`和应用open flags，不能用配置请求值冒充协商结果。
+
+DFS复用以完整提交版本ID及长度为准；新open仍在线检查权限和Meta。dirty、provider、
+可写或外部S3句柄不取得此复用资格，身份表超限时保守不保留。已经交给内核的页面
+不再次经过用户态授权，不能解释成可立即撤回的远端载荷。
+
+提高worker数会增加可同时存活的私有读取结果。原读配置是每操作上限，不是Node全局
+RSS配额；A共享正文、B填充、帧、元数据、allocator和内核页缓存须分别核算。
+默认线程数也不构成吞吐或时延达标保证。
+
+版本缓存不保存权限或正文，不代替新open的在线检查。entries与bytes双上限均在启动时
+生效；bytes按版本、布局、索引的容器capacity、各ID字符串capacity和缓存容器包装
+保守估算，不只统计extent数量。超大布局仍能被当前操作使用，但不被缓存保留；淘汰后
+在途读者仍可持有其Arc。此上限不等于所有活跃引用、加载临时分配或整个Node RSS上限，
+不能据命中率推断新鲜度或授权有效。
+
+超大版本未被保留时，后续需要该布局的每次用户态读取可能重新执行Meta
+`get_file_version`、传输完整布局并重建索引，存在比原单项缓存更高的控制成本；
+内核页缓存命中不进入该路径。缓存还预扣与entries相关的保守容器开销T，只有
+`T + 单项保留估算 <= dfs_version_cache_bytes`时才可能接纳该项。当前64位构建中
+T约为`2048 + 384 × dfs_version_cache_entries`字节：默认4096项约1.50MiB，65536项
+约24.00MiB；这是实现估算，非实测RSS，也不是固定文件大小阈值。bytes不大于T时
+没有空间保留任何非空条目，较小entries／较大bytes须配套考虑。当前仅分别校验两项
+参数的范围，不拒绝或告警这类组合；过小bytes会使缓存无法接纳条目，但读取仍可执行。
+
 ## 原生 Peer 可丢弃磁盘读缓存
 
 仅供未配置外部后端的 DFS Node；配置在读者 B 上即可，普通缺省 OFF。
@@ -188,21 +232,63 @@ directory = "/opt/adx/cache/afs/peer"
 capacity_bytes = 268435456
 ```
 
-容量可配置，非零且不超过1TiB；256MiB只是示例。缓存存储不可变对象的临时副本，
-近似LRU自动淘汰，ready文件（正文与header）及临时落盘的实际分配受容量限制，
-目录及marker管理开销另计，条目数量最多4096。分段摘要和文件身份元信息另有1MiB硬上限，不能视为零RAM开销。
-没有RAM正文驻留缓存；同一个cache operation串行限制当前对象的填充。符合multi-thread runtime、
-有界HTTP/2窗口及原读预算条件时，gRPC用单producer／单消费者及两个256KiB固定载荷块，
-按块重叠接收、完整校验和私有文件写入；wire帧仍至多64KiB，块用完归还后才能复用。
-原4MiB填充额度保守覆盖块actual capacity、控制字段及接收缓冲，另加本次私有输出仍不得超过原单批预算。
-不满足条件时沿用至多4MiB完整对象缓冲，不同时持有两种填充额度，不增加配置项或线程池。
-缓存创建／配额／写盘失败继续同次RPC验证并交付授权范围；实际EOF、排空及最终授权通过前不Ready或公开输出。初次获取／重启恢复完整验证可信Meta根并生成1MiB分段摘要；稳定磁盘命中对完整对齐1MiB请求直接读入原私有结果，再完整校验分段；partial／跨段／尾段仍使用64KiB临时scratch完整校验覆盖分段，仍有本地文件IO和校验成本。文件device／inode／length／mtime／ctime变化使证明失效并完整重验；metadata不变的未请求段静默损坏延后到该段读取检测。元信息不足时保守全文扫描。内核pagecache与进程其它缓冲不归此磁盘配额管理。
+容量可配置，非零且不超过1TiB；256MiB只是示例。缓存保存不可变对象的临时副本，
+近似LRU自动淘汰，条目最多4096；v2文件为4096B固定header、正文和至多8192B的
+Bao outboard trailer。ready与pending实际分配受磁盘容量限制，目录及marker开销另计。
+旧v1专属缓存条目可退休重建；这不是持久数据格式迁移，不得删除A的唯一持久副本。
+回滚到只识别v1的旧Node时，不能直接复用包含v2 ready文件的缓存目录；应先正常停止
+Node，再按专属缓存目录的清理合同退休可丢弃条目，或配置新的空缓存目录／禁用可选缓存。
+此操作仅针对B的可再生缓存，不得清理A的持久副本、catalog或Meta数据。
 
-授权覆盖整个当前chunk时才允许整块Peer回填，否则保留原范围读取；不是预取下一对象。
-缓存不会成为Meta持久副本，不提高可靠性或允许A唯一持久数据被删除。每次命中仍需
-有效的版本／布局授权、Node/session及最终期限检查；正常退出等待活动operation结束，
-停止后不接纳fill。可丢弃缓存不要求fsync，成功应用fsync仍依赖原持久副本和Meta屏障。
-本次未启用外部S3后端的Peer缓存协同；该扩展另行验证，不同时配置两种后端缓存。
+原1MiB proof ledger由同一Node的A store、原生写pool和B cache共用；计入proof实际
+capacity、Arc／包装、构建／encode／decode临时分配及证明索引（当前64位构建为32KiB），
+在途引用直到最后owner释放才退账。总额的一半（默认512KiB）作为常驻保留子限，
+A pinned／Peer单槽和B proof／索引包装共同受限；不是额外额度或另一池。条目淘汰但
+引用仍活跃时不能提前退账。临时验证／写入builder共享剩余总账，超过可用额度允许安全
+回退，不保证默认32 workers都取得快路径。容量不足不能当作健康proof损坏并触发反复
+重建或写盘；对应准入失败、原生写无proof和范围全扫回退需要分别观察。不挪用正文额度。它不代表进程总RAM；codec、TLS、HTTP/2及内核pagecache
+仍按原独立预算核算。这里没有新增正文RAM驻留缓存或预取。
+
+本机读、A端Peer范围服务及B磁盘命中统一使用标准BLAKE3根与32KiB覆盖组outboard。
+proof包含64B格式／长度／根header和parent CV，4MiB对象最多8192B；命中仍读取、
+校验覆盖组；连续对齐范围直读私有输出后用官方range validator验证，仍有32KiB
+scratch复制，非对齐／多范围沿用原路径，不承诺零复制。本机规范ChunkId的根／长度
+须与Meta布局及catalog一致，无需新增Meta RPC；legacy ID或持久副本缺失、旧／坏sidecar
+走原完整根扫描。sidecar是可选优化；原生写在原ACK前可能多出sidecar文件sync、rename
+及实际持久化批次合并的目录sync成本；健康proof避免重写／rename但保留文件同步。
+可选proof失败不改变正文、catalog、receipt及成功fsync屏障。
+读侧也可同步修复缺失／损坏的sidecar，安装可能产生文件与目录sync。健康sidecar仅
+在固定共享修复锁内比较而不write／rename／sync，避免同对象重复安装；已验证Peer正文
+单槽命中不再访问sidecar。修复不持
+Peer正文单槽锁，也不增加后台修复服务。缺容量时走完整根安全读取，不能借修复改变
+原正文、catalog或成功fsync合同。
+
+并发范围验证的快路径受原proof总账约束：每张工作票据76KiB，resident接近512KiB且
+没有其他临时占用时，剩余约512KiB仅容纳6张并存票据。不是固定第7路必退化，实际
+取决于占用及调度重叠。票据不足会安全全根扫描，例如128KiB范围读4MiB对象可产生
+32倍正文读取／hash放大；默认32worker不等于32路均走范围快路径。此退化不重建或
+落盘sidecar。性能／容量规划须同时采集全账、resident和全扫事件，不能只看缓存命中率。
+
+符合multi-thread runtime、有界HTTP/2窗口及原读预算条件时，gRPC使用单producer／
+consumer与两个256KiB固定载荷块，wire帧仍至多64KiB，块归还后才能复用。
+首正文前固定核根模式：有预算支持的完整peer tree由consumer完成唯一正文根计算，
+同时匹配Meta锚定整对象根及Completion；缺proof／预算不足／旧Peer保留producer核根
+安全路径。旧Peer不提供proof时，producer完整核根与consumer缓存outboard构建可能
+形成两次正文hash；producer hash归零只适用于合格的新Peer consumer-tree路径。
+两条链仍双块重叠，所有实际hash各自计量。原4MiB填充额度与本次私有输出不能超过原单批预算；
+不满足条件沿用完整对象缓冲回退，不增加队列、连接数、窗口或线程池。
+
+整个当前chunk获授权时才请求整对象proof；partial保持精确授权正文与range checksum，
+由A核对本地可信根覆盖组，不宣称B取得独立整对象证明。
+旧Peer缺少可选字段时完整根安全回退；格式、长度或对象绑定错误拒绝。
+实际EOF、成功join、完整根／CV、身份和最终授权都通过前，不产生Ready或公开输出。
+缓存创建／配额／写盘失败仍以同次RPC完成强校验和合法区间交付；Meta／Peer真实错误仍传播。
+文件身份变化使证明失效，未请求覆盖组的静默损坏在读取该组时检测。
+
+正常退出等待活动operation结束，停止后不接纳fill；可丢弃缓存不要求fsync，成功应用
+fsync依赖原持久副本与Meta屏障。S3原有窗口、载荷／descriptor预算独立保持，外部写不生成
+这份原生写proof；外部S3与Peer缓存协同仍后置，不同时配置两种后端缓存。
+这些是实现及部署边界，不表示本候选已完成运行、回归或性能验收。
 
 ## 原生写 buffer 与 Node allocator
 
@@ -243,7 +329,7 @@ dfs_read_diagnostics_enabled = true
 
 诊断只保留当前进程前256条记录，不轮转、不存正文、路径、inode、用户身份或授权token。
 检查 `schema_version`、`overflow`、`clock_failures` 及每项完成／成功状态后再解释数据；
-溢出或缺失记录不能用于完整归因。根／段区间及临时元数据有固定上限，不增加正文缓存或载荷预算。
+溢出或缺失记录不能用于完整归因。根／outboard工作区间及临时元数据有固定上限，不增加正文缓存或载荷预算。
 关闭时不分配诊断journal、不采诊断时钟，仍有轻量状态判断及原有指标，不承诺零指令开销。
 正式性能轮关闭该选项，诊断轮单独保存；父子阶段、重叠区间和累计hash耗时不能从E2E直接扣减。
 详细边界见[测试说明](../testing/afs.md#原生读粗粒度诊断)。

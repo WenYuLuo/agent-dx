@@ -1,0 +1,100 @@
+# DFS / JuiceFS 双口径对照驱动
+
+该目录只包含可维护的测量工具。产品由外部 fixture 启停；SeaweedFS、PostgreSQL
+的部署、实验数据和主机路径不属于此目录。驱动不会创建 VM、格式化磁盘、部署后端、
+全局停止进程或修改后端参数。
+
+## 测量边界
+
+- `contract`：双方 `O_RDONLY | O_DIRECT`，记录并核对 `read_ahead_kb=0`、
+  `prefetch=0`。用于自身读引擎的同条件比较。
+- `product`：双方 `O_RDONLY`，使用各自真实默认缓存/预读配置并记录具体值。
+  单独报告页缓存收益，不能用于声称历史 O_DIRECT 路径提速。
+- A 提前准备相同内容及 SHA-256；A/B 控制进程和 TCP 通道提前建立；两条等待连接在 GO 前通过 Linux pidfd 阻塞，
+  GO 后不启动 SSH/Lima/Python 轮询或主动采集。ready 并预备完成后，
+  一律静置 30 秒；读取前的指标快照在 A 创建文件之前完成。
+- A 按 4MiB 调用写入，执行文件 `fsync → close → rename → 父目录 fsync` 后通知 B。
+  B 每次重新打开，以 4MiB `readv` 读到 EOF，并核对长度及完整 SHA-256。
+- 主 E2E 是 **A 创建开始到 A 核验 B 首读 SHA/EOF ACK**，由 A 单一单调时钟直接测量。
+  `total_with_repeat_ns` 另列，包含固定一秒复读等待。二者都不做阶段求和或 S3 扣减。
+- A/B 指标在首读之前、首读 ACK 之后、复读 ACK 之后采样。中间快照使用固定复读间隔，
+  不计入应用 read 或首读 E2E。A/B 均记录快照原始耗时；快照本身或首读 ACK 边界至快照完成超过半秒时，该轮失败并保留时长证据，不允许靠延长固定复读间隔通过。
+  快照包含各自单调时钟；差分不代表所有跨组件累计耗时都在关键路径上。
+  兼容字段 `metric_deltas.*.first` 的实际区间由 `metric_window_boundaries` 明确：A 是 publish＋first，
+  B 是 BEGIN 至首读 ACK，均不是严格隔离的单次 read；repeat 区间也包含固定等待，不能据此把写入 RPC 归因成读 RPC。
+- 每种系列、每个标签恰好三轮，串行执行；默认测前固定顺序 AB/BA/AB。原始值、中位数、max/min 全部保留；
+  稳定性门槛为 `max/min <= 1.10`，不满足时不追加样本。`completed` 与 `stable` 分别登记。
+
+## 使用
+
+复制 [config.example.json](config.example.json)，填入当前环境的固定二进制 SHA、
+外部 fixture、挂载、资源预算和有效配置。示例不是可直接运行的部署配方。
+
+```sh
+python3 build/e2e/afs/perf/dfs_compare.py --config /absolute/private/config.json --validate-only
+python3 build/e2e/afs/perf/dfs_compare.py --config /absolute/private/config.json --series both
+python3 -m unittest discover -s build/e2e/afs/perf -p 'test_*.py' -v
+```
+
+`--labels afs-baseline,juicefs` 固定执行顺序；`--rounds` 仅用于明确覆盖配置，正式运行仍必须
+是三轮。诊断配置必须 `diagnostic=true, rounds=1`，使用独立输出目录；其证据不混入正式样本。
+该工具就绪或单测通过不代表基线、诊断或功能验收通过。
+
+## 配置与外部 fixture 合同
+
+JSON 字段如下：
+
+| 字段 | 要求 |
+|---|---|
+| `orders` | 可选，每轮完整 label 排列；默认 AB/BA/AB，执行前固定，不按结果调整 |
+| `run_id` | 无路径分隔符的独立标识。实际每轮为 `<run_id>-<series>-<label>-<round>` |
+| `output` | 源码树外绝对路径，必须不存在或为空；失败不覆盖旧结果 |
+| `nodes.a/b/c.transport` | `ssh` 或 `limactl shell VM --` 的 argv。SSH 逐参数 shell quoting，无模板 eval |
+| `nodes.*.command_prefix` | 默认空；仅允许显式 `["sudo", "-n"]`，用于固定为与 FUSE 挂载相同的 root 测试身份 |
+| `nodes.*.root` | Linux 上独立控制根；每轮创建其下唯一目录，与挂载数据目录分离 |
+| `nodes.*.min_free_bytes` | 启动前最低容量。必须计入正文、副本、缓存和临时产物 |
+| `nodes.*.dependencies` | 预检查的可执行文件名 |
+| `nodes.*.ports/process_names` | 不能已被使用的端口及精确进程 comm 名称；不得列入共享后端进程 |
+| `nodes.*.binaries` | `{path,sha256}` 数组；启动前完整校验。客户端、Meta、参考版本由配置提供 |
+| `control` | 明确的 B 监听/连接地址、A 源地址及独立 TCP 端口；HMAC 密钥逐轮生成、不写入证据 |
+| `labels.*.mounts.a/b` | 当前系列的空白测试挂载根，目标文件固定 `test.bin` |
+| `labels.*.identity` | 候选/参考 commit、tree、二进制目录等身份，原样记录 |
+| `labels.*.settings.contract/product` | 实际预读、预取及其他固定配置；`ready` 必须逐项确认一致 |
+| `labels.*.budgets` | Node、Peer 磁盘缓存、载荷、descriptor、VM 等预算；fixture 核验，驱动记录 |
+| `labels.*.page_cache_initial_state` | 初始页缓存状态及清场方式，不能笼统写“冷缓存” |
+| `labels.*.external_backend` | 外部 S3/Meta 版本与连接配置身份；认证仅引用外部私密配置文件 |
+| `labels.*.metrics` | `{node:a或b,name,url}`，节点回环 HTTP `/metrics` 地址；保留原文和差分 |
+| `labels.*.metric_counter_patterns` | 可选，单调计数器名称匹配，默认 `_total/_bucket/_sum/_count`；原始 gauge 不做工作量差分 |
+| `labels.*.hooks` | 下列六组顺序命令。每条为 `{node:a/b/c/controller,argv:[...]}` |
+
+每个 label 必须提供：
+
+1. `preflight`：只读核对候选身份、配置、目录空白、实际挂载/资源/端口和环境占用；输出紧凑 JSON。
+2. `start`：只启动该 run 的 AFS 或 JuiceFS 客户端和必要的自有 Meta，不能部署/修改第三方后端。
+3. `ready`：输出单一 JSON `{ "ready": true, "effective_settings": { ... } }`，有效配置必须匹配配置文件。
+4. `stop`：正常停止本 run。`{successful}` 为 `true` 时可先在挂载仍有效时删除 `test.bin` 并 fsync
+   父目录，再卸载/排空；为 `false` 时保留复现数据。不得停止共享服务或按名称全局 kill。
+5. `cleanup`：仅在测量及正常停止成功时调用，清理本 run 的可再生数据。S3 对象/collection 只经
+   外部已核验接口回收；不能直接删除其底层文件。证据、失败和配置必须保留。
+6. `verify_clean`：输出单一 JSON `{ "clean": true, ... }`，核对无本 run 进程、挂载等残留；
+   不要求保留的失败数据消失。清理失败使整轮不能通过。
+
+argv 允许 `{run_id}`、`{label}`、`{series}`、`{round}`、`{run_root}`、`{mount}`、
+`{size_bytes}`、`{successful}`、`{diagnostic}`。它们只是逐参数替换，不执行表达式、shell
+或命令替换。`controller` 在编排主机执行，其他命令在对应 Linux 节点执行。fixture 必须
+验证这些值的授权范围，不能把它们交给 eval。hook 默认180秒，`hook_timeout_seconds` 可显式覆盖。
+
+任何失败都会保存当前轮的结果和已取得的原始证据，然后停止本次序列，不重试；其他独立序列
+由调用方另建 run 决定。控制进程按 PID/start_ticks/boot_id/命令身份定向停止，拒绝误杀。
+控制工具按内容 SHA 在每节点复用一份，不逐轮复制源码快照；每轮只保留控制状态和日志，密钥退休。大型结果不入源码树。配置/日志可能含基础设施地址，
+请使用私密输出目录，并在分享前核对内容。
+
+## 验证局限
+
+单测仅覆盖驱动合同，不证明 Linux FUSE 行为、实际性能或第三方后端回收。实际运行须同时保存
+固定二进制/配置身份、fixture 准入及恢复证据。当前驱动输出原始指标和差分；某个版本没有尺寸
+直方图或相应计数器时应标为缺失，不能伪造零值或宣称验收完整。旧基线与增加低开销尺寸观测的
+变体须分别记录二进制身份。
+
+仅验证控制协议时，可在 Linux ext4 数据目录运行 `python3 build/e2e/afs/perf/smoke_protocol.py --root /absolute/fresh/smoke`。
+该用例只跑64KiB普通文件系统、两种open模式和pidfd等待，不运行FUSE，也不采用正式30秒静置，不能作为产品或性能验收。
