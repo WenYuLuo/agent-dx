@@ -554,12 +554,18 @@ after_repeat核对全部固定标签；漏采、非有限值或缺快照为证�
 ```sh
 cargo test --locked -p afs --lib write_buffer_tests
 cargo test --locked -p afs --lib native_builder_
+cargo test --locked -p afs --lib p2_w1_ -- --test-threads=1
 cargo test --locked -p afs --lib dispatch_tests
 cargo test --locked -p afs --test config_contract
 cargo test --locked -p afs --bin afs-node allocator::tests
 cargo fmt --all -- --check
 cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 ```
+
+`p2_w1_`比较原生区间索引与旧 extent 日志的确定性写入／截断／冻结／恢复序列，核对内容、
+write_seq、Chunk 划分及实际输入复制次数；另测16MiB中十万次对齐覆盖的活跃区间上界。
+该结构上界不外推任意字节边界，也不是全部分配或RSS实测；S3／legacy沿用原日志，
+其预算与恢复须由受影响的`deferred_publication_`回归单独核对。
 
 真实 FUSE 使用本地 owner、NodeReplicated R1、无 S3：六次应用1MiB写入合计6MiB，记录内核实际
 回调大小和中途提交轨迹；同批原提交入口冻结4MiB＋2MiB有效正文，复制入口合计6MiB、地址保持，
