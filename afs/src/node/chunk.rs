@@ -1783,7 +1783,15 @@ impl PeerReadReservation {
         let capacity = u64::try_from(capacity).map_err(|_| peer_payload_capacity())?;
         if capacity > self.bytes {
             let extra = capacity - self.bytes;
-            reserve_peer_bytes(&self.budget, extra, self.metrics.as_ref())?;
+            let _admission = self
+                .budget
+                .admission
+                .lock()
+                .map_err(|_| peer_serve_unavailable("Peer budget admission poisoned"))?;
+            // This lease was admitted before stop. Drain still waits for its
+            // Arc, including a zero-byte owner; actual capacity must remain
+            // charged without admitting another owner or exceeding the limit.
+            charge_peer_bytes_locked(&self.budget, extra, self.metrics.as_ref())?;
             self.bytes = capacity;
         }
         Ok(())
@@ -1841,6 +1849,15 @@ fn reserve_peer_bytes_locked(
     if budget.stopped.load(Ordering::Acquire) {
         return Err(peer_serve_unavailable("Peer serve is stopped"));
     }
+    charge_peer_bytes_locked(budget, bytes, metrics)
+}
+
+#[cfg(any(feature = "dfs", test))]
+fn charge_peer_bytes_locked(
+    budget: &PeerReadBudget,
+    bytes: u64,
+    metrics: Option<&super::read_work::ReadWorkMetrics>,
+) -> Result<()> {
     let mut used = budget.used.load(Ordering::Acquire);
     loop {
         let next = used
@@ -7505,6 +7522,44 @@ mod replica_replay_tests {
         });
         assert_eq!(Arc::strong_count(&store.peer_read_budget), 1);
         assert_eq!(store.peer_read_budget.used.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn p2_t1_stop_rejects_new_owners_but_keeps_existing_capacity_charged() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+        let mut lease = store.reserve_peer_read_payload(0).unwrap();
+        store.close_peer_serve_admission();
+        for bytes in [0, 1] {
+            assert_eq!(
+                store.reserve_peer_read_payload(bytes).unwrap_err().code(),
+                afs_error::IO_UNAVAILABLE
+            );
+            assert_eq!(
+                store
+                    .reserve_peer_read_payload_until(bytes, store.peer_serve_deadline())
+                    .unwrap_err()
+                    .code(),
+                afs_error::IO_UNAVAILABLE
+            );
+        }
+        lease.retain_capacity(31).unwrap();
+        assert_eq!(store.peer_read_budget.used.load(Ordering::Acquire), 31);
+        assert_eq!(store.peer_read_budget.peak.load(Ordering::Acquire), 31);
+        assert_eq!(
+            lease
+                .retain_capacity(PEER_READ_PAYLOAD_LIMIT + 1)
+                .unwrap_err()
+                .code(),
+            afs_error::IO_CAPACITY
+        );
+        assert_eq!(lease.bytes, 31);
+        assert_eq!(store.peer_read_budget.used.load(Ordering::Acquire), 31);
+        assert_eq!(Arc::strong_count(&store.peer_read_budget), 2);
+        drop(lease);
+        assert_eq!(store.peer_read_budget.used.load(Ordering::Acquire), 0);
+        assert_eq!(Arc::strong_count(&store.peer_read_budget), 1);
+        store.shutdown_peer_serve().unwrap();
     }
 
     #[test]
