@@ -141,3 +141,5 @@ argv 允许 `{run_id}`、`{label}`、`{series}`、`{round}`、`{run_root}`、`{m
 
 仅验证控制协议时，可在 Linux ext4 数据目录运行 `python3 build/e2e/afs/perf/smoke_protocol.py --root /absolute/fresh/smoke`。
 该用例只跑64KiB普通文件系统、两种open模式和pidfd等待，不运行FUSE，也不采用正式30秒静置，不能作为产品或性能验收。
+
+诊断轮次（`diagnostic=true`）额外记录B端完整read的单调起止和实际readv区间（含EOF），最多128条、溢出另计；正式轮次不保留该列表。区间复用原计时边界，完整read仍包含应用SHA256、open和close。实际FUSE回调仍须从Node记录关联，不能假设应用4MiB等于一次FUSE请求。跨节点时钟不得直接相减，诊断时延不作为正式性能成绩。

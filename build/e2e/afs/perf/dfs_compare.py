@@ -434,6 +434,7 @@ def run_round(config, series, label_name, number, output):
                 raise ValueError('workload mount and control root must be disjoint')
             worker_config = {'run_root': run_root, 'run_id': run_id, 'role': role,
                              'series': series, 'size_bytes': config['size_bytes'],
+                             'diagnostic': config.get('diagnostic', False),
                              'write_block_bytes': result['workload']['write_block_bytes'],
                              'salt': number, 'path': mount + '/test.bin', 'control': config['control'],
                              'timeout_seconds': config.get('timeout_seconds', 180),

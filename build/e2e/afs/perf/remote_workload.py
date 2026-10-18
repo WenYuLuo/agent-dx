@@ -229,20 +229,28 @@ def write_prepared(path, data, digest, write_block_bytes=BLOCK):
             'publication': 'create/write/file fsync/close/rename/parent fsync'}
 
 
-def read_file(path, direct):
+def read_file(path, direct, diagnostic=False):
     start = time.monotonic_ns()
     fd = os.open(path, os.O_RDONLY | (os.O_DIRECT if direct else 0))
     opened = time.monotonic_ns()
     digest = hashlib.sha256()
     count = 0
     calls = []
+    intervals = [] if diagnostic else None
+    interval_overflow = 0
     try:
         size = os.fstat(fd).st_size
         with mmap.mmap(-1, BLOCK) as buffer:
             while True:
                 before = time.monotonic_ns()
                 length = os.readv(fd, [buffer])
-                elapsed = time.monotonic_ns() - before
+                completed = time.monotonic_ns()
+                elapsed = completed - before
+                if intervals is not None:
+                    if len(intervals) < 128:
+                        intervals.append({'start_ns': before, 'end_ns': completed, 'bytes': length})
+                    else:
+                        interval_overflow += 1
                 if length == 0:
                     eof_ns = elapsed
                     break
@@ -251,10 +259,15 @@ def read_file(path, direct):
                 digest.update(memoryview(buffer)[:length])
     finally:
         os.close(fd)
-    return {'full_read_ns': time.monotonic_ns() - start, 'open_ns': opened - start,
+    end = time.monotonic_ns()
+    result = {'full_read_ns': end - start, 'open_ns': opened - start,
             'read_io_ns': sum(calls), 'read_call_ns': calls, 'eof_ns': eof_ns,
             'bytes': count, 'stat_bytes': size, 'sha256': digest.hexdigest(), 'eof': True,
             'o_direct': direct, 'full_read_includes_application_sha256': True}
+    if intervals is not None:
+        result.update(start_monotonic_ns=start, end_monotonic_ns=end,
+                      read_intervals=intervals, read_intervals_overflow=interval_overflow)
+    return result
 
 
 def verify_read(value, size, digest):
@@ -338,7 +351,7 @@ def role(config):
                 before = metrics(config)
                 send_frame(connection, token, {**common, 'type': 'BEGIN_READY'})
                 receive_frame(connection, token, run_id, 'PUBLISHED')
-                first = verify_read(read_file(config['path'], config['series'] == 'contract'),
+                first = verify_read(read_file(config['path'], config['series'] == 'contract', config.get('diagnostic', False)),
                                     config['size_bytes'], expected)
                 cold_end = time.monotonic_ns()
                 send_frame(connection, token, {**common, 'type': 'FIRST_COMPLETE', 'read': first})
@@ -348,7 +361,7 @@ def role(config):
                 while time.monotonic_ns() < deadline:
                     time.sleep(max(0, (deadline - time.monotonic_ns()) / 1e9))
                 repeat_start = time.monotonic_ns()
-                repeat = verify_read(read_file(config['path'], config['series'] == 'contract'),
+                repeat = verify_read(read_file(config['path'], config['series'] == 'contract', config.get('diagnostic', False)),
                                      config['size_bytes'], expected)
                 gap_ns = repeat_start - cold_end
                 send_frame(connection, token, {**common, 'type': 'COMPLETE', 'read': repeat,

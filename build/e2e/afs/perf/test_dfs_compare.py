@@ -219,6 +219,37 @@ class Accounting(unittest.TestCase):
 
 
 class MetricsSampling(unittest.TestCase):
+    def test_read_diagnostics_preserve_data_and_exact_application_boundaries(self):
+        data = b'bounded-read-diagnostic' * 256
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'input'
+            path.write_bytes(data)
+            ordinary = driver.worker.read_file(path, False)
+            diagnostic = driver.worker.read_file(path, False, True)
+        self.assertNotIn('read_intervals', ordinary)
+        self.assertEqual(ordinary['sha256'], diagnostic['sha256'])
+        self.assertEqual(diagnostic['bytes'], len(data))
+        self.assertEqual(diagnostic['full_read_ns'],
+                         diagnostic['end_monotonic_ns'] - diagnostic['start_monotonic_ns'])
+        self.assertEqual(diagnostic['read_intervals_overflow'], 0)
+        self.assertEqual([x['bytes'] for x in diagnostic['read_intervals']], [len(data), 0])
+        self.assertEqual(diagnostic['read_call_ns'],
+                         [x['end_ns'] - x['start_ns'] for x in diagnostic['read_intervals'] if x['bytes']])
+        for row in diagnostic['read_intervals']:
+            self.assertLessEqual(diagnostic['start_monotonic_ns'], row['start_ns'])
+            self.assertLessEqual(row['start_ns'], row['end_ns'])
+            self.assertLessEqual(row['end_ns'], diagnostic['end_monotonic_ns'])
+
+    def test_read_diagnostic_window_storage_is_bounded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'input'
+            path.write_bytes(b'x' * 130)
+            with mock.patch.object(driver.worker, 'BLOCK', 1):
+                result = driver.worker.read_file(path, False, True)
+        self.assertEqual(result['bytes'], 130)
+        self.assertEqual(len(result['read_intervals']), 128)
+        self.assertEqual(result['read_intervals_overflow'], 3)
+
     def test_configured_write_syscalls_and_separate_fsync_boundary(self):
         data = bytearray(3 * 1024**2)
         with tempfile.TemporaryDirectory() as tmp:
