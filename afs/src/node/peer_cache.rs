@@ -1912,6 +1912,12 @@ impl PeerCacheOperation<'_> {
         let _diagnostic = self.cache.read_work.as_ref().and_then(|metrics| {
             metrics.coarse_diagnostic("cache_hit_read_verify", out.len() as u64)
         });
+        let object_diagnostic = self.cache.read_work.as_ref().and_then(|metrics| {
+            metrics.object_diagnostic(
+                super::read_work::ReadObjectDiagnosticStage::CacheHitReadVerify,
+                &chunk.id.0,
+            )
+        });
         let path = self.cache.path(&key);
         let mut finalize_started = None;
         let result = (|| {
@@ -2075,6 +2081,9 @@ impl PeerCacheOperation<'_> {
         drop(old_proof);
         drop(local_entry);
         drop(pin);
+        if let Some(diagnostic) = object_diagnostic {
+            diagnostic.finish(outcome.as_ref().is_ok_and(|hit| *hit));
+        }
         outcome
     }
 
@@ -2108,6 +2117,12 @@ impl PeerCacheOperation<'_> {
             cache: self.cache,
             generation: Some(generation),
         };
+        let object_diagnostic = self.cache.read_work.as_ref().and_then(|metrics| {
+            metrics.object_diagnostic(
+                super::read_work::ReadObjectDiagnosticStage::CacheHitRootFallback,
+                &chunk.id.0,
+            )
+        });
         let result = (|| {
             let (mut file, before) = open_private(&self.cache.path(&key))?;
             if (before.dev(), before.ino()) != expected {
@@ -2143,7 +2158,7 @@ impl PeerCacheOperation<'_> {
             }
             Ok(())
         })();
-        match result {
+        let outcome = match result {
             Ok(()) => {
                 self.state.stats.hits += 1;
                 Ok(true)
@@ -2158,7 +2173,11 @@ impl PeerCacheOperation<'_> {
                 Ok(false)
             }
             Err(error) => Err(error),
+        };
+        if let Some(diagnostic) = object_diagnostic {
+            diagnostic.finish(outcome.as_ref().is_ok_and(|hit| *hit));
         }
+        outcome
     }
 
     /// Only borrowed typed proof is admitted; this method does not hash again.
@@ -3680,6 +3699,15 @@ mod tests {
             .unwrap();
         assert_eq!(hit.calls, 1);
         assert_eq!(hit.bytes, out.len() as u64);
+        // The earlier miss consumes no compact object slot.
+        assert_eq!(snapshot.object_records.len(), 1);
+        assert_eq!(snapshot.object_overflow, 0);
+        assert!(snapshot.object_records[0].completed);
+        assert!(snapshot.object_records[0].success);
+        assert_eq!(
+            snapshot.object_records[0].stage,
+            super::super::read_work::ReadObjectDiagnosticStage::CacheHitReadVerify
+        );
     }
 
     #[test]

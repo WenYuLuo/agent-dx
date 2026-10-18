@@ -551,6 +551,19 @@ validator补读边界时，verify_ns包含该I/O，read_ns另记录实际读取�
 
 原生读粗诊断由默认OFF的`dfs_read_diagnostics_enabled`显式开启，使用固定有界对象聚合。双块诊断按实际核根者记录producer完整根或consumer的outboard校验，并记录写入／提取；legacy `SegmentBlake3`／root_segment字段在本候选表示后者，成功join且两条lane都确有工作时才计算真实区间交集；单一核根者下没有另一条root工作，不能伪造重叠或有效零值。空、时钟失败或固定区间容量溢出同样不得记成有效零重叠。它不保存逐帧事件或正文，不增加载荷额度。ON时延不作OFF成绩，聚合hash／交集不从完整E2E扣减；同步线程CPU降低也不等于全Node CPU降低。
 
+同一schema4响应还可包含`object_capacity`／`object_overflow`／`object_records`：固定120个
+24B槽，记录A端每对象读取／核验及B端实际索引命中的读取／核验区间，miss不占槽。
+它与原256条请求记录及两个既有工作区合计受同一64KiB静态上限约束，溢出不覆盖旧槽。
+记录的56位ChunkId摘要只用于有界诊断关联，有碰撞局限，不是对象身份／授权依据；
+active、成功及错误退出分开，缺失端点或旧版没有这些字段均为未知，不能当0。
+A区间不含此前的Meta授权，B区间不含此前的源解析；使用各自单调时钟核对父子边界，
+不能跨节点相减或把并行区间之和当作E2E关键路径。扫描区间也不等于可以全部消除的时延。
+
+仅在导出已开启的诊断快照时采集`sampled_monotonic_ns`和`process_cpu_ns`（可为空）；
+后者为本Node进程累计user＋sys CPU，不是线程或组件独占CPU。前后差值只对应采样窗口；
+A窗口若包含写入发布须明确注明，不能改称仅首次读CPU。正式性能轮次保持诊断OFF，
+诊断单次数据不用于证明稳定提速或跨版本时延变化的因果关系。
+
 
 通过现有Node管理HTTP的 `GET /v1/diagnostics/dfs-read-timing` 在测量窗口外读取固定快照。
 先检查schema、容量、overflow、clock_failures及每条success/completed；该进程前256条之后不轮转，

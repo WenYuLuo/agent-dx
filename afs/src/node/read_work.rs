@@ -553,6 +553,17 @@ impl ReadWorkMetrics {
         self.diagnostics.as_ref()?.begin(stage)
     }
 
+    /// Compact object boundaries for one bounded diagnostic activity. OFF
+    /// returns before hashing identity, taking clocks, or cloning metadata.
+    #[cfg(any(feature = "dfs", test))]
+    pub(crate) fn object_diagnostic(
+        &self,
+        stage: ReadObjectDiagnosticStage,
+        chunk_id: &str,
+    ) -> Option<ReadObjectDiagnosticSpan> {
+        self.diagnostics.as_ref()?.begin_object(stage, chunk_id)
+    }
+
     /// Fixed phase totals for diagnostic runs only. OFF returns before sampling a
     /// clock or cloning the journal. Timings are attempted work, can overlap,
     /// and must never be added to their enclosing request as extra elapsed time.
@@ -1270,6 +1281,76 @@ impl Drop for ReadCoarseDiagnosticSpan {
     }
 }
 
+// Separate from the 256 request records: 112 B indexed-hit attempts fit
+// one 64MiB first+repeat diagnostic; overflow remains explicit, never wraps.
+#[cfg(any(feature = "dfs", test))]
+const READ_OBJECT_DIAGNOSTIC_CAPACITY: usize = 120;
+#[cfg(any(feature = "dfs", test))]
+const READ_OBJECT_TAG_MASK: u64 = (1_u64 << 56) - 1;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg(any(feature = "dfs", test))]
+#[repr(u64)]
+pub(crate) enum ReadObjectDiagnosticStage {
+    PeerReadVerify = 1,
+    CacheHitReadVerify = 2,
+    CacheHitRootFallback = 3,
+}
+
+#[derive(Debug, Default)]
+#[cfg(any(feature = "dfs", test))]
+struct ReadObjectDiagnosticSlot {
+    // 56-bit diagnostic tag, 4-bit stage, 4-bit status. Not object authority.
+    identity: AtomicU64,
+    start_ns: AtomicU64,
+    end_ns: AtomicU64,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[cfg(any(feature = "dfs", test))]
+pub(crate) struct ReadObjectDiagnosticRecord {
+    pub(crate) id: usize,
+    pub(crate) tag: u64,
+    pub(crate) stage: ReadObjectDiagnosticStage,
+    pub(crate) start_ns: u64,
+    pub(crate) end_ns: u64,
+    pub(crate) completed: bool,
+    pub(crate) success: bool,
+}
+
+/// Only metadata is retained. A dropped/error guard is never a successful read.
+#[cfg(any(feature = "dfs", test))]
+pub(crate) struct ReadObjectDiagnosticSpan {
+    journal: Arc<ReadDiagnostics>,
+    index: usize,
+    finished: bool,
+}
+
+#[cfg(any(feature = "dfs", test))]
+impl ReadObjectDiagnosticSpan {
+    pub(crate) fn finish(mut self, success: bool) {
+        self.record(success);
+    }
+
+    fn record(&mut self, success: bool) {
+        if !self.finished {
+            let slot = &self.journal.objects[self.index];
+            slot.end_ns.store(self.journal.now(), Ordering::Relaxed);
+            slot.identity
+                .fetch_or((if success { 1 } else { 2 }) << 60, Ordering::Release);
+            self.finished = true;
+        }
+    }
+}
+
+#[cfg(any(feature = "dfs", test))]
+impl Drop for ReadObjectDiagnosticSpan {
+    fn drop(&mut self) {
+        self.record(false);
+    }
+}
+
 #[derive(Debug)]
 #[cfg(any(feature = "dfs", test))]
 struct ReadDiagnostics {
@@ -1278,6 +1359,9 @@ struct ReadDiagnostics {
     next: AtomicU64,
     overflow: AtomicU64,
     clock_failures: AtomicU64,
+    objects: [ReadObjectDiagnosticSlot; READ_OBJECT_DIAGNOSTIC_CAPACITY],
+    object_next: AtomicU64,
+    object_overflow: AtomicU64,
 }
 
 #[cfg(any(feature = "dfs", test))]
@@ -1321,12 +1405,19 @@ pub(crate) struct ReadDiagnosticRecord {
 #[cfg(any(feature = "dfs", test))]
 pub(crate) struct ReadDiagnosticsSnapshot {
     pub(crate) schema_version: u32,
+    /// Sampled only while exporting an enabled diagnostic snapshot. These are
+    /// process totals, not CPU attributed to any request or remote component.
+    pub(crate) sampled_monotonic_ns: Option<u64>,
+    pub(crate) process_cpu_ns: Option<u64>,
     pub(crate) capacity: usize,
     pub(crate) metadata_bytes: usize,
     pub(crate) overflow: u64,
     pub(crate) clock_failures: u64,
     pub(crate) records: Vec<ReadDiagnosticRecord>,
     pub(crate) coarse_phases: Vec<ReadCoarseDiagnosticRecord>,
+    pub(crate) object_capacity: usize,
+    pub(crate) object_overflow: u64,
+    pub(crate) object_records: Vec<ReadObjectDiagnosticRecord>,
 }
 
 #[cfg(any(feature = "dfs", test))]
@@ -1338,6 +1429,9 @@ impl ReadDiagnostics {
             next: AtomicU64::new(0),
             overflow: AtomicU64::new(0),
             clock_failures: AtomicU64::new(0),
+            objects: std::array::from_fn(|_| ReadObjectDiagnosticSlot::default()),
+            object_next: AtomicU64::new(0),
+            object_overflow: AtomicU64::new(0),
         }
     }
 
@@ -1367,6 +1461,33 @@ impl ReadDiagnostics {
                 journal: self.clone(),
                 index: index as usize,
             },
+            finished: false,
+        })
+    }
+
+    fn begin_object(
+        self: &Arc<Self>,
+        stage: ReadObjectDiagnosticStage,
+        chunk_id: &str,
+    ) -> Option<ReadObjectDiagnosticSpan> {
+        let index = self.object_next.fetch_add(1, Ordering::Relaxed);
+        let Some(slot) = usize::try_from(index)
+            .ok()
+            .and_then(|index| self.objects.get(index))
+        else {
+            self.object_overflow.fetch_add(1, Ordering::Relaxed);
+            return None;
+        };
+        let digest = blake3::hash(chunk_id.as_bytes());
+        let mut prefix = [0; 8];
+        prefix.copy_from_slice(&digest.as_bytes()[..8]);
+        let tag = u64::from_le_bytes(prefix) & READ_OBJECT_TAG_MASK;
+        slot.identity
+            .store(tag | ((stage as u64) << 56), Ordering::Relaxed);
+        slot.start_ns.store(self.now(), Ordering::Release);
+        Some(ReadObjectDiagnosticSpan {
+            journal: self.clone(),
+            index: index as usize,
             finished: false,
         })
     }
@@ -1411,11 +1532,40 @@ impl ReadDiagnostics {
             .collect();
         ReadDiagnosticsSnapshot {
             schema_version: 4,
+            sampled_monotonic_ns: monotonic_ns(),
+            process_cpu_ns: process_cpu_ns(),
             capacity: READ_DIAGNOSTIC_CAPACITY,
             metadata_bytes: std::mem::size_of::<ReadDiagnosticSlot>() * READ_DIAGNOSTIC_CAPACITY
                 + std::mem::size_of::<ReadDiagnostics>(),
             overflow: self.overflow.load(Ordering::Acquire),
             clock_failures: self.clock_failures.load(Ordering::Acquire),
+            object_capacity: READ_OBJECT_DIAGNOSTIC_CAPACITY,
+            object_overflow: self.object_overflow.load(Ordering::Acquire),
+            object_records: self.objects[..self
+                .object_next
+                .load(Ordering::Acquire)
+                .min(READ_OBJECT_DIAGNOSTIC_CAPACITY as u64)
+                as usize]
+                .iter()
+                .enumerate()
+                .map(|(index, slot)| {
+                    let identity = slot.identity.load(Ordering::Acquire);
+                    let status = identity >> 60;
+                    ReadObjectDiagnosticRecord {
+                        id: index + 1,
+                        tag: identity & READ_OBJECT_TAG_MASK,
+                        stage: match (identity >> 56) & 15 {
+                            1 => ReadObjectDiagnosticStage::PeerReadVerify,
+                            3 => ReadObjectDiagnosticStage::CacheHitRootFallback,
+                            _ => ReadObjectDiagnosticStage::CacheHitReadVerify,
+                        },
+                        start_ns: slot.start_ns.load(Ordering::Acquire),
+                        end_ns: slot.end_ns.load(Ordering::Relaxed),
+                        completed: status != 0,
+                        success: status == 1,
+                    }
+                })
+                .collect(),
             records,
             coarse_phases: READ_COARSE_PHASES
                 .iter()
@@ -1444,6 +1594,24 @@ fn monotonic_ns() -> Option<u64> {
     };
     // SAFETY: value is a valid writable timespec and clock_gettime retains no pointer.
     if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut value) } != 0 {
+        return None;
+    }
+    let seconds = u64::try_from(value.tv_sec).ok()?;
+    let nanos = u64::try_from(value.tv_nsec)
+        .ok()
+        .filter(|n| *n < 1_000_000_000)?;
+    seconds.checked_mul(1_000_000_000)?.checked_add(nanos)
+}
+
+#[cfg(any(feature = "dfs", test))]
+fn process_cpu_ns() -> Option<u64> {
+    let mut value = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: value is writable and aligned for this call; the process clock
+    // reads this process's CPU total and retains no pointer or other state.
+    if unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut value) } != 0 {
         return None;
     }
     let seconds = u64::try_from(value.tv_sec).ok()?;
@@ -1786,6 +1954,70 @@ mod tests {
         assert!(metrics.coarse_diagnostic("persist_body_sync", 1).is_none());
         assert!(metrics.diagnostics_snapshot().is_none());
         assert!(metrics.with_read_diagnostics(false).diagnostics.is_none());
+    }
+
+    #[test]
+    fn object_diagnostics_off_has_no_identity_or_clock_storage() {
+        let registry = afs_metrics::Registry::new();
+        let metrics = ReadWorkMetrics::register(&registry).unwrap();
+        assert!(
+            metrics
+                .object_diagnostic(
+                    super::ReadObjectDiagnosticStage::PeerReadVerify,
+                    "not-retained",
+                )
+                .is_none()
+        );
+        assert!(metrics.diagnostics.is_none());
+    }
+
+    #[test]
+    fn object_diagnostics_are_bounded_and_distinguish_active_success_and_drop() {
+        let registry = afs_metrics::Registry::new();
+        let metrics = ReadWorkMetrics::register(&registry)
+            .unwrap()
+            .with_read_diagnostics(true);
+        let stage = super::ReadObjectDiagnosticStage::CacheHitReadVerify;
+        let active = metrics.object_diagnostic(stage, "same-object").unwrap();
+        let snapshot = metrics.diagnostics_snapshot().unwrap();
+        assert!(!snapshot.object_records[0].completed);
+        active.finish(true);
+        drop(metrics.object_diagnostic(stage, "same-object").unwrap());
+        for _ in 2..super::READ_OBJECT_DIAGNOSTIC_CAPACITY {
+            metrics
+                .object_diagnostic(stage, "same-object")
+                .unwrap()
+                .finish(true);
+        }
+        assert!(metrics.object_diagnostic(stage, "overflow").is_none());
+        let snapshot = metrics.diagnostics_snapshot().unwrap();
+        assert_eq!(snapshot.object_records.len(), 120);
+        assert_eq!(snapshot.object_overflow, 1);
+        assert_eq!(snapshot.records.len(), 0);
+        assert_eq!(snapshot.clock_failures, 0);
+        assert!(snapshot.sampled_monotonic_ns.is_some());
+        assert!(snapshot.process_cpu_ns.is_some());
+        let next_snapshot = metrics.diagnostics_snapshot().unwrap();
+        assert!(next_snapshot.sampled_monotonic_ns >= snapshot.sampled_monotonic_ns);
+        assert!(next_snapshot.process_cpu_ns >= snapshot.process_cpu_ns);
+        assert!(snapshot.object_records[0].completed && snapshot.object_records[0].success);
+        assert!(snapshot.object_records[1].completed && !snapshot.object_records[1].success);
+        assert_eq!(
+            snapshot.object_records[0].tag,
+            snapshot.object_records[1].tag
+        );
+        assert_eq!(snapshot.object_records[0].stage, stage);
+        assert!(
+            snapshot
+                .object_records
+                .iter()
+                .all(|entry| entry.end_ns >= entry.start_ns)
+        );
+        assert!(
+            snapshot.metadata_bytes + 2 * std::mem::size_of::<super::ReadDiagnosticIntervals>()
+                <= super::READ_DIAGNOSTIC_MAX_METADATA_BYTES
+        );
+        assert_eq!(std::mem::size_of::<super::ReadObjectDiagnosticSlot>(), 24);
     }
 
     #[test]

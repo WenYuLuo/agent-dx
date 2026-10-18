@@ -3309,6 +3309,12 @@ impl LocalChunkStore {
         // Includes catalog/file identity work and actual read/verification;
         // excludes slot acquisition and the optional sidecar repair below.
         let read_verify = self.coarse_diagnostic("peer_read_verify", length as u64);
+        let object_diagnostic = self.read_work.as_ref().and_then(|metrics| {
+            metrics.object_diagnostic(
+                super::read_work::ReadObjectDiagnosticStage::PeerReadVerify,
+                &chunk_id.0,
+            )
+        });
         let mut repair_proof = None;
         let result = (|| {
             let record = self.peer_catalog_record(chunk_id)?;
@@ -3546,6 +3552,9 @@ impl LocalChunkStore {
         {
             self.retire_observed_peer_resident(slot.as_ref());
             slot.take();
+        }
+        if let Some(diagnostic) = object_diagnostic {
+            diagnostic.finish(result.is_ok());
         }
         drop(read_verify);
         // Optional proof I/O never holds the serve table; reads and the W-0
