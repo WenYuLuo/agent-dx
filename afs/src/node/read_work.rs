@@ -76,6 +76,11 @@ fn thread_cpu_ns() -> Option<u64> {
 pub struct ReadWorkMetrics {
     scan_bytes: afs_metrics::IntCounter,
     hashes: afs_metrics::IntCounterVec,
+    outboard_total_bytes: afs_metrics::IntGauge,
+    outboard_resident_bytes: afs_metrics::IntGauge,
+    outboard_total_limit: afs_metrics::IntGauge,
+    outboard_resident_limit: afs_metrics::IntGauge,
+    outboard_events: afs_metrics::IntCounterVec,
     #[cfg(any(feature = "dfs", test))]
     disk_cache_metadata_bytes: afs_metrics::IntGauge,
     #[cfg(any(feature = "dfs", test))]
@@ -169,6 +174,24 @@ impl ReadWorkMetrics {
             afs_metrics::register_collector(registry, &disk_cache_metadata_bytes)?;
             #[cfg(any(feature = "dfs", test))]
             afs_metrics::register_collector(registry, &disk_cache_metadata_peak_bytes)?;
+            let outboard_total_bytes = afs_metrics::IntGauge::new(
+                "afs_dfs_outboard_metadata_bytes", "All live Node outboard ledger charges, including resident and working metadata; not RSS.")?;
+            let outboard_resident_bytes = afs_metrics::IntGauge::new(
+                "afs_dfs_outboard_resident_bytes", "Resident subset of the same Node outboard ledger, retained until the last allocation owner releases.")?;
+            let outboard_total_limit = afs_metrics::IntGauge::new(
+                "afs_dfs_outboard_metadata_limit_bytes", "Shared Node outboard ledger limit; resident is a subset, not another pool.")?;
+            let outboard_resident_limit = afs_metrics::IntGauge::new(
+                "afs_dfs_outboard_resident_limit_bytes", "Resident admission sublimit within the shared Node outboard ledger.")?;
+            let outboard_events = afs_metrics::IntCounterVec::new(
+                afs_metrics::Opts::new("afs_dfs_outboard_events_total",
+                    "Bounded outboard admission failures and actual native write/range fallback events."), &["event"])?;
+            for event in ["reserve_total_failed", "reserve_resident_failed", "write_without_proof", "range_fullscan_fallback", "range_fullscan_unretained"] {
+                outboard_events.with_label_values(&[event]);
+            }
+            for gauge in [&outboard_total_bytes, &outboard_resident_bytes, &outboard_total_limit, &outboard_resident_limit] {
+                afs_metrics::register_collector(registry, gauge)?;
+            }
+            afs_metrics::register_collector(registry, &outboard_events)?;
             let scans = afs_metrics::IntCounter::new(
                 "afs_dfs_read_scans_total",
                 "Immutable Chunk verification scans, including failed scans.",
@@ -385,6 +408,11 @@ impl ReadWorkMetrics {
             Ok(Self {
                 scan_bytes,
                 hashes,
+                outboard_total_bytes,
+                outboard_resident_bytes,
+                outboard_total_limit,
+                outboard_resident_limit,
+                outboard_events,
                 #[cfg(any(feature = "dfs", test))]
                 disk_cache_metadata_bytes,
                 #[cfg(any(feature = "dfs", test))]
@@ -630,6 +658,39 @@ impl ReadWorkMetrics {
             metrics: self,
             bytes: 0,
             copied: 0,
+        }
+    }
+
+    pub(crate) fn outboard_limits(&self, total: usize, resident: usize) {
+        if let (Ok(total), Ok(resident)) = (i64::try_from(total), i64::try_from(resident)) {
+            self.outboard_total_limit.set(total);
+            self.outboard_resident_limit.set(resident);
+        }
+    }
+    pub(crate) fn outboard_adjust(&self, resident: bool, bytes: usize, add: bool) {
+        if let Ok(bytes) = i64::try_from(bytes) {
+            let gauge = if resident {
+                &self.outboard_resident_bytes
+            } else {
+                &self.outboard_total_bytes
+            };
+            if add {
+                gauge.add(bytes);
+            } else {
+                gauge.sub(bytes);
+            }
+        }
+    }
+    pub(crate) fn outboard_event(&self, event: &'static str) {
+        if matches!(
+            event,
+            "reserve_total_failed"
+                | "reserve_resident_failed"
+                | "write_without_proof"
+                | "range_fullscan_fallback"
+                | "range_fullscan_unretained"
+        ) {
+            self.outboard_events.with_label_values(&[event]).inc();
         }
     }
 

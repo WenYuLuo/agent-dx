@@ -60,6 +60,7 @@ pub const DFS_WRITE_LEASE_SECONDS: u64 = 30;
 pub const DEFAULT_DIRTY_DATA_BUDGET_BYTES: u64 = 16 * 1024 * 1024;
 const ROOT_INODE: u64 = 1;
 const DEFAULT_VERSION_CACHE_ENTRIES: usize = 4096;
+const DEFAULT_VERSION_CACHE_BYTES: usize = 32 * 1024 * 1024;
 const NATIVE_READ_VIEW_TTL: Duration = Duration::from_secs(5);
 const COMMIT_CHUNK_BYTES: u64 = crate::node::chunk::MAX_STAGED_CHUNK_BYTES as u64;
 const DEFERRED_PUBLICATION_WINDOW_BYTES: u64 = 64 * 1024 * 1024;
@@ -264,7 +265,7 @@ pub struct DistributedFs {
     closed_lock_sessions: Mutex<HashSet<String>>,
     closed_lock_session_admission_closed: AtomicBool,
     remote_operation_results: Mutex<HashMap<RemoteOperationKey, RemoteOperationResult>>,
-    readonly_version_cache: Mutex<BoundedLru<FileVersionId, Arc<ReadOnlyVersion>>>,
+    readonly_version_cache: Mutex<ReadOnlyVersionCache>,
     readonly_empty_version: Arc<ReadOnlyVersion>,
     dirty_budget_bytes: u64,
     write_buffer_pool: Arc<WriteBufferPool>,
@@ -285,7 +286,140 @@ struct ReadOnlyVersion {
     index: LayoutReadIndex,
 }
 
+struct CachedReadOnlyVersion {
+    value: Arc<ReadOnlyVersion>,
+    retained_bytes: usize,
+}
+
+/// Bounds this cache's retained metadata estimate, not total Node RSS. Evicted
+/// Arc values stay live until their active readers release them. Cache-owned
+/// containers are charged conservatively at their configured maximum, so a
+/// HashMap's retained capacity after eviction cannot escape the byte budget.
+struct ReadOnlyVersionCache {
+    entries: BoundedLru<FileVersionId, CachedReadOnlyVersion>,
+    capacity: usize,
+    byte_limit: usize,
+    table_bytes: usize,
+    value_bytes: usize,
+    entry_count: usize,
+}
+
+impl ReadOnlyVersionCache {
+    fn new(capacity: usize, byte_limit: usize) -> Self {
+        // Four times each slot permits hash-table growth/control storage and
+        // sparsely occupied BTree nodes; the base covers small-table/node
+        // allocations. Charge both key buffers separately in each value.
+        let table_slot = std::mem::size_of::<(FileVersionId, CachedReadOnlyVersion, u64)>()
+            .saturating_add(std::mem::size_of::<(u64, FileVersionId)>())
+            .saturating_mul(4)
+            .saturating_add(64);
+        let table_bytes = capacity.saturating_mul(table_slot).saturating_add(2048);
+        Self {
+            entries: BoundedLru::new(capacity),
+            capacity,
+            byte_limit,
+            table_bytes,
+            value_bytes: 0,
+            entry_count: 0,
+        }
+    }
+
+    fn get(&mut self, key: &FileVersionId) -> Option<&Arc<ReadOnlyVersion>> {
+        self.entries.get(key).map(|entry| &entry.value)
+    }
+
+    fn insert(&mut self, key: FileVersionId, value: Arc<ReadOnlyVersion>) {
+        if let Some(previous) = self.entries.remove(&key) {
+            self.value_bytes = self.value_bytes.saturating_sub(previous.retained_bytes);
+            self.entry_count -= 1;
+        }
+        let retained_bytes = value.cache_retained_bytes(&key);
+        if self.capacity == 0 || self.table_bytes.saturating_add(retained_bytes) > self.byte_limit {
+            if self.entry_count == 0 {
+                // A rejected replacement must also release any old empty table
+                // allocation; zero retained entries otherwise have zero charge.
+                self.entries = BoundedLru::new(self.capacity);
+            }
+            return;
+        }
+        while self.entry_count >= self.capacity
+            || self
+                .table_bytes
+                .saturating_add(self.value_bytes)
+                .saturating_add(retained_bytes)
+                > self.byte_limit
+        {
+            let Some((_, evicted)) = self.entries.pop_oldest() else {
+                return;
+            };
+            self.value_bytes = self.value_bytes.saturating_sub(evicted.retained_bytes);
+            self.entry_count -= 1;
+        }
+        self.entries.insert(
+            key,
+            CachedReadOnlyVersion {
+                value,
+                retained_bytes,
+            },
+        );
+        self.value_bytes = self.value_bytes.saturating_add(retained_bytes);
+        self.entry_count += 1;
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entry_count
+    }
+}
+
 impl ReadOnlyVersion {
+    fn cache_retained_bytes(&self, key: &FileVersionId) -> usize {
+        // The hash table and recency tree each own a key. Counting the source
+        // capacity twice conservatively covers the cloned key's allocation.
+        // Heap allocations also include a two-word bookkeeping allowance;
+        // this remains a portable retained-size estimate, not allocator RSS.
+        let heap = |capacity: usize| {
+            if capacity == 0 {
+                0
+            } else {
+                capacity.saturating_add(2 * std::mem::size_of::<usize>())
+            }
+        };
+        let mut bytes = std::mem::size_of::<Self>()
+            .saturating_add(2 * std::mem::size_of::<usize>())
+            .saturating_add(heap(key.0.capacity()).saturating_mul(2))
+            .saturating_add(heap(self.layout.id.0.capacity()))
+            .saturating_add(heap(
+                self.layout
+                    .inline_extents
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Extent>()),
+            ))
+            .saturating_add(heap(
+                self.index
+                    .entries
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<IndexedExtent>()),
+            ));
+        if let Some(version) = &self.version {
+            for capacity in [
+                version.id.0.capacity(),
+                version.inode_id.0.capacity(),
+                version
+                    .parent_version
+                    .as_ref()
+                    .map_or(0, |id| id.0.capacity()),
+                version.layout_root.0.capacity(),
+            ] {
+                bytes = bytes.saturating_add(heap(capacity));
+            }
+        }
+        for extent in &self.layout.inline_extents {
+            bytes = bytes.saturating_add(heap(extent.chunk_id.0.capacity()));
+        }
+        bytes
+    }
+
     fn empty() -> Self {
         Self {
             version: None,
@@ -1951,7 +2085,10 @@ impl DistributedFs {
             closed_lock_sessions: Mutex::new(HashSet::new()),
             closed_lock_session_admission_closed: AtomicBool::new(false),
             remote_operation_results: Mutex::new(HashMap::new()),
-            readonly_version_cache: Mutex::new(BoundedLru::new(DEFAULT_VERSION_CACHE_ENTRIES)),
+            readonly_version_cache: Mutex::new(ReadOnlyVersionCache::new(
+                DEFAULT_VERSION_CACHE_ENTRIES,
+                DEFAULT_VERSION_CACHE_BYTES,
+            )),
             readonly_empty_version: Arc::new(ReadOnlyVersion::empty()),
             dirty_budget_bytes: DEFAULT_DIRTY_DATA_BUDGET_BYTES,
             write_buffer_pool: WriteBufferPool::new(128 * 1024 * 1024),
@@ -1971,7 +2108,20 @@ impl DistributedFs {
     }
 
     pub(crate) fn with_version_cache_capacity(mut self, capacity: usize) -> Self {
-        self.readonly_version_cache = Mutex::new(BoundedLru::new(capacity));
+        let cache = self
+            .readonly_version_cache
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner());
+        *cache = ReadOnlyVersionCache::new(capacity, cache.byte_limit);
+        self
+    }
+
+    pub(crate) fn with_version_cache_bytes(mut self, bytes: u64) -> Self {
+        let cache = self
+            .readonly_version_cache
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner());
+        *cache = ReadOnlyVersionCache::new(cache.capacity, usize::try_from(bytes).unwrap_or(0));
         self
     }
 
@@ -21354,6 +21504,244 @@ mod tests {
         assert_eq!(meta.get_inode_call_count(), get_inode_after_cache_fill);
 
         fs.release(&context(), reader).unwrap();
+    }
+
+    fn p2_byte_cache_version(name: &str, extent_count: usize) -> Arc<ReadOnlyVersion> {
+        let id = FileVersionId::new(name);
+        let layout_id = LayoutRootId::new(format!("{name}-layout"));
+        let length = extent_count as u64 * 2;
+        let chunk_id = "c".repeat(512);
+        let layout = LayoutRoot {
+            id: layout_id.clone(),
+            file_length: length,
+            inline_extents: (0..extent_count)
+                .map(|index| Extent {
+                    file_offset: index as u64 * 2,
+                    length: 1,
+                    chunk_id: crate::dfs::ChunkId::new(chunk_id.clone()),
+                    chunk_offset: 0,
+                })
+                .collect(),
+        };
+        let version = FileVersion {
+            id: id.clone(),
+            inode_id: InodeId::new("byte-cache-file"),
+            parent_version: None,
+            length,
+            layout_root: layout_id,
+            created_at_unix_ms: 0,
+        };
+        Arc::new(ReadOnlyVersion::checked(&id, version, layout).unwrap())
+    }
+
+    #[test]
+    fn p2_version_cache_bytes_evict_fragmented_lru_without_retiring_active_reader() {
+        let (_temp, _meta, fs) = test_fs();
+        let held = p2_byte_cache_version("byte-first", 24_000);
+        let second = p2_byte_cache_version("byte-second", 24_000);
+        let third = p2_byte_cache_version("byte-third", 24_000);
+        let first_id = held.version.as_ref().unwrap().id.clone();
+        let second_id = second.version.as_ref().unwrap().id.clone();
+        let third_id = third.version.as_ref().unwrap().id.clone();
+        let expected = held.ops(2, 3).unwrap();
+        assert_eq!(expected.len(), 2);
+        let weak = Arc::downgrade(&held);
+        {
+            let mut cache = fs.readonly_version_cache.lock().unwrap();
+            cache.insert(first_id.clone(), held.clone());
+            cache.insert(second_id.clone(), second);
+            assert!(cache.get(&first_id).is_some());
+            cache.insert(third_id.clone(), third);
+            assert_eq!(cache.len(), 2, "three fragmented layouts exceed 32MiB");
+            assert!(
+                cache.get(&second_id).is_none(),
+                "the untouched entry is oldest"
+            );
+            assert!(cache.get(&third_id).is_some());
+            assert!(cache.get(&first_id).is_some());
+            // Make the held version oldest and evict only the cache's owner.
+            let fourth_id = FileVersionId::new("byte-fourth");
+            cache.insert(
+                fourth_id.clone(),
+                p2_byte_cache_version("byte-fourth", 24_000),
+            );
+            assert!(cache.get(&fourth_id).is_some());
+            cache.insert(
+                FileVersionId::new("byte-fifth"),
+                p2_byte_cache_version("byte-fifth", 24_000),
+            );
+            assert!(cache.get(&first_id).is_none());
+        }
+        assert_eq!(held.ops(2, 3).unwrap(), expected);
+        assert!(
+            weak.upgrade().is_some(),
+            "the active reader still owns its metadata"
+        );
+        drop(held);
+        assert!(
+            weak.upgrade().is_none(),
+            "the cache has no retired ownership"
+        );
+    }
+
+    #[test]
+    fn p2_version_cache_bytes_counts_reserved_extent_and_index_capacity() {
+        const LIMIT: usize = 32 * 1024 * 1024;
+        for index_capacity in [false, true] {
+            let (_temp, _meta, fs) = test_fs();
+            let mut version = p2_byte_cache_version("reserved-layout", 1);
+            let value = Arc::get_mut(&mut version).unwrap();
+            if index_capacity {
+                value
+                    .index
+                    .entries
+                    .reserve_exact(LIMIT / std::mem::size_of::<IndexedExtent>());
+            } else {
+                value
+                    .layout
+                    .inline_extents
+                    .reserve_exact(LIMIT / std::mem::size_of::<Extent>());
+            }
+            let id = version.version.as_ref().unwrap().id.clone();
+            let mut cache = fs.readonly_version_cache.lock().unwrap();
+            cache.insert(id.clone(), version.clone());
+            assert!(
+                cache.get(&id).is_none(),
+                "capacity counts even when len is one"
+            );
+            assert_eq!(version.ops(0, 1).unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn p2_version_cache_bytes_counts_string_capacity_and_same_key_replacement() {
+        const MIB: usize = 1024 * 1024;
+        let (_temp, _meta, fs) = test_fs();
+        let mut inflated = p2_byte_cache_version("replacement", 1);
+        Arc::get_mut(&mut inflated).unwrap().layout.inline_extents[0]
+            .chunk_id
+            .0
+            .reserve_exact(12 * MIB);
+        let compact = Arc::new(
+            ReadOnlyVersion::checked(
+                &inflated.version.as_ref().unwrap().id,
+                inflated.version.clone().unwrap(),
+                inflated.layout.clone(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(inflated.layout, compact.layout);
+        let id = inflated.version.as_ref().unwrap().id.clone();
+        let second = p2_byte_cache_version("replacement-second", 24_000);
+        let second_id = second.version.as_ref().unwrap().id.clone();
+        let third = p2_byte_cache_version("replacement-third", 24_000);
+        let third_id = third.version.as_ref().unwrap().id.clone();
+        let mut cache = fs.readonly_version_cache.lock().unwrap();
+        cache.insert(id.clone(), inflated.clone());
+        cache.insert(second_id.clone(), second);
+        cache.insert(id.clone(), compact);
+        cache.insert(third_id.clone(), third);
+        assert!(
+            cache.get(&second_id).is_some(),
+            "replaced capacity must be subtracted"
+        );
+        assert!(cache.get(&third_id).is_some());
+        cache.insert(id.clone(), inflated);
+        assert!(
+            cache.get(&second_id).is_none(),
+            "expanded replacement must be charged"
+        );
+        assert!(cache.get(&third_id).is_some());
+        assert!(cache.get(&id).is_some());
+    }
+
+    #[test]
+    fn p2_version_cache_bytes_counts_version_layout_and_key_string_capacity() {
+        const LIMIT: usize = 32 * 1024 * 1024;
+        for field in [
+            "version",
+            "inode",
+            "parent",
+            "version-layout",
+            "layout",
+            "key",
+        ] {
+            let (_temp, _meta, fs) = test_fs();
+            let mut value = p2_byte_cache_version("reserved-id", 1);
+            let mut key = value.version.as_ref().unwrap().id.clone();
+            let inner = Arc::get_mut(&mut value).unwrap();
+            let version = inner.version.as_mut().unwrap();
+            version.parent_version = Some(FileVersionId::new("parent"));
+            let string = match field {
+                "version" => &mut version.id.0,
+                "inode" => &mut version.inode_id.0,
+                "parent" => &mut version.parent_version.as_mut().unwrap().0,
+                "version-layout" => &mut version.layout_root.0,
+                "layout" => &mut inner.layout.id.0,
+                "key" => &mut key.0,
+                _ => unreachable!(),
+            };
+            string.reserve_exact(LIMIT);
+            let lookup = key.clone();
+            let mut cache = fs.readonly_version_cache.lock().unwrap();
+            cache.insert(key, value.clone());
+            assert!(
+                cache.get(&lookup).is_none(),
+                "reserved {field} capacity must count"
+            );
+            assert_eq!(value.ops(0, 1).unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn p2_version_cache_bytes_small_limit_survives_both_configuration_orders() {
+        for bytes_first in [false, true] {
+            let (_temp, meta, fs) = test_fs();
+            let fs = if bytes_first {
+                fs.with_version_cache_bytes(1)
+                    .with_version_cache_capacity(2)
+            } else {
+                fs.with_version_cache_capacity(2)
+                    .with_version_cache_bytes(1)
+            };
+            let head = meta.publish_external_version(17);
+            let before = meta.file_version_load_count();
+            let first = fs.load_readonly_version(Some(&head)).unwrap();
+            let second = fs.load_readonly_version(Some(&head)).unwrap();
+            assert!(!Arc::ptr_eq(&first, &second));
+            assert_eq!(first.layout.file_length, 17);
+            assert_eq!(meta.file_version_load_count() - before, 2);
+            assert_eq!(fs.readonly_version_cache.lock().unwrap().len(), 0);
+        }
+    }
+
+    #[test]
+    fn p2_version_cache_bytes_oversized_version_remains_usable_without_retention() {
+        let (_temp, meta, fs) = test_fs();
+        let oversized = p2_byte_cache_version("oversized-source", 64_000);
+        let head = meta.publish_external_version_with_receipts(
+            oversized.layout.file_length,
+            oversized.layout.inline_extents.clone(),
+            Vec::new(),
+        );
+        drop(oversized);
+        let before = meta.file_version_load_count();
+        let first = fs.load_readonly_version(Some(&head)).unwrap();
+        let second = fs.load_readonly_version(Some(&head)).unwrap();
+        assert_eq!(first.ops(2, 3).unwrap().len(), 2);
+        assert_eq!(first.layout, second.layout);
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "an overlarge version is not retained"
+        );
+        assert_eq!(meta.file_version_load_count() - before, 2);
+        assert!(
+            fs.readonly_version_cache
+                .lock()
+                .unwrap()
+                .get(&head)
+                .is_none()
+        );
     }
 
     #[test]

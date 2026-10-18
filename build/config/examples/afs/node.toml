@@ -23,6 +23,9 @@ uds_path = "/opt/adx/run/afs/node-a.sock"
 # fuse_max_readahead_bytes = 1048576
 # Resident immutable metadata entries, not a byte or authorization budget.
 # dfs_version_cache_entries = 4096
+# Cache-retained metadata estimate; active reader Arcs and Node RSS are separate.
+# Includes layout/index capacities, ID buffers and conservative cache-table overhead.
+# dfs_version_cache_bytes = 33554432
 timeout_ms = 5000
 log_level = "info"
 trace_enabled = false

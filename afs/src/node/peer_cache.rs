@@ -674,7 +674,7 @@ impl CacheState {
     fn new(budget: Arc<OutboardBudget>) -> Self {
         // All optional proof slots are bounded up front. A small shared budget
         // can disable proof acceleration without disabling complete verification.
-        let index_lease = budget.try_reserve(
+        let index_lease = budget.try_reserve_resident(
             MAX_PEER_CACHE_ENTRIES * std::mem::size_of::<Option<Box<VerifiedDiskOutboard>>>(),
         );
         Self {
@@ -1218,6 +1218,7 @@ impl PeerCacheOperation<'_> {
                 ) {
                     Ok(()) => None,
                     Err(error) if error.code() == afs_error::IO_CAPACITY => {
+                        self.state.budget.record_range_fullscan_fallback();
                         // Optional proof work must not create a new read failure
                         // when another live proof temporarily holds the ledger.
                         let started = Instant::now();
@@ -1253,6 +1254,9 @@ impl PeerCacheOperation<'_> {
                 } else {
                     None
                 };
+                // Without the retained complete FileIdentity we cannot claim
+                // unchanged bytes merely because a trailer is well shaped.
+                self.state.budget.record_range_fullscan_unretained();
                 let result = scan_body(
                     &mut file,
                     body_start,
@@ -1619,16 +1623,41 @@ fn install_proof(
         entry.proof = None;
     }
     refresh_metadata(state);
-    if proof_can_fit(state)
-        && let Some(outboard) = outboard
-        && let Some(lease) = state.budget.try_reserve(proof_allocation_charge() as usize)
-        && let Some(entry) = state.entries.get_mut(key)
-    {
-        entry.proof = Some(Box::new(VerifiedDiskOutboard {
-            identity,
-            outboard,
-            _lease: lease,
-        }));
+    if !proof_can_fit(state) {
+        return;
+    }
+    let Some(outboard) = outboard.filter(|proof| proof.uses_budget(&state.budget)) else {
+        return;
+    };
+    loop {
+        // The pointer index, identity wrapper and shared proof all use the same
+        // resident sublimit. This promotion never charges the proof twice total.
+        if let Some(lease) = state
+            .budget
+            .try_reserve_resident(proof_allocation_charge() as usize)
+            && outboard.try_mark_resident()
+        {
+            if let Some(entry) = state.entries.get_mut(key) {
+                entry.proof = Some(Box::new(VerifiedDiskOutboard {
+                    identity,
+                    outboard,
+                    _lease: lease,
+                }));
+            }
+            break;
+        }
+        // Retire only old proof ownership. Healthy body entries remain usable;
+        // outside Arc holders keep their own resident charge until last drop.
+        let victim = state
+            .entries
+            .values_mut()
+            .filter(|entry| entry.proof.is_some())
+            .min_by_key(|entry| entry.touched);
+        let Some(entry) = victim else {
+            break;
+        };
+        entry.proof = None;
+        refresh_metadata(state);
     }
     refresh_metadata(state);
 }
@@ -2140,6 +2169,88 @@ mod tests {
         );
         assert_eq!(budget.used(), budget.limit());
         drop(held);
+    }
+
+    #[test]
+    fn pr60_natural_resident_pressure_preserves_shared_working_headroom() {
+        use std::sync::{
+            Barrier,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let budget = OutboardBudget::new(MAX_PEER_CACHE_PROOF_BYTES as usize);
+        let mut config = options(temp.path().join("cache"));
+        config.capacity_bytes = 64 * 1024 * 1024;
+        let cache = DiskPeerCache::open_with_outboard_budget(config, budget.clone()).unwrap();
+        let index_charge = budget.used();
+        let first = StagedChunk::new(OperationId::new("resident-first"), vec![0; 4096]);
+        assert!(fill(&cache, &first).unwrap());
+        let one_proof = budget.used() - index_charge;
+        assert!(one_proof > 0);
+        // Use actual natural proof ownership, not an injected global reservation.
+        // Unique 4KiB objects keep real body data below 16MiB / 4096 entries.
+        let objects = (budget.limit() / 2) / one_proof + 16;
+        assert!(objects < MAX_PEER_CACHE_ENTRIES);
+        for index in 1..objects {
+            let mut bytes = vec![0; 4096];
+            bytes[..8].copy_from_slice(&(index as u64).to_le_bytes());
+            let staged = StagedChunk::new(OperationId::new(format!("resident-{index}")), bytes);
+            assert!(fill(&cache, &staged).unwrap());
+        }
+        assert_eq!(
+            cache.stats().unwrap().entries,
+            objects,
+            "proof retention may retire metadata, never healthy body entries"
+        );
+        assert!(
+            budget.used() <= budget.limit() / 2,
+            "natural resident proofs consumed the working half: used={} total={}",
+            budget.used(),
+            budget.limit()
+        );
+
+        let ready = Arc::new(Barrier::new(9));
+        let release = Arc::new(Barrier::new(9));
+        let peak = Arc::new(AtomicUsize::new(budget.used()));
+        let mut threads = Vec::new();
+        for _ in 0..8 {
+            let (budget, ready, release, peak) =
+                (budget.clone(), ready.clone(), release.clone(), peak.clone());
+            threads.push(std::thread::spawn(move || {
+                let work = budget.try_reserve(64 * 1024);
+                peak.fetch_max(budget.used(), Ordering::AcqRel);
+                ready.wait();
+                release.wait();
+                work.is_some()
+            }));
+        }
+        ready.wait();
+        release.wait();
+        let admitted: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        assert!(
+            admitted.into_iter().all(|value| value),
+            "bounded 512KiB working admission must remain available after resident pressure"
+        );
+        assert!(peak.load(Ordering::Acquire) <= budget.limit());
+        assert!(budget.used() <= budget.limit() / 2);
+        let mut output = [99; 19];
+        assert!(
+            cache
+                .operation()
+                .unwrap()
+                .read_range(&first.chunk, 0, &mut output)
+                .unwrap()
+        );
+        assert_eq!(output, [0; 19]);
+        cache.shutdown().unwrap();
+        assert_eq!(
+            budget.used(),
+            0,
+            "resident and working ownership must both retire"
+        );
     }
 
     #[test]

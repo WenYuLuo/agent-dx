@@ -3015,8 +3015,12 @@ mod dispatch_tests {
     }
 
     #[test]
-    fn inode_cache_open_fence_drains_with_one_or_two_dispatch_workers() {
-        for workers in [1, 2] {
+    fn inode_cache_open_fence_drains_with_small_and_production_worker_counts() {
+        for workers in [
+            1,
+            2,
+            usize::from(super::FuseMountOptions::default().fuse_workers),
+        ] {
             let dispatch = Arc::new(super::FuseDispatch::new(workers));
             let gate = Arc::new(std::sync::RwLock::new(()));
             let (started_tx, started_rx) = std::sync::mpsc::channel();
@@ -3132,8 +3136,12 @@ mod dispatch_tests {
     }
 
     #[test]
-    fn borrowed_write_and_release_follow_the_read_batch_with_one_or_two_workers() {
-        for workers in [1, 2] {
+    fn borrowed_write_and_release_follow_the_read_batch_with_production_workers() {
+        for workers in [
+            1,
+            2,
+            usize::from(super::FuseMountOptions::default().fuse_workers),
+        ] {
             let dispatch = super::FuseDispatch::new(workers);
             let events = Arc::new(std::sync::Mutex::new(Vec::new()));
             for value in [1, 2] {
@@ -3836,52 +3844,59 @@ mod dispatch_tests {
 
     #[test]
     fn closing_dispatch_drops_a_blocked_callback_without_running_its_body() {
-        for access in [super::FuseAccess::Exclusive, super::FuseAccess::Read] {
-            let dispatch = Arc::new(FuseDispatch::new(1));
-            let (started_tx, started_rx) = mpsc::channel();
-            let (release_tx, release_rx) = mpsc::channel();
-            dispatch.submit_access(51, access, move || {
-                started_tx.send(()).unwrap();
-                release_rx.recv().unwrap();
-            });
-            started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-            for _ in 1..dispatch.capacity {
-                dispatch.submit_access(51, access, || {});
-            }
-            let (submitting_tx, submitting_rx) = mpsc::channel();
-            let (returned_tx, returned_rx) = mpsc::channel();
-            let (body_tx, body_rx) = mpsc::channel();
-            let (dropped_tx, dropped_rx) = mpsc::channel();
-            let producer_dispatch = dispatch.clone();
-            let producer = std::thread::spawn(move || {
-                let captured_reply = RejectedCallbackCapture(dropped_tx);
-                submitting_tx.send(()).unwrap();
-                producer_dispatch.submit_access(52, access, move || {
-                    let _captured_reply = captured_reply;
-                    body_tx.send(()).unwrap();
+        for workers in [
+            1,
+            usize::from(super::FuseMountOptions::default().fuse_workers),
+        ] {
+            for access in [super::FuseAccess::Exclusive, super::FuseAccess::Read] {
+                let dispatch = Arc::new(FuseDispatch::new(workers));
+                let (started_tx, started_rx) = mpsc::channel();
+                let (release_tx, release_rx) = mpsc::channel();
+                // An exclusive predecessor keeps both queued access kinds behind
+                // the same handle barrier even with production worker concurrency.
+                dispatch.submit_access(51, super::FuseAccess::Exclusive, move || {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
                 });
-                returned_tx.send(()).unwrap();
-            });
-            submitting_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-            let early_admission = returned_rx.recv_timeout(Duration::from_millis(100));
-            let drain_dispatch = dispatch.clone();
-            let drainer = std::thread::spawn(move || drain_dispatch.close_and_drain());
-            let rejected = returned_rx.recv_timeout(Duration::from_secs(1));
-            let captured_reply_dropped = dropped_rx.recv_timeout(Duration::from_secs(1));
-            release_tx.send(()).unwrap();
-            producer.join().unwrap();
-            drainer.join().unwrap();
-            assert!(early_admission.is_err(), "full queue admitted a callback");
-            assert!(rejected.is_ok(), "closing left an ingress waiter blocked");
-            assert!(
-                captured_reply_dropped.is_ok(),
-                "rejected reply was retained"
-            );
-            assert!(
-                body_rx.try_recv().is_err(),
-                "closing executed an unaccepted callback"
-            );
-            assert_eq!(dispatch.shared.queue.lock().unwrap().jobs, 0);
+                started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+                for _ in 1..dispatch.capacity {
+                    dispatch.submit_access(51, access, || {});
+                }
+                let (submitting_tx, submitting_rx) = mpsc::channel();
+                let (returned_tx, returned_rx) = mpsc::channel();
+                let (body_tx, body_rx) = mpsc::channel();
+                let (dropped_tx, dropped_rx) = mpsc::channel();
+                let producer_dispatch = dispatch.clone();
+                let producer = std::thread::spawn(move || {
+                    let captured_reply = RejectedCallbackCapture(dropped_tx);
+                    submitting_tx.send(()).unwrap();
+                    producer_dispatch.submit_access(52, access, move || {
+                        let _captured_reply = captured_reply;
+                        body_tx.send(()).unwrap();
+                    });
+                    returned_tx.send(()).unwrap();
+                });
+                submitting_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+                let early_admission = returned_rx.recv_timeout(Duration::from_millis(100));
+                let drain_dispatch = dispatch.clone();
+                let drainer = std::thread::spawn(move || drain_dispatch.close_and_drain());
+                let rejected = returned_rx.recv_timeout(Duration::from_secs(1));
+                let captured_reply_dropped = dropped_rx.recv_timeout(Duration::from_secs(1));
+                release_tx.send(()).unwrap();
+                producer.join().unwrap();
+                drainer.join().unwrap();
+                assert!(early_admission.is_err(), "full queue admitted a callback");
+                assert!(rejected.is_ok(), "closing left an ingress waiter blocked");
+                assert!(
+                    captured_reply_dropped.is_ok(),
+                    "rejected reply was retained"
+                );
+                assert!(
+                    body_rx.try_recv().is_err(),
+                    "closing executed an unaccepted callback"
+                );
+                assert_eq!(dispatch.shared.queue.lock().unwrap().jobs, 0);
+            }
         }
     }
 

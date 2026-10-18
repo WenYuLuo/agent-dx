@@ -300,6 +300,11 @@ legacy ID保持全扫；核对无新增Meta RPC。原生写proof sidecar在原AC
 rename、按实际persist_batch合并目录sync；核对健康proof完整字节匹配和重放不重写／rename、
 仍保留file sync；注入rename／目录同步失败后重试补足屏障。optional失败不降低正文／
 catalog barrier、receipt或fsync持久性。
+读侧另测健康sidecar的多对象Peer／Pinned读取：write、rename、file sync、directory sync
+均为0；热Peer单槽命中不访问／修复sidecar，逐出后完整扫描才按需修复；
+多个独立reader面对同对象缺失／损坏，只作有界共享修复，并证明修复期间Peer
+正文slot已释放。不得把写批次必要file sync一起删掉。读侧容量错误保留健康proof，
+安全全扫不触发proof重建或持久化；缺坏修复仍不得改写正文／catalog。
 S3不生成本次原生写proof，原S3窗口、载荷／descriptor预算和有序发布回归保持独立。
 
 同一Node原1MiB proof ledger共用于A store、native写pool及B cache；检查实际proof容量、
@@ -307,10 +312,28 @@ Arc／包装、构建／encode／decode临时分配、4096项证明指针索引�
 以及在途、缓存替换、eviction、shutdown和最后clone释放。预算0／被其它持有者占满必须
 保留完整根安全读取，不能暗增池、先释放仍在途的分配或制造可选缓存满的新读失败。
 未使用的CV不能标成已验证证明；格式／身份结构错误即使预算不足仍拒绝。
+补自然多对象驻留压力：A多个pinned reader与B缓存proof共用总额一半的resident子限，
+不能只手工占满账本模拟结果。验证新writer仍有机会生成proof、工作租约有余量，resident
+引用退役至最后owner才退账；并发超过总额时允许安全fallback，不能要求32路全部快路径。
+范围工作租约须贯穿proof加载到验证，不重复预留或跨账本使用；容量不足、损坏与普通
+I/O错误分开验证。总账／resident用量、预留失败、原生写无proof及范围全扫退化分列，
+cache局部metadata指标不能替代全账。当前用量／限额是
+`afs_dfs_outboard_metadata_bytes`、`afs_dfs_outboard_metadata_limit_bytes`及
+`afs_dfs_outboard_resident_bytes`、`afs_dfs_outboard_resident_limit_bytes`；固定事件
+`afs_dfs_outboard_events_total{event}`区分`reserve_total_failed`、`reserve_resident_failed`、
+`write_without_proof`、`range_fullscan_fallback`与`range_fullscan_unretained`。最后一项包括
+B退休proof后失去完整文件身份的安全全扫，不能误判为容量错误触发修复。
 proof ledger不等于RSS，原codec／TLS／网络envelope及磁盘配额分别核算。
+
+版本cache验证entries和保留bytes双上限、碎片化大layout、extent／index／ID字符串的
+capacity、同key替换及LRU；不能只按len估算。超大版本经真实加载可读但不进入缓存；
+淘汰后的活跃Arc正确性保持，不将cache账本下降当成所有内存释放。
+
 
 协议回归检查request tag7 `include_blake3_outboard`默认false、header tag8只在显式请求
 且完整对象时附带；普通无cache完整读、合法partial、旧Peer缺字段继续原安全路径。
+`DfsReadRangesHeader.blake3_outboard`与`DfsPutReplicaFrame.data`生成Rust字段为Bytes，
+需检查仓内调用和所有权；wire tag兼容不等于Rust源码API完全兼容。
 partial不扩大grant或正文：A按可信根验证本地覆盖组，B保留原range checksum，不冒称B完成
 独立整对象根证明。A header的Bytes共享原proof owner；B先检查边界／绑定、同账本预留后
 只复制小proof元数据并退役opaque解码Bytes；codec产生的wire copy仍属原transport预算。
@@ -322,6 +345,8 @@ peer tree且预算可用时，consumer唯一正文根计算同时匹配Meta锚�
 consumer按实际块做outboard更新、私有落盘和提取；两个256KiB块和单项交接队列保持。
 Completion只登记待确认状态；真实EOF／成功join、长度／摘要及私有sink／输出绑定全部
 通过后，consumer finish核对实际根／CV并最终授权，才能Ready和公开输出。
+旧Peer没有proof时仍可能同时执行producer完整hash与consumer的cache outboard构建，
+应记录两份实际工作；producer hash为0不是所有混合版本的承诺。
 两种模式都检查真实工作量及回收；缓存写失败仍完成完整核根，不因producer hash为0
 冒称未校验，也不把标准outboard计算当免费。
 针对性检查超过两块的真实复用、32KiB组／256KiB块边界、尾块、Header／Completion／额外帧、

@@ -96,7 +96,10 @@ head/source/授权刷新需要Meta时失败即报错。读取拒绝失效对应�
 命中只更新淘汰顺序，不延长grant或TTL。淘汰释放cache引用，在途Arc仍可安全完成；
 resident条目上限不是全部活跃FD、载荷或进程RSS上限。
 
-不可变版本／布局另按完整版本ID缓存`Arc`，默认4096项，可配置容量；首次加载核对
+不可变版本／布局另按完整版本ID缓存`Arc`，默认4096项及32MiB保守保留字节预算，
+两项均可配置；超大版本可被当前操作使用但不进入缓存。计入版本、布局／索引的
+容器capacity、重复ID字符串capacity及缓存容器包装估算；逐出后活跃Arc另行核算，
+该预算不是整个Node RSS或加载时峰值上限。首次加载核对
 版本、布局和长度，在使用inode时再核对归属。并发miss在锁外查询和建索引，安装时
 再次检查canonical条目，不把缓存作为授权或承诺消除初次重复RPC。布局索引一次构建，
 以二分定位候选；legacy未排序或重叠extent保持原序和溢出检查，不改变序列化格式。
@@ -127,6 +130,13 @@ rename，同一实际持久化批次合并目录sync。健康proof逐字节匹�
 仍保留文件与批次目录屏障；它可能增加成本。sidecar失败不改变原正文／catalog持久化屏障、
 receipt或错误传播合同；后续读退回完整根扫描。S3写路径不生成这份原生写proof，
 原外部窗口、载荷／descriptor预算和有序发布合同独立保持。
+
+本机和A端完整扫描后也可能修复缺失／损坏的可选sidecar。在固定共享修复分片锁内做
+不带sync的完整字节比较，健康文件不重写、不rename、不做文件或目录sync；仅缺坏文件
+才安装。已验证Peer正文单槽命中不再访问sidecar。修复可能产生文件与目录sync，但不持有Peer正文单槽锁；原正文填充
+singleflight与额度不变。容量不足不当作损坏，不丢弃健康证明后重建／落盘；安全完整根
+扫描仍保留。修复失败只放弃可选优化，不削弱正文／catalog／receipt持久屏障。
+固定修复锁及reader结构属于有界运行时开销，不宣称被proof额度覆盖全部Node内存。
 
 ### B端可丢弃磁盘缓存与Peer交接
 
@@ -164,13 +174,21 @@ consumer收到Completion仍不能产生完成凭证；实际EOF和producer成功
 A store、原生写pool与B cache在同一Node共用原1MiB proof ledger，不各自新增额度。
 其内计入outboard实际capacity、Arc／包装、构建与编码／解码临时工作，以及缓存证明
 索引（当前64位构建中4096个指针占32KiB）。共享引用直到最后owner释放才退账；
-预算不足时不生成或不保存优化证明，保留完整根安全路径。该预算不等于整个Node RSS，
+其中常驻保留最多使用总额一半（默认512KiB），A pinned reader、Peer单槽proof和B
+proof／索引／包装共用该子限；不是新增一套内存池。已标记常驻的分配直到最后引用释放
+才退还总账与子限，淘汰条目不能提前退账。在途工作、writer与验证者仍竞争原总账，
+不保证32个并发请求全部取得快路径；额度不足保守回退。保留／工作准入失败、原生写
+没有生成proof及范围验证退回全扫分别计数。该预算不等于整个Node RSS，
 codec／TLS／网络编码拷贝仍属于原transport envelope，不冒称已由proof ledger覆盖。
+B缓存退休proof后，若已无完整FileIdentity，仍使用完整根扫描；不以只剩dev/inode的身份
+启用部分验证。A pinned reader保留完整身份时可用临时proof完成范围验证，不长期驻留。
 ready文件的4096B header、正文、trailer与staging实际分配计入磁盘容量；目录、marker等
 管理开销另列。近似LRU只淘汰专属可丢弃缓存，不增加持久副本数。
 
 原生gRPC的64KiB正文帧仍以Bytes共享已验证对象的合法范围；A附带proof也以Bytes
-共享原proof owner，B仅在同ledger准入后复制小proof元数据。载荷、proof及各自租约
+共享原proof owner，B仅在同ledger准入后复制小proof元数据。生成的Rust API中
+`DfsReadRangesHeader.blake3_outboard`与`DfsPutReplicaFrame.data`均使用`Bytes`；这属于
+源码API变化，不改变既有wire tag，不能宣称完全无兼容变化。载荷、proof及各自租约
 不能因缓存淘汰、producer退出或取消提前退账；最后真实持有者释放后才释放额度。
 授权与帧生产继续在同一blocking任务，拒绝在返回stream前传播；原4帧队列、8 read slots、
 单RPC总截止和排空合同保持。Bytes共享不等于整个Prost／TLS／网络栈零复制。

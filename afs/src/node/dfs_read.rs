@@ -686,10 +686,16 @@ impl<K: Clone + Eq + Hash, V> BoundedLru<K, V> {
         self.entries.insert(key, LruEntry { value, used: tick });
     }
 
-    fn remove(&mut self, key: &K) -> Option<V> {
+    pub(super) fn remove(&mut self, key: &K) -> Option<V> {
         let entry = self.entries.remove(key)?;
         self.order.remove(&entry.used);
         Some(entry.value)
+    }
+
+    pub(super) fn pop_oldest(&mut self) -> Option<(K, V)> {
+        let (_, key) = self.order.pop_first()?;
+        let entry = self.entries.remove(&key)?;
+        Some((key, entry.value))
     }
 
     fn retain(&mut self, mut keep: impl FnMut(&K, &mut V) -> bool) {

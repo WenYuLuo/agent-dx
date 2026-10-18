@@ -190,6 +190,7 @@ cache ON 必须按[验收说明](../testing/afs.md#dfs-外部-s3-闭环)登记�
 | `dfs_fuse_attr_ttl_ms` | `0` | `0..=60000`，属性TTL；CREATE的单TTL回复取两者较小值 |
 | `fuse_max_readahead_bytes` | `1048576` | `0..=16777216`，仅DFS的内核read-ahead请求上限，实际值受协商限制 |
 | `dfs_version_cache_entries` | `4096` | `1..=65536`，不可变版本／布局的resident元数据条目数 |
+| `dfs_version_cache_bytes` | `33554432`（32MiB） | `1..=1073741824`，不可变版本缓存的保守保留字节预算；同时受entries约束 |
 
 TTL均保持0才属于严格路径新鲜度配置；正值是显式宽松模式，rename替换等路径
 可能在TTL内继续解析为旧inode，不能宣传严格close-to-open。OwnerFs原Home缓存、TTL、
@@ -204,9 +205,11 @@ DFS复用以完整提交版本ID及长度为准；新open仍在线检查权限�
 RSS配额；A共享正文、B填充、帧、元数据、allocator和内核页缓存须分别核算。
 默认线程数也不构成吞吐或时延达标保证。
 
-版本缓存不保存权限或正文，不代替新open的在线检查。缓存淘汰后，在途读者仍可
-持有其Arc；每条布局及索引大小随extent数量增长，条目数不能当作内存字节或全部
-活跃引用上限。配置容量在启动时生效，不能据命中率推断新鲜度或授权有效。
+版本缓存不保存权限或正文，不代替新open的在线检查。entries与bytes双上限均在启动时
+生效；bytes按版本、布局、索引的容器capacity、各ID字符串capacity和缓存容器包装
+保守估算，不只统计extent数量。超大布局仍能被当前操作使用，但不被缓存保留；淘汰后
+在途读者仍可持有其Arc。此上限不等于所有活跃引用、加载临时分配或整个Node RSS上限，
+不能据命中率推断新鲜度或授权有效。
 
 ## 原生 Peer 可丢弃磁盘读缓存
 
@@ -230,8 +233,11 @@ Node，再按专属缓存目录的清理合同退休可丢弃条目，或配置�
 
 原1MiB proof ledger由同一Node的A store、原生写pool和B cache共用；计入proof实际
 capacity、Arc／包装、构建／encode／decode临时分配及证明索引（当前64位构建为32KiB），
-在途引用直到最后owner释放才退账。额度不足保守完整根扫描或跳过优化证明，不另开
-1MiB池，不挪用正文额度。它不代表进程总RAM；codec、TLS、HTTP/2及内核pagecache
+在途引用直到最后owner释放才退账。总额的一半（默认512KiB）作为常驻保留子限，
+A pinned／Peer单槽和B proof／索引包装共同受限；不是额外额度或另一池。条目淘汰但
+引用仍活跃时不能提前退账。临时验证／写入builder共享剩余总账，超过可用额度允许安全
+回退，不保证默认32 workers都取得快路径。容量不足不能当作健康proof损坏并触发反复
+重建或写盘；对应准入失败、原生写无proof和范围全扫回退需要分别观察。不挪用正文额度。它不代表进程总RAM；codec、TLS、HTTP/2及内核pagecache
 仍按原独立预算核算。这里没有新增正文RAM驻留缓存或预取。
 
 本机读、A端Peer范围服务及B磁盘命中统一使用标准BLAKE3根与32KiB覆盖组outboard。
@@ -242,12 +248,19 @@ scratch复制，非对齐／多范围沿用原路径，不承诺零复制。本�
 走原完整根扫描。sidecar是可选优化；原生写在原ACK前可能多出sidecar文件sync、rename
 及实际持久化批次合并的目录sync成本；健康proof避免重写／rename但保留文件同步。
 可选proof失败不改变正文、catalog、receipt及成功fsync屏障。
+读侧也可同步修复缺失／损坏的sidecar，安装可能产生文件与目录sync。健康sidecar仅
+在固定共享修复锁内比较而不write／rename／sync，避免同对象重复安装；已验证Peer正文
+单槽命中不再访问sidecar。修复不持
+Peer正文单槽锁，也不增加后台修复服务。缺容量时走完整根安全读取，不能借修复改变
+原正文、catalog或成功fsync合同。
 
 符合multi-thread runtime、有界HTTP/2窗口及原读预算条件时，gRPC使用单producer／
 consumer与两个256KiB固定载荷块，wire帧仍至多64KiB，块归还后才能复用。
 首正文前固定核根模式：有预算支持的完整peer tree由consumer完成唯一正文根计算，
 同时匹配Meta锚定整对象根及Completion；缺proof／预算不足／旧Peer保留producer核根
-安全路径。两条链仍双块重叠，所有实际hash各自计量。原4MiB填充额度与本次私有输出不能超过原单批预算；
+安全路径。旧Peer不提供proof时，producer完整核根与consumer缓存outboard构建可能
+形成两次正文hash；producer hash归零只适用于合格的新Peer consumer-tree路径。
+两条链仍双块重叠，所有实际hash各自计量。原4MiB填充额度与本次私有输出不能超过原单批预算；
 不满足条件沿用完整对象缓冲回退，不增加队列、连接数、窗口或线程池。
 
 整个当前chunk获授权时才请求整对象proof；partial保持精确授权正文与range checksum，

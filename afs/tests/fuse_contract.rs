@@ -511,7 +511,9 @@ fn fuse_ftruncate_on_same_handle_waits_for_prior_write() {
     std::fs::create_dir(&mount).unwrap();
 
     let backend = Arc::new(MockBackend::default());
-    let session = fuse::mount_test_backend(backend.clone(), &mount).unwrap();
+    let session =
+        fuse::mount_dfs_with_options(backend.clone(), &mount, fuse::FuseMountOptions::default())
+            .unwrap();
     wait_until_mounted(&mount).unwrap();
 
     let root = mount.clone();
@@ -793,7 +795,7 @@ fn dfs_buffered_open_after_old_lookup_size_reads_fresh_length_without_fstat() {
 #[test]
 #[ignore = "requires Linux /dev/fuse and fusermount3"]
 fn dfs_buffered_new_open_cannot_reuse_an_old_inflight_read_result() {
-    for workers in [1, 2] {
+    for workers in [1, 2, 32] {
         assert_dfs_open_fences_inflight_read(workers);
     }
 }
@@ -801,32 +803,43 @@ fn dfs_buffered_new_open_cannot_reuse_an_old_inflight_read_result() {
 #[test]
 #[ignore = "requires Linux /dev/fuse and fusermount3"]
 fn dfs_buffered_same_descriptor_reads_enter_backend_concurrently() {
+    for (workers, readers) in [(2, 2), (32, 32)] {
+        assert_dfs_same_descriptor_parallel_reads(workers, readers);
+    }
+}
+
+fn assert_dfs_same_descriptor_parallel_reads(workers: u16, readers: usize) {
     let temp = tempfile::tempdir().unwrap();
     let mount = temp.path().join("mnt");
     std::fs::create_dir(&mount).unwrap();
-    let data = [vec![b'a'; 4096], vec![b'b'; 4096]].concat();
+    let data: Vec<u8> = (0..readers)
+        .flat_map(|index| std::iter::repeat_n(index as u8, 4096))
+        .collect();
     let backend = Arc::new(VersionedReadBackend::new("parallel", data));
-    let probe = Arc::new(ParallelReadProbe::default());
+    let probe = Arc::new(ParallelReadProbe {
+        target: readers as u64,
+        ..Default::default()
+    });
     *backend.parallel_read_probe.lock().unwrap() = Some(probe.clone());
     let _session = MountedTestBackend::mount_dfs_with_options(
         backend,
         mount.clone(),
         fuse::FuseMountOptions {
-            fuse_workers: 2,
+            fuse_workers: workers,
             fuse_max_readahead_bytes: 0,
             ..Default::default()
         },
     );
     let file = Arc::new(std::fs::File::open(mount.join("file")).unwrap());
-    let start = Arc::new(std::sync::Barrier::new(3));
+    let start = Arc::new(std::sync::Barrier::new(readers + 1));
     let mut reads = Vec::new();
-    for offset in [0, 4096] {
+    for index in 0..readers {
         let file = file.clone();
         let start = start.clone();
         reads.push(std::thread::spawn(move || {
             let mut bytes = vec![0; 4096];
             start.wait();
-            let count = file.read_at(&mut bytes, offset)?;
+            let count = file.read_at(&mut bytes, (index * 4096) as u64)?;
             io::Result::Ok((count, bytes))
         }));
     }
@@ -834,20 +847,134 @@ fn dfs_buffered_same_descriptor_reads_enter_backend_concurrently() {
     for (index, read) in reads.into_iter().enumerate() {
         let (count, bytes) = read.join().unwrap().unwrap();
         assert_eq!(count, 4096);
-        assert!(
-            bytes
-                .iter()
-                .all(|byte| *byte == if index == 0 { b'a' } else { b'b' })
+        assert!(bytes.iter().all(|byte| *byte == index as u8));
+    }
+    let peak = probe.peak.load(Ordering::SeqCst);
+    assert!(peak >= 2, "same fd READ callbacks remained serial");
+    assert!(peak <= u64::from(workers));
+    assert_eq!(probe.active.load(Ordering::SeqCst), 0);
+    eprintln!("parallel READ diagnostic workers={workers} readers={readers} backend_peak={peak}");
+}
+
+#[test]
+#[ignore = "requires Linux /dev/fuse and fusermount3; bounded bucket contention diagnostic"]
+fn dfs_same_cache_bucket_open_waits_for_another_inode_read_on_this_linux() {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let temp = tempfile::tempdir().unwrap();
+    let mount = temp.path().join("mnt");
+    std::fs::create_dir(&mount).unwrap();
+    let backend = Arc::new(MockBackend::default());
+    {
+        let mut state = backend.state.lock().unwrap();
+        for index in 0..65 {
+            let inode = state.insert_node(FileKind::Regular, vec![b'b'; 4096]);
+            state
+                .entries
+                .insert((1, OsString::from(format!("bucket-{index}"))), inode);
+        }
+    }
+    let registry = afs_metrics::Registry::new();
+    let metrics = fuse::FuseRequestMetrics::register(&registry).unwrap();
+    let mut session = MountedTestBackend {
+        mount: mount.clone(),
+        session: Some(
+            fuse::mount_dfs_with_metrics_and_options(
+                backend.clone(),
+                &mount,
+                metrics,
+                fuse::FuseMountOptions {
+                    fuse_max_readahead_bytes: 0,
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        ),
+    };
+    wait_until_mounted(&mount).unwrap();
+    // Materialize consecutive frontend inode identities, rather than assuming
+    // that backend inode numbers are identical to kernel FUSE inode numbers.
+    let mut inodes = Vec::new();
+    for index in 0..65 {
+        inodes.push(
+            std::fs::metadata(mount.join(format!("bucket-{index}")))
+                .unwrap()
+                .ino(),
         );
     }
+    assert_ne!(inodes[0], inodes[64]);
+    assert_eq!(inodes[0] % 64, inodes[64] % 64);
+    let file = std::fs::File::open(mount.join("bucket-0")).unwrap();
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    *backend.read_blocker.lock().unwrap() = Some(WriteBlocker {
+        entered: entered_tx,
+        release: release_rx,
+    });
+    let reader = std::thread::spawn(move || {
+        let mut bytes = [0; 4096];
+        file.read_at(&mut bytes, 0).map(|count| (count, bytes))
+    });
+    let entered = entered_rx.recv_timeout(Duration::from_secs(5));
+    let (opened_tx, opened_rx) = mpsc::channel();
+    let other = mount.join("bucket-64");
+    let opener = std::thread::spawn(move || {
+        let started = std::time::Instant::now();
+        let result = std::fs::File::open(other);
+        let _ = opened_tx.send(());
+        result.map(|file| (file, started.elapsed()))
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let open_received = loop {
+        let text = afs_metrics::encode_text(&registry).unwrap();
+        if text.lines().any(|line| {
+            line.starts_with("afs_fuse_callbacks_total{")
+                && line.contains("operation=\"open\"")
+                && line
+                    .split_whitespace()
+                    .last()
+                    .unwrap()
+                    .parse::<u64>()
+                    .unwrap()
+                    >= 2
+        }) {
+            break true;
+        }
+        if std::time::Instant::now() >= deadline {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    let completed_while_read_held = opened_rx.recv_timeout(Duration::from_millis(100)).is_ok();
+    // Always release and join both requests before asserting diagnostics, so a
+    // failed assertion cannot strand a callback during normal mount teardown.
+    let _ = release_tx.send(());
+    let (count, bytes) = reader.join().unwrap().unwrap();
+    let (other_file, elapsed) = opener.join().unwrap().unwrap();
+    assert!(entered.is_ok() && open_received);
+    assert_eq!(count, 4096);
+    assert_eq!(bytes, [b'b'; 4096]);
     assert!(
-        probe.peak.load(Ordering::SeqCst) >= 2,
-        "same fd READ callbacks remained serial despite kernel ASYNC_READ"
+        !completed_while_read_held,
+        "same-bucket OPEN bypassed the active READ fence"
     );
+    eprintln!(
+        "bucket contention diagnostic inode_a={} inode_b={} open_wait_us={} workers={}",
+        inodes[0],
+        inodes[64],
+        elapsed.as_micros(),
+        fuse::FuseMountOptions::default().fuse_workers
+    );
+    // This records this Linux implementation's cross-inode bucket wait. It
+    // does not claim std::sync::RwLock writer priority on other platforms, or
+    // that a future queued writer must precede every newly arriving reader.
+    drop(other_file);
+    session.session.take().unwrap().join().unwrap();
 }
 
 #[derive(Default)]
 struct ParallelReadProbe {
+    target: u64,
     active: AtomicU64,
     peak: AtomicU64,
     arrived: Mutex<u64>,
@@ -863,7 +990,9 @@ impl ParallelReadProbe {
         self.changed.notify_all();
         drop(
             self.changed
-                .wait_timeout_while(arrived, Duration::from_millis(500), |value| *value < 2)
+                .wait_timeout_while(arrived, Duration::from_secs(3), |value| {
+                    *value < self.target.max(2)
+                })
                 .unwrap(),
         );
         ParallelReadGuard(self)
@@ -1197,6 +1326,7 @@ struct MockBackend {
     state: Mutex<MockState>,
     statfs_capacity: Mutex<Option<FilesystemCapacity>>,
     write_blocker: Mutex<Option<WriteBlocker>>,
+    read_blocker: Mutex<Option<WriteBlocker>>,
     events: Mutex<Vec<&'static str>>,
     getattr_calls: AtomicU64,
     read_calls: AtomicU64,
@@ -1337,6 +1467,11 @@ impl Backend for MockBackend {
         out: &mut [u8],
     ) -> afs_error::Result<usize> {
         self.read_calls.fetch_add(1, Ordering::SeqCst);
+        let blocker = self.read_blocker.lock().unwrap().take();
+        if let Some(blocker) = blocker {
+            blocker.entered.send(()).unwrap();
+            blocker.release.recv().unwrap();
+        }
         let state = self.state.lock().unwrap();
         let inode = *state.file_handles.get(&handle.0).ok_or_else(not_found)?;
         let data = &state.nodes.get(&inode).ok_or_else(not_found)?.data;

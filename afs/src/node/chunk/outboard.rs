@@ -18,7 +18,7 @@ use std::{
     fs::File,
     io,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
     time::Instant,
@@ -28,16 +28,40 @@ pub(crate) const DEFAULT_OUTBOARD_BUDGET_BYTES: usize = 1024 * 1024;
 pub(crate) const OUTBOARD_GROUP_BYTES: usize = 32 * 1024;
 pub(crate) const MAX_ENCODED_OUTBOARD_BYTES: usize = 8192;
 
+const RANGE_WORKING_BYTES: usize = 2 * OUTBOARD_GROUP_BYTES + MAX_ENCODED_OUTBOARD_BYTES + 4096;
+
 #[derive(Debug)]
 pub struct OutboardBudget {
     limit: usize,
     used: AtomicUsize,
+    resident_limit: usize,
+    resident_used: AtomicUsize,
+    metrics: Option<super::super::read_work::ReadWorkMetrics>,
 }
 impl OutboardBudget {
     pub fn new(limit: usize) -> Arc<Self> {
+        Self::create(limit, None)
+    }
+    #[cfg(any(feature = "dfs", test))]
+    pub(crate) fn new_with_metrics(
+        limit: usize,
+        metrics: super::super::read_work::ReadWorkMetrics,
+    ) -> Arc<Self> {
+        Self::create(limit, Some(metrics))
+    }
+    fn create(
+        limit: usize,
+        metrics: Option<super::super::read_work::ReadWorkMetrics>,
+    ) -> Arc<Self> {
+        if let Some(metrics) = &metrics {
+            metrics.outboard_limits(limit, limit / 2);
+        }
         Arc::new(Self {
             limit,
             used: AtomicUsize::new(0),
+            resident_limit: limit / 2,
+            resident_used: AtomicUsize::new(0),
+            metrics,
         })
     }
     pub fn limit(&self) -> usize {
@@ -46,22 +70,94 @@ impl OutboardBudget {
     pub fn used(&self) -> usize {
         self.used.load(Ordering::Acquire)
     }
+    pub fn resident_limit(&self) -> usize {
+        self.resident_limit
+    }
+    pub fn resident_used(&self) -> usize {
+        self.resident_used.load(Ordering::Acquire)
+    }
+    fn event(&self, event: &'static str) {
+        if let Some(metrics) = &self.metrics {
+            metrics.outboard_event(event);
+        }
+    }
+    pub(crate) fn record_write_without_proof(&self) {
+        self.event("write_without_proof");
+    }
+    pub(crate) fn record_range_fullscan_fallback(&self) {
+        self.event("range_fullscan_fallback");
+    }
+    #[cfg(any(feature = "dfs", test))]
+    pub(crate) fn record_range_fullscan_unretained(&self) {
+        self.event("range_fullscan_unretained");
+    }
     pub(crate) fn try_reserve(self: &Arc<Self>, bytes: usize) -> Option<OutboardLease> {
         let mut used = self.used();
         loop {
-            let next = used.checked_add(bytes).filter(|next| *next <= self.limit)?;
+            let Some(next) = used.checked_add(bytes).filter(|next| *next <= self.limit) else {
+                self.event("reserve_total_failed");
+                return None;
+            };
             match self
                 .used
                 .compare_exchange_weak(used, next, Ordering::AcqRel, Ordering::Acquire)
             {
                 Ok(_) => {
+                    if let Some(metrics) = &self.metrics {
+                        metrics.outboard_adjust(false, bytes, true);
+                    }
                     return Some(OutboardLease {
                         budget: self.clone(),
                         bytes,
+                        resident: Mutex::new(false),
                     });
                 }
                 Err(actual) => used = actual,
             }
+        }
+    }
+    pub(crate) fn try_reserve_resident(self: &Arc<Self>, bytes: usize) -> Option<OutboardLease> {
+        let lease = self.try_reserve(bytes)?;
+        lease.try_mark_resident().then_some(lease)
+    }
+    pub(crate) fn try_reserve_range_work(self: &Arc<Self>) -> Option<OutboardLease> {
+        self.try_reserve(RANGE_WORKING_BYTES)
+    }
+    fn admit_resident(&self, bytes: usize) -> bool {
+        let mut used = self.resident_used();
+        loop {
+            let Some(next) = used
+                .checked_add(bytes)
+                .filter(|next| *next <= self.resident_limit)
+            else {
+                self.event("reserve_resident_failed");
+                return false;
+            };
+            match self.resident_used.compare_exchange_weak(
+                used,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    if let Some(metrics) = &self.metrics {
+                        metrics.outboard_adjust(true, bytes, true);
+                    }
+                    return true;
+                }
+                Err(actual) => used = actual,
+            }
+        }
+    }
+    fn release(&self, resident: bool, bytes: usize) {
+        let counter = if resident {
+            &self.resident_used
+        } else {
+            &self.used
+        };
+        counter.fetch_sub(bytes, Ordering::AcqRel);
+        if let Some(metrics) = &self.metrics {
+            metrics.outboard_adjust(resident, bytes, false);
         }
     }
 }
@@ -70,19 +166,40 @@ impl OutboardBudget {
 pub(crate) struct OutboardLease {
     budget: Arc<OutboardBudget>,
     bytes: usize,
+    // This mutex only serializes the one-way admission of this exact allocation.
+    // It never protects I/O. Arc clones share one admission until final drop.
+    resident: Mutex<bool>,
 }
 impl OutboardLease {
+    fn try_mark_resident(&self) -> bool {
+        let Ok(mut retained) = self.resident.lock() else {
+            return false;
+        };
+        if *retained {
+            return true;
+        }
+        if !self.budget.admit_resident(self.bytes) {
+            return false;
+        }
+        *retained = true;
+        true
+    }
     pub(crate) fn retain_capacity(&mut self, bytes: usize) -> Result<()> {
+        let retained = *self.resident.get_mut().map_err(|_| capacity())?;
         if bytes > self.bytes {
-            let mut extra = self
-                .budget
-                .try_reserve(bytes - self.bytes)
-                .ok_or_else(capacity)?;
+            let mut extra = if retained {
+                self.budget.try_reserve_resident(bytes - self.bytes)
+            } else {
+                self.budget.try_reserve(bytes - self.bytes)
+            }
+            .ok_or_else(capacity)?;
+            // Transfer both total and (when applicable) resident accounting.
             extra.bytes = 0;
         } else {
-            self.budget
-                .used
-                .fetch_sub(self.bytes - bytes, Ordering::AcqRel);
+            if retained {
+                self.budget.release(true, self.bytes - bytes);
+            }
+            self.budget.release(false, self.bytes - bytes);
         }
         self.bytes = bytes;
         Ok(())
@@ -90,7 +207,15 @@ impl OutboardLease {
 }
 impl Drop for OutboardLease {
     fn drop(&mut self) {
-        self.budget.used.fetch_sub(self.bytes, Ordering::AcqRel);
+        // Poisoning cannot erase a successfully admitted resident reservation.
+        let retained = match self.resident.get_mut() {
+            Ok(value) => *value,
+            Err(error) => **error.get_ref(),
+        };
+        if retained {
+            self.budget.release(true, self.bytes);
+        }
+        self.budget.release(false, self.bytes);
         drop_event("lease_released", self.budget.used());
     }
 }
@@ -146,6 +271,9 @@ impl ChunkOutboard {
     pub(crate) fn raw_cv_bytes(&self) -> &[u8] {
         &self.encoded[HEADER..]
     }
+    pub(crate) fn try_mark_resident(&self) -> bool {
+        self.lease.try_mark_resident()
+    }
     pub(crate) fn uses_budget(&self, budget: &Arc<OutboardBudget>) -> bool {
         Arc::ptr_eq(&self.lease.budget, budget)
     }
@@ -196,6 +324,7 @@ impl ChunkOutboard {
         let empty = OutboardLease {
             budget: owned.lease.budget.clone(),
             bytes: 0,
+            resident: Mutex::new(false),
         };
         let lease = std::mem::replace(&mut owned.lease, empty);
         Ok(Arc::new(Self {
@@ -223,6 +352,7 @@ impl ChunkOutboard {
             &mut OutboardReadWork::default(),
         )
     }
+    #[cfg(any(feature = "dfs", test))]
     pub(crate) fn read_ranges_into_with_work(
         &self,
         file: &File,
@@ -232,18 +362,44 @@ impl ChunkOutboard {
         out: &mut [u8],
         work: &mut OutboardReadWork,
     ) -> Result<Vec<usize>> {
+        let working = self
+            .lease
+            .budget
+            .try_reserve_range_work()
+            .ok_or_else(capacity)?;
+        self.read_ranges_into_with_reserved_work(
+            file,
+            body_start,
+            expected,
+            ranges,
+            out,
+            OutboardReadContext { work, working },
+        )
+    }
+    pub(crate) fn read_ranges_into_with_reserved_work(
+        &self,
+        file: &File,
+        body_start: u64,
+        expected: &ChunkObject,
+        ranges: &[VerifiedRangeCopy],
+        out: &mut [u8],
+        context: OutboardReadContext<'_>,
+    ) -> Result<Vec<usize>> {
+        let OutboardReadContext { work, working } = context;
         Self::validate_encoded_shape(expected, &self.encoded)?;
         if self.length != expected.length || self.digest != expected.content_digest {
             return Err(super::corrupt(&expected.id, "outboard identity differs"));
         }
-        let working_bytes = 2 * OUTBOARD_GROUP_BYTES + MAX_ENCODED_OUTBOARD_BYTES + 4096;
-        // Charge all temporary body/encoded capacities as well as metadata,
-        // rather than treating the old scratch allowance as a second budget.
-        let _working = self
-            .lease
-            .budget
-            .try_reserve(working_bytes)
-            .ok_or_else(capacity)?;
+        let retained = *working.resident.lock().map_err(|_| capacity())?;
+        if !Arc::ptr_eq(&working.budget, &self.lease.budget)
+            || working.bytes < RANGE_WORKING_BYTES
+            || retained
+        {
+            return Err(capacity());
+        }
+        // Own the original reservation through encoder/decoder destruction. No
+        // second reservation after loading/retaining proof metadata.
+        let _working = working;
         let end = body_start
             .checked_add(self.length)
             .ok_or_else(|| super::invalid("outboard body offset overflow"))?;
@@ -486,6 +642,13 @@ impl Size for OffsetFile<'_> {
     fn size(&self) -> io::Result<Option<u64>> {
         Ok(Some(self.length))
     }
+}
+
+/// One range call's observations and already charged working ownership.
+/// The consuming read keeps the ticket alive until all codec scratch drops.
+pub(crate) struct OutboardReadContext<'a> {
+    pub(crate) work: &'a mut OutboardReadWork,
+    pub(crate) working: OutboardLease,
 }
 
 #[derive(Debug, Default)]
@@ -816,6 +979,7 @@ impl OutboardBuilder {
                 let replacement = OutboardLease {
                     budget: builder.lease.budget.clone(),
                     bytes: 0,
+                    resident: Mutex::new(false),
                 };
                 let lease = std::mem::replace(&mut builder.lease, replacement);
                 let proof = Arc::new(ChunkOutboard {
@@ -1396,5 +1560,178 @@ mod tests {
         let built = builder.finish().unwrap();
         assert_eq!(built.digest.bytes, *blake3::hash(&body).as_bytes());
         assert!(built.outboard.is_some());
+    }
+    #[test]
+    fn pr60_resident_mark_is_shared_until_last_owner_and_not_a_second_pool() {
+        let budget = OutboardBudget::new(DEFAULT_OUTBOARD_BUDGET_BYTES);
+        let body = vec![31; 64 * 1024];
+        let proof = build_borrowed(&body, &budget).outboard.unwrap();
+        let charge = proof.charged_bytes();
+        assert_eq!(budget.resident_used(), 0);
+        assert_eq!(budget.used(), charge);
+        let barrier = Arc::new(std::sync::Barrier::new(17));
+        let mut threads = Vec::new();
+        for _ in 0..16 {
+            let proof = proof.clone();
+            let barrier = barrier.clone();
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                proof.try_mark_resident()
+            }));
+        }
+        barrier.wait();
+        let admitted: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        assert!(admitted.into_iter().all(|value| value));
+        assert_eq!(
+            budget.resident_used(),
+            charge,
+            "one allocation, one resident admission"
+        );
+        assert_eq!(
+            budget.used(),
+            charge,
+            "promotion cannot double-charge total"
+        );
+        let last = proof.clone();
+        drop(proof);
+        assert_eq!(budget.resident_used(), charge);
+        drop(last);
+        assert_eq!(budget.resident_used(), 0);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn pr60_resident_lease_resize_and_rejection_keep_one_exact_total() {
+        let budget = OutboardBudget::new(1024);
+        let mut resident = budget.try_reserve_resident(512).unwrap();
+        assert_eq!((budget.used(), budget.resident_used()), (512, 512));
+        assert!(budget.try_reserve_resident(1).is_none());
+        assert_eq!((budget.used(), budget.resident_used()), (512, 512));
+        let working = budget.try_reserve(512).unwrap();
+        assert_eq!((budget.used(), budget.resident_used()), (1024, 512));
+        drop(working);
+        resident.retain_capacity(256).unwrap();
+        assert_eq!((budget.used(), budget.resident_used()), (256, 256));
+        resident.retain_capacity(384).unwrap();
+        assert_eq!((budget.used(), budget.resident_used()), (384, 384));
+        assert!(resident.retain_capacity(513).is_err());
+        assert_eq!((budget.used(), budget.resident_used()), (384, 384));
+        drop(resident);
+        assert_eq!((budget.used(), budget.resident_used()), (0, 0));
+    }
+
+    #[test]
+    fn pr60_range_work_ticket_keeps_ledger_identity_and_is_not_reserved_twice() {
+        let budget = OutboardBudget::new(DEFAULT_OUTBOARD_BUDGET_BYTES);
+        let body = vec![43; 64 * 1024];
+        let chunk = expected(&body);
+        let proof = build_borrowed(&body, &budget).outboard.unwrap();
+        let file = tempfile::tempfile().unwrap();
+        use std::os::unix::fs::FileExt;
+        file.write_all_at(&body, 0).unwrap();
+        let range = [VerifiedRangeCopy {
+            chunk_offset: 0,
+            output_offset: 0,
+            length: OUTBOARD_GROUP_BYTES,
+        }];
+        let mut out = vec![0; OUTBOARD_GROUP_BYTES];
+        let foreign = OutboardBudget::new(DEFAULT_OUTBOARD_BUDGET_BYTES);
+        let work = foreign.try_reserve_range_work().unwrap();
+        let mut observed = OutboardReadWork::default();
+        assert!(
+            proof
+                .read_ranges_into_with_reserved_work(
+                    &file,
+                    0,
+                    &chunk,
+                    &range,
+                    &mut out,
+                    OutboardReadContext {
+                        work: &mut observed,
+                        working: work
+                    },
+                )
+                .is_err()
+        );
+        assert_eq!(observed.read_calls, 0);
+        assert_eq!(foreign.used(), 0);
+        let undersized = budget.try_reserve(1).unwrap();
+        assert!(
+            proof
+                .read_ranges_into_with_reserved_work(
+                    &file,
+                    0,
+                    &chunk,
+                    &range,
+                    &mut out,
+                    OutboardReadContext {
+                        work: &mut observed,
+                        working: undersized
+                    },
+                )
+                .is_err()
+        );
+        let ticket = budget.try_reserve_range_work().unwrap();
+        let pressure = budget.try_reserve(budget.limit() - budget.used()).unwrap();
+        assert_eq!(budget.used(), budget.limit());
+        proof
+            .read_ranges_into_with_reserved_work(
+                &file,
+                0,
+                &chunk,
+                &range,
+                &mut out,
+                OutboardReadContext {
+                    work: &mut observed,
+                    working: ticket,
+                },
+            )
+            .unwrap();
+        assert_eq!(out, body[..OUTBOARD_GROUP_BYTES]);
+        assert!(observed.hash_bytes > 0);
+        drop(pressure);
+        drop(proof);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn pr60_ledger_metrics_do_not_call_read_builder_fallback_a_native_write() {
+        let registry = afs_metrics::Registry::new();
+        let metrics = super::super::super::read_work::ReadWorkMetrics::register(&registry).unwrap();
+        let budget = OutboardBudget::new_with_metrics(1024, metrics);
+        let resident = budget.try_reserve_resident(512).unwrap();
+        let working = budget.try_reserve(256).unwrap();
+        let built = build_borrowed(&[11; 4096], &budget);
+        assert!(built.outboard.is_none());
+        let text = afs_metrics::encode_text(&registry).unwrap();
+        assert!(text.contains("afs_dfs_outboard_events_total{event=\"write_without_proof\"} 0\n"));
+        assert!(text.contains("afs_dfs_outboard_metadata_bytes 768\n"));
+        assert!(text.contains("afs_dfs_outboard_resident_bytes 512\n"));
+        assert!(budget.try_reserve_resident(1).is_none());
+        assert!(budget.try_reserve(1024).is_none());
+        budget.record_write_without_proof();
+        budget.record_range_fullscan_fallback();
+        budget.record_range_fullscan_unretained();
+        drop(working);
+        drop(resident);
+        let text = afs_metrics::encode_text(&registry).unwrap();
+        assert!(text.contains("afs_dfs_outboard_metadata_bytes 0\n"));
+        assert!(text.contains("afs_dfs_outboard_resident_bytes 0\n"));
+        for event in [
+            "reserve_resident_failed",
+            "write_without_proof",
+            "range_fullscan_fallback",
+            "range_fullscan_unretained",
+        ] {
+            assert!(
+                text.contains(&format!(
+                    "afs_dfs_outboard_events_total{{event=\"{event}\"}} 1\n"
+                )),
+                "{text}"
+            );
+        }
     }
 }

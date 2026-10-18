@@ -245,6 +245,9 @@ pub struct Cli {
     /// Maximum cached immutable DFS version/layout entries (1..=65536).
     #[arg(long)]
     pub dfs_version_cache_entries: Option<usize>,
+    /// Retained immutable metadata estimate (1..=1GiB), separate from active readers and RSS.
+    #[arg(long)]
+    pub dfs_version_cache_bytes: Option<u64>,
     /// Filesystem-wide immutable DFS replica target count. Applied by Meta at initialization.
     #[arg(long)]
     pub dfs_desired_copies: Option<u16>,
@@ -320,6 +323,7 @@ struct FileConfig {
     dfs_fuse_attr_ttl_ms: Option<u32>,
     fuse_max_readahead_bytes: Option<u32>,
     dfs_version_cache_entries: Option<usize>,
+    dfs_version_cache_bytes: Option<u64>,
     dfs_external_backend: Option<DfsExternalBackendConfig>,
     dfs_peer_cache: Option<DfsPeerCacheConfig>,
     dfs_write_buffer_idle_bytes: Option<u64>,
@@ -377,6 +381,7 @@ pub struct Config {
     pub dfs_fuse_attr_ttl_ms: u32,
     pub fuse_max_readahead_bytes: u32,
     pub dfs_version_cache_entries: usize,
+    pub dfs_version_cache_bytes: u64,
     pub dfs_external_backend: Option<DfsExternalBackendConfig>,
     pub dfs_peer_cache: Option<DfsPeerCacheConfig>,
     /// Reusable idle write-body capacity only, not a live-body quota.
@@ -538,6 +543,13 @@ impl Config {
         if !(1..=65536).contains(&dfs_version_cache_entries) {
             return Err(invalid("DFS version cache entries must be 1..=65536"));
         }
+        let dfs_version_cache_bytes = cli
+            .dfs_version_cache_bytes
+            .or(file.dfs_version_cache_bytes)
+            .unwrap_or(32 * 1024 * 1024);
+        if !(1..=1024 * 1024 * 1024).contains(&dfs_version_cache_bytes) {
+            return Err(invalid("DFS version cache bytes must be 1..=1073741824"));
+        }
         let cfg = Self {
             grpc_listen: cli.grpc_listen.or(file.grpc_listen).unwrap_or_else(|| {
                 ([127, 0, 0, 1], if role == Role::Meta { 7400 } else { 7500 }).into()
@@ -606,6 +618,7 @@ impl Config {
             dfs_fuse_attr_ttl_ms,
             fuse_max_readahead_bytes,
             dfs_version_cache_entries,
+            dfs_version_cache_bytes,
             dfs_external_backend: file.dfs_external_backend,
             dfs_peer_cache: file.dfs_peer_cache,
             dfs_write_buffer_idle_bytes: file

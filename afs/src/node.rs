@@ -1211,9 +1211,10 @@ async fn run_node(
     // readers, Peer frames and the disposable disk cache. Payload and existing
     // transport windows remain separately bounded by their original limits.
     #[cfg(feature = "dfs")]
-    let dfs_outboard_budget = chunk::outboard::OutboardBudget::new(usize::try_from(
-        peer_cache::MAX_PEER_CACHE_PROOF_BYTES,
-    )?);
+    let dfs_outboard_budget = chunk::outboard::OutboardBudget::new_with_metrics(
+        usize::try_from(peer_cache::MAX_PEER_CACHE_PROOF_BYTES)?,
+        dfs_read_work_metrics.clone(),
+    );
     #[cfg(feature = "dfs")]
     let local_chunk_store = if cfg.dfs {
         Some(Arc::new(
@@ -1640,6 +1641,7 @@ async fn run_node(
             )
             .with_remote_owner_factory(remote_factory)
             .with_version_cache_capacity(cfg.dfs_version_cache_entries)
+            .with_version_cache_bytes(cfg.dfs_version_cache_bytes)
             .with_write_buffer_pool(dfs_write_buffers.clone()),
         ))
     } else {

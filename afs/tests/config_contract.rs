@@ -724,6 +724,90 @@ fn fuse_execution_settings_reject_out_of_range_values_before_startup() {
 }
 
 #[test]
+fn p2_dfs_version_cache_bytes_default_and_file_configuration() {
+    let defaults =
+        serde_json::to_value(Config::resolve(Role::Node, Cli::default()).unwrap()).unwrap();
+    assert_eq!(defaults["dfs_version_cache_bytes"], 32 * 1024 * 1024);
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("node.toml");
+    std::fs::write(&path, "dfs_version_cache_bytes=4194304\n").unwrap();
+    let config = Config::resolve(
+        Role::Node,
+        Cli {
+            config: Some(path),
+            ..Cli::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(config).unwrap()["dfs_version_cache_bytes"],
+        4 * 1024 * 1024
+    );
+}
+
+#[test]
+fn p2_dfs_version_cache_bytes_cli_overrides_file() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("node.toml");
+    std::fs::write(&path, "dfs_version_cache_bytes=4194304\n").unwrap();
+    let cli = Cli::try_parse_from([
+        "afs-node",
+        "--config",
+        path.to_str().unwrap(),
+        "--dfs-version-cache-bytes",
+        "8388608",
+    ])
+    .expect("version cache byte retention has a public Node option");
+    let config = Config::resolve(Role::Node, cli).unwrap();
+    assert_eq!(
+        serde_json::to_value(config).unwrap()["dfs_version_cache_bytes"],
+        8 * 1024 * 1024
+    );
+}
+
+#[test]
+fn p2_dfs_version_cache_bytes_configuration_bounds() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("node.toml");
+    for bytes in [1_u64, 1024 * 1024 * 1024] {
+        std::fs::write(&path, format!("dfs_version_cache_bytes={bytes}\n")).unwrap();
+        let config = Config::resolve(
+            Role::Node,
+            Cli {
+                config: Some(path.clone()),
+                ..Cli::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(config).unwrap()["dfs_version_cache_bytes"],
+            bytes
+        );
+    }
+    for bytes in [0_u64, 1024 * 1024 * 1024 + 1, 4 * 1024 * 1024 * 1024] {
+        std::fs::write(&path, format!("dfs_version_cache_bytes={bytes}\n")).unwrap();
+        let error = Config::resolve(
+            Role::Node,
+            Cli {
+                config: Some(path.clone()),
+                ..Cli::default()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), afs_error::CONFIG_INVALID);
+        assert!(error.to_string().contains("version cache"), "{error}");
+    }
+    for bytes in ["0", "1073741825"] {
+        let cli = Cli::try_parse_from(["afs-node", "--dfs-version-cache-bytes", bytes])
+            .expect("byte option accepts an integer before configuration validation");
+        assert_eq!(
+            Config::resolve(Role::Node, cli).unwrap_err().code(),
+            afs_error::CONFIG_INVALID
+        );
+    }
+}
+
+#[test]
 fn dfs_version_cache_capacity_has_bounded_file_cli_configuration() {
     let defaults =
         serde_json::to_value(Config::resolve(Role::Node, Cli::default()).unwrap()).unwrap();
