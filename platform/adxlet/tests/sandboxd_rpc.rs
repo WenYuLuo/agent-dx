@@ -1572,3 +1572,34 @@ async fn backend_transport_failure_remains_unavailable() {
     assert!(status.message().contains("sandboxd transport"));
     assert!(adx_protocol::deadline_failure(&status).is_none());
 }
+
+#[tokio::test]
+async fn mixed_router_delete_before_start_fences_jiuwenbox_too() {
+    let (sandboxd, _harness) = connect(Server::default()).await;
+    let directory = tempfile::tempdir().unwrap();
+    let config = serde_json::from_value(serde_json::json!({
+        "socket": directory.path().join("unused.sock"),
+        "state_dir": directory.path().join("journal"),
+        "bootstrap": {"image":directory.path().join("unused.erofs"),"sha256":"a".repeat(64),"target":"/__adx","command":["/__adx/usr/local/bin/adx-execd"]},
+        "classes": {"supervisor":{"images":{"execd:test":{}}}}
+    })).unwrap();
+    let jiuwenbox = adxlet::jiuwenbox::Jiuwenbox::with_host(
+        config,
+        Config::default(),
+        Arc::new(adxlet::jiuwenbox::host::LinuxHost),
+    )
+    .await
+    .unwrap();
+    let router =
+        adxlet::runtime_router::RuntimeRouter::new(Some(sandboxd), Some(jiuwenbox.clone()))
+            .unwrap();
+    router.remove("i-1").await.unwrap();
+    assert!(jiuwenbox.owns("i-1").await.unwrap());
+    let mut wanted = spec();
+    wanted.runtime_class = "supervisor".into();
+    wanted.resources.disk_bytes = 0;
+    assert!(matches!(
+        router.start(&wanted, "i-1", 1, &[]).await,
+        Err(adx_core::Error::Conflict)
+    ));
+}

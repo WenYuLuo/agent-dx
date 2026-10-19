@@ -11,6 +11,7 @@ use std::{
 struct Backend {
     actual: Mutex<Vec<RuntimeObservation>>,
     fail_inventory: std::sync::atomic::AtomicBool,
+    allow_start: std::sync::atomic::AtomicBool,
     fail_remove: std::sync::atomic::AtomicBool,
     block_remove: std::sync::atomic::AtomicBool,
     remove_entered: tokio::sync::Notify,
@@ -38,12 +39,24 @@ impl RuntimeDriver for Backend {
     }
     async fn start(
         &self,
-        _: &EnvironmentSpec,
-        _: &str,
-        _: u64,
+        spec: &EnvironmentSpec,
+        id: &str,
+        generation: u64,
         _: &[adx_core::scheduling::DeviceAllocation],
     ) -> Result<std::net::IpAddr> {
-        panic!("reconciliation must not recreate an image")
+        assert!(
+            self.allow_start.load(std::sync::atomic::Ordering::SeqCst),
+            "reconciliation must not recreate an image without restart policy"
+        );
+        self.events.lock().unwrap().push(format!("start:{id}"));
+        self.actual.lock().unwrap().push(RuntimeObservation {
+            environment_id: spec.id.clone(),
+            runtime_id: id.into(),
+            generation,
+            tenant_id: spec.tenant_id.clone(),
+            running: true,
+        });
+        Ok("10.0.0.3".parse().unwrap())
     }
     async fn remove(&self, id: &str) -> Result<()> {
         self.events.lock().unwrap().push(format!("remove:{id}"));
@@ -385,4 +398,127 @@ async fn restart_after_interrupted_reconciliation_retries_physical_cleanup() {
         .unwrap()
         .iter()
         .any(|event| event.starts_with("bind:")));
+}
+
+#[tokio::test(start_paused = true)]
+async fn missing_running_execution_reconciles_into_bounded_cold_restart() {
+    let backend = Arc::new(Backend::default());
+    backend
+        .allow_start
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let node = manager(&backend);
+    node.update_capacity(
+        Resources {
+            cpu_millis: 4,
+            memory_bytes: 4,
+            disk_bytes: 0,
+        },
+        Duration::from_secs(30),
+    )
+    .unwrap();
+    let mut original = record("reboot", EnvironmentState::Running);
+    original.spec.lifecycle.restart = Some(adx_core::lifecycle::RestartPolicy {
+        max_attempts: 2,
+        initial_backoff_seconds: 1,
+        max_backoff_seconds: 1,
+    });
+    node.reconcile(vec![original.clone()]).await.unwrap();
+    let handle = node
+        .environment(original.spec.clone(), original.assignment.clone())
+        .unwrap();
+    let failed = handle.sync().await.unwrap().record;
+    assert_eq!(failed.state, EnvironmentState::Failed);
+    assert!(
+        failed.restart_pending,
+        "confirmed runtime loss during boot must retain configured restart intent"
+    );
+    assert_eq!(failed.restart_attempts, 0);
+    assert!(!failed.resources_held);
+    assert_eq!(node.used(), Resources::default());
+    tokio::time::advance(Duration::from_secs(2)).await;
+    handle.tick().await.unwrap();
+    let recovered = handle.sync().await.unwrap().record;
+    assert_eq!(recovered.state, EnvironmentState::Running);
+    assert_eq!(recovered.assignment, original.assignment);
+    assert_ne!(recovered.runtime.id, original.runtime.id);
+    assert_eq!(recovered.restart_attempts, 1);
+    assert!(!recovered.restart_pending);
+    assert_eq!(backend.actual.lock().unwrap().len(), 1);
+    let events = backend.events.lock().unwrap().clone();
+    let removed = events
+        .iter()
+        .position(|event| event == "remove:reboot-7")
+        .unwrap();
+    let started = events
+        .iter()
+        .position(|event| event.starts_with("start:"))
+        .unwrap();
+    assert!(removed < started);
+    handle.delete().await.unwrap();
+    assert_eq!(node.used(), Resources::default());
+}
+
+#[tokio::test]
+async fn boot_reconciliation_preserves_exhausted_restart_budget() {
+    let backend = Arc::new(Backend::default());
+    let node = manager(&backend);
+    let mut original = record("exhausted", EnvironmentState::Running);
+    original.spec.lifecycle.restart = Some(adx_core::lifecycle::RestartPolicy {
+        max_attempts: 2,
+        initial_backoff_seconds: 1,
+        max_backoff_seconds: 1,
+    });
+    original.restart_attempts = 2;
+    node.reconcile(vec![original.clone()]).await.unwrap();
+    let handle = node
+        .environment(original.spec, original.assignment)
+        .unwrap();
+    let failed = handle.sync().await.unwrap().record;
+    assert_eq!(failed.state, EnvironmentState::Failed);
+    assert_eq!(failed.restart_attempts, 2);
+    assert!(!failed.restart_pending);
+    assert!(!failed.resources_held);
+    assert!(!backend
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|event| event.starts_with("start:")));
+}
+
+#[tokio::test]
+async fn boot_restart_waits_for_confirmed_cleanup() {
+    let backend = Arc::new(Backend::default());
+    backend
+        .allow_start
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    backend
+        .fail_remove
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let node = manager(&backend);
+    let mut original = record("blocked", EnvironmentState::Running);
+    original.spec.lifecycle.restart = Some(adx_core::lifecycle::RestartPolicy {
+        max_attempts: 2,
+        initial_backoff_seconds: 1,
+        max_backoff_seconds: 1,
+    });
+    assert!(node.reconcile(vec![original.clone()]).await.is_err());
+    assert!(!backend
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|event| event.starts_with("start:")));
+    backend
+        .fail_remove
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    node.reconcile(vec![original.clone()]).await.unwrap();
+    let handle = node
+        .environment(original.spec, original.assignment)
+        .unwrap();
+    let failed = handle.sync().await.unwrap().record;
+    assert_eq!(failed.state, EnvironmentState::Failed);
+    assert!(failed.restart_pending);
+    assert_eq!(failed.restart_attempts, 0);
+    assert!(!failed.resources_held);
 }

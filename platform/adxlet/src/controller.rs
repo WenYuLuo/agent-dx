@@ -601,6 +601,7 @@ impl Controller {
                 Err(error) => return Err(error),
             }
         } else {
+            let lost_running = self.record.state == EnvironmentState::Running;
             if let Some(status) = observation {
                 self.record.failure = status.failure;
             }
@@ -615,6 +616,12 @@ impl Controller {
             } else if self.record.state == EnvironmentState::Failed {
                 self.record.revision =
                     self.record.revision.checked_add(1).ok_or(Error::Conflict)?;
+            }
+            // A boot/reconnect can confirm the same loss that a live monitor
+            // would detect. Keep the existing bounded restart policy after
+            // physical cleanup, without restoring a snapshot or resetting attempts.
+            if lost_running && !self.record.spec.execution.failover {
+                self.schedule_restart();
             }
         }
         self.sync().await

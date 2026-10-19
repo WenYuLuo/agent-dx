@@ -3,11 +3,13 @@ use adx_protocol::control as pb;
 use adx_transport::tls::TlsFiles;
 use adxlet::resources::{PressureGate, PressurePolicy, ResourceSource};
 use adxlet::{
+    jiuwenbox::Jiuwenbox,
     readiness::ExecdReadiness,
     routes::UdsRoutes,
     rpc::{CoordinatorStateSink, NodeRpc},
     runtime_logs::{RuntimeLogPolicy, RuntimeLogs},
-    sandboxd::{connect_when_ready, Config as RuntimeConfig, Sandboxd},
+    runtime_router::RuntimeRouter,
+    sandboxd::{connect_when_ready, Config as RuntimeConfig},
     Adxlet, RuntimeDriver,
 };
 use serde::Deserialize;
@@ -35,7 +37,10 @@ struct Config {
     tls: TlsFiles,
     #[serde(default)]
     admin_socket: Option<PathBuf>,
-    sandboxd_socket: PathBuf,
+    #[serde(default)]
+    sandboxd_socket: Option<PathBuf>,
+    #[serde(default)]
+    jiuwenbox: Option<adxlet::jiuwenbox::Config>,
     #[serde(default)]
     runtime_logs: RuntimeLogPolicy,
     proxy_socket: PathBuf,
@@ -94,7 +99,7 @@ fn execd_ready_poll_interval() -> Duration {
 }
 async fn sample(
     source: &ResourceSource,
-    runtime: &Sandboxd,
+    runtime: &RuntimeRouter,
     timeout: Duration,
 ) -> adx_core::Result<(adxlet::resources::Observation, Duration)> {
     if matches!(source, ResourceSource::Sandboxd { .. }) {
@@ -146,6 +151,9 @@ async fn inspect_node(
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config: Config = read_config()?;
+    if config.sandboxd_socket.is_none() && config.jiuwenbox.is_none() {
+        return Err("configure sandboxd_socket and/or jiuwenbox".into());
+    }
     config.checkpoint_gc.validate()?;
     let runtime_logs = RuntimeLogs::new(config.runtime_logs.clone())?;
     // Embedded Proxy and Adxlet share this process-wide subscriber and
@@ -273,15 +281,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         rpc_timeout: timeout,
         runtime_logs: Some(config.runtime_logs.clone()),
     };
-    let runtime = Arc::new(tokio::select! {
-        result = connect_when_ready(
-            config.sandboxd_socket,
-            runtime_config,
-            Duration::from_secs(config.runtime_ready_timeout_seconds),
-            Duration::from_secs(config.report_interval_seconds),
-        ) => result?,
-        _ = shutdown() => return Ok(()),
-    });
+    let jiuwenbox = match config.jiuwenbox {
+        Some(backend) => Some(Jiuwenbox::connect(backend, runtime_config.clone()).await?),
+        None => None,
+    };
+    let sandboxd = match config.sandboxd_socket {
+        Some(socket) => Some(tokio::select! {
+            result = connect_when_ready(socket, runtime_config,
+                Duration::from_secs(config.runtime_ready_timeout_seconds),
+                Duration::from_secs(config.report_interval_seconds)) => result?,
+            _ = shutdown() => return Ok(()),
+        }),
+        None => None,
+    };
+    let runtime = Arc::new(RuntimeRouter::new(sandboxd, jiuwenbox)?);
     // The sandboxd network plugin may create the configured bridge during
     // initialization. Bind only after backend readiness, before admitting work.
     let stream_listener = if let Some((listen, _)) = &stream_setup {
@@ -654,7 +667,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(inventory) => inventory.into_iter().map(|item| item.runtime_id).collect(),
                 Err(error) => {
                     adx_observability::warn!(
-                        "runtime log GC skipped; sandboxd inventory unavailable: {error}"
+                        "runtime log GC skipped; backend inventory unavailable: {error}"
                     );
                     continue;
                 }
@@ -748,6 +761,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn jiuwenbox_example_configures_a_node_without_sandboxd() {
+        let config: Config = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/config/examples/node-jiuwenbox.json"
+        )))
+        .unwrap();
+        assert!(config.sandboxd_socket.is_none());
+        config.jiuwenbox.as_ref().unwrap().validate().unwrap();
+        assert!(matches!(
+            config.resource_source,
+            Some(ResourceSource::Auto { .. })
+        ));
+        assert!(config.checkpoint_dir.is_none());
+    }
 
     #[test]
     fn execd_readiness_poll_keeps_startup_jitter_below_twenty_milliseconds() {

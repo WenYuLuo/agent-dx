@@ -45,7 +45,7 @@ Agent DX (**Agent Distributed eXecutor**) is a distributed execution substrate f
 |---|---|---|
 | 1 · Access | A caller authenticates and creates or operates an Environment through one public contract. | `gateway/apiserver/`, `platform/sdk/environment/python/` |
 | 2 · Place | API Server uses local-first admission or sends the request to Coordinator. Coordinator rotates across Shards; each Shard queues, filters, scores, and reserves a node. | `platform/coordinator/`, `platform/crates/scheduling/` |
-| 3 · Run | adxlet performs final local admission, serializes the Environment lifecycle, and asks sandboxd to create a Runtime with Execd. | `platform/adxlet/`, `third_party/sandboxd/`, `platform/runtime/execd/` |
+| 3 · Run | adxlet performs final local admission, serializes the Environment lifecycle, and dispatches to sandboxd or the configured Jiuwenbox driver to create a Runtime with Execd. | `platform/adxlet/`, `third_party/sandboxd/`, `platform/runtime/execd/` |
 | 4 · Operate and recover | Ingress routes data to the owning Relay. Versioned ownership fences old Runtimes; pause, resume, snapshots, restart policy, and reconciliation converge state after failures. | `gateway/`, `platform/adxlet/`, Redis, checkpoint storage |
 
 API Server embeds Ingress by default, and adxlet embeds Relay by default. Both pairs keep the same contracts when configured as separate processes.
@@ -53,6 +53,8 @@ API Server embeds Ingress by default, and adxlet embeds Relay by default. Both p
 ## 📦 Installation
 
 ADX release packages target Linux and contain `adx-coordinator`, `adxlet` (embedded Relay by default), `adx-apiserver` (embedded Ingress by default), the optional standalone `adx-ingress` and `adx-relay` binaries, `adxctl`, the read-only [`adx-inspect`](docs/deployment/adx-inspect.md), Execd, the Python Environment SDK, and managed Redis with `redis-cli`. The debug forwarder is a source-build tool. sandboxd remains independently managed and is pinned by [`third_party/sandboxd/source.json`](third_party/sandboxd/source.json).
+
+The opt-in [Jiuwenbox adapter](docs/testing/jiuwenbox-runtime.md) supports the `supervisor` and `conch` classes using independently managed Jiuwenbox/Conch services. Execd remains a separately mounted EROFS artifact; this path has component contracts, real Linux runtime integration, and installed public SDK acceptance for lifecycle, files, EROFS, process recovery, Redis outages and dedicated Linux VM host reboot. See the [recovery acceptance record](docs/testing/jiuwenbox-recovery-20261019.md) for storage requirements and the tested boundary.
 
 ```sh
 mkdir adx-release
@@ -146,13 +148,13 @@ ADX separates stable logical identity from replaceable execution:
 | `Environment` | Public API and SDK handle presented to applications |
 | Platform `Environment` | Stable internal identity containing tenant, specification, lifecycle, and desired/observed state |
 | `RuntimeProfile` | Deployment-owned rootfs, bootstrap and startup variables; configuration rather than a running Environment |
-| `Runtime` | One concrete sandboxd execution of an Environment on one node; restart or recovery may replace it |
+| `Runtime` | One concrete backend execution of an Environment on one node; restart or recovery may replace it |
 | `Assignment` | Authoritative node and device ownership with a `generation` that fences late old execution |
 | `Route` / `Binding` | Versioned ownership published to Ingress and rechecked locally by Relay before forwarding |
 | `Restore Point` / `Snapshot` | A restore point keeps the Environment ID; a reusable Snapshot creates a new Environment |
 | `Request ID` / `Operation ID` | One logical write identity for retry, deduplication, result lookup, and reconciliation |
 
-The fixed control path is Agent/application → Environment SDK/HTTP API → API Server → Coordinator/Shard scheduler or local-first adxlet → sandboxd. Runtime traffic follows Ingress → Relay → Execd and does not enter lifecycle queues. Public lifecycle and error payloads identify the Environment with `environmentId`. The directory keeps `/api/instances` and its `instance_id` query parameter; internal Rust types, RPCs, persistence keys, metrics, and runtime identity use Environment terminology.
+The fixed control path is Agent/application → Environment SDK/HTTP API → API Server → Coordinator/Shard scheduler or local-first adxlet → runtime driver (sandboxd or Jiuwenbox). Runtime traffic follows Ingress → Relay → Execd and does not enter lifecycle queues. Public lifecycle and error payloads identify the Environment with `environmentId`. The directory keeps `/api/instances` and its `instance_id` query parameter; internal Rust types, RPCs, persistence keys, metrics, and runtime identity use Environment terminology.
 
 Execd can initiate a dedicated bidirectional control stream to adxlet, publishing Ready and checkpoint state while receiving checkpoint commands. Enable it with the [node runtime-control configuration](docs/deployment/runtime-control-stream.md); both the node binary and the Execd inside the runtime image must be updated. Without that configuration, runtime cooperation uses HTTP. The [contract](platform/api/proto/runtime-control.md) and [component validation](docs/testing/runtime-control-stream.md) describe identity fencing, reconnect and acknowledgements after authoritative result submission.
 

@@ -7,6 +7,7 @@ pub mod control_stream;
 mod controller;
 mod local;
 pub use local::LocalReservation;
+pub mod jiuwenbox;
 pub mod journal;
 pub mod managed_mounts;
 pub mod metrics;
@@ -18,6 +19,7 @@ pub mod routes;
 pub mod rpc;
 pub mod runtime_control;
 pub mod runtime_logs;
+pub mod runtime_router;
 pub mod sandboxd;
 
 use adx_core::scheduling::{validate_device_assignment, Device, DeviceAllocation, DeviceLedger};

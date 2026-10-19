@@ -859,7 +859,7 @@ fn environment_mount(value: &adx_core::execution::Mount) -> Result<proto::Mount>
     })
 }
 
-fn environment_network_policy(
+pub(crate) fn environment_network_policy(
     value: &adx_core::execution::NetworkPolicy,
     ports: &[u16],
     config: &Config,
@@ -869,6 +869,18 @@ fn environment_network_policy(
         model::NetworkAction::Allow => proto::NetworkPolicyAction::Allow as i32,
         model::NetworkAction::Deny => proto::NetworkPolicyAction::Deny as i32,
     };
+    let execd_port = config
+        .env
+        .get("EXECD_HTTP_PORT")
+        .map(|v| v.parse::<u16>())
+        .transpose()
+        .map_err(|_| Error::Invalid("invalid Execd control port".into()))?
+        .unwrap_or(50090);
+    if execd_port == 0 {
+        return Err(Error::Invalid(
+            "positive Execd control port required".into(),
+        ));
+    }
     let control_peer = runtime_control_peer(config)?;
     let traffic = value.traffic.as_ref().map(|traffic| {
         let mut rules: Vec<_> = traffic
@@ -910,13 +922,13 @@ fn environment_network_policy(
         // Control traffic and declared public ports remain reachable under a
         // deny-by-default user policy. UINT32_MAX is reserved by the public
         // contract for these platform-owned rules.
-        for port in std::iter::once(50090u16).chain(ports.iter().copied()) {
+        for port in std::iter::once(execd_port).chain(ports.iter().copied()) {
             rules.push(proto::TrafficRule {
                 action: proto::NetworkPolicyAction::Allow as i32,
                 // Execd control replies must not depend on a conntrack entry
                 // from the previous policy generation. Stateless published
                 // ports also need an explicit return-path rule.
-                direction: if port == 50090 || traffic.mode == model::TrafficMode::Stateless {
+                direction: if port == execd_port || traffic.mode == model::TrafficMode::Stateless {
                     proto::NetworkDirection::Both as i32
                 } else {
                     proto::NetworkDirection::Ingress as i32
