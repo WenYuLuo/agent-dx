@@ -27,6 +27,12 @@ pip 改用华为云 HTTPS 镜像，固定五项依赖及当前两个大依赖均
 SHA256 `9dab55f57c74c3cad24c323bacbbd04be4705ba6eb0d92e920b1fc4837ed5079` 与镜像索引一致。
 这是本机镜像连通性/完整性证据，CI 速度和 supervisor 通过结果仍待新提交重跑。
 服务端和 SDK 的 pip 缓存放在既有 `/mnt/paas/build-cache/adx/pip/jiuwenbox`。
+
+[#166](https://buildkite.com/agent-dx/agent-dx/builds/166) 已证明镜像源在 CI 生效：
+pydantic_core 下载 71.9 MB/s、cryptography 106.4 MB/s，且 cgroup v1 前置检查通过。
+后续 ADXlet 未就绪，日志明确为 EROFS `failed to setup loop device`，SDK cases 仍为空。
+Pod 原先没有显式映射宿主设备目录；已补充 `/dev` hostPath，并在下载前运行只读
+`losetup --find` 检查，实际 EROFS 挂载及 SDK 结果仍需修正后的提交重跑。
 Jiuwenbox archive/wheel 的固定摘要保持原样。
 
 ## 接入行为

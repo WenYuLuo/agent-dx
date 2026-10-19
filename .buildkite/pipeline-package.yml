@@ -665,11 +665,14 @@ steps:
           volumeMounts:
           - {name: build-cache, mountPath: /mnt/paas}
           - {name: cgroup, mountPath: /sys/fs/cgroup}
+          - {name: devices, mountPath: /dev}
         volumes:
         - name: build-cache
           hostPath: {path: /mnt/paas, type: DirectoryOrCreate}
         - name: cgroup
           hostPath: {path: /sys/fs/cgroup, type: Directory}
+        - name: devices
+          hostPath: {path: /dev, type: Directory}
 - label: Publish · adxadmin · PyPI
   key: admin-pypi
   depends_on: platform-e2e

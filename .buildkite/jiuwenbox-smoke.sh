@@ -18,6 +18,8 @@ if [[ $missing_tools == 1 ]]; then
 fi
 # Check the backend's supported cgroup layouts before artifact or pip downloads.
 python3 -c 'import runpy; runpy.run_path("build/e2e/jiuwenbox/smoke.py", run_name="preflight")["preflight"]()'
+# The privileged Pod must expose loop-control and dynamically allocated devices.
+losetup --find >/dev/null
 [[ -z $(git status --porcelain) ]] || { echo 'clean checkout required' >&2; exit 1; }
 [[ $(git rev-parse HEAD) == "$BUILDKITE_COMMIT" ]] || { echo 'checkout commit mismatch' >&2; exit 1; }
 mkdir -p out/buildkite/logs
