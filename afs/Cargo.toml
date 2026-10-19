@@ -25,6 +25,10 @@ name = "afs-root-command-meta"
 path = "tests/support/root_command_meta.rs"
 required-features = ["ownerfs"]
 
+[[example]]
+name = "afs-perf-denominators"
+path = "tests/support/perf_denominators.rs"
+
 [dependencies]
 afs-error = { path = "common/error" }
 afs-logging = { path = "common/logging" }

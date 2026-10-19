@@ -248,6 +248,42 @@ pub struct Cli {
     /// Retained immutable metadata estimate (1..=1GiB), separate from active readers and RSS.
     #[arg(long)]
     pub dfs_version_cache_bytes: Option<u64>,
+    /// Maximum shared outboard range-work admission wait (0..=50 ms).
+    #[arg(long)]
+    pub dfs_outboard_work_wait_ms: Option<u64>,
+    /// Queued plus active catalog commit requests (1..=256), with a separate 1MiB control bound.
+    #[arg(long)]
+    pub dfs_catalog_commit_queue: Option<usize>,
+    /// Native Node live write-body capacity (4..=64MiB); S3 budgets are separate.
+    #[arg(long)]
+    pub dfs_dirty_budget_bytes: Option<u64>,
+    /// Native uploaded but unpublished objects (1..=1024), within 4MiB metadata.
+    #[arg(long)]
+    pub dfs_unpublished_descriptors: Option<usize>,
+    /// Native Node upload tasks (1..=8), sharing the live-body budget.
+    #[arg(long)]
+    pub dfs_upload_inflight_chunks: Option<usize>,
+    /// Native background commit scheduling period (1..=60000ms), not a deadline.
+    #[arg(long)]
+    pub dfs_background_commit_ms: Option<u64>,
+    /// Queued plus active optional sidecar installs (1..=64).
+    #[arg(long)]
+    pub dfs_sidecar_install_queue: Option<usize>,
+    /// Concurrent native cache fill-flight records (1..=8), not active body transfers.
+    #[arg(long)]
+    pub dfs_fetch_max_inflight_objects: Option<usize>,
+    /// Native object lookahead distance (0..=32MiB); 0 disables background fetch.
+    #[arg(long)]
+    pub dfs_readahead_max_bytes: Option<u64>,
+    /// Verified Peer resident objects (1..=16), sharing the payload byte limit.
+    #[arg(long)]
+    pub dfs_peer_serve_resident_objects: Option<usize>,
+    /// Shared Peer resident, in-flight and retained frame bytes (4..=64 MiB).
+    #[arg(long)]
+    pub dfs_peer_serve_payload_bytes: Option<u64>,
+    /// One native Peer admission wait deadline (0..=50 ms); zero never waits.
+    #[arg(long)]
+    pub dfs_peer_serve_wait_ms: Option<u64>,
     /// Filesystem-wide immutable DFS replica target count. Applied by Meta at initialization.
     #[arg(long)]
     pub dfs_desired_copies: Option<u16>,
@@ -266,7 +302,11 @@ pub struct Cli {
     #[arg(long)]
     pub dfs_read_max_inflight_bytes: Option<u64>,
     #[arg(long)]
-    pub dfs_read_source_cache_ttl_ms: Option<u64>,
+    pub dfs_source_cache_max_ms: Option<u64>,
+    #[arg(long)]
+    pub dfs_source_lookahead_chunks: Option<usize>,
+    #[arg(long)]
+    pub dfs_source_cache_bytes: Option<usize>,
     /// Bounded coarse read timing for explicit diagnosis only; disabled by default.
     #[arg(long)]
     pub dfs_read_diagnostics_enabled: Option<bool>,
@@ -324,6 +364,18 @@ struct FileConfig {
     fuse_max_readahead_bytes: Option<u32>,
     dfs_version_cache_entries: Option<usize>,
     dfs_version_cache_bytes: Option<u64>,
+    dfs_outboard_work_wait_ms: Option<u64>,
+    dfs_catalog_commit_queue: Option<usize>,
+    dfs_dirty_budget_bytes: Option<u64>,
+    dfs_unpublished_descriptors: Option<usize>,
+    dfs_upload_inflight_chunks: Option<usize>,
+    dfs_background_commit_ms: Option<u64>,
+    dfs_sidecar_install_queue: Option<usize>,
+    dfs_fetch_max_inflight_objects: Option<usize>,
+    dfs_readahead_max_bytes: Option<u64>,
+    dfs_peer_serve_resident_objects: Option<usize>,
+    dfs_peer_serve_payload_bytes: Option<u64>,
+    dfs_peer_serve_wait_ms: Option<u64>,
     dfs_external_backend: Option<DfsExternalBackendConfig>,
     dfs_peer_cache: Option<DfsPeerCacheConfig>,
     dfs_write_buffer_idle_bytes: Option<u64>,
@@ -334,7 +386,9 @@ struct FileConfig {
     dfs_local_copy: Option<String>,
     dfs_read_max_ops_per_batch: Option<usize>,
     dfs_read_max_inflight_bytes: Option<u64>,
-    dfs_read_source_cache_ttl_ms: Option<u64>,
+    dfs_source_cache_max_ms: Option<u64>,
+    dfs_source_lookahead_chunks: Option<usize>,
+    dfs_source_cache_bytes: Option<usize>,
     dfs_read_diagnostics_enabled: Option<bool>,
     timeout_ms: Option<u64>,
     log_level: Option<String>,
@@ -382,6 +436,18 @@ pub struct Config {
     pub fuse_max_readahead_bytes: u32,
     pub dfs_version_cache_entries: usize,
     pub dfs_version_cache_bytes: u64,
+    pub dfs_outboard_work_wait_ms: u64,
+    pub dfs_catalog_commit_queue: usize,
+    pub dfs_dirty_budget_bytes: u64,
+    pub dfs_unpublished_descriptors: usize,
+    pub dfs_upload_inflight_chunks: usize,
+    pub dfs_background_commit_ms: u64,
+    pub dfs_sidecar_install_queue: usize,
+    pub dfs_fetch_max_inflight_objects: usize,
+    pub dfs_readahead_max_bytes: u64,
+    pub dfs_peer_serve_resident_objects: usize,
+    pub dfs_peer_serve_payload_bytes: u64,
+    pub dfs_peer_serve_wait_ms: u64,
     pub dfs_external_backend: Option<DfsExternalBackendConfig>,
     pub dfs_peer_cache: Option<DfsPeerCacheConfig>,
     /// Reusable idle write-body capacity only, not a live-body quota.
@@ -393,7 +459,9 @@ pub struct Config {
     pub dfs_local_copy: String,
     pub dfs_read_max_ops_per_batch: usize,
     pub dfs_read_max_inflight_bytes: u64,
-    pub dfs_read_source_cache_ttl_ms: u64,
+    pub dfs_source_cache_max_ms: u64,
+    pub dfs_source_lookahead_chunks: usize,
+    pub dfs_source_cache_bytes: usize,
     pub dfs_read_diagnostics_enabled: bool,
     pub timeout_ms: u64,
     pub log_level: String,
@@ -500,13 +568,26 @@ impl Config {
             .dfs_read_max_inflight_bytes
             .or(file.dfs_read_max_inflight_bytes)
             .unwrap_or(8 * 1024 * 1024);
-        let dfs_read_source_cache_ttl_ms = cli
-            .dfs_read_source_cache_ttl_ms
-            .or(file.dfs_read_source_cache_ttl_ms)
-            .unwrap_or(500);
+        let dfs_source_cache_max_ms = cli
+            .dfs_source_cache_max_ms
+            .or(file.dfs_source_cache_max_ms)
+            .unwrap_or(5000);
+        let dfs_source_lookahead_chunks = cli
+            .dfs_source_lookahead_chunks
+            .or(file.dfs_source_lookahead_chunks)
+            .unwrap_or(64);
+        let dfs_source_cache_bytes = cli
+            .dfs_source_cache_bytes
+            .or(file.dfs_source_cache_bytes)
+            .unwrap_or(4 * 1024 * 1024);
+        if dfs_source_lookahead_chunks > 128 || dfs_source_cache_bytes > 4 * 1024 * 1024 {
+            return Err(invalid(
+                "DFS source metadata requires lookahead <= 128 chunks and cache <= 4194304 bytes",
+            ));
+        }
         if dfs_read_max_ops_per_batch == 0
             || dfs_read_max_inflight_bytes == 0
-            || dfs_read_source_cache_ttl_ms > 60_000
+            || dfs_source_cache_max_ms > 60_000
         {
             return Err(invalid(
                 "DFS read budgets must be non-zero and source cache TTL must be <= 60000 ms",
@@ -549,6 +630,106 @@ impl Config {
             .unwrap_or(32 * 1024 * 1024);
         if !(1..=1024 * 1024 * 1024).contains(&dfs_version_cache_bytes) {
             return Err(invalid("DFS version cache bytes must be 1..=1073741824"));
+        }
+        #[cfg(feature = "dfs")]
+        if role == Role::Node {
+            let minimum =
+                crate::node::vfs::dfs::version_cache_minimum_bytes(dfs_version_cache_entries)
+                    .ok_or_else(|| invalid("DFS version cache minimum byte estimate overflows"))?;
+            if usize::try_from(dfs_version_cache_bytes)
+                .ok()
+                .is_none_or(|bytes| bytes < minimum)
+            {
+                return Err(invalid(format!(
+                    "DFS version cache bytes {dfs_version_cache_bytes} is below minimum {minimum} for {dfs_version_cache_entries} entries",
+                )));
+            }
+        }
+        let dfs_outboard_work_wait_ms = cli
+            .dfs_outboard_work_wait_ms
+            .or(file.dfs_outboard_work_wait_ms)
+            .unwrap_or(2);
+        if dfs_outboard_work_wait_ms > 50 {
+            return Err(invalid("DFS outboard work wait must be 0..=50 ms"));
+        }
+        let dfs_catalog_commit_queue = cli
+            .dfs_catalog_commit_queue
+            .or(file.dfs_catalog_commit_queue)
+            .unwrap_or(256);
+        if !(1..=256).contains(&dfs_catalog_commit_queue) {
+            return Err(invalid("DFS catalog commit queue must be 1..=256"));
+        }
+        let dfs_dirty_budget_bytes = cli
+            .dfs_dirty_budget_bytes
+            .or(file.dfs_dirty_budget_bytes)
+            .unwrap_or(64 * 1024 * 1024);
+        if !(4 * 1024 * 1024..=64 * 1024 * 1024).contains(&dfs_dirty_budget_bytes) {
+            return Err(invalid("DFS native dirty budget bytes must be 4..=64MiB"));
+        }
+        let dfs_unpublished_descriptors = cli
+            .dfs_unpublished_descriptors
+            .or(file.dfs_unpublished_descriptors)
+            .unwrap_or(1024);
+        if !(1..=1024).contains(&dfs_unpublished_descriptors) {
+            return Err(invalid("DFS unpublished descriptors must be 1..=1024"));
+        }
+        let dfs_upload_inflight_chunks = cli
+            .dfs_upload_inflight_chunks
+            .or(file.dfs_upload_inflight_chunks)
+            .unwrap_or(8);
+        if !(1..=8).contains(&dfs_upload_inflight_chunks) {
+            return Err(invalid("DFS native upload inflight chunks must be 1..=8"));
+        }
+        let dfs_background_commit_ms = cli
+            .dfs_background_commit_ms
+            .or(file.dfs_background_commit_ms)
+            .unwrap_or(5000);
+        if !(1..=60000).contains(&dfs_background_commit_ms) {
+            return Err(invalid(
+                "DFS native background commit period must be 1..=60000ms",
+            ));
+        }
+        let dfs_sidecar_install_queue = cli
+            .dfs_sidecar_install_queue
+            .or(file.dfs_sidecar_install_queue)
+            .unwrap_or(64);
+        if !(1..=64).contains(&dfs_sidecar_install_queue) {
+            return Err(invalid("DFS sidecar install queue must be 1..=64"));
+        }
+        let dfs_fetch_max_inflight_objects = cli
+            .dfs_fetch_max_inflight_objects
+            .or(file.dfs_fetch_max_inflight_objects)
+            .unwrap_or(8);
+        if !(1..=8).contains(&dfs_fetch_max_inflight_objects) {
+            return Err(invalid("DFS fetch inflight objects must be 1..=8"));
+        }
+        let dfs_readahead_max_bytes = cli
+            .dfs_readahead_max_bytes
+            .or(file.dfs_readahead_max_bytes)
+            .unwrap_or(0);
+        if dfs_readahead_max_bytes > 32 * 1024 * 1024 {
+            return Err(invalid("DFS readahead distance must be 0..=32MiB"));
+        }
+        let dfs_peer_serve_resident_objects = cli
+            .dfs_peer_serve_resident_objects
+            .or(file.dfs_peer_serve_resident_objects)
+            .unwrap_or(2);
+        if !(1..=16).contains(&dfs_peer_serve_resident_objects) {
+            return Err(invalid("DFS Peer serve resident objects must be 1..=16"));
+        }
+        let dfs_peer_serve_payload_bytes = cli
+            .dfs_peer_serve_payload_bytes
+            .or(file.dfs_peer_serve_payload_bytes)
+            .unwrap_or(16 * 1024 * 1024);
+        if !(4 * 1024 * 1024..=64 * 1024 * 1024).contains(&dfs_peer_serve_payload_bytes) {
+            return Err(invalid("DFS Peer serve payload bytes must be 4..=64 MiB"));
+        }
+        let dfs_peer_serve_wait_ms = cli
+            .dfs_peer_serve_wait_ms
+            .or(file.dfs_peer_serve_wait_ms)
+            .unwrap_or(20);
+        if dfs_peer_serve_wait_ms > 50 {
+            return Err(invalid("DFS Peer serve wait must be 0..=50 ms"));
         }
         let cfg = Self {
             grpc_listen: cli.grpc_listen.or(file.grpc_listen).unwrap_or_else(|| {
@@ -619,6 +800,18 @@ impl Config {
             fuse_max_readahead_bytes,
             dfs_version_cache_entries,
             dfs_version_cache_bytes,
+            dfs_outboard_work_wait_ms,
+            dfs_catalog_commit_queue,
+            dfs_dirty_budget_bytes,
+            dfs_unpublished_descriptors,
+            dfs_upload_inflight_chunks,
+            dfs_background_commit_ms,
+            dfs_sidecar_install_queue,
+            dfs_fetch_max_inflight_objects,
+            dfs_readahead_max_bytes,
+            dfs_peer_serve_resident_objects,
+            dfs_peer_serve_payload_bytes,
+            dfs_peer_serve_wait_ms,
             dfs_external_backend: file.dfs_external_backend,
             dfs_peer_cache: file.dfs_peer_cache,
             dfs_write_buffer_idle_bytes: file
@@ -631,7 +824,9 @@ impl Config {
             dfs_local_copy,
             dfs_read_max_ops_per_batch,
             dfs_read_max_inflight_bytes,
-            dfs_read_source_cache_ttl_ms,
+            dfs_source_cache_max_ms,
+            dfs_source_lookahead_chunks,
+            dfs_source_cache_bytes,
             dfs_read_diagnostics_enabled: cli
                 .dfs_read_diagnostics_enabled
                 .or(file.dfs_read_diagnostics_enabled)

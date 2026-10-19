@@ -452,7 +452,7 @@ impl PendingTrace {
             return;
         }
         let commit = &pending.batch.commit;
-        let Ok(bytes) = serde_json::to_vec(commit) else {
+        let Ok(bytes) = serde_json::to_vec(commit.as_ref()) else {
             writer.disabled = true;
             return;
         };

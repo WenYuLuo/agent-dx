@@ -1047,6 +1047,90 @@ impl Drop for FuseDispatch {
     }
 }
 
+/// Short shard-table locks only protect gate identity and reference retirement.
+/// The per-inode lock, never the table lock, spans backend work and FUSE reply.
+struct InodeCacheGates {
+    shards: [Mutex<HashMap<u64, Arc<RwLock<()>>>>; PAGE_CACHE_INODE_GATES],
+}
+
+impl Default for InodeCacheGates {
+    fn default() -> Self {
+        Self {
+            shards: std::array::from_fn(|_| Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+impl InodeCacheGates {
+    fn acquire(&self, ino: u64) -> std::result::Result<InodeCacheGate<'_>, i32> {
+        let shard = &self.shards[(ino % PAGE_CACHE_INODE_GATES as u64) as usize];
+        let mut table = shard.lock().map_err(|_| libc::EIO)?;
+        let gate = table
+            .entry(ino)
+            .or_insert_with(|| Arc::new(RwLock::new(())))
+            .clone();
+        Ok(InodeCacheGate {
+            shard,
+            ino,
+            gate: Some(gate),
+        })
+    }
+}
+
+/// Each lease owns one reference outside the table. It cannot be cloned:
+/// acquisition and final retirement must both serialize through the table lock.
+struct InodeCacheGate<'a> {
+    shard: &'a Mutex<HashMap<u64, Arc<RwLock<()>>>>,
+    ino: u64,
+    gate: Option<Arc<RwLock<()>>>,
+}
+
+impl InodeCacheGate<'_> {
+    fn read(&self) -> std::result::Result<std::sync::RwLockReadGuard<'_, ()>, i32> {
+        self.gate
+            .as_ref()
+            .ok_or(libc::EIO)?
+            .read()
+            .map_err(|_| libc::EIO)
+    }
+
+    fn write(&self) -> std::result::Result<std::sync::RwLockWriteGuard<'_, ()>, i32> {
+        self.gate
+            .as_ref()
+            .ok_or(libc::EIO)?
+            .write()
+            .map_err(|_| libc::EIO)
+    }
+}
+
+impl Drop for InodeCacheGate<'_> {
+    fn drop(&mut self) {
+        let Some(gate) = self.gate.take() else {
+            return;
+        };
+        // Even a poisoned optimization table must release leases. No backend
+        // state is protected here, and acquire still fails closed on poison.
+        let mut table = self
+            .shard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let same_gate = table
+            .get(&self.ino)
+            .is_some_and(|current| Arc::ptr_eq(current, &gate));
+        // Release this lease while holding the acquisition lock. Concurrent
+        // last drops cannot both observe each other's still-live reference and
+        // leave an idle entry forever. A waiting acquire cannot split identity.
+        drop(gate);
+        if same_gate
+            && table
+                .get(&self.ino)
+                .is_some_and(|current| Arc::strong_count(current) == 1)
+        {
+            table.remove(&self.ino);
+        }
+    }
+}
+
 pub struct AfsFuse {
     #[cfg(any(feature = "dfs", test))]
     read_work: Option<crate::node::read_work::ReadWorkMetrics>,
@@ -1055,7 +1139,7 @@ pub struct AfsFuse {
     cached_io: bool,
     mount_options: FuseMountOptions,
     page_cache_ids: Arc<Mutex<PageCacheIdentities>>,
-    inode_cache_gates: Arc<[RwLock<()>; PAGE_CACHE_INODE_GATES]>,
+    inode_cache_gates: Arc<InodeCacheGates>,
     inline_local_read_scratch: Mutex<Vec<u8>>,
     state: Arc<Mutex<FuseState>>,
     file_handle_inodes: Arc<Mutex<HashMap<u64, u64>>>,
@@ -1090,7 +1174,7 @@ impl AfsFuse {
             cached_io: false,
             mount_options,
             page_cache_ids: Arc::new(Mutex::new(PageCacheIdentities::default())),
-            inode_cache_gates: Arc::new(std::array::from_fn(|_| RwLock::new(()))),
+            inode_cache_gates: Arc::new(InodeCacheGates::default()),
             inline_local_read_scratch: Mutex::new(Vec::new()),
             state,
             file_handle_inodes: Arc::new(Mutex::new(HashMap::new())),
@@ -1715,8 +1799,21 @@ impl Filesystem for AfsFuse {
             // No table lock crosses Meta RPCs or reply I/O. This bounded local
             // fence drains old READ replies before a fresh OPEN changes the
             // inode mapping, and serializes identity decisions through reply.
-            let _cache_open = if cached_io {
-                match cache_gates[(ino as usize) % PAGE_CACHE_INODE_GATES].write() {
+            // Declare the lease first: its RwLock guard must drop before the
+            // lease retires the final per-inode reference on every return path.
+            let cache_gate = if cached_io {
+                match cache_gates.acquire(ino) {
+                    Ok(gate) => Some(gate),
+                    Err(error) => {
+                        reply.error(fuse_errno(error));
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+            let _cache_open = if let Some(gate) = &cache_gate {
+                match gate.write() {
                     Ok(guard) => Some(guard),
                     Err(_) => {
                         reply.error(fuse_errno(libc::EIO));
@@ -1862,8 +1959,25 @@ impl Filesystem for AfsFuse {
             return;
         }
         let run = move || {
-            let _cache_read = if cached_io {
-                match cache_gates[(ino as usize) % PAGE_CACHE_INODE_GATES].read() {
+            let cache_gate = if cached_io {
+                match cache_gates.acquire(ino) {
+                    Ok(gate) => Some(gate),
+                    Err(error) => {
+                        complete_read_reply(
+                            #[cfg(any(feature = "dfs", test))]
+                            diagnostic,
+                            #[cfg(any(feature = "dfs", test))]
+                            false,
+                            || reply.error(fuse_errno(error)),
+                        );
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+            let _cache_read = if let Some(gate) = &cache_gate {
+                match gate.read() {
                     Ok(guard) => Some(guard),
                     Err(_) => {
                         complete_read_reply(
@@ -3015,6 +3129,113 @@ mod dispatch_tests {
     }
 
     #[test]
+    fn inode_cache_gates_allow_distinct_inodes_in_one_shard() {
+        // Exercise the current gate lookup with two distinct inode identities.
+        // The held read is the barrier; a different inode's OPEN must acquire
+        // its write side before this read is released, including shard peers.
+        let fs = super::AfsFuse::new(Arc::new(OwnedReadBackend::default()));
+        let gates = &fs.inode_cache_gates;
+        let first_ino = 7;
+        let other_ino = first_ino + super::PAGE_CACHE_INODE_GATES as u64;
+        let first_gate = gates.acquire(first_ino).unwrap();
+        let first_read = first_gate.read().unwrap();
+        let other_gate = gates.acquire(other_ino).unwrap();
+        let other_open = other_gate.gate.as_ref().unwrap().try_write();
+        assert!(
+            other_open.is_ok(),
+            "another inode in the same shard was fenced by this READ"
+        );
+        drop(other_open);
+        drop(first_read);
+    }
+
+    fn inode_cache_gate_entries(gates: &super::InodeCacheGates) -> usize {
+        gates
+            .shards
+            .iter()
+            .map(|shard| shard.lock().unwrap().len())
+            .sum()
+    }
+
+    #[test]
+    fn inode_cache_gate_concurrent_acquisition_keeps_live_identity() {
+        let fs = super::AfsFuse::new(Arc::new(OwnedReadBackend::default()));
+        let gates = &fs.inode_cache_gates;
+        let anchor = gates.acquire(17).unwrap();
+        let writer = anchor.write().unwrap();
+        let expected = Arc::as_ptr(anchor.gate.as_ref().unwrap()) as usize;
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    for _ in 0..128 {
+                        let lease = gates.acquire(17).unwrap();
+                        assert_eq!(Arc::as_ptr(lease.gate.as_ref().unwrap()) as usize, expected);
+                        assert!(lease.gate.as_ref().unwrap().try_read().is_err());
+                    }
+                });
+            }
+        });
+        assert_eq!(inode_cache_gate_entries(gates), 1);
+        drop(writer);
+        drop(anchor);
+        assert_eq!(inode_cache_gate_entries(gates), 0);
+    }
+
+    #[test]
+    fn inode_cache_gate_concurrent_last_release_does_not_accumulate() {
+        let fs = super::AfsFuse::new(Arc::new(OwnedReadBackend::default()));
+        let gates = &fs.inode_cache_gates;
+        let barrier = std::sync::Barrier::new(9);
+        let mut leaked_entries = 0;
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    for round in 0..64 {
+                        // A different inode each round would accumulate leaked
+                        // table-only entries if simultaneous last drops race.
+                        let lease = gates.acquire(round * 64 + 3).unwrap();
+                        let read = lease.read().unwrap();
+                        barrier.wait();
+                        drop(read);
+                        drop(lease);
+                        barrier.wait();
+                        barrier.wait();
+                    }
+                });
+            }
+            for _ in 0..64 {
+                barrier.wait();
+                barrier.wait();
+                leaked_entries += inode_cache_gate_entries(gates);
+                barrier.wait();
+            }
+        });
+        assert_eq!(leaked_entries, 0);
+        assert_eq!(inode_cache_gate_entries(gates), 0);
+    }
+
+    #[test]
+    fn inode_cache_gate_error_returns_retire_leases() {
+        fn failed_read(gates: &super::InodeCacheGates, ino: u64) -> std::result::Result<(), i32> {
+            let lease = gates.acquire(ino)?;
+            let _read = lease.read()?;
+            Err(libc::ESTALE)
+        }
+        fn failed_open(gates: &super::InodeCacheGates, ino: u64) -> std::result::Result<(), i32> {
+            let lease = gates.acquire(ino)?;
+            let _open = lease.write()?;
+            Err(libc::EACCES)
+        }
+        let fs = super::AfsFuse::new(Arc::new(OwnedReadBackend::default()));
+        for ino in 0..128 {
+            assert_eq!(failed_read(&fs.inode_cache_gates, ino), Err(libc::ESTALE));
+            assert_eq!(failed_open(&fs.inode_cache_gates, ino), Err(libc::EACCES));
+            assert_eq!(inode_cache_gate_entries(&fs.inode_cache_gates), 0);
+        }
+    }
+
+    #[test]
     fn inode_cache_open_fence_drains_with_small_and_production_worker_counts() {
         for workers in [
             1,
@@ -3022,25 +3243,29 @@ mod dispatch_tests {
             usize::from(super::FuseMountOptions::default().fuse_workers),
         ] {
             let dispatch = Arc::new(super::FuseDispatch::new(workers));
-            let gate = Arc::new(std::sync::RwLock::new(()));
+            let fs = super::AfsFuse::new(Arc::new(OwnedReadBackend::default()));
+            let gates = fs.inode_cache_gates.clone();
             let (started_tx, started_rx) = std::sync::mpsc::channel();
             let (release_tx, release_rx) = std::sync::mpsc::channel();
-            let first_gate = gate.clone();
+            let first_gate = gates.clone();
             dispatch.submit_keyed(61, move || {
-                let _read = first_gate.read().unwrap();
+                let lease = first_gate.acquire(61).unwrap();
+                let _read = lease.read().unwrap();
                 started_tx.send(()).unwrap();
                 release_rx.recv().unwrap();
             });
             started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
             let (opened_tx, opened_rx) = std::sync::mpsc::channel();
-            let open_gate = gate.clone();
+            let open_gate = gates.clone();
             dispatch.submit(move || {
-                let _open = open_gate.write().unwrap();
+                let lease = open_gate.acquire(61).unwrap();
+                let _open = lease.write().unwrap();
                 opened_tx.send(()).unwrap();
             });
             let (second_tx, second_rx) = std::sync::mpsc::channel();
             dispatch.submit_keyed(62, move || {
-                let _read = gate.read().unwrap();
+                let lease = gates.acquire(61).unwrap();
+                let _read = lease.read().unwrap();
                 second_tx.send(()).unwrap();
             });
             let (drained_tx, drained_rx) = std::sync::mpsc::channel();
@@ -3056,6 +3281,7 @@ mod dispatch_tests {
             drained_rx.recv_timeout(Duration::from_secs(1)).unwrap();
             drainer.join().unwrap();
             assert!(early_drain.is_err());
+            assert_eq!(inode_cache_gate_entries(&fs.inode_cache_gates), 0);
         }
     }
 

@@ -74,6 +74,24 @@ def identity_matches(saved):
     return current['state'] != 'Z'
 
 
+def memory_admission(config):
+    required = config.get('min_available_memory_bytes')
+    if required is None:
+        return None
+    if isinstance(required, bool) or not isinstance(required, int) or required <= 0:
+        raise ValueError('minimum available memory must be a positive byte count')
+    for line in Path('/proc/meminfo').read_text().splitlines():
+        fields = line.split()
+        if len(fields) == 3 and fields[0] == 'MemAvailable:' and fields[2] == 'kB':
+            available = int(fields[1]) * 1024
+            if available < required:
+                raise RuntimeError('insufficient MemAvailable before starting fixture: '
+                                   + json.dumps({'available_bytes': available, 'required_bytes': required}))
+            return {'available_bytes': available, 'required_bytes': required,
+                    'source': '/proc/meminfo MemAvailable; not a product memory limit'}
+    raise RuntimeError('MemAvailable unavailable; memory admission not proven')
+
+
 def preflight(config):
     root = safe_path(config['run_root'])
     require_empty_directory(root)
@@ -83,6 +101,7 @@ def preflight(config):
     free = shutil.disk_usage(ancestor).free
     if free < config['min_free_bytes']:
         raise RuntimeError('insufficient free space before starting fixture')
+    memory = memory_admission(config)
     missing = [name for name in config.get('dependencies', ['python3']) if shutil.which(name) is None]
     if missing:
         raise RuntimeError('missing dependencies: ' + ', '.join(missing))
@@ -108,6 +127,7 @@ def preflight(config):
             raise RuntimeError('binary SHA256 differs: ' + str(path))
         binaries.append({'path': str(path), 'sha256': actual})
     return {'admitted': True, 'free_bytes': free, 'binaries': binaries,
+            'memory': memory,
             'kernel': os.uname().release,
             'boot_id': Path('/proc/sys/kernel/random/boot_id').read_text().strip()}
 
@@ -160,7 +180,10 @@ def expected_digest(size, salt):
     return digest.hexdigest()
 
 
-def write_prepared(path, data, digest):
+def write_prepared(path, data, digest, write_block_bytes=BLOCK):
+    invalid_type = isinstance(write_block_bytes, bool) or not isinstance(write_block_bytes, int)
+    if invalid_type or not 0 < write_block_bytes <= BLOCK or write_block_bytes % 4096:
+        raise ValueError('write block must be a positive 4096-aligned size at most 4MiB')
     path = Path(path)
     temporary = path.with_name(path.name + '.tmp')
     if path.exists() or temporary.exists():
@@ -168,21 +191,26 @@ def write_prepared(path, data, digest):
     parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
     start = time.monotonic_ns()
     calls = []
+    syscalls = 0
     try:
         fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
         try:
-            for offset in range(0, len(data), BLOCK):
-                pending = memoryview(data)[offset:offset + BLOCK]
+            open_end = time.monotonic_ns()
+            write_start = time.monotonic_ns()
+            for offset in range(0, len(data), write_block_bytes):
+                pending = memoryview(data)[offset:offset + write_block_bytes]
                 before = time.monotonic_ns()
                 while pending:
                     count = os.write(fd, pending)
+                    syscalls += 1
                     if count <= 0:
                         raise OSError('write made no progress')
                     pending = pending[count:]
                 calls.append(time.monotonic_ns() - before)
             fsync_start = time.monotonic_ns()
             os.fsync(fd)
-            fsync_ns = time.monotonic_ns() - fsync_start
+            fsync_end = time.monotonic_ns()
+            fsync_ns = fsync_end - fsync_start
         finally:
             os.close(fd)
         os.rename(temporary, path)
@@ -191,25 +219,40 @@ def write_prepared(path, data, digest):
     finally:
         os.close(parent)
     return {'publish_ns': end - start, 'start_monotonic_ns': start, 'end_monotonic_ns': end,
+            'open_end_monotonic_ns': open_end, 'write_start_monotonic_ns': write_start,
+            'file_fsync_end_monotonic_ns': fsync_end,
+            'write_and_fsync_ns': fsync_end - write_start,
+            'write_and_fsync_boundary': (
+                'before first write loop to successful file fsync return; '
+                'excludes open, close, rename and directory fsync'),
+            'write_block_bytes': write_block_bytes, 'write_syscalls': syscalls,
             'file_fsync_ns': fsync_ns, 'write_call_ns': calls, 'bytes': len(data),
             'sha256': digest, 'file_fsync': True, 'parent_fsync': True,
             'publication': 'create/write/file fsync/close/rename/parent fsync'}
 
 
-def read_file(path, direct):
+def read_file(path, direct, diagnostic=False):
     start = time.monotonic_ns()
     fd = os.open(path, os.O_RDONLY | (os.O_DIRECT if direct else 0))
     opened = time.monotonic_ns()
     digest = hashlib.sha256()
     count = 0
     calls = []
+    intervals = [] if diagnostic else None
+    interval_overflow = 0
     try:
         size = os.fstat(fd).st_size
         with mmap.mmap(-1, BLOCK) as buffer:
             while True:
                 before = time.monotonic_ns()
                 length = os.readv(fd, [buffer])
-                elapsed = time.monotonic_ns() - before
+                completed = time.monotonic_ns()
+                elapsed = completed - before
+                if intervals is not None:
+                    if len(intervals) < 128:
+                        intervals.append({'start_ns': before, 'end_ns': completed, 'bytes': length})
+                    else:
+                        interval_overflow += 1
                 if length == 0:
                     eof_ns = elapsed
                     break
@@ -218,10 +261,15 @@ def read_file(path, direct):
                 digest.update(memoryview(buffer)[:length])
     finally:
         os.close(fd)
-    return {'full_read_ns': time.monotonic_ns() - start, 'open_ns': opened - start,
+    end = time.monotonic_ns()
+    result = {'full_read_ns': end - start, 'open_ns': opened - start,
             'read_io_ns': sum(calls), 'read_call_ns': calls, 'eof_ns': eof_ns,
             'bytes': count, 'stat_bytes': size, 'sha256': digest.hexdigest(), 'eof': True,
             'o_direct': direct, 'full_read_includes_application_sha256': True}
+    if intervals is not None:
+        result.update(start_monotonic_ns=start, end_monotonic_ns=end,
+                      read_intervals=intervals, read_intervals_overflow=interval_overflow)
+    return result
 
 
 def verify_read(value, size, digest):
@@ -305,8 +353,9 @@ def role(config):
                 before = metrics(config)
                 send_frame(connection, token, {**common, 'type': 'BEGIN_READY'})
                 receive_frame(connection, token, run_id, 'PUBLISHED')
-                first = verify_read(read_file(config['path'], config['series'] == 'contract'),
-                                    config['size_bytes'], expected)
+                first = verify_read(
+                    read_file(config['path'], config['series'] == 'contract', config.get('diagnostic', False)),
+                    config['size_bytes'], expected)
                 cold_end = time.monotonic_ns()
                 send_frame(connection, token, {**common, 'type': 'FIRST_COMPLETE', 'read': first})
                 # Snapshot is after the first ACK, outside the A first E2E boundary.
@@ -315,8 +364,9 @@ def role(config):
                 while time.monotonic_ns() < deadline:
                     time.sleep(max(0, (deadline - time.monotonic_ns()) / 1e9))
                 repeat_start = time.monotonic_ns()
-                repeat = verify_read(read_file(config['path'], config['series'] == 'contract'),
-                                     config['size_bytes'], expected)
+                repeat = verify_read(
+                    read_file(config['path'], config['series'] == 'contract', config.get('diagnostic', False)),
+                    config['size_bytes'], expected)
                 gap_ns = repeat_start - cold_end
                 send_frame(connection, token, {**common, 'type': 'COMPLETE', 'read': repeat,
                                                'repeat_gap_ns': gap_ns})
@@ -339,7 +389,7 @@ def role(config):
         before = metrics(config)
         send_frame(connection, token, {**common, 'type': 'BEGIN'})
         receive_frame(connection, token, run_id, 'BEGIN_READY')
-        publish = write_prepared(config['path'], data, digest)
+        publish = write_prepared(config['path'], data, digest, config.get('write_block_bytes', BLOCK))
         start = publish['start_monotonic_ns']
         send_frame(connection, token, {**common, 'type': 'PUBLISHED'})
         first = receive_frame(connection, token, run_id, 'FIRST_COMPLETE')

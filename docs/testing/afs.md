@@ -49,7 +49,7 @@ AFS 产品二进制只支持 ARM64，也不代表 x86_64 包或定向 Linux driv
 
 时延必须先固定操作范围、计时边界和判定分位数，记录 p50/p95/p99。不得成绩出来后选择有利指标，也不得由吞吐反推时延。不具备同条件对照的结果只能作为摸底。
 
-## DFS 双口径测量与 P1 定向回归
+## DFS 双口径测量与定向回归
 
 维护入口为[双口径驱动](../../build/e2e/afs/perf/README.md)，由仓外fixture提供固定候选、
 挂载、身份及已有后端；该驱动不部署SeaweedFS、PostgreSQL或VM。
@@ -84,11 +84,28 @@ cargo test --locked -p afs --all-features --lib node::dfs_read::tests
 
 ### 已知验证欠账与测量边界
 
-真实DFS跨句柄V1场景已有一次仓外driver运行证据：H1部分读v1，A成功fsync发布v2，
-H2重开读v2，H1读取未缓存尾页，H2全量prime后H3全读v2且正文READ增量0。
-该场景尚未沉淀为仓内可重复的真实DFS回归，属于明确欠账；现有mock／其他FUSE
-合同不能替代它。此次workload使用uid0，不覆盖非root权限拒绝或撤销；READ零增量
-仅支持KEEP行为，没有直接采集FOPEN flag，也不承诺旧句柄固定快照。
+真实 DFS 跨句柄合同已放入 `afs/tests/fuse_contract.rs`：
+`real_dfs_keep_cache_contract::dfs_real_nodes_cross_handle_keep_cache_and_permission`。
+外部流程先准备同一 Linux 主机上的 local-file Meta 和两个真实 DFS Node、mTLS、R1，
+B 预读为 0；再在 A 的专属子目录设置非 root 调用者权限，传入 B 的对应子目录。
+不要修改受保护的 DFS 根目录来准备权限。测试本身不部署服务，不在 libtest 内降权。
+
+整个测试进程以非 root 身份运行，并提供三个必需参数；缺失参数、非真实 DFS 挂载、
+metrics 缺失或异常均明确失败。`AFS_DFS_FUSE_WRITER_MOUNT` 和
+`AFS_DFS_FUSE_READER_MOUNT` 是挂载下的绝对目录，必须属于两个不同的真实 DFS mount；
+`AFS_DFS_FUSE_READER_METRICS` 是 B 的 HTTP `IP:port`。测试所在网络须直连该 metrics
+地址；使用 loopback fixture 时，子进程的 `NO_PROXY`／`no_proxy` 需覆盖两个 Node 的地址。
+外部流程把已构建的测试 ELF 整体以非 root 身份执行：
+
+```sh
+"$FUSE_CONTRACT_TEST_ELF" real_dfs_keep_cache_contract::dfs_real_nodes_cross_handle_keep_cache_and_permission --ignored --exact --nocapture
+```
+
+合同核对 H1 部分读 v1、A 同 inode 覆盖并 fsync 发布 v2、H2 重开读 v2、H1 未缓存尾页、
+H2 全量校验后 H3 全读且正文 READ 增量 0，以及 chmod 000 拒绝新的非 root OPEN 后恢复。
+完整内容、BLAKE3、长度、EOF 和 READ 增量分别保留。READ 零增量仅支持 KEEP 行为，
+没有直接采集 FOPEN flag，也不承诺旧句柄固定快照或立即撤销已授权句柄。
+单主机两真实 Node 的功能通过不等于跨 VM 性能或完整 POSIX 通过。
 
 V1挂载显式配置`fuse_max_readahead_bytes=0`以隔离可见性，属于功能诊断，不是product
 默认预读性能样本。16MiB校验阶段约4097次READ不能据此判断“1MiB预读或max_pages失效”。
@@ -97,9 +114,11 @@ read_ahead_kb、协商max_pages及挂载参数；不从配置或一次功能测�
 
 生产默认32worker已有有限合同回归，但真实Node中FUSE／Peer／私有结果同时活跃峰值
 仍未知。32应用线程RSS观察不等于32个后端请求同时运行，也不证明整个Node内存上限
-或峰值后回收。既有运行漏采新增全局proof total／resident gauges；cache局部metadata
-不能代替全账。后续性能工作须采集下文全账指标及容量全扫事件，记录并发下实际退化
-比例，区分配置估算、局部单测和运行峰值，不将历史通过默认扩展到这些缺口。
+或峰值后回收。全局 proof total／resident gauges 与 events 必须一起采集；cache 局部
+metadata 不能代替全账。有限资源诊断可以报告采样最大值和容量全扫事件增量，不能把
+32 个应用调用当作真实范围请求分母，也不能把采样最大值当作精确在途峰值。缺少范围
+请求分母时将降级率记为未知，不用 0 个事件伪造完整比例。区分配置估算、局部单测和
+运行观测，不将历史通过默认扩展到未覆盖的并发峰值、RSS 或回收结论。
 
 ## 当前候选版本工程验收
 
@@ -243,27 +262,39 @@ peer_outboard_metadata；proof小元数据复制与正文复制分别解释，�
 read开始和最终交付均检查session/epoch、停止及原截止，borrowed输出在成功前不修改。
 普通Meta断链不会伪造撤销，但新open、head刷新、source miss或授权刷新需要Meta时
 失败直接报错。read/grant拒绝清除受影响上下文，Node注册拒绝、epoch变化或停止才
-停止共享授权。source缓存500ms、A授权缓存最多5秒及原grant期限不延长。
+停止共享授权。源缓存默认max5秒、grant安全余量1秒，命中不续期；A授权缓存最多5秒，
+原grant及Node／读取上下文截止不延长。
 
 A端Peer服务仅复用当前被请求的
 已验证不可变对象，不预读下一个对象；B的可选纯磁盘缓存单独验收。对象首次完整BLAKE3通过后
-才可入单槽；命中仍核对catalog、Durable、device/epoch、record revision及当前物理文件的
+才可进入有界LRU；命中仍核对catalog、Durable、device/epoch、record revision及当前物理文件的
 dev/ino/size/mtime/ctime，变化则失效重验。命中交付的是已验证的内存字节，不能声称每次
 命中都重新检测磁盘后来发生的静默损坏；缓存不是读授权，逐range授权与范围checksum保留。
 
-A端每个LocalChunkStore共用8MiB Peer读载荷额度，当前对象槽最多4MiB。
-填充、驻留、淘汰后仍被发送流持有的对象、范围回退正文和RDMA packed正文，均按实际
-capacity计费至最后一个载荷所有者释放；额度不足返回结构化容量错误，不暗增内存。
-原8个read slots、每流4个64KiB待发送帧及扫描scratch仍各受原上限约束，需单独计入
-进程资源预算；8MiB不是总RSS，也不是每个请求额外获得8MiB。大于4MiB对象保留范围
-读取，协议允许的最大请求不代表当前共享额度一定能准入。fsync与持久提交路径不变。
+A端每个LocalChunkStore默认共用16MiB Peer正文额度、2个LRU条目，每个驻留对象最多4MiB；
+这是已批准的原8MiB额度调整。填充、驻留、淘汰后仍被发送流持有的对象、范围回退正文和
+RDMA packed正文，均按实际capacity计费至最后一个载荷所有者释放；native gRPC额度不足
+按入口固定的`dfs_peer_serve_wait_ms`有界等待，默认20ms，0禁等；RDMA packed仍立即准入。单飞表最多8个active key，完整对象可共享一次填充；partial／无完整Ready结果不承诺
+只扫描一次。原8个read slots、每流4个64KiB待发送帧及扫描scratch仍受原上限约束，
+需单独计入进程资源预算；16MiB不是总RSS，也不是每个请求额外获得16MiB。大于4MiB对象
+保留范围读取，协议最大请求不代表当前额度一定能准入。fsync与持久提交路径不变。
+
+R-6定向回归应通过屏障证明：不同对象能同时填充、同完整对象8请求只填充一次；旧Ready
+follower不移除新代健康resident；packed准入跨越关闭时，shutdown不得在真实lease释放前
+假成功；帧／退役对象及零字节可增长lease的最后引用必须保留计费／排空责任。已知停止或
+等待后过期不得发送Header，原根／I/O失败不能被并发停止掩盖。首次关闭起10秒期限不续期，
+超时报告错误且不detach真实工作。这些局部证明不替代多VM、实际RDMA硬件或正式性能。
 
 `afs_dfs_peer_read_payload_bytes`和`afs_dfs_peer_read_payload_peak_bytes`分别报告当前
 计费载荷及历史峰值；`afs_dfs_peer_read_payload_reserved_bytes_total`／
 `afs_dfs_peer_read_payload_released_bytes_total`记录准入和最终释放容量。
 `afs_dfs_peer_read_object_cache_total{result="hit|miss"}`仅记录固定标签的槽查询结果。
-这些指标不授予权限、不执行准入；槽中4MiB驻留并非泄漏，取消／排空及最终引用退账
-须用针对性回归分别确认，不能仅看RSS推断。
+`afs_dfs_peer_serve_resources{resource}`补充residents、flights、readers、payload_limit_bytes、
+fixed_control_bytes、control_bytes、control_peak_bytes、control_limit_bytes固定标签。
+控制元数据包络64KiB计入内联表、ID／record capacity、有界终态错误与Arc包装；控制owner
+末引用才退账，shutdown后实际动态占用须为0。类型／capacity账不是实测allocator或RSS。
+这些指标不授予权限、不执行准入；LRU驻留并非泄漏，取消／排空及最终引用退账须用针对性
+回归分别确认，不能仅看RSS推断。
 
 原生gRPC正文帧使用Bytes持有原PeerReadPayload：保留Data frame后取消流、淘汰
 缓存槽，必须继续计费直到最后一个frame／对象引用释放；范围fallback遵守同一规则。
@@ -315,12 +346,17 @@ Meta仍只有原A持久副本，缓存不能提高副本数或掩盖真实Meta�
 B缓存v2固定4096B header＋正文＋proof trailer；正文offset固定，trailer最多8192B，
 无优化证明时可保守完整根扫描。旧v1可丢弃缓存退休重建；持久副本旧／缺／坏sidecar不能
 当缓存删除，必须保留完整根验证。原生规范ChunkId的根／长度锚与Meta布局及catalog一致，
-legacy ID保持全扫；核对无新增Meta RPC。原生写proof sidecar在原ACK前可能新增文件sync、
-rename、按实际persist_batch合并目录sync；核对健康proof完整字节匹配和重放不重写／rename、
-仍保留file sync；注入rename／目录同步失败后重试补足屏障。optional失败不降低正文／
-catalog barrier、receipt或fsync持久性。
+legacy ID保持全扫；核对无新增Meta RPC。原生写ACK只等待原正文／目录／catalog屏障，
+可选sidecar安装在后台。用阻塞住的installer证明ACK仍能成功，不用“还没来得及安装”
+推断解耦；另核对ACK后崩溃的正文／catalog恢复、按需修复及完整BLAKE3。
+只有测试明确等待installer idle后，才能断言sidecar存在或覆盖组扫描量；安装前完整核根
+回退仍合法，不能把这个成本从首次读性能中扣掉。核对queue=1/32/64、queued＋active上限、
+原ledger内control／proof和最后引用退账；健康proof不重写／rename／file sync。
+注入安装／目录sync错误、控制准入和线程启动失败，ACK与必需屏障仍保持；停止拒新、
+绝对截止、真实join及watchdog失败需分别证明。optional失败不降低正文／catalog barrier、
+receipt或fsync持久性。
 读侧另测健康sidecar的多对象Peer／Pinned读取：write、rename、file sync、directory sync
-均为0；热Peer单槽命中不访问／修复sidecar，逐出后完整扫描才按需修复；
+均为0；热Peer正文LRU命中不访问／修复sidecar，逐出后完整扫描才按需修复；
 多个独立reader面对同对象缺失／损坏，只作有界共享修复，并证明修复期间Peer
 正文slot已释放。不得把写批次必要file sync一起删掉。读侧容量错误保留健康proof，
 安全全扫不触发proof重建或持久化；缺坏修复仍不得改写正文／catalog。
@@ -372,8 +408,8 @@ peer tree且预算可用时，consumer唯一正文根计算同时匹配Meta锚�
 consumer按实际块做outboard更新、私有落盘和提取；两个256KiB块和单项交接队列保持。
 Completion只登记待确认状态；真实EOF／成功join、长度／摘要及私有sink／输出绑定全部
 通过后，consumer finish核对实际根／CV并最终授权，才能Ready和公开输出。
-旧Peer没有proof时仍可能同时执行producer完整hash与consumer的cache outboard构建，
-应记录两份实际工作；producer hash为0不是所有混合版本的承诺。
+旧Peer没有proof但本地取得有账Tree时，consumer独占正文核根；Tree不可用则producer
+独占完整根，consumer不再保留root-only构建器。producer hash为0不是所有混合版本的承诺。
 两种模式都检查真实工作量及回收；缓存写失败仍完成完整核根，不因producer hash为0
 冒称未校验，也不把标准outboard计算当免费。
 针对性检查超过两块的真实复用、32KiB组／256KiB块边界、尾块、Header／Completion／额外帧、
@@ -397,6 +433,22 @@ header和尾部EOF探测。`stage_nanoseconds_total`／`stage_observations_total
 聚合准备、正文读取、校验及结束检查，legacy `segment_verify`在本候选表示outboard校验。
 低频计时／计数也有成本，不从完整E2E扣减，不把两读合计伪拆为每次读。
 
+R-5并发回归用屏障证明阻塞fill不阻塞独立hit、四个同对象请求只填充一次、每请求最终
+授权独立、leader个体失效不撤销合法follower。共享flight失败不能替代另一请求的授权、
+期限或source结论；合法follower经既有有界范围读独立回源并完整校验，不重新加入仍被
+引用的终态flight。另测leader异常drop／请求级超时／另一source损坏后的独立读取，以及
+follower自身停止时不得重试或交付；同时覆盖pin退休／同key替换、外来文件、
+删除失败、flight上限及停止唤醒。Ready等待后的复查和取得fill许可后的复查遇到可选缓存
+I/O错误时均应安全回源，不能吞掉真正Peer／授权错误。shutdown指标归零须同时检查
+实际ledger used/resident及活动持有者，不能只将gauge写成0。
+
+`afs_dfs_peer_disk_cache_resources{resource}`使用固定标签：operations、flights、fill_body_bytes、
+indexed_entries、retired_entries、retired_disk_bytes、control_bytes。fill_body_bytes是显式准入的
+逻辑4MiB额度，不是实测RSS或已分配正文；retired_disk_bytes在实际删除前保持收费。
+proof与资源gauge在同一短表锁内发布，操作hash／read／copy统计使用本操作账本累加，
+不能用并发全局前后差推算单请求工作。锁持有分位数与真实分配观测须单列，不能以
+无锁依赖屏障或逻辑包络代替；当前局部回归不构成多VM、FUSE性能或完整资源验收。
+
 填充链`afs_dfs_peer_disk_cache_fill_stage_nanoseconds_total{stage}`及对应observations
 记录lock_wait、lookup、prepare、receive_verify、store、deliver和total。lock_wait还覆盖
 首次root检查；lookup不含此前Meta sources RPC。receive_verify含完整Peer调用、解码、
@@ -405,20 +457,94 @@ header和尾部EOF探测。`stage_nanoseconds_total`／`stage_observations_total
 `fill_stage_thread_cpu_nanoseconds_total`及对应observations只含同步consumer线程，
 不含远端、producer及h2／TLS后台线程；wall减threadCPU不能命名成网络／磁盘等待。
 
-原`stream_reserved_bytes`／`stream_reserved_peak_bytes`继续观察4MiB流式额度，
-`stream_private_peak_bytes`另含私有输出；`stream_frame_bytes`／`stream_frame_peak_bytes`
+并发回填以确定性屏障验证两个不同对象可同时进入独立pending、同对象只填充一次、
+legacy独占、超限及取消不泄漏。实际RPC回归检查活动流固定复用同一Channel、两个块
+总capacity为512KiB、控制额度为256KiB；连接LRU淘汰不能另开活动会话。最后块仍被持有
+时reservation不能归零；最后释放后旧会话即使还有测试引用也不能保留载荷分配。
+原`stream_reserved_bytes`／`stream_reserved_peak_bytes`按共享会话观察一次4MiB流式额度，
+不按并发请求重复增加；`stream_private_peak_bytes`为单操作私有输出加包络的峰值观察，
+不是Node并发输出总量或RSS上限。`stream_frame_bytes`／`stream_frame_peak_bytes`
 只观察两个块的真实capacity，归还池仍占账，最后owner销毁才释放。控制余量与transport
 分别核算，指标不执行准入。旧完整Vec的fill_bytes与流式reservation互斥，不合并为同次峰值。
 `peer_frame_to_block`是帧到块复制，`fill_to_output`是请求区间提取；没有完整Vec不等于零复制。
 `afs_dfs_peer_read_events_total`的stream_frame包含控制帧，stream_block_alloc记录实际分配，
 stream_block_handoff／stream_block_write记录块交接／sink调用，不等于物理write或成功落盘。
-64MiB完整4MiB对象的预期1024个Data帧、256次块交接仍须以实际回调与尾块记录核对。
+旧64KiB Data分支中，64MiB完整4MiB对象的预期1024帧、256次块交接仍须以实际
+回调与尾块核对。R-4健康proof分支采用32KiB已验证帧，预期2048帧，不能混用两条路径。
 
 功能检查后再固定数据、并发、cache容量、双方预读0、持久屏障及repeat间隔做分时性能
 对照。诊断轮与正式轮分开；若两读间未采样，只报告合计工作。首次回源、稳定磁盘命中、
 超cache repeat分别登记，不借旧版本结论宣称收益。64MiB本地单时钟可由A在create前起，
 覆盖发布和B首次完整读校验ACK；若总时间含固定1秒repeat等待必须注明，阶段和仅作辅助。
 测试专用控制适配器留在本地测试方案，不进产品包。
+
+## 源元数据批量与有界缓存验证
+
+R-1只前瞻源元数据，双方关闭正文预读的contract配置仍有效。必要回归应覆盖：
+当前mandatory优先、总128项、同版本后续16对象一次拿源但只有当前正文ops、0禁用、
+512B以上advisory跳过、缺源时精确错误码限定一次mandatory重验、真正权限／会话错误
+不被可选降级吞掉。请求前mono／wall锚点、短grant不驻留、慢回复和external延迟安装
+不重赠期限，均以受控时钟／屏障验证，不能只测默认数值。
+
+已知失效的交错必须分别证明：其他版本／peer的健康缓存不被误清；旧在途回复不恢复
+已清的源；新远端epoch回复不能混入本批此前已命中的旧源，须丢弃所有旧命中并对全部
+当前mandatory至多重新授权一次。Node与device两种epoch、持续变化的Unavailable和
+最终授权／私有输出失败原子性均保留。没有实时watcher，不把未知变化宣传成即时获知。
+
+`afs_dfs_source_cache_resources{resource="entries|bytes|peak_bytes|limit_bytes"}`使用固定标签，
+分别记录实际驻留条目、保守容量估算、高水位和配置字节限。capacity包含两份key、
+所有嵌套String／Vec及索引包络；空表须实际释放后才报0，Drop／失效及native/external
+同账分别核对。4MiB不涵盖当前RPC reply、读取clone或进程RSS。正式中期检查点逐A/B、
+逐before／after_first／after_repeat检查四个series存在及实际值；漏采是证据不完整，
+不补0。B首读`get_chunk_sources≤1`、1秒复读0和A授权防回退分别核对；单测计数不代替
+真实FUSE计数，次数减少不等于控制关键路径或完整E2E已经改善。
+
+## 原生对象调度与磁盘预读回归
+
+`dfs_readahead_max_bytes`默认0，范围0..33554432；0不创建后台任务，contract固定0。
+product如需验证ON，测前显式设为8388608并由实际ELF的`--print-config`确认；A/B有效
+值、配置和二进制SHA都要留证。原生只读句柄按固定版本上的顺序访问增长1／2／4窗口，
+距上次结尾至多1MiB，随机跳转清零；对象数按4MiB保守折算并封顶8。页缓存、内核
+read-ahead、源元数据lookahead与正文预读分别记录，不能用“配置请求ON”冒充真实后台工作。
+
+`dfs_fetch::ObjectFetcher`的前台分片及后台任务复用唯一FillFlight对象表，不另建正文
+对象缓存。必要的Linux回归包括：
+
+- 同对象前后台单飞、不同对象实际sink重叠；跨对象请求仍保持失败不公开部分结果，所有
+  分片必须join并最终核权后才复制输出，回退前释放旧scratch，不多持一整份正文。
+- 默认0的后台任务／Peer调用严格为0；ON按顺序窗口实际填入可丢弃磁盘缓存，缺失、
+  partial、过期或失效grant不查询Meta、不取得flight、不读正文；随机和版本变化使旧scope失效。
+- 后台首次poll遇cache、Channel、stream状态锁或任务／proof／磁盘容量不足立即放弃，
+  不等待、不驱逐健康条目争空间；前台等待者优先。前台排队使用原读截止和原授权，不能续时。
+- 正文只用共享两块256KiB，最多两个流复用同一Channel和connection≤2MiB窗口，
+  每流窗口≤2MiB、解码消息≤128KiB；私有输出沿原单批预算，后台空输出绑定不申请假4MiB。
+- 每帧、consumer和磁盘commit前重查来源generation、句柄scope、已知拒绝及Node停止；
+  receipt已完成后再失效也不得安装Ready。最后核权与rename沿用既有非原子边界，不承诺
+  新的全局撤销协议；缓存后续交付仍独立授权。
+- 静默网络、块／控制等待和慢消费者期间取消能唤醒并真实join；先drop receiver、取消／
+  结束producer，再join实际任务，不能detach或提前退账。取消不能中断已进入内核的磁盘I/O。
+- 固定状态、handle容器、任务上下文和字符串实际capacity从原proof总账／resident子限收费，
+  额度不足安全降级，最后持有者释放前不退账。S3 pending36MiB不得挪用。
+
+针对性入口按受影响范围选择，不把命令列出等同于已经通过：
+
+```sh
+cargo test --locked -p afs --lib --all-features r7_
+cargo test --locked -p afs --lib --all-features node::dfs_fetch::tests::
+cargo test --locked -p afs --test config_contract --all-features
+```
+
+正常测量采集`afs_dfs_fetch_events_total{event}`的scheduled、skip_disabled、skip_budget、
+skip_grant、skip_busy、joined、cancelled、failed，单位是事件次数；
+`afs_dfs_fetch_resources{resource}`的jobs／job_limit是数量，metadata_bytes／
+metadata_peak_bytes是原账本内的当前／高水位字节，不是新增额度或RSS。实际构造前
+job_limit可能为0。任务数不等于正文并发，指标本身不执行准入，也不证明持续峰值。
+
+新候选可在[双口径驱动](../../build/e2e/afs/perf/README.md)上显式选择
+`fetch_metric_profile="r7"`并保留`metric_profile="p2"`，逐B端before／after_first／
+after_repeat核对全部固定标签；漏采、非有限值或缺快照为证据不完整，不补0。旧P1M
+不强求新字段。先形成Linux回归，再以单独候选身份做有限FUSE及分时contract／product
+测试；局部并发证明、默认OFF或ON工具接线不替代正式读侧验收与性能目标。
 
 ## 原生写 buffer 验证
 
@@ -428,6 +554,7 @@ stream_block_handoff／stream_block_write记录块交接／sink调用，不等�
 ```sh
 cargo test --locked -p afs --lib write_buffer_tests
 cargo test --locked -p afs --lib native_builder_
+cargo test --locked -p afs --lib p2_w1_ -- --test-threads=1
 cargo test --locked -p afs --lib dispatch_tests
 cargo test --locked -p afs --test config_contract
 cargo test --locked -p afs --bin afs-node allocator::tests
@@ -435,10 +562,16 @@ cargo fmt --all -- --check
 cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 ```
 
+`p2_w1_`比较原生区间索引与旧 extent 日志的确定性写入／截断／冻结／恢复序列，核对内容、
+write_seq、Chunk 划分及实际输入复制次数；另测16MiB中十万次对齐覆盖的活跃区间上界。
+该结构上界不外推任意字节边界，也不是全部分配或RSS实测；S3／legacy沿用原日志，
+其预算与恢复须由受影响的`deferred_publication_`回归单独核对。
+
 真实 FUSE 使用本地 owner、NodeReplicated R1、无 S3：六次应用1MiB写入合计6MiB，记录内核实际
-回调大小和中途提交轨迹；同批原提交入口冻结4MiB＋2MiB有效正文，复制入口合计6MiB、地址保持，
+回调大小和中途提交轨迹；满4MiB块先冻结预上传，2MiB尾块在原生发布入口冻结，
+无中途发布时同一版本包含4MiB＋2MiB有效正文。复制入口合计6MiB、冻结地址保持，
 远端重新打开核对 SHA／长度／EOF。随后偏移8192覆盖4KiB，验证小 Chunk、新布局和旧 Chunk 不变；
-另验证未冻结时同位置原地覆盖。若后台中途提交，功能结果与“同批两正文”结构验收必须分开登记。
+另验证未冻结时同位置原地覆盖。若后台中途发布，功能结果与“同批两正文”结构验收必须分开登记。
 
 `afs_dfs_write_buffer_*` 记录实际 live/idle/peak capacity、分配、复用、释放和输入 copy；
 `input_copy_bytes_total`／`input_copies_total` 来自实际 slice-copy/extend 入口，不能当端到端总复制。
@@ -455,9 +588,41 @@ RSS允许偏差和观测窗口，完成原提交入口、释放所有引用后�
 未知 Meta ACK 精确重试、停止排空，以及受影响 OwnerFs／RN／RDMA／S3 回归。完整BLAKE3、授权、
 成功 fsync 和 close-to-open 不因这些优化放松；RDMA仍按现有独立注册 endpoint 缓冲合同验证。
 
+## Peer 完整对象唯一核根回归
+
+Header固定consumer Tree或producer/plain checksum，之后不切换。分别验证新Peer证明、
+legacy无证明但有预算、root-only／零预算三条路径：实际正文根hash输入恰为对象长度，
+正常consumer的producer工作为0；缓存覆盖组和parent CV另外计量，不漏计也不重复算根。
+完整流必须覆盖Header、所有Data、Completion、真实EOF和join；迟到错误、Meta根／wire根
+不符、篡改、输出绑定和授权失败仍拒绝。同步完整结果入口与双缓冲入口都需覆盖。
+`root_fallback`事件是次数，同名hash stage仍为字节，不能通过改计数掩盖实际重复执行。
+
+## 未对齐覆盖组读取回归
+
+保留原对齐一次正文读和32KiB官方scratch防回退；非对齐1MiB及两个非连续512KiB范围，
+用真实positioned读次数和复制量证明不再逐组编码／解码。完整覆盖组hash量不能少计；
+测试首尾未请求padding、中部篡改、短尾、越界与预算末引用。源／输出别名、超过128个
+范围及无完整中部的小读取仍保持旧codec及写入顺序，不宣称所有范围均走直读。
+所有结果都在私有输出内验证；根、文件身份及最终授权未通过不得交付。
+validator补读边界时，verify_ns包含该I/O，read_ns另记录实际读取，二者不能排他相加。
+局部读／复制次数不等于完整E2E性能达标。
+
 ## 原生读粗粒度诊断
 
-原生读粗诊断由默认OFF的`dfs_read_diagnostics_enabled`显式开启，使用固定有界对象聚合。双块诊断分别记录producer完整根与consumer的写入／提取／outboard校验；legacy `SegmentBlake3`／root_segment字段在本候选表示后者，成功join后计算真实区间交集；空、时钟失败或固定区间容量溢出不能记成有效零重叠。它不保存逐帧事件或正文，不增加载荷额度。ON时延不作OFF成绩，聚合hash／交集不从完整E2E扣减；同步线程CPU降低也不等于全Node CPU降低。
+原生读粗诊断由默认OFF的`dfs_read_diagnostics_enabled`显式开启，使用固定有界对象聚合。双块诊断按实际核根者记录producer完整根或consumer的outboard校验，并记录写入／提取；legacy `SegmentBlake3`／root_segment字段在本候选表示后者，成功join且两条lane都确有工作时才计算真实区间交集；单一核根者下没有另一条root工作，不能伪造重叠或有效零值。空、时钟失败或固定区间容量溢出同样不得记成有效零重叠。它不保存逐帧事件或正文，不增加载荷额度。ON时延不作OFF成绩，聚合hash／交集不从完整E2E扣减；同步线程CPU降低也不等于全Node CPU降低。
+
+同一schema4响应还可包含`object_capacity`／`object_overflow`／`object_records`：固定120个
+24B槽，记录A端每对象读取／核验及B端实际索引命中的读取／核验区间，miss不占槽。
+它与原256条请求记录及两个既有工作区合计受同一64KiB静态上限约束，溢出不覆盖旧槽。
+记录的56位ChunkId摘要只用于有界诊断关联，有碰撞局限，不是对象身份／授权依据；
+active、成功及错误退出分开，缺失端点或旧版没有这些字段均为未知，不能当0。
+A区间不含此前的Meta授权，B区间不含此前的源解析；使用各自单调时钟核对父子边界，
+不能跨节点相减或把并行区间之和当作E2E关键路径。扫描区间也不等于可以全部消除的时延。
+
+仅在导出已开启的诊断快照时采集`sampled_monotonic_ns`和`process_cpu_ns`（可为空）；
+后者为本Node进程累计user＋sys CPU，不是线程或组件独占CPU。前后差值只对应采样窗口；
+A窗口若包含写入发布须明确注明，不能改称仅首次读CPU。正式性能轮次保持诊断OFF，
+诊断单次数据不用于证明稳定提速或跨版本时延变化的因果关系。
 
 
 通过现有Node管理HTTP的 `GET /v1/diagnostics/dfs-read-timing` 在测量窗口外读取固定快照。
@@ -466,6 +631,16 @@ RSS允许偏差和观测窗口，完成原提交入口、释放所有引用后�
 校验完成或授权交付。Meta、FUSE及对象父阶段按实际嵌套与重叠核对，不能直接相加；
 consumer线程CPU不含producer或远端CPU。快照不保留正文／路径／授权信息，也不是业务授权来源。
 开启配置及监听范围见[部署说明](../deployment/afs.md#原生读粗粒度诊断)。
+
+schema 4 在原有 256 条请求记录内补充 Peer 服务、持久化批次和写侧 Meta 调用，
+并用固定的 24 个粗阶段聚合记录 slot／cache 锁等待、帧交接、正文／目录／catalog
+屏障、proof 安装及 Meta 客户端调用。诊断元数据仍受原 64KiB 上限约束；正式性能
+运行保持关闭，独立短诊断使用前后快照核对，记录容量不足时明确登记不完整。
+`first_data_ns` 在 A 表示首帧交入本地发送队列，在 B 表示首个非空正文帧解码完成；
+它们都不代表线上发送时间。粗阶段的 `wall_ns` 是可能重叠的累计尝试耗时，
+首尾时间只是包络；不能把包络当连续忙碌时间，也不能与其请求父阶段重复相加。
+Meta 区间包含请求准备、排队／传输和结果转换，不是纯 Meta 服务端或网络耗时。
+各 Node 的单调时钟分别分析；同一轴上的父子区间取并集／交集，不能跨 Node 相减。
 
 ## 共用 Node 的受影响验证
 
@@ -485,3 +660,108 @@ cargo clippy --locked -p afs --no-default-features --features dfs --all-targets 
 有界诊断账本，不表示关闭所有 span／时钟／指标。未测量时不宣称这些观测没有性能成本。
 
 Meta 快照增长与版本回滚限制见[部署说明](../deployment/afs.md#meta-快照升级与回滚边界)。
+
+## Peer 覆盖组发送回归
+
+健康sidecar整对象请求使用两块32KiB最终帧交替读取及标准根验证。针对性入口：
+
+```sh
+cargo test --locked -p afs --lib p2_r4_
+cargo test --locked -p afs --lib dfs_stream_whole_digest_reuse_preserves_wire_and_partial_hash_work
+cargo test --locked -p afs --lib peer_read_event_metrics_are_fixed_and_shared
+```
+
+覆盖损坏首组零正文、损坏后组只有已验证前缀且无Completion、慢消费者两帧真实背压、
+Bytes末引用与预算退账、stop／调用者失效退出、catalog／路径置换、可选proof损坏退休及
+缺proof／容量不足的Header前回退。正常完整流不先做整对象扫描，B整对象核根保持。
+固定事件`stream_verified_group`、`stream_group_corrupt`、`stream_proof_retired`只累计次数；
+`data_frame`按实际帧计，64MiB全部走该路径时为2048个32KiB帧，不能复用旧1024帧假设。
+`peer_read_verify`粗聚合为实际组读／验证，未含全部回压／身份核查，不能冒充整个Peer父项；
+新路径不产生旧整对象私有读取compact记录，缺失不解释为耗时零。正常性能关闭额外诊断，
+独立诊断的组工作与发送父项会交叠，完整E2E按同条件实测。
+
+## 原生 catalog 尾事务恢复回归
+
+`LocalCatalog::recover`只处理物理EOF处无换行且JSON解析为不完整的尾事务：保留此前
+有效前缀，截断并同步后可重新追加和恢复。完整JSON无末尾换行仍原样接受，后续追加
+补分隔符；非法UTF-8、完整语法／字段、checksum、revision以及带换行的不完整记录
+都应拒绝启动。恢复不删除正文孤儿，截断或sync失败明确报错。
+
+```sh
+cargo test --locked -p afs --lib --all-features catalog_tail_recovery_tests
+```
+
+覆盖事务头、记录中部、记录间及checksum尾截断；部分多字节UTF-8与真正非法字节分别
+处理，并核对完整无换行→append→restart。复用原ACK／persist／精确重放回归，证明
+正文／目录／catalog屏障和未知Meta提交阻挡后续修改未降低。尾恢复只是恢复前置，
+不能替代组提交、停止排空或性能验收。
+
+### 原生持久化组提交回归
+
+```sh
+cargo test --locked -p afs --lib --all-features p2_w3_ -- --test-threads=1
+cargo test --locked -p afs --lib --all-features p2_w0_
+cargo test --locked -p afs --lib --all-features immutable_chunk_retry_
+```
+
+受控同批须让16个单对象请求在取批前都完成正文持久化，再证明共享一次目录／WAL及父目录
+屏障、同一提交revision，且屏障前无ACK；非受控并发只报告真实批数，不要求恰好一组。
+同ID安装／重放／quarantine与旧reader、新inode替换交错必须安全；阻塞磁盘I/O时其他
+catalog元数据操作仍能进展。首组ACK不依赖后续请求全部耗尽。
+
+队列检查queued加active，1MiB控制账在真实引用释放前不退；超过额度的原大批保持整批
+独占fallback，不永等不可能满足的许可。失败注入分别核验WAL／同步／父目录屏障前无
+成功ACK、失败锁存后健康重放也报错且不新增WAL字节、重开后按原尾恢复合同处理。
+还须覆盖修复rename后目录失败、同批后续正文失败和正常drop／重开，证明健康重放
+不能跳过目录屏障。完整且checksum有效的WAL（含无末换行）重开时也必须执行文件
+同步，失败拒绝open；完整损坏仍先拒绝，不走同步成功快路。停止必须允许最后dirty提交，再关闭准入并唤醒／排空等待者。计数和软件回归不替代实际
+Node生命周期、RSS、完整E2E或性能门槛；未运行的场景须单独保留待验收。
+
+## Native Peer 准入等待回归
+
+`cargo test --locked -p afs --lib --all-features p2_t1_`覆盖8个真实RPC槽已占满时
+首次poll等待、释放后真实流完成、0禁等、固定期限／spurious通知、排队后grant到期、
+stop及最后Bytes切片释放。预算check/wait之间的交错用屏障验证，不能只凭睡眠猜测；
+配置合同另核对默认20ms、CLI/TOML优先级和0..50ms范围。R-4、native Peer和RDMA
+packed软件回归保留；单元RPC不等于FUSE／多VM性能或真实verbs验收。
+同一入口的RPC槽、flight和control/payload共享原deadline，重试／Header前回退不重赠
+20ms；已开始的I/O、同flight结果和R-4双帧背压受原授权／stop／传输合同约束。
+大窗口和多连接仍后置；当前两个流共享一个Channel及原≤2MiB connection窗口，
+不能把小窗口等待通过宣传成16MiB connection／4MiB stream或多连接验收。
+
+## 原生写入准入、预上传与有序发布回归
+
+原生路径与 S3 原预算分别验证；不能用参数存在、基元单测或编译成功代替整组运行通过。
+保留原16MiB提交阈值tests-only RED，后续核对普通write不触发该旧入口、满4MiB只预上传，
+成功fsync覆盖先前接纳的所有序号。一次提交只等已冻结的 `through_seq`，持续生产不使
+旧提交无限等待；未知结果用原OperationId／精确请求重放，write／resize／setattr不能越过。
+
+分别覆盖本机Required且实际持久ACK验证后的 Uploaded 回读，以及无本机副本时正文
+保留至发布；按根完整校验，失败不交付部分输出。慢上传、读快照、冻结请求和最后共享
+slice期间不得提前退live，实际capacity、空闲池、元数据actual／reserved和RSS分列。
+另用已有大base布局加一次小覆盖，核对不会把原可提交文件变成4MiB元数据门槛错误；
+记录既有完整layout/domain并存份数不增加。新增描述符与工作区受限，不冒称全部布局／RPC受限。
+冷池／热池、FIFO取消／并发顺序、预算等待不持inode锁、描述符压力、无副本live压力、
+定时busy补做、stop唤醒与真实任务join都须有针对性证据。连续超过预算的写入须证明
+能推进，不能只测试不满预算的64MiB；S3有界窗口、OwnerFs和RDMA受影响范围另登记。
+
+正式功能核对需记录真实FUSE callback大小、6MiB的4＋2MiB几何、正文输入复制、
+冻结前后地址／capacity／代际、提交后4KiB覆盖、提交前原地覆盖，以及远端重开SHA／
+长度／EOF。正式性能与诊断分开，保留固定计时和缓存条件；未运行的资源与性能项继续待验收。
+
+
+### 原生上传错误归属与终态回归
+
+区分产品runtime与no-runtime同步推进：后者因预算等待而推进其他inode上传时，
+业务失败仍必须交还真实owner，不能污染当前write／fsync；结构故障不能伪装成功。
+两个inode共享同一pipeline，以确定性失败验证owner保留原OperationId／不可变正文，
+健康inode不继承外来错误；任务取消或失败不能提前退仍被持有的正文额度。
+
+receipt安装的实际容量拒绝属于已记录的业务失败，不是外层结构错误。
+结构错误回归必须命中真正提前返回的分支，并核对已取走任务后的joining、任务表、
+等待者唤醒和owner失败，不能用容量拒绝通过替代该证明。锁中毒时不能强行恢复为健康，
+后续同步／drain须明确失败而非无限等待，原请求与正文保留，未成功发布前不得生成成功回执。
+
+handle错误cursor与对象尝试错误分别验证；恢复后仍可能消费历史异步错误，不能规定
+任意固定重试次数必定成功。正常drain首个inode提交失败可中止后续inode发布，必须返回
+失败；该best-effort边界不降低成功fsync持久性，也不等于真实持FD dirty停止已验收。
