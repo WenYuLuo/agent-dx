@@ -457,8 +457,13 @@ writable-layer enforcement.
 ## Rootfs and mounts
 
 `rootfs=S3Config(...)` starts from an S3-compatible EROFS root filesystem.
-`Mount` supports image-backed read-only bind mounts and S3-backed bind or EROFS
-mounts. Credentials are sent to the control plane and sandboxd; callers should
+`Mount` supports image-backed read-only bind mounts, S3-backed bind or EROFS
+mounts, and Local bind mounts through `host_path`. Local mounts accept `options`
+(`ro` by default, or `rw`, plus `nosuid`/`nodev`/`noexec`) and `create_if_missing`
+for leaf-directory creation. The shared filesystem must already be mounted in
+the worker runtime namespace. For example, an SFS/MooseFS user workspace uses
+`Mount(target="/home/jiuwen", host_path="/home/agentos/users/user-1",
+options=("rw",), create_if_missing=True)`. Credentials are sent to the control plane and sandboxd; callers should
 use scoped object-store credentials. EXECD is still supplied by the deployment's
 local runtime environment, so a custom rootfs does not need to bake in ADX.
 

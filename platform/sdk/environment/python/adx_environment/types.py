@@ -702,55 +702,63 @@ class S3Config:
 
 @dataclass(frozen=True)
 class Mount:
-    """Read-only mount configuration for Environment.
+    """Image/S3 read-only mount or a node-local bind mount.
 
-    Mounts are always read-only. The source is either a container image
-    (``image_url``) or an S3 object (``s3_config``); sandboxd resolves
-    the source to a local path and exposes it at ``target``.
-
-    ``type`` selects the in-environment filesystem:
-
-    - ``"bind"`` (default): bind-mount the resolved host path (file or
-      directory tree) at ``target`` via FDFS.
-    - ``"erofs"``: mount the resolved host path as a read-only EROFS
-      filesystem. The source must point at an EROFS image file (e.g.
-      an S3 object whose content is a ``.img`` EROFS image).
-
-    Exactly one of ``image_url`` or ``s3_config`` must be specified.
-
-    Examples::
-
-        Mount(target="/opt/tool", image_url="registry/tool:v1")
-        Mount(target="/weights", type="erofs", s3_config=S3Config(...))
+    ``host_path`` refers to a path visible to the worker (including a mounted
+    shared filesystem such as MooseFS). ADX does not mount the filesystem itself.
+    Local bind mounts support ``rw`` and optional leaf-directory creation;
+    image/S3 sources remain read-only.
     """
 
     target: str
     image_url: Optional[str] = None
     s3_config: Optional[S3Config] = None
     type: str = "bind"
+    host_path: Optional[str] = None
+    options: Sequence[str] = ("ro",)
+    create_if_missing: bool = False
 
     def __post_init__(self) -> None:
-        if not isinstance(self.target, str) or not self.target.startswith("/"):
-            raise ValueError("target must be an absolute environment path")
-        sources = [self.image_url, self.s3_config]
-        count = sum(1 for s in sources if s is not None)
+        for label, path in (("target", self.target), ("host_path", self.host_path)):
+            if path is None and label == "host_path":
+                continue
+            if not isinstance(path, str) or not path.startswith("/") or "\0" in path or ".." in path.split("/"):
+                raise ValueError(f"{label} must be an absolute path without parent traversal or NUL")
+        count = sum(source is not None for source in (self.image_url, self.s3_config, self.host_path))
         if count != 1:
-            raise ValueError(f"Exactly one of image_url, s3_config must be specified, got {count}")
+            raise ValueError(f"Exactly one of image_url, s3_config, host_path must be specified, got {count}")
         if self.image_url is not None and (not isinstance(self.image_url, str) or not self.image_url.strip()):
             raise ValueError("image_url must be a non-empty string")
+        if self.s3_config is not None and not isinstance(self.s3_config, S3Config):
+            raise ValueError("s3_config must be an S3Config")
         if self.type not in ("bind", "erofs"):
             raise ValueError(f"type must be 'bind' or 'erofs', got {self.type!r}")
+        if isinstance(self.options, str):
+            raise ValueError("options must be a sequence of mount flags")
+        options = tuple(self.options)
+        if any(flag not in {"ro", "rw", "nosuid", "nodev", "noexec"} for flag in options):
+            raise ValueError("unsupported mount option")
+        if len(set(options)) != len(options) or ("ro" in options and "rw" in options):
+            raise ValueError("mount options must be unique and cannot contain both ro and rw")
+        if "ro" not in options and "rw" not in options:
+            options = ("ro",) + options
+        if "rw" in options and (self.host_path is None or self.type != "bind"):
+            raise ValueError("only local bind mounts may be writable")
+        if not isinstance(self.create_if_missing, bool):
+            raise ValueError("create_if_missing must be a boolean")
+        if self.create_if_missing and (self.host_path is None or self.type != "bind"):
+            raise ValueError("create_if_missing requires a local bind mount")
+        object.__setattr__(self, "options", options)
 
     def to_dict(self) -> Dict[str, Any]:
-        d: Dict[str, Any] = {
-            "type": self.type,
-            "target": self.target,
-            "options": ["ro"],
-        }
+        d: Dict[str, Any] = {"type": self.type, "target": self.target, "options": list(self.options)}
         if self.image_url is not None:
             d["image_url"] = self.image_url
         if self.s3_config is not None:
             d["s3_config"] = self.s3_config.to_dict()
+        if self.host_path is not None:
+            d["host_path"] = self.host_path
+            d["create_if_missing"] = self.create_if_missing
         return d
 
 
