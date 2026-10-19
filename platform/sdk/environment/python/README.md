@@ -385,6 +385,17 @@ failures with an uncertain write result surface the same fields on
 `EnvironmentError`. Other malformed typed-result
 shapes can instead surface `ValueError` or `TypeError` while values are
 converted, or `RuntimeError` when resume `portMappings` is not an object.
+A confirmed cancellation before assignment returns
+`DEADLINE_EXCEEDED / never / not_started`; the SDK makes no additional attempt
+or backoff after that response. `error.scheduling_failure` contains placement
+rejection counts, requested resources, and worker capacity/available maxima
+when the server supplies them. Maxima are per dimension and may describe
+different workers; diagnostics describe the current snapshot, not future
+capacity after scaling. A deliberate new create call can start a new queue wait.
+Unconfirmed runtime/transport results retain the same-operation retry policy.
+After retries, a complete service failure remains `EnvironmentHTTPError` with
+its status, payload and metadata; it is not labeled as a connection failure.
+
 `reload()` translates `EnvironmentError` into `False`; it does not normalize those
 other programming/shape exceptions.
 

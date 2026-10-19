@@ -194,6 +194,11 @@ impl RuntimeDriver for Backend {
             _ => (),
         }
         self.started.fetch_add(1, Ordering::SeqCst);
+        if spec.id == "assignment-wins" {
+            // Assignment wins before the queue deadline; runtime readiness may
+            // legitimately finish after that deadline under the create budget.
+            tokio::time::sleep(Duration::from_millis(1200)).await;
+        }
         self.running.lock().unwrap().insert(id.into());
         Ok("10.0.0.2".parse().unwrap())
     }
@@ -597,14 +602,17 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
     let mut expires = create("queue-deadline");
     expires.schedule_timeout_seconds = 1;
     let started = tokio::time::Instant::now();
+    let error = frontend.create_environment(expires).await.unwrap_err();
+    assert_eq!(error.code(), tonic::Code::DeadlineExceeded);
+    // Cancellation is acknowledged only before any assignment exists.
     assert_eq!(
-        frontend
-            .create_environment(expires)
-            .await
-            .unwrap_err()
-            .code(),
-        tonic::Code::DeadlineExceeded
+        error.metadata().get("adx-scheduling-cancelled").unwrap(),
+        "true"
     );
+    let failure: serde_json::Value = serde_json::from_slice(error.details()).unwrap();
+    assert_eq!(failure["rejections"]["insufficient_cpu"], 1);
+    assert_eq!(failure["requested"]["cpu_millis"], 100);
+    assert_eq!(failure["maxAvailable"]["cpu_millis"], 0);
     assert!(started.elapsed() >= Duration::from_millis(900));
     assert_eq!(
         session.get("queue-deadline").await.unwrap_err(),
@@ -613,6 +621,28 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
     assert!(scrape_metrics(metrics_address)
         .await
         .contains("adx_coordinator_queued_requests{shard_id=\"0\"} 0\n"));
+
+    for (id, cpu, memory, reason) in [
+        ("cpu-nonfit", 101, 128, "insufficient_cpu"),
+        ("memory-nonfit", 100, 129, "insufficient_memory"),
+    ] {
+        let mut request = create(id);
+        request.schedule_timeout_seconds = 1;
+        let resources = request.spec.as_mut().unwrap().resources.as_mut().unwrap();
+        resources.cpu_millis = cpu;
+        resources.memory_bytes = memory;
+        let error = frontend.create_environment(request).await.unwrap_err();
+        assert_eq!(error.code(), tonic::Code::DeadlineExceeded);
+        let failure = adx_protocol::scheduling_failure(&error).unwrap();
+        assert_eq!(failure.rejections[reason], 1);
+        assert_eq!(failure.max_capacity.cpu_millis, 100);
+        assert_eq!(failure.max_capacity.memory_bytes, 128);
+        assert_eq!(
+            session.get(id).await.unwrap_err(),
+            adx_core::Error::NotFound
+        );
+    }
+    assert_eq!(backend.started.load(Ordering::SeqCst), 1);
 
     let mut pending = Request::new(create("second"));
     pending.set_timeout(Duration::from_millis(80));
@@ -649,6 +679,13 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
     })
     .await
     .unwrap();
+    // Freeing capacity after cancellation must not revive expired requests.
+    for id in ["queue-deadline", "cpu-nonfit", "memory-nonfit"] {
+        assert_eq!(
+            session.get(id).await.unwrap_err(),
+            adx_core::Error::NotFound
+        );
+    }
     assert_eq!(backend.started.load(Ordering::SeqCst), 2);
     assert_eq!(backend.removed.load(Ordering::SeqCst), 1);
     assert_eq!(
@@ -695,6 +732,31 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
     ));
     assert!(!metrics.contains("adx_coordinator_deleted_records"));
     assert!(metrics
+        .contains("adx_coordinator_node_reserved_cpu_millis{shard_id=\"0\",node_id=\"node\"} 0\n"));
+
+    let mut assigned = create("assignment-wins");
+    assigned.schedule_timeout_seconds = 1;
+    let started = tokio::time::Instant::now();
+    let result = frontend
+        .create_environment(assigned)
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(started.elapsed() >= Duration::from_millis(1200));
+    let record = result.record.unwrap();
+    assert_eq!(record.state, pb::EnvironmentState::Running as i32);
+    node_frontend
+        .delete_environment(pb::DeleteEnvironmentRequest {
+            failed_revision: None,
+            node_session_id: String::new(),
+            assignment: record.assignment,
+            caller: caller(),
+        })
+        .await
+        .unwrap();
+    assert!(backend.running.lock().unwrap().is_empty());
+    assert!(scrape_metrics(metrics_address)
+        .await
         .contains("adx_coordinator_node_reserved_cpu_millis{shard_id=\"0\",node_id=\"node\"} 0\n"));
 
     if let Ok(api_binary) = std::env::var("ADX_TEST_APISERVER") {
@@ -789,7 +851,15 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
             "{}",
             String::from_utf8_lossy(&result.stderr)
         );
-        for id in ["t-http-case", "t-http-peer", "t-http-affinity"] {
+        for id in [
+            "t-http-case",
+            "t-http-peer",
+            "t-http-affinity",
+            "t-http-cpu-json",
+            "t-http-cpu-sse",
+            "t-http-memory-json",
+            "t-http-memory-sse",
+        ] {
             assert!(matches!(
                 session.get(id).await,
                 Err(adx_core::Error::NotFound)

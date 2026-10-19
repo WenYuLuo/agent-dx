@@ -440,3 +440,67 @@ code, value = call('DELETE', '/api/environment/' + quote(identity, safe=''))
 if not (code == 200):
     raise AssertionError((code, value))
 print('Escaped instance ID deletion passed')
+
+# Exercise the public wire protocols against the real Coordinator/Redis fixture.
+import uuid
+
+code, baseline = call('GET', '/api/environment/v1/resources')
+if code != 200:
+    raise AssertionError((code, baseline))
+workers = baseline['items']
+max_cpu = max(worker['capacity']['CPU'] for worker in workers)
+max_memory = max(worker['capacity']['Memory'] for worker in workers)
+for resource, reason in [('cpu', 'insufficient_cpu'), ('memory', 'insufficient_memory')]:
+    for sse in (False, True):
+        name = 'http-' + resource + ('-sse' if sse else '-json')
+        request_id = 'create-' + str(uuid.uuid4())
+        request_body = {
+            'namespace': 't', 'name': name, 'image': 'image',
+            'cpu': max_cpu + 1 if resource == 'cpu' else 100,
+            'memory': max_memory + 1 if resource == 'memory' else 1,
+            'scheduleTimeoutSeconds': 1, 'createTimeoutSeconds': 61,
+        }
+        headers = {'Accept': 'text/event-stream' if sse else 'application/json',
+                   'X-Request-Id': request_id}
+        started = time.monotonic()
+        if sse:
+            request = urllib.request.Request(
+                endpoint + '/api/environment/v1/environments',
+                data=json.dumps(request_body).encode(), method='POST',
+                headers={**headers, 'Content-Type': 'application/json', 'X-Auth': 'a' * 40},
+            )
+            with urllib.request.urlopen(request, context=context, timeout=10) as response:
+                if response.status != 200 or 'text/event-stream' not in response.headers['Content-Type']:
+                    raise AssertionError((response.status, response.headers))
+                stream = response.read().decode()
+            finals = [frame for frame in stream.split('\n\n') if frame.startswith('event: final\n')]
+            if len(finals) != 1:
+                raise AssertionError(stream)
+            payload = json.loads(finals[0].split('data: ', 1)[1])
+            if payload['errorCode'] != 504 or payload['status'] != 'timeout':
+                raise AssertionError(payload)
+        else:
+            code, payload = call('POST', '/api/environment/v1/environments', request_body, extra=headers)
+            if code != 504:
+                raise AssertionError((code, payload))
+            payload = json.loads(payload)
+        elapsed = time.monotonic() - started
+        if not 0.9 <= elapsed < 6:
+            raise AssertionError(('queue wait duration', elapsed))
+        detail = payload['error']
+        if (detail['code'], detail['retry'], detail['outcome']) != ('DEADLINE_EXCEEDED', 'never', 'not_started'):
+            raise AssertionError(payload)
+        if detail['requestId'] != request_id or detail['environmentId'] != 't-' + name:
+            raise AssertionError(payload)
+        diagnosis = detail['schedulingFailure']
+        if diagnosis['rejections'].get(reason, 0) < 1 or diagnosis['eligibleNodes'] != 0:
+            raise AssertionError(payload)
+        if diagnosis['maxCapacity']['cpu_millis'] != max_cpu:
+            raise AssertionError(payload)
+code, after = call('GET', '/api/environment/v1/resources')
+if code != 200 or after != baseline:
+    raise AssertionError(('resource baseline changed', baseline, after))
+code, queue = call('GET', '/global-scheduler/scheduling_queue', key=admin)
+if code != 200 or queue != {'count': 0, 'instanceInfos': []}:
+    raise AssertionError((code, queue))
+print('Raw JSON/SSE CPU and memory non-fit: bounded wait, diagnosis, known cancellation and resource baseline passed')
