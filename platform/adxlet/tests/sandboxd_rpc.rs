@@ -1,4 +1,6 @@
 //! Local gRPC/UDS contract tests against the pinned protocol, not sandboxd E2E.
+#[path = "common/authority.rs"]
+mod authority;
 use adx_core::{Assignment, EnvironmentRecord, EnvironmentSpec, EnvironmentState, Resources};
 use adxlet::{
     sandboxd::{connect_when_ready, proto::*, start_request, Config, Sandboxd},
@@ -1602,4 +1604,68 @@ async fn mixed_router_delete_before_start_fences_jiuwenbox_too() {
         router.start(&wanted, "i-1", 1, &[]).await,
         Err(adx_core::Error::Conflict)
     ));
+}
+
+#[tokio::test]
+async fn public_authority_cycle_collects_sandboxd_orphan_without_local_controller() {
+    let server = Server::default();
+    let (creator, harness) = connect(server.clone()).await;
+    let adapter = Sandboxd::connect(
+        harness._directory.path().join("rpc.sock"),
+        Config::default(),
+    )
+    .await
+    .unwrap();
+    let router = adxlet::runtime_router::RuntimeRouter::new(Some(adapter), None).unwrap();
+    let node = authority::manager(Arc::new(router));
+    let mut authority = authority::Fixture::new().await;
+    authority.cycle(&node).await.unwrap();
+    // An external successful create has no corresponding node controller/catalog entry.
+    creator.start(&spec(), "i-1", 1, &[]).await.unwrap();
+    assert!(*server.running.lock().unwrap());
+    authority.cycle(&node).await.unwrap();
+    assert!(!*server.running.lock().unwrap());
+    assert_eq!(server.starts.lock().unwrap().len(), 1);
+    assert_eq!(node.used(), Resources::default());
+    assert!(node.accepting_allocations());
+    assert!(
+        authority
+            .authority
+            .reports
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .accepting_allocations
+    );
+}
+
+#[tokio::test]
+async fn public_authority_cycle_reaps_transport_lost_create_after_empty_scan() {
+    let server = Server {
+        transport_error: true,
+        ..Default::default()
+    };
+    let (creator, harness) = connect(server.clone()).await;
+    let adapter = Sandboxd::connect(
+        harness._directory.path().join("rpc.sock"),
+        Config::default(),
+    )
+    .await
+    .unwrap();
+    let node = authority::manager(Arc::new(adapter));
+    assert!(creator.start(&spec(), "i-1", 1, &[]).await.is_err());
+    let mut authority = authority::Fixture::new().await;
+    authority.cycle(&node).await.unwrap();
+    // The first complete inventory was empty; the failed create materializes later.
+    *server.running.lock().unwrap() = true;
+    authority.cycle(&node).await.unwrap();
+    assert!(!*server.running.lock().unwrap());
+    assert!(server
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|r| r == "delete:generated-backend-id"));
+    assert_eq!(server.starts.lock().unwrap().len(), 1);
 }

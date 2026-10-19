@@ -11,7 +11,6 @@ import json
 import os
 from pathlib import Path
 import signal
-import sqlite3
 import subprocess
 import time
 
@@ -24,19 +23,25 @@ def command(*args, check=True):
 
 
 class Acceptance:
-    def __init__(self, root, run):
+    def __init__(self, root, run, backends=None):
+        self.backends = tuple(backends or ('supervisor', 'conch'))
         self.root = root
         self.run = root / 'runs' / run
         self.run.mkdir(parents=True, exist_ok=False)
         self.name = run
-        kernel_sha = hashlib.sha256((root/'artifacts/vmlinux').read_bytes()).hexdigest()
-        self.template = 'localhost/adx-acceptance:'+kernel_sha[:16]
-        self.template_ready = root/'artifacts'/('template-ready-'+kernel_sha[:16])
+        self.template_binding = {}
+        if 'conch' in self.backends:
+            kernel_sha = hashlib.sha256((root/'artifacts/vmlinux').read_bytes()).hexdigest()
+            self.template = 'localhost/adx-acceptance:'+kernel_sha[:16]
+            self.template_binding = {'template_name': self.template}
+            self.template_ready = root/'artifacts'/('template-ready-'+kernel_sha[:16])
         self.jw_socket = self.run / 'j.sock'
         self.conch_socket = Path('/var/run/conch/conchd.sock')
         self.children = {}
         self.results = []
         self.drivers = []
+        self.driver_configs = {}
+        self.expected = {}
         self.sha = hashlib.sha256((root / 'artifacts/execd.erofs').read_bytes()).hexdigest()
 
     def spawn(self, name, args, env=None):
@@ -79,34 +84,48 @@ class Acceptance:
 
     async def prepare(self):
         assert os.geteuid() == 0
-        assert not self.conch_socket.exists(), 'existing Conch socket must be preserved'
+        if 'conch' in self.backends:
+            assert not self.conch_socket.exists(), 'existing Conch socket must be preserved'
         assert not Path('/root/.jiuwenbox').exists() or (self.root/'artifacts/host-config-owned').exists(), 'existing Jiuwenbox state must be preserved'
-        cni = Path('/etc/conch/cni/net.d')
-        assert not cni.exists() or not list(cni.iterdir()) or ((self.root/'artifacts/host-config-owned').exists() and [p.name for p in cni.iterdir()]==['10-adx-acceptance.conf']), 'existing CNI configuration must be preserved'
-        cni.mkdir(parents=True, exist_ok=True)
+        if 'conch' in self.backends:
+            cni = Path('/etc/conch/cni/net.d')
+            assert not cni.exists() or not list(cni.iterdir()) or ((self.root/'artifacts/host-config-owned').exists() and [p.name for p in cni.iterdir()]==['10-adx-acceptance.conf']), 'existing CNI configuration must be preserved'
+            cni.mkdir(parents=True, exist_ok=True)
+            self.cni_path = cni / '10-adx-acceptance.conf'
+            self.cni_path.write_text(json.dumps({'cniVersion':'1.0.0','name':'adxjbx-acceptance','type':'bridge','bridge':'adxjbc0','isGateway':True,'ipMasq':True,'ipam':{'type':'host-local','subnet':'10.83.0.0/24','routes':[{'dst':'0.0.0.0/0'}]}}))
         (self.root/'artifacts/host-config-owned').touch()
-        self.cni_path = cni / '10-adx-acceptance.conf'
-        self.cni_path.write_text(json.dumps({'cniVersion':'1.0.0','name':'adxjbx-acceptance','type':'bridge','bridge':'adxjbc0','isGateway':True,'ipMasq':True,'ipam':{'type':'host-local','subnet':'10.83.0.0/24','routes':[{'dst':'0.0.0.0/0'}]}}))
         policy = yaml.safe_load((self.root/'jiuwenbox/src/jiuwenbox/configs/default-policy.yaml').read_text())
         policy['process'] = {'run_as_user':'root','run_as_group':'root'}
         policy['namespace']['user'] = False
         policy['network']['ingress'] = {'default':'allow'}
         policy['network']['egress'] = {'default':'allow'}
         (self.run/'policy.yaml').write_text(yaml.safe_dump(policy))
-        conch = yaml.safe_load((self.root/'conch/config/config.yaml').read_text())
-        conch['server'] = {'work_dir':'/var/run/conch','state_dir':str(self.root/'conch-state')}
-        conch['sandbox']['backend'] = 'cloud-hypervisor'
-        conch['sandbox']['cloud_hypervisor']['binary'] = str(self.root/'bin/cloud-hypervisor')
-        conch['network']['warm_pool_size'] = 2
-        conch['network']['cni']['plugin_bin_dirs'] = ['/usr/lib/cni','/usr/libexec/cni','/opt/cni/bin']
-        conch['volume']['virtiofs']['binary'] = str(self.root/'tools/bin/virtiofsd')
-        (self.run/'conch.yaml').write_text(yaml.safe_dump(conch))
-        (self.run/'conch.yaml').chmod(0o600)
-        await self.start_conch()
-        if not self.template_ready.exists():
-            result = await asyncio.to_thread(command, str(self.root/'conch/bin/conch'), 'template','create','--config',str(self.run/'conch.yaml'),'--name',self.template,'--source','docker.io/library/ubuntu:24.04','--kernel',str(self.root/'artifacts/vmlinux'),'--initrd',str(self.root/'conch/build-artifacts/conch-init-initramfs.cpio.gz'))
-            (self.run/'template.log').write_text(result)
-            self.template_ready.write_text(result)
+        if 'conch' in self.backends:
+            conch = yaml.safe_load((self.root/'conch/config/config.yaml').read_text())
+            conch['server'] = {'work_dir':'/var/run/conch','state_dir':str(self.root/'conch-state')}
+            fixture_path = self.root/'backend-fixture.json'
+            fixture = json.loads(fixture_path.read_text()) if fixture_path.exists() else {}
+            backend = fixture.get('conch_backend', 'cloud-hypervisor')
+            assert backend in ('cloud-hypervisor', 'stratovirt'), backend
+            conch['sandbox']['backend'] = backend
+            conch['sandbox'][backend.replace('-', '_')]['binary'] = str(self.root/'bin'/backend)
+            conch['network']['warm_pool_size'] = 2
+            conch['network']['refill_threshold'] = 1
+            conch['network']['cni']['plugin_bin_dirs'] = ['/usr/lib/cni','/usr/libexec/cni','/opt/cni/bin']
+            conch['volume']['virtiofs']['binary'] = str(self.root/'tools/bin/virtiofsd')
+            (self.run/'conch.yaml').write_text(yaml.safe_dump(conch))
+            (self.run/'conch.yaml').chmod(0o600)
+            await self.start_conch()
+            if not self.template_ready.exists():
+                result = await asyncio.to_thread(command, str(self.root/'conch/bin/conch'), 'template','create','--config',str(self.run/'conch.yaml'),'--name',self.template,'--source','docker.io/library/ubuntu:24.04','--kernel',str(self.root/'artifacts/vmlinux'),'--initrd',str(self.root/'conch/build-artifacts/conch-init-initramfs.cpio.gz'))
+                (self.run/'template.log').write_text(result)
+                self.template_ready.write_text(result)
+            if fixture.get('conch_template_selector') == 'id':
+                lines = self.template_ready.read_text().splitlines()
+                template_id = next(line.removeprefix('Template ID: ').strip()
+                                   for line in lines if line.startswith('Template ID: '))
+                assert template_id.startswith('sha256:') and len(template_id) == 71, template_id
+                self.template_binding = {'template_id': template_id}
         await self.start_jw()
         recovered = []
         for previous in (self.root/'runs').glob('*/*/config.json'):
@@ -117,18 +136,18 @@ class Acceptance:
             recovery = previous.parent/'recovery.json'
             recovery.write_text(json.dumps(config))
             p = await self.driver(recovery)
-            await self.ok(p,'inventory')
+            await self.ok(p,'reconcile',catalog=[])
             await self.kill_driver(p)
             recovered.append(recovery)
         for recovery in recovered:
             await self.audit(recovery)
 
     def config(self, case, socket=None):
-        config = {'socket':str(socket or self.jw_socket),'conch_socket':str(self.conch_socket),'state_dir':str(self.run/case/'state'),'bootstrap':{'image':str(self.root/'artifacts/execd.erofs'),'sha256':self.sha,'target':'/__adx','command':['/__adx/usr/local/bin/adx-execd']},'classes':{}}
-        for backend in ['supervisor','conch']:
+        config = {'socket':str(socket or self.jw_socket),'conch_socket':str(self.conch_socket) if 'conch' in self.backends else None,'state_dir':str(self.run/case/'state'),'bootstrap':{'image':str(self.root/'artifacts/execd.erofs'),'sha256':self.sha,'target':'/__adx','command':['/__adx/usr/local/bin/adx-execd']},'classes':{}}
+        for backend in self.backends:
             image = {'process':{'args':['/bin/sleep','600'],'cwd':'/','user':'0:0'}}
             if backend == 'conch':
-                image['template_name'] = self.template
+                image.update(self.template_binding)
             config['classes'][backend] = {'images':{'acceptance:v1':image}}
         path = self.run/case/'config.json'
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -141,14 +160,24 @@ class Acceptance:
         ready = await asyncio.wait_for(p.stdout.readline(), 30)
         assert ready and json.loads(ready).get('ready'), f'driver start failed: {ready!r}'
         self.drivers.append(p)
+        self.driver_configs[p.pid] = config
         return p
 
     async def rpc(self, driver, action, id='', **kwargs):
+        config = self.driver_configs[driver.pid]
+        if action == 'start':
+            self.expected.setdefault(config.parent, {})[id] = {
+                'runtime_id': id, 'sandbox_id': 'adx-'+hashlib.sha256(id.encode()).hexdigest()[:28],
+                'spec': kwargs['spec'], 'ip': None,
+            }
         driver.stdin.write((json.dumps(dict(action=action,id=id,**kwargs))+'\n').encode())
         await driver.stdin.drain()
         line = await asyncio.wait_for(driver.stdout.readline(), 180)
         assert line, f'driver exited {driver.returncode}'
-        return json.loads(line)
+        result = json.loads(line)
+        if action == 'start' and result['ok']:
+            self.expected[config.parent][id]['ip'] = result['value']['ip']
+        return result
 
     async def ok(self, *args, **kwargs):
         result = await self.rpc(*args, **kwargs)
@@ -190,11 +219,30 @@ class Acceptance:
         return id
 
     def records(self, config):
-        database = config.parent/'state/ownership.sqlite'
-        if not database.exists():
-            return []
-        with sqlite3.connect(database) as db:
-            return [json.loads(row[0]) for row in db.execute('SELECT payload FROM runtime')]
+        return list(self.expected.get(config.parent, {}).values())
+
+    def runtime_catalog(self, config):
+        # Test-owned authority input, never a production driver recovery file.
+        return [dict(spec=r['spec'], assignment=dict(environment_id=r['spec']['id'],
+                    node_id='acceptance', shard_id=0, generation=1, devices=[]),
+                    state='Running', revision=1, runtime=dict(id=r['runtime_id'], ip=r['ip']),
+                    checkpoint=None, last_operation=None, resources_held=True,
+                    failure=None, restart_attempts=0, restart_pending=False)
+                for r in self.records(config) if r['ip']]
+
+    async def managed_backends_absent(self):
+        sockets = [self.jw_socket] + ([self.conch_socket] if 'conch' in self.backends else [])
+        for socket in sockets:
+            response = await self.uds(socket, 'GET', '/api/v1/sandboxes?limit=5000')
+            response.raise_for_status()
+            values = response.json()
+            assert len(values) < 5000, 'possibly truncated native inventory'
+            if any(v.get('sandboxID', v.get('id', '')).startswith('adx-') for v in values):
+                return False
+        for directory, pattern in [(Path('/sys/fs/cgroup/jiuwenbox'), 'adx-*'), (Path('/run/netns'), 'jbx-adx-*')]:
+            if any(directory.glob(pattern)):
+                return False
+        return True
 
     async def audit(self, config):
         records = self.records(config)
@@ -202,8 +250,6 @@ class Acceptance:
         runtime_ids = {r['runtime_id'] for r in records}
         leftovers = []
         for record in records:
-            if record['phase'] != 'Deleted':
-                leftovers.append('journal:'+record['runtime_id']+':'+record['phase'])
             id = record['sandbox_id']
             for path in [Path('/sys/fs/cgroup/jiuwenbox')/id,Path('/run/netns')/('jbx-'+id),Path('/sys/class/net')/('jwbH'+hashlib.sha256(id.encode()).hexdigest()[:8])]:
                 if path.exists():
@@ -211,9 +257,10 @@ class Acceptance:
             digest = hashlib.sha256(record['runtime_id'].encode()).hexdigest()[:20]
             if f'ADXJI{digest}' in command('iptables-save','-t','filter') or f'ADXJE{digest}' in command('iptables-save','-t','filter'):
                 leftovers.append('iptables:'+id)
-            native = await self.uds(self.conch_socket,'GET','/api/v1/sandboxes/'+id)
-            if native.status_code != 404:
-                leftovers.append('conch:'+id+':'+str(native.status_code))
+            if 'conch' in self.backends:
+                native = await self.uds(self.conch_socket,'GET','/api/v1/sandboxes/'+id)
+                if native.status_code != 404:
+                    leftovers.append('conch:'+id+':'+str(native.status_code))
         for proc in Path('/proc').iterdir():
             if not proc.name.isdigit() or int(proc.name)==os.getpid():
                 continue
@@ -228,10 +275,22 @@ class Acceptance:
                         leftovers.append('execd:'+proc.name)
             except (FileNotFoundError,PermissionError,ProcessLookupError):
                 pass
-        image = str(self.root/'artifacts/execd.erofs')
-        if command('losetup','-j',image).strip():
-            leftovers.append('execd-loop')
-        output = {'journal':records,'leftovers':leftovers}
+        mount = config.parent/'state/bootstrap'/self.sha
+        retained = command('findmnt','-J','-M',str(mount), check=False)
+        if records:
+            assert 'erofs' in retained and 'ro,' in retained, retained
+        if self.run in config.parents:
+            assert not (config.parent/'state/ownership.sqlite').exists()
+        listed = await self.uds(self.jw_socket, 'GET', '/api/v1/sandboxes')
+        listed.raise_for_status()
+        leftovers.extend('jiuwenbox:'+r['id'] for r in listed.json() if r['id'].startswith('adx-'))
+        if 'conch' in self.backends:
+            native = await self.uds(self.conch_socket, 'GET', '/api/v1/sandboxes?limit=5000')
+            native.raise_for_status()
+            assert len(native.json()) < 5000, 'possibly truncated native inventory'
+            leftovers.extend('conch:'+r.get('sandboxID',r.get('id','')) for r in native.json()
+                             if r.get('sandboxID',r.get('id','')).startswith('adx-'))
+        output = {'expected':records,'retained_bootstrap':json.loads(retained) if retained else None,'leftovers':leftovers}
         (config.parent/'audit.json').write_text(json.dumps(output,indent=2))
         assert not leftovers, output
 
@@ -249,12 +308,12 @@ class Acceptance:
         if mode=='driver-restart':
             await self.kill_driver(p)
             p = await self.driver(config)
-            assert (await self.ok(p,'inventory'))['count']==1
+            assert (await self.ok(p,'reconcile',catalog=self.runtime_catalog(config)))['count']==1
             assert (await self.ok(p,'observe',id))['running']
         elif mode=='jiuwenbox-restart':
             await self.stop(self.jw, signal.SIGKILL)
             await self.start_jw()
-            assert (await self.ok(p,'inventory'))['count']==0
+            assert (await self.ok(p,'reconcile',catalog=self.runtime_catalog(config)))['count']==0
         elif mode=='conchd-restart':
             await self.stop(self.conch,signal.SIGKILL)
             await self.start_conch()
@@ -307,7 +366,10 @@ class Acceptance:
 
     def host_audit(self):
         leftovers = []
-        for directory, pattern in [(Path('/run/conch/netns'),'slot-*'), (Path('/run/netns'),'jbx-*'), (Path('/sys/fs/cgroup/jiuwenbox'), '*')]:
+        directories = [(Path('/run/netns'),'jbx-*'), (Path('/sys/fs/cgroup/jiuwenbox'), '*')]
+        if 'conch' in self.backends:
+            directories.append((Path('/run/conch/netns'),'slot-*'))
+        for directory, pattern in directories:
             leftovers.extend(str(path) for path in directory.glob(pattern) if path.is_dir() or directory != Path('/sys/fs/cgroup/jiuwenbox'))
         for proc in Path('/proc').iterdir():
             if not proc.name.isdigit():
@@ -315,15 +377,14 @@ class Acceptance:
             try:
                 executable = (proc/'exe').resolve().name
                 cmdline = (proc/'cmdline').read_bytes().decode(errors='replace')
-                if executable in ['cloud-hypervisor','virtiofsd','jiuwenbox_acceptance'] and str(self.root) in cmdline:
+                if executable in ['cloud-hypervisor','stratovirt','virtiofsd','jiuwenbox_acceptance'] and str(self.root) in cmdline:
                     leftovers.append('backend-process:'+proc.name)
             except (FileNotFoundError,PermissionError,ProcessLookupError):
                 pass
-        if command('losetup','-j',str(self.root/'artifacts/execd.erofs')).strip():
-            leftovers.append('execd-loop')
+        retained_loops = command('losetup','-j',str(self.root/'artifacts/execd.erofs')).splitlines()
         rules = command('iptables-save','-t','filter')
         leftovers.extend(line for line in rules.splitlines() if line.startswith((':ADXJI',':ADXJE')))
-        output = {'leftovers':leftovers, 'conch_bridge_ports':json.loads(command('ip','-j','link','show','master','adxjbc0'))}
+        output = {'leftovers':leftovers, 'retained_bootstrap_loops':retained_loops, 'conch_bridge_ports':json.loads(command('ip','-j','link','show','master','adxjbc0')) if 'conch' in self.backends else []}
         (self.run/'host-audit.json').write_text(json.dumps(output,indent=2))
         return output
 

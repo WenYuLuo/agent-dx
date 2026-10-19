@@ -1,229 +1,205 @@
-//! Ordered host IPv4 rules shared by both Jiuwenbox backends.
-use crate::sandboxd::proto;
-use adx_core::{execution::NetworkPolicy, Error, Result};
-use sha2::{Digest, Sha256};
-use std::net::{IpAddr, Ipv4Addr};
+//! Translate only policies whose semantics the unmodified native backends preserve.
+use crate::sandboxd::Config;
+use adx_core::{
+    execution::{NetworkAction, NetworkDirection, NetworkPolicy, NetworkProtocol, TrafficMode},
+    Error, Result,
+};
+use serde_json::{json, Value};
+use std::{collections::BTreeSet, net::Ipv4Addr};
 
-/// DNS enforcement and IPv6 require capabilities outside this adapter.
-pub fn validate_network(policy: Option<&NetworkPolicy>) -> Result<()> {
+fn unsupported(message: &str) -> Error {
+    Error::Invalid(format!("Jiuwenbox native ACL: {message}"))
+}
+
+fn address(text: &str) -> Result<()> {
+    let (ip, bits) = text
+        .split_once('/')
+        .map_or((text, None), |(ip, bits)| (ip, Some(bits)));
+    ip.parse::<Ipv4Addr>()
+        .map_err(|_| unsupported("IPv4 address/CIDR required"))?;
+    if bits.is_some_and(|b| b.parse::<u8>().map_or(true, |n| n > 32)) {
+        return Err(unsupported("invalid IPv4 prefix"));
+    }
+    Ok(())
+}
+
+/// Creation and live updates share this exact translation. Unsupported combinations
+/// fail before any backend mutation; no host firewall is installed by ADXlet.
+pub fn network_policy(
+    class: &str,
+    policy: Option<&NetworkPolicy>,
+    ports: &[u16],
+    launch: &Config,
+) -> Result<Value> {
+    if !matches!(class, "supervisor" | "conch") {
+        return Err(unsupported("unknown runtime class"));
+    }
+    let mut result = json!({"ingress":{"default":"allow"},"egress":{"default":"allow"}});
+    for direction in ["ingress", "egress"] {
+        result[direction]["allowed_ips"] = json!([]);
+        result[direction]["blocked_ips"] = json!([]);
+        if class == "supervisor" {
+            result[direction]["allowed_ports"] = json!([]);
+            result[direction]["blocked_ports"] = json!([]);
+        }
+    }
     let Some(policy) = policy else {
-        return Ok(());
+        return Ok(result);
     };
     policy.validate()?;
     if policy.dns.is_some() {
-        return Err(Error::Invalid(
-            "Jiuwenbox host filtering does not support DNS policies".into(),
-        ));
+        return Err(unsupported("DNS policy is unsupported"));
     }
-    if let Some(traffic) = &policy.traffic {
-        for rule in &traffic.rules {
-            let peer = &rule.peer;
-            use adx_core::execution::NetworkProtocol;
-            let ports = peer.port > 0
-                || peer.port_range.is_some()
-                || rule.environment_port > 0
-                || rule.environment_port_range.is_some();
-            if (ports && !matches!(rule.protocol, NetworkProtocol::Tcp | NetworkProtocol::Udp))
-                || (!peer.address.is_empty() && !peer.cidr.is_empty())
-                || (peer.port > 0 && peer.port_range.is_some())
-                || (rule.environment_port > 0 && rule.environment_port_range.is_some())
-            {
-                return Err(Error::Invalid(
-                    "ambiguous network selector or ports without TCP/UDP".into(),
-                ));
-            }
-
-            if !peer.domain.is_empty() {
-                return Err(Error::Invalid(
-                    "network domain matching is unsupported".into(),
-                ));
-            }
-            for text in [&peer.address, &peer.cidr]
-                .into_iter()
-                .filter(|v| !v.is_empty())
-            {
-                validate_address(text)?;
-            }
-        }
-    }
-    Ok(())
-}
-
-fn validate_address(text: &str) -> Result<()> {
-    let (ip, bits) = text
-        .split_once('/')
-        .map_or((text, None), |(a, b)| (a, Some(b)));
-    ip.parse::<Ipv4Addr>()
-        .map_err(|_| Error::Invalid("IPv4 policy address required".into()))?;
-    if bits.is_some_and(|b| b.parse::<u8>().map_or(true, |n| n > 32)) {
-        return Err(Error::Invalid("invalid IPv4 policy prefix".into()));
-    }
-    Ok(())
-}
-
-pub(super) fn chains(id: &str) -> (String, String) {
-    let hash = format!("{:x}", Sha256::digest(id.as_bytes()));
-    (
-        format!("ADXJI{}", &hash[..20]),
-        format!("ADXJE{}", &hash[..20]),
-    )
-}
-
-fn target(action: i32) -> Result<&'static str> {
-    match proto::NetworkPolicyAction::try_from(action) {
-        Ok(proto::NetworkPolicyAction::Allow) => Ok("RETURN"),
-        Ok(proto::NetworkPolicyAction::Deny) => Ok("DROP"),
-        _ => Err(Error::Invalid("unknown traffic action".into())),
-    }
-}
-
-fn rule_args(rule: &proto::TrafficRule, ingress: bool) -> Result<String> {
-    let protocol = match proto::NetworkProtocol::try_from(rule.protocol) {
-        Ok(proto::NetworkProtocol::Any) => "",
-        Ok(proto::NetworkProtocol::Tcp) => " -p tcp",
-        Ok(proto::NetworkProtocol::Udp) => " -p udp",
-        Ok(proto::NetworkProtocol::Icmp) => " -p icmp",
-        _ => return Err(Error::Invalid("unknown traffic protocol".into())),
+    let Some(traffic) = &policy.traffic else {
+        return Ok(result);
     };
-    let mut args = protocol.to_owned();
-    if let Some(peer) = &rule.peer {
-        if !peer.domain.is_empty() {
-            return Err(Error::Invalid("network domains unsupported".into()));
-        }
-        let address = if peer.cidr.is_empty() {
-            &peer.address
-        } else {
-            &peer.cidr
-        };
-        if !address.is_empty() {
-            validate_address(address)?;
-            args.push_str(&format!(" {} {address}", if ingress { "-s" } else { "-d" }));
-        }
-        let range = peer.port_range.or_else(|| {
-            (peer.port > 0).then_some(proto::PortRange {
-                first: peer.port,
-                last: peer.port,
-            })
-        });
-        append_port(
-            &mut args,
-            range.as_ref(),
-            if ingress { "--sport" } else { "--dport" },
-            rule.protocol,
-        )?;
+    if traffic.mode != TrafficMode::Stateful {
+        return Err(unsupported("stateless filtering is unsupported"));
     }
-    let port = rule.sandbox_port_range.or_else(|| {
-        (rule.sandbox_port > 0).then_some(proto::PortRange {
-            first: rule.sandbox_port,
-            last: rule.sandbox_port,
-        })
-    });
-    append_port(
-        &mut args,
-        port.as_ref(),
-        if ingress { "--dport" } else { "--sport" },
-        rule.protocol,
-    )?;
-    args.push_str(&format!(" -j {}", target(rule.action)?));
-    Ok(args)
-}
-
-fn append_port(
-    args: &mut String,
-    range: Option<&proto::PortRange>,
-    flag: &str,
-    protocol: i32,
-) -> Result<()> {
-    if let Some(range) = range {
-        if !(protocol == proto::NetworkProtocol::Tcp as i32
-            || protocol == proto::NetworkProtocol::Udp as i32)
-            || range.first == 0
-            || range.first > range.last
-            || range.last > 65535
+    let execd_port = launch
+        .env
+        .get("EXECD_HTTP_PORT")
+        .map(String::as_str)
+        .unwrap_or("50090")
+        .parse::<u16>()
+        .map_err(|_| unsupported("invalid Execd port"))?;
+    let protected_ports: BTreeSet<_> = ports
+        .iter()
+        .copied()
+        .chain(std::iter::once(execd_port))
+        .collect();
+    for (name, direction, default) in [
+        (
+            "ingress",
+            NetworkDirection::Ingress,
+            traffic.ingress_default_action,
+        ),
+        (
+            "egress",
+            NetworkDirection::Egress,
+            traffic.egress_default_action,
+        ),
+    ] {
+        let mut ips = BTreeSet::new();
+        let mut port_set = BTreeSet::new();
+        if direction == NetworkDirection::Ingress
+            && class == "conch"
+            && default == NetworkAction::Deny
         {
-            return Err(Error::Invalid("TCP/UDP port range required".into()));
+            return Err(unsupported(
+                "Conch cannot express ingress control/public-port exceptions",
+            ));
         }
-        args.push_str(&format!(" {flag} {}:{}", range.first, range.last));
-    }
-    Ok(())
-}
-
-/// One restore transaction replaces this runtime's rules and exact hooks.
-pub fn filter_script(
-    id: &str,
-    ip: IpAddr,
-    policy: Option<&proto::NetworkPolicy>,
-    saved: &str,
-    remove: bool,
-) -> Result<String> {
-    if !ip.is_ipv4() {
-        return Err(Error::Invalid("isolated IPv4 networking required".into()));
-    }
-    let (input, output) = chains(id);
-    let mut script = String::from("*filter\n");
-    if !remove {
-        script.push_str(&format!(
-            ":{input} - [0:0]\n:{output} - [0:0]\n-F {input}\n-F {output}\n"
-        ));
-    }
-    for line in saved.lines().filter(|line| line.starts_with("-A ")) {
-        let words: Vec<_> = line.split_whitespace().collect();
-        if words
-            .windows(2)
-            .any(|w| w[0] == "-j" && (w[1] == input || w[1] == output))
+        if direction == NetworkDirection::Egress
+            && class == "supervisor"
+            && default == NetworkAction::Deny
         {
-            script.push_str(&format!("-D {}\n", &line[3..]));
+            // Supervisor unconditionally allows DNS before its default drop. ADX
+            // deny-by-default does not imply that exception, so do not broaden it.
+            return Err(unsupported(
+                "supervisor egress default-deny has implicit DNS exceptions",
+            ));
         }
-    }
-    if remove {
-        for chain in [&input, &output] {
-            if saved
-                .lines()
-                .any(|line| line.starts_with(&format!(":{chain} ")))
-            {
-                script.push_str(&format!("-F {chain}\n-X {chain}\n"));
+        for rule in traffic
+            .rules
+            .iter()
+            .filter(|r| r.direction == direction || r.direction == NetworkDirection::Both)
+        {
+            if rule.action == default {
+                return Err(unsupported(
+                    "ordered allow/deny combinations are unsupported",
+                ));
             }
-        }
-    } else {
-        if policy.is_some_and(|p| p.dns.is_some()) {
-            return Err(Error::Invalid("DNS policies unsupported".into()));
-        }
-        for (chain, ingress) in [(&input, true), (&output, false)] {
-            if let Some(traffic) = policy.and_then(|p| p.traffic.as_ref()) {
-                if traffic.mode == proto::TrafficPolicyMode::Stateful as i32 {
-                    script.push_str(&format!(
-                        "-A {chain} -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN\n"
+            let peer = &rule.peer;
+            if !peer.domain.is_empty()
+                || (!peer.address.is_empty() && !peer.cidr.is_empty())
+                || peer.port_range.is_some()
+                || rule.environment_port_range.is_some()
+                || (direction == NetworkDirection::Ingress && peer.port != 0)
+                || (direction == NetworkDirection::Egress && rule.environment_port != 0)
+            {
+                return Err(unsupported(
+                    "domain, range or source-port selectors are unsupported",
+                ));
+            }
+            let ip = if peer.address.is_empty() {
+                &peer.cidr
+            } else {
+                &peer.address
+            };
+            let port = if direction == NetworkDirection::Ingress {
+                rule.environment_port
+            } else {
+                peer.port
+            };
+            if ip.is_empty() && port == 0 || !ip.is_empty() && port != 0 {
+                return Err(unsupported(
+                    "a rule must select only an IP/CIDR or a TCP destination port",
+                ));
+            }
+            if direction == NetworkDirection::Ingress {
+                // Native IP ACLs cannot give the platform's TCP control/public-port
+                // exception precedence over IP rules. Do not widen them to all ports.
+                if class == "conch" || !ip.is_empty() {
+                    return Err(unsupported(
+                        "ingress IP rules cannot preserve platform port exceptions",
                     ));
                 }
-                let mut rules: Vec<_> = traffic.rules.iter().collect();
-                rules.sort_by_key(|r| std::cmp::Reverse(r.priority));
-                for rule in rules {
-                    let direction = proto::NetworkDirection::try_from(rule.direction)
-                        .map_err(|_| Error::Invalid("invalid network direction".into()))?;
-                    if direction == proto::NetworkDirection::Both
-                        || (ingress && direction == proto::NetworkDirection::Ingress)
-                        || (!ingress && direction == proto::NetworkDirection::Egress)
-                    {
-                        script.push_str(&format!("-A {chain}{}\n", rule_args(rule, ingress)?));
-                    }
+            } else if launch
+                .env
+                .get("ADX_RUNTIME_CONTROL_ADDRESS")
+                .is_some_and(|v| !v.is_empty())
+            {
+                return Err(unsupported(
+                    "egress rules cannot preserve the runtime-control stream exception",
+                ));
+            }
+            if !ip.is_empty() {
+                if rule.protocol != NetworkProtocol::Any {
+                    return Err(unsupported("IP rules require protocol Any"));
                 }
-                let default = if ingress {
-                    traffic.ingress_default_action
-                } else {
-                    traffic.egress_default_action
-                };
-                script.push_str(&format!("-A {chain} -j {}\n", target(default)?));
+                address(ip)?;
+                ips.insert(ip.to_owned());
             } else {
-                script.push_str(&format!("-A {chain} -j RETURN\n"));
+                if class == "conch" || rule.protocol != NetworkProtocol::Tcp {
+                    return Err(unsupported(
+                        "native destination-port rules require supervisor TCP",
+                    ));
+                }
+                let port = u16::try_from(port).map_err(|_| unsupported("invalid TCP port"))?;
+                if direction != NetworkDirection::Ingress || !protected_ports.contains(&port) {
+                    port_set.insert(port);
+                }
             }
         }
-        for hook in ["FORWARD", "OUTPUT"] {
-            script.push_str(&format!("-I {hook} 1 -d {ip}/32 -j {input}\n"));
+        if direction == NetworkDirection::Ingress && default == NetworkAction::Deny {
+            port_set.extend(&protected_ports);
         }
-        for hook in ["FORWARD", "INPUT"] {
-            script.push_str(&format!("-I {hook} 1 -s {ip}/32 -j {output}\n"));
+        let action = if default == NetworkAction::Deny {
+            "allowed"
+        } else {
+            "blocked"
+        };
+        result[name]["default"] = json!(if default == NetworkAction::Deny {
+            "deny"
+        } else {
+            "allow"
+        });
+        result[name][format!("{action}_ips")] = json!(ips);
+        if class == "supervisor" {
+            result[name][format!("{action}_ports")] = json!(port_set);
         }
     }
-    script.push_str("COMMIT\n");
-    Ok(script)
+    if class == "conch" {
+        let mut count = 0;
+        for d in ["ingress", "egress"] {
+            for f in ["allowed_ips", "blocked_ips"] {
+                count += result[d][f].as_array().map_or(0, Vec::len);
+            }
+        }
+        if count > 1024 {
+            return Err(unsupported("Conch supports at most 1024 destinations"));
+        }
+    }
+    Ok(result)
 }

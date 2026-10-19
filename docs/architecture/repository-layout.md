@@ -108,10 +108,10 @@ agent-dx/
 | Coordinator | `storage.rs`、`storage/`、`rpc.rs`、`rpc/` | Redis 条件提交、原子归属、目录、节点失效、快照克隆、共享恢复协调；不执行节点普通生命周期 |
 | Coordinator | `auth.rs`、`routes.rs`、`metrics.rs` | API Key 摘要、路由发布、集群指标 |
 | adxlet | `controller.rs`、`controller/{lifecycle,monitor,snapshots}.rs` | 每 Environment 串行任务、暂停/恢复/删除、空闲回收与重启 |
-| adxlet | `runtime_router.rs`、`sandboxd.rs`、`jiuwenbox/` | 按 runtime class 创建、按持久化身份分发；Jiuwenbox 独立 EROFS、所有权记录和故障清理；后端源码不变 |
+| adxlet | `runtime_router.rs`、`sandboxd.rs`、`jiuwenbox/` | 按 runtime class 创建、按执行归属分发；Jiuwenbox 从权威目录重建内存关联，复用独立 EROFS 和原生 ACL；后端源码不变 |
 | adxlet | `runtime_control.rs`、`readiness.rs` | Execd 双向控制流／HTTP 协作与就绪 |
 | adxlet | `checkpoint.rs`、`checkpoint/` | 可扩展 CheckpointStore、本地/S3、缓存引用和远端孤儿回收 |
-| adxlet | `journal.rs`、`reconciliation.rs` | SQLite 故障降级日志与 Coordinator 权威目录对账 |
+| adxlet | `node_reconciliation.rs`、`reconciliation.rs`、`journal.rs` | 全后端共用启动和周期性权威对账、孤儿/晚到资源清理、准入及心跳协调；既有可选 SQLite 结果降级日志 |
 | adxlet | `resources.rs`、`routes.rs`、`activity.rs`、`proxy.rs` | 容量源/准入、绑定同步、活动采集、代理进程组合 |
 | Rust API Server | `contract.rs`、`http.rs`、`clients.rs`、`operations.rs` | HTTP 兼容字段到 Environment RPC；认证、版本化 Environment 目录订阅、入口节点轮转、直达节点、快照目录 |
 

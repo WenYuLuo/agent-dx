@@ -36,9 +36,9 @@ class RedisRecovery(FullSDK):
         try:
             await asyncio.sleep(35)
             assert "T" in Path(f"/proc/{pid}/status").read_text().split("State:", 1)[1].splitlines()[0]
-            # Existing execution state is independently journaled and must remain owned.
-            live = [record for record in self.records(self.runtime_config) if record["phase"] != "Deleted"]
-            assert len(live) == 2 and all(record["phase"] == "Ready" for record in live), live
+            # Verify physical resources directly while Redis cannot serve authority.
+            live = await self.backend_evidence(before.values())
+            assert len(live) == 2, live
             (self.run / "outage-ownership.json").write_text(json.dumps(live, indent=2))
         finally:
             os.kill(pid, signal.SIGCONT)
@@ -54,7 +54,7 @@ class RedisRecovery(FullSDK):
             await self.sdk_rpc("delete", backend)
             await self.until(lambda: self.record(id) is None, "SDK deletion committed")
         await self.until(
-            lambda: all(record["phase"] == "Deleted" for record in self.records(self.runtime_config)),
+            self.managed_backends_absent,
             "physical deletion",
         )
         await self.audit(self.runtime_config)

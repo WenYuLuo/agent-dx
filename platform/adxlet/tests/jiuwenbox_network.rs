@@ -1,129 +1,80 @@
-use adxlet::{jiuwenbox::policy::filter_script, sandboxd::proto::*};
+use adx_core::execution::*;
+use adxlet::{jiuwenbox::policy::network_policy, sandboxd::Config};
+use serde_json::json;
 
 fn policy() -> NetworkPolicy {
     NetworkPolicy {
         traffic: Some(TrafficPolicy {
-            ingress_default_action: NetworkPolicyAction::Deny as i32,
-            egress_default_action: NetworkPolicyAction::Deny as i32,
-            mode: TrafficPolicyMode::Stateful as i32,
-            rules: vec![
-                TrafficRule {
-                    action: NetworkPolicyAction::Deny as i32,
-                    direction: NetworkDirection::Both as i32,
-                    protocol: NetworkProtocol::Any as i32,
-                    peer: Some(NetworkEndpoint {
-                        cidr: "10.0.0.0/8".into(),
-                        ..Default::default()
-                    }),
-                    priority: 200,
-                    ..Default::default()
-                },
-                TrafficRule {
-                    action: NetworkPolicyAction::Allow as i32,
-                    direction: NetworkDirection::Ingress as i32,
-                    protocol: NetworkProtocol::Tcp as i32,
-                    sandbox_port_range: Some(PortRange {
-                        first: 50090,
-                        last: 50090,
-                    }),
-                    priority: u32::MAX,
-                    ..Default::default()
-                },
-            ],
-            ..Default::default()
+            ingress_default_action: NetworkAction::Deny,
+            egress_default_action: NetworkAction::Allow,
+            mode: TrafficMode::Stateful,
+            rules: vec![NetworkRule {
+                action: NetworkAction::Allow,
+                direction: NetworkDirection::Ingress,
+                protocol: NetworkProtocol::Tcp,
+                peer: NetworkPeer::default(),
+                environment_port: 8080,
+                environment_port_range: None,
+                priority: 100,
+            }],
         }),
         dns: None,
-        ..Default::default()
     }
 }
 
 #[test]
-fn preserves_order_ports_defaults_and_two_sided_filtering() {
-    let script = filter_script(
-        "runtime-1",
-        "192.0.2.2".parse().unwrap(),
-        Some(&policy()),
-        "",
-        false,
-    )
-    .unwrap();
-    assert!(
-        script.find("--dport 50090:50090 -j RETURN").unwrap()
-            < script.find("-s 10.0.0.0/8 -j DROP").unwrap()
+fn supervisor_native_acl_keeps_declared_and_control_ports_reachable() {
+    let mapped =
+        network_policy("supervisor", Some(&policy()), &[8081], &Config::default()).unwrap();
+    assert_eq!(mapped["ingress"]["default"], "deny");
+    assert_eq!(
+        mapped["ingress"]["allowed_ports"],
+        json!([8080, 8081, 50090])
     );
-    assert!(script.contains("-d 10.0.0.0/8 -j DROP"));
-    assert!(!script.contains("-j ACCEPT"));
-    assert!(script.contains("-I FORWARD 1 -d 192.0.2.2/32"));
-    assert!(script.contains("-I FORWARD 1 -s 192.0.2.2/32"));
-    assert!(script.ends_with("COMMIT\n"));
+    assert_eq!(mapped["egress"]["default"], "allow");
 }
 
 #[test]
-fn replacement_and_cleanup_touch_only_exact_owned_chains() {
-    let installed = filter_script(
-        "runtime-1",
-        "192.0.2.2".parse().unwrap(),
-        Some(&policy()),
-        "",
-        false,
-    )
-    .unwrap();
-    let input = installed
-        .lines()
-        .find(|s| s.starts_with(":ADXJI"))
-        .unwrap()
-        .split_whitespace()
-        .next()
-        .unwrap()
-        .trim_start_matches(':');
-    let output = installed
-        .lines()
-        .find(|s| s.starts_with(":ADXJE"))
-        .unwrap()
-        .split_whitespace()
-        .next()
-        .unwrap()
-        .trim_start_matches(':');
-    let saved=format!("*filter\n:{input} - [0:0]\n:{output} - [0:0]\n:UNRELATED - [0:0]\n-A FORWARD -d 192.0.2.2/32 -j {input}\n-A INPUT -j UNRELATED\nCOMMIT\n");
-    let replace = filter_script(
-        "runtime-1",
-        "192.0.2.2".parse().unwrap(),
-        None,
-        &saved,
-        false,
-    )
-    .unwrap();
-    assert!(replace.contains(&format!("-F {input}")));
-    assert!(replace.contains(&format!("-D FORWARD -d 192.0.2.2/32 -j {input}")));
-    assert!(!replace.contains("UNRELATED"));
-    assert!(!replace.contains("10.0.0.0/8"));
-    let cleanup = filter_script(
-        "runtime-1",
-        "192.0.2.2".parse().unwrap(),
-        None,
-        &saved,
-        true,
-    )
-    .unwrap();
-    assert!(cleanup.contains(&format!("-X {input}")));
-    assert!(!cleanup.contains("-I "));
-    assert!(!cleanup.contains("UNRELATED"));
+fn conch_maps_egress_ip_allowlist_without_unsupported_port_fields() {
+    let mut p = policy();
+    let t = p.traffic.as_mut().unwrap();
+    t.ingress_default_action = NetworkAction::Allow;
+    t.egress_default_action = NetworkAction::Deny;
+    t.rules[0].direction = NetworkDirection::Egress;
+    t.rules[0].protocol = NetworkProtocol::Any;
+    t.rules[0].environment_port = 0;
+    t.rules[0].peer.cidr = "10.0.0.0/8".into();
+    let mapped = network_policy("conch", Some(&p), &[], &Config::default()).unwrap();
+    assert_eq!(mapped["egress"]["default"], "deny");
+    assert_eq!(mapped["egress"]["allowed_ips"], json!(["10.0.0.0/8"]));
+    assert!(mapped["ingress"].get("allowed_ports").is_none());
 }
 
 #[test]
-fn rejects_ipv6_and_invalid_ports_instead_of_emitting_partial_policy() {
-    assert!(filter_script("runtime-1", "::1".parse().unwrap(), None, "", false).is_err());
-    let mut invalid = policy();
-    invalid.traffic.as_mut().unwrap().rules[1].sandbox_port_range = Some(PortRange {
-        first: 1,
-        last: 70000,
+fn refuses_policies_that_native_backends_cannot_preserve() {
+    assert!(network_policy("conch", Some(&policy()), &[], &Config::default()).is_err());
+    let mut p = policy();
+    p.traffic.as_mut().unwrap().mode = TrafficMode::Stateless;
+    assert!(network_policy("supervisor", Some(&p), &[], &Config::default()).is_err());
+    p = policy();
+    p.traffic.as_mut().unwrap().rules[0].environment_port_range = Some(PortRange {
+        first: 80,
+        last: 90,
     });
-    assert!(filter_script(
-        "runtime-1",
-        "192.0.2.2".parse().unwrap(),
-        Some(&invalid),
-        "",
-        false
-    )
-    .is_err());
+    assert!(network_policy("supervisor", Some(&p), &[], &Config::default()).is_err());
+    p = policy();
+    p.traffic.as_mut().unwrap().egress_default_action = NetworkAction::Deny;
+    assert!(network_policy("supervisor", Some(&p), &[], &Config::default()).is_err());
+}
+
+#[test]
+fn clear_policy_explicitly_clears_every_native_list() {
+    for class in ["supervisor", "conch"] {
+        let mapped = network_policy(class, None, &[], &Config::default()).unwrap();
+        for direction in ["ingress", "egress"] {
+            assert_eq!(mapped[direction]["default"], "allow");
+            assert_eq!(mapped[direction]["allowed_ips"], json!([]));
+            assert_eq!(mapped[direction]["blocked_ips"], json!([]));
+        }
+    }
 }

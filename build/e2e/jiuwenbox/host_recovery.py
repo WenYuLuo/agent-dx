@@ -101,6 +101,8 @@ class HostRecovery(FullSDK):
         self.sha = state["bootstrap_sha256"]
         self.children = {name: UnitProcess(unit) for name, unit in state["units"].items()}
         self.results = []
+        self.expected = {}
+        self.driver_configs = {}
         return self, state
 
     async def stage(self):
@@ -165,7 +167,7 @@ class HostRecovery(FullSDK):
                 await self.sdk_rpc("delete", backend)
                 await self.until(lambda: self.record(id) is None, "delete commit after reboot")
             await self.until(
-                lambda: all(record["phase"] == "Deleted" for record in self.records(self.runtime_config)),
+                self.managed_backends_absent,
                 "reboot native cleanup",
             )
             await self.audit(self.runtime_config)

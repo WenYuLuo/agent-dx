@@ -1,5 +1,37 @@
 # Jiuwenbox Linux runtime acceptance
 
+## Accepted prebuilt artifacts
+
+[prebuilt-lock.json](prebuilt-lock.json) pins the accepted Linux x86_64 runtime
+set, its source URLs, archive/member SHA256 values, Conch SDK, packaged guest
+kernel/initrd, StratoVirt and helper identity. The original archives and selected
+packages are retained under `/root/adx-jbx-prebuilt-20261019/pinned/sha256/` on the
+acceptance host; `cache_path` is relative to its `pinned/` directory. Verify SHA256
+before installing a cached file. The upstream `last_successful_build` URL remains
+a rolling channel and must match the lock before use.
+
+The JiuwenSwarm wheel's version is `1`; Conch RPM is
+`0.1.0-10.oe2403sp4`, with SDK `0.2.0`. The lock also records the VMM's reported
+version because it differs from its RPM label. This set uses StratoVirt and the
+RPM-provided guest kernel/initrd. It was extracted into an isolated Ubuntu 24.04
+fixture, rather than installed globally through RPM scriptlets. Jiuwenbox and
+Conch contents remain unchanged.
+
+The fixture root supplies `backend-fixture.json` with `conch_backend` set to
+`stratovirt` and `conch_template_selector` set to `id`; template creation resolves
+the immutable content ID into ADX's `template_id` image binding. Runtime paths
+under `conch/` and `jiuwenbox/src/` point to the extracted RPM and installed wheel.
+See [prebuilt acceptance evidence](../../../docs/testing/jiuwenbox-prebuilt-20261019.md)
+for preparation, scope and the successful run identities.
+
+The latest lock validation uses `final-runtime003` (9/9) and `final-sdk003`
+(11/11), with the PTY-close-fixed Execd supplied by an independent EROFS.
+It records the ADX package/source manifests, installed public SDK wheel and
+Execd identities, plus the actual Conch CLI/daemon binary SHA256 values.
+The external wheel/RPM payloads remain byte-for-byte unchanged.
+
+## Source-built fixture
+
 This driver exercises ADX's production Jiuwenbox RuntimeDriver and Linux host
 operations against separately installed, unmodified Jiuwenbox and Conch. It
 requires a dedicated root Linux KVM host and reserves the existing backends'
@@ -42,12 +74,12 @@ late create and Execd is not started afterward. Conch additionally covers
 conchd SIGKILL/restart. Fault injection is in a test UDS proxy, with external
 backend source unchanged.
 
-Per-case `audit.json` checks durable deletion, native absence, backend processes,
-Execd identity, supervisor cgroups/netns/veth, owned firewall chains, and the
-Execd loop attachment. After stopping services, `host-audit.json` additionally
+Per-case `audit.json` checks native absence, backend processes, Execd identity,
+supervisor cgroups/netns/veth, and the retained read-only Execd EROFS mount.
+The fixture also rejects leftover ADX host-filter chains from older runs. After stopping services, `host-audit.json` additionally
 checks Conch's pooled namespaces and bridge ports. Logs, failed attempts,
 configuration, and `results.json` remain under `runs/<run>/`. Later attempts
-reconcile prior owned journals before starting new cases.
+run an explicit empty-authority reconciliation on the dedicated test backends before starting new cases.
 
 This is runtime integration acceptance. It does not exercise the public SDK,
 Coordinator scheduling, Gateway routing, complete adxlet process deployment,
@@ -135,3 +167,53 @@ EROFS checks and physical deletion. On failure it retains service state and
 through public SDK calls, stops/disables/removes the recorded units, and audits
 resources. No checkpoint/restore is used; this is not power-loss or disk-loss
 acceptance.
+
+The acceptance bridge now accepts an explicit `reconcile` action with a complete
+`catalog` array. The fixture supplies this test-owned authority for driver recovery;
+the production ADXlet obtains it from the Coordinator. Resource audits query native
+inventory and expected test identities, not a local ownership database. Shared Execd
+EROFS mounts and their loop devices remain installed after environment deletion and
+are reported separately from orphan resources. Kernel/VM/public SDK acceptance must
+be rerun for these semantics; earlier reports describe the previous implementation.
+
+
+## Buildkite supervisor smoke
+
+`prepare_supervisor.py` prepares the pinned original JiuwenSwarm wheel and a
+fresh server venv from `requirements-supervisor.txt`. The content-addressed cache
+retains the locked source archive and wheel. The CI bootstrap supplies bubblewrap
+and the `/etc/pki` directory referenced by the pinned default policy. `smoke.py` verifies the current ADX
+package, creates a private fixture, installs that package's public SDK wheel,
+and invokes `full_sdk.py --runtime supervisor` for eight required cases.
+
+The base Buildkite pipeline runs this as `jiuwenbox-smoke` using the existing
+privileged Linux x86_64 Python worker. See
+[Buildkite setup](../../../.buildkite/README.md#jiuwenbox-supervisor-smoke) for
+cache controls, kernel prerequisites and artifact boundaries.
+
+```sh
+python3 build/e2e/jiuwenbox/prepare_supervisor.py \
+  --cache /absolute/pinned-cache --output /absolute/new-backend-root
+sudo /absolute/new-backend-root/venv/bin/python -u build/e2e/jiuwenbox/smoke.py \
+  --backend-root /absolute/new-backend-root \
+  --package /absolute/current-release-package \
+  --output /absolute/new-smoke-output \
+  --commit <current-40-character-clean-commit>
+```
+
+`--commit` is mandatory in the Buildkite wrapper. Omit it only for explicit local
+testing of an uncommitted package; that dirty identity remains in the result.
+The fixture creates its ownership marker after checking existing host state;
+use an isolated container or a dedicated test backend namespace. The SDK runs
+in Python isolated mode and its package files are checked against the wheel.
+
+The eight-case gate covers supervisor creation, exec, binary/UTF-8 files,
+independent read-only EROFS, five process recovery scenarios, public deletion and
+native audit. A pass also requires unchanged Jiuwenbox files and successful
+job-private mount teardown. JUnit, summary and sanitized logs are public; keys,
+rendered configs and venvs remain outside the artifact glob.
+
+`full_sdk.py` without `--runtime` retains the existing two-backend complete
+acceptance. `--runtime supervisor` selects only supervisor and avoids VM/backend
+setup paths. The standalone runtime, host recovery and Redis recovery drivers
+retain their existing default scope.

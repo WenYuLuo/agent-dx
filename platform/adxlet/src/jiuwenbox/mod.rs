@@ -2,12 +2,12 @@
 mod client;
 pub mod host;
 pub mod policy;
-mod store;
+mod state;
 
 use self::{
     client::{unavailable, Client},
     host::{HostOperations, LinuxHost},
-    store::{Phase, Record, Store},
+    state::{Phase, Record, State},
 };
 use crate::{
     sandboxd::{self, Config as LaunchConfig},
@@ -16,7 +16,7 @@ use crate::{
 use adx_core::{
     execution::{NetworkPolicy, StorageSource},
     scheduling::DeviceAllocation,
-    EnvironmentSpec, Error, Result,
+    EnvironmentRecord, EnvironmentSpec, EnvironmentState, Error, Result,
 };
 use async_trait::async_trait;
 use hyper::Method;
@@ -27,7 +27,10 @@ use std::{
     collections::BTreeMap,
     net::IpAddr,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
 };
 use tokio::{sync::Mutex as AsyncMutex, time::Instant};
 
@@ -56,6 +59,8 @@ pub struct Image {
     #[serde(default)]
     pub template_name: Option<String>,
     #[serde(default)]
+    pub template_id: Option<String>,
+    #[serde(default)]
     pub process: Option<Process>,
 }
 
@@ -80,7 +85,7 @@ pub struct Config {
     pub classes: BTreeMap<String, Class>,
     #[serde(default)]
     pub conch_socket: Option<PathBuf>,
-    /// Read once at startup; the token itself is not persisted in the journal.
+    /// Read once at startup.
     #[serde(default)]
     pub token_file: Option<PathBuf>,
 }
@@ -93,10 +98,11 @@ pub struct Jiuwenbox {
     launch: LaunchConfig,
     client: Client,
     conch: Option<Client>,
-    store: Store,
+    state: State,
+    authority_loaded: Arc<AtomicBool>,
     host: Arc<dyn HostOperations>,
     gates: ExecutionGates,
-    mount_gate: Arc<AsyncMutex<()>>,
+    bootstrap_root: Arc<tokio::sync::OnceCell<PathBuf>>,
     _lease: Arc<std::fs::File>,
 }
 
@@ -171,14 +177,16 @@ impl Config {
                 return Err(Error::Invalid("Conch recovery socket is required".into()));
             }
             for image in class.images.values() {
+                let template = match (&image.template_name, &image.template_id) {
+                    (Some(value), None) | (None, Some(value)) => Some(value),
+                    _ => None,
+                };
                 if name == "conch"
-                    && image
-                        .template_name
-                        .as_ref()
-                        .is_none_or(|s| s.trim().is_empty())
+                    && template.is_none_or(|value| value.trim().is_empty() || value.contains('\0'))
                 {
                     return Err(Error::Invalid(
-                        "Conch image binding requires an immutable template_name".into(),
+                        "Conch image binding requires exactly one immutable template_name or template_id"
+                            .into(),
                     ));
                 }
                 if let Some(p) = &image.process {
@@ -202,10 +210,7 @@ impl Config {
 impl Jiuwenbox {
     pub async fn connect(config: Config, launch: LaunchConfig) -> Result<Self> {
         let driver = Self::with_host(config, launch, Arc::new(LinuxHost)).await?;
-        driver
-            .host
-            .prepare(&driver.config.bootstrap, &driver.root())
-            .await?;
+        driver.prepare_bootstrap().await?;
         Ok(driver)
     }
     pub async fn with_host(
@@ -269,27 +274,16 @@ impl Jiuwenbox {
         lease
             .try_lock()
             .map_err(|_| unavailable("another adxlet owns the Jiuwenbox state directory"))?;
-        let store = Store::new(config.state_dir.join("ownership.sqlite"))?;
-        // A request owned by a previous adxlet must be rediscovered, never replayed.
-        for r in store
-            .all()
-            .await?
-            .values()
-            .filter(|r| r.phase == Phase::Creating)
-        {
-            store
-                .update(&r.runtime_id, |r| r.phase = Phase::Uncertain)
-                .await?;
-        }
         Ok(Self {
             config: Arc::new(config),
             launch,
             client,
             conch,
-            store,
+            state: State::default(),
+            authority_loaded: Arc::default(),
             host,
             gates: Arc::default(),
-            mount_gate: Arc::default(),
+            bootstrap_root: Arc::default(),
             _lease: Arc::new(lease),
         })
     }
@@ -302,7 +296,7 @@ impl Jiuwenbox {
             .clone()
     }
     pub async fn owns(&self, id: &str) -> Result<bool> {
-        Ok(self.store.get(id).await?.is_some())
+        Ok(self.state.get(id).await?.is_some())
     }
     pub async fn available_runtime_classes(&self) -> Result<Vec<String>> {
         self.client
@@ -325,7 +319,7 @@ impl Jiuwenbox {
                 "disable Jiuwenbox idle_timeout for ADX-managed execution",
             ));
         }
-        self.inventory().await?;
+        self.backend_inventory().await?;
         Ok(self.config.classes.keys().cloned().collect())
     }
     fn conch(&self) -> Result<&Client> {
@@ -347,6 +341,122 @@ impl Jiuwenbox {
             .join("bootstrap")
             .join(&self.config.bootstrap.sha256)
     }
+    async fn prepare_bootstrap(&self) -> Result<PathBuf> {
+        self.bootstrap_root
+            .get_or_try_init(|| async {
+                self.host
+                    .prepare(&self.config.bootstrap, &self.root())
+                    .await
+            })
+            .await
+            .cloned()
+    }
+
+    /// All ADX-prefixed resources on this node-exclusive backend belong to ADX.
+    /// Read every source before performing destructive orphan collection.
+    async fn backend_inventory(&self) -> Result<BTreeMap<String, String>> {
+        let mut seen = BTreeMap::new();
+        for value in self.list().await? {
+            let id = value["id"]
+                .as_str()
+                .ok_or_else(|| unavailable("Jiuwenbox inventory record has no ID"))?;
+            if !id.starts_with("adx-") {
+                continue;
+            }
+            let backend = match value["sandbox_runtime"].as_str() {
+                Some("conch") => "conch",
+                Some("process" | "bwrap" | "supervisor") => "supervisor",
+                _ if value["phase"] == "provisioning" => "",
+                _ => return Err(unavailable("managed sandbox has unknown runtime")),
+            };
+            if !managed_id(id) || seen.insert(id.to_owned(), backend.to_owned()).is_some() {
+                return Err(Error::Conflict);
+            }
+        }
+        if let Some(native) = &self.conch {
+            let listed = native
+                .request(Method::GET, "/api/v1/sandboxes?limit=5000", None, false)
+                .await?;
+            let listed = listed
+                .as_array()
+                .ok_or_else(|| unavailable("invalid Conch inventory"))?;
+            if listed.len() >= 5000 {
+                return Err(unavailable("Conch inventory may be truncated"));
+            }
+            for value in listed {
+                let id = value["sandboxID"]
+                    .as_str()
+                    .or_else(|| value["id"].as_str())
+                    .ok_or_else(|| unavailable("Conch inventory record has no ID"))?;
+                if !id.starts_with("adx-") {
+                    continue;
+                }
+                if !managed_id(id) || seen.get(id).is_some_and(|b| !b.is_empty() && b != "conch") {
+                    return Err(Error::Conflict);
+                }
+                seen.insert(id.to_owned(), "conch".into());
+            }
+        }
+        for id in self.host.supervisor_inventory().await? {
+            if !managed_id(&id)
+                || seen
+                    .get(&id)
+                    .is_some_and(|b| !b.is_empty() && b != "supervisor")
+            {
+                return Err(Error::Conflict);
+            }
+            seen.insert(id, "supervisor".into());
+        }
+        Ok(seen)
+    }
+
+    async fn cleanup_backend(&self, id: &str, backend: &str) -> Result<()> {
+        if !managed_id(id) {
+            return Err(Error::Invalid("invalid managed sandbox ID".into()));
+        }
+        let path = format!("/api/v1/sandboxes/{id}");
+        match self.client.request(Method::GET, &path, None, false).await {
+            Ok(value) if value["phase"] == "provisioning" => {
+                return Err(unavailable("create remains in flight"))
+            }
+            Ok(_) => {
+                self.client
+                    .request(Method::DELETE, &path, None, false)
+                    .await?;
+                match self.client.request(Method::GET, &path, None, false).await {
+                    Err(Error::NotFound) => {}
+                    Ok(_) => return Err(unavailable("Jiuwenbox delete not complete")),
+                    Err(e) => return Err(e),
+                }
+            }
+            Err(Error::NotFound) => {}
+            Err(e) => return Err(e),
+        }
+        if backend == "conch" {
+            let client = self.conch()?;
+            match client.request(Method::GET, &path, None, false).await {
+                Ok(_) => {
+                    client.request(Method::DELETE, &path, None, false).await?;
+                }
+                Err(Error::NotFound) => {}
+                Err(e) => return Err(e),
+            }
+            match client.request(Method::GET, &path, None, false).await {
+                Err(Error::NotFound) => {}
+                Ok(_) => return Err(unavailable("Conch delete not complete")),
+                Err(e) => return Err(e),
+            }
+        } else if backend == "supervisor" {
+            self.host.cleanup_supervisor(id).await?;
+        }
+        match std::fs::remove_dir_all(self.config.state_dir.join("launch").join(id)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(unavailable(e)),
+        }
+        Ok(())
+    }
+
     fn files(&self, id: &str) -> PathBuf {
         self.config.state_dir.join("launch").join(sandbox_id(id))
     }
@@ -358,7 +468,7 @@ impl Jiuwenbox {
         generation: u64,
         devices: &[DeviceAllocation],
         root: &Path,
-    ) -> Result<(Value, Value, Option<sandboxd::proto::NetworkPolicy>)> {
+    ) -> Result<(Value, Value)> {
         let class = self
             .config
             .classes
@@ -368,7 +478,12 @@ impl Jiuwenbox {
             .images
             .get(&spec.image)
             .ok_or_else(|| Error::Invalid("image is not bound on this Jiuwenbox node".into()))?;
-        policy::validate_network(spec.execution.network.as_ref())?;
+        let network = policy::network_policy(
+            &spec.runtime_class,
+            spec.execution.network.as_ref(),
+            &spec.execution.ports,
+            &self.launch,
+        )?;
         if !devices.is_empty()
             || !spec.execution.extra_config.is_empty()
             || spec.execution.limits.disk_bytes > 0
@@ -459,7 +574,20 @@ impl Jiuwenbox {
                 .get("conch")
                 .cloned()
                 .unwrap_or_else(empty_object);
-            let owned = json!({"template_name":image.template_name,"vcpu_num":cpu/1000,"vcpu_max":cpu/1000,"ram_mb":memory/1_048_576,"filesystem_policy":{"bind_mounts":mounts},"network":{"ingress":{"default":"allow"},"egress":{"default":"allow"}}});
+            // The deployment binding owns the selector, including when the
+            // operator policy contains a different default. Some Jiuwenbox
+            // distributions accept only content IDs and reject template_name.
+            let selector = conch
+                .as_object_mut()
+                .ok_or_else(|| Error::Invalid("Conch policy must be an object".into()))?;
+            selector.remove("template_name");
+            selector.remove("template_id");
+            if let Some(id) = &image.template_id {
+                selector.insert("template_id".into(), json!(id));
+            } else if let Some(name) = &image.template_name {
+                selector.insert("template_name".into(), json!(name));
+            }
+            let owned = json!({"vcpu_num":cpu/1000,"vcpu_max":cpu/1000,"ram_mb":memory/1_048_576,"filesystem_policy":{"bind_mounts":mounts},"network":network});
             for (key, value) in owned
                 .as_object()
                 .ok_or_else(|| unavailable("invalid owned Conch policy"))?
@@ -477,12 +605,16 @@ impl Jiuwenbox {
             backend_policy["cgroup"]["cpu_max"] = json!(format!("{quota} 100000"));
             backend_policy["cgroup"]["memory_max"] = json!(memory);
             backend_policy["network"]["mode"] = json!("isolated");
-            backend_policy["network"]["ingress"] = json!({"default":"allow"});
-            backend_policy["network"]["egress"] = json!({"default":"allow"});
+            for (key, value) in network
+                .as_object()
+                .ok_or_else(|| unavailable("invalid native network policy"))?
+            {
+                backend_policy["network"][key] = value.clone();
+            }
         }
         let body = json!({"sandbox_id":sandbox_id(id),"sandbox_runtime":if spec.runtime_class=="conch"{"conch"}else{"bwrap"},"env":request.envs,"policy_mode":"append","policy":backend_policy});
         let exec = json!({"job_id":"adx-execd","command":self.config.bootstrap.command,"workdir":request.cwd,"env":request.envs});
-        Ok((body, exec, request.network_policy))
+        Ok((body, exec))
     }
 
     async fn write_process(&self, spec: &EnvironmentSpec, id: &str) -> Result<()> {
@@ -522,7 +654,7 @@ impl Jiuwenbox {
             .start_backend(&spec, &id, generation, &devices, deadline)
             .await;
         if result.is_err() {
-            self.store.update(&id, |r| r.phase = Phase::Failed).await?;
+            self.state.update(&id, |r| r.phase = Phase::Failed).await?;
             if let Err(error) = self.cleanup(&id).await {
                 adx_observability::warn!(runtime_id=%id,error=%error,"Jiuwenbox failed start cleanup pending");
             }
@@ -536,7 +668,7 @@ impl Jiuwenbox {
             ));
         }
         if self
-            .store
+            .state
             .get(id)
             .await?
             .is_none_or(|r| r.phase != Phase::Creating)
@@ -554,17 +686,11 @@ impl Jiuwenbox {
         deadline: Instant,
     ) -> Result<IpAddr> {
         self.still_starting(id, deadline).await?;
-        let _mount = self.mount_gate.lock().await;
-        let root = self
-            .host
-            .prepare(&self.config.bootstrap, &self.root())
-            .await?;
-        drop(_mount);
+        let root = self.prepare_bootstrap().await?;
         crate::managed_mounts::prepare(spec).await?;
         self.write_process(spec, id).await?;
-        let (body, exec, network) = self.plan(spec, id, generation, devices, &root)?;
+        let (body, exec) = self.plan(spec, id, generation, devices, &root)?;
         self.still_starting(id, deadline).await?;
-        self.store.update(id, |r| r.create_sent = true).await?;
         let response = self
             .client
             .request(Method::POST, "/api/v1/sandboxes", Some(body), true)
@@ -580,15 +706,8 @@ impl Jiuwenbox {
         if !ip.is_ipv4() || ip.is_loopback() || ip.is_unspecified() {
             return Err(unavailable("invalid isolated backend address"));
         }
-        let pid = response["pid"].as_u64().and_then(|v| u32::try_from(v).ok());
-        self.store
-            .update(id, move |r| {
-                r.ip = Some(ip);
-                r.pid = pid;
-            })
-            .await?;
+        self.state.update(id, move |r| r.ip = Some(ip)).await?;
         self.still_starting(id, deadline).await?;
-        self.host.network(id, ip, network.as_ref(), false).await?;
         let response = self
             .client
             .request(
@@ -602,7 +721,7 @@ impl Jiuwenbox {
             return Err(unavailable("Execd background launch failed"));
         }
         self.still_starting(id, deadline).await?;
-        self.store
+        self.state
             .update(id, |r| {
                 if r.phase == Phase::Creating {
                     r.phase = Phase::Ready;
@@ -613,89 +732,13 @@ impl Jiuwenbox {
     }
 
     async fn cleanup(&self, id: &str) -> Result<()> {
-        let Some(record) = self.store.get(id).await? else {
+        let Some(record) = self.state.get(id).await? else {
             return Ok(());
         };
-        if record.phase == Phase::Deleted {
-            return self.release_if_idle().await;
-        }
-        let epoch = self.client.epoch().await?;
-        let path = format!("/api/v1/sandboxes/{}", record.sandbox_id);
-        let observed = self.client.request(Method::GET, &path, None, false).await;
-        match observed {
-            Ok(ref value) if value["phase"] == "provisioning" => {
-                return Err(unavailable("create remains in flight"))
-            }
-            Ok(_) => {
-                self.client
-                    .request(Method::DELETE, &path, None, false)
-                    .await?;
-            }
-            Err(Error::NotFound) if record.epoch != epoch || !record.create_sent => {}
-            Err(Error::NotFound)
-                if record.phase == Phase::Ready || record.phase == Phase::Deleting => {}
-            Err(Error::NotFound) => return Err(unavailable(
-                "unobserved create absent in the same backend epoch; restart backend to fence it",
-            )),
-            Err(e) => return Err(e),
-        }
-        self.store.update(id, |r| r.create_sent = false).await?;
-        if record.backend == "conch" {
-            let client = self.conch()?;
-            let path = format!("/api/v1/sandboxes/{}", record.sandbox_id);
-            match client.request(Method::GET, &path, None, false).await {
-                Ok(_) => {
-                    client.request(Method::DELETE, &path, None, false).await?;
-                }
-                Err(Error::NotFound) => {}
-                Err(e) => return Err(e),
-            }
-            match client.request(Method::GET, &path, None, false).await {
-                Err(Error::NotFound) => {}
-                Ok(_) => return Err(unavailable("Conch delete not complete")),
-                Err(e) => return Err(e),
-            }
-        } else {
-            self.host.cleanup_supervisor(&record.sandbox_id).await?;
-        }
-        if let Some(ip) = record.ip {
-            self.host.network(id, ip, None, true).await?;
-        }
-        self.store.update(id, |r| r.phase = Phase::Deleted).await?;
-        match std::fs::remove_dir_all(
-            self.config
-                .state_dir
-                .join("launch")
-                .join(&record.sandbox_id),
-        ) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(unavailable(e)),
-        }
-        self.release_if_idle().await
-    }
-
-    async fn release_if_idle(&self) -> Result<()> {
-        let _mount = self.mount_gate.lock().await;
-        let records = self.store.all().await?;
-        let hashes: std::collections::BTreeSet<_> = records
-            .values()
-            .map(|r| r.bootstrap_sha256.clone())
-            .chain(std::iter::once(self.config.bootstrap.sha256.clone()))
-            .filter(|h| !h.is_empty())
-            .collect();
-        for hash in hashes {
-            if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
-                return Err(unavailable("invalid stored bootstrap digest"));
-            }
-            if records
-                .values()
-                .all(|r| r.phase == Phase::Deleted || r.bootstrap_sha256 != hash)
-            {
-                self.host
-                    .release(&self.config.state_dir.join("bootstrap").join(hash))
-                    .await?;
-            }
+        if record.phase != Phase::Deleted {
+            self.cleanup_backend(&record.sandbox_id, &record.backend)
+                .await?;
+            self.state.update(id, |r| r.phase = Phase::Deleted).await?;
         }
         Ok(())
     }
@@ -794,6 +837,21 @@ impl Jiuwenbox {
     }
 }
 
+fn managed_id(id: &str) -> bool {
+    id.starts_with("adx-")
+        && id.len() > 4
+        && id.len() <= 64
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+fn fingerprint(spec: &EnvironmentSpec) -> Result<String> {
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(spec).map_err(unavailable)?)
+    ))
+}
+
 fn sandbox_id(id: &str) -> String {
     format!(
         "adx-{}",
@@ -843,11 +901,8 @@ impl RuntimeDriver for Jiuwenbox {
         let lock = tokio::time::timeout_at(deadline, gate.lock_owned())
             .await
             .map_err(|_| Error::DeadlineExceeded("waiting for prior Jiuwenbox operation".into()))?;
-        let fingerprint = format!(
-            "{:x}",
-            Sha256::digest(serde_json::to_vec(spec).map_err(unavailable)?)
-        );
-        if let Some(r) = self.store.get(id).await? {
+        let fingerprint = fingerprint(spec)?;
+        if let Some(r) = self.state.get(id).await? {
             if r.fingerprint != fingerprint || r.generation != generation {
                 return Err(Error::Conflict);
             }
@@ -857,7 +912,7 @@ impl RuntimeDriver for Jiuwenbox {
                 Err(Error::Conflict)
             };
         }
-        self.store
+        self.state
             .insert(Record {
                 runtime_id: id.into(),
                 environment_id: spec.id.clone(),
@@ -869,9 +924,6 @@ impl RuntimeDriver for Jiuwenbox {
                 fingerprint,
                 phase: Phase::Creating,
                 ip: None,
-                pid: None,
-                create_sent: false,
-                bootstrap_sha256: self.config.bootstrap.sha256.clone(),
             })
             .await?;
         let driver = self.clone();
@@ -887,7 +939,7 @@ impl RuntimeDriver for Jiuwenbox {
         match tokio::time::timeout_at(deadline, task).await {
             Ok(result) => result.map_err(unavailable)?,
             Err(_) => {
-                self.store
+                self.state
                     .update(id, |r| {
                         if r.phase == Phase::Creating {
                             r.phase = Phase::Failed;
@@ -901,7 +953,7 @@ impl RuntimeDriver for Jiuwenbox {
         }
     }
     async fn is_running(&self, id: &str) -> Result<bool> {
-        match self.store.get(id).await? {
+        match self.state.get(id).await? {
             Some(r) => self.observation(&r).await,
             None => Ok(false),
         }
@@ -912,49 +964,102 @@ impl RuntimeDriver for Jiuwenbox {
             failure: None,
         })
     }
+
+    async fn reconcile_inventory(
+        &self,
+        catalog: &[EnvironmentRecord],
+    ) -> Result<Vec<RuntimeObservation>> {
+        // The catalog is supplied only after the node has validated authority and
+        // drained accepted controller operations. Never infer it from local files.
+        let seen = self.backend_inventory().await?;
+        let epoch = self.client.epoch().await?;
+        for r in catalog
+            .iter()
+            .filter(|r| matches!(r.spec.runtime_class.as_str(), "supervisor" | "conch"))
+        {
+            if !adx_core::valid_runtime_id(&r.spec.id, r.assignment.generation, &r.runtime.id) {
+                return Err(Error::Conflict);
+            }
+            if self.state.get(&r.runtime.id).await?.is_some() {
+                continue;
+            }
+            let backend_id = sandbox_id(&r.runtime.id);
+            let registered = self
+                .client
+                .request(
+                    Method::GET,
+                    &format!("/api/v1/sandboxes/{backend_id}"),
+                    None,
+                    false,
+                )
+                .await;
+            let ready = match registered {
+                Ok(value) => {
+                    let ready = value["phase"] == "ready"
+                        && r.state == EnvironmentState::Running
+                        && r.resources_held;
+                    if ready
+                        && (seen.get(&backend_id) != Some(&r.spec.runtime_class)
+                            || value["ip_address"]
+                                .as_str()
+                                .and_then(|ip| ip.parse::<IpAddr>().ok())
+                                != r.runtime.ip)
+                    {
+                        return Err(Error::Conflict);
+                    }
+                    ready
+                }
+                Err(Error::NotFound) => false,
+                Err(e) => return Err(e),
+            };
+            self.state
+                .insert(Record {
+                    runtime_id: r.runtime.id.clone(),
+                    environment_id: r.spec.id.clone(),
+                    tenant_id: r.spec.tenant_id.clone(),
+                    generation: r.assignment.generation,
+                    sandbox_id: backend_id,
+                    backend: r.spec.runtime_class.clone(),
+                    epoch: epoch.clone(),
+                    fingerprint: fingerprint(&r.spec)?,
+                    phase: if ready { Phase::Ready } else { Phase::Deleting },
+                    ip: r.runtime.ip,
+                })
+                .await?;
+        }
+        self.authority_loaded.store(true, Ordering::Release);
+        self.inventory().await
+    }
+
     async fn inventory(&self) -> Result<Vec<RuntimeObservation>> {
         let current = self.client.epoch().await?;
-        let actual = self.list().await?;
-        let mut records = self.store.all().await?;
-        let mut seen = std::collections::BTreeSet::new();
-        for value in &actual {
-            let id = value["id"]
-                .as_str()
-                .ok_or_else(|| unavailable("Jiuwenbox inventory record has no ID"))?;
-            seen.insert(id.to_owned());
+        let seen = self.backend_inventory().await?;
+        let mut records = self.state.all().await?;
+        let unknown: Vec<_> = seen
+            .iter()
+            .filter(|(id, _)| !records.values().any(|r| r.sandbox_id == **id))
+            .collect();
+        if !unknown.is_empty() && !self.authority_loaded.load(Ordering::Acquire) {
+            return Err(unavailable(
+                "authoritative catalog required before orphan collection",
+            ));
         }
-        if let Some(native) = &self.conch {
-            let listed = native
-                .request(Method::GET, "/api/v1/sandboxes?limit=5000", None, false)
-                .await?;
-            let listed = listed
-                .as_array()
-                .ok_or_else(|| unavailable("invalid Conch inventory"))?;
-            if listed.len() >= 5000 {
-                return Err(unavailable("Conch inventory may be truncated"));
-            }
-            for value in listed {
-                let id = value["sandboxID"]
-                    .as_str()
-                    .or_else(|| value["id"].as_str())
-                    .ok_or_else(|| unavailable("Conch inventory record has no ID"))?;
-                seen.insert(id.to_owned());
-            }
-        }
-        for id in seen.iter().filter(|id| id.starts_with("adx-")) {
-            if !records.values().any(|r| r.sandbox_id == *id) {
-                return Err(unavailable("managed backend absent from ownership journal"));
-            }
+        for (id, backend) in unknown {
+            self.cleanup_backend(id, backend).await?;
         }
         for r in records
             .values_mut()
-            .filter(|r| r.phase == Phase::Deleted && seen.contains(&r.sandbox_id))
+            .filter(|r| r.phase == Phase::Deleted && seen.contains_key(&r.sandbox_id))
         {
             if r.backend.is_empty() {
-                return Err(unavailable("unexpected backend for an unowned tombstone"));
+                r.backend = seen[&r.sandbox_id].clone();
+                let backend = r.backend.clone();
+                self.state
+                    .update(&r.runtime_id, move |r| r.backend = backend)
+                    .await?;
             }
             *r = self
-                .store
+                .state
                 .update(&r.runtime_id, |r| r.phase = Phase::Deleting)
                 .await?;
         }
@@ -967,9 +1072,7 @@ impl RuntimeDriver for Jiuwenbox {
                     continue;
                 };
             }
-            if r.epoch != current
-                || matches!(r.phase, Phase::Failed | Phase::Uncertain | Phase::Deleting)
-            {
+            if r.epoch != current || matches!(r.phase, Phase::Failed | Phase::Deleting) {
                 let gate = self.gate(&r.runtime_id);
                 let _lock = gate
                     .try_lock()
@@ -989,20 +1092,19 @@ impl RuntimeDriver for Jiuwenbox {
                 },
             });
         }
-        self.release_if_idle().await?;
         Ok(observations)
     }
     async fn remove(&self, id: &str) -> Result<()> {
         let gate = self.gate(id);
         let _lock = gate.lock().await;
-        if let Some(r) = self.store.get(id).await? {
+        if let Some(r) = self.state.get(id).await? {
             if r.phase == Phase::Ready {
-                self.store.update(id, |r| r.phase = Phase::Deleting).await?;
+                self.state.update(id, |r| r.phase = Phase::Deleting).await?;
             }
             self.cleanup(id).await?;
         } else {
-            // A delete before start fences future reuse, even when no backend exists.
-            self.store
+            // Fence accepted operations for this process; recovery uses the authority catalog.
+            self.state
                 .insert(Record {
                     runtime_id: id.into(),
                     environment_id: String::new(),
@@ -1014,9 +1116,6 @@ impl RuntimeDriver for Jiuwenbox {
                     fingerprint: String::new(),
                     phase: Phase::Deleted,
                     ip: None,
-                    pid: None,
-                    create_sent: false,
-                    bootstrap_sha256: String::new(),
                 })
                 .await?;
         }
@@ -1028,17 +1127,26 @@ impl RuntimeDriver for Jiuwenbox {
         network: Option<&NetworkPolicy>,
         ports: &[u16],
     ) -> Result<()> {
-        policy::validate_network(network)?;
         let gate = self.gate(id);
         let _lock = gate.lock().await;
-        let r = self.store.get(id).await?.ok_or(Error::NotFound)?;
+        let r = self.state.get(id).await?.ok_or(Error::NotFound)?;
         if r.phase != Phase::Ready {
             return Err(Error::Conflict);
         }
-        let ip = r.ip.ok_or_else(|| unavailable("runtime IP missing"))?;
-        let policy = network
-            .map(|n| sandboxd::environment_network_policy(n, ports, &self.launch))
-            .transpose()?;
-        self.host.network(id, ip, policy.as_ref(), false).await
+        let mapped = policy::network_policy(&r.backend, network, ports, &self.launch)?;
+        let fragment = if r.backend == "conch" {
+            json!({"conch":{"network":mapped}})
+        } else {
+            json!({"network":mapped})
+        };
+        self.client
+            .request(
+                Method::PUT,
+                &format!("/api/v1/policies/{}", r.sandbox_id),
+                Some(json!({"policy":fragment,"policy_mode":"override"})),
+                false,
+            )
+            .await?;
+        Ok(())
     }
 }

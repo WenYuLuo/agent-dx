@@ -1129,9 +1129,9 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                 let live = state.live.get(&r.node_id).ok_or_else(|| {
                     Status::failed_precondition("register node before reconciliation")
                 })?;
-                if live.session != r.session_id || !live.report.reconciling {
+                if live.session != r.session_id || live.report.accepting_allocations {
                     return Err(Status::failed_precondition(
-                        "node must enter reconciliation first",
+                        "node must close allocation admission before inspection",
                     ));
                 }
                 let snapshot = state.session.snapshot().await.map_err(status)?;

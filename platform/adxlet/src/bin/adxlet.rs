@@ -15,7 +15,6 @@ use adxlet::{
 use serde::Deserialize;
 use std::{
     collections::{HashMap, HashSet},
-    future::Future,
     net::SocketAddr,
     path::PathBuf,
     sync::Arc,
@@ -112,42 +111,6 @@ async fn sample(
     source.sample(timeout).await
 }
 
-async fn bounded_rpc<T>(
-    timeout: Duration,
-    future: impl Future<Output = Result<T, tonic::Status>>,
-) -> Result<T, tonic::Status> {
-    tokio::time::timeout(timeout, future)
-        .await
-        .map_err(|_| tonic::Status::deadline_exceeded("control-plane RPC deadline exceeded"))?
-}
-
-async fn register_node(
-    coordinator: &mut pb::coordinator_service_client::CoordinatorServiceClient<
-        adx_transport::rpc::RpcChannel,
-    >,
-    registration: pb::RegisterNodeRequest,
-    timeout: Duration,
-) -> Result<tonic::Response<pb::RegisterNodeResponse>, tonic::Status> {
-    let mut request = tonic::Request::new(registration);
-    request.set_timeout(timeout);
-    bounded_rpc(timeout, coordinator.register_node(request)).await
-}
-
-async fn inspect_node(
-    coordinator: &mut pb::coordinator_service_client::CoordinatorServiceClient<
-        adx_transport::rpc::RpcChannel,
-    >,
-    node_id: &str,
-    session_id: &str,
-    timeout: Duration,
-) -> Result<tonic::Response<pb::InspectNodeResponse>, tonic::Status> {
-    let mut request = tonic::Request::new(pb::InspectNodeRequest {
-        node_id: node_id.into(),
-        session_id: session_id.into(),
-    });
-    request.set_timeout(timeout);
-    bounded_rpc(timeout, coordinator.inspect_node(request)).await
-}
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config: Config = read_config()?;
@@ -431,7 +394,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let sample_timeout = timeout.min(Duration::from_secs(config.report_interval_seconds));
         let mut interval =
             tokio::time::interval(Duration::from_secs(config.report_interval_seconds));
-        let mut reconciled = false;
         let mut gc_jobs = tokio::task::JoinSet::new();
         let gc_interval = Duration::from_secs(config.checkpoint_gc.interval_seconds);
         let mut next_gc = tokio::time::Instant::now();
@@ -453,14 +415,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         coordinator =
                             pb::coordinator_service_client::CoordinatorServiceClient::new(channel);
                         endpoint = found.address;
-                        reconciled = false;
                     }
                     // Existing channel may remain useful while Redis is unavailable.
                     _ => (),
                 }
-            }
-            if reconciled && manager.sync_proxy().await.is_err() {
-                reconciled = false;
             }
             let mut r = last.clone();
             // A failed capability refresh closes new admission, but existing
@@ -491,139 +449,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     };
                 manager.set_pressure(!accepting);
             }
-            r.heartbeat_sequence = r
-                .heartbeat_sequence
-                .checked_add(1)
-                .ok_or("heartbeat sequence exhausted")?;
-            r.reconciling = !reconciled;
-            r.accepting_allocations = !manager.is_draining()
-                && manager.accepting_allocations()
-                && reconciled
-                && tokio::time::Instant::now() < valid_until;
-            if !reconciled {
-                manager.pause_lifecycle().await;
-            }
-            last = r.clone();
-            match register_node(&mut coordinator, r, timeout).await {
-                Ok(_) if !reconciled => {
-                    let catalog =
-                        inspect_node(&mut coordinator, &config.node_id, &session_id, timeout).await;
-                    match catalog {
-                        Ok(snapshot) => {
-                            let mut catalog = snapshot.into_inner();
-                            if let Some(journal) = &journal {
-                                let records = catalog
-                                    .records
-                                    .iter()
-                                    .cloned()
-                                    .map(TryInto::try_into)
-                                    .collect::<adx_core::Result<Vec<_>>>()?;
-                                if let Err(error) = journal.recover(&records).await {
-                                    adx_observability::warn!(
-                                        "degradation journal recovery incomplete: {error}"
-                                    );
-                                    continue;
-                                }
-                                // Replay may change executions and checkpoint ownership. Fetch
-                                // both Environment and snapshot records from the same fresh catalog.
-                                catalog = match inspect_node(
-                                    &mut coordinator,
-                                    &config.node_id,
-                                    &session_id,
-                                    timeout,
-                                )
-                                .await
-                                {
-                                    Ok(snapshot) => snapshot.into_inner(),
-                                    Err(error) => {
-                                        adx_observability::warn!(
-                                            "fresh node catalog unavailable after journal recovery: {error}"
-                                        );
-                                        continue;
-                                    }
-                                };
-                            }
-                            let records = catalog
-                                .records
-                                .into_iter()
-                                .map(TryInto::try_into)
-                                .collect::<adx_core::Result<Vec<_>>>()?;
-                            let snapshots = catalog
-                                .snapshots
-                                .into_iter()
-                                .map(TryInto::try_into)
-                                .collect::<adx_core::Result<Vec<_>>>()?;
-                            let retained = catalog
-                                .retained_checkpoints
-                                .into_iter()
-                                .map(|cp| {
-                                    adx_core::RestorePoint::try_from(cp).map(|cp| cp.artifact)
-                                })
-                                .collect::<adx_core::Result<Vec<_>>>()?;
-                            let recovery = manager.reconcile_retained(records, snapshots, retained);
-                            tokio::pin!(recovery);
-                            // Large catalogs must not expire a healthy node while
-                            // the serial controllers restore bindings and commit results.
-                            loop {
-                                tokio::select! {
-                                    result = &mut recovery => {
-                                        match result {
-                                            Ok(()) => reconciled = true,
-                                            Err(error) => adx_observability::warn!("node reconciliation incomplete: {error}"),
-                                        }
-                                        break;
-                                    }
-                                    _ = interval.tick() => {
-                                        last.heartbeat_sequence = last.heartbeat_sequence.checked_add(1).ok_or("heartbeat sequence exhausted")?;
-                                        if register_node(&mut coordinator, last.clone(), timeout).await.is_err() {
-                                            // Cancellation leaves the gate closed. Accepted controller
-                                            // work completes independently and retries on the next catalog.
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        Err(error) => adx_observability::warn!(
-                            "authoritative node catalog unavailable; lifecycle remains closed: {error}"
-                        ),
-                    }
-                }
-                Ok(_) => {
+            last = r;
+            // Startup and every reporting period use the same complete authority
+            // cycle for every configured runtime. The cycle publishes readiness
+            // immediately after success, before waiting for the next report tick.
+            match adxlet::node_reconciliation::reconcile_node(
+                &mut coordinator,
+                &mut last,
+                &manager,
+                journal.as_deref(),
+                timeout,
+                Duration::from_secs(config.report_interval_seconds),
+                valid_until,
+            ).await {
+                Ok(()) => {
                     if let Some(journal) = &journal {
                         if let Err(error) = journal.flush().await {
-                            if matches!(
-                                error,
-                                adx_core::Error::Conflict | adx_core::Error::NotFound
-                            ) {
-                                reconciled = false;
-                                manager.pause_lifecycle().await;
-                            }
-                            adx_observability::warn!(
-                                "degradation journal publication incomplete: {error}"
-                            );
+                            manager.pause_lifecycle().await;
+                            adx_observability::warn!("degradation journal publication incomplete: {error}");
                             continue;
                         }
                     }
-                    if config.checkpoint_gc.enabled
-                        && gc_jobs.is_empty()
-                        && tokio::time::Instant::now() >= next_gc
-                    {
+                    if config.checkpoint_gc.enabled && gc_jobs.is_empty()
+                        && tokio::time::Instant::now() >= next_gc {
                         next_gc = tokio::time::Instant::now() + gc_interval;
                         let manager = manager.clone();
                         gc_jobs.spawn(async move {
                             tokio::time::timeout(timeout, manager.collect_remote_orphans()).await
                         });
                     }
-                }
-                Err(status) => {
-                    if status.code() == tonic::Code::FailedPrecondition {
-                        reconciled = false;
-                    }
-                    adx_observability::warn!(
-                        "node heartbeat unavailable; waiting to register or reconcile"
-                    );
-                }
+                },
+                Err(error) => adx_observability::warn!("authoritative node reconciliation incomplete; new admission remains closed: {error}"),
             }
         }
         #[allow(unreachable_code)]
@@ -781,16 +637,5 @@ mod tests {
     #[test]
     fn execd_readiness_poll_keeps_startup_jitter_below_twenty_milliseconds() {
         assert!(execd_ready_poll_interval() <= Duration::from_millis(20));
-    }
-
-    #[tokio::test]
-    async fn bounded_rpc_releases_a_stalled_heartbeat() {
-        let result = bounded_rpc(
-            Duration::from_millis(10),
-            std::future::pending::<Result<(), tonic::Status>>(),
-        )
-        .await;
-
-        assert_eq!(result.unwrap_err().code(), tonic::Code::DeadlineExceeded);
     }
 }

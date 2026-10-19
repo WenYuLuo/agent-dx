@@ -11,6 +11,7 @@ pub mod jiuwenbox;
 pub mod journal;
 pub mod managed_mounts;
 pub mod metrics;
+pub mod node_reconciliation;
 pub mod proxy;
 pub mod readiness;
 mod reconciliation;
@@ -173,6 +174,14 @@ pub trait RuntimeDriver: Send + Sync {
             "runtime inventory is unsupported".into(),
         ))
     }
+    /// Rediscover executions using the validated, complete current node catalog.
+    /// The caller closes admission and drains accepted operations before this call.
+    async fn reconcile_inventory(
+        &self,
+        _catalog: &[EnvironmentRecord],
+    ) -> Result<Vec<RuntimeObservation>> {
+        self.inventory().await
+    }
     /// Correlate the supplied platform execution identity with a backend-generated
     /// ID. A failed Start is terminal for this execution; a late backend must be
     /// cleaned by reconciliation, not adopted as a successful create.
@@ -203,8 +212,9 @@ pub trait RuntimeDriver: Send + Sync {
             "runtime does not support network policy updates".into(),
         ))
     }
-    /// Idempotent. Success means this runtime is confirmed absent and an older
-    /// in-flight start cannot materialize it later. Uncertain cleanup is an error.
+    /// Idempotent. Confirm observed resources absent and serialize accepted starts.
+    /// A transport-lost create may materialize later; such backends must collect
+    /// late resources on repeated authoritative reconciliation before reuse.
     async fn remove(&self, runtime_id: &str) -> Result<()>;
 }
 
@@ -344,6 +354,8 @@ pub struct Adxlet {
     local_holds: Mutex<BTreeMap<String, local::LocalHold>>,
     draining: std::sync::atomic::AtomicBool,
     lifecycle_ready: tokio::sync::RwLock<bool>,
+    authority_reconciling: std::sync::atomic::AtomicBool,
+    authority_initialized: std::sync::atomic::AtomicBool,
     retired_environments: Mutex<BTreeMap<String, RetiredEnvironment>>,
     services: Arc<Services>,
     environments: Mutex<BTreeMap<String, (EnvironmentSpec, Assignment, EnvironmentHandle)>>,
@@ -368,6 +380,8 @@ impl Adxlet {
             local_holds: Mutex::default(),
             draining: std::sync::atomic::AtomicBool::new(false),
             lifecycle_ready: tokio::sync::RwLock::new(true),
+            authority_reconciling: std::sync::atomic::AtomicBool::new(false),
+            authority_initialized: std::sync::atomic::AtomicBool::new(false),
             retired_environments: Mutex::default(),
             services: Arc::new(Services {
                 runtime,
@@ -529,6 +543,13 @@ impl Adxlet {
     }
 
     pub fn accepting_allocations(&self) -> bool {
+        !self
+            .authority_reconciling
+            .load(std::sync::atomic::Ordering::Acquire)
+            && self.locally_accepting_allocations()
+    }
+
+    fn locally_accepting_allocations(&self) -> bool {
         if !self.lifecycle_ready.try_read().is_ok_and(|ready| *ready) {
             return false;
         }
@@ -675,6 +696,14 @@ impl Adxlet {
                 return Err(Error::Conflict);
             }
             environments.remove(&spec.id);
+        }
+        if self
+            .authority_reconciling
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(Error::Unavailable(
+                "node authority reconciliation pending".into(),
+            ));
         }
         retired.remove(&spec.id);
         // The registry lock makes controller creation atomic across concurrent callers.

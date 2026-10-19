@@ -1,8 +1,10 @@
 //! Real HTTP/UDS contract tests; host mounts and VMs are replaced explicitly.
-use adx_core::{EnvironmentSpec, Error};
+#[path = "common/authority.rs"]
+mod authority;
+use adx_core::{Assignment, EnvironmentRecord, EnvironmentSpec, EnvironmentState, Error};
 use adxlet::{
     jiuwenbox::{host::HostOperations, Bootstrap, Config, Jiuwenbox},
-    sandboxd::{proto, Config as LaunchConfig},
+    sandboxd::Config as LaunchConfig,
     RuntimeDriver,
 };
 use async_trait::async_trait;
@@ -14,7 +16,6 @@ use serde_json::{json, Value};
 use std::{
     collections::BTreeMap,
     convert::Infallible,
-    net::IpAddr,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -28,7 +29,7 @@ use tokio::{net::UnixListener, sync::Semaphore, task::JoinHandle, time::Instant}
 struct Host {
     prepares: AtomicUsize,
     releases: AtomicUsize,
-    networks: Mutex<Vec<(String, bool)>>,
+    supervisors: Mutex<Vec<String>>,
     process_alive: AtomicBool,
     mounted: AtomicBool,
 }
@@ -39,20 +40,12 @@ impl HostOperations for Host {
         self.mounted.store(true, Ordering::SeqCst);
         Ok(root.into())
     }
-    async fn release(&self, _: &Path) -> adx_core::Result<()> {
-        if self.mounted.swap(false, Ordering::SeqCst) {
-            self.releases.fetch_add(1, Ordering::SeqCst);
-        }
-        Ok(())
+    async fn supervisor_inventory(&self) -> adx_core::Result<Vec<String>> {
+        Ok(self.supervisors.lock().unwrap().clone())
     }
-    async fn network(
-        &self,
-        id: &str,
-        _: IpAddr,
-        _: Option<&proto::NetworkPolicy>,
-        remove: bool,
-    ) -> adx_core::Result<()> {
-        self.networks.lock().unwrap().push((id.into(), remove));
+    async fn cleanup_supervisor(&self, id: &str) -> adx_core::Result<()> {
+        self.supervisors.lock().unwrap().retain(|v| v != id);
+        self.process_alive.store(false, Ordering::SeqCst);
         Ok(())
     }
     async fn supervisor_absent(&self, _: &str) -> adx_core::Result<bool> {
@@ -116,7 +109,7 @@ impl Backend {
                     .unwrap()
                     .insert(id.clone(), json!({"id":id,"phase":"provisioning"}));
                 self.release.acquire().await.unwrap().forget();
-                let value = json!({"id":id,"phase":"ready","ip_address":"192.0.2.2","pid":12345,"runtime":body["sandbox_runtime"]});
+                let value = json!({"id":id,"phase":"ready","ip_address":"192.0.2.2","pid":12345,"sandbox_runtime":body["sandbox_runtime"]});
                 self.refs.lock().unwrap().insert(id.clone(), value.clone());
                 if body["sandbox_runtime"] == "conch" {
                     self.physical
@@ -145,6 +138,8 @@ impl Backend {
                     .cloned()
                     .collect::<Vec<_>>())
             }
+        } else if path.starts_with("/api/v1/policies/") && method == "PUT" {
+            body["policy"].clone()
         } else if path.ends_with("/exec_background") {
             json!({"started":true,"job_id":"adx-execd","pid":5678})
         } else if path.starts_with("/api/v1/sandboxes/") {
@@ -319,7 +314,7 @@ async fn creates_conch_with_erofs_volume_and_fenced_execd_identity() {
         assert_eq!(fixture.host.releases.load(Ordering::SeqCst), 0);
     }
     driver.remove("tenant-agent-1").await.unwrap();
-    assert_eq!(fixture.host.releases.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.host.releases.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
@@ -411,7 +406,7 @@ async fn deadline_keeps_late_create_owned_and_delete_waits_for_completion() {
             .count(),
         0
     );
-    assert_eq!(fixture.host.releases.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.host.releases.load(Ordering::SeqCst), 0);
     assert!(driver
         .start_with_deadline(
             &spec("conch"),
@@ -425,7 +420,7 @@ async fn deadline_keeps_late_create_owned_and_delete_waits_for_completion() {
 }
 
 #[tokio::test]
-async fn jiuwenbox_restart_cleans_conch_via_native_api_before_releasing_mount() {
+async fn jiuwenbox_restart_cleans_conch_via_native_api_and_keeps_mount() {
     let mut fixture = Fixture::new();
     let driver = fixture.driver().await;
     driver
@@ -442,7 +437,7 @@ async fn jiuwenbox_restart_cleans_conch_via_native_api_before_releasing_mount() 
     drop(driver);
     fixture.restart();
     let recovered = fixture.driver().await;
-    assert!(recovered.inventory().await.unwrap().is_empty());
+    assert!(recovered.reconcile_inventory(&[]).await.unwrap().is_empty());
     assert!(fixture.native.physical.lock().unwrap().is_empty());
     assert!(fixture
         .native
@@ -451,7 +446,7 @@ async fn jiuwenbox_restart_cleans_conch_via_native_api_before_releasing_mount() 
         .unwrap()
         .iter()
         .any(|(m, _, _)| m == "DELETE"));
-    assert!(fixture.host.releases.load(Ordering::SeqCst) > 0);
+    assert_eq!(fixture.host.releases.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
@@ -473,7 +468,7 @@ async fn delete_failure_retains_mount_and_remains_retryable() {
     assert_eq!(fixture.host.releases.load(Ordering::SeqCst), 0);
     fixture.backend.reject_delete.store(false, Ordering::SeqCst);
     driver.remove("tenant-agent-1").await.unwrap();
-    assert_eq!(fixture.host.releases.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.host.releases.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
@@ -497,16 +492,12 @@ async fn execd_transport_failure_keeps_live_vm_available_to_readiness_policy() {
 }
 
 #[tokio::test]
-async fn delete_before_start_is_a_durable_tombstone() {
+async fn delete_before_start_fences_current_process_without_local_persistence() {
     let fixture = Fixture::new();
     let driver = fixture.driver().await;
     driver.remove("tenant-agent-1").await.unwrap();
-    drop(driver);
-    let recovered = fixture.driver().await;
     assert!(matches!(
-        recovered
-            .start(&spec("conch"), "tenant-agent-1", 1, &[])
-            .await,
+        driver.start(&spec("conch"), "tenant-agent-1", 1, &[]).await,
         Err(Error::Conflict)
     ));
     assert_eq!(fixture.backend.count("POST", "/api/v1/sandboxes"), 0);
@@ -537,7 +528,7 @@ async fn checkpoint_is_explicitly_unsupported() {
 }
 
 #[tokio::test]
-async fn lost_create_result_does_not_turn_same_epoch_404_into_successful_cleanup() {
+async fn rejected_create_can_be_cleaned_without_restarting_backend() {
     let mut fixture = Fixture::new();
     let driver = fixture.driver().await;
     fixture.backend.reject_create.store(true, Ordering::SeqCst);
@@ -551,36 +542,39 @@ async fn lost_create_result_does_not_turn_same_epoch_404_into_successful_cleanup
         )
         .await
         .is_err());
-    assert!(driver.remove("tenant-agent-1").await.is_err());
+    driver.remove("tenant-agent-1").await.unwrap();
     assert_eq!(fixture.host.releases.load(Ordering::SeqCst), 0);
     drop(driver);
     fixture.restart();
     let recovered = fixture.driver().await;
-    assert!(recovered.inventory().await.unwrap().is_empty());
-    assert_eq!(fixture.host.releases.load(Ordering::SeqCst), 1);
+    assert!(recovered.reconcile_inventory(&[]).await.unwrap().is_empty());
+    assert_eq!(fixture.host.releases.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
-async fn unknown_managed_vm_closes_inventory_without_deleting_another_owner() {
+async fn unknown_managed_vm_is_deleted_after_authority_while_foreign_vm_is_preserved() {
     let fixture = Fixture::new();
     let driver = fixture.driver().await;
     fixture.native.physical.lock().unwrap().insert(
         "adx-unknown-owner".into(),
         json!({"sandboxID":"adx-unknown-owner"}),
     );
-    assert!(driver.inventory().await.is_err());
-    assert!(driver.available_runtime_classes().await.is_err());
-    assert!(!fixture
+    fixture
         .native
-        .calls
+        .physical
         .lock()
         .unwrap()
-        .iter()
-        .any(|(m, _, _)| m == "DELETE"));
+        .insert("foreign-vm".into(), json!({"sandboxID":"foreign-vm"}));
+    assert!(driver.inventory().await.is_err());
+    assert!(driver.available_runtime_classes().await.is_ok());
+    assert!(driver.reconcile_inventory(&[]).await.unwrap().is_empty());
+    let physical = fixture.native.physical.lock().unwrap();
+    assert!(!physical.contains_key("adx-unknown-owner"));
+    assert!(physical.contains_key("foreign-vm"));
 }
 
 #[tokio::test]
-async fn erofs_is_retained_until_both_generations_are_physically_deleted() {
+async fn erofs_is_mounted_once_and_retained_after_all_generations_are_deleted() {
     let fixture = Fixture::new();
     let driver = fixture.driver().await;
     fixture.backend.release.add_permits(1);
@@ -599,7 +593,8 @@ async fn erofs_is_retained_until_both_generations_are_physically_deleted() {
     driver.remove("tenant-agent-1").await.unwrap();
     assert_eq!(fixture.host.releases.load(Ordering::SeqCst), 0);
     driver.remove("tenant-agent-2").await.unwrap();
-    assert_eq!(fixture.host.releases.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.host.prepares.load(Ordering::SeqCst), 1);
+    assert!(fixture.host.mounted.load(Ordering::SeqCst));
 }
 
 #[tokio::test]
@@ -664,6 +659,266 @@ async fn truncated_native_inventory_closes_admission() {
 }
 
 #[tokio::test]
+async fn reconciliation_deletes_unknown_and_later_arriving_managed_vms() {
+    let fixture = Fixture::new();
+    let driver = fixture.driver().await;
+    for id in ["adx-first-orphan", "adx-later-orphan"] {
+        fixture
+            .native
+            .physical
+            .lock()
+            .unwrap()
+            .insert(id.into(), json!({"sandboxID":id}));
+        assert!(driver.reconcile_inventory(&[]).await.unwrap().is_empty());
+        assert!(fixture.native.physical.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn driver_has_no_ownership_database_and_retains_shared_mount_after_delete() {
+    let fixture = Fixture::new();
+    let driver = fixture.driver().await;
+    assert!(!fixture.config.state_dir.join("ownership.sqlite").exists());
+    driver
+        .start_with_deadline(
+            &spec("conch"),
+            "tenant-agent-1",
+            1,
+            &[],
+            Instant::now() + Duration::from_secs(3),
+        )
+        .await
+        .unwrap();
+    driver.remove("tenant-agent-1").await.unwrap();
+    assert!(fixture.host.mounted.load(Ordering::SeqCst));
+    assert_eq!(fixture.host.releases.load(Ordering::SeqCst), 0);
+}
+
+fn running_record(class: &str) -> EnvironmentRecord {
+    EnvironmentRecord {
+        spec: spec(class),
+        assignment: Assignment {
+            environment_id: "tenant-agent".into(),
+            node_id: "n".into(),
+            shard_id: 0,
+            generation: 1,
+            devices: vec![],
+        },
+        state: EnvironmentState::Running,
+        revision: 2,
+        runtime: adx_core::Runtime {
+            id: "tenant-agent-1".into(),
+            ip: Some("192.0.2.2".parse().unwrap()),
+        },
+        checkpoint: None,
+        last_operation: None,
+        resources_held: true,
+        failure: None,
+        restart_attempts: 0,
+        restart_pending: false,
+    }
+}
+
+#[tokio::test]
+async fn router_recovers_live_execution_from_authority_without_replaying_create() {
+    let fixture = Fixture::new();
+    let driver = fixture.driver().await;
+    driver
+        .start_with_deadline(
+            &spec("conch"),
+            "tenant-agent-1",
+            1,
+            &[],
+            Instant::now() + Duration::from_secs(3),
+        )
+        .await
+        .unwrap();
+    drop(driver);
+    let recovered = fixture.driver().await;
+    assert!(!recovered.owns("tenant-agent-1").await.unwrap());
+    let router = adxlet::runtime_router::RuntimeRouter::new(None, Some(recovered.clone())).unwrap();
+    let actual = router
+        .reconcile_inventory(&[running_record("conch")])
+        .await
+        .unwrap();
+    assert_eq!(actual.len(), 1);
+    assert!(actual[0].running);
+    assert_eq!(actual[0].tenant_id, "t");
+    assert!(recovered.owns("tenant-agent-1").await.unwrap());
+    assert!(router.is_running("tenant-agent-1").await.unwrap());
+    assert_eq!(fixture.backend.count("POST", "/api/v1/sandboxes"), 1);
+    assert_eq!(fixture.native.physical.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn unpublished_backend_is_deleted_after_driver_restart() {
+    let fixture = Fixture::new();
+    let driver = fixture.driver().await;
+    driver
+        .start_with_deadline(
+            &spec("conch"),
+            "tenant-agent-1",
+            1,
+            &[],
+            Instant::now() + Duration::from_secs(3),
+        )
+        .await
+        .unwrap();
+    drop(driver);
+    let recovered = fixture.driver().await;
+    let mut pending = running_record("conch");
+    pending.state = EnvironmentState::Pending;
+    pending.revision = 0;
+    assert!(recovered
+        .reconcile_inventory(&[pending])
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(fixture.native.physical.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn orphan_delete_failure_is_retried_by_later_reconciliation() {
+    let fixture = Fixture::new();
+    let driver = fixture.driver().await;
+    fixture
+        .native
+        .physical
+        .lock()
+        .unwrap()
+        .insert("adx-orphan".into(), json!({"sandboxID":"adx-orphan"}));
+    fixture.native.reject_delete.store(true, Ordering::SeqCst);
+    assert!(driver.reconcile_inventory(&[]).await.is_err());
+    assert_eq!(fixture.native.physical.lock().unwrap().len(), 1);
+    fixture.native.reject_delete.store(false, Ordering::SeqCst);
+    assert!(driver.reconcile_inventory(&[]).await.unwrap().is_empty());
+    assert!(fixture.native.physical.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn supervisor_orphans_are_discovered_without_registry_or_driver_state() {
+    let fixture = Fixture::new();
+    fixture
+        .host
+        .supervisors
+        .lock()
+        .unwrap()
+        .push("adx-supervisor-orphan".into());
+    fixture.host.process_alive.store(true, Ordering::SeqCst);
+    let driver = fixture.driver().await;
+    assert!(driver.reconcile_inventory(&[]).await.unwrap().is_empty());
+    assert!(fixture.host.supervisors.lock().unwrap().is_empty());
+    assert!(!fixture.host.process_alive.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn policy_updates_use_jiuwenbox_api_and_reject_unsupported_before_mutation() {
+    use adx_core::execution::{NetworkAction, NetworkPolicy, TrafficMode, TrafficPolicy};
+    let fixture = Fixture::new();
+    let driver = fixture.driver().await;
+    driver
+        .start_with_deadline(
+            &spec("conch"),
+            "tenant-agent-1",
+            1,
+            &[],
+            Instant::now() + Duration::from_secs(3),
+        )
+        .await
+        .unwrap();
+    driver
+        .set_network_policy("tenant-agent-1", None, &[])
+        .await
+        .unwrap();
+    let puts = fixture
+        .backend
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(m, _, _)| m == "PUT")
+        .count();
+    assert_eq!(puts, 1);
+    let invalid = NetworkPolicy {
+        dns: None,
+        traffic: Some(TrafficPolicy {
+            ingress_default_action: NetworkAction::Deny,
+            egress_default_action: NetworkAction::Allow,
+            mode: TrafficMode::Stateful,
+            rules: vec![],
+        }),
+    };
+    assert!(matches!(
+        driver
+            .set_network_policy("tenant-agent-1", Some(&invalid), &[])
+            .await,
+        Err(Error::Invalid(_))
+    ));
+    let calls = fixture.backend.calls.lock().unwrap();
+    let updates: Vec<_> = calls.iter().filter(|(m, _, _)| m == "PUT").collect();
+    assert_eq!(updates.len(), puts);
+    assert_eq!(updates[0].2["policy_mode"], "override");
+    assert_eq!(
+        updates[0].2["policy"]["conch"]["network"]["egress"]["blocked_ips"],
+        json!([])
+    );
+}
+
+#[tokio::test]
+async fn public_authority_cycle_reaps_late_supervisor_and_conch_without_local_records() {
+    for class in ["supervisor", "conch"] {
+        let fixture = Fixture::new();
+        let driver = fixture.driver().await;
+        let router = adxlet::runtime_router::RuntimeRouter::new(None, Some(driver)).unwrap();
+        let node = authority::manager(Arc::new(router));
+        let mut authority = authority::Fixture::new().await;
+        authority.cycle(&node).await.unwrap();
+        let id = format!("adx-late-{class}");
+        let physical = json!({"id":id,"phase":"ready","sandbox_runtime":if class=="conch" {"conch"} else {"bwrap"},"ip_address":"192.0.2.2"});
+        fixture
+            .backend
+            .refs
+            .lock()
+            .unwrap()
+            .insert(id.clone(), physical.clone());
+        if class == "conch" {
+            fixture
+                .native
+                .physical
+                .lock()
+                .unwrap()
+                .insert(id.clone(), physical);
+        } else {
+            fixture.host.supervisors.lock().unwrap().push(id);
+            fixture.host.process_alive.store(true, Ordering::SeqCst);
+        }
+        // Both backends appeared after an empty authority cycle, without driver records.
+        authority.cycle(&node).await.unwrap();
+        assert!(fixture.backend.refs.lock().unwrap().is_empty(), "{class}");
+        assert!(
+            fixture.native.physical.lock().unwrap().is_empty(),
+            "{class}"
+        );
+        assert!(
+            fixture.host.supervisors.lock().unwrap().is_empty(),
+            "{class}"
+        );
+        assert!(node.accepting_allocations());
+        assert!(
+            authority
+                .authority
+                .reports
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .accepting_allocations
+        );
+        assert!(!fixture.config.state_dir.join("ownership.sqlite").exists());
+    }
+}
+
+#[tokio::test]
 async fn conch_reserved_mount_targets_are_rejected_before_side_effects() {
     let fixture = Fixture::new();
     let driver = fixture.driver().await;
@@ -683,4 +938,44 @@ async fn conch_reserved_mount_targets_are_rejected_before_side_effects() {
     }
     assert_eq!(fixture.host.prepares.load(Ordering::SeqCst), 0);
     assert_eq!(fixture.backend.count("POST", "/api/v1/sandboxes"), 0);
+}
+
+#[tokio::test]
+async fn conch_content_id_binding_sends_only_template_id() {
+    let mut fixture = Fixture::new();
+    let template_id = format!("sha256:{}", "b".repeat(64));
+    let mut config = serde_json::to_value(&fixture.config).unwrap();
+    let image = config["classes"]["conch"]["images"]["agent:v1"]
+        .as_object_mut()
+        .unwrap();
+    image.remove("template_name");
+    image.insert("template_id".into(), json!(template_id));
+    fixture.config = serde_json::from_value(config).unwrap();
+    fixture.config.validate().unwrap();
+    let driver = fixture.driver().await;
+    driver
+        .start_with_deadline(
+            &spec("conch"),
+            "tenant-agent-1",
+            1,
+            &[],
+            Instant::now() + Duration::from_secs(3),
+        )
+        .await
+        .unwrap();
+    {
+        let calls = fixture.backend.calls.lock().unwrap();
+        let body = &calls
+            .iter()
+            .find(|(m, p, _)| m == "POST" && p == "/api/v1/sandboxes")
+            .unwrap()
+            .2;
+        assert_eq!(body["policy"]["conch"]["template_id"], template_id);
+        assert!(body["policy"]["conch"].get("template_name").is_none());
+    }
+    driver.remove("tenant-agent-1").await.unwrap();
+    let mut config = serde_json::to_value(&fixture.config).unwrap();
+    config["classes"]["conch"]["images"]["agent:v1"]["template_name"] = json!("also-selected");
+    let ambiguous: Config = serde_json::from_value(config).unwrap();
+    assert!(ambiguous.validate().is_err());
 }

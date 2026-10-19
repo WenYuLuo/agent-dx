@@ -40,7 +40,8 @@ class FullSDK(Acceptance):
         mount = {"host_path": str(workspace), "sandbox_path": "/workspace", "mode": "rw"}
         policy["filesystem_policy"]["bind_mounts"].append(mount)
         policy["filesystem_policy"]["read_write"].append("/workspace")
-        policy["conch"]["filesystem_policy"]["bind_mounts"].append(mount)
+        if "conch" in self.backends:
+            policy["conch"]["filesystem_policy"]["bind_mounts"].append(mount)
         (self.run / "policy.yaml").write_text(yaml.safe_dump(policy))
         await self.start_jw()
         self.package = self.root / "package-sdk"
@@ -283,7 +284,37 @@ class FullSDK(Acceptance):
 
     def record(self, id):
         value = self.catalog().get("environment:" + id)
-        return json.loads(value) if value else None
+        record = json.loads(value) if value else None
+        if record and record.get("result"):
+            runtime = record["result"]["runtime"]
+            runtime_id = runtime["id"]
+            self.expected.setdefault(self.runtime_config.parent, {})[runtime_id] = dict(
+                runtime_id=runtime_id, sandbox_id="adx-"+hashlib.sha256(runtime_id.encode()).hexdigest()[:28],
+                spec=record["spec"], ip=runtime["ip"],
+            )
+        return record
+
+    async def backend_evidence(self, records):
+        evidence = []
+        running = set()
+        if "conch" in self.backends:
+            native = await self.uds(self.conch_socket, "GET", "/api/v1/sandboxes?state=running&limit=5000")
+            native.raise_for_status()
+            assert len(native.json()) < 5000
+            running = {v.get("sandboxID", v.get("id")) for v in native.json()}
+        for record in records:
+            runtime = record["result"]["runtime"]
+            id = "adx-"+hashlib.sha256(runtime["id"].encode()).hexdigest()[:28]
+            response = await self.uds(self.jw_socket, "GET", "/api/v1/sandboxes/"+id)
+            response.raise_for_status()
+            ref = response.json()
+            assert ref["phase"] == "ready" and ref["ip_address"] == runtime["ip"], ref
+            if record["spec"]["runtime_class"] == "conch":
+                assert id in running, id
+            else:
+                assert (Path("/sys/fs/cgroup/jiuwenbox")/id/"cgroup.procs").read_text().strip(), id
+            evidence.append(dict(runtime_id=runtime["id"], sandbox_id=id, backend=ref))
+        return evidence
 
     async def node_ready(self):
         try:
@@ -292,7 +323,7 @@ class FullSDK(Acceptance):
             if (
                 not node
                 or not node["node"]["available"]
-                or set(node["node"]["runtime_classes"]) != {"supervisor", "conch"}
+                or set(node["node"]["runtime_classes"]) != set(self.backends)
                 or not node["session"]["routable"]
             ):
                 return False
@@ -370,7 +401,7 @@ class FullSDK(Acceptance):
         await self.until(replaced, "supervisor restarts " + service)
 
     async def scenarios(self, ids):
-        for backend in ("supervisor", "conch"):
+        for backend in self.backends:
             value = await self.sdk_rpc("create", backend)
             ids[backend] = value["id"]
             value["record"] = self.record(value["id"])
@@ -400,21 +431,22 @@ class FullSDK(Acceptance):
         await self.start_jw()
         await self.until(lambda: self.new_runtimes_ready(ids, old), "Jiuwenbox restart cold recovery", 240)
         await self.check_all("jiuwenbox-restart", ids)
-        old_conch = self.record(ids["conch"])
-        await self.stop(self.conch, signal.SIGKILL)
-        await self.start_conch()
-        await self.until(
-            lambda: self.new_runtimes_ready({"conch": ids["conch"]}, {"conch": old_conch}),
-            "conchd restart cold recovery",
-            240,
-        )
-        await self.check_all("conchd-restart", ids)
+        if "conch" in self.backends:
+            old_conch = self.record(ids["conch"])
+            await self.stop(self.conch, signal.SIGKILL)
+            await self.start_conch()
+            await self.until(
+                lambda: self.new_runtimes_ready({"conch": ids["conch"]}, {"conch": old_conch}),
+                "conchd restart cold recovery",
+                240,
+            )
+            await self.check_all("conchd-restart", ids)
         for backend, id in ids.items():
             await self.sdk_rpc("delete", backend)
             await self.until(lambda: self.record(id) is None, "public deletion committed")
             self.results.append({"case": backend + "-delete", "status": "passed"})
         await self.until(
-            lambda: all(r["phase"] == "Deleted" for r in self.records(self.runtime_config)),
+            self.managed_backends_absent,
             "runtime deletion converges",
         )
         await self.audit(self.runtime_config)
@@ -508,5 +540,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--run", required=True)
+    parser.add_argument("--runtime", action="append", choices=("supervisor", "conch"))
     args = parser.parse_args()
-    asyncio.run(FullSDK(args.root.resolve(), args.run).run_all())
+    asyncio.run(FullSDK(args.root.resolve(), args.run, args.runtime).run_all())

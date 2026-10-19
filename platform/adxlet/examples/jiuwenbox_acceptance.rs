@@ -43,6 +43,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 driver.start_with_deadline(&spec,id,1,&[],Instant::now()+Duration::from_millis(input["deadline_ms"].as_u64().unwrap_or(90000))).await.map(|ip|json!({"ip":ip}))
             }
             "remove" => driver.remove(id).await.map(|_|json!({"deleted":true})),
+            "reconcile" => {
+                let catalog: Vec<adx_core::EnvironmentRecord> = serde_json::from_value(input.get("catalog").cloned().unwrap_or(json!([])))?;
+                driver.reconcile_inventory(&catalog).await.map(|r|json!({"count":r.len(),"ids":r.into_iter().map(|r|r.runtime_id).collect::<Vec<_>>()}))
+            },
             "inventory" => driver.inventory().await.map(|r|json!({"count":r.len(),"ids":r.into_iter().map(|r|r.runtime_id).collect::<Vec<_>>()})),
             "classes" => driver.available_runtime_classes().await.map(|c|json!({"classes":c})),
             "observe" => driver.is_running(id).await.map(|r|json!({"running":r})),

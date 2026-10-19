@@ -1020,6 +1020,31 @@ async fn heartbeat_expiry_reconciliation_and_old_session_fencing() {
     };
     session.commit(running.clone()).await.unwrap();
     assert_eq!(session.snapshot().await.unwrap().routes().unwrap().len(), 1);
+    assert!(
+        node.inspect_node(pb::InspectNodeRequest {
+            node_id: "node".into(),
+            session_id: report.session_id.clone(),
+        })
+        .await
+        .is_err(),
+        "inspection requires closed allocation admission"
+    );
+    report.heartbeat_sequence = 3;
+    report.accepting_allocations = false;
+    node.register_node(report.clone()).await.unwrap();
+    let catalog = node
+        .inspect_node(pb::InspectNodeRequest {
+            node_id: "node".into(),
+            session_id: report.session_id.clone(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(catalog.records.len(), 1);
+    assert_eq!(session.snapshot().await.unwrap().routes().unwrap().len(), 1);
+    report.heartbeat_sequence = 4;
+    report.accepting_allocations = true;
+    node.register_node(report.clone()).await.unwrap();
     // Duplicate packets acknowledge the same request but cannot extend liveness.
     tokio::time::sleep(Duration::from_millis(180)).await;
     node.register_node(report.clone()).await.unwrap();
@@ -1764,6 +1789,18 @@ async fn published_routes_drive_real_gateway_streams_and_reconnect_to_new_coordi
         .unwrap()
         .unwrap();
     assert_eq!(echoed, payload);
+    // Periodic authority reconciliation must preserve an established H2 CONNECT stream.
+    for _ in 0..3 {
+        routes.begin_reconcile().await.unwrap();
+        routes.activate(&record).await.unwrap();
+        routes.finish_reconcile().await.unwrap();
+        stream.write_all(payload).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), stream.read_exact(&mut echoed))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(echoed, payload);
+    }
     drop(stream);
     // Exercise an incremental frame on the same stream, including its base cursor.
     record.revision = 3;

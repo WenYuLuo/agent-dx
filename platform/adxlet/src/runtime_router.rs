@@ -1,10 +1,11 @@
-//! Runtime class dispatch at start, durable ownership dispatch afterwards.
+//! Runtime class dispatch and execution ownership recovered from node authority.
 use crate::{
     jiuwenbox::Jiuwenbox, sandboxd::Sandboxd, RestoreSource, RuntimeDriver, RuntimeObservation,
     RuntimeStatus,
 };
 use adx_core::{
-    execution::NetworkPolicy, scheduling::DeviceAllocation, EnvironmentSpec, Error, Result,
+    execution::NetworkPolicy, scheduling::DeviceAllocation, EnvironmentRecord, EnvironmentSpec,
+    Error, Result,
 };
 use async_trait::async_trait;
 use std::{net::IpAddr, path::Path, time::Duration};
@@ -134,6 +135,23 @@ impl RuntimeDriver for RuntimeRouter {
             runtime.remove(id).await?;
         }
         Ok(())
+    }
+    async fn reconcile_inventory(
+        &self,
+        catalog: &[EnvironmentRecord],
+    ) -> Result<Vec<RuntimeObservation>> {
+        let mut inventory = vec![];
+        if let Some(r) = &self.sandboxd {
+            inventory.extend(r.reconcile_inventory(catalog).await?);
+        }
+        if let Some(r) = &self.jiuwenbox {
+            inventory.extend(r.reconcile_inventory(catalog).await?);
+        }
+        let mut ids = std::collections::BTreeSet::new();
+        if inventory.iter().any(|r| !ids.insert(&r.runtime_id)) {
+            return Err(Error::Conflict);
+        }
+        Ok(inventory)
     }
     async fn inventory(&self) -> Result<Vec<RuntimeObservation>> {
         let mut inventory = vec![];

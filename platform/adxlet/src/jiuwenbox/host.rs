@@ -1,11 +1,9 @@
-//! Linux-owned EROFS mounts and traffic filtering; external backends stay intact.
-use super::{client::unavailable, policy, Bootstrap};
-use crate::sandboxd::proto;
+//! Shared Linux EROFS mount and supervisor resource discovery/cleanup.
+use super::{client::unavailable, Bootstrap};
 use adx_core::{Error, Result};
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 use std::{
-    net::IpAddr,
     path::{Path, PathBuf},
     process::Stdio,
     time::Duration,
@@ -16,14 +14,8 @@ use tokio::io::AsyncWriteExt;
 #[async_trait]
 pub trait HostOperations: Send + Sync {
     async fn prepare(&self, bootstrap: &Bootstrap, root: &Path) -> Result<PathBuf>;
-    async fn release(&self, root: &Path) -> Result<()>;
-    async fn network(
-        &self,
-        id: &str,
-        ip: IpAddr,
-        policy: Option<&proto::NetworkPolicy>,
-        remove: bool,
-    ) -> Result<()>;
+    /// Complete IDs discovered from cgroups and named network namespaces.
+    async fn supervisor_inventory(&self) -> Result<Vec<String>>;
     async fn supervisor_absent(&self, id: &str) -> Result<bool>;
     async fn cleanup_supervisor(&self, id: &str) -> Result<()> {
         if self.supervisor_absent(id).await? {
@@ -170,36 +162,25 @@ impl HostOperations for LinuxHost {
         }
         Ok(root.to_path_buf())
     }
-    async fn release(&self, root: &Path) -> Result<()> {
-        if mounted(root)? {
-            command("umount", &[path(root)?], None).await?;
-        }
-        Ok(())
-    }
-    async fn network(
-        &self,
-        id: &str,
-        ip: IpAddr,
-        policy: Option<&proto::NetworkPolicy>,
-        remove: bool,
-    ) -> Result<()> {
-        if !remove {
-            let bridge = Path::new("/proc/sys/net/bridge/bridge-nf-call-iptables");
-            if !bridge.exists()
-                || std::fs::read_to_string(bridge).map_err(unavailable)?.trim() != "1"
-            {
-                return Err(unavailable("bridge-nf-call-iptables must be 1"));
+    async fn supervisor_inventory(&self) -> Result<Vec<String>> {
+        let mut ids = std::collections::BTreeSet::new();
+        for (directory, prefix) in [("/sys/fs/cgroup/jiuwenbox", ""), ("/run/netns", "jbx-")] {
+            let entries = match std::fs::read_dir(directory) {
+                Ok(entries) => entries,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(unavailable(e)),
+            };
+            for entry in entries {
+                let name = entry.map_err(unavailable)?.file_name();
+                let name = name
+                    .to_str()
+                    .ok_or_else(|| unavailable("invalid supervisor resource name"))?;
+                if let Some(id) = name.strip_prefix(prefix).filter(|id| super::managed_id(id)) {
+                    ids.insert(id.to_owned());
+                }
             }
         }
-        let saved = command("iptables-save", &["-t", "filter"], None).await?;
-        let script = policy::filter_script(id, ip, policy, &saved, remove)?;
-        command(
-            "iptables-restore",
-            &["--wait", "5", "--noflush"],
-            Some(&script),
-        )
-        .await?;
-        Ok(())
+        Ok(ids.into_iter().collect())
     }
     async fn supervisor_absent(&self, id: &str) -> Result<bool> {
         let root = Path::new("/sys/fs/cgroup");
@@ -214,8 +195,26 @@ impl HostOperations for LinuxHost {
         }
     }
     async fn cleanup_supervisor(&self, id: &str) -> Result<()> {
+        if !super::managed_id(id) {
+            return Err(Error::Invalid("invalid managed supervisor ID".into()));
+        }
         if !self.supervisor_absent(id).await? {
-            return Err(unavailable("supervisor processes remain"));
+            // cgroup.kill targets the entire owned group without PID reuse races.
+            std::fs::write(
+                Path::new("/sys/fs/cgroup/jiuwenbox")
+                    .join(id)
+                    .join("cgroup.kill"),
+                "1",
+            )
+            .map_err(unavailable)?;
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !self.supervisor_absent(id).await? {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Ok::<(), Error>(())
+            })
+            .await
+            .map_err(|_| unavailable("supervisor processes remain"))??;
         }
         let namespace = format!("jbx-{id}");
         if Path::new("/run/netns").join(&namespace).exists() {
