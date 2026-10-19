@@ -1,5 +1,9 @@
 //! Global and embedded ShardScheduler scheduling.
 
+// Let library tests reuse the integration Redis fixture through its crate path.
+#[cfg(test)]
+extern crate self as adx_coordinator;
+
 pub use adx_core::snapshots;
 pub mod auth;
 pub mod autoscaling;
@@ -230,6 +234,27 @@ impl Coordinator {
         self.shards[shard].enqueue(spec);
         self.wake(shard);
         Ok(shard)
+    }
+
+    /// Inspect current placement constraints, including held reservations.
+    /// This does not cancel requests or imply that execution has not started.
+    pub fn scheduling_failure(
+        &self,
+        spec: &EnvironmentSpec,
+    ) -> Result<adx_core::scheduling::SchedulingFailure> {
+        spec.validate()?;
+        let mut failure = adx_core::scheduling::SchedulingFailure {
+            snapshot_revision: self.snapshot.revision,
+            requested: spec.resources,
+            ..Default::default()
+        };
+        for shard in &self.shards {
+            shard.diagnose(spec, &self.snapshot, &mut failure)?;
+        }
+        if failure.node_count == 0 {
+            failure.rejections.insert("no_workers".into(), 1);
+        }
+        Ok(failure)
     }
 
     /// Remove an unassigned request after its central queue deadline.

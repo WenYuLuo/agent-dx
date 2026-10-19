@@ -49,6 +49,9 @@ struct State {
     recovering: BTreeMap<String, tokio::time::Instant>,
     retired_sessions: BTreeSet<(String, String)>,
     scheduling_deadlines: BTreeMap<String, tokio::time::Instant>,
+    // Local ownership CAS batches run outside the state lock. Cancellation must
+    // wait until their result has been synchronized or authoritatively fenced.
+    claims_in_flight: BTreeMap<String, usize>,
 }
 
 fn requires_node_reconciliation(environment: &StoredEnvironment) -> bool {
@@ -409,6 +412,7 @@ impl CoordinatorRpc {
                 recovering,
                 retired_sessions: BTreeSet::new(),
                 scheduling_deadlines: BTreeMap::new(),
+                claims_in_flight: BTreeMap::new(),
             }),
             claim_sender,
             changed: Notify::new(),
@@ -717,10 +721,8 @@ impl CoordinatorRpc {
                 {
                     continue;
                 }
-                if self.expire_pending(&spec, deadline).await? {
-                    return Err(Status::deadline_exceeded(
-                        "central scheduling queue deadline exceeded; retry the same Environment ID",
-                    ));
+                if let Some(failure) = self.expire_pending(&spec, deadline).await? {
+                    return Err(adx_protocol::scheduling_deadline(failure));
                 }
             }
         }
@@ -730,13 +732,24 @@ impl CoordinatorRpc {
         &self,
         spec: &EnvironmentSpec,
         deadline: tokio::time::Instant,
-    ) -> std::result::Result<bool, Status> {
+    ) -> std::result::Result<Option<adx_core::scheduling::SchedulingFailure>, Status> {
         let mut state = self.0.state.lock().await;
+        state.recover_authoritative_state().await.map_err(status)?;
+        state.healthy().map_err(status)?;
+        if state.claims_in_flight.contains_key(&spec.id) {
+            return Err(Status::deadline_exceeded(
+                "central scheduling queue deadline exceeded with ownership claim in flight; query the same Environment ID",
+            ));
+        }
         if state.environments.contains_key(&spec.id)
             || state.scheduling_deadlines.get(&spec.id) != Some(&deadline)
-            || !state.scheduler.cancel_pending(&spec.id)
         {
-            return Ok(false);
+            return Ok(None);
+        }
+        // Diagnose and cancel under the same lock as assignment/reservation.
+        let failure = state.scheduler.scheduling_failure(spec).map_err(status)?;
+        if !state.scheduler.cancel_pending(&spec.id) {
+            return Ok(None);
         }
         state.specs.remove(&spec.id);
         state.scheduling_deadlines.remove(&spec.id);
@@ -753,7 +766,7 @@ impl CoordinatorRpc {
                 .map_err(status)?;
         }
         self.0.changed.notify_waiters();
-        Ok(true)
+        Ok(Some(failure))
     }
     async fn commit(
         &self,
@@ -1545,5 +1558,145 @@ mod reconciliation_tests {
             requires_node_reconciliation(&environment),
             "an invalidated Failed record must remain manageable for cleanup and deletion"
         );
+    }
+}
+
+#[cfg(test)]
+#[path = "../tests/common/mod.rs"]
+mod cancellation_test_redis;
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires isolated Redis; set ADX_TEST_REDIS_SERVER"]
+    async fn expiry_waits_for_local_claim_then_preserves_its_assignment() {
+        let mut redis = cancellation_test_redis::Redis::new().await;
+        let session = redis.store().await.begin(1).await.unwrap();
+        let mut rpc = CoordinatorRpc::new(
+            session.clone(),
+            Placement::Pack,
+            Peers::network(),
+            RpcClient::network(Principal::Coordinator),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        // Replace the batch consumer so persistence is released at an exact
+        // boundary, without sleeps or a race against the real batch window.
+        let (sender, mut claims) = mpsc::channel(1);
+        Arc::get_mut(&mut rpc.0).unwrap().claim_sender = sender;
+        let spec: EnvironmentSpec = serde_json::from_value(serde_json::json!({
+            "id":"claim-race", "tenant_id":"tenant", "image":"image",
+            "runtime_class":"runsc", "priority":0,
+            "resources":{"cpu_millis":100,"memory_bytes":128,"disk_bytes":0}
+        }))
+        .unwrap();
+        let node = Node {
+            id: "node".into(),
+            capacity: spec.resources,
+            available: true,
+            labels: Default::default(),
+            devices: vec![],
+            runtime_classes: vec!["runsc".into()],
+        };
+        let stored = session
+            .register_session(
+                node.clone(),
+                "127.0.0.1:1".into(),
+                "127.0.0.1:2".into(),
+                Some(NodeSession {
+                    id: "boot".into(),
+                    sequence: 1,
+                    routable: true,
+                }),
+            )
+            .await
+            .unwrap();
+        {
+            let mut state = rpc.0.state.lock().await;
+            state.scheduler.register(node).unwrap();
+            state.nodes.insert("node".into(), stored);
+            state.live.insert(
+                "node".into(),
+                LiveNode {
+                    expired: false,
+                    session: "boot".into(),
+                    sequence: 1,
+                    last_seen: tokio::time::Instant::now(),
+                    inspected: true,
+                    report: pb::RegisterNodeRequest::default(),
+                },
+            );
+        }
+        let claiming = tokio::spawn({
+            let service = rpc.clone();
+            let spec = spec.clone();
+            async move {
+                service
+                    .claim_local(
+                        "node".into(),
+                        pb::ClaimEnvironmentRequest {
+                            spec: Some(spec.into()),
+                            node_session_id: "boot".into(),
+                            devices: vec![],
+                            caller: Some(pb::CallerContext {
+                                tenant_id: "tenant".into(),
+                                administrator: false,
+                            }),
+                        },
+                    )
+                    .await
+            }
+        });
+        let pending = claims.recv().await.unwrap();
+        let deadline = tokio::time::Instant::now();
+        {
+            let mut state = rpc.0.state.lock().await;
+            assert_eq!(state.claims_in_flight[&spec.id], 1);
+            state.scheduler.submit(spec.clone()).unwrap();
+            state.specs.insert(spec.id.clone(), spec.clone());
+            state.scheduling_deadlines.insert(spec.id.clone(), deadline);
+        }
+        let uncertain = rpc.expire_pending(&spec, deadline).await.unwrap_err();
+        assert_eq!(uncertain.code(), tonic::Code::DeadlineExceeded);
+        assert!(adx_protocol::scheduling_failure(&uncertain).is_none());
+        assert_eq!(rpc.0.state.lock().await.scheduler.pending(0).unwrap(), 1);
+        let outcome = session
+            .claim(pending.spec, &pending.candidate)
+            .await
+            .unwrap();
+        pending.response.send(Ok(outcome)).unwrap();
+        claiming.await.unwrap().unwrap();
+        assert!(rpc.0.state.lock().await.claims_in_flight.is_empty());
+        assert!(rpc.expire_pending(&spec, deadline).await.unwrap().is_none());
+        assert_eq!(
+            session.get(&spec.id).await.unwrap().assignment.node_id,
+            "node"
+        );
+
+        let mut cancelled = spec.clone();
+        cancelled.id = "cancelled".into();
+        {
+            let mut state = rpc.0.state.lock().await;
+            state.scheduler.submit(cancelled.clone()).unwrap();
+            state.specs.insert(cancelled.id.clone(), cancelled.clone());
+            state
+                .scheduling_deadlines
+                .insert(cancelled.id.clone(), deadline);
+        }
+        let failure = rpc
+            .expire_pending(&cancelled, deadline)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(failure.rejections["insufficient_cpu"], 1);
+        assert_eq!(
+            session.get(&cancelled.id).await.unwrap_err(),
+            Error::NotFound
+        );
+        assert_eq!(rpc.0.state.lock().await.scheduler.pending(0).unwrap(), 0);
+        redis.crash();
     }
 }

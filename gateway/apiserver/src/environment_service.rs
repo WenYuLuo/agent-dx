@@ -279,6 +279,7 @@ impl EnvironmentService {
         // Repeated inconclusive retries do not renew that window.
         if result.as_ref().is_err_and(|error| {
             adx_protocol::deadline_failure(error).is_none()
+                && adx_protocol::scheduling_failure(error).is_none()
                 && matches!(
                     error.code(),
                     Code::Cancelled
