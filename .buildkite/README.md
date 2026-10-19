@@ -671,8 +671,10 @@ stale commit or dirty package before starting the backend.
 
 The step reuses the existing `default,os=linux,arch=amd64` Kubernetes worker and
 the digest-pinned `adx-python-build` image. Its container is privileged, with
-writable cgroup v2 and the existing `/mnt/paas` cache. It installs bubblewrap, prepares `/etc/pki` for the pinned distro-neutral
-policy, and uses loop/EROFS, network namespaces and iptables. The CI worker kernel must
+writable cgroup v2 and the existing `/mnt/paas` cache. It installs missing Git
+and native runtime tools before checkout verification, prepares `/etc/pki` for
+the pinned distro-neutral policy, and uses loop/EROFS, network namespaces and
+iptables. The CI worker kernel must
 support those facilities. `ADX_JIUWENBOX_CACHE` optionally overrides the default
 `/mnt/paas/build-cache/adx/jiuwenbox` content-addressed cache.
 

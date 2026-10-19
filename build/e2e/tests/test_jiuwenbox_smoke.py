@@ -133,27 +133,46 @@ class JiuwenboxPipelineTests(unittest.TestCase):
         self.assertIn('out/buildkite/jiuwenbox/**/*', step['artifact_paths'])
         self.assertFalse(any('private' in p for p in step['artifact_paths']))
 
-    def test_bad_archive_checksum_stops_before_deployment_and_keeps_exit_code(self):
+    def run_checksum_fixture(self, git_missing=False):
         import os
+        import shutil
         import subprocess
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             tools = root / 'tools';tools.mkdir()
+            git = '#!/bin/sh\n[ "$1" = rev-parse ] && echo fixture-commit\nexit 0\n'
             scripts = {
-                'git': '#!/bin/sh\n[ "$1" = rev-parse ] && echo fixture-commit\nexit 0\n',
-                'buildkite-agent': '#!/bin/sh\nexit 0\n',
-                'sha256sum': '#!/bin/sh\nexit 34\n',
-                'tar': '#!/bin/sh\ntouch SHOULD_NOT_EXTRACT\n',
+                name: '#!/bin/sh\nexit 0\n'
+                for name in ('bwrap', 'ip', 'iptables', 'busybox', 'mount', 'findmnt', 'losetup', 'openssl', 'curl', 'buildkite-agent')
             }
+            scripts.update({
+                'id': '#!/bin/sh\nprintf "0\\n"\n',
+                'sha256sum': '#!/bin/sh\nexit 34\n',
+                'tar': '#!/bin/sh\nprintf extracted > SHOULD_NOT_EXTRACT\n',
+                'apt-get': '#!/bin/sh\nprintf apt > "$FIXTURE_TOOLS/bootstrap"\n/bin/cat > "$FIXTURE_TOOLS/git" <<\'GIT\'\n' + git + 'GIT\n/bin/chmod +x "$FIXTURE_TOOLS/git"\n',
+            })
+            if not git_missing:
+                scripts['git'] = git
             for name, script in scripts.items():
                 path = tools / name;path.write_text(script);path.chmod(0o755)
-            env = dict(os.environ, PATH=str(tools) + os.pathsep + os.environ['PATH'],
+            (tools / 'mkdir').symlink_to(shutil.which('mkdir'))
+            env = dict(os.environ, PATH=str(tools), FIXTURE_TOOLS=str(tools),
                        BUILDKITE_COMMIT='fixture-commit', BUILDKITE_BUILD_ID='fixture-build',
                        ADX_JIUWENBOX_CACHE='/fixture/cache')
-            result = subprocess.run(['bash', str(ROOT / '.buildkite/jiuwenbox-smoke.sh')],
+            result = subprocess.run(['/bin/bash', str(ROOT / '.buildkite/jiuwenbox-smoke.sh')],
                                     cwd=root, env=env, capture_output=True, text=True)
-            self.assertEqual(result.returncode, 34, result.stderr)
             self.assertFalse((root / 'SHOULD_NOT_EXTRACT').exists())
+            return result, (tools / 'bootstrap').exists()
+
+    def test_bad_archive_checksum_stops_before_deployment_and_keeps_exit_code(self):
+        result, bootstrapped = self.run_checksum_fixture()
+        self.assertEqual(result.returncode, 34, result.stderr)
+        self.assertFalse(bootstrapped)
+
+    def test_python_image_without_git_is_bootstrapped_before_checkout_verification(self):
+        result, bootstrapped = self.run_checksum_fixture(git_missing=True)
+        self.assertEqual(result.returncode, 34, result.stderr)
+        self.assertTrue(bootstrapped)
 
 
 class JiuwenboxArtifactTests(unittest.TestCase):

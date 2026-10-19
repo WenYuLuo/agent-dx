@@ -3,6 +3,19 @@
 set -euo pipefail
 : "${BUILDKITE_COMMIT:?Buildkite revision required}"
 : "${BUILDKITE_BUILD_ID:?Buildkite build ID required}"
+# Python workers do not necessarily include Git or native runtime tools.
+if [[ $(id -u) != 0 ]]; then
+  echo 'Jiuwenbox smoke requires the privileged root CI container' >&2
+  exit 1
+fi
+missing_tools=0
+for tool in git curl bwrap ip iptables busybox mount findmnt losetup openssl; do
+  command -v "$tool" >/dev/null || missing_tools=1
+done
+if [[ $missing_tools == 1 ]]; then
+  apt-get update
+  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git curl bubblewrap iproute2 iptables busybox-static util-linux openssl
+fi
 [[ -z $(git status --porcelain) ]] || { echo 'clean checkout required' >&2; exit 1; }
 [[ $(git rev-parse HEAD) == "$BUILDKITE_COMMIT" ]] || { echo 'checkout commit mismatch' >&2; exit 1; }
 mkdir -p out/buildkite/logs
@@ -15,14 +28,6 @@ package="$PWD/out/buildkite/jiuwenbox-package"
 mkdir "$package"
 tar -xzf out/buildkite/adx-release.tar.gz -C "$package"
 echo '--- :package: Prepare Jiuwenbox supervisor'
-if [[ $(id -u) != 0 ]]; then
-  echo 'Jiuwenbox smoke requires the privileged root CI container' >&2
-  exit 1
-fi
-if ! command -v bwrap >/dev/null || ! command -v ip >/dev/null || ! command -v openssl >/dev/null; then
-  apt-get update
-  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends bubblewrap iproute2 iptables busybox-static util-linux openssl
-fi
 # The pinned policy includes the distro-neutral CA directory.
 mkdir -p /etc/pki
 if [[ ! -w /sys/fs/cgroup/cgroup.subtree_control ]]; then
