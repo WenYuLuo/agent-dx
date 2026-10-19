@@ -24,11 +24,11 @@ use std::{
 use afs_error::{Error, Result};
 use afs_tracing::tracing;
 use fuser::{
-    AccessFlags, BackgroundSession, Config, Errno, FileAttr, FileHandle as FuseFileHandle,
-    FileType, Filesystem, FopenFlags, Generation, INodeNo, InitFlags, KernelConfig, LockOwner,
-    MountOption, OpenFlags, RenameFlags as FuseRenameFlags, ReplyAttr, ReplyCreate, ReplyData,
-    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyLock, ReplyOpen, ReplyStatfs, ReplyWrite,
-    ReplyXattr, Request, SessionACL, TimeOrNow, WriteFlags,
+    AccessFlags, BackgroundSession, Config, CopyFileRangeFlags, Errno, FileAttr,
+    FileHandle as FuseFileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo, InitFlags,
+    KernelConfig, LockOwner, MountOption, OpenFlags, RenameFlags as FuseRenameFlags, ReplyAttr,
+    ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyLock, ReplyOpen,
+    ReplyStatfs, ReplyWrite, ReplyXattr, Request, SessionACL, TimeOrNow, WriteFlags,
 };
 
 #[cfg(feature = "ownerfs")]
@@ -247,6 +247,7 @@ fn complete_read_reply(
 pub struct FuseRequestMetrics {
     requests: afs_metrics::IntCounterVec,
     io_size_bytes: afs_metrics::HistogramVec,
+    copy_range_duration: afs_metrics::HistogramVec,
 }
 
 impl FuseRequestMetrics {
@@ -268,7 +269,18 @@ impl FuseRequestMetrics {
             )?;
             afs_metrics::register_collector(registry, &requests)?;
             afs_metrics::register_collector(registry, &io_size_bytes)?;
+            let copy_range_duration = afs_metrics::HistogramVec::new(
+                afs_metrics::HistogramOpts::new(
+                    "afs_fuse_copy_file_range_duration_seconds",
+                    "Dispatched copy_file_range queue and execution wall time.",
+                ),
+                &["filesystem", "stage"],
+            )?;
+            afs_metrics::register_collector(registry, &copy_range_duration)?;
             for filesystem in ["ownerfs", "dfs"] {
+                for stage in ["queue", "execute"] {
+                    copy_range_duration.with_label_values(&[filesystem, stage]);
+                }
                 for operation in FUSE_CALLBACKS {
                     requests.with_label_values(&[filesystem, operation]);
                 }
@@ -276,10 +288,7 @@ impl FuseRequestMetrics {
                     io_size_bytes.with_label_values(&[filesystem, operation]);
                 }
             }
-            Ok(Self {
-                requests,
-                io_size_bytes,
-            })
+            Ok(Self { requests, io_size_bytes, copy_range_duration })
         })
     }
 
@@ -317,6 +326,7 @@ const FUSE_CALLBACKS: &[&str] = &[
     "open",
     "read",
     "write",
+    "copy_file_range",
     "flush",
     "release",
     "fsync",
@@ -2137,6 +2147,73 @@ impl Filesystem for AfsFuse {
                 self.dispatch.submit_keyed(fh, move || run(&data));
             }
         }
+    }
+
+    fn copy_file_range(
+        &self,
+        req: &Request,
+        ino_in: INodeNo,
+        fh_in: FuseFileHandle,
+        offset_in: u64,
+        ino_out: INodeNo,
+        fh_out: FuseFileHandle,
+        offset_out: u64,
+        len: u64,
+        flags: CopyFileRangeFlags,
+        reply: ReplyWrite,
+    ) {
+        self.record_request("copy_file_range");
+        if !flags.is_empty() {
+            reply.error(fuse_errno(libc::EINVAL));
+            return;
+        }
+        let backend = self.backend.clone();
+        let state = self.state.clone();
+        let context = Self::context(req, 0);
+        let queued = std::time::Instant::now();
+        let metrics = self.requests.clone();
+        self.dispatch.submit_keyed(fh_out.0, move || {
+            let _timer = metrics.as_ref().map(|(metrics, filesystem)| {
+                metrics
+                    .copy_range_duration
+                    .with_label_values(&[filesystem, "queue"])
+                    .observe(queued.elapsed().as_secs_f64());
+                metrics
+                    .copy_range_duration
+                    .with_label_values(&[filesystem, "execute"])
+                    .start_timer()
+            });
+            let result = (|| {
+                let (source, destination) = {
+                    let state = state.lock().unwrap();
+                    (
+                        state.file_handle(fh_in.0).ok_or(libc::ESTALE)?,
+                        state.file_handle(fh_out.0).ok_or(libc::ESTALE)?,
+                    )
+                };
+                AfsFuse::validate_handle_inode_in(&state, ino_in.0)?;
+                AfsFuse::validate_handle_inode_in(&state, ino_out.0)?;
+                backend
+                    .copy_file_range(
+                        &context,
+                        crate::node::vfs::types::CopyFileRange {
+                            source: source.handle,
+                            source_offset: offset_in,
+                            destination: destination.handle,
+                            destination_offset: offset_out,
+                            length: len,
+                        },
+                    )
+                    .map_err(errno)
+            })();
+            match result {
+                Ok(copied) => match u32::try_from(copied) {
+                    Ok(copied) => reply.written(copied),
+                    Err(_) => reply.error(fuse_errno(libc::EOVERFLOW)),
+                },
+                Err(error) => reply.error(fuse_errno(error)),
+            }
+        });
     }
 
     fn flush(

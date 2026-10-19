@@ -90,6 +90,10 @@ OwnerFs 面向小规模 Agent workspace。Home 节点把 workspace 保存为普�
 
 DFS 把已提交数据表示为不可变 chunk。普通写入先进入 inode 的 dirty 状态；sync、同步写标志、close-time flush 或后台策略触发提交，形成新的 `FileVersion`。复制发生在文件布局之下，Meta 只在收到可验证持久 receipt 后提交新版本和副本目录。验证缓存不能自动算作持久副本。
 
+DFS 的 `copy_file_range` 通过元数据 COW 为目标创建独立 FileVersion，重映射指定源范围的不可变 chunk；不读取或重新上传源数据。范围覆盖保留目标其它区域和源稀疏空洞。Meta 核验源与目标属于同一 namespace、布局严格对应声明范围，重试沿用原操作身份。后续写入提交独立 chunk，源目录删除不会使已提交副本失去数据。
+
+文件提交和完整元数据同步遇到事务 CAS 未命中时，会重新验证 head 和写租约身份；同身份续期或并发 inode 属性变化不再永久污染 writer。换主和 head 变化仍拒绝。单次处理的持续竞争返回可重试错误，保留原 operation，避免把暂时竞争带到退出 drain。
+
 所有启用 OwnerFs 或 DFS 权威能力的 Meta 都要求 mTLS 和
 `trusted_node_certs`。CA 只证明证书链可信；Meta 还把握手得到的叶证书 DER 精确
 映射到一个 Node ID，并校验 RPC 中声明的 caller／holder／owner 身份。DFS-only
@@ -574,11 +578,71 @@ Meta 纯传输断链时，已打开视图的未到期合法范围可读本地 ca
 对象存储部署与服务端持久性属于外部依赖，Meta 状态持久化
 仍由 AFS 配置的 Meta 后端承担。详见[配置](../deployment/afs.md#dfs-外部-s3-连接)。
 
+### 文件写租约维护
+
+打开的写文件、脏数据和待确认的提交仍需要有效写租约。DFS 节点通过独立的每秒维护任务，
+在 30 秒租约到期前为这些状态续租；该任务不排队等待普通后台写回完成。
+续租只更新同一归属的有效期，不改动已经冻结、需要按原身份重放的提交请求。
+迟到响应不能覆盖新的归属或缩短有效期，正常关闭且已提交的文件无需继续续租。
+Meta 不可用超过租约期限时仍会拒绝旧写入，不通过复活过期租约绕过隔离。
+
 ## OwnerFs workspace bind mount
 
 OwnerFs workspace bind mount 是当前实际试用场景的优先能力，默认 OFF。开启后，它把 Home 上 workspace 的底层真实目录 bind 到独立原生 `ownerfs_workspace_egress_root` 下的同名一级目录。egress root 必须在 OwnerFs FUSE 挂载和 Node 数据目录之外；FUSE 子树仍保留，不以 bind 覆盖。把 FUSE 目录自身 bind 到别处不满足此设计。
 
 核心实现只负责挂载、身份核验和卸载；runc、容器启动、执行、停止和探针属于适配层。ON 场景仍需保留授权、Home/root/epoch 核验、数据新鲜度、close-to-open、权限、错误传播、正常卸载和受管引用排空。当前不承诺已有 native FD、mmap、描述符转移或二级 clone 的即时撤权。
+
+## Checkpoint 共享存储接入
+
+Platform 的 `adx-checkpoint-storage` 用普通文件接口访问 DFS 挂载，不依赖 AFS RPC crate。
+adxlet 直接捕获到共享目录，恢复时把该目录交给 sandboxd；不会先下载整个 checkpoint。
+Coordinator 挂载同一 namespace，统一管理共享文件的回收；节点仅管理执行文件访问。
+匿名恢复点跟随 Environment，可复用 Snapshot 使用中删除返回 Sandbox 列表。
+运行时文件依赖与挂载的实际验证边界见[存储流程](../testing/snapshot-storage.md)。
+
+## DFS 历史与数据块回收
+
+NodeReplicated DFS 的回收由 Meta 判定可达性、AFS Node 删除本机块。Platform Coordinator
+仍负责匿名 checkpoint／Snapshot 的共享目录生命周期；AFS 的回收只处理目录删除后失去引用的
+inode、FileVersion、LayoutRoot 与数据块，两层职责不混用。
+
+- 有链接的 inode 当前版本是保留根。打开的文件／目录使用持久引用；文件的在途访问共享同一引用，
+  最后一个使用者退出才排队释放。有效写租约、尚未提交的上传与复制任务也构成保留根。
+- 最后一个写句柄关闭后，即使数据已提交且序号相同，也后台提交剩余元数据；提交结果未确认时保留
+  原请求和写租约，确认干净后停止续租，避免已 unlink 文件因时间戳脏状态永久保留历史。
+- COW 目标布局直接引用共享 chunk；源文件删除不改变目标的所有权。`parent_version` 仅记录血缘，
+  不作为永久保留历史的理由。打开的 inode 保守保留全部版本，关闭后再回收历史。
+- 新引用的创建请求带固定的 30 秒准入期限，重放不刷新期限；Meta 最多接受 60 秒的剩余期限，
+  容纳时钟差。期限只限制创建请求，已打开文件和长上传的保护不受它限制。
+  对尚未出现的引用释放也必须持久化墓碑，防止释放先到、创建后到；墓碑保护期结束后，
+  原创建请求已过期，不能重新激活引用。
+- 正常关闭先提交释放，默认再等待 60 秒，覆盖已签发的 30 秒读取授权。心跳超时不释放引用。
+  同一 Node 的新 session 接管后，旧 session 引用最早在旧授权截止时间加 60 秒后失效。
+- Meta 先持久化带代次的删除批次和待确认 Node 列表，再删除不可达元数据；该批次中的 chunk
+  在所有相关 Node 确认前禁止重新发布。同内容重新上传需等屏障完成。
+- Node 删除块和校验旁文件，持久化 catalog 检查点及已完成代次后应答；重启或应答丢失重试不重复
+  删除新上传的同内容块。catalog WAL 随检查点截断。Node 清单还会发现无主上传残留。
+
+每批最多 1024 个 chunk，Node 每 5 秒推进，引用释放每次最多 64 个。不可达 Node 会保守阻塞
+当前物理删除批次，不以心跳失联推定磁盘已清空。DFS 外部对象持久化模式目前不启用本机块回收；
+其对象删除需要独立的外部存储回收合同，不能直接套用 NodeReplicated 协议。
+
+## Meta 保留窗口与 Watch 重新同步
+
+生产 Meta 默认保留 24 小时幂等结果和最近 4096 个提交 revision 的 Watch 事件。
+`[meta_retention]` 的 `request_window_ms`、`watch_revisions` 必须大于零。
+写入时推进持久化清理水位；结果扫描最多约 10 秒一次，Watch 按完整 revision 截断。
+一次提交批次可能暂时多保留至多 64 个 revision；单个 revision 的事件不会被拆开。
+
+变更请求使用 `afs1-<Unix毫秒>-<原请求身份>`，重试复用完整身份。超过清理水位返回
+`META_REQUEST_EXPIRED`，不得换身份重做不确定结果的操作；缺少时间或超前超过 30 秒返回
+`META_REQUEST_TIME_INVALID`。文件系统固定初始化记录单独保留。水位随 WAL／检查点持久化，
+重启不会让过期请求重新执行；扩大窗口不会降低已有水位。
+
+旧 Watch 游标得到 Compacted 与恢复游标。RootCommand 调用自动从同一份只读视图取得
+当前 session 的待处理命令和 revision，随后从该 revision 增量跟进；历史截断不会丢掉
+仍待执行的撤销命令。`GET /v1/store` 提供实体数量、结果／事件数量、水位和 GC 屏障进度，
+用于观测收敛，管理端口应限制在受信网络。
 
 ## 后置能力
 

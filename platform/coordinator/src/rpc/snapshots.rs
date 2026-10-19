@@ -17,16 +17,16 @@ impl CoordinatorRpc {
                         if let Some(environment) = state.environments.get(environment_id) {
                             if environment.spec.snapshot_id.as_deref() == Some(snapshot.id.as_str())
                                 && environment.result.as_ref().is_some_and(|record| {
-                                    record
-                                        .checkpoint
-                                        .as_ref()
-                                        .is_some_and(|cp| cp.artifact != snapshot.artifact)
-                                        || (!record.resources_held
-                                            && matches!(
-                                                record.state,
-                                                EnvironmentState::Failed
-                                                    | EnvironmentState::Deleted
-                                            ))
+                                    !record.execution_artifacts.contains(&snapshot.artifact)
+                                        && record
+                                            .snapshot_source
+                                            .as_ref()
+                                            .is_none_or(|p| p.artifact != snapshot.artifact)
+                                        && (record
+                                            .checkpoint
+                                            .as_ref()
+                                            .is_some_and(|cp| cp.artifact != snapshot.artifact)
+                                            || record.state == EnvironmentState::Deleted)
                                 })
                             {
                                 state
@@ -39,6 +39,7 @@ impl CoordinatorRpc {
                 }
             }
             let snapshots = state.session.retained_snapshots().await?;
+            let holds = state.session.execution_holds().await?;
             let mut candidates = Vec::new();
             for snapshot in &snapshots {
                 if !snapshot.collectable() {
@@ -54,12 +55,20 @@ impl CoordinatorRpc {
                     .iter()
                     .any(|s| s.id != snapshot.id && same(&s.artifact))
                     || state.environments.values().any(|i| {
-                        i.result
-                            .as_ref()
-                            .and_then(|r| r.checkpoint.as_ref())
-                            .is_some_and(|c| same(&c.artifact))
+                        i.result.as_ref().is_some_and(|r| {
+                            r.checkpoint
+                                .iter()
+                                .chain(r.snapshot_source.iter())
+                                .any(|p| same(&p.artifact))
+                                || r.execution_artifacts.iter().any(same)
+                        })
                     })
+                    || holds.iter().any(|h| h.artifacts.iter().any(same))
                 {
+                    continue;
+                }
+                if snapshot.artifact.storage != "local" {
+                    candidates.push((snapshot.clone(), String::new(), String::new()));
                     continue;
                 }
                 let Some(live) = state.live.get(&snapshot.source_node_id) else {
@@ -85,6 +94,23 @@ impl CoordinatorRpc {
                 // Recheck persistent authority before issuing each destructive RPC.
                 if session.get_snapshot(&snapshot.id).await? != snapshot {
                     return Err(Error::Conflict);
+                }
+                if snapshot.artifact.storage != "local" {
+                    let reclaimers = self
+                        .0
+                        .reclaimers
+                        .read()
+                        .expect("reclaimer registry lock poisoned")
+                        .clone();
+                    session
+                        .claim_artifact_deletion(&snapshot.artifact, Some(&snapshot.id))
+                        .await?;
+                    reclaimers.remove(&snapshot.artifact).await?;
+                    session.forget_artifact(&snapshot.artifact).await?;
+                    session
+                        .finish_snapshot_deletion(&snapshot.id, snapshot.revision)
+                        .await?;
+                    return Ok(());
                 }
                 let channel = self
                     .0
@@ -194,19 +220,12 @@ impl pb::snapshot_service_server::SnapshotService for CoordinatorRpc {
                     Err(Error::NotFound) => (),
                     Err(error) => return Err(status(error)),
                 }
-                let checkpoint = source
-                    .result
-                    .as_ref()
-                    .and_then(|r| r.checkpoint.as_ref())
-                    .ok_or_else(|| {
-                        Status::failed_precondition("source checkpoint must be committed first")
-                    })?;
-                if checkpoint.source_runtime_id != snapshot.source_runtime_id
-                    || checkpoint.artifact.size_bytes != snapshot.artifact.size_bytes
-                    || checkpoint.artifact == snapshot.artifact
-                {
+                if !source.result.as_ref().is_some_and(|record| {
+                    record.runtime.id == snapshot.source_runtime_id
+                        && record.execution_artifacts.contains(&snapshot.artifact)
+                }) {
                     return Err(Status::failed_precondition(
-                        "snapshot requires an independent copy of the source checkpoint",
+                        "snapshot source input must be committed first",
                     ));
                 }
                 if state
@@ -274,7 +293,12 @@ impl pb::snapshot_service_server::SnapshotService for CoordinatorRpc {
                     Principal::ApiServer => {
                         tenant(r.caller.as_ref(), &snapshot.template.tenant_id)?
                     }
-                    Principal::Node(id) if id == snapshot.source_node_id => (),
+                    Principal::Node(id)
+                        if id == snapshot.source_node_id
+                            || state.environments.values().any(|e| {
+                                e.assignment.node_id == id
+                                    && e.spec.snapshot_id.as_deref() == Some(snapshot.id.as_str())
+                            }) => {}
                     _ => return Err(Status::permission_denied("snapshot source node mismatch")),
                 }
                 if snapshot.state == SnapshotState::Deleted {
@@ -359,6 +383,43 @@ impl pb::snapshot_service_server::SnapshotService for CoordinatorRpc {
                 state.healthy().map_err(status)?;
                 let snapshot = state.session.get_snapshot(&r.id).await.map_err(status)?;
                 tenant(r.caller.as_ref(), &snapshot.template.tenant_id)?;
+                let mut users = std::collections::BTreeSet::new();
+                let mut templates = std::collections::BTreeSet::new();
+                for reference in &snapshot.references {
+                    match reference {
+                        adx_core::snapshots::Reference::Restore { environment_id } => {
+                            users.insert(environment_id.clone());
+                        }
+                        adx_core::snapshots::Reference::Template {
+                            node_id,
+                            template_id,
+                        } => {
+                            templates.insert(format!("{node_id}/{template_id}"));
+                        }
+                    }
+                }
+                for environment in state.environments.values() {
+                    if environment.result.as_ref().is_some_and(|record| {
+                        record.execution_artifacts.contains(&snapshot.artifact)
+                            || record
+                                .snapshot_source
+                                .as_ref()
+                                .is_some_and(|p| p.artifact == snapshot.artifact)
+                    }) {
+                        users.insert(environment.spec.id.clone());
+                    }
+                }
+                for hold in state.session.execution_holds().await.map_err(status)? {
+                    if hold.artifacts.contains(&snapshot.artifact) {
+                        users.insert(hold.assignment.environment_id);
+                    }
+                }
+                if !users.is_empty() || !templates.is_empty() {
+                    return Err(status(Error::SnapshotInUse {
+                        sandbox_ids: users.into_iter().collect(),
+                        template_ids: templates.into_iter().collect(),
+                    }));
+                }
                 let deleted = state
                     .session
                     .delete_snapshot(&r.id, &snapshot.template.tenant_id)

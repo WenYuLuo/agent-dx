@@ -21,6 +21,7 @@ use std::{
 };
 
 mod catalog_commit;
+mod gc;
 #[cfg(any(feature = "dfs", test))]
 mod native_live;
 #[cfg(test)]
@@ -1434,6 +1435,7 @@ impl CatalogTxn {
 #[derive(Debug, Default)]
 pub struct LocalCatalog {
     revision: u64,
+    gc_generation: u64,
     records: HashMap<ChunkId, LocalChunkRecord>,
 }
 
@@ -1443,12 +1445,14 @@ impl LocalCatalog {
     }
 
     fn recover(path: &Path) -> Result<Self> {
+        let mut catalog =
+            gc::load_checkpoint(&path.with_file_name("catalog.snapshot"))?.unwrap_or_default();
+        let base_revision = catalog.revision;
         if !path.exists() {
-            return Ok(Self::default());
+            return Ok(catalog);
         }
         let file = File::open(path).map_err(Error::from)?;
         let mut reader = BufReader::new(file);
-        let mut catalog = Self::default();
         let mut valid_bytes = 0_u64;
         let mut line = Vec::new();
         loop {
@@ -1493,6 +1497,10 @@ impl LocalCatalog {
                 }
             };
             txn.verify()?;
+            if txn.revision <= base_revision {
+                valid_bytes = next_offset;
+                continue;
+            }
             if txn.revision != catalog.revision.saturating_add(1) {
                 return Err(invalid("local chunk catalog revision is not contiguous"));
             }
@@ -2995,6 +3003,7 @@ pub struct LocalChunkStore {
     catalog: Mutex<LocalCatalog>,
     catalog_committer: CatalogCommitter,
     next_staging: AtomicU64,
+    gc_inventory_cursor: AtomicU64,
     read_work: Option<super::read_work::ReadWorkMetrics>,
     sidecar_installer: SidecarInstaller,
     #[cfg(test)]
@@ -3071,6 +3080,7 @@ impl LocalChunkStore {
             catalog: Mutex::new(catalog),
             catalog_committer: CatalogCommitter::default(),
             next_staging: AtomicU64::new(1),
+            gc_inventory_cursor: AtomicU64::new(0),
             read_work: None,
             sidecar_installer: SidecarInstaller::default(),
             #[cfg(test)]

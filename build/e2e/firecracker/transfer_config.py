@@ -2,6 +2,7 @@
 
 import copy
 import json
+import os
 from pathlib import Path
 from storage_fixture import public as public_storage
 
@@ -37,7 +38,10 @@ def configure(root):
             c['tls'][key] = str(root / 'secrets/tls' / f'{cert}.{suffix}')
         if public_storage(root)['kind'] == 'minio':
             c['checkpoint_storage']['endpoint'] = f'http://{HOST}:19090'
-        c['checkpoint_gc']['min_age_seconds'] = 3600
+        if public_storage(root)['kind'] == 'afs':
+            from filesystem_fixture import storage_config
+
+            c['checkpoint_storage'] = storage_config(os.environ['ADX_FC_AFS_ROOT'], name, root.name)
         env = service['env']
         env['ADX_DATA_PLANE_RELAY_TLS_CERT'] = c['tls']['certificate']
         env['ADX_DATA_PLANE_RELAY_TLS_KEY'] = c['tls']['private_key']
@@ -60,11 +64,28 @@ def configure(root):
         if name == 'node2':
             text = text.replace('ip_range = "10.231.16.1/20"', 'ip_range = "10.231.32.1/20"')
         text = text.replace('cgroup_root_name = "/adx-fc-', f'cgroup_root_name = "/{name}-adx-fc-')
+        if public_storage(root)['kind'] == 'afs':
+            # Private writable runtime files share the filesystem, but never
+            # share the immutable checkpoint directory or another executor's state.
+            runtime = Path(c['checkpoint_storage']['mount_root']) / 'runtime' / root.name / name
+            runtime.mkdir(parents=True, exist_ok=True)
+            text = text.replace(f'filestore_dir = "{backend}/filestore"', f'filestore_dir = "{runtime}"')
         (backend / 'config.toml').write_text(text)
     control = copy.deepcopy(original)
     control['services'] = [s for s in control['services'] if s['role'] not in ('adxlet', 'relay')]
     coordinator = next(s for s in control['services'] if s['role'] == 'coordinator')['config']
     coordinator.update(advertised_address=f'https://{HOST}:17000', heartbeat_timeout_seconds=12)
+    if os.getenv('ADX_FC_SUITE') == 'storage':
+        ingress = copy.deepcopy(next(s for s in control['services'] if s['role'] == 'ingress'))
+        ingress['id'] = 'ingress2'
+        ingress['env'].update(ADX_DATA_PLANE_INGRESS_TLS_BIND='0.0.0.0:9443',
+                              ADX_DATA_PLANE_INGRESS_PLAIN_BIND='127.0.0.1:9080',
+                              ADX_DATA_PLANE_INGRESS_HEALTH_BIND='127.0.0.1:19080')
+        replica = root / 'ingress2'
+        replica.mkdir()
+        (replica / 'deployment.yaml').write_text(json.dumps({**control, 'services': [ingress],
+                                                            'state_dir': str(replica / 'state')}, indent=2))
+        (replica / 'deployment.yaml').chmod(0o600)
     (root / 'deployment.yaml').write_text(json.dumps(control, indent=2))
     path = root / 'registry.yaml'
     path.write_text(path.read_text().replace('127.0.0.1:5000', '0.0.0.0:5000'))

@@ -115,6 +115,32 @@ impl StoreOwnerRootAuthority {
     pub fn new(store: Arc<dyn MetaStore>) -> Self {
         Self { store }
     }
+
+    // Commands and the resume cursor come from the same pinned authority view.
+    // A revocation that fell out of Watch history must still be delivered.
+    async fn resynchronize_commands(
+        &self,
+        input: &WatchRootCommandsInput,
+    ) -> Result<(StoreRevision, Vec<WatchedRootCommand>)> {
+        let view = self.store.read_view().await?;
+        let session = view
+            .read(MetaRead::CurrentNodeSession {
+                node_id: input.node_id.clone(),
+            })
+            .await?;
+        if !matches!(session.entity,Some(MetaEntity::NodeSession(ref session)) if session.session_id==input.session_id && session.is_live_at_unix_ms(now_unix_ms()))
+        {
+            return Err(invalid("node session is not current"));
+        }
+        let (revision, entities) = view.snapshot()?;
+        let commands=entities.iter().filter_map(|entity| {
+            let MetaEntity::RootCommand(command)=entity else {return None};
+            if command.home_node_id!=input.node_id || command.home_session_id!=input.session_id {return None;}
+            let acknowledged=entities.iter().any(|entity| matches!(entity,MetaEntity::RootCommandAck(ack) if ack.command_id==command.command_id && ack.node_id==command.home_node_id && ack.session_id==command.home_session_id && ack.root_id==command.root_id && ack.root_epoch==command.root_epoch && ack.access_generation==command.old_access_generation && ack.success));
+            (!acknowledged).then(||WatchedRootCommand{command:command.clone(),revision})
+        }).collect();
+        Ok((revision, commands))
+    }
 }
 
 impl OwnerRootAuthority for StoreOwnerRootAuthority {
@@ -642,9 +668,10 @@ impl OwnerRootAuthority for StoreOwnerRootAuthority {
                         _ => None,
                     })
                     .collect()),
-                WatchBatch::Compacted { .. } => {
-                    Err(invalid("watch history was compacted; caller must recover"))
-                }
+                WatchBatch::Compacted { .. } => self
+                    .resynchronize_commands(&input)
+                    .await
+                    .map(|(_, commands)| commands),
             }
         })
     }
@@ -694,15 +721,14 @@ impl OwnerRootAuthority for StoreOwnerRootAuthority {
                         commands,
                     })
                 }
-                WatchBatch::Compacted {
-                    requested_after,
-                    compacted_to,
-                    recovery,
-                } => Ok(RootCommandBatch::Compacted {
-                    requested_after,
-                    compacted_to,
-                    recovery,
-                }),
+                WatchBatch::Compacted { .. } => {
+                    let (revision, commands) = self.resynchronize_commands(&input).await?;
+                    Ok(RootCommandBatch::Events {
+                        start_revision: StoreRevision(input.after_revision),
+                        next_revision: revision.next(),
+                        commands,
+                    })
+                }
             }
         })
     }
@@ -1084,4 +1110,128 @@ fn now_unix_ms() -> u64 {
         .map_or(0, |duration| {
             u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
         })
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use super::*;
+    use crate::meta::store::{NodeSessionLease, RetentionPolicy, Store, memory::MemoryBackend};
+    #[tokio::test]
+    async fn compacted_watch_resynchronizes_pending_commands_without_losing_new_events() {
+        let store = Arc::new(
+            Store::open_with_retention(
+                Arc::new(MemoryBackend::default()),
+                Some(RetentionPolicy {
+                    request_window_ms: 60_000,
+                    watch_revisions: 2,
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+        let key = || RequestKey::new("node", crate::meta::store::timed_request_id(uuid_id()));
+        store
+            .register_node_session(
+                key(),
+                NodeSessionLease {
+                    node_id: "n".into(),
+                    session_id: "s".into(),
+                    grpc_addr: "http://n:1".into(),
+                    data_addr: "http://n:2".into(),
+                    rest_addr: "http://n:3".into(),
+                    storage_devices: vec![],
+                    lease_ttl: std::time::Duration::from_secs(30),
+                },
+            )
+            .await
+            .unwrap();
+        async fn command(store: &Store, key: RequestKey, id: &str) {
+            let mut txn = MetaTxn::new(key.clone(), StoreOperation::BeginRootRevocation);
+            txn.conditions
+                .push(TxnCondition::RequestAbsent(key.clone()));
+            txn.mutations.push(TxnMutation::Put(MetaEntity::RootCommand(
+                RootCommandRecord {
+                    command_id: id.into(),
+                    home_node_id: "n".into(),
+                    home_session_id: "s".into(),
+                    root_id: "root".into(),
+                    root_epoch: 1,
+                    old_access_generation: 1,
+                    command_type: RootCommandType::RevokeAccess,
+                },
+            )));
+            txn.mutations.push(TxnMutation::RecordRequestOutcome(
+                super::super::store::RequestOutcome {
+                    request: key,
+                    operation: StoreOperation::BeginRootRevocation,
+                    result: OperationResult::Empty,
+                },
+            ));
+            assert!(matches!(
+                store.compare_and_commit(txn).await.unwrap(),
+                TxnOutcome::Committed { .. }
+            ));
+        }
+        command(&store, key(), "old-pending").await;
+        for _ in 0..6 {
+            let key = key();
+            let mut txn = MetaTxn::new(key.clone(), StoreOperation::BeginRootRevocation);
+            txn.conditions
+                .push(TxnCondition::RequestAbsent(key.clone()));
+            txn.mutations.push(TxnMutation::RecordRequestOutcome(
+                super::super::store::RequestOutcome {
+                    request: key,
+                    operation: StoreOperation::BeginRootRevocation,
+                    result: OperationResult::Empty,
+                },
+            ));
+            store.compare_and_commit(txn).await.unwrap();
+        }
+        let authority = StoreOwnerRootAuthority::new(store.clone());
+        let RootCommandBatch::Events {
+            commands,
+            next_revision,
+            ..
+        } = authority
+            .poll_root_command_batch(WatchRootCommandsInput {
+                node_id: "n".into(),
+                session_id: "s".into(),
+                after_revision: 0,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("compaction must return a full resynchronization")
+        };
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].command.command_id, "old-pending");
+        command(&store, key(), "new-pending").await;
+        let RootCommandBatch::Events { commands, .. } = authority
+            .poll_root_command_batch(WatchRootCommandsInput {
+                node_id: "n".into(),
+                session_id: "s".into(),
+                after_revision: next_revision.0 - 1,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("incremental follow-up")
+        };
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].command.command_id, "new-pending");
+        assert!(
+            authority
+                .poll_root_command_batch(WatchRootCommandsInput {
+                    node_id: "n".into(),
+                    session_id: "old".into(),
+                    after_revision: 0
+                })
+                .await
+                .is_err()
+        );
+    }
+    fn uuid_id() -> u64 {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
 }

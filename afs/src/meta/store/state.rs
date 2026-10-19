@@ -704,6 +704,7 @@ impl State {
             }
             MetaRead::DfsReplicationTasks => None,
             MetaRead::DfsWriteLease(id) => state.entities.get(&MetaKey::DfsWriteLease(id.clone())),
+            MetaRead::DfsGc => state.entities.get(&MetaKey::DfsGc),
         };
         let request_outcome = match &read {
             MetaRead::RequestOutcome(key) => state.requests.get(key).cloned(),

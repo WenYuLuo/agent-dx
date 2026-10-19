@@ -431,7 +431,7 @@ impl Adxlet {
 
     pub fn with_checkpointing(
         mut self,
-        store: Arc<dyn checkpoint::CheckpointStore>,
+        store: Arc<dyn checkpoint::CheckpointAccess>,
         cooperation: Arc<dyn checkpoint::CheckpointCooperation>,
     ) -> Result<Self> {
         Arc::get_mut(&mut self.services)

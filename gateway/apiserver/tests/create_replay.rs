@@ -77,6 +77,8 @@ service_impl!(pb::coordinator_service_server::CoordinatorService, {
             } else {
                 self.0.starts.fetch_add(1, Ordering::SeqCst);
                 let record = pb::EnvironmentRecord {
+                    execution_artifacts: vec![],
+            snapshot_source: None,
                     failure: None,
 assignment: Some(pb::Assignment { environment_id: spec.id.clone(), node_id: "node".into(), generation: 1, ..Default::default() }),
                     spec: Some(spec.clone()), state: if self.0.pending_response.load(Ordering::SeqCst) { pb::EnvironmentState::Pending as i32 } else { pb::EnvironmentState::Running as i32 }, revision: 1,

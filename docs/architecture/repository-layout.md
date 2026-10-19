@@ -158,3 +158,11 @@ Rust 共用根 Cargo workspace，Python 工具独立打包；外部 sandboxd 按
 Coordinator/adxlet 的 Environment 数、资源预留与使用量，Ingress/Relay 的连接、流量与请求指标由各自 `/metrics` 导出。Trace 由组件 OpenTelemetry SDK 经 OTLP/HTTP 发往外部 Collector；结构化 stdout 由 supervisor 滚动压缩，Collector filelog 采集。Pod 可部署 Collector sidecar，进程环境独立托管。统一实时 Trace 队列丢弃指标已后置，不能与已有导出失败计数混同。
 
 Jiuwenbox 接入路径和验收边界见 [Jiuwenbox P0](../testing/jiuwenbox-runtime.md)。正常创建经 Jiuwenbox，Conch 原生 UDS 仅用于失联后的发现和清理。此驱动不提供 checkpoint；EROFS 先挂载到宿主，再通过 bind／virtiofs 暴露给沙箱。
+
+## Checkpoint 存储边界
+
+`platform/crates/checkpoint-storage/` 共享 local、S3+缓存和 AFS 文件适配。
+adxlet 使用 `CheckpointAccess` 捕获和取得恢复目录；Coordinator 使用
+`ArtifactReclaimer` 回收 S3/AFS。匿名恢复点属于 Environment，运行时文件使用独立保护；
+可复用 Snapshot 通过引用被恢复使用，使用中删除直接返回 Sandbox 列表。
+配置、流程和故障边界见[Checkpoint 存储](../testing/snapshot-storage.md)。

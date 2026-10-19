@@ -543,11 +543,11 @@ impl GrpcRootMeta {
     }
 
     fn request_id(&self) -> String {
-        format!(
+        crate::meta::store::timed_request_id(format!(
             "{}-{}",
             self.session_id,
             self.sequence.fetch_add(1, Ordering::Relaxed)
-        )
+        ))
     }
 
     fn client(&self) -> OwnerRootsClient<Channel> {
@@ -964,11 +964,11 @@ pub async fn register_node_with_readiness(
     let mut client = MetaClient::new(afs_tracing::traced_channel(channel));
     let reply = client
         .register_node(RegisterNodeRequest {
-            request_id: format!(
+            request_id: crate::meta::store::timed_request_id(format!(
                 "register-{}-{}",
                 node.session_id,
                 REGISTER_SEQUENCE.fetch_add(1, Ordering::Relaxed),
-            ),
+            )),
             node: Some(node),
             lease_seconds: NODE_REGISTRATION_LEASE_SECONDS,
         })
@@ -1076,11 +1076,11 @@ impl GrpcDfsMeta {
     }
 
     fn request_id(&self) -> String {
-        format!(
+        crate::meta::store::timed_request_id(format!(
             "{}-dfs-{}",
             self.session_id,
             self.sequence.fetch_add(1, Ordering::Relaxed)
-        )
+        ))
     }
 
     fn run<T>(
@@ -2205,6 +2205,14 @@ impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
                                 .map(wire_chunk_receipt)
                                 .collect(),
                             metadata_delta: Some(wire_dfs_metadata_delta(commit.metadata_delta)),
+                            clone_source: commit.clone_source.map(|source| {
+                                afs_protocol::meta::DfsCloneFileRange {
+                                    version_id: source.version.0,
+                                    source_offset: source.source_offset,
+                                    destination_offset: source.destination_offset,
+                                    length: source.length,
+                                }
+                            }),
                         },
                     )),
                 timeout,
@@ -4362,6 +4370,7 @@ mod tests {
                 inline_extents: Vec::new(),
             },
             chunk_receipts: Vec::new(),
+            clone_source: None,
             metadata_delta: crate::dfs::CommitMetadataDelta {
                 mode: crate::dfs::CommitMetadataMode::Full,
                 mtime_unix_ms: Some(1),
@@ -4577,5 +4586,109 @@ mod tests {
         .await;
 
         listener.abort();
+    }
+}
+
+#[cfg(feature = "dfs")]
+impl crate::node::gc::GcControl for GrpcDfsMeta {
+    fn retain(
+        &self,
+        id: &str,
+        inode: &crate::dfs::InodeId,
+        version: Option<&crate::dfs::FileVersionId>,
+        publication: bool,
+    ) -> Result<()> {
+        self.update_gc(id, Some(inode), version, publication, Vec::new(), false)
+    }
+    fn release(&self, id: &str) -> Result<()> {
+        self.update_gc(id, None, None, false, Vec::new(), true)
+    }
+    fn reserve_publication(
+        &self,
+        operation: &crate::dfs::OperationId,
+        chunks: Vec<crate::dfs::ChunkObject>,
+    ) -> Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match self.update_gc(
+                &format!("publish:{}", operation.0),
+                None,
+                None,
+                true,
+                chunks.clone(),
+                false,
+            ) {
+                Err(error)
+                    if error.code() == afs_error::META_DFS_GC_BUSY && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(50))
+                }
+                result => return result,
+            }
+        }
+    }
+    fn collect(
+        &self,
+        completed: u64,
+        inventory: Vec<crate::dfs::ChunkObject>,
+    ) -> Result<crate::dfs::GcState> {
+        let mut client =
+            afs_protocol::meta::dfs_meta_client::DfsMetaClient::new(self.channel.clone());
+        let reply = self
+            .run(
+                client.collect_garbage(afs_protocol::meta::CollectDfsGarbageRequest {
+                    node_id: self.node_id.clone(),
+                    session_id: self.session_id.clone(),
+                    completed_generation: completed,
+                    inventory: inventory.into_iter().map(wire_chunk_object).collect(),
+                }),
+            )?
+            .into_inner();
+        Ok(crate::dfs::GcState {
+            generation: reply.generation,
+            chunks: reply
+                .chunk_ids
+                .into_iter()
+                .map(crate::dfs::ChunkId::new)
+                .collect(),
+            waiting_nodes: if reply.pending_for_node {
+                vec![self.node_id.clone()]
+            } else {
+                Vec::new()
+            },
+        })
+    }
+}
+#[cfg(feature = "dfs")]
+impl GrpcDfsMeta {
+    fn update_gc(
+        &self,
+        id: &str,
+        inode: Option<&crate::dfs::InodeId>,
+        version: Option<&crate::dfs::FileVersionId>,
+        publication: bool,
+        chunks: Vec<crate::dfs::ChunkObject>,
+        release: bool,
+    ) -> Result<()> {
+        let mut client =
+            afs_protocol::meta::dfs_meta_client::DfsMetaClient::new(self.channel.clone());
+        self.run(
+            client.update_gc_reference(afs_protocol::meta::UpdateDfsGcReferenceRequest {
+                node_id: self.node_id.clone(),
+                session_id: self.session_id.clone(),
+                reference_id: id.into(),
+                admission_deadline_unix_ms: if inode.is_some() && !release {
+                    crate::meta::store::now_unix_ms().saturating_add(30_000)
+                } else {
+                    0
+                },
+                inode_id: inode.map(|id| id.0.clone()).unwrap_or_default(),
+                version_id: version.map(|id| id.0.clone()).unwrap_or_default(),
+                publication,
+                chunks: chunks.into_iter().map(wire_chunk_object).collect(),
+                release,
+            }),
+        )?;
+        Ok(())
     }
 }

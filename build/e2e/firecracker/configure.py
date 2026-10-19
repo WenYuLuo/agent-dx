@@ -281,7 +281,7 @@ add(
         'report_interval_seconds': 2,
         # Demand holds readiness across a checkpoint TTL; autoscaling holds
         # local-first forwarding while another real VM starts before unpause.
-        'rpc_timeout_seconds': 120 if os.getenv('ADX_FC_SUITE') in ('demand', 'autoscaling', 'cache') else 20,
+        'rpc_timeout_seconds': 120 if os.getenv('ADX_FC_SUITE') in ('demand', 'autoscaling', 'cache', 'storage') else 20,
         'execd_port': 50090,
         'execd_command': ['/usr/local/bin/adx-execd'],
         'execd_env': {},
@@ -369,7 +369,9 @@ kernel_args = "console=ttyS0 reboot=k panic=1 pci=off init=/init random.trust_cp
 kvm_device = "/dev/kvm"
 default_vcpu_count = 1
 default_memory_mib = 512
-default_overlay_size_bytes = {32 * 1024**2 if os.getenv('ADX_FC_SUITE') in ('demand', 'autoscaling', 'cache') else 536870912}
+default_overlay_size_bytes = {32 * 1024**2 if os.getenv('ADX_FC_SUITE') in ('demand', 'autoscaling', 'cache', 'storage') else 536870912}
+{'''writable_io_engine = "Sync"
+writable_cache_type = "Writeback"''' if os.getenv('ADX_FC_SUITE') == 'storage' else ''}
 checkpoint_mode = "full"
 virtiofs_enabled = true
 virtiofsd_path = "{BASE}/tools/virtiofsd"
@@ -421,19 +423,29 @@ for service in deployment['services']:
         if selected['kind'] == 'real_obs':
             c['checkpoint_storage'].update({key: selected[key] for key in ('alias', 'bucket', 'region', 'endpoint', 'prefix')})
             c['checkpoint_storage']['allow_http'] = False
-            c['checkpoint_gc'] = {'enabled': False}
             service['env']['AWS_VIRTUAL_HOSTED_STYLE_REQUEST'] = 'true'
             service['env']['AWS_TIMEOUT'] = '240s'
-        if selected['kind'] != 'real_obs':
-            c['checkpoint_gc'] = {'enabled': True, 'min_age_seconds': 0, 'interval_seconds': 1, 'max_artifacts': 100}
-        if os.getenv('ADX_FC_SUITE') == 'cache':
-            c['checkpoint_gc'] = {'enabled': False}
         service['env'].update(
             {
                 'AWS_ACCESS_KEY_ID': (PRIVATE / 's3-user').read_text().strip(),
                 'AWS_SECRET_ACCESS_KEY': (PRIVATE / 's3-key').read_text().strip(),
             }
         )
+node_service = next(s for s in deployment['services'] if s['role'] == 'adxlet')
+coordinator_service = next(s for s in deployment['services'] if s['role'] == 'coordinator')
+coordinator_service['config']['checkpoint_reclaimers'] = [{
+    key: value for key, value in node_service['config']['checkpoint_storage'].items()
+    if key in ('kind', 'alias', 'bucket', 'region', 'endpoint', 'allow_http', 'prefix')
+}]
+coordinator_service['env'].update({key: value for key, value in node_service['env'].items() if key.startswith('AWS_')})
+if os.getenv('ADX_FC_AFS_ROOT'):
+    from filesystem_fixture import storage_config
+
+    node_service['config']['checkpoint_storage'] = storage_config(os.environ['ADX_FC_AFS_ROOT'], 'node1', RUN.name)
+    coordinator_service['config']['checkpoint_reclaimers'] = [storage_config(os.environ['ADX_FC_AFS_ROOT'], 'coordinator', RUN.name)]
+    for service in (node_service, coordinator_service):
+        service['env'] = {key: value for key, value in service['env'].items() if not key.startswith('AWS_')}
+    (EVIDENCE / 'storage.json').write_text(json.dumps({'kind': 'afs', 'alias': 'afs', 'prefix': 'adx/' + RUN.name}, indent=2))
 config_path.write_text(json.dumps(deployment, indent=2))
 
 if os.environ.get('ADX_FC_PROXY_MODE', 'embedded') == 'embedded':
@@ -461,7 +473,6 @@ allowed = {
     'proxy_socket',
     'proxy_address',
     'checkpoint_storage',
-    'checkpoint_gc',
     'runtime_control',
 }
 result = {

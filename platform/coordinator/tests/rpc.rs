@@ -205,6 +205,10 @@ impl RuntimeDriver for Backend {
     async fn checkpoint_supported(&self, _: &str) -> Result<()> {
         Ok(())
     }
+    async fn checkpoint_running(&self, _: &str, path: &std::path::Path, _: Duration) -> Result<()> {
+        std::fs::write(path.join("memory"), b"saved runtime state").unwrap();
+        Ok(())
+    }
     async fn checkpoint(&self, id: &str, path: &std::path::Path, _: Duration) -> Result<()> {
         std::fs::write(path.join("memory"), b"saved runtime state").unwrap();
         self.running.lock().unwrap().remove(id);
@@ -1073,6 +1077,8 @@ async fn heartbeat_expiry_reconciliation_and_old_session_fencing() {
         .await
         .unwrap();
     let running = EnvironmentRecord {
+        execution_artifacts: vec![],
+        snapshot_source: None,
         failure: None,
         restart_attempts: 0,
         restart_pending: false,
@@ -1514,6 +1520,8 @@ async fn coordinator_restart_bounds_re_registration_grace() {
             .await
             .unwrap();
         let running = EnvironmentRecord {
+            execution_artifacts: vec![],
+            snapshot_source: None,
             failure: None,
             spec: spec("held"),
             assignment,
@@ -1750,6 +1758,8 @@ async fn published_routes_drive_real_gateway_streams_and_reconnect_to_new_coordi
         .await
         .unwrap();
     let mut record = EnvironmentRecord {
+        execution_artifacts: vec![],
+        snapshot_source: None,
         failure: None,
         restart_attempts: 0,
         restart_pending: false,
@@ -1956,7 +1966,7 @@ async fn published_routes_drive_real_gateway_streams_and_reconnect_to_new_coordi
 
 #[tokio::test]
 #[ignore = "requires isolated Redis and generated mTLS certificates"]
-async fn snapshot_rpc_enforces_component_tenant_and_deferred_deletion() {
+async fn snapshot_rpc_enforces_tenant_and_rejects_busy_deletion() {
     use adx_core::{
         snapshots::{Reference, Snapshot, SnapshotState},
         CheckpointArtifact,
@@ -2076,24 +2086,22 @@ async fn snapshot_rpc_enforces_component_tenant_and_deferred_deletion() {
     let page = client.list_snapshots(next).await.unwrap().into_inner();
     assert_eq!(page.snapshots[0].id, "snapshot-b");
     assert!(page.next_page_token.is_empty());
-    let deleted = client
+    let error = client
         .delete_snapshot(pb::DeleteSnapshotRequest {
             id: snapshot.id.clone(),
             caller: caller(),
         })
         .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(deleted.state, pb::SnapshotState::Deleting as i32);
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    let details: serde_json::Value = serde_json::from_slice(error.details()).unwrap();
+    assert_eq!(details["code"], "SNAPSHOT_IN_USE");
+    assert_eq!(details["sandbox_ids"], serde_json::json!([]));
+    assert_eq!(details["template_ids"], serde_json::json!(["node/base"]));
     assert_eq!(
         session.get_snapshot(&snapshot.id).await.unwrap().state,
-        SnapshotState::Deleting
+        SnapshotState::Ready
     );
-    assert!(!session
-        .get_snapshot(&snapshot.id)
-        .await
-        .unwrap()
-        .collectable());
     drop(servers);
     redis.crash();
 }
@@ -2217,6 +2225,9 @@ async fn tenant_key_rpc_requires_frontend_admin_and_revokes_verification() {
 
 #[async_trait::async_trait]
 impl adxlet::checkpoint::CheckpointCooperation for LocalChecks {
+    async fn resumed(&self, _: &EnvironmentRecord, _: &str) -> Result<()> {
+        Ok(())
+    }
     async fn prepare(&self, _: &EnvironmentRecord, _: &str) -> Result<()> {
         Ok(())
     }
@@ -2229,12 +2240,12 @@ impl adxlet::checkpoint::CheckpointCooperation for LocalChecks {
 #[ignore = "requires isolated Redis and generated mTLS certificates"]
 async fn snapshot_gc_waits_for_node_ack_and_recovers_from_lost_ack() {
     use adx_core::snapshots::{Reference, Snapshot, SnapshotState};
-    use adxlet::checkpoint::{CheckpointStore, LocalCheckpointStore};
+    use adxlet::checkpoint::{CheckpointAccess, LocalCheckpointStore};
     let redis = common::Redis::new().await;
     let session = redis.store().await.begin(1).await.unwrap();
     let root = tempfile::tempdir().unwrap();
     let store = Arc::new(LocalCheckpointStore::new(root.path().into()).unwrap());
-    let path = store.allocate().await.unwrap();
+    let path = store.begin_capture().await.unwrap();
     std::fs::write(path.join("memory"), b"preserve snapshot memory").unwrap();
     let snapshot = Snapshot::new(
         "snapshot-gc".into(),
@@ -2242,7 +2253,7 @@ async fn snapshot_gc_waits_for_node_ack_and_recovers_from_lost_ack() {
         spec("source"),
         "node".into(),
         "source-1".into(),
-        store.publish(&path).await.unwrap(),
+        store.seal(&path).await.unwrap(),
     )
     .unwrap();
     session.publish_snapshot(snapshot.clone()).await.unwrap();
@@ -2365,14 +2376,18 @@ async fn snapshot_gc_waits_for_node_ack_and_recovers_from_lost_ack() {
         .acquire_snapshot(&snapshot.id, "tenant", reference.clone())
         .await
         .unwrap();
-    session
+    assert!(session
         .delete_snapshot(&snapshot.id, "tenant")
         .await
-        .unwrap();
+        .is_err());
     assert_eq!(coordinator.collect_snapshots().await.unwrap(), 0);
     assert!(path.exists());
-    let deleting = session
+    session
         .release_snapshot(&snapshot.id, reference)
+        .await
+        .unwrap();
+    let deleting = session
+        .delete_snapshot(&snapshot.id, "tenant")
         .await
         .unwrap();
     let request = pb::CollectSnapshotRequest {
@@ -2499,41 +2514,25 @@ async fn snapshot_gc_waits_for_node_ack_and_recovers_from_lost_ack() {
         source.spec.as_ref().unwrap().resources
     );
     let clone_artifact = created
-        .checkpoint
+        .snapshot_source
         .as_ref()
         .unwrap()
         .artifact
         .as_ref()
-        .unwrap();
-    assert_ne!(clone_artifact, reusable.artifact.as_ref().unwrap());
-    assert!(session
-        .get_snapshot(&reusable.id)
-        .await
         .unwrap()
-        .references
-        .contains(&Reference::Restore {
-            environment_id: "snapshot-clone".into()
-        }));
+        .clone();
+    assert_eq!(&clone_artifact, reusable.artifact.as_ref().unwrap());
     assert_eq!(coordinator.collect_snapshots().await.unwrap(), 0);
     assert!(session
-        .get_snapshot(&reusable.id)
-        .await
-        .unwrap()
-        .references
-        .is_empty());
-    session
         .delete_snapshot(&reusable.id, "tenant")
         .await
-        .unwrap();
-    assert_eq!(coordinator.collect_snapshots().await.unwrap(), 1);
-    assert!(!std::path::Path::new(&reusable.artifact.as_ref().unwrap().location).exists());
-    assert!(std::path::Path::new(&clone_artifact.location).exists());
-    // Retry a completed create even after its source was collected.
+        .is_err());
+    // Repeating create uses the assigned Sandbox and its retained Snapshot reference.
     assert_eq!(
         frontend
             .create_local_environment(pb::LocalEnvironmentCreateRequest {
                 create: Some(request.clone()),
-                node_session_id: "gc-boot".into(),
+                node_session_id: "gc-boot".into()
             })
             .await
             .unwrap()
@@ -2560,6 +2559,17 @@ async fn snapshot_gc_waits_for_node_ack_and_recovers_from_lost_ack() {
         })
         .await
         .unwrap();
+    assert!(session
+        .get_snapshot(&reusable.id)
+        .await
+        .unwrap()
+        .references
+        .is_empty());
+    session
+        .delete_snapshot(&reusable.id, "tenant")
+        .await
+        .unwrap();
+    assert_eq!(coordinator.collect_snapshots().await.unwrap(), 1);
     assert!(!std::path::Path::new(&clone_artifact.location).exists());
 }
 
@@ -2605,7 +2615,7 @@ async fn coordinator_restart_releases_snapshot_pins_for_lost_memory_queue_only()
         )
         .await
         .unwrap();
-    first.delete_snapshot(&snapshot.id, "tenant").await.unwrap();
+    assert!(first.delete_snapshot(&snapshot.id, "tenant").await.is_err());
     let second = store.begin(1).await.unwrap();
     let _coordinator = CoordinatorRpc::new(
         second.clone(),
@@ -2680,7 +2690,7 @@ impl RuntimeDriver for RecoveryBackend {
 #[ignore = "requires isolated Redis and mTLS certificates"]
 async fn shared_checkpoint_moves_to_new_node_and_old_node_cleans_without_deleting_artifact() {
     use adx_core::{Assignment, EnvironmentState, RestorePoint};
-    use adxlet::checkpoint::{CheckpointStore, ObjectCheckpointStore, RemoteGcConfig};
+    use adxlet::checkpoint::{CheckpointAccess, ObjectCheckpointStore};
     let redis = common::Redis::new().await;
     let session = redis.store().await.begin(2).await.unwrap();
     let test_peers = || {
@@ -2722,15 +2732,11 @@ async fn shared_checkpoint_moves_to_new_node_and_old_node_cleans_without_deletin
         1024,
     )
     .unwrap()
-    .with_owner(
-        "source".into(),
-        "old-upload-session".into(),
-        RemoteGcConfig::default(),
-    )
+    .with_owner("source".into(), "old-upload-session".into())
     .unwrap();
-    let staged = source_store.allocate().await.unwrap();
+    let staged = source_store.begin_capture().await.unwrap();
     std::fs::write(staged.join("memory"), b"saved runtime state").unwrap();
-    let artifact = source_store.publish(&staged).await.unwrap();
+    let artifact = source_store.seal(&staged).await.unwrap();
     let target_dir = tempfile::tempdir().unwrap();
     let target_store = Arc::new(
         ObjectCheckpointStore::new(
@@ -2794,6 +2800,7 @@ async fn shared_checkpoint_moves_to_new_node_and_old_node_cleans_without_deletin
         ..Default::default()
     };
     let mut target_report = pb::RegisterNodeRequest {
+        labels: [("ADX_CHECKPOINT_STORAGE".into(), "shared".into())].into(),
         runtime_classes: vec![
             "runsc".into(),
             "runc".into(),
@@ -2836,6 +2843,8 @@ async fn shared_checkpoint_moves_to_new_node_and_old_node_cleans_without_deletin
         .await
         .unwrap();
     let old = EnvironmentRecord {
+        execution_artifacts: vec![],
+        snapshot_source: None,
         failure: None,
         spec: spec("held"),
         assignment: previous,
@@ -2929,7 +2938,7 @@ async fn shared_checkpoint_moves_to_new_node_and_old_node_cleans_without_deletin
         .unwrap()
         .into_inner();
     assert!(catalog.records.is_empty());
-    assert_eq!(catalog.retained_checkpoints.len(), 1);
+    assert_eq!(catalog.retained_artifacts.len(), 1);
     let returned_dir = tempfile::tempdir().unwrap();
     let returned_store = Arc::new(
         ObjectCheckpointStore::new(
@@ -2940,14 +2949,7 @@ async fn shared_checkpoint_moves_to_new_node_and_old_node_cleans_without_deletin
             1024,
         )
         .unwrap()
-        .with_owner(
-            "source".into(),
-            "new-upload-session".into(),
-            RemoteGcConfig {
-                min_age_seconds: 0,
-                ..Default::default()
-            },
-        )
+        .with_owner("source".into(), "new-upload-session".into())
         .unwrap(),
     );
     let old_backend = Arc::new(Backend {
@@ -2970,17 +2972,16 @@ async fn shared_checkpoint_moves_to_new_node_and_old_node_cleans_without_deletin
     .with_checkpointing(returned_store.clone(), Arc::new(LocalChecks))
     .unwrap();
     let retained = catalog
-        .retained_checkpoints
+        .retained_artifacts
         .into_iter()
-        .map(|cp| RestorePoint::try_from(cp).unwrap().artifact)
+        .map(|cp| adx_core::CheckpointArtifact::try_from(cp).unwrap())
         .collect();
     returned
         .reconcile_retained(vec![], vec![], retained)
         .await
         .unwrap();
     assert!(old_backend.running.lock().unwrap().is_empty());
-    assert_eq!(returned.collect_remote_orphans().await.unwrap(), 0);
-    assert!(returned_store.materialize(&artifact).await.is_ok());
+    assert!(returned_store.prepare_restore(&artifact).await.is_ok());
 }
 
 #[path = "rpc/local_first.rs"]

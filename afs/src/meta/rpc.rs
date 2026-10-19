@@ -892,6 +892,63 @@ impl OwnerRootsService for OwnerRootsRpc {
 
 #[tonic::async_trait]
 impl DfsMetaService for DfsMetaRpc {
+    async fn update_gc_reference(
+        &self,
+        request: Request<afs_protocol::meta::UpdateDfsGcReferenceRequest>,
+    ) -> Result<Response<afs_protocol::meta::UpdateDfsGcReferenceReply>, Status> {
+        let authenticated = authenticated_node_id(&self.0, &request)?;
+        let request = request.into_inner();
+        validate_caller(authenticated.as_deref(), &request.node_id)?;
+        dfs_service(&self.0)?
+            .update_gc_reference(crate::dfs::UpdateGcReference {
+                node_id: request.node_id,
+                session_id: request.session_id,
+                reference_id: request.reference_id,
+                inode_id: optional_id(request.inode_id).map(crate::dfs::InodeId::new),
+                version_id: optional_id(request.version_id).map(crate::dfs::FileVersionId::new),
+                publication: request.publication,
+                chunks: request
+                    .chunks
+                    .into_iter()
+                    .map(domain_chunk_object)
+                    .collect::<Result<Vec<_>, _>>()?,
+                release: request.release,
+                admission_deadline_unix_ms: request.admission_deadline_unix_ms,
+            })
+            .await
+            .map_err(afs_transport::grpc::error_status::error_to_status)?;
+        Ok(Response::new(
+            afs_protocol::meta::UpdateDfsGcReferenceReply {},
+        ))
+    }
+    async fn collect_garbage(
+        &self,
+        request: Request<afs_protocol::meta::CollectDfsGarbageRequest>,
+    ) -> Result<Response<afs_protocol::meta::CollectDfsGarbageReply>, Status> {
+        let authenticated = authenticated_node_id(&self.0, &request)?;
+        let request = request.into_inner();
+        validate_caller(authenticated.as_deref(), &request.node_id)?;
+        let node = request.node_id.clone();
+        let state = dfs_service(&self.0)?
+            .collect_garbage(
+                request.node_id,
+                request.session_id,
+                request.completed_generation,
+                request
+                    .inventory
+                    .into_iter()
+                    .map(domain_chunk_object)
+                    .collect::<Result<Vec<_>, _>>()?,
+            )
+            .await
+            .map_err(afs_transport::grpc::error_status::error_to_status)?;
+        Ok(Response::new(afs_protocol::meta::CollectDfsGarbageReply {
+            generation: state.generation,
+            pending_for_node: state.waiting_nodes.contains(&node),
+            chunk_ids: state.chunks.into_iter().map(|id| id.0).collect(),
+        }))
+    }
+
     async fn lookup(
         &self,
         request: Request<DfsLookupRequest>,
@@ -1960,6 +2017,14 @@ impl DfsMetaService for DfsMetaRpc {
                     file_version: version,
                     layout_root: layout,
                     chunk_receipts: receipts,
+                    clone_source: request
+                        .clone_source
+                        .map(|source| crate::dfs::CloneFileRange {
+                            version: crate::dfs::FileVersionId::new(source.version_id),
+                            source_offset: source.source_offset,
+                            destination_offset: source.destination_offset,
+                            length: source.length,
+                        }),
                     metadata_delta,
                 },
             )

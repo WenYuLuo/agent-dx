@@ -39,6 +39,7 @@ pub mod journal;
 pub use journal::MetaLog;
 pub mod local_log;
 pub mod log;
+mod profile;
 mod state;
 use state::State;
 #[cfg(test)]
@@ -307,6 +308,8 @@ pub enum MetaEntity {
     DfsWriteLease(WriteLease),
     /// Latest issued OwnerFs incarnation; never removed with a Root.
     RootEpochWatermark(u64),
+    DfsReference(crate::dfs::GcReference),
+    DfsGc(crate::dfs::GcState),
 }
 
 impl MetaEntity {
@@ -330,6 +333,8 @@ impl MetaEntity {
             Self::DfsReplicationTask(_) => "dfs_replication_task",
             Self::DfsWriteLease(_) => "dfs_write_lease",
             Self::RootEpochWatermark(_) => "root_epoch_watermark",
+            Self::DfsReference(_) => "dfs_reference",
+            Self::DfsGc(_) => "dfs_gc",
         }
     }
 }
@@ -396,6 +401,7 @@ pub enum MetaRead {
     DfsReplicationTask(ReplicationTaskId),
     DfsReplicationTasks,
     DfsWriteLease(InodeId),
+    DfsGc,
 }
 
 /// A linearizable read response. Empty results are represented explicitly so
@@ -413,6 +419,7 @@ pub struct MetaSnapshot {
 pub enum TxnCondition {
     /// Compare the allocation floor in the same writer turn as reserving an epoch.
     RootEpochWatermarkEquals(u64),
+    StoreRevisionEquals(StoreRevision),
     Missing(MetaKey),
     RevisionEquals {
         key: MetaKey,
@@ -520,7 +527,13 @@ pub enum MetaKey {
     DfsCopy(crate::dfs::CopyId),
     DfsReplicationTask(ReplicationTaskId),
     DfsWriteLease(InodeId),
+    DfsGc,
     RootEpochWatermark,
+    DfsReference {
+        node_id: String,
+        session_id: String,
+        reference_id: String,
+    },
 }
 
 /// Idempotent result stored in the same transaction as the authority mutation.
@@ -563,6 +576,8 @@ pub enum StoreOperation {
     DfsRenewWriteLease,
     DfsSyncInodeMetadata,
     DfsCommitFileVersion,
+    DfsUpdateReference,
+    DfsCollectGarbage,
     DfsInitializeReplicationConfig,
     DfsInitializeDurabilityPolicy,
     DfsClaimReplicationTask,
@@ -603,6 +618,8 @@ impl StoreOperation {
             Self::DfsRenewWriteLease => "dfs_renew_write_lease",
             Self::DfsSyncInodeMetadata => "dfs_sync_inode_metadata",
             Self::DfsCommitFileVersion => "dfs_commit_file_version",
+            Self::DfsUpdateReference => "dfs_update_reference",
+            Self::DfsCollectGarbage => "dfs_collect_garbage",
             Self::DfsInitializeReplicationConfig => "dfs_initialize_replication_config",
             Self::DfsInitializeDurabilityPolicy => "dfs_initialize_durability_policy",
             Self::DfsClaimReplicationTask => "dfs_claim_replication_task",
@@ -866,6 +883,10 @@ pub struct OwnerRootScan {
 /// Operations are serialized by Store in the active Meta. Only durable
 /// backends preserve facts across restart; memory is explicitly volatile.
 /// Boxed only on the coarse Meta control path.
+pub fn timed_request_id(id: impl std::fmt::Display) -> String {
+    format!("afs1-{}-{id}", now_unix_ms())
+}
+
 pub type MetaFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
 
 #[derive(Clone, Copy)]
@@ -1149,13 +1170,13 @@ impl MetaReadView {
                 .clone(),
         }
     }
-    pub async fn read(&self, read: MetaRead) -> Result<MetaSnapshot> {
+    fn with_state<T>(&self, read: impl FnOnce(&State) -> Result<T>) -> Result<T> {
         match &self.state {
             #[cfg(test)]
-            ReadState::Unmanaged(state) => state.read(read),
+            ReadState::Unmanaged(state) => read(state),
             ReadState::Pinned(pin) => {
                 let held = pin.capture()?;
-                let result = held.allocation.state.read(read);
+                let result = read(&held.allocation.state);
                 pin.check()?;
                 if held.owner.bytes.is_closed() {
                     return Err(unavailable("Meta read budget failed"));
@@ -1164,6 +1185,28 @@ impl MetaReadView {
             }
         }
     }
+
+    pub(crate) fn snapshot(&self) -> Result<(StoreRevision, Vec<MetaEntity>)> {
+        self.with_state(|state| Ok((state.revision,
+            state.entities.values().map(|entry| entry.entity.clone()).collect())))
+    }
+
+    pub(crate) fn statistics(&self) -> Result<serde_json::Value> {
+        self.with_state(|state| {
+            let mut kinds = std::collections::BTreeMap::new();
+            for entry in state.entities.values() {
+                *kinds.entry(entry.entity.name()).or_insert(0_u64) += 1;
+            }
+            Ok(serde_json::json!({"revision": state.revision.0, "entities": kinds,
+                "requests": state.requests.len(), "events": state.events.len(),
+                "watch_floor": state.compacted_to.0}))
+        })
+    }
+
+    pub async fn read(&self, read: MetaRead) -> Result<MetaSnapshot> {
+        self.with_state(|state| state.read(read))
+    }
+
 }
 
 pub trait MetaStore: Send + Sync {
@@ -2526,6 +2569,12 @@ pub(crate) fn now_unix_ms() -> u64 {
 fn entity_key(entity: &MetaEntity) -> MetaKey {
     match entity {
         MetaEntity::RootEpochWatermark(_) => MetaKey::RootEpochWatermark,
+        MetaEntity::DfsReference(reference) => MetaKey::DfsReference {
+            node_id: reference.node_id.clone(),
+            session_id: reference.session_id.clone(),
+            reference_id: reference.reference_id.clone(),
+        },
+        MetaEntity::DfsGc(_) => MetaKey::DfsGc,
         MetaEntity::NodeSession(session) => MetaKey::NodeSession {
             node_id: session.node_id.clone(),
             session_id: session.session_id.clone(),
@@ -2565,6 +2614,7 @@ fn entity_key(entity: &MetaEntity) -> MetaKey {
 
 fn condition_matches(state: &State, condition: &TxnCondition) -> bool {
     match condition {
+        TxnCondition::StoreRevisionEquals(revision) => state.revision == *revision,
         TxnCondition::RootEpochWatermarkEquals(expected) => {
             state.root_epoch_watermark() == *expected
         }

@@ -1,5 +1,6 @@
 //! Async RPC coordination around the synchronous scheduler and Redis repository.
 use adx_transport::rpc::RpcClient;
+mod artifacts;
 mod autoscaling;
 mod claims;
 mod cloning;
@@ -209,6 +210,7 @@ impl State {
     }
 }
 struct Inner {
+    reclaimers: std::sync::RwLock<adx_checkpoint_storage::reclaim::Reclaimers>,
     resume_admission: Arc<tokio::sync::Semaphore>,
     resume_locks: std::sync::Mutex<BTreeMap<String, std::sync::Weak<Mutex<()>>>>,
     state: Mutex<State>,
@@ -385,6 +387,7 @@ impl CoordinatorRpc {
         let (claim_sender, claim_requests) = mpsc::channel(CLAIM_BATCH_CAPACITY);
         tokio::spawn(run_claim_batches(session.clone(), claim_requests));
         Ok(Self(Arc::new(Inner {
+            reclaimers: Default::default(),
             resume_admission: Arc::new(tokio::sync::Semaphore::new(1024)),
             resume_locks: std::sync::Mutex::new(BTreeMap::new()),
             state: Mutex::new(State {
@@ -421,6 +424,14 @@ impl CoordinatorRpc {
             timeout,
             heartbeat_timeout,
         })))
+    }
+    pub fn with_reclaimers(self, reclaimers: adx_checkpoint_storage::reclaim::Reclaimers) -> Self {
+        *self
+            .0
+            .reclaimers
+            .write()
+            .expect("reclaimer registry lock poisoned") = reclaimers;
+        self
     }
     /// Invalidate expired executions and their routes before admitting a returning node.
     pub async fn expire_nodes(&self) -> Result<usize> {
@@ -1148,14 +1159,38 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                     ));
                 }
                 let snapshot = state.session.snapshot().await.map_err(status)?;
-                let retained_checkpoints = snapshot
-                    .environments
-                    .values()
-                    .filter_map(|i| i.result.as_ref().and_then(|r| r.checkpoint.as_ref()))
-                    .filter(|cp| cp.artifact.storage != "local")
-                    .cloned()
-                    .map(Into::into)
-                    .collect();
+                let holds = state.session.execution_holds().await.map_err(status)?;
+                let mut retained = BTreeMap::new();
+                let mut retain = |artifact: &adx_core::CheckpointArtifact| {
+                    if artifact.storage == "local" {
+                        return;
+                    }
+                    let key = (artifact.storage.clone(), artifact.location.clone());
+                    let entry = retained.entry(key).or_insert_with(|| artifact.clone());
+                    if artifact.size_bytes > entry.size_bytes {
+                        *entry = artifact.clone();
+                    }
+                };
+                for environment in snapshot.environments.values() {
+                    if let Some(record) = &environment.result {
+                        for point in record
+                            .checkpoint
+                            .iter()
+                            .chain(record.snapshot_source.iter())
+                        {
+                            retain(&point.artifact);
+                        }
+                        for artifact in &record.execution_artifacts {
+                            retain(artifact);
+                        }
+                    }
+                }
+                for hold in holds {
+                    for artifact in hold.artifacts {
+                        retain(&artifact);
+                    }
+                }
+                let retained_artifacts = retained.into_values().map(Into::into).collect();
                 let records = snapshot
                     .environments
                     .into_values()
@@ -1165,6 +1200,8 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                     .map(|i| {
                         i.result
                             .unwrap_or_else(|| EnvironmentRecord {
+                                execution_artifacts: vec![],
+                                snapshot_source: None,
                                 failure: None,
                                 restart_attempts: 0,
                                 restart_pending: false,
@@ -1201,7 +1238,7 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                 Ok(Response::new(pb::InspectNodeResponse {
                     records,
                     snapshots,
-                    retained_checkpoints,
+                    retained_artifacts,
                     coordinator_epoch: state.session.epoch(),
                 }))
             })
@@ -1323,6 +1360,19 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
             }
             state.nodes.insert(saved.node.id.clone(), saved);
             state.recovering.remove(&r.node_id);
+            if !r.reconciling
+                && inspected
+                && state
+                    .live
+                    .get(&r.node_id)
+                    .is_some_and(|live| live.report.reconciling)
+            {
+                state
+                    .session
+                    .release_execution_holds(&r.node_id, &r.session_id)
+                    .await
+                    .map_err(status)?;
+            }
             if let Some(old) = state.live.remove(&r.node_id) {
                 if old.session != r.session_id {
                     state
@@ -1533,6 +1583,8 @@ mod reconciliation_tests {
             spec: spec.clone(),
             assignment: assignment.clone(),
             result: Some(EnvironmentRecord {
+                execution_artifacts: vec![],
+                snapshot_source: None,
                 failure: None,
                 spec,
                 assignment,

@@ -22,6 +22,7 @@ impl Session {
             .arg(
                 r#"
             if redis.call('HGET', KEYS[1], 'header') ~= ARGV[1] then return 0 end
+            if redis.call('HEXISTS',KEYS[3],ARGV[5]) == 1 and ARGV[6] ~= 'deletion' then return 2 end
             local old = redis.call('HGET', KEYS[2], ARGV[2])
             if ARGV[3] == '' then
                 if old then return 0 end
@@ -29,14 +30,21 @@ impl Session {
             redis.call('HSET', KEYS[2], ARGV[2], ARGV[4]); return 1
         "#,
             )
-            .arg(2)
+            .arg(3)
             .arg(&self.store.key)
             .arg(self.snapshots_key())
+            .arg(format!("{}:artifact-gc",self.store.key))
             .arg(header_value.as_deref().ok_or(Error::Conflict)?)
             .arg(id)
             .arg(old.unwrap_or(""))
-            .arg(encode(next)?);
-        Ok(self.store.query::<u64>(command).await? == 1)
+            .arg(encode(next)?)
+            .arg(artifacts::artifact_key(&next.artifact))
+            .arg(if matches!(next.state, SnapshotState::Deleting | SnapshotState::Deleted) { "deletion" } else { "reference" });
+        match self.store.query::<u64>(command).await? {
+            1 => Ok(true),
+            2 => Err(Error::Conflict),
+            _ => Ok(false),
+        }
     }
     pub async fn publish_snapshot(&self, record: Snapshot) -> Result<Snapshot> {
         record.validate()?;

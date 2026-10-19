@@ -688,6 +688,8 @@ mod tests {
             ..Default::default()
         };
         let record = pb::EnvironmentRecord {
+            execution_artifacts: vec![],
+            snapshot_source: None,
             failure: None,
             spec: Some(spec.clone()),
             state: pb::EnvironmentState::Running as i32,
@@ -730,6 +732,8 @@ mod tests {
         spec.env
             .insert("EXECD_TUNNEL_HTTP_PORT".into(), "12345".into());
         let record = pb::EnvironmentRecord {
+            execution_artifacts: vec![],
+            snapshot_source: None,
             failure: None,
             spec: Some(spec.clone()),
             state: pb::EnvironmentState::Running as i32,
@@ -748,6 +752,8 @@ mod tests {
     #[test]
     fn create_owner_cache_must_cover_the_published_running_revision() {
         let record = pb::EnvironmentRecord {
+            execution_artifacts: vec![],
+            snapshot_source: None,
             failure: None,
             spec: Some(pb::EnvironmentSpec {
                 id: "tenant-worker".into(),
@@ -766,6 +772,8 @@ mod tests {
         };
         let owner = |state, generation, revision, node_id: &str| pb::GetEnvironmentResponse {
             record: Some(pb::EnvironmentRecord {
+                execution_artifacts: vec![],
+                snapshot_source: None,
                 failure: None,
                 spec: record.spec.clone(),
                 assignment: Some(pb::Assignment {

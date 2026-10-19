@@ -23,6 +23,7 @@ from demand_physical import audit as audit_demand
 from autoscaling_contract import verify as verify_autoscaling
 from cache_contract import verify as verify_cache
 from storage_fixture import public as public_storage
+from storage_contract import verify as verify_storage
 
 
 def _executable(name, environment=None, cwd=None):
@@ -40,7 +41,7 @@ def _executable(name, environment=None, cwd=None):
 def main():
     root = Path(sys.argv[1]).resolve()
     suite = os.getenv('ADX_FC_SUITE', 'transfer')
-    if suite not in ('transfer', 'demand', 'autoscaling', 'cache'):
+    if suite not in ('transfer', 'demand', 'autoscaling', 'cache', 'storage'):
         raise ValueError('unknown Firecracker suite')
     demand_suite = suite == 'demand'
     verify = {
@@ -48,6 +49,7 @@ def main():
         'demand': verify_demand,
         'autoscaling': verify_autoscaling,
         'cache': verify_cache,
+        'storage': verify_storage,
     }[suite]
     sdk_result_name = 'sdk-' + suite + '.json'
     base = Path(os.environ.get('ADX_FC_BASE', '/opt/adx'))
@@ -225,7 +227,8 @@ def main():
                 ],
             )
             wait(lambda: urllib.request.urlopen('http://127.0.0.1:19090/minio/health/ready', timeout=2).status == 200)
-        call(['python3', base / 'e2e/firecracker/s3_probe.py', root, '--create'])
+        if public_storage(root)['kind'] != 'afs':
+            call(['python3', base / 'e2e/firecracker/s3_probe.py', root, '--create'])
         spawn('registry', ['docker-registry', 'serve', root / 'registry.yaml'])
         sys.path.insert(0, str(base / 'e2e'))
         import publish
@@ -234,6 +237,8 @@ def main():
         image = f'{HOST}:5000/adx-execd@{digest}'
         (evidence / 'execd-image.json').write_text(json.dumps({'image': image}))
         spawn('control', [base / 'package/bin/adxctl', 'run', '--config', root / 'deployment.yaml'])
+        if suite == 'storage':
+            spawn('ingress2', [base / 'package/bin/adxctl', 'run', '--config', root / 'ingress2/deployment.yaml'])
         for node, ns in namespaces.items():
             folder = root / node
             mask = folder / 'peer-mask'
@@ -302,11 +307,12 @@ def main():
         (root / 'backend-pids.json').write_text(json.dumps(backend_pids))
         print('TWO FIRECRACKER NODES READY', flush=True)
         driver = 'sdk_' + suite + '.py'
-        call([base / 'client/bin/python', '-u', base / 'e2e/firecracker' / driver, root, image], timeout=14400 if demand_suite else 900)
+        call([base / 'client/bin/python', '-u', base / 'e2e/firecracker' / driver, root, image], timeout=14400 if suite in ('demand', 'storage') else 900)
         result.update(json.loads((evidence / sdk_result_name).read_text()))
         for name in namespaces:
             result['inventories'][name] = inventory(name)
-        call(['python3', base / 'e2e/firecracker/s3_probe.py', root])
+        if public_storage(root)['kind'] != 'afs':
+            call(['python3', base / 'e2e/firecracker/s3_probe.py', root])
         result['obs_empty'] = public_storage(root)['kind'] == 'real_obs'
     except BaseException as error:
         sdk_result = evidence / sdk_result_name
@@ -353,6 +359,11 @@ def main():
                 call([base / 'package/bin/adxctl', 'stop', '--config', root / node / 'deployment.yaml'], timeout=90)
             except Exception as error:
                 result['cleanup_errors'].append(f'{node}: {error}')
+        if suite == 'storage':
+            try:
+                call([base / 'package/bin/adxctl', 'stop', '--config', root / 'ingress2/deployment.yaml'], timeout=90)
+            except Exception as error:
+                result['cleanup_errors'].append(f'ingress2: {error}')
         try:
             call([base / 'package/bin/adxctl', 'stop', '--config', root / 'deployment.yaml'], timeout=90)
         except Exception as error:

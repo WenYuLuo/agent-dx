@@ -650,7 +650,7 @@ impl Ingress {
             drop(guard);
             return Err(io::Error::new(
                 io::ErrorKind::NotConnected,
-                "route changed while opening the stream",
+                IngressOpenError::RouteChanged,
             ));
         }
         let stream = self
@@ -2558,8 +2558,13 @@ fn strip_token_query(query: &str) -> String {
 }
 
 fn error_response(error: IngressOpenError) -> Response<ProxyBody> {
-    if matches!(&error, IngressOpenError::Resolve(ResolveError::Resuming))
-        || matches!(&error, IngressOpenError::Connect(e) if e.get_ref().and_then(|e| e.downcast_ref::<ResolveError>()) == Some(&ResolveError::Resuming))
+    // RouteChanged is emitted only before CONNECT or the business send. Keep
+    // that typed evidence so clients can retry; never classify by message text.
+    if matches!(
+        &error,
+        IngressOpenError::Resolve(ResolveError::Resuming) | IngressOpenError::RouteChanged
+    ) || matches!(&error, IngressOpenError::Connect(e) if e.get_ref().and_then(|e| e.downcast_ref::<ResolveError>()) == Some(&ResolveError::Resuming)
+        || matches!(e.get_ref().and_then(|e| e.downcast_ref::<IngressOpenError>()), Some(IngressOpenError::RouteChanged)))
     {
         return resuming_response("", "");
     }
@@ -2642,6 +2647,33 @@ mod tests {
     use super::*;
     use crate::common::protocol::ConnectTarget;
     use crate::common::route::{DataPlaneAuthMode, DataPlaneSecurityMode};
+
+    #[tokio::test]
+    async fn preforward_route_change_is_retryable_but_other_connection_errors_are_not() {
+        for error in [
+            IngressOpenError::RouteChanged,
+            IngressOpenError::Connect(io::Error::new(
+                io::ErrorKind::NotConnected,
+                IngressOpenError::RouteChanged,
+            )),
+        ] {
+            let response = error_response(error);
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(
+                response.headers().get("x-adx-error-code").unwrap(),
+                "ENV_RESUMING"
+            );
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"]["requestForwarded"], false);
+        }
+        // Words alone are not evidence that no application bytes were sent.
+        let response = error_response(IngressOpenError::Connect(io::Error::new(
+            io::ErrorKind::NotConnected,
+            "route changed while opening the stream",
+        )));
+        assert!(response.headers().get("x-adx-error-code").is_none());
+    }
 
     #[test]
     fn watch_subscription_failure_reconnects_transient_transport_but_rejects_permissions() {

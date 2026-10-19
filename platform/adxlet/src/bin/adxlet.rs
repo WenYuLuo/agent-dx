@@ -61,8 +61,6 @@ struct Config {
     checkpoint_storage: Option<adxlet::checkpoint::StorageConfig>,
     #[serde(default)]
     degradation_journal: Option<PathBuf>,
-    #[serde(default)]
-    checkpoint_gc: adxlet::checkpoint::RemoteGcConfig,
     report_interval_seconds: u64,
     rpc_timeout_seconds: u64,
     #[serde(default = "runtime_ready_timeout")]
@@ -117,7 +115,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if config.sandboxd_socket.is_none() && config.jiuwenbox.is_none() {
         return Err("configure sandboxd_socket and/or jiuwenbox".into());
     }
-    config.checkpoint_gc.validate()?;
     let runtime_logs = RuntimeLogs::new(config.runtime_logs.clone())?;
     // Embedded Proxy and Adxlet share this process-wide subscriber and
     // tracer provider; standalone Proxy initializes the same library itself.
@@ -300,11 +297,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(storage) = checkpoint_storage {
         manager = manager
             .with_checkpointing(
-                storage.build_for_node(
-                    config.node_id.clone(),
-                    session_id.clone(),
-                    config.checkpoint_gc.clone(),
-                )?,
+                storage.build_for_node(config.node_id.clone(), session_id.clone())?,
                 Arc::new(control.clone()),
             )?
             .with_snapshot_catalog(sink.clone())?;
@@ -394,19 +387,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let sample_timeout = timeout.min(Duration::from_secs(config.report_interval_seconds));
         let mut interval =
             tokio::time::interval(Duration::from_secs(config.report_interval_seconds));
-        let mut gc_jobs = tokio::task::JoinSet::new();
-        let gc_interval = Duration::from_secs(config.checkpoint_gc.interval_seconds);
-        let mut next_gc = tokio::time::Instant::now();
         loop {
             interval.tick().await;
-            while let Some(result) = gc_jobs.try_join_next() {
-                match result {
-                    Ok(Ok(Ok(count))) => {
-                        adx_observability::warn!("remote orphan GC completed: removed={count}")
-                    }
-                    other => adx_observability::warn!("remote orphan GC incomplete: {other:?}"),
-                }
-            }
             if let Some(discovery) = &discovery {
                 match discovery.lookup().await {
                     Ok(found) if found.address != endpoint => {
@@ -465,18 +447,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(()) => {
                     if let Some(journal) = &journal {
                         if let Err(error) = journal.flush().await {
-                            manager.pause_lifecycle().await;
+                            let mut handshake_required = false;
+                            adxlet::node_reconciliation::pause_lifecycle_reporting(
+                                &manager, &mut coordinator, &mut last, timeout,
+                                Duration::from_secs(config.report_interval_seconds),
+                                &mut handshake_required,
+                            ).await?;
+                            last.reconciling |= handshake_required;
                             adx_observability::warn!("degradation journal publication incomplete: {error}");
                             continue;
                         }
-                    }
-                    if config.checkpoint_gc.enabled && gc_jobs.is_empty()
-                        && tokio::time::Instant::now() >= next_gc {
-                        next_gc = tokio::time::Instant::now() + gc_interval;
-                        let manager = manager.clone();
-                        gc_jobs.spawn(async move {
-                            tokio::time::timeout(timeout, manager.collect_remote_orphans()).await
-                        });
                     }
                 },
                 Err(error) => adx_observability::warn!("authoritative node reconciliation incomplete; new admission remains closed: {error}"),

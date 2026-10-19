@@ -224,6 +224,8 @@ pub struct DistributedFs {
     read_engine: Arc<DfsReadEngine>,
     remote_owner_factory: Option<Arc<dyn DfsRemoteOwnerFactory>>,
     handles: DfsHandleTable,
+    gc_references: Option<Arc<crate::node::gc::GcReferences>>,
+    gc_gate: Mutex<()>,
     dir_handles: Mutex<HashMap<u64, DfsDirectoryHandle>>,
     inode_writes: ShardedMap<InodeId, SharedInodeWriteState>,
     remote_inode_providers: ShardedMap<InodeId, RemoteDfsWriteSession>,
@@ -255,6 +257,7 @@ pub struct DistributedFs {
     lock_session_reap_cursor: AtomicU64,
     owner_handle_reap_cursor: AtomicU64,
     writeback_cursor: AtomicU64,
+    write_lease_cursor: AtomicU64,
     writeback_maintenance_gate: Mutex<()>,
     write_pipeline_budget: Arc<DeferredWriteBudget>,
     write_pipeline_budget_gate: Mutex<()>,
@@ -643,6 +646,7 @@ struct NativeReadView {
 }
 
 struct DfsFileHandle {
+    gc_pin: Option<Arc<crate::node::gc::GcPin>>,
     inode_id: InodeId,
     opened_inode: InodeRecord,
     opened_page_identity: Option<PageCacheIdentity>,
@@ -655,6 +659,7 @@ struct DfsFileHandle {
 }
 
 struct DfsHandle {
+    _gc_pin: Option<Arc<crate::node::gc::GcPin>>,
     inode_id: InodeId,
     flags: i32,
     owner_scope: Option<DfsOwnerHandleScope>,
@@ -730,6 +735,7 @@ impl NativeReadRefresh {
 impl From<DfsFileHandle> for DfsHandle {
     fn from(opened: DfsFileHandle) -> Self {
         Self {
+            _gc_pin: opened.gc_pin,
             inode_id: opened.inode_id,
             flags: opened.flags,
             owner_scope: opened.owner_scope,
@@ -1095,6 +1101,7 @@ impl OwnerOpenFinishPause {
 }
 
 struct DfsDirectoryHandle {
+    _gc_pin: Option<Arc<crate::node::gc::GcPin>>,
     entries: Vec<DirectoryEntry>,
 }
 
@@ -2340,6 +2347,7 @@ impl Drop for NativeUploadPermit {
 }
 
 struct NativeUpload {
+    _gc_pin: Option<Arc<crate::node::gc::GcPin>>,
     operation_id: OperationId,
     chunk: ChunkObject,
     owner: Weak<InodeWriteStateCell>,
@@ -2459,6 +2467,7 @@ struct DirtyExtentMap {
     next_builder_order: u64,
     native_admitted_bytes: Option<u64>,
     native_operation_id: Option<OperationId>,
+    native_gc_pin: Option<Arc<crate::node::gc::GcPin>>,
 }
 
 struct NativeDirtyBuilder {
@@ -2496,6 +2505,7 @@ impl Clone for DirtyExtentMap {
             next_builder_order: self.next_builder_order,
             native_admitted_bytes: self.native_admitted_bytes,
             native_operation_id: self.native_operation_id.clone(),
+            native_gc_pin: self.native_gc_pin.clone(),
         }
     }
 }
@@ -2542,6 +2552,7 @@ struct OverlaySegment {
 
 #[derive(Clone)]
 struct CommitBatch {
+    _gc_pin: Option<Arc<crate::node::gc::GcPin>>,
     through_seq: u64,
     commit: Arc<CommitFileVersion>,
     _native_accounting: Option<Arc<NativeCommitAccounting>>,
@@ -2643,6 +2654,8 @@ impl DistributedFs {
             read_engine,
             remote_owner_factory: None,
             handles: DfsHandleTable::default(),
+            gc_references: None,
+            gc_gate: Mutex::new(()),
             dir_handles: Mutex::new(HashMap::new()),
             inode_writes: ShardedMap::default(),
             remote_inode_providers: ShardedMap::default(),
@@ -2673,6 +2686,7 @@ impl DistributedFs {
             lock_session_reap_cursor: AtomicU64::new(0),
             owner_handle_reap_cursor: AtomicU64::new(0),
             writeback_cursor: AtomicU64::new(0),
+            write_lease_cursor: AtomicU64::new(0),
             writeback_maintenance_gate: Mutex::new(()),
             write_pipeline_budget: Arc::new(DeferredWriteBudget::default()),
             write_pipeline_budget_gate: Mutex::new(()),
@@ -2700,6 +2714,41 @@ impl DistributedFs {
             next_operation: AtomicU64::new(1),
             next_owner_open_seq: AtomicU64::new(1),
         }
+    }
+
+    pub fn with_gc_references(
+        mut self,
+        references: Option<Arc<crate::node::gc::GcReferences>>,
+    ) -> Self {
+        self.gc_references = references;
+        self
+    }
+    pub fn flush_gc_releases(&self) -> Result<()> {
+        if let Some(references) = &self.gc_references {
+            references.flush()?;
+        }
+        Ok(())
+    }
+    pub fn collect_garbage(&self) -> Result<usize> {
+        let Some(references) = &self.gc_references else {
+            return Ok(0);
+        };
+        let _gate = self
+            .gc_gate
+            .lock()
+            .map_err(|_| unavailable("GC worker poisoned"))?;
+        references.flush()?;
+        let completed = self.read_engine.gc_generation()?;
+        let batch = references
+            .control
+            .collect(completed, self.read_engine.gc_inventory()?)?;
+        if batch.waiting_nodes.contains(&self.node_id) && batch.generation > completed {
+            self.read_engine
+                .collect_generation(batch.generation, &batch.chunks)?;
+            references.control.collect(batch.generation, Vec::new())?;
+            return Ok(batch.chunks.len());
+        }
+        Ok(0)
     }
 
     pub(crate) fn with_native_write_pipeline(
@@ -3076,6 +3125,14 @@ impl DistributedFs {
                     self.observe_handle_error(handle)?;
                 }
             }
+            let gc_pin = if generation.is_none() {
+                self.gc_references
+                    .as_ref()
+                    .map(|references| references.pin(&snapshot.inode_id, None, Some(&operation_id)))
+                    .transpose()?
+            } else {
+                None
+            };
             let operation = self.begin_inode_operation(&snapshot.inode_id, cell.clone())?;
             let (written, accepted_seq) = {
                 let mut state = cell
@@ -3102,6 +3159,7 @@ impl DistributedFs {
                 let next_seq = state.next_write_seq.saturating_add(1);
                 if state.dirty_extents.native_operation_id.is_none() {
                     state.dirty_extents.native_operation_id = Some(operation_id.clone());
+                    state.dirty_extents.native_gc_pin = gc_pin;
                 }
                 let written = state.dirty_extents.write_native_prepared(
                     position,
@@ -3216,6 +3274,7 @@ impl DistributedFs {
             // standard BLAKE3 scan; no body concatenation or clone is involved.
             let staged = StagedChunk::from_shared(operation_id.clone(), body.clone());
             let upload = Arc::new(NativeUpload {
+                _gc_pin: state.dirty_extents.native_gc_pin.clone(),
                 operation_id: operation_id.clone(),
                 chunk: staged.chunk.clone(),
                 owner: Arc::downgrade(cell),
@@ -3690,11 +3749,11 @@ impl DistributedFs {
     }
 
     fn operation_id(&self, prefix: &str) -> OperationId {
-        OperationId::new(format!(
+        OperationId::new(crate::meta::store::timed_request_id(format!(
             "{}-{prefix}-{}",
             self.session_id,
             self.next_operation.fetch_add(1, Ordering::Relaxed)
-        ))
+        )))
     }
 
     fn validate_inode(&self, inode: InodeRecord) -> Result<InodeRecord> {
@@ -3789,9 +3848,13 @@ impl DistributedFs {
         })
     }
 
-    fn allocate_handle(&self, handle: DfsFileHandle) -> Result<FileHandle> {
+    fn allocate_handle(&self, mut handle: DfsFileHandle) -> Result<FileHandle> {
         let id = self.next_handle.fetch_add(1, Ordering::Relaxed);
         let inode_id = handle.inode_id.clone();
+        if let Some(references) = &self.gc_references {
+            handle.gc_pin =
+                Some(references.pin(&inode_id, handle.opened_inode.head_version.as_ref(), None)?);
+        }
         self.handles.insert(id, handle, || {
             let dynamic = self.write_state(&inode_id)?.is_some()
                 || self.current_remote_provider(&inode_id)?.is_some();
@@ -3922,7 +3985,6 @@ impl DistributedFs {
             && state.in_flight.is_none()
             && !state.commit_busy
             && !state.operation_busy
-            && !state.last_writer_background_requested
             && state.background_error.is_none()
             && state.terminal_error.is_none()
     }
@@ -5269,15 +5331,23 @@ impl DistributedFs {
                     state.commit_busy = true;
                     break 'action CommitAction::Send(pending);
                 } else {
+                    // Data-only commits can advance the data sequence while
+                    // leaving timestamps pending. Once the last writer closes,
+                    // flush that metadata even when both sequences are equal;
+                    // otherwise lease renewal keeps unlinked versions forever.
                     let sync_metadata_only = state.metadata_dirty
-                        && matches!(
+                        && (matches!(
                             reason,
                             CommitReason::DataSync
                                 | CommitReason::FullSync
                                 | CommitReason::Close
                                 | CommitReason::NodeDrain
-                        )
-                        && state.visible_write_seq > state.committed_write_seq;
+                        ) && state.visible_write_seq > state.committed_write_seq
+                            || state.open_writers == 0
+                                && matches!(
+                                    reason,
+                                    CommitReason::Background | CommitReason::LastWriter
+                                ));
                     if !(state.dirty
                         || sync_metadata_only
                         || matches!(reason, CommitReason::FullSync) && state.metadata_dirty
@@ -5610,6 +5680,7 @@ impl DistributedFs {
                 state.inode = updated;
                 state.metadata_dirty = false;
                 state.kill_suidgid_dirty = false;
+                state.last_writer_background_requested = false;
                 state.durable_write_seq = state.durable_write_seq.max(through_seq);
                 state.committed_write_seq = state.committed_write_seq.max(through_seq);
                 Ok(Some(state.committed_write_seq))
@@ -5786,6 +5857,7 @@ impl DistributedFs {
                     unavailable("native publication body has no descriptor reservation")
                 })?;
             let upload = Arc::new(NativeUpload {
+                _gc_pin: frozen.dirty_extents.native_gc_pin.clone(),
                 operation_id: operation_id.clone(),
                 chunk: staged.chunk.clone(),
                 owner: self
@@ -5876,6 +5948,23 @@ impl DistributedFs {
                     .map(|window| window.operation_id.clone())
             })
             .unwrap_or_else(|| self.operation_id(reason.operation_prefix()));
+        let gc_pin = match (&frozen.dirty_extents.native_gc_pin, &self.gc_references) {
+            (Some(pin), _) => Some(pin.clone()),
+            (None, Some(references)) => Some(
+                references
+                    .pin(
+                        &frozen.inode.inode_id,
+                        frozen.inode.head_version.as_ref(),
+                        Some(&operation_id),
+                    )
+                    .map_err(|error| PrepareCommitError {
+                        error,
+                        publication_window: None,
+                        budget_reservations: Vec::new(),
+                    })?,
+            ),
+            (None, None) => None,
+        };
         let generation = self.next_operation.fetch_add(1, Ordering::Relaxed);
         let layout_id = LayoutRootId::new(format!("{}-layout-{generation}", self.session_id));
 
@@ -5979,6 +6068,7 @@ impl DistributedFs {
             file_version: version,
             layout_root,
             chunk_receipts: receipts,
+            clone_source: None,
             metadata_delta: reason.metadata_delta(
                 frozen.inode.attributes.mtime_unix_ms,
                 frozen.inode.attributes.ctime_unix_ms,
@@ -6060,6 +6150,7 @@ impl DistributedFs {
             None
         };
         Ok(CommitBatch {
+            _gc_pin: gc_pin,
             through_seq: frozen.through_seq,
             _budget_reservations: budget_reservations,
             _native_accounting: native_accounting,
@@ -6470,7 +6561,7 @@ impl DistributedFs {
         if kill_suidgid {
             Self::apply_kernel_killpriv_to_state(&mut state);
         }
-        if state.open_writers == 0 && state.dirty {
+        if state.open_writers == 0 && (state.dirty || state.metadata_dirty) {
             state.last_writer_background_requested = true;
         }
         Ok(state.visible_write_seq)
@@ -6485,7 +6576,7 @@ impl DistributedFs {
             .lock()
             .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
         state.open_writers = state.open_writers.saturating_sub(1);
-        if state.open_writers == 0 && state.dirty {
+        if state.open_writers == 0 && (state.dirty || state.metadata_dirty) {
             state.last_writer_background_requested = true;
         }
         Ok(())
@@ -7955,6 +8046,70 @@ impl DistributedFs {
         )
     }
 
+    pub fn renew_active_write_leases(&self) -> Result<usize> {
+        // Open idle writers and unknown commits still depend on their lease.
+        // Renew independently of writeback, without changing a frozen request.
+        let mut entries = self.inode_writes.snapshot()?;
+        entries.sort_by(|left, right| left.0.0.cmp(&right.0.0));
+        if !entries.is_empty() {
+            let start = self.write_lease_cursor.load(Ordering::Relaxed) as usize % entries.len();
+            entries.rotate_left(start);
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut examined = 0;
+        let mut renewed_count = 0;
+        let mut first_error = None;
+        for (_, cell) in entries {
+            if Instant::now() >= deadline {
+                break;
+            }
+            examined += 1;
+            let lease = {
+                let Ok(state) = cell.state.try_lock() else {
+                    continue;
+                };
+                if state.terminal_error.is_some()
+                    || !(state.open_writers > 0
+                        || state.dirty
+                        || state.metadata_dirty
+                        || state.kill_suidgid_dirty
+                        || state.in_flight.is_some())
+                    || !should_background_renew(&state.write_lease)
+                {
+                    continue;
+                }
+                state.write_lease.clone()
+            };
+            match self.meta.renew_write_lease_with_timeout(
+                lease.clone(),
+                deadline.saturating_duration_since(Instant::now()),
+            ) {
+                Ok(renewed) if same_lease_identity(&lease, &renewed) => {
+                    let mut state = cell
+                        .lock()
+                        .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+                    // A late reply cannot replace a newer authority or shorten TTL.
+                    if state.terminal_error.is_none()
+                        && same_lease_identity(&state.write_lease, &lease)
+                    {
+                        state.write_lease = merge_same_identity_lease(&state.write_lease, renewed);
+                        renewed_count += 1;
+                    }
+                }
+                Ok(_) => {
+                    first_error
+                        .get_or_insert_with(|| stale("DFS writer renewal changed lease identity"));
+                }
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        self.write_lease_cursor
+            .fetch_add(examined, Ordering::Relaxed);
+        first_error.map_or(Ok(renewed_count), Err)
+    }
+
     fn writeback_pending_with_budget(&self, budget: Duration, max_ops: usize) -> Result<usize> {
         let _guard = match self.writeback_maintenance_gate.try_lock() {
             Ok(guard) => guard,
@@ -8013,6 +8168,16 @@ impl DistributedFs {
                         committed += 1;
                     }
                     Ok(None) => {}
+                    // A bounded maintenance RPC can expire after Meta committed.
+                    // finish_commit retains the exact request for replay. This
+                    // scheduling deferral must not poison a later successful
+                    // foreground fsync; real I/O and fencing errors still do.
+                    Err(error) if error.kind() == afs_error::ErrorKind::DeadlineExceeded => {
+                        afs_logging::debug!("dfs.background_commit_deferred";
+                            "inode_id" => inode_id.0.as_str(),
+                            "error" => error.to_string()
+                        );
+                    }
                     Err(error) => self.record_background_error(&inode_id, error)?,
                 }
             }
@@ -9157,6 +9322,7 @@ impl DirtyExtentMap {
     fn restore_before(&mut self, mut older: DirtyExtentMap) {
         if self.native_operation_id.is_none() {
             self.native_operation_id = older.native_operation_id.take();
+            self.native_gc_pin = older.native_gc_pin.take();
         }
         // The restored batch has already frozen its owners. Mutable builder
         // indices belong only to the active map and must never be renumbered.
@@ -11546,6 +11712,7 @@ impl Backend for DistributedFs {
         self.install_write_state(inode.clone(), write_lease)?;
         let session = self.open_write_session(&inode, flags)?;
         let handle = self.allocate_handle(DfsFileHandle {
+            gc_pin: None,
             inode_id: inode.inode_id.clone(),
             opened_inode: inode.clone(),
             opened_page_identity: None,
@@ -11699,6 +11866,7 @@ impl Backend for DistributedFs {
             self.check_native_read_view(view)?;
         }
         self.allocate_handle(DfsFileHandle {
+            gc_pin: None,
             inode_id: opened_inode.inode_id.clone(),
             opened_inode,
             opened_page_identity,
@@ -12289,6 +12457,157 @@ impl Backend for DistributedFs {
         Ok(total_written)
     }
 
+    fn copy_file_range(
+        &self,
+        _: &RequestContext,
+        range: super::types::CopyFileRange,
+    ) -> Result<u64> {
+        let source = self.handle_snapshot(range.source)?;
+        let destination = self.handle_snapshot(range.destination)?;
+        if source.flags & libc::O_ACCMODE == libc::O_WRONLY
+            || destination.flags & libc::O_ACCMODE == libc::O_RDONLY
+        {
+            return Err(bad_file_descriptor(
+                "COW copy requires readable source and writable destination",
+            ));
+        }
+        if source.inode_id == destination.inode_id {
+            return Err(Error::coded(
+                afs_error::IO_NOT_SUPPORTED,
+                "same-inode COW range is unsupported",
+            ));
+        }
+        let session = destination
+            .write_session
+            .as_ref()
+            .ok_or_else(|| bad_file_descriptor("missing destination write session"))?;
+        if session.remote.is_some()
+            || destination.flags & libc::O_APPEND != 0
+            || self
+                .remote_provider_visible_for_reads(&source.inode_id)?
+                .is_some()
+        {
+            return Err(Error::coded(
+                afs_error::IO_NOT_SUPPORTED,
+                "COW requires local destination authority and committed source",
+            ));
+        }
+        // Snapshot the source before acquiring destination admission, avoiding
+        // cross-copy deadlock. Concurrent later writes create another version.
+        self.commit_inode(&source.inode_id, CommitReason::FullSync)?;
+        let inode = self.validate_inode(self.meta.get_inode(&source.inode_id)?)?;
+        let Some(version_id) = inode.head_version else {
+            return Ok(0);
+        };
+        let (source_version, source_layout) = self.meta.get_file_version(&version_id)?;
+        if range.source_offset >= source_version.length || range.length == 0 {
+            return Ok(0);
+        }
+        let length = range
+            .length
+            .min(source_version.length - range.source_offset)
+            .min(u64::from(u32::MAX));
+        let cell = self
+            .write_state(&destination.inode_id)?
+            .ok_or_else(|| stale("destination write state is missing"))?;
+        let _operation = self.begin_inode_operation(&destination.inode_id, cell.clone())?;
+        self.commit_inode_inside_operation(&destination.inode_id, CommitReason::FullSync)?;
+        let pending = {
+            let mut state = cell
+                .lock()
+                .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+            if should_renew(&state.write_lease) {
+                state.write_lease = self.meta.renew_write_lease(state.write_lease.clone())?;
+            }
+            let clone_source = crate::dfs::CloneFileRange {
+                version: version_id,
+                source_offset: range.source_offset,
+                destination_offset: range.destination_offset,
+                length,
+            };
+            let generation = self.next_operation.fetch_add(1, Ordering::Relaxed);
+            let layout = crate::dfs::clone_file_layout(
+                &state.base_layout,
+                &source_layout,
+                &clone_source,
+                LayoutRootId::new(format!("{}-cow-layout-{generation}", self.session_id)),
+            )?;
+            let now = now_unix_ms();
+            state.next_write_seq = state.next_write_seq.saturating_add(1);
+            state.visible_write_seq = state.next_write_seq;
+            state.logical_length = layout.file_length;
+            state.metadata_dirty = true;
+            state.inode.attributes.mtime_unix_ms = now;
+            state.inode.attributes.ctime_unix_ms = now;
+            Self::apply_kernel_killpriv_to_state(&mut state);
+            let frozen = FrozenCommit {
+                through_seq: state.visible_write_seq,
+                logical_length: layout.file_length,
+                inode: state.inode.clone(),
+                write_lease: state.write_lease.clone(),
+                base_version: state.base_version.clone(),
+                base_layout: state.base_layout.clone(),
+                dirty_extents: DirtyExtentMap::default(),
+                // COW shares committed chunks; it owns no dirty write body.
+                dirty_budget_reservations: Vec::new(),
+                kill_suidgid_dirty: state.kill_suidgid_dirty,
+            };
+            let commit = CommitFileVersion {
+                operation_id: self.operation_id("cow-copy"),
+                inode_id: destination.inode_id.clone(),
+                write_lease: state.write_lease.clone(),
+                expected_inode_revision: state.inode.revision,
+                expected_head_version: state.inode.head_version.clone(),
+                file_version: FileVersion {
+                    id: FileVersionId::new(format!("{}-cow-version-{generation}", self.session_id)),
+                    inode_id: destination.inode_id.clone(),
+                    parent_version: state.inode.head_version.clone(),
+                    length: layout.file_length,
+                    layout_root: layout.id.clone(),
+                    created_at_unix_ms: now,
+                },
+                layout_root: layout,
+                chunk_receipts: Vec::new(),
+                clone_source: Some(clone_source),
+                metadata_delta: CommitReason::FullSync.metadata_delta(
+                    now,
+                    now,
+                    state.kill_suidgid_dirty,
+                ),
+            };
+            let pending = PendingFileCommit {
+                frozen,
+                batch: CommitBatch {
+                    _gc_pin: None,
+                    through_seq: state.visible_write_seq,
+                    commit: Arc::new(commit),
+                    _native_accounting: None,
+                    _native_uploads: Vec::new(),
+                    _budget_reservations: Vec::new(),
+                },
+                trace_send_attempt: self
+                    .pending_trace
+                    .as_ref()
+                    .map(|_| Arc::new(AtomicU64::new(0))),
+            };
+            state.in_flight = Some(InFlightCommit::File(Box::new(pending.clone())));
+            state.commit_busy = true;
+            InFlightCommit::File(Box::new(pending))
+        };
+        if let Some(seq) = self.finish_commit(cell, pending, None, "cow-copy")? {
+            self.update_handles_after_commit(&destination.inode_id, seq)?;
+            self.update_handle_write_progress(range.destination, seq)?;
+        }
+        afs_logging::info!("dfs.cow_range_committed";
+            "source_inode" => source.inode_id.0,
+            "source_version" => source_version.id.0,
+            "destination_inode" => destination.inode_id.0,
+            "source_offset" => range.source_offset,
+            "destination_offset" => range.destination_offset,
+            "length" => length);
+        Ok(length)
+    }
+
     fn flush(&self, _: &RequestContext, handle: FileHandle) -> Result<()> {
         let snapshot = self.handle_snapshot(handle)?;
         if let Some(session) = snapshot.write_session.as_ref() {
@@ -12358,7 +12677,17 @@ impl Backend for DistributedFs {
         self.dir_handles
             .lock()
             .map_err(|_| unavailable("DFS directory handle table is poisoned"))?
-            .insert(id, DfsDirectoryHandle { entries });
+            .insert(
+                id,
+                DfsDirectoryHandle {
+                    entries,
+                    _gc_pin: self
+                        .gc_references
+                        .as_ref()
+                        .map(|references| references.pin(&inode_id, None, None))
+                        .transpose()?,
+                },
+            );
         Ok(DirectoryHandle(id))
     }
 
@@ -12777,6 +13106,7 @@ impl crate::node::rpc::control::DfsOwnerLifecycleHandler for DistributedFs {
                 Self::apply_kernel_killpriv_to_state(&mut state);
             }
             self.allocate_handle(DfsFileHandle {
+                gc_pin: None,
                 inode_id: inode.inode_id.clone(),
                 opened_inode: inode.clone(),
                 opened_page_identity: None,
@@ -14519,6 +14849,7 @@ mod tests {
                     inline_extents,
                 },
                 chunk_receipts,
+                clone_source: None,
                 metadata_delta: CommitMetadataDelta {
                     mode: CommitMetadataMode::Full,
                     mtime_unix_ms: Some(now),
@@ -16705,6 +17036,79 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    #[test]
+    fn native_generation_retains_gc_reference_through_upload_and_publication() {
+        #[derive(Default)]
+        struct Control {
+            active: Mutex<HashSet<String>>,
+        }
+        impl crate::node::gc::GcControl for Control {
+            fn retain(
+                &self,
+                id: &str,
+                _: &InodeId,
+                _: Option<&FileVersionId>,
+                _: bool,
+            ) -> Result<()> {
+                self.active.lock().unwrap().insert(id.into());
+                Ok(())
+            }
+            fn release(&self, id: &str) -> Result<()> {
+                self.active.lock().unwrap().remove(id);
+                Ok(())
+            }
+            fn reserve_publication(&self, _: &OperationId, _: Vec<ChunkObject>) -> Result<()> {
+                Ok(())
+            }
+            fn collect(&self, _: u64, _: Vec<ChunkObject>) -> Result<crate::dfs::GcState> {
+                Ok(crate::dfs::GcState::default())
+            }
+        }
+        let (_temp, meta, fs, _runtime, _store) = native_pipeline_fixture(true, 8 * 1024 * 1024, 8);
+        let control = Arc::new(Control::default());
+        let references = crate::node::gc::GcReferences::new(control.clone());
+        let fs = fs.with_gc_references(Some(references.clone()));
+        let file = fs
+            .create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new("native-gc"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        let body = vec![7; 4 * 1024 * 1024];
+        fs.write(&context(), file.handle, 0, &body).unwrap();
+        native_wait_uploads(&fs, 1);
+        references.flush().unwrap();
+        assert_eq!(meta.commits.lock().unwrap().len(), 0);
+        assert_eq!(
+            control
+                .active
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|id| id.starts_with("publish:"))
+                .count(),
+            1,
+            "uploaded but unpublished generation must remain protected"
+        );
+        fs.fsync(&context(), file.handle, SyncMode::Full).unwrap();
+        references.flush().unwrap();
+        assert_eq!(meta.commits.lock().unwrap().len(), 1);
+        assert_eq!(
+            control
+                .active
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|id| id.starts_with("publish:"))
+                .count(),
+            0,
+            "published generation must release its reference"
+        );
     }
 
     #[test]
@@ -25013,6 +25417,7 @@ mod tests {
                             .insert(
                                 id,
                                 DfsFileHandle {
+                                    gc_pin: None,
                                     inode_id: inode.inode_id.clone(),
                                     opened_inode: inode.clone(),
                                     opened_page_identity: None,
@@ -27592,6 +27997,51 @@ mod tests {
     }
 
     #[test]
+    fn background_commit_timeout_defers_exact_replay_without_poisoning_fsync() {
+        let (_temp, meta, fs) = test_fs();
+        let created = fs
+            .create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new("budget-replay.bin"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        fs.write(&context(), created.handle, 0, b"pending").unwrap();
+        meta.fail_next_commit_with(Error::coded(
+            afs_error::CLIENT_DEADLINE_EXCEEDED,
+            "background RPC budget expired after send",
+        ));
+        assert_eq!(
+            fs.writeback_pending_with_budget(Duration::from_secs(1), 64)
+                .unwrap(),
+            0
+        );
+        let pending = meta.failed_commits.lock().unwrap()[0].clone();
+        let cell = fs.write_state(&pending.inode_id).unwrap().unwrap();
+        {
+            let state = cell.lock().unwrap();
+            assert!(
+                state.in_flight.is_some(),
+                "unknown acknowledgement retains the exact request"
+            );
+            assert!(
+                state.background_error.is_none(),
+                "maintenance budget expiry must not become a later FUSE error"
+            );
+        }
+        assert_eq!(
+            fs.writeback_pending_with_budget(Duration::from_secs(1), 64)
+                .unwrap(),
+            1
+        );
+        assert_eq!(meta.commits.lock().unwrap().as_slice(), &[pending]);
+        fs.fsync(&context(), created.handle, SyncMode::Full)
+            .unwrap();
+    }
+
+    #[test]
     fn background_writeback_expired_before_send_retains_exact_pending_for_replay() {
         let (temp, meta, mut fs) = test_fs();
         let created = fs
@@ -27718,6 +28168,138 @@ mod tests {
         assert!(state.background_error.is_none());
         assert!(state.dirty);
         assert!(state.in_flight.is_none());
+    }
+
+    #[test]
+    fn closed_metadata_only_writer_stops_pinning_old_versions() {
+        let (_temp, meta, fs) = test_fs();
+        let created = fs
+            .create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new("closed-metadata.bin"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        fs.write(&context(), created.handle, 0, b"data").unwrap();
+        fs.fsync(&context(), created.handle, SyncMode::DataOnly)
+            .unwrap();
+        let inode_id = meta.inode.lock().unwrap().inode_id.clone();
+        let cell = fs.write_state(&inode_id).unwrap().unwrap();
+        {
+            let state = cell.lock().unwrap();
+            assert!(!state.dirty);
+            assert!(state.metadata_dirty);
+            assert_eq!(state.visible_write_seq, state.committed_write_seq);
+        }
+        fs.release(&context(), created.handle).unwrap();
+        assert_eq!(fs.writeback_pending().unwrap(), 1);
+        {
+            let mut state = cell.lock().unwrap();
+            assert!(!state.metadata_dirty);
+            assert!(!state.last_writer_background_requested);
+            assert!(state.in_flight.is_none());
+            state.write_lease.expires_at_unix_ms = now_unix_ms() + 10_000;
+        }
+        assert_eq!(fs.renew_active_write_leases().unwrap(), 0);
+        assert_eq!(meta.metadata_syncs.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn active_writer_lease_renewal_runs_without_mutating_pending_commit() {
+        let (_temp, meta, fs) = test_fs();
+        let created = fs
+            .create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new("idle-writer.bin"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        fs.write(&context(), created.handle, 0, b"pending").unwrap();
+        meta.fail_next_commit_with(Error::coded(
+            afs_error::CLIENT_DEADLINE_EXCEEDED,
+            "unknown commit",
+        ));
+        fs.fsync(&context(), created.handle, SyncMode::Full)
+            .unwrap_err();
+        let pending = meta.failed_commits.lock().unwrap()[0].clone();
+        let cell = fs.write_state(&pending.inode_id).unwrap().unwrap();
+        cell.lock().unwrap().write_lease.expires_at_unix_ms = now_unix_ms() + 10_000;
+        let renewed_expiry = now_unix_ms() + 30_000;
+        meta.queue_renew_result(Ok(meta.lease_with_expiry(renewed_expiry)));
+        assert_eq!(fs.renew_active_write_leases().unwrap(), 1);
+        assert_eq!(
+            cell.lock().unwrap().write_lease.expires_at_unix_ms,
+            renewed_expiry
+        );
+        fs.fsync(&context(), created.handle, SyncMode::Full)
+            .unwrap();
+        assert_eq!(meta.commits.lock().unwrap()[0], pending);
+    }
+
+    #[test]
+    fn active_writer_lease_renewal_skips_closed_clean_states_and_rejects_fencing() {
+        let (_temp, meta, fs) = test_fs();
+        let mut lease = meta.lease.lock().unwrap().clone();
+        lease.expires_at_unix_ms = now_unix_ms() + 10_000;
+        let cell = synthetic_write_state(
+            lease.inode_id.clone(),
+            lease.clone(),
+            false,
+            false,
+            false,
+            false,
+        );
+        fs.inode_writes
+            .insert(lease.inode_id.clone(), cell.clone())
+            .unwrap();
+        assert_eq!(fs.renew_active_write_leases().unwrap(), 0);
+        assert_eq!(meta.renew_call_count(), 0);
+        cell.lock().unwrap().open_writers = 1;
+        let mut fenced = lease.clone();
+        fenced.lease_epoch += 1;
+        meta.queue_renew_result(Ok(fenced));
+        assert!(fs.renew_active_write_leases().is_err());
+        assert_eq!(cell.lock().unwrap().write_lease, lease);
+        meta.queue_renew_result(Err(unavailable("transient Meta outage")));
+        assert!(fs.renew_active_write_leases().is_err());
+        assert!(cell.lock().unwrap().terminal_error.is_none());
+    }
+
+    #[test]
+    fn active_writer_lease_renewal_late_reply_cannot_replace_newer_authority() {
+        let (_temp, meta, fs) = test_fs();
+        let fs = Arc::new(fs);
+        let mut lease = meta.lease.lock().unwrap().clone();
+        lease.expires_at_unix_ms = now_unix_ms() + 10_000;
+        let cell = synthetic_write_state(
+            lease.inode_id.clone(),
+            lease.clone(),
+            true,
+            false,
+            false,
+            false,
+        );
+        fs.inode_writes
+            .insert(lease.inode_id.clone(), cell.clone())
+            .unwrap();
+        let pause = meta.pause_next_renew();
+        meta.queue_renew_result(Ok(meta.lease_with_expiry(now_unix_ms() + 30_000)));
+        let worker_fs = fs.clone();
+        let worker = std::thread::spawn(move || worker_fs.renew_active_write_leases());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !pause.was_reached() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(pause.was_reached());
+        lease.lease_epoch += 1;
+        cell.lock().unwrap().write_lease = lease.clone();
+        pause.release();
+        assert_eq!(worker.join().unwrap().unwrap(), 0);
+        assert_eq!(cell.lock().unwrap().write_lease, lease);
     }
 
     #[test]

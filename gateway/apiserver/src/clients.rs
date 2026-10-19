@@ -587,6 +587,8 @@ mod tests {
     fn owned(id: &str, tenant: &str) -> pb::GetEnvironmentResponse {
         pb::GetEnvironmentResponse {
             record: Some(pb::EnvironmentRecord {
+                execution_artifacts: vec![],
+                snapshot_source: None,
                 failure: None,
                 spec: Some(pb::EnvironmentSpec {
                     id: id.into(),

@@ -1,171 +1,216 @@
-# Checkpoint 存储与可复用快照
+# Checkpoint 存储与快照生命周期
 
-`CheckpointStore` 是 adxlet 的存储边界。已有本地目录与 S3 兼容对象存储适配；新增后端实现该接口，生命周期状态机不依赖具体存储 SDK。
+`adx-checkpoint-storage` 提供节点文件访问接口 `CheckpointAccess` 和 Coordinator
+共享回收接口 `ArtifactReclaimer`。adxlet 处理捕获、恢复和本机缓存；Coordinator
+管理 Environment/Snapshot 的保留关系并回收共享文件。默认 ADX 构建不依赖 AFS/FUSE。
 
-## 配置
+## 三种模式
 
-adxlet 可使用原来的 `checkpoint_dir`，或显式选择 `checkpoint_storage`，二者不能同时设置。
+| 模式 | 捕获 | 恢复 | 物理回收 |
+| --- | --- | --- | --- |
+| local only | 写节点私有目录，完成可读性校验 | 直接读取本地目录 | 原节点；不支持跨节点恢复 |
+| S3 + 本地缓存 | 写本地 staging，文件上传完成后发布 manifest | 命中缓存直接用；否则下载并校验后使用 | Coordinator 删除 S3；节点独立淘汰缓存 |
+| AFS / distributed_fs | 直接写挂载目录中的独立捕获目录，逐文件同步后发布 manifest | 直接使用同一共享路径，不预下载整个制品 | Coordinator 删除共享 manifest 和目录 |
+
+每个共享后端使用稳定 `alias`。同一 alias 的所有节点与 Coordinator 必须配置同一
+存储 namespace。调度通过 `ADX_CHECKPOINT_STORAGE=<alias>` 选择兼容节点。
+S3/AFS 支持跨节点恢复；本地恢复仍受源节点约束。
+
+### adxlet 配置
+
+`checkpoint_dir` 是本地目录简写；与 `checkpoint_storage` 互斥。
+以下片段分别放入节点配置：
 
 ```json
-{
-  "checkpoint_storage": {
-    "kind": "s3",
-    "alias": "obs",
-    "bucket": "adx-checkpoints",
-    "region": "cn-north-4",
-    "endpoint": "https://obs.cn-north-4.myhuaweicloud.com",
-    "allow_http": false,
-    "prefix": "production/checkpoints",
-    "root": "/opt/adx/data/checkpoints",
-    "cache_max_entries": 500,
-    "cache_budget_bytes": 53687091200
-  }
-}
+{"checkpoint_storage":{"kind":"local","root":"/opt/adx/data/checkpoints"}}
 ```
 
-部署环境通过标准 AWS 凭证环境变量或环境提供的身份机制配置 S3 访问。实例记录只保存存储别名、制品 ID 与字节数，不保存端点和密钥。每个集群使用独立的 bucket/prefix；共享该存储的节点必须为同一别名配置相同 bucket/prefix，并保持节点 ID 和存储别名稳定；本地目录是节点私有的暂存与下载缓存。
+```json
+{"checkpoint_storage":{"kind":"s3","alias":"obs","bucket":"adx-checkpoints","region":"cn-north-4","endpoint":"https://obs.cn-north-4.myhuaweicloud.com","allow_http":false,"prefix":"production/checkpoints","root":"/opt/adx/data/checkpoints","cache_max_entries":500,"cache_budget_bytes":53687091200}}
+```
 
-### Environment 匿名恢复点策略
+```json
+{"checkpoint_storage":{"kind":"distributed_fs","alias":"afs-checkpoints","mount_root":"/mnt/afs-dfs","prefix":"adx/checkpoints"}}
+```
 
-创建 HTTP 的 `pauseOptions.storage` / SDK `PausePolicy.storage` 配置匿名恢复点：
+S3 通过标准 AWS 环境变量/身份机制取得凭据。记录只保存 alias、制品 ID、大小，
+不保存端点或密钥。缓存默认 500 条、50 GiB，活跃恢复/执行文件受到 pin 保护。
+上传完成并提交权威结果后，原 staging 直接进入缓存，不复制或重新下载。
 
-| 值 | 发布行为 | 跨节点恢复 |
-| --- | --- | --- |
-| configured（默认） | 使用节点配置的本地/S3 后端 | 后端为共享对象存储时支持 |
-| local | 即使节点配置 S3 也保留本地制品 | 不支持 |
-| shared | 必须上传到配置的对象存储，否则拒绝 | 支持同别名的兼容节点 |
+AFS 要求 Linux 上实际存在来源为 `afs-dfs` 的 FUSE 挂载。启动及每次访问均检查挂载，
+缺失时返回错误，不落到挂载点下面的普通本地目录。Coordinator 也需要挂载同一 namespace。
+各进程使用自己的 AFS 身份与权限；`store-id` 核验 prefix 与 alias 一致。
 
-该策略用于手动/自动 pause 和 workload checkpoint；它不替代可复用 Snapshot 目录。
-`pauseOptions.retention` 接受有限 TTL 或显式永久保留；永久暂停点在 Redis/RPC 中的
-过期时间为空，经过期扫描、对账或节点失效仍保持休眠。显式删除或替换时释放引用，
-实际制品清理继续遵守存储引用及孤儿回收契约。
-OBS 使用既有 S3 兼容适配器和标准凭据配置，上面的 endpoint 是配置示例。
-真实 OBS/Firecracker 验证入口和运行边界见[跨节点验收说明](firecracker-cross-node.md)。节点注册自动携带
-`ADX_CHECKPOINT_STORAGE=<alias>`，shared 创建过滤掉 local 节点，恢复目标必须匹配
-制品存储别名及原有运行时/放置约束；别名相同须由部署保证指向同一 bucket/prefix。
+外部 sandboxd 必须能看到传入的绝对路径。运行时的可写文件应放到私有执行目录，
+不能修改已发布的 checkpoint。若希望避免跨文件系统复制，sandboxd 的运行目录也应配置
+在同一 AFS 文件系统中；ADX 目前不通过单次 restore RPC 改写 sandboxd 的全局存储根。
+此配置下需选择该文件系统支持的磁盘 I/O 模式；本仓存储验证使用 sandboxd
+`writable_io_engine = "Sync"`、`writable_cache_type = "Writeback"`，S3 对照采用相同配置。
+当前 AFS 不提供 `AsyncDirect` 所需的 direct I/O 对齐信息，不能直接沿用该运行时默认值。
+DFS 的 `copy_file_range` 通过独立 inode / FileVersion 共享不可变 chunk 的 extent，
+支持分段大文件、稀疏空洞和目标范围覆盖，不预读或重新上传源文件数据。
+Meta 校验固定源版本、同 namespace、源/目标范围及完整布局；副本后续写入不会改变源快照。
+源与私有运行文件需要处于同一 AFS 文件系统，且目标写归属在本客户端；
+同 inode 或远端目标写归属返回不支持，调用方可能走普通复制回退。
 
-## 制品提交与恢复
+锁定 sandboxd `efc2015` / Firecracker `v1.16.1-akernel.3` 的 SharedFile 路径
+使用上述标准文件操作创建私有 `memory.live`，无需修改外部运行时协议。
+验收同时检查 COW 提交日志、系统调用和延迟触页的远端数据增量；
+`copy_file_range` 返回逻辑字节数或 guest RSS 增长本身都不代表实际数据已按需读取。
 
-- 本地目录发布检查制品路径、文件类型和总长度，成功时文件已生成且可在本机读取；adxlet 不对制品和目录执行 `fsync`，由操作系统及执行后端异步写回。local-only 不承诺返回前已稳定落盘，也不支持丢失节点后的跨节点恢复。恢复点元数据仍按生命周期契约提交给 Coordinator。暂停、workload checkpoint、上传失败后的本地保留和本地快照复制共用该语义。
-- 本地恢复与节点重启对账重新检查制品；缺失、长度变化、符号链接及特殊文件会被拒绝。该校验不是本地逐字节校验和或断电耐久性保证。
-- 后端先生成完整本地 checkpoint。对象适配器按文件流式上传，记录每个文件的长度、SHA256 和权限；所有文件完成后才写入版本化格式的 manifest，作为发布完成标记。
-- 下载按 manifest 限制路径、长度和校验和，不接受符号链接及特殊文件。完整下载后以 rename 暴露缓存目录，避免恢复读取半成品。
-- 上传失败保留本地制品，adxlet 尝试回滚恢复。回滚使用的本地恢复点写入实例结果，保持 local-only 语义；成功上传后的本地目录在结果全局提交后直接登记到节点 LRU，复用原有文件和路径，不复制快照、不重新从对象存储下载。
-- 运行中的 Execd 通过 Unix Socket 发起 workload checkpoint 时，按 Environment 的 `pause.storage` 策略使用节点配置的存储后端或保留本地制品。S3 上传及实例结果提交完成后才回复成功；上传失败向 Execd 返回错误，运行中的源实例保持运行，不把本地暂存误报为共享恢复点。
-- 制品清理与快照复制保留接口边界。复制产生独立制品 ID；源暂停恢复点删除不影响可复用副本。远端文件支持服务端复制，大文件使用有界流式复制。
+### Coordinator 配置
 
-## 缓存与实际执行引用
+本地模式使用默认空列表。共享模式必须配置对应的回收后端，配置中没有节点缓存目录：
 
-对象存储的可复用本地副本默认最多 **500 条、50 GiB（53,687,091,200 字节）**；`cache_max_entries` 和 `cache_budget_bytes` 均可省略以使用默认值，显式值必须大于零。一个完整快照算一条，文件数不单独计数。条目数或磁盘占用任一超限即按 LRU 淘汰，直到同时满足两个上限；磁盘计量使用本机已分配块，包括快照目录和每条索引文件。共享目录自身的固定开销、文件系统元数据和写入中的索引临时文件仍需要额外磁盘余量。
+```json
+{"checkpoint_reclaimers":[{"kind":"s3","alias":"obs","bucket":"adx-checkpoints","region":"cn-north-4","endpoint":"https://obs.cn-north-4.myhuaweicloud.com","allow_http":false,"prefix":"production/checkpoints"}]}
+```
 
-- 本节点 Pause：完成对象上传和权威元数据提交后，将原本地目录直接登记为缓存，入缓存失败仅记录告警，不改变已成功的 Pause。快照副本可被淘汰，OBS 对象和 Paused 状态保持不变。
-- Resume：优先使用本机副本，命中不请求远端 manifest 或快照数据；未命中则下载并校验。下载期间使用私有 `.download-*` 目录，完整后 rename 才可供恢复使用。同一快照并发请求合并为一次下载，不同快照下载不持有全局缓存锁。
-- 执行引用：下载中、恢复中以及运行时仍依赖的文件属于执行占用，单独计量，不占可复用缓存的 500 条／50 GiB 配额。缓存满、全部已有文件被引用，以及单份快照超过预算，均不会返回缓存配额 `NoCapacity`，不会阻挡 Resume；真实磁盘空间不足或其他存储／运行时错误仍会导致恢复失败。
-- 引用释放：最后一个执行引用释放后，异步检查双上限，接纳可保留副本并淘汰 LRU；超大副本可直接清理。退出中断维护时，下一次启动对账会重复检查。local-only 唯一恢复点和未完成权威提交的 staging 不属于可淘汰缓存。
-- 最近使用顺序在入缓存和恢复命中时更新，持久化到 `cache-index/`。索引是节点缓存元数据，写入失败仅告警；远端 manifest 和权威恢复点身份保持不变。本地原上传目录可以继续位于 `staging/`，其生命周期由缓存索引接管，以保留运行时可能引用的原始路径。
-- 重启对账：先恢复运行实例所需的 pin，再校验和重建缓存索引、实际占用及 LRU 顺序，随后应用当前双上限；清理无权威引用、损坏的无执行引用副本及中断下载。暂停实例的远端校验只读取 manifest，对账不会将所有 OBS 快照下载到本地。
+```json
+{"checkpoint_reclaimers":[{"kind":"distributed_fs","alias":"afs-checkpoints","mount_root":"/mnt/afs-dfs","prefix":"adx/checkpoints"}]}
+```
 
-sandboxd 的 runsc/gVisor 在同步 Restore 成功后不再依赖输入目录，adxlet 释放其执行 pin。Firecracker v2 继续依赖调用方的内存快照作为映射或增量基线，adxlet 保守持有 pin 到执行停止；运行中捕获的新基线也在入缓存前保护。未知 RuntimeDriver 默认保留输入。过期恢复点立即失去再次恢复资格，仍被执行使用的文件延迟清理。
+Coordinator 的 S3 身份需要 prefix 下的 List/Delete；AFS 身份需要目录访问与删除权限。
+缺少回收器时删除保持待完成并报告错误，不转交给源节点删除共享数据。
 
-共享制品在另一节点删除后，原节点限额内、无执行引用的缓存副本可以继续保留；后续 LRU 淘汰或完整权威对账回收它，不通过全局缓存失效广播立即删除。
+## 文件接口与流程
 
-50 GiB 是**可复用缓存**上限，不是整个 checkpoint 根目录的总磁盘上限；实际节点占用还包括执行引用、下载和未完成提交的 staging。丢失节点缓存不影响从对象存储跨节点恢复。
+节点侧：
 
-## 快照目录与引用
+1. `begin_capture()` 分配运行时写入目录；`capture_references()` 给出捕获预留身份。
+2. adxlet 在调用运行时前持久化文件预留。`size_bytes=0` 仅用于未完成捕获的保护，不能恢复。
+3. runtime 写入完成后，`seal()` 完成该后端的发布合同并返回完整 artifact。
+   S3 上传并发布 manifest；AFS 同步文件并发布 manifest；local 校验文件可读性。
+4. adxlet 提交恢复点/Snapshot 的权威元数据，随后调用 `committed()` 完成本地缓存登记。
+5. 恢复时 `prepare_restore()` 返回 `RestoreAccess`；S3 取得缓存 pin，AFS/local 返回原目录。
+   adxlet 在执行仍依赖文件时保留访问对象及持久化输入记录，确认停止后释放。
+6. 节点 `release()` 只处理本地文件/缓存，AFS 不在此删除共享文件。
 
-Coordinator 的快照目录模型、Redis 存储与 mTLS SnapshotService 已实现。API Server 的查询、分页和删除接口经已认证的租户上下文调用该服务；创建快照由 adxlet 串行控制任务执行；克隆复用调度和恢复链路。每条记录包含创建模板、源节点/执行身份、制品、版本和状态。
+`seal()` 完成不代表 Environment/Snapshot 元数据已经提交；对外成功需要两者完成。
+local-only 沿用异步写回语义，不强制 fsync，也不承诺主机断电/丢失后的文件耐久性。
+AFS restore 检查 manifest、路径、文件类型和长度，不扫描完整文件内容；数据读取由 AFS 执行。
 
-- Ready 接受新引用；引用使用恢复实例或节点模板的明确身份，重试不重复增加计数。
-- 删除将状态改为 Deleting，拒绝新引用，保留已有引用直到释放。
-- 引用归零后才允许物理制品回收；后端确认删除后，再将目录标记为 Deleted。完成请求使用版本复核。
-- Redis CAS 同时校验当前 Coordinator epoch 和旧记录内容，旧 Coordinator 不可修改新 Coordinator 接管后的引用。租户检查和不可变制品身份在目录层执行。
+## 匿名快照跟随 Environment
+
+`EnvironmentRecord.checkpoint` 是该 Environment 的匿名恢复点。
+显式有限 TTL 或永久保留沿用 pause 的 retention；永久保留持续到替换或删除 Environment。
+到期、替换或删除会移除对应保留关系。旧文件若仍被运行时映射，需等该执行停止后才能回收。
+
+`pauseOptions.storage` 的 typed 枚举值为 `configured`（默认）、`local`、`shared`。
+`configured` 使用配置后端，`shared` 要求共享后端；S3 节点可用 `local` 保留本地恢复点。
+AFS 节点显式 `local` 会拒绝，需选择本地存储节点。该选项不会把 AFS 目录当本地磁盘。
+
+## 可复用 Snapshot
+
+创建 Snapshot 直接捕获独立制品，不需要先创建匿名恢复点或复制已有恢复点。
+从 Snapshot 创建 Environment 时借用该不可变制品，并创建独立运行身份和可写运行状态；
+不自动复制第二份快照。`snapshot_source` 与匿名 `checkpoint` 分开记录。
+目标暂停生成自己的匿名恢复点，且停止原执行后，才释放旧 Snapshot 的使用关系。
+
+Snapshot 使用中删除立即返回 HTTP 409：
+
+```json
+{"code":409,"message":"snapshot is in use","error":{"code":"SNAPSHOT_IN_USE","retry":"never","outcome":"not_started","requestId":"request-id","sandbox_ids":["sandbox-a","sandbox-b"],"template_ids":["node/base"]}}
+```
+
+保持 Snapshot Ready，不排队等待 Sandbox 退出。调用方处理完列表中的使用者后重新删除。
+列表包含已分配恢复、仍映射文件的源/目标执行，以及失联节点未确认清理的旧执行。
+SDK 的 `EnvironmentHTTPError.sandbox_ids` / `template_ids` 提供这些列表。
+
+无使用者时，Redis CAS 将 Snapshot 置为 Deleting，关闭新引用。后台执行物理删除并提交 Deleted；
+存储失败或应答丢失会幂等重试。共享删除不要求源 adxlet 在线。
+
+## 共享回收与故障
+
+Coordinator 在 Redis 持久化共享制品清单。每轮检查 Environment 恢复点、执行输入、
+Snapshot 和旧执行保护，随后原子写入删除标记，拒绝迟到提交重新引用该身份。
+物理删除成功后移除清单项；删除标记跨 Coordinator 重启保留。
+
+节点失联只让执行归属失效，不证明进程已停止。旧执行文件保护在 Redis 中保留；
+节点重新完成停止旧执行及对账，并用当前会话报告可路由后，才释放该保护。
+无法恢复的节点会保守保留文件，需要运维确认隔离/清理后恢复该节点的对账，不能只按心跳 TTL 删除。
+Paused 保持休眠，不因为节点失效批量唤醒。
+
+Coordinator 重启后，adxlet 排空已接纳的恢复操作期间仍上报心跳，标记正在对账且停止接纳新任务。
+关闭准入不能阻塞心跳，否则共享存储下载较慢时会把健康恢复节点误判失效。
+
+节点已不运行共享存储删除扫描。无权威记录的历史对象不自动推断归属；
+S3 未完成 multipart upload 由部署配置过期中止规则。
+停止写入且已无保留关系的捕获预留（`size_bytes=0`）也由 Coordinator 回收；
+这种记录仍禁止用于恢复，回收不要求先形成完整 manifest。
 
 ## 验证边界
 
-`platform/adxlet/tests/local_checkpoint.rs` 覆盖本地发布后立即读取、存储对象重建、回滚保留、独立快照复制以及缺失／截断／非法文件拒绝。Linux 上可用 `python3 build/ci/check_local_checkpoint_io.py --test-binary <local_checkpoint 测试可执行文件> --output <证据目录>` 对真实存储调用执行 syscall 检查，确认这些本地发布路径不触发强制刷盘；需要先构建 `cargo test -p adxlet --test local_checkpoint --no-run`，并安装 `strace`。该组件检查不替代真实执行后端恢复验收。
+定向测试包含存储目录直读、缺失挂载、manifest/符号链接拒绝、缓存 pin、
+匿名恢复点生命周期、真实 Redis 的重启/引用竞争/旧执行保护、HTTP/SDK 使用中删除契约。
+目录 fixture 仅验证文件访问适配逻辑。真实 AFS/FUSE、双 Ingress、Firecracker 与
+S3/OBS 的单独验证由 `build/e2e/firecracker/storage.py` 执行，日志和逐项证据保存在
+工作树 `out/afs-fc/`；原有组件测试日志保留在 `out/snapshot-storage/`。
+测试拓扑为同一专用 KVM 主机的两个隔离执行节点，不代表两台物理机器故障域。
+AFS COW 与同版本 S3 对比的本轮日志另保存在工作树 `out/afs-cow/`；故障用例记录
+Coordinator 重启后的目录进度与排空心跳，并检查目标节点未被误判失效、旧 VMM 退出早于替代 VMM 启动。
 
-本地发布契约的真实 FC 同节点恢复、Paused 时重启、Unix checkpoint／reload 和耗时边界见 [2026-10-11 回归记录](2026-10-11-local-checkpoint-publication.md)。
+## 分段 profile 与性能对比
 
-对象存储、文件引用、上传失败回滚已有 adxlet 行为测试；快照引用、延迟删除、Redis/Coordinator 重启已有真实 Redis 测试。真实 S3＋Firecracker 部署验收已通过，下节列出证据。创建链路已通过组件与真实 Redis/mTLS 测试，统一 package-v12 的 Lima r15 已通过 13 项真实 FC/SDK 验收。从快照创建新实例的实现和本地验证见后文；未登记远端制品回收的契约与验收见后文。
+在已准备好的 Firecracker / AFS fixture 中，为 Meta 进程及其启动父进程设置
+`AFS_META_PROFILE=1` 可记录批次提交、排队、旧状态释放及后台完整检查点的分段耗时。先保留整份脱敏 `export/`
+（包括两个 Ingress 的服务日志），再汇总：
 
-
-## 本地 S3 验收（2026-09-16）
-
-Lima `adx-fc`，运行目录 `/var/lib/adx-pause-r11`，`package-v9`（基于 `0dde79ad`，包含未提交修改），真实 Firecracker 与独立 MinIO S3 服务。10 项公共 SDK checkpoint／生命周期用例通过。暂停后读取远端 manifest，确认本机上传暂存已清理，再重启 adxlet；恢复后的内存计数从 91 继续到 239，PID 保持 15。最终所有 Environment 为 Deleted、资源释放、sandboxd 清单为空、本地 checkpoint 文件与 S3 对象库存均为空，平台正常停止。
-
-证据：`out/ci/pause-resume/fc-r11/evidence/{sdk/result.json,lifecycle/result.json,s3-paused-manifest.json,s3-final.xml,catalog-final.json,inventory-final.txt,result.json}`。完整编译、打包、部署与用例日志为 `out/ci/stage-3/{linux-3,package-3,fc-r11}.log`。MinIO 测试制品为 `RELEASE.2025-09-07T16-13-09Z` Linux ARM64，SHA256 `5c83cd2cf151717ba0243f73e1c7802ff36e272b67144bdd7f1f7d684fd6f03d`。
-
-本轮也修复了 checkpoint 返回与后端源执行退出之间的竞态：不再以一次 Running 查询拒绝暂停，转而等待幂等删除确认后释放容量。r10 为该问题的失败证据，`source-exit-red.log` 为定向复现；`node-green-5.log` 中 74 项节点测试通过。`snapshot-rpc-green-1.log` 验证真实 mTLS、租户隔离、分页与延迟删除，`go-catalog-green-2.log` 验证 API Server 新目录调用链。API Server 目录适配是在 package-v9 之后构建，因此 r11 不作为该 HTTP 目录链路的端到端证据。
-
-
-本地制品确认丢失的回归：`missing-local-red.log` 复现原实现将 NotFound 当作临时存储故障、导致对账始终关闭；现明确返回 NotFound，权威 Paused 记录转为 Failed。`node-green-6.log` 的75项节点测试与 `clippy-4.log` 通过。API Server依赖裁剪后，`go-catalog-all.log` 的全部Go包测试、vet和API构建通过。
-
-## 快照创建、节点重启与物理清理
-
-`CreateSnapshot` 由 API Server 根据缓存的 Environment 归属直达 adxlet。节点先检查 Coordinator 可达，随后在该 Environment 的串行任务内完成 checkpoint、制品独立复制、目录发布和源实例恢复。成功响应要求快照目录及恢复运行结果均已提交到 Coordinator。创建过程中源实例会短暂暂停；源进程恢复失败会返回失败，不能宣称源实例仍运行。内部中间恢复点使用 24 小时有效期，可复用快照自身不设过期时间。
-
-复制、目录发布或暂停结果提交失败时，只要已有完整 Paused 恢复点，节点会尝试恢复源实例。发布结果不确定时保留复制制品，不能根据一次超时把可能已发布的快照删掉；远端未登记制品由下文的旧进程会话回收器处理。请求 ID 按租户及 Environment 派生快照 ID，完成结果记录原请求版本；重复调用复用已完成快照，后续生命周期操作之后的旧请求不能重新创建或恢复源实例。
-
-Coordinator 的 `InspectNode` 同时返回 Environment 及来源属于该节点的 Ready/Deleting 快照。SQLite 补写后重新获取完整目录，节点先校验所有记录再执行清理。本地快照即使源 Environment 已删除或处于延迟删除阶段，也不会因节点重启被当作孤儿制品移除。
-
-Coordinator 每 5 秒独立扫描删除中且无引用的快照，通过带节点会话的 mTLS RPC 请求源节点清理。维护开关不阻止清理；未完成对账或失联的节点暂不接收请求。adxlet 确认存储后端删除后，Coordinator 以目录版本及 epoch 复核完成状态。丢失确认、存储错误和进程重启可重试；仍被其他目录或实例恢复点使用的制品拒绝清理。节点不可用期间物理删除会保持待处理。
-
-本轮定向证据：`reconciliation-red.log` / `reconciliation-green.log`、`gc-red.log` / `gc-green.log`、`create-red.log` / `create-green-1.log`、`snapshot-commit-red.log` / `create-final-rust.log`，均位于 `out/ci/stage-3/`。节点 80 项测试、Coordinator 7 项真实 Redis/mTLS 测试、Clippy、全部 Go 测试/vet、SDK 139 项单测及部署驱动 47 项测试已通过。
-
-公共 SDK 的 `Environment.get_snapshot`、`list_snapshots`、`delete_snapshot` 支持可选 `connection=ConnectionConfig(...)`，可沿用源实例的地址、凭证和 TLS 校验设置。
-
-### 创建与删除的真实 Firecracker 验收
-
-2026-09-16，统一 `package-v12`（本地未提交工作树，`dirty=true`）在 Lima `adx-fc` 的 `/var/lib/adx-pause-r15` 上通过13项公共SDK/生命周期用例。可复用快照创建后源进程PID保持一致、内存计数继续增加、二进制文件一致；删除源实例后，SDK仍能查询和分页列出快照。删除快照后，Redis目录为Deleted且无引用，sandboxd实例、本地checkpoint文件和S3对象全部清空，停止流程成功。
-
-严格验收器输出 `verified 13`。日志为 `out/ci/stage-3/fc-r15.log`、`fc-r15-acceptance.log`；证据为 `out/ci/pause-resume/fc-r15/evidence/`。该验收覆盖快照创建、查询和删除，不代表从快照创建新Environment或Kubernetes验收已完成。
-
-package-v13 / Lima r16 再次通过相同13项验收，并确认 SDK 命令订阅不再出现 `ssl=None` 或 `command watch unavailable` 错误。对应日志为 `out/ci/stage-6/{fc-r16,fc-r16-acceptance}.log`，证据为 `out/ci/pause-resume/fc-r16/evidence/`。
-
-
-## 从可复用快照创建新 Environment
-
-公共入口为 `Environment.create(snapshot, connection=...)`。未指定的镜像、运行时、CPU/内存/磁盘从源快照继承。当前 Firecracker 实现要求显式资源与 checkpoint 的资源规格一致，不做恢复时扩缩容。调用者可指定新名称、环境变量和节点约束；新 Environment ID 必须不同于源实例。
-
-Coordinator 将 `snapshot_id` 纳入创建规格与幂等校验；加入 Shard 内存队列前在 Redis 持有以目标 Environment ID 命名的恢复引用。local-only 制品给每个候选节点条件附加源 NODE_ID 约束；共享存储沿正常调度路径选择节点。正在删除的快照仅允许已持有引用的请求继续，禁止新增克隆。Coordinator 重启清理没有持久化分配的旧队列引用，保留已经分配的请求引用。
-
-adxlet 在串行控制任务内校验来源并复制独立制品，再调用 RuntimeDriver.restore_from。复制失败提交 Failed；创建规格声明了快照却缺少恢复点时拒绝执行。复制成功后的恢复文件保持引用直到执行停止，避免 Firecracker 后续读取时文件被缓存淘汰。目标的恢复点保存 checkpoint 内的源运行身份，供重启和再次恢复校验；之后对目标执行新暂停时，恢复点转为目标自己的运行身份。初次克隆的恢复点跟随实例清理，不单独设置暂停 TTL；显式暂停仍沿用请求 TTL。
-
-sandboxd 适配器把恢复来源写入受控的恢复环境 `ADX_RESTORE_ORIGIN`，普通启动会清除同名用户输入。Execd 校验来源必须等于 checkpoint 内的完整 Environment/执行/归属代数，并且目标属于新 Environment；普通恢复保持既有版本校验。通过校验后更新身份、环境和认证信息并重新打开 HTTP/隧道监听。旧源身份的管控请求随后会被拒绝。
-
-结果提交到 Redis 后，Coordinator 维护任务释放源快照引用。删除源实例或源快照均不删除克隆的独立制品；克隆的暂停、恢复和删除继续由其所属 adxlet 管理。执行完成而持久化前节点故障，仍按已定契约清理与持久化记录不符的执行，不根据未提交信息补造成功结果。
-
-本轮 TDD 证据位于 `out/ci/stage-3/clone-{red,go-red,rust-green,rpc-final,go-final,sdk}.log`。package-v15 / Lima r18 已通过16项真实FC验收。两个新Environment继承资源规格并保留原PID、内存计数和二进制文件；写入相互隔离。验收先确认源快照物理回收完成，再分别暂停/恢复/删除两个克隆。最终6个实例均Deleted且资源释放，sandboxd清单、本地checkpoint和S3对象全部清空，服务停止成功。
-
-证据目录：`out/ci/pause-resume/fc-r18/evidence/`；严格顺序证据为 `sdk/snapshot-collected-before-clone-resume.json`，汇总为 `sdk/result.json`、`lifecycle/result.json`、`snapshots-final.json` 和 `result.json`。构建/打包/验收日志为 `out/ci/stage-3/clone-{linux-release,package-v15,fc-r18,fc-r18-acceptance}.log`。最终节点暂停/恢复测试21项、真实Redis/mTLS RPC 8项、SDK 139项、驱动6项通过；五个相关Rust包的全目标Clippy通过。该结果为同一Lima节点上的真实FC验证；跨节点迁移和正式Kubernetes验收分别跟踪。
-
-
-## 未登记远端制品回收
-
-对象上传或复制前先写 `owner.json`，记录节点 ID 和本次进程会话。文件上传完但结果未登记、或上传中途进程退出，都可能留下没有 Redis 权威记录的对象。回收器只处理**同一节点旧进程会话**的残留；当前会话、其他节点、没有归属标记或标记无效的历史对象均跳过。
-
-启动时先恢复 SQLite 降级日志，重新读取 Coordinator 的完整实例及快照目录，再完成执行状态和本机路由对账，最后开启回收。完整目录中引用过的制品在本次启动期间一直受到保护，后续删除由已有实例／快照清理流程负责。Coordinator 不可用或对账未完成时，不启动新一轮回收；当前会话提交失败的制品会留到后续进程重启、完成对账和达到保留时间后再判断。
-
-adxlet 的 `checkpoint_gc` 配置：
-
-```json
-{
-  "checkpoint_gc": {
-    "enabled": true,
-    "min_age_seconds": 86400,
-    "interval_seconds": 300,
-    "max_artifacts": 100
-  }
-}
+```bash
+python3 build/e2e/firecracker/profile_storage.py /path/to/export/evidence --output /path/to/stages.json
 ```
 
-所有子对象都达到最小存留时间、且没有本机恢复文件引用，才允许删除。后台任务在成功心跳后触发，单次并发为一，受 `rpc_timeout_seconds` 限制；失败留到后续轮次重试。归属标记最后删除，部分文件删除失败后仍能重新发现。日志输出每轮删除数量或失败原因。本地存储不执行远端扫描。
+汇总按 Environment、Runtime 和首个成功请求的 ID 关联恢复阶段，包括 adxlet 准备、
+sandboxd open / prepare / instantiate / VMM ready / load / agent、应用就绪探测、
+路由激活和 Ingress 等待。COW 排队与执行计时取同一请求组前后指标增量，属于
+sandboxd 阶段内部开销，不能与父阶段相加；RPC 与首 HTTP 的外层差值单独保留。
+汇总保留提交数量和编码字节区间；local-file 的日常编码是本批次增量，不能把它的编码字节
+当成完整权威状态大小，与旧版完整快照的大小区间直接比较。前后对比应同时核对
+`state_counts`（实体、幂等结果和事件数量）、请求操作及负载；后台完整检查点另计，
+避免把后台续租数量变化或编码格式改变误当成相同工作量。
 
-对象存储凭证需要该 prefix 的 List/Get/Put/Delete 权限。未完成的 S3 multipart upload 不属于普通对象清单，需要部署环境配置后端的过期中止规则。本实现不会自动推断无标记历史文件的归属。
+Meta 增量持久化回归由 `cargo test -p afs --all-features` 覆盖：小提交不重写历史快照、
+后台检查点保留并发提交、跨检查点重开不丢幂等结果／watch 事件、提交成功后应答丢失、
+不完整尾帧截断、完整帧校验和损坏、版本缺口／重复、检查点安装中断后恢复及失败后的权威关闭。
+另验证后台等待到期保留原 pending 请求，正常关闭期间的迟到心跳不重新开启读授权。
+这些进程／文件测试不代表物理断电或跨物理主机的存储故障验证。
 
-本轮节点测试 85 项、真实 Redis/mTLS RPC 8 项、Clippy 与 FC 驱动测试 6 项通过。定向日志位于 `out/ci/stage-3/orphan-gc/`；统一 package-v16 / Lima r20 已通过17项真实 MinIO＋FC 验收，包含节点重启后的残留回收和原暂停实例恢复。
+正式后端对比关闭 Meta profile 和 syscall trace；`compare_storage.py` 会拒绝带此类
+诊断的轮次，并核对发布包、外部运行时、guest 镜像和工作负载身份。每个后端保留
+三次冷恢复、三次热恢复及生命周期验证，使用相同拓扑和顺序。独立的带 trace 轮次
+验证内存文件 COW、首次响应前未整份读取、延迟触页后远端读取增加，不计入性能样本。
+业务 HTTP 失败时，fixture 在删除 Environment 前保留请求身份、Ingress 副本、状态码、
+响应正文及一次 guest 日志／网络状态采集；guest 采集失败也保留原错误响应。
+只有明确的 `503 ENV_RESUMING` 使用等待重试，502 等执行结果不确定的失败直接终止验收。
 
+OBS 的恢复中重启用例在目标 fixture 的网络 namespace 内，临时阻断 Execd readiness
+端口 50090。确认真实目标 VMM 已恢复且控制面仍有 pending recovery 后，才重启
+Coordinator；观察目标节点至少两次成功的排空心跳后解除阻断。异常退出也移除规则，
+且最终验证目标未失效、旧 VMM 先退出后再启动替代 VMM。该阻断只用于性能样本之后的
+故障用例，上传、下载、VMM 和业务请求仍使用真实实现。
 
-2026-09-16，r20 的 `orphan-gc.json` 确认当前会话残留受到保护，新会话完成权威对账后删除旧会话残留；已登记 checkpoint、其他节点与无标记对象保持。真实节点日志记录 `remote orphan GC completed: removed=1`，之后原进程 PID、内存计数和文件恢复通过；双克隆及所有节点生命周期场景通过。最终业务对象清单、backend 实例清单和本地 checkpoint 清空，平台停止成功。证据位于 `out/ci/pause-resume/fc-r20/evidence/`，日志为 `out/ci/stage-3/orphan-gc/{fc-r20,acceptance-r20}.log`。
+## 原生 AFS 回收验收
 
-同一 package-v16 的 r19 已通过新增回收场景，但随后克隆因测试磁盘触及 MinIO 最低空闲阈值而失败。确认历史测试进程已停止后，仅清理 r15/r16/r18 的 MinIO 内部 trash，保留历史日志，释放约13GB，再完成 r20 的全部17项验收。r19 失败证据保留，不计为通过。上述均为本地 Lima 验收，正式 Buildkite/Kubernetes 单独跟踪。
+设置 `ADX_STORAGE_GC=1` 后，真实 AFS/Firecracker 驱动把专用 Meta 的结果窗口设为 30 秒、
+Watch 窗口设为 16 个 revision，保留生产的 60 秒引用保护期。
+驱动先验证 COW/open-unlink 数据在回收期间仍可读取，替换一个 AFS Node session 后再检查
+剩余读者及最终物理清理。之后执行双 Ingress 流量唤醒和 Coordinator／执行节点故障场景，
+再对同一个 Environment 做两批各三次暂停恢复，每次 12 个并发请求且只允许一次物理恢复。
+
+`gc-observations.json` 记录每阶段的 Meta 实体、幂等结果、Watch 水位，以及各 Node 的
+实际 chunk 数量、字节和 catalog 大小。两批之间等待保护期结束，比较稳定存量；删除
+Environment 后必须回到初始存量附近，同时 inode、目录项、版本、布局、引用、写租约和 chunk
+实体不能超过初始数量。初始存量只允许 CheckpointStore 的三字节 `store-id` 及其元数据，
+不允许上轮执行文件或写租约。只看到目录删除或 SDK 成功不能判定物理回收通过。
+执行拓扑仍是一台 KVM 主机上的两个隔离执行节点，不代表两个物理故障域。
+
+## AFS unlink 并发回归
+
+`afs/tests/dfs_commit_contention.rs` 在 unlink 读取与提交之间执行真实 DfsService
+元数据写回／同父目录的另一个 unlink，检查冲突后重新校验和提交。回归同时覆盖
+权限变化、名字被替换、目录新增子项、持续竞争返回 EAGAIN，以及提交成功但应答
+丢失后的幂等重放。测试不把预设返回值代替真实的 Meta 比较提交。
+
+真实 AFS/Firecracker 验证可开启 `AFS_META_NAMESPACE_TRACE=1` 关联失败条件和
+相邻写入事务；关联必须使用 inode 及版本／head，不能只凭相近时间认定竞争双方。
+删除验收还要检查私有运行文件、匿名恢复点、Meta 实体和物理数据块均已收敛。

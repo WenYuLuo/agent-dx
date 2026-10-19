@@ -227,8 +227,7 @@ class FirecrackerEvidenceTests(unittest.TestCase):
             )
             orphan_checks = (
                 'passed',
-                'current_session_preserved',
-                'retired_session_removed',
+                'coordinator_collected',
                 'foreign_preserved',
                 'unmarked_preserved',
             )

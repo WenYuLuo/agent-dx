@@ -257,7 +257,7 @@ try:
     if a.restart_command:
         subprocess.run([*a.restart_command, environment.id], check=True, timeout=180)
         passed('Adxlet restart while paused')
-        passed('remote orphan GC preserves registered checkpoint')
+        passed('Coordinator reclaims abandoned capture and preserves registered checkpoint')
     resumed = environment.resume()
     if not (resumed.environment_id == environment.id):
         raise AssertionError()
@@ -362,7 +362,30 @@ try:
     if not (clones[1].files.read('/tmp/checkpoint.bin', format='bytes') == payload):
         raise AssertionError()
     passed('snapshot clones have independent identity and writable files')
-    Environment.delete_snapshot(snapshot.snapshot_id, connection=connection)
+    try:
+        Environment.delete_snapshot(snapshot.snapshot_id, connection=connection)
+    except Exception as error:
+        if getattr(error, 'code', None) != 'SNAPSHOT_IN_USE' or not set(c.id for c in clones).issubset(set(error.sandbox_ids)):
+            raise
+    else:
+        raise AssertionError('deletion must fail while clones borrow the snapshot')
+    passed('snapshot deletion rejected while clones use snapshot')
+    counts = {}
+    for clone in clones:
+        environment = clone
+        counts[clone.id] = int(command('cat /tmp/counter'))
+        checkpoint = clone.pause(retention=RetentionPolicy.for_seconds(600), timeout_seconds=120)
+        if checkpoint.size <= 0:
+            raise AssertionError('clone did not capture its own restore point')
+    deadline = time.monotonic() + 120
+    while True:
+        try:
+            Environment.delete_snapshot(snapshot.snapshot_id, connection=connection)
+            break
+        except Exception as error:
+            if getattr(error, 'code', None) != 'SNAPSHOT_IN_USE' or time.monotonic() >= deadline:
+                raise
+            time.sleep(1)
     passed('snapshot deletion accepted for artifact collection')
     # Source reference release and physical GC run asynchronously. Prove the
     # remaining clones survive after the shared snapshot has been collected.
@@ -394,10 +417,7 @@ try:
         time.sleep(1)
     for clone in clones:
         environment = clone
-        count = int(command('cat /tmp/counter'))
-        checkpoint = clone.pause(retention=RetentionPolicy.for_seconds(600), timeout_seconds=120)
-        if not (checkpoint.size > 0):
-            raise AssertionError()
+        count = counts[clone.id]
         clone.resume()
         if not (command('cat /tmp/counter.pid') == pid):
             raise AssertionError()

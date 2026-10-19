@@ -98,6 +98,8 @@ impl State {
             .get(&stored.assignment.node_id)
             .ok_or(Error::NotFound)?;
         let record = stored.result.clone().unwrap_or_else(|| EnvironmentRecord {
+            execution_artifacts: vec![],
+            snapshot_source: None,
             failure: None,
             spec: stored.spec.clone(),
             assignment: stored.assignment.clone(),

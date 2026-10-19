@@ -68,7 +68,7 @@ package-v13 / Lima r16再次通过13项；本轮同时修复SDK在 `verify_tls=T
 package-v15/Lima r18 已通过16项及全部最终清理，严格时序证据已验证；该记录不表示目标Kubernetes已执行。
 
 
-当前必需集合增加远端残留回收验证，共17项。暂停成功后，从真实制品读取上传归属标记，注入同会话的半成品文件，并验证当前会话期间保留；杀死 Adxlet 后，等待新会话完成 Redis 权威对账，确认旧会话残留被删除、已登记暂停点仍可恢复、其他节点及无标记对象仍保留。注入的是存储残留，实际 S3 删除、节点重启、checkpoint 恢复均由生产组件执行。测试专用 `checkpoint_gc` 使用零保留期和一秒周期，生产默认仍为24小时和5分钟。逐项证据为 `orphan-gc.json`。
+当前驱动验证 Coordinator 的共享回收：注入已无 Environment 引用的捕获清单及真实 S3 半成品，等待 Coordinator 删除，并确认已登记恢复点、未登记对象保持。节点不运行共享删除扫描。克隆使用 Snapshot 时删除返回 `SNAPSHOT_IN_USE`；克隆暂停取得自己的恢复点后才允许回收 Snapshot，然后从各自匿名恢复点恢复。此处描述驱动断言，最新版本实际端到端结果以本次运行证据为准。
 
 测试 VM 的 MinIO 在停止前可能尚未完成其内部 `.minio.sys/tmp/.trash` 回收。S3 最终清单为空证明业务对象已删除，不代表后台垃圾已归还磁盘；反复运行前需要检查可用空间。只可在确认测试服务已停止、证据已保留后清理该次运行的内部垃圾目录，不能删除仍在服务的 MinIO 数据目录。
 
@@ -127,3 +127,58 @@ sudo env ADX_FC_BASE=/opt/adx-checkpoint-cache ADX_FC_SUITE=cache \
 `cache_contract.py` 严格要求七项完整证据及实例、本地快照、对象存储和两个物理后端清单归零。结果为 `evidence/sdk-cache.json`；外层 `evidence/result.json` 还要求测试进程和命名空间清理成功。这个集合不填满实际 50 GiB 磁盘，也不等同于 500 份快照的规模测试。
 
 跨节点集合 `ADX_FC_SUITE=transfer` 继续验证共享快照在原节点失联后的恢复。原节点限额内的无执行引用副本可以保留到下次 LRU 或权威对账；该集合在全局删除后额外重启两个 adxlet，并检查本地文件全部回收，证据为 `cache-reconciliation-cleanup.json`。默认单节点 checkpoint 集合的 `restart_paused.py` 则在所有物理后端停止且权威状态为 Paused 时注入本机缓存丢失，继续验证从 S3 恢复。
+
+### AFS/S3 双执行节点存储验证
+
+`storage.py` 在专用 Linux KVM 主机运行，沿用 `transfer.py` 的两个隔离网络命名空间。
+需要同一候选构建的发布包（`ADX_WITH_AFS=1`）、匹配锁定 revision 的 sandboxd、
+Firecracker/virtiofsd/kernel，以及含 Python HTTP 服务的工作负载镜像。
+存储套件对所有后端统一设置 `writable_io_engine = "Sync"` 与
+`writable_cache_type = "Writeback"`，以兼容 AFS 的文件 I/O 能力；运行时默认
+`AsyncDirect` 在该 AFS 挂载上会因缺少 direct I/O 对齐信息而拒绝创建磁盘。
+
+```bash
+ADX_FC_BASE=/opt/adx-storage ADX_FC_SOURCE=/source \
+ADX_FC_AFS_ROOT=/source/out/afs-fc/afs-services-RUN \
+  /opt/adx/client/bin/python -u build/e2e/firecracker/storage.py /var/lib/adx-storage-afs-RUN
+```
+
+AFS 使用一个 local-file Meta 和三个独立 DFS 客户端，分别供两个执行节点及 Coordinator
+访问同一 namespace；配置为一份必需副本。AFS 服务与执行节点进程独立，执行节点故障
+注入不会同时杀死存储服务。此拓扑不证明跨物理主机故障域或 AFS 存储高可用。
+运行目录与 AFS 根目录必须全新，驱动保留日志并停止自己的服务、卸载自己的挂载。
+
+取消 `ADX_FC_AFS_ROOT` 可运行 S3＋本地缓存模式（默认独立 MinIO）；提供私有
+`ADX_FC_OBS_CONFIG` 可改为真实 OBS。对比必须保留具体服务版本、端点类型和网络位置，
+MinIO 结果不能标为 OBS 性能。
+
+每种后端默认分别运行三次 cold 与三次 warm：cold 从独立客户端/无该制品缓存的节点
+恢复，warm 在刚完成捕获的原节点恢复。它们分别是跨节点冷恢复与原节点热恢复，
+不能据此隔离调度迁移本身的成本；不执行全机 drop_caches。记录暂停发布耗时、首个
+真实 HTTP 响应、全部并发响应及延迟触页耗时，同时核对 guest PID、内存状态和文件。
+每次发起 12 个请求，交替经过两个 Ingress，必须只产生一次物理恢复。
+
+AFS 模式额外保存实际挂载来源、直接捕获路径、分阶段文件数据读流量及 VMM smaps。
+这些观测用于判断运行时是否仍整份读取/复制，接口返回快不等于按需恢复已经通过。
+故障验证持久使用保护跨 Coordinator 重启保留，Environment 删除后旧执行仍阻止回收；
+原节点完成清理对账后才允许回收。Coordinator 删除系统调用保存在 `coordinator-gc.trace*`。
+`fault-progress.json` 记录恢复期间的目录变化，健康目标节点不能被失效处理；真实 OBS 还要求
+重启后排空旧恢复操作期间至少两次成功心跳。`recovery-runtime.trace*` 校验被替换 VMM 的退出早于下一次启动。
+另将已停止写入的未完成捕获加入持久清单，确认大小为 0、未发布 manifest 的目录也能回收。
+原始样本及汇总在 `evidence/sdk-storage.json`，最终完整生命周期裁决在 `evidence/result.json`。
+
+多个完整成功轮次可使用 `compare_storage.py AFS_EVIDENCE S3_EVIDENCE --output comparison.json`
+汇总；该工具拒绝不同发布包、外部运行时或 guest 工作负载混用。
+
+使用 `ADX_STORAGE_REPETITIONS=1 ADX_STORAGE_TRACE_RESTORE=1` 可运行独立 AFS 诊断，
+跟踪目标 sandboxd 及其 Firecracker 子进程对快照 `memory` 的读取和复制，
+在首轮 HTTP 完成、显式触页之前停止跟踪。诊断轮仅将目标 AFS 节点日志提高到 INFO，
+保存 `dfs.cow_range_committed` 的固定源版本、目标 inode 和范围；性能轮保留 WARN。
+`restore-trace-summary.json` 同时记录直接读取字节数、逻辑复制字节数、COW 提交事件和
+随后触页的远端读增量。只有元数据 COW 被确认、没有完整数据复制、延迟触页产生新增
+远端读取时诊断才通过；不能仅按 `copy_file_range` 的逻辑返回大小推断实际复制。
+此轮不参与性能比较。
+
+独立文件系统验证使用 `build/e2e/afs/scripts/dfs/cow.py --binary-dir PACKAGE/bin --root NEW_ROOT`，
+覆盖普通文件、非零偏移覆盖和超过 4 GiB 的稀疏分段复制，复制期间源数据读流量必须为 0；
+同时验证修改隔离、源删除后副本可读、打开写文件闲置 35 秒后仍可写入和同步，以及正常卸载/退出。

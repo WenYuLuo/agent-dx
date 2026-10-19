@@ -325,3 +325,35 @@ class ReusableSnapshotTests(unittest.TestCase):
 
         self.assertEqual(len(client._http.calls), 1)
         sleep.assert_not_called()
+
+    def test_busy_delete_reports_sandbox_ids_and_does_not_retry(self):
+        import httpx
+        from adx_environment._transport import EnvironmentHTTPError
+
+        calls = []
+        class HTTP:
+            @staticmethod
+            def delete(url, **kwargs):
+                calls.append((url, kwargs))
+                return httpx.Response(409, json={"code": 409, "message": "snapshot is in use", "error": {
+                    "code": "SNAPSHOT_IN_USE", "retry": "never", "outcome": "not_started",
+                    "sandbox_ids": ["source", "sandbox-a"], "template_ids": ["node/base"],
+                }})
+
+        client = object.__new__(EnvironmentClient)
+        client._connection = adx_environment.ConnectionConfig(server_address="frontend", token="test-token")
+        client._base = "https://frontend/api/environment/v1"
+        client._http = HTTP()
+        with patch("adx_environment._transport.time.sleep") as sleep:
+            with self.assertRaises(EnvironmentHTTPError) as caught:
+                client.delete_snapshot("snapshot-1")
+            sleep.assert_not_called()
+        self.assertEqual(caught.exception.code, "SNAPSHOT_IN_USE")
+        self.assertEqual(caught.exception.sandbox_ids, ("source", "sandbox-a"))
+        self.assertEqual(caught.exception.template_ids, ("node/base",))
+        self.assertEqual(len(calls), 1)
+
+    def test_legacy_text_error_does_not_break_error_decoding(self):
+        import httpx
+        error = EnvironmentClient._http_error(httpx.Response(500, json={"error": "failed"}))
+        self.assertEqual(error.sandbox_ids, ())

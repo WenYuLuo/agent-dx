@@ -79,6 +79,8 @@ fn start(address: &str) -> Process {
 }
 fn record() -> EnvironmentRecord {
     EnvironmentRecord {
+        execution_artifacts: vec![],
+        snapshot_source: None,
         failure: None,
         spec: EnvironmentSpec {
             id: "i".into(),

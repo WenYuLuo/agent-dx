@@ -133,6 +133,10 @@ class EnvironmentHTTPError(EnvironmentError):
         )
         self.status_code = status_code
         self.payload = payload
+        raw_detail = payload.get("error")
+        detail = raw_detail if isinstance(raw_detail, dict) else {}
+        self.sandbox_ids = tuple(detail.get("sandbox_ids") or ())
+        self.template_ids = tuple(detail.get("template_ids") or ())
 
 
 class _InvokeResult(dict):
