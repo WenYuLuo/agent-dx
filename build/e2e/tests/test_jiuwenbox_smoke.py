@@ -12,7 +12,7 @@ spec.loader.exec_module(smoke)
 
 
 class JiuwenboxSmokeTests(unittest.TestCase):
-    def test_ci_rejects_stale_or_dirty_release_before_starting_backends(self):
+    def test_rejects_stale_or_dirty_release_before_starting_backends(self):
         self.assertEqual(len(smoke.EXPECTED_CASES), 8)
         self.assertFalse(any('conch' in name for name in smoke.EXPECTED_CASES))
         manifest = {'commit': 'a' * 40, 'dirty': False, 'target': 'x86_64-unknown-linux-gnu'}
@@ -82,7 +82,7 @@ class JiuwenboxSmokeTests(unittest.TestCase):
             self.assertFalse((public / 'runtime/config.json').exists())
             self.assertFalse((public / 'tls').exists())
 
-    def test_ci_teardown_only_unmounts_its_private_fixture(self):
+    def test_teardown_only_unmounts_its_private_fixture(self):
         from types import SimpleNamespace
         from unittest.mock import patch
         with tempfile.TemporaryDirectory() as directory:
@@ -101,7 +101,7 @@ class JiuwenboxSmokeTests(unittest.TestCase):
             self.assertEqual(protected.read_text(), 'keep')
             self.assertEqual(command.call_args_list[1].args[0], ['umount', '--', str(target)])
 
-    def test_ci_teardown_refuses_an_unexpected_mount(self):
+    def test_teardown_refuses_an_unexpected_mount(self):
         from types import SimpleNamespace
         from unittest.mock import patch
         with tempfile.TemporaryDirectory() as directory:
@@ -155,72 +155,6 @@ class JiuwenboxSmokeTests(unittest.TestCase):
                 self.assertEqual(acceptance.host_audit()['leftovers'], [str(orphan)])
                 orphan.rmdir()
                 self.assertEqual(acceptance.host_audit()['leftovers'], [])
-
-
-class JiuwenboxPipelineTests(unittest.TestCase):
-    def test_required_smoke_consumes_current_package_and_exports_only_public_evidence(self):
-        import yaml
-        pipeline = yaml.safe_load((ROOT / '.buildkite/pipeline-package.yml').read_text())
-        steps = {step['key']: step for step in pipeline['steps']}
-        step = steps['jiuwenbox-smoke']
-        self.assertEqual(step['depends_on'], 'platform-build')
-        self.assertEqual(step['agents'], {'queue': 'default', 'os': 'linux', 'arch': 'amd64'})
-        spec = step['plugins'][0]['kubernetes']['podSpec']
-        self.assertTrue(spec['containers'][0]['securityContext']['privileged'])
-        self.assertNotIn('/dev/kvm', json.dumps(spec))
-        self.assertEqual(step['concurrency'], 1)
-        self.assertNotIn('soft_fail', step)
-        self.assertNotIn('if', step)
-        self.assertIn('out/buildkite/jiuwenbox/**/*', step['artifact_paths'])
-        self.assertFalse(any('private' in p for p in step['artifact_paths']))
-
-    def run_checksum_fixture(self, git_missing=False, cgroup_available=True):
-        import os
-        import shutil
-        import subprocess
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            tools = root / 'tools';tools.mkdir()
-            git = '#!/bin/sh\n[ "$1" = rev-parse ] && echo fixture-commit\nexit 0\n'
-            scripts = {
-                name: '#!/bin/sh\nexit 0\n'
-                for name in ('bwrap', 'ip', 'iptables', 'busybox', 'mount', 'findmnt', 'losetup', 'openssl', 'curl', 'buildkite-agent')
-            }
-            scripts.update({
-                'id': '#!/bin/sh\nprintf "0\\n"\n',
-                'python3': '#!/bin/sh\n' + ('exit 0\n' if cgroup_available else 'echo compatible cgroup required >&2\nexit 1\n'),
-                'sha256sum': '#!/bin/sh\nexit 34\n',
-                'tar': '#!/bin/sh\nprintf extracted > SHOULD_NOT_EXTRACT\n',
-                'apt-get': '#!/bin/sh\nprintf apt > "$FIXTURE_TOOLS/bootstrap"\n/bin/cat > "$FIXTURE_TOOLS/git" <<\'GIT\'\n' + git + 'GIT\n/bin/chmod +x "$FIXTURE_TOOLS/git"\n',
-            })
-            if not git_missing:
-                scripts['git'] = git
-            for name, script in scripts.items():
-                path = tools / name;path.write_text(script);path.chmod(0o755)
-            (tools / 'mkdir').symlink_to(shutil.which('mkdir'))
-            env = dict(os.environ, PATH=str(tools), FIXTURE_TOOLS=str(tools),
-                       BUILDKITE_COMMIT='fixture-commit', BUILDKITE_BUILD_ID='fixture-build',
-                       ADX_JIUWENBOX_CACHE='/fixture/cache')
-            result = subprocess.run(['/bin/bash', str(ROOT / '.buildkite/jiuwenbox-smoke.sh')],
-                                    cwd=root, env=env, capture_output=True, text=True)
-            self.assertFalse((root / 'SHOULD_NOT_EXTRACT').exists())
-            return result, (tools / 'bootstrap').exists()
-
-    def test_bad_archive_checksum_stops_before_deployment_and_keeps_exit_code(self):
-        result, bootstrapped = self.run_checksum_fixture()
-        self.assertEqual(result.returncode, 34, result.stderr)
-        self.assertFalse(bootstrapped)
-
-    def test_python_image_without_git_is_bootstrapped_before_checkout_verification(self):
-        result, bootstrapped = self.run_checksum_fixture(git_missing=True)
-        self.assertEqual(result.returncode, 34, result.stderr)
-        self.assertTrue(bootstrapped)
-
-    def test_missing_cgroup_stops_before_downloading_dependencies(self):
-        result, bootstrapped = self.run_checksum_fixture(cgroup_available=False)
-        self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertIn('cgroup', result.stderr)
-        self.assertFalse(bootstrapped)
 
 
 class JiuwenboxArtifactTests(unittest.TestCase):

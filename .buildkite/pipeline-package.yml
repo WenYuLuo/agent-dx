@@ -633,46 +633,6 @@ steps:
                 name: swr-pull-secret
                 key: .dockerconfigjson
                 optional: true
-- label: Acceptance · Jiuwenbox supervisor · SDK smoke
-  key: jiuwenbox-smoke
-  depends_on: platform-build
-  agents:
-    queue: default
-    os: linux
-    arch: amd64
-  concurrency: 1
-  concurrency_group: adx/jiuwenbox-smoke
-  command: bash .buildkite/step.sh jiuwenbox-smoke bash .buildkite/jiuwenbox-smoke.sh
-  timeout_in_minutes: 20
-  artifact_paths:
-  - out/buildkite/jiuwenbox/**/*
-  - out/buildkite/logs/step-jiuwenbox-smoke.log
-  env:
-    BUILDKITE_AGENT_NAME: agent-stack-k8s
-    PIP_INDEX_URL: https://repo.huaweicloud.com/repository/pypi/simple/
-    PIP_CACHE_DIR: /mnt/paas/build-cache/adx/pip/jiuwenbox
-  plugins:
-  - kubernetes:
-      podSpec:
-        imagePullSecrets:
-        - name: swr-pull-secret
-        containers:
-        - image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/adx-python-build@sha256:12afbd81cde9ec5931c9db8aaf955720fdfd1e1e267545a44430ce79a4d81854
-          securityContext: {privileged: true, runAsUser: 0}
-          resources:
-            requests: {cpu: '2', memory: 4Gi}
-            limits: {cpu: '4', memory: 8Gi}
-          volumeMounts:
-          - {name: build-cache, mountPath: /mnt/paas}
-          - {name: cgroup, mountPath: /sys/fs/cgroup}
-          - {name: devices, mountPath: /dev}
-        volumes:
-        - name: build-cache
-          hostPath: {path: /mnt/paas, type: DirectoryOrCreate}
-        - name: cgroup
-          hostPath: {path: /sys/fs/cgroup, type: Directory}
-        - name: devices
-          hostPath: {path: /dev, type: Directory}
 - label: Publish · adxadmin · PyPI
   key: admin-pypi
   depends_on: platform-e2e

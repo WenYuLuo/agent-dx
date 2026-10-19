@@ -36,9 +36,9 @@ def verify_identity(manifest, commit):
     if manifest.get('target') != 'x86_64-unknown-linux-gnu':
         raise ValueError('Jiuwenbox smoke requires a Linux x86_64 package')
     if commit and manifest.get('commit') != commit:
-        raise ValueError('package commit differs from Buildkite commit')
+        raise ValueError('package commit differs from expected commit')
     if commit and manifest.get('dirty') is not False:
-        raise ValueError('CI cannot accept a dirty package')
+        raise ValueError('expected-commit validation rejects a dirty package')
 
 
 def verify_wheel(wheel, site, prefixes):
@@ -119,13 +119,13 @@ def export_evidence(run, output, acceptance_log=None):
 
 def cleanup_fixture(private):
     # The SDK audit already proved the mount survives environment deletion.
-    # CI now tears down its own temporary node; other nodes' shared mounts stay.
+    # The runner now tears down its temporary node; other nodes' shared mounts stay.
     digest = sha(private / 'package-sdk/runtime/adx-runtime-rootfs.img')
     target = private / 'runs/smoke/runtime/state/bootstrap' / digest
     result = subprocess.run(['findmnt', '-J', '-M', str(target)], capture_output=True, text=True, check=True)
     mounts = json.loads(result.stdout)['filesystems']
     if len(mounts) != 1 or mounts[0]['target'] != str(target) or mounts[0]['fstype'] != 'erofs':
-        raise ValueError('unexpected fixture mount during CI teardown')
+        raise ValueError('unexpected fixture mount during teardown')
     subprocess.run(['umount', '--', str(target)], check=True)
     shutil.rmtree(private)
     return {'fixture_mount_unmounted': True, 'private_directory_removed': True}
@@ -195,7 +195,7 @@ def run(args):
                 'prebuilt_lock_sha256': sha(LOCK),
             }
             shutil.copy2(LOCK, output / 'prebuilt-lock.json')
-            # Do not inherit CI credentials or a host-only TMPDIR into sandboxes.
+            # Do not inherit caller credentials or a host-only TMPDIR into sandboxes.
             environment = {'PATH': os.environ.get('PATH', os.defpath), 'LANG': 'C.UTF-8',
                            'PYTHONDONTWRITEBYTECODE': '1', 'TMPDIR': '/tmp'}
             command = [str(backend / 'venv/bin/python'), '-u', str(Path(__file__).with_name('full_sdk.py')),
@@ -240,7 +240,7 @@ def main():
     parser.add_argument('--backend-root', type=Path, required=True)
     parser.add_argument('--package', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
-    parser.add_argument('--commit', help='CI requires the exact clean Buildkite package revision')
+    parser.add_argument('--commit', help='Require this exact clean package revision')
     args = parser.parse_args()
     raise SystemExit(run(args))
 

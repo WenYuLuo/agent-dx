@@ -4,7 +4,7 @@ ADX uses four Buildkite pipelines backed by one repository:
 
 | Buildkite display name | URL slug | Configuration | Responsibility |
 |---|---|---|---|
-| Agent DX | `agent-dx` | `pipeline-package.yml` | Platform/Execd/SDK/adxadmin UT and packages, install smoke, real Kubernetes L0, Jiuwenbox supervisor smoke, default OBS upload and optional PyPI publication |
+| Agent DX | `agent-dx` | `pipeline-package.yml` | Platform/Execd/SDK/adxadmin UT and packages, install smoke, real Kubernetes L0, default OBS upload and optional PyPI publication |
 | Agent DX Environment SDK | `agent-dx-python-sdk` | `pipeline-sdk.yml` | Environment SDK tests, wheel/sdist, clean install smoke and optional OBS/PyPI publication |
 | agent-dx-admin | `agent-dx-admin` | `pipeline-admin.yml` | Standalone adxadmin UT, wheel/sdist, install smoke and optional PyPI publication |
 | Agent DX Environment Full Test | `agent-dx-full-test` | `pipeline-full.yml` | Compose exact base/SDK candidates and run the eleven-group Kubernetes Full gate |
@@ -661,54 +661,3 @@ rebuild instruction. Package and install-smoke virtualenvs remain isolated.
 The Docker runner mounts the same persistent pip directory that it passes as
 `PIP_CACHE_DIR`; `PIP_INDEX_URL`, `PIP_EXTRA_INDEX_URL` and `PIP_DEFAULT_TIMEOUT`
 are forwarded when configured, for runs using an image without a wheelhouse.
-
-## Jiuwenbox supervisor smoke
-
-The base package pipeline has a required `jiuwenbox-smoke` step after
-`platform-build`, alongside Kubernetes L0. It downloads this build UUID's
-`adx-release.tar.gz` and checksum, verifies all package files, and rejects a
-stale commit or dirty package before starting the backend.
-
-The step reuses the existing `default,os=linux,arch=amd64` Kubernetes worker and
-the digest-pinned `adx-python-build` image. Its container is privileged, with
-writable cgroup v1 or v2, the host `/dev` device directory and the existing
-`/mnt/paas` cache. It installs missing Git
-and native runtime tools before checkout verification, prepares `/etc/pki` for
-the pinned distro-neutral policy, and uses loop/EROFS, network namespaces and
-iptables. The CI worker kernel must
-support those facilities. `ADX_JIUWENBOX_CACHE` optionally overrides the default
-`/mnt/paas/build-cache/adx/jiuwenbox` content-addressed cache.
-The worker cgroup layout and availability of a loop device are checked before
-artifact or pip downloads. Both the
-backend's v1 controller hierarchies and its v2 unified hierarchy are accepted.
-The supervisor step uses the Huawei Cloud HTTPS PyPI mirror via `PIP_INDEX_URL`
-and keeps server/SDK pip downloads under
-`/mnt/paas/build-cache/adx/pip/jiuwenbox` via `PIP_CACHE_DIR`. Dependency pins and
-external wheel checksums are unchanged.
-
-`prepare_supervisor.py` downloads the archive selected by
-[`prebuilt-lock.json`](../build/e2e/jiuwenbox/prebuilt-lock.json), verifies its
-SHA256/size, extracts only the pinned JiuwenSwarm wheel and checks that member's
-SHA256/size. A cache hit is reverified. It installs the original wheel with a
-small server dependency set into a fresh venv. The rolling upstream download URL
-must still match the pin; different content fails rather than updating the lock.
-Preseed the same locked archive/wheel on additional workers when the upstream
-channel has moved. Jiuwenbox package files are checked before and after smoke.
-
-The supervisor gate contains eight required cases: create/exec/files/read-only
-EROFS; ADXlet, Coordinator, API Server, Ingress and Jiuwenbox restart recovery;
-public deletion; and native cleanup audit. It uses the existing complete ADX
-process deployment and installed public SDK, with a fresh SDK venv from this
-build's package wheel. Execd and EROFS also come from this build's package.
-The source pin's `validation` section describes the earlier manual run; each CI
-run records its actual package/SDK/Execd identities in `summary.json`.
-
-Buildkite concurrency and a host flock protect fixed backend paths. Secrets and
-host-only TMPDIR are not propagated to sandboxes. After the suite verifies that
-EROFS remains mounted after Environment deletion, CI tears down only its own
-temporary node mount and private directory. Failed runs retain private state.
-Only `out/buildkite/jiuwenbox/**/*` and the step log are uploaded: summary,
-aggregate JUnit, case/recovery results, wheel checks and redacted logs. Credentials,
-rendered configs and venvs stay outside that glob in `jiuwenbox-private/` and
-`jiuwenbox-backend/`. Missing cases, changed payloads or cleanup failures fail the
-job. The independent SDK and Full pipelines retain their current scopes.

@@ -177,43 +177,44 @@ are reported separately from orphan resources. Kernel/VM/public SDK acceptance m
 be rerun for these semantics; earlier reports describe the previous implementation.
 
 
-## Buildkite supervisor smoke
+## Supervisor SDK smoke
 
-`prepare_supervisor.py` prepares the pinned original JiuwenSwarm wheel and a
-fresh server venv from `requirements-supervisor.txt`. The content-addressed cache
-retains the locked source archive and wheel. The CI bootstrap supplies bubblewrap
-and the `/etc/pki` directory referenced by the pinned default policy. `smoke.py` verifies the current ADX
-package, creates a private fixture, installs that package's public SDK wheel,
-and invokes `full_sdk.py --runtime supervisor` for eight required cases.
+`prepare_supervisor.py` installs the pinned original JiuwenSwarm wheel into a
+fresh server venv. Its content-addressed cache verifies the source archive and
+wheel by SHA256 and size. `smoke.py` verifies the ADX package, creates a private
+fixture, installs its public SDK wheel and runs eight supervisor cases.
 
-The base Buildkite pipeline runs this as `jiuwenbox-smoke` using the existing
-privileged Linux x86_64 Python worker. See
-[Buildkite setup](../../../.buildkite/README.md#jiuwenbox-supervisor-smoke) for
-cache controls, kernel prerequisites and artifact boundaries.
+Use a dedicated privileged Linux x86_64 host or container with bubblewrap,
+iproute2, iptables, busybox, util-linux, OpenSSL, cgroup v1/v2 and loop/EROFS
+support. A container must expose the cgroup hierarchy and loop devices.
+Prepare `/etc/pki`, which the pinned default policy references, before running.
+The fixture checks existing host state before creating its ownership marker.
 
 ```sh
+PIP_INDEX_URL=https://repo.huaweicloud.com/repository/pypi/simple/ \
+PIP_CACHE_DIR=/absolute/pinned-cache/pip \
 python3 build/e2e/jiuwenbox/prepare_supervisor.py \
   --cache /absolute/pinned-cache --output /absolute/new-backend-root
-sudo /absolute/new-backend-root/venv/bin/python -u build/e2e/jiuwenbox/smoke.py \
+sudo env PIP_INDEX_URL=https://repo.huaweicloud.com/repository/pypi/simple/ \
+  PIP_CACHE_DIR=/absolute/pinned-cache/pip \
+  /absolute/new-backend-root/venv/bin/python -u build/e2e/jiuwenbox/smoke.py \
   --backend-root /absolute/new-backend-root \
   --package /absolute/current-release-package \
   --output /absolute/new-smoke-output \
   --commit <current-40-character-clean-commit>
 ```
 
-`--commit` is mandatory in the Buildkite wrapper. Omit it only for explicit local
-testing of an uncommitted package; that dirty identity remains in the result.
-The fixture creates its ownership marker after checking existing host state;
-use an isolated container or a dedicated test backend namespace. The SDK runs
-in Python isolated mode and its package files are checked against the wheel.
+`--commit` validates the expected clean package identity. Omit it for explicit
+local testing of an uncommitted package; the result records that dirty identity.
+The SDK runs in Python isolated mode and its files are checked against the wheel.
 
-The eight-case gate covers supervisor creation, exec, binary/UTF-8 files,
+The eight required cases cover supervisor creation, exec, binary/UTF-8 files,
 independent read-only EROFS, five process recovery scenarios, public deletion and
-native audit. A pass also requires unchanged Jiuwenbox files and successful
-job-private mount teardown. JUnit, summary and sanitized logs are public; keys,
-rendered configs and venvs remain outside the artifact glob.
+native audit. A pass requires unchanged Jiuwenbox files and successful fixture
+teardown. EROFS remains mounted after Environment deletion until that teardown.
+JUnit, summary and sanitized logs are written to `--output`; credentials,
+rendered configs and venvs remain in the adjacent private directory on failure.
 
-`full_sdk.py` without `--runtime` retains the existing two-backend complete
-acceptance. `--runtime supervisor` selects only supervisor and avoids VM/backend
-setup paths. The standalone runtime, host recovery and Redis recovery drivers
-retain their existing default scope.
+`full_sdk.py` defaults to the complete supervisor/Conch acceptance. Select
+`--runtime supervisor` for the supervisor suite. The runtime, host recovery and
+Redis recovery drivers retain their existing default scope.

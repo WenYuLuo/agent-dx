@@ -1,11 +1,8 @@
-# Jiuwenbox supervisor Buildkite smoke — 2026-10-19
+# Jiuwenbox supervisor 验收记录 — 2026-10-19
 
-本次在基础 Buildkite pipeline 增加必跑的 `jiuwenbox-smoke` step，依赖同一次构建的
-`platform-build` 统一发布包。使用现有 Linux amd64 Kubernetes worker，容器以 root、
-privileged 运行，并挂载节点 cgroup 和既有缓存目录。Conch 冒烟暂不加入。
-
-源码工作树为 `feat/jiuwenbox-runtime-p0`，基线
-`e6bb99a1b53940edff6f9d1441f653826288c632`，下文为首次新增 CI 配置时的未提交本地验收记录；正式 CI 的后续执行状态见上述跟进。
+本文保留手工验收与 Buildkite 试验记录。当前 package pipeline 已撤下 Jiuwenbox
+冒烟入口，独立运行方式见 [Supervisor SDK smoke](../../build/e2e/jiuwenbox/README.md#supervisor-sdk-smoke)。
+Jiuwenbox 继续作为固定摘要的外部依赖。
 
 ## 正式 CI 跟进
 
@@ -33,9 +30,12 @@ pydantic_core 下载 71.9 MB/s、cryptography 106.4 MB/s，且 cgroup v1 前置�
 后续 ADXlet 未就绪，日志明确为 EROFS `failed to setup loop device`，SDK cases 仍为空。
 Pod 原先没有显式映射宿主设备目录；已补充 `/dev` hostPath，并在下载前运行只读
 `losetup --find` 检查，实际 EROFS 挂载及 SDK 结果仍需修正后的提交重跑。
+后续 [#167](https://buildkite.com/agent-dx/agent-dx/builds/167) 通过 loop 设备预检查及包校验，
+SDK 阶段仍失败且 `cases=[]`，没有形成公开 SDK 通过结果。该轮已确认 canceled。本阶段结束 CI 试验，
+package pipeline 的 step 与专用 bootstrap wrapper 已移除，保留手工验收工具及全部原始记录。
 Jiuwenbox archive/wheel 的固定摘要保持原样。
 
-## 接入行为
+## 试验期间的接入行为
 
 - `.buildkite/jiuwenbox-smoke.sh` 限定 clean checkout 和当前 `BUILDKITE_COMMIT`，
   通过当前 `BUILDKITE_BUILD_ID` 下载 `platform-build` 包及 checksum；校验后部署。
