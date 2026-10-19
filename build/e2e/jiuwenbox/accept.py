@@ -22,6 +22,11 @@ def command(*args, check=True):
     return subprocess.run(args, text=True, capture_output=True, check=check).stdout
 
 
+def cgroup_roots(root=Path('/sys/fs/cgroup')):
+    # Audit both supported layouts, including remnants on hybrid hosts.
+    return [root / 'jiuwenbox'] + [root / controller / 'jiuwenbox' for controller in ('memory', 'cpu', 'pids')]
+
+
 class Acceptance:
     def __init__(self, root, run, backends=None):
         self.backends = tuple(backends or ('supervisor', 'conch'))
@@ -239,7 +244,7 @@ class Acceptance:
             assert len(values) < 5000, 'possibly truncated native inventory'
             if any(v.get('sandboxID', v.get('id', '')).startswith('adx-') for v in values):
                 return False
-        for directory, pattern in [(Path('/sys/fs/cgroup/jiuwenbox'), 'adx-*'), (Path('/run/netns'), 'jbx-adx-*')]:
+        for directory, pattern in [(root, 'adx-*') for root in cgroup_roots()] + [(Path('/run/netns'), 'jbx-adx-*')]:
             if any(directory.glob(pattern)):
                 return False
         return True
@@ -251,7 +256,7 @@ class Acceptance:
         leftovers = []
         for record in records:
             id = record['sandbox_id']
-            for path in [Path('/sys/fs/cgroup/jiuwenbox')/id,Path('/run/netns')/('jbx-'+id),Path('/sys/class/net')/('jwbH'+hashlib.sha256(id.encode()).hexdigest()[:8])]:
+            for path in [root/id for root in cgroup_roots()] + [Path('/run/netns')/('jbx-'+id),Path('/sys/class/net')/('jwbH'+hashlib.sha256(id.encode()).hexdigest()[:8])]:
                 if path.exists():
                     leftovers.append(str(path))
             digest = hashlib.sha256(record['runtime_id'].encode()).hexdigest()[:20]
@@ -366,11 +371,11 @@ class Acceptance:
 
     def host_audit(self):
         leftovers = []
-        directories = [(Path('/run/netns'),'jbx-*'), (Path('/sys/fs/cgroup/jiuwenbox'), '*')]
+        directories = [(Path('/run/netns'),'jbx-*')] + [(root, '*') for root in cgroup_roots()]
         if 'conch' in self.backends:
             directories.append((Path('/run/conch/netns'),'slot-*'))
         for directory, pattern in directories:
-            leftovers.extend(str(path) for path in directory.glob(pattern) if path.is_dir() or directory != Path('/sys/fs/cgroup/jiuwenbox'))
+            leftovers.extend(str(path) for path in directory.glob(pattern) if path.is_dir() or directory not in cgroup_roots())
         for proc in Path('/proc').iterdir():
             if not proc.name.isdigit():
                 continue

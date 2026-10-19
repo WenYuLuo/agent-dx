@@ -16,7 +16,7 @@ import traceback
 
 import httpx
 import yaml
-from accept import Acceptance, command as backend_command
+from accept import Acceptance, cgroup_roots, command as backend_command
 
 
 def command(*args):
@@ -312,7 +312,12 @@ class FullSDK(Acceptance):
             if record["spec"]["runtime_class"] == "conch":
                 assert id in running, id
             else:
-                assert (Path("/sys/fs/cgroup/jiuwenbox")/id/"cgroup.procs").read_text().strip(), id
+                unified, memory, cpu, pids = [root/id for root in cgroup_roots()]
+                groups = [unified] if unified.is_dir() else [memory, cpu]
+                if not unified.is_dir() and pids.is_dir():
+                    groups.append(pids)
+                for group in groups:
+                    assert (group/"cgroup.procs").read_text().strip(), str(group)
             evidence.append(dict(runtime_id=runtime["id"], sandbox_id=id, backend=ref))
         return evidence
 

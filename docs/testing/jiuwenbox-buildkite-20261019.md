@@ -2,11 +2,32 @@
 
 本次在基础 Buildkite pipeline 增加必跑的 `jiuwenbox-smoke` step，依赖同一次构建的
 `platform-build` 统一发布包。使用现有 Linux amd64 Kubernetes worker，容器以 root、
-privileged 运行，并挂载节点 cgroup v2 和既有缓存目录。Conch 冒烟暂不加入。
+privileged 运行，并挂载节点 cgroup 和既有缓存目录。Conch 冒烟暂不加入。
 
 源码工作树为 `feat/jiuwenbox-runtime-p0`，基线
-`e6bb99a1b53940edff6f9d1441f653826288c632`，当前改动未提交。没有触发正式 Buildkite
-构建。本报告记录脚本、契约测试和真实 supervisor 容器验收，不能作为正式 CI 运行结果。
+`e6bb99a1b53940edff6f9d1441f653826288c632`，下文为首次新增 CI 配置时的未提交本地验收记录；正式 CI 的后续执行状态见上述跟进。
+
+## 正式 CI 跟进
+
+以下原始本地验收记录已随 `efaf577` 提交。随后已推送同一分支并执行正式 CI：
+
+- [#163](https://buildkite.com/agent-dx/agent-dx/builds/163)：ARM secret 权限失败，
+  Linux builder 长期 reserved；取消该轮后，`3a48934` 恢复 #162 已验证的固定 builder，
+  后续构建显式设置 `ADX_ARM_BUILD=0`。
+- [#164](https://buildkite.com/agent-dx/agent-dx/builds/164)：x86 构建和组装通过；
+  supervisor 在 Python 镜像的 `git` 缺失处失败。`9b4acab` 将工具安装移至 checkout 检查前，
+  缺 Git 的回归用例已先失败、后通过。
+- [#165](https://buildkite.com/agent-dx/agent-dx/builds/165)：构建、发布、镜像和 Kubernetes
+  E2E 均通过；supervisor 在本仓库夹具的 v2-only preflight 失败，未执行 SDK case。
+  原始 wheel 的 `supervisor/cgroup.py` 已核对：`detect_backend` 同时支持 v1/v2；
+  该轮没有证明后端不支持当前 worker。夹具检查与两种层级的进程/孤儿审计均已修正。
+
+pip 改用华为云 HTTPS 镜像，固定五项依赖及当前两个大依赖均有对应版本。
+同一 `cryptography-50.0.2` Linux wheel（4,752,576 bytes）本机镜像下载 1.157 秒，
+SHA256 `9dab55f57c74c3cad24c323bacbbd04be4705ba6eb0d92e920b1fc4837ed5079` 与镜像索引一致。
+这是本机镜像连通性/完整性证据，CI 速度和 supervisor 通过结果仍待新提交重跑。
+服务端和 SDK 的 pip 缓存放在既有 `/mnt/paas/build-cache/adx/pip/jiuwenbox`。
+Jiuwenbox archive/wheel 的固定摘要保持原样。
 
 ## 接入行为
 

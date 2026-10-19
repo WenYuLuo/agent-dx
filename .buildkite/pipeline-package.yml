@@ -649,6 +649,8 @@ steps:
   - out/buildkite/logs/step-jiuwenbox-smoke.log
   env:
     BUILDKITE_AGENT_NAME: agent-stack-k8s
+    PIP_INDEX_URL: https://repo.huaweicloud.com/repository/pypi/simple/
+    PIP_CACHE_DIR: /mnt/paas/build-cache/adx/pip/jiuwenbox
   plugins:
   - kubernetes:
       podSpec:

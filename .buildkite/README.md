@@ -671,12 +671,18 @@ stale commit or dirty package before starting the backend.
 
 The step reuses the existing `default,os=linux,arch=amd64` Kubernetes worker and
 the digest-pinned `adx-python-build` image. Its container is privileged, with
-writable cgroup v2 and the existing `/mnt/paas` cache. It installs missing Git
+writable cgroup v1 or v2 and the existing `/mnt/paas` cache. It installs missing Git
 and native runtime tools before checkout verification, prepares `/etc/pki` for
 the pinned distro-neutral policy, and uses loop/EROFS, network namespaces and
 iptables. The CI worker kernel must
 support those facilities. `ADX_JIUWENBOX_CACHE` optionally overrides the default
 `/mnt/paas/build-cache/adx/jiuwenbox` content-addressed cache.
+The worker cgroup layout is checked before artifact or pip downloads. Both the
+backend's v1 controller hierarchies and its v2 unified hierarchy are accepted.
+The supervisor step uses the Huawei Cloud HTTPS PyPI mirror via `PIP_INDEX_URL`
+and keeps server/SDK pip downloads under
+`/mnt/paas/build-cache/adx/pip/jiuwenbox` via `PIP_CACHE_DIR`. Dependency pins and
+external wheel checksums are unchanged.
 
 `prepare_supervisor.py` downloads the archive selected by
 [`prebuilt-lock.json`](../build/e2e/jiuwenbox/prebuilt-lock.json), verifies its

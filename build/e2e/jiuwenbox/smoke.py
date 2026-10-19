@@ -137,8 +137,10 @@ def preflight():
     for tool in ('busybox', 'bwrap', 'ip', 'iptables', 'mount', 'findmnt', 'losetup'):
         if not shutil.which(tool):
             raise ValueError('missing backend prerequisite: ' + tool)
-    if not Path('/sys/fs/cgroup/cgroup.controllers').is_file():
-        raise ValueError('cgroup v2 is required')
+    cgroup = Path('/sys/fs/cgroup')
+    if not ((cgroup / 'cgroup.controllers').is_file() or
+            all((cgroup / controller).is_dir() for controller in ('memory', 'cpu', 'pids'))):
+        raise ValueError('cgroup v1 controllers or cgroup v2 are required')
 
 
 def prepare_fixture(backend, package, private):

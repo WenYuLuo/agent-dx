@@ -16,6 +16,8 @@ if [[ $missing_tools == 1 ]]; then
   apt-get update
   DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git curl bubblewrap iproute2 iptables busybox-static util-linux openssl
 fi
+# Check the backend's supported cgroup layouts before artifact or pip downloads.
+python3 -c 'import runpy; runpy.run_path("build/e2e/jiuwenbox/smoke.py", run_name="preflight")["preflight"]()'
 [[ -z $(git status --porcelain) ]] || { echo 'clean checkout required' >&2; exit 1; }
 [[ $(git rev-parse HEAD) == "$BUILDKITE_COMMIT" ]] || { echo 'checkout commit mismatch' >&2; exit 1; }
 mkdir -p out/buildkite/logs
@@ -30,7 +32,7 @@ tar -xzf out/buildkite/adx-release.tar.gz -C "$package"
 echo '--- :package: Prepare Jiuwenbox supervisor'
 # The pinned policy includes the distro-neutral CA directory.
 mkdir -p /etc/pki
-if [[ ! -w /sys/fs/cgroup/cgroup.subtree_control ]]; then
+if [[ -f /sys/fs/cgroup/cgroup.controllers && ! -w /sys/fs/cgroup/cgroup.subtree_control ]]; then
   mount -o remount,rw /sys/fs/cgroup
 fi
 backend="$PWD/out/buildkite/jiuwenbox-backend"

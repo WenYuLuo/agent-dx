@@ -115,6 +115,47 @@ class JiuwenboxSmokeTests(unittest.TestCase):
             self.assertEqual(command.call_count, 1)
             self.assertTrue(private.exists())
 
+    def test_host_preflight_accepts_both_backend_cgroup_layouts(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory:
+            cgroup = Path(directory)
+            with patch.object(smoke.sys, 'platform', 'linux'), \
+                    patch.object(smoke.platform, 'machine', return_value='x86_64'), \
+                    patch.object(smoke.os, 'geteuid', return_value=0), \
+                    patch.object(smoke.shutil, 'which', return_value='/tool'), \
+                    patch.object(smoke, 'Path', return_value=cgroup):
+                with self.assertRaisesRegex(ValueError, 'cgroup'):
+                    smoke.preflight()
+                for controller in ('memory', 'cpu', 'pids'):
+                    (cgroup / controller).mkdir()
+                smoke.preflight()
+                for controller in ('memory', 'cpu', 'pids'):
+                    (cgroup / controller).rmdir()
+                (cgroup / 'cgroup.controllers').write_text('memory cpu pids')
+                smoke.preflight()
+
+    def test_native_audit_detects_v1_orphan_and_clears_after_removal(self):
+        import sys
+        from unittest.mock import MagicMock, patch
+        spec = importlib.util.spec_from_file_location('accept_fixture', ROOT / 'build/e2e/jiuwenbox/accept.py')
+        backend = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, {'httpx': MagicMock(), 'yaml': MagicMock()}):
+            spec.loader.exec_module(backend)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            empty = root / 'empty';empty.mkdir()
+            roots = backend.cgroup_roots(root / 'cgroup')
+            orphan = roots[1] / 'adx-orphan'
+            orphan.mkdir(parents=True)
+            acceptance = backend.Acceptance.__new__(backend.Acceptance)
+            acceptance.root, acceptance.run, acceptance.backends = root, root, ('supervisor',)
+            with patch.object(backend, 'cgroup_roots', return_value=roots), \
+                    patch.object(backend, 'Path', side_effect=lambda p: empty if p in ('/proc', '/run/netns') else Path(p)), \
+                    patch.object(backend, 'command', return_value=''):
+                self.assertEqual(acceptance.host_audit()['leftovers'], [str(orphan)])
+                orphan.rmdir()
+                self.assertEqual(acceptance.host_audit()['leftovers'], [])
+
 
 class JiuwenboxPipelineTests(unittest.TestCase):
     def test_required_smoke_consumes_current_package_and_exports_only_public_evidence(self):
@@ -133,7 +174,7 @@ class JiuwenboxPipelineTests(unittest.TestCase):
         self.assertIn('out/buildkite/jiuwenbox/**/*', step['artifact_paths'])
         self.assertFalse(any('private' in p for p in step['artifact_paths']))
 
-    def run_checksum_fixture(self, git_missing=False):
+    def run_checksum_fixture(self, git_missing=False, cgroup_available=True):
         import os
         import shutil
         import subprocess
@@ -147,6 +188,7 @@ class JiuwenboxPipelineTests(unittest.TestCase):
             }
             scripts.update({
                 'id': '#!/bin/sh\nprintf "0\\n"\n',
+                'python3': '#!/bin/sh\n' + ('exit 0\n' if cgroup_available else 'echo compatible cgroup required >&2\nexit 1\n'),
                 'sha256sum': '#!/bin/sh\nexit 34\n',
                 'tar': '#!/bin/sh\nprintf extracted > SHOULD_NOT_EXTRACT\n',
                 'apt-get': '#!/bin/sh\nprintf apt > "$FIXTURE_TOOLS/bootstrap"\n/bin/cat > "$FIXTURE_TOOLS/git" <<\'GIT\'\n' + git + 'GIT\n/bin/chmod +x "$FIXTURE_TOOLS/git"\n',
@@ -173,6 +215,12 @@ class JiuwenboxPipelineTests(unittest.TestCase):
         result, bootstrapped = self.run_checksum_fixture(git_missing=True)
         self.assertEqual(result.returncode, 34, result.stderr)
         self.assertTrue(bootstrapped)
+
+    def test_missing_cgroup_stops_before_downloading_dependencies(self):
+        result, bootstrapped = self.run_checksum_fixture(cgroup_available=False)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn('cgroup', result.stderr)
+        self.assertFalse(bootstrapped)
 
 
 class JiuwenboxArtifactTests(unittest.TestCase):
