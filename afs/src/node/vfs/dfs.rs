@@ -8,23 +8,25 @@
 //! writes before reporting close success; `release` only drops the handle.
 
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     ffi::{OsStr, OsString},
+    hash::{Hash, Hasher},
     os::unix::ffi::OsStringExt,
     sync::{
-        Arc, Condvar, Mutex,
+        Arc, Condvar, Mutex, RwLock, Weak,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use afs_error::{Error, Result};
+use afs_tracing::tracing;
 
 mod pending_trace;
 use pending_trace::PendingTrace;
 
 use super::{
-    Backend,
+    Backend, PageCacheIdentity, WriteAdmissionMode,
     locks::{LockError, LockRequest, LockTable, LockWaiterId, LockWaiterOutcome},
     types::{
         AttributeChange, BackendInode, CreatedFile, DirectoryEntry, DirectoryHandle, Entry,
@@ -35,22 +37,45 @@ use super::{
 };
 use crate::{
     dfs::{
-        CallerContext, CommitFileVersion, CommitMetadataDelta, CommitMetadataMode, DentryRecord,
-        DfsWriteSessionId, Extent, FileVersion, FileVersionId, GetXattrRequest, InodeAttrUpdate,
-        InodeAttributes, InodeId, InodeKind, InodeRecord, LayoutRoot, LayoutRootId,
-        ListXattrRequest, MknodRequest, NamespaceId, OperationId, ReadLinkRequest,
-        RemoveXattrRequest, RenameMode, RenameOutcome, SetInodeAttrRequest, SetXattrRequest,
-        SpecialNodeKind, SymlinkRequest, SyncInodeMetadata, WriteLease, XattrSetMode,
+        CallerContext, ChunkObject, ChunkReceipt, CommitFileVersion, CommitMetadataDelta,
+        CommitMetadataMode, DentryRecord, DfsWriteSessionId, Extent, FileVersion, FileVersionId,
+        GetXattrRequest, InodeAttrUpdate, InodeAttributes, InodeId, InodeKind, InodeRecord,
+        LayoutRoot, LayoutRootId, ListXattrRequest, MknodRequest, NamespaceId, OperationId,
+        ReadLinkRequest, RemoveXattrRequest, RenameMode, RenameOutcome, SetInodeAttrRequest,
+        SetXattrRequest, SpecialNodeKind, SymlinkRequest, SyncInodeMetadata, WriteLease,
+        XattrSetMode,
     },
-    node::chunk::{ChunkBuilder, ChunkStore, StagedChunk},
-    node::dfs_read::{ChunkReadOp, DfsReadEngine, ReadBatch},
+    node::chunk::{
+        ChunkBuilder, ChunkStore, DeferredChunkPut, DeferredWriteBudget, NativeChunkReceipt,
+        NativeWriteAdmission, NativeWriteBudget, NativeWriteOwner, SharedChunkBytes, StagedChunk,
+        WriteBudgetReservation, WriteBufferPool,
+    },
+    node::dfs_read::{
+        BoundedLru, ChunkReadOp, CurrentExternalReadOutcome, DfsReadEngine,
+        NativeReadAuthoritySnapshot, ReadBatch,
+    },
     node::rpc::peer::RemoteDfsOwner,
 };
 
 pub const DFS_WRITE_LEASE_SECONDS: u64 = 30;
 pub const DEFAULT_DIRTY_DATA_BUDGET_BYTES: u64 = 16 * 1024 * 1024;
 const ROOT_INODE: u64 = 1;
+const DEFAULT_VERSION_CACHE_ENTRIES: usize = 4096;
+const DEFAULT_VERSION_CACHE_BYTES: usize = 32 * 1024 * 1024;
+const NATIVE_READ_VIEW_TTL: Duration = Duration::from_secs(5);
 const COMMIT_CHUNK_BYTES: u64 = crate::node::chunk::MAX_STAGED_CHUNK_BYTES as u64;
+const DEFERRED_PUBLICATION_WINDOW_BYTES: u64 = 64 * 1024 * 1024;
+const DEFERRED_PUBLISHER_RESERVE_BYTES: u64 = 32 * 1024 * 1024;
+const DEFERRED_NORMAL_BUDGET_BYTES: u64 = 128 * 1024 * 1024;
+const DEFERRED_PIPELINE_BUDGET_BYTES: u64 =
+    DEFERRED_NORMAL_BUDGET_BYTES + DEFERRED_PUBLISHER_RESERVE_BYTES;
+const DEFERRED_DESCRIPTOR_BUDGET_BYTES: u64 = 1024 * 1024;
+const DEFERRED_MIN_NORMAL_RESERVATION_BYTES: u64 = 64 * 1024;
+const MAX_DEFERRED_DESCRIPTORS: usize = 32;
+const DEFERRED_DESCRIPTOR_BYTES_PER_CHUNK: u64 =
+    DEFERRED_DESCRIPTOR_BUDGET_BYTES / MAX_DEFERRED_DESCRIPTORS as u64;
+const MAX_DEFERRED_PREUPLOAD_BATCH_CHUNKS: usize = 1;
+const MAX_DEFERRED_PREUPLOAD_BATCHES: usize = 16;
 const MAX_PENDING_REMOTE_RELEASES: usize = 1024;
 const REMOTE_RELEASE_MAINTENANCE_BUDGET: std::time::Duration =
     std::time::Duration::from_millis(250);
@@ -198,12 +223,13 @@ pub struct DistributedFs {
     chunk_store: Arc<dyn ChunkStore>,
     read_engine: Arc<DfsReadEngine>,
     remote_owner_factory: Option<Arc<dyn DfsRemoteOwnerFactory>>,
-    handles: Mutex<HashMap<u64, DfsFileHandle>>,
+    handles: DfsHandleTable,
     dir_handles: Mutex<HashMap<u64, DfsDirectoryHandle>>,
-    inode_writes: Mutex<HashMap<InodeId, SharedInodeWriteState>>,
-    remote_inode_providers: Mutex<HashMap<InodeId, RemoteDfsWriteSession>>,
+    inode_writes: ShardedMap<InodeId, SharedInodeWriteState>,
+    remote_inode_providers: ShardedMap<InodeId, RemoteDfsWriteSession>,
     pending_remote_releases: Mutex<PendingRemoteReleaseState>,
-    lock_authorities: Mutex<HashMap<InodeId, Arc<DfsLockAuthority>>>,
+    lock_authorities: ShardedMap<InodeId, Arc<DfsLockAuthority>>,
+    lock_authority_admission: Mutex<()>,
     lock_renewal: Arc<DfsLockRenewal>,
     remote_lock_authorities: Mutex<HashMap<InodeId, DfsRemoteLockAuthority>>,
     remote_lock_authority_sessions: Mutex<HashMap<InodeId, HashMap<String, usize>>>,
@@ -214,10 +240,25 @@ pub struct DistributedFs {
         Mutex<HashMap<DfsOwnerOpenRouteKey, Arc<DfsRemoteOpenAdmissionLock>>>,
     #[cfg(test)]
     owner_open_finish_pause: Mutex<Option<Arc<OwnerOpenFinishPause>>>,
+    #[cfg(test)]
+    native_read_before_delivery: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    native_read_before_refresh: Mutex<Option<Arc<std::sync::Barrier>>>,
+    #[cfg(test)]
+    native_read_after_committed: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    backend_inode_after_missing: Mutex<Option<Arc<std::sync::Barrier>>>,
+    #[cfg(test)]
+    handle_registration_after_route_check: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    readonly_version_before_install: Mutex<Option<Arc<std::sync::Barrier>>>,
     lock_session_reap_cursor: AtomicU64,
     owner_handle_reap_cursor: AtomicU64,
     writeback_cursor: AtomicU64,
     writeback_maintenance_gate: Mutex<()>,
+    write_pipeline_budget: Arc<DeferredWriteBudget>,
+    write_pipeline_budget_gate: Mutex<()>,
+    publisher_prepare_gate: Mutex<()>,
     #[cfg(test)]
     writeback_after_examine_pause: Mutex<Option<Duration>>,
     #[cfg(test)]
@@ -225,29 +266,751 @@ pub struct DistributedFs {
     closed_lock_sessions: Mutex<HashSet<String>>,
     closed_lock_session_admission_closed: AtomicBool,
     remote_operation_results: Mutex<HashMap<RemoteOperationKey, RemoteOperationResult>>,
-    readonly_version_cache: Mutex<Option<ReadOnlyVersionCache>>,
+    readonly_version_cache: Mutex<ReadOnlyVersionCache>,
+    readonly_empty_version: Arc<ReadOnlyVersion>,
     dirty_budget_bytes: u64,
-    inode_to_backend: Mutex<HashMap<InodeId, u64>>,
-    backend_to_inode: Mutex<HashMap<u64, InodeId>>,
+    write_buffer_pool: Arc<WriteBufferPool>,
+    native_pipeline: Option<Arc<NativeWritePipeline>>,
+    inode_to_backend: ShardedMap<InodeId, u64>,
+    backend_to_inode: ShardedMap<u64, InodeId>,
+    inode_mapping_creation: Mutex<()>,
     next_inode: AtomicU64,
     next_handle: AtomicU64,
     next_operation: AtomicU64,
     next_owner_open_seq: AtomicU64,
 }
 
-#[derive(Clone)]
-struct ReadOnlyVersionCache {
-    version_id: FileVersionId,
-    version: FileVersion,
+/// Immutable metadata only. An Arc never grants authority or extends the
+/// separately captured inode/session view deadline.
+struct ReadOnlyVersion {
+    version: Option<FileVersion>,
     layout: LayoutRoot,
+    index: LayoutReadIndex,
+}
+
+struct CachedReadOnlyVersion {
+    value: Arc<ReadOnlyVersion>,
+    retained_bytes: usize,
+}
+
+/// Bounds this cache's retained metadata estimate, not total Node RSS. Evicted
+/// Arc values stay live until their active readers release them. Cache-owned
+/// containers are charged conservatively at their configured maximum, so a
+/// HashMap's retained capacity after eviction cannot escape the byte budget.
+struct ReadOnlyVersionCache {
+    entries: BoundedLru<FileVersionId, CachedReadOnlyVersion>,
+    capacity: usize,
+    byte_limit: usize,
+    table_bytes: usize,
+    value_bytes: usize,
+    entry_count: usize,
+}
+
+fn version_cache_table_bytes(capacity: usize) -> Option<usize> {
+    // Preserve the runtime estimate: permit hash-table growth/control storage
+    // and sparsely occupied BTree nodes; key buffers are charged per value.
+    let table_slot = std::mem::size_of::<(FileVersionId, CachedReadOnlyVersion, u64)>()
+        .checked_add(std::mem::size_of::<(u64, FileVersionId)>())?
+        .checked_mul(4)?
+        .checked_add(64)?;
+    capacity.checked_mul(table_slot)?.checked_add(2048)
+}
+
+/// Startup floor for the table and one value's fixed fields/Arc header. This
+/// makes no assumption about identifier lengths or layout cardinality: actual
+/// String/Vec capacities are charged on admission and can still exceed it.
+pub(crate) fn version_cache_minimum_bytes(capacity: usize) -> Option<usize> {
+    version_cache_table_bytes(capacity)?.checked_add(ReadOnlyVersion::fixed_retained_bytes())
+}
+
+impl ReadOnlyVersionCache {
+    fn new(capacity: usize, byte_limit: usize) -> Self {
+        let table_bytes = version_cache_table_bytes(capacity).unwrap_or(usize::MAX);
+        Self {
+            entries: BoundedLru::new(capacity),
+            capacity,
+            byte_limit,
+            table_bytes,
+            value_bytes: 0,
+            entry_count: 0,
+        }
+    }
+
+    fn get(&mut self, key: &FileVersionId) -> Option<&Arc<ReadOnlyVersion>> {
+        self.entries.get(key).map(|entry| &entry.value)
+    }
+
+    fn insert(&mut self, key: FileVersionId, value: Arc<ReadOnlyVersion>) {
+        if let Some(previous) = self.entries.remove(&key) {
+            self.value_bytes = self.value_bytes.saturating_sub(previous.retained_bytes);
+            self.entry_count -= 1;
+        }
+        let retained_bytes = value.cache_retained_bytes(&key);
+        if self.capacity == 0 || self.table_bytes.saturating_add(retained_bytes) > self.byte_limit {
+            if self.entry_count == 0 {
+                // A rejected replacement must also release any old empty table
+                // allocation; zero retained entries otherwise have zero charge.
+                self.entries = BoundedLru::new(self.capacity);
+            }
+            return;
+        }
+        while self.entry_count >= self.capacity
+            || self
+                .table_bytes
+                .saturating_add(self.value_bytes)
+                .saturating_add(retained_bytes)
+                > self.byte_limit
+        {
+            let Some((_, evicted)) = self.entries.pop_oldest() else {
+                return;
+            };
+            self.value_bytes = self.value_bytes.saturating_sub(evicted.retained_bytes);
+            self.entry_count -= 1;
+        }
+        self.entries.insert(
+            key,
+            CachedReadOnlyVersion {
+                value,
+                retained_bytes,
+            },
+        );
+        self.value_bytes = self.value_bytes.saturating_add(retained_bytes);
+        self.entry_count += 1;
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entry_count
+    }
+}
+
+impl ReadOnlyVersion {
+    fn fixed_retained_bytes() -> usize {
+        std::mem::size_of::<Self>().saturating_add(2 * std::mem::size_of::<usize>())
+    }
+
+    fn cache_retained_bytes(&self, key: &FileVersionId) -> usize {
+        // The hash table and recency tree each own a key. Counting the source
+        // capacity twice conservatively covers the cloned key's allocation.
+        // Heap allocations also include a two-word bookkeeping allowance;
+        // this remains a portable retained-size estimate, not allocator RSS.
+        let heap = |capacity: usize| {
+            if capacity == 0 {
+                0
+            } else {
+                capacity.saturating_add(2 * std::mem::size_of::<usize>())
+            }
+        };
+        let mut bytes = Self::fixed_retained_bytes()
+            .saturating_add(heap(key.0.capacity()).saturating_mul(2))
+            .saturating_add(heap(self.layout.id.0.capacity()))
+            .saturating_add(heap(
+                self.layout
+                    .inline_extents
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Extent>()),
+            ))
+            .saturating_add(heap(
+                self.index
+                    .entries
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<IndexedExtent>()),
+            ));
+        if let Some(version) = &self.version {
+            for capacity in [
+                version.id.0.capacity(),
+                version.inode_id.0.capacity(),
+                version
+                    .parent_version
+                    .as_ref()
+                    .map_or(0, |id| id.0.capacity()),
+                version.layout_root.0.capacity(),
+            ] {
+                bytes = bytes.saturating_add(heap(capacity));
+            }
+        }
+        for extent in &self.layout.inline_extents {
+            bytes = bytes.saturating_add(heap(extent.chunk_id.0.capacity()));
+        }
+        bytes
+    }
+
+    fn empty() -> Self {
+        Self {
+            version: None,
+            layout: LayoutRoot {
+                id: LayoutRootId::new("empty"),
+                file_length: 0,
+                inline_extents: Vec::new(),
+            },
+            index: LayoutReadIndex {
+                entries: Vec::new(),
+                serialization_ordered: true,
+            },
+        }
+    }
+
+    fn checked(expected: &FileVersionId, version: FileVersion, layout: LayoutRoot) -> Result<Self> {
+        if version.id != *expected
+            || version.layout_root != layout.id
+            || version.length != layout.file_length
+        {
+            return Err(invalid(
+                "DFS readonly version/layout identity or length differs",
+            ));
+        }
+        let index = LayoutReadIndex::new(&layout)?;
+        Ok(Self {
+            version: Some(version),
+            layout,
+            index,
+        })
+    }
+
+    fn ops(&self, offset: u64, length: usize) -> Result<Vec<ChunkReadOp>> {
+        self.index.ops(&self.layout, offset, length)
+    }
+
+    fn read_batch(&self, offset: u64, length: usize, lookahead: usize) -> Result<ReadBatch> {
+        let ops = self.ops(offset, length)?;
+        let end = offset
+            .checked_add(length as u64)
+            .ok_or_else(|| invalid("read range overflow"))?;
+        let next = self
+            .index
+            .entries
+            .partition_point(|entry| self.layout.inline_extents[entry.original].file_offset < end);
+        Ok(ReadBatch {
+            lookahead: source_lookahead_ids(
+                self.index.entries[next..]
+                    .iter()
+                    .map(|entry| &self.layout.inline_extents[entry.original]),
+                &ops,
+                lookahead,
+            ),
+            file_version_id: self.version.as_ref().map(|version| version.id.clone()),
+            layout_root_id: self.layout.id.clone(),
+            ops,
+        })
+    }
+}
+
+/// Metadata only. These IDs never enter body operations or expand ranges.
+fn source_lookahead_ids<'a>(
+    extents: impl Iterator<Item = &'a Extent>,
+    ops: &[ChunkReadOp],
+    limit: usize,
+) -> Vec<crate::dfs::ChunkId> {
+    let mut ids = Vec::new();
+    let limit = limit.min(crate::node::dfs_read::MAX_DFS_READ_OPS);
+    if limit == 0 || ops.is_empty() {
+        return ids;
+    }
+    for extent in extents {
+        if extent.length == 0
+            || extent.chunk_id.0.is_empty()
+            || extent.chunk_id.0.len() > crate::node::dfs_read::MAX_SOURCE_LOOKAHEAD_ID_BYTES
+            || ops.iter().any(|op| op.chunk_id == extent.chunk_id)
+            || ids.contains(&extent.chunk_id)
+        {
+            continue;
+        }
+        ids.push(extent.chunk_id.clone());
+        if ids.len() == limit {
+            break;
+        }
+    }
+    ids
+}
+
+struct IndexedExtent {
+    original: usize,
+    max_end: u64,
+}
+
+/// The prefix maximum handles overlapping/unsorted legacy layouts without
+/// dropping an extent that starts before the request. Read operations retain
+/// original serialization order, including its overlap precedence.
+struct LayoutReadIndex {
+    entries: Vec<IndexedExtent>,
+    serialization_ordered: bool,
+}
+
+impl LayoutReadIndex {
+    fn new(layout: &LayoutRoot) -> Result<Self> {
+        let mut entries = layout
+            .inline_extents
+            .iter()
+            .enumerate()
+            .map(|(original, extent)| {
+                let max_end = extent
+                    .file_offset
+                    .checked_add(extent.length)
+                    .ok_or_else(|| invalid("extent range overflow"))?;
+                Ok(IndexedExtent { original, max_end })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        entries.sort_by_key(|entry| {
+            (
+                layout.inline_extents[entry.original].file_offset,
+                entry.original,
+            )
+        });
+        let mut max_end = 0;
+        for entry in &mut entries {
+            max_end = max_end.max(entry.max_end);
+            entry.max_end = max_end;
+        }
+        let serialization_ordered = entries
+            .windows(2)
+            .all(|pair| pair[0].original < pair[1].original);
+        Ok(Self {
+            entries,
+            serialization_ordered,
+        })
+    }
+
+    fn ops(&self, layout: &LayoutRoot, offset: u64, length: usize) -> Result<Vec<ChunkReadOp>> {
+        let end = offset
+            .checked_add(length as u64)
+            .ok_or_else(|| invalid("read range overflow"))?;
+        let first = self
+            .entries
+            .partition_point(|entry| entry.max_end <= offset);
+        let last = self
+            .entries
+            .partition_point(|entry| layout.inline_extents[entry.original].file_offset < end);
+        if first >= last {
+            return Ok(Vec::new());
+        }
+        let mut ops = Vec::new();
+        let mut append = |original: usize| -> Result<()> {
+            if let Some(op) = extent_read_op(&layout.inline_extents[original], offset, end)? {
+                ops.push(op);
+            }
+            Ok(())
+        };
+        if self.serialization_ordered {
+            // Canonical layouts need neither a candidate allocation nor a
+            // per-read sort. Legacy unordered layouts retain exact precedence.
+            for entry in &self.entries[first..last] {
+                append(entry.original)?;
+            }
+        } else {
+            let mut candidates = self.entries[first..last]
+                .iter()
+                .map(|entry| entry.original)
+                .collect::<Vec<_>>();
+            candidates.sort_unstable();
+            for original in candidates {
+                append(original)?;
+            }
+        }
+        Ok(ops)
+    }
+}
+
+fn extent_read_op(extent: &Extent, offset: u64, end: u64) -> Result<Option<ChunkReadOp>> {
+    let extent_end = extent
+        .file_offset
+        .checked_add(extent.length)
+        .ok_or_else(|| invalid("extent range overflow"))?;
+    let start = offset.max(extent.file_offset);
+    let stop = end.min(extent_end);
+    if start >= stop {
+        return Ok(None);
+    }
+    let output_offset =
+        usize::try_from(start - offset).map_err(|_| invalid("read output offset is too large"))?;
+    let length = usize::try_from(stop - start).map_err(|_| invalid("read length is too large"))?;
+    let chunk_offset = extent
+        .chunk_offset
+        .checked_add(start - extent.file_offset)
+        .ok_or_else(|| invalid("chunk read offset overflow"))?;
+    Ok(Some(ChunkReadOp {
+        chunk_id: extent.chunk_id.clone(),
+        chunk_offset,
+        length: length as u64,
+        output_offset,
+    }))
+}
+
+#[derive(Clone)]
+struct NativeReadView {
+    generation: u64,
+    authority: NativeReadAuthoritySnapshot,
+    deadline: Instant,
 }
 
 struct DfsFileHandle {
     inode_id: InodeId,
     opened_inode: InodeRecord,
+    opened_page_identity: Option<PageCacheIdentity>,
+    native_read_view: Option<NativeReadView>,
+    native_read_generation: u64,
+    native_denial_serial: u64,
     write_session: Option<DfsRemoteWriteSession>,
     flags: i32,
     owner_scope: Option<DfsOwnerHandleScope>,
+}
+
+struct DfsHandle {
+    inode_id: InodeId,
+    flags: i32,
+    owner_scope: Option<DfsOwnerHandleScope>,
+    state: Mutex<HandleMut>,
+    closed: AtomicBool,
+    // A conservative route hint only: once any mutable/proxy state is
+    // installed, future reads use the original inode-wide visibility path.
+    dynamic_read_route: AtomicBool,
+}
+
+struct HandleMut {
+    opened_inode: Arc<InodeRecord>,
+    opened_page_identity: Option<PageCacheIdentity>,
+    native_read_view: Option<NativeReadView>,
+    native_read_generation: u64,
+    native_denial_serial: u64,
+    // Accepted/synced sequences and the observed error cursor change after open.
+    write_session: Option<DfsRemoteWriteSession>,
+    refresh: Option<Arc<NativeReadRefresh>>,
+    read_sequence: crate::node::dfs_fetch::ReadSequence,
+}
+
+type NativeReadRefreshResult = Result<(Arc<InodeRecord>, NativeReadView)>;
+
+struct NativeReadRefresh {
+    result: Mutex<Option<NativeReadRefreshResult>>,
+    changed: Condvar,
+    #[cfg(test)]
+    joined_waiters: AtomicUsize,
+}
+
+impl NativeReadRefresh {
+    fn new() -> Self {
+        Self {
+            result: Mutex::new(None),
+            changed: Condvar::new(),
+            #[cfg(test)]
+            joined_waiters: AtomicUsize::new(0),
+        }
+    }
+
+    fn finish(&self, result: NativeReadRefreshResult) -> Result<()> {
+        *self
+            .result
+            .lock()
+            .map_err(|_| unavailable("DFS native refresh result is poisoned"))? = Some(result);
+        self.changed.notify_all();
+        Ok(())
+    }
+
+    fn wait(&self, fs: &DistributedFs, operation: &NativeReadView) -> NativeReadRefreshResult {
+        #[cfg(test)]
+        self.joined_waiters.fetch_add(1, Ordering::SeqCst);
+        let mut result = self
+            .result
+            .lock()
+            .map_err(|_| unavailable("DFS native refresh result is poisoned"))?;
+        loop {
+            fs.check_native_read_view(operation)?;
+            if let Some(result) = result.as_ref() {
+                return result.clone();
+            }
+            let remaining = operation.deadline.saturating_duration_since(Instant::now());
+            let (next, _) = self
+                .changed
+                .wait_timeout(result, remaining)
+                .map_err(|_| unavailable("DFS native refresh result is poisoned"))?;
+            result = next;
+        }
+    }
+}
+
+impl From<DfsFileHandle> for DfsHandle {
+    fn from(opened: DfsFileHandle) -> Self {
+        Self {
+            inode_id: opened.inode_id,
+            flags: opened.flags,
+            owner_scope: opened.owner_scope,
+            state: Mutex::new(HandleMut {
+                opened_inode: Arc::new(opened.opened_inode),
+                opened_page_identity: opened.opened_page_identity,
+                native_read_view: opened.native_read_view,
+                native_read_generation: opened.native_read_generation,
+                native_denial_serial: opened.native_denial_serial,
+                write_session: opened.write_session,
+                refresh: None,
+                read_sequence: crate::node::dfs_fetch::ReadSequence::default(),
+            }),
+            closed: AtomicBool::new(false),
+            dynamic_read_route: AtomicBool::new(false),
+        }
+    }
+}
+
+const DFS_HANDLE_SHARDS: usize = 64;
+
+#[cfg(test)]
+std::thread_local! {
+    static DFS_METADATA_TABLE_LOCKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn record_metadata_table_lock() {
+    #[cfg(test)]
+    DFS_METADATA_TABLE_LOCKS.with(|count| count.set(count.get() + 1));
+}
+
+/// Shared metadata utility; guards never cross RPCs or inode state waits.
+struct ShardedMap<K, V> {
+    shards: [RwLock<HashMap<K, V>>; DFS_HANDLE_SHARDS],
+}
+
+impl<K: Eq + Hash, V> Default for ShardedMap<K, V> {
+    fn default() -> Self {
+        Self::from_entries(std::iter::empty())
+    }
+}
+
+impl<K: Eq + Hash, V> ShardedMap<K, V> {
+    fn shard(key: &K) -> usize {
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut hash);
+        hash.finish() as usize % DFS_HANDLE_SHARDS
+    }
+
+    fn from_entries(entries: impl IntoIterator<Item = (K, V)>) -> Self {
+        let mut maps = std::array::from_fn::<_, DFS_HANDLE_SHARDS, _>(|_| HashMap::new());
+        for (key, value) in entries {
+            maps[Self::shard(&key)].insert(key, value);
+        }
+        Self {
+            shards: maps.map(RwLock::new),
+        }
+    }
+
+    fn read(
+        &self,
+        key: &K,
+    ) -> std::sync::LockResult<std::sync::RwLockReadGuard<'_, HashMap<K, V>>> {
+        record_metadata_table_lock();
+        self.shards[Self::shard(key)].read()
+    }
+
+    fn write(
+        &self,
+        key: &K,
+    ) -> std::sync::LockResult<std::sync::RwLockWriteGuard<'_, HashMap<K, V>>> {
+        record_metadata_table_lock();
+        self.shards[Self::shard(key)].write()
+    }
+
+    fn snapshot(&self) -> Result<Vec<(K, V)>>
+    where
+        K: Clone,
+        V: Clone,
+    {
+        let mut entries = Vec::new();
+        for shard in &self.shards {
+            record_metadata_table_lock();
+            let shard = shard
+                .read()
+                .map_err(|_| unavailable("DFS metadata shard is poisoned"))?;
+            entries.extend(
+                shard
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone())),
+            );
+        }
+        Ok(entries)
+    }
+
+    fn len(&self) -> Result<usize> {
+        let mut count = 0;
+        for shard in &self.shards {
+            count += shard
+                .read()
+                .map_err(|_| unavailable("DFS metadata shard is poisoned"))?
+                .len();
+        }
+        Ok(count)
+    }
+
+    fn insert(&self, key: K, value: V) -> Result<Option<V>> {
+        Ok(self
+            .write(&key)
+            .map_err(|_| unavailable("DFS metadata shard is poisoned"))?
+            .insert(key, value))
+    }
+
+    fn values_snapshot(&self) -> Result<Vec<V>>
+    where
+        K: Clone,
+        V: Clone,
+    {
+        Ok(self
+            .snapshot()?
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect())
+    }
+
+    fn keys_snapshot(&self) -> Result<Vec<K>>
+    where
+        K: Clone,
+        V: Clone,
+    {
+        Ok(self.snapshot()?.into_iter().map(|(key, _)| key).collect())
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.len().unwrap() == 0
+    }
+}
+type HandleShard = RwLock<HashMap<u64, Arc<DfsHandle>>>;
+type InodeHandleIndex = Mutex<HashMap<InodeId, HashMap<u64, Weak<DfsHandle>>>>;
+
+/// Structural locks protect Arc registration only. Registration/removal takes
+/// the inode index before the handle shard; callers drop both before HandleMut,
+/// inode write state, or RPCs. No HandleMut guard may cross an RPC or acquire an
+/// inode write state guard. Lifecycle snapshots contain metadata owners, not data.
+struct DfsHandleTable {
+    shards: [HandleShard; DFS_HANDLE_SHARDS],
+    by_inode: [InodeHandleIndex; DFS_HANDLE_SHARDS],
+}
+
+impl Default for DfsHandleTable {
+    fn default() -> Self {
+        Self {
+            shards: std::array::from_fn(|_| RwLock::new(HashMap::new())),
+            by_inode: std::array::from_fn(|_| Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+impl DfsHandleTable {
+    fn inode_shard(inode_id: &InodeId) -> usize {
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        inode_id.hash(&mut hash);
+        (hash.finish() as usize) % DFS_HANDLE_SHARDS
+    }
+
+    fn get(&self, id: u64) -> Result<Option<Arc<DfsHandle>>> {
+        record_metadata_table_lock();
+        Ok(self.shards[id as usize % DFS_HANDLE_SHARDS]
+            .read()
+            .map_err(|_| unavailable("DFS handle shard is poisoned"))?
+            .get(&id)
+            .cloned())
+    }
+
+    fn insert(
+        &self,
+        id: u64,
+        opened: DfsFileHandle,
+        dynamic: impl FnOnce() -> Result<bool>,
+    ) -> Result<()> {
+        let handle = Arc::new(DfsHandle::from(opened));
+        let mut index = self.by_inode[Self::inode_shard(&handle.inode_id)]
+            .lock()
+            .map_err(|_| unavailable("DFS inode handle index is poisoned"))?;
+        handle
+            .dynamic_read_route
+            .store(dynamic()?, Ordering::Release);
+        let mut shard = self.shards[id as usize % DFS_HANDLE_SHARDS]
+            .write()
+            .map_err(|_| unavailable("DFS handle shard is poisoned"))?;
+        if shard.contains_key(&id) {
+            return Err(unavailable("DFS file handle identity exhausted"));
+        }
+        index
+            .entry(handle.inode_id.clone())
+            .or_default()
+            .insert(id, Arc::downgrade(&handle));
+        shard.insert(id, handle);
+        Ok(())
+    }
+
+    fn remove(&self, id: u64) -> Result<Option<Arc<DfsHandle>>> {
+        let Some(handle) = self.get(id)? else {
+            return Ok(None);
+        };
+        let mut index = self.by_inode[Self::inode_shard(&handle.inode_id)]
+            .lock()
+            .map_err(|_| unavailable("DFS inode handle index is poisoned"))?;
+        let removed = self.shards[id as usize % DFS_HANDLE_SHARDS]
+            .write()
+            .map_err(|_| unavailable("DFS handle shard is poisoned"))?
+            .remove(&id);
+        if let Some(handle) = &removed {
+            handle.closed.store(true, Ordering::Release);
+        }
+        if let Some(handles) = index.get_mut(&handle.inode_id) {
+            handles.remove(&id);
+            if handles.is_empty() {
+                index.remove(&handle.inode_id);
+            }
+        }
+        Ok(removed)
+    }
+
+    fn for_inode(&self, inode_id: &InodeId) -> Result<Vec<Arc<DfsHandle>>> {
+        let index = self.by_inode[Self::inode_shard(inode_id)]
+            .lock()
+            .map_err(|_| unavailable("DFS inode handle index is poisoned"))?;
+        Ok(index
+            .get(inode_id)
+            .into_iter()
+            .flat_map(|handles| handles.values())
+            .filter_map(Weak::upgrade)
+            .collect())
+    }
+
+    fn mark_dynamic(&self, inode_id: &InodeId) -> Result<()> {
+        // Allocate holds the same index lock while checking the published
+        // maps. Publishers must release their map guard before entering here.
+        let index = self.by_inode[Self::inode_shard(inode_id)]
+            .lock()
+            .map_err(|_| unavailable("DFS inode handle index is poisoned"))?;
+        if let Some(handles) = index.get(inode_id) {
+            for handle in handles.values().filter_map(Weak::upgrade) {
+                handle.dynamic_read_route.store(true, Ordering::Release);
+            }
+        }
+        Ok(())
+    }
+
+    fn snapshot(&self) -> Result<Vec<(u64, Arc<DfsHandle>)>> {
+        let mut entries = Vec::new();
+        for shard in &self.shards {
+            let shard = shard
+                .read()
+                .map_err(|_| unavailable("DFS handle shard is poisoned"))?;
+            entries.extend(shard.iter().map(|(id, handle)| (*id, handle.clone())));
+        }
+        Ok(entries)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.shards
+            .iter()
+            .map(|shard| shard.read().unwrap().len())
+            .sum()
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    #[cfg(test)]
+    fn clear(&self) {
+        for (id, _) in self.snapshot().unwrap() {
+            self.remove(id).unwrap();
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -845,6 +1608,14 @@ pub struct DfsWriteSession {
     pub error_cursor: u64,
 }
 
+struct ResolvedReadView {
+    committed: Option<FileVersionId>,
+    length: u64,
+    layout: LayoutRoot,
+    frozen: Option<DirtyExtentMap>,
+    active: DirtyExtentMap,
+}
+
 struct InodeWriteState {
     inode: InodeRecord,
     write_lease: WriteLease,
@@ -854,9 +1625,16 @@ struct InodeWriteState {
     metadata_dirty: bool,
     kill_suidgid_dirty: bool,
     dirty_extents: DirtyExtentMap,
+    dirty_budget_reservations: Vec<WriteBudgetReservation>,
+    publication_window: Option<PublicationWindow>,
     in_flight: Option<InFlightCommit>,
     commit_busy: bool,
     operation_busy: bool,
+    native_queue: NativeTicketQueue,
+    native_thread: Option<std::thread::ThreadId>,
+    native_owner: Arc<NativeWriteOwner>,
+    native_due: bool,
+    native_due_through: u64,
     dirty: bool,
     next_write_seq: u64,
     visible_write_seq: u64,
@@ -868,14 +1646,767 @@ struct InodeWriteState {
     terminal_error: Option<Error>,
 }
 
+struct PublicationWindow {
+    operation_id: OperationId,
+    pending_reservation: Option<WriteBudgetReservation>,
+    pending_start: Option<u64>,
+    pending: Vec<u8>,
+    ready_chunks: VecDeque<WindowStagedChunk>,
+    active_bytes: u64,
+    high_water_bytes: u64,
+    high_water_uploads: usize,
+    uploads: Vec<PendingPublicationUpload>,
+    completed: Vec<WindowChunkReceipt>,
+}
+
+#[derive(Clone)]
+struct WindowStagedChunk {
+    file_offset: u64,
+    staged: StagedChunk,
+}
+
+#[derive(Clone)]
+struct WindowChunkObject {
+    file_offset: u64,
+    chunk: ChunkObject,
+}
+
+struct WindowChunkReceipt {
+    file_offset: u64,
+    receipt: crate::dfs::ChunkReceipt,
+    _descriptor_reservation: Option<WriteBudgetReservation>,
+}
+
+struct PublicationCommitPlan {
+    budget_reservations: Vec<WriteBudgetReservation>,
+    extents: Vec<Extent>,
+    receipts: Vec<crate::dfs::ChunkReceipt>,
+    staged_chunks: usize,
+    staged_bytes: u64,
+}
+
+struct PrepareCommitError {
+    error: Error,
+    publication_window: Option<Box<PublicationWindow>>,
+    budget_reservations: Vec<WriteBudgetReservation>,
+}
+
+impl DeferredWriteBudget {
+    pub(in crate::node) fn reserve_normal(
+        self: &Arc<Self>,
+        bytes: u64,
+    ) -> Result<WriteBudgetReservation> {
+        if bytes == 0 {
+            return Ok(WriteBudgetReservation::new(self.clone(), 0, 0, 0, 0));
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| unavailable("DFS deferred write budget is poisoned"))?;
+        let next = state.normal_bytes.saturating_add(bytes);
+        if next > DEFERRED_NORMAL_BUDGET_BYTES {
+            return Err(unavailable("DFS deferred write normal budget is exhausted"));
+        }
+        state.normal_bytes = next;
+        Ok(WriteBudgetReservation::new(self.clone(), bytes, 0, 0, 0))
+    }
+
+    fn reserve_publisher(self: &Arc<Self>, bytes: u64) -> Result<WriteBudgetReservation> {
+        if bytes == 0 {
+            return Ok(WriteBudgetReservation::new(self.clone(), 0, 0, 0, 0));
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| unavailable("DFS deferred write budget is poisoned"))?;
+        let next = state.publisher_bytes.saturating_add(bytes);
+        if next > DEFERRED_PUBLISHER_RESERVE_BYTES {
+            return Err(unavailable(
+                "DFS deferred write publisher budget is exhausted",
+            ));
+        }
+        state.publisher_bytes = next;
+        Ok(WriteBudgetReservation::new(self.clone(), 0, bytes, 0, 0))
+    }
+
+    fn reserve_descriptors(self: &Arc<Self>, descriptors: usize) -> Result<WriteBudgetReservation> {
+        if descriptors == 0 {
+            return Ok(WriteBudgetReservation::new(self.clone(), 0, 0, 0, 0));
+        }
+        let descriptor_bytes =
+            (descriptors as u64).saturating_mul(DEFERRED_DESCRIPTOR_BYTES_PER_CHUNK);
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| unavailable("DFS deferred write budget is poisoned"))?;
+        if state.descriptors.saturating_add(descriptors) > MAX_DEFERRED_DESCRIPTORS
+            || state.descriptor_bytes.saturating_add(descriptor_bytes)
+                > DEFERRED_DESCRIPTOR_BUDGET_BYTES
+        {
+            return Err(unavailable(
+                "DFS deferred write descriptor budget is exhausted",
+            ));
+        }
+        state.descriptors = state.descriptors.saturating_add(descriptors);
+        state.descriptor_bytes = state.descriptor_bytes.saturating_add(descriptor_bytes);
+        Ok(WriteBudgetReservation::new(
+            self.clone(),
+            0,
+            0,
+            descriptor_bytes,
+            descriptors,
+        ))
+    }
+}
+
+impl PublicationWindow {
+    fn new(operation_id: OperationId) -> Self {
+        Self {
+            operation_id,
+            pending_reservation: None,
+            pending_start: None,
+            pending: Vec::new(),
+            ready_chunks: VecDeque::new(),
+            active_bytes: 0,
+            high_water_bytes: 0,
+            high_water_uploads: 0,
+            uploads: Vec::new(),
+            completed: Vec::new(),
+        }
+    }
+
+    fn buffered_bytes(&self) -> u64 {
+        self.active_bytes
+            .saturating_add(self.pending.len() as u64)
+            .saturating_add(self.ready_chunks.iter().fold(0_u64, |sum, chunk| {
+                sum.saturating_add(chunk.staged.chunk.length)
+            }))
+    }
+
+    fn reserved_bytes(&self, seen: &mut HashSet<usize>) -> u64 {
+        let mut total = self.pending.capacity() as u64;
+        for chunk in &self.ready_chunks {
+            total = total.saturating_add(account_arc_bytes(seen, &chunk.staged.shared_bytes()));
+        }
+        for pending in &self.uploads {
+            for chunk in &pending.staged {
+                total = total.saturating_add(account_arc_bytes(seen, &chunk.staged.shared_bytes()));
+            }
+        }
+        total
+    }
+
+    fn append_sequential(
+        &mut self,
+        file_offset: u64,
+        bytes: &[u8],
+        pending_reservation: Option<WriteBudgetReservation>,
+        budget: &Arc<DeferredWriteBudget>,
+    ) -> Result<Vec<WindowStagedChunk>> {
+        if bytes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let expected = self
+            .pending_start
+            .map(|start| start + self.pending.len() as u64)
+            .unwrap_or(file_offset);
+        if expected != file_offset || self.pending.len() + bytes.len() > COMMIT_CHUNK_BYTES as usize
+        {
+            return Err(unavailable(
+                "DFS publication append must stay within the next sequential chunk",
+            ));
+        }
+        let conversion = if self.pending.len() + bytes.len() == COMMIT_CHUNK_BYTES as usize {
+            Some(budget.reserve_publisher(COMMIT_CHUNK_BYTES)?)
+        } else {
+            None
+        };
+        if self.pending.capacity() == 0 {
+            let reservation = pending_reservation.ok_or_else(|| {
+                unavailable("DFS pending capacity must be reserved before allocation")
+            })?;
+            self.pending = Vec::with_capacity(COMMIT_CHUNK_BYTES as usize);
+            self.pending_reservation = Some(reservation);
+        }
+        self.pending_start.get_or_insert(file_offset);
+        tracing::info_span!(
+            "node.dfs.deferred_window.pending_copy",
+            operation_id = %self.operation_id.0,
+            file_offset,
+            bytes = bytes.len() as u64,
+            pending_before = self.pending.len() as u64,
+        )
+        .in_scope(|| self.pending.extend_from_slice(bytes));
+        let sealed = if let Some(conversion) = conversion {
+            let staged = self.seal_pending(conversion)?;
+            let result = vec![staged.clone()];
+            self.ready_chunks.push_back(staged);
+            result
+        } else {
+            Vec::new()
+        };
+        self.high_water_bytes = self.high_water_bytes.max(self.buffered_bytes());
+        Ok(sealed)
+    }
+
+    fn seal_pending(&mut self, _conversion: WriteBudgetReservation) -> Result<WindowStagedChunk> {
+        let file_offset = self
+            .pending_start
+            .ok_or_else(|| unavailable("DFS pending chunk has no start"))?;
+        let length = self.pending.len() as u64;
+        tracing::info_span!(
+            "node.dfs.deferred_window.seal",
+            operation_id = %self.operation_id.0,
+            file_offset,
+            bytes = length,
+            chunk_id = tracing::field::Empty,
+        )
+        .in_scope(|| {
+            // Keep the existing conservative publisher admission. Freezing now
+            // moves the Vec allocation; the long-lived normal lease must cover
+            // its actual capacity, including a partially filled final buffer.
+            let mut reservation = self
+                .pending_reservation
+                .take()
+                .ok_or_else(|| unavailable("DFS pending chunk lost its allocation lease"))?;
+            let mut builder = ChunkBuilder::default();
+            tracing::info_span!(
+                "node.dfs.deferred_window.pending_vec_move",
+                operation_id = %self.operation_id.0,
+                file_offset,
+                bytes = length,
+            )
+            .in_scope(|| builder.replace(std::mem::take(&mut self.pending)));
+            let mut staged = builder.stage(self.operation_id.clone());
+            tracing::Span::current().record("chunk_id", staged.chunk.id.0.as_str());
+            reservation.reduce_normal_to(staged.shared_bytes().capacity() as u64)?;
+            staged.retain_write_budget(std::slice::from_ref(&reservation));
+            self.pending_start = None;
+            Ok(WindowStagedChunk {
+                file_offset,
+                staged,
+            })
+        })
+    }
+
+    fn flush_tail(&mut self, budget: &Arc<DeferredWriteBudget>) -> Result<()> {
+        if !self.pending.is_empty() {
+            let conversion = budget.reserve_publisher(self.pending.len() as u64)?;
+            let staged = self.seal_pending(conversion)?;
+            self.ready_chunks.push_back(staged);
+            self.high_water_bytes = self.high_water_bytes.max(self.buffered_bytes());
+        }
+        Ok(())
+    }
+}
+
+struct PendingPublicationUpload {
+    chunks: Vec<WindowChunkObject>,
+    staged: Vec<WindowStagedChunk>,
+    upload: Box<dyn DeferredChunkPut>,
+    _descriptor_reservation: WriteBudgetReservation,
+}
+
 #[derive(Clone)]
 struct ObservedWriteError {
     cursor: u64,
     error: Error,
 }
 
+const NATIVE_METADATA_BYTES: usize = 4 * 1024 * 1024;
+const NATIVE_CONTROL_BYTES: usize = 64 * 1024;
+const NATIVE_DESCRIPTOR_BYTES: usize = NATIVE_METADATA_BYTES - NATIVE_CONTROL_BYTES;
+
+#[derive(Clone, Copy)]
+pub(crate) struct NativeWriteConfig {
+    pub unpublished_descriptors: usize,
+    pub upload_inflight_chunks: usize,
+}
+
+impl Default for NativeWriteConfig {
+    fn default() -> Self {
+        Self {
+            unpublished_descriptors: 1024,
+            upload_inflight_chunks: 8,
+        }
+    }
+}
+
+#[derive(Default)]
+struct NativeMetadataState {
+    control_bytes: usize,
+    control_peak: usize,
+    descriptor_bytes: usize,
+    descriptor_reserved_bytes: usize,
+    scratch_reserved_bytes: usize,
+    descriptor_peak: usize,
+    descriptors: usize,
+    descriptor_peak_count: usize,
+    inflight: usize,
+    inflight_peak: usize,
+    completed: u64,
+    failed: u64,
+    pressure_descriptor: u64,
+    pressure_live: u64,
+}
+
+struct NativeMetadataBudget {
+    state: Mutex<NativeMetadataState>,
+    descriptor_limit: usize,
+    upload_limit: usize,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+struct NativeMetadataLease {
+    budget: Arc<NativeMetadataBudget>,
+    bytes: usize,
+    descriptor: bool,
+    counted_descriptor: bool,
+    actual_bytes: usize,
+}
+
+impl NativeMetadataBudget {
+    fn reserve(
+        self: &Arc<Self>,
+        bytes: usize,
+        descriptor: bool,
+    ) -> Result<Option<NativeMetadataLease>> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| unavailable("native metadata budget is poisoned"))?;
+        if descriptor {
+            if state.descriptors >= self.descriptor_limit
+                || bytes > NATIVE_DESCRIPTOR_BYTES.saturating_sub(state.descriptor_reserved_bytes)
+            {
+                return Ok(None);
+            }
+            state.descriptors += 1;
+            state.descriptor_reserved_bytes += bytes;
+            state.descriptor_peak_count = state.descriptor_peak_count.max(state.descriptors);
+        } else {
+            if bytes > NATIVE_CONTROL_BYTES.saturating_sub(state.control_bytes) {
+                return Ok(None);
+            }
+            state.control_bytes += bytes;
+            state.control_peak = state.control_peak.max(state.control_bytes);
+        }
+        Ok(Some(NativeMetadataLease {
+            budget: self.clone(),
+            bytes,
+            descriptor,
+            counted_descriptor: descriptor,
+            actual_bytes: 0,
+        }))
+    }
+}
+
+impl NativeMetadataLease {
+    fn set_actual(&mut self, actual: usize) -> Result<()> {
+        let budget = self.budget.clone();
+        let mut state = budget
+            .state
+            .lock()
+            .map_err(|_| unavailable("native metadata budget is poisoned"))?;
+        self.set_actual_locked(actual, &mut state)
+    }
+
+    // Caller has already separated a structural lock failure from an
+    // owner-scoped capacity refusal. The arithmetic and limits stay shared.
+    fn set_actual_locked(&mut self, actual: usize, state: &mut NativeMetadataState) -> Result<()> {
+        if self.descriptor {
+            let reserved = self.bytes.max(actual.saturating_mul(4));
+            if reserved - self.bytes
+                > NATIVE_DESCRIPTOR_BYTES.saturating_sub(state.descriptor_reserved_bytes)
+            {
+                return Err(unavailable(
+                    "native metadata actual capacity exceeds its reservation",
+                ));
+            }
+            let next_reserved = state.descriptor_reserved_bytes + reserved - self.bytes;
+            let next_actual = state.descriptor_bytes - self.actual_bytes + actual;
+            if next_actual.saturating_add(state.scratch_reserved_bytes) > next_reserved {
+                return Err(unavailable(
+                    "native receipt cannot consume reserved publication scratch",
+                ));
+            }
+            state.descriptor_reserved_bytes = next_reserved;
+            state.descriptor_bytes = next_actual;
+            state.descriptor_peak = state.descriptor_peak.max(state.descriptor_bytes);
+            self.bytes = reserved;
+            self.actual_bytes = actual;
+        }
+        Ok(())
+    }
+}
+
+fn native_receipt_heap(receipt: &ChunkReceipt) -> usize {
+    receipt.operation_id.0.capacity()
+        + receipt.chunk.id.0.capacity()
+        + receipt.replica_group_id.0.capacity()
+        + receipt.durable_acks.capacity() * std::mem::size_of::<crate::dfs::ReplicaAck>()
+        + receipt
+            .durable_acks
+            .iter()
+            .map(|ack| {
+                ack.operation_id.0.capacity()
+                    + ack.chunk_id.0.capacity()
+                    + ack.node_id.capacity()
+                    + ack.device_id.capacity()
+            })
+            .sum::<usize>()
+        + receipt.external_commit.as_ref().map_or(0, |external| {
+            external.store_id.capacity()
+                + external.generation.capacity()
+                + external.object_key.capacity()
+        })
+}
+
+impl Drop for NativeMetadataLease {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.budget.state.lock() {
+            if self.descriptor {
+                state.descriptor_reserved_bytes =
+                    state.descriptor_reserved_bytes.saturating_sub(self.bytes);
+                state.descriptor_bytes = state.descriptor_bytes.saturating_sub(self.actual_bytes);
+                if self.counted_descriptor {
+                    state.descriptors = state.descriptors.saturating_sub(1);
+                }
+            } else {
+                state.control_bytes = state.control_bytes.saturating_sub(self.bytes);
+            }
+        }
+        self.budget.notify.notify_one();
+    }
+}
+
+#[derive(Default)]
+struct NativeTicketQueue {
+    values: VecDeque<u64>,
+    allocation: Option<NativeMetadataLease>,
+}
+
+impl NativeTicketQueue {
+    fn push(&mut self, id: u64, budget: &Arc<NativeMetadataBudget>) -> Result<()> {
+        if self.values.len() == self.values.capacity() {
+            let target = self.values.capacity().saturating_mul(2).max(4);
+            let bytes = target
+                .checked_mul(std::mem::size_of::<u64>())
+                .ok_or_else(file_too_large)?;
+            // Charge the replacement while the old capacity is still owned.
+            let Some(mut allocation) = budget.reserve(bytes, false)? else {
+                return Err(unavailable("native admission control capacity is full"));
+            };
+            let mut replacement = VecDeque::new();
+            replacement.try_reserve_exact(target).map_err(|_| {
+                Error::coded(
+                    afs_error::IO_OUT_OF_MEMORY,
+                    "native admission queue allocation refused",
+                )
+            })?;
+            let actual = replacement.capacity() * std::mem::size_of::<u64>();
+            if actual > allocation.bytes {
+                let Some(mut extra) = budget.reserve(actual - allocation.bytes, false)? else {
+                    return Err(unavailable(
+                        "native admission queue actual capacity exceeds its control budget",
+                    ));
+                };
+                // Transfer the two reservations into one without refunding the
+                // extra capacity while the replacement remains live.
+                allocation.bytes += extra.bytes;
+                extra.bytes = 0;
+            }
+            replacement.extend(self.values.drain(..));
+            self.values = replacement;
+            self.allocation = Some(allocation);
+        }
+        self.values.push_back(id);
+        Ok(())
+    }
+
+    fn remove(&mut self, id: u64) {
+        if let Some(index) = self.values.iter().position(|value| *value == id) {
+            self.values.remove(index);
+        }
+        if self.values.is_empty() {
+            self.values = VecDeque::new();
+            self.allocation = None;
+        }
+    }
+}
+
+struct NativeWritePipeline {
+    budget: Arc<NativeWriteBudget>,
+    metadata: Arc<NativeMetadataBudget>,
+    runtime: Option<tokio::runtime::Handle>,
+    notify: Arc<tokio::sync::Notify>,
+    metrics: Option<crate::node::read_work::ReadWorkMetrics>,
+    closed: AtomicBool,
+    next_ticket: AtomicU64,
+    allocation_queue: Mutex<NativeTicketQueue>,
+    tasks: Mutex<Vec<Arc<NativeUpload>>>,
+    _task_capacity: Option<NativeMetadataLease>,
+}
+
+impl NativeWritePipeline {
+    fn new(
+        budget: Arc<NativeWriteBudget>,
+        config: NativeWriteConfig,
+        runtime: Option<tokio::runtime::Handle>,
+        metrics: Option<crate::node::read_work::ReadWorkMetrics>,
+    ) -> Self {
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let metadata = Arc::new(NativeMetadataBudget {
+            state: Mutex::new(NativeMetadataState::default()),
+            descriptor_limit: config.unpublished_descriptors,
+            upload_limit: config.upload_inflight_chunks,
+            notify: notify.clone(),
+        });
+        let tasks = Vec::with_capacity(config.upload_inflight_chunks);
+        let task_capacity = metadata
+            .reserve(
+                tasks.capacity() * std::mem::size_of::<Arc<NativeUpload>>(),
+                false,
+            )
+            .ok()
+            .flatten();
+        Self {
+            budget,
+            metadata,
+            runtime,
+            notify,
+            metrics,
+            closed: AtomicBool::new(false),
+            next_ticket: AtomicU64::new(1),
+            allocation_queue: Mutex::new(NativeTicketQueue::default()),
+            tasks: Mutex::new(tasks),
+            _task_capacity: task_capacity,
+        }
+    }
+
+    fn observe(&self) {
+        let Some(metrics) = &self.metrics else {
+            return;
+        };
+        let live = self.budget.snapshot();
+        metrics.native_write_live(&live);
+        if let Ok(state) = self.metadata.state.lock() {
+            metrics.native_write_resources(&[
+                (
+                    "descriptor_reserved_bytes",
+                    state.descriptor_reserved_bytes as u64,
+                ),
+                (
+                    "publication_scratch_reserved_bytes",
+                    state.scratch_reserved_bytes as u64,
+                ),
+                ("descriptor_bytes", state.descriptor_bytes as u64),
+                ("descriptor_peak_bytes", state.descriptor_peak as u64),
+                ("descriptors", state.descriptors as u64),
+                ("descriptor_peak_count", state.descriptor_peak_count as u64),
+                ("control_bytes", state.control_bytes as u64),
+                ("control_peak_bytes", state.control_peak as u64),
+                ("control_reserve_bytes", NATIVE_CONTROL_BYTES as u64),
+                ("metadata_limit_bytes", NATIVE_METADATA_BYTES as u64),
+                ("descriptor_limit_bytes", NATIVE_DESCRIPTOR_BYTES as u64),
+                ("upload_inflight", state.inflight as u64),
+                ("upload_peak", state.inflight_peak as u64),
+                ("upload_limit", self.metadata.upload_limit as u64),
+                ("pressure_descriptor", state.pressure_descriptor),
+                ("pressure_live", state.pressure_live),
+                ("completed_uploads", state.completed),
+                ("failed_uploads", state.failed),
+            ]);
+        }
+    }
+}
+
+struct NativeMutationTicket {
+    id: u64,
+    cell: SharedInodeWriteState,
+    pipeline: Arc<NativeWritePipeline>,
+}
+
+impl Drop for NativeMutationTicket {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.cell.lock() {
+            if state.native_queue.values.front() == Some(&self.id) {
+                state.native_thread = None;
+            }
+            state.native_queue.remove(self.id);
+        }
+        self.cell.notify_all();
+        self.pipeline.notify.notify_one();
+    }
+}
+
+struct NativeAllocationTurn {
+    id: u64,
+    pipeline: Arc<NativeWritePipeline>,
+}
+
+impl Drop for NativeAllocationTurn {
+    fn drop(&mut self) {
+        if let Ok(mut queue) = self.pipeline.allocation_queue.lock() {
+            queue.remove(self.id);
+        }
+        self.pipeline.notify.notify_one();
+    }
+}
+
+struct NativeCommitAccounting {
+    budget: Arc<NativeMetadataBudget>,
+    reserved: usize,
+    actual: AtomicUsize,
+    _owners: Vec<Arc<Mutex<NativeMetadataLease>>>,
+}
+
+impl NativeCommitAccounting {
+    fn set_actual(&self, bytes: usize) -> Result<()> {
+        if bytes > self.reserved {
+            return Err(unavailable(
+                "native commit metadata exceeds its publication scratch",
+            ));
+        }
+        let mut state = self
+            .budget
+            .state
+            .lock()
+            .map_err(|_| unavailable("native metadata budget is poisoned"))?;
+        let previous = self.actual.swap(bytes, Ordering::Relaxed);
+        state.descriptor_bytes = state
+            .descriptor_bytes
+            .saturating_sub(previous)
+            .saturating_add(bytes);
+        state.descriptor_peak = state.descriptor_peak.max(state.descriptor_bytes);
+        Ok(())
+    }
+}
+
+impl Drop for NativeCommitAccounting {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.budget.state.lock() {
+            state.scratch_reserved_bytes =
+                state.scratch_reserved_bytes.saturating_sub(self.reserved);
+            state.descriptor_bytes = state
+                .descriptor_bytes
+                .saturating_sub(self.actual.load(Ordering::Relaxed));
+        }
+        self.budget.notify.notify_one();
+    }
+}
+
+struct NativeRpcAccounting {
+    accounting: Arc<NativeCommitAccounting>,
+    base: usize,
+}
+impl Drop for NativeRpcAccounting {
+    fn drop(&mut self) {
+        let _ = self.accounting.set_actual(self.base);
+    }
+}
+
+// P1M already retains complete base/layout/version and owned Meta RPC values.
+// Do not impose a new file-size limit on those existing layers. This ledger
+// covers W2's additional retained receipts and incremental publication owners;
+// full-layout/domain/wire capacity remains a separately reported RSS cost.
+fn native_commit_heap(commit: &CommitFileVersion) -> usize {
+    std::mem::size_of::<CommitFileVersion>()
+        + commit.operation_id.0.capacity()
+        + commit.inode_id.0.capacity()
+        + commit
+            .expected_head_version
+            .as_ref()
+            .map_or(0, |id| id.0.capacity())
+        + commit.write_lease.inode_id.0.capacity()
+        + commit.write_lease.owner_node_id.capacity()
+        + commit.write_lease.owner_session_id.capacity()
+        + commit.chunk_receipts.capacity() * std::mem::size_of::<ChunkReceipt>()
+        + commit
+            .chunk_receipts
+            .iter()
+            .map(native_receipt_heap)
+            .sum::<usize>()
+}
+
+struct NativeUploadPermit(Arc<NativeMetadataBudget>);
+impl Drop for NativeUploadPermit {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.0.state.lock() {
+            state.inflight = state.inflight.saturating_sub(1);
+        }
+        self.0.notify.notify_one();
+    }
+}
+
+struct NativeUpload {
+    operation_id: OperationId,
+    chunk: ChunkObject,
+    owner: Weak<InodeWriteStateCell>,
+    state: Mutex<NativeUploadState>,
+    cv: Condvar,
+    _descriptor: Arc<Mutex<NativeMetadataLease>>,
+}
+
+struct NativeUploadState {
+    body: Option<SharedChunkBytes>,
+    staged: Option<StagedChunk>,
+    task: Option<tokio::task::JoinHandle<Result<NativeChunkReceipt>>>,
+    receipt: Option<NativeChunkReceipt>,
+    error: Option<Error>,
+    terminal_error: Option<Error>,
+    joining: bool,
+}
+
+impl NativeUpload {
+    fn read_at(&self, store: &dyn ChunkStore, offset: u64, out: &mut [u8]) -> Result<usize> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| unavailable("native upload state is poisoned"))?;
+        if let Some(error) = &state.terminal_error {
+            return Err(error.clone());
+        }
+        if let Some(body) = &state.body {
+            let start = usize::try_from(offset)
+                .map_err(|_| file_too_large())?
+                .min(body.len());
+            let size = out.len().min(body.len() - start);
+            out[..size].copy_from_slice(&body[start..start + size]);
+            return Ok(size);
+        }
+        let receipt = state
+            .receipt
+            .as_ref()
+            .ok_or_else(|| unavailable("native uploaded body has no durable receipt"))?;
+        if !receipt.local_required_and_durable {
+            return Err(unavailable(
+                "native nonlocal body was released before publication",
+            ));
+        }
+        store.read_native_uploaded_at(&receipt.receipt, offset, out)
+    }
+}
+
+struct NativeInodeMutationGuard<'a> {
+    state: std::sync::MutexGuard<'a, InodeWriteState>,
+    _ticket: Option<NativeMutationTicket>,
+}
+impl std::ops::Deref for NativeInodeMutationGuard<'_> {
+    type Target = InodeWriteState;
+    fn deref(&self) -> &Self::Target {
+        &self.state
+    }
+}
+impl std::ops::DerefMut for NativeInodeMutationGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.state
+    }
+}
+
 struct InodeOperationGuard {
     cell: SharedInodeWriteState,
+    native_notify: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl Drop for InodeOperationGuard {
@@ -883,6 +2414,9 @@ impl Drop for InodeOperationGuard {
         if let Ok(mut state) = self.cell.lock() {
             state.operation_busy = false;
             self.cell.notify_all();
+        }
+        if let Some(notify) = &self.native_notify {
+            notify.notify_one();
         }
     }
 }
@@ -892,12 +2426,78 @@ struct DirtyExtent {
     file_offset: u64,
     length: u64,
     write_seq: u64,
-    data: Option<Arc<[u8]>>,
+    data: Option<SharedChunkBytes>,
+    builder: Option<usize>,
+    source_offset: usize,
+    // The last write's original coverage boundary, independent of visible
+    // interval splits. Reusing this owner must not turn one input copy into
+    // multiple copies merely because later writes split the visible map.
+    native_reuse_end: u64,
+    uploaded: Option<UploadedDirtyExtent>,
+    native_upload: Option<Arc<NativeUpload>>,
+    native_descriptor: Option<Arc<Mutex<NativeMetadataLease>>>,
+    // A resolved dirty read view can outlive publication and must keep the
+    // original allocation charged even after the inode/window releases it.
+    budget_reservations: Vec<WriteBudgetReservation>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
+struct UploadedDirtyExtent {
+    chunk: ChunkObject,
+    receipt: ChunkReceipt,
+}
+
+#[derive(Default)]
 struct DirtyExtentMap {
-    extents: Vec<DirtyExtent>,
+    // Native writes retain only the final nonoverlapping visible intervals.
+    extents: BTreeMap<u64, DirtyExtent>,
+    // S3/legacy retains its original history and admission/budget semantics.
+    // Exactly one container owns a live write mode; snapshots preserve it.
+    legacy_extents: Vec<DirtyExtent>,
+    builders: Vec<NativeDirtyBuilder>,
+    append_builders: BTreeMap<u64, BTreeSet<(u64, usize)>>,
+    next_builder_order: u64,
+    native_admitted_bytes: Option<u64>,
+    native_operation_id: Option<OperationId>,
+}
+
+struct NativeDirtyBuilder {
+    file_offset: u64,
+    builder: ChunkBuilder,
+    descriptor: Option<Arc<Mutex<NativeMetadataLease>>>,
+    creation_order: u64,
+}
+
+// Frozen maps and S3 maps only clone immutable owners. The sole mutable-map
+// clone fallback is a read snapshot; production reads use snapshot_range instead.
+impl Clone for DirtyExtentMap {
+    fn clone(&self) -> Self {
+        let bodies = self
+            .builders
+            .iter()
+            .map(|entry| SharedChunkBytes::from_vec(entry.builder.as_bytes().to_vec()))
+            .collect::<Vec<_>>();
+        let freeze = |extent: &DirtyExtent| {
+            let mut extent = extent.clone();
+            if let Some(index) = extent.builder.take() {
+                extent.data = Some(bodies[index].clone());
+            }
+            extent
+        };
+        Self {
+            extents: self
+                .extents
+                .iter()
+                .map(|(key, extent)| (*key, freeze(extent)))
+                .collect(),
+            legacy_extents: self.legacy_extents.iter().map(freeze).collect(),
+            builders: Vec::new(),
+            append_builders: BTreeMap::new(),
+            next_builder_order: self.next_builder_order,
+            native_admitted_bytes: self.native_admitted_bytes,
+            native_operation_id: self.native_operation_id.clone(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -909,14 +2509,14 @@ struct FrozenCommit {
     base_version: Option<FileVersion>,
     base_layout: LayoutRoot,
     dirty_extents: DirtyExtentMap,
+    dirty_budget_reservations: Vec<WriteBudgetReservation>,
     kill_suidgid_dirty: bool,
 }
 
-#[derive(Clone)]
 enum InFlightCommit {
-    Preparing(Box<FrozenCommit>),
+    Preparing(Box<FrozenCommit>, Option<Box<PublicationWindow>>),
     File(Box<PendingFileCommit>),
-    Metadata(SyncInodeMetadata),
+    Metadata(SyncInodeMetadata, u64),
 }
 
 #[derive(Clone)]
@@ -937,13 +2537,16 @@ struct CommitPlan {
 struct OverlaySegment {
     file_offset: u64,
     length: u64,
-    data: Option<(Arc<[u8]>, usize)>,
+    data: Option<(SharedChunkBytes, usize)>,
 }
 
 #[derive(Clone)]
 struct CommitBatch {
     through_seq: u64,
-    commit: CommitFileVersion,
+    commit: Arc<CommitFileVersion>,
+    _native_accounting: Option<Arc<NativeCommitAccounting>>,
+    _native_uploads: Vec<Arc<NativeUpload>>,
+    _budget_reservations: Vec<WriteBudgetReservation>,
 }
 
 enum AppliedCommit {
@@ -955,6 +2558,7 @@ enum AppliedCommit {
         updated: InodeRecord,
     },
     Metadata {
+        through_seq: u64,
         updated: InodeRecord,
     },
 }
@@ -973,9 +2577,9 @@ enum CommitReason {
 impl InFlightCommit {
     fn dirty_extents(&self) -> Option<DirtyExtentMap> {
         match self {
-            InFlightCommit::Preparing(frozen) => Some(frozen.dirty_extents.clone()),
+            InFlightCommit::Preparing(frozen, _) => Some(frozen.dirty_extents.clone()),
             InFlightCommit::File(pending) => Some(pending.frozen.dirty_extents.clone()),
-            InFlightCommit::Metadata(_) => None,
+            InFlightCommit::Metadata(_, _) => None,
         }
     }
 }
@@ -1015,6 +2619,16 @@ impl DistributedFs {
     ) -> Self {
         let node_id = node_id.into();
         let session_id = session_id.into();
+        let native_pipeline = (!read_engine.has_external_backend()
+            && !chunk_store.supports_deferred_put())
+        .then(|| {
+            Arc::new(NativeWritePipeline::new(
+                NativeWriteBudget::new(64 * 1024 * 1024),
+                NativeWriteConfig::default(),
+                None,
+                None,
+            ))
+        });
         #[cfg(not(test))]
         let pending_trace = PendingTrace::from_env(&namespace_id.0, &node_id, &session_id);
         #[cfg(test)]
@@ -1028,12 +2642,13 @@ impl DistributedFs {
             chunk_store,
             read_engine,
             remote_owner_factory: None,
-            handles: Mutex::new(HashMap::new()),
+            handles: DfsHandleTable::default(),
             dir_handles: Mutex::new(HashMap::new()),
-            inode_writes: Mutex::new(HashMap::new()),
-            remote_inode_providers: Mutex::new(HashMap::new()),
+            inode_writes: ShardedMap::default(),
+            remote_inode_providers: ShardedMap::default(),
             pending_remote_releases: Mutex::new(PendingRemoteReleaseState::default()),
-            lock_authorities: Mutex::new(HashMap::new()),
+            lock_authorities: ShardedMap::default(),
+            lock_authority_admission: Mutex::new(()),
             lock_renewal: Arc::new(DfsLockRenewal::new()),
             remote_lock_authorities: Mutex::new(HashMap::new()),
             remote_lock_authority_sessions: Mutex::new(HashMap::new()),
@@ -1043,10 +2658,25 @@ impl DistributedFs {
             remote_open_admission_locks: Mutex::new(HashMap::new()),
             #[cfg(test)]
             owner_open_finish_pause: Mutex::new(None),
+            #[cfg(test)]
+            native_read_before_delivery: Mutex::new(None),
+            #[cfg(test)]
+            native_read_before_refresh: Mutex::new(None),
+            #[cfg(test)]
+            native_read_after_committed: Mutex::new(None),
+            #[cfg(test)]
+            backend_inode_after_missing: Mutex::new(None),
+            #[cfg(test)]
+            handle_registration_after_route_check: Mutex::new(None),
+            #[cfg(test)]
+            readonly_version_before_install: Mutex::new(None),
             lock_session_reap_cursor: AtomicU64::new(0),
             owner_handle_reap_cursor: AtomicU64::new(0),
             writeback_cursor: AtomicU64::new(0),
             writeback_maintenance_gate: Mutex::new(()),
+            write_pipeline_budget: Arc::new(DeferredWriteBudget::default()),
+            write_pipeline_budget_gate: Mutex::new(()),
+            publisher_prepare_gate: Mutex::new(()),
             #[cfg(test)]
             writeback_after_examine_pause: Mutex::new(None),
             #[cfg(test)]
@@ -1054,10 +2684,17 @@ impl DistributedFs {
             closed_lock_sessions: Mutex::new(HashSet::new()),
             closed_lock_session_admission_closed: AtomicBool::new(false),
             remote_operation_results: Mutex::new(HashMap::new()),
-            readonly_version_cache: Mutex::new(None),
+            readonly_version_cache: Mutex::new(ReadOnlyVersionCache::new(
+                DEFAULT_VERSION_CACHE_ENTRIES,
+                DEFAULT_VERSION_CACHE_BYTES,
+            )),
+            readonly_empty_version: Arc::new(ReadOnlyVersion::empty()),
             dirty_budget_bytes: DEFAULT_DIRTY_DATA_BUDGET_BYTES,
-            inode_to_backend: Mutex::new(HashMap::from([(InodeId::new("1"), ROOT_INODE)])),
-            backend_to_inode: Mutex::new(HashMap::from([(ROOT_INODE, InodeId::new("1"))])),
+            write_buffer_pool: WriteBufferPool::new(128 * 1024 * 1024),
+            native_pipeline,
+            inode_to_backend: ShardedMap::from_entries([(InodeId::new("1"), ROOT_INODE)]),
+            backend_to_inode: ShardedMap::from_entries([(ROOT_INODE, InodeId::new("1"))]),
+            inode_mapping_creation: Mutex::new(()),
             next_inode: AtomicU64::new(ROOT_INODE + 1),
             next_handle: AtomicU64::new(1),
             next_operation: AtomicU64::new(1),
@@ -1065,8 +2702,990 @@ impl DistributedFs {
         }
     }
 
+    pub(crate) fn with_native_write_pipeline(
+        mut self,
+        budget: Arc<NativeWriteBudget>,
+        config: NativeWriteConfig,
+        runtime: tokio::runtime::Handle,
+        metrics: Option<crate::node::read_work::ReadWorkMetrics>,
+    ) -> Result<Self> {
+        if self.deferred_publication_enabled()
+            || config.unpublished_descriptors == 0
+            || config.unpublished_descriptors > 1024
+            || config.upload_inflight_chunks == 0
+            || config.upload_inflight_chunks > 8
+        {
+            return Err(invalid("invalid native write pipeline configuration"));
+        }
+        self.native_pipeline = Some(Arc::new(NativeWritePipeline::new(
+            budget,
+            config,
+            Some(runtime),
+            metrics,
+        )));
+        self.observe_native_resources();
+        Ok(self)
+    }
+
+    pub(crate) fn native_writeback_notify(&self) -> Option<Arc<tokio::sync::Notify>> {
+        self.native_pipeline
+            .as_ref()
+            .map(|pipeline| pipeline.notify.clone())
+    }
+
+    pub(crate) fn close_native_write_admission(&self) {
+        if let Some(pipeline) = &self.native_pipeline {
+            pipeline.closed.store(true, Ordering::Release);
+            pipeline.budget.stop();
+            pipeline.notify.notify_waiters();
+            if let Ok(states) = self.inode_writes.snapshot() {
+                for (_, state) in states {
+                    state.notify_all();
+                }
+            }
+        }
+    }
+
+    fn native_ticket(&self, cell: &SharedInodeWriteState) -> Result<Option<NativeMutationTicket>> {
+        self.native_ticket_with_cleanup(cell, false)
+    }
+
+    fn native_ticket_with_cleanup(
+        &self,
+        cell: &SharedInodeWriteState,
+        cleanup: bool,
+    ) -> Result<Option<NativeMutationTicket>> {
+        let Some(pipeline) = &self.native_pipeline else {
+            return Ok(None);
+        };
+        if !cleanup && pipeline.closed.load(Ordering::Acquire) {
+            return Err(unavailable("native write admission is closed"));
+        }
+        let id = pipeline.next_ticket.fetch_add(1, Ordering::Relaxed);
+        let mut state = cell
+            .lock()
+            .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+        if state.native_thread == Some(std::thread::current().id()) {
+            return Ok(None);
+        }
+        state.native_queue.push(id, &pipeline.metadata)?;
+        let ticket = NativeMutationTicket {
+            id,
+            cell: cell.clone(),
+            pipeline: pipeline.clone(),
+        };
+        loop {
+            if !cleanup && pipeline.closed.load(Ordering::Acquire) {
+                drop(state);
+                drop(ticket);
+                return Err(unavailable("native write admission is closed"));
+            }
+            if state.native_queue.values.front() == Some(&id) {
+                state.native_thread = Some(std::thread::current().id());
+                break;
+            }
+            state = cell
+                .cv
+                .wait_timeout(state, Duration::from_millis(10))
+                .map_err(|_| unavailable("native mutation queue is poisoned"))?
+                .0;
+        }
+        drop(state);
+        Ok(Some(ticket))
+    }
+
+    fn observe_native_resources(&self) {
+        let Some(pipeline) = &self.native_pipeline else {
+            return;
+        };
+        pipeline.observe();
+        if let Some(metrics) = &pipeline.metrics
+            && let Ok(states) = self.inode_writes.snapshot()
+        {
+            let mut pending = 0_u64;
+            for (_, cell) in states {
+                if let Ok(state) = cell.lock() {
+                    pending += u64::from(state.dirty_extents.native_operation_id.is_some());
+                    pending += u64::from(state.in_flight.is_some());
+                }
+            }
+            metrics.native_write_resources(&[("pending_generations", pending)]);
+        }
+    }
+
+    fn native_wait_mutation_ready(
+        &self,
+        inode: &InodeId,
+        cell: &SharedInodeWriteState,
+    ) -> Result<()> {
+        loop {
+            let state = cell
+                .lock()
+                .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+            if let Some(error) = &state.terminal_error {
+                return Err(error.clone());
+            }
+            if !Self::in_flight_blocks_mutation(&state.in_flight) {
+                return Ok(());
+            }
+            if state.commit_busy {
+                drop(
+                    cell.cv
+                        .wait_timeout(state, Duration::from_millis(10))
+                        .map_err(|_| unavailable("DFS inode write state is poisoned"))?,
+                );
+            } else {
+                drop(state);
+                if let Some(seq) = self.commit_inode(inode, CommitReason::Background)? {
+                    self.update_handles_after_commit(inode, seq)?;
+                }
+            }
+        }
+    }
+
+    fn native_owner_limit(&self, pipeline: &NativeWritePipeline) -> Result<usize> {
+        let mut writers = 0;
+        for (_, cell) in self.inode_writes.snapshot()? {
+            let state = cell
+                .lock()
+                .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+            if state.open_writers != 0 || state.dirty {
+                writers += 1;
+            }
+        }
+        Ok((16 * 1024 * 1024).max(pipeline.budget.snapshot().limit / writers.max(1)))
+    }
+
+    fn native_ordinary_write(
+        &self,
+        handle: FileHandle,
+        snapshot: &DfsFileHandleSnapshot,
+        cell: SharedInodeWriteState,
+        offset: u64,
+        data: &[u8],
+        options: WriteOptions,
+    ) -> Result<usize> {
+        let mut accepted = 0;
+        let result = self.native_ordinary_write_inner(
+            handle,
+            snapshot,
+            cell,
+            (offset, data, options),
+            &mut accepted,
+        );
+        match result {
+            Err(error)
+                if accepted > 0
+                    && snapshot.flags & libc::O_SYNC != libc::O_SYNC
+                    && !has_o_dsync(snapshot.flags) =>
+            {
+                // A prefix is already visible. Report its real length, retain
+                // the failure for the next barrier, and never repeat input.
+                self.record_background_error(&snapshot.inode_id, error)?;
+                Ok(accepted)
+            }
+            result => result,
+        }
+    }
+
+    fn native_ordinary_write_inner(
+        &self,
+        handle: FileHandle,
+        snapshot: &DfsFileHandleSnapshot,
+        cell: SharedInodeWriteState,
+        input: (u64, &[u8], WriteOptions),
+        accepted: &mut usize,
+    ) -> Result<usize> {
+        let (offset, data, options) = input;
+        let pipeline = self
+            .native_pipeline
+            .as_ref()
+            .ok_or_else(|| unavailable("native write pipeline is missing"))?
+            .clone();
+        let ticket = self
+            .native_ticket(&cell)?
+            .ok_or_else(|| unavailable("native mutation ticket is missing"))?;
+        'accept: while *accepted < data.len() {
+            self.native_wait_mutation_ready(&snapshot.inode_id, &cell)?;
+            if pipeline.closed.load(Ordering::Acquire) {
+                return Err(unavailable("native write admission is closed"));
+            }
+            let _ = self.poll_native_uploads()?;
+            self.observe_handle_error(handle)?;
+            let (position, selection, capacity, generation, seq, owner) = {
+                let state = cell
+                    .lock()
+                    .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+                if let Some(error) = &state.terminal_error {
+                    return Err(error.clone());
+                }
+                let position = if snapshot.flags & libc::O_APPEND != 0 {
+                    state.logical_length
+                } else {
+                    offset
+                        .checked_add(*accepted as u64)
+                        .ok_or_else(file_too_large)?
+                };
+                position
+                    .checked_add((data.len() - *accepted) as u64)
+                    .ok_or_else(file_too_large)?;
+                let selection = state
+                    .dirty_extents
+                    .native_selection(position, state.logical_length);
+                let capacity = DirtyExtentMap::native_capacity(
+                    position,
+                    data.len() - *accepted,
+                    state.logical_length,
+                );
+                (
+                    position,
+                    selection,
+                    capacity,
+                    state.dirty_extents.native_operation_id.clone(),
+                    state.next_write_seq,
+                    state.native_owner.clone(),
+                )
+            };
+            let operation_id = generation
+                .clone()
+                .unwrap_or_else(|| self.operation_id("native-generation"));
+            let mut prepared = None;
+            let mut descriptor = None;
+            if selection.is_none() {
+                let turn_id = ticket.id;
+                {
+                    let mut queue = pipeline
+                        .allocation_queue
+                        .lock()
+                        .map_err(|_| unavailable("native allocation queue is poisoned"))?;
+                    queue.push(turn_id, &pipeline.metadata)?;
+                }
+                let _turn = NativeAllocationTurn {
+                    id: turn_id,
+                    pipeline: pipeline.clone(),
+                };
+                loop {
+                    if pipeline.closed.load(Ordering::Acquire) {
+                        return Err(unavailable("native write admission is closed"));
+                    }
+                    let is_front = pipeline
+                        .allocation_queue
+                        .lock()
+                        .map_err(|_| unavailable("native allocation queue is poisoned"))?
+                        .values
+                        .front()
+                        == Some(&turn_id);
+                    if is_front {
+                        if descriptor.is_none() {
+                            let reservation = self
+                                .chunk_store
+                                .native_descriptor_reservation_bytes(&operation_id)?;
+                            if reservation > NATIVE_DESCRIPTOR_BYTES {
+                                return Err(Error::coded(
+                                    afs_error::IO_CAPACITY,
+                                    "native descriptor and publication scratch exceed their fixed metadata budget",
+                                ));
+                            }
+                            descriptor = pipeline
+                                .metadata
+                                .reserve(reservation, true)?
+                                .map(|lease| Arc::new(Mutex::new(lease)));
+                            if let Some(owner) = &descriptor {
+                                owner
+                                    .lock()
+                                    .map_err(|_| {
+                                        unavailable("native descriptor reservation is poisoned")
+                                    })?
+                                    .set_actual(
+                                        std::mem::size_of::<Mutex<NativeMetadataLease>>()
+                                            + 2 * std::mem::size_of::<usize>(),
+                                    )?;
+                            }
+                            if descriptor.is_none() {
+                                self.request_native_pressure(&cell, true)?;
+                                let progressed = self.progress_native_writeback()?;
+                                if pipeline.runtime.is_none() && progressed == 0 {
+                                    return Err(Error::coded(
+                                        afs_error::IO_CAPACITY,
+                                        "native descriptor admission needs externally driven writeback or a Node runtime",
+                                    ));
+                                }
+                                let epoch = pipeline.budget.snapshot().epoch;
+                                pipeline
+                                    .budget
+                                    .wait_for_change(epoch, Duration::from_millis(10));
+                                continue;
+                            }
+                        }
+                        let limit = self.native_owner_limit(&pipeline)?;
+                        match pipeline
+                            .budget
+                            .try_reserve_for(owner.clone(), capacity, limit)?
+                        {
+                            NativeWriteAdmission::Reserved(lease) => {
+                                match ChunkBuilder::with_native_lease(
+                                    self.write_buffer_pool.clone(),
+                                    capacity,
+                                    lease,
+                                ) {
+                                    Ok(builder) => {
+                                        prepared = Some(builder);
+                                        break;
+                                    }
+                                    Err(error)
+                                        if error.code() == afs_error::IO_OUT_OF_MEMORY
+                                            && *accepted > 0 =>
+                                    {
+                                        // The rejected tail was never accepted. Complete
+                                        // any sync barrier for the visible prefix below.
+                                        break 'accept;
+                                    }
+                                    Err(error) if error.code() == afs_error::IO_WOULD_BLOCK => {}
+                                    Err(error) => return Err(error),
+                                }
+                            }
+                            NativeWriteAdmission::Wait { epoch } => {
+                                if pipeline.runtime.is_none() {
+                                    while let Some(upload) =
+                                        Self::next_native_upload_for_cell(&cell)?
+                                    {
+                                        self.wait_native_upload(&upload)?;
+                                    }
+                                }
+                                self.request_native_pressure(&cell, false)?;
+                                self.progress_native_writeback()?;
+                                if pipeline.runtime.is_none()
+                                    && pipeline.budget.snapshot().epoch == epoch
+                                {
+                                    return Err(unavailable(
+                                        "native admission needs externally driven writeback or a Node runtime",
+                                    ));
+                                }
+                                pipeline
+                                    .budget
+                                    .wait_for_change(epoch, Duration::from_millis(10));
+                            }
+                        }
+                    } else {
+                        let epoch = pipeline.budget.snapshot().epoch;
+                        pipeline
+                            .budget
+                            .wait_for_change(epoch, Duration::from_millis(10));
+                    }
+                    let _ = self.poll_native_uploads()?;
+                    self.observe_handle_error(handle)?;
+                }
+            }
+            let operation = self.begin_inode_operation(&snapshot.inode_id, cell.clone())?;
+            let (written, accepted_seq) = {
+                let mut state = cell
+                    .lock()
+                    .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+                let actual_position = if snapshot.flags & libc::O_APPEND != 0 {
+                    state.logical_length
+                } else {
+                    offset + *accepted as u64
+                };
+                if state.next_write_seq != seq
+                    || state.dirty_extents.native_operation_id != generation
+                    || actual_position != position
+                    || state
+                        .dirty_extents
+                        .native_selection(position, state.logical_length)
+                        != selection
+                {
+                    drop(state);
+                    drop(operation);
+                    drop(prepared);
+                    continue;
+                }
+                let next_seq = state.next_write_seq.saturating_add(1);
+                if state.dirty_extents.native_operation_id.is_none() {
+                    state.dirty_extents.native_operation_id = Some(operation_id.clone());
+                }
+                let written = state.dirty_extents.write_native_prepared(
+                    position,
+                    &data[*accepted..],
+                    next_seq,
+                    selection,
+                    prepared,
+                    descriptor,
+                )?;
+                state.logical_length = state.logical_length.max(position + written as u64);
+                state.next_write_seq = next_seq;
+                state.visible_write_seq = next_seq;
+                state.dirty = true;
+                state.metadata_dirty = true;
+                let now = now_unix_ms();
+                state.inode.attributes.mtime_unix_ms = now;
+                state.inode.attributes.ctime_unix_ms = now;
+                if options.kill_suidgid {
+                    Self::apply_kernel_killpriv_to_state(&mut state);
+                }
+                (written, next_seq)
+            };
+            *accepted += written;
+            drop(operation);
+            self.update_handle_write_progress(handle, accepted_seq)?;
+            self.seal_native_full_builders(&cell)?;
+            self.start_native_uploads()?;
+            self.observe_native_resources();
+        }
+        // Keep the FIFO ticket, but release every short operation guard before
+        // waiting for the persistent barrier. Preparing may finish meanwhile.
+        if snapshot.flags & libc::O_SYNC == libc::O_SYNC {
+            self.commit_handle_inside_operation(handle, CommitReason::FullSync)?;
+        } else if has_o_dsync(snapshot.flags) {
+            self.commit_handle_inside_operation(handle, CommitReason::DataSync)?;
+        }
+        drop(ticket);
+        Ok(*accepted)
+    }
+
+    fn request_native_pressure(
+        &self,
+        cell: &SharedInodeWriteState,
+        descriptor: bool,
+    ) -> Result<()> {
+        let Some(pipeline) = &self.native_pipeline else {
+            return Ok(());
+        };
+        let mut state = cell
+            .lock()
+            .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+        let retained_nonlocal = state.dirty_extents.iter_extents().any(|extent| {
+            extent.native_upload.as_ref().is_some_and(|upload| {
+                upload.state.lock().is_ok_and(|state| {
+                    state.terminal_error.is_none()
+                        && state
+                            .receipt
+                            .as_ref()
+                            .is_some_and(|receipt| !receipt.local_required_and_durable)
+                })
+            })
+        });
+        if descriptor || retained_nonlocal {
+            state.native_due = true;
+            state.native_due_through = state.native_due_through.max(state.visible_write_seq);
+            let mut metadata = pipeline
+                .metadata
+                .state
+                .lock()
+                .map_err(|_| unavailable("native metadata budget is poisoned"))?;
+            if descriptor {
+                metadata.pressure_descriptor += 1;
+            } else {
+                metadata.pressure_live += 1;
+            }
+        }
+        pipeline.notify.notify_one();
+        Ok(())
+    }
+
+    fn seal_native_full_builders(&self, cell: &SharedInodeWriteState) -> Result<()> {
+        let Some(pipeline) = &self.native_pipeline else {
+            return Ok(());
+        };
+        let mut state = cell
+            .lock()
+            .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+        let Some(operation_id) = state.dirty_extents.native_operation_id.clone() else {
+            return Ok(());
+        };
+        while let Some(index) = state.dirty_extents.builders.iter().position(|entry| {
+            !entry.builder.is_empty() && entry.builder.len() == entry.builder.writable_capacity()
+        }) {
+            let entry = &mut state.dirty_extents.builders[index];
+            let descriptor = entry
+                .descriptor
+                .take()
+                .ok_or_else(|| unavailable("native full builder has no descriptor reservation"))?;
+            let end = entry.file_offset + entry.builder.len() as u64;
+            let creation_order = entry.creation_order;
+            let body = std::mem::take(&mut entry.builder).freeze();
+            for extent in state.dirty_extents.extents.values_mut() {
+                if extent.builder == Some(index) {
+                    extent.builder = None;
+                    extent.data = Some(body.clone());
+                }
+            }
+            if let Some(indices) = state.dirty_extents.append_builders.get_mut(&end) {
+                indices.remove(&(creation_order, index));
+            }
+            // The immutable allocation stays the same. Staging performs the
+            // standard BLAKE3 scan; no body concatenation or clone is involved.
+            let staged = StagedChunk::from_shared(operation_id.clone(), body.clone());
+            let upload = Arc::new(NativeUpload {
+                operation_id: operation_id.clone(),
+                chunk: staged.chunk.clone(),
+                owner: Arc::downgrade(cell),
+                state: Mutex::new(NativeUploadState {
+                    body: Some(body),
+                    staged: Some(staged),
+                    task: None,
+                    receipt: None,
+                    error: None,
+                    terminal_error: None,
+                    joining: false,
+                }),
+                cv: Condvar::new(),
+                _descriptor: descriptor,
+            });
+            let actual = std::mem::size_of::<NativeUpload>()
+                + std::mem::size_of::<Mutex<NativeMetadataLease>>()
+                + 4 * std::mem::size_of::<usize>()
+                + upload.operation_id.0.capacity()
+                + upload.chunk.id.0.capacity()
+                + upload
+                    .state
+                    .lock()
+                    .map_err(|_| unavailable("native upload state is poisoned"))?
+                    .staged
+                    .as_ref()
+                    .map_or(0, StagedChunk::native_retained_metadata_bytes);
+            upload
+                ._descriptor
+                .lock()
+                .map_err(|_| unavailable("native descriptor reservation is poisoned"))?
+                .set_actual(actual)?;
+            let allocation = upload
+                .state
+                .lock()
+                .map_err(|_| unavailable("native upload state is poisoned"))?
+                .body
+                .as_ref()
+                .map(|body| body.allocation_id());
+            for extent in state.dirty_extents.extents.values_mut() {
+                if extent
+                    .data
+                    .as_ref()
+                    .is_some_and(|body| Some(body.allocation_id()) == allocation)
+                {
+                    extent.data = None;
+                    extent.native_upload = Some(upload.clone());
+                }
+            }
+        }
+        drop(state);
+        pipeline.notify.notify_one();
+        Ok(())
+    }
+
+    fn next_native_upload(&self) -> Result<Option<Arc<NativeUpload>>> {
+        // Existing inode registry snapshots are shared lifecycle metadata, not
+        // a second W2 payload or per-object queue. Hold no registry lock while
+        // examining an inode or waiting for an upload.
+        for (_, cell) in self.inode_writes.snapshot()? {
+            if let Some(upload) = Self::next_native_upload_for_cell(&cell)? {
+                return Ok(Some(upload));
+            }
+        }
+        Ok(None)
+    }
+
+    fn next_native_upload_for_cell(
+        cell: &SharedInodeWriteState,
+    ) -> Result<Option<Arc<NativeUpload>>> {
+        let state = cell
+            .lock()
+            .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+        if state.terminal_error.is_some() {
+            return Ok(None);
+        }
+        for extent in state.dirty_extents.iter_extents() {
+            if let Some(upload) = &extent.native_upload {
+                let upload_state = upload
+                    .state
+                    .lock()
+                    .map_err(|_| unavailable("native upload state is poisoned"))?;
+                if upload_state.receipt.is_none()
+                    && upload_state.task.is_none()
+                    && !upload_state.joining
+                    && upload_state.error.is_none()
+                    && upload_state.terminal_error.is_none()
+                {
+                    return Ok(Some(upload.clone()));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn start_native_upload(&self, upload: &Arc<NativeUpload>, blocking: bool) -> Result<bool> {
+        let pipeline = self
+            .native_pipeline
+            .as_ref()
+            .ok_or_else(|| unavailable("native write pipeline is missing"))?;
+        let mut state = upload
+            .state
+            .lock()
+            .map_err(|_| unavailable("native upload state is poisoned"))?;
+        if let Some(error) = &state.terminal_error {
+            return Err(error.clone());
+        }
+        if state.receipt.is_some() || state.task.is_some() || state.joining || state.error.is_some()
+        {
+            return Ok(false);
+        }
+        let Some(body) = state.body.clone() else {
+            return Err(unavailable("native upload lost its body"));
+        };
+        if pipeline.runtime.is_none() && !blocking {
+            return Ok(false);
+        }
+        let mut task_table = pipeline
+            .tasks
+            .lock()
+            .map_err(|_| unavailable("native upload task table is poisoned"))?;
+        if task_table.len() >= pipeline.metadata.upload_limit {
+            return Ok(false);
+        }
+        {
+            let mut metadata = pipeline
+                .metadata
+                .state
+                .lock()
+                .map_err(|_| unavailable("native metadata budget is poisoned"))?;
+            if metadata.inflight >= pipeline.metadata.upload_limit {
+                return Ok(false);
+            }
+            metadata.inflight += 1;
+            metadata.inflight_peak = metadata.inflight_peak.max(metadata.inflight);
+        }
+        let permit = NativeUploadPermit(pipeline.metadata.clone());
+        let store = self.chunk_store.clone();
+        let staged = state
+            .staged
+            .take()
+            .unwrap_or_else(|| StagedChunk::from_shared(upload.operation_id.clone(), body));
+        if staged.chunk != upload.chunk {
+            return Err(invalid("native upload changed its immutable object"));
+        }
+        if let Some(runtime) = &pipeline.runtime {
+            let notify = pipeline.notify.clone();
+            state.task = Some(runtime.spawn_blocking(move || {
+                let _permit = permit;
+                let result = store
+                    .put_native_batch(vec![staged])
+                    .and_then(|mut receipts| {
+                        if receipts.len() != 1 {
+                            return Err(invalid("native upload returned the wrong receipt count"));
+                        }
+                        Ok(receipts.remove(0))
+                    });
+                notify.notify_one();
+                result
+            }));
+            task_table.push(upload.clone());
+        } else {
+            drop(state);
+            drop(task_table);
+            let result = store
+                .put_native_batch(vec![staged])
+                .and_then(|mut receipts| {
+                    if receipts.len() != 1 {
+                        return Err(invalid("native upload returned the wrong receipt count"));
+                    }
+                    Ok(receipts.remove(0))
+                });
+            drop(permit);
+            if let Some(error) = self.install_native_receipt(upload, result)? {
+                return Err(error);
+            }
+        }
+        Ok(true)
+    }
+
+    fn install_native_receipt(
+        &self,
+        upload: &Arc<NativeUpload>,
+        result: Result<NativeChunkReceipt>,
+    ) -> Result<Option<Error>> {
+        let pipeline = self
+            .native_pipeline
+            .as_ref()
+            .ok_or_else(|| unavailable("native write pipeline is missing"))?;
+        // Do not move a successful receipt until every fallible structural lock
+        // has been acquired. A broken installer must retain that identity and
+        // the original body/reservation without advertising a healthy install.
+        let mut result = Some(result);
+        let installed: Result<Option<Error>> = (|| {
+            let retained = result
+                .as_ref()
+                .ok_or_else(|| unavailable("native installer lost its retained result"))?;
+            let failure = match retained {
+                Ok(receipt)
+                    if receipt.receipt.operation_id != upload.operation_id
+                        || receipt.receipt.chunk != upload.chunk =>
+                {
+                    Some(invalid("native receipt differs from its immutable upload"))
+                }
+                Ok(receipt) => {
+                    let actual = std::mem::size_of::<NativeUpload>()
+                        + std::mem::size_of::<Mutex<NativeMetadataLease>>()
+                        + 4 * std::mem::size_of::<usize>()
+                        + upload.operation_id.0.capacity()
+                        + upload.chunk.id.0.capacity()
+                        + native_receipt_heap(&receipt.receipt);
+                    let mut descriptor = upload
+                        ._descriptor
+                        .lock()
+                        .map_err(|_| unavailable("native descriptor reservation is poisoned"))?;
+                    let budget = descriptor.budget.clone();
+                    let mut metadata = budget
+                        .state
+                        .lock()
+                        .map_err(|_| unavailable("native metadata budget is poisoned"))?;
+                    // Capacity refusal remains an owner-scoped business error.
+                    descriptor.set_actual_locked(actual, &mut metadata).err()
+                }
+                Err(error) => Some(error.clone()),
+            };
+            let mut state = upload
+                .state
+                .lock()
+                .map_err(|_| unavailable("native upload state is poisoned"))?;
+            let mut metadata = pipeline
+                .metadata
+                .state
+                .lock()
+                .map_err(|_| unavailable("native metadata budget is poisoned"))?;
+            state.joining = false;
+            if let Some(error) = &failure {
+                state.error = Some(error.clone());
+                metadata.failed += 1;
+            } else {
+                let Some(Ok(receipt)) = result.take() else {
+                    return Err(unavailable("native installer lost its validated receipt"));
+                };
+                if receipt.local_required_and_durable {
+                    state.body = None;
+                }
+                state.receipt = Some(receipt);
+                metadata.completed += 1;
+            }
+            upload.cv.notify_all();
+            if failure.is_none() {
+                pipeline.notify.notify_one();
+            }
+            Ok(failure)
+        })();
+        if let Err(error) = &installed {
+            // Poison recovery is cleanup-only: never clear poison, release a
+            // body/charge, or permit this upload to retry as healthy. A valid
+            // receipt is diagnostic retention, not an installed success.
+            let mut state = upload
+                .state
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            state.joining = false;
+            state.terminal_error = Some(error.clone());
+            if let Some(Ok(receipt)) = result.take()
+                && receipt.receipt.operation_id == upload.operation_id
+                && receipt.receipt.chunk == upload.chunk
+            {
+                state.receipt = Some(receipt);
+            }
+            drop(state);
+            if let Some(cell) = upload.owner.upgrade() {
+                cell.lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .terminal_error = Some(error.clone());
+                cell.notify_all();
+            }
+            upload.cv.notify_all();
+            pipeline.notify.notify_one();
+        }
+        installed
+    }
+
+    fn poll_native_uploads(&self) -> Result<Option<Error>> {
+        let Some(pipeline) = &self.native_pipeline else {
+            return Ok(None);
+        };
+        let tasks: [Option<Arc<NativeUpload>>; 8] = {
+            let tasks = pipeline
+                .tasks
+                .lock()
+                .map_err(|_| unavailable("native upload task table is poisoned"))?;
+            std::array::from_fn(|index| tasks.get(index).cloned())
+        };
+        let mut first_error = None;
+        for upload in tasks.into_iter().flatten() {
+            let task = {
+                let mut state = upload
+                    .state
+                    .lock()
+                    .map_err(|_| unavailable("native upload state is poisoned"))?;
+                if state.task.as_ref().is_some_and(|task| task.is_finished()) {
+                    state.joining = true;
+                    state.task.take()
+                } else {
+                    None
+                }
+            };
+            if let Some(task) = task {
+                let result = pipeline
+                    .runtime
+                    .as_ref()
+                    .ok_or_else(|| unavailable("native upload runtime is missing"))?
+                    .block_on(task)
+                    .map_err(|error| unavailable(format!("native upload worker failed: {error}")))
+                    .and_then(|result| result);
+                let installed = self.install_native_receipt(&upload, result);
+                // A consumed JoinHandle must leave the table even when receipt
+                // installation encounters a structural error. This guard only
+                // removes the joined slot; a poisoned table remains poisoned.
+                match pipeline.tasks.lock() {
+                    Ok(mut table) => table.retain(|other| !Arc::ptr_eq(other, &upload)),
+                    Err(poison) => {
+                        poison
+                            .into_inner()
+                            .retain(|other| !Arc::ptr_eq(other, &upload));
+                        return Err(unavailable("native upload task table is poisoned"));
+                    }
+                }
+                if let Some(error) = installed? {
+                    if let Some(cell) = upload.owner.upgrade() {
+                        let mut state = cell
+                            .lock()
+                            .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+                        let cursor = state
+                            .background_error
+                            .as_ref()
+                            .map_or(1, |previous| previous.cursor.saturating_add(1));
+                        state.background_error = Some(ObservedWriteError {
+                            cursor,
+                            error: error.clone(),
+                        });
+                        cell.notify_all();
+                    }
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        self.observe_native_resources();
+        // Business failures belong to their inode. A caller may have harvested
+        // another inode's task; only drain consumes this Node-wide summary.
+        Ok(first_error)
+    }
+
+    fn start_native_uploads(&self) -> Result<()> {
+        while let Some(upload) = self.next_native_upload()? {
+            if !self.start_native_upload(&upload, false)? {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn wait_native_upload(&self, upload: &Arc<NativeUpload>) -> Result<ChunkReceipt> {
+        loop {
+            let _ = self.poll_native_uploads()?;
+            {
+                let mut state = upload
+                    .state
+                    .lock()
+                    .map_err(|_| unavailable("native upload state is poisoned"))?;
+                if let Some(error) = &state.terminal_error {
+                    return Err(error.clone());
+                }
+                if let Some(receipt) = &state.receipt {
+                    return Ok(receipt.receipt.clone());
+                }
+                if let Some(error) = state.error.take() {
+                    return Err(error);
+                }
+            }
+            if let Err(error) = self.start_native_upload(upload, true) {
+                // A synchronous (no-runtime) upload already delivered this
+                // failure to its caller. Keep the immutable object for retry,
+                // but do not report the same attempt twice.
+                if self
+                    .native_pipeline
+                    .as_ref()
+                    .is_some_and(|pipeline| pipeline.runtime.is_none())
+                {
+                    upload
+                        .state
+                        .lock()
+                        .map_err(|_| unavailable("native upload state is poisoned"))?
+                        .error
+                        .take();
+                }
+                return Err(error);
+            }
+            let state = upload
+                .state
+                .lock()
+                .map_err(|_| unavailable("native upload state is poisoned"))?;
+            if state.receipt.is_none() {
+                drop(
+                    upload
+                        .cv
+                        .wait_timeout(state, Duration::from_millis(10))
+                        .map_err(|_| unavailable("native upload state is poisoned"))?,
+                );
+            }
+        }
+    }
+
+    pub(crate) fn progress_native_writeback(&self) -> Result<usize> {
+        if self.native_pipeline.is_none() {
+            return Ok(0);
+        }
+        let _ = self.poll_native_uploads()?;
+        self.start_native_uploads()?;
+        let mut committed = 0;
+        for (inode, cell) in self.inode_writes.snapshot()? {
+            let due = {
+                let state = cell
+                    .lock()
+                    .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+                state.native_due || state.last_writer_background_requested
+            };
+            if due {
+                match self.commit_inode(&inode, CommitReason::Background) {
+                    Ok(Some(seq)) => {
+                        self.update_handles_after_commit(&inode, seq)?;
+                        committed += 1;
+                    }
+                    Ok(None) => {}
+                    Err(error) => self.record_background_error(&inode, error)?,
+                }
+            }
+        }
+        self.observe_native_resources();
+        Ok(committed)
+    }
+
+    /// S3/legacy publication-window setting. Native writes use their separate
+    /// NativeWriteBudget and explicit publication entries instead of this threshold.
     pub fn with_dirty_budget_bytes(mut self, budget: u64) -> Self {
         self.dirty_budget_bytes = budget.max(1);
+        self
+    }
+
+    pub(crate) fn with_version_cache_capacity(mut self, capacity: usize) -> Self {
+        let cache = self
+            .readonly_version_cache
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner());
+        *cache = ReadOnlyVersionCache::new(capacity, cache.byte_limit);
+        self
+    }
+
+    pub(crate) fn with_version_cache_bytes(mut self, bytes: u64) -> Self {
+        let cache = self
+            .readonly_version_cache
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner());
+        *cache = ReadOnlyVersionCache::new(cache.capacity, usize::try_from(bytes).unwrap_or(0));
+        self
+    }
+
+    pub fn with_write_buffer_pool(mut self, pool: Arc<WriteBufferPool>) -> Self {
+        self.write_buffer_pool = pool;
         self
     }
 
@@ -1087,11 +3706,12 @@ impl DistributedFs {
 
     fn inode_size_and_blocks(&self, inode: &InodeRecord) -> Result<(u64, u64)> {
         match inode.head_version.as_ref() {
-            Some(version_id) => {
-                let (version, layout) = self.meta.get_file_version(version_id)?;
+            Some(_) => {
+                let cached = self.readonly_version_for_inode(inode)?;
+                let length = cached.layout.file_length;
                 Ok((
-                    version.length,
-                    allocated_blocks(&layout, version.length, None, &DirtyExtentMap::default())?,
+                    length,
+                    allocated_blocks(&cached.layout, length, None, &DirtyExtentMap::default())?,
                 ))
             }
             None if inode.kind == InodeKind::Symlink => Ok((
@@ -1107,7 +3727,7 @@ impl DistributedFs {
 
     fn inode_id(&self, inode: BackendInode) -> Result<InodeId> {
         self.backend_to_inode
-            .lock()
+            .read(&inode.value)
             .map_err(|_| unavailable("DFS inode table is poisoned"))?
             .get(&inode.value)
             .cloned()
@@ -1117,7 +3737,27 @@ impl DistributedFs {
     fn backend_inode(&self, inode: &InodeId) -> Result<BackendInode> {
         if let Some(value) = self
             .inode_to_backend
+            .read(inode)
+            .map_err(|_| unavailable("DFS inode table is poisoned"))?
+            .get(inode)
+            .copied()
+        {
+            return Ok(BackendInode { value });
+        }
+        #[cfg(test)]
+        {
+            let barrier = self.backend_inode_after_missing.lock().unwrap().clone();
+            if let Some(barrier) = barrier {
+                barrier.wait();
+            }
+        }
+        let _creation = self
+            .inode_mapping_creation
             .lock()
+            .map_err(|_| unavailable("DFS inode mapping creation lock is poisoned"))?;
+        if let Some(value) = self
+            .inode_to_backend
+            .read(inode)
             .map_err(|_| unavailable("DFS inode table is poisoned"))?
             .get(inode)
             .copied()
@@ -1125,14 +3765,16 @@ impl DistributedFs {
             return Ok(BackendInode { value });
         }
         let value = self.next_inode.fetch_add(1, Ordering::Relaxed);
-        self.inode_to_backend
-            .lock()
-            .map_err(|_| unavailable("DFS inode table is poisoned"))?
-            .insert(inode.clone(), value);
-        self.backend_to_inode
-            .lock()
-            .map_err(|_| unavailable("DFS inode table is poisoned"))?
-            .insert(value, inode.clone());
+        let mut forward = self
+            .inode_to_backend
+            .write(inode)
+            .map_err(|_| unavailable("DFS inode table is poisoned"))?;
+        let mut reverse = self
+            .backend_to_inode
+            .write(&value)
+            .map_err(|_| unavailable("DFS inode table is poisoned"))?;
+        reverse.insert(value, inode.clone());
+        forward.insert(inode.clone(), value);
         Ok(BackendInode { value })
     }
 
@@ -1149,10 +3791,23 @@ impl DistributedFs {
 
     fn allocate_handle(&self, handle: DfsFileHandle) -> Result<FileHandle> {
         let id = self.next_handle.fetch_add(1, Ordering::Relaxed);
-        self.handles
-            .lock()
-            .map_err(|_| unavailable("DFS handle table is poisoned"))?
-            .insert(id, handle);
+        let inode_id = handle.inode_id.clone();
+        self.handles.insert(id, handle, || {
+            let dynamic = self.write_state(&inode_id)?.is_some()
+                || self.current_remote_provider(&inode_id)?.is_some();
+            #[cfg(test)]
+            {
+                let hook = self
+                    .handle_registration_after_route_check
+                    .lock()
+                    .unwrap()
+                    .take();
+                if let Some(hook) = hook {
+                    hook();
+                }
+            }
+            Ok(dynamic)
+        })?;
         Ok(FileHandle(id))
     }
 
@@ -1178,42 +3833,67 @@ impl DistributedFs {
     fn load_readonly_version(
         &self,
         version_id: Option<&FileVersionId>,
-    ) -> Result<(Option<FileVersion>, LayoutRoot)> {
-        // Safe only for the read-only no-write-state path: callers must first
-        // fetch and validate the current inode head on every read. The cached
-        // payload is immutable FileVersion/LayoutRoot data keyed by the exact
-        // head ID, and the cache lock is not held across Meta RPCs.
+    ) -> Result<Arc<ReadOnlyVersion>> {
         let Some(version_id) = version_id else {
-            return self.load_version(None);
+            return Ok(self.readonly_empty_version.clone());
         };
+        let span = tracing::info_span!("node.dfs.read.head", version_id = %version_id.0,
+            branch = "readonly_version", cached = tracing::field::Empty);
+        record_metadata_table_lock();
         if let Some(cached) = self
             .readonly_version_cache
             .lock()
             .map_err(|_| unavailable("DFS readonly version cache is poisoned"))?
-            .as_ref()
-            .filter(|cached| &cached.version_id == version_id)
+            .get(version_id)
             .cloned()
         {
-            return Ok((Some(cached.version), cached.layout));
+            span.record("cached", true);
+            return Ok(cached);
         }
-
-        let (version, layout) = self.meta.get_file_version(version_id)?;
-        *self
+        span.record("cached", false);
+        // No cache guard crosses Meta RPC, validation or index construction.
+        let (version, layout) = span.in_scope(|| self.meta.get_file_version(version_id))?;
+        let cached = Arc::new(ReadOnlyVersion::checked(version_id, version, layout)?);
+        #[cfg(test)]
+        {
+            let barrier = self.readonly_version_before_install.lock().unwrap().clone();
+            if let Some(barrier) = barrier {
+                barrier.wait();
+            }
+        }
+        record_metadata_table_lock();
+        let mut cache = self
             .readonly_version_cache
             .lock()
-            .map_err(|_| unavailable("DFS readonly version cache is poisoned"))? =
-            Some(ReadOnlyVersionCache {
-                version_id: version_id.clone(),
-                version: version.clone(),
-                layout: layout.clone(),
-            });
-        Ok((Some(version), layout))
+            .map_err(|_| unavailable("DFS readonly version cache is poisoned"))?;
+        if let Some(existing) = cache.get(version_id) {
+            if existing.version != cached.version || existing.layout != cached.layout {
+                return Err(invalid(
+                    "DFS immutable version changed during concurrent cache admission",
+                ));
+            }
+            return Ok(existing.clone());
+        }
+        cache.insert(version_id.clone(), cached.clone());
+        Ok(cached)
+    }
+
+    fn readonly_version_for_inode(&self, inode: &InodeRecord) -> Result<Arc<ReadOnlyVersion>> {
+        let cached = self.load_readonly_version(inode.head_version.as_ref())?;
+        if cached
+            .version
+            .as_ref()
+            .is_some_and(|version| version.inode_id != inode.inode_id)
+        {
+            return Err(invalid("DFS readonly version belongs to a different inode"));
+        }
+        Ok(cached)
     }
 
     fn write_state(&self, inode_id: &InodeId) -> Result<Option<SharedInodeWriteState>> {
         Ok(self
             .inode_writes
-            .lock()
+            .read(inode_id)
             .map_err(|_| unavailable("DFS inode write table is poisoned"))?
             .get(inode_id)
             .cloned())
@@ -1473,9 +4153,16 @@ impl DistributedFs {
             metadata_dirty: false,
             kill_suidgid_dirty: false,
             dirty_extents: DirtyExtentMap::default(),
+            dirty_budget_reservations: Vec::new(),
+            publication_window: None,
             in_flight: None,
             commit_busy: false,
             operation_busy: false,
+            native_queue: NativeTicketQueue::default(),
+            native_thread: None,
+            native_owner: NativeWriteOwner::new(),
+            native_due: false,
+            native_due_through: 0,
             inode: inode.clone(),
             dirty: false,
             next_write_seq: 0,
@@ -1488,10 +4175,11 @@ impl DistributedFs {
             terminal_error: None,
         }));
         self.inode_writes
-            .lock()
+            .write(&inode.inode_id)
             .map_err(|_| unavailable("DFS inode write table is poisoned"))?
-            .entry(inode.inode_id)
+            .entry(inode.inode_id.clone())
             .or_insert(state);
+        self.handles.mark_dynamic(&inode.inode_id)?;
         Ok(())
     }
 
@@ -1611,6 +4299,7 @@ impl DistributedFs {
     fn observe_inode_record(&self, inode: InodeRecord) -> Result<InodeRecord> {
         let inode = self.validate_inode(inode)?;
         self.refresh_retained_committed_view(&inode)?;
+        self.invalidate_native_inode_views(&inode.inode_id)?;
         Ok(inode)
     }
 
@@ -1643,63 +4332,672 @@ impl DistributedFs {
             }
             state.inode = inode.clone();
         }
-        let mut handles = self
-            .handles
-            .lock()
-            .map_err(|_| unavailable("DFS handle table is poisoned"))?;
-        for handle in handles
-            .values_mut()
-            .filter(|handle| handle.inode_id == inode.inode_id)
-        {
-            handle.opened_inode = inode.clone();
+        let opened_inode = Arc::new(inode.clone());
+        for handle in self.handles.for_inode(&inode.inode_id)? {
+            let mut handle = handle
+                .state
+                .lock()
+                .map_err(|_| unavailable("DFS handle state is poisoned"))?;
+            handle.opened_inode = opened_inode.clone();
+            handle.native_read_generation = handle
+                .native_read_generation
+                .checked_add(1)
+                .ok_or_else(|| unavailable("DFS native read generation exhausted"))?;
+            handle.native_read_view = None;
+            handle.opened_page_identity = None;
         }
         Ok(inode)
     }
 
-    fn read_visible(&self, inode_id: &InodeId, offset: u64, out: &mut [u8]) -> Result<usize> {
-        // The base version and its layout must come from the same owner-state
-        // snapshot. An open handle identifies an inode, not a lifetime version.
-        let (committed, length, layout, frozen, active) =
-            if let Some(state) = self.write_state(inode_id)? {
+    fn capture_native_read_view(&self) -> Result<NativeReadView> {
+        let started = Instant::now();
+        let authority = self.read_engine.capture_native_read_authority()?;
+        let deadline = authority
+            .expires_at()
+            .map_or(started + NATIVE_READ_VIEW_TTL, |expiry| {
+                expiry.min(started + NATIVE_READ_VIEW_TTL)
+            });
+        Ok(NativeReadView {
+            generation: 0,
+            authority,
+            deadline,
+        })
+    }
+
+    fn check_native_read_view(&self, view: &NativeReadView) -> Result<()> {
+        self.read_engine
+            .check_native_read_authority(&view.authority)?;
+        if Instant::now() >= view.deadline {
+            return Err(unavailable("DFS native read view expired before delivery"));
+        }
+        Ok(())
+    }
+
+    fn invalidate_native_inode_views(&self, inode_id: &InodeId) -> Result<()> {
+        if self.read_engine.has_external_backend() {
+            return Ok(());
+        }
+        for handle in self.handles.for_inode(inode_id)? {
+            let mut handle = handle
+                .state
+                .lock()
+                .map_err(|_| unavailable("DFS handle state is poisoned"))?;
+            handle.native_read_generation = handle
+                .native_read_generation
+                .checked_add(1)
+                .ok_or_else(|| unavailable("DFS native read generation exhausted"))?;
+            handle.native_read_view = None;
+            handle.opened_page_identity = None;
+        }
+        Ok(())
+    }
+
+    fn invalidate_native_inode_views_on_error(&self, inode_id: &InodeId, error: &Error) {
+        if matches!(
+            error.kind(),
+            afs_error::ErrorKind::PermissionDenied | afs_error::ErrorKind::Unauthenticated
+        ) {
+            // Preserve the originating failure. A poisoned handle table also
+            // prevents any later read from reusing the rejected context.
+            if let Ok(handles) = self.handles.for_inode(inode_id) {
+                for handle in handles {
+                    if let Ok(mut current) = handle.state.lock() {
+                        current.native_read_view = None;
+                        current.opened_page_identity = None;
+                        current.native_read_generation =
+                            current.native_read_generation.saturating_add(1);
+                        current.native_denial_serial =
+                            current.native_denial_serial.saturating_add(1);
+                    }
+                }
+            }
+        }
+    }
+
+    fn invalidate_native_handle_view_on_error(&self, handle: FileHandle, error: &Error) {
+        if matches!(
+            error.kind(),
+            afs_error::ErrorKind::PermissionDenied | afs_error::ErrorKind::Unauthenticated
+        ) && let Ok(Some(handle)) = self.handles.get(handle.0)
+            && let Ok(mut current) = handle.state.lock()
+        {
+            current.native_read_view = None;
+            current.opened_page_identity = None;
+            // An exhausted generation can never be used by a new view.
+            current.native_read_generation = current.native_read_generation.saturating_add(1);
+            current.native_denial_serial = current.native_denial_serial.saturating_add(1);
+        }
+    }
+
+    fn native_inode_for_read(
+        &self,
+        handle: FileHandle,
+        snapshot: &DfsFileHandleSnapshot,
+    ) -> NativeReadRefreshResult {
+        if snapshot.native_read_generation == u64::MAX {
+            return Err(unavailable("DFS native read generation exhausted"));
+        }
+        if let Some(view) = snapshot.native_read_view.as_ref()
+            && view.deadline > Instant::now()
+        {
+            self.check_native_read_view(view)?;
+            return Ok((snapshot.opened_inode.clone(), view.clone()));
+        }
+        #[cfg(test)]
+        {
+            let barrier = self.native_read_before_refresh.lock().unwrap().clone();
+            if let Some(barrier) = barrier {
+                barrier.wait();
+            }
+        }
+        // Neither queueing nor a slow Meta response may restart the original
+        // authority/deadline. Waiters independently keep their operation fence.
+        let operation = self.capture_native_read_view()?;
+        let opened = snapshot.handle.clone();
+        if opened.closed.load(Ordering::Acquire) {
+            return Err(stale("DFS file handle is no longer open"));
+        }
+        let (flight, mut generation, leader) = {
+            let mut current = opened
+                .state
+                .lock()
+                .map_err(|_| unavailable("DFS handle state is poisoned"))?;
+            if current.native_denial_serial != snapshot.native_denial_serial {
+                return Err(unavailable(
+                    "DFS native read authorization changed during refresh",
+                ));
+            }
+            if let Some(view) = current.native_read_view.as_ref()
+                && view.deadline > Instant::now()
+            {
+                let result = (current.opened_inode.clone(), view.clone());
+                drop(current);
+                self.check_native_read_view(&result.1)?;
+                return Ok(result);
+            }
+            if let Some(flight) = current.refresh.as_ref() {
+                (flight.clone(), current.native_read_generation, false)
+            } else {
+                let flight = Arc::new(NativeReadRefresh::new());
+                current.refresh = Some(flight.clone());
+                (flight, current.native_read_generation, true)
+            }
+        };
+        if !leader {
+            let result = flight.wait(self, &operation)?;
+            self.check_native_read_view(&result.1)?;
+            return Ok(result);
+        }
+        let result = (|| {
+            loop {
+                self.check_native_read_view(&operation)?;
+                let inode = Arc::new(
+                    self.validate_inode(
+                        tracing::info_span!("node.dfs.read.head", inode_id = %snapshot.inode_id.0,
+                        branch = "inode", cached = false)
+                        .in_scope(|| self.meta.get_inode(&snapshot.inode_id))
+                        .inspect_err(|error| {
+                            self.invalidate_native_handle_view_on_error(handle, error)
+                        })?,
+                    )?,
+                );
+                self.check_native_read_view(&operation)?;
+                let mut current = opened
+                    .state
+                    .lock()
+                    .map_err(|_| unavailable("DFS handle state is poisoned"))?;
+                if current.native_denial_serial != snapshot.native_denial_serial {
+                    return Err(unavailable(
+                        "DFS native read authorization changed during refresh",
+                    ));
+                }
+                if current.native_read_generation != generation {
+                    // An explicit metadata observation or local publication won.
+                    // Do not install an older reply over it; retry under this
+                    // same flight and the same bounded authority.
+                    generation = current.native_read_generation;
+                    continue;
+                }
+                current.native_read_generation = current
+                    .native_read_generation
+                    .checked_add(1)
+                    .ok_or_else(|| unavailable("DFS native read generation exhausted"))?;
+                let mut view = operation.clone();
+                view.generation = current.native_read_generation;
+                current.opened_inode = inode.clone();
+                current.native_read_view = Some(view.clone());
+                current.opened_page_identity = None;
+                return Ok((inode, view));
+            }
+        })();
+        // Complete every ordinary error path for all joined readers. Clearing
+        // only our own flight prevents a late completion retiring another one.
+        if let Ok(mut current) = opened.state.lock()
+            && current
+                .refresh
+                .as_ref()
+                .is_some_and(|value| Arc::ptr_eq(value, &flight))
+        {
+            current.refresh = None;
+        }
+        flight.finish(result.clone())?;
+        result
+    }
+
+    fn read_native_owned(
+        &self,
+        handle: FileHandle,
+        snapshot: &DfsFileHandleSnapshot,
+        offset: u64,
+        size: usize,
+    ) -> Result<Vec<u8>> {
+        self.read_engine.validate_native_read_size(size)?;
+        if snapshot.native_denial_serial == u64::MAX {
+            return Err(unavailable("DFS native read denial serial exhausted"));
+        }
+        let operation = self.capture_native_read_view()?;
+        let mut fetch_hint = None;
+        let mut fetched_deadline = None;
+        let result = (|| {
+            if snapshot.handle.dynamic_read_route.load(Ordering::Acquire)
+                && let Some(remote) = self.remote_provider_visible_for_reads(&snapshot.inode_id)?
+            {
+                return self.remote_read_owned(&remote, offset, size);
+            }
+            if snapshot.handle.dynamic_read_route.load(Ordering::Acquire)
+                && self.write_state(&snapshot.inode_id)?.is_some()
+            {
+                let mut out = vec![0; size];
+                let count = self.read_visible_from_handle_inode(
+                    handle,
+                    &snapshot.inode_id,
+                    Some(&snapshot.opened_inode),
+                    offset,
+                    &mut out,
+                )?;
+                out.truncate(count);
+                return Ok(out);
+            }
+            let (inode, view) = self.native_inode_for_read(handle, snapshot)?;
+            let out = self.read_committed_inode_owned_hint(
+                &inode,
+                offset,
+                size,
+                &mut fetch_hint,
+                Some(operation.deadline.min(view.deadline)),
+            )?;
+            fetched_deadline = Some(view.deadline);
+            #[cfg(test)]
+            {
+                let hook = self.native_read_after_committed.lock().unwrap().take();
+                if let Some(hook) = hook {
+                    hook();
+                }
+            }
+            self.check_native_read_view(&view)?;
+            // A successful parallel refresh does not revoke this operation's
+            // committed version. The final authority/denial fence below still
+            // protects output from known invalidation and handle retirement.
+            Ok(out)
+        })()
+        .inspect_err(|error| {
+            self.invalidate_native_handle_view_on_error(handle, error);
+        })?;
+        #[cfg(test)]
+        {
+            let hook = self.native_read_before_delivery.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        // Local, dirty, empty and owner-proxy paths also validate before a
+        // private result escapes. A known rejection has a separate serial:
+        // normal publication may change generation without cancelling itself.
+        self.check_native_read_view(&operation)?;
+        if snapshot.handle.closed.load(Ordering::Acquire) {
+            return Err(stale("DFS file handle is no longer open"));
+        }
+        let mut current = snapshot
+            .handle
+            .state
+            .lock()
+            .map_err(|_| unavailable("DFS handle state is poisoned"))?;
+        if current.native_denial_serial != snapshot.native_denial_serial {
+            return Err(unavailable(
+                "DFS native read authorization changed before delivery",
+            ));
+        }
+        let hint = fetch_hint.and_then(|batch: ReadBatch| {
+            let version = batch.file_version_id.as_ref()?;
+            let mut hash = blake3::Hasher::new();
+            hash.update(&(version.0.len() as u64).to_le_bytes());
+            hash.update(version.0.as_bytes());
+            hash.update(batch.layout_root_id.0.as_bytes());
+            let window = current.read_sequence.record(
+                *hash.finalize().as_bytes(),
+                offset,
+                result.len(),
+                self.read_engine.readahead_object_limit(),
+            );
+            Some((
+                batch,
+                window,
+                current.read_sequence.generation(),
+                current.native_read_generation,
+            ))
+        });
+        drop(current);
+        if let Some((batch, window, sequence, view_generation)) = hint {
+            let handle = Arc::downgrade(&snapshot.handle);
+            let denial_serial = snapshot.native_denial_serial;
+            let deadline = fetched_deadline.unwrap_or(operation.deadline);
+            // No handle table/mutable state lock is held while scheduling work.
+            self.read_engine.prefetch_cached(
+                &batch,
+                window,
+                Arc::new(move || {
+                    let handle = handle
+                        .upgrade()
+                        .ok_or_else(|| stale("DFS prefetch handle closed"))?;
+                    if handle.closed.load(Ordering::Acquire) || Instant::now() >= deadline {
+                        return Err(stale("DFS prefetch handle view retired"));
+                    }
+                    let state = handle
+                        .state
+                        .lock()
+                        .map_err(|_| unavailable("DFS prefetch handle state poisoned"))?;
+                    if state.native_denial_serial != denial_serial
+                        || state.native_read_generation != view_generation
+                        || state.read_sequence.generation() != sequence
+                    {
+                        return Err(unavailable("DFS prefetch handle scope changed"));
+                    }
+                    Ok(())
+                }),
+            );
+        }
+        Ok(result)
+    }
+
+    fn read_visible_from_handle_inode(
+        &self,
+        handle: FileHandle,
+        inode_id: &InodeId,
+        opened_inode: Option<&InodeRecord>,
+        offset: u64,
+        out: &mut [u8],
+    ) -> Result<usize> {
+        if self.deferred_publication_enabled()
+            && let Some(inode) = self.publish_accepted_writes_for_local_read(handle, inode_id)?
+        {
+            return self.read_committed_inode(&inode, offset, out);
+        }
+
+        if let Some(state) = self.write_state(inode_id)? {
+            let view = {
                 let state = state
                     .lock()
                     .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
-                (
-                    state
+                ResolvedReadView {
+                    committed: state
                         .base_version
                         .as_ref()
                         .map(|version| version.id.clone()),
-                    state.logical_length,
-                    state.base_layout.clone(),
-                    state
+                    length: state.logical_length,
+                    layout: state.base_layout.clone(),
+                    frozen: state
                         .in_flight
                         .as_ref()
                         .and_then(InFlightCommit::dirty_extents),
-                    state.dirty_extents.clone(),
-                )
-            } else {
-                let inode = self.validate_inode(self.meta.get_inode(inode_id)?)?;
-                let (version, layout) = self.load_readonly_version(inode.head_version.as_ref())?;
-                (
-                    version.as_ref().map(|version| version.id.clone()),
-                    version.as_ref().map_or(0, |value| value.length),
-                    layout,
-                    None,
-                    DirtyExtentMap::default(),
-                )
+                    active: state.dirty_extents.snapshot_range(offset, out.len())?,
+                }
             };
+            return self.read_visible_resolved(view, offset, out);
+        }
+
+        if let Some(opened_inode) = opened_inode
+            && let Some(count) = self.try_read_external_version(opened_inode, offset, out)?
+        {
+            return Ok(count);
+        }
+
+        let inode = self.validate_inode(
+            tracing::info_span!(
+                "node.dfs.read.head",
+                inode_id = %inode_id.0,
+                branch = "inode",
+                cached = false,
+            )
+            .in_scope(|| self.meta.get_inode(inode_id))?,
+        )?;
+        self.read_committed_inode(&inode, offset, out)
+    }
+
+    fn publish_accepted_writes_for_local_read(
+        &self,
+        handle: FileHandle,
+        inode_id: &InodeId,
+    ) -> Result<Option<InodeRecord>> {
+        if !self.deferred_publication_enabled() {
+            return Ok(None);
+        }
+        // The base version and its layout must come from the same owner-state
+        // snapshot. An open handle identifies an inode, not a lifetime version.
+        let Some(state) = self.write_state(inode_id)? else {
+            return Ok(None);
+        };
+        let needs_barrier = {
+            let state = state
+                .lock()
+                .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+            state.visible_write_seq > state.committed_write_seq
+                || state.dirty
+                || state.in_flight.is_some()
+                || state.publication_window.is_some()
+        };
+        if !needs_barrier {
+            return Ok(None);
+        }
+        self.commit_handle(handle, CommitReason::DataSync)?;
+        let inode = state
+            .lock()
+            .map_err(|_| unavailable("DFS inode write state is poisoned"))?
+            .inode
+            .clone();
+        Ok(Some(inode))
+    }
+
+    fn read_committed_inode(
+        &self,
+        inode: &InodeRecord,
+        offset: u64,
+        out: &mut [u8],
+    ) -> Result<usize> {
+        let cached = self.readonly_version_for_inode(inode)?;
+        let length = cached.layout.file_length;
         if offset >= length || out.is_empty() {
             return Ok(0);
         }
         let count = usize::try_from((length - offset).min(out.len() as u64))
             .map_err(|_| invalid("read length is too large"))?;
         out[..count].fill(0);
-        self.read_layout_range(committed.as_ref(), &layout, offset, &mut out[..count])?;
-        if let Some(frozen) = frozen {
-            frozen.overlay(offset, &mut out[..count])?;
+        let batch = cached.read_batch(offset, count, self.read_engine.source_lookahead_chunks())?;
+        if self.read_engine.has_external_backend() {
+            self.read_engine.read_batch(&batch, &mut out[..count])?;
+        } else {
+            self.read_engine
+                .read_batch_native_into_private(&batch, &mut out[..count])?;
         }
-        active.overlay(offset, &mut out[..count])?;
         Ok(count)
+    }
+
+    #[cfg(test)]
+    fn read_committed_inode_owned(
+        &self,
+        inode: &InodeRecord,
+        offset: u64,
+        size: usize,
+    ) -> Result<Vec<u8>> {
+        self.read_committed_inode_owned_hint(inode, offset, size, &mut None, None)
+    }
+
+    fn read_committed_inode_owned_hint(
+        &self,
+        inode: &InodeRecord,
+        offset: u64,
+        size: usize,
+        hint: &mut Option<ReadBatch>,
+        deadline: Option<Instant>,
+    ) -> Result<Vec<u8>> {
+        let cached = self.readonly_version_for_inode(inode)?;
+        let length = cached.layout.file_length;
+        if offset >= length || size == 0 {
+            return Ok(Vec::new());
+        }
+        let count = usize::try_from((length - offset).min(size as u64))
+            .map_err(|_| invalid("read length is too large"))?;
+        let batch = cached.read_batch(offset, count, self.read_engine.source_lookahead_chunks())?;
+        if let Some(result) = self
+            .read_engine
+            .read_batch_native_owned_before(&batch, count, deadline)?
+        {
+            if self.read_engine.readahead_object_limit() != 0 {
+                *hint = Some(batch);
+            }
+            return Ok(result);
+        }
+        let mut result = vec![0; count];
+        self.read_engine
+            .read_batch_native_into_private_before(&batch, &mut result, deadline)?;
+        if self.read_engine.readahead_object_limit() != 0 {
+            *hint = Some(batch);
+        }
+        Ok(result)
+    }
+
+    fn read_visible_resolved(
+        &self,
+        view: ResolvedReadView,
+        offset: u64,
+        out: &mut [u8],
+    ) -> Result<usize> {
+        if offset >= view.length || out.is_empty() {
+            return Ok(0);
+        }
+        let count = usize::try_from((view.length - offset).min(out.len() as u64))
+            .map_err(|_| invalid("read length is too large"))?;
+        out[..count].fill(0);
+        self.read_layout_range(
+            view.committed.as_ref(),
+            &view.layout,
+            offset,
+            &mut out[..count],
+        )?;
+        if let Some(frozen) = view.frozen {
+            frozen.overlay_native(offset, &mut out[..count], Some(self.chunk_store.as_ref()))?;
+        }
+        view.active
+            .overlay_native(offset, &mut out[..count], Some(self.chunk_store.as_ref()))?;
+        Ok(count)
+    }
+
+    fn try_read_external_version(
+        &self,
+        opened_inode: &InodeRecord,
+        offset: u64,
+        out: &mut [u8],
+    ) -> Result<Option<usize>> {
+        let opened_inode = self.validate_inode(opened_inode.clone())?;
+        if !self.read_engine.has_external_backend() {
+            return Ok(None);
+        }
+        if opened_inode.head_version.is_none() {
+            return Ok(None);
+        }
+        let cached = self.readonly_version_for_inode(&opened_inode)?;
+        let Some(version) = cached.version.as_ref() else {
+            return Ok(None);
+        };
+        let length = version.length;
+        if offset >= length || out.is_empty() {
+            return Ok(Some(0));
+        }
+        let count = usize::try_from((length - offset).min(out.len() as u64))
+            .map_err(|_| invalid("read length is too large"))?;
+        match self.read_layout_range_external_version(
+            &opened_inode.inode_id,
+            &version.id,
+            &cached,
+            offset,
+            &mut out[..count],
+        )? {
+            CurrentExternalReadOutcome::Read => Ok(Some(count)),
+            CurrentExternalReadOutcome::Unsupported => Ok(None),
+            CurrentExternalReadOutcome::HeadChanged(_) => Err(invalid(
+                "external version read must not use current-head refresh replies",
+            )),
+        }
+    }
+
+    fn try_read_external_version_owned(
+        &self,
+        opened_inode: &InodeRecord,
+        offset: u64,
+        size: usize,
+    ) -> Result<Option<Vec<u8>>> {
+        let opened_inode = self.validate_inode(opened_inode.clone())?;
+        if !self.read_engine.has_external_backend() {
+            return Ok(None);
+        }
+        if opened_inode.head_version.is_none() {
+            return Ok(None);
+        }
+        let cached = self.readonly_version_for_inode(&opened_inode)?;
+        let Some(version) = cached.version.as_ref() else {
+            return Ok(None);
+        };
+        let length = version.length;
+        if offset >= length || size == 0 {
+            return Ok(Some(Vec::new()));
+        }
+        let count = usize::try_from((length - offset).min(size as u64))
+            .map_err(|_| invalid("read length is too large"))?;
+        self.read_layout_range_external_version_owned(
+            &opened_inode.inode_id,
+            &version.id,
+            &cached,
+            offset,
+            count,
+        )
+    }
+
+    fn layout_read_ops(
+        &self,
+        layout: &LayoutRoot,
+        offset: u64,
+        length: usize,
+    ) -> Result<Vec<ChunkReadOp>> {
+        let end = offset
+            .checked_add(length as u64)
+            .ok_or_else(|| invalid("read range overflow"))?;
+        let mut ops = Vec::new();
+        for extent in &layout.inline_extents {
+            if let Some(op) = extent_read_op(extent, offset, end)? {
+                ops.push(op);
+            }
+        }
+        Ok(ops)
+    }
+
+    fn read_layout_range_external_version(
+        &self,
+        inode_id: &InodeId,
+        committed: &FileVersionId,
+        cached: &ReadOnlyVersion,
+        offset: u64,
+        out: &mut [u8],
+    ) -> Result<CurrentExternalReadOutcome> {
+        let ops = cached.ops(offset, out.len())?;
+        let covered = ops
+            .iter()
+            .fold(0_u64, |sum, op| sum.saturating_add(op.length));
+        if covered != out.len() as u64 || ops.is_empty() {
+            return Ok(CurrentExternalReadOutcome::Unsupported);
+        }
+        self.read_engine.read_batch_external_version(
+            inode_id,
+            &ReadBatch {
+                lookahead: Vec::new(),
+                file_version_id: Some(committed.clone()),
+                layout_root_id: cached.layout.id.clone(),
+                ops,
+            },
+            out,
+        )
+    }
+
+    fn read_layout_range_external_version_owned(
+        &self,
+        inode_id: &InodeId,
+        committed: &FileVersionId,
+        cached: &ReadOnlyVersion,
+        offset: u64,
+        length: usize,
+    ) -> Result<Option<Vec<u8>>> {
+        if length == 0 {
+            return Ok(Some(Vec::new()));
+        }
+        let ops = cached.ops(offset, length)?;
+        self.read_engine.read_batch_external_version_owned(
+            inode_id,
+            &ReadBatch {
+                lookahead: Vec::new(),
+                file_version_id: Some(committed.clone()),
+                layout_root_id: cached.layout.id.clone(),
+                ops,
+            },
+            length,
+        )
     }
 
     fn read_layout_range(
@@ -1709,61 +5007,151 @@ impl DistributedFs {
         offset: u64,
         out: &mut [u8],
     ) -> Result<()> {
+        let ops = self.layout_read_ops(layout, offset, out.len())?;
         let end = offset
             .checked_add(out.len() as u64)
             .ok_or_else(|| invalid("read range overflow"))?;
-        let mut ops = Vec::new();
-        for extent in &layout.inline_extents {
-            let extent_end = extent
-                .file_offset
-                .checked_add(extent.length)
-                .ok_or_else(|| invalid("extent range overflow"))?;
-            let start = offset.max(extent.file_offset);
-            let stop = end.min(extent_end);
-            if start >= stop {
-                continue;
-            }
-            let output_offset = usize::try_from(start - offset)
-                .map_err(|_| invalid("read output offset is too large"))?;
-            let length =
-                usize::try_from(stop - start).map_err(|_| invalid("read length is too large"))?;
-            let chunk_offset = extent
-                .chunk_offset
-                .checked_add(start - extent.file_offset)
-                .ok_or_else(|| invalid("chunk read offset overflow"))?;
-            ops.push(ChunkReadOp {
-                chunk_id: extent.chunk_id.clone(),
-                chunk_offset,
-                length: length as u64,
-                output_offset,
-            });
-        }
-        self.read_engine.read_batch(
-            &ReadBatch {
-                file_version_id: committed.cloned(),
-                layout_root_id: layout.id.clone(),
-                ops,
+        let batch = ReadBatch {
+            lookahead: if committed.is_some() {
+                source_lookahead_ids(
+                    layout
+                        .inline_extents
+                        .iter()
+                        .filter(|extent| extent.file_offset >= end),
+                    &ops,
+                    self.read_engine.source_lookahead_chunks(),
+                )
+            } else {
+                Vec::new()
             },
-            out,
-        )?;
+            file_version_id: committed.cloned(),
+            layout_root_id: layout.id.clone(),
+            ops,
+        };
+        if self.read_engine.has_external_backend() {
+            self.read_engine.read_batch(&batch, out)?;
+        } else {
+            // Every native caller supplies its unpublished final Vec. Avoid
+            // allocating another aggregate stage before the outer checks.
+            self.read_engine
+                .read_batch_native_into_private(&batch, out)?;
+        }
         Ok(())
     }
 
+    fn native_read_capability(&self, handle: FileHandle) -> Option<Arc<DfsHandle>> {
+        if self.read_engine.has_external_backend() {
+            return None;
+        }
+        let opened = self.handles.get(handle.0).ok()??;
+        if opened.flags & libc::O_ACCMODE != libc::O_RDONLY
+            || opened.flags & libc::O_PATH != 0
+            || opened.owner_scope.is_some()
+            || opened.closed.load(Ordering::Acquire)
+            || opened.dynamic_read_route.load(Ordering::Acquire)
+        {
+            return None;
+        }
+        {
+            let state = opened.state.lock().ok()?;
+            if state.write_session.is_some() || state.opened_inode.kind != InodeKind::Regular {
+                return None;
+            }
+            self.check_native_read_view(state.native_read_view.as_ref()?)
+                .ok()?;
+        }
+        Some(opened)
+    }
+
+    fn opened_page_identity(&self, inode: &InodeRecord) -> Result<PageCacheIdentity> {
+        let cached = self.readonly_version_for_inode(inode)?;
+        Ok(PageCacheIdentity {
+            version_id: cached.version.as_ref().map(|version| version.id.0.clone()),
+            length: cached.layout.file_length,
+        })
+    }
+
     fn handle_snapshot(&self, handle: FileHandle) -> Result<DfsFileHandleSnapshot> {
-        self.handles
-            .lock()
-            .map_err(|_| unavailable("DFS handle table is poisoned"))?
-            .get(&handle.0)
-            .map(DfsFileHandleSnapshot::from)
-            .ok_or_else(|| stale("DFS file handle is no longer open"))
+        let handle = self
+            .handles
+            .get(handle.0)?
+            .ok_or_else(|| stale("DFS file handle is no longer open"))?;
+        DfsFileHandleSnapshot::from_handle(&handle)
     }
 
     fn commit_handle(&self, handle: FileHandle, reason: CommitReason) -> Result<()> {
+        self.commit_handle_with_operation_gate(handle, reason, true)
+    }
+
+    fn commit_handle_inside_operation(
+        &self,
+        handle: FileHandle,
+        reason: CommitReason,
+    ) -> Result<()> {
+        self.commit_handle_with_operation_gate(handle, reason, false)
+    }
+
+    fn commit_handle_with_operation_gate(
+        &self,
+        handle: FileHandle,
+        reason: CommitReason,
+        wait_for_operation: bool,
+    ) -> Result<()> {
         self.observe_handle_error(handle)?;
         let snapshot = self.handle_snapshot(handle)?;
-        let committed_seq = self.commit_inode(&snapshot.inode_id, reason)?;
-        if let Some(committed_seq) = committed_seq {
-            self.update_handles_after_commit(&snapshot.inode_id, committed_seq)?;
+        let Some(state) = self.write_state(&snapshot.inode_id)? else {
+            // A read-only open without a local writer has no accepted writes
+            // to publish. With a local writer, fsync is an inode-wide barrier.
+            return if snapshot.write_session.is_none() {
+                Ok(())
+            } else {
+                Err(stale("DFS write state is no longer open"))
+            };
+        };
+        let _native_ticket = if wait_for_operation {
+            self.native_ticket_with_cleanup(&state, true)?
+        } else {
+            None
+        };
+        let _operation = if wait_for_operation && self.native_pipeline.is_none() {
+            Some(self.begin_inode_operation(&snapshot.inode_id, state.clone())?)
+        } else {
+            None
+        };
+        let target_seq = state
+            .lock()
+            .map_err(|_| unavailable("DFS inode write state is poisoned"))?
+            .visible_write_seq;
+        loop {
+            let synced = state
+                .lock()
+                .map_err(|_| unavailable("DFS inode write state is poisoned"))?
+                .committed_write_seq;
+            let metadata_pending = matches!(reason, CommitReason::FullSync)
+                && self.needs_full_metadata_sync(&state)?;
+            if synced >= target_seq && !metadata_pending {
+                break;
+            }
+            let committed_seq =
+                self.commit_inode_with_operation_gate(&snapshot.inode_id, reason, false, None)?;
+            if let Some(committed_seq) = committed_seq {
+                self.update_handles_after_commit(&snapshot.inode_id, committed_seq)?;
+                continue;
+            }
+            let committed_seq = state
+                .lock()
+                .map_err(|_| unavailable("DFS inode write state is poisoned"))?
+                .committed_write_seq;
+            if committed_seq >= target_seq {
+                self.update_handles_after_commit(&snapshot.inode_id, committed_seq)?;
+                continue;
+            }
+            if target_seq == 0 {
+                break;
+            }
+            return Err(unavailable(
+                "DFS sync made no progress toward the accepted write sequence",
+            ));
         }
         Ok(())
     }
@@ -1796,16 +5184,25 @@ impl DistributedFs {
         wait_for_operation: bool,
         deadline: Option<Instant>,
     ) -> Result<Option<u64>> {
+        let commit_span = tracing::info_span!(
+            "node.dfs.commit",
+            reason = reason.operation_prefix(),
+            inode_id = %inode_id.0,
+            wait_for_operation,
+            has_deadline = deadline.is_some(),
+            branch = tracing::field::Empty,
+        );
+        let _entered = commit_span.enter();
         let Some(cell) = self.write_state(inode_id)? else {
             return Ok(None);
         };
         enum CommitAction {
-            Prepare(Box<FrozenCommit>),
+            Prepare(Box<FrozenCommit>, Option<PublicationWindow>),
             Send(InFlightCommit),
         }
 
         loop {
-            let action = loop {
+            let action = 'action: {
                 let maintenance =
                     matches!(reason, CommitReason::Background | CommitReason::LastWriter);
                 let mut state = if maintenance {
@@ -1836,25 +5233,53 @@ impl DistributedFs {
                 if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                     return Ok(None);
                 }
-                if let Some(in_flight) = state.in_flight.clone() {
-                    let pending = match in_flight {
-                        InFlightCommit::Preparing(_) => {
-                            if maintenance {
-                                return Ok(None);
-                            }
-                            state = cell
-                                .wait(state)
-                                .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
-                            drop(state);
-                            continue;
+                if state.in_flight.is_some() {
+                    let pending = match state.in_flight.as_ref() {
+                        Some(InFlightCommit::Preparing(_, _)) => {
+                            let taken = state.in_flight.take().ok_or_else(|| {
+                                unavailable(
+                                    "DFS preparing commit disappeared before ownership transfer",
+                                )
+                            })?;
+                            let InFlightCommit::Preparing(frozen, publication_window) = taken
+                            else {
+                                return Err(unavailable(
+                                    "DFS in-flight commit changed before preparing ownership transfer",
+                                ));
+                            };
+                            state.in_flight = Some(InFlightCommit::Preparing(frozen.clone(), None));
+                            state.commit_busy = true;
+                            break 'action CommitAction::Prepare(
+                                frozen,
+                                publication_window.map(|window| *window),
+                            );
                         }
-                        InFlightCommit::File(pending) => InFlightCommit::File(pending),
-                        InFlightCommit::Metadata(sync) => InFlightCommit::Metadata(sync),
+                        Some(InFlightCommit::File(pending)) => {
+                            InFlightCommit::File(pending.clone())
+                        }
+                        Some(InFlightCommit::Metadata(sync, through_seq)) => {
+                            InFlightCommit::Metadata(sync.clone(), *through_seq)
+                        }
+                        None => {
+                            return Err(unavailable(
+                                "DFS in-flight commit disappeared before send ownership transfer",
+                            ));
+                        }
                     };
                     state.commit_busy = true;
-                    break CommitAction::Send(pending);
+                    break 'action CommitAction::Send(pending);
                 } else {
+                    let sync_metadata_only = state.metadata_dirty
+                        && matches!(
+                            reason,
+                            CommitReason::DataSync
+                                | CommitReason::FullSync
+                                | CommitReason::Close
+                                | CommitReason::NodeDrain
+                        )
+                        && state.visible_write_seq > state.committed_write_seq;
                     if !(state.dirty
+                        || sync_metadata_only
                         || matches!(reason, CommitReason::FullSync) && state.metadata_dirty
                         || state.kill_suidgid_dirty)
                     {
@@ -1893,25 +5318,21 @@ impl DistributedFs {
                                 kill_suidgid: state.kill_suidgid_dirty,
                             },
                         };
-                        let pending = InFlightCommit::Metadata(sync);
-                        state.in_flight = Some(pending.clone());
+                        let through_seq = state.visible_write_seq;
+                        let pending = InFlightCommit::Metadata(sync.clone(), through_seq);
+                        state.in_flight = Some(InFlightCommit::Metadata(sync, through_seq));
                         state.commit_busy = true;
-                        break CommitAction::Send(pending);
+                        break 'action CommitAction::Send(pending);
                     } else {
-                        let frozen = FrozenCommit {
-                            through_seq: state.visible_write_seq,
-                            logical_length: state.logical_length,
-                            inode: state.inode.clone(),
-                            write_lease: state.write_lease.clone(),
-                            base_version: state.base_version.clone(),
-                            base_layout: state.base_layout.clone(),
-                            dirty_extents: std::mem::take(&mut state.dirty_extents),
-                            kill_suidgid_dirty: state.kill_suidgid_dirty,
-                        };
-                        state.in_flight = Some(InFlightCommit::Preparing(Box::new(frozen.clone())));
+                        let mut frozen = Self::freeze_state_for_commit(&mut state);
+                        frozen.dirty_budget_reservations =
+                            std::mem::take(&mut state.dirty_budget_reservations);
+                        let publication_window = state.publication_window.take();
+                        state.in_flight =
+                            Some(InFlightCommit::Preparing(Box::new(frozen.clone()), None));
                         state.commit_busy = true;
                         state.dirty = false;
-                        break CommitAction::Prepare(Box::new(frozen));
+                        break 'action CommitAction::Prepare(Box::new(frozen), publication_window);
                     }
                 }
             };
@@ -1919,37 +5340,62 @@ impl DistributedFs {
             let pending_reuse = matches!(&action, CommitAction::Send(_));
             let pending = match action {
                 CommitAction::Send(pending) => pending,
-                CommitAction::Prepare(frozen) => match self.prepare_commit(&frozen, reason) {
-                    Ok(batch) => {
-                        let pending = InFlightCommit::File(Box::new(PendingFileCommit {
-                            frozen: *frozen,
-                            batch,
-                            trace_send_attempt: self
-                                .pending_trace
-                                .as_ref()
-                                .map(|_| Arc::new(AtomicU64::new(0))),
-                        }));
-                        let mut state = cell
-                            .lock()
-                            .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
-                        state.in_flight = Some(pending.clone());
-                        #[cfg(test)]
-                        self.pause_after_writeback_prepare();
-                        pending
-                    }
-                    Err(error) => {
-                        let mut state = cell
-                            .lock()
-                            .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
-                        if let Some(InFlightCommit::Preparing(failed)) = state.in_flight.take() {
-                            state.dirty_extents.restore_before(failed.dirty_extents);
+                CommitAction::Prepare(frozen, publication_window) => {
+                    match self.prepare_commit(&frozen, reason, publication_window) {
+                        Ok(batch) => {
+                            let pending_file = PendingFileCommit {
+                                frozen: *frozen,
+                                batch,
+                                trace_send_attempt: self
+                                    .pending_trace
+                                    .as_ref()
+                                    .map(|_| Arc::new(AtomicU64::new(0))),
+                            };
+                            let pending = InFlightCommit::File(Box::new(pending_file.clone()));
+                            let mut state = cell
+                                .lock()
+                                .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+                            while self.native_pipeline.is_some()
+                                && wait_for_operation
+                                && state.operation_busy
+                            {
+                                state = cell.wait(state).map_err(|_| {
+                                    unavailable("DFS inode write state is poisoned")
+                                })?;
+                            }
+                            state.in_flight = Some(InFlightCommit::File(Box::new(pending_file)));
+                            #[cfg(test)]
+                            self.pause_after_writeback_prepare();
+                            pending
                         }
-                        state.dirty = !state.dirty_extents.is_empty();
-                        state.commit_busy = false;
-                        cell.notify_all();
-                        return Err(error);
+                        Err(prepare_error) => {
+                            let mut state = cell
+                                .lock()
+                                .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+                            let failed = *frozen;
+                            let publication_window = prepare_error.publication_window;
+                            if state.dirty_extents.is_empty() && publication_window.is_none() {
+                                state.dirty_extents.restore_before(failed.dirty_extents);
+                                state
+                                    .dirty_budget_reservations
+                                    .extend(failed.dirty_budget_reservations);
+                                state.in_flight = None;
+                            } else {
+                                state.in_flight = Some(InFlightCommit::Preparing(
+                                    Box::new(failed),
+                                    publication_window,
+                                ));
+                            }
+                            state
+                                .dirty_budget_reservations
+                                .extend(prepare_error.budget_reservations);
+                            state.dirty = !state.dirty_extents.is_empty();
+                            state.commit_busy = false;
+                            cell.notify_all();
+                            return Err(prepare_error.error);
+                        }
                     }
-                },
+                }
             };
 
             if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
@@ -1974,6 +5420,7 @@ impl DistributedFs {
             } else {
                 "new_prepare"
             };
+            commit_span.record("branch", branch);
             let committed = self.finish_commit(cell.clone(), pending, timeout, branch)?;
             if matches!(reason, CommitReason::FullSync) && self.needs_full_metadata_sync(&cell)? {
                 continue;
@@ -1990,26 +5437,77 @@ impl DistributedFs {
         branch: &str,
     ) -> Result<Option<u64>> {
         let committed_kill_suidgid = matches!(&pending, InFlightCommit::File(pending) if pending.frozen.kill_suidgid_dirty)
-            || matches!(&pending, InFlightCommit::Metadata(sync) if sync.metadata_delta.kill_suidgid);
+            || matches!(&pending, InFlightCommit::Metadata(sync, _) if sync.metadata_delta.kill_suidgid);
         let result = (|| match &pending {
-            InFlightCommit::Preparing(_) => Err(unavailable("DFS inode commit is still preparing")),
+            InFlightCommit::Preparing(_, _) => {
+                Err(unavailable("DFS inode commit is still preparing"))
+            }
             InFlightCommit::File(pending) => {
                 let committed_full_metadata =
                     pending.batch.commit.metadata_delta.mode == CommitMetadataMode::Full;
                 let version = pending.batch.commit.file_version.clone();
                 let layout = pending.batch.commit.layout_root.clone();
+                let _native_rpc_accounting =
+                    if let Some(accounting) = &pending.batch._native_accounting {
+                        let base = accounting.actual.load(Ordering::Relaxed);
+                        accounting
+                            .set_actual(base + native_commit_heap(pending.batch.commit.as_ref()))?;
+                        Some(NativeRpcAccounting {
+                            accounting: accounting.clone(),
+                            base,
+                        })
+                    } else {
+                        None
+                    };
                 if let Some(trace) = &self.pending_trace
                     && let Ok(state) = cell.lock()
                 {
                     trace.observe("dfs_pending_commit_send", branch, &state, pending, None);
                 }
-                let updated = self.validate_inode(if let Some(timeout) = timeout {
-                    self.meta
-                        .commit_file_version_with_timeout(pending.batch.commit.clone(), timeout)?
-                } else {
-                    self.meta
-                        .commit_file_version(pending.batch.commit.clone())?
-                })?;
+                let publish_span = tracing::info_span!(
+                    "node.dfs.commit.publish",
+                    branch,
+                    inode_id = %pending.batch.commit.inode_id.0,
+                    operation_id = %pending.batch.commit.operation_id.0,
+                    through_seq = pending.batch.through_seq,
+                    chunks = pending.batch.commit.chunk_receipts.len(),
+                    file_length = pending.batch.commit.file_version.length,
+                    metadata_mode = ?pending.batch.commit.metadata_delta.mode,
+                    has_timeout = timeout.is_some(),
+                );
+                let rpc_started = Instant::now();
+                let updated = self.validate_inode(
+                    publish_span
+                        .in_scope(|| {
+                            let publication_diagnostic = self.read_engine.publication_diagnostic();
+                            let _coarse = self.read_engine.publication_coarse_diagnostic();
+                            let result = if let Some(timeout) = timeout {
+                                self.meta.commit_file_version_with_timeout(
+                                    pending.batch.commit.as_ref().clone(),
+                                    timeout,
+                                )
+                            } else {
+                                self.meta
+                                    .commit_file_version(pending.batch.commit.as_ref().clone())
+                            };
+                            if let Some(diagnostic) = publication_diagnostic {
+                                diagnostic.finish(result.is_ok());
+                            }
+                            result
+                        })
+                        .inspect_err(|error| {
+                            afs_logging::warn!("dfs.commit_rpc_failed";
+                                "method" => "commit_file_version",
+                                "inode_id" => pending.batch.commit.inode_id.0.as_str(),
+                                "operation_id" => pending.batch.commit.operation_id.0.as_str(),
+                                "branch" => branch,
+                                "timeout" => timeout.map(|value| format!("{}ms", value.as_millis()))
+                                    .unwrap_or_else(|| "foreground_default".to_owned()),
+                                "elapsed_ms" => rpc_started.elapsed().as_secs_f64() * 1000.0,
+                                "error" => error.to_string()
+                            );
+                        })?,
+                )?;
                 Ok(AppliedCommit::File {
                     through_seq: pending.batch.through_seq,
                     committed_full_metadata,
@@ -2018,14 +5516,32 @@ impl DistributedFs {
                     updated,
                 })
             }
-            InFlightCommit::Metadata(sync) => {
-                let updated = self.validate_inode(if let Some(timeout) = timeout {
-                    self.meta
-                        .sync_inode_metadata_with_timeout(sync.clone(), timeout)?
-                } else {
-                    self.meta.sync_inode_metadata(sync.clone())?
-                })?;
-                Ok(AppliedCommit::Metadata { updated })
+            InFlightCommit::Metadata(sync, through_seq) => {
+                let rpc_started = Instant::now();
+                let updated = self.validate_inode(
+                    (if let Some(timeout) = timeout {
+                        self.meta
+                            .sync_inode_metadata_with_timeout(sync.clone(), timeout)
+                    } else {
+                        self.meta.sync_inode_metadata(sync.clone())
+                    })
+                    .inspect_err(|error| {
+                        afs_logging::warn!("dfs.commit_rpc_failed";
+                            "method" => "sync_inode_metadata",
+                            "inode_id" => sync.inode_id.0.as_str(),
+                            "operation_id" => sync.operation_id.0.as_str(),
+                            "branch" => branch,
+                            "timeout" => timeout.map(|value| format!("{}ms", value.as_millis()))
+                                .unwrap_or_else(|| "foreground_default".to_owned()),
+                            "elapsed_ms" => rpc_started.elapsed().as_secs_f64() * 1000.0,
+                            "error" => error.to_string()
+                        );
+                    })?,
+                )?;
+                Ok(AppliedCommit::Metadata {
+                    through_seq: *through_seq,
+                    updated,
+                })
             }
         })();
 
@@ -2047,6 +5563,15 @@ impl DistributedFs {
                     updated.attributes.mtime_unix_ms = state.inode.attributes.mtime_unix_ms;
                     updated.attributes.ctime_unix_ms = state.inode.attributes.ctime_unix_ms;
                 }
+                let has_later_dirty = state.visible_write_seq > through_seq;
+                if has_later_dirty {
+                    updated.attributes.mtime_unix_ms = state.inode.attributes.mtime_unix_ms;
+                    updated.attributes.ctime_unix_ms = state.inode.attributes.ctime_unix_ms;
+                    if state.kill_suidgid_dirty {
+                        updated.attributes.mode =
+                            Self::clear_kernel_write_privileges(updated.attributes.mode);
+                    }
+                }
                 state.inode = updated;
                 state.base_version = Some(version);
                 state.base_layout = layout;
@@ -2054,13 +5579,14 @@ impl DistributedFs {
                 state.durable_write_seq = through_seq;
                 state.committed_write_seq = through_seq;
                 state.last_writer_background_requested = false;
+                state.native_due = state.native_due_through > through_seq;
                 if committed_full_metadata
                     && state.dirty_extents.is_empty()
                     && state.visible_write_seq <= through_seq
                 {
                     state.metadata_dirty = false;
                 }
-                if committed_kill_suidgid {
+                if committed_kill_suidgid && !has_later_dirty {
                     state.kill_suidgid_dirty = false;
                 }
                 if let Some(trace) = &self.pending_trace
@@ -2076,11 +5602,16 @@ impl DistributedFs {
                 }
                 Ok(Some(through_seq))
             }
-            Ok(AppliedCommit::Metadata { updated }) => {
+            Ok(AppliedCommit::Metadata {
+                through_seq,
+                updated,
+            }) => {
                 state.in_flight = None;
                 state.inode = updated;
                 state.metadata_dirty = false;
                 state.kill_suidgid_dirty = false;
+                state.durable_write_seq = state.durable_write_seq.max(through_seq);
+                state.committed_write_seq = state.committed_write_seq.max(through_seq);
                 Ok(Some(state.committed_write_seq))
             }
             Err(error) => {
@@ -2102,6 +5633,9 @@ impl DistributedFs {
                         state
                             .dirty_extents
                             .restore_before(pending.frozen.dirty_extents);
+                        state
+                            .dirty_budget_reservations
+                            .extend(pending.batch._budget_reservations.clone());
                         state.dirty = !state.dirty_extents.is_empty();
                     }
                 } else if let Some(trace) = &self.pending_trace
@@ -2138,7 +5672,11 @@ impl DistributedFs {
             let mut state = cell
                 .lock()
                 .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
-            while state.commit_busy || state.operation_busy {
+            while state.operation_busy
+                || state.commit_busy
+                    && (self.native_pipeline.is_none()
+                        || Self::in_flight_blocks_mutation(&state.in_flight))
+            {
                 state = cell
                     .wait(state)
                     .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
@@ -2146,13 +5684,18 @@ impl DistributedFs {
             if let Some(error) = state.terminal_error.clone() {
                 return Err(error);
             }
-            if state.in_flight.is_none() {
+            if !Self::in_flight_blocks_mutation(&state.in_flight) {
                 state.operation_busy = true;
                 drop(state);
-                return Ok(InodeOperationGuard { cell });
+                return Ok(InodeOperationGuard {
+                    cell,
+                    native_notify: self.native_writeback_notify(),
+                });
             }
             drop(state);
-            self.commit_inode(inode_id, CommitReason::Background)?;
+            if let Some(seq) = self.commit_inode(inode_id, CommitReason::Background)? {
+                self.update_handles_after_commit(inode_id, seq)?;
+            }
         }
     }
 
@@ -2160,12 +5703,17 @@ impl DistributedFs {
         &self,
         inode_id: &InodeId,
         cell: &'a SharedInodeWriteState,
-    ) -> Result<std::sync::MutexGuard<'a, InodeWriteState>> {
+    ) -> Result<NativeInodeMutationGuard<'a>> {
+        let ticket = self.native_ticket(cell)?;
         loop {
             let mut state = cell
                 .lock()
                 .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
-            while state.commit_busy || state.operation_busy {
+            while state.operation_busy
+                || state.commit_busy
+                    && (self.native_pipeline.is_none()
+                        || Self::in_flight_blocks_mutation(&state.in_flight))
+            {
                 state = cell
                     .wait(state)
                     .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
@@ -2173,25 +5721,240 @@ impl DistributedFs {
             if let Some(error) = state.terminal_error.clone() {
                 return Err(error);
             }
-            if state.in_flight.is_none() {
-                return Ok(state);
+            if !Self::in_flight_blocks_mutation(&state.in_flight) {
+                return Ok(NativeInodeMutationGuard {
+                    state,
+                    _ticket: ticket,
+                });
             }
             drop(state);
             self.commit_inode(inode_id, CommitReason::Background)?;
         }
     }
 
-    fn prepare_commit(&self, frozen: &FrozenCommit, reason: CommitReason) -> Result<CommitBatch> {
-        let operation_id = self.operation_id(reason.operation_prefix());
+    fn in_flight_blocks_mutation(in_flight: &Option<InFlightCommit>) -> bool {
+        matches!(
+            in_flight,
+            Some(InFlightCommit::File(_) | InFlightCommit::Metadata(_, _))
+        )
+    }
+
+    fn prepare_native_generation(
+        &self,
+        frozen: &FrozenCommit,
+        operation_id: &OperationId,
+        layout_id: LayoutRootId,
+        retained_uploads: &mut Vec<Arc<NativeUpload>>,
+    ) -> Result<(LayoutRoot, Vec<ChunkReceipt>)> {
+        let mut plan = CommitPlanner.plan(frozen, operation_id.clone(), layout_id)?;
+        let mut receipts: Vec<ChunkReceipt> = Vec::new();
+        for extent in frozen.dirty_extents.extents.values() {
+            if let Some(upload) = &extent.native_upload {
+                let receipt = self.wait_native_upload(upload)?;
+                if extent.file_offset < frozen.logical_length {
+                    plan.layout_root.inline_extents.push(Extent {
+                        file_offset: extent.file_offset,
+                        length: extent
+                            .length
+                            .min(frozen.logical_length - extent.file_offset),
+                        chunk_id: receipt.chunk.id.clone(),
+                        chunk_offset: extent.source_offset as u64,
+                    });
+                    if !receipts
+                        .iter()
+                        .any(|previous| previous.chunk.id == receipt.chunk.id)
+                    {
+                        receipts.push(receipt);
+                    }
+                }
+            }
+        }
+        for staged in unique_staged_chunks(plan.staged_chunks)? {
+            let body = staged.shared_bytes();
+            let descriptor = frozen
+                .dirty_extents
+                .iter_extents()
+                .find_map(|extent| {
+                    extent
+                        .data
+                        .as_ref()
+                        .filter(|bytes| bytes.allocation_id() == body.allocation_id())
+                        .and(extent.native_descriptor.as_ref())
+                        .cloned()
+                })
+                .ok_or_else(|| {
+                    unavailable("native publication body has no descriptor reservation")
+                })?;
+            let upload = Arc::new(NativeUpload {
+                operation_id: operation_id.clone(),
+                chunk: staged.chunk.clone(),
+                owner: self
+                    .write_state(&frozen.inode.inode_id)?
+                    .as_ref()
+                    .map_or_else(Weak::new, Arc::downgrade),
+                state: Mutex::new(NativeUploadState {
+                    body: Some(body),
+                    staged: Some(staged),
+                    task: None,
+                    receipt: None,
+                    error: None,
+                    terminal_error: None,
+                    joining: false,
+                }),
+                cv: Condvar::new(),
+                _descriptor: descriptor,
+            });
+            let receipt = self.wait_native_upload(&upload)?;
+            if !receipts
+                .iter()
+                .any(|previous| previous.chunk.id == receipt.chunk.id)
+            {
+                receipts.push(receipt);
+            }
+            retained_uploads.push(upload);
+        }
+        plan.layout_root
+            .inline_extents
+            .sort_by_key(|extent| extent.file_offset);
+        plan.layout_root
+            .inline_extents
+            .dedup_by(|extent, previous| {
+                if previous.file_offset + previous.length == extent.file_offset
+                    && previous.chunk_id == extent.chunk_id
+                    && previous.chunk_offset + previous.length == extent.chunk_offset
+                {
+                    previous.length += extent.length;
+                    true
+                } else {
+                    false
+                }
+            });
+        receipts.sort_by(|left, right| left.chunk.id.0.cmp(&right.chunk.id.0));
+        Ok((plan.layout_root, receipts))
+    }
+
+    fn prepare_commit(
+        &self,
+        frozen: &FrozenCommit,
+        reason: CommitReason,
+        publication_window: Option<PublicationWindow>,
+    ) -> std::result::Result<CommitBatch, PrepareCommitError> {
+        let dirty_bytes = frozen.dirty_extents.dirty_data_bytes();
+        let span = tracing::info_span!(
+            "node.dfs.commit.prepare",
+            reason = reason.operation_prefix(),
+            inode_id = %frozen.inode.inode_id.0,
+            logical_length = frozen.logical_length,
+            dirty_bytes,
+            staged_chunks = tracing::field::Empty,
+            staged_bytes = tracing::field::Empty,
+            unique_chunks = tracing::field::Empty,
+            unique_bytes = tracing::field::Empty,
+            receipts = tracing::field::Empty,
+        );
+        let _entered = span.enter();
+        let _publisher_prepare_gate = if self.deferred_publication_enabled() {
+            Some(
+                self.publisher_prepare_gate
+                    .lock()
+                    .map_err(|_| PrepareCommitError {
+                        error: unavailable("DFS publisher prepare gate is poisoned"),
+                        publication_window: None,
+                        budget_reservations: Vec::new(),
+                    })?,
+            )
+        } else {
+            None
+        };
+        let operation_id = frozen
+            .dirty_extents
+            .native_operation_id
+            .clone()
+            .or_else(|| {
+                publication_window
+                    .as_ref()
+                    .map(|window| window.operation_id.clone())
+            })
+            .unwrap_or_else(|| self.operation_id(reason.operation_prefix()));
         let generation = self.next_operation.fetch_add(1, Ordering::Relaxed);
-        let plan = CommitPlanner.plan(
-            frozen,
-            operation_id.clone(),
-            LayoutRootId::new(format!("{}-layout-{generation}", self.session_id)),
-        )?;
-        let receipts = self
-            .chunk_store
-            .put_batch(unique_staged_chunks(plan.staged_chunks)?)?;
+        let layout_id = LayoutRootId::new(format!("{}-layout-{generation}", self.session_id));
+
+        let mut budget_reservations = frozen.dirty_budget_reservations.clone();
+        let mut native_uploads = Vec::new();
+        let (layout_root, receipts) = if publication_window.is_some() {
+            let publication = self.wait_publication_window(publication_window, &operation_id)?;
+            budget_reservations.extend(publication.budget_reservations);
+            span.record("staged_chunks", publication.staged_chunks as u64);
+            span.record("staged_bytes", publication.staged_bytes);
+            span.record("unique_chunks", publication.receipts.len() as u64);
+            let unique_bytes = publication.receipts.iter().fold(0_u64, |sum, receipt| {
+                sum.saturating_add(receipt.chunk.length)
+            });
+            span.record("unique_bytes", unique_bytes);
+            let layout_root =
+                match self.layout_from_publication(frozen, layout_id, publication.extents) {
+                    Ok(layout_root) => layout_root,
+                    Err(error) => {
+                        return Err(PrepareCommitError {
+                            error,
+                            publication_window: None,
+                            budget_reservations,
+                        });
+                    }
+                };
+            (layout_root, publication.receipts)
+        } else if frozen.dirty_extents.native_operation_id.is_some() {
+            self.prepare_native_generation(frozen, &operation_id, layout_id, &mut native_uploads)
+                .map_err(|error| PrepareCommitError {
+                    error,
+                    publication_window: None,
+                    budget_reservations: Vec::new(),
+                })?
+        } else {
+            let plan = CommitPlanner
+                .plan(frozen, operation_id.clone(), layout_id)
+                .map_err(|error| PrepareCommitError {
+                    error,
+                    publication_window: None,
+                    budget_reservations: Vec::new(),
+                })?;
+            let staged_chunks = plan.staged_chunks.len();
+            let staged_bytes = plan
+                .staged_chunks
+                .iter()
+                .fold(0_u64, |sum, chunk| sum.saturating_add(chunk.chunk.length));
+            span.record("staged_chunks", staged_chunks as u64);
+            span.record("staged_bytes", staged_bytes);
+            let mut unique =
+                unique_staged_chunks(plan.staged_chunks).map_err(|error| PrepareCommitError {
+                    error,
+                    publication_window: None,
+                    budget_reservations: Vec::new(),
+                })?;
+            for staged in &mut unique {
+                staged.retain_write_budget(&budget_reservations);
+            }
+            let unique_bytes = unique
+                .iter()
+                .fold(0_u64, |sum, chunk| sum.saturating_add(chunk.chunk.length));
+            span.record("unique_chunks", unique.len() as u64);
+            span.record("unique_bytes", unique_bytes);
+            let receipts = tracing::info_span!(
+                "node.dfs.commit.put_batch",
+                reason = reason.operation_prefix(),
+                chunks = unique.len(),
+                bytes = unique_bytes,
+                reused_receipts = 0_u64,
+            )
+            .in_scope(|| self.chunk_store.put_batch(unique))
+            .map_err(|error| PrepareCommitError {
+                error,
+                publication_window: None,
+                budget_reservations: Vec::new(),
+            })?;
+            (plan.layout_root, receipts)
+        };
+        span.record("receipts", receipts.len() as u64);
         let now = now_unix_ms();
         let version = FileVersion {
             id: FileVersionId::new(format!("{}-version-{generation}", self.session_id)),
@@ -2201,29 +5964,431 @@ impl DistributedFs {
                 .as_ref()
                 .map(|version| version.id.clone()),
             length: frozen.logical_length,
-            layout_root: plan.layout_root.id.clone(),
+            layout_root: layout_root.id.clone(),
             created_at_unix_ms: now,
+        };
+        let commit = CommitFileVersion {
+            operation_id,
+            inode_id: frozen.inode.inode_id.clone(),
+            write_lease: frozen.write_lease.clone(),
+            expected_inode_revision: frozen.inode.revision,
+            expected_head_version: frozen
+                .base_version
+                .as_ref()
+                .map(|version| version.id.clone()),
+            file_version: version,
+            layout_root,
+            chunk_receipts: receipts,
+            metadata_delta: reason.metadata_delta(
+                frozen.inode.attributes.mtime_unix_ms,
+                frozen.inode.attributes.ctime_unix_ms,
+                frozen.kill_suidgid_dirty,
+            ),
+        };
+        let native_accounting = if frozen.dirty_extents.native_operation_id.is_some()
+            && (!commit.chunk_receipts.is_empty()
+                || frozen
+                    .dirty_extents
+                    .iter_extents()
+                    .any(|extent| extent.native_descriptor.is_some()))
+        {
+            let pipeline = self
+                .native_pipeline
+                .as_ref()
+                .ok_or_else(|| PrepareCommitError {
+                    error: unavailable("native write pipeline is missing"),
+                    publication_window: None,
+                    budget_reservations: Vec::new(),
+                })?;
+            let mut owners: Vec<Arc<Mutex<NativeMetadataLease>>> = Vec::new();
+            for extent in frozen.dirty_extents.iter_extents() {
+                if let Some(owner) = &extent.native_descriptor
+                    && !owners.iter().any(|other| Arc::ptr_eq(other, owner))
+                {
+                    owners.push(owner.clone());
+                }
+            }
+            let mut owned_headroom = 0usize;
+            for owner in &owners {
+                let owner = owner.lock().map_err(|_| PrepareCommitError {
+                    error: unavailable("native descriptor reservation is poisoned"),
+                    publication_window: None,
+                    budget_reservations: Vec::new(),
+                })?;
+                owned_headroom =
+                    owned_headroom.saturating_add(owner.bytes.saturating_sub(owner.actual_bytes));
+            }
+            let base = native_commit_heap(&commit)
+                + owners.capacity() * std::mem::size_of::<Arc<Mutex<NativeMetadataLease>>>()
+                + native_uploads.capacity() * std::mem::size_of::<Arc<NativeUpload>>();
+            let reserved = base.saturating_mul(3);
+            let mut state = pipeline
+                .metadata
+                .state
+                .lock()
+                .map_err(|_| PrepareCommitError {
+                    error: unavailable("native metadata budget is poisoned"),
+                    publication_window: None,
+                    budget_reservations: Vec::new(),
+                })?;
+            if reserved > owned_headroom
+                || reserved
+                    > state
+                        .descriptor_reserved_bytes
+                        .saturating_sub(state.descriptor_bytes)
+                        .saturating_sub(state.scratch_reserved_bytes)
+            {
+                return Err(PrepareCommitError {
+                    error: unavailable(
+                        "native commit cannot fit its pre-reserved publication scratch",
+                    ),
+                    publication_window: None,
+                    budget_reservations: Vec::new(),
+                });
+            }
+            state.scratch_reserved_bytes += reserved;
+            state.descriptor_bytes += base;
+            state.descriptor_peak = state.descriptor_peak.max(state.descriptor_bytes);
+            drop(state);
+            Some(Arc::new(NativeCommitAccounting {
+                budget: pipeline.metadata.clone(),
+                reserved,
+                actual: AtomicUsize::new(base),
+                _owners: owners,
+            }))
+        } else {
+            None
         };
         Ok(CommitBatch {
             through_seq: frozen.through_seq,
-            commit: CommitFileVersion {
-                operation_id,
-                inode_id: frozen.inode.inode_id.clone(),
-                write_lease: frozen.write_lease.clone(),
-                expected_inode_revision: frozen.inode.revision,
-                expected_head_version: frozen
-                    .base_version
-                    .as_ref()
-                    .map(|version| version.id.clone()),
-                file_version: version,
-                layout_root: plan.layout_root,
-                chunk_receipts: receipts,
-                metadata_delta: reason.metadata_delta(
-                    frozen.inode.attributes.mtime_unix_ms,
-                    frozen.inode.attributes.ctime_unix_ms,
-                    frozen.kill_suidgid_dirty,
-                ),
-            },
+            _budget_reservations: budget_reservations,
+            _native_accounting: native_accounting,
+            _native_uploads: native_uploads,
+            commit: Arc::new(commit),
+        })
+    }
+
+    fn layout_from_publication(
+        &self,
+        frozen: &FrozenCommit,
+        layout_id: LayoutRootId,
+        publication_extents: Vec<Extent>,
+    ) -> Result<LayoutRoot> {
+        let mut extents = frozen
+            .base_layout
+            .inline_extents
+            .iter()
+            .filter_map(|extent| clip_extent(extent, frozen.logical_length))
+            .collect::<Vec<_>>();
+        for extent in &publication_extents {
+            extents = subtract_range(extents, extent.file_offset, extent.length)?;
+        }
+        extents.extend(publication_extents);
+        extents.sort_by_key(|extent| extent.file_offset);
+        Ok(LayoutRoot {
+            id: layout_id,
+            file_length: frozen.logical_length,
+            inline_extents: extents,
+        })
+    }
+
+    fn push_publication_receipt(
+        receipts: &mut Vec<crate::dfs::ChunkReceipt>,
+        seen: &mut HashMap<crate::dfs::ChunkId, ChunkObject>,
+        receipt: crate::dfs::ChunkReceipt,
+    ) -> Result<()> {
+        match seen.get(&receipt.chunk.id) {
+            Some(existing) if existing != &receipt.chunk => {
+                return Err(invalid(
+                    "deferred PUT returned inconsistent metadata for a chunk id",
+                ));
+            }
+            Some(_) => return Ok(()),
+            None => {
+                seen.insert(receipt.chunk.id.clone(), receipt.chunk.clone());
+                receipts.push(receipt);
+            }
+        }
+        Ok(())
+    }
+
+    fn wait_publication_window(
+        &self,
+        publication_window: Option<PublicationWindow>,
+        operation_id: &OperationId,
+    ) -> std::result::Result<PublicationCommitPlan, PrepareCommitError> {
+        let Some(mut window) = publication_window else {
+            return Ok(PublicationCommitPlan {
+                budget_reservations: Vec::new(),
+                extents: Vec::new(),
+                receipts: Vec::new(),
+                staged_chunks: 0,
+                staged_bytes: 0,
+            });
+        };
+        if let Err(error) = window.flush_tail(&self.write_pipeline_budget) {
+            return Err(PrepareCommitError {
+                error,
+                publication_window: Some(Box::new(window)),
+                budget_reservations: Vec::new(),
+            });
+        }
+        let active_uploads = window.uploads.len();
+        let high_water_bytes = window.high_water_bytes;
+        let high_water_uploads = window.high_water_uploads;
+        let mut extents = Vec::new();
+        let mut receipts = Vec::new();
+        let mut seen_receipts = HashMap::new();
+        let mut budget_reservations = Vec::new();
+        let mut staged_chunks = 0_usize;
+        let mut staged_bytes = 0_u64;
+
+        let completed_receipts = window
+            .completed
+            .iter()
+            .map(|completed| {
+                (
+                    completed.file_offset,
+                    completed.receipt.clone(),
+                    completed._descriptor_reservation.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        for (file_offset, receipt, descriptor_reservation) in completed_receipts {
+            if let Some(reservation) = descriptor_reservation {
+                budget_reservations.push(reservation);
+            }
+            extents.push(Extent {
+                file_offset,
+                length: receipt.chunk.length,
+                chunk_id: receipt.chunk.id.clone(),
+                chunk_offset: 0,
+            });
+            staged_chunks = staged_chunks.saturating_add(1);
+            staged_bytes = staged_bytes.saturating_add(receipt.chunk.length);
+            if let Err(error) =
+                Self::push_publication_receipt(&mut receipts, &mut seen_receipts, receipt)
+            {
+                return Err(PrepareCommitError {
+                    error,
+                    publication_window: Some(Box::new(window)),
+                    budget_reservations: Vec::new(),
+                });
+            }
+        }
+
+        while let Some(window_chunk) = window.ready_chunks.pop_front() {
+            let WindowStagedChunk {
+                file_offset,
+                staged,
+            } = window_chunk;
+            let chunk = staged.chunk.clone();
+            let uploaded = match self.chunk_store.put_batch(vec![staged.clone()]) {
+                Ok(uploaded) => uploaded,
+                Err(error) => {
+                    window.ready_chunks.push_front(WindowStagedChunk {
+                        file_offset,
+                        staged,
+                    });
+                    return Err(PrepareCommitError {
+                        error,
+                        publication_window: Some(Box::new(window)),
+                        budget_reservations: Vec::new(),
+                    });
+                }
+            };
+            let mut uploaded = uploaded;
+            if uploaded.len() != 1 {
+                window.ready_chunks.push_front(WindowStagedChunk {
+                    file_offset,
+                    staged,
+                });
+                return Err(PrepareCommitError {
+                    error: invalid("deferred tail PUT returned the wrong receipt count"),
+                    publication_window: Some(Box::new(window)),
+                    budget_reservations: Vec::new(),
+                });
+            }
+            let Some(receipt) = uploaded.pop() else {
+                return Err(PrepareCommitError {
+                    error: invalid("deferred tail PUT returned no receipt"),
+                    publication_window: Some(Box::new(window)),
+                    budget_reservations: Vec::new(),
+                });
+            };
+            if receipt.operation_id != *operation_id {
+                window.ready_chunks.push_front(WindowStagedChunk {
+                    file_offset,
+                    staged,
+                });
+                return Err(PrepareCommitError {
+                    error: invalid("deferred tail receipt operation does not match commit"),
+                    publication_window: Some(Box::new(window)),
+                    budget_reservations: Vec::new(),
+                });
+            }
+            if receipt.chunk != chunk {
+                window.ready_chunks.push_front(WindowStagedChunk {
+                    file_offset,
+                    staged,
+                });
+                return Err(PrepareCommitError {
+                    error: invalid("deferred tail receipt chunk metadata changed"),
+                    publication_window: Some(Box::new(window)),
+                    budget_reservations: Vec::new(),
+                });
+            }
+            window.completed.push(WindowChunkReceipt {
+                file_offset,
+                receipt: receipt.clone(),
+                _descriptor_reservation: None,
+            });
+            extents.push(Extent {
+                file_offset,
+                length: receipt.chunk.length,
+                chunk_id: receipt.chunk.id.clone(),
+                chunk_offset: 0,
+            });
+            staged_chunks = staged_chunks.saturating_add(1);
+            staged_bytes = staged_bytes.saturating_add(receipt.chunk.length);
+            if let Err(error) =
+                Self::push_publication_receipt(&mut receipts, &mut seen_receipts, receipt)
+            {
+                return Err(PrepareCommitError {
+                    error,
+                    publication_window: Some(Box::new(window)),
+                    budget_reservations: Vec::new(),
+                });
+            }
+        }
+
+        let mut uploads = VecDeque::from(std::mem::take(&mut window.uploads));
+        while let Some(pending) = uploads.pop_front() {
+            let PendingPublicationUpload {
+                chunks: expected,
+                staged,
+                upload,
+                _descriptor_reservation,
+            } = pending;
+            let uploaded = match upload.wait() {
+                Ok(uploaded) => uploaded,
+                Err(error) => {
+                    for chunk in staged.into_iter().rev() {
+                        window.ready_chunks.push_front(chunk);
+                    }
+                    window.uploads = uploads.into_iter().collect();
+                    window.active_bytes = window
+                        .uploads
+                        .iter()
+                        .flat_map(|pending| pending.chunks.iter())
+                        .fold(0_u64, |sum, chunk| sum.saturating_add(chunk.chunk.length));
+                    return Err(PrepareCommitError {
+                        error,
+                        publication_window: Some(Box::new(window)),
+                        budget_reservations: Vec::new(),
+                    });
+                }
+            };
+            if uploaded.len() != expected.len() {
+                for chunk in staged.into_iter().rev() {
+                    window.ready_chunks.push_front(chunk);
+                }
+                window.uploads = uploads.into_iter().collect();
+                window.active_bytes = window
+                    .uploads
+                    .iter()
+                    .flat_map(|pending| pending.chunks.iter())
+                    .fold(0_u64, |sum, chunk| sum.saturating_add(chunk.chunk.length));
+                return Err(PrepareCommitError {
+                    error: invalid("deferred PUT returned the wrong receipt count"),
+                    publication_window: Some(Box::new(window)),
+                    budget_reservations: Vec::new(),
+                });
+            }
+            let mut validated = Vec::with_capacity(expected.len());
+            for (receipt, chunk) in uploaded.into_iter().zip(expected) {
+                if receipt.operation_id != *operation_id {
+                    for chunk in staged.into_iter().rev() {
+                        window.ready_chunks.push_front(chunk);
+                    }
+                    window.uploads = uploads.into_iter().collect();
+                    window.active_bytes = window
+                        .uploads
+                        .iter()
+                        .flat_map(|pending| pending.chunks.iter())
+                        .fold(0_u64, |sum, chunk| sum.saturating_add(chunk.chunk.length));
+                    return Err(PrepareCommitError {
+                        error: invalid("deferred PUT receipt operation does not match commit"),
+                        publication_window: Some(Box::new(window)),
+                        budget_reservations: Vec::new(),
+                    });
+                }
+                if receipt.chunk != chunk.chunk {
+                    for chunk in staged.into_iter().rev() {
+                        window.ready_chunks.push_front(chunk);
+                    }
+                    window.uploads = uploads.into_iter().collect();
+                    window.active_bytes = window
+                        .uploads
+                        .iter()
+                        .flat_map(|pending| pending.chunks.iter())
+                        .fold(0_u64, |sum, chunk| sum.saturating_add(chunk.chunk.length));
+                    return Err(PrepareCommitError {
+                        error: invalid("deferred PUT receipt chunk metadata changed"),
+                        publication_window: Some(Box::new(window)),
+                        budget_reservations: Vec::new(),
+                    });
+                }
+                validated.push((chunk, receipt));
+            }
+            let mut descriptor_reservation = Some(_descriptor_reservation);
+            for (chunk, receipt) in validated {
+                let completed_descriptor = descriptor_reservation.take();
+                if let Some(reservation) = completed_descriptor.as_ref() {
+                    budget_reservations.push(reservation.clone());
+                }
+                window.completed.push(WindowChunkReceipt {
+                    file_offset: chunk.file_offset,
+                    receipt: receipt.clone(),
+                    _descriptor_reservation: completed_descriptor,
+                });
+                staged_chunks = staged_chunks.saturating_add(1);
+                staged_bytes = staged_bytes.saturating_add(chunk.chunk.length);
+                extents.push(Extent {
+                    file_offset: chunk.file_offset,
+                    length: chunk.chunk.length,
+                    chunk_id: chunk.chunk.id.clone(),
+                    chunk_offset: 0,
+                });
+                if let Err(error) =
+                    Self::push_publication_receipt(&mut receipts, &mut seen_receipts, receipt)
+                {
+                    return Err(PrepareCommitError {
+                        error,
+                        publication_window: Some(Box::new(window)),
+                        budget_reservations: Vec::new(),
+                    });
+                }
+            }
+        }
+        window.active_bytes = 0;
+        extents.sort_by_key(|extent| extent.file_offset);
+        tracing::info_span!(
+            "node.dfs.deferred_put.collect",
+            active_uploads = active_uploads as u64,
+            receipts = receipts.len() as u64,
+            staged_chunks = staged_chunks as u64,
+            staged_bytes,
+            high_water_bytes,
+            high_water_uploads = high_water_uploads as u64,
+        )
+        .in_scope(|| {});
+        Ok(PublicationCommitPlan {
+            budget_reservations,
+            extents,
+            receipts,
+            staged_chunks,
+            staged_bytes,
         })
     }
 
@@ -2247,6 +6412,13 @@ impl DistributedFs {
             return Ok(());
         };
         self.update_handle_error_cursor(handle, observed.cursor)?;
+        afs_logging::warn!("dfs.background_error_consumed";
+            "inode_id" => snapshot.inode_id.0.as_str(),
+            "handle" => handle.0,
+            "previous_cursor" => session.local.error_cursor,
+            "cursor" => observed.cursor,
+            "error" => observed.error.to_string()
+        );
         Err(observed.error)
     }
 
@@ -2259,6 +6431,28 @@ impl DistributedFs {
         let state = self
             .write_state(inode_id)?
             .ok_or_else(|| stale("DFS write state is no longer open"))?;
+        let _deferred_write_gate = if self.deferred_publication_enabled() {
+            Some(
+                self.write_pipeline_budget_gate
+                    .lock()
+                    .map_err(|_| unavailable("DFS write pipeline budget gate is poisoned"))?,
+            )
+        } else {
+            None
+        };
+        if self.deferred_publication_enabled() {
+            let drain_before_resize = {
+                let state = state
+                    .lock()
+                    .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+                state.publication_window.is_some()
+            };
+            if drain_before_resize
+                && let Some(committed_seq) = self.commit_inode(inode_id, CommitReason::DataSync)?
+            {
+                self.update_handles_after_commit(inode_id, committed_seq)?;
+            }
+        }
         let mut state = self.lock_for_mutation(inode_id, &state)?;
         state.next_write_seq = state.next_write_seq.saturating_add(1);
         let write_seq = state.next_write_seq;
@@ -2286,6 +6480,7 @@ impl DistributedFs {
         let Some(state) = self.write_state(&session.inode_id)? else {
             return Ok(());
         };
+        let _native_ticket = self.native_ticket_with_cleanup(&state, true)?;
         let mut state = state
             .lock()
             .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
@@ -2384,9 +6579,8 @@ impl DistributedFs {
             lifecycle: RemoteProviderLifecycle::live(),
         };
         self.remote_inode_providers
-            .lock()
-            .map_err(|_| unavailable("DFS remote owner table is poisoned"))?
-            .insert(inode.inode_id.clone(), remote.clone());
+            .insert(inode.inode_id.clone(), remote.clone())?;
+        self.handles.mark_dynamic(&inode.inode_id)?;
         Ok(DfsRemoteWriteSession {
             local: DfsWriteSession {
                 id: DfsWriteSessionId::new(format!(
@@ -2620,7 +6814,7 @@ impl DistributedFs {
     fn existing_lock_authority_for(&self, inode_id: &InodeId) -> Result<Option<DfsLockTarget>> {
         if let Some(authority) = self
             .lock_authorities
-            .lock()
+            .read(inode_id)
             .map_err(|_| unavailable("DFS lock authority table is poisoned"))?
             .get(inode_id)
             .cloned()
@@ -2637,19 +6831,20 @@ impl DistributedFs {
     }
 
     fn reclaim_idle_lock_authorities(&self) -> Result<()> {
-        let mut authorities = self
+        let idle = self
             .lock_authorities
-            .lock()
-            .map_err(|_| unavailable("DFS lock authority table is poisoned"))?;
-        let idle = authorities
-            .iter()
-            .filter_map(|(inode_id, authority)| {
-                let idle = authority.table.is_idle().ok()?;
-                (idle && Arc::strong_count(authority) <= 2)
-                    .then(|| (inode_id.clone(), authority.clone()))
+            .snapshot()?
+            .into_iter()
+            .filter(|(_, authority)| {
+                // The snapshot adds one metadata reference to table + renewal.
+                authority.table.is_idle().unwrap_or(false) && Arc::strong_count(authority) <= 3
             })
             .collect::<Vec<_>>();
         for (inode_id, authority) in idle {
+            let mut authorities = self
+                .lock_authorities
+                .write(&inode_id)
+                .map_err(|_| unavailable("DFS lock authority table is poisoned"))?;
             let current_is_idle = authorities.get(&inode_id).is_some_and(|current| {
                 Arc::ptr_eq(current, &authority)
                     && Arc::strong_count(current) <= 3
@@ -2657,6 +6852,9 @@ impl DistributedFs {
             });
             if current_is_idle {
                 authorities.remove(&inode_id);
+            }
+            drop(authorities);
+            if current_is_idle {
                 let _ = self.lock_renewal.untrack_if_current(&inode_id, &authority);
             }
         }
@@ -2688,10 +6886,15 @@ impl DistributedFs {
         inode_id: &InodeId,
         lease: WriteLease,
     ) -> Result<Arc<DfsLockAuthority>> {
+        let admission = self
+            .lock_authority_admission
+            .lock()
+            .map_err(|_| unavailable("DFS lock authority admission is poisoned"))?;
         self.reclaim_idle_lock_authorities()?;
+        let count = self.lock_authorities.len()?;
         let mut authorities = self
             .lock_authorities
-            .lock()
+            .write(inode_id)
             .map_err(|_| unavailable("DFS lock authority table is poisoned"))?;
         if let Some(authority) = authorities.get(inode_id).cloned() {
             let epoch = authority
@@ -2702,6 +6905,7 @@ impl DistributedFs {
                 .lease_epoch;
             if epoch == lease.lease_epoch {
                 drop(authorities);
+                drop(admission);
                 let _renewal = lock_authority_renewal_guard(&authority)?;
                 refresh_same_epoch_lock_authority(&authority, lease)?;
                 self.check_lock_renewal_locked(&authority)?;
@@ -2712,7 +6916,7 @@ impl DistributedFs {
             authorities.insert(inode_id.clone(), replacement.clone());
             return Ok(replacement);
         }
-        if authorities.len() >= MAX_LOCK_AUTHORITIES {
+        if count >= MAX_LOCK_AUTHORITIES {
             return Err(Error::from(std::io::Error::from_raw_os_error(libc::ENOLCK)));
         }
         let authority = Arc::new(DfsLockAuthority::new(lease));
@@ -2972,7 +7176,7 @@ impl DistributedFs {
         let inode_id = InodeId::new(authority.inode_id);
         let existing = self
             .lock_authorities
-            .lock()
+            .read(&inode_id)
             .map_err(|_| unavailable("DFS lock authority table is poisoned"))?
             .get(&inode_id)
             .cloned();
@@ -3005,13 +7209,7 @@ impl DistributedFs {
     }
 
     fn collect_peer_lock_scopes(&self) -> Result<HashMap<(String, String), HashSet<String>>> {
-        let authorities = self
-            .lock_authorities
-            .lock()
-            .map_err(|_| unavailable("DFS lock authority table is poisoned"))?
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
+        let authorities = self.lock_authorities.values_snapshot()?;
         let mut scopes: HashMap<(String, String), HashSet<String>> = HashMap::new();
         for authority in authorities {
             let state = authority
@@ -3047,13 +7245,7 @@ impl DistributedFs {
         for scope in &scopes {
             self.note_closed_lock_session(scope)?;
         }
-        let authorities = self
-            .lock_authorities
-            .lock()
-            .map_err(|_| unavailable("DFS lock authority table is poisoned"))?
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
+        let authorities = self.lock_authorities.values_snapshot()?;
         let mut first_error = None;
         for authority in authorities {
             for scope in &scopes {
@@ -3744,6 +7936,19 @@ impl DistributedFs {
     /// close contract. Failures remain attached to the inode and are reported
     /// once per open writer by a later write/flush/sync operation.
     pub fn writeback_pending(&self) -> Result<usize> {
+        if self.native_pipeline.is_some() {
+            for (_, cell) in self.inode_writes.snapshot()? {
+                let mut state = cell
+                    .lock()
+                    .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+                if state.dirty || state.in_flight.is_some() {
+                    state.native_due = true;
+                    state.native_due_through =
+                        state.native_due_through.max(state.visible_write_seq);
+                }
+            }
+            return self.progress_native_writeback();
+        }
         self.writeback_pending_with_budget(
             WRITEBACK_MAINTENANCE_BUDGET,
             WRITEBACK_MAINTENANCE_MAX_OPS,
@@ -3761,13 +7966,7 @@ impl DistributedFs {
         let deadline = Instant::now() + budget;
         // Snapshot references only. No inode lock or network wait may be held
         // under the shared table: that would stall unrelated inode lookups.
-        let mut states = self
-            .inode_writes
-            .lock()
-            .map_err(|_| unavailable("DFS inode write table is poisoned"))?
-            .iter()
-            .map(|(inode_id, state)| (inode_id.clone(), state.clone()))
-            .collect::<Vec<_>>();
+        let mut states = self.inode_writes.snapshot()?;
         states.sort_by(|left, right| left.0.0.cmp(&right.0.0));
         if !states.is_empty() {
             let start = (self.writeback_cursor.load(Ordering::Relaxed) as usize) % states.len();
@@ -3839,25 +8038,531 @@ impl DistributedFs {
         }
     }
 
+    fn deferred_publication_enabled(&self) -> bool {
+        self.chunk_store.supports_deferred_put()
+    }
+
+    fn write_publication_window_bytes(&self) -> u64 {
+        if self.deferred_publication_enabled() {
+            DEFERRED_PUBLICATION_WINDOW_BYTES
+        } else {
+            self.dirty_budget_bytes
+        }
+    }
+
+    fn current_write_pipeline_bytes(&self) -> Result<u64> {
+        let states = self.inode_writes.values_snapshot()?;
+        let mut total = 0_u64;
+        let mut seen_payloads = HashSet::new();
+        for cell in states {
+            let state = cell
+                .lock()
+                .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+            total =
+                total.saturating_add(state.dirty_extents.reserved_data_bytes(&mut seen_payloads));
+            if let Some(in_flight) = &state.in_flight
+                && let Some(dirty) = in_flight.dirty_extents()
+            {
+                total = total.saturating_add(dirty.reserved_data_bytes(&mut seen_payloads));
+            }
+            if let Some(window) = &state.publication_window {
+                total = total.saturating_add(window.reserved_bytes(&mut seen_payloads));
+            }
+        }
+        Ok(total)
+    }
+
+    fn write_pipeline_budget_snapshot(&self) -> Result<(u64, u64, u64, usize)> {
+        let state = self
+            .write_pipeline_budget
+            .state
+            .lock()
+            .map_err(|_| unavailable("DFS deferred write budget is poisoned"))?;
+        Ok((
+            state.normal_bytes,
+            state.publisher_bytes,
+            state.descriptor_bytes,
+            state.descriptors,
+        ))
+    }
+
+    fn enforce_deferred_write_budget_inside_operation(
+        &self,
+        inode_id: &InodeId,
+    ) -> Result<Option<u64>> {
+        if !self.deferred_publication_enabled() {
+            return Ok(None);
+        }
+        if self.current_write_pipeline_bytes()? <= DEFERRED_PIPELINE_BUDGET_BYTES {
+            return Ok(None);
+        }
+        match self.commit_inode_inside_operation(inode_id, CommitReason::DirtyBudget)? {
+            Some(seq) => Ok(Some(seq)),
+            None => self.commit_deferred_budget_victim(Some(inode_id)),
+        }
+    }
+
+    fn advance_full_deferred_window_inside_operation(
+        &self,
+        inode_id: &InodeId,
+        cell: &SharedInodeWriteState,
+    ) -> Result<Option<u64>> {
+        if !self.deferred_publication_enabled() {
+            return Ok(None);
+        }
+        let active_full = {
+            let state = cell
+                .lock()
+                .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+            state.dirty_extents.dirty_data_bytes() >= self.write_publication_window_bytes()
+        };
+        if !active_full {
+            return Ok(None);
+        }
+        if let Some(seq) = self.freeze_deferred_window_inside_operation(cell)? {
+            return Ok(Some(seq));
+        }
+        let Some(committed_seq) =
+            self.commit_inode_inside_operation(inode_id, CommitReason::DirtyBudget)?
+        else {
+            return Ok(None);
+        };
+        self.update_handles_after_commit(inode_id, committed_seq)?;
+        match self.freeze_deferred_window_inside_operation(cell)? {
+            Some(seq) => Ok(Some(seq)),
+            None => Ok(Some(committed_seq)),
+        }
+    }
+
+    fn freeze_deferred_window_inside_operation(
+        &self,
+        cell: &SharedInodeWriteState,
+    ) -> Result<Option<u64>> {
+        if !self.deferred_publication_enabled() {
+            return Ok(None);
+        }
+        let mut state = cell
+            .lock()
+            .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+        if state.in_flight.is_some() || !state.dirty || state.publication_window.is_none() {
+            return Ok(None);
+        }
+        let mut frozen = Self::freeze_state_for_commit(&mut state);
+        frozen.dirty_budget_reservations = std::mem::take(&mut state.dirty_budget_reservations);
+        let through_seq = frozen.through_seq;
+        let logical_length = frozen.logical_length;
+        let inode_id = frozen.inode.inode_id.clone();
+        let publication_window = state.publication_window.take();
+        let operation_id = publication_window
+            .as_ref()
+            .map(|window| window.operation_id.0.as_str())
+            .unwrap_or("legacy");
+        let operation_id_owned = operation_id.to_owned();
+        let publication_window = publication_window.map(Box::new);
+        state.in_flight = Some(InFlightCommit::Preparing(
+            Box::new(frozen),
+            publication_window,
+        ));
+        state.dirty = false;
+        tracing::info_span!(
+            "node.dfs.deferred_window.freeze",
+            inode_id = %inode_id.0,
+            operation_id = %operation_id_owned,
+            through_seq,
+            logical_end = logical_length,
+        )
+        .in_scope(|| {});
+        cell.notify_all();
+        Ok(Some(through_seq))
+    }
+
+    fn commit_deferred_budget_victim(&self, exclude: Option<&InodeId>) -> Result<Option<u64>> {
+        if !self.deferred_publication_enabled() {
+            return Ok(None);
+        }
+        let mut states = self
+            .inode_writes
+            .snapshot()?
+            .into_iter()
+            .filter(|(inode_id, _)| exclude != Some(inode_id))
+            .collect::<Vec<_>>();
+        states.sort_by(|left, right| left.0.0.cmp(&right.0.0));
+        for (inode_id, cell) in states {
+            let state = match cell.state.try_lock() {
+                Ok(state) => state,
+                Err(std::sync::TryLockError::WouldBlock) => continue,
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    return Err(unavailable("DFS inode write state is poisoned"));
+                }
+            };
+            let eligible = !state.operation_busy
+                && !state.commit_busy
+                && (state.dirty
+                    || state.metadata_dirty
+                    || state.kill_suidgid_dirty
+                    || state.in_flight.is_some());
+            drop(state);
+            if eligible
+                && let Some(seq) = self.commit_inode(&inode_id, CommitReason::DirtyBudget)?
+            {
+                self.update_handles_after_commit(&inode_id, seq)?;
+                return Ok(Some(seq));
+            }
+        }
+        Ok(None)
+    }
+
+    fn freeze_state_for_commit(state: &mut InodeWriteState) -> FrozenCommit {
+        let mut dirty_extents = std::mem::take(&mut state.dirty_extents);
+        dirty_extents.freeze_builders();
+        FrozenCommit {
+            through_seq: state.visible_write_seq,
+            logical_length: state.logical_length,
+            inode: state.inode.clone(),
+            write_lease: state.write_lease.clone(),
+            base_version: state.base_version.clone(),
+            base_layout: state.base_layout.clone(),
+            dirty_extents,
+            dirty_budget_reservations: state.dirty_budget_reservations.clone(),
+            kill_suidgid_dirty: state.kill_suidgid_dirty,
+        }
+    }
+
+    fn preupload_ready_chunks_inside_operation(
+        &self,
+        inode_id: &InodeId,
+        cell: &SharedInodeWriteState,
+    ) -> Result<Option<u64>> {
+        if !self.deferred_publication_enabled() {
+            return Ok(None);
+        }
+        let (mut staged, operation_id) = {
+            let mut state = cell
+                .lock()
+                .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+            if !state.dirty || Self::in_flight_blocks_mutation(&state.in_flight) {
+                return Ok(None);
+            }
+            let Some(window) = state.publication_window.as_mut() else {
+                return Ok(None);
+            };
+            if window.uploads.len() >= MAX_DEFERRED_PREUPLOAD_BATCHES {
+                return Ok(None);
+            }
+            if window.ready_chunks.is_empty() {
+                return Ok(None);
+            }
+            let operation_id = window.operation_id.clone();
+            let mut staged = Vec::new();
+            while let Some(value) = window.ready_chunks.pop_front() {
+                staged.push(value);
+                if staged.len() >= MAX_DEFERRED_PREUPLOAD_BATCH_CHUNKS {
+                    break;
+                }
+            }
+            (staged, operation_id)
+        };
+
+        let uploaded_bytes = staged.iter().fold(0_u64, |sum, chunk| {
+            sum.saturating_add(chunk.staged.chunk.length)
+        });
+        let uploaded_chunks = staged.len();
+        let descriptor_reservation = match self
+            .write_pipeline_budget
+            .reserve_descriptors(uploaded_chunks)
+        {
+            Ok(reservation) => reservation,
+            Err(_error) => {
+                let mut state = cell
+                    .lock()
+                    .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+                if let Some(window) = state.publication_window.as_mut()
+                    && window.operation_id == operation_id
+                {
+                    for chunk in staged.into_iter().rev() {
+                        window.ready_chunks.push_front(chunk);
+                    }
+                }
+                drop(state);
+                return self.commit_inode_inside_operation(inode_id, CommitReason::DirtyBudget);
+            }
+        };
+        for chunk in &mut staged {
+            chunk
+                .staged
+                .retain_write_budget(std::slice::from_ref(&descriptor_reservation));
+        }
+        let chunks = staged
+            .iter()
+            .map(|chunk| WindowChunkObject {
+                file_offset: chunk.file_offset,
+                chunk: chunk.staged.chunk.clone(),
+            })
+            .collect::<Vec<_>>();
+        let staged_for_upload = staged
+            .iter()
+            .map(|chunk| chunk.staged.clone())
+            .collect::<Vec<_>>();
+        let upload = match self.chunk_store.put_batch_deferred(staged_for_upload) {
+            Ok(upload) => upload,
+            Err(error) => {
+                let mut state = cell
+                    .lock()
+                    .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+                if let Some(window) = state.publication_window.as_mut()
+                    && window.operation_id == operation_id
+                {
+                    for chunk in staged.into_iter().rev() {
+                        window.ready_chunks.push_front(chunk);
+                    }
+                }
+                return Err(error);
+            }
+        };
+        let mut state = cell
+            .lock()
+            .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+        let window = state
+            .publication_window
+            .as_mut()
+            .ok_or_else(|| unavailable("DFS publication window disappeared during deferred PUT"))?;
+        if window.operation_id != operation_id {
+            return Err(unavailable("DFS publication window operation changed"));
+        }
+        window.active_bytes = window.active_bytes.saturating_add(uploaded_bytes);
+        window.uploads.push(PendingPublicationUpload {
+            chunks,
+            staged,
+            upload,
+            _descriptor_reservation: descriptor_reservation,
+        });
+        window.high_water_bytes = window.high_water_bytes.max(window.buffered_bytes());
+        window.high_water_uploads = window.high_water_uploads.max(window.uploads.len());
+        tracing::info_span!(
+            "node.dfs.deferred_put.submit",
+            chunks = uploaded_chunks as u64,
+            bytes = uploaded_bytes,
+            active_bytes = window.active_bytes,
+            high_water_bytes = window.high_water_bytes,
+            active_batches = window.uploads.len() as u64,
+            high_water_uploads = window.high_water_uploads as u64,
+        )
+        .in_scope(|| {});
+        Ok(None)
+    }
+
+    fn poll_publication_window_upload(
+        window: &mut PublicationWindow,
+        dirty_extents: &mut DirtyExtentMap,
+    ) -> Result<u64> {
+        fn restore_consumed_upload(
+            window: &mut PublicationWindow,
+            index: usize,
+            staged: Vec<WindowStagedChunk>,
+        ) {
+            let _pending = window.uploads.remove(index);
+            for chunk in staged.into_iter().rev() {
+                window.ready_chunks.push_front(chunk);
+            }
+            window.active_bytes = window
+                .uploads
+                .iter()
+                .flat_map(|pending| pending.chunks.iter())
+                .fold(0_u64, |sum, chunk| sum.saturating_add(chunk.chunk.length));
+        }
+
+        let operation_id = window.operation_id.clone();
+        let mut index = 0;
+        let selected = loop {
+            if index >= window.uploads.len() {
+                return Ok(0);
+            }
+            let poll = window.uploads[index].upload.try_wait();
+            let uploaded = match poll {
+                Ok(Some(uploaded)) => uploaded,
+                Ok(None) => {
+                    index += 1;
+                    continue;
+                }
+                Err(error) => {
+                    let staged = window.uploads[index].staged.clone();
+                    restore_consumed_upload(window, index, staged);
+                    return Err(error);
+                }
+            };
+            let expected = window.uploads[index].chunks.clone();
+            let staged_for_error = window.uploads[index].staged.clone();
+            if uploaded.len() != expected.len() {
+                restore_consumed_upload(window, index, staged_for_error);
+                return Err(invalid("deferred PUT returned the wrong receipt count"));
+            }
+            let mut batch = Vec::with_capacity(expected.len());
+            for (receipt, chunk) in uploaded.into_iter().zip(expected.iter()) {
+                if receipt.operation_id != operation_id {
+                    restore_consumed_upload(window, index, staged_for_error.clone());
+                    return Err(invalid(
+                        "deferred PUT receipt operation does not match commit",
+                    ));
+                }
+                if receipt.chunk != chunk.chunk {
+                    restore_consumed_upload(window, index, staged_for_error.clone());
+                    return Err(invalid("deferred PUT receipt chunk metadata changed"));
+                }
+                batch.push((chunk.file_offset, receipt));
+            }
+            break (index, batch);
+        };
+
+        let (index, completed) = selected;
+        for (file_offset, receipt) in &completed {
+            dirty_extents.mark_uploaded(*file_offset, receipt.clone())?;
+        }
+        let pending = window.uploads.remove(index);
+        let mut descriptor_reservation = Some(pending._descriptor_reservation);
+        let retired_bytes = completed.iter().fold(0_u64, |sum, (file_offset, receipt)| {
+            window.completed.push(WindowChunkReceipt {
+                file_offset: *file_offset,
+                receipt: receipt.clone(),
+                _descriptor_reservation: descriptor_reservation.take(),
+            });
+            sum.saturating_add(receipt.chunk.length)
+        });
+        window.active_bytes = window
+            .uploads
+            .iter()
+            .flat_map(|pending| pending.chunks.iter())
+            .fold(0_u64, |sum, chunk| sum.saturating_add(chunk.chunk.length));
+        Ok(retired_bytes)
+    }
+
+    fn poll_deferred_uploads_inside_operation(&self, cell: &SharedInodeWriteState) -> Result<()> {
+        if !self.deferred_publication_enabled() {
+            return Ok(());
+        }
+        let before_budget = self.write_pipeline_budget_snapshot()?;
+        let mut state = cell
+            .lock()
+            .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+        let mut retired_bytes = 0_u64;
+        if let Some(InFlightCommit::Preparing(frozen, publication_window)) =
+            state.in_flight.as_mut()
+            && let Some(mut window) = publication_window.take()
+        {
+            let result =
+                Self::poll_publication_window_upload(&mut window, &mut frozen.dirty_extents);
+            *publication_window = Some(window);
+            retired_bytes = retired_bytes.saturating_add(result?);
+        }
+        if let Some(mut window) = state.publication_window.take() {
+            let result =
+                Self::poll_publication_window_upload(&mut window, &mut state.dirty_extents);
+            state.publication_window = Some(window);
+            retired_bytes = retired_bytes.saturating_add(result?);
+        }
+        drop(state);
+        if retired_bytes != 0 {
+            let after_budget = self.write_pipeline_budget_snapshot()?;
+            tracing::info_span!(
+                "node.dfs.deferred_put.retire_body",
+                retired_bytes,
+                normal_before = before_budget.0,
+                normal_after = after_budget.0,
+                normal_released = before_budget.0.saturating_sub(after_budget.0),
+                publisher_before = before_budget.1,
+                publisher_after = after_budget.1,
+                descriptor_bytes_before = before_budget.2,
+                descriptor_bytes_after = after_budget.2,
+                descriptors_before = before_budget.3 as u64,
+                descriptors_after = after_budget.3 as u64,
+            )
+            .in_scope(|| {});
+        }
+        Ok(())
+    }
+
+    fn join_native_uploads_for_drain(&self) -> Result<Option<Error>> {
+        let Some(pipeline) = &self.native_pipeline else {
+            return Ok(None);
+        };
+        let mut first_error = None;
+        loop {
+            if let Some(error) = self.poll_native_uploads()? {
+                first_error.get_or_insert(error);
+            }
+            if pipeline
+                .tasks
+                .lock()
+                .map_err(|_| unavailable("native upload task table is poisoned"))?
+                .is_empty()
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        Ok(first_error)
+    }
+
     /// Best-effort graceful drain. It gives a clean Node shutdown a chance to
     /// publish dirty state, while an abrupt crash is still allowed to recover
     /// only the last committed FileVersion.
     pub fn drain(&self) -> Result<usize> {
-        let inode_ids = self
-            .inode_writes
-            .lock()
-            .map_err(|_| unavailable("DFS inode write table is poisoned"))?
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut committed = 0;
-        for inode_id in inode_ids {
-            if let Some(seq) = self.commit_inode(&inode_id, CommitReason::NodeDrain)? {
-                self.update_handles_after_commit(&inode_id, seq)?;
-                committed += 1;
+        // Harvest existing Node-wide tasks before per-inode preparation can
+        // consume a different owner's error. Node shutdown has closed admission.
+        let mut join_error = self.join_native_uploads_for_drain()?;
+        let result = (|| -> Result<usize> {
+            let inode_ids = self.inode_writes.keys_snapshot()?;
+            let mut committed = 0;
+            for inode_id in inode_ids {
+                loop {
+                    let target_seq = self
+                        .write_state(&inode_id)?
+                        .ok_or_else(|| stale("DFS write state is no longer open"))?
+                        .lock()
+                        .map_err(|_| unavailable("DFS inode write state is poisoned"))?
+                        .visible_write_seq;
+                    let synced_seq = self
+                        .write_state(&inode_id)?
+                        .ok_or_else(|| stale("DFS write state is no longer open"))?
+                        .lock()
+                        .map_err(|_| unavailable("DFS inode write state is poisoned"))?
+                        .committed_write_seq;
+                    if synced_seq >= target_seq {
+                        break;
+                    }
+                    if let Some(seq) = self.commit_inode(&inode_id, CommitReason::NodeDrain)? {
+                        self.update_handles_after_commit(&inode_id, seq)?;
+                        committed += 1;
+                    } else {
+                        return Err(unavailable(
+                            "DFS drain made no progress toward the accepted write sequence",
+                        ));
+                    }
+                }
             }
+            if let Ok((normal_bytes, publisher_bytes, descriptor_bytes, descriptors)) =
+                self.write_pipeline_budget_snapshot()
+            {
+                tracing::info_span!(
+                    "node.dfs.deferred_put.drain_budget",
+                    normal_bytes,
+                    publisher_bytes,
+                    descriptor_bytes,
+                    descriptors = descriptors as u64,
+                )
+                .in_scope(|| {});
+            }
+            Ok(committed)
+        })();
+        if let Some(error) = self.join_native_uploads_for_drain()? {
+            join_error.get_or_insert(error);
         }
-        Ok(committed)
+        match result {
+            Err(error) => Err(error),
+            Ok(value) => match join_error {
+                Some(error) => Err(error),
+                None => Ok(value),
+            },
+        }
     }
 
     fn record_background_error(&self, inode_id: &InodeId, error: Error) -> Result<()> {
@@ -3871,6 +8576,11 @@ impl DistributedFs {
             .background_error
             .as_ref()
             .map_or(1, |previous| previous.cursor.saturating_add(1));
+        afs_logging::warn!("dfs.background_error_recorded";
+            "inode_id" => inode_id.0.as_str(),
+            "cursor" => cursor,
+            "error" => error.to_string()
+        );
         state.background_error = Some(ObservedWriteError { cursor, error });
         Ok(())
     }
@@ -3878,61 +8588,529 @@ impl DistributedFs {
 
 #[derive(Clone)]
 struct DfsFileHandleSnapshot {
+    handle: Arc<DfsHandle>,
     inode_id: InodeId,
-    opened_inode: InodeRecord,
+    opened_inode: Arc<InodeRecord>,
+    native_read_view: Option<NativeReadView>,
+    native_read_generation: u64,
+    native_denial_serial: u64,
     write_session: Option<DfsRemoteWriteSession>,
     flags: i32,
     owner_scope: Option<DfsOwnerHandleScope>,
 }
 
-impl From<&DfsFileHandle> for DfsFileHandleSnapshot {
-    fn from(handle: &DfsFileHandle) -> Self {
-        Self {
+impl DfsFileHandleSnapshot {
+    fn from_handle(handle: &Arc<DfsHandle>) -> Result<Self> {
+        let state = handle
+            .state
+            .lock()
+            .map_err(|_| unavailable("DFS handle state is poisoned"))?;
+        if handle.closed.load(Ordering::Acquire) {
+            return Err(stale("DFS file handle is no longer open"));
+        }
+        Ok(Self {
+            handle: handle.clone(),
             inode_id: handle.inode_id.clone(),
-            opened_inode: handle.opened_inode.clone(),
-            write_session: handle.write_session.clone(),
+            opened_inode: state.opened_inode.clone(),
+            native_read_view: state.native_read_view.clone(),
+            native_read_generation: state.native_read_generation,
+            native_denial_serial: state.native_denial_serial,
+            write_session: state.write_session.clone(),
             flags: handle.flags,
             owner_scope: handle.owner_scope.clone(),
-        }
+        })
+    }
+}
+
+fn account_arc_bytes(seen: &mut HashSet<usize>, data: &SharedChunkBytes) -> u64 {
+    if data.capacity() == 0 {
+        return 0;
+    }
+    let key = data.allocation_id() as usize;
+    if seen.insert(key) {
+        data.capacity() as u64
+    } else {
+        0
     }
 }
 
 impl DirtyExtentMap {
+    fn native_selection(
+        &self,
+        position: u64,
+        logical_length: u64,
+    ) -> Option<(usize, usize, usize)> {
+        let latest = self
+            .extents
+            .range(..=position)
+            .next_back()
+            .map(|(_, extent)| extent)
+            .filter(|extent| position < extent.file_offset + extent.length);
+        if let Some(extent) = latest
+            && let Some(index) = extent.builder
+        {
+            return Some((
+                index,
+                extent.source_offset + (position - extent.file_offset) as usize,
+                (extent.native_reuse_end - position) as usize,
+            ));
+        }
+        if position >= logical_length {
+            return self
+                .append_builders
+                .get(&position)
+                .and_then(|indices| indices.last())
+                .map(|(_, index)| {
+                    let entry = &self.builders[*index];
+                    (
+                        *index,
+                        entry.builder.len(),
+                        entry.builder.writable_capacity() - entry.builder.len(),
+                    )
+                });
+        }
+        None
+    }
+
+    fn native_capacity(position: u64, remaining: usize, logical_length: u64) -> usize {
+        if position >= logical_length {
+            COMMIT_CHUNK_BYTES as usize
+        } else {
+            remaining
+                .min(COMMIT_CHUNK_BYTES as usize)
+                .max(4096)
+                .next_power_of_two()
+        }
+    }
+
+    fn write_native_prepared(
+        &mut self,
+        position: u64,
+        data: &[u8],
+        write_seq: u64,
+        selection: Option<(usize, usize, usize)>,
+        prepared: Option<ChunkBuilder>,
+        descriptor: Option<Arc<Mutex<NativeMetadataLease>>>,
+    ) -> Result<usize> {
+        self.promote_native();
+        let (index, source_offset, available) = if let Some(selection) = selection {
+            selection
+        } else {
+            let builder =
+                prepared.ok_or_else(|| unavailable("native write has no admitted builder"))?;
+            let capacity = builder.writable_capacity();
+            let index = self
+                .builders
+                .iter()
+                .position(|entry| {
+                    entry.builder.writable_capacity() == 0 && entry.descriptor.is_none()
+                })
+                .unwrap_or(self.builders.len());
+            let creation_order = self.next_builder_order;
+            self.next_builder_order = self
+                .next_builder_order
+                .checked_add(1)
+                .ok_or_else(file_too_large)?;
+            let entry = NativeDirtyBuilder {
+                file_offset: position,
+                builder,
+                descriptor,
+                creation_order,
+            };
+            if index == self.builders.len() {
+                self.builders.push(entry);
+            } else {
+                self.builders[index] = entry;
+            }
+            (index, 0, capacity)
+        };
+        let take = available.min(data.len());
+        let previous_end =
+            self.builders[index].file_offset + self.builders[index].builder.len() as u64;
+        self.builders[index]
+            .builder
+            .write_at(source_offset as u64, &data[..take])?;
+        self.update_append_builder(index, Some(previous_end));
+        self.insert_native(DirtyExtent {
+            file_offset: position,
+            length: take as u64,
+            write_seq,
+            data: None,
+            builder: Some(index),
+            source_offset,
+            native_reuse_end: position + take as u64,
+            uploaded: None,
+            native_upload: None,
+            native_descriptor: self.builders[index].descriptor.clone(),
+            budget_reservations: Vec::new(),
+        });
+        let admitted = self.native_admitted_bytes.get_or_insert(0);
+        *admitted = admitted.saturating_add(take as u64);
+        Ok(take)
+    }
+
+    fn iter_extents(&self) -> impl DoubleEndedIterator<Item = &DirtyExtent> {
+        self.extents.values().chain(self.legacy_extents.iter())
+    }
+
+    fn iter_extents_mut(&mut self) -> impl Iterator<Item = &mut DirtyExtent> {
+        self.extents
+            .values_mut()
+            .chain(self.legacy_extents.iter_mut())
+    }
+
+    fn range_start(&self, offset: u64) -> u64 {
+        self.extents
+            .range(..=offset)
+            .next_back()
+            .map_or(offset, |(start, extent)| {
+                if extent.file_offset + extent.length > offset {
+                    *start
+                } else {
+                    offset
+                }
+            })
+    }
+
+    fn intersecting_extents(&self, offset: u64, end: u64) -> impl Iterator<Item = &DirtyExtent> {
+        self.extents
+            .range(self.range_start(offset)..end)
+            .map(|(_, extent)| extent)
+            .chain(self.legacy_extents.iter().filter(move |extent| {
+                extent.file_offset < end && offset < extent.file_offset + extent.length
+            }))
+    }
+
+    // Caller has already checked the new extent's endpoint. Only the two
+    // boundary fragments survive; masked owners are dropped without touching
+    // immutable snapshots, frozen batches or asynchronous holders.
+    fn insert_native(&mut self, extent: DirtyExtent) {
+        let start = extent.file_offset;
+        let end = start + extent.length;
+        if start == end {
+            return;
+        }
+        let keys = self
+            .extents
+            .range(self.range_start(start)..end)
+            .map(|(key, _)| *key)
+            .collect::<Vec<_>>();
+        for key in keys {
+            let Some(previous) = self.extents.remove(&key) else {
+                continue;
+            };
+            let previous_end = previous.file_offset + previous.length;
+            if previous.file_offset < start {
+                let mut left = previous.clone();
+                left.length = start - previous.file_offset;
+                self.extents.insert(left.file_offset, left);
+            }
+            if previous_end > end {
+                let mut right = previous;
+                if right.data.is_some()
+                    || right.builder.is_some()
+                    || right.uploaded.is_some()
+                    || right.native_upload.is_some()
+                {
+                    right.source_offset += (end - right.file_offset) as usize;
+                }
+                right.file_offset = end;
+                right.length = previous_end - end;
+                self.extents.insert(end, right);
+            }
+        }
+        self.extents.insert(start, extent);
+    }
+
+    fn update_append_builder(&mut self, index: usize, previous_end: Option<u64>) {
+        if let Some(end) = previous_end
+            && let Some(indices) = self.append_builders.get_mut(&end)
+        {
+            indices.remove(&(self.builders[index].creation_order, index));
+            if indices.is_empty() {
+                self.append_builders.remove(&end);
+            }
+        }
+        let entry = &self.builders[index];
+        if entry.builder.len() < entry.builder.writable_capacity() {
+            self.append_builders
+                .entry(entry.file_offset + entry.builder.len() as u64)
+                .or_default()
+                .insert((entry.creation_order, index));
+        }
+    }
+
+    fn promote_native(&mut self) {
+        if self.native_admitted_bytes.is_none() {
+            self.native_admitted_bytes = Some(0);
+            // A truncate-only map can precede its first native write. Its hole
+            // tombstones move into the index without changing their order.
+            for extent in std::mem::take(&mut self.legacy_extents) {
+                self.insert_native(extent);
+            }
+        }
+    }
+
+    fn write_native_at(
+        &mut self,
+        offset: u64,
+        data: &[u8],
+        write_seq: u64,
+        pool: &Arc<WriteBufferPool>,
+        logical_length: u64,
+    ) -> Result<usize> {
+        offset
+            .checked_add(data.len() as u64)
+            .ok_or_else(file_too_large)?;
+        self.promote_native();
+        let mut accepted = 0;
+        while accepted < data.len() {
+            let position = offset + accepted as u64;
+            let latest = self
+                .extents
+                .range(..=position)
+                .next_back()
+                .map(|(_, extent)| extent)
+                .filter(|extent| position < extent.file_offset + extent.length);
+            let existing = latest.and_then(|extent| {
+                extent.builder.map(|index| {
+                    let source = extent.source_offset + (position - extent.file_offset) as usize;
+                    (index, source, (extent.native_reuse_end - position) as usize)
+                })
+            });
+            let append = if existing.is_none() && position >= logical_length {
+                self.append_builders
+                    .get(&position)
+                    .and_then(|indices| indices.last())
+                    .map(|(_, index)| {
+                        let entry = &self.builders[*index];
+                        let length = entry.builder.len();
+                        (*index, length, entry.builder.writable_capacity() - length)
+                    })
+            } else {
+                None
+            };
+            let (index, source_offset, available) = if let Some(existing) = existing.or(append) {
+                existing
+            } else {
+                let remaining = data.len() - accepted;
+                let capacity = if position >= logical_length {
+                    COMMIT_CHUNK_BYTES as usize
+                } else {
+                    remaining
+                        .min(COMMIT_CHUNK_BYTES as usize)
+                        .max(4096)
+                        .next_power_of_two()
+                };
+                let builder = match ChunkBuilder::with_pool(pool.clone(), capacity) {
+                    Ok(builder) => builder,
+                    Err(_error) if accepted > 0 => return Ok(accepted),
+                    Err(error) => return Err(error),
+                };
+                let index = self.builders.len();
+                self.builders.push(NativeDirtyBuilder {
+                    file_offset: position,
+                    builder,
+                    descriptor: None,
+                    creation_order: index as u64,
+                });
+                (index, 0, capacity)
+            };
+            let take = available.min(data.len() - accepted);
+            let previous_end =
+                self.builders[index].file_offset + self.builders[index].builder.len() as u64;
+            self.builders[index]
+                .builder
+                .write_at(source_offset as u64, &data[accepted..accepted + take])?;
+            self.update_append_builder(index, Some(previous_end));
+            self.insert_native(DirtyExtent {
+                file_offset: position,
+                length: take as u64,
+                write_seq,
+                data: None,
+                builder: Some(index),
+                source_offset,
+                native_reuse_end: position + take as u64,
+                uploaded: None,
+                native_upload: None,
+                native_descriptor: None,
+                budget_reservations: Vec::new(),
+            });
+            let admitted = self.native_admitted_bytes.get_or_insert(0);
+            *admitted = admitted.saturating_add(take as u64);
+            accepted += take;
+        }
+        Ok(accepted)
+    }
+
+    // Consuming builders is the only path that exposes their allocation to
+    // asynchronous holders. No writable alias survives this transition.
+    fn freeze_builders(&mut self) {
+        let bodies = std::mem::take(&mut self.builders)
+            .into_iter()
+            .map(|entry| entry.builder.freeze())
+            .collect::<Vec<_>>();
+        self.append_builders.clear();
+        for extent in self.iter_extents_mut() {
+            if let Some(index) = extent.builder.take() {
+                extent.data = Some(bodies[index].clone());
+            }
+        }
+    }
+
+    // Called while the inode mutex is held. Copy only bytes intersecting this
+    // read; a later write may mutate its builder while network reads run.
+    fn snapshot_range(&self, offset: u64, length: usize) -> Result<Self> {
+        let end = offset
+            .checked_add(length as u64)
+            .ok_or_else(|| invalid("dirty snapshot range overflow"))?;
+        let mut snapshot = Self {
+            native_admitted_bytes: self.native_admitted_bytes.map(|_| 0),
+            ..Self::default()
+        };
+        for extent in self.intersecting_extents(offset, end) {
+            let start = offset.max(extent.file_offset);
+            let stop = end.min(
+                extent
+                    .file_offset
+                    .checked_add(extent.length)
+                    .ok_or_else(|| invalid("dirty snapshot extent overflow"))?,
+            );
+            if start >= stop {
+                continue;
+            }
+            let mut copied = extent.clone();
+            copied.file_offset = start;
+            copied.length = stop - start;
+            let source = extent.source_offset
+                + usize::try_from(start - extent.file_offset)
+                    .map_err(|_| invalid("dirty snapshot source overflow"))?;
+            if let Some(index) = extent.builder {
+                let bytes = &self.builders[index].builder.as_bytes();
+                // Holes installed by truncate can mask an obsolete tail. Do not
+                // even read that tail into the snapshot before applying holes.
+                let available = bytes
+                    .len()
+                    .saturating_sub(source)
+                    .min(copied.length as usize);
+                let mut body = vec![0; copied.length as usize];
+                if available > 0 {
+                    body[..available].copy_from_slice(&bytes[source..source + available]);
+                }
+                tracing::info_span!(
+                    "node.dfs.write_buffer.read_snapshot_copy",
+                    bytes = available as u64
+                )
+                .in_scope(|| {});
+                copied.data = Some(SharedChunkBytes::from_vec(body));
+                copied.source_offset = 0;
+                copied.builder = None;
+            } else {
+                copied.source_offset = source;
+            }
+            if self.native_admitted_bytes.is_some() {
+                snapshot.extents.insert(copied.file_offset, copied);
+            } else {
+                snapshot.legacy_extents.push(copied);
+            }
+        }
+        Ok(snapshot)
+    }
+
     fn write_at(&mut self, offset: u64, data: &[u8], write_seq: u64) -> Result<usize> {
         let _ = usize::try_from(offset).map_err(|_| invalid("write offset is too large"))?;
         if !data.is_empty() {
-            self.extents.push(DirtyExtent {
+            self.legacy_extents.push(DirtyExtent {
                 file_offset: offset,
                 length: data.len() as u64,
                 write_seq,
-                data: Some(Arc::from(data)),
+                data: Some(SharedChunkBytes::from_vec(data.to_vec())),
+                builder: None,
+                source_offset: 0,
+                native_reuse_end: 0,
+                uploaded: None,
+                native_upload: None,
+                native_descriptor: None,
+                budget_reservations: Vec::new(),
             });
         }
         Ok(data.len())
     }
 
+    fn retain_write_budget(&mut self, write_seq: u64, reservations: &[WriteBudgetReservation]) {
+        for extent in self.iter_extents_mut() {
+            if extent.write_seq == write_seq && extent.data.is_some() {
+                extent.budget_reservations.extend_from_slice(reservations);
+            }
+        }
+    }
+
     fn resize(&mut self, old_length: u64, new_length: u64, write_seq: u64) -> Result<()> {
+        if new_length < old_length {
+            for entry in &mut self.builders {
+                let keep = new_length
+                    .saturating_sub(entry.file_offset)
+                    .min(entry.builder.len() as u64) as usize;
+                entry.builder.truncate(keep);
+            }
+            self.append_builders.clear();
+            for index in 0..self.builders.len() {
+                self.update_append_builder(index, None);
+            }
+            for extent in self.iter_extents_mut() {
+                if extent.builder.is_some() {
+                    extent.length = extent
+                        .length
+                        .min(new_length.saturating_sub(extent.file_offset));
+                    extent.native_reuse_end = extent.native_reuse_end.min(new_length);
+                }
+            }
+            self.extents.retain(|_, extent| extent.length > 0);
+            self.legacy_extents.retain(|extent| extent.length > 0);
+        }
         let (start, stop) = if new_length < old_length {
             (new_length, old_length)
         } else {
             (old_length, new_length)
         };
         if start < stop {
-            self.extents.push(DirtyExtent {
+            let hole = DirtyExtent {
                 file_offset: start,
                 length: stop - start,
                 write_seq,
                 data: None,
-            });
+                builder: None,
+                source_offset: 0,
+                native_reuse_end: 0,
+                uploaded: None,
+                native_upload: None,
+                native_descriptor: None,
+                budget_reservations: Vec::new(),
+            };
+            if self.native_admitted_bytes.is_some() {
+                self.insert_native(hole);
+            } else {
+                self.legacy_extents.push(hole);
+            }
         }
         Ok(())
     }
 
+    #[cfg(test)]
     fn overlay(&self, offset: u64, out: &mut [u8]) -> Result<()> {
+        self.overlay_native(offset, out, None)
+    }
+
+    fn overlay_native(
+        &self,
+        offset: u64,
+        out: &mut [u8],
+        store: Option<&dyn ChunkStore>,
+    ) -> Result<()> {
         let end = offset
             .checked_add(out.len() as u64)
             .ok_or_else(|| invalid("dirty read range overflow"))?;
-        for extent in &self.extents {
+        for extent in self.intersecting_extents(offset, end) {
             let extent_end = extent
                 .file_offset
                 .checked_add(extent.length)
@@ -3946,12 +9124,29 @@ impl DirtyExtentMap {
                 .map_err(|_| invalid("dirty output offset is too large"))?;
             let length = usize::try_from(stop - start)
                 .map_err(|_| invalid("dirty overlay length is too large"))?;
+            if let Some(upload) = &extent.native_upload {
+                let store = store
+                    .ok_or_else(|| unavailable("native uploaded read requires its local store"))?;
+                let source = extent.source_offset as u64 + start - extent.file_offset;
+                if upload.read_at(store, source, &mut out[output_start..output_start + length])?
+                    != length
+                {
+                    return Err(unavailable("native uploaded local read ended early"));
+                }
+                continue;
+            }
             match &extent.data {
                 Some(data) => {
-                    let data_start = usize::try_from(start - extent.file_offset)
-                        .map_err(|_| invalid("dirty data offset is too large"))?;
+                    let data_start = extent.source_offset
+                        + usize::try_from(start - extent.file_offset)
+                            .map_err(|_| invalid("dirty data offset is too large"))?;
                     out[output_start..output_start + length]
                         .copy_from_slice(&data[data_start..data_start + length]);
+                }
+                None if extent.uploaded.is_some() => {
+                    return Err(unavailable(
+                        "DFS uploaded dirty extent must be published before local read",
+                    ));
                 }
                 None => out[output_start..output_start + length].fill(0),
             }
@@ -3960,20 +9155,203 @@ impl DirtyExtentMap {
     }
 
     fn restore_before(&mut self, mut older: DirtyExtentMap) {
-        older.extents.append(&mut self.extents);
-        older.extents.sort_by_key(|extent| extent.write_seq);
-        self.extents = older.extents;
+        if self.native_operation_id.is_none() {
+            self.native_operation_id = older.native_operation_id.take();
+        }
+        // The restored batch has already frozen its owners. Mutable builder
+        // indices belong only to the active map and must never be renumbered.
+        if older.native_admitted_bytes.is_some() || self.native_admitted_bytes.is_some() {
+            let mut ordered = std::mem::take(&mut older.extents)
+                .into_values()
+                .chain(std::mem::take(&mut older.legacy_extents))
+                .chain(std::mem::take(&mut self.extents).into_values())
+                .chain(std::mem::take(&mut self.legacy_extents))
+                .collect::<Vec<_>>();
+            ordered.sort_by_key(|extent| extent.write_seq);
+            for extent in ordered {
+                self.insert_native(extent);
+            }
+        } else {
+            older.legacy_extents.append(&mut self.legacy_extents);
+            older.legacy_extents.sort_by_key(|extent| extent.write_seq);
+            self.legacy_extents = older.legacy_extents;
+        }
+        self.native_admitted_bytes = match (older.native_admitted_bytes, self.native_admitted_bytes)
+        {
+            (None, None) => None,
+            (left, right) => Some(left.unwrap_or(0).saturating_add(right.unwrap_or(0))),
+        };
+    }
+
+    fn replace_range_with_shared(
+        &mut self,
+        offset: u64,
+        data: SharedChunkBytes,
+        write_seq: u64,
+        budget_reservations: Vec<WriteBudgetReservation>,
+    ) -> Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        let end = offset
+            .checked_add(data.len() as u64)
+            .ok_or_else(|| invalid("dirty shared replacement range overflow"))?;
+        let mut rebuilt = Vec::with_capacity(self.legacy_extents.len().saturating_add(1));
+        for extent in self.legacy_extents.drain(..) {
+            let extent_end = extent
+                .file_offset
+                .checked_add(extent.length)
+                .ok_or_else(|| invalid("dirty extent range overflow"))?;
+            if extent_end <= offset || extent.file_offset >= end {
+                rebuilt.push(extent);
+                continue;
+            }
+            if extent.uploaded.is_some() {
+                return Err(unavailable(
+                    "DFS uploaded dirty extent must be published before overlapping replacement",
+                ));
+            }
+            if extent.file_offset < offset {
+                let left_len = offset - extent.file_offset;
+                let left_data = extent.data.as_ref().map(|bytes| {
+                    let len = usize::try_from(left_len).unwrap_or(bytes.len());
+                    bytes.slice(extent.source_offset..extent.source_offset + len)
+                });
+                rebuilt.push(DirtyExtent {
+                    file_offset: extent.file_offset,
+                    length: left_len,
+                    write_seq: extent.write_seq,
+                    data: left_data,
+                    builder: None,
+                    source_offset: 0,
+                    native_reuse_end: 0,
+                    uploaded: None,
+                    native_upload: None,
+                    native_descriptor: None,
+                    budget_reservations: extent.budget_reservations.clone(),
+                });
+            }
+            if extent_end > end {
+                let right_offset = end;
+                let right_len = extent_end - end;
+                let right_data = extent.data.as_ref().map(|bytes| {
+                    let start = usize::try_from(end - extent.file_offset).unwrap_or(bytes.len());
+                    bytes.slice(
+                        extent.source_offset + start..extent.source_offset + extent.length as usize,
+                    )
+                });
+                rebuilt.push(DirtyExtent {
+                    file_offset: right_offset,
+                    length: right_len,
+                    write_seq: extent.write_seq,
+                    data: right_data,
+                    builder: None,
+                    source_offset: 0,
+                    native_reuse_end: 0,
+                    uploaded: None,
+                    native_upload: None,
+                    native_descriptor: None,
+                    budget_reservations: extent.budget_reservations.clone(),
+                });
+            }
+        }
+        rebuilt.push(DirtyExtent {
+            file_offset: offset,
+            length: data.len() as u64,
+            write_seq,
+            data: Some(data),
+            builder: None,
+            source_offset: 0,
+            native_reuse_end: 0,
+            uploaded: None,
+            native_upload: None,
+            native_descriptor: None,
+            budget_reservations,
+        });
+        rebuilt.sort_by_key(|extent| (extent.write_seq, extent.file_offset));
+        self.legacy_extents = rebuilt;
+        Ok(())
+    }
+
+    fn mark_uploaded(&mut self, file_offset: u64, receipt: ChunkReceipt) -> Result<()> {
+        let length = receipt.chunk.length;
+        let stop = file_offset
+            .checked_add(length)
+            .ok_or_else(|| invalid("uploaded dirty extent range overflow"))?;
+        let mut matched = None;
+        let mut already_uploaded = false;
+        for (index, extent) in self.legacy_extents.iter().enumerate() {
+            let extent_stop = extent
+                .file_offset
+                .checked_add(extent.length)
+                .ok_or_else(|| invalid("dirty extent range overflow"))?;
+            if extent.file_offset == file_offset && extent_stop == stop {
+                if extent.data.is_none() && extent.uploaded.is_some() {
+                    if matched.is_none() {
+                        matched = Some(index);
+                        already_uploaded = true;
+                    }
+                    continue;
+                }
+                if extent.data.is_none() {
+                    return Err(invalid(
+                        "uploaded dirty extent matched a sparse hole instead of buffered data",
+                    ));
+                }
+                matched = Some(index);
+                already_uploaded = false;
+                continue;
+            }
+            if file_offset < extent_stop && extent.file_offset < stop {
+                return Err(unavailable(
+                    "uploaded dirty extent does not align with the buffered dirty payload",
+                ));
+            }
+        }
+        let Some(index) = matched else {
+            return Err(unavailable(
+                "uploaded dirty extent has no matching buffered dirty payload",
+            ));
+        };
+        if already_uploaded {
+            return Ok(());
+        }
+        let extent = &mut self.legacy_extents[index];
+        extent.data = None;
+        extent.budget_reservations.clear();
+        extent.uploaded = Some(UploadedDirtyExtent {
+            chunk: receipt.chunk.clone(),
+            receipt,
+        });
+        Ok(())
     }
 
     fn dirty_data_bytes(&self) -> u64 {
-        self.extents
-            .iter()
-            .filter(|extent| extent.data.is_some())
+        if let Some(accepted) = self.native_admitted_bytes {
+            return accepted;
+        }
+        self.iter_extents()
+            .filter(|extent| {
+                extent.data.is_some()
+                    || extent
+                        .uploaded
+                        .as_ref()
+                        .is_some_and(|uploaded| uploaded.chunk == uploaded.receipt.chunk)
+            })
             .fold(0u64, |total, extent| total.saturating_add(extent.length))
     }
 
+    fn reserved_data_bytes(&self, seen: &mut HashSet<usize>) -> u64 {
+        self.iter_extents().fold(0_u64, |total, extent| {
+            let Some(data) = &extent.data else {
+                return total;
+            };
+            total.saturating_add(account_arc_bytes(seen, data))
+        })
+    }
+
     fn is_empty(&self) -> bool {
-        self.extents.is_empty()
+        self.extents.is_empty() && self.legacy_extents.is_empty()
     }
 }
 
@@ -3997,6 +9375,102 @@ impl CommitPlanner {
             extents = subtract_range(extents, segment.file_offset, segment.length)?;
         }
 
+        if frozen.dirty_extents.native_admitted_bytes.is_some() {
+            let mut visible_sources: HashMap<(u64, usize, usize), Vec<(usize, usize)>> =
+                HashMap::new();
+            for segment in &overlay {
+                let Some((bytes, source_offset)) = &segment.data else {
+                    continue;
+                };
+                let length = usize::try_from(segment.length)
+                    .map_err(|_| invalid("native source range is too large"))?;
+                let end = source_offset
+                    .checked_add(length)
+                    .filter(|end| *end <= bytes.len())
+                    .ok_or_else(|| invalid("native source range exceeds immutable body"))?;
+                let identity = (bytes.allocation_id(), bytes.as_ptr() as usize, bytes.len());
+                visible_sources
+                    .entry(identity)
+                    .or_default()
+                    .push((*source_offset, end));
+            }
+            for ranges in visible_sources.values_mut() {
+                ranges.sort_unstable();
+                let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+                for (start, end) in ranges.drain(..) {
+                    if let Some(previous) = merged.last_mut()
+                        && start <= previous.1
+                    {
+                        previous.1 = previous.1.max(end);
+                    } else {
+                        merged.push((start, end));
+                    }
+                }
+                *ranges = merged;
+            }
+            let mut staged_chunks = Vec::new();
+            let mut staged_by_source = HashMap::new();
+            for segment in overlay {
+                let Some((bytes, source_offset)) = segment.data else {
+                    continue;
+                };
+                let identity = (bytes.allocation_id(), bytes.as_ptr() as usize, bytes.len());
+                let source_end = source_offset + segment.length as usize;
+                let (start, end) = visible_sources
+                    .get(&identity)
+                    .and_then(|ranges| {
+                        ranges
+                            .iter()
+                            .copied()
+                            .find(|(start, end)| *start <= source_offset && source_end <= *end)
+                    })
+                    .ok_or_else(|| invalid("native source has no final visible interval"))?;
+                // Only final visible contiguous source ranges are hashed and
+                // persisted. Restored frozen tails and overwritten interiors
+                // stay owned but never become new submitted payload bytes.
+                let key = (identity, start, end);
+                let staged_index = match staged_by_source.get(&key) {
+                    Some(index) => *index,
+                    None => {
+                        let index = staged_chunks.len();
+                        staged_chunks.push(StagedChunk::from_shared(
+                            operation_id.clone(),
+                            bytes.slice(start..end),
+                        ));
+                        staged_by_source.insert(key, index);
+                        index
+                    }
+                };
+                let staged: &StagedChunk = &staged_chunks[staged_index];
+                extents.push(Extent {
+                    file_offset: segment.file_offset,
+                    length: segment.length,
+                    chunk_id: staged.chunk.id.clone(),
+                    chunk_offset: (source_offset - start) as u64,
+                });
+            }
+            extents.sort_by_key(|extent| extent.file_offset);
+            let mut coalesced: Vec<Extent> = Vec::with_capacity(extents.len());
+            for extent in extents {
+                if let Some(previous) = coalesced.last_mut()
+                    && previous.file_offset + previous.length == extent.file_offset
+                    && previous.chunk_id == extent.chunk_id
+                    && previous.chunk_offset + previous.length == extent.chunk_offset
+                {
+                    previous.length += extent.length;
+                } else {
+                    coalesced.push(extent);
+                }
+            }
+            return Ok(CommitPlan {
+                layout_root: LayoutRoot {
+                    id: layout_id,
+                    file_length: frozen.logical_length,
+                    inline_extents: coalesced,
+                },
+                staged_chunks,
+            });
+        }
         let mut staged_chunks = Vec::new();
         let mut pending_start = None;
         let mut pending = Vec::new();
@@ -4078,8 +9552,30 @@ fn unique_staged_chunks(staged_chunks: Vec<StagedChunk>) -> Result<Vec<StagedChu
 }
 
 fn normalized_overlay(map: &DirtyExtentMap, file_length: u64) -> Result<Vec<OverlaySegment>> {
+    if map.native_admitted_bytes.is_some() {
+        return map
+            .extents
+            .values()
+            .filter(|extent| extent.file_offset < file_length && extent.length > 0)
+            .map(|extent| {
+                if extent.uploaded.is_some() {
+                    return Err(unavailable(
+                        "DFS uploaded dirty extent must use its publication receipt",
+                    ));
+                }
+                Ok(OverlaySegment {
+                    file_offset: extent.file_offset,
+                    length: extent.length.min(file_length - extent.file_offset),
+                    data: extent
+                        .data
+                        .as_ref()
+                        .map(|bytes| (bytes.clone(), extent.source_offset)),
+                })
+            })
+            .collect();
+    }
     let mut output: Vec<OverlaySegment> = Vec::new();
-    for dirty in &map.extents {
+    for dirty in &map.legacy_extents {
         if dirty.file_offset >= file_length || dirty.length == 0 {
             continue;
         }
@@ -4124,7 +9620,15 @@ fn normalized_overlay(map: &DirtyExtentMap, file_length: u64) -> Result<Vec<Over
         next.push(OverlaySegment {
             file_offset: dirty.file_offset,
             length: dirty_end - dirty.file_offset,
-            data: dirty.data.clone().map(|bytes| (bytes, 0)),
+            data: match &dirty.data {
+                Some(bytes) => Some((bytes.clone(), dirty.source_offset)),
+                None if dirty.uploaded.is_some() => {
+                    return Err(unavailable(
+                        "DFS uploaded dirty extent must use its publication receipt",
+                    ));
+                }
+                None => None,
+            },
         });
         next.sort_by_key(|segment| segment.file_offset);
         output = next;
@@ -4145,9 +9649,27 @@ fn flush_pending(
     if pending.is_empty() {
         return;
     }
+    let bytes = pending.len() as u64;
     let mut builder = ChunkBuilder::default();
-    builder.replace(std::mem::take(pending));
-    let staged = builder.stage(operation_id.clone());
+    tracing::info_span!(
+        "node.dfs.commit_planner.pending_vec_move",
+        operation_id = %operation_id.0,
+        file_offset,
+        bytes,
+    )
+    .in_scope(|| builder.replace(std::mem::take(pending)));
+    let staged = tracing::info_span!(
+        "node.dfs.commit_planner.seal",
+        operation_id = %operation_id.0,
+        file_offset,
+        bytes,
+        chunk_id = tracing::field::Empty,
+    )
+    .in_scope(|| {
+        let staged = builder.stage(operation_id.clone());
+        tracing::Span::current().record("chunk_id", staged.chunk.id.0.as_str());
+        staged
+    });
     extents.push(Extent {
         file_offset,
         length: staged.chunk.length,
@@ -4232,6 +9754,31 @@ impl DistributedFs {
         let count = reply.data.len().min(out.len());
         out[..count].copy_from_slice(&reply.data[..count]);
         Ok(count)
+    }
+
+    fn remote_read_owned(
+        &self,
+        provider: &RemoteDfsProviderIo,
+        offset: u64,
+        length: usize,
+    ) -> Result<Vec<u8>> {
+        self.read_engine.validate_native_read_size(length)?;
+        if length == 0 {
+            return Ok(Vec::new());
+        }
+        let remote = &provider.remote;
+        let handle = remote.read_handle.as_ref().unwrap_or(&remote.handle);
+        let reply = remote
+            .owner
+            .read(afs_protocol::node_data::DfsOwnerReadRequest {
+                handle: Some(Self::data_owner_handle(handle)),
+                offset,
+                length: length as u64,
+            })?;
+        if reply.data.len() > length {
+            return Err(invalid("DFS owner read returned more bytes than requested"));
+        }
+        Ok(reply.data)
     }
 
     fn remote_getattr(&self, provider: &RemoteDfsProviderIo) -> Result<FileAttributes> {
@@ -4756,7 +10303,7 @@ impl DistributedFs {
 
     fn current_remote_provider(&self, inode_id: &InodeId) -> Result<Option<RemoteDfsWriteSession>> {
         self.remote_inode_providers
-            .lock()
+            .read(inode_id)
             .map_err(|_| unavailable("DFS remote owner table is poisoned"))
             .map(|providers| providers.get(inode_id).cloned())
     }
@@ -4767,14 +10314,19 @@ impl DistributedFs {
         released: &RemoteDfsWriteSession,
         preferred: Option<&RemoteDfsWriteSession>,
     ) -> Result<Option<RemoteDfsWriteSession>> {
-        let handles = self
-            .handles
-            .lock()
-            .map_err(|_| unavailable("DFS handle table is poisoned"))?;
+        let handles = self.handles.for_inode(inode_id)?;
+        let snapshots = handles
+            .iter()
+            .filter_map(|handle| match DfsFileHandleSnapshot::from_handle(handle) {
+                Ok(snapshot) => Some(Ok(snapshot)),
+                Err(error) if error.code() == afs_error::NODE_DFS_STALE_HANDLE => None,
+                Err(error) => Some(Err(error)),
+            })
+            .collect::<Result<Vec<_>>>()?;
         if let Some(preferred) = preferred
             && !Self::same_remote_provider(preferred, released)
             && preferred.lifecycle.is_live()?
-            && handles.values().any(|handle| {
+            && snapshots.iter().any(|handle| {
                 handle.inode_id == *inode_id
                     && handle
                         .write_session
@@ -4785,8 +10337,8 @@ impl DistributedFs {
         {
             return Ok(Some(preferred.clone()));
         }
-        for handle in handles
-            .values()
+        for handle in snapshots
+            .iter()
             .filter(|handle| handle.inode_id == *inode_id)
         {
             let Some(remote) = handle
@@ -4812,7 +10364,7 @@ impl DistributedFs {
         let replacement = self.replacement_remote_provider(inode_id, released, preferred)?;
         let mut providers = self
             .remote_inode_providers
-            .lock()
+            .write(inode_id)
             .map_err(|_| unavailable("DFS remote owner table is poisoned"))?;
         if providers
             .get(inode_id)
@@ -4827,6 +10379,8 @@ impl DistributedFs {
                 providers.remove(inode_id);
             }
         }
+        drop(providers);
+        self.handles.mark_dynamic(inode_id)?;
         Ok(())
     }
 
@@ -5284,6 +10838,18 @@ impl CommitReason {
 }
 
 impl Backend for DistributedFs {
+    fn page_cache_identity(&self, handle: FileHandle) -> Option<PageCacheIdentity> {
+        let opened = self.native_read_capability(handle)?;
+        let state = opened.state.lock().ok()?;
+        self.check_native_read_view(state.native_read_view.as_ref()?)
+            .ok()?;
+        state.opened_page_identity.clone()
+    }
+
+    fn supports_parallel_reads(&self, handle: FileHandle) -> bool {
+        self.native_read_capability(handle).is_some()
+    }
+
     fn root_inode(&self) -> BackendInode {
         BackendInode { value: ROOT_INODE }
     }
@@ -5568,13 +11134,7 @@ impl Backend for DistributedFs {
             }
             return Ok(());
         }
-        let authorities = self
-            .lock_authorities
-            .lock()
-            .map_err(|_| unavailable("DFS lock authority table is poisoned"))?
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
+        let authorities = self.lock_authorities.values_snapshot()?;
         let mut last_error = None;
         for authority in authorities {
             match authority
@@ -5651,13 +11211,7 @@ impl Backend for DistributedFs {
         let scoped_session = Self::lock_scope(&self.node_id, &self.session_id, ingress_session_id)?;
         let ingress_session_id = scoped_session.as_str();
         self.note_closed_lock_session(ingress_session_id)?;
-        let authorities = self
-            .lock_authorities
-            .lock()
-            .map_err(|_| unavailable("DFS lock authority table is poisoned"))?
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
+        let authorities = self.lock_authorities.values_snapshot()?;
         let mut errors = Vec::new();
         for authority in authorities {
             if let Err(error) = authority
@@ -5735,16 +11289,37 @@ impl Backend for DistributedFs {
         if let Some(handle) = handle {
             let snapshot = self.handle_snapshot(handle)?;
             if let Some(remote) = self.remote_provider_visible_for_reads(&snapshot.inode_id)? {
-                return self.remote_getattr(&remote);
+                return self.remote_getattr(&remote).inspect_err(|error| {
+                    self.invalidate_native_inode_views_on_error(&snapshot.inode_id, error);
+                });
             }
-            let record = self.observe_inode_record(self.meta.get_inode(&snapshot.inode_id)?)?;
+            let observed = self
+                .meta
+                .get_inode(&snapshot.inode_id)
+                .inspect_err(|error| {
+                    self.invalidate_native_inode_views_on_error(&snapshot.inode_id, error);
+                })?;
+            if self.read_engine.has_external_backend() {
+                let record = self.refresh_inode_record(observed, true, true)?;
+                return self.visible_attributes(&record);
+            }
+            let record = self.observe_inode_record(observed)?;
             return self.visible_attributes_with_observed_inode(&snapshot.opened_inode, &record);
         }
         let inode_id = self.inode_id(inode)?;
         if let Some(remote) = self.remote_provider_visible_for_reads(&inode_id)? {
-            return self.remote_getattr(&remote);
+            return self.remote_getattr(&remote).inspect_err(|error| {
+                self.invalidate_native_inode_views_on_error(&inode_id, error);
+            });
         }
-        let record = self.observe_inode_record(self.meta.get_inode(&inode_id)?)?;
+        let observed = self.meta.get_inode(&inode_id).inspect_err(|error| {
+            self.invalidate_native_inode_views_on_error(&inode_id, error);
+        })?;
+        let record = if self.read_engine.has_external_backend() {
+            self.refresh_inode_record(observed, true, true)?
+        } else {
+            self.observe_inode_record(observed)?
+        };
         self.visible_attributes_with_observed_inode(&record, &record)
     }
 
@@ -5769,6 +11344,15 @@ impl Backend for DistributedFs {
         let inode_id = self.inode_id(inode)?;
         let mut change = change.clone();
         let mut killpriv_setattr = false;
+        let _native_ticket = if let Some(cell) = self.write_state(&inode_id)? {
+            let ticket = self.native_ticket(&cell)?;
+            if self.native_pipeline.is_some() {
+                drop(self.begin_inode_operation(&inode_id, cell)?);
+            }
+            ticket
+        } else {
+            None
+        };
         if options.kill_suidgid {
             let current = self.validate_inode(self.meta.get_inode(&inode_id)?)?;
             if current.kind == InodeKind::Regular {
@@ -5856,7 +11440,10 @@ impl Backend for DistributedFs {
             } else {
                 self.resize_dirty_inode(&snapshot.inode_id, length, options.kill_suidgid)?
             };
-            (snapshot.opened_inode, Some((handle, accepted_seq)))
+            (
+                snapshot.opened_inode.as_ref().clone(),
+                Some((handle, accepted_seq)),
+            )
         } else {
             let (record, write_lease) = self.meta.open_write(&inode_id)?;
             let mut record = self.validate_inode(record)?;
@@ -5961,6 +11548,10 @@ impl Backend for DistributedFs {
         let handle = self.allocate_handle(DfsFileHandle {
             inode_id: inode.inode_id.clone(),
             opened_inode: inode.clone(),
+            opened_page_identity: None,
+            native_read_view: None,
+            native_read_generation: 0,
+            native_denial_serial: 0,
             write_session: Some(Self::make_local_write_session(session)),
             flags,
             owner_scope: None,
@@ -6019,7 +11610,17 @@ impl Backend for DistributedFs {
         options: OpenOptions,
     ) -> Result<FileHandle> {
         let inode_id = self.inode_id(inode)?;
-        let preflight = self.validate_inode(self.meta.get_inode(&inode_id)?)?;
+        let native_read_view = if !self.read_engine.has_external_backend()
+            && flags & libc::O_ACCMODE == libc::O_RDONLY
+        {
+            Some(self.capture_native_read_view()?)
+        } else {
+            None
+        };
+        let preflight =
+            self.validate_inode(self.meta.get_inode(&inode_id).inspect_err(|error| {
+                self.invalidate_native_inode_views_on_error(&inode_id, error);
+            })?)?;
         if matches!(preflight.kind, InodeKind::Special(_)) {
             return Err(Error::coded(
                 afs_error::IO_NOT_SUPPORTED,
@@ -6076,12 +11677,34 @@ impl Backend for DistributedFs {
             };
             (inode, Some(session))
         } else {
-            let inode = self.observe_inode_record(self.meta.get_inode(&inode_id)?)?;
+            let inode = if self.read_engine.has_external_backend() {
+                self.refresh_inode_record(preflight, true, true)?
+            } else {
+                self.observe_inode_record(preflight)?
+            };
             (inode, None)
         };
+        let opened_page_identity = if native_read_view.is_some()
+            && opened_inode.kind == InodeKind::Regular
+            && self.write_state(&inode_id)?.is_none()
+            && self.current_remote_provider(&inode_id)?.is_none()
+        {
+            // The first version/layout cache miss costs one Meta RPC, outside
+            // all handle locks. Authority still starts before the inode RPC.
+            Some(self.opened_page_identity(&opened_inode)?)
+        } else {
+            None
+        };
+        if let Some(view) = native_read_view.as_ref() {
+            self.check_native_read_view(view)?;
+        }
         self.allocate_handle(DfsFileHandle {
             inode_id: opened_inode.inode_id.clone(),
             opened_inode,
+            opened_page_identity,
+            native_read_view,
+            native_read_generation: 0,
+            native_denial_serial: 0,
             write_session,
             flags,
             owner_scope: None,
@@ -6099,10 +11722,63 @@ impl Backend for DistributedFs {
         if snapshot.flags & libc::O_ACCMODE == libc::O_WRONLY {
             return Err(bad_file_descriptor("DFS handle was not opened for reading"));
         }
+        if !self.read_engine.has_external_backend() {
+            let result = self.read_native_owned(handle, &snapshot, offset, out.len())?;
+            out[..result.len()].copy_from_slice(&result);
+            return Ok(result.len());
+        }
         if let Some(remote) = self.remote_provider_visible_for_reads(&snapshot.inode_id)? {
             return self.remote_read(&remote, offset, out);
         }
-        self.read_visible(&snapshot.inode_id, offset, out)
+        self.read_visible_from_handle_inode(
+            handle,
+            &snapshot.inode_id,
+            Some(&snapshot.opened_inode),
+            offset,
+            out,
+        )
+    }
+
+    fn read_owned(
+        &self,
+        ctx: &RequestContext,
+        handle: FileHandle,
+        offset: u64,
+        size: usize,
+    ) -> Result<Vec<u8>> {
+        let snapshot = self.handle_snapshot(handle)?;
+        if snapshot.flags & libc::O_ACCMODE == libc::O_WRONLY {
+            return Err(bad_file_descriptor("DFS handle was not opened for reading"));
+        }
+        if !self.read_engine.has_external_backend() {
+            return self.read_native_owned(handle, &snapshot, offset, size);
+        }
+        let fallback = || {
+            let mut out = vec![0; size];
+            let n = <Self as Backend>::read(self, ctx, handle, offset, &mut out)?;
+            out.truncate(n);
+            Ok(out)
+        };
+        if self
+            .remote_provider_visible_for_reads(&snapshot.inode_id)?
+            .is_some()
+        {
+            return fallback();
+        }
+        if let Some(inode) =
+            self.publish_accepted_writes_for_local_read(handle, &snapshot.inode_id)?
+        {
+            if let Some(data) = self.try_read_external_version_owned(&inode, offset, size)? {
+                return Ok(data);
+            }
+            return fallback();
+        }
+        if let Some(data) =
+            self.try_read_external_version_owned(&snapshot.opened_inode, offset, size)?
+        {
+            return Ok(data);
+        }
+        fallback()
     }
 
     fn write(
@@ -6113,6 +11789,20 @@ impl Backend for DistributedFs {
         data: &[u8],
     ) -> Result<usize> {
         self.write_with_options(ctx, handle, offset, data, WriteOptions::default())
+    }
+
+    fn write_admission_mode(&self, handle: FileHandle) -> WriteAdmissionMode {
+        if !self.deferred_publication_enabled()
+            && self
+                .handle_snapshot(handle)
+                .ok()
+                .and_then(|snapshot| snapshot.write_session)
+                .is_some_and(|session| session.remote.is_none())
+        {
+            WriteAdmissionMode::Borrowed
+        } else {
+            WriteAdmissionMode::Queued
+        }
     }
 
     fn write_with_options(
@@ -6148,21 +11838,229 @@ impl Backend for DistributedFs {
         if data.is_empty() {
             return Ok(0);
         }
+        if self.native_pipeline.is_some() {
+            return self.native_ordinary_write(handle, &snapshot, state, offset, data, options);
+        }
+        let deferred_publication = self.deferred_publication_enabled();
+        let mut use_deferred_publication = deferred_publication;
+        let _deferred_write_gate = if deferred_publication {
+            Some(
+                self.write_pipeline_budget_gate
+                    .lock()
+                    .map_err(|_| unavailable("DFS write pipeline budget gate is poisoned"))?,
+            )
+        } else {
+            None
+        };
         let _operation = self.begin_inode_operation(&snapshot.inode_id, state.clone())?;
+        if deferred_publication {
+            loop {
+                let (drain_before_deferred, starts_at_eof) = {
+                    let state = state
+                        .lock()
+                        .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+                    let append = snapshot.flags & libc::O_APPEND != 0;
+                    let starts_at_eof = append || offset == state.logical_length;
+                    let has_legacy_dirty =
+                        state.publication_window.is_none() && !state.dirty_extents.is_empty();
+                    let conflicting_window = state.publication_window.is_some() && !starts_at_eof;
+                    (has_legacy_dirty || conflicting_window, starts_at_eof)
+                };
+                if !drain_before_deferred {
+                    use_deferred_publication = starts_at_eof;
+                    break;
+                }
+                match self
+                    .commit_inode_inside_operation(&snapshot.inode_id, CommitReason::DataSync)?
+                {
+                    Some(committed_seq) => {
+                        self.update_handles_after_commit(&snapshot.inode_id, committed_seq)?;
+                    }
+                    None => {
+                        use_deferred_publication = false;
+                        break;
+                    }
+                }
+            }
+        }
+        let span = tracing::info_span!(
+            "node.dfs.write",
+            inode_id = %snapshot.inode_id.0,
+            fh = handle.0,
+            offset,
+            requested_bytes = data.len() as u64,
+            dirty_budget_bytes = self.dirty_budget_bytes,
+            accepted_bytes = tracing::field::Empty,
+            dirty_budget_commits = tracing::field::Empty,
+        );
+        let _entered = span.enter();
         let mut total_written = 0usize;
+        let mut dirty_budget_commits = 0_u64;
         let mut accepted_seq = None;
         while total_written < data.len() {
+            if use_deferred_publication {
+                match self.advance_full_deferred_window_inside_operation(&snapshot.inode_id, &state)
+                {
+                    Ok(Some(seq)) => {
+                        self.update_handle_write_progress(handle, seq)?;
+                        dirty_budget_commits = dirty_budget_commits.saturating_add(1);
+                        continue;
+                    }
+                    Ok(None) => {
+                        let active_full = {
+                            let state = state
+                                .lock()
+                                .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+                            state.dirty_extents.dirty_data_bytes()
+                                >= self.write_publication_window_bytes()
+                        };
+                        if active_full {
+                            let error = unavailable(
+                                "DFS deferred publication window is full and cannot advance",
+                            );
+                            if snapshot.flags & libc::O_SYNC == libc::O_SYNC
+                                || has_o_dsync(snapshot.flags)
+                            {
+                                return Err(error);
+                            }
+                            if let Some(seq) = accepted_seq {
+                                self.update_handle_write_progress(handle, seq)?;
+                            }
+                            if total_written > 0 {
+                                self.record_background_error(&snapshot.inode_id, error)?;
+                                return Ok(total_written);
+                            }
+                            return Err(error);
+                        }
+                    }
+                    Err(error)
+                        if snapshot.flags & libc::O_SYNC == libc::O_SYNC
+                            || has_o_dsync(snapshot.flags) =>
+                    {
+                        return Err(error);
+                    }
+                    Err(error) => {
+                        if let Some(seq) = accepted_seq {
+                            self.update_handle_write_progress(handle, seq)?;
+                        }
+                        if total_written > 0 {
+                            self.record_background_error(&snapshot.inode_id, error)?;
+                            return Ok(total_written);
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+            let planned_take = {
+                let state = state
+                    .lock()
+                    .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+                let write_budget = if use_deferred_publication {
+                    self.write_publication_window_bytes()
+                } else {
+                    self.dirty_budget_bytes
+                };
+                let mut take = (data.len() - total_written).min(
+                    usize::try_from(
+                        write_budget
+                            .saturating_sub(state.dirty_extents.dirty_data_bytes())
+                            .max(1),
+                    )
+                    .unwrap_or(usize::MAX),
+                );
+                if deferred_publication {
+                    take = take.min(COMMIT_CHUNK_BYTES as usize);
+                }
+                if use_deferred_publication {
+                    let pending = state
+                        .publication_window
+                        .as_ref()
+                        .map_or(0, |window| window.pending.len());
+                    take = take.min(COMMIT_CHUNK_BYTES as usize - pending);
+                }
+                take
+            };
+            let requested_deferred_reservation = if deferred_publication {
+                let admission = (|| {
+                    let factor = if use_deferred_publication { 1 } else { 2 };
+                    let raw = self.write_pipeline_budget.reserve_normal(
+                        (planned_take as u64)
+                            .saturating_mul(factor)
+                            .max(DEFERRED_MIN_NORMAL_RESERVATION_BYTES),
+                    )?;
+                    let needs_pending = use_deferred_publication
+                        && state
+                            .lock()
+                            .map_err(|_| unavailable("DFS inode write state is poisoned"))?
+                            .publication_window
+                            .as_ref()
+                            .is_none_or(|window| window.pending.capacity() == 0);
+                    let pending = if needs_pending {
+                        Some(
+                            self.write_pipeline_budget
+                                .reserve_normal(COMMIT_CHUNK_BYTES)?,
+                        )
+                    } else {
+                        None
+                    };
+                    Ok((raw, pending))
+                })();
+                match admission {
+                    Ok(reservation) => Some(reservation),
+                    Err(error) => {
+                        match self.commit_inode_inside_operation(
+                            &snapshot.inode_id,
+                            CommitReason::DirtyBudget,
+                        ) {
+                            Ok(Some(committed_seq)) => {
+                                self.update_handles_after_commit(
+                                    &snapshot.inode_id,
+                                    committed_seq,
+                                )?;
+                                dirty_budget_commits = dirty_budget_commits.saturating_add(1);
+                                continue;
+                            }
+                            Ok(None) => match self
+                                .commit_deferred_budget_victim(Some(&snapshot.inode_id))
+                            {
+                                Ok(Some(_)) => {
+                                    dirty_budget_commits = dirty_budget_commits.saturating_add(1);
+                                    continue;
+                                }
+                                Ok(None) if total_written > 0 => {
+                                    if let Some(seq) = accepted_seq {
+                                        self.update_handle_write_progress(handle, seq)?;
+                                    }
+                                    return Ok(total_written);
+                                }
+                                Ok(None) => return Err(error),
+                                Err(commit_error) => return Err(commit_error),
+                            },
+                            Err(commit_error) => return Err(commit_error),
+                        }
+                    }
+                }
+            } else {
+                None
+            };
             let (written, seq, over_budget) = {
+                let (mut deferred_reservation, mut pending_reservation) =
+                    match requested_deferred_reservation {
+                        Some((raw, pending)) => (Some(raw), pending),
+                        None => (None, None),
+                    };
                 let mut state = state
                     .lock()
                     .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
                 if let Some(error) = state.terminal_error.clone() {
                     return Err(error);
                 }
-                let dirty_bytes = state.dirty_extents.dirty_data_bytes();
-                let budget_remaining = self.dirty_budget_bytes.saturating_sub(dirty_bytes);
-                let take = (data.len() - total_written)
-                    .min(usize::try_from(budget_remaining.max(1)).unwrap_or(usize::MAX));
+                let write_budget = if use_deferred_publication {
+                    self.write_publication_window_bytes()
+                } else {
+                    self.dirty_budget_bytes
+                };
+                let take = planned_take;
                 let chunk = &data[total_written..total_written + take];
                 let file_offset = if snapshot.flags & libc::O_APPEND != 0 {
                     state.logical_length
@@ -6171,8 +12069,66 @@ impl Backend for DistributedFs {
                         .checked_add(total_written as u64)
                         .ok_or_else(file_too_large)?
                 };
+                let _end_offset = file_offset
+                    .checked_add(chunk.len() as u64)
+                    .ok_or_else(file_too_large)?;
                 let next_seq = state.next_write_seq.saturating_add(1);
-                let written = state.dirty_extents.write_at(file_offset, chunk, next_seq)?;
+                let written = if use_deferred_publication {
+                    let Some(payload_reservation) = deferred_reservation.take() else {
+                        return Err(unavailable(
+                            "DFS deferred write payload reservation disappeared before append",
+                        ));
+                    };
+                    let dirty_reservation = payload_reservation;
+                    let sealed = {
+                        let window = state.publication_window.get_or_insert_with(|| {
+                            PublicationWindow::new(self.operation_id("deferred-publish"))
+                        });
+                        window.append_sequential(
+                            file_offset,
+                            chunk,
+                            pending_reservation.take(),
+                            &self.write_pipeline_budget,
+                        )?
+                    };
+                    let written = chunk.len();
+                    if sealed.is_empty() {
+                        state.dirty_extents.write_at(file_offset, chunk, next_seq)?;
+                        state.dirty_extents.retain_write_budget(
+                            next_seq,
+                            std::slice::from_ref(&dirty_reservation),
+                        );
+                    }
+                    for sealed_chunk in sealed {
+                        state.dirty_extents.replace_range_with_shared(
+                            sealed_chunk.file_offset,
+                            sealed_chunk.staged.shared_bytes(),
+                            next_seq,
+                            sealed_chunk.staged.write_budget_reservations().to_vec(),
+                        )?;
+                    }
+                    written
+                } else {
+                    let logical_length = state.logical_length;
+                    let written = if deferred_publication {
+                        state.dirty_extents.write_at(file_offset, chunk, next_seq)?
+                    } else {
+                        state.dirty_extents.write_native_at(
+                            file_offset,
+                            chunk,
+                            next_seq,
+                            &self.write_buffer_pool,
+                            logical_length,
+                        )?
+                    };
+                    if let Some(reservation) = deferred_reservation.take() {
+                        state
+                            .dirty_extents
+                            .retain_write_budget(next_seq, std::slice::from_ref(&reservation));
+                        state.dirty_budget_reservations.push(reservation);
+                    }
+                    written
+                };
                 let end_offset = file_offset
                     .checked_add(written as u64)
                     .ok_or_else(file_too_large)?;
@@ -6189,8 +12145,8 @@ impl Backend for DistributedFs {
                         Self::apply_kernel_killpriv_to_state(&mut state);
                     }
                 }
-                let over_budget = written > 0
-                    && state.dirty_extents.dirty_data_bytes() >= self.dirty_budget_bytes;
+                let over_budget =
+                    written > 0 && state.dirty_extents.dirty_data_bytes() >= write_budget;
                 (written, state.visible_write_seq, over_budget)
             };
             if written == 0 {
@@ -6198,7 +12154,104 @@ impl Backend for DistributedFs {
             }
             total_written += written;
             accepted_seq = Some(seq);
+            match self.preupload_ready_chunks_inside_operation(&snapshot.inode_id, &state) {
+                Ok(Some(committed_seq)) => {
+                    self.update_handles_after_commit(&snapshot.inode_id, committed_seq)?;
+                    self.update_handle_write_progress(handle, seq)?;
+                    dirty_budget_commits = dirty_budget_commits.saturating_add(1);
+                }
+                Ok(None) => {
+                    if let Err(error) = self.poll_deferred_uploads_inside_operation(&state) {
+                        self.update_handle_write_progress(handle, seq)?;
+                        if snapshot.flags & libc::O_SYNC == libc::O_SYNC
+                            || has_o_dsync(snapshot.flags)
+                        {
+                            return Err(error);
+                        }
+                        self.record_background_error(&snapshot.inode_id, error)?;
+                        return Ok(total_written);
+                    }
+                }
+                Err(error) => {
+                    self.update_handle_write_progress(handle, seq)?;
+                    if snapshot.flags & libc::O_SYNC == libc::O_SYNC || has_o_dsync(snapshot.flags)
+                    {
+                        return Err(error);
+                    }
+                    self.record_background_error(&snapshot.inode_id, error)?;
+                    return Ok(total_written);
+                }
+            }
+            if use_deferred_publication {
+                match self.enforce_deferred_write_budget_inside_operation(&snapshot.inode_id) {
+                    Ok(Some(committed_seq)) => {
+                        self.update_handles_after_commit(&snapshot.inode_id, committed_seq)?;
+                        self.update_handle_write_progress(handle, seq)?;
+                        dirty_budget_commits = dirty_budget_commits.saturating_add(1);
+                    }
+                    Ok(None) => {}
+                    Err(error)
+                        if snapshot.flags & libc::O_SYNC == libc::O_SYNC
+                            || has_o_dsync(snapshot.flags) =>
+                    {
+                        return Err(error);
+                    }
+                    Err(error) => {
+                        self.update_handle_write_progress(handle, seq)?;
+                        self.record_background_error(&snapshot.inode_id, error)?;
+                        return Ok(total_written);
+                    }
+                }
+            }
+            if written < planned_take {
+                // A fallible builder allocation accepted only a prefix. Keep
+                // the existing sync handling below and report a legal short write.
+                break;
+            }
             if over_budget {
+                dirty_budget_commits = dirty_budget_commits.saturating_add(1);
+                tracing::info_span!(
+                    "node.dfs.write.dirty_budget_trigger",
+                    inode_id = %snapshot.inode_id.0,
+                    fh = handle.0,
+                    accepted_bytes = total_written as u64,
+                    dirty_budget_bytes = self.dirty_budget_bytes,
+                )
+                .in_scope(|| {});
+                if use_deferred_publication {
+                    match self
+                        .advance_full_deferred_window_inside_operation(&snapshot.inode_id, &state)
+                    {
+                        Ok(Some(progress_seq)) => {
+                            self.update_handle_write_progress(handle, progress_seq)?;
+                            continue;
+                        }
+                        Ok(None) => {
+                            let error = unavailable(
+                                "DFS deferred publication window is full and cannot advance",
+                            );
+                            if snapshot.flags & libc::O_SYNC == libc::O_SYNC
+                                || has_o_dsync(snapshot.flags)
+                            {
+                                return Err(error);
+                            }
+                            self.update_handle_write_progress(handle, seq)?;
+                            self.record_background_error(&snapshot.inode_id, error)?;
+                            return Ok(total_written);
+                        }
+                        Err(error)
+                            if snapshot.flags & libc::O_SYNC == libc::O_SYNC
+                                || has_o_dsync(snapshot.flags) =>
+                        {
+                            return Err(error);
+                        }
+                        Err(error) => {
+                            self.update_handle_write_progress(handle, seq)?;
+                            self.record_background_error(&snapshot.inode_id, error)?;
+                            return Ok(total_written);
+                        }
+                    }
+                }
                 match self
                     .commit_inode_inside_operation(&snapshot.inode_id, CommitReason::DirtyBudget)
                 {
@@ -6223,21 +12276,15 @@ impl Backend for DistributedFs {
                 }
             }
         }
+        span.record("accepted_bytes", total_written as u64);
+        span.record("dirty_budget_commits", dirty_budget_commits);
         if let Some(seq) = accepted_seq {
             self.update_handle_write_progress(handle, seq)?;
         }
         if snapshot.flags & libc::O_SYNC == libc::O_SYNC {
-            let committed_seq =
-                self.commit_inode_inside_operation(&snapshot.inode_id, CommitReason::FullSync)?;
-            if let Some(committed_seq) = committed_seq {
-                self.update_handles_after_commit(&snapshot.inode_id, committed_seq)?;
-            }
+            self.commit_handle_inside_operation(handle, CommitReason::FullSync)?;
         } else if has_o_dsync(snapshot.flags) {
-            let committed_seq =
-                self.commit_inode_inside_operation(&snapshot.inode_id, CommitReason::DataSync)?;
-            if let Some(committed_seq) = committed_seq {
-                self.update_handles_after_commit(&snapshot.inode_id, committed_seq)?;
-            }
+            self.commit_handle_inside_operation(handle, CommitReason::DataSync)?;
         }
         Ok(total_written)
     }
@@ -6275,11 +12322,15 @@ impl Backend for DistributedFs {
     fn release(&self, _: &RequestContext, handle: FileHandle) -> Result<()> {
         let removed = self
             .handles
-            .lock()
-            .map_err(|_| unavailable("DFS handle table is poisoned"))?
-            .remove(&handle.0)
+            .remove(handle.0)?
             .ok_or_else(|| stale("DFS file handle is no longer open"))?;
-        if let Some(session) = removed.write_session.as_ref() {
+        let session = removed
+            .state
+            .lock()
+            .map_err(|_| unavailable("DFS handle state is poisoned"))?
+            .write_session
+            .clone();
+        if let Some(session) = session.as_ref() {
             if session.remote.is_some() {
                 self.close_remote_write_session(&removed.inode_id, session)?;
             } else {
@@ -6568,13 +12619,14 @@ impl Backend for DistributedFs {
 
 impl DistributedFs {
     fn update_handle_write_progress(&self, handle: FileHandle, accepted_seq: u64) -> Result<()> {
-        let mut handles = self
+        let opened = self
             .handles
-            .lock()
-            .map_err(|_| unavailable("DFS handle table is poisoned"))?;
-        let file = handles
-            .get_mut(&handle.0)
+            .get(handle.0)?
             .ok_or_else(|| stale("DFS file handle is no longer open"))?;
+        let mut file = opened
+            .state
+            .lock()
+            .map_err(|_| unavailable("DFS handle state is poisoned"))?;
         if let Some(session) = file.write_session.as_mut() {
             session.local.last_accepted_seq = accepted_seq;
         }
@@ -6582,13 +12634,14 @@ impl DistributedFs {
     }
 
     fn update_handle_error_cursor(&self, handle: FileHandle, cursor: u64) -> Result<()> {
-        let mut handles = self
+        let opened = self
             .handles
-            .lock()
-            .map_err(|_| unavailable("DFS handle table is poisoned"))?;
-        let file = handles
-            .get_mut(&handle.0)
+            .get(handle.0)?
             .ok_or_else(|| stale("DFS file handle is no longer open"))?;
+        let mut file = opened
+            .state
+            .lock()
+            .map_err(|_| unavailable("DFS handle state is poisoned"))?;
         if let Some(session) = file.write_session.as_mut() {
             session.local.error_cursor = cursor;
         }
@@ -6603,16 +12656,21 @@ impl DistributedFs {
             .map_err(|_| unavailable("DFS inode write state is poisoned"))?
             .inode
             .clone();
-        let mut handles = self
-            .handles
-            .lock()
-            .map_err(|_| unavailable("DFS handle table is poisoned"))?;
-        for handle in handles
-            .values_mut()
-            .filter(|handle| handle.inode_id == *inode_id)
-        {
+        for handle in self.handles.for_inode(inode_id)? {
+            let mut handle = handle
+                .state
+                .lock()
+                .map_err(|_| unavailable("DFS handle state is poisoned"))?;
+            handle.native_read_generation = handle
+                .native_read_generation
+                .checked_add(1)
+                .ok_or_else(|| unavailable("DFS native read generation exhausted"))?;
+            handle.native_read_view = None;
+            handle.opened_page_identity = None;
+            if handle.write_session.is_some() {
+                handle.opened_inode = Arc::new(inode.clone());
+            }
             if let Some(session) = handle.write_session.as_mut() {
-                handle.opened_inode = inode.clone();
                 session.local.last_synced_seq = session.local.last_synced_seq.max(committed_seq);
             }
         }
@@ -6721,6 +12779,10 @@ impl crate::node::rpc::control::DfsOwnerLifecycleHandler for DistributedFs {
             self.allocate_handle(DfsFileHandle {
                 inode_id: inode.inode_id.clone(),
                 opened_inode: inode.clone(),
+                opened_page_identity: None,
+                native_read_view: None,
+                native_read_generation: 0,
+                native_denial_serial: 0,
                 write_session: Some(Self::make_local_write_session(session)),
                 flags: request.open_flags,
                 owner_scope: Some(DfsOwnerHandleScope {
@@ -7058,15 +13120,15 @@ impl crate::node::rpc::data::DfsOwnerFilesHandler for DistributedFs {
             .ok_or_else(|| stale("DFS owner read missing handle"))?;
         let handle = Self::control_owner_handle(&handle);
         let file = self.validate_owner_handle(peer, &handle)?;
-        let mut data = vec![0; request.length as usize];
-        let read = <Self as Backend>::read(
+        let length = usize::try_from(request.length)
+            .map_err(|_| invalid("DFS owner read length exceeds platform limits"))?;
+        let data = <Self as Backend>::read_owned(
             self,
             &owner_request_context(),
             file,
             request.offset,
-            &mut data,
+            length,
         )?;
-        data.truncate(read);
         let visible_write_seq = self
             .write_state(&InodeId::new(handle.inode_id))?
             .and_then(|state| state.lock().ok().map(|state| state.visible_write_seq))
@@ -7600,27 +13662,17 @@ impl DistributedFs {
         handle: &afs_protocol::node_control::DfsOwnerHandle,
     ) -> Result<Option<FileHandle>> {
         let (inode_id, file) = self.validate_owner_handle_basic(peer, handle)?;
-        let Some(snapshot) = self
-            .handles
-            .lock()
-            .map_err(|_| unavailable("DFS handle table is poisoned"))?
-            .get(&file.0)
-            .map(DfsFileHandleSnapshot::from)
-        else {
+        let Some(opened) = self.handles.get(file.0)? else {
             return Ok(None);
         };
+        let snapshot = DfsFileHandleSnapshot::from_handle(&opened)?;
         self.validate_owner_handle_scope(peer, handle, &inode_id, &snapshot)?;
         Ok(Some(file))
     }
 
     fn peer_owner_handle_sessions(&self) -> Result<HashMap<String, HashSet<String>>> {
         let mut sessions: HashMap<String, HashSet<String>> = HashMap::new();
-        for handle in self
-            .handles
-            .lock()
-            .map_err(|_| unavailable("DFS handle table is poisoned"))?
-            .values()
-        {
+        for (_, handle) in self.handles.snapshot()? {
             if let Some(scope) = handle.owner_scope.as_ref() {
                 sessions
                     .entry(scope.caller_node_id.clone())
@@ -7696,13 +13748,12 @@ impl DistributedFs {
     fn reap_peer_owner_session(&self, node_id: &str, session_id: &str) -> Result<usize> {
         let handles = self
             .handles
-            .lock()
-            .map_err(|_| unavailable("DFS handle table is poisoned"))?
-            .iter()
+            .snapshot()?
+            .into_iter()
             .filter_map(|(id, handle)| {
                 handle.owner_scope.as_ref().and_then(|scope| {
                     (scope.caller_node_id == node_id && scope.caller_session_id == session_id)
-                        .then_some(FileHandle(*id))
+                        .then_some(FileHandle(id))
                 })
             })
             .collect::<Vec<_>>();
@@ -7908,8 +13959,8 @@ fn push_dirty_allocated_ranges(
     map: &DirtyExtentMap,
     logical_length: u64,
 ) -> Result<()> {
-    for extent in &map.extents {
-        if extent.data.is_some() {
+    for extent in map.iter_extents() {
+        if extent.data.is_some() || extent.builder.is_some() || extent.native_upload.is_some() {
             push_allocated_range(ranges, extent.file_offset, extent.length, logical_length)?;
         }
     }
@@ -8058,7 +14109,22 @@ fn bad_file_descriptor(message: impl Into<String>) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::node::chunk::LocalChunkStore;
+    use crate::{
+        dfs::{
+            AuthorizeCurrentExternalRead, AuthorizeCurrentExternalReadReply,
+            AuthorizeExternalVersionRead, AuthorizeExternalVersionReadReply, ChunkSources, CopyId,
+            CopyLocation, CopyRole, CopyState, DfsAuthorizedRead, DfsChunkSourcesReply,
+            DfsExternalAuthorizedRead, DfsMissingReadSource, DfsReadGrant, DfsReadValidation,
+            SourceCandidate,
+        },
+        node::{
+            chunk::LocalChunkStore,
+            dfs_read::{
+                DfsReadConfig, ExternalChunkReader, ExternalReadAuthorizer, ReadSourceProvider,
+                UnimplementedChunkTransfer, VerifiedExternalChunk,
+            },
+        },
+    };
     use std::sync::atomic::AtomicUsize;
 
     struct CommitPause {
@@ -8088,6 +14154,10 @@ mod tests {
             let (lock, cv) = &self.release;
             *lock.lock().unwrap() = true;
             cv.notify_all();
+        }
+
+        fn was_reached(&self) -> bool {
+            *self.reached.0.lock().unwrap()
         }
 
         fn block(&self) {
@@ -8201,7 +14271,9 @@ mod tests {
         next_renew_error: Mutex<Option<Error>>,
         next_open_write_error: Mutex<Option<Error>>,
         next_get_inode_error: Mutex<Option<Error>>,
+        next_get_inode_pause: Mutex<Option<Arc<NativeReadPause>>>,
         next_get_file_version_error: Mutex<Option<Error>>,
+        file_version_replies: Mutex<VecDeque<(FileVersion, LayoutRoot)>>,
         next_get_inode_bad_id: Mutex<bool>,
         next_open_write_bad_namespace: Mutex<bool>,
         open_write_results: Mutex<std::collections::VecDeque<Result<(InodeRecord, WriteLease)>>>,
@@ -8217,6 +14289,7 @@ mod tests {
         open_write_calls: AtomicUsize,
         resolve_lock_calls: AtomicUsize,
         resolve_write_calls: AtomicUsize,
+        get_inode_calls: AtomicUsize,
     }
 
     impl RecordingMeta {
@@ -8260,7 +14333,9 @@ mod tests {
                 next_renew_error: Mutex::new(None),
                 next_open_write_error: Mutex::new(None),
                 next_get_inode_error: Mutex::new(None),
+                next_get_inode_pause: Mutex::new(None),
                 next_get_file_version_error: Mutex::new(None),
+                file_version_replies: Mutex::new(VecDeque::new()),
                 next_get_inode_bad_id: Mutex::new(false),
                 next_open_write_bad_namespace: Mutex::new(false),
                 open_write_results: Mutex::new(std::collections::VecDeque::new()),
@@ -8276,6 +14351,7 @@ mod tests {
                 open_write_calls: AtomicUsize::new(0),
                 resolve_lock_calls: AtomicUsize::new(0),
                 resolve_write_calls: AtomicUsize::new(0),
+                get_inode_calls: AtomicUsize::new(0),
             }
         }
 
@@ -8298,10 +14374,6 @@ mod tests {
 
         fn fail_next_commit_with(&self, error: Error) {
             *self.next_commit_error.lock().unwrap() = Some(error);
-        }
-
-        fn fail_commit_after_successes(&self, successes: usize, error: Error) {
-            *self.commit_error_after_successes.lock().unwrap() = Some((successes, error));
         }
 
         fn pause_commit_after_successes(&self, successes: usize) -> Arc<CommitPause> {
@@ -8338,6 +14410,10 @@ mod tests {
 
         fn file_version_load_count(&self) -> usize {
             self.file_version_loads.load(Ordering::SeqCst)
+        }
+
+        fn get_inode_call_count(&self) -> usize {
+            self.get_inode_calls.load(Ordering::SeqCst)
         }
 
         fn return_bad_inode_on_next_get_inode(&self) {
@@ -8477,7 +14553,13 @@ mod tests {
         }
 
         fn get_inode(&self, _: &InodeId) -> Result<InodeRecord> {
-            if let Some(error) = self.next_get_inode_error.lock().unwrap().take() {
+            self.get_inode_calls.fetch_add(1, Ordering::SeqCst);
+            let error = self.next_get_inode_error.lock().unwrap().take();
+            let pause = self.next_get_inode_pause.lock().unwrap().take();
+            if let Some(pause) = pause {
+                pause.block();
+            }
+            if let Some(error) = error {
                 return Err(error);
             }
             let mut inode = self.inode.lock().unwrap().clone();
@@ -8495,6 +14577,9 @@ mod tests {
             self.file_version_loads.fetch_add(1, Ordering::SeqCst);
             if let Some(error) = self.next_get_file_version_error.lock().unwrap().take() {
                 return Err(error);
+            }
+            if let Some(reply) = self.file_version_replies.lock().unwrap().pop_front() {
+                return Ok(reply);
             }
             self.commits
                 .lock()
@@ -8861,6 +14946,41 @@ mod tests {
         .with_dirty_budget_bytes(budget)
     }
 
+    fn test_fs_with_native_authority() -> (
+        tempfile::TempDir,
+        Arc<RecordingMeta>,
+        DistributedFs,
+        Arc<crate::node::dfs_read::LocalReadAuthority>,
+    ) {
+        let meta = Arc::new(RecordingMeta::new());
+        let temp = tempfile::tempdir().unwrap();
+        let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
+        let authority = Arc::new(crate::node::dfs_read::LocalReadAuthority::new(
+            1,
+            Instant::now() + Duration::from_secs(30),
+        ));
+        let engine = Arc::new(
+            DfsReadEngine::new(
+                NamespaceId::new("default"),
+                "node-a".into(),
+                local.clone(),
+                Arc::new(crate::node::dfs_read::UnimplementedReadSourceProvider),
+                Arc::new(crate::node::dfs_read::UnimplementedChunkTransfer),
+                crate::node::dfs_read::DfsReadConfig::default(),
+            )
+            .with_read_authority(authority.clone()),
+        );
+        let fs = DistributedFs::new(
+            NamespaceId::new("default"),
+            "node-a",
+            "session-a",
+            meta.clone(),
+            local,
+            engine,
+        );
+        (temp, meta, fs, authority)
+    }
+
     fn publish_external_version_with_bytes(
         meta: &RecordingMeta,
         fs: &DistributedFs,
@@ -8878,6 +14998,341 @@ mod tests {
             bytes.len() as u64,
             vec![Extent {
                 file_offset: 0,
+                length: bytes.len() as u64,
+                chunk_id: receipt.chunk.id.clone(),
+                chunk_offset: 0,
+            }],
+            vec![receipt],
+        )
+    }
+
+    #[derive(Clone, Copy)]
+    enum CurrentExternalFixtureMode {
+        Authorized,
+        Denied,
+    }
+
+    struct CurrentExternalFixture {
+        meta: Arc<RecordingMeta>,
+        chunks: Mutex<HashMap<crate::dfs::ChunkId, (ChunkObject, Vec<u8>)>>,
+        mode: Mutex<CurrentExternalFixtureMode>,
+        current_calls: AtomicUsize,
+        legacy_calls: AtomicUsize,
+        source_calls: AtomicUsize,
+        fetch_calls: AtomicUsize,
+    }
+
+    impl CurrentExternalFixture {
+        fn new(meta: Arc<RecordingMeta>) -> Self {
+            Self {
+                meta,
+                chunks: Mutex::new(HashMap::new()),
+                mode: Mutex::new(CurrentExternalFixtureMode::Authorized),
+                current_calls: AtomicUsize::new(0),
+                legacy_calls: AtomicUsize::new(0),
+                source_calls: AtomicUsize::new(0),
+                fetch_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn set_mode(&self, mode: CurrentExternalFixtureMode) {
+            *self.mode.lock().unwrap() = mode;
+        }
+
+        fn current_call_count(&self) -> usize {
+            self.current_calls.load(Ordering::SeqCst)
+        }
+
+        fn legacy_call_count(&self) -> usize {
+            self.legacy_calls.load(Ordering::SeqCst)
+        }
+
+        fn insert_chunk(&self, chunk: ChunkObject, bytes: Vec<u8>) {
+            self.chunks
+                .lock()
+                .unwrap()
+                .insert(chunk.id.clone(), (chunk, bytes));
+        }
+
+        fn authorization_for(&self, validation: DfsReadValidation) -> DfsExternalAuthorizedRead {
+            let (chunk, _) = self
+                .chunks
+                .lock()
+                .unwrap()
+                .get(&validation.chunk_id)
+                .cloned()
+                .expect("test chunk should be known to external fixture");
+            let object_key =
+                crate::dfs::external_object_key("test-store", "test-revision", &chunk.id)
+                    .expect("fixture must return the committed external chunk key");
+            DfsExternalAuthorizedRead {
+                authorized: DfsAuthorizedRead {
+                    validation,
+                    allowed_ranges: vec![(0, chunk.length)],
+                    expires_at_unix_ms: u64::MAX,
+                },
+                chunk,
+                location: CopyLocation::External {
+                    store_id: "test-store".into(),
+                    object_key,
+                    object_revision: "test-revision".into(),
+                },
+            }
+        }
+
+        fn authorization_for_request(
+            &self,
+            request: DfsMissingReadSource,
+            file_version_id: &FileVersionId,
+            layout_root_id: &LayoutRootId,
+        ) -> DfsExternalAuthorizedRead {
+            let (chunk, _) = self
+                .chunks
+                .lock()
+                .unwrap()
+                .get(&request.chunk_id)
+                .cloned()
+                .expect("test chunk should be known to external fixture");
+            self.authorization_for(DfsReadValidation {
+                grant: DfsReadGrant {
+                    namespace_id: NamespaceId::new("default"),
+                    file_version_id: file_version_id.clone(),
+                    layout_root_id: layout_root_id.clone(),
+                    caller_node_id: "node-a".into(),
+                    caller_node_epoch: 1,
+                    expires_at_unix_ms: u64::MAX,
+                    fence: 1,
+                    token: "test-token".into(),
+                },
+                chunk_id: chunk.id.clone(),
+                copy_id: CopyId::new(format!("external-copy-{}", chunk.id.0)),
+                chunk_offset: request.chunk_offset,
+                length: request.length,
+            })
+        }
+    }
+
+    impl ReadSourceProvider for CurrentExternalFixture {
+        fn sources_for(
+            &self,
+            request: crate::dfs::DfsChunkSourcesRequest,
+        ) -> Result<DfsChunkSourcesReply> {
+            self.source_calls.fetch_add(1, Ordering::SeqCst);
+            let chunks = self.chunks.lock().unwrap();
+            Ok(DfsChunkSourcesReply {
+                revision: 1,
+                chunks: request
+                    .chunk_ids
+                    .into_iter()
+                    .filter_map(|chunk_id| {
+                        chunks.get(&chunk_id).map(|(chunk, _)| ChunkSources {
+                            chunk_id: chunk_id.clone(),
+                            chunk: Some(chunk.clone()),
+                            allowed_ranges: Vec::new(),
+                            sources: vec![SourceCandidate {
+                                copy_id: CopyId::new(format!("external-copy-{}", chunk_id.0)),
+                                chunk_id: chunk_id.clone(),
+                                role: CopyRole::ExternalCommitted,
+                                state: CopyState::Ready,
+                                location: CopyLocation::External {
+                                    store_id: "test-store".into(),
+                                    object_key: crate::dfs::external_object_key(
+                                        "test-store",
+                                        "test-revision",
+                                        &chunk.id,
+                                    )
+                                    .expect("fixture must return the committed external chunk key"),
+                                    object_revision: "test-revision".into(),
+                                },
+                                data_endpoint: None,
+                                load_hint: 0,
+                                read_grant: DfsReadGrant {
+                                    namespace_id: request.namespace_id.clone(),
+                                    file_version_id: request.file_version_id.clone(),
+                                    layout_root_id: request.layout_root_id.clone(),
+                                    caller_node_id: request.caller_id.clone(),
+                                    caller_node_epoch: 1,
+                                    expires_at_unix_ms: u64::MAX,
+                                    fence: 1,
+                                    token: "test-token".into(),
+                                },
+                            }],
+                        })
+                    })
+                    .collect(),
+            })
+        }
+    }
+
+    impl ExternalReadAuthorizer for CurrentExternalFixture {
+        fn authorize_external_version_read(
+            &self,
+            request: AuthorizeExternalVersionRead,
+        ) -> Result<Option<AuthorizeExternalVersionReadReply>> {
+            self.current_calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(request.caller_id, "node-a");
+            assert_eq!(request.namespace_id, NamespaceId::new("default"));
+            assert!(!request.requests.is_empty());
+            match *self.mode.lock().unwrap() {
+                CurrentExternalFixtureMode::Authorized => {
+                    Ok(Some(AuthorizeExternalVersionReadReply {
+                        authorizations: request
+                            .requests
+                            .into_iter()
+                            .map(|entry| {
+                                self.authorization_for_request(
+                                    entry,
+                                    &request.file_version_id,
+                                    &request.layout_root_id,
+                                )
+                            })
+                            .collect(),
+                        remaining_validity_ms: 5_000,
+                    }))
+                }
+                CurrentExternalFixtureMode::Denied => Err(Error::coded(
+                    afs_error::IO_PERMISSION_DENIED,
+                    "test external version authorization denied",
+                )),
+            }
+        }
+
+        fn authorize_current_external_read(
+            &self,
+            request: AuthorizeCurrentExternalRead,
+        ) -> Result<Option<AuthorizeCurrentExternalReadReply>> {
+            self.current_calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(request.caller_id, "node-a");
+            assert_eq!(request.namespace_id, NamespaceId::new("default"));
+            let inode = self.meta.inode.lock().unwrap().clone();
+            match *self.mode.lock().unwrap() {
+                CurrentExternalFixtureMode::Authorized => {
+                    assert_eq!(
+                        inode.head_version.as_ref(),
+                        Some(&request.expected_head_version)
+                    );
+                    Ok(Some(AuthorizeCurrentExternalReadReply::Authorized {
+                        inode,
+                        authorizations: request
+                            .validations
+                            .into_iter()
+                            .map(|validation| self.authorization_for(validation))
+                            .collect(),
+                    }))
+                }
+                CurrentExternalFixtureMode::Denied => Err(Error::coded(
+                    afs_error::IO_PERMISSION_DENIED,
+                    "test current external authorization denied",
+                )),
+            }
+        }
+
+        fn validate_external_read_grants(
+            &self,
+            caller_id: &str,
+            validations: Vec<DfsReadValidation>,
+        ) -> Result<Vec<DfsExternalAuthorizedRead>> {
+            assert_eq!(caller_id, "node-a");
+            self.legacy_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(validations
+                .into_iter()
+                .map(|validation| self.authorization_for(validation))
+                .collect())
+        }
+    }
+
+    impl ExternalChunkReader for CurrentExternalFixture {
+        fn read_chunk(
+            &self,
+            chunk: &ChunkObject,
+            source: &SourceCandidate,
+        ) -> Result<VerifiedExternalChunk> {
+            assert!(matches!(source.location, CopyLocation::External { .. }));
+            self.fetch_calls.fetch_add(1, Ordering::SeqCst);
+            let (_, bytes) = self
+                .chunks
+                .lock()
+                .unwrap()
+                .get(&chunk.id)
+                .cloned()
+                .ok_or_else(|| unavailable("test external chunk not found"))?;
+            VerifiedExternalChunk::verify(chunk, bytes)
+        }
+    }
+
+    fn test_fs_with_current_external_fixture() -> (
+        tempfile::TempDir,
+        Arc<RecordingMeta>,
+        DistributedFs,
+        Arc<CurrentExternalFixture>,
+    ) {
+        let meta = Arc::new(RecordingMeta::new());
+        let temp = tempfile::tempdir().unwrap();
+        let chunks = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
+        let fixture = Arc::new(CurrentExternalFixture::new(meta.clone()));
+        let read_engine = Arc::new(
+            DfsReadEngine::new(
+                NamespaceId::new("default"),
+                "node-a".into(),
+                chunks.clone(),
+                fixture.clone(),
+                Arc::new(UnimplementedChunkTransfer),
+                DfsReadConfig {
+                    source_cache_ttl: Duration::from_secs(60),
+                    ..DfsReadConfig::default()
+                },
+            )
+            .with_external_backend(fixture.clone(), fixture.clone()),
+        );
+        let fs = DistributedFs::new(
+            NamespaceId::new("default"),
+            "node-a",
+            "session-a",
+            meta.clone(),
+            chunks,
+            read_engine,
+        );
+        (temp, meta, fs, fixture)
+    }
+
+    fn publish_external_fixture_version(
+        meta: &RecordingMeta,
+        fs: &DistributedFs,
+        fixture: &CurrentExternalFixture,
+        operation_id: &str,
+        bytes: &[u8],
+    ) -> FileVersionId {
+        let staged = StagedChunk::new(OperationId::new(operation_id), bytes.to_vec());
+        fixture.insert_chunk(staged.chunk.clone(), bytes.to_vec());
+        let receipt = fs.chunk_store.put(staged).unwrap();
+        meta.publish_external_version_with_receipts(
+            bytes.len() as u64,
+            vec![Extent {
+                file_offset: 0,
+                length: bytes.len() as u64,
+                chunk_id: receipt.chunk.id.clone(),
+                chunk_offset: 0,
+            }],
+            vec![receipt],
+        )
+    }
+
+    fn publish_sparse_external_fixture_version(
+        meta: &RecordingMeta,
+        fs: &DistributedFs,
+        fixture: &CurrentExternalFixture,
+        operation_id: &str,
+        file_length: u64,
+        file_offset: u64,
+        bytes: &[u8],
+    ) -> FileVersionId {
+        let staged = StagedChunk::new(OperationId::new(operation_id), bytes.to_vec());
+        fixture.insert_chunk(staged.chunk.clone(), bytes.to_vec());
+        let receipt = fs.chunk_store.put(staged).unwrap();
+        meta.publish_external_version_with_receipts(
+            file_length,
+            vec![Extent {
+                file_offset,
                 length: bytes.len() as u64,
                 chunk_id: receipt.chunk.id.clone(),
                 chunk_offset: 0,
@@ -8935,6 +15390,221 @@ mod tests {
     }
 
     #[cfg(feature = "dfs")]
+    fn deferred_budget_counts(fs: &DistributedFs) -> (u64, u64, usize) {
+        let state = fs.write_pipeline_budget.state.lock().unwrap();
+        (
+            state.normal_bytes,
+            state.descriptor_bytes,
+            state.descriptors,
+        )
+    }
+
+    #[cfg(feature = "dfs")]
+    fn deferred_publisher_bytes(fs: &DistributedFs) -> u64 {
+        fs.write_pipeline_budget
+            .state
+            .lock()
+            .unwrap()
+            .publisher_bytes
+    }
+
+    #[cfg(feature = "dfs")]
+    fn deferred_uploaded_extent_count(fs: &DistributedFs, inode_id: &InodeId) -> usize {
+        let cell = fs.write_state(inode_id).unwrap().unwrap();
+        let state = cell.lock().unwrap();
+        state
+            .dirty_extents
+            .iter_extents()
+            .filter(|extent| extent.data.is_none() && extent.uploaded.is_some())
+            .count()
+    }
+
+    #[cfg(feature = "dfs")]
+    fn deferred_window_counts(fs: &DistributedFs, inode_id: &InodeId) -> (usize, usize, usize) {
+        let cell = fs.write_state(inode_id).unwrap().unwrap();
+        let state = cell.lock().unwrap();
+        let Some(window) = state.publication_window.as_ref() else {
+            return (0, 0, 0);
+        };
+        (
+            window.ready_chunks.len(),
+            window.uploads.len(),
+            window.completed.len(),
+        )
+    }
+
+    #[cfg(feature = "dfs")]
+    struct RecordingDeferredChunkStore {
+        inner: Arc<dyn ChunkStore>,
+        deferred_batches: Arc<Mutex<Vec<Vec<ChunkObject>>>>,
+        sync_batches: Arc<Mutex<Vec<Vec<ChunkObject>>>>,
+        wait_count: Arc<AtomicUsize>,
+        wait_error_at: Arc<Mutex<Option<(usize, Error)>>>,
+        try_wait_ready: Arc<AtomicBool>,
+        corrupt_try_wait_operation_at: Arc<Mutex<Option<usize>>>,
+        retained_staged: Mutex<Option<Vec<StagedChunk>>>,
+    }
+
+    #[cfg(feature = "dfs")]
+    impl RecordingDeferredChunkStore {
+        fn new(inner: Arc<dyn ChunkStore>) -> Self {
+            Self {
+                inner,
+                deferred_batches: Arc::new(Mutex::new(Vec::new())),
+                sync_batches: Arc::new(Mutex::new(Vec::new())),
+                wait_count: Arc::new(AtomicUsize::new(0)),
+                wait_error_at: Arc::new(Mutex::new(None)),
+                try_wait_ready: Arc::new(AtomicBool::new(true)),
+                corrupt_try_wait_operation_at: Arc::new(Mutex::new(None)),
+                retained_staged: Mutex::new(None),
+            }
+        }
+
+        fn fail_wait_with(&self, wait_index: usize, error: Error) {
+            *self.wait_error_at.lock().unwrap() = Some((wait_index, error));
+        }
+
+        fn hold_try_wait(&self) {
+            self.try_wait_ready.store(false, Ordering::SeqCst);
+        }
+
+        fn corrupt_try_wait_operation_at(&self, wait_index: usize) {
+            *self.corrupt_try_wait_operation_at.lock().unwrap() = Some(wait_index);
+        }
+
+        fn deferred_batches(&self) -> Vec<Vec<ChunkObject>> {
+            self.deferred_batches.lock().unwrap().clone()
+        }
+
+        fn sync_batches(&self) -> Vec<Vec<ChunkObject>> {
+            self.sync_batches.lock().unwrap().clone()
+        }
+    }
+
+    #[cfg(feature = "dfs")]
+    struct RecordingDeferredPut {
+        inner: Arc<dyn ChunkStore>,
+        staged: Vec<StagedChunk>,
+        receipts: Option<Vec<crate::dfs::ChunkReceipt>>,
+        wait_count: Arc<AtomicUsize>,
+        wait_error_at: Arc<Mutex<Option<(usize, Error)>>>,
+        try_wait_ready: Arc<AtomicBool>,
+        corrupt_try_wait_operation_at: Arc<Mutex<Option<usize>>>,
+    }
+
+    #[cfg(feature = "dfs")]
+    impl DeferredChunkPut for RecordingDeferredPut {
+        fn try_wait(&mut self) -> Result<Option<Vec<crate::dfs::ChunkReceipt>>> {
+            if let Some(receipts) = self.receipts.as_ref() {
+                return Ok(Some(receipts.clone()));
+            }
+            if !self.try_wait_ready.load(Ordering::SeqCst) {
+                return Ok(None);
+            }
+            let wait_index = self.wait_count.fetch_add(1, Ordering::SeqCst) + 1;
+            let mut injected = self.wait_error_at.lock().unwrap();
+            if injected
+                .as_ref()
+                .is_some_and(|(target, _error)| *target == wait_index)
+            {
+                let (_target, error) = injected.take().unwrap();
+                return Err(error);
+            }
+            drop(injected);
+            let mut receipts = self.inner.put_batch(std::mem::take(&mut self.staged))?;
+            let corrupt_operation = {
+                let mut target = self.corrupt_try_wait_operation_at.lock().unwrap();
+                if matches!(*target, Some(target_wait) if target_wait == wait_index) {
+                    *target = None;
+                    true
+                } else {
+                    false
+                }
+            };
+            if corrupt_operation && let Some(receipt) = receipts.first_mut() {
+                receipt.operation_id = OperationId::new("wrong-operation");
+            }
+            self.receipts = Some(receipts.clone());
+            Ok(Some(receipts))
+        }
+
+        fn wait(self: Box<Self>) -> Result<Vec<crate::dfs::ChunkReceipt>> {
+            let mut this = *self;
+            if let Some(receipts) = this.receipts.take() {
+                return Ok(receipts);
+            }
+            let wait_index = this.wait_count.fetch_add(1, Ordering::SeqCst) + 1;
+            let mut injected = this.wait_error_at.lock().unwrap();
+            if injected
+                .as_ref()
+                .is_some_and(|(target, _error)| *target == wait_index)
+            {
+                let (_target, error) = injected.take().unwrap();
+                return Err(error);
+            }
+            drop(injected);
+            this.inner.put_batch(this.staged)
+        }
+    }
+
+    #[cfg(feature = "dfs")]
+    impl ChunkStore for RecordingDeferredChunkStore {
+        fn supports_deferred_put(&self) -> bool {
+            true
+        }
+
+        fn put_batch_deferred(
+            &self,
+            staged: Vec<StagedChunk>,
+        ) -> Result<Box<dyn DeferredChunkPut>> {
+            if let Some(retained) = self.retained_staged.lock().unwrap().as_mut() {
+                retained.extend(staged.iter().cloned());
+            }
+            self.deferred_batches.lock().unwrap().push(
+                staged
+                    .iter()
+                    .map(|chunk| chunk.chunk.clone())
+                    .collect::<Vec<_>>(),
+            );
+            Ok(Box::new(RecordingDeferredPut {
+                inner: self.inner.clone(),
+                staged,
+                receipts: None,
+                wait_count: self.wait_count.clone(),
+                wait_error_at: self.wait_error_at.clone(),
+                try_wait_ready: self.try_wait_ready.clone(),
+                corrupt_try_wait_operation_at: self.corrupt_try_wait_operation_at.clone(),
+            }))
+        }
+
+        fn put_batch(&self, staged: Vec<StagedChunk>) -> Result<Vec<crate::dfs::ChunkReceipt>> {
+            if let Some(retained) = self.retained_staged.lock().unwrap().as_mut() {
+                retained.extend(staged.iter().cloned());
+            }
+            self.sync_batches.lock().unwrap().push(
+                staged
+                    .iter()
+                    .map(|chunk| chunk.chunk.clone())
+                    .collect::<Vec<_>>(),
+            );
+            self.inner.put_batch(staged)
+        }
+
+        fn read_at(
+            &self,
+            chunk_id: &crate::dfs::ChunkId,
+            offset: u64,
+            out: &mut [u8],
+        ) -> Result<usize> {
+            self.inner.read_at(chunk_id, offset, out)
+        }
+
+        fn capacity(&self) -> Result<FilesystemCapacity> {
+            self.inner.capacity()
+        }
+    }
+
+    #[cfg(feature = "dfs")]
     struct UnsupportedCapacityChunkStore {
         inner: Arc<dyn ChunkStore>,
     }
@@ -8953,6 +15623,2506 @@ mod tests {
         ) -> Result<usize> {
             self.inner.read_at(chunk_id, offset, out)
         }
+    }
+
+    // Frozen 693d144 Vec algorithm: independent of the indexed insert,
+    // lookup, append index and normalization used by the production candidate.
+    #[cfg(feature = "dfs")]
+    #[derive(Default)]
+    struct W1LegacyDirtyMap {
+        extents: Vec<DirtyExtent>,
+        builders: Vec<NativeDirtyBuilder>,
+        native_admitted_bytes: Option<u64>,
+    }
+
+    #[cfg(feature = "dfs")]
+    impl W1LegacyDirtyMap {
+        fn write_native_at(
+            &mut self,
+            offset: u64,
+            data: &[u8],
+            write_seq: u64,
+            pool: &Arc<WriteBufferPool>,
+            logical_length: u64,
+        ) -> Result<usize> {
+            offset
+                .checked_add(data.len() as u64)
+                .ok_or_else(file_too_large)?;
+            self.native_admitted_bytes.get_or_insert(0);
+            let mut accepted = 0;
+            while accepted < data.len() {
+                let position = offset + accepted as u64;
+                let latest = self.extents.iter().rev().find(|extent| {
+                    extent.file_offset <= position && position < extent.file_offset + extent.length
+                });
+                let existing = latest.and_then(|extent| {
+                    extent.builder.map(|index| {
+                        let source =
+                            extent.source_offset + (position - extent.file_offset) as usize;
+                        (
+                            index,
+                            source,
+                            (extent.file_offset + extent.length - position) as usize,
+                        )
+                    })
+                });
+                let append = if existing.is_none() && position >= logical_length {
+                    self.builders
+                        .iter()
+                        .enumerate()
+                        .rev()
+                        .find_map(|(index, entry)| {
+                            let length = entry.builder.len();
+                            (entry.file_offset + length as u64 == position
+                                && length < entry.builder.writable_capacity())
+                            .then_some((index, length, entry.builder.writable_capacity() - length))
+                        })
+                } else {
+                    None
+                };
+                let (index, source_offset, available) = if let Some(existing) = existing.or(append)
+                {
+                    existing
+                } else {
+                    let remaining = data.len() - accepted;
+                    let capacity = if position >= logical_length {
+                        COMMIT_CHUNK_BYTES as usize
+                    } else {
+                        remaining
+                            .min(COMMIT_CHUNK_BYTES as usize)
+                            .max(4096)
+                            .next_power_of_two()
+                    };
+                    let builder = match ChunkBuilder::with_pool(pool.clone(), capacity) {
+                        Ok(builder) => builder,
+                        Err(_error) if accepted > 0 => return Ok(accepted),
+                        Err(error) => return Err(error),
+                    };
+                    let index = self.builders.len();
+                    self.builders.push(NativeDirtyBuilder {
+                        file_offset: position,
+                        builder,
+                        descriptor: None,
+                        creation_order: index as u64,
+                    });
+                    (index, 0, capacity)
+                };
+                let take = available.min(data.len() - accepted);
+                self.builders[index]
+                    .builder
+                    .write_at(source_offset as u64, &data[accepted..accepted + take])?;
+                self.extents.push(DirtyExtent {
+                    file_offset: position,
+                    length: take as u64,
+                    write_seq,
+                    data: None,
+                    builder: Some(index),
+                    source_offset,
+                    native_reuse_end: 0,
+                    uploaded: None,
+                    native_upload: None,
+                    native_descriptor: None,
+                    budget_reservations: Vec::new(),
+                });
+                let admitted = self.native_admitted_bytes.get_or_insert(0);
+                *admitted = admitted.saturating_add(take as u64);
+                accepted += take;
+            }
+            Ok(accepted)
+        }
+
+        fn freeze_builders(&mut self) {
+            let bodies = std::mem::take(&mut self.builders)
+                .into_iter()
+                .map(|entry| entry.builder.freeze())
+                .collect::<Vec<_>>();
+            for extent in &mut self.extents {
+                if let Some(index) = extent.builder.take() {
+                    extent.data = Some(bodies[index].clone());
+                }
+            }
+        }
+
+        fn snapshot_range(&self, offset: u64, length: usize) -> Result<Self> {
+            let end = offset
+                .checked_add(length as u64)
+                .ok_or_else(|| invalid("dirty snapshot range overflow"))?;
+            let mut snapshot = Self::default();
+            for extent in &self.extents {
+                let start = offset.max(extent.file_offset);
+                let stop = end.min(
+                    extent
+                        .file_offset
+                        .checked_add(extent.length)
+                        .ok_or_else(|| invalid("dirty snapshot extent overflow"))?,
+                );
+                if start >= stop {
+                    continue;
+                }
+                let mut copied = extent.clone();
+                copied.file_offset = start;
+                copied.length = stop - start;
+                let source = extent.source_offset
+                    + usize::try_from(start - extent.file_offset)
+                        .map_err(|_| invalid("dirty snapshot source overflow"))?;
+                if let Some(index) = extent.builder {
+                    let bytes = &self.builders[index].builder.as_bytes();
+                    // Holes installed by truncate can mask an obsolete tail. Do not
+                    // even read that tail into the snapshot before applying holes.
+                    let available = bytes
+                        .len()
+                        .saturating_sub(source)
+                        .min(copied.length as usize);
+                    let mut body = vec![0; copied.length as usize];
+                    if available > 0 {
+                        body[..available].copy_from_slice(&bytes[source..source + available]);
+                    }
+                    tracing::info_span!(
+                        "node.dfs.write_buffer.read_snapshot_copy",
+                        bytes = available as u64
+                    )
+                    .in_scope(|| {});
+                    copied.data = Some(SharedChunkBytes::from_vec(body));
+                    copied.source_offset = 0;
+                    copied.builder = None;
+                } else {
+                    copied.source_offset = source;
+                }
+                snapshot.extents.push(copied);
+            }
+            Ok(snapshot)
+        }
+
+        fn resize(&mut self, old_length: u64, new_length: u64, write_seq: u64) -> Result<()> {
+            if new_length < old_length {
+                for entry in &mut self.builders {
+                    let keep = new_length
+                        .saturating_sub(entry.file_offset)
+                        .min(entry.builder.len() as u64) as usize;
+                    entry.builder.truncate(keep);
+                }
+                // A masked tail must not survive as an extent longer than the
+                // now-shorter immutable body when this batch is frozen/retried.
+                for extent in &mut self.extents {
+                    if extent.builder.is_some() {
+                        extent.length = extent
+                            .length
+                            .min(new_length.saturating_sub(extent.file_offset));
+                    }
+                }
+                self.extents.retain(|extent| extent.length > 0);
+            }
+            let (start, stop) = if new_length < old_length {
+                (new_length, old_length)
+            } else {
+                (old_length, new_length)
+            };
+            if start < stop {
+                self.extents.push(DirtyExtent {
+                    file_offset: start,
+                    length: stop - start,
+                    write_seq,
+                    data: None,
+                    builder: None,
+                    source_offset: 0,
+                    native_reuse_end: 0,
+                    uploaded: None,
+                    native_upload: None,
+                    native_descriptor: None,
+                    budget_reservations: Vec::new(),
+                });
+            }
+            Ok(())
+        }
+
+        fn overlay(&self, offset: u64, out: &mut [u8]) -> Result<()> {
+            let end = offset
+                .checked_add(out.len() as u64)
+                .ok_or_else(|| invalid("dirty read range overflow"))?;
+            for extent in &self.extents {
+                let extent_end = extent
+                    .file_offset
+                    .checked_add(extent.length)
+                    .ok_or_else(|| invalid("dirty extent range overflow"))?;
+                let start = offset.max(extent.file_offset);
+                let stop = end.min(extent_end);
+                if start >= stop {
+                    continue;
+                }
+                let output_start = usize::try_from(start - offset)
+                    .map_err(|_| invalid("dirty output offset is too large"))?;
+                let length = usize::try_from(stop - start)
+                    .map_err(|_| invalid("dirty overlay length is too large"))?;
+                match &extent.data {
+                    Some(data) => {
+                        let data_start = extent.source_offset
+                            + usize::try_from(start - extent.file_offset)
+                                .map_err(|_| invalid("dirty data offset is too large"))?;
+                        out[output_start..output_start + length]
+                            .copy_from_slice(&data[data_start..data_start + length]);
+                    }
+                    None if extent.uploaded.is_some() => {
+                        return Err(unavailable(
+                            "DFS uploaded dirty extent must be published before local read",
+                        ));
+                    }
+                    None => out[output_start..output_start + length].fill(0),
+                }
+            }
+            Ok(())
+        }
+
+        fn restore_before(&mut self, mut older: W1LegacyDirtyMap) {
+            older.extents.append(&mut self.extents);
+            older.extents.sort_by_key(|extent| extent.write_seq);
+            self.extents = older.extents;
+            self.native_admitted_bytes =
+                match (older.native_admitted_bytes, self.native_admitted_bytes) {
+                    (None, None) => None,
+                    (left, right) => Some(left.unwrap_or(0).saturating_add(right.unwrap_or(0))),
+                };
+        }
+
+        fn dirty_data_bytes(&self) -> u64 {
+            if let Some(accepted) = self.native_admitted_bytes {
+                return accepted;
+            }
+            self.extents
+                .iter()
+                .filter(|extent| {
+                    extent.data.is_some()
+                        || extent
+                            .uploaded
+                            .as_ref()
+                            .is_some_and(|uploaded| uploaded.chunk == uploaded.receipt.chunk)
+                })
+                .fold(0u64, |total, extent| total.saturating_add(extent.length))
+        }
+    }
+
+    #[cfg(feature = "dfs")]
+    fn w1_legacy_normalized_overlay(
+        map: &W1LegacyDirtyMap,
+        file_length: u64,
+    ) -> Result<Vec<OverlaySegment>> {
+        let mut output: Vec<OverlaySegment> = Vec::new();
+        for dirty in &map.extents {
+            if dirty.file_offset >= file_length || dirty.length == 0 {
+                continue;
+            }
+            let dirty_end = dirty
+                .file_offset
+                .checked_add(dirty.length)
+                .ok_or_else(|| invalid("dirty extent range overflow"))?
+                .min(file_length);
+            let mut next = Vec::with_capacity(output.len().saturating_add(1));
+            for segment in output {
+                let segment_end = segment.file_offset + segment.length;
+                if dirty_end <= segment.file_offset || dirty.file_offset >= segment_end {
+                    next.push(segment);
+                    continue;
+                }
+                if dirty.file_offset > segment.file_offset {
+                    next.push(OverlaySegment {
+                        file_offset: segment.file_offset,
+                        length: dirty.file_offset - segment.file_offset,
+                        data: segment.data.clone(),
+                    });
+                }
+                if dirty_end < segment_end {
+                    let data = match segment.data {
+                        Some((bytes, source_offset)) => {
+                            let delta = usize::try_from(dirty_end - segment.file_offset)
+                                .map_err(|_| invalid("overlay source offset is too large"))?;
+                            let source_offset = source_offset
+                                .checked_add(delta)
+                                .ok_or_else(|| invalid("overlay source offset overflow"))?;
+                            Some((bytes, source_offset))
+                        }
+                        None => None,
+                    };
+                    next.push(OverlaySegment {
+                        file_offset: dirty_end,
+                        length: segment_end - dirty_end,
+                        data,
+                    });
+                }
+            }
+            next.push(OverlaySegment {
+                file_offset: dirty.file_offset,
+                length: dirty_end - dirty.file_offset,
+                data: match &dirty.data {
+                    Some(bytes) => Some((bytes.clone(), dirty.source_offset)),
+                    None if dirty.uploaded.is_some() => {
+                        return Err(unavailable(
+                            "DFS uploaded dirty extent must use its publication receipt",
+                        ));
+                    }
+                    None => None,
+                },
+            });
+            next.sort_by_key(|segment| segment.file_offset);
+            output = next;
+        }
+        Ok(output)
+    }
+
+    #[cfg(feature = "dfs")]
+    fn w1_legacy_visible_seq(map: &W1LegacyDirtyMap, offset: u64) -> Option<u64> {
+        map.extents
+            .iter()
+            .rev()
+            .find(|extent| {
+                extent.file_offset <= offset && offset < extent.file_offset + extent.length
+            })
+            .map(|extent| extent.write_seq)
+    }
+
+    #[cfg(feature = "dfs")]
+    fn w1_indexed_visible_seq(map: &DirtyExtentMap, offset: u64) -> Option<u64> {
+        map.extents
+            .range(..=offset)
+            .next_back()
+            .and_then(|(_, extent)| {
+                (offset < extent.file_offset + extent.length).then_some(extent.write_seq)
+            })
+            .or_else(|| {
+                map.legacy_extents
+                    .iter()
+                    .rev()
+                    .find(|extent| {
+                        extent.file_offset <= offset && offset < extent.file_offset + extent.length
+                    })
+                    .map(|extent| extent.write_seq)
+            })
+    }
+
+    #[cfg(feature = "dfs")]
+    fn w1_legacy_plan_map(map: &W1LegacyDirtyMap, logical_length: u64) -> DirtyExtentMap {
+        let mut indexed = DirtyExtentMap {
+            native_admitted_bytes: map.native_admitted_bytes,
+            ..DirtyExtentMap::default()
+        };
+        for segment in w1_legacy_normalized_overlay(map, logical_length).unwrap() {
+            let (data, source_offset) = match segment.data {
+                Some((data, source_offset)) => (Some(data), source_offset),
+                None => (None, 0),
+            };
+            indexed.extents.insert(
+                segment.file_offset,
+                DirtyExtent {
+                    file_offset: segment.file_offset,
+                    length: segment.length,
+                    write_seq: 0,
+                    data,
+                    builder: None,
+                    source_offset,
+                    native_reuse_end: 0,
+                    uploaded: None,
+                    native_upload: None,
+                    native_descriptor: None,
+                    budget_reservations: Vec::new(),
+                },
+            );
+        }
+        indexed
+    }
+
+    #[cfg(feature = "dfs")]
+    #[test]
+    fn p2_w1_dirty_interval_index_matches_legacy_for_ten_thousand_sequences() {
+        let (_temp, meta, fs) = test_fs();
+        fs.create(
+            &context(),
+            fs.root_inode(),
+            OsStr::new("w1-model.bin"),
+            0o640,
+            libc::O_RDWR,
+        )
+        .unwrap();
+        let inode_id = meta.inode.lock().unwrap().inode_id.clone();
+        let cell = fs.write_state(&inode_id).unwrap().unwrap();
+        let template = DistributedFs::freeze_state_for_commit(&mut cell.lock().unwrap());
+        let mut seed = 0xe4d2_b96f_7350_8a61_u64;
+        let mut random = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for case in 0..10_000_u64 {
+            let pool = WriteBufferPool::new(0);
+            let legacy_pool = WriteBufferPool::new(0);
+            let mut indexed = DirtyExtentMap::default();
+            let mut legacy = W1LegacyDirtyMap::default();
+            let mut length = 0_u64;
+            let mut held = None;
+            let mut held_legacy = None;
+            let mut pinned: Option<(DirtyExtentMap, W1LegacyDirtyMap, u64, Vec<u8>)> = None;
+            let operations = 8 + random() as usize % 17;
+            for operation in 0..operations {
+                let draw = random();
+                let seq = operation as u64 + 1;
+                match draw % 10 {
+                    4 if case % 11 == 0 => {
+                        // This offset cannot hit or append any current small
+                        // builder. Both implementations must reject the same
+                        // allocation without admitting or exposing a tail.
+                        pool.fail_next_allocation();
+                        legacy_pool.fail_next_allocation();
+                        let actual = indexed
+                            .write_native_at(1 << 20, &[5; 32], seq, &pool, length)
+                            .unwrap_err();
+                        let expected = legacy
+                            .write_native_at(1 << 20, &[5; 32], seq, &legacy_pool, length)
+                            .unwrap_err();
+                        assert_eq!(
+                            actual.code(),
+                            expected.code(),
+                            "allocation failure case={case} operation={operation}"
+                        );
+                    }
+                    5 if case % 13 == 0 => {
+                        let actual = indexed
+                            .write_native_at(u64::MAX, &[5], seq, &pool, length)
+                            .unwrap_err();
+                        let expected = legacy
+                            .write_native_at(u64::MAX, &[5], seq, &legacy_pool, length)
+                            .unwrap_err();
+                        assert_eq!(
+                            actual.code(),
+                            expected.code(),
+                            "overflow case={case} operation={operation}"
+                        );
+                    }
+                    0 | 1 => {
+                        let new_length = random() % 16_385;
+                        indexed.resize(length, new_length, seq).unwrap();
+                        legacy.resize(length, new_length, seq).unwrap();
+                        length = new_length;
+                    }
+                    2 if held.is_none() => {
+                        let mut frozen = std::mem::take(&mut indexed);
+                        let mut old_frozen = std::mem::take(&mut legacy);
+                        frozen.freeze_builders();
+                        old_frozen.freeze_builders();
+                        held = Some(frozen);
+                        held_legacy = Some(old_frozen);
+                    }
+                    3 if held.is_some() => {
+                        indexed.restore_before(held.take().unwrap());
+                        legacy.restore_before(held_legacy.take().unwrap());
+                    }
+                    _ => {
+                        let offset = if draw & 16 == 0 {
+                            length
+                        } else {
+                            random() % 16_385
+                        };
+                        let size = 1 + random() as usize % 2048;
+                        let payload = (0..size)
+                            .map(|index| (draw.wrapping_add(index as u64 * 37) >> 8) as u8)
+                            .collect::<Vec<_>>();
+                        let accepted = indexed
+                            .write_native_at(offset, &payload, seq, &pool, length)
+                            .unwrap();
+                        let expected = legacy
+                            .write_native_at(offset, &payload, seq, &legacy_pool, length)
+                            .unwrap();
+                        assert_eq!(accepted, expected, "case={case} operation={operation}");
+                        length = length.max(offset + accepted as u64);
+                    }
+                }
+                assert_eq!(
+                    indexed.dirty_data_bytes(),
+                    legacy.dirty_data_bytes(),
+                    "admission case={case} operation={operation}"
+                );
+                let actual_stats = pool.snapshot();
+                let expected_stats = legacy_pool.snapshot();
+                assert_eq!(
+                    actual_stats.copied_bytes, expected_stats.copied_bytes,
+                    "input copy bytes case={case} operation={operation}"
+                );
+                assert_eq!(
+                    actual_stats.copy_operations, expected_stats.copy_operations,
+                    "input copy calls case={case} operation={operation}"
+                );
+                assert_eq!(
+                    indexed.builders.len(),
+                    legacy.builders.len(),
+                    "owner count case={case} operation={operation}"
+                );
+                for (actual, expected) in indexed.builders.iter().zip(&legacy.builders) {
+                    assert_eq!(actual.file_offset, expected.file_offset);
+                    assert_eq!(actual.builder.capacity(), expected.builder.capacity());
+                    assert!(
+                        actual.builder.as_bytes() == expected.builder.as_bytes(),
+                        "owner body case={case} operation={operation}"
+                    );
+                }
+                if let Some((snapshot, old_snapshot, offset, bytes)) = &pinned {
+                    let mut actual = vec![91; bytes.len()];
+                    let mut expected = vec![91; bytes.len()];
+                    snapshot.overlay(*offset, &mut actual).unwrap();
+                    old_snapshot.overlay(*offset, &mut expected).unwrap();
+                    assert!(
+                        actual == *bytes && expected == *bytes,
+                        "pinned snapshot case={case} operation={operation}"
+                    );
+                }
+                let offset = random() % length.max(1);
+                let size = 1024.min(length.saturating_sub(offset) as usize);
+                let mut actual = vec![91; size];
+                let mut expected = vec![91; size];
+                if let Some(frozen) = &held {
+                    frozen.overlay(offset, &mut actual).unwrap();
+                    held_legacy
+                        .as_ref()
+                        .unwrap()
+                        .overlay(offset, &mut expected)
+                        .unwrap();
+                }
+                indexed
+                    .snapshot_range(offset, size)
+                    .unwrap()
+                    .overlay(offset, &mut actual)
+                    .unwrap();
+                legacy
+                    .snapshot_range(offset, size)
+                    .unwrap()
+                    .overlay(offset, &mut expected)
+                    .unwrap();
+                assert!(
+                    actual == expected,
+                    "visible bytes case={case} operation={operation} offset={offset}"
+                );
+                if operation % 8 == 0 {
+                    let actual_snapshot = indexed.snapshot_range(offset, size).unwrap();
+                    let expected_snapshot = legacy.snapshot_range(offset, size).unwrap();
+                    let mut bytes = vec![91; size];
+                    actual_snapshot.overlay(offset, &mut bytes).unwrap();
+                    pinned = Some((actual_snapshot, expected_snapshot, offset, bytes));
+                }
+                // Sequence is independent of body identity and cannot be erased
+                // just because two neighboring ranges use the same allocation.
+                for probe in [0, offset, length.saturating_sub(1)] {
+                    assert_eq!(
+                        w1_indexed_visible_seq(&indexed, probe),
+                        w1_legacy_visible_seq(&legacy, probe),
+                        "seq case={case} operation={operation} offset={probe}"
+                    );
+                }
+                let mut last_end = 0;
+                for (start, extent) in &indexed.extents {
+                    assert!(*start >= last_end);
+                    assert_eq!(*start, extent.file_offset);
+                    last_end = *start + extent.length;
+                }
+            }
+            if let Some(frozen) = held.take() {
+                indexed.restore_before(frozen);
+                legacy.restore_before(held_legacy.take().unwrap());
+            }
+            let identities = indexed
+                .builders
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.builder.allocation_id(),
+                        (entry.builder.data_ptr() as usize, entry.builder.capacity()),
+                    )
+                })
+                .collect::<HashMap<_, _>>();
+            let before = pool.snapshot();
+            indexed.freeze_builders();
+            legacy.freeze_builders();
+            for extent in indexed.iter_extents() {
+                if let Some(data) = &extent.data
+                    && let Some(identity) = identities.get(&data.allocation_id())
+                {
+                    assert_eq!(
+                        *identity,
+                        (data.as_ptr() as usize, data.capacity()),
+                        "freeze owner case={case}"
+                    );
+                }
+            }
+            let mut actual_frozen = template.clone();
+            actual_frozen.logical_length = length;
+            actual_frozen.dirty_extents = indexed;
+            let mut expected_frozen = template.clone();
+            expected_frozen.logical_length = length;
+            expected_frozen.dirty_extents = w1_legacy_plan_map(&legacy, length);
+            let operation_id = OperationId::new("w1-differential");
+            let layout_id = LayoutRootId::new("w1-differential-layout");
+            let actual = CommitPlanner
+                .plan(&actual_frozen, operation_id.clone(), layout_id.clone())
+                .unwrap();
+            let expected = CommitPlanner
+                .plan(&expected_frozen, operation_id, layout_id)
+                .unwrap();
+            assert_eq!(
+                actual.layout_root, expected.layout_root,
+                "layout case={case}"
+            );
+            assert_eq!(
+                actual.staged_chunks.len(),
+                expected.staged_chunks.len(),
+                "objects case={case}"
+            );
+            for (actual, expected) in actual.staged_chunks.iter().zip(&expected.staged_chunks) {
+                assert_eq!(actual.chunk, expected.chunk, "standard object case={case}");
+                assert!(
+                    actual.shared_bytes().as_ref() == expected.shared_bytes().as_ref(),
+                    "submitted body case={case}"
+                );
+            }
+            assert_eq!(
+                pool.snapshot().copied_bytes,
+                before.copied_bytes,
+                "freeze/planner copy bytes case={case}"
+            );
+            assert_eq!(
+                pool.snapshot().copy_operations,
+                before.copy_operations,
+                "freeze/planner copy calls case={case}"
+            );
+        }
+    }
+
+    #[test]
+    fn p2_w1_append_index_keeps_creation_order_after_shrink_regrow() {
+        let pool = WriteBufferPool::new(0);
+        let mut map = DirtyExtentMap::default();
+        map.write_native_at(0, &[1; 4096], 1, &pool, 0).unwrap();
+        map.resize(4096, 0, 2).unwrap();
+        map.resize(0, 4096, 3).unwrap();
+        // The hole masks the old builder, so this interior patch gets a new,
+        // smaller owner at the same file start.
+        map.write_native_at(0, &[2; 4096], 4, &pool, 4096).unwrap();
+        assert_eq!(map.builders.len(), 2);
+        assert_eq!(map.builders[1].builder.capacity(), 4096);
+        map.resize(4096, 0, 5).unwrap();
+        map.write_native_at(0, &[3; 16], 6, &pool, 0).unwrap();
+        assert_eq!(map.builders.len(), 2);
+        assert_eq!(map.builders[0].builder.len(), 0);
+        assert_eq!(map.builders[1].builder.as_bytes(), &[3; 16]);
+        assert_eq!(pool.snapshot().copy_operations, 3);
+    }
+
+    #[test]
+    fn p2_w1_shadowed_frozen_owner_releases_only_after_last_snapshot() {
+        let pool = WriteBufferPool::new(0);
+        let mut older = DirtyExtentMap::default();
+        older
+            .write_native_at(0, &[1; 4096], 1, &pool, 4096)
+            .unwrap();
+        older.freeze_builders();
+        let pinned = older.clone();
+        let owner = older
+            .extents
+            .first_key_value()
+            .unwrap()
+            .1
+            .data
+            .as_ref()
+            .unwrap()
+            .clone();
+        let mut active = DirtyExtentMap::default();
+        active
+            .write_native_at(0, &[2; 4096], 2, &pool, 4096)
+            .unwrap();
+        active.restore_before(older);
+        assert_eq!(active.extents.len(), 1);
+        assert!(active.legacy_extents.is_empty());
+        assert_eq!(pool.snapshot().live_buffers, 2);
+        drop(owner);
+        assert_eq!(pool.snapshot().live_buffers, 2);
+        let mut out = [0; 4096];
+        pinned.overlay(0, &mut out).unwrap();
+        assert_eq!(out, [1; 4096]);
+        drop(pinned);
+        assert_eq!(pool.snapshot().live_buffers, 1);
+        drop(active);
+        assert_eq!(pool.snapshot().live_buffers, 0);
+    }
+
+    #[test]
+    fn p2_w1_native_promotion_restore_holes_and_equal_sequence_are_preserved() {
+        let pool = WriteBufferPool::new(0);
+        let mut map = DirtyExtentMap::default();
+        map.resize(0, 16_384, 1).unwrap();
+        map.write_native_at(8192, &[3; 4096], 2, &pool, 16_384)
+            .unwrap();
+        assert!(map.legacy_extents.is_empty());
+        let mut older = std::mem::take(&mut map);
+        older.freeze_builders();
+        map.write_native_at(8192, &[7; 4096], 2, &pool, 16_384)
+            .unwrap();
+        map.restore_before(older);
+        let snapshot = map.snapshot_range(0, 16_384).unwrap();
+        let mut out = vec![91; 16_384];
+        snapshot.overlay(0, &mut out).unwrap();
+        assert!(out[..8192].iter().all(|byte| *byte == 0));
+        assert!(out[8192..12_288].iter().all(|byte| *byte == 7));
+        assert!(out[12_288..].iter().all(|byte| *byte == 0));
+        assert_eq!(map.native_admitted_bytes, Some(8192));
+        assert!(map.legacy_extents.is_empty());
+    }
+
+    #[cfg(feature = "dfs")]
+    #[test]
+    fn p2_w1_aligned_overwrite_metadata_stays_bounded() {
+        const OBJECT_BYTES: usize = 4 * 1024 * 1024;
+        const FILE_BYTES: usize = 4 * OBJECT_BYTES;
+        const BLOCK_BYTES: usize = 4096;
+        const BLOCKS: usize = FILE_BYTES / BLOCK_BYTES;
+        const WRITES: usize = 100_000;
+        let pool = WriteBufferPool::new(0);
+        let mut dirty = DirtyExtentMap::default();
+        let mut expected = vec![0_u8; BLOCKS];
+        for index in 0..4 {
+            let marker = index as u8 + 1;
+            let payload = vec![marker; OBJECT_BYTES];
+            dirty
+                .write_native_at(
+                    (index * OBJECT_BYTES) as u64,
+                    &payload,
+                    index as u64 + 1,
+                    &pool,
+                    (index * OBJECT_BYTES) as u64,
+                )
+                .unwrap();
+            expected[index * 1024..(index + 1) * 1024].fill(marker);
+        }
+        let identities = dirty
+            .builders
+            .iter()
+            .map(|entry| {
+                (
+                    entry.builder.allocation_id(),
+                    (entry.builder.data_ptr() as usize, entry.builder.capacity()),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let mut seed = 0x39e7_3b5d_2c61_8a47_u64;
+        let mut patch = [0_u8; BLOCK_BYTES];
+        for iteration in 0..WRITES {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let block = (seed as usize) % BLOCKS;
+            let marker = (seed >> 32) as u8;
+            patch.fill(marker);
+            assert_eq!(
+                dirty
+                    .write_native_at(
+                        (block * BLOCK_BYTES) as u64,
+                        &patch,
+                        iteration as u64 + 5,
+                        &pool,
+                        FILE_BYTES as u64,
+                    )
+                    .unwrap(),
+                BLOCK_BYTES
+            );
+            expected[block] = marker;
+            if (iteration + 1) % 1024 == 0 || iteration + 1 == WRITES {
+                // This is live metadata, not normalized temporary output. The
+                // old Vec log fails here; the indexed map must finish all writes.
+                assert!(
+                    dirty.extents.len() <= BLOCKS,
+                    "writes={} live_extents={} maximum={BLOCKS}",
+                    iteration + 1,
+                    dirty.extents.len(),
+                );
+                assert_eq!(dirty.builders.len(), 4);
+                let stats = pool.snapshot();
+                assert_eq!(stats.allocations, 4);
+                assert_eq!(stats.live_buffers, 4);
+                assert_eq!(
+                    stats.copied_bytes,
+                    (FILE_BYTES + (iteration + 1) * BLOCK_BYTES) as u64,
+                );
+                assert_eq!(stats.copy_operations, iteration as u64 + 5);
+            }
+        }
+        assert_eq!(
+            dirty.dirty_data_bytes(),
+            (FILE_BYTES + WRITES * BLOCK_BYTES) as u64,
+            "accepted overwrite bytes still count toward the original trigger",
+        );
+        let before_freeze = pool.snapshot();
+        let (_temp, meta, fs) = test_fs();
+        fs.create(
+            &context(),
+            fs.root_inode(),
+            OsStr::new("w1-bounded-map.bin"),
+            0o640,
+            libc::O_RDWR,
+        )
+        .unwrap();
+        let inode_id = meta.inode.lock().unwrap().inode_id.clone();
+        let cell = fs.write_state(&inode_id).unwrap().unwrap();
+        let frozen = {
+            let mut state = cell.lock().unwrap();
+            state.dirty_extents = dirty;
+            state.logical_length = FILE_BYTES as u64;
+            state.next_write_seq = WRITES as u64 + 4;
+            state.visible_write_seq = state.next_write_seq;
+            DistributedFs::freeze_state_for_commit(&mut state)
+        };
+        let plan = CommitPlanner
+            .plan(
+                &frozen,
+                OperationId::new("w1-bounded-map"),
+                LayoutRootId::new("w1-bounded-map-layout"),
+            )
+            .unwrap();
+        assert_eq!(plan.staged_chunks.len(), 4, "large objects remain large");
+        assert_eq!(plan.layout_root.inline_extents.len(), 4);
+        for (index, extent) in plan.layout_root.inline_extents.iter().enumerate() {
+            assert_eq!(extent.file_offset, (index * OBJECT_BYTES) as u64);
+            assert_eq!(extent.length, OBJECT_BYTES as u64);
+            assert_eq!(extent.chunk_offset, 0);
+            let staged = plan
+                .staged_chunks
+                .iter()
+                .find(|chunk| chunk.chunk.id == extent.chunk_id)
+                .unwrap();
+            let body = staged.shared_bytes();
+            assert_eq!(body.len(), OBJECT_BYTES);
+            assert_eq!(
+                identities.get(&body.allocation_id()),
+                Some(&(body.as_ptr() as usize, body.capacity())),
+                "freeze and planning keep the original body allocation",
+            );
+            for (block, bytes) in body.chunks_exact(BLOCK_BYTES).enumerate() {
+                let marker = expected[index * 1024 + block];
+                assert!(bytes.iter().all(|byte| *byte == marker));
+            }
+        }
+        assert_eq!(pool.snapshot().copied_bytes, before_freeze.copied_bytes);
+        assert_eq!(
+            pool.snapshot().copy_operations,
+            before_freeze.copy_operations
+        );
+    }
+
+    #[test]
+    fn p2_w1_overwrite_preserves_original_builder_span_and_copy_calls() {
+        let pool = WriteBufferPool::new(0);
+        let mut dirty = DirtyExtentMap::default();
+        let original = vec![3; 4 * 1024 * 1024];
+        dirty.write_native_at(0, &original, 1, &pool, 0).unwrap();
+        let pointer = dirty.builders[0].builder.data_ptr();
+        dirty
+            .write_native_at(8192, &[7; 4096], 2, &pool, original.len() as u64)
+            .unwrap();
+        let before = pool.snapshot();
+        dirty
+            .write_native_at(0, &original, 3, &pool, original.len() as u64)
+            .unwrap();
+        let after = pool.snapshot();
+        assert_eq!(
+            after.copied_bytes - before.copied_bytes,
+            original.len() as u64
+        );
+        assert_eq!(after.copy_operations - before.copy_operations, 1);
+        assert_eq!(dirty.builders.len(), 1);
+        assert_eq!(dirty.builders[0].builder.data_ptr(), pointer);
+        assert_eq!(dirty.builders[0].builder.as_bytes(), original.as_slice());
+    }
+
+    #[test]
+    fn native_builder_six_megabytes_freezes_two_allocations_without_body_move() {
+        let pool = WriteBufferPool::new(16 * 1024 * 1024);
+        let mut dirty = DirtyExtentMap::default();
+        for index in 0..6u64 {
+            let bytes = vec![index as u8 + 1; 1024 * 1024];
+            assert_eq!(
+                dirty
+                    .write_native_at(
+                        index * 1024 * 1024,
+                        &bytes,
+                        index + 1,
+                        &pool,
+                        index * 1024 * 1024
+                    )
+                    .unwrap(),
+                bytes.len()
+            );
+        }
+        assert_eq!(dirty.builders.len(), 2);
+        assert_eq!(dirty.builders[0].builder.len(), 4 * 1024 * 1024);
+        assert_eq!(dirty.builders[1].builder.len(), 2 * 1024 * 1024);
+        let identities = dirty
+            .builders
+            .iter()
+            .map(|entry| {
+                (
+                    entry.builder.data_ptr(),
+                    entry.builder.capacity(),
+                    entry.builder.allocation_id(),
+                )
+            })
+            .collect::<Vec<_>>();
+        dirty.freeze_builders();
+        assert!(dirty.builders.is_empty());
+        let mut bodies = HashMap::new();
+        for extent in dirty.iter_extents() {
+            let body = extent.data.as_ref().unwrap();
+            bodies.entry(body.allocation_id()).or_insert(body.clone());
+        }
+        assert_eq!(bodies.len(), 2);
+        for (pointer, capacity, generation) in identities {
+            let body = &bodies[&generation];
+            assert_eq!(body.as_ptr(), pointer);
+            assert_eq!(body.capacity(), capacity);
+        }
+        assert_eq!(dirty.dirty_data_bytes(), 6 * 1024 * 1024);
+    }
+
+    struct NativeFixtureStore {
+        local: Arc<LocalChunkStore>,
+        required: bool,
+        calls: AtomicUsize,
+        fail_next: AtomicBool,
+        pause: Mutex<Option<Arc<CommitPause>>>,
+    }
+
+    impl ChunkStore for NativeFixtureStore {
+        fn put_batch(&self, staged: Vec<StagedChunk>) -> Result<Vec<ChunkReceipt>> {
+            self.local.put_batch(staged)
+        }
+        fn put_native_batch(&self, staged: Vec<StagedChunk>) -> Result<Vec<NativeChunkReceipt>> {
+            self.calls.fetch_add(staged.len(), Ordering::SeqCst);
+            if let Some(pause) = self.pause.lock().unwrap().take() {
+                pause.block();
+            }
+            if self.fail_next.swap(false, Ordering::SeqCst) {
+                return Err(unavailable("injected native upload failure"));
+            }
+            self.local.put_batch(staged).map(|receipts| {
+                receipts
+                    .into_iter()
+                    .map(|receipt| NativeChunkReceipt {
+                        receipt,
+                        local_required_and_durable: self.required,
+                    })
+                    .collect()
+            })
+        }
+        fn read_native_uploaded_at(
+            &self,
+            receipt: &ChunkReceipt,
+            offset: u64,
+            out: &mut [u8],
+        ) -> Result<usize> {
+            self.local
+                .open_receipt_reader(&receipt.chunk)?
+                .read_at(offset, out)
+        }
+        fn read_at(
+            &self,
+            chunk: &crate::dfs::ChunkId,
+            offset: u64,
+            out: &mut [u8],
+        ) -> Result<usize> {
+            self.local.read_at(chunk, offset, out)
+        }
+    }
+
+    fn native_pipeline_fixture(
+        required: bool,
+        live: usize,
+        descriptors: usize,
+    ) -> (
+        tempfile::TempDir,
+        Arc<RecordingMeta>,
+        DistributedFs,
+        tokio::runtime::Runtime,
+        Arc<NativeFixtureStore>,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let meta = Arc::new(RecordingMeta::new());
+        let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
+        let store = Arc::new(NativeFixtureStore {
+            local: local.clone(),
+            required,
+            calls: AtomicUsize::new(0),
+            fail_next: AtomicBool::new(false),
+            pause: Mutex::new(None),
+        });
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let fs = distributed_fs_with_chunk_store(
+            meta.clone(),
+            local,
+            store.clone(),
+            DEFAULT_DIRTY_DATA_BUDGET_BYTES,
+        )
+        .with_write_buffer_pool(WriteBufferPool::new(0))
+        .with_native_write_pipeline(
+            NativeWriteBudget::new(live),
+            NativeWriteConfig {
+                unpublished_descriptors: descriptors,
+                upload_inflight_chunks: 2,
+            },
+            runtime.handle().clone(),
+            None,
+        )
+        .unwrap();
+        (temp, meta, fs, runtime, store)
+    }
+
+    fn native_wait_uploads(fs: &DistributedFs, completed: u64) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            fs.progress_native_writeback().unwrap();
+            if fs
+                .native_pipeline
+                .as_ref()
+                .unwrap()
+                .metadata
+                .state
+                .lock()
+                .unwrap()
+                .completed
+                >= completed
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "native uploads did not finish within bounded test window"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn p2_w2_required_upload_retires_body_and_dirty_read_uses_anchored_local_object() {
+        let (_temp, meta, fs, _runtime, store) = native_pipeline_fixture(true, 8 * 1024 * 1024, 8);
+        let file = fs
+            .create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new("w2-required"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        let body = vec![0x29; 4 * 1024 * 1024];
+        assert_eq!(
+            fs.write(&context(), file.handle, 0, &body).unwrap(),
+            body.len()
+        );
+        native_wait_uploads(&fs, 1);
+        assert_eq!(store.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(meta.commits.lock().unwrap().len(), 0);
+        assert_eq!(
+            fs.native_pipeline
+                .as_ref()
+                .unwrap()
+                .budget
+                .snapshot()
+                .live_bytes,
+            0
+        );
+        let mut out = [0; 4096];
+        assert_eq!(
+            fs.read(&context(), file.handle, 8192, &mut out).unwrap(),
+            out.len()
+        );
+        assert_eq!(out, [0x29; 4096]);
+        fs.fsync(&context(), file.handle, SyncMode::Full).unwrap();
+        assert_eq!(meta.commits.lock().unwrap().len(), 1);
+        assert_eq!(
+            fs.native_pipeline
+                .as_ref()
+                .unwrap()
+                .metadata
+                .state
+                .lock()
+                .unwrap()
+                .descriptors,
+            0
+        );
+        fs.release(&context(), file.handle).unwrap();
+    }
+
+    #[test]
+    fn p2_w2_nonrequired_upload_keeps_body_until_publication_and_pressure_progresses() {
+        let (_temp, meta, fs, _runtime, _store) =
+            native_pipeline_fixture(false, 4 * 1024 * 1024, 8);
+        let file = fs
+            .create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new("w2-nonrequired"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        let body = vec![0x47; 4 * 1024 * 1024];
+        fs.write(&context(), file.handle, 0, &body).unwrap();
+        native_wait_uploads(&fs, 1);
+        assert_eq!(
+            fs.native_pipeline
+                .as_ref()
+                .unwrap()
+                .budget
+                .snapshot()
+                .live_bytes,
+            body.len()
+        );
+        assert!(meta.commits.lock().unwrap().is_empty());
+        assert_eq!(
+            fs.write(&context(), file.handle, body.len() as u64, &body)
+                .unwrap(),
+            body.len()
+        );
+        assert_eq!(
+            meta.commits.lock().unwrap().len(),
+            1,
+            "D14 live pressure must publish the older generation without changing copy policy"
+        );
+        fs.fsync(&context(), file.handle, SyncMode::Full).unwrap();
+        assert_eq!(meta.commits.lock().unwrap().len(), 2);
+        let pipeline = fs.native_pipeline.as_ref().unwrap();
+        assert_eq!(pipeline.budget.snapshot().live_bytes, 0);
+        assert!(pipeline.metadata.state.lock().unwrap().pressure_live > 0);
+        fs.release(&context(), file.handle).unwrap();
+    }
+
+    #[test]
+    fn p2_w2_descriptor_pressure_publishes_before_accepting_the_next_descriptor() {
+        let (_temp, meta, fs, _runtime, _store) = native_pipeline_fixture(true, 8 * 1024 * 1024, 1);
+        let file = fs
+            .create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new("w2-descriptor"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        let body = vec![0x63; 4 * 1024 * 1024];
+        fs.write(&context(), file.handle, 0, &body).unwrap();
+        native_wait_uploads(&fs, 1);
+        assert!(meta.commits.lock().unwrap().is_empty());
+        fs.write(&context(), file.handle, body.len() as u64, &body)
+            .unwrap();
+        assert_eq!(meta.commits.lock().unwrap().len(), 1);
+        let pipeline = fs.native_pipeline.as_ref().unwrap();
+        assert_eq!(
+            pipeline
+                .metadata
+                .state
+                .lock()
+                .unwrap()
+                .descriptor_peak_count,
+            1
+        );
+        assert!(pipeline.metadata.state.lock().unwrap().pressure_descriptor > 0);
+        fs.fsync(&context(), file.handle, SyncMode::Full).unwrap();
+        fs.release(&context(), file.handle).unwrap();
+    }
+
+    #[test]
+    fn p2_w2_timer_and_stop_drain_publish_tails_but_closed_admission_rejects_new_input() {
+        let (_temp, meta, fs, _runtime, _store) = native_pipeline_fixture(true, 8 * 1024 * 1024, 8);
+        let file = fs
+            .create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new("w2-timer-stop"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        fs.write(&context(), file.handle, 0, b"tail").unwrap();
+        fs.progress_native_writeback().unwrap();
+        assert!(meta.commits.lock().unwrap().is_empty());
+        assert_eq!(
+            fs.writeback_pending().unwrap(),
+            1,
+            "the Node timer is an explicit publication entry"
+        );
+        assert_eq!(meta.commits.lock().unwrap().len(), 1);
+        fs.write(&context(), file.handle, 4, b"more").unwrap();
+        fs.close_native_write_admission();
+        assert!(fs.write(&context(), file.handle, 8, b"x").is_err());
+        assert_eq!(fs.drain().unwrap(), 1);
+        assert_eq!(meta.commits.lock().unwrap().len(), 2);
+        assert_eq!(
+            fs.native_pipeline
+                .as_ref()
+                .unwrap()
+                .budget
+                .snapshot()
+                .live_bytes,
+            0
+        );
+        fs.release(&context(), file.handle).unwrap();
+    }
+
+    #[test]
+    fn p2_w2_unknown_request_keeps_original_identity_and_body_until_exact_retry() {
+        let (_temp, meta, fs, _runtime, _store) =
+            native_pipeline_fixture(false, 8 * 1024 * 1024, 8);
+        let file = fs
+            .create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new("w2-unknown"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        fs.write(&context(), file.handle, 0, b"exact").unwrap();
+        meta.fail_next_commit();
+        assert!(fs.fsync(&context(), file.handle, SyncMode::Full).is_err());
+        let failed = meta.failed_commits.lock().unwrap()[0].clone();
+        let cell = fs
+            .write_state(&fs.inode_id(file.entry.inode).unwrap())
+            .unwrap()
+            .unwrap();
+        let owner = {
+            let state = cell.lock().unwrap();
+            let Some(InFlightCommit::File(pending)) = state.in_flight.as_ref() else {
+                panic!("unknown request identity was not retained");
+            };
+            assert_eq!(pending.batch.commit.as_ref(), &failed);
+            pending
+                .frozen
+                .dirty_extents
+                .iter_extents()
+                .next()
+                .unwrap()
+                .data
+                .clone()
+                .unwrap()
+        };
+        meta.fail_next_commit();
+        assert!(fs.write(&context(), file.handle, 5, b"!").is_err());
+        assert_eq!(meta.failed_commits.lock().unwrap()[1], failed);
+        for change in [
+            AttributeChange {
+                size: Some(2),
+                ..AttributeChange::default()
+            },
+            AttributeChange {
+                mode: Some(0o600),
+                ..AttributeChange::default()
+            },
+        ] {
+            meta.fail_next_commit();
+            assert!(
+                fs.setattr(&context(), file.entry.inode, Some(file.handle), &change)
+                    .is_err()
+            );
+            assert_eq!(meta.failed_commits.lock().unwrap().last().unwrap(), &failed);
+        }
+        fs.fsync(&context(), file.handle, SyncMode::Full).unwrap();
+        assert_eq!(meta.commits.lock().unwrap()[0], failed);
+        assert!(
+            fs.native_pipeline
+                .as_ref()
+                .unwrap()
+                .budget
+                .snapshot()
+                .live_bytes
+                > 0,
+            "a real frozen read holder must keep its allocation live after publish"
+        );
+        drop(owner);
+        assert_eq!(
+            fs.native_pipeline
+                .as_ref()
+                .unwrap()
+                .budget
+                .snapshot()
+                .live_bytes,
+            0
+        );
+        fs.release(&context(), file.handle).unwrap();
+    }
+
+    #[test]
+    fn p2_w2_control_fifo_cancellation_and_last_descriptor_owner_release_capacity() {
+        let pipeline = Arc::new(NativeWritePipeline::new(
+            NativeWriteBudget::new(4 * 1024 * 1024),
+            NativeWriteConfig::default(),
+            None,
+            None,
+        ));
+        let mut queue = NativeTicketQueue::default();
+        queue.push(10, &pipeline.metadata).unwrap();
+        queue.push(11, &pipeline.metadata).unwrap();
+        queue.push(12, &pipeline.metadata).unwrap();
+        queue.remove(11);
+        assert_eq!(
+            queue.values.iter().copied().collect::<Vec<_>>(),
+            vec![10, 12]
+        );
+        queue.remove(10);
+        assert_eq!(queue.values.front(), Some(&12));
+        queue.remove(12);
+        assert_eq!(queue.values.capacity(), 0);
+        let descriptor = Arc::new(Mutex::new(
+            pipeline.metadata.reserve(16 * 1024, true).unwrap().unwrap(),
+        ));
+        descriptor.lock().unwrap().set_actual(512).unwrap();
+        let frozen = descriptor.clone();
+        drop(descriptor);
+        assert_eq!(pipeline.metadata.state.lock().unwrap().descriptors, 1);
+        drop(frozen);
+        assert_eq!(pipeline.metadata.state.lock().unwrap().descriptors, 0);
+        assert_eq!(
+            pipeline
+                .metadata
+                .state
+                .lock()
+                .unwrap()
+                .descriptor_reserved_bytes,
+            0
+        );
+        assert_eq!(pipeline.metadata.state.lock().unwrap().descriptor_bytes, 0);
+    }
+
+    #[test]
+    fn p2_w2_large_existing_layout_small_patch_keeps_the_original_fsync_capability() {
+        let (_temp, meta, fs, _runtime, _store) = native_pipeline_fixture(true, 8 * 1024 * 1024, 8);
+        let file = fs
+            .create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new("w2-large-base"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        fs.release(&context(), file.handle).unwrap();
+        let extents = (0..65_536_u64)
+            .map(|index| Extent {
+                file_offset: index * 2,
+                length: 1,
+                chunk_id: crate::dfs::ChunkId::new("existing-immutable-base-object"),
+                chunk_offset: 0,
+            })
+            .collect();
+        meta.publish_external_version_with_receipts(131_072, extents, Vec::new());
+        let inode = fs.inode_id(file.entry.inode).unwrap();
+        fs.inode_writes.write(&inode).unwrap().remove(&inode);
+        let writer = fs.open(&context(), file.entry.inode, libc::O_RDWR).unwrap();
+        fs.write(&context(), writer, 8192, &[0x92; 4096]).unwrap();
+        fs.fsync(&context(), writer, SyncMode::Full).unwrap();
+        let commits = meta.commits.lock().unwrap();
+        let committed = commits.last().unwrap();
+        assert_eq!(committed.file_version.length, 131_072);
+        assert!(committed.layout_root.inline_extents.len() > 60_000);
+        assert_eq!(committed.chunk_receipts.len(), 1);
+        drop(commits);
+        fs.release(&context(), writer).unwrap();
+    }
+
+    #[test]
+    fn p2_w2_actual_cross_block_allocation_failure_returns_the_visible_prefix() {
+        let (_temp, meta, fs, _runtime, _store) =
+            native_pipeline_fixture(false, 8 * 1024 * 1024, 8);
+        let file = fs
+            .create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new("w2-short"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        fs.write(&context(), file.handle, 0, &vec![1; 1024 * 1024])
+            .unwrap();
+        fs.write_buffer_pool.fail_next_allocation();
+        assert_eq!(
+            fs.write(
+                &context(),
+                file.handle,
+                1024 * 1024,
+                &vec![2; 4 * 1024 * 1024]
+            )
+            .unwrap(),
+            3 * 1024 * 1024
+        );
+        assert!(meta.commits.lock().unwrap().is_empty());
+        fs.fsync(&context(), file.handle, SyncMode::Full).unwrap();
+        assert_eq!(
+            meta.commits.lock().unwrap()[0].file_version.length,
+            4 * 1024 * 1024
+        );
+        assert_eq!(
+            fs.write_buffer_pool.snapshot().copied_bytes,
+            4 * 1024 * 1024
+        );
+        fs.release(&context(), file.handle).unwrap();
+    }
+
+    #[test]
+    fn p2_w2_budget_waiter_fifo_does_not_block_timer_or_the_following_sync() {
+        let (_temp, meta, fs, _runtime, _store) = native_pipeline_fixture(true, 4 * 1024 * 1024, 8);
+        let fs = Arc::new(fs);
+        let file = fs
+            .create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new("w2-fifo-progress"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        let other = fs.open(&context(), file.entry.inode, libc::O_RDWR).unwrap();
+        fs.write(&context(), file.handle, 0, b"a").unwrap();
+        let worker_fs = fs.clone();
+        let worker = std::thread::spawn(move || worker_fs.write(&context(), other, 4096, b"b"));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while fs
+            .native_pipeline
+            .as_ref()
+            .unwrap()
+            .allocation_queue
+            .lock()
+            .unwrap()
+            .values
+            .is_empty()
+        {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let sync_fs = fs.clone();
+        let sync =
+            std::thread::spawn(move || sync_fs.fsync(&context(), file.handle, SyncMode::Full));
+        let cell = fs
+            .write_state(&fs.inode_id(file.entry.inode).unwrap())
+            .unwrap()
+            .unwrap();
+        loop {
+            let state = cell.lock().unwrap();
+            if state.native_queue.values.len() == 2 {
+                assert!(!state.operation_busy);
+                break;
+            }
+            drop(state);
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        fs.writeback_pending().unwrap();
+        assert_eq!(worker.join().unwrap().unwrap(), 1);
+        sync.join().unwrap().unwrap();
+        assert_eq!(meta.commits.lock().unwrap().len(), 2);
+        assert!(cell.lock().unwrap().native_queue.values.is_empty());
+        fs.release(&context(), other).unwrap();
+        fs.release(&context(), file.handle).unwrap();
+    }
+
+    #[test]
+    fn p2_w2_upload_failure_reaches_the_sync_barrier_without_publishing() {
+        let (_temp, meta, fs, _runtime, store) = native_pipeline_fixture(false, 8 * 1024 * 1024, 8);
+        let file = fs
+            .create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new("w2-upload-failure"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        store.fail_next.store(true, Ordering::SeqCst);
+        fs.write(&context(), file.handle, 0, &vec![0x31; 4 * 1024 * 1024])
+            .unwrap();
+        assert!(fs.fsync(&context(), file.handle, SyncMode::Full).is_err());
+        assert!(meta.commits.lock().unwrap().is_empty());
+        assert_eq!(
+            fs.native_pipeline
+                .as_ref()
+                .unwrap()
+                .budget
+                .snapshot()
+                .live_bytes,
+            4 * 1024 * 1024
+        );
+        // A latched background failure may be reported once more before retry;
+        // the exact object remains available and a later barrier may succeed.
+        for _ in 0..3 {
+            if fs.fsync(&context(), file.handle, SyncMode::Full).is_ok() {
+                break;
+            }
+        }
+        assert_eq!(meta.commits.lock().unwrap().len(), 1);
+        fs.release(&context(), file.handle).unwrap();
+    }
+
+    #[test]
+    fn p2_w2_preparing_freezes_through_seq_and_busy_timer_preserves_the_later_generation() {
+        let (_temp, meta, fs, _runtime, store) = native_pipeline_fixture(true, 8 * 1024 * 1024, 8);
+        let fs = Arc::new(fs);
+        let file = fs
+            .create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new("w2-preparing"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        let second = fs.open(&context(), file.entry.inode, libc::O_RDWR).unwrap();
+        let pause = Arc::new(CommitPause::new(0));
+        struct ResumeOnDrop(Arc<CommitPause>);
+        impl Drop for ResumeOnDrop {
+            fn drop(&mut self) {
+                self.0.release();
+            }
+        }
+        let _resume = ResumeOnDrop(pause.clone());
+        *store.pause.lock().unwrap() = Some(pause.clone());
+        fs.write(&context(), file.handle, 0, &vec![0x51; 4 * 1024 * 1024])
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !pause.was_reached() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let timer_fs = fs.clone();
+        let timer = std::thread::spawn(move || timer_fs.writeback_pending());
+        let cell = fs
+            .write_state(&fs.inode_id(file.entry.inode).unwrap())
+            .unwrap()
+            .unwrap();
+        loop {
+            if matches!(
+                cell.lock().unwrap().in_flight.as_ref(),
+                Some(InFlightCommit::Preparing(_, _))
+            ) {
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            fs.write(&context(), second, 4 * 1024 * 1024, b"n").unwrap(),
+            1
+        );
+        let later_seq = cell.lock().unwrap().visible_write_seq;
+        assert_eq!(
+            fs.writeback_pending().unwrap(),
+            0,
+            "a busy timer records the later target instead of waiting behind itself"
+        );
+        {
+            let state = cell.lock().unwrap();
+            let Some(InFlightCommit::Preparing(frozen, _)) = state.in_flight.as_ref() else {
+                panic!("old preparation unexpectedly changed");
+            };
+            assert!(frozen.through_seq < later_seq);
+            assert_eq!(frozen.logical_length, 4 * 1024 * 1024);
+            assert!(state.native_due);
+        }
+        pause.release();
+        assert_eq!(timer.join().unwrap().unwrap(), 1);
+        assert_eq!(
+            meta.commits.lock().unwrap()[0].file_version.length,
+            4 * 1024 * 1024
+        );
+        assert!(cell.lock().unwrap().native_due);
+        assert_eq!(fs.progress_native_writeback().unwrap(), 1);
+        assert_eq!(
+            meta.commits.lock().unwrap()[1].file_version.length,
+            4 * 1024 * 1024 + 1
+        );
+        fs.release(&context(), second).unwrap();
+        fs.release(&context(), file.handle).unwrap();
+    }
+
+    #[test]
+    fn p2_w2_no_runtime_constructor_requires_explicit_writeback_without_waiting_forever() {
+        let (_temp, meta, mut fs) = test_fs();
+        fs.native_pipeline = Some(Arc::new(NativeWritePipeline::new(
+            NativeWriteBudget::new(4 * 1024 * 1024),
+            NativeWriteConfig::default(),
+            None,
+            None,
+        )));
+        let file = fs
+            .create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new("w2-no-runtime"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        fs.write(&context(), file.handle, 0, b"a").unwrap();
+        let error = fs.write(&context(), file.handle, 4096, b"b").unwrap_err();
+        assert_eq!(error.code(), afs_error::NODE_VFS_UNAVAILABLE);
+        assert!(error.to_string().contains("externally driven writeback"));
+        assert!(
+            meta.commits.lock().unwrap().is_empty(),
+            "Required live pressure alone must not add a publication entry"
+        );
+        fs.writeback_pending().unwrap();
+        assert_eq!(fs.write(&context(), file.handle, 4096, b"b").unwrap(), 1);
+        fs.fsync(&context(), file.handle, SyncMode::Full).unwrap();
+        fs.release(&context(), file.handle).unwrap();
+    }
+
+    #[test]
+    fn p2_w2_empty_generation_truncate_then_extend_fsync_keeps_holes_and_eof() {
+        for size in [4096, 4 * 1024 * 1024] {
+            let (_temp, meta, fs, _runtime, _store) =
+                native_pipeline_fixture(true, 8 * 1024 * 1024, 8);
+            let file = fs
+                .create(
+                    &context(),
+                    fs.root_inode(),
+                    OsStr::new("w2-empty-generation"),
+                    0o640,
+                    libc::O_RDWR,
+                )
+                .unwrap();
+            fs.write(&context(), file.handle, 0, &vec![0x83; size])
+                .unwrap();
+            if size == 4 * 1024 * 1024 {
+                native_wait_uploads(&fs, 1);
+            }
+            for size in [0, 8192] {
+                fs.setattr(
+                    &context(),
+                    file.entry.inode,
+                    Some(file.handle),
+                    &AttributeChange {
+                        size: Some(size),
+                        ..AttributeChange::default()
+                    },
+                )
+                .unwrap();
+            }
+            fs.fsync(&context(), file.handle, SyncMode::Full).unwrap();
+            let commits = meta.commits.lock().unwrap();
+            assert_eq!(commits.last().unwrap().file_version.length, 8192);
+            assert!(commits.last().unwrap().chunk_receipts.is_empty());
+            assert!(
+                commits
+                    .last()
+                    .unwrap()
+                    .layout_root
+                    .inline_extents
+                    .is_empty()
+            );
+            drop(commits);
+            let mut out = vec![0x55; 8192];
+            assert_eq!(
+                fs.read(&context(), file.handle, 0, &mut out).unwrap(),
+                out.len()
+            );
+            assert!(out.iter().all(|byte| *byte == 0));
+            assert_eq!(
+                fs.read(&context(), file.handle, 8192, &mut [0x55]).unwrap(),
+                0
+            );
+            fs.release(&context(), file.handle).unwrap();
+        }
+    }
+
+    #[test]
+    fn p2_w2_no_runtime_shared_descriptor_pressure_requires_external_progress() {
+        let (_first_temp, first_meta, mut first) = test_fs();
+        let (_second_temp, second_meta, mut second) = test_fs();
+        second_meta.inode.lock().unwrap().inode_id = InodeId::new("inode:second");
+        second_meta.lease.lock().unwrap().inode_id = InodeId::new("inode:second");
+        let pipeline = Arc::new(NativeWritePipeline::new(
+            NativeWriteBudget::new(8 * 1024 * 1024),
+            NativeWriteConfig {
+                unpublished_descriptors: 1,
+                upload_inflight_chunks: 1,
+            },
+            None,
+            None,
+        ));
+        first.native_pipeline = Some(pipeline.clone());
+        second.native_pipeline = Some(pipeline.clone());
+        let a = first
+            .create(
+                &context(),
+                first.root_inode(),
+                OsStr::new("w2-owner-a"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        let b = second
+            .create(
+                &context(),
+                second.root_inode(),
+                OsStr::new("w2-owner-b"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        first.write(&context(), a.handle, 0, b"a").unwrap();
+        let error = second.write(&context(), b.handle, 0, b"b").unwrap_err();
+        assert_eq!(error.code(), afs_error::IO_CAPACITY);
+        assert!(error.to_string().contains("externally driven writeback"));
+        assert!(first_meta.commits.lock().unwrap().is_empty());
+        assert!(second_meta.commits.lock().unwrap().is_empty());
+        assert_eq!(pipeline.metadata.state.lock().unwrap().descriptors, 1);
+        first.writeback_pending().unwrap();
+        assert_eq!(second.write(&context(), b.handle, 0, b"b").unwrap(), 1);
+        second.fsync(&context(), b.handle, SyncMode::Full).unwrap();
+        assert_eq!(pipeline.metadata.state.lock().unwrap().descriptors, 0);
+        first.release(&context(), a.handle).unwrap();
+        second.release(&context(), b.handle).unwrap();
+    }
+
+    #[test]
+    fn p2_w2_upload_error_is_owned_by_its_inode_while_drain_still_aggregates() {
+        let (_a_temp, a_meta, a_fs, _a_runtime, a_store) =
+            native_pipeline_fixture(false, 16 * 1024 * 1024, 8);
+        let (_b_temp, b_meta, mut b_fs, _b_runtime, _b_store) =
+            native_pipeline_fixture(false, 16 * 1024 * 1024, 8);
+        b_meta.inode.lock().unwrap().inode_id = InodeId::new("inode:unrelated-b");
+        b_meta.lease.lock().unwrap().inode_id = InodeId::new("inode:unrelated-b");
+        b_fs.native_pipeline = a_fs.native_pipeline.clone();
+        b_fs.next_operation.store(10_000, Ordering::SeqCst);
+        let a = a_fs
+            .create(
+                &context(),
+                a_fs.root_inode(),
+                OsStr::new("failure-owner-a"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        let b = b_fs
+            .create(
+                &context(),
+                b_fs.root_inode(),
+                OsStr::new("healthy-owner-b"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        let pipeline = a_fs.native_pipeline.as_ref().unwrap();
+        let a_cell = a_fs
+            .write_state(&a_fs.inode_id(a.entry.inode).unwrap())
+            .unwrap()
+            .unwrap();
+        let b_cell = b_fs
+            .write_state(&b_fs.inode_id(b.entry.inode).unwrap())
+            .unwrap()
+            .unwrap();
+        let body = vec![0x64; 4 * 1024 * 1024];
+        a_store.fail_next.store(true, Ordering::SeqCst);
+        assert_eq!(
+            a_fs.write(&context(), a.handle, 0, &body).unwrap(),
+            body.len()
+        );
+        let upload = pipeline.tasks.lock().unwrap()[0].clone();
+        let operation = upload.operation_id.clone();
+        let chunk = upload.chunk.clone();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !upload
+            .state
+            .lock()
+            .unwrap()
+            .task
+            .as_ref()
+            .unwrap()
+            .is_finished()
+        {
+            assert!(
+                Instant::now() < deadline,
+                "injected upload failure did not complete"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            a_cell.lock().unwrap().background_error.is_none(),
+            "no caller has polled the completed task yet"
+        );
+        assert_eq!(
+            b_fs.write(&context(), b.handle, 0, b"healthy").unwrap(),
+            7,
+            "polling another inode's failed upload must not fail an unrelated ordinary write"
+        );
+        b_fs.fsync(&context(), b.handle, SyncMode::Full).unwrap();
+        assert_eq!(b_meta.commits.lock().unwrap().len(), 1);
+        assert!(
+            b_cell.lock().unwrap().background_error.is_none(),
+            "A's failure must never be relabelled as B's error"
+        );
+        assert!(a_fs.fsync(&context(), a.handle, SyncMode::Full).is_err());
+        assert!(
+            a_meta.commits.lock().unwrap().is_empty(),
+            "the failed owner may not publish"
+        );
+        {
+            let state = upload.state.lock().unwrap();
+            assert_eq!(upload.operation_id, operation);
+            assert_eq!(upload.chunk, chunk);
+            assert!(
+                state.body.as_ref().unwrap().as_ref() == body.as_slice(),
+                "owner body changed after failed upload"
+            );
+        }
+        // The owner cursor and that upload's retained attempt error are
+        // separately observed; retry still uses the same immutable object.
+        assert!(a_fs.fsync(&context(), a.handle, SyncMode::Full).is_err());
+        a_fs.fsync(&context(), a.handle, SyncMode::Full).unwrap();
+        {
+            let commits = a_meta.commits.lock().unwrap();
+            assert_eq!(commits.len(), 1);
+            assert_eq!(commits[0].operation_id, operation);
+            assert_eq!(commits[0].chunk_receipts[0].chunk, chunk);
+        }
+        drop(upload);
+        // B has its own unpublished tail. Drain must publish B successfully,
+        // but retain A's error even if B's preparation would harvest that task.
+        b_fs.write(&context(), b.handle, 7, b"!").unwrap();
+        a_store.fail_next.store(true, Ordering::SeqCst);
+        a_fs.write(&context(), a.handle, body.len() as u64, &body)
+            .unwrap();
+        let failed = pipeline.tasks.lock().unwrap()[0].clone();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !failed
+            .state
+            .lock()
+            .unwrap()
+            .task
+            .as_ref()
+            .unwrap()
+            .is_finished()
+        {
+            assert!(Instant::now() < deadline, "drain fault did not complete");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let error = b_fs.drain().unwrap_err();
+        assert!(error.to_string().contains("injected native upload failure"));
+        assert!(
+            pipeline.tasks.lock().unwrap().is_empty(),
+            "failed tasks must still be joined"
+        );
+        assert!(a_cell.lock().unwrap().background_error.is_some());
+        assert!(b_cell.lock().unwrap().background_error.is_none());
+        assert_eq!(a_meta.commits.lock().unwrap().len(), 1);
+        assert_eq!(b_meta.commits.lock().unwrap().len(), 2);
+        assert_eq!(b_meta.commits.lock().unwrap()[1].file_version.length, 8);
+    }
+
+    #[test]
+    fn p2_review_no_runtime_wait_never_consumes_another_inode_upload_error() {
+        let (_a_temp, a_meta, mut a_fs, _runtime, store) =
+            native_pipeline_fixture(false, 4 * 1024 * 1024, 8);
+        let (_b_temp, b_meta, mut b_fs) = test_fs();
+        b_meta.inode.lock().unwrap().inode_id = InodeId::new("inode:no-runtime-b");
+        b_meta.lease.lock().unwrap().inode_id = InodeId::new("inode:no-runtime-b");
+        let pipeline = Arc::new(NativeWritePipeline::new(
+            NativeWriteBudget::new(4 * 1024 * 1024),
+            NativeWriteConfig::default(),
+            None,
+            None,
+        ));
+        a_fs.native_pipeline = Some(pipeline.clone());
+        b_fs.native_pipeline = Some(pipeline.clone());
+        b_fs.chunk_store = store.clone();
+        b_fs.next_operation.store(10_000, Ordering::SeqCst);
+        let a = a_fs
+            .create(
+                &context(),
+                a_fs.root_inode(),
+                OsStr::new("no-runtime-a"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        let b = b_fs
+            .create(
+                &context(),
+                b_fs.root_inode(),
+                OsStr::new("no-runtime-b"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        let a_id = a_fs.inode_id(a.entry.inode).unwrap();
+        let a_cell = a_fs.write_state(&a_id).unwrap().unwrap();
+        // The existing single-inode Meta fixture uses separate facades; share
+        // its real cell as well as the store/pipeline to exercise a Node-wide scan.
+        b_fs.inode_writes.insert(a_id, a_cell.clone()).unwrap();
+        a_fs.write(&context(), a.handle, 0, &vec![0x48; 4 * 1024 * 1024])
+            .unwrap();
+        let upload = a_fs.next_native_upload().unwrap().unwrap();
+        let operation = upload.operation_id.clone();
+        let chunk = upload.chunk.clone();
+        store.fail_next.store(true, Ordering::SeqCst);
+        let error = b_fs.write(&context(), b.handle, 0, b"b").unwrap_err();
+        assert!(
+            error.to_string().contains("externally driven writeback"),
+            "B must report its own capacity limitation rather than A's upload failure: {error}"
+        );
+        assert_eq!(
+            store.calls.load(Ordering::SeqCst),
+            0,
+            "B must not execute A's failing synchronous upload"
+        );
+        assert!(upload.state.lock().unwrap().error.is_none());
+        assert!(a_meta.commits.lock().unwrap().is_empty());
+        assert!(b_meta.commits.lock().unwrap().is_empty());
+        assert!(
+            a_fs.fsync(&context(), a.handle, SyncMode::Full)
+                .unwrap_err()
+                .to_string()
+                .contains("injected native upload failure")
+        );
+        assert!(a_meta.commits.lock().unwrap().is_empty());
+        a_fs.fsync(&context(), a.handle, SyncMode::Full).unwrap();
+        assert_eq!(a_meta.commits.lock().unwrap()[0].operation_id, operation);
+        assert_eq!(
+            a_meta.commits.lock().unwrap()[0].chunk_receipts[0].chunk,
+            chunk
+        );
+        drop(upload);
+        assert_eq!(b_fs.write(&context(), b.handle, 0, b"b").unwrap(), 1);
+        b_fs.fsync(&context(), b.handle, SyncMode::Full).unwrap();
+        assert_eq!(b_meta.commits.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn p2_review_structural_install_failure_cleans_join_without_retiring_body() {
+        let (_temp, meta, fs, _runtime, store) = native_pipeline_fixture(false, 8 * 1024 * 1024, 8);
+        let file = fs
+            .create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new("structural-install"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        fs.write(&context(), file.handle, 0, &vec![0x72; 4 * 1024 * 1024])
+            .unwrap();
+        let pipeline = fs.native_pipeline.as_ref().unwrap().clone();
+        let upload = pipeline.tasks.lock().unwrap()[0].clone();
+        let operation = upload.operation_id.clone();
+        let chunk = upload.chunk.clone();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !upload
+            .state
+            .lock()
+            .unwrap()
+            .task
+            .as_ref()
+            .unwrap()
+            .is_finished()
+        {
+            assert!(
+                Instant::now() < deadline,
+                "structural fixture upload did not finish"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let reserved_before = pipeline
+            .metadata
+            .state
+            .lock()
+            .unwrap()
+            .descriptor_reserved_bytes;
+        // A real installer outer error: capacity rejection would be an inner
+        // business error and cannot prove task-table cleanup on this branch.
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = upload._descriptor.lock().unwrap();
+            panic!("intentional descriptor poison for terminal cleanup regression");
+        }));
+        assert!(poisoned.is_err());
+        let error = fs.poll_native_uploads().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("native descriptor reservation is poisoned")
+        );
+        assert!(
+            pipeline.tasks.lock().unwrap().is_empty(),
+            "a consumed JoinHandle must not leave an unjoinable task slot"
+        );
+        let cell = fs
+            .write_state(&fs.inode_id(file.entry.inode).unwrap())
+            .unwrap()
+            .unwrap();
+        assert!(
+            cell.lock().unwrap().terminal_error.is_some(),
+            "the damaged owner must become terminal rather than retry as healthy"
+        );
+        {
+            let state = upload.state.lock().unwrap();
+            assert!(!state.joining);
+            assert!(state.task.is_none());
+            assert_eq!(upload.operation_id, operation);
+            assert_eq!(upload.chunk, chunk);
+            assert_eq!(state.body.as_ref().unwrap().len(), 4 * 1024 * 1024);
+            assert_eq!(
+                state.receipt.as_ref().unwrap().receipt.chunk,
+                chunk,
+                "preserve the successful durable receipt for terminal diagnostics"
+            );
+        }
+        assert_eq!(
+            pipeline.budget.snapshot().live_bytes,
+            4 * 1024 * 1024,
+            "a terminal error is not permission to retire a still-owned body"
+        );
+        let mut output = [0xa5; 16];
+        assert!(upload.read_at(store.as_ref(), 0, &mut output).is_err());
+        assert_eq!(
+            output, [0xa5; 16],
+            "terminal diagnostic receipt must not enable a read"
+        );
+        assert!(fs.start_native_upload(&upload, true).is_err());
+        let before = Instant::now();
+        for _ in 0..2 {
+            assert!(fs.wait_native_upload(&upload).is_err());
+        }
+        assert!(fs.drain().is_err());
+        assert!(before.elapsed() < Duration::from_secs(5));
+        assert_eq!(
+            store.calls.load(Ordering::SeqCst),
+            1,
+            "terminal state must not retry through a poisoned descriptor"
+        );
+        assert!(meta.commits.lock().unwrap().is_empty());
+        assert_eq!(
+            pipeline
+                .metadata
+                .state
+                .lock()
+                .unwrap()
+                .descriptor_reserved_bytes,
+            reserved_before,
+            "a poisoned installer must retain the original reservation"
+        );
+        drop(upload);
+        drop(fs);
+        assert_eq!(
+            pipeline.budget.snapshot().live_bytes,
+            4 * 1024 * 1024,
+            "the explicit inode view still owns the dirty body after its facade drops"
+        );
+        drop(cell);
+        assert_eq!(
+            pipeline.budget.snapshot().live_bytes,
+            0,
+            "only the final body owner releases its charge"
+        );
+        let metadata = pipeline.metadata.state.lock().unwrap();
+        assert_eq!(metadata.descriptors, 0);
+        assert_eq!(metadata.descriptor_reserved_bytes, 0);
+    }
+
+    // W-2 changes version publication, not merely a dirty-budget constant.
+    // This uses only existing interfaces so the pre-W2 candidate must compile
+    // before the old 16MiB automatic publication is observed as a behavior RED.
+    #[test]
+    fn p2_w2_native_ordinary_write_does_not_publish_at_the_old_sixteen_mib_threshold() {
+        let (_temp, meta, fs) = test_fs();
+        let created = fs
+            .create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new("w2-no-old-threshold.bin"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        let body = vec![0x39; 1024 * 1024];
+        let before = meta.commits.lock().unwrap().len();
+        for index in 0..16_u64 {
+            assert_eq!(
+                fs.write(&context(), created.handle, index * body.len() as u64, &body)
+                    .unwrap(),
+                body.len()
+            );
+        }
+        assert_eq!(
+            meta.commits.lock().unwrap().len(),
+            before,
+            "ordinary native writes below W2 descriptor/live pressure must not publish at the old 16MiB threshold"
+        );
+        fs.fsync(&context(), created.handle, SyncMode::Full)
+            .unwrap();
+        assert_eq!(meta.commits.lock().unwrap().len(), before + 1);
+        let reader = fs
+            .open(&context(), created.entry.inode, libc::O_RDONLY)
+            .unwrap();
+        let mut output = vec![0; body.len()];
+        assert_eq!(
+            fs.read(&context(), reader, 15 * body.len() as u64, &mut output)
+                .unwrap(),
+            body.len()
+        );
+        assert_eq!(output, body);
+        let mut eof = [0; 1];
+        assert_eq!(
+            fs.read(&context(), reader, 16 * body.len() as u64, &mut eof)
+                .unwrap(),
+            0
+        );
+        fs.release(&context(), reader).unwrap();
+        fs.release(&context(), created.handle).unwrap();
+    }
+
+    // Existing buffer ownership must remain true before a native quota is
+    // attached at that same allocation owner. This is a guard, not a RED claim.
+    #[test]
+    fn p2_w2_existing_shared_slices_hold_the_final_native_allocation_owner() {
+        let pool = WriteBufferPool::new(0);
+        let mut builder = ChunkBuilder::with_pool(pool.clone(), 4096).unwrap();
+        builder.write_at(0, &[7; 4096]).unwrap();
+        let pointer = builder.data_ptr();
+        let capacity = builder.capacity();
+        let body = builder.freeze();
+        assert_eq!(body.as_ptr(), pointer);
+        let tail = body.slice(4095..4096);
+        let staged = StagedChunk::from_shared(OperationId::new("w2-owner-guard"), body.clone());
+        drop(body);
+        drop(staged);
+        assert_eq!(pool.snapshot().live_bytes, capacity);
+        assert_eq!(tail.as_ref(), &[7]);
+        drop(tail);
+        assert_eq!(pool.snapshot().live_bytes, 0);
+    }
+
+    #[test]
+    fn native_builder_uncommitted_overwrite_is_in_place_and_counts_admission() {
+        let pool = WriteBufferPool::new(0);
+        let mut dirty = DirtyExtentMap::default();
+        dirty
+            .write_native_at(0, &vec![3; 4 * 1024 * 1024], 1, &pool, 0)
+            .unwrap();
+        let pointer = dirty.builders[0].builder.data_ptr();
+        dirty
+            .write_native_at(8192, &[7; 4096], 2, &pool, 4 * 1024 * 1024)
+            .unwrap();
+        assert_eq!(dirty.builders.len(), 1);
+        assert_eq!(dirty.builders[0].builder.data_ptr(), pointer);
+        assert_eq!(
+            &dirty.builders[0].builder.as_bytes()[8192..12288],
+            &[7; 4096]
+        );
+        assert_eq!(dirty.dirty_data_bytes(), 4 * 1024 * 1024 + 4096);
+    }
+
+    #[test]
+    fn native_builder_committed_patch_is_small_and_truncate_extension_is_a_hole() {
+        let pool = WriteBufferPool::new(0);
+        let mut patch = DirtyExtentMap::default();
+        patch
+            .write_native_at(8192, &[9; 4096], 1, &pool, 6 * 1024 * 1024)
+            .unwrap();
+        assert_eq!(patch.builders[0].builder.capacity(), 4096);
+        assert_eq!(patch.builders[0].builder.len(), 4096);
+        let mut dirty = DirtyExtentMap::default();
+        dirty.write_native_at(0, &[5; 16384], 1, &pool, 0).unwrap();
+        dirty.resize(16384, 8192, 2).unwrap();
+        dirty.resize(8192, 16384, 3).unwrap();
+        let snapshot = dirty.snapshot_range(0, 16384).unwrap();
+        let mut out = vec![99; 16384];
+        snapshot.overlay(0, &mut out).unwrap();
+        assert_eq!(&out[..8192], &[5; 8192]);
+        assert_eq!(&out[8192..], &[0; 8192]);
+        dirty.freeze_builders();
+        assert_eq!(
+            dirty
+                .extents
+                .first_key_value()
+                .unwrap()
+                .1
+                .data
+                .as_ref()
+                .unwrap()
+                .len(),
+            8192
+        );
+    }
+
+    #[test]
+    fn native_builder_allocation_failure_retains_old_body_and_allows_short_write() {
+        let pool = WriteBufferPool::new(0);
+        let mut dirty = DirtyExtentMap::default();
+        dirty
+            .write_native_at(0, &[1; 4096], 1, &pool, 8192)
+            .unwrap();
+        pool.fail_next_allocation();
+        let error = dirty
+            .write_native_at(8192, &[2; 4096], 2, &pool, 16384)
+            .unwrap_err();
+        assert_eq!(error.code(), afs_error::IO_OUT_OF_MEMORY);
+        assert_eq!(dirty.dirty_data_bytes(), 4096);
+        assert_eq!(dirty.builders[0].builder.as_bytes(), &[1; 4096]);
+        // The first 4KiB overwrites an existing owner; the second needs an allocation.
+        pool.fail_next_allocation();
+        assert_eq!(
+            dirty
+                .write_native_at(0, &[3; 8192], 3, &pool, 16384)
+                .unwrap(),
+            4096
+        );
+        assert_eq!(dirty.dirty_data_bytes(), 8192);
+        assert_eq!(dirty.builders[0].builder.as_bytes(), &[3; 4096]);
+    }
+
+    #[cfg(feature = "dfs")]
+    #[test]
+    fn native_builder_commit_planner_keeps_two_bodies_and_small_followup_patch() {
+        let (_temp, meta, fs) = test_fs();
+        let pool = WriteBufferPool::new(16 * 1024 * 1024);
+        let fs = fs.with_write_buffer_pool(pool.clone());
+        let created = fs
+            .create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new("native-bodies.bin"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        let mut expected = Vec::new();
+        for index in 0..6u64 {
+            let bytes = vec![index as u8 + 1; 1024 * 1024];
+            fs.write(&context(), created.handle, index * 1024 * 1024, &bytes)
+                .unwrap();
+            expected.extend_from_slice(&bytes);
+        }
+        assert_eq!(meta.commit_count(), 0);
+        assert_eq!(pool.snapshot().copied_bytes, expected.len() as u64);
+        assert_eq!(pool.snapshot().allocations, 2);
+        fs.fsync(&context(), created.handle, SyncMode::Full)
+            .unwrap();
+        let first = meta.commits.lock().unwrap()[0].clone();
+        assert_eq!(first.layout_root.inline_extents.len(), 2);
+        assert_eq!(first.layout_root.inline_extents[0].length, 4 * 1024 * 1024);
+        assert_eq!(first.layout_root.inline_extents[1].length, 2 * 1024 * 1024);
+        assert_eq!(pool.snapshot().copied_bytes, expected.len() as u64);
+        fs.write(&context(), created.handle, 8192, &[17; 4096])
+            .unwrap();
+        fs.fsync(&context(), created.handle, SyncMode::Full)
+            .unwrap();
+        expected[8192..12288].fill(17);
+        let second = meta.commits.lock().unwrap()[1].clone();
+        assert_eq!(second.layout_root.inline_extents.len(), 4);
+        assert_eq!(second.layout_root.inline_extents[1].length, 4096);
+        assert_eq!(
+            second.layout_root.inline_extents[0].chunk_id,
+            first.layout_root.inline_extents[0].chunk_id
+        );
+        assert_eq!(
+            second.layout_root.inline_extents[2].chunk_id,
+            first.layout_root.inline_extents[0].chunk_id
+        );
+        let mut actual = vec![0; expected.len()];
+        assert_eq!(
+            fs.read(&context(), created.handle, 0, &mut actual).unwrap(),
+            expected.len()
+        );
+        assert_eq!(actual, expected);
+        assert_eq!(pool.snapshot().copied_bytes, expected.len() as u64 + 4096);
+    }
+
+    #[cfg(feature = "dfs")]
+    #[test]
+    fn native_builder_vfs_short_write_does_not_extend_unaccepted_tail() {
+        for sync_flag in [0, libc::O_SYNC, libc::O_DSYNC] {
+            let (_temp, meta, fs) = test_fs();
+            let pool = WriteBufferPool::new(0);
+            let fs = fs.with_write_buffer_pool(pool.clone());
+            let created = fs
+                .create(
+                    &context(),
+                    fs.root_inode(),
+                    OsStr::new("native-short.bin"),
+                    0o640,
+                    libc::O_RDWR,
+                )
+                .unwrap();
+            let prefix = COMMIT_CHUNK_BYTES as usize - 4096;
+            assert_eq!(
+                fs.write(&context(), created.handle, 0, &vec![5; prefix])
+                    .unwrap(),
+                prefix
+            );
+            let writer = fs
+                .open(&context(), created.entry.inode, libc::O_RDWR | sync_flag)
+                .unwrap();
+            pool.fail_next_allocation();
+            assert_eq!(
+                fs.write(&context(), writer, prefix as u64, &[7; 8192])
+                    .unwrap(),
+                4096
+            );
+            assert_eq!(
+                fs.getattr(&context(), created.entry.inode, Some(writer))
+                    .unwrap()
+                    .size,
+                COMMIT_CHUNK_BYTES
+            );
+            assert_eq!(
+                meta.commit_count(),
+                usize::from(sync_flag != 0),
+                "accepted short prefix follows the handle's original sync flag"
+            );
+            fs.fsync(&context(), writer, SyncMode::Full).unwrap();
+            assert_eq!(
+                meta.commits.lock().unwrap()[0].file_version.length,
+                COMMIT_CHUNK_BYTES
+            );
+            let mut tail = [0; 8192];
+            assert_eq!(
+                fs.read(&context(), writer, prefix as u64, &mut tail)
+                    .unwrap(),
+                4096
+            );
+            assert_eq!(&tail[..4096], &[7; 4096]);
+            assert_eq!(
+                fs.read(&context(), writer, COMMIT_CHUNK_BYTES, &mut tail)
+                    .unwrap(),
+                0
+            );
+            assert_eq!(pool.snapshot().copied_bytes, COMMIT_CHUNK_BYTES);
+        }
+    }
+
+    #[cfg(feature = "dfs")]
+    #[test]
+    fn native_builder_preupload_retry_preserves_object_but_layout_excludes_old_tail_and_patch() {
+        struct FailOnceStore {
+            inner: Arc<LocalChunkStore>,
+            fail: AtomicBool,
+            attempts: Mutex<Vec<Vec<ChunkObject>>>,
+        }
+        impl ChunkStore for FailOnceStore {
+            fn put_batch(&self, staged: Vec<StagedChunk>) -> Result<Vec<ChunkReceipt>> {
+                self.attempts
+                    .lock()
+                    .unwrap()
+                    .push(staged.iter().map(|chunk| chunk.chunk.clone()).collect());
+                if self.fail.swap(false, Ordering::SeqCst) {
+                    return Err(unavailable("injected prepare put failure"));
+                }
+                self.inner.put_batch(staged)
+            }
+            fn read_at(
+                &self,
+                chunk_id: &crate::dfs::ChunkId,
+                offset: u64,
+                out: &mut [u8],
+            ) -> Result<usize> {
+                self.inner.read_at(chunk_id, offset, out)
+            }
+        }
+        let meta = Arc::new(RecordingMeta::new());
+        let temp = tempfile::tempdir().unwrap();
+        let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
+        let store = Arc::new(FailOnceStore {
+            inner: local.clone(),
+            fail: AtomicBool::new(true),
+            attempts: Mutex::new(Vec::new()),
+        });
+        let pool = WriteBufferPool::new(0);
+        let fs = distributed_fs_with_chunk_store(
+            meta.clone(),
+            local,
+            store.clone(),
+            DEFAULT_DIRTY_DATA_BUDGET_BYTES,
+        )
+        .with_write_buffer_pool(pool.clone());
+        let created = fs
+            .create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new("native-restore-tail.bin"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        let half = COMMIT_CHUNK_BYTES as usize / 2;
+        let mut original = vec![5; COMMIT_CHUNK_BYTES as usize];
+        original[half..].fill(9);
+        fs.write(&context(), created.handle, 0, &original).unwrap();
+        assert!(
+            fs.fsync(&context(), created.handle, SyncMode::Full)
+                .is_err()
+        );
+        assert_eq!(meta.commit_count(), 0);
+        let inode_id = meta.inode.lock().unwrap().inode_id.clone();
+        let cell = fs.write_state(&inode_id).unwrap().unwrap();
+        assert!(cell.lock().unwrap().dirty_extents.builders.is_empty());
+        for length in [half as u64, COMMIT_CHUNK_BYTES] {
+            fs.setattr(
+                &context(),
+                created.entry.inode,
+                Some(created.handle),
+                &AttributeChange {
+                    size: Some(length),
+                    ..AttributeChange::default()
+                },
+            )
+            .unwrap();
+        }
+        fs.write(&context(), created.handle, 8192, &[7; 4096])
+            .unwrap();
+        fs.fsync(&context(), created.handle, SyncMode::Full)
+            .unwrap();
+        let attempts = store.attempts.lock().unwrap();
+        assert_eq!(attempts.len(), 3);
+        assert_eq!(attempts[0][0].length, COMMIT_CHUNK_BYTES);
+        assert_eq!(
+            attempts[1], attempts[0],
+            "retry keeps the sealed immutable object; it does not rewrite its hidden tail"
+        );
+        assert_eq!(attempts[2].len(), 1);
+        assert_eq!(attempts[2][0].length, 4096);
+        assert_eq!(
+            attempts[1][0].content_digest.bytes,
+            *blake3::hash(&original).as_bytes()
+        );
+        assert_eq!(
+            attempts[2][0].content_digest.bytes,
+            *blake3::hash(&[7; 4096]).as_bytes()
+        );
+        let original_id = attempts[0][0].id.clone();
+        drop(attempts);
+        let commits = meta.commits.lock().unwrap();
+        let commit = commits.last().unwrap();
+        assert_eq!(commit.chunk_receipts.len(), 2);
+        for extent in &commit.layout_root.inline_extents {
+            if extent.chunk_id == original_id {
+                assert!(
+                    extent.chunk_offset + extent.length <= half as u64,
+                    "layout-authorized ranges never include the original hidden tail"
+                );
+            }
+        }
+        drop(commits);
+        let mut expected = original;
+        expected[half..].fill(0);
+        expected[8192..12288].fill(7);
+        let mut actual = vec![0; expected.len()];
+        assert_eq!(
+            fs.read(&context(), created.handle, 0, &mut actual).unwrap(),
+            expected.len()
+        );
+        assert_eq!(actual, expected);
+        assert_eq!(pool.snapshot().copied_bytes, COMMIT_CHUNK_BYTES + 4096);
     }
 
     #[cfg(feature = "dfs")]
@@ -9598,7 +18768,7 @@ mod tests {
         let snapshot = InodeMutationSnapshot {
             logical_length: state.logical_length,
             dirty: state.dirty,
-            dirty_extent_count: state.dirty_extents.extents.len(),
+            dirty_extent_count: state.dirty_extents.iter_extents().count(),
             visible_write_seq: state.visible_write_seq,
             durable_write_seq: state.durable_write_seq,
             committed_write_seq: state.committed_write_seq,
@@ -10057,7 +19227,7 @@ mod tests {
             std::fs::copy(&trace_output, directory.join("trace-unknown.jsonl")).unwrap();
             std::fs::write(
                 directory.join("commit-request.json"),
-                serde_json::to_vec(&pending.batch.commit).unwrap(),
+                serde_json::to_vec(pending.batch.commit.as_ref()).unwrap(),
             )
             .unwrap();
             std::fs::write(
@@ -10159,8 +19329,8 @@ mod tests {
         assert_eq!(chunks_a.put_batch_count(), 1);
         let captured_commits = meta_a.commits();
         assert_eq!(captured_commits.len(), 2);
-        assert_eq!(captured_commits[0], pending.batch.commit);
-        assert_eq!(captured_commits[1], pending.batch.commit);
+        assert_eq!(&captured_commits[0], pending.batch.commit.as_ref());
+        assert_eq!(&captured_commits[1], pending.batch.commit.as_ref());
 
         {
             let fs = fs_a.clone();
@@ -10545,7 +19715,7 @@ mod tests {
     }
 
     #[test]
-    fn dirty_budget_writeback_splits_streaming_writes_without_per_write_meta_rpc() {
+    fn native_writeback_buffers_streaming_writes_until_an_explicit_barrier() {
         let (_temp, meta, fs) = test_fs_with_dirty_budget(8);
         let created = fs
             .create(
@@ -10564,19 +19734,15 @@ mod tests {
         );
         assert_eq!(
             meta.commit_count(),
-            2,
-            "one large write is staged and committed in budget-sized windows"
+            0,
+            "ordinary write no longer publishes legacy dirty-budget windows"
         );
-
+        fs.fsync(&context(), created.handle, SyncMode::DataOnly)
+            .unwrap();
         let commits = meta.commits.lock().unwrap();
+        assert_eq!(commits.len(), 1);
         assert_eq!(commits[0].metadata_delta.mode, CommitMetadataMode::DataOnly);
-        assert_eq!(commits[0].file_version.length, 8);
-        assert_eq!(commits[1].metadata_delta.mode, CommitMetadataMode::DataOnly);
-        assert_eq!(commits[1].file_version.length, 16);
-        assert_eq!(
-            commits[1].file_version.parent_version,
-            Some(commits[0].file_version.id.clone())
-        );
+        assert_eq!(commits[0].file_version.length, 16);
         drop(commits);
 
         let mut out = [0; 16];
@@ -10588,7 +19754,7 @@ mod tests {
     }
 
     #[test]
-    fn dirty_budget_repeated_identical_chunks_share_receipt_but_keep_layout_references() {
+    fn native_repeated_identical_chunks_share_receipt_but_keep_layout_references() {
         let (_temp, meta, fs) = test_fs_with_dirty_budget(DEFAULT_DIRTY_DATA_BUDGET_BYTES);
         let created = fs
             .create(
@@ -10603,16 +19769,21 @@ mod tests {
         let mut offset = 0u64;
 
         for size in (1..=8192).rev() {
+            let size = size.min((DEFAULT_DIRTY_DATA_BUDGET_BYTES - offset) as usize);
+            if size == 0 {
+                break;
+            }
             assert_eq!(
                 fs.write(&context(), created.handle, offset, &payload[..size])
                     .unwrap(),
                 size
             );
             offset += size as u64;
-            if meta.commit_count() > 0 {
-                break;
-            }
         }
+        assert_eq!(offset, DEFAULT_DIRTY_DATA_BUDGET_BYTES);
+        assert_eq!(meta.commit_count(), 0);
+        fs.fsync(&context(), created.handle, SyncMode::Full)
+            .unwrap();
 
         let commits = meta.commits.lock().unwrap();
         assert_eq!(commits.len(), 1);
@@ -10688,8 +19859,11 @@ mod tests {
     }
 
     #[test]
-    fn dirty_budget_unknown_commit_ack_preserves_exact_request_and_backpressures_next_write() {
+    fn explicit_publication_unknown_commit_ack_preserves_exact_request_and_backpressures_next_write()
+     {
         let (_temp, meta, fs) = test_fs_with_dirty_budget(4);
+        let pool = WriteBufferPool::new(0);
+        let fs = fs.with_write_buffer_pool(pool.clone());
         let created = fs
             .create(
                 &context(),
@@ -10706,8 +19880,43 @@ mod tests {
             4,
             "buffered write reports bytes admitted into the exact pending request"
         );
+        assert!(
+            fs.fsync(&context(), created.handle, SyncMode::Full)
+                .is_err()
+        );
         let failed = meta.failed_commits.lock().unwrap()[0].clone();
+        let inode_id = fs.inode_id(created.entry.inode).unwrap();
+        let cell = fs.write_state(&inode_id).unwrap().unwrap();
+        let retained_body = {
+            let state = cell.lock().unwrap();
+            let InFlightCommit::File(pending) = state.in_flight.as_ref().unwrap() else {
+                panic!("unknown Meta outcome must retain the exact prepared commit");
+            };
+            assert_eq!(
+                serde_json::to_vec(pending.batch.commit.as_ref()).unwrap(),
+                serde_json::to_vec(&failed).unwrap()
+            );
+            pending
+                .frozen
+                .dirty_extents
+                .iter_extents()
+                .next()
+                .unwrap()
+                .data
+                .as_ref()
+                .unwrap()
+                .clone()
+        };
+        let pointer = retained_body.as_ptr();
+        let generation = retained_body.allocation_id();
+        let capacity = retained_body.capacity();
+        let last_holder = retained_body.clone();
+        assert_eq!(retained_body.as_ref(), b"data");
+        assert_eq!(pool.snapshot().live_bytes, capacity);
+        assert_eq!(pool.snapshot().idle_bytes, 0);
+        assert_eq!(pool.snapshot().released_bytes, 0);
 
+        meta.fail_next_commit();
         assert_eq!(
             fs.write(&context(), created.handle, 4, b"!")
                 .unwrap_err()
@@ -10715,9 +19924,35 @@ mod tests {
             afs_error::NODE_VFS_UNAVAILABLE,
             "the unknown commit is reported before admitting new mutation"
         );
+        {
+            let state = cell.lock().unwrap();
+            let InFlightCommit::File(pending) = state.in_flight.as_ref().unwrap() else {
+                panic!("unobserved retry must not retire pending identity");
+            };
+            let body = pending
+                .frozen
+                .dirty_extents
+                .iter_extents()
+                .next()
+                .unwrap()
+                .data
+                .as_ref()
+                .unwrap();
+            assert_eq!(body.as_ptr(), pointer);
+            assert_eq!(body.allocation_id(), generation);
+            assert_eq!(
+                serde_json::to_vec(pending.batch.commit.as_ref()).unwrap(),
+                serde_json::to_vec(&failed).unwrap()
+            );
+        }
+        assert_eq!(pool.snapshot().live_bytes, capacity);
         assert_eq!(fs.write(&context(), created.handle, 4, b"!").unwrap(), 1);
         let commits = meta.commits.lock().unwrap();
         assert_eq!(commits.len(), 1);
+        assert_eq!(
+            serde_json::to_vec(&failed).unwrap(),
+            serde_json::to_vec(&commits[0]).unwrap()
+        );
         assert_eq!(failed.operation_id, commits[0].operation_id);
         assert_eq!(failed.file_version.id, commits[0].file_version.id);
         assert_eq!(failed.layout_root.id, commits[0].layout_root.id);
@@ -10728,10 +19963,1619 @@ mod tests {
         let commits = meta.commits.lock().unwrap();
         assert_eq!(commits.len(), 2);
         assert_eq!(commits[1].file_version.length, 5);
+        drop(commits);
+        assert!(cell.lock().unwrap().in_flight.is_none());
+        assert_eq!(
+            pool.snapshot().live_bytes,
+            capacity,
+            "an ACK and inode retirement cannot release an independent body holder"
+        );
+        assert_eq!(pool.snapshot().idle_bytes, 0);
+        assert_eq!(retained_body.as_ptr(), pointer);
+        assert_eq!(retained_body.allocation_id(), generation);
+        assert_eq!(retained_body.as_ref(), b"data");
+        drop(retained_body);
+        assert_eq!(pool.snapshot().live_bytes, capacity);
+        drop(last_holder);
+        assert_eq!(pool.snapshot().live_bytes, 0);
+        assert_eq!(pool.snapshot().idle_bytes, 0);
+        assert_eq!(pool.snapshot().copied_bytes, 5);
     }
 
     #[test]
-    fn dirty_budget_returns_admitted_bytes_and_latches_later_error() {
+    fn native_builder_slow_put_and_transport_retry_keep_pool_live_until_last_owner() {
+        struct SlowStore {
+            inner: Arc<LocalChunkStore>,
+            pause: Arc<CommitPause>,
+            held: Mutex<Option<StagedChunk>>,
+        }
+        impl ChunkStore for SlowStore {
+            fn put_batch(&self, staged: Vec<StagedChunk>) -> Result<Vec<ChunkReceipt>> {
+                *self.held.lock().unwrap() = staged.first().cloned();
+                self.pause.block();
+                self.inner.put_batch(staged)
+            }
+            fn read_at(
+                &self,
+                chunk_id: &crate::dfs::ChunkId,
+                offset: u64,
+                out: &mut [u8],
+            ) -> Result<usize> {
+                self.inner.read_at(chunk_id, offset, out)
+            }
+        }
+        let meta = Arc::new(RecordingMeta::new());
+        let temp = tempfile::tempdir().unwrap();
+        let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
+        let pause = Arc::new(CommitPause::new(0));
+        let store = Arc::new(SlowStore {
+            inner: local.clone(),
+            pause: pause.clone(),
+            held: Mutex::new(None),
+        });
+        let pool = WriteBufferPool::new(0);
+        let fs = Arc::new(
+            distributed_fs_with_chunk_store(
+                meta.clone(),
+                local,
+                store.clone(),
+                DEFAULT_DIRTY_DATA_BUDGET_BYTES,
+            )
+            .with_write_buffer_pool(pool.clone()),
+        );
+        let created = fs
+            .create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new("native-slow-put.bin"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        let payload = vec![23; 64 * 1024];
+        fs.write(&context(), created.handle, 0, &payload).unwrap();
+        let inode_id = fs.inode_id(created.entry.inode).unwrap();
+        let cell = fs.write_state(&inode_id).unwrap().unwrap();
+        let (pointer, generation, capacity) = {
+            let state = cell.lock().unwrap();
+            let builder = &state.dirty_extents.builders[0].builder;
+            (
+                builder.data_ptr(),
+                builder.allocation_id(),
+                builder.capacity(),
+            )
+        };
+        let writer_fs = fs.clone();
+        let writer =
+            std::thread::spawn(move || writer_fs.fsync(&context(), created.handle, SyncMode::Full));
+        pause.wait_until_reached();
+        let during_put = pool.snapshot();
+        let commit_count_during_put = meta.commit_count();
+        let retained = store.held.lock().unwrap().take().unwrap();
+        let body = retained.shared_bytes();
+        // Always unblock the test store before assertions, including a failed
+        // invariant, so the runtime thread cannot be stranded by this test.
+        pause.release();
+        writer.join().unwrap().unwrap();
+        assert_eq!(during_put.live_bytes, capacity);
+        assert_eq!(during_put.idle_bytes, 0);
+        assert_eq!(during_put.released_bytes, 0);
+        assert_eq!(commit_count_during_put, 0);
+        assert_eq!(body.as_ptr(), pointer);
+        assert_eq!(body.allocation_id(), generation);
+        assert_eq!(body.as_ref(), payload.as_slice());
+        assert_eq!(pool.snapshot().live_bytes, capacity);
+        assert_eq!(pool.snapshot().idle_bytes, 0);
+        let transport = axum::body::Bytes::from_owner(retained);
+        let retry = transport.clone();
+        drop(body);
+        drop(transport);
+        assert_eq!(
+            pool.snapshot().live_bytes,
+            capacity,
+            "a slow/retry transport clone retains the same allocation after Meta ACK"
+        );
+        assert_eq!(retry.as_ref(), payload.as_slice());
+        drop(retry);
+        assert_eq!(pool.snapshot().live_bytes, 0);
+        assert_eq!(pool.snapshot().idle_bytes, 0);
+        assert_eq!(pool.snapshot().released_bytes, capacity as u64);
+        assert_eq!(pool.snapshot().copied_bytes, payload.len() as u64);
+    }
+
+    #[test]
+    fn deferred_publication_preuploads_full_chunks_before_meta_publish() {
+        let meta = Arc::new(RecordingMeta::new());
+        let temp = tempfile::tempdir().unwrap();
+        let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
+        let deferred = Arc::new(RecordingDeferredChunkStore::new(local.clone()));
+        let fs = distributed_fs_with_chunk_store(
+            meta.clone(),
+            local,
+            deferred.clone(),
+            DEFAULT_DIRTY_DATA_BUDGET_BYTES,
+        );
+        let created = fs
+            .create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new("deferred-preupload.bin"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        let mut payload = vec![b'p'; COMMIT_CHUNK_BYTES as usize];
+        payload.extend(vec![b'q'; COMMIT_CHUNK_BYTES as usize]);
+
+        assert_eq!(
+            fs.write(&context(), created.handle, 0, &payload).unwrap(),
+            payload.len()
+        );
+        assert_eq!(
+            meta.commit_count(),
+            0,
+            "deferred full chunks upload before the Meta version is published"
+        );
+        let batches = deferred.deferred_batches();
+        assert_eq!(
+            batches.iter().map(Vec::len).sum::<usize>(),
+            2,
+            "each full 4MiB chunk is submitted before Meta publish"
+        );
+        assert!(
+            batches.iter().all(|batch| batch.len() == 1),
+            "DFS submits sealed 4MiB chunks incrementally; the shared store owns PUT concurrency"
+        );
+
+        fs.fsync(&context(), created.handle, SyncMode::DataOnly)
+            .unwrap();
+        let commits = meta.commits.lock().unwrap();
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].file_version.length, payload.len() as u64);
+        assert_eq!(commits[0].layout_root.inline_extents.len(), 2);
+        assert_eq!(commits[0].chunk_receipts.len(), 2);
+        for receipt in &commits[0].chunk_receipts {
+            assert_eq!(receipt.operation_id, commits[0].operation_id);
+        }
+    }
+
+    #[test]
+    fn deferred_publication_put_failure_does_not_publish_meta_version() {
+        let meta = Arc::new(RecordingMeta::new());
+        let temp = tempfile::tempdir().unwrap();
+        let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
+        let deferred = Arc::new(RecordingDeferredChunkStore::new(local.clone()));
+        deferred.fail_wait_with(2, unavailable("injected deferred PUT failure"));
+        let fs = distributed_fs_with_chunk_store(
+            meta.clone(),
+            local,
+            deferred.clone(),
+            DEFAULT_DIRTY_DATA_BUDGET_BYTES,
+        );
+        let created = fs
+            .create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new("deferred-put-failure.bin"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        let mut payload = vec![b'f'; COMMIT_CHUNK_BYTES as usize];
+        payload.extend(vec![b'g'; COMMIT_CHUNK_BYTES as usize]);
+
+        assert_eq!(
+            fs.write(&context(), created.handle, 0, &payload).unwrap(),
+            payload.len()
+        );
+        assert_eq!(
+            fs.fsync(&context(), created.handle, SyncMode::DataOnly)
+                .unwrap_err()
+                .code(),
+            afs_error::NODE_VFS_UNAVAILABLE
+        );
+        assert_eq!(
+            meta.commit_count(),
+            0,
+            "failed deferred PUT must not leave a Meta reference to missing data"
+        );
+        let deferred_after_failure = deferred.deferred_batches();
+        let successful_deferred_chunk = deferred_after_failure[0][0].id.clone();
+
+        fs.fsync(&context(), created.handle, SyncMode::DataOnly)
+            .unwrap();
+        let commits = meta.commits.lock().unwrap();
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].file_version.length, payload.len() as u64);
+        assert_eq!(commits[0].layout_root.inline_extents.len(), 2);
+        assert_eq!(
+            commits[0]
+                .chunk_receipts
+                .iter()
+                .filter(|receipt| receipt.operation_id == commits[0].operation_id)
+                .count(),
+            2,
+            "retry keeps the same publication operation and publishes every window chunk"
+        );
+        let deferred_after_retry = deferred.deferred_batches();
+        assert_eq!(
+            deferred_after_retry.len(),
+            deferred_after_failure.len(),
+            "retry waits retained successful tickets instead of submitting new deferred PUTs"
+        );
+        for (after_retry, after_failure) in deferred_after_retry
+            .iter()
+            .zip(deferred_after_failure.iter())
+        {
+            assert_eq!(after_retry.len(), after_failure.len());
+            for (retry_chunk, failure_chunk) in after_retry.iter().zip(after_failure.iter()) {
+                assert_eq!(retry_chunk.id, failure_chunk.id);
+            }
+        }
+        let sync_batches = deferred.sync_batches();
+        assert_eq!(sync_batches.iter().map(Vec::len).sum::<usize>(), 1);
+        assert_ne!(
+            sync_batches[0][0].id, successful_deferred_chunk,
+            "the already successful deferred PUT is not uploaded again during retry"
+        );
+    }
+
+    #[test]
+    fn deferred_publication_unknown_ack_retries_same_prepared_request() {
+        let meta = Arc::new(RecordingMeta::new());
+        let temp = tempfile::tempdir().unwrap();
+        let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
+        let deferred = Arc::new(RecordingDeferredChunkStore::new(local.clone()));
+        let fs = distributed_fs_with_chunk_store(
+            meta.clone(),
+            local,
+            deferred.clone(),
+            DEFAULT_DIRTY_DATA_BUDGET_BYTES,
+        );
+        let created = fs
+            .create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new("deferred-unknown-ack.bin"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        let mut payload = vec![b'u'; COMMIT_CHUNK_BYTES as usize];
+        payload.extend(vec![b'v'; COMMIT_CHUNK_BYTES as usize]);
+        fs.write(&context(), created.handle, 0, &payload).unwrap();
+        let deferred_batches_before_retry = deferred.deferred_batches().len();
+        meta.fail_next_commit();
+
+        fs.fsync(&context(), created.handle, SyncMode::DataOnly)
+            .unwrap_err();
+        let failed = meta.failed_commits.lock().unwrap()[0].clone();
+        fs.fsync(&context(), created.handle, SyncMode::DataOnly)
+            .unwrap();
+
+        let commits = meta.commits.lock().unwrap();
+        assert_eq!(commits.len(), 1);
+        assert_eq!(failed.operation_id, commits[0].operation_id);
+        assert_eq!(failed.file_version.id, commits[0].file_version.id);
+        assert_eq!(failed.layout_root.id, commits[0].layout_root.id);
+        assert_eq!(commits[0].layout_root.inline_extents.len(), 2);
+        assert_eq!(
+            deferred.deferred_batches().len(),
+            deferred_batches_before_retry,
+            "unknown Meta ACK retry reuses the retained request instead of reuploading"
+        );
+    }
+
+    #[test]
+    fn deferred_publication_range_overflow_does_not_pollute_window() {
+        let meta = Arc::new(RecordingMeta::new());
+        let temp = tempfile::tempdir().unwrap();
+        let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
+        let deferred = Arc::new(RecordingDeferredChunkStore::new(local.clone()));
+        let fs = distributed_fs_with_chunk_store(
+            meta.clone(),
+            local,
+            deferred,
+            DEFAULT_DIRTY_DATA_BUDGET_BYTES,
+        );
+        let created = fs
+            .create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new("deferred-overflow-clean.bin"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+
+        assert_eq!(
+            fs.write(&context(), created.handle, u64::MAX, b"xy")
+                .unwrap_err()
+                .code(),
+            afs_error::IO_FILE_TOO_LARGE
+        );
+        let state = fs
+            .write_state(&fs.inode_id(created.entry.inode).unwrap())
+            .unwrap()
+            .unwrap();
+        let state = state.lock().unwrap();
+        assert!(state.publication_window.is_none());
+        assert!(state.dirty_extents.is_empty());
+        assert_eq!(state.logical_length, 0);
+        assert_eq!(deferred_budget_counts(&fs), (0, 0, 0));
+    }
+
+    #[test]
+    fn deferred_publication_sparse_fallback_does_not_create_empty_window() {
+        let meta = Arc::new(RecordingMeta::new());
+        let temp = tempfile::tempdir().unwrap();
+        let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
+        let deferred = Arc::new(RecordingDeferredChunkStore::new(local.clone()));
+        let fs = distributed_fs_with_chunk_store(
+            meta.clone(),
+            local,
+            deferred,
+            DEFAULT_DIRTY_DATA_BUDGET_BYTES,
+        );
+        let created = fs
+            .create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new("deferred-sparse-fallback.bin"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+
+        assert_eq!(fs.write(&context(), created.handle, 4, b"xy").unwrap(), 2);
+        fs.fsync(&context(), created.handle, SyncMode::DataOnly)
+            .unwrap();
+
+        let commits = meta.commits.lock().unwrap();
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].file_version.length, 6);
+        drop(commits);
+        let reader = fs
+            .open(&context(), created.entry.inode, libc::O_RDONLY)
+            .unwrap();
+        let mut out = [0_u8; 6];
+        assert_eq!(fs.read(&context(), reader, 0, &mut out).unwrap(), 6);
+        assert_eq!(&out[..4], &[0, 0, 0, 0]);
+        assert_eq!(&out[4..], b"xy");
+    }
+
+    #[test]
+    fn deferred_publication_commits_legacy_dirty_before_eof_window() {
+        let meta = Arc::new(RecordingMeta::new());
+        let temp = tempfile::tempdir().unwrap();
+        let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
+        let deferred = Arc::new(RecordingDeferredChunkStore::new(local.clone()));
+        let fs = distributed_fs_with_chunk_store(
+            meta.clone(),
+            local,
+            deferred,
+            DEFAULT_DIRTY_DATA_BUDGET_BYTES,
+        );
+        let created = fs
+            .create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new("deferred-mixed-fallback.bin"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+
+        fs.write(&context(), created.handle, 0, b"abcdef").unwrap();
+        fs.fsync(&context(), created.handle, SyncMode::DataOnly)
+            .unwrap();
+        fs.write(&context(), created.handle, 1, b"ZZ").unwrap();
+        fs.write(&context(), created.handle, 6, b"tail").unwrap();
+        fs.fsync(&context(), created.handle, SyncMode::DataOnly)
+            .unwrap();
+
+        let commits = meta.commits.lock().unwrap();
+        assert_eq!(commits.len(), 3);
+        assert_eq!(commits[2].file_version.length, 10);
+        drop(commits);
+        let reader = fs
+            .open(&context(), created.entry.inode, libc::O_RDONLY)
+            .unwrap();
+        let mut out = [0_u8; 10];
+        assert_eq!(fs.read(&context(), reader, 0, &mut out).unwrap(), 10);
+        assert_eq!(&out, b"aZZdeftail");
+    }
+
+    #[test]
+    fn deferred_publication_resize_drains_window_and_updates_handle_sync_progress() {
+        let meta = Arc::new(RecordingMeta::new());
+        let temp = tempfile::tempdir().unwrap();
+        let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
+        let deferred = Arc::new(RecordingDeferredChunkStore::new(local.clone()));
+        let fs = distributed_fs_with_chunk_store(
+            meta.clone(),
+            local,
+            deferred,
+            DEFAULT_DIRTY_DATA_BUDGET_BYTES,
+        );
+        let created = fs
+            .create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new("deferred-resize-drain.bin"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        let mut payload = vec![b'r'; COMMIT_CHUNK_BYTES as usize];
+        payload.extend(vec![b's'; COMMIT_CHUNK_BYTES as usize]);
+
+        fs.write(&context(), created.handle, 0, &payload).unwrap();
+        assert_eq!(meta.commit_count(), 0);
+        let accepted_before_resize = fs
+            .handle_snapshot(created.handle)
+            .unwrap()
+            .write_session
+            .as_ref()
+            .unwrap()
+            .local
+            .last_accepted_seq;
+        fs.setattr(
+            &context(),
+            created.entry.inode,
+            Some(created.handle),
+            &AttributeChange {
+                size: Some(payload.len() as u64),
+                ..AttributeChange::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(meta.commit_count(), 1);
+        let snapshot = fs.handle_snapshot(created.handle).unwrap();
+        let session = snapshot.write_session.unwrap().local;
+        assert!(
+            session.last_synced_seq >= accepted_before_resize,
+            "resize drain must advance writable handles past the drained publication commit"
+        );
+        fs.fsync(&context(), created.handle, SyncMode::DataOnly)
+            .unwrap();
+        assert_eq!(
+            meta.commit_count(),
+            1,
+            "same-length resize after drain must not create a second FileVersion"
+        );
+    }
+
+    #[test]
+    fn deferred_publication_dirty_read_pin_keeps_budget_after_commit() {
+        let meta = Arc::new(RecordingMeta::new());
+        let temp = tempfile::tempdir().unwrap();
+        let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
+        let deferred = Arc::new(RecordingDeferredChunkStore::new(local.clone()));
+        let fs =
+            distributed_fs_with_chunk_store(meta, local, deferred, DEFAULT_DIRTY_DATA_BUDGET_BYTES);
+        let created = fs
+            .create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new("pinned-write-budget.bin"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        fs.write(&context(), created.handle, 0, b"pinned").unwrap();
+        let inode_id = fs.inode_id(created.entry.inode).unwrap();
+        let cell = fs.write_state(&inode_id).unwrap().unwrap();
+        let read_pin = cell.lock().unwrap().dirty_extents.clone();
+        fs.fsync(&context(), created.handle, SyncMode::DataOnly)
+            .unwrap();
+        assert!(
+            deferred_budget_counts(&fs).0 >= DEFERRED_MIN_NORMAL_RESERVATION_BYTES,
+            "a retired dirty read view still owns its allocation"
+        );
+        let mut bytes = [0_u8; 6];
+        read_pin.overlay(0, &mut bytes).unwrap();
+        assert_eq!(&bytes, b"pinned");
+        drop(read_pin);
+        assert_eq!(deferred_budget_counts(&fs), (0, 0, 0));
+    }
+
+    #[test]
+    fn deferred_publication_transport_pin_keeps_full_and_tail_budgets() {
+        let meta = Arc::new(RecordingMeta::new());
+        let temp = tempfile::tempdir().unwrap();
+        let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
+        let deferred = Arc::new(RecordingDeferredChunkStore::new(local.clone()));
+        *deferred.retained_staged.lock().unwrap() = Some(Vec::new());
+        let fs = distributed_fs_with_chunk_store(
+            meta,
+            local,
+            deferred.clone(),
+            DEFAULT_DIRTY_DATA_BUDGET_BYTES,
+        );
+        let created = fs
+            .create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new("transport-pinned-write-budget.bin"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        let full = vec![b'p'; COMMIT_CHUNK_BYTES as usize];
+        fs.write(&context(), created.handle, 0, &full).unwrap();
+        fs.write(&context(), created.handle, COMMIT_CHUNK_BYTES, b"tail")
+            .unwrap();
+        let full_budget = COMMIT_CHUNK_BYTES;
+        let descriptor_budget = DEFERRED_DESCRIPTOR_BYTES_PER_CHUNK;
+        assert_eq!(
+            deferred_budget_counts(&fs),
+            (
+                full_budget + COMMIT_CHUNK_BYTES + DEFERRED_MIN_NORMAL_RESERVATION_BYTES,
+                descriptor_budget,
+                1,
+            ),
+        );
+        fs.fsync(&context(), created.handle, SyncMode::DataOnly)
+            .unwrap();
+        assert_eq!(
+            deferred_budget_counts(&fs),
+            (full_budget + COMMIT_CHUNK_BYTES, descriptor_budget, 1,),
+            "retained full and tail stages each charge actual 4MiB allocation capacity",
+        );
+        let mut staged = deferred.retained_staged.lock().unwrap().take().unwrap();
+        assert_eq!(staged.len(), 2);
+        staged.sort_by_key(|stage| stage.chunk.length);
+        let full_stage = staged.pop().unwrap();
+        let tail_stage = staged.pop().unwrap();
+        assert_eq!(full_stage.chunk.length, COMMIT_CHUNK_BYTES);
+        assert_eq!(tail_stage.bytes(), b"tail");
+        let full_body = axum::body::Bytes::from_owner(full_stage);
+        let tail_body = axum::body::Bytes::from_owner(tail_stage);
+        drop(tail_body);
+        assert_eq!(
+            deferred_budget_counts(&fs),
+            (full_budget, descriptor_budget, 1),
+            "the full sealed stage must not retain the later tail reservation",
+        );
+        let retry_body = full_body.clone();
+        drop(full_body);
+        assert_eq!(
+            deferred_budget_counts(&fs),
+            (full_budget, descriptor_budget, 1)
+        );
+        drop(retry_body);
+        assert_eq!(deferred_budget_counts(&fs), (0, 0, 0));
+    }
+
+    #[test]
+    fn deferred_budget_reservation_releases_once_after_last_clone() {
+        let budget = Arc::new(DeferredWriteBudget::default());
+        let reservation = budget.reserve_normal(64).unwrap();
+        let clone = reservation.clone();
+        drop(reservation);
+        assert_eq!(budget.state.lock().unwrap().normal_bytes, 64);
+        drop(clone);
+        assert_eq!(budget.state.lock().unwrap().normal_bytes, 0);
+    }
+
+    #[test]
+    fn deferred_publication_fallback_dirty_holds_budget_until_commit() {
+        let meta = Arc::new(RecordingMeta::new());
+        let temp = tempfile::tempdir().unwrap();
+        let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
+        let deferred = Arc::new(RecordingDeferredChunkStore::new(local.clone()));
+        let fs =
+            distributed_fs_with_chunk_store(meta, local, deferred, DEFAULT_DIRTY_DATA_BUDGET_BYTES);
+        let created = fs
+            .create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new("deferred-fallback-budget.bin"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+
+        fs.write(&context(), created.handle, 4, b"xy").unwrap();
+        assert!(deferred_budget_counts(&fs).0 >= DEFERRED_MIN_NORMAL_RESERVATION_BYTES);
+        fs.fsync(&context(), created.handle, SyncMode::DataOnly)
+            .unwrap();
+        assert_eq!(deferred_budget_counts(&fs), (0, 0, 0));
+    }
+
+    #[test]
+    fn deferred_publication_put_failure_retains_budget_until_retry_success() {
+        let meta = Arc::new(RecordingMeta::new());
+        let temp = tempfile::tempdir().unwrap();
+        let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
+        let deferred = Arc::new(RecordingDeferredChunkStore::new(local.clone()));
+        deferred.fail_wait_with(2, unavailable("injected deferred PUT failure"));
+        let fs =
+            distributed_fs_with_chunk_store(meta, local, deferred, DEFAULT_DIRTY_DATA_BUDGET_BYTES);
+        let created = fs
+            .create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new("deferred-put-budget.bin"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        let mut payload = vec![b'b'; COMMIT_CHUNK_BYTES as usize];
+        payload.extend(vec![b'c'; COMMIT_CHUNK_BYTES as usize]);
+
+        fs.write(&context(), created.handle, 0, &payload).unwrap();
+        assert!(deferred_budget_counts(&fs).0 > 0);
+        fs.fsync(&context(), created.handle, SyncMode::DataOnly)
+            .unwrap_err();
+        let retained = deferred_budget_counts(&fs);
+        assert!(retained.0 > 0 || retained.1 > 0 || retained.2 > 0);
+        fs.fsync(&context(), created.handle, SyncMode::DataOnly)
+            .unwrap();
+        assert_eq!(deferred_budget_counts(&fs), (0, 0, 0));
+    }
+
+    #[test]
+    fn deferred_publication_unknown_ack_retains_budget_until_exact_retry() {
+        let meta = Arc::new(RecordingMeta::new());
+        let temp = tempfile::tempdir().unwrap();
+        let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
+        let deferred = Arc::new(RecordingDeferredChunkStore::new(local.clone()));
+        let fs = distributed_fs_with_chunk_store(
+            meta.clone(),
+            local,
+            deferred,
+            DEFAULT_DIRTY_DATA_BUDGET_BYTES,
+        );
+        let created = fs
+            .create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new("deferred-unknown-budget.bin"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        let mut payload = vec![b'k'; COMMIT_CHUNK_BYTES as usize];
+        payload.extend(vec![b'l'; COMMIT_CHUNK_BYTES as usize]);
+        fs.write(&context(), created.handle, 0, &payload).unwrap();
+        meta.fail_next_commit();
+
+        fs.fsync(&context(), created.handle, SyncMode::DataOnly)
+            .unwrap_err();
+        let retained = deferred_budget_counts(&fs);
+        assert!(retained.0 > 0 || retained.1 > 0 || retained.2 > 0);
+        fs.fsync(&context(), created.handle, SyncMode::DataOnly)
+            .unwrap();
+        assert_eq!(deferred_budget_counts(&fs), (0, 0, 0));
+    }
+
+    #[test]
+    fn deferred_publication_definite_rejection_restores_dirty_budget() {
+        let meta = Arc::new(RecordingMeta::new());
+        let temp = tempfile::tempdir().unwrap();
+        let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
+        let deferred = Arc::new(RecordingDeferredChunkStore::new(local.clone()));
+        let fs = distributed_fs_with_chunk_store(
+            meta.clone(),
+            local,
+            deferred,
+            DEFAULT_DIRTY_DATA_BUDGET_BYTES,
+        );
+        let created = fs
+            .create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new("deferred-reject-budget.bin"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        let mut payload = vec![b'm'; COMMIT_CHUNK_BYTES as usize];
+        payload.extend(vec![b'n'; COMMIT_CHUNK_BYTES as usize]);
+        fs.write(&context(), created.handle, 0, &payload).unwrap();
+        meta.fail_next_commit_with(Error::coded(
+            afs_error::META_DFS_CONFLICT,
+            "confirmed test conflict",
+        ));
+
+        fs.fsync(&context(), created.handle, SyncMode::DataOnly)
+            .unwrap_err();
+        let retained = deferred_budget_counts(&fs);
+        assert!(retained.0 > 0 || retained.1 > 0 || retained.2 > 0);
+    }
+
+    #[test]
+    fn deferred_publication_accepts_next_window_before_previous_meta_ack() {
+        let meta = Arc::new(RecordingMeta::new());
+        let temp = tempfile::tempdir().unwrap();
+        let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
+        let deferred = Arc::new(RecordingDeferredChunkStore::new(local.clone()));
+        let fs = Arc::new(distributed_fs_with_chunk_store(
+            meta.clone(),
+            local,
+            deferred,
+            DEFAULT_DIRTY_DATA_BUDGET_BYTES,
+        ));
+        let created = fs
+            .create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new("deferred-cross-window.bin"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        let first_window = DEFERRED_PUBLICATION_WINDOW_BYTES as usize;
+        let payload_len = first_window + COMMIT_CHUNK_BYTES as usize;
+        let mut payload = vec![b'a'; first_window];
+        payload.extend(vec![b'b'; COMMIT_CHUNK_BYTES as usize]);
+        let pause = meta.pause_commit_after_successes(0);
+
+        let writer_fs = fs.clone();
+        let writer_handle = created.handle;
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            done_tx
+                .send(writer_fs.write(&context(), writer_handle, 0, &payload))
+                .unwrap();
+        });
+
+        match done_rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(result) => assert_eq!(
+                result.unwrap(),
+                payload_len,
+                "ordinary write reports every byte accepted into the active/frozen windows"
+            ),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if pause.was_reached() {
+                    pause.release();
+                    let _ = writer.join();
+                }
+                panic!("ordinary write must not wait for the previous 64MiB window's Meta ACK");
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                if pause.was_reached() {
+                    pause.release();
+                }
+                let _ = writer.join();
+                panic!("writer thread exited without reporting a result");
+            }
+        }
+        writer.join().unwrap();
+        assert!(
+            !pause.was_reached(),
+            "plain write must not enter Meta publish before fsync/close/drain"
+        );
+
+        assert_eq!(
+            fs.getattr(&context(), created.entry.inode, Some(created.handle))
+                .unwrap()
+                .size,
+            payload_len as u64,
+            "local visibility follows the accepted byte count before durable publication"
+        );
+        let read_fs = fs.clone();
+        let read_handle = created.handle;
+        let (read_tx, read_rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let mut tail = vec![0_u8; COMMIT_CHUNK_BYTES as usize];
+            let result = read_fs
+                .read(&context(), read_handle, first_window as u64, &mut tail)
+                .map(|count| (count, tail));
+            read_tx.send(result).unwrap();
+        });
+        pause.wait_until_reached();
+        assert!(
+            matches!(
+                read_rx.recv_timeout(Duration::from_millis(50)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "dirty read must wait for the ordered publication ACK before returning"
+        );
+        pause.release();
+        let (count, tail) = read_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        reader.join().unwrap();
+        assert_eq!(count, COMMIT_CHUNK_BYTES as usize);
+        assert!(
+            tail.iter().all(|byte| *byte == b'b'),
+            "read-own-write returns the published accepted window after the ACK"
+        );
+
+        fs.write(&context(), created.handle, payload_len as u64, b"z")
+            .unwrap();
+        let pause = meta.pause_commit_after_successes(meta.commit_count());
+
+        let sync_fs = fs.clone();
+        let sync_handle = created.handle;
+        let (sync_done_tx, sync_done_rx) = std::sync::mpsc::channel();
+        let syncer = std::thread::spawn(move || {
+            sync_done_tx
+                .send(sync_fs.fsync(&context(), sync_handle, SyncMode::DataOnly))
+                .unwrap();
+        });
+        pause.wait_until_reached();
+        let blocked_fs = fs.clone();
+        let blocked_handle = created.handle;
+        let (blocked_tx, blocked_rx) = std::sync::mpsc::channel();
+        let blocked_writer = std::thread::spawn(move || {
+            blocked_tx
+                .send(blocked_fs.write(&context(), blocked_handle, payload_len as u64 + 1, b"c"))
+                .unwrap();
+        });
+        assert!(
+            matches!(
+                blocked_rx.recv_timeout(Duration::from_millis(50)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "new mutations must wait while a prepared Meta request is in flight"
+        );
+        assert!(
+            matches!(
+                sync_done_rx.recv_timeout(Duration::from_millis(50)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "fsync must wait for the ordered first-window Meta ACK"
+        );
+        pause.release();
+        sync_done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        syncer.join().unwrap();
+        assert_eq!(
+            blocked_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap(),
+            1
+        );
+        blocked_writer.join().unwrap();
+        let commits = meta.commits.lock().unwrap();
+        assert!(
+            commits.len() >= 3,
+            "fsync must publish the next accepted write after the read-triggered ACK"
+        );
+        assert_eq!(commits[0].file_version.length, first_window as u64);
+        assert_eq!(
+            commits.last().unwrap().file_version.length,
+            payload_len as u64 + 1
+        );
+    }
+
+    #[test]
+    fn deferred_publication_o_sync_drains_all_accepted_windows() {
+        let meta = Arc::new(RecordingMeta::new());
+        let temp = tempfile::tempdir().unwrap();
+        let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
+        let deferred = Arc::new(RecordingDeferredChunkStore::new(local.clone()));
+        let fs = distributed_fs_with_chunk_store(
+            meta.clone(),
+            local,
+            deferred,
+            DEFAULT_DIRTY_DATA_BUDGET_BYTES,
+        );
+        let created = fs
+            .create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new("deferred-o-sync.bin"),
+                0o640,
+                libc::O_RDWR | libc::O_SYNC,
+            )
+            .unwrap();
+        let first_window = DEFERRED_PUBLICATION_WINDOW_BYTES as usize;
+        let payload_len = first_window + COMMIT_CHUNK_BYTES as usize;
+        let mut payload = vec![b'a'; first_window];
+        payload.extend(vec![b'b'; COMMIT_CHUNK_BYTES as usize]);
+
+        assert_eq!(
+            fs.write(&context(), created.handle, 0, &payload).unwrap(),
+            payload_len,
+            "O_SYNC write reports the whole cross-window payload"
+        );
+        let commits = meta.commits.lock().unwrap();
+        assert!(
+            commits.len() >= 2,
+            "O_SYNC must publish every accepted deferred window before returning"
+        );
+        assert_eq!(commits[0].file_version.length, first_window as u64);
+        assert_eq!(
+            commits.last().unwrap().file_version.length,
+            payload_len as u64
+        );
+    }
+
+    #[test]
+    fn deferred_publication_retired_bodies_do_not_fragment_full_active_window() {
+        let meta = Arc::new(RecordingMeta::new());
+        let temp = tempfile::tempdir().unwrap();
+        let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
+        let deferred = Arc::new(RecordingDeferredChunkStore::new(local.clone()));
+        let fs = distributed_fs_with_chunk_store(
+            meta.clone(),
+            local,
+            deferred,
+            DEFAULT_DIRTY_DATA_BUDGET_BYTES,
+        );
+        let created = fs
+            .create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new("retired-active-window-fragmentation.bin"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        let mut chunk = vec![b'w'; COMMIT_CHUNK_BYTES as usize];
+        let chunks = 33_u64;
+
+        for index in 0..chunks {
+            chunk[0] = index as u8;
+            let mut written = 0_usize;
+            while written < chunk.len() {
+                let offset = index
+                    .saturating_mul(COMMIT_CHUNK_BYTES)
+                    .saturating_add(written as u64);
+                let n = fs
+                    .write(&context(), created.handle, offset, &chunk[written..])
+                    .unwrap();
+                assert!(n > 0, "write must make progress for chunk {index}");
+                written = written.saturating_add(n);
+            }
+        }
+        fs.fsync(&context(), created.handle, SyncMode::DataOnly)
+            .unwrap();
+
+        let commits = meta.commits.lock().unwrap();
+        assert!(!commits.is_empty());
+        let mut previous_length = 0_u64;
+        for commit in commits.iter() {
+            let delta = commit.file_version.length.saturating_sub(previous_length);
+            assert!(
+                delta <= DEFERRED_PUBLICATION_WINDOW_BYTES,
+                "publication delta {delta} exceeds one logical deferred window"
+            );
+            previous_length = commit.file_version.length;
+        }
+        let final_commit = commits.last().unwrap();
+        assert_eq!(
+            final_commit.file_version.length,
+            chunks * COMMIT_CHUNK_BYTES
+        );
+        assert_eq!(
+            final_commit.layout_root.inline_extents.len(),
+            chunks as usize,
+            "retiring uploaded bodies must not let a full active window admit fragmentary extents"
+        );
+        for (index, extent) in final_commit.layout_root.inline_extents.iter().enumerate() {
+            assert_eq!(extent.file_offset, index as u64 * COMMIT_CHUNK_BYTES);
+            assert_eq!(extent.length, COMMIT_CHUNK_BYTES);
+            assert_eq!(extent.chunk_offset, 0);
+        }
+        drop(commits);
+        assert_eq!(deferred_budget_counts(&fs), (0, 0, 0));
+        assert_eq!(deferred_publisher_bytes(&fs), 0);
+    }
+
+    #[test]
+    fn deferred_publication_read_publishes_inode_accepted_seq_before_returning() {
+        let meta = Arc::new(RecordingMeta::new());
+        let temp = tempfile::tempdir().unwrap();
+        let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
+        let deferred = Arc::new(RecordingDeferredChunkStore::new(local.clone()));
+        let fs = distributed_fs_with_chunk_store(
+            meta.clone(),
+            local,
+            deferred,
+            DEFAULT_DIRTY_DATA_BUDGET_BYTES,
+        );
+        let created = fs
+            .create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new("read-barrier.bin"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        let reader = fs
+            .open(&context(), created.entry.inode, libc::O_RDONLY)
+            .unwrap();
+        fs.write(&context(), created.handle, 0, b"accepted")
+            .unwrap();
+        assert_eq!(meta.commit_count(), 0);
+
+        let mut out = [0; 8];
+        assert_eq!(fs.read(&context(), reader, 0, &mut out).unwrap(), 8);
+
+        assert_eq!(&out, b"accepted");
+        assert_eq!(
+            meta.commit_count(),
+            1,
+            "read must publish the inode accepted sequence, not only the reader FD sequence"
+        );
+        let reopened = fs
+            .open(&context(), created.entry.inode, libc::O_RDONLY)
+            .unwrap();
+        let mut published = [0; 8];
+        assert_eq!(fs.read(&context(), reopened, 0, &mut published).unwrap(), 8);
+        assert_eq!(&published, b"accepted");
+    }
+
+    #[test]
+    fn deferred_publication_uploaded_body_retirement_waits_for_last_transport_pin() {
+        let meta = Arc::new(RecordingMeta::new());
+        let temp = tempfile::tempdir().unwrap();
+        let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
+        let deferred = Arc::new(RecordingDeferredChunkStore::new(local.clone()));
+        *deferred.retained_staged.lock().unwrap() = Some(Vec::new());
+        let fs = distributed_fs_with_chunk_store(
+            meta.clone(),
+            local,
+            deferred.clone(),
+            DEFAULT_DIRTY_DATA_BUDGET_BYTES,
+        );
+        let created = fs
+            .create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new("uploaded-retire.bin"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        let payload = vec![b'u'; COMMIT_CHUNK_BYTES as usize];
+
+        fs.write(&context(), created.handle, 0, &payload).unwrap();
+
+        let inode_id = fs.inode_id(created.entry.inode).unwrap();
+        assert_eq!(meta.commit_count(), 0);
+        assert_eq!(
+            deferred_uploaded_extent_count(&fs, &inode_id),
+            1,
+            "successful upload must leave an explicit Uploaded dirty extent, not a sparse hole"
+        );
+        let pinned = deferred.retained_staged.lock().unwrap().take().unwrap();
+        assert_eq!(
+            deferred_budget_counts(&fs).0,
+            COMMIT_CHUNK_BYTES,
+            "the retained transport body pin keeps normal bytes charged"
+        );
+        assert_eq!(
+            deferred_budget_counts(&fs).2,
+            1,
+            "the uploaded receipt remains charged against the bounded descriptor budget"
+        );
+        drop(pinned);
+        assert_eq!(
+            deferred_budget_counts(&fs).0,
+            0,
+            "normal body bytes retire only after the last body owner exits"
+        );
+        assert_eq!(deferred_budget_counts(&fs).2, 1);
+
+        fs.fsync(&context(), created.handle, SyncMode::DataOnly)
+            .unwrap();
+        assert_eq!(deferred_budget_counts(&fs), (0, 0, 0));
+    }
+
+    #[test]
+    fn deferred_publication_poll_identity_error_restores_consumed_batch_and_keeps_completed() {
+        let meta = Arc::new(RecordingMeta::new());
+        let temp = tempfile::tempdir().unwrap();
+        let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
+        let deferred = Arc::new(RecordingDeferredChunkStore::new(local.clone()));
+        deferred.corrupt_try_wait_operation_at(2);
+        let fs = distributed_fs_with_chunk_store(
+            meta.clone(),
+            local,
+            deferred,
+            DEFAULT_DIRTY_DATA_BUDGET_BYTES,
+        );
+        let created = fs
+            .create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new("poll-identity-retry.bin"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        let mut payload = vec![b'a'; COMMIT_CHUNK_BYTES as usize];
+        payload.extend(vec![b'b'; COMMIT_CHUNK_BYTES as usize]);
+
+        assert_eq!(
+            fs.write(&context(), created.handle, 0, &payload).unwrap(),
+            payload.len(),
+            "ordinary write reports all accepted bytes even when later poll records background error"
+        );
+
+        let inode_id = fs.inode_id(created.entry.inode).unwrap();
+        assert_eq!(
+            deferred_window_counts(&fs, &inode_id),
+            (1, 0, 1),
+            "bad terminal receipt is consumed, its staged chunk is ready for retry, and prior success remains completed"
+        );
+        assert_eq!(
+            deferred_uploaded_extent_count(&fs, &inode_id),
+            1,
+            "only the verified receipt may retire its dirty body"
+        );
+        assert_eq!(
+            fs.fsync(&context(), created.handle, SyncMode::DataOnly)
+                .unwrap_err()
+                .code(),
+            afs_error::NODE_VFS_INVALID
+        );
+        fs.fsync(&context(), created.handle, SyncMode::DataOnly)
+            .unwrap();
+        assert_eq!(meta.commit_count(), 1);
+        assert_eq!(deferred_budget_counts(&fs), (0, 0, 0));
+    }
+
+    #[test]
+    fn deferred_publication_wait_unknown_ack_keeps_descriptor_until_retry() {
+        let meta = Arc::new(RecordingMeta::new());
+        let temp = tempfile::tempdir().unwrap();
+        let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
+        let deferred = Arc::new(RecordingDeferredChunkStore::new(local.clone()));
+        deferred.hold_try_wait();
+        let fs = distributed_fs_with_chunk_store(
+            meta.clone(),
+            local,
+            deferred,
+            DEFAULT_DIRTY_DATA_BUDGET_BYTES,
+        );
+        let created = fs
+            .create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new("wait-unknown-ack-descriptor.bin"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        let payload = vec![b'd'; COMMIT_CHUNK_BYTES as usize];
+        fs.write(&context(), created.handle, 0, &payload).unwrap();
+        assert_eq!(
+            deferred_budget_counts(&fs).2,
+            1,
+            "pending upload identity is charged before blocking fsync waits for it"
+        );
+        meta.fail_next_commit_with(unavailable("injected unknown commit ACK"));
+
+        assert_eq!(
+            fs.fsync(&context(), created.handle, SyncMode::DataOnly)
+                .unwrap_err()
+                .code(),
+            afs_error::NODE_VFS_UNAVAILABLE
+        );
+        assert_eq!(
+            deferred_budget_counts(&fs).2,
+            1,
+            "blocking wait success must keep descriptor charged while Meta outcome is unknown"
+        );
+        assert_eq!(meta.commit_count(), 0);
+
+        fs.fsync(&context(), created.handle, SyncMode::DataOnly)
+            .unwrap();
+        assert_eq!(meta.commit_count(), 1);
+        assert_eq!(deferred_budget_counts(&fs), (0, 0, 0));
+    }
+
+    #[test]
+    fn deferred_publication_read_reports_publish_failure_without_old_overlay() {
+        let meta = Arc::new(RecordingMeta::new());
+        let temp = tempfile::tempdir().unwrap();
+        let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
+        let deferred = Arc::new(RecordingDeferredChunkStore::new(local.clone()));
+        let fs = distributed_fs_with_chunk_store(
+            meta.clone(),
+            local,
+            deferred,
+            DEFAULT_DIRTY_DATA_BUDGET_BYTES,
+        );
+        let created = fs
+            .create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new("read-upload-error.bin"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        fs.write(&context(), created.handle, 0, b"new").unwrap();
+        let reader = fs
+            .open(&context(), created.entry.inode, libc::O_RDONLY)
+            .unwrap();
+        meta.fail_next_commit_with(unavailable("injected read publication failure"));
+        let mut out = vec![0x55; 3];
+
+        let error = fs.read(&context(), reader, 0, &mut out).unwrap_err();
+
+        assert_eq!(error.code(), afs_error::NODE_VFS_UNAVAILABLE);
+        assert!(
+            out.iter().all(|byte| *byte == 0x55),
+            "failed read barrier must not return stale or partial dirty overlay bytes"
+        );
+        assert_eq!(meta.commit_count(), 0);
+    }
+
+    #[test]
+    fn deferred_publication_budget_covers_frozen_active_and_pending_bytes() {
+        let meta = Arc::new(RecordingMeta::new());
+        let temp = tempfile::tempdir().unwrap();
+        let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
+        let deferred = Arc::new(RecordingDeferredChunkStore::new(local.clone()));
+        deferred.hold_try_wait();
+        let fs = distributed_fs_with_chunk_store(
+            meta,
+            local,
+            deferred.clone(),
+            DEFAULT_DIRTY_DATA_BUDGET_BYTES,
+        );
+        let created = fs
+            .create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new("deferred-budget-accounting.bin"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        let first_window = DEFERRED_PUBLICATION_WINDOW_BYTES as usize;
+        let mut payload = vec![b'a'; first_window];
+        payload.extend(vec![b'b'; COMMIT_CHUNK_BYTES as usize]);
+        payload.extend_from_slice(b"tail");
+
+        assert_eq!(
+            fs.write(&context(), created.handle, 0, &payload).unwrap(),
+            payload.len()
+        );
+        let normal = deferred_budget_counts(&fs).0;
+        let publisher = deferred_publisher_bytes(&fs);
+        let observed = fs.current_write_pipeline_bytes().unwrap();
+        assert!(
+            normal.saturating_add(publisher) >= observed,
+            "normal plus publisher leases must cover observed frozen, active and pending bytes"
+        );
+        assert!(
+            normal <= DEFERRED_NORMAL_BUDGET_BYTES,
+            "normal payload leases stay within the fixed 128MiB budget"
+        );
+        assert!(
+            normal >= DEFERRED_PUBLICATION_WINDOW_BYTES + 2 * COMMIT_CHUNK_BYTES,
+            "normal leases include both the sealed next chunk and its distinct pending Vec capacity"
+        );
+        assert_eq!(
+            publisher, 0,
+            "publisher reserve is transient, not a persistent active payload allowance"
+        );
+        assert!(
+            publisher <= DEFERRED_PUBLISHER_RESERVE_BYTES,
+            "pending/construct leases stay within the fixed 32MiB publisher budget"
+        );
+    }
+
+    #[test]
+    fn deferred_publication_conversion_budget_refusal_keeps_pending_unchanged() {
+        let budget = Arc::new(DeferredWriteBudget::default());
+        let _held = budget
+            .reserve_publisher(DEFERRED_PUBLISHER_RESERVE_BYTES)
+            .unwrap();
+        let pending = budget.reserve_normal(COMMIT_CHUNK_BYTES).unwrap();
+        let mut window = PublicationWindow::new(OperationId::new("refused-conversion"));
+        let data = vec![b'x'; COMMIT_CHUNK_BYTES as usize];
+        assert!(
+            window
+                .append_sequential(0, &data, Some(pending), &budget)
+                .is_err()
+        );
+        assert!(
+            window.pending.is_empty(),
+            "refused construction must not absorb unaccepted bytes"
+        );
+        assert_eq!(
+            window.pending.capacity(),
+            0,
+            "refusal must precede a new allocation"
+        );
+        assert_eq!(budget.state.lock().unwrap().normal_bytes, 0);
+    }
+
+    #[test]
+    fn deferred_publication_partial_pin_and_http_pin_are_independently_charged() {
+        let meta = Arc::new(RecordingMeta::new());
+        let temp = tempfile::tempdir().unwrap();
+        let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
+        let deferred = Arc::new(RecordingDeferredChunkStore::new(local.clone()));
+        *deferred.retained_staged.lock().unwrap() = Some(Vec::new());
+        let fs = distributed_fs_with_chunk_store(
+            meta,
+            local,
+            deferred.clone(),
+            DEFAULT_DIRTY_DATA_BUDGET_BYTES,
+        );
+        let created = fs
+            .create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new("independent-pins.bin"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        let mib = 1024 * 1024;
+        fs.write(&context(), created.handle, 0, &vec![b'p'; mib])
+            .unwrap();
+        let inode_id = fs.inode_id(created.entry.inode).unwrap();
+        let cell = fs.write_state(&inode_id).unwrap().unwrap();
+        let old_partial = cell.lock().unwrap().dirty_extents.clone();
+        fs.write(&context(), created.handle, mib as u64, &vec![b'q'; 3 * mib])
+            .unwrap();
+        fs.write(
+            &context(),
+            created.handle,
+            COMMIT_CHUNK_BYTES,
+            &vec![b'r'; DEFERRED_PUBLICATION_WINDOW_BYTES as usize],
+        )
+        .unwrap();
+        let payload = DEFERRED_PUBLICATION_WINDOW_BYTES + COMMIT_CHUNK_BYTES;
+        assert_eq!(
+            deferred_budget_counts(&fs).0,
+            payload + mib as u64,
+            "old partial pin and new sealed allocation are distinct physical bytes"
+        );
+        assert_eq!(
+            deferred_publisher_bytes(&fs),
+            0,
+            "no construction reserve may become a persistent payload budget"
+        );
+        let mut pinned = vec![0; mib];
+        old_partial.overlay(0, &mut pinned).unwrap();
+        assert!(pinned.iter().all(|byte| *byte == b'p'));
+        fs.fsync(&context(), created.handle, SyncMode::DataOnly)
+            .unwrap();
+        assert_eq!(deferred_budget_counts(&fs).0, payload + mib as u64);
+        drop(old_partial);
+        assert_eq!(deferred_budget_counts(&fs).0, payload);
+        let mut transport = deferred.retained_staged.lock().unwrap().take().unwrap();
+        let first = transport.remove(0);
+        drop(transport);
+        assert_eq!(
+            deferred_budget_counts(&fs).0,
+            COMMIT_CHUNK_BYTES,
+            "one HTTP pin must not retain leases for unrelated objects"
+        );
+        let body = axum::body::Bytes::from_owner(first);
+        let retry = body.clone();
+        drop(body);
+        assert_eq!(deferred_budget_counts(&fs).0, COMMIT_CHUNK_BYTES);
+        drop(retry);
+        assert_eq!(deferred_budget_counts(&fs), (0, 0, 0));
+        assert_eq!(deferred_publisher_bytes(&fs), 0);
+    }
+
+    #[test]
+    fn deferred_publication_flush_and_drain_include_active_window() {
+        for close in [false, true] {
+            let meta = Arc::new(RecordingMeta::new());
+            let temp = tempfile::tempdir().unwrap();
+            let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
+            let deferred = Arc::new(RecordingDeferredChunkStore::new(local.clone()));
+            let fs = distributed_fs_with_chunk_store(
+                meta.clone(),
+                local,
+                deferred,
+                DEFAULT_DIRTY_DATA_BUDGET_BYTES,
+            );
+            let created = fs
+                .create(
+                    &context(),
+                    fs.root_inode(),
+                    OsStr::new("drain-active.bin"),
+                    0o640,
+                    libc::O_RDWR,
+                )
+                .unwrap();
+            let length = DEFERRED_PUBLICATION_WINDOW_BYTES + COMMIT_CHUNK_BYTES;
+            let bytes = vec![b'x'; length as usize];
+            assert_eq!(
+                fs.write(&context(), created.handle, 0, &bytes).unwrap(),
+                bytes.len()
+            );
+            if close {
+                fs.flush(&context(), created.handle).unwrap();
+            } else {
+                assert_eq!(fs.drain().unwrap(), 2);
+            }
+            assert_eq!(
+                meta.commits
+                    .lock()
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .file_version
+                    .length,
+                length
+            );
+            assert_eq!(deferred_budget_counts(&fs), (0, 0, 0));
+            assert_eq!(deferred_publisher_bytes(&fs), 0);
+        }
+    }
+
+    #[test]
+    fn deferred_publication_fsync_from_synced_fd_drains_other_writer() {
+        let meta = Arc::new(RecordingMeta::new());
+        let temp = tempfile::tempdir().unwrap();
+        let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
+        let deferred = Arc::new(RecordingDeferredChunkStore::new(local.clone()));
+        let fs = distributed_fs_with_chunk_store(
+            meta.clone(),
+            local,
+            deferred,
+            DEFAULT_DIRTY_DATA_BUDGET_BYTES,
+        );
+        let created = fs
+            .create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new("deferred-two-fd.bin"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        fs.write(&context(), created.handle, 0, b"aaaa").unwrap();
+        fs.fsync(&context(), created.handle, SyncMode::DataOnly)
+            .unwrap();
+        let second = fs
+            .open(&context(), created.entry.inode, libc::O_RDWR)
+            .unwrap();
+        fs.write(&context(), second, 4, b"bbbb").unwrap();
+
+        fs.fsync(&context(), created.handle, SyncMode::DataOnly)
+            .unwrap();
+
+        let commits = meta.commits.lock().unwrap();
+        assert!(
+            commits.iter().any(|commit| commit.file_version.length == 8),
+            "fdatasync on an already-synced FD must still drain another FD's accepted inode write"
+        );
+        fs.release(&context(), second).unwrap();
+    }
+
+    #[test]
+    fn deferred_publication_readonly_fsync_drains_writer_but_flush_does_not() {
+        let (_temp, meta, fs) = test_fs();
+        let entry = fs
+            .lookup(&context(), fs.root_inode(), OsStr::new("readonly-sync.bin"))
+            .unwrap();
+        let only_reader = fs.open(&context(), entry.inode, libc::O_RDONLY).unwrap();
+        fs.fsync(&context(), only_reader, SyncMode::Full).unwrap();
+        assert_eq!(
+            meta.commit_count(),
+            0,
+            "read-only inode without local writes has nothing to publish"
+        );
+        fs.release(&context(), only_reader).unwrap();
+        let created = fs
+            .create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new("readonly-sync.bin"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        fs.write(&context(), created.handle, 0, b"first").unwrap();
+        let reader = fs
+            .open(&context(), created.entry.inode, libc::O_RDONLY)
+            .unwrap();
+        fs.fsync(&context(), reader, SyncMode::DataOnly).unwrap();
+        assert_eq!(
+            meta.commits
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .file_version
+                .length,
+            5
+        );
+        fs.write(&context(), created.handle, 5, b"second").unwrap();
+        let before = meta.commit_count();
+        fs.flush(&context(), reader).unwrap();
+        fs.release(&context(), reader).unwrap();
+        assert_eq!(
+            meta.commit_count(),
+            before,
+            "readonly close must not publish another writer's pending data"
+        );
+        fs.fsync(&context(), created.handle, SyncMode::Full)
+            .unwrap();
+        assert_eq!(
+            meta.commits
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .file_version
+                .length,
+            11
+        );
+    }
+
+    #[test]
+    fn deferred_publication_old_ack_does_not_restore_active_killpriv() {
+        let meta = Arc::new(RecordingMeta::new());
+        meta.inode.lock().unwrap().attributes.mode = 0o6777;
+        let temp = tempfile::tempdir().unwrap();
+        let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
+        let deferred = Arc::new(RecordingDeferredChunkStore::new(local.clone()));
+        let fs = distributed_fs_with_chunk_store(
+            meta.clone(),
+            local,
+            deferred,
+            DEFAULT_DIRTY_DATA_BUDGET_BYTES,
+        );
+        let created = fs
+            .create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new("cross-window-killpriv.bin"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        let first = vec![b'a'; DEFERRED_PUBLICATION_WINDOW_BYTES as usize];
+        fs.write(&context(), created.handle, 0, &first).unwrap();
+        fs.write_with_options(
+            &context(),
+            created.handle,
+            first.len() as u64,
+            b"b",
+            WriteOptions { kill_suidgid: true },
+        )
+        .unwrap();
+        let inode = fs.handle_snapshot(created.handle).unwrap().inode_id;
+        fs.commit_inode(&inode, CommitReason::DirtyBudget).unwrap();
+        {
+            let commits = meta.commits.lock().unwrap();
+            assert_eq!(commits.len(), 1);
+            assert!(
+                !commits[0].metadata_delta.kill_suidgid,
+                "old frozen window predates killpriv"
+            );
+        }
+        assert_eq!(
+            fs.getattr(&context(), created.entry.inode, Some(created.handle))
+                .unwrap()
+                .mode,
+            0o0777,
+            "old ACK must not restore setid bits already cleared by accepted active data"
+        );
+        fs.fsync(&context(), created.handle, SyncMode::Full)
+            .unwrap();
+        assert!(
+            meta.commits
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .metadata_delta
+                .kill_suidgid
+        );
+        assert_eq!(meta.inode.lock().unwrap().attributes.mode, 0o0777);
+    }
+
+    #[test]
+    fn publication_failure_preserves_admitted_bytes_and_blocks_later_mutation() {
         let (_temp, meta, fs) = test_fs_with_dirty_budget(4);
         let created = fs
             .create(
@@ -10743,14 +21587,18 @@ mod tests {
             )
             .unwrap();
 
-        meta.fail_commit_after_successes(1, unavailable("injected second commit failure"));
+        meta.fail_next_commit();
         assert_eq!(
             fs.write(&context(), created.handle, 0, b"abcdefgh")
                 .unwrap(),
             8,
             "buffered write reports every byte admitted into dirty/pending state"
         );
-        assert_eq!(meta.commit_count(), 1);
+        assert!(
+            fs.fsync(&context(), created.handle, SyncMode::Full)
+                .is_err()
+        );
+        assert_eq!(meta.commit_count(), 0);
         assert_eq!(meta.failed_commits.lock().unwrap().len(), 1);
         assert_eq!(
             fs.getattr(&context(), created.entry.inode, Some(created.handle))
@@ -10759,6 +21607,7 @@ mod tests {
             8,
             "visible length follows the returned admitted byte count"
         );
+        meta.fail_next_commit();
         assert_eq!(
             fs.write(&context(), created.handle, 8, b"!")
                 .unwrap_err()
@@ -10769,7 +21618,7 @@ mod tests {
     }
 
     #[test]
-    fn dirty_budget_sync_write_error_does_not_report_unconfirmed_bytes() {
+    fn native_sync_write_error_does_not_report_unconfirmed_bytes() {
         let (_temp, meta, fs) = test_fs_with_dirty_budget(4);
         let created = fs
             .create(
@@ -10781,20 +21630,20 @@ mod tests {
             )
             .unwrap();
 
-        meta.fail_commit_after_successes(1, unavailable("injected second commit failure"));
+        meta.fail_next_commit();
         assert_eq!(
             fs.write(&context(), created.handle, 0, b"abcdefgh")
                 .unwrap_err()
                 .code(),
             afs_error::NODE_VFS_UNAVAILABLE,
-            "O_SYNC cannot report bytes whose dirty-budget commit is unknown"
+            "O_SYNC cannot report bytes whose publication result is unknown"
         );
-        assert_eq!(meta.commit_count(), 1);
+        assert_eq!(meta.commit_count(), 0);
         assert_eq!(meta.failed_commits.lock().unwrap().len(), 1);
     }
 
     #[test]
-    fn dirty_budget_append_write_serializes_concurrent_resize() {
+    fn native_sync_append_write_serializes_concurrent_resize() {
         let (_temp, meta, fs) = test_fs_with_dirty_budget(4);
         let fs = Arc::new(fs);
         let created = fs
@@ -10803,7 +21652,7 @@ mod tests {
                 fs.root_inode(),
                 OsStr::new("append-resize.bin"),
                 0o640,
-                libc::O_RDWR | libc::O_APPEND,
+                libc::O_RDWR | libc::O_APPEND | libc::O_SYNC,
             )
             .unwrap();
         let pause = meta.pause_commit_after_successes(0);
@@ -10838,16 +21687,25 @@ mod tests {
         assert_eq!(
             fs.getattr(&context(), inode, Some(handle)).unwrap().size,
             1,
-            "resize runs after the complete append write, not between budget windows"
+            "resize runs after the complete append write, not before its accepted sync barrier"
         );
-        let commits = meta.commits.lock().unwrap();
-        assert_eq!(commits.len(), 2);
-        assert_eq!(commits[0].file_version.length, 4);
-        assert_eq!(commits[1].file_version.length, 8);
+        assert_eq!(meta.commits.lock().unwrap().len(), 1);
+        assert_eq!(meta.commits.lock().unwrap()[0].file_version.length, 8);
+        fs.fsync(&context(), handle, SyncMode::Full).unwrap();
+        assert_eq!(
+            meta.commits
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .file_version
+                .length,
+            1
+        );
     }
 
     #[test]
-    fn dirty_budget_append_write_serializes_concurrent_full_sync() {
+    fn native_datasync_append_write_serializes_concurrent_full_sync() {
         let (_temp, meta, fs) = test_fs_with_dirty_budget(4);
         let fs = Arc::new(fs);
         let created = fs
@@ -10856,7 +21714,7 @@ mod tests {
                 fs.root_inode(),
                 OsStr::new("append-sync.bin"),
                 0o640,
-                libc::O_RDWR | libc::O_APPEND,
+                libc::O_RDWR | libc::O_APPEND | libc::O_DSYNC,
             )
             .unwrap();
         let pause = meta.pause_commit_after_successes(0);
@@ -10881,17 +21739,16 @@ mod tests {
         syncer.join().unwrap().unwrap();
 
         let commits = meta.commits.lock().unwrap();
-        assert_eq!(commits.len(), 2);
-        assert_eq!(commits[0].file_version.length, 4);
-        assert_eq!(commits[1].file_version.length, 8);
-        let final_head = Some(commits[1].file_version.id.clone());
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].file_version.length, 8);
+        let final_head = Some(commits[0].file_version.id.clone());
         drop(commits);
 
         let metadata_syncs = meta.metadata_syncs.lock().unwrap();
         assert_eq!(metadata_syncs.len(), 1);
         assert_eq!(
             metadata_syncs[0].expected_head_version, final_head,
-            "full fsync must synchronize the completed append version, not a mid-write budget window"
+            "full fsync must synchronize the completed append version, after its completed data-sync barrier"
         );
     }
 
@@ -12137,15 +22994,11 @@ mod tests {
             .expect("remote open installs provider");
         assert!(provider.read_handle.is_some());
         let owner_writer = DistributedFs::file_handle_from_owner(&provider.handle).unwrap();
-        fs_a.handles
-            .lock()
-            .unwrap()
-            .remove(&owner_writer.0)
-            .unwrap();
+        fs_a.handles.remove(owner_writer.0).unwrap().unwrap();
 
         fs_b.release(&context(), writer).unwrap();
         assert!(fs_b.current_remote_provider(&inode_id).unwrap().is_none());
-        assert!(fs_a.handles.lock().unwrap().is_empty());
+        assert!(fs_a.handles.is_empty());
     }
 
     #[test]
@@ -12218,7 +23071,7 @@ mod tests {
         pause.resume();
         releaser.join().unwrap().unwrap();
         assert_eq!(scripted.release_call_count(), 2);
-        assert!(fs_a.handles.lock().unwrap().is_empty());
+        assert!(fs_a.handles.is_empty());
     }
 
     #[test]
@@ -12308,7 +23161,7 @@ mod tests {
         releaser.join().unwrap().unwrap();
         assert!(release_done_rx.recv().is_ok());
         assert_eq!(scripted.release_call_count(), 2);
-        assert!(fs_a.handles.lock().unwrap().is_empty());
+        assert!(fs_a.handles.is_empty());
     }
 
     #[test]
@@ -12398,11 +23251,7 @@ mod tests {
             .unwrap();
         let temp_remote = temp.remote.as_ref().unwrap().clone();
         let owner_writer = DistributedFs::file_handle_from_owner(&temp_remote.handle).unwrap();
-        fs_a.handles
-            .lock()
-            .unwrap()
-            .remove(&owner_writer.0)
-            .unwrap();
+        fs_a.handles.remove(owner_writer.0).unwrap().unwrap();
 
         fs_b.close_temporary_remote_write_session(&inode_id, &temp, Some(previous.clone()))
             .unwrap();
@@ -12467,7 +23316,7 @@ mod tests {
         fs_b.release(&context(), writer)
             .expect_err("lost release ACK is reported once");
         assert_eq!(fs_b.pending_remote_release_count().unwrap(), 1);
-        assert!(fs_a.handles.lock().unwrap().is_empty());
+        assert!(fs_a.handles.is_empty());
         assert_eq!(fs_b.retry_pending_remote_releases().unwrap(), 1);
         assert_eq!(fs_b.pending_remote_release_count().unwrap(), 0);
         assert_eq!(scripted.release_call_count(), 2);
@@ -12526,10 +23375,10 @@ mod tests {
         fs_b.release(&context(), writer)
             .expect_err("pre-apply release failure is reported");
         assert_eq!(fs_b.pending_remote_release_count().unwrap(), 1);
-        assert_eq!(fs_a.handles.lock().unwrap().len(), 1);
+        assert_eq!(fs_a.handles.len(), 1);
         assert_eq!(fs_b.retry_pending_remote_releases().unwrap(), 1);
         assert_eq!(fs_b.pending_remote_release_count().unwrap(), 0);
-        assert!(fs_a.handles.lock().unwrap().is_empty());
+        assert!(fs_a.handles.is_empty());
     }
 
     #[test]
@@ -12858,7 +23707,7 @@ mod tests {
         let inode_b = fs_b.backend_inode(&inode_id).unwrap();
         let error = fs_b.open(&context(), inode_b, libc::O_RDWR).unwrap_err();
         assert_eq!(error.code(), afs_error::NODE_VFS_UNAVAILABLE);
-        assert!(fs_a.handles.lock().unwrap().is_empty());
+        assert!(fs_a.handles.is_empty());
     }
 
     #[test]
@@ -12929,7 +23778,7 @@ mod tests {
         assert!(state.inflight.is_empty());
         assert!(state.cancelled.is_empty());
         assert!(state.active.is_empty());
-        assert!(fs.handles.lock().unwrap().is_empty());
+        assert!(fs.handles.is_empty());
     }
 
     #[test]
@@ -12965,7 +23814,7 @@ mod tests {
         assert!(state.cancelled.is_empty());
         assert!(state.active.is_empty());
         drop(routes);
-        assert!(fs.handles.lock().unwrap().is_empty());
+        assert!(fs.handles.is_empty());
         let state = fs.write_state(&inode_id).unwrap().unwrap();
         assert_eq!(state.lock().unwrap().open_writers, 0);
 
@@ -12976,7 +23825,7 @@ mod tests {
         )
         .expect_err("failed owner admission sequence must be retired");
         assert_eq!(replay.code(), afs_error::NODE_DFS_STALE_HANDLE);
-        assert!(fs.handles.lock().unwrap().is_empty());
+        assert!(fs.handles.is_empty());
     }
 
     #[test]
@@ -13017,7 +23866,7 @@ mod tests {
         .handle
         .unwrap();
         assert_eq!(replay.opaque_handle, first.opaque_handle);
-        assert_eq!(fs.handles.lock().unwrap().len(), 1);
+        assert_eq!(fs.handles.len(), 1);
 
         let changed = <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::open(
             &fs,
@@ -13026,7 +23875,7 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(changed.code(), afs_error::NODE_DFS_STALE_HANDLE);
-        assert_eq!(fs.handles.lock().unwrap().len(), 1);
+        assert_eq!(fs.handles.len(), 1);
     }
 
     #[test]
@@ -13048,7 +23897,7 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(late.code(), afs_error::NODE_DFS_STALE_HANDLE);
-        assert!(fs.handles.lock().unwrap().is_empty());
+        assert!(fs.handles.is_empty());
 
         let phantom = DistributedFs::data_owner_handle(&dfs_owner_cleanup_handle(2));
         let read = <DistributedFs as crate::node::rpc::data::DfsOwnerFilesHandler>::read(
@@ -13075,7 +23924,7 @@ mod tests {
             )
             .unwrap();
         }
-        assert_eq!(fs.handles.lock().unwrap().len(), 5000);
+        assert_eq!(fs.handles.len(), 5000);
     }
 
     #[test]
@@ -13175,7 +24024,7 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(error.code(), afs_error::NODE_DFS_STALE_HANDLE);
-        assert_eq!(fs.handles.lock().unwrap().len(), 1);
+        assert_eq!(fs.handles.len(), 1);
         let replay = <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::open(
             &fs, "node-b", request,
         )
@@ -13197,7 +24046,7 @@ mod tests {
         .unwrap()
         .handle
         .unwrap();
-        fs.handles.lock().unwrap().clear();
+        fs.handles.clear();
         let error =
             <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::release(
                 &fs,
@@ -13367,14 +24216,14 @@ mod tests {
             )
         });
         pause.wait_until_reached();
-        assert_eq!(fs.handles.lock().unwrap().len(), 1);
+        assert_eq!(fs.handles.len(), 1);
         meta.set_node_session("node-b", Some("session-b2"));
         assert_eq!(fs.reap_expired_peer_owner_handles().unwrap(), 1);
-        assert!(fs.handles.lock().unwrap().is_empty());
+        assert!(fs.handles.is_empty());
         pause.resume();
         let error = open.join().unwrap().unwrap_err();
         assert_eq!(error.code(), afs_error::NODE_DFS_STALE_HANDLE);
-        assert!(fs.handles.lock().unwrap().is_empty());
+        assert!(fs.handles.is_empty());
         assert!(fs.owner_open_routes.lock().unwrap().is_empty());
         fs.set_owner_open_finish_pause(None);
     }
@@ -13430,14 +24279,14 @@ mod tests {
         let error = fs_b.open(&context(), inode_b, libc::O_RDWR).unwrap_err();
         assert_eq!(error.code(), afs_error::NODE_VFS_UNAVAILABLE);
         assert_eq!(fs_b.pending_remote_release_count().unwrap(), 1);
-        assert_eq!(fs_a.handles.lock().unwrap().len(), 1);
+        assert_eq!(fs_a.handles.len(), 1);
         assert_eq!(fs_b.retry_pending_remote_releases().unwrap(), 1);
-        assert!(fs_a.handles.lock().unwrap().is_empty());
+        assert!(fs_a.handles.is_empty());
 
         let late = scripted.open_requests()[0].clone();
         let late = scripted.open(late).unwrap_err();
         assert_eq!(late.code(), afs_error::NODE_DFS_STALE_HANDLE);
-        assert!(fs_a.handles.lock().unwrap().is_empty());
+        assert!(fs_a.handles.is_empty());
     }
 
     #[test]
@@ -13493,9 +24342,9 @@ mod tests {
         assert_eq!(error.code(), afs_error::NODE_VFS_UNAVAILABLE);
         assert_eq!(scripted.open_requests().len(), 2);
         assert_eq!(fs_b.pending_remote_release_count().unwrap(), 1);
-        assert_eq!(fs_a.handles.lock().unwrap().len(), 1);
+        assert_eq!(fs_a.handles.len(), 1);
         assert_eq!(fs_b.retry_pending_remote_releases().unwrap(), 1);
-        assert!(fs_a.handles.lock().unwrap().is_empty());
+        assert!(fs_a.handles.is_empty());
     }
 
     #[test]
@@ -13545,7 +24394,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(fs.handles.lock().unwrap().is_empty());
+        assert!(fs.handles.is_empty());
     }
 
     #[test]
@@ -13570,10 +24419,10 @@ mod tests {
         assert!(open.handle.is_some());
         meta.fail_next_current_session_with(unavailable("injected Meta session lookup failure"));
         assert!(fs.reap_expired_peer_owner_handles().is_err());
-        assert_eq!(fs.handles.lock().unwrap().len(), 1);
+        assert_eq!(fs.handles.len(), 1);
         meta.set_node_session("node-b", Some("session-b2"));
         assert_eq!(fs.reap_expired_peer_owner_handles().unwrap(), 1);
-        assert!(fs.handles.lock().unwrap().is_empty());
+        assert!(fs.handles.is_empty());
     }
 
     #[test]
@@ -13607,7 +24456,7 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(error.code(), afs_error::NODE_DFS_STALE_HANDLE);
-        assert_eq!(fs.handles.lock().unwrap().len(), 1);
+        assert_eq!(fs.handles.len(), 1);
         <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::release(
             &fs,
             "node-b",
@@ -13651,17 +24500,19 @@ mod tests {
             owner: fs_a.clone(),
             peer: "node-b".into(),
         }) as Arc<dyn RemoteDfsOwner>;
-        let fs_b = DistributedFs::new(
-            NamespaceId::new("default"),
-            "node-b",
-            "session-b",
-            meta.clone(),
-            chunks_b,
-            read_engine_b,
-        )
-        .with_remote_owner_factory(Arc::new(StaticRemoteOwnerFactory {
-            owner: remote_owner,
-        }));
+        let fs_b = Arc::new(
+            DistributedFs::new(
+                NamespaceId::new("default"),
+                "node-b",
+                "session-b",
+                meta.clone(),
+                chunks_b,
+                read_engine_b,
+            )
+            .with_remote_owner_factory(Arc::new(StaticRemoteOwnerFactory {
+                owner: remote_owner,
+            })),
+        );
         let inode_id = meta.inode.lock().unwrap().inode_id.clone();
         let inode_b = fs_b.backend_inode(&inode_id).unwrap();
         let writer = fs_b
@@ -13670,6 +24521,8 @@ mod tests {
 
         assert_eq!(fs_b.write(&context(), writer, 0, b"XYZ").unwrap(), 3);
         let reader = fs_b.open(&context(), inode_b, libc::O_RDONLY).unwrap();
+        assert!(fs_b.page_cache_identity(reader).is_none());
+        assert!(!fs_b.supports_parallel_reads(reader));
         assert_eq!(
             fs_b.getattr(&context(), inode_b, Some(reader))
                 .unwrap()
@@ -13679,12 +24532,51 @@ mod tests {
         let mut data = [0; 3];
         assert_eq!(fs_b.read(&context(), reader, 0, &mut data).unwrap(), 3);
         assert_eq!(&data, b"XYZ");
+        assert!(fs_b.read_owned(&context(), reader, 0, usize::MAX).is_err());
+        for with_handle in [false, true] {
+            let denial_reader = fs_b.open(&context(), inode_b, libc::O_RDONLY).unwrap();
+            let before = fs_b
+                .handle_snapshot(denial_reader)
+                .unwrap()
+                .native_denial_serial;
+            meta.fail_next_current_session_with(Error::coded(
+                afs_error::IO_PERMISSION_DENIED,
+                "owner getattr rejected",
+            ));
+            assert!(
+                fs_b.getattr(&context(), inode_b, with_handle.then_some(denial_reader))
+                    .is_err()
+            );
+            let rejected = fs_b.handle_snapshot(denial_reader).unwrap();
+            assert!(rejected.native_read_view.is_none());
+            assert!(rejected.native_denial_serial > before);
+            // Re-entering the proxy checks the owner again; a rejected local
+            // view is never used as authority for a later result.
+            assert_eq!(
+                fs_b.read_owned(&context(), denial_reader, 0, 3).unwrap(),
+                b"XYZ"
+            );
+            fs_b.release(&context(), denial_reader).unwrap();
+        }
+        let hook_fs = fs_b.clone();
+        let hook_meta = meta.clone();
+        *fs_b.native_read_before_delivery.lock().unwrap() = Some(Box::new(move || {
+            hook_meta.fail_next_current_session_with(Error::coded(
+                afs_error::IO_PERMISSION_DENIED,
+                "proxy revoked",
+            ));
+            assert!(hook_fs.getattr(&context(), inode_b, Some(reader)).is_err());
+        }));
+        let mut unchanged = [9; 3];
+        assert!(fs_b.read(&context(), reader, 0, &mut unchanged).is_err());
+        assert_eq!(unchanged, [9; 3]);
+        assert_eq!(fs_b.read_owned(&context(), reader, 0, 3).unwrap(), b"XYZ");
 
         assert!(fs_b.read(&context(), writer, 0, &mut data).is_err());
         fs_b.release(&context(), reader).unwrap();
         fs_b.release(&context(), writer).unwrap();
         assert!(fs_b.current_remote_provider(&inode_id).unwrap().is_none());
-        assert!(fs_a.handles.lock().unwrap().is_empty());
+        assert!(fs_a.handles.is_empty());
     }
 
     #[test]
@@ -13756,14 +24648,14 @@ mod tests {
         assert_eq!(error.code(), afs_error::NODE_VFS_UNAVAILABLE);
         assert_eq!(scripted.release_call_count(), 0);
         assert_eq!(fs_b.pending_remote_release_count().unwrap(), 2);
-        assert_eq!(fs_a.handles.lock().unwrap().len(), 2);
+        assert_eq!(fs_a.handles.len(), 2);
         assert_eq!(fs_b.pending_remote_releases.lock().unwrap().reserved, 0);
 
         fs_b.retry_pending_remote_releases()
             .expect_err("maintenance must not release while provider IO is admitted");
         assert_eq!(scripted.release_call_count(), 0);
         assert_eq!(fs_b.pending_remote_release_count().unwrap(), 2);
-        assert_eq!(fs_a.handles.lock().unwrap().len(), 2);
+        assert_eq!(fs_a.handles.len(), 2);
 
         drop(guard);
 
@@ -13771,7 +24663,7 @@ mod tests {
         assert_eq!(scripted.release_call_count(), 2);
         assert_eq!(fs_b.pending_remote_release_count().unwrap(), 0);
         assert_eq!(fs_b.pending_remote_releases.lock().unwrap().reserved, 0);
-        assert!(fs_a.handles.lock().unwrap().is_empty());
+        assert!(fs_a.handles.is_empty());
     }
 
     #[test]
@@ -13931,6 +24823,2059 @@ mod tests {
     }
 
     #[test]
+    fn readonly_external_version_repeated_reads_skip_fresh_head() {
+        let (_temp, meta, fs, fixture) = test_fs_with_current_external_fixture();
+        let inode_id = meta.inode.lock().unwrap().inode_id.clone();
+        publish_external_fixture_version(&meta, &fs, &fixture, "version-stable", b"cached-view");
+        let inode = fs.backend_inode(&inode_id).unwrap();
+        let reader = fs.open(&context(), inode, libc::O_RDONLY).unwrap();
+
+        let mut first = [0; 16];
+        assert_eq!(fs.read(&context(), reader, 0, &mut first).unwrap(), 11);
+        assert_eq!(&first[..11], b"cached-view");
+        assert_eq!(meta.file_version_load_count(), 1);
+        let get_inode_after_cache_fill = meta.get_inode_call_count();
+        let version_auth_after_cache_fill = fixture.current_call_count();
+        let legacy_after_cache_fill = fixture.legacy_call_count();
+
+        meta.fail_next_get_inode_with(unavailable(
+            "external version path should not call GetInode for an opened head",
+        ));
+        let mut second = [0; 16];
+        assert_eq!(fs.read(&context(), reader, 0, &mut second).unwrap(), 11);
+        assert_eq!(&second[..11], b"cached-view");
+        assert!(
+            fixture.current_call_count() >= version_auth_after_cache_fill,
+            "version authorizations may be reused or renewed, but reads must not refresh head"
+        );
+        assert_eq!(fixture.legacy_call_count(), legacy_after_cache_fill);
+        assert_eq!(meta.get_inode_call_count(), get_inode_after_cache_fill);
+        assert_eq!(meta.file_version_load_count(), 1);
+
+        fs.release(&context(), reader).unwrap();
+    }
+
+    fn expire_native_read_view(fs: &DistributedFs, handle: FileHandle) {
+        let opened = fs.handles.get(handle.0).unwrap().unwrap();
+        let mut state = opened.state.lock().unwrap();
+        if let Some(view) = state.native_read_view.as_mut() {
+            view.deadline = Instant::now();
+        }
+    }
+
+    #[derive(Default)]
+    struct NativeReadPause {
+        state: Mutex<(bool, bool)>,
+        changed: Condvar,
+    }
+
+    impl NativeReadPause {
+        fn block(&self) {
+            let mut state = self.state.lock().unwrap();
+            state.0 = true;
+            self.changed.notify_all();
+            let (state, timeout) = self
+                .changed
+                .wait_timeout_while(state, Duration::from_secs(5), |state| !state.1)
+                .unwrap();
+            assert!(
+                state.1 && !timeout.timed_out(),
+                "native read pause timed out"
+            );
+        }
+
+        fn wait_until_reached(&self) {
+            let state = self.state.lock().unwrap();
+            let (state, timeout) = self
+                .changed
+                .wait_timeout_while(state, Duration::from_secs(5), |state| !state.0)
+                .unwrap();
+            assert!(
+                state.0 && !timeout.timed_out(),
+                "native read did not reach pause"
+            );
+        }
+
+        fn resume(&self) {
+            self.state.lock().unwrap().1 = true;
+            self.changed.notify_all();
+        }
+    }
+
+    struct ResumeNativeReadOnDrop(Arc<NativeReadPause>);
+
+    impl Drop for ResumeNativeReadOnDrop {
+        fn drop(&mut self) {
+            self.0.resume();
+        }
+    }
+
+    #[test]
+    fn p1_readonly_open_uses_one_fresh_get_inode() {
+        let (_temp, meta, fs) = test_fs();
+        let inode_id = meta.inode.lock().unwrap().inode_id.clone();
+        publish_external_version_with_bytes(&meta, &fs, "p1-open-fresh", b"fresh");
+        let inode = fs.backend_inode(&inode_id).unwrap();
+        let before = meta.get_inode_call_count();
+        let reader = fs.open(&context(), inode, libc::O_RDONLY).unwrap();
+        let calls = meta.get_inode_call_count() - before;
+        let data = fs.read_owned(&context(), reader, 0, 16).unwrap();
+        fs.release(&context(), reader).unwrap();
+        assert_eq!(
+            calls, 1,
+            "read-only open must reuse its fresh preflight inode"
+        );
+        assert_eq!(data, b"fresh");
+        assert_eq!(meta.get_inode_call_count() - before, 1);
+    }
+
+    #[test]
+    fn p1_handle_snapshots_share_immutable_inode_payload() {
+        let (_temp, meta, fs) = test_fs();
+        let inode_id = {
+            let mut inode = meta.inode.lock().unwrap();
+            inode
+                .xattrs
+                .insert(b"user.p1-payload".to_vec(), vec![37; 64 * 1024]);
+            inode.inode_id.clone()
+        };
+        let reader = fs
+            .open(
+                &context(),
+                fs.backend_inode(&inode_id).unwrap(),
+                libc::O_RDONLY,
+            )
+            .unwrap();
+        let first = fs.handle_snapshot(reader).unwrap();
+        let second = fs.handle_snapshot(reader).unwrap();
+        let first_payload = first
+            .opened_inode
+            .xattrs
+            .get(b"user.p1-payload".as_slice())
+            .unwrap();
+        let second_payload = second
+            .opened_inode
+            .xattrs
+            .get(b"user.p1-payload".as_slice())
+            .unwrap();
+        fs.release(&context(), reader).unwrap();
+        assert_eq!(first_payload, second_payload);
+        assert_eq!(
+            first_payload.as_ptr(),
+            second_payload.as_ptr(),
+            "snapshots of one unchanged handle must share its inode payload"
+        );
+    }
+
+    #[test]
+    fn p1_backend_inode_parallel_first_lookup_is_bijective() {
+        let (_temp, _meta, fs) = test_fs();
+        let inode = InodeId::new("inode:p1-concurrent-first-lookup");
+        *fs.backend_inode_after_missing.lock().unwrap() =
+            Some(Arc::new(std::sync::Barrier::new(2)));
+        let (first, second) = std::thread::scope(|scope| {
+            let first = scope.spawn(|| fs.backend_inode(&inode));
+            let second = scope.spawn(|| fs.backend_inode(&inode));
+            (
+                first.join().unwrap().unwrap(),
+                second.join().unwrap().unwrap(),
+            )
+        });
+        *fs.backend_inode_after_missing.lock().unwrap() = None;
+        assert_eq!(
+            first, second,
+            "one DFS inode must have one backend identity"
+        );
+        assert_eq!(fs.inode_id(first).unwrap(), inode);
+        assert_eq!(fs.inode_id(second).unwrap(), inode);
+        assert_eq!(fs.backend_inode(&inode).unwrap(), first);
+    }
+
+    #[test]
+    fn p1_handle_table_register_snapshot_release_stress_is_bounded() {
+        let table = DfsHandleTable::default();
+        let inode = RecordingMeta::new().inode.into_inner().unwrap();
+        std::thread::scope(|scope| {
+            for worker in 0_u64..16 {
+                let table = &table;
+                let inode = inode.clone();
+                scope.spawn(move || {
+                    for iteration in 0_u64..6250 {
+                        let id = worker * 6250 + iteration + 1;
+                        table
+                            .insert(
+                                id,
+                                DfsFileHandle {
+                                    inode_id: inode.inode_id.clone(),
+                                    opened_inode: inode.clone(),
+                                    opened_page_identity: None,
+                                    native_read_view: None,
+                                    native_read_generation: 0,
+                                    native_denial_serial: 0,
+                                    write_session: None,
+                                    flags: libc::O_RDONLY,
+                                    owner_scope: None,
+                                },
+                                || Ok(false),
+                            )
+                            .unwrap();
+                        let handle = table.get(id).unwrap().unwrap();
+                        let snapshot = DfsFileHandleSnapshot::from_handle(&handle).unwrap();
+                        assert_eq!(snapshot.inode_id, inode.inode_id);
+                        assert!(
+                            table
+                                .for_inode(&inode.inode_id)
+                                .unwrap()
+                                .iter()
+                                .any(|entry| Arc::ptr_eq(entry, &handle))
+                        );
+                        let removed = table.remove(id).unwrap().unwrap();
+                        assert!(Arc::ptr_eq(&handle, &removed));
+                        assert!(table.get(id).unwrap().is_none());
+                    }
+                });
+            }
+        });
+        assert!(table.is_empty());
+        assert!(table.for_inode(&inode.inode_id).unwrap().is_empty());
+        let fixed = std::mem::size_of::<DfsHandleTable>();
+        assert!(
+            fixed <= 16 * 1024,
+            "empty sharded table metadata exceeds fixed allowance"
+        );
+        let point_tables = std::mem::size_of::<ShardedMap<InodeId, SharedInodeWriteState>>()
+            + std::mem::size_of::<ShardedMap<InodeId, RemoteDfsWriteSession>>()
+            + std::mem::size_of::<ShardedMap<InodeId, Arc<DfsLockAuthority>>>()
+            + std::mem::size_of::<ShardedMap<InodeId, u64>>()
+            + std::mem::size_of::<ShardedMap<u64, InodeId>>();
+        assert!(
+            fixed + point_tables <= 64 * 1024,
+            "fixed sharded metadata exceeds its bounded non-body allowance"
+        );
+        println!(
+            "handle_table_fixed_bytes={fixed} point_tables_fixed_bytes={point_tables} operations=100000 workers=16 live_handles=0 reverse_entries=0"
+        );
+    }
+
+    #[test]
+    fn p1_native_refresh_two_readers_share_one_fresh_inode() {
+        let (_temp, meta, fs) = test_fs();
+        let inode_id = meta.inode.lock().unwrap().inode_id.clone();
+        publish_external_version_with_bytes(&meta, &fs, "p1-refresh-old", b"old");
+        let reader = fs
+            .open(
+                &context(),
+                fs.backend_inode(&inode_id).unwrap(),
+                libc::O_RDONLY,
+            )
+            .unwrap();
+        expire_native_read_view(&fs, reader);
+        let snapshot = fs.handle_snapshot(reader).unwrap();
+        let head = publish_external_version_with_bytes(&meta, &fs, "p1-refresh-new", b"new");
+        *fs.native_read_before_refresh.lock().unwrap() = Some(Arc::new(std::sync::Barrier::new(2)));
+        let before = meta.get_inode_call_count();
+        let (first, second) = std::thread::scope(|scope| {
+            let first = scope.spawn(|| fs.native_inode_for_read(reader, &snapshot));
+            let second = scope.spawn(|| fs.native_inode_for_read(reader, &snapshot));
+            (first.join().unwrap(), second.join().unwrap())
+        });
+        *fs.native_read_before_refresh.lock().unwrap() = None;
+        let calls = meta.get_inode_call_count() - before;
+        fs.release(&context(), reader).unwrap();
+        assert!(first.is_ok(), "first refresh failed: {:?}", first.err());
+        assert!(second.is_ok(), "second refresh failed: {:?}", second.err());
+        assert_eq!(first.unwrap().0.head_version, Some(head.clone()));
+        assert_eq!(second.unwrap().0.head_version, Some(head));
+        assert_eq!(calls, 1, "concurrent refresh must be single-flight");
+    }
+
+    #[test]
+    fn p1_native_joined_refresh_waiters_share_error_and_later_read_retries() {
+        for failure in [
+            unavailable("Meta reply unavailable"),
+            Error::coded(afs_error::IO_PERMISSION_DENIED, "Meta rejected this read"),
+        ] {
+            let (_temp, meta, fs) = test_fs();
+            let fs = Arc::new(fs);
+            let inode_id = meta.inode.lock().unwrap().inode_id.clone();
+            publish_external_version_with_bytes(&meta, &fs, "p1-refresh-error", b"data");
+            let reader = fs
+                .open(
+                    &context(),
+                    fs.backend_inode(&inode_id).unwrap(),
+                    libc::O_RDONLY,
+                )
+                .unwrap();
+            expire_native_read_view(&fs, reader);
+            let pause = Arc::new(NativeReadPause::default());
+            let _resume = ResumeNativeReadOnDrop(pause.clone());
+            *meta.next_get_inode_pause.lock().unwrap() = Some(pause.clone());
+            meta.fail_next_get_inode_with(failure.clone());
+            let before = meta.get_inode_call_count();
+            let first_fs = fs.clone();
+            let first = std::thread::spawn(move || first_fs.read_owned(&context(), reader, 0, 16));
+            pause.wait_until_reached();
+            let opened = fs.handles.get(reader.0).unwrap().unwrap();
+            let flight = opened.state.lock().unwrap().refresh.clone().unwrap();
+            let second_fs = fs.clone();
+            let second =
+                std::thread::spawn(move || second_fs.read_owned(&context(), reader, 0, 16));
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while flight.joined_waiters.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let joined = flight.joined_waiters.load(Ordering::SeqCst);
+            pause.resume();
+            let first = first.join().unwrap();
+            let second = second.join().unwrap();
+            assert_eq!(joined, 1, "second reader must join the held Meta request");
+            assert_eq!(first.unwrap_err(), failure);
+            assert_eq!(second.unwrap_err(), failure);
+            assert_eq!(meta.get_inode_call_count() - before, 1);
+            assert_eq!(fs.read_owned(&context(), reader, 0, 16).unwrap(), b"data");
+            assert_eq!(meta.get_inode_call_count() - before, 2);
+            fs.release(&context(), reader).unwrap();
+        }
+    }
+
+    #[test]
+    fn p1_refresh_waiter_deadline_does_not_cancel_later_leader_success() {
+        let (_temp, meta, fs) = test_fs();
+        let inode = Arc::new(meta.inode.lock().unwrap().clone());
+        let leader_view = fs.capture_native_read_view().unwrap();
+        let mut waiter_view = leader_view.clone();
+        waiter_view.deadline = Instant::now() + Duration::from_millis(5);
+        let flight = NativeReadRefresh::new();
+        let started = Instant::now();
+        assert!(flight.wait(&fs, &waiter_view).is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(
+            flight.result.lock().unwrap().is_none(),
+            "waiter expiry cannot complete the shared flight"
+        );
+        flight.finish(Ok((inode.clone(), leader_view))).unwrap();
+        let fresh_waiter = fs.capture_native_read_view().unwrap();
+        let (result, _) = flight.wait(&fs, &fresh_waiter).unwrap();
+        assert!(Arc::ptr_eq(&inode, &result));
+        assert!(
+            flight.wait(&fs, &waiter_view).is_err(),
+            "completed result cannot revive an expired waiter"
+        );
+    }
+
+    #[test]
+    fn p1_native_successful_refresh_keeps_inflight_committed_read_valid() {
+        let (_temp, meta, fs) = test_fs();
+        let fs = Arc::new(fs);
+        let inode_id = meta.inode.lock().unwrap().inode_id.clone();
+        publish_external_version_with_bytes(&meta, &fs, "p1-inflight-old", b"old-data");
+        let inode = fs.backend_inode(&inode_id).unwrap();
+        let reader = fs.open(&context(), inode, libc::O_RDONLY).unwrap();
+        let pause = Arc::new(NativeReadPause::default());
+        let _resume = ResumeNativeReadOnDrop(pause.clone());
+        let read_pause = pause.clone();
+        *fs.native_read_after_committed.lock().unwrap() =
+            Some(Box::new(move || read_pause.block()));
+        let read_fs = fs.clone();
+        let read = std::thread::spawn(move || read_fs.read_owned(&context(), reader, 0, 32));
+        pause.wait_until_reached();
+        expire_native_read_view(&fs, reader);
+        publish_external_version_with_bytes(&meta, &fs, "p1-inflight-new", b"new-data");
+        let snapshot = fs.handle_snapshot(reader).unwrap();
+        fs.native_inode_for_read(reader, &snapshot).unwrap();
+        pause.resume();
+        let result = read.join().unwrap();
+        let next = fs.read_owned(&context(), reader, 0, 32).unwrap();
+        fs.release(&context(), reader).unwrap();
+        assert_eq!(result.unwrap(), b"old-data");
+        assert_eq!(next, b"new-data");
+    }
+
+    #[test]
+    fn p1_native_known_denial_rejects_inflight_committed_output() {
+        let (_temp, meta, fs) = test_fs();
+        let fs = Arc::new(fs);
+        let inode_id = meta.inode.lock().unwrap().inode_id.clone();
+        publish_external_version_with_bytes(&meta, &fs, "p1-inflight-denial", b"data");
+        let inode = fs.backend_inode(&inode_id).unwrap();
+        let reader = fs.open(&context(), inode, libc::O_RDONLY).unwrap();
+        let pause = Arc::new(NativeReadPause::default());
+        let _resume = ResumeNativeReadOnDrop(pause.clone());
+        let read_pause = pause.clone();
+        *fs.native_read_after_committed.lock().unwrap() =
+            Some(Box::new(move || read_pause.block()));
+        let read_fs = fs.clone();
+        let read = std::thread::spawn(move || {
+            let mut output = [0xa5; 16];
+            let result = read_fs.read(&context(), reader, 0, &mut output);
+            (result, output)
+        });
+        pause.wait_until_reached();
+        meta.fail_next_get_inode_with(Error::coded(afs_error::IO_PERMISSION_DENIED, "revoked"));
+        let denial = fs.getattr(&context(), inode, Some(reader));
+        pause.resume();
+        let (result, output) = read.join().unwrap();
+        fs.release(&context(), reader).unwrap();
+        assert!(denial.is_err());
+        assert!(result.is_err());
+        assert_eq!(
+            output, [0xa5; 16],
+            "denied read must leave output unchanged"
+        );
+    }
+
+    #[test]
+    fn p1_native_release_racing_delivery_never_exposes_partial_output() {
+        let (_temp, meta, fs) = test_fs();
+        let fs = Arc::new(fs);
+        let inode_id = meta.inode.lock().unwrap().inode_id.clone();
+        publish_external_version_with_bytes(&meta, &fs, "p1-close-race", b"data");
+        let reader = fs
+            .open(
+                &context(),
+                fs.backend_inode(&inode_id).unwrap(),
+                libc::O_RDONLY,
+            )
+            .unwrap();
+        let pause = Arc::new(NativeReadPause::default());
+        let _resume = ResumeNativeReadOnDrop(pause.clone());
+        let read_pause = pause.clone();
+        *fs.native_read_after_committed.lock().unwrap() =
+            Some(Box::new(move || read_pause.block()));
+        let read_fs = fs.clone();
+        let read = std::thread::spawn(move || {
+            let mut output = [0xa5; 16];
+            let result = read_fs.read(&context(), reader, 0, &mut output);
+            (result, output)
+        });
+        pause.wait_until_reached();
+        let release_fs = fs.clone();
+        let (entered, observed) = std::sync::mpsc::channel();
+        let release = std::thread::spawn(move || {
+            entered.send(()).unwrap();
+            release_fs.release(&context(), reader)
+        });
+        observed.recv_timeout(Duration::from_secs(5)).unwrap();
+        pause.resume();
+        let (result, output) = read.join().unwrap();
+        release.join().unwrap().unwrap();
+        if let Ok(count) = result {
+            assert_eq!(count, 4);
+            assert_eq!(&output[..4], b"data");
+            assert_eq!(&output[4..], &[0xa5; 12]);
+        } else {
+            assert_eq!(output, [0xa5; 16]);
+        }
+        assert!(fs.read_owned(&context(), reader, 0, 16).is_err());
+    }
+
+    #[test]
+    fn p1_native_read_capabilities_bind_exact_opened_head_and_length() {
+        let (_temp, meta, fs) = test_fs();
+        let inode_id = meta.inode.lock().unwrap().inode_id.clone();
+        let head = publish_external_version_with_bytes(&meta, &fs, "p1-open-identity", b"payload");
+        let reader = fs
+            .open(
+                &context(),
+                fs.backend_inode(&inode_id).unwrap(),
+                libc::O_RDONLY,
+            )
+            .unwrap();
+        let inode_calls = meta.get_inode_call_count();
+        let version_calls = meta.file_version_load_count();
+        let identity = fs.page_cache_identity(reader);
+        let parallel = fs.supports_parallel_reads(reader);
+        fs.release(&context(), reader).unwrap();
+        assert_eq!(
+            identity,
+            Some(super::super::PageCacheIdentity {
+                version_id: Some(head.0),
+                length: 7,
+            })
+        );
+        assert!(parallel);
+        assert_eq!(meta.get_inode_call_count(), inode_calls);
+        assert_eq!(
+            meta.file_version_load_count(),
+            version_calls,
+            "capability hooks cannot issue RPCs"
+        );
+    }
+
+    #[test]
+    fn p1_native_empty_open_has_explicit_zero_length_identity() {
+        let (_temp, meta, fs) = test_fs();
+        let inode_id = meta.inode.lock().unwrap().inode_id.clone();
+        let reader = fs
+            .open(
+                &context(),
+                fs.backend_inode(&inode_id).unwrap(),
+                libc::O_RDONLY,
+            )
+            .unwrap();
+        let identity = fs.page_cache_identity(reader);
+        let parallel = fs.supports_parallel_reads(reader);
+        fs.release(&context(), reader).unwrap();
+        assert_eq!(
+            identity,
+            Some(super::super::PageCacheIdentity {
+                version_id: None,
+                length: 0,
+            })
+        );
+        assert!(parallel);
+        assert_eq!(meta.file_version_load_count(), 0);
+    }
+
+    #[test]
+    fn p1_read_capabilities_exclude_writable_dirty_and_external_paths() {
+        let (_temp, meta, fs) = test_fs();
+        let inode_id = meta.inode.lock().unwrap().inode_id.clone();
+        let inode = fs.backend_inode(&inode_id).unwrap();
+        let reader = fs.open(&context(), inode, libc::O_RDONLY).unwrap();
+        let writer = fs.open(&context(), inode, libc::O_RDWR).unwrap();
+        fs.write(&context(), writer, 0, b"dirty").unwrap();
+        assert!(fs.page_cache_identity(writer).is_none());
+        assert!(!fs.supports_parallel_reads(writer));
+        assert!(fs.page_cache_identity(reader).is_none());
+        assert!(!fs.supports_parallel_reads(reader));
+        fs.flush(&context(), writer).unwrap();
+        fs.release(&context(), reader).unwrap();
+        fs.release(&context(), writer).unwrap();
+
+        let (_temp, meta, fs, _fixture) = test_fs_with_current_external_fixture();
+        let inode_id = meta.inode.lock().unwrap().inode_id.clone();
+        let reader = fs
+            .open(
+                &context(),
+                fs.backend_inode(&inode_id).unwrap(),
+                libc::O_RDONLY,
+            )
+            .unwrap();
+        assert!(fs.page_cache_identity(reader).is_none());
+        assert!(!fs.supports_parallel_reads(reader));
+        fs.release(&context(), reader).unwrap();
+    }
+
+    #[test]
+    fn p1_page_cache_identity_is_retired_not_relabelled_after_invalidation() {
+        let (_temp, meta, fs) = test_fs();
+        let inode_id = meta.inode.lock().unwrap().inode_id.clone();
+        publish_external_version_with_bytes(&meta, &fs, "p1-cache-id-old", b"old");
+        let inode = fs.backend_inode(&inode_id).unwrap();
+        let reader = fs.open(&context(), inode, libc::O_RDONLY).unwrap();
+        assert!(fs.page_cache_identity(reader).is_some());
+        publish_external_version_with_bytes(&meta, &fs, "p1-cache-id-new", b"new-data");
+        fs.getattr(&context(), inode, Some(reader)).unwrap();
+        assert!(fs.page_cache_identity(reader).is_none());
+        assert!(!fs.supports_parallel_reads(reader));
+        assert_eq!(
+            fs.read_owned(&context(), reader, 0, 16).unwrap(),
+            b"new-data"
+        );
+        assert!(
+            fs.page_cache_identity(reader).is_none(),
+            "read refresh cannot relabel old kernel pages"
+        );
+        assert!(fs.supports_parallel_reads(reader));
+        fs.release(&context(), reader).unwrap();
+    }
+
+    #[test]
+    fn p1_cached_native_read_uses_at_most_two_metadata_table_locks() {
+        let (_temp, meta, fs) = test_fs();
+        let inode_id = meta.inode.lock().unwrap().inode_id.clone();
+        publish_external_version_with_bytes(&meta, &fs, "p1-hot-metadata", b"data");
+        let reader = fs
+            .open(
+                &context(),
+                fs.backend_inode(&inode_id).unwrap(),
+                libc::O_RDONLY,
+            )
+            .unwrap();
+        assert_eq!(fs.read_owned(&context(), reader, 0, 16).unwrap(), b"data");
+        let inode_calls = meta.get_inode_call_count();
+        DFS_METADATA_TABLE_LOCKS.with(|count| count.set(0));
+        let result = fs.read_owned(&context(), reader, 0, 16).unwrap();
+        let locks = DFS_METADATA_TABLE_LOCKS.with(std::cell::Cell::get);
+        fs.release(&context(), reader).unwrap();
+        assert_eq!(result, b"data");
+        assert!(
+            locks <= 2,
+            "cached native read took {locks} metadata table locks"
+        );
+        assert_eq!(meta.get_inode_call_count(), inode_calls);
+        println!("cached_native_metadata_table_locks={locks}");
+    }
+
+    #[test]
+    fn p1_handle_registration_racing_local_or_proxy_install_preserves_dirty_visibility() {
+        for remote in [false, true] {
+            let (_owner_temp, meta, owner) = test_fs();
+            let owner = Arc::new(owner);
+            let reader_temp = tempfile::tempdir().unwrap();
+            let fs = if remote {
+                let chunks = Arc::new(LocalChunkStore::open(reader_temp.path(), "node-b").unwrap());
+                let reads = Arc::new(DfsReadEngine::new(
+                    NamespaceId::new("default"),
+                    "node-b".into(),
+                    chunks.clone(),
+                    Arc::new(crate::node::dfs_read::UnimplementedReadSourceProvider),
+                    Arc::new(UnimplementedChunkTransfer),
+                    DfsReadConfig::default(),
+                ));
+                Arc::new(
+                    DistributedFs::new(
+                        NamespaceId::new("default"),
+                        "node-b",
+                        "session-b",
+                        meta.clone(),
+                        chunks,
+                        reads,
+                    )
+                    .with_remote_owner_factory(Arc::new(
+                        StaticRemoteOwnerFactory {
+                            owner: Arc::new(LoopbackRemoteDfsOwner {
+                                owner: owner.clone(),
+                                peer: "node-b".into(),
+                            }),
+                        },
+                    )),
+                )
+            } else {
+                owner.clone()
+            };
+            let inode_id = meta.inode.lock().unwrap().inode_id.clone();
+            let inode = fs.backend_inode(&inode_id).unwrap();
+            let pause = Arc::new(NativeReadPause::default());
+            let _resume = ResumeNativeReadOnDrop(pause.clone());
+            let registration_pause = pause.clone();
+            *fs.handle_registration_after_route_check.lock().unwrap() =
+                Some(Box::new(move || registration_pause.block()));
+            let read_fs = fs.clone();
+            let opening =
+                std::thread::spawn(move || read_fs.open(&context(), inode, libc::O_RDONLY));
+            pause.wait_until_reached();
+            let writer_fs = fs.clone();
+            let writer =
+                std::thread::spawn(move || writer_fs.open(&context(), inode, libc::O_RDWR));
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut published = false;
+            while Instant::now() < deadline {
+                published = if remote {
+                    fs.current_remote_provider(&inode_id).unwrap().is_some()
+                } else {
+                    fs.write_state(&inode_id).unwrap().is_some()
+                };
+                if published {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            pause.resume();
+            let reader = opening.join().unwrap().unwrap();
+            let writer = writer.join().unwrap().unwrap();
+            assert!(
+                published,
+                "routing map was not published before registration resumed"
+            );
+            assert!(
+                fs.handle_snapshot(reader)
+                    .unwrap()
+                    .handle
+                    .dynamic_read_route
+                    .load(Ordering::Acquire)
+            );
+            fs.write(&context(), writer, 0, b"dirty").unwrap();
+            assert_eq!(
+                meta.commit_count(),
+                0,
+                "this check precedes durable publication"
+            );
+            assert_eq!(fs.read_owned(&context(), reader, 0, 16).unwrap(), b"dirty");
+            assert!(fs.page_cache_identity(reader).is_none());
+            assert!(!fs.supports_parallel_reads(reader));
+            fs.flush(&context(), writer).unwrap();
+            fs.release(&context(), reader).unwrap();
+            fs.release(&context(), writer).unwrap();
+        }
+    }
+
+    #[test]
+    fn r7_product_sequential_reads_schedule_one_two_four_objects_and_zero_stays_idle() {
+        use crate::{
+            dfs::*,
+            node::{
+                dfs_read::{
+                    ChunkTransfer, DfsReadConfig, LocalReadAuthority, PeerReadBatch,
+                    PrefetchControl, ReadSourceProvider,
+                },
+                peer_cache::{
+                    CompletedPeerDiskRead, DiskPeerCache, PeerCacheOptions, PeerStreamSink,
+                },
+            },
+        };
+        struct Fixture {
+            chunks: Vec<(ChunkObject, Vec<u8>)>,
+            lookups: AtomicUsize,
+            background: AtomicUsize,
+        }
+        impl ReadSourceProvider for Fixture {
+            fn sources_for(&self, request: DfsChunkSourcesRequest) -> Result<DfsChunkSourcesReply> {
+                self.lookups.fetch_add(1, Ordering::SeqCst);
+                Ok(DfsChunkSourcesReply {
+                    revision: 1,
+                    chunks: self
+                        .chunks
+                        .iter()
+                        .filter(|(chunk, _)| request.chunk_ids.contains(&chunk.id))
+                        .map(|(chunk, _)| ChunkSources {
+                            chunk_id: chunk.id.clone(),
+                            chunk: Some(chunk.clone()),
+                            allowed_ranges: vec![(0, chunk.length)],
+                            sources: vec![SourceCandidate {
+                                chunk_id: chunk.id.clone(),
+                                copy_id: CopyId::new("copy"),
+                                role: CopyRole::DurableReplica,
+                                state: CopyState::Ready,
+                                location: CopyLocation::Node {
+                                    node_id: "node-b".into(),
+                                    node_epoch: 1,
+                                    device_id: "local-0".into(),
+                                    device_epoch: 1,
+                                    catalog_revision: 1,
+                                },
+                                data_endpoint: Some("http://node-b".into()),
+                                load_hint: 0,
+                                read_grant: DfsReadGrant {
+                                    namespace_id: request.namespace_id.clone(),
+                                    file_version_id: request.file_version_id.clone(),
+                                    layout_root_id: request.layout_root_id.clone(),
+                                    caller_node_id: request.caller_id.clone(),
+                                    caller_node_epoch: 1,
+                                    expires_at_unix_ms: u64::MAX,
+                                    fence: 1,
+                                    token: "test-token".into(),
+                                },
+                            }],
+                        })
+                        .collect(),
+                })
+            }
+        }
+        impl ChunkTransfer for Fixture {
+            fn read_ranges(&self, _: &PeerReadBatch, _: &mut [u8]) -> Result<()> {
+                Err(unavailable("R7 fixture must use the verified sink"))
+            }
+            fn supports_verified_object_sink(&self) -> bool {
+                true
+            }
+            fn read_verified_object_to_sink<'output>(
+                &self,
+                _: &PeerReadBatch,
+                chunk: &ChunkObject,
+                offset: u64,
+                out: &'output mut [u8],
+                sink: &mut PeerStreamSink<'_>,
+            ) -> Result<Option<CompletedPeerDiskRead<'output>>> {
+                let body = &self
+                    .chunks
+                    .iter()
+                    .find(|(object, _)| object == chunk)
+                    .unwrap()
+                    .1;
+                crate::node::rpc::peer::complete_peer_disk_read_for_test(
+                    chunk, body, offset, out, sink,
+                )
+                .map(Some)
+            }
+            fn try_read_verified_object_to_sink<'output>(
+                &self,
+                batch: &PeerReadBatch,
+                chunk: &ChunkObject,
+                offset: u64,
+                out: &'output mut [u8],
+                sink: &mut PeerStreamSink<'_>,
+                control: &PrefetchControl,
+            ) -> Result<Option<CompletedPeerDiskRead<'output>>> {
+                assert!(
+                    out.is_empty(),
+                    "background read cannot allocate a fake private object"
+                );
+                control.check()?;
+                self.background.fetch_add(1, Ordering::SeqCst);
+                self.read_verified_object_to_sink(batch, chunk, offset, out, sink)
+            }
+        }
+        for maximum in [0, 32 * 1024 * 1024] {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            let temp = tempfile::tempdir().unwrap();
+            let local =
+                Arc::new(LocalChunkStore::open(temp.path().join("local"), "node-a").unwrap());
+            let fixture = Arc::new(Fixture {
+                chunks: (1..=5)
+                    .map(|byte| {
+                        let staged = StagedChunk::new(
+                            OperationId::new(format!("r7-sequence-{byte}")),
+                            vec![byte; 64 * 1024],
+                        );
+                        (staged.chunk.clone(), staged.bytes().to_vec())
+                    })
+                    .collect(),
+                lookups: AtomicUsize::new(0),
+                background: AtomicUsize::new(0),
+            });
+            let cache = Arc::new(
+                DiskPeerCache::open(PeerCacheOptions {
+                    directory: temp.path().join("cache"),
+                    capacity_bytes: 2 * 1024 * 1024,
+                    namespace_id: NamespaceId::new("default"),
+                })
+                .unwrap(),
+            );
+            let engine = {
+                let _entered = runtime.enter();
+                Arc::new(
+                    DfsReadEngine::new(
+                        NamespaceId::new("default"),
+                        "node-a".into(),
+                        local.clone(),
+                        fixture.clone(),
+                        fixture.clone(),
+                        DfsReadConfig {
+                            readahead_max_bytes: maximum,
+                            ..DfsReadConfig::default()
+                        },
+                    )
+                    .with_read_authority(Arc::new(LocalReadAuthority::new(
+                        1,
+                        Instant::now() + Duration::from_secs(30),
+                    )))
+                    .with_peer_cache(cache.clone()),
+                )
+            };
+            // Window selection and best-effort body admission are separate
+            // contracts. Join each test attempt before the next one so that
+            // the successful 1/2/4 case does not race its own metadata locks.
+            // Production and the real-RPC overlap tests have no such hook.
+            let attempts = Arc::new(Mutex::new(Vec::new()));
+            let attempt_windows = attempts.clone();
+            let fetcher = engine.object_fetcher().unwrap();
+            engine.set_prefetch_attempt_hook_for_test(Arc::new(move |window, _| {
+                attempt_windows.lock().unwrap().push(window);
+                fetcher.join_background_for_test().unwrap();
+            }));
+            let meta = Arc::new(RecordingMeta::new());
+            meta.publish_external_version_with_receipts(
+                5 * 64 * 1024,
+                fixture
+                    .chunks
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (chunk, _))| Extent {
+                        file_offset: index as u64 * 64 * 1024,
+                        length: chunk.length,
+                        chunk_id: chunk.id.clone(),
+                        chunk_offset: 0,
+                    })
+                    .collect(),
+                Vec::new(),
+            );
+            let fs = Arc::new(DistributedFs::new(
+                NamespaceId::new("default"),
+                "node-a",
+                "session-a",
+                meta.clone(),
+                local,
+                engine.clone(),
+            ));
+            let inode = fs
+                .backend_inode(&meta.inode.lock().unwrap().inode_id)
+                .unwrap();
+            let reader = fs.open(&context(), inode, libc::O_RDONLY).unwrap();
+            for (index, expected_entries) in [2, 3, 5].into_iter().enumerate() {
+                assert_eq!(
+                    fs.read_owned(&context(), reader, index as u64 * 8, 8)
+                        .unwrap(),
+                    [1; 8]
+                );
+                if maximum != 0 {
+                    assert_eq!(cache.stats().unwrap().entries, expected_entries);
+                }
+            }
+            assert_eq!(
+                *attempts.lock().unwrap(),
+                if maximum == 0 {
+                    Vec::new()
+                } else {
+                    vec![1, 2, 2, 4, 4, 4, 4]
+                }
+            );
+            if maximum == 0 {
+                // Exercise the public borrowed-output boundary with all fetch
+                // slots held. Preserve this existing handle deadline; the
+                // engine must not start a fresh five-second view while queued.
+                let fetcher = engine.object_fetcher().unwrap();
+                let permits: Vec<_> = (0..8)
+                    .map(|_| fetcher.try_reserve_background(1).unwrap().unwrap())
+                    .collect();
+                {
+                    let opened = fs.handles.get(reader.0).unwrap().unwrap();
+                    opened
+                        .state
+                        .lock()
+                        .unwrap()
+                        .native_read_view
+                        .as_mut()
+                        .unwrap()
+                        .deadline = Instant::now() + Duration::from_secs(1);
+                }
+                let reading_fs = fs.clone();
+                let (done_tx, done_rx) = std::sync::mpsc::channel();
+                let reading = std::thread::spawn(move || {
+                    let mut output = [91; 16];
+                    let result = reading_fs.read(&context(), reader, 64 * 1024 - 8, &mut output);
+                    done_tx.send((result.is_err(), output)).unwrap();
+                });
+                let before_slot_release = done_rx.recv_timeout(Duration::from_secs(2)).ok();
+                drop(permits);
+                reading.join().unwrap();
+                assert_eq!(
+                    before_slot_release,
+                    Some((true, [91; 16])),
+                    "the original VFS view must expire in queue without changing public output"
+                );
+            }
+            fs.release(&context(), reader).unwrap();
+            runtime
+                .block_on(engine.object_fetcher().unwrap().shutdown())
+                .unwrap();
+            assert_eq!(
+                fixture.background.load(Ordering::SeqCst),
+                if maximum == 0 { 0 } else { 4 }
+            );
+            assert_eq!(
+                cache.stats().unwrap().entries,
+                if maximum == 0 { 1 } else { 5 }
+            );
+            assert_eq!(
+                fixture.lookups.load(Ordering::SeqCst),
+                1,
+                "background work cannot query Meta"
+            );
+        }
+    }
+
+    #[test]
+    fn readonly_native_owned_read_reuses_bounded_head_and_reopen_is_fresh() {
+        let (_temp, meta, fs) = test_fs();
+        let inode_id = meta.inode.lock().unwrap().inode_id.clone();
+        publish_external_version_with_bytes(&meta, &fs, "native-owned-old", b"old");
+        let inode = fs.backend_inode(&inode_id).unwrap();
+        let reader = fs.open(&context(), inode, libc::O_RDONLY).unwrap();
+        let before = meta.get_inode_call_count();
+        let deadline = fs
+            .handle_snapshot(reader)
+            .unwrap()
+            .native_read_view
+            .unwrap()
+            .deadline;
+        for _ in 0..4 {
+            assert_eq!(fs.read_owned(&context(), reader, 0, 16).unwrap(), b"old");
+        }
+        assert_eq!(meta.get_inode_call_count(), before);
+        assert_eq!(
+            fs.handle_snapshot(reader)
+                .unwrap()
+                .native_read_view
+                .unwrap()
+                .deadline,
+            deadline
+        );
+
+        publish_external_version_with_bytes(&meta, &fs, "native-owned-new", b"new-data");
+        assert_eq!(fs.read_owned(&context(), reader, 0, 16).unwrap(), b"old");
+        let fresh = fs.open(&context(), inode, libc::O_RDONLY).unwrap();
+        assert_eq!(
+            fs.read_owned(&context(), fresh, 0, 16).unwrap(),
+            b"new-data"
+        );
+        expire_native_read_view(&fs, reader);
+        assert_eq!(
+            fs.read_owned(&context(), reader, 0, 16).unwrap(),
+            b"new-data"
+        );
+        assert_eq!(fs.read_owned(&context(), reader, 6, 16).unwrap(), b"ta");
+        fs.release(&context(), fresh).unwrap();
+        fs.release(&context(), reader).unwrap();
+    }
+
+    #[test]
+    fn readonly_native_view_disconnect_reuses_only_until_deadline() {
+        let (_temp, meta, fs) = test_fs();
+        let inode_id = meta.inode.lock().unwrap().inode_id.clone();
+        publish_external_version_with_bytes(&meta, &fs, "native-disconnect", b"data");
+        let inode = fs.backend_inode(&inode_id).unwrap();
+        let reader = fs.open(&context(), inode, libc::O_RDONLY).unwrap();
+        meta.fail_next_get_inode_with(unavailable("disconnected Meta"));
+        assert_eq!(fs.read_owned(&context(), reader, 0, 16).unwrap(), b"data");
+        assert!(fs.open(&context(), inode, libc::O_RDONLY).is_err());
+        expire_native_read_view(&fs, reader);
+        meta.fail_next_get_inode_with(unavailable("disconnected Meta"));
+        let mut output = [9; 16];
+        assert!(fs.read(&context(), reader, 0, &mut output).is_err());
+        assert_eq!(output, [9; 16]);
+        assert!(
+            fs.handle_snapshot(reader)
+                .unwrap()
+                .native_read_view
+                .unwrap()
+                .deadline
+                <= Instant::now()
+        );
+        fs.release(&context(), reader).unwrap();
+    }
+
+    #[test]
+    fn readonly_native_getattr_invalidates_view_for_next_read() {
+        let (_temp, meta, fs) = test_fs();
+        let inode_id = meta.inode.lock().unwrap().inode_id.clone();
+        publish_external_version_with_bytes(&meta, &fs, "native-getattr-old", b"old");
+        let inode = fs.backend_inode(&inode_id).unwrap();
+        let reader = fs.open(&context(), inode, libc::O_RDONLY).unwrap();
+        publish_external_version_with_bytes(&meta, &fs, "native-getattr-new", b"new-data");
+        fs.getattr(&context(), inode, Some(reader)).unwrap();
+        assert_eq!(
+            fs.read_owned(&context(), reader, 0, 16).unwrap(),
+            b"new-data"
+        );
+        fs.release(&context(), reader).unwrap();
+    }
+
+    #[test]
+    fn readonly_native_known_stop_and_denial_reject_cached_output() {
+        let (_temp, meta, fs, authority) = test_fs_with_native_authority();
+        let inode_id = meta.inode.lock().unwrap().inode_id.clone();
+        publish_external_version_with_bytes(&meta, &fs, "native-stop", b"data");
+        let inode = fs.backend_inode(&inode_id).unwrap();
+        let reader = fs.open(&context(), inode, libc::O_RDONLY).unwrap();
+        assert_eq!(fs.read_owned(&context(), reader, 0, 16).unwrap(), b"data");
+        authority.stop();
+        let mut output = [7; 16];
+        assert!(fs.read(&context(), reader, 0, &mut output).is_err());
+        assert_eq!(output, [7; 16]);
+        assert!(fs.read_owned(&context(), reader, 99, 0).is_err());
+        fs.release(&context(), reader).unwrap();
+
+        let (_temp, meta, fs, _authority) = test_fs_with_native_authority();
+        let inode_id = meta.inode.lock().unwrap().inode_id.clone();
+        publish_external_version_with_bytes(&meta, &fs, "native-denial", b"data");
+        let inode = fs.backend_inode(&inode_id).unwrap();
+        let reader = fs.open(&context(), inode, libc::O_RDONLY).unwrap();
+        meta.fail_next_get_inode_with(Error::coded(
+            afs_error::IO_PERMISSION_DENIED,
+            "known revoked",
+        ));
+        assert!(fs.open(&context(), inode, libc::O_RDONLY).is_err());
+        assert!(
+            fs.handle_snapshot(reader)
+                .unwrap()
+                .native_read_view
+                .is_none()
+        );
+        meta.fail_next_get_inode_with(unavailable("fresh reauthorization unavailable"));
+        assert!(fs.read_owned(&context(), reader, 0, 16).is_err());
+        assert_eq!(fs.read_owned(&context(), reader, 0, 16).unwrap(), b"data");
+        fs.release(&context(), reader).unwrap();
+    }
+
+    #[test]
+    fn readonly_native_view_deadline_is_not_extended_by_heartbeat() {
+        let (_temp, _meta, fs, authority) = test_fs_with_native_authority();
+        let view = fs.capture_native_read_view().unwrap();
+        let original = view.deadline;
+        authority
+            .refresh(1, Instant::now() + Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(view.deadline, original);
+        assert!(view.deadline <= Instant::now() + Duration::from_secs(5));
+        let mut expired = view;
+        expired.deadline = Instant::now();
+        assert!(fs.check_native_read_view(&expired).is_err());
+    }
+
+    #[test]
+    fn readonly_native_publish_and_truncate_invalidate_existing_view() {
+        let (_temp, meta, fs) = test_fs();
+        let created = fs
+            .create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new("native-local"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        let inode_id = meta.inode.lock().unwrap().inode_id.clone();
+        let inode = fs.backend_inode(&inode_id).unwrap();
+        let reader = fs.open(&context(), inode, libc::O_RDONLY).unwrap();
+        assert!(
+            fs.handle_snapshot(reader)
+                .unwrap()
+                .native_read_view
+                .is_some()
+        );
+        fs.write(&context(), created.handle, 0, b"new-data")
+            .unwrap();
+        fs.fsync(&context(), created.handle, SyncMode::Full)
+            .unwrap();
+        assert!(
+            fs.handle_snapshot(reader)
+                .unwrap()
+                .native_read_view
+                .is_none()
+        );
+        assert_eq!(
+            fs.read_owned(&context(), reader, 0, 16).unwrap(),
+            b"new-data"
+        );
+        fs.setattr(
+            &context(),
+            inode,
+            Some(created.handle),
+            &AttributeChange {
+                size: Some(2),
+                ..AttributeChange::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(fs.read_owned(&context(), reader, 0, 16).unwrap(), b"ne");
+        fs.release(&context(), reader).unwrap();
+        fs.release(&context(), created.handle).unwrap();
+    }
+
+    #[test]
+    fn readonly_native_refresh_reuses_winner_without_installing_late_old_snapshot() {
+        let (_temp, meta, fs) = test_fs();
+        let inode_id = meta.inode.lock().unwrap().inode_id.clone();
+        publish_external_version_with_bytes(&meta, &fs, "native-cas-old", b"old");
+        let reader = fs
+            .open(
+                &context(),
+                fs.backend_inode(&inode_id).unwrap(),
+                libc::O_RDONLY,
+            )
+            .unwrap();
+        expire_native_read_view(&fs, reader);
+        let stale_snapshot = fs.handle_snapshot(reader).unwrap();
+        let old_inode = meta.inode.lock().unwrap().clone();
+        publish_external_version_with_bytes(&meta, &fs, "native-cas-new", b"new-data");
+        let (new_inode, new_view) = fs.native_inode_for_read(reader, &stale_snapshot).unwrap();
+        assert!(new_view.generation > stale_snapshot.native_read_generation);
+        // A stale caller joins/reuses the winning refresh, rather than issuing
+        // a second Meta call whose older response could overwrite its head.
+        *meta.inode.lock().unwrap() = old_inode;
+        let calls = meta.get_inode_call_count();
+        let (joined_inode, joined_view) =
+            fs.native_inode_for_read(reader, &stale_snapshot).unwrap();
+        assert_eq!(joined_inode.head_version, new_inode.head_version);
+        assert_eq!(joined_view.generation, new_view.generation);
+        assert_eq!(meta.get_inode_call_count(), calls);
+        let current = fs.handle_snapshot(reader).unwrap();
+        assert_eq!(current.opened_inode.head_version, new_inode.head_version);
+        assert_eq!(current.native_read_generation, new_view.generation);
+        fs.release(&context(), reader).unwrap();
+    }
+
+    #[test]
+    fn readonly_native_getattr_denial_invalidates_view_then_requires_fresh_head() {
+        for with_handle in [false, true] {
+            let (_temp, meta, fs) = test_fs();
+            let inode_id = meta.inode.lock().unwrap().inode_id.clone();
+            publish_external_version_with_bytes(&meta, &fs, "native-getattr-denied", b"data");
+            let inode = fs.backend_inode(&inode_id).unwrap();
+            let reader = fs.open(&context(), inode, libc::O_RDONLY).unwrap();
+            meta.fail_next_get_inode_with(Error::coded(afs_error::IO_PERMISSION_DENIED, "revoked"));
+            assert!(
+                fs.getattr(&context(), inode, with_handle.then_some(reader))
+                    .is_err()
+            );
+            assert!(
+                fs.handle_snapshot(reader)
+                    .unwrap()
+                    .native_read_view
+                    .is_none()
+            );
+            let before = meta.get_inode_call_count();
+            assert_eq!(fs.read_owned(&context(), reader, 0, 16).unwrap(), b"data");
+            assert_eq!(meta.get_inode_call_count(), before + 1);
+            fs.release(&context(), reader).unwrap();
+        }
+    }
+
+    #[test]
+    fn readonly_native_dirty_late_denial_does_not_publish_output() {
+        let (_temp, meta, fs) = test_fs();
+        let fs = Arc::new(fs);
+        let created = fs
+            .create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new("late-dirty"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        fs.write(&context(), created.handle, 0, b"dirty").unwrap();
+        let inode_id = meta.inode.lock().unwrap().inode_id.clone();
+        let inode = fs.backend_inode(&inode_id).unwrap();
+        let reader = fs.open(&context(), inode, libc::O_RDONLY).unwrap();
+        let hook_fs = fs.clone();
+        let hook_meta = meta.clone();
+        *fs.native_read_before_delivery.lock().unwrap() = Some(Box::new(move || {
+            hook_meta.fail_next_get_inode_with(Error::coded(
+                afs_error::IO_PERMISSION_DENIED,
+                "late revoked",
+            ));
+            assert!(hook_fs.getattr(&context(), inode, Some(reader)).is_err());
+        }));
+        let mut output = [9; 8];
+        assert!(fs.read(&context(), reader, 0, &mut output).is_err());
+        assert_eq!(output, [9; 8]);
+        // A fresh context can recover; ordinary publication must not act as a
+        // known rejection and cancel its own successful dirty read.
+        assert_eq!(fs.read_owned(&context(), reader, 0, 8).unwrap(), b"dirty");
+        fs.release(&context(), reader).unwrap();
+        fs.release(&context(), created.handle).unwrap();
+    }
+
+    #[test]
+    fn readonly_native_size_gate_precedes_dirty_allocation() {
+        let (_temp, _meta, fs) = test_fs();
+        let created = fs
+            .create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new("size-gate"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        fs.write(&context(), created.handle, 0, b"data").unwrap();
+        assert!(
+            fs.read_owned(&context(), created.handle, 0, usize::MAX)
+                .is_err()
+        );
+        fs.release(&context(), created.handle).unwrap();
+    }
+
+    #[test]
+    fn readonly_native_owned_sparse_fallback_preserves_zero_holes() {
+        let (_temp, meta, fs) = test_fs();
+        let inode_id = meta.inode.lock().unwrap().inode_id.clone();
+        let receipt = fs
+            .chunk_store
+            .put(StagedChunk::new(
+                OperationId::new("native-owned-sparse"),
+                b"data".to_vec(),
+            ))
+            .unwrap();
+        meta.publish_external_version_with_receipts(
+            12,
+            vec![Extent {
+                file_offset: 4,
+                length: 4,
+                chunk_id: receipt.chunk.id.clone(),
+                chunk_offset: 0,
+            }],
+            vec![receipt],
+        );
+        let inode = fs.backend_inode(&inode_id).unwrap();
+        let reader = fs.open(&context(), inode, libc::O_RDONLY).unwrap();
+        assert_eq!(
+            fs.read_owned(&context(), reader, 0, 16).unwrap(),
+            b"\0\0\0\0data\0\0\0\0"
+        );
+        fs.release(&context(), reader).unwrap();
+    }
+
+    #[test]
+    fn readonly_external_version_owned_returns_private_tail_and_zero_holes() {
+        let (_temp, meta, fs, fixture) = test_fs_with_current_external_fixture();
+        let inode_id = meta.inode.lock().unwrap().inode_id.clone();
+        publish_sparse_external_fixture_version(
+            &meta,
+            &fs,
+            &fixture,
+            "version-owned-sparse",
+            12,
+            4,
+            b"data",
+        );
+        let inode = fs.backend_inode(&inode_id).unwrap();
+        let reader = fs.open(&context(), inode, libc::O_RDONLY).unwrap();
+
+        let data = fs.read_owned(&context(), reader, 0, 16).unwrap();
+        assert_eq!(data, b"\0\0\0\0data\0\0\0\0");
+        assert_eq!(fixture.legacy_call_count(), 0);
+        assert_eq!(meta.file_version_load_count(), 1);
+
+        let tail = fs.read_owned(&context(), reader, 6, 16).unwrap();
+        assert_eq!(tail, b"ta\0\0\0\0");
+
+        fs.release(&context(), reader).unwrap();
+    }
+
+    #[test]
+    fn readonly_external_version_owned_denial_does_not_fallback_to_buffered_read() {
+        let (_temp, meta, fs, fixture) = test_fs_with_current_external_fixture();
+        let inode_id = meta.inode.lock().unwrap().inode_id.clone();
+        publish_external_fixture_version(&meta, &fs, &fixture, "version-owned-denied", b"data");
+        let inode = fs.backend_inode(&inode_id).unwrap();
+        let reader = fs.open(&context(), inode, libc::O_RDONLY).unwrap();
+
+        fixture.set_mode(CurrentExternalFixtureMode::Denied);
+        meta.fail_next_get_inode_with(unavailable(
+            "denied owned read must not fall back to a fresh-head buffered read",
+        ));
+        assert_eq!(
+            fs.read_owned(&context(), reader, 0, 16)
+                .expect_err("external version authorization denial must propagate")
+                .code(),
+            afs_error::IO_PERMISSION_DENIED
+        );
+        assert_eq!(fixture.legacy_call_count(), 0);
+
+        fs.release(&context(), reader).unwrap();
+    }
+
+    #[test]
+    fn readonly_external_version_reopen_sees_new_head_and_getattr_refreshes_old_handle() {
+        let (_temp, meta, fs, fixture) = test_fs_with_current_external_fixture();
+        let inode_id = meta.inode.lock().unwrap().inode_id.clone();
+        publish_external_fixture_version(&meta, &fs, &fixture, "version-old-head", b"old");
+        let inode = fs.backend_inode(&inode_id).unwrap();
+        let reader = fs.open(&context(), inode, libc::O_RDONLY).unwrap();
+        let mut old = [0; 8];
+        assert_eq!(fs.read(&context(), reader, 0, &mut old).unwrap(), 3);
+        assert_eq!(&old[..3], b"old");
+        let get_inode_after_old_read = meta.get_inode_call_count();
+
+        publish_external_fixture_version(&meta, &fs, &fixture, "version-new-head", b"new-content");
+        let mut still_old = [0; 16];
+        assert_eq!(fs.read(&context(), reader, 0, &mut still_old).unwrap(), 3);
+        assert_eq!(&still_old[..3], b"old");
+        assert_eq!(meta.get_inode_call_count(), get_inode_after_old_read);
+
+        let fresh_reader = fs.open(&context(), inode, libc::O_RDONLY).unwrap();
+        let fresh = fs.read_owned(&context(), fresh_reader, 0, 16).unwrap();
+        assert_eq!(fresh, b"new-content");
+        fs.release(&context(), fresh_reader).unwrap();
+
+        assert_eq!(meta.file_version_load_count(), 2);
+        fs.getattr(&context(), inode, Some(reader)).unwrap();
+        let loads_after_getattr = meta.file_version_load_count();
+        let mut refreshed = [0; 16];
+        assert_eq!(fs.read(&context(), reader, 0, &mut refreshed).unwrap(), 11);
+        assert_eq!(&refreshed[..11], b"new-content");
+        assert_eq!(
+            meta.file_version_load_count(),
+            loads_after_getattr,
+            "a read must reuse the coherent view after explicit getattr refresh"
+        );
+
+        fs.release(&context(), reader).unwrap();
+    }
+
+    #[test]
+    fn readonly_external_version_denial_does_not_fallback_or_modify_output() {
+        let (_temp, meta, fs, fixture) = test_fs_with_current_external_fixture();
+        let inode_id = meta.inode.lock().unwrap().inode_id.clone();
+        publish_external_fixture_version(&meta, &fs, &fixture, "version-denied", b"cached-view");
+        let inode = fs.backend_inode(&inode_id).unwrap();
+        let reader = fs.open(&context(), inode, libc::O_RDONLY).unwrap();
+        let get_inode_after_cache_fill = meta.get_inode_call_count();
+        let legacy_after_cache_fill = fixture.legacy_call_count();
+
+        fixture.set_mode(CurrentExternalFixtureMode::Denied);
+        meta.fail_next_get_inode_with(unavailable(
+            "denied version authorization must not fall back to GetInode",
+        ));
+        let mut second = [b'!'; 16];
+        assert_eq!(
+            fs.read(&context(), reader, 0, &mut second)
+                .expect_err("external version authorization denial must propagate")
+                .code(),
+            afs_error::IO_PERMISSION_DENIED
+        );
+        assert_eq!(second, [b'!'; 16]);
+        assert!(fixture.current_call_count() >= 1);
+        assert_eq!(fixture.legacy_call_count(), legacy_after_cache_fill);
+        assert_eq!(meta.get_inode_call_count(), get_inode_after_cache_fill);
+
+        fs.release(&context(), reader).unwrap();
+    }
+
+    #[test]
+    fn c1b_version_cache_estimate_shares_runtime_floor_and_checks_overflow() {
+        let slot = (std::mem::size_of::<(FileVersionId, CachedReadOnlyVersion, u64)>()
+            + std::mem::size_of::<(u64, FileVersionId)>())
+            * 4
+            + 64;
+        let fixed = std::mem::size_of::<ReadOnlyVersion>() + 2 * std::mem::size_of::<usize>();
+        for entries in [1_usize, 4096, 65536] {
+            let table = entries * slot + 2048;
+            let minimum = version_cache_minimum_bytes(entries).unwrap();
+            assert_eq!(
+                ReadOnlyVersionCache::new(entries, minimum).table_bytes,
+                table
+            );
+            assert_eq!(minimum, table + fixed);
+        }
+        assert!(version_cache_table_bytes(usize::MAX).is_none());
+        assert!(version_cache_minimum_bytes(usize::MAX).is_none());
+        let last_fitting = (usize::MAX - 2048 - fixed) / slot;
+        assert!(version_cache_minimum_bytes(last_fitting).is_some());
+        assert!(version_cache_minimum_bytes(last_fitting + 1).is_none());
+        assert_eq!(
+            ReadOnlyVersionCache::new(usize::MAX, 1).table_bytes,
+            usize::MAX
+        );
+    }
+
+    #[test]
+    fn c1b_version_cache_floor_does_not_exempt_actual_identifier_capacity() {
+        let value = p2_byte_cache_version("nonempty-version", 0);
+        let key = value.version.as_ref().unwrap().id.clone();
+        let minimum = version_cache_minimum_bytes(1).unwrap();
+        let table = version_cache_table_bytes(1).unwrap();
+        let retained = value.cache_retained_bytes(&key);
+        assert!(retained > ReadOnlyVersion::fixed_retained_bytes());
+        let mut cache = ReadOnlyVersionCache::new(1, minimum);
+        cache.insert(key.clone(), value.clone());
+        assert_eq!(
+            cache.len(),
+            0,
+            "startup floor does not waive actual heap charges"
+        );
+        assert_eq!(cache.value_bytes, 0);
+        let mut cache = ReadOnlyVersionCache::new(1, table + retained);
+        cache.insert(key.clone(), value);
+        assert!(cache.get(&key).is_some());
+        assert_eq!(cache.table_bytes + cache.value_bytes, table + retained);
+    }
+
+    fn p2_byte_cache_version(name: &str, extent_count: usize) -> Arc<ReadOnlyVersion> {
+        let id = FileVersionId::new(name);
+        let layout_id = LayoutRootId::new(format!("{name}-layout"));
+        let length = extent_count as u64 * 2;
+        let chunk_id = "c".repeat(512);
+        let layout = LayoutRoot {
+            id: layout_id.clone(),
+            file_length: length,
+            inline_extents: (0..extent_count)
+                .map(|index| Extent {
+                    file_offset: index as u64 * 2,
+                    length: 1,
+                    chunk_id: crate::dfs::ChunkId::new(chunk_id.clone()),
+                    chunk_offset: 0,
+                })
+                .collect(),
+        };
+        let version = FileVersion {
+            id: id.clone(),
+            inode_id: InodeId::new("byte-cache-file"),
+            parent_version: None,
+            length,
+            layout_root: layout_id,
+            created_at_unix_ms: 0,
+        };
+        Arc::new(ReadOnlyVersion::checked(&id, version, layout).unwrap())
+    }
+
+    #[test]
+    fn p2_r1_version_layout_batch_looks_ahead_without_changing_requested_ranges() {
+        const CHUNK: u64 = 4 * 1024 * 1024;
+        let id = FileVersionId::new("r1-fixed-version");
+        let layout_id = LayoutRootId::new("r1-fixed-layout");
+        // Deliberately reversed serialization order: the existing index must
+        // select later logical offsets without rebuilding or loading a layout.
+        let layout = LayoutRoot {
+            id: layout_id.clone(),
+            file_length: 16 * CHUNK,
+            inline_extents: (0..16)
+                .rev()
+                .map(|index| Extent {
+                    file_offset: index * CHUNK,
+                    length: CHUNK,
+                    chunk_id: crate::dfs::ChunkId::new(format!("r1-object-{index}")),
+                    chunk_offset: 0,
+                })
+                .collect(),
+        };
+        let version = FileVersion {
+            id: id.clone(),
+            inode_id: InodeId::new("r1-inode"),
+            parent_version: None,
+            length: layout.file_length,
+            layout_root: layout_id,
+            created_at_unix_ms: 0,
+        };
+        let cached = ReadOnlyVersion::checked(&id, version, layout).unwrap();
+        let batch = cached.read_batch(0, 128 * 1024, 64).unwrap();
+        assert_eq!(batch.ops.len(), 1);
+        assert_eq!(batch.ops[0].length, 128 * 1024);
+        assert_eq!(batch.ops[0].chunk_id.0, "r1-object-0");
+        assert_eq!(batch.lookahead.len(), 15);
+        assert_eq!(batch.lookahead[0].0, "r1-object-1");
+        assert_eq!(batch.lookahead[14].0, "r1-object-15");
+        assert_eq!(batch.file_version_id.as_ref(), Some(&id));
+        assert!(
+            cached
+                .read_batch(15 * CHUNK, 128 * 1024, 64)
+                .unwrap()
+                .lookahead
+                .is_empty()
+        );
+        assert!(
+            cached
+                .read_batch(0, 128 * 1024, 0)
+                .unwrap()
+                .lookahead
+                .is_empty()
+        );
+        let capped = cached.read_batch(0, 128 * 1024, 2).unwrap();
+        assert_eq!(capped.ops, batch.ops);
+        assert_eq!(capped.lookahead.len(), 2);
+    }
+
+    #[test]
+    fn p2_r1_lookahead_deduplicates_fragmented_layout_without_widening_body() {
+        let current = crate::dfs::ChunkId::new("current");
+        let next = crate::dfs::ChunkId::new("next");
+        let extents = [
+            Extent {
+                file_offset: 1,
+                length: 1,
+                chunk_id: current.clone(),
+                chunk_offset: 1,
+            },
+            Extent {
+                file_offset: 1,
+                length: 1,
+                chunk_id: crate::dfs::ChunkId::new(
+                    "x".repeat(crate::node::dfs_read::MAX_SOURCE_LOOKAHEAD_ID_BYTES + 1),
+                ),
+                chunk_offset: 0,
+            },
+            Extent {
+                file_offset: 2,
+                length: 1,
+                chunk_id: next.clone(),
+                chunk_offset: 0,
+            },
+            Extent {
+                file_offset: 3,
+                length: 1,
+                chunk_id: next.clone(),
+                chunk_offset: 1,
+            },
+        ];
+        let ops = [ChunkReadOp {
+            chunk_id: current,
+            chunk_offset: 0,
+            length: 1,
+            output_offset: 0,
+        }];
+        assert_eq!(source_lookahead_ids(extents.iter(), &ops, 64), vec![next]);
+        assert_eq!(ops[0].length, 1);
+    }
+
+    #[test]
+    fn p2_version_cache_bytes_evict_fragmented_lru_without_retiring_active_reader() {
+        let (_temp, _meta, fs) = test_fs();
+        let held = p2_byte_cache_version("byte-first", 24_000);
+        let second = p2_byte_cache_version("byte-second", 24_000);
+        let third = p2_byte_cache_version("byte-third", 24_000);
+        let first_id = held.version.as_ref().unwrap().id.clone();
+        let second_id = second.version.as_ref().unwrap().id.clone();
+        let third_id = third.version.as_ref().unwrap().id.clone();
+        let expected = held.ops(2, 3).unwrap();
+        assert_eq!(expected.len(), 2);
+        let weak = Arc::downgrade(&held);
+        {
+            let mut cache = fs.readonly_version_cache.lock().unwrap();
+            cache.insert(first_id.clone(), held.clone());
+            cache.insert(second_id.clone(), second);
+            assert!(cache.get(&first_id).is_some());
+            cache.insert(third_id.clone(), third);
+            assert_eq!(cache.len(), 2, "three fragmented layouts exceed 32MiB");
+            assert!(
+                cache.get(&second_id).is_none(),
+                "the untouched entry is oldest"
+            );
+            assert!(cache.get(&third_id).is_some());
+            assert!(cache.get(&first_id).is_some());
+            // Make the held version oldest and evict only the cache's owner.
+            let fourth_id = FileVersionId::new("byte-fourth");
+            cache.insert(
+                fourth_id.clone(),
+                p2_byte_cache_version("byte-fourth", 24_000),
+            );
+            assert!(cache.get(&fourth_id).is_some());
+            cache.insert(
+                FileVersionId::new("byte-fifth"),
+                p2_byte_cache_version("byte-fifth", 24_000),
+            );
+            assert!(cache.get(&first_id).is_none());
+        }
+        assert_eq!(held.ops(2, 3).unwrap(), expected);
+        assert!(
+            weak.upgrade().is_some(),
+            "the active reader still owns its metadata"
+        );
+        drop(held);
+        assert!(
+            weak.upgrade().is_none(),
+            "the cache has no retired ownership"
+        );
+    }
+
+    #[test]
+    fn p2_version_cache_bytes_counts_reserved_extent_and_index_capacity() {
+        const LIMIT: usize = 32 * 1024 * 1024;
+        for index_capacity in [false, true] {
+            let (_temp, _meta, fs) = test_fs();
+            let mut version = p2_byte_cache_version("reserved-layout", 1);
+            let value = Arc::get_mut(&mut version).unwrap();
+            if index_capacity {
+                value
+                    .index
+                    .entries
+                    .reserve_exact(LIMIT / std::mem::size_of::<IndexedExtent>());
+            } else {
+                value
+                    .layout
+                    .inline_extents
+                    .reserve_exact(LIMIT / std::mem::size_of::<Extent>());
+            }
+            let id = version.version.as_ref().unwrap().id.clone();
+            let mut cache = fs.readonly_version_cache.lock().unwrap();
+            cache.insert(id.clone(), version.clone());
+            assert!(
+                cache.get(&id).is_none(),
+                "capacity counts even when len is one"
+            );
+            assert_eq!(version.ops(0, 1).unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn p2_version_cache_bytes_counts_string_capacity_and_same_key_replacement() {
+        const MIB: usize = 1024 * 1024;
+        let (_temp, _meta, fs) = test_fs();
+        let mut inflated = p2_byte_cache_version("replacement", 1);
+        Arc::get_mut(&mut inflated).unwrap().layout.inline_extents[0]
+            .chunk_id
+            .0
+            .reserve_exact(12 * MIB);
+        let compact = Arc::new(
+            ReadOnlyVersion::checked(
+                &inflated.version.as_ref().unwrap().id,
+                inflated.version.clone().unwrap(),
+                inflated.layout.clone(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(inflated.layout, compact.layout);
+        let id = inflated.version.as_ref().unwrap().id.clone();
+        let second = p2_byte_cache_version("replacement-second", 24_000);
+        let second_id = second.version.as_ref().unwrap().id.clone();
+        let third = p2_byte_cache_version("replacement-third", 24_000);
+        let third_id = third.version.as_ref().unwrap().id.clone();
+        let mut cache = fs.readonly_version_cache.lock().unwrap();
+        cache.insert(id.clone(), inflated.clone());
+        cache.insert(second_id.clone(), second);
+        cache.insert(id.clone(), compact);
+        cache.insert(third_id.clone(), third);
+        assert!(
+            cache.get(&second_id).is_some(),
+            "replaced capacity must be subtracted"
+        );
+        assert!(cache.get(&third_id).is_some());
+        cache.insert(id.clone(), inflated);
+        assert!(
+            cache.get(&second_id).is_none(),
+            "expanded replacement must be charged"
+        );
+        assert!(cache.get(&third_id).is_some());
+        assert!(cache.get(&id).is_some());
+    }
+
+    #[test]
+    fn p2_version_cache_bytes_counts_version_layout_and_key_string_capacity() {
+        const LIMIT: usize = 32 * 1024 * 1024;
+        for field in [
+            "version",
+            "inode",
+            "parent",
+            "version-layout",
+            "layout",
+            "key",
+        ] {
+            let (_temp, _meta, fs) = test_fs();
+            let mut value = p2_byte_cache_version("reserved-id", 1);
+            let mut key = value.version.as_ref().unwrap().id.clone();
+            let inner = Arc::get_mut(&mut value).unwrap();
+            let version = inner.version.as_mut().unwrap();
+            version.parent_version = Some(FileVersionId::new("parent"));
+            let string = match field {
+                "version" => &mut version.id.0,
+                "inode" => &mut version.inode_id.0,
+                "parent" => &mut version.parent_version.as_mut().unwrap().0,
+                "version-layout" => &mut version.layout_root.0,
+                "layout" => &mut inner.layout.id.0,
+                "key" => &mut key.0,
+                _ => unreachable!(),
+            };
+            string.reserve_exact(LIMIT);
+            let lookup = key.clone();
+            let mut cache = fs.readonly_version_cache.lock().unwrap();
+            cache.insert(key, value.clone());
+            assert!(
+                cache.get(&lookup).is_none(),
+                "reserved {field} capacity must count"
+            );
+            assert_eq!(value.ops(0, 1).unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn p2_version_cache_bytes_small_limit_survives_both_configuration_orders() {
+        for bytes_first in [false, true] {
+            let (_temp, meta, fs) = test_fs();
+            let fs = if bytes_first {
+                fs.with_version_cache_bytes(1)
+                    .with_version_cache_capacity(2)
+            } else {
+                fs.with_version_cache_capacity(2)
+                    .with_version_cache_bytes(1)
+            };
+            let head = meta.publish_external_version(17);
+            let before = meta.file_version_load_count();
+            let first = fs.load_readonly_version(Some(&head)).unwrap();
+            let second = fs.load_readonly_version(Some(&head)).unwrap();
+            assert!(!Arc::ptr_eq(&first, &second));
+            assert_eq!(first.layout.file_length, 17);
+            assert_eq!(meta.file_version_load_count() - before, 2);
+            assert_eq!(fs.readonly_version_cache.lock().unwrap().len(), 0);
+        }
+    }
+
+    #[test]
+    fn p2_version_cache_bytes_oversized_version_remains_usable_without_retention() {
+        let (_temp, meta, fs) = test_fs();
+        let oversized = p2_byte_cache_version("oversized-source", 64_000);
+        let head = meta.publish_external_version_with_receipts(
+            oversized.layout.file_length,
+            oversized.layout.inline_extents.clone(),
+            Vec::new(),
+        );
+        drop(oversized);
+        let before = meta.file_version_load_count();
+        let first = fs.load_readonly_version(Some(&head)).unwrap();
+        let second = fs.load_readonly_version(Some(&head)).unwrap();
+        assert_eq!(first.ops(2, 3).unwrap().len(), 2);
+        assert_eq!(first.layout, second.layout);
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "an overlarge version is not retained"
+        );
+        assert_eq!(meta.file_version_load_count() - before, 2);
+        assert!(
+            fs.readonly_version_cache
+                .lock()
+                .unwrap()
+                .get(&head)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn p1_version_cache_reuses_multiple_immutable_heads_without_meta_reload() {
+        let (_temp, meta, fs) = test_fs();
+        let first = meta.publish_external_version(17);
+        let second = meta.publish_external_version(23);
+        let before = meta.file_version_load_count();
+        for head in [&first, &second, &first, &second] {
+            fs.load_readonly_version(Some(head)).unwrap();
+        }
+        assert_eq!(
+            meta.file_version_load_count() - before,
+            2,
+            "alternating immutable heads must remain in the bounded cache"
+        );
+    }
+
+    #[test]
+    fn p1_version_cache_hits_share_extent_allocation() {
+        let (_temp, meta, fs) = test_fs();
+        let head = publish_external_version_with_bytes(&meta, &fs, "p1-shared-layout", b"data");
+        let first = fs.load_readonly_version(Some(&head)).unwrap();
+        let second = fs.load_readonly_version(Some(&head)).unwrap();
+        assert_eq!(
+            first.layout.inline_extents.as_ptr(),
+            second.layout.inline_extents.as_ptr(),
+            "cache hits cannot deep-copy immutable layout extents"
+        );
+    }
+
+    #[test]
+    fn p1_version_cache_rejects_cross_inode_version_on_consumption() {
+        let (_temp, meta, fs) = test_fs();
+        publish_external_version_with_bytes(&meta, &fs, "p1-wrong-inode-layout", b"data");
+        let inode = meta.inode.lock().unwrap().clone();
+        meta.commits
+            .lock()
+            .unwrap()
+            .last_mut()
+            .unwrap()
+            .file_version
+            .inode_id = InodeId::new("different-inode");
+        assert!(
+            fs.read_committed_inode_owned(&inode, 0, 16).is_err(),
+            "an immutable cached version cannot authorize a different inode"
+        );
+    }
+
+    #[test]
+    fn p1_version_cache_rejects_inconsistent_layout_identity_and_length() {
+        for wrong_length in [false, true] {
+            let (_temp, meta, fs) = test_fs();
+            let head = meta.publish_external_version(17);
+            {
+                let mut commits = meta.commits.lock().unwrap();
+                let commit = commits.last_mut().unwrap();
+                if wrong_length {
+                    commit.layout_root.file_length = 16;
+                } else {
+                    commit.layout_root.id = LayoutRootId::new("wrong-layout");
+                }
+            }
+            assert!(
+                fs.load_readonly_version(Some(&head)).is_err(),
+                "immutable version/layout mismatch must be rejected before cache admission"
+            );
+            {
+                let mut commits = meta.commits.lock().unwrap();
+                let commit = commits.last_mut().unwrap();
+                commit.layout_root.id = commit.file_version.layout_root.clone();
+                commit.layout_root.file_length = commit.file_version.length;
+            }
+            assert!(
+                fs.load_readonly_version(Some(&head)).is_ok(),
+                "rejected metadata must not poison later cache admission"
+            );
+            assert_eq!(meta.file_version_load_count(), 2);
+        }
+    }
+
+    #[test]
+    fn p1_version_cache_concurrent_admission_shares_canonical_arc_and_rejects_changed_value() {
+        for changed in [false, true] {
+            let (_temp, meta, fs) = test_fs();
+            let head = meta.publish_external_version(17);
+            let original = {
+                let commits = meta.commits.lock().unwrap();
+                let commit = commits.last().unwrap();
+                (commit.file_version.clone(), commit.layout_root.clone())
+            };
+            let mut other = original.clone();
+            if changed {
+                other.0.length = 18;
+                other.1.file_length = 18;
+            }
+            meta.file_version_replies
+                .lock()
+                .unwrap()
+                .extend([original, other]);
+            *fs.readonly_version_before_install.lock().unwrap() =
+                Some(Arc::new(std::sync::Barrier::new(2)));
+            let (first, second) = std::thread::scope(|scope| {
+                let first = scope.spawn(|| fs.load_readonly_version(Some(&head)));
+                let second = scope.spawn(|| fs.load_readonly_version(Some(&head)));
+                (first.join().unwrap(), second.join().unwrap())
+            });
+            *fs.readonly_version_before_install.lock().unwrap() = None;
+            assert_eq!(
+                meta.file_version_load_count(),
+                2,
+                "this cache does not single-flight Meta misses"
+            );
+            if changed {
+                assert_ne!(
+                    first.is_ok(),
+                    second.is_ok(),
+                    "same immutable ID cannot conceal divergent metadata"
+                );
+            } else {
+                assert!(Arc::ptr_eq(&first.unwrap(), &second.unwrap()));
+            }
+        }
+    }
+
+    #[test]
+    fn p1_version_cache_lookup_open_read_reuses_one_version_rpc_per_head() {
+        let (_temp, meta, fs) = test_fs();
+        let original = meta.inode.lock().unwrap().clone();
+        let mut files = Vec::new();
+        for number in 0..100 {
+            let mut inode = original.clone();
+            inode.inode_id = InodeId::new(format!("p1-many-files-{number}"));
+            *meta.inode.lock().unwrap() = inode;
+            let bytes = format!("file-{number}").into_bytes();
+            publish_external_version_with_bytes(
+                &meta,
+                &fs,
+                &format!("p1-many-files-chunk-{number}"),
+                &bytes,
+            );
+            files.push((meta.inode.lock().unwrap().clone(), bytes));
+        }
+        let before = meta.file_version_load_count();
+        let opens_before = meta.get_inode_call_count();
+        for _ in 0..2 {
+            for (inode, bytes) in &files {
+                *meta.inode.lock().unwrap() = inode.clone();
+                let entry = fs
+                    .lookup(
+                        &context(),
+                        fs.root_inode(),
+                        OsStr::new("fixture-current-file"),
+                    )
+                    .unwrap();
+                assert_eq!(entry.attributes.size, bytes.len() as u64);
+                let reader = fs.open(&context(), entry.inode, libc::O_RDONLY).unwrap();
+                assert_eq!(fs.read_owned(&context(), reader, 0, 64).unwrap(), *bytes);
+                fs.release(&context(), reader).unwrap();
+            }
+        }
+        assert_eq!(
+            meta.file_version_load_count() - before,
+            files.len(),
+            "lookup/open/read share validated immutable metadata across files"
+        );
+        assert_eq!(
+            meta.get_inode_call_count() - opens_before,
+            2 * files.len(),
+            "every open still obtains one online fresh inode"
+        );
+    }
+
+    #[test]
+    fn p1_version_cache_lru_preserves_hot_entries_and_retired_arc() {
+        let (_temp, meta, fs) = test_fs();
+        let fs = fs.with_version_cache_capacity(2);
+        let first = meta.publish_external_version(17);
+        let second = meta.publish_external_version(23);
+        let third = meta.publish_external_version(29);
+        let held = fs.load_readonly_version(Some(&first)).unwrap();
+        fs.load_readonly_version(Some(&second)).unwrap();
+        assert!(Arc::ptr_eq(
+            &held,
+            &fs.load_readonly_version(Some(&first)).unwrap()
+        ));
+        fs.load_readonly_version(Some(&third)).unwrap();
+        {
+            let mut cache = fs.readonly_version_cache.lock().unwrap();
+            assert_eq!(cache.len(), 2);
+            assert!(cache.get(&second).is_none());
+            assert!(Arc::ptr_eq(cache.get(&first).unwrap(), &held));
+        }
+        let before = meta.file_version_load_count();
+        fs.load_readonly_version(Some(&second)).unwrap();
+        fs.load_readonly_version(Some(&third)).unwrap();
+        assert_eq!(meta.file_version_load_count() - before, 2);
+        assert_eq!(
+            held.layout.file_length, 17,
+            "eviction cannot retire an in-flight metadata owner"
+        );
+    }
+
+    #[test]
+    fn p1_layout_index_matches_linear_ops_for_ten_thousand_layouts() {
+        let (_temp, _meta, fs) = test_fs();
+        let mut seed = 0x52a9_6d71_3f08_c4e2_u64;
+        let mut random = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for case in 0..10_000 {
+            let count = (random() % 24) as usize;
+            let extents = (0..count)
+                .map(|index| Extent {
+                    file_offset: random() % 4096,
+                    length: random() % 512,
+                    chunk_id: crate::dfs::ChunkId::new(format!("index-{case}-{index}")),
+                    chunk_offset: random() % 1024,
+                })
+                .collect();
+            let layout = LayoutRoot {
+                id: LayoutRootId::new("index-equivalence"),
+                file_length: 4608,
+                inline_extents: extents,
+            };
+            let index = LayoutReadIndex::new(&layout).unwrap();
+            let offset = random() % 5120;
+            let length = (random() % 1024) as usize;
+            let expected = fs.layout_read_ops(&layout, offset, length).unwrap();
+            let actual = index.ops(&layout, offset, length).unwrap();
+            assert_eq!(
+                actual, expected,
+                "case={case} offset={offset} length={length}"
+            );
+        }
+    }
+
+    #[test]
+    fn p1_layout_index_preserves_overflow_and_sparse_range_checks() {
+        let (_temp, _meta, fs) = test_fs();
+        let mut layout = LayoutRoot {
+            id: LayoutRootId::new("index-overflow"),
+            file_length: u64::MAX,
+            inline_extents: vec![Extent {
+                file_offset: u64::MAX,
+                length: 2,
+                chunk_id: crate::dfs::ChunkId::new("overflow"),
+                chunk_offset: 0,
+            }],
+        };
+        assert!(fs.layout_read_ops(&layout, 0, 1).is_err());
+        assert!(
+            LayoutReadIndex::new(&layout).is_err(),
+            "out-of-request overflow cannot be skipped by index"
+        );
+        layout.inline_extents[0].file_offset = 100;
+        layout.inline_extents[0].length = 16;
+        layout.inline_extents[0].chunk_offset = u64::MAX;
+        let index = LayoutReadIndex::new(&layout).unwrap();
+        assert_eq!(
+            index.ops(&layout, 0, 16).unwrap(),
+            fs.layout_read_ops(&layout, 0, 16).unwrap()
+        );
+        assert!(index.ops(&layout, 101, 1).is_err());
+        assert!(fs.layout_read_ops(&layout, 101, 1).is_err());
+        assert!(index.ops(&layout, u64::MAX, 2).is_err());
+        assert!(fs.layout_read_ops(&layout, u64::MAX, 2).is_err());
+    }
+
+    #[test]
     fn readonly_read_reuses_cached_file_version_for_same_head() {
         let (_temp, meta, fs) = test_fs();
         let inode_id = meta.inode.lock().unwrap().inode_id.clone();
@@ -13956,7 +26901,7 @@ mod tests {
     }
 
     #[test]
-    fn readonly_read_loads_changed_head_and_returns_new_content_and_length() {
+    fn readonly_native_expired_read_loads_changed_head_and_returns_new_content_and_length() {
         let (_temp, meta, fs) = test_fs();
         let inode_id = meta.inode.lock().unwrap().inode_id.clone();
         publish_external_version_with_bytes(&meta, &fs, "cache-old-head", b"old");
@@ -13968,6 +26913,7 @@ mod tests {
         assert_eq!(meta.file_version_load_count(), 1);
 
         publish_external_version_with_bytes(&meta, &fs, "cache-new-head", b"new-content");
+        expire_native_read_view(&fs, reader);
         let mut new = [0; 16];
         assert_eq!(fs.read(&context(), reader, 0, &mut new).unwrap(), 11);
         assert_eq!(&new[..11], b"new-content");
@@ -13977,7 +26923,7 @@ mod tests {
     }
 
     #[test]
-    fn readonly_cached_read_still_propagates_get_inode_error() {
+    fn readonly_native_expired_read_propagates_get_inode_error() {
         let (_temp, meta, fs) = test_fs();
         let inode_id = meta.inode.lock().unwrap().inode_id.clone();
         publish_external_version_with_bytes(&meta, &fs, "cache-inode-error", b"cached-view");
@@ -13987,6 +26933,7 @@ mod tests {
         assert_eq!(fs.read(&context(), reader, 0, &mut first).unwrap(), 11);
         assert_eq!(meta.file_version_load_count(), 1);
 
+        expire_native_read_view(&fs, reader);
         meta.fail_next_get_inode_with(unavailable("injected readonly get_inode failure"));
         let mut second = [7; 16];
         assert_eq!(
@@ -13999,14 +26946,14 @@ mod tests {
         assert_eq!(
             meta.file_version_load_count(),
             1,
-            "cache lookup must not bypass the per-read inode validation"
+            "expired view must not bypass fresh inode validation"
         );
 
         fs.release(&context(), reader).unwrap();
     }
 
     #[test]
-    fn readonly_changed_version_load_error_does_not_return_cached_old_content() {
+    fn readonly_native_expired_version_load_error_does_not_return_cached_old_content() {
         let (_temp, meta, fs) = test_fs();
         let inode_id = meta.inode.lock().unwrap().inode_id.clone();
         publish_external_version_with_bytes(&meta, &fs, "cache-old-before-error", b"old-data");
@@ -14017,6 +26964,7 @@ mod tests {
         assert_eq!(&old[..8], b"old-data");
 
         publish_external_version_with_bytes(&meta, &fs, "cache-new-error", b"new-data");
+        expire_native_read_view(&fs, reader);
         meta.fail_next_get_file_version_with(unavailable(
             "injected readonly GetFileVersion failure",
         ));
@@ -14217,8 +27165,8 @@ mod tests {
             let state = state.lock().unwrap();
             let pending = match state.in_flight.as_ref().expect("commit remains in flight") {
                 InFlightCommit::File(pending) => pending,
-                InFlightCommit::Preparing(_) => panic!("commit should have reached Meta"),
-                InFlightCommit::Metadata(_) => panic!("test expects data commit"),
+                InFlightCommit::Preparing(_, _) => panic!("commit should have reached Meta"),
+                InFlightCommit::Metadata(_, _) => panic!("test expects data commit"),
             };
             (
                 state.inode.revision,
@@ -14249,10 +27197,10 @@ mod tests {
                 );
                 assert_eq!(&pending.batch.commit.file_version.id, &pending_version);
             }
-            InFlightCommit::Preparing(_) => {
+            InFlightCommit::Preparing(_, _) => {
                 panic!("commit should still be exact pending file commit")
             }
-            InFlightCommit::Metadata(_) => panic!("test expects data commit"),
+            InFlightCommit::Metadata(_, _) => panic!("test expects data commit"),
         }
         drop(state);
         fs.release(&context(), reader).unwrap();
@@ -14410,9 +27358,12 @@ mod tests {
         pause.wait_until_reached();
         let inode_id = meta.inode.lock().unwrap().inode_id.clone();
         let cell = fs.write_state(&inode_id).unwrap().unwrap();
-        let exact = match cell.lock().unwrap().in_flight.clone().unwrap() {
-            InFlightCommit::File(pending) => pending.batch.commit,
-            _ => panic!("expected exact prepared file request"),
+        let exact = {
+            let state = cell.lock().unwrap();
+            match state.in_flight.as_ref().unwrap() {
+                InFlightCommit::File(pending) => pending.batch.commit.clone(),
+                _ => panic!("expected exact prepared file request"),
+            }
         };
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let maintenance_fs = fs.clone();
@@ -14428,7 +27379,7 @@ mod tests {
         let committed = meta.commits.lock().unwrap();
         assert_eq!(committed.len(), 1);
         assert_eq!(
-            serde_json::to_value(&exact).unwrap(),
+            serde_json::to_value(exact.as_ref()).unwrap(),
             serde_json::to_value(&committed[0]).unwrap()
         );
     }
@@ -14475,9 +27426,16 @@ mod tests {
             metadata_dirty,
             kill_suidgid_dirty,
             dirty_extents: DirtyExtentMap::default(),
+            dirty_budget_reservations: Vec::new(),
+            publication_window: None,
             in_flight: None,
             commit_busy: false,
             operation_busy,
+            native_queue: NativeTicketQueue::default(),
+            native_thread: None,
+            native_owner: NativeWriteOwner::new(),
+            native_due: false,
+            native_due_through: 0,
             dirty,
             next_write_seq: 0,
             visible_write_seq: 0,
@@ -14495,26 +27453,30 @@ mod tests {
         let (_temp, meta, fs) = test_fs();
         let lease = meta.lease.lock().unwrap().clone();
         {
-            let mut states = fs.inode_writes.lock().unwrap();
+            let states = &fs.inode_writes;
             for index in 0..64 {
                 let inode_id = InodeId::new(format!("inode:fair-{index:03}"));
-                states.insert(
-                    inode_id.clone(),
-                    synthetic_write_state(
-                        inode_id,
-                        lease.clone(),
-                        index == 63,
-                        false,
-                        false,
-                        index == 63,
-                    ),
-                );
+                states
+                    .insert(
+                        inode_id.clone(),
+                        synthetic_write_state(
+                            inode_id,
+                            lease.clone(),
+                            index == 63,
+                            false,
+                            false,
+                            index == 63,
+                        ),
+                    )
+                    .unwrap();
             }
             let inode_id = InodeId::new("inode:fair-064");
-            states.insert(
-                inode_id.clone(),
-                synthetic_write_state(inode_id, lease, false, false, true, false),
-            );
+            states
+                .insert(
+                    inode_id.clone(),
+                    synthetic_write_state(inode_id, lease, false, false, true, false),
+                )
+                .unwrap();
         }
 
         assert_eq!(
@@ -14539,13 +27501,22 @@ mod tests {
         let (_temp, meta, fs) = test_fs();
         let lease = meta.lease.lock().unwrap().clone();
         {
-            let mut states = fs.inode_writes.lock().unwrap();
+            let states = &fs.inode_writes;
             for index in 0..4 {
                 let inode_id = InodeId::new(format!("inode:partial-{index:03}"));
-                states.insert(
-                    inode_id.clone(),
-                    synthetic_write_state(inode_id, lease.clone(), false, false, index == 3, false),
-                );
+                states
+                    .insert(
+                        inode_id.clone(),
+                        synthetic_write_state(
+                            inode_id,
+                            lease.clone(),
+                            false,
+                            false,
+                            index == 3,
+                            false,
+                        ),
+                    )
+                    .unwrap();
             }
         }
         *fs.writeback_after_examine_pause.lock().unwrap() = Some(Duration::from_millis(60));
@@ -14578,7 +27549,7 @@ mod tests {
         let (_temp, meta, fs) = test_fs();
         let lease = meta.lease.lock().unwrap().clone();
         {
-            let mut states = fs.inode_writes.lock().unwrap();
+            let states = &fs.inode_writes;
             for index in 0..2 {
                 let inode_id = InodeId::new(format!("inode:timeout-{index:03}"));
                 let cell = synthetic_write_state(
@@ -14590,7 +27561,7 @@ mod tests {
                     false,
                 );
                 cell.lock().unwrap().inode.revision = (index + 1) as u64;
-                states.insert(inode_id, cell);
+                states.insert(inode_id, cell).unwrap();
             }
         }
 
@@ -14659,7 +27630,7 @@ mod tests {
                     );
                     pending.batch.commit.clone()
                 }
-                InFlightCommit::Preparing(_) | InFlightCommit::Metadata(_) => {
+                InFlightCommit::Preparing(_, _) | InFlightCommit::Metadata(_, _) => {
                     panic!("expected exact prepared file commit")
                 }
             }
@@ -14680,7 +27651,10 @@ mod tests {
         assert_eq!(rows[1]["send_attempt"], 1);
         assert_eq!(rows[2]["event"], "dfs_pending_commit_unknown_retained");
         assert_eq!(rows[2]["send_attempt"], 1);
-        assert_eq!(meta.failed_commits.lock().unwrap()[0], pending_commit);
+        assert_eq!(
+            &meta.failed_commits.lock().unwrap()[0],
+            pending_commit.as_ref()
+        );
         assert_eq!(
             fs.writeback_pending_with_budget(Duration::from_secs(1), 64)
                 .unwrap(),
@@ -14689,7 +27663,8 @@ mod tests {
         let commits = meta.commits.lock().unwrap();
         assert_eq!(commits.len(), 1);
         assert_eq!(
-            commits[0], pending_commit,
+            &commits[0],
+            pending_commit.as_ref(),
             "exact request, lease, CAS and receipts must replay"
         );
         let rows: Vec<serde_json::Value> = std::fs::read_to_string(&output)
@@ -14722,9 +27697,8 @@ mod tests {
             .write_at(0, b"x", 1)
             .unwrap();
         fs.inode_writes
-            .lock()
-            .unwrap()
-            .insert(inode_id.clone(), cell.clone());
+            .insert(inode_id.clone(), cell.clone())
+            .unwrap();
 
         *fs.writeback_after_examine_pause.lock().unwrap() = Some(Duration::from_millis(2));
         assert_eq!(
@@ -15202,7 +28176,8 @@ mod tests {
                 InFlightCommit::File(p) => p.as_ref().clone(),
                 _ => unreachable!(),
             };
-            stale.batch.commit.operation_id = OperationId::new("wrong-stale-operation");
+            Arc::make_mut(&mut stale.batch.commit).operation_id =
+                OperationId::new("wrong-stale-operation");
             fs.pending_trace.as_ref().unwrap().observe(
                 "dfs_pending_commit_unknown_retained",
                 "pending_reuse",
@@ -16633,7 +29608,7 @@ mod tests {
         .unwrap_err();
         let authority = fs
             .lock_authorities
-            .lock()
+            .read(&InodeId::new("inode:test"))
             .unwrap()
             .get(&InodeId::new("inode:test"))
             .cloned()
@@ -17125,9 +30100,9 @@ mod tests {
         for _ in 0..100 {
             registered = fs
                 .lock_authorities
-                .lock()
+                .values_snapshot()
                 .unwrap()
-                .values()
+                .iter()
                 .any(|authority| !authority.state.lock().unwrap().waiters.is_empty());
             if registered {
                 break;
@@ -17140,7 +30115,7 @@ mod tests {
         );
         let local_authority = fs
             .lock_authorities
-            .lock()
+            .read(&inode_id)
             .unwrap()
             .get(&inode_id)
             .cloned()
@@ -17772,7 +30747,7 @@ mod tests {
 
         let authority = fs
             .lock_authorities
-            .lock()
+            .read(&InodeId::new("inode:test"))
             .unwrap()
             .get(&InodeId::new("inode:test"))
             .cloned()
@@ -17833,7 +30808,7 @@ mod tests {
 
         let authority = fs
             .lock_authorities
-            .lock()
+            .read(&InodeId::new("inode:test"))
             .unwrap()
             .get(&InodeId::new("inode:test"))
             .cloned()
@@ -18041,7 +31016,7 @@ mod tests {
             ReleaseKind::PosixOwner,
         )
         .unwrap();
-        assert!(fs.lock_authorities.lock().unwrap().is_empty());
+        assert!(fs.lock_authorities.is_empty());
         assert!(fs.remote_lock_authorities.lock().unwrap().is_empty());
     }
 

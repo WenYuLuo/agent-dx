@@ -482,6 +482,7 @@ impl Jiuwenbox {
             &spec.runtime_class,
             spec.execution.network.as_ref(),
             &spec.execution.ports,
+            spec.execution.tunnel_http_port,
             &self.launch,
         )?;
         if !devices.is_empty()
@@ -1126,6 +1127,7 @@ impl RuntimeDriver for Jiuwenbox {
         id: &str,
         network: Option<&NetworkPolicy>,
         ports: &[u16],
+        tunnel_http_port: Option<u16>,
     ) -> Result<()> {
         let gate = self.gate(id);
         let _lock = gate.lock().await;
@@ -1133,7 +1135,8 @@ impl RuntimeDriver for Jiuwenbox {
         if r.phase != Phase::Ready {
             return Err(Error::Conflict);
         }
-        let mapped = policy::network_policy(&r.backend, network, ports, &self.launch)?;
+        let mapped =
+            policy::network_policy(&r.backend, network, ports, tunnel_http_port, &self.launch)?;
         let fragment = if r.backend == "conch" {
             json!({"conch":{"network":mapped}})
         } else {

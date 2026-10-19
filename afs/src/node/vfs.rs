@@ -14,6 +14,24 @@ use std::ffi::OsStr;
 
 use afs_error::{Error, Result};
 
+/// FUSE write admission controls the lifetime of the borrowed request body.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WriteAdmissionMode {
+    /// Preserve worker dispatch; the frontend owns a request-body copy.
+    Queued,
+    /// Complete admission before returning from the FUSE callback, joining the
+    /// same handle FIFO as queued operations without retaining borrowed input.
+    Borrowed,
+}
+
+/// Exact committed content identity used only for kernel page reuse at open.
+/// It neither grants access nor pins a snapshot for the lifetime of a handle.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PageCacheIdentity {
+    pub version_id: Option<String>,
+    pub length: u64,
+}
+
 /// 两种后端接收同一组文件操作；每项默认拒绝，未实现时不得报告成功。
 ///
 /// 这里仅规定入口必须提供的参数与返回值。根授权、文件身份、缓存和持久化
@@ -22,6 +40,27 @@ use afs_error::{Error, Result};
 pub trait Backend: Send + Sync {
     /// 当前 Backend 在本 mount 内的根 inode。它不是 FUSE inode，也不是跨进程身份。
     fn root_inode(&self) -> types::BackendInode;
+
+    /// Select request-body admission for this open handle. Borrowed admission
+    /// can block the receive thread through existing synchronous commit triggers;
+    /// it does not change write completion or persistence semantics. Implementors
+    /// must not retain the borrowed slice after `write_with_options` returns.
+    fn write_admission_mode(&self, _handle: types::FileHandle) -> WriteAdmissionMode {
+        WriteAdmissionMode::Queued
+    }
+
+    /// Local capability query after a successful fresh open. `None` requires
+    /// discarding pages; implementations must not perform RPCs from this hook.
+    fn page_cache_identity(&self, _handle: types::FileHandle) -> Option<PageCacheIdentity> {
+        None
+    }
+
+    /// Permit concurrent reads only when the backend preserves per-operation
+    /// version, authority and deadline checks. The frontend still orders reads
+    /// against write/resize/sync/release barriers on the same handle.
+    fn supports_parallel_reads(&self, _handle: types::FileHandle) -> bool {
+        false
+    }
 
     /// Linux FUSE killpriv v2 is advertised only when the selected backend can
     /// honor explicit kernel kill_suidgid causes on open/create, write and setattr.
@@ -214,6 +253,22 @@ pub trait Backend: Send + Sync {
         _out: &mut [u8],
     ) -> Result<usize> {
         Err(unsupported("read"))
+    }
+
+    /// Optional owned read response for backends that can build a private final
+    /// payload without first filling a caller-owned buffer. The default keeps
+    /// legacy backends compatible by delegating to `read`.
+    fn read_owned(
+        &self,
+        ctx: &types::RequestContext,
+        handle: types::FileHandle,
+        offset: u64,
+        size: usize,
+    ) -> Result<Vec<u8>> {
+        let mut out = vec![0; size];
+        let n = self.read(ctx, handle, offset, &mut out)?;
+        out.truncate(n);
+        Ok(out)
     }
 
     /// 返回底层确认的实际字节数；不能把部分成功或未知结果报成整笔成功。
@@ -422,4 +477,66 @@ fn unsupported(operation: &str) -> Error {
         afs_error::NODE_VFS_UNIMPLEMENTED,
         format!("VFS backend operation '{operation}' is not implemented"),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        Backend,
+        types::{BackendInode, FileHandle, RequestContext},
+    };
+    use afs_error::Result;
+
+    struct DefaultReadOwnedBackend;
+
+    impl Backend for DefaultReadOwnedBackend {
+        fn root_inode(&self) -> BackendInode {
+            BackendInode { value: 1 }
+        }
+
+        fn read(
+            &self,
+            _ctx: &RequestContext,
+            handle: FileHandle,
+            offset: u64,
+            out: &mut [u8],
+        ) -> Result<usize> {
+            assert_eq!(handle, FileHandle(7));
+            assert_eq!(offset, 3);
+            out[..5].copy_from_slice(b"owned");
+            Ok(5)
+        }
+    }
+
+    #[test]
+    fn default_write_admission_retains_owned_worker_dispatch() {
+        assert_eq!(
+            DefaultReadOwnedBackend.write_admission_mode(FileHandle(7)),
+            super::WriteAdmissionMode::Queued
+        );
+    }
+
+    #[test]
+    fn default_backend_never_opts_into_kernel_page_reuse_or_parallel_reads() {
+        assert!(
+            DefaultReadOwnedBackend
+                .page_cache_identity(FileHandle(7))
+                .is_none()
+        );
+        assert!(!DefaultReadOwnedBackend.supports_parallel_reads(FileHandle(7)));
+    }
+
+    #[test]
+    fn default_read_owned_delegates_to_buffered_read() {
+        let backend = DefaultReadOwnedBackend;
+        let ctx = RequestContext {
+            uid: 1000,
+            gid: 1000,
+            pid: 1234,
+            umask: 0,
+            supplementary_gids: Vec::new(),
+        };
+        let data = backend.read_owned(&ctx, FileHandle(7), 3, 16).unwrap();
+        assert_eq!(data, b"owned");
+    }
 }

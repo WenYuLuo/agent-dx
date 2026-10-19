@@ -1,4 +1,6 @@
 //! Generated transport contracts and validated conversions, without services.
+mod admission;
+pub use admission::{scheduling_deadline, scheduling_failure};
 mod runtime_profile;
 mod snapshots;
 pub mod control {

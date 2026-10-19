@@ -29,6 +29,7 @@ pub fn network_policy(
     class: &str,
     policy: Option<&NetworkPolicy>,
     ports: &[u16],
+    tunnel_http_port: Option<u16>,
     launch: &Config,
 ) -> Result<Value> {
     if !matches!(class, "supervisor" | "conch") {
@@ -63,10 +64,20 @@ pub fn network_policy(
         .unwrap_or("50090")
         .parse::<u16>()
         .map_err(|_| unsupported("invalid Execd port"))?;
+    // The tunnel WebSocket listener is platform-owned, just like Execd. Native
+    // stateful ACLs only need an ingress exception for the inbound handshake.
+    let tunnel_ws_port = tunnel_http_port
+        .map(|port| {
+            port.checked_sub(1)
+                .filter(|port| *port != 0)
+                .ok_or_else(|| unsupported("invalid tunnel HTTP port"))
+        })
+        .transpose()?;
     let protected_ports: BTreeSet<_> = ports
         .iter()
         .copied()
         .chain(std::iter::once(execd_port))
+        .chain(tunnel_ws_port)
         .collect();
     for (name, direction, default) in [
         (

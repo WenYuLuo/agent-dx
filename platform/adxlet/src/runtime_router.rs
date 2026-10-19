@@ -172,10 +172,11 @@ impl RuntimeDriver for RuntimeRouter {
         id: &str,
         policy: Option<&NetworkPolicy>,
         ports: &[u16],
+        tunnel_http_port: Option<u16>,
     ) -> Result<()> {
         self.owner(id)
             .await?
-            .set_network_policy(id, policy, ports)
+            .set_network_policy(id, policy, ports, tunnel_http_port)
             .await
     }
     async fn stats(&self, id: &str) -> Result<crate::metrics::RuntimeUsage> {

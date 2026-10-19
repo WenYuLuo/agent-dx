@@ -9,10 +9,12 @@ description = "Agent FS process and backend foundation"
 publish = false
 
 [features]
-default = ["ownerfs", "dfs"]
+default = ["ownerfs", "dfs", "node-jemalloc"]
 ownerfs = []
 dfs = []
 rdma = ["afs-transport/rdma"]
+# Disable only for allocator comparisons; only afs-node installs it globally.
+node-jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
 
 [[example]]
 name = "afs-workspace-probe"
@@ -22,6 +24,10 @@ path = "tests/support/workspace_probe.rs"
 name = "afs-root-command-meta"
 path = "tests/support/root_command_meta.rs"
 required-features = ["ownerfs"]
+
+[[example]]
+name = "afs-perf-denominators"
+path = "tests/support/perf_denominators.rs"
 
 [dependencies]
 afs-error = { path = "common/error" }
@@ -44,8 +50,18 @@ prost = "0.14"
 axum = "0.8"
 thiserror = "2.0.16"
 libc = "0.2"
-blake3 = "1.8"
+blake3 = { version = "=1.8.7", features = ["rayon"] }
+bao-tree = { version = "=0.16.1", default-features = false }
+rayon-core = "=1.13.0"
+object_store = { version = "0.14", default-features = false, features = ["aws-base", "reqwest", "ring"] }
+# Match ADX public TLS wiring; aws-base does not enable reqwest TLS by itself.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 fuser = { version = "=0.18.0", default-features = false }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tikv-jemallocator = { version = "=0.7.0", optional = true, default-features = false, features = ["background_threads_runtime_support", "stats"] }
+tikv-jemalloc-ctl = { version = "=0.7.0", optional = true, features = ["use_std", "stats"] }
 
 [dev-dependencies]
 tempfile = "3"

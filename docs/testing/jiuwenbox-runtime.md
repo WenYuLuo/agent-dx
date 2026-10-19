@@ -56,7 +56,9 @@ Conch CPU limit 要求整 vCPU，memory limit 要求整 MiB，不能静默舍入
 ADXlet 不另建宿主过滤链。创建与更新使用相同的保守映射，无法保持语义的配置返回 Invalid。
 
 - supervisor 支持 stateful 入站 TCP 目的端口允许/拒绝列表；入站默认拒绝时显式放行
-  Execd 和声明端口。出站默认允许时支持 IPv4/CIDR 或 TCP 目的端口拒绝列表。
+  Execd、声明端口和启用反向隧道时的 WebSocket 监听端口（`tunnel_http_port - 1`）。
+  隧道监听端口只增加入站例外；其值由执行配置派生，不采用用户环境变量覆盖。
+  出站默认允许时支持 IPv4/CIDR 或 TCP 目的端口拒绝列表。
 - Conch 支持 stateful 出站 IPv4/CIDR 允许或拒绝列表；入站须默认允许且无额外规则，
   因为其原生 IP ACL 无法单独表达平台控制端口例外。总地址数不超过 1024。
 - stateless、DNS/IPv6、UDP/ICMP 专属规则、端口范围、源端口、IP 与端口组合、

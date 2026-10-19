@@ -624,6 +624,12 @@ pub fn start_request(
         xpu.entry(kind.into()).or_default().push(d.id);
     }
     let options = &spec.execution;
+    options.validate_tunnel_network(options.network.as_ref())?;
+    envs.retain(|key, _| !key.starts_with("EXECD_TUNNEL_"));
+    if let Some(port) = options.tunnel_http_port {
+        envs.insert("EXECD_TUNNEL_HTTP_PORT".into(), port.to_string());
+        envs.insert("EXECD_TUNNEL_WS_PORT".into(), (port - 1).to_string());
+    }
     // Only the typed constructor option may configure runtime initialization.
     envs.remove("ADX_ENVIRONMENT_CWD");
     if let Some(cwd) = &options.cwd {
@@ -778,7 +784,9 @@ pub fn start_request(
         network_policy: options
             .network
             .as_ref()
-            .map(|policy| environment_network_policy(policy, &options.ports, config))
+            .map(|policy| {
+                environment_network_policy(policy, &options.ports, options.tunnel_http_port, config)
+            })
             .transpose()?,
         inject_entrypoint: if options.inherit_entrypoint {
             image_process_config.into()
@@ -862,9 +870,16 @@ fn environment_mount(value: &adx_core::execution::Mount) -> Result<proto::Mount>
 pub(crate) fn environment_network_policy(
     value: &adx_core::execution::NetworkPolicy,
     ports: &[u16],
+    tunnel_http_port: Option<u16>,
     config: &Config,
 ) -> Result<proto::NetworkPolicy> {
     use adx_core::execution as model;
+    model::ExecutionOptions {
+        tunnel_http_port,
+        ports: ports.to_vec(),
+        ..Default::default()
+    }
+    .validate_tunnel_network(Some(value))?;
     let action = |value| match value {
         model::NetworkAction::Allow => proto::NetworkPolicyAction::Allow as i32,
         model::NetworkAction::Deny => proto::NetworkPolicyAction::Deny as i32,
@@ -942,6 +957,22 @@ pub(crate) fn environment_network_policy(
                 sandbox_port_range: Some(proto::PortRange {
                     first: u32::from(port),
                     last: u32::from(port),
+                }),
+                priority: u32::MAX,
+                ..Default::default()
+            });
+        }
+        // Only a new inbound handshake may establish the tunnel return path.
+        // A Both rule would allow arbitrary outbound TCP with this source port.
+        if let Some(port) = tunnel_http_port {
+            rules.push(proto::TrafficRule {
+                action: proto::NetworkPolicyAction::Allow as i32,
+                direction: proto::NetworkDirection::Ingress as i32,
+                protocol: proto::NetworkProtocol::Tcp as i32,
+                peer: Some(proto::NetworkEndpoint::default()),
+                sandbox_port_range: Some(proto::PortRange {
+                    first: u32::from(port - 1),
+                    last: u32::from(port - 1),
                 }),
                 priority: u32::MAX,
                 ..Default::default()
@@ -1146,6 +1177,7 @@ impl RuntimeDriver for Sandboxd {
         runtime_id: &str,
         policy: Option<&adx_core::execution::NetworkPolicy>,
         ports: &[u16],
+        tunnel_http_port: Option<u16>,
     ) -> Result<()> {
         let id = self.physical_id(runtime_id).await?.ok_or(Error::NotFound)?;
         self.client
@@ -1154,7 +1186,9 @@ impl RuntimeDriver for Sandboxd {
                 self.request(proto::SetNetworkPolicyRequest {
                     sandbox_id: id,
                     network_policy: policy
-                        .map(|value| environment_network_policy(value, ports, &self.config))
+                        .map(|value| {
+                            environment_network_policy(value, ports, tunnel_http_port, &self.config)
+                        })
                         .transpose()?,
                 }),
             )

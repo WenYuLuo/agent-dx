@@ -303,6 +303,7 @@ impl From<core::ExecutionOptions> for pb::ExecutionOptions {
     fn from(value: core::ExecutionOptions) -> Self {
         Self {
             cwd: value.cwd,
+            tunnel_http_port: value.tunnel_http_port.map(u32::from),
             rootfs: value.rootfs.map(Into::into),
             mounts: value.mounts.into_iter().map(Into::into).collect(),
             network: value.network.map(Into::into),
@@ -332,6 +333,10 @@ impl TryFrom<pb::ExecutionOptions> for core::ExecutionOptions {
         let limits = value.limits.unwrap_or_default();
         Ok(Self {
             cwd: value.cwd,
+            tunnel_http_port: value
+                .tunnel_http_port
+                .map(|port| u16::try_from(port).map_err(|_| invalid("tunnel port")))
+                .transpose()?,
             rootfs: value.rootfs.map(TryInto::try_into).transpose()?,
             mounts: value
                 .mounts

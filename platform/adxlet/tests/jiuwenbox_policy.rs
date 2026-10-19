@@ -3,7 +3,7 @@ use adxlet::{jiuwenbox::policy::network_policy, sandboxd::Config};
 
 #[test]
 fn accepts_no_network_override() {
-    assert!(network_policy("supervisor", None, &[], &Config::default()).is_ok());
+    assert!(network_policy("supervisor", None, &[], None, &Config::default()).is_ok());
 }
 
 #[test]
@@ -15,5 +15,5 @@ fn refuses_dns_enforcement_that_native_acl_cannot_provide() {
         }),
         traffic: None,
     };
-    assert!(network_policy("conch", Some(&policy), &[], &Config::default()).is_err());
+    assert!(network_policy("conch", Some(&policy), &[], None, &Config::default()).is_err());
 }

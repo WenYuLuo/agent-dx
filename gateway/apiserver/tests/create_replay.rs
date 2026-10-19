@@ -20,6 +20,7 @@ struct State {
     create_calls: AtomicUsize,
     lookups: AtomicUsize,
     response_error: AtomicUsize,
+    scheduling_expired: AtomicBool,
     block_response: AtomicBool,
     pending_response: AtomicBool,
     deadlines: Mutex<Vec<u64>>,
@@ -55,6 +56,12 @@ service_impl!(pb::coordinator_service_server::CoordinatorService, {
         self.0.deadlines.lock().unwrap().push(request.get_ref().create_deadline_unix_millis);
         self.0.create_calls.fetch_add(1, Ordering::SeqCst);
         let spec = request.into_inner().spec.unwrap();
+        if self.0.scheduling_expired.load(Ordering::SeqCst) {
+            return Err(adx_protocol::scheduling_deadline(adx_core::scheduling::SchedulingFailure {
+                rejections: [("insufficient_cpu".into(), 1)].into(),
+                ..Default::default()
+            }));
+        }
         let record = {
             let mut owners = self.0.owners.lock().unwrap();
             if let Some(owner) = owners.get_mut(&spec.id) {
@@ -223,6 +230,35 @@ fn caller() -> pb::CallerContext {
         tenant_id: "tenant".into(),
         administrator: false,
     }
+}
+
+#[tokio::test]
+async fn cancelled_schedule_is_cached_without_resubmission_or_runtime_start() {
+    let fixture = Fixture::new().await;
+    fixture
+        .state
+        .scheduling_expired
+        .store(true, Ordering::SeqCst);
+    let error = fixture
+        .create("too-large", "create-too-large")
+        .await
+        .unwrap_err();
+    assert!(adx_protocol::scheduling_failure(&error).is_some());
+    let replay = fixture
+        .create("too-large", "create-too-large")
+        .await
+        .unwrap_err();
+    assert_eq!(replay.details(), error.details());
+    assert_eq!(fixture.state.create_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.state.starts.load(Ordering::SeqCst), 0);
+    assert!(fixture.state.owners.lock().unwrap().is_empty());
+    // A deliberate new logical request may wait for placement again.
+    let error = fixture
+        .create("too-large", "create-new-budget")
+        .await
+        .unwrap_err();
+    assert!(adx_protocol::scheduling_failure(&error).is_some());
+    assert_eq!(fixture.state.create_calls.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]

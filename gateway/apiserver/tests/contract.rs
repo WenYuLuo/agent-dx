@@ -481,3 +481,49 @@ fn directory_creation_rejects_non_local_or_non_bind_mounts() {
         assert!(create_spec(json!({"image":"app","mounts":[mount]}), &caller()).is_err());
     }
 }
+
+#[test]
+fn tunnel_listener_configuration_cannot_be_supplied_through_user_environment() {
+    for key in ["EXECD_TUNNEL_WS_PORT", "EXECD_TUNNEL_HTTP_PORT"] {
+        assert!(
+            create_spec(json!({"image":"image", "env":{key:"12345"}}), &caller()).is_err(),
+            "accepted {key}"
+        );
+    }
+}
+
+#[test]
+fn tunnel_configuration_is_not_stored_in_untrusted_environment() {
+    let spec = create_spec(
+        json!({"image":"image", "tunnel":{"enabled":true,"proxyPort":18766}}),
+        &caller(),
+    )
+    .unwrap();
+    assert!(!spec.env.contains_key("EXECD_TUNNEL_WS_PORT"));
+    assert!(!spec.env.contains_key("EXECD_TUNNEL_HTTP_PORT"));
+}
+
+#[test]
+fn tunnel_listeners_roundtrip_with_default_and_custom_ports() {
+    for (input, expected) in [(0, 8766), (18766, 18766)] {
+        let spec = create_spec(json!({"image":"image", "tunnel":{"enabled":true,"proxyPort":input},"network":{"blockNetwork":true}}), &caller()).unwrap();
+        let options: adx_core::execution::ExecutionOptions =
+            spec.execution.unwrap().try_into().unwrap();
+        assert_eq!(options.tunnel_http_port, Some(expected));
+        let wire: pb::ExecutionOptions = options.clone().into();
+        let restored: adx_core::execution::ExecutionOptions = wire.try_into().unwrap();
+        assert_eq!(restored, options);
+    }
+    for request in [
+        json!({"image":"image","tunnel":{"enabled":true,"proxyPort":65536}}),
+        json!({"image":"image","tunnel":{"enabled":true,"proxyPort":50090}}),
+        json!({"image":"image","tunnel":{"enabled":true,"proxyPort":50091}}),
+        json!({"image":"image","tunnel":{"enabled":true},"ports":["8765"]}),
+        json!({"image":"image","tunnel":{"enabled":true},"network":{"schemaVersion":2,"traffic":{"ingressDefaultAction":"deny","egressDefaultAction":"deny","mode":"stateless","rules":[]}}}),
+    ] {
+        assert!(
+            create_spec(request.clone(), &caller()).is_err(),
+            "accepted {request}"
+        );
+    }
+}

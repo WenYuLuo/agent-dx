@@ -10,11 +10,11 @@ use afs_error::{Error, Result};
 
 use crate::{
     dfs::{
-        ChunkId, ChunkReceipt, LocalCopyPolicy, PlacementSnapshot, ReplicaAck, ReplicaGroup,
-        ReplicaGroupId, ReplicaTarget, ReplicaWriteGrant, ReplicationConfig,
+        ChunkId, ChunkReceipt, LocalCopyPolicy, OperationId, PlacementSnapshot, ReplicaAck,
+        ReplicaGroup, ReplicaGroupId, ReplicaTarget, ReplicaWriteGrant, ReplicationConfig,
     },
     node::{
-        chunk::{ChunkStore, LocalChunkStore, StagedChunk},
+        chunk::{ChunkStore, LocalChunkStore, NativeChunkReceipt, StagedChunk},
         vfs::types::FilesystemCapacity,
     },
 };
@@ -417,6 +417,7 @@ impl ReplicationEngine {
                 }
                 validate_acks(plan, &item, &durable_acks, &self.local_node_id)?;
                 receipts[index] = Some(ChunkReceipt {
+                    external_commit: None,
                     operation_id: item.operation_id,
                     chunk: item.chunk,
                     placement_revision: plan.placement_revision,
@@ -559,6 +560,7 @@ impl DfsChunkStore {
                 .zip(local_acks)
             {
                 receipts[index] = Some(ChunkReceipt {
+                    external_commit: None,
                     operation_id: item.operation_id,
                     chunk: item.chunk,
                     placement_revision: group.plan.placement_revision,
@@ -584,6 +586,115 @@ impl ChunkStore for DfsChunkStore {
             self.replication
                 .put_replicated_batch(staged, snapshot.revision)
         }
+    }
+
+    fn native_descriptor_reservation_bytes(&self, operation_id: &OperationId) -> Result<usize> {
+        let snapshot = self.placement.snapshot()?;
+        if !snapshot.replication.is_valid() || snapshot.replica_groups.is_empty() {
+            return Err(invalid(
+                "native descriptor admission needs valid placement authority",
+            ));
+        }
+        let synchronous = usize::from(snapshot.replication.sync_required_copies);
+        let mut receipt = 0usize;
+        for group in &snapshot.replica_groups {
+            if group.targets.len() < synchronous {
+                return Err(invalid("native placement has too few synchronous targets"));
+            }
+            let ack_bytes = group.targets.iter().try_fold(0usize, |sum, target| {
+                sum.checked_add(
+                    std::mem::size_of::<ReplicaAck>()
+                        + operation_id.0.capacity()
+                        + 128
+                        + target.node_id.capacity()
+                        + target.device.device_id.capacity(),
+                )
+                .ok_or_else(|| invalid("native descriptor capacity overflow"))
+            })?;
+            receipt = receipt.max(
+                std::mem::size_of::<ChunkReceipt>()
+                    + operation_id.0.capacity()
+                    + 128
+                    + group.id.0.capacity()
+                    + ack_bytes,
+            );
+        }
+        // This is a pre-admission reservation, not an actual-capacity metric.
+        // It includes owned descriptor state, layout/domain clones and bounded
+        // publication scratch while keeping the original 4MiB envelope fixed.
+        receipt
+            .checked_mul(8)
+            .and_then(|bytes| bytes.checked_add(8192))
+            .ok_or_else(|| invalid("native descriptor reservation overflow"))
+    }
+
+    fn put_native_batch(&self, staged: Vec<StagedChunk>) -> Result<Vec<NativeChunkReceipt>> {
+        let snapshot = self.placement.snapshot()?;
+        let receipts = if snapshot.replication.is_local_fast_path() {
+            self.put_local_batch(staged, &snapshot)?
+        } else {
+            self.replication
+                .put_replicated_batch(staged, snapshot.revision)?
+        };
+        let required = snapshot.replication.local_copy == LocalCopyPolicy::Required;
+        let device = if required {
+            Some(self.local.device_descriptor()?)
+        } else {
+            None
+        };
+        receipts
+            .into_iter()
+            .map(|receipt| {
+                if let Some(device) = &device {
+                    let local_ack = receipt
+                        .durable_acks
+                        .iter()
+                        .find(|ack| {
+                            ack.node_id == self.local_node_id
+                                && self
+                                    .local_node_epoch
+                                    .is_none_or(|epoch| ack.node_epoch == epoch)
+                                && ack.device_id == device.device_id
+                                && ack.device_epoch == device.device_epoch
+                        })
+                        .ok_or_else(|| {
+                            invalid("native Required receipt has no matching local durable ACK")
+                        })?;
+                    if local_ack.operation_id != receipt.operation_id
+                        || local_ack.chunk_id != receipt.chunk.id
+                        || local_ack.placement_revision != receipt.placement_revision
+                        || local_ack.placement_epoch != receipt.placement_epoch
+                        || local_ack.persisted_bytes != receipt.chunk.length
+                        || local_ack.verified_digest != receipt.chunk.content_digest
+                    {
+                        return Err(invalid("native local ACK does not match its exact receipt"));
+                    }
+                    // Pinning checks catalog and content-addressed identity without
+                    // another full scan. Every later local read verifies its groups.
+                    self.local.open_receipt_reader(&receipt.chunk)?;
+                }
+                Ok(NativeChunkReceipt {
+                    receipt,
+                    local_required_and_durable: required,
+                })
+            })
+            .collect()
+    }
+
+    fn read_native_uploaded_at(
+        &self,
+        receipt: &ChunkReceipt,
+        offset: u64,
+        out: &mut [u8],
+    ) -> Result<usize> {
+        let reader = self.local.open_receipt_reader(&receipt.chunk)?;
+        let result = reader.read_at(offset, out);
+        if result.is_err() {
+            // This rechecks the actual local object before quarantining; a
+            // caller's expected-root mismatch above never quarantines it.
+            let _ = self.local.quarantine_if_invalid(&receipt.chunk.id);
+        }
+        result
     }
 
     fn read_at(&self, chunk_id: &ChunkId, offset: u64, out: &mut [u8]) -> Result<usize> {
@@ -1238,6 +1349,127 @@ mod tests {
             min_distinct_failure_domains: 1,
             local_copy: LocalCopyPolicy::Required,
         }
+    }
+
+    #[test]
+    fn p2_w2_required_receipt_releases_only_for_exact_local_durable_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
+        let snapshot = Arc::new(PlacementSnapshot {
+            revision: 11,
+            replication: config(1),
+            replica_groups: vec![ReplicaGroup {
+                id: ReplicaGroupId::new("native-local"),
+                placement_epoch: 12,
+                targets: vec![target_with_epoch(
+                    "node-a",
+                    1,
+                    local.device_descriptor().unwrap(),
+                )],
+            }],
+        });
+        let store = DfsChunkStore::new_with_epoch(
+            "node-a".into(),
+            1,
+            local.clone(),
+            Arc::new(StaticPlacement { snapshot }),
+            Arc::new(FakeDataPlane::default()),
+        );
+        let input = staged("native-durable-body");
+        let mut receipts = store.put_native_batch(vec![input.clone()]).unwrap();
+        let receipt = receipts.remove(0);
+        assert!(receipt.local_required_and_durable);
+        assert_eq!(receipt.receipt.chunk, input.chunk);
+        let mut output = [0; 7];
+        assert_eq!(
+            store
+                .read_native_uploaded_at(&receipt.receipt, 0, &mut output)
+                .unwrap(),
+            output.len()
+        );
+        assert_eq!(&output, b"native-");
+        let mut wrong = receipt.receipt.clone();
+        wrong.chunk.length += 1;
+        let mut untouched = [0x81; 7];
+        assert!(
+            store
+                .read_native_uploaded_at(&wrong, 0, &mut untouched)
+                .is_err()
+        );
+        assert_eq!(untouched, [0x81; 7]);
+        assert!(
+            local.open_receipt_reader(&receipt.receipt.chunk).is_ok(),
+            "a caller expected-root mismatch must not quarantine a healthy local object"
+        );
+    }
+
+    #[test]
+    fn p2_w2_nonrequired_remote_receipt_never_claims_local_body_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let local = Arc::new(LocalChunkStore::open(temp.path(), "writer").unwrap());
+        let mut policy = config(1);
+        policy.local_copy = LocalCopyPolicy::Preferred;
+        let snapshot = Arc::new(PlacementSnapshot {
+            revision: 7,
+            replication: policy,
+            replica_groups: vec![ReplicaGroup {
+                id: ReplicaGroupId::new("remote-only"),
+                placement_epoch: 8,
+                targets: vec![target("node-b", remote_device("remote-b"))],
+            }],
+        });
+        let store = DfsChunkStore::new_with_epoch(
+            "writer".into(),
+            1,
+            local,
+            Arc::new(StaticPlacement { snapshot }),
+            Arc::new(FakeDataPlane::default()),
+        );
+        let receipt = store
+            .put_native_batch(vec![staged("remote-native")])
+            .unwrap()
+            .remove(0);
+        assert!(!receipt.local_required_and_durable);
+        assert!(
+            receipt
+                .receipt
+                .durable_acks
+                .iter()
+                .all(|ack| ack.node_id != "writer")
+        );
+    }
+
+    #[test]
+    fn p2_w2_descriptor_reservation_accounts_for_all_possible_authority_targets() {
+        let temp = tempfile::tempdir().unwrap();
+        let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
+        let mut long_node = String::with_capacity(8192);
+        long_node.push_str("remote-b");
+        let mut remote = target(&long_node, remote_device("remote-b"));
+        remote.node_id = long_node;
+        let snapshot = Arc::new(PlacementSnapshot {
+            revision: 7,
+            replication: config(1),
+            replica_groups: vec![ReplicaGroup {
+                id: ReplicaGroupId::new("reservation"),
+                placement_epoch: 8,
+                targets: vec![target("node-a", local.device_descriptor().unwrap()), remote],
+            }],
+        });
+        let store = DfsChunkStore::new_with_epoch(
+            "node-a".into(),
+            1,
+            local,
+            Arc::new(StaticPlacement { snapshot }),
+            Arc::new(FakeDataPlane::default()),
+        );
+        let reserved = store
+            .native_descriptor_reservation_bytes(&OperationId::new("native-reservation"))
+            .unwrap();
+        assert!(
+            reserved >= 8192 * 8,
+            "authority beyond the minimum synchronous prefix must still be reserved"
+        );
     }
 
     #[test]

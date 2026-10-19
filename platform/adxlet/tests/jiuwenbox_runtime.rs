@@ -827,7 +827,7 @@ async fn policy_updates_use_jiuwenbox_api_and_reject_unsupported_before_mutation
         .await
         .unwrap();
     driver
-        .set_network_policy("tenant-agent-1", None, &[])
+        .set_network_policy("tenant-agent-1", None, &[], None)
         .await
         .unwrap();
     let puts = fixture
@@ -850,7 +850,7 @@ async fn policy_updates_use_jiuwenbox_api_and_reject_unsupported_before_mutation
     };
     assert!(matches!(
         driver
-            .set_network_policy("tenant-agent-1", Some(&invalid), &[])
+            .set_network_policy("tenant-agent-1", Some(&invalid), &[], None)
             .await,
         Err(Error::Invalid(_))
     ));
@@ -978,4 +978,45 @@ async fn conch_content_id_binding_sends_only_template_id() {
     config["classes"]["conch"]["images"]["agent:v1"]["template_name"] = json!("also-selected");
     let ambiguous: Config = serde_json::from_value(config).unwrap();
     assert!(ambiguous.validate().is_err());
+}
+
+#[tokio::test]
+async fn supervisor_tunnel_acl_survives_create_and_routed_policy_update() {
+    use adx_core::execution::{NetworkAction, NetworkPolicy, TrafficMode, TrafficPolicy};
+    let fixture = Fixture::new();
+    let driver = fixture.driver().await;
+    let mut spec = spec("supervisor");
+    let policy = NetworkPolicy {
+        dns: None,
+        traffic: Some(TrafficPolicy {
+            ingress_default_action: NetworkAction::Deny,
+            egress_default_action: NetworkAction::Allow,
+            mode: TrafficMode::Stateful,
+            rules: vec![],
+        }),
+    };
+    spec.execution.network = Some(policy.clone());
+    spec.execution.tunnel_http_port = Some(18766);
+    spec.env
+        .insert("EXECD_TUNNEL_WS_PORT".into(), "12345".into());
+    driver.start(&spec, "tenant-agent-1", 1, &[]).await.unwrap();
+    let router = adxlet::runtime_router::RuntimeRouter::new(None, Some(driver)).unwrap();
+    router
+        .set_network_policy("tenant-agent-1", Some(&policy), &[], Some(18766))
+        .await
+        .unwrap();
+    let calls = fixture.backend.calls.lock().unwrap();
+    let create = &calls
+        .iter()
+        .find(|(m, p, _)| m == "POST" && p == "/api/v1/sandboxes")
+        .unwrap()
+        .2;
+    let update = &calls.iter().find(|(m, _, _)| m == "PUT").unwrap().2;
+    assert_eq!(create["env"]["EXECD_TUNNEL_WS_PORT"], "18765");
+    for request in [create, update] {
+        let network = &request["policy"]["network"];
+        assert_eq!(network["ingress"]["allowed_ports"], json!([1, 18765]));
+        assert_eq!(network["egress"]["allowed_ports"], json!([]));
+        assert_eq!(network["egress"]["blocked_ports"], json!([]));
+    }
 }

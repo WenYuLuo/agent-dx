@@ -207,6 +207,7 @@ pub trait RuntimeDriver: Send + Sync {
         _runtime_id: &str,
         _policy: Option<&adx_core::execution::NetworkPolicy>,
         _ports: &[u16],
+        _tunnel_http_port: Option<u16>,
     ) -> Result<()> {
         Err(Error::Invalid(
             "runtime does not support network policy updates".into(),

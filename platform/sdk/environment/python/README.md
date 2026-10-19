@@ -385,6 +385,17 @@ failures with an uncertain write result surface the same fields on
 `EnvironmentError`. Other malformed typed-result
 shapes can instead surface `ValueError` or `TypeError` while values are
 converted, or `RuntimeError` when resume `portMappings` is not an object.
+A confirmed cancellation before assignment returns
+`DEADLINE_EXCEEDED / never / not_started`; the SDK makes no additional attempt
+or backoff after that response. `error.scheduling_failure` contains placement
+rejection counts, requested resources, and worker capacity/available maxima
+when the server supplies them. Maxima are per dimension and may describe
+different workers; diagnostics describe the current snapshot, not future
+capacity after scaling. A deliberate new create call can start a new queue wait.
+Unconfirmed runtime/transport results retain the same-operation retry policy.
+After retries, a complete service failure remains `EnvironmentHTTPError` with
+its status, payload and metadata; it is not labeled as a connection failure.
+
 `reload()` translates `EnvironmentError` into `False`; it does not normalize those
 other programming/shape exceptions.
 
@@ -473,6 +484,21 @@ passing `None` clears it. Adxlet reserves the EXECD control port and declared
 published ports with the highest rule priority so a user default-deny policy
 cannot cut the control route. User priorities must be in `1..UINT32_MAX-1`.
 Enforcement is provided by sandboxd's network policy implementation.
+
+Reverse tunnels also retain their server-owned WS listener (default 8765;
+`upstream` HTTP port minus one). The HTTP proxy remains guest-loopback only.
+Tunnel ports cannot overlap the Execd control or published ports, and caller
+`EXECD_TUNNEL_*` environment overrides are rejected. With a traffic policy,
+reverse tunnels require stateful mode; stateless combinations are rejected at
+creation and replacement. After a successful policy update, an Environment
+that owns a tunnel actively retires its current WS transport. The existing
+reconnect loop retains the session and resumable requests while opening a fresh
+connection. Policy-update completion does not wait for tunnel readiness; retry
+application requests during recovery. Updates through another client or raw HTTP
+are detected by the existing application heartbeat (20-second interval and
+10-second pong timeout by default). Only tunnel ingress is protected, so its
+local source port does not authorize new outbound connections.
+
 
 ## Connection configuration
 
