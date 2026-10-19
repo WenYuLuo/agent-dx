@@ -65,19 +65,24 @@ def workload_settings(config):
 
 
 def p2_required_metrics(node):
-    common = list(OUTBOARD_GAUGES) + [
-        'afs_dfs_outboard_events_total{event="' + event + '"}' for event in (
+    common = list(OUTBOARD_GAUGES)
+    for event in (
             'reserve_total_failed', 'reserve_resident_failed', 'write_without_proof',
-            'range_fullscan_fallback', 'range_fullscan_unretained')]
+            'range_fullscan_fallback', 'range_fullscan_unretained'):
+        common.append('afs_dfs_outboard_events_total{event="' + event + '"}')
     if node == 'a':
         return common + ['afs_dfs_read_rpc_calls_total{method="validate_read_grants"}']
-    return common + ['afs_dfs_read_rpc_calls_total{method="get_chunk_sources"}',
+    required = common + [
+        'afs_dfs_read_rpc_calls_total{method="get_chunk_sources"}',
         'afs_dfs_peer_disk_cache_data_read_calls_total',
         'afs_dfs_read_copy_bytes_total{stage="cache_to_output"}',
-        'afs_fuse_callbacks_total{filesystem="dfs",operation="read"}'] + [
-        'afs_dfs_read_hash_bytes_total{stage="' + stage + '"}' for stage in (
+        'afs_fuse_callbacks_total{filesystem="dfs",operation="read"}',
+    ]
+    for stage in (
             'root_in_receive', 'root_fallback', 'outboard_body_hash', 'outboard_parent_hash',
-            'cache_segment_hash', 'cache_full_hash')]
+            'cache_segment_hash', 'cache_full_hash'):
+        required.append('afs_dfs_read_hash_bytes_total{stage="' + stage + '"}')
+    return required
 
 
 def metric_evidence(label, snapshots):

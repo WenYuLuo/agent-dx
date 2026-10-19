@@ -36,42 +36,57 @@ class Configuration(unittest.TestCase):
             driver.validate_config(cfg)
         self.assertEqual(driver.workload_settings(cfg)['write_block_bytes'], 1024**2)
         cfg['size_bytes'] = 64 * 1024**2
-        with self.assertRaises(ValueError): driver.validate_config(cfg)
+        with self.assertRaises(ValueError):
+            driver.validate_config(cfg)
 
     def test_scene_write_size_must_match_frozen_contract(self):
         for size in [0, True, 4097, 8 * 1024**2]:
-            cfg = fixture(); cfg['write_block_bytes'] = size
-            with self.subTest(size=size), self.assertRaises(ValueError): driver.validate_config(cfg)
-        cfg = fixture(); cfg.update(scene='write-1g', size_bytes=1024**3,
-                                    write_block_bytes=4 * 1024**2)
-        with self.assertRaises(ValueError): driver.validate_config(cfg)
+            cfg = fixture()
+            cfg['write_block_bytes'] = size
+            with self.subTest(size=size), self.assertRaises(ValueError):
+                driver.validate_config(cfg)
+        cfg = fixture()
+        cfg.update(
+            scene='write-1g', size_bytes=1024**3,
+            write_block_bytes=4 * 1024**2,
+        )
+        with self.assertRaises(ValueError):
+            driver.validate_config(cfg)
 
     def test_p2_profile_requires_separate_node_endpoints(self):
-        cfg = fixture(); cfg['labels']['afs-baseline']['metric_profile'] = 'p2'
-        with self.assertRaises(ValueError): driver.validate_config(cfg)
+        cfg = fixture()
+        cfg['labels']['afs-baseline']['metric_profile'] = 'p2'
+        with self.assertRaises(ValueError):
+            driver.validate_config(cfg)
         cfg['labels']['afs-baseline']['metrics'] = [
             {'node': node, 'name': 'node-' + node, 'url': 'http://127.0.0.1:9000/metrics'}
             for node in ['a', 'b']]
         driver.validate_config(cfg)
         cfg['labels']['afs-baseline']['metric_profile'] = 'typo'
-        with self.assertRaises(ValueError): driver.validate_config(cfg)
+        with self.assertRaises(ValueError):
+            driver.validate_config(cfg)
 
     def test_r7_fetch_profile_is_explicit_and_needs_p2_endpoints(self):
-        cfg = fixture(); label = cfg['labels']['afs-baseline']
+        cfg = fixture()
+        label = cfg['labels']['afs-baseline']
         label['fetch_metric_profile'] = 'r7'
-        with self.assertRaisesRegex(ValueError, 'p2 A/B endpoints'): driver.validate_config(cfg)
+        with self.assertRaisesRegex(ValueError, 'p2 A/B endpoints'):
+            driver.validate_config(cfg)
         label['metric_profile'] = 'p2'
         label['metrics'] = [{'node': node, 'name': 'node-' + node,
                              'url': 'http://127.0.0.1:9000/metrics'} for node in ['a', 'b']]
         driver.validate_config(cfg)
         label['fetch_metric_profile'] = 'typo'
-        with self.assertRaisesRegex(ValueError, 'fetch metric profile'): driver.validate_config(cfg)
+        with self.assertRaisesRegex(ValueError, 'fetch metric profile'):
+            driver.validate_config(cfg)
 
     def test_explicit_driver_memory_admission(self):
-        cfg = fixture(); cfg['nodes']['a']['min_available_memory_bytes'] = 3 * 1024**3
+        cfg = fixture()
+        cfg['nodes']['a']['min_available_memory_bytes'] = 3 * 1024**3
         driver.validate_config(cfg)
         cfg['nodes']['a']['min_available_memory_bytes'] = True
-        with self.assertRaises(ValueError): driver.validate_config(cfg)
+        with self.assertRaises(ValueError):
+            driver.validate_config(cfg)
 
     def test_valid_dual_modes(self):
         driver.validate_config(fixture())
@@ -286,6 +301,7 @@ class MetricsSampling(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             original_write = driver.worker.os.write
             lengths = []
+
             def write(fd, payload):
                 lengths.append(len(payload))
                 return original_write(fd, payload)

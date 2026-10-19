@@ -181,8 +181,8 @@ def expected_digest(size, salt):
 
 
 def write_prepared(path, data, digest, write_block_bytes=BLOCK):
-    if (isinstance(write_block_bytes, bool) or not isinstance(write_block_bytes, int)
-            or not 0 < write_block_bytes <= BLOCK or write_block_bytes % 4096):
+    invalid_type = isinstance(write_block_bytes, bool) or not isinstance(write_block_bytes, int)
+    if invalid_type or not 0 < write_block_bytes <= BLOCK or write_block_bytes % 4096:
         raise ValueError('write block must be a positive 4096-aligned size at most 4MiB')
     path = Path(path)
     temporary = path.with_name(path.name + '.tmp')
@@ -222,7 +222,9 @@ def write_prepared(path, data, digest, write_block_bytes=BLOCK):
             'open_end_monotonic_ns': open_end, 'write_start_monotonic_ns': write_start,
             'file_fsync_end_monotonic_ns': fsync_end,
             'write_and_fsync_ns': fsync_end - write_start,
-            'write_and_fsync_boundary': 'before first write loop to successful file fsync return; excludes open, close, rename and directory fsync',
+            'write_and_fsync_boundary': (
+                'before first write loop to successful file fsync return; '
+                'excludes open, close, rename and directory fsync'),
             'write_block_bytes': write_block_bytes, 'write_syscalls': syscalls,
             'file_fsync_ns': fsync_ns, 'write_call_ns': calls, 'bytes': len(data),
             'sha256': digest, 'file_fsync': True, 'parent_fsync': True,
@@ -351,8 +353,9 @@ def role(config):
                 before = metrics(config)
                 send_frame(connection, token, {**common, 'type': 'BEGIN_READY'})
                 receive_frame(connection, token, run_id, 'PUBLISHED')
-                first = verify_read(read_file(config['path'], config['series'] == 'contract', config.get('diagnostic', False)),
-                                    config['size_bytes'], expected)
+                first = verify_read(
+                    read_file(config['path'], config['series'] == 'contract', config.get('diagnostic', False)),
+                    config['size_bytes'], expected)
                 cold_end = time.monotonic_ns()
                 send_frame(connection, token, {**common, 'type': 'FIRST_COMPLETE', 'read': first})
                 # Snapshot is after the first ACK, outside the A first E2E boundary.
@@ -361,8 +364,9 @@ def role(config):
                 while time.monotonic_ns() < deadline:
                     time.sleep(max(0, (deadline - time.monotonic_ns()) / 1e9))
                 repeat_start = time.monotonic_ns()
-                repeat = verify_read(read_file(config['path'], config['series'] == 'contract', config.get('diagnostic', False)),
-                                     config['size_bytes'], expected)
+                repeat = verify_read(
+                    read_file(config['path'], config['series'] == 'contract', config.get('diagnostic', False)),
+                    config['size_bytes'], expected)
                 gap_ns = repeat_start - cold_end
                 send_frame(connection, token, {**common, 'type': 'COMPLETE', 'read': repeat,
                                                'repeat_gap_ns': gap_ns})
