@@ -430,6 +430,15 @@ fsync依赖原持久副本与Meta屏障。S3原有窗口、载荷／descriptor�
 否则保留正文至发布且最后持有者释放。普通write接纳成功不等同已发布，成功fsync、
 同步写、可写close/flush和排空仍等待所需对象与Meta持久屏障。
 
+后台写入错误由所属inode保存，各打开handle按自己的错误cursor观察。上传重试或发布已恢复后，
+同一handle仍可能收到此前未消费的错误；错误返回不等于本次又发生一次上传故障，
+不能据此承诺固定重试次数后必然成功。不同inode不应继承该业务错误。
+
+正常停止的dirty drain是best-effort：按inode推进，首个inode提交失败时返回错误，
+后续inode可能尚未发布；调用方不能将该停止报告为排空成功。成功fsync的持久性保证不变，
+未同步的dirty写入不承诺在失败停止或强杀／OOM后全部保留。需保证全部写入已同步时，
+应先停止应用写入并确认各文件同步成功，再正常停止Node；这不是持FD dirty排空已验收的声明。
+
 `afs_dfs_native_write_resources{resource="..."}`分别报告live／峰值／等待、descriptor实际／
 预留、publication scratch预留、control、upload和压力事件；不带inode标签。
 这些项存在包含或预留关系，不直接相加；4MiB限新增W2结构，不含P1M既有完整文件布局、

@@ -2354,6 +2354,7 @@ struct NativeUploadState {
     task: Option<tokio::task::JoinHandle<Result<NativeChunkReceipt>>>,
     receipt: Option<NativeChunkReceipt>,
     error: Option<Error>,
+    terminal_error: Option<Error>,
     joining: bool,
 }
 
@@ -2363,6 +2364,9 @@ impl NativeUpload {
             .state
             .lock()
             .map_err(|_| unavailable("native upload state is poisoned"))?;
+        if let Some(error) = &state.terminal_error {
+            return Err(error.clone());
+        }
         if let Some(body) = &state.body {
             let start = usize::try_from(offset)
                 .map_err(|_| file_too_large())?
@@ -3042,7 +3046,9 @@ impl DistributedFs {
                             }
                             NativeWriteAdmission::Wait { epoch } => {
                                 if pipeline.runtime.is_none() {
-                                    while let Some(upload) = self.next_native_upload()? {
+                                    while let Some(upload) =
+                                        Self::next_native_upload_for_cell(&cell)?
+                                    {
                                         self.wait_native_upload(&upload)?;
                                     }
                                 }
@@ -3150,10 +3156,11 @@ impl DistributedFs {
         let retained_nonlocal = state.dirty_extents.iter_extents().any(|extent| {
             extent.native_upload.as_ref().is_some_and(|upload| {
                 upload.state.lock().is_ok_and(|state| {
-                    state
-                        .receipt
-                        .as_ref()
-                        .is_some_and(|receipt| !receipt.local_required_and_durable)
+                    state.terminal_error.is_none()
+                        && state
+                            .receipt
+                            .as_ref()
+                            .is_some_and(|receipt| !receipt.local_required_and_durable)
                 })
             })
         });
@@ -3218,6 +3225,7 @@ impl DistributedFs {
                     task: None,
                     receipt: None,
                     error: None,
+                    terminal_error: None,
                     joining: false,
                 }),
                 cv: Condvar::new(),
@@ -3268,22 +3276,35 @@ impl DistributedFs {
         // a second W2 payload or per-object queue. Hold no registry lock while
         // examining an inode or waiting for an upload.
         for (_, cell) in self.inode_writes.snapshot()? {
-            let state = cell
-                .lock()
-                .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
-            for extent in state.dirty_extents.iter_extents() {
-                if let Some(upload) = &extent.native_upload {
-                    let upload_state = upload
-                        .state
-                        .lock()
-                        .map_err(|_| unavailable("native upload state is poisoned"))?;
-                    if upload_state.receipt.is_none()
-                        && upload_state.task.is_none()
-                        && !upload_state.joining
-                        && upload_state.error.is_none()
-                    {
-                        return Ok(Some(upload.clone()));
-                    }
+            if let Some(upload) = Self::next_native_upload_for_cell(&cell)? {
+                return Ok(Some(upload));
+            }
+        }
+        Ok(None)
+    }
+
+    fn next_native_upload_for_cell(
+        cell: &SharedInodeWriteState,
+    ) -> Result<Option<Arc<NativeUpload>>> {
+        let state = cell
+            .lock()
+            .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+        if state.terminal_error.is_some() {
+            return Ok(None);
+        }
+        for extent in state.dirty_extents.iter_extents() {
+            if let Some(upload) = &extent.native_upload {
+                let upload_state = upload
+                    .state
+                    .lock()
+                    .map_err(|_| unavailable("native upload state is poisoned"))?;
+                if upload_state.receipt.is_none()
+                    && upload_state.task.is_none()
+                    && !upload_state.joining
+                    && upload_state.error.is_none()
+                    && upload_state.terminal_error.is_none()
+                {
+                    return Ok(Some(upload.clone()));
                 }
             }
         }
@@ -3299,6 +3320,9 @@ impl DistributedFs {
             .state
             .lock()
             .map_err(|_| unavailable("native upload state is poisoned"))?;
+        if let Some(error) = &state.terminal_error {
+            return Err(error.clone());
+        }
         if state.receipt.is_some() || state.task.is_some() || state.joining || state.error.is_some()
         {
             return Ok(false);
@@ -3381,70 +3405,98 @@ impl DistributedFs {
             .native_pipeline
             .as_ref()
             .ok_or_else(|| unavailable("native write pipeline is missing"))?;
-        let result = match result {
-            Ok(receipt)
-                if receipt.receipt.operation_id != upload.operation_id
-                    || receipt.receipt.chunk != upload.chunk =>
-            {
-                Err(invalid("native receipt differs from its immutable upload"))
-            }
-            Ok(receipt) => {
-                let actual = std::mem::size_of::<NativeUpload>()
-                    + std::mem::size_of::<Mutex<NativeMetadataLease>>()
-                    + 4 * std::mem::size_of::<usize>()
-                    + upload.operation_id.0.capacity()
-                    + upload.chunk.id.0.capacity()
-                    + native_receipt_heap(&receipt.receipt);
-                let mut descriptor = upload
-                    ._descriptor
-                    .lock()
-                    .map_err(|_| unavailable("native descriptor reservation is poisoned"))?;
-                let budget = descriptor.budget.clone();
-                let mut metadata = budget
-                    .state
-                    .lock()
-                    .map_err(|_| unavailable("native metadata budget is poisoned"))?;
-                descriptor
-                    .set_actual_locked(actual, &mut metadata)
-                    .map(|()| receipt)
-            }
-            Err(error) => Err(error),
-        };
-        let mut state = upload
-            .state
-            .lock()
-            .map_err(|_| unavailable("native upload state is poisoned"))?;
-        state.joining = false;
-        let failure = match result {
-            Ok(receipt) => {
+        // Do not move a successful receipt until every fallible structural lock
+        // has been acquired. A broken installer must retain that identity and
+        // the original body/reservation without advertising a healthy install.
+        let mut result = Some(result);
+        let installed: Result<Option<Error>> = (|| {
+            let retained = result
+                .as_ref()
+                .ok_or_else(|| unavailable("native installer lost its retained result"))?;
+            let failure = match retained {
+                Ok(receipt)
+                    if receipt.receipt.operation_id != upload.operation_id
+                        || receipt.receipt.chunk != upload.chunk =>
+                {
+                    Some(invalid("native receipt differs from its immutable upload"))
+                }
+                Ok(receipt) => {
+                    let actual = std::mem::size_of::<NativeUpload>()
+                        + std::mem::size_of::<Mutex<NativeMetadataLease>>()
+                        + 4 * std::mem::size_of::<usize>()
+                        + upload.operation_id.0.capacity()
+                        + upload.chunk.id.0.capacity()
+                        + native_receipt_heap(&receipt.receipt);
+                    let mut descriptor = upload
+                        ._descriptor
+                        .lock()
+                        .map_err(|_| unavailable("native descriptor reservation is poisoned"))?;
+                    let budget = descriptor.budget.clone();
+                    let mut metadata = budget
+                        .state
+                        .lock()
+                        .map_err(|_| unavailable("native metadata budget is poisoned"))?;
+                    // Capacity refusal remains an owner-scoped business error.
+                    descriptor.set_actual_locked(actual, &mut metadata).err()
+                }
+                Err(error) => Some(error.clone()),
+            };
+            let mut state = upload
+                .state
+                .lock()
+                .map_err(|_| unavailable("native upload state is poisoned"))?;
+            let mut metadata = pipeline
+                .metadata
+                .state
+                .lock()
+                .map_err(|_| unavailable("native metadata budget is poisoned"))?;
+            state.joining = false;
+            if let Some(error) = &failure {
+                state.error = Some(error.clone());
+                metadata.failed += 1;
+            } else {
+                let Some(Ok(receipt)) = result.take() else {
+                    return Err(unavailable("native installer lost its validated receipt"));
+                };
                 if receipt.local_required_and_durable {
                     state.body = None;
                 }
                 state.receipt = Some(receipt);
-                pipeline
-                    .metadata
-                    .state
-                    .lock()
-                    .map_err(|_| unavailable("native metadata budget is poisoned"))?
-                    .completed += 1;
-                None
+                metadata.completed += 1;
             }
-            Err(error) => {
-                state.error = Some(error.clone());
-                pipeline
-                    .metadata
-                    .state
-                    .lock()
-                    .map_err(|_| unavailable("native metadata budget is poisoned"))?
-                    .failed += 1;
-                Some(error)
+            upload.cv.notify_all();
+            if failure.is_none() {
+                pipeline.notify.notify_one();
             }
-        };
-        upload.cv.notify_all();
-        if failure.is_none() {
+            Ok(failure)
+        })();
+        if let Err(error) = &installed {
+            // Poison recovery is cleanup-only: never clear poison, release a
+            // body/charge, or permit this upload to retry as healthy. A valid
+            // receipt is diagnostic retention, not an installed success.
+            let mut state = upload
+                .state
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            state.joining = false;
+            state.terminal_error = Some(error.clone());
+            if let Some(Ok(receipt)) = result.take()
+                && receipt.receipt.operation_id == upload.operation_id
+                && receipt.receipt.chunk == upload.chunk
+            {
+                state.receipt = Some(receipt);
+            }
+            drop(state);
+            if let Some(cell) = upload.owner.upgrade() {
+                cell.lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .terminal_error = Some(error.clone());
+                cell.notify_all();
+            }
+            upload.cv.notify_all();
             pipeline.notify.notify_one();
         }
-        Ok(failure)
+        installed
     }
 
     fn poll_native_uploads(&self) -> Result<Option<Error>> {
@@ -3480,13 +3532,20 @@ impl DistributedFs {
                     .block_on(task)
                     .map_err(|error| unavailable(format!("native upload worker failed: {error}")))
                     .and_then(|result| result);
-                let installed = self.install_native_receipt(&upload, result)?;
-                pipeline
-                    .tasks
-                    .lock()
-                    .map_err(|_| unavailable("native upload task table is poisoned"))?
-                    .retain(|other| !Arc::ptr_eq(other, &upload));
-                if let Some(error) = installed {
+                let installed = self.install_native_receipt(&upload, result);
+                // A consumed JoinHandle must leave the table even when receipt
+                // installation encounters a structural error. This guard only
+                // removes the joined slot; a poisoned table remains poisoned.
+                match pipeline.tasks.lock() {
+                    Ok(mut table) => table.retain(|other| !Arc::ptr_eq(other, &upload)),
+                    Err(poison) => {
+                        poison
+                            .into_inner()
+                            .retain(|other| !Arc::ptr_eq(other, &upload));
+                        return Err(unavailable("native upload task table is poisoned"));
+                    }
+                }
+                if let Some(error) = installed? {
                     if let Some(cell) = upload.owner.upgrade() {
                         let mut state = cell
                             .lock()
@@ -3528,6 +3587,9 @@ impl DistributedFs {
                     .state
                     .lock()
                     .map_err(|_| unavailable("native upload state is poisoned"))?;
+                if let Some(error) = &state.terminal_error {
+                    return Err(error.clone());
+                }
                 if let Some(receipt) = &state.receipt {
                     return Ok(receipt.receipt.clone());
                 }
@@ -5736,6 +5798,7 @@ impl DistributedFs {
                     task: None,
                     receipt: None,
                     error: None,
+                    terminal_error: None,
                     joining: false,
                 }),
                 cv: Condvar::new(),
@@ -17456,6 +17519,214 @@ mod tests {
         assert_eq!(a_meta.commits.lock().unwrap().len(), 1);
         assert_eq!(b_meta.commits.lock().unwrap().len(), 2);
         assert_eq!(b_meta.commits.lock().unwrap()[1].file_version.length, 8);
+    }
+
+    #[test]
+    fn p2_review_no_runtime_wait_never_consumes_another_inode_upload_error() {
+        let (_a_temp, a_meta, mut a_fs, _runtime, store) =
+            native_pipeline_fixture(false, 4 * 1024 * 1024, 8);
+        let (_b_temp, b_meta, mut b_fs) = test_fs();
+        b_meta.inode.lock().unwrap().inode_id = InodeId::new("inode:no-runtime-b");
+        b_meta.lease.lock().unwrap().inode_id = InodeId::new("inode:no-runtime-b");
+        let pipeline = Arc::new(NativeWritePipeline::new(
+            NativeWriteBudget::new(4 * 1024 * 1024),
+            NativeWriteConfig::default(),
+            None,
+            None,
+        ));
+        a_fs.native_pipeline = Some(pipeline.clone());
+        b_fs.native_pipeline = Some(pipeline.clone());
+        b_fs.chunk_store = store.clone();
+        b_fs.next_operation.store(10_000, Ordering::SeqCst);
+        let a = a_fs
+            .create(
+                &context(),
+                a_fs.root_inode(),
+                OsStr::new("no-runtime-a"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        let b = b_fs
+            .create(
+                &context(),
+                b_fs.root_inode(),
+                OsStr::new("no-runtime-b"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        let a_id = a_fs.inode_id(a.entry.inode).unwrap();
+        let a_cell = a_fs.write_state(&a_id).unwrap().unwrap();
+        // The existing single-inode Meta fixture uses separate facades; share
+        // its real cell as well as the store/pipeline to exercise a Node-wide scan.
+        b_fs.inode_writes.insert(a_id, a_cell.clone()).unwrap();
+        a_fs.write(&context(), a.handle, 0, &vec![0x48; 4 * 1024 * 1024])
+            .unwrap();
+        let upload = a_fs.next_native_upload().unwrap().unwrap();
+        let operation = upload.operation_id.clone();
+        let chunk = upload.chunk.clone();
+        store.fail_next.store(true, Ordering::SeqCst);
+        let error = b_fs.write(&context(), b.handle, 0, b"b").unwrap_err();
+        assert!(
+            error.to_string().contains("externally driven writeback"),
+            "B must report its own capacity limitation rather than A's upload failure: {error}"
+        );
+        assert_eq!(
+            store.calls.load(Ordering::SeqCst),
+            0,
+            "B must not execute A's failing synchronous upload"
+        );
+        assert!(upload.state.lock().unwrap().error.is_none());
+        assert!(a_meta.commits.lock().unwrap().is_empty());
+        assert!(b_meta.commits.lock().unwrap().is_empty());
+        assert!(
+            a_fs.fsync(&context(), a.handle, SyncMode::Full)
+                .unwrap_err()
+                .to_string()
+                .contains("injected native upload failure")
+        );
+        assert!(a_meta.commits.lock().unwrap().is_empty());
+        a_fs.fsync(&context(), a.handle, SyncMode::Full).unwrap();
+        assert_eq!(a_meta.commits.lock().unwrap()[0].operation_id, operation);
+        assert_eq!(
+            a_meta.commits.lock().unwrap()[0].chunk_receipts[0].chunk,
+            chunk
+        );
+        drop(upload);
+        assert_eq!(b_fs.write(&context(), b.handle, 0, b"b").unwrap(), 1);
+        b_fs.fsync(&context(), b.handle, SyncMode::Full).unwrap();
+        assert_eq!(b_meta.commits.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn p2_review_structural_install_failure_cleans_join_without_retiring_body() {
+        let (_temp, meta, fs, _runtime, store) = native_pipeline_fixture(false, 8 * 1024 * 1024, 8);
+        let file = fs
+            .create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new("structural-install"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        fs.write(&context(), file.handle, 0, &vec![0x72; 4 * 1024 * 1024])
+            .unwrap();
+        let pipeline = fs.native_pipeline.as_ref().unwrap().clone();
+        let upload = pipeline.tasks.lock().unwrap()[0].clone();
+        let operation = upload.operation_id.clone();
+        let chunk = upload.chunk.clone();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !upload
+            .state
+            .lock()
+            .unwrap()
+            .task
+            .as_ref()
+            .unwrap()
+            .is_finished()
+        {
+            assert!(
+                Instant::now() < deadline,
+                "structural fixture upload did not finish"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let reserved_before = pipeline
+            .metadata
+            .state
+            .lock()
+            .unwrap()
+            .descriptor_reserved_bytes;
+        // A real installer outer error: capacity rejection would be an inner
+        // business error and cannot prove task-table cleanup on this branch.
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = upload._descriptor.lock().unwrap();
+            panic!("intentional descriptor poison for terminal cleanup regression");
+        }));
+        assert!(poisoned.is_err());
+        let error = fs.poll_native_uploads().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("native descriptor reservation is poisoned")
+        );
+        assert!(
+            pipeline.tasks.lock().unwrap().is_empty(),
+            "a consumed JoinHandle must not leave an unjoinable task slot"
+        );
+        let cell = fs
+            .write_state(&fs.inode_id(file.entry.inode).unwrap())
+            .unwrap()
+            .unwrap();
+        assert!(
+            cell.lock().unwrap().terminal_error.is_some(),
+            "the damaged owner must become terminal rather than retry as healthy"
+        );
+        {
+            let state = upload.state.lock().unwrap();
+            assert!(!state.joining);
+            assert!(state.task.is_none());
+            assert_eq!(upload.operation_id, operation);
+            assert_eq!(upload.chunk, chunk);
+            assert_eq!(state.body.as_ref().unwrap().len(), 4 * 1024 * 1024);
+            assert_eq!(
+                state.receipt.as_ref().unwrap().receipt.chunk,
+                chunk,
+                "preserve the successful durable receipt for terminal diagnostics"
+            );
+        }
+        assert_eq!(
+            pipeline.budget.snapshot().live_bytes,
+            4 * 1024 * 1024,
+            "a terminal error is not permission to retire a still-owned body"
+        );
+        let mut output = [0xa5; 16];
+        assert!(upload.read_at(store.as_ref(), 0, &mut output).is_err());
+        assert_eq!(
+            output, [0xa5; 16],
+            "terminal diagnostic receipt must not enable a read"
+        );
+        assert!(fs.start_native_upload(&upload, true).is_err());
+        let before = Instant::now();
+        for _ in 0..2 {
+            assert!(fs.wait_native_upload(&upload).is_err());
+        }
+        assert!(fs.drain().is_err());
+        assert!(before.elapsed() < Duration::from_secs(5));
+        assert_eq!(
+            store.calls.load(Ordering::SeqCst),
+            1,
+            "terminal state must not retry through a poisoned descriptor"
+        );
+        assert!(meta.commits.lock().unwrap().is_empty());
+        assert_eq!(
+            pipeline
+                .metadata
+                .state
+                .lock()
+                .unwrap()
+                .descriptor_reserved_bytes,
+            reserved_before,
+            "a poisoned installer must retain the original reservation"
+        );
+        drop(upload);
+        drop(fs);
+        assert_eq!(
+            pipeline.budget.snapshot().live_bytes,
+            4 * 1024 * 1024,
+            "the explicit inode view still owns the dirty body after its facade drops"
+        );
+        drop(cell);
+        assert_eq!(
+            pipeline.budget.snapshot().live_bytes,
+            0,
+            "only the final body owner releases its charge"
+        );
+        let metadata = pipeline.metadata.state.lock().unwrap();
+        assert_eq!(metadata.descriptors, 0);
+        assert_eq!(metadata.descriptor_reserved_bytes, 0);
     }
 
     // W-2 changes version publication, not merely a dirty-budget constant.
