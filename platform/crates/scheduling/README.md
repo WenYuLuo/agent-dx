@@ -76,3 +76,14 @@ The migrated optimizations are documented with baseline provenance, configuratio
 - `coordinator/src/queue.rs`: ordered priority/FIFO trees per tenant, round-robin across tenants, retained tickets for deferred requests. No full backlog drain on each assignment.
 
 These changes do not add distributed queues or persistence. The event-loop API is `take_ready_shard` + `schedule_round`; `RoundOutcome.error` can coexist with successful assignments, which the caller must still dispatch. Topology expansion is outside this optimization iteration.
+
+## Queue-expiry diagnostics
+
+`Framework::rejections` evaluates hard filters on a read-only candidate and
+reports every failed filter; it does not score, allocate, or change selection.
+Scalar non-fit is split into CPU, memory and disk reasons. Coordinator combines
+these results under its scheduling lock with the same reservation ledgers used
+for placement. Diagnostics are evaluated on queue expiry, outside the normal
+selection hot path. Rejection counts can overlap, and capacity maxima do not
+imply a jointly feasible node. See the [HTTP error contract](../../api/http/error-contract.md#调度队列到期)
+for cancellation, retry and public diagnostic semantics.

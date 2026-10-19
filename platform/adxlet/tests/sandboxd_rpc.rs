@@ -496,11 +496,11 @@ async fn dynamic_network_policy_uses_generated_backend_identity_and_can_clear() 
         dns: None,
     };
     adapter
-        .set_network_policy("i-1", Some(&policy), &[8080])
+        .set_network_policy("i-1", Some(&policy), &[8080], None)
         .await
         .unwrap();
     adapter
-        .set_network_policy("i-1", None, &[8080])
+        .set_network_policy("i-1", None, &[8080], None)
         .await
         .unwrap();
     let updates = server.network_updates.lock().unwrap();
@@ -1148,7 +1148,7 @@ async fn stateless_policy_allows_execd_and_published_port_replies() {
     let (adapter, _harness) = connect(server.clone()).await;
     adapter.start(&spec, "i-1", 1, &[]).await.unwrap();
     adapter
-        .set_network_policy("i-1", Some(&policy), &[8080])
+        .set_network_policy("i-1", Some(&policy), &[8080], None)
         .await
         .unwrap();
     let starts = server.starts.lock().unwrap();
@@ -1220,7 +1220,7 @@ async fn blocked_policy_preserves_only_node_control_endpoint_at_start_and_update
     let (adapter, _harness) = connect_with_env(server.clone(), env).await;
     adapter.start(&spec, "i-1", 1, &[]).await.unwrap();
     adapter
-        .set_network_policy("i-1", Some(&policy), &[])
+        .set_network_policy("i-1", Some(&policy), &[], None)
         .await
         .unwrap();
     let updates = server.network_updates.lock().unwrap();
@@ -1290,7 +1290,7 @@ async fn stateful_policy_keeps_execd_replies_independent_of_conntrack_generation
     let (adapter, _harness) = connect(server.clone()).await;
     adapter.start(&spec, "i-1", 1, &[]).await.unwrap();
     adapter
-        .set_network_policy("i-1", Some(&policy), &[])
+        .set_network_policy("i-1", Some(&policy), &[], None)
         .await
         .unwrap();
     let starts = server.starts.lock().unwrap();
@@ -1571,4 +1571,66 @@ async fn backend_transport_failure_remains_unavailable() {
     assert_eq!(status.code(), tonic::Code::Unavailable);
     assert!(status.message().contains("sandboxd transport"));
     assert!(adx_protocol::deadline_failure(&status).is_none());
+}
+
+#[tokio::test]
+async fn blocked_tunnel_listeners_are_trusted_and_never_add_an_egress_exception() {
+    use adx_core::execution as model;
+    let policy = model::NetworkPolicy {
+        traffic: Some(model::TrafficPolicy {
+            ingress_default_action: model::NetworkAction::Deny,
+            egress_default_action: model::NetworkAction::Deny,
+            rules: vec![],
+            mode: model::TrafficMode::Stateful,
+        }),
+        dns: None,
+    };
+    for http_port in [8766, 18766] {
+        let mut spec = spec();
+        spec.execution.network = Some(policy.clone());
+        spec.execution.tunnel_http_port = Some(http_port);
+        spec.env
+            .insert("EXECD_TUNNEL_WS_PORT".into(), "12345".into());
+        let server = Server::default();
+        let (adapter, _harness) = connect(server.clone()).await;
+        adapter.start(&spec, "i-1", 1, &[]).await.unwrap();
+        adapter
+            .set_network_policy("i-1", Some(&policy), &[], Some(http_port))
+            .await
+            .unwrap();
+        let starts = server.starts.lock().unwrap();
+        let updates = server.network_updates.lock().unwrap();
+        assert_eq!(
+            starts[0].envs["EXECD_TUNNEL_WS_PORT"],
+            (http_port - 1).to_string()
+        );
+        for policy in [
+            starts[0].network_policy.as_ref().unwrap(),
+            updates[0].network_policy.as_ref().unwrap(),
+        ] {
+            let traffic = policy.traffic.as_ref().unwrap();
+            let rules: Vec<_> = traffic
+                .rules
+                .iter()
+                .filter(|rule| {
+                    rule.sandbox_port_range
+                        .as_ref()
+                        .is_some_and(|range| range.first == u32::from(http_port - 1))
+                })
+                .collect();
+            assert_eq!(rules.len(), 1);
+            assert_eq!(rules[0].direction, NetworkDirection::Ingress as i32);
+            assert_eq!(rules[0].protocol, NetworkProtocol::Tcp as i32);
+            assert_eq!(rules[0].priority, u32::MAX);
+            assert!(!traffic.rules.iter().any(|rule| rule
+                .sandbox_port_range
+                .as_ref()
+                .is_some_and(|range| range.first == u32::from(http_port) || range.first == 12345)));
+        }
+    }
+    let mut spec = spec();
+    spec.env
+        .insert("EXECD_TUNNEL_WS_PORT".into(), "12345".into());
+    let request = start_request(&spec, "i-1", 1, &[], &Config::default()).unwrap();
+    assert!(!request.envs.contains_key("EXECD_TUNNEL_WS_PORT"));
 }

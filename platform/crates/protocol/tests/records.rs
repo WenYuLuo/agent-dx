@@ -9,6 +9,7 @@ fn environment_options_roundtrip_preserves_backend_contract() {
 
     let options = model::ExecutionOptions {
         cwd: Some("/workspace/task".into()),
+        tunnel_http_port: Some(18766),
         rootfs: Some(model::Rootfs {
             readonly: true,
             source: model::StorageSource::S3(model::S3Source {

@@ -514,3 +514,17 @@ mod tests {
         assert_eq!(ledger.available().len(), 1);
     }
 }
+
+/// Placement diagnostics from one locked scheduling snapshot at queue expiry.
+/// Rejection counts can overlap; scalar maxima may belong to different nodes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SchedulingFailure {
+    pub snapshot_revision: u64,
+    pub node_count: u64,
+    pub eligible_nodes: u64,
+    pub requested: Resources,
+    pub max_capacity: Resources,
+    pub max_available: Resources,
+    pub rejections: BTreeMap<String, u64>,
+}

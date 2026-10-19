@@ -94,6 +94,7 @@ impl RuntimeDriver for Dependencies {
         _runtime_id: &str,
         policy: Option<&adx_core::execution::NetworkPolicy>,
         ports: &[u16],
+        _tunnel_http_port: Option<u16>,
     ) -> Result<()> {
         self.event(if policy.is_some() {
             "network:set"
@@ -1258,4 +1259,36 @@ async fn healthcheck_failure_uses_existing_cold_restart_policy() {
     assert_eq!(restarted.restart_attempts, 1);
     assert_ne!(restarted.runtime.id, created.record.runtime.id);
     assert!(restarted.failure.is_none());
+}
+
+#[tokio::test]
+async fn tunnel_rejects_stateless_update_before_changing_backend_or_record() {
+    use adx_core::execution::{NetworkAction, NetworkPolicy, TrafficMode, TrafficPolicy};
+    let deps = Dependencies::new(false);
+    let node = node(&deps);
+    let mut value = spec("tunnel-network");
+    value.execution.ports = vec![8080];
+    value.execution.tunnel_http_port = Some(8766);
+    let environment = node
+        .environment(value, assignment("tunnel-network"))
+        .unwrap();
+    let created = environment.create().await.unwrap();
+    deps.events.lock().unwrap().clear();
+    let policy = NetworkPolicy {
+        traffic: Some(TrafficPolicy {
+            ingress_default_action: NetworkAction::Deny,
+            egress_default_action: NetworkAction::Deny,
+            rules: vec![],
+            mode: TrafficMode::Stateless,
+        }),
+        dns: None,
+    };
+    assert!(matches!(
+        environment
+            .update_network_policy(Some(policy), "p".repeat(128), created.record.revision)
+            .await,
+        Err(Error::Invalid(_))
+    ));
+    assert!(deps.events.lock().unwrap().is_empty());
+    assert_eq!(environment.sync().await.unwrap().record, created.record);
 }
