@@ -485,6 +485,21 @@ published ports with the highest rule priority so a user default-deny policy
 cannot cut the control route. User priorities must be in `1..UINT32_MAX-1`.
 Enforcement is provided by sandboxd's network policy implementation.
 
+Reverse tunnels also retain their server-owned WS listener (default 8765;
+`upstream` HTTP port minus one). The HTTP proxy remains guest-loopback only.
+Tunnel ports cannot overlap the Execd control or published ports, and caller
+`EXECD_TUNNEL_*` environment overrides are rejected. With a traffic policy,
+reverse tunnels require stateful mode; stateless combinations are rejected at
+creation and replacement. After a successful policy update, an Environment
+that owns a tunnel actively retires its current WS transport. The existing
+reconnect loop retains the session and resumable requests while opening a fresh
+connection. Policy-update completion does not wait for tunnel readiness; retry
+application requests during recovery. Updates through another client or raw HTTP
+are detected by the existing application heartbeat (20-second interval and
+10-second pong timeout by default). Only tunnel ingress is protected, so its
+local source port does not authorize new outbound connections.
+
+
 ## Connection configuration
 
 Pass an immutable `ConnectionConfig` to avoid process-global environment

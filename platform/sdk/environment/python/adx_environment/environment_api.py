@@ -1035,7 +1035,8 @@ class Environment:
         """Atomically replace this environment's complete network policy.
 
         Passing None or an empty NetworkPolicy clears the policy and restores
-        unrestricted networking.
+        unrestricted networking. After acknowledgement, this client's active
+        tunnel reconnects asynchronously to refresh connection tracking.
         """
         if policy is not None and not isinstance(policy, NetworkPolicy):
             raise TypeError("policy must be a NetworkPolicy or None")
@@ -1045,6 +1046,9 @@ class Environment:
         result = self._client.update_network_policy(self._sid, body)
         if not bool(result.get("success", False)):
             raise EnvironmentError("network policy update was not acknowledged")
+        tunnel = getattr(self, "_tunnel_client", None)
+        if tunnel is not None:
+            tunnel.reconnect()
 
     def _close(self, *, delete_remote: bool) -> None:
         if self._closed:

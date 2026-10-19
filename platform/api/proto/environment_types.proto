@@ -113,6 +113,7 @@ message ExecutionOptions {
   uint64 init_timeout_seconds = 12;
   // Execd creates this constructor directory before reporting Ready.
   optional string cwd = 13;
+  optional uint32 tunnel_http_port = 14;
 }
 
 enum IdleAction { IDLE_ACTION_DELETE = 0; IDLE_ACTION_PAUSE = 1; }
