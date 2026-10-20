@@ -40,7 +40,7 @@ impl CoordinatorRpc {
         let mut removed = 0;
         for artifact in candidates {
             // Verify the Coordinator epoch before destructive I/O. Artifact identities are never reused.
-            session.claim_artifact_deletion(&artifact, None).await?;
+            let _deletion = session.claim_artifact_deletion(&artifact, None).await?;
             stores.remove(&artifact).await?;
             session.forget_artifact(&artifact).await?;
             removed += 1;

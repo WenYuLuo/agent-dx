@@ -102,7 +102,7 @@ impl CoordinatorRpc {
                         .read()
                         .expect("reclaimer registry lock poisoned")
                         .clone();
-                    session
+                    let _deletion = session
                         .claim_artifact_deletion(&snapshot.artifact, Some(&snapshot.id))
                         .await?;
                     reclaimers.remove(&snapshot.artifact).await?;

@@ -3,6 +3,7 @@
 mod claims;
 pub use claims::{ClaimOutcome, LocalClaim};
 mod artifacts;
+pub use artifacts::ArtifactDeletionGuard;
 mod collection;
 mod credentials;
 mod failure;
@@ -29,7 +30,6 @@ local old = redis.call('HGET', KEYS[1], 'header')
 if ARGV[1] == '' then
   if redis.call('HLEN', KEYS[1]) ~= 0 then return 0 end
 elseif old ~= ARGV[1] then return 0 end
-for i = 5, #ARGV, 2 do if redis.call('HEXISTS', KEYS[3], ARGV[i]) == 1 then return 2 end end
 if #ARGV == 2 then
   redis.call('HSET', KEYS[1], 'header', ARGV[2])
 else
@@ -453,6 +453,7 @@ struct Connection {
     current: Mutex<Option<MultiplexedConnection>>,
     timeout: Duration,
     committed_changes: broadcast::Sender<ControlChange>,
+    artifact_locks: std::sync::Mutex<BTreeMap<String, std::sync::Weak<tokio::sync::RwLock<()>>>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -494,6 +495,7 @@ impl RedisStore {
                 current: Mutex::new(None),
                 timeout: duration,
                 committed_changes,
+                artifact_locks: Default::default(),
             }),
             key: format!("adx:{{{namespace}}}:control:v1"),
         };
@@ -561,24 +563,25 @@ impl RedisStore {
             .as_ref()
             .map(|(name, _)| vec![(*name).to_owned()])
             .unwrap_or_default();
-        let mut cmd = redis::cmd("EVAL");
-        cmd.arg(CAS)
-            .arg(3)
-            .arg(&self.key)
-            .arg(format!("{}:artifacts", self.key))
-            .arg(format!("{}:artifact-gc", self.key))
-            .arg(expected)
-            .arg(encode(header)?);
-        if let Some((name, value)) = field {
-            let artifacts = if name.starts_with("environment:") {
-                decode::<StoredEnvironment>(&value)?
+        let artifacts = match &field {
+            Some((name, value)) if name.starts_with("environment:") => {
+                decode::<StoredEnvironment>(value)?
                     .result
                     .as_ref()
                     .map(artifacts::record_artifacts)
                     .unwrap_or_default()
-            } else {
-                vec![]
-            };
+            }
+            _ => vec![],
+        };
+        let _access = self.lock_artifacts(&artifacts)?;
+        let mut cmd = redis::cmd("EVAL");
+        cmd.arg(CAS)
+            .arg(2)
+            .arg(&self.key)
+            .arg(format!("{}:artifacts", self.key))
+            .arg(expected)
+            .arg(encode(header)?);
+        if let Some((name, value)) = field {
             cmd.arg(name).arg(value);
             for artifact in artifacts {
                 cmd.arg(artifacts::artifact_key(&artifact))
@@ -586,9 +589,6 @@ impl RedisStore {
             }
         }
         let applied: u8 = self.query(cmd).await?;
-        if applied == 2 {
-            return Err(Error::Conflict);
-        }
         if applied == 1 {
             self.notify_committed_change(header.revision, changed);
         }

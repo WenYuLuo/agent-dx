@@ -186,7 +186,7 @@ async fn acquire_and_delete_race_has_one_winner_and_deletion_fences_republicatio
             (Err(_), Ok(deleted)) => assert_eq!(deleted.state, SnapshotState::Deleting),
             pair => panic!("unexpected race result: {pair:?}"),
         }
-        session
+        let _deletion = session
             .claim_artifact_deletion(&s.artifact, Some(&s.id))
             .await
             .unwrap();

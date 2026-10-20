@@ -1,4 +1,4 @@
-//! Durable inventory, interrupted-execution holds, and deletion fencing.
+//! Durable inventory and execution holds; deletion uses scoped in-memory exclusion.
 use super::*;
 use adx_core::snapshots::Snapshot;
 use adx_core::CheckpointArtifact;
@@ -8,6 +8,51 @@ pub struct ExecutionHold {
     pub assignment: Assignment,
     pub artifacts: Vec<CheckpointArtifact>,
 }
+
+/// Serializes artifact references with deletion in the single active Coordinator.
+/// Dropping the guard (including on cancellation or failure) permits a fresh retry.
+#[must_use = "keep the guard until storage and inventory deletion have completed"]
+pub struct ArtifactDeletionGuard {
+    _lock: tokio::sync::OwnedRwLockWriteGuard<()>,
+}
+
+impl RedisStore {
+    fn artifact_lock(&self, key: String) -> Result<Arc<tokio::sync::RwLock<()>>> {
+        let mut locks = self
+            .connection
+            .artifact_locks
+            .lock()
+            .map_err(|_| Error::Unavailable("artifact lock registry poisoned".into()))?;
+        // Only active operations retain entries; completed deletions leave no tombstones.
+        locks.retain(|_, lock| lock.strong_count() != 0);
+        Ok(locks
+            .get(&key)
+            .and_then(std::sync::Weak::upgrade)
+            .unwrap_or_else(|| {
+                let lock = Arc::new(tokio::sync::RwLock::new(()));
+                locks.insert(key, Arc::downgrade(&lock));
+                lock
+            }))
+    }
+
+    pub(super) fn lock_artifacts(
+        &self,
+        artifacts: &[CheckpointArtifact],
+    ) -> Result<Vec<tokio::sync::OwnedRwLockReadGuard<()>>> {
+        artifacts
+            .iter()
+            .map(artifact_key)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .map(|key| {
+                self.artifact_lock(key)?
+                    .try_read_owned()
+                    .map_err(|_| Error::Conflict)
+            })
+            .collect()
+    }
+}
+
 impl Session {
     pub async fn execution_holds(&self) -> Result<Vec<ExecutionHold>> {
         let [header] = self.store.fields([HEADER.into()]).await?;
@@ -56,12 +101,20 @@ impl Session {
         let values: Vec<String> = self.store.query(cmd).await?;
         values.into_iter().map(|v| decode(&v)).collect()
     }
-    /// Atomically close future references before destructive I/O. The marker survives retries/epochs.
+    /// Check references and exclude concurrent publication until the guard is dropped.
+    /// No deletion marker is persisted: interrupted deletion is retried from the inventory.
     pub async fn claim_artifact_deletion(
         &self,
         artifact: &CheckpointArtifact,
         deleting_snapshot: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<ArtifactDeletionGuard> {
+        let guard = ArtifactDeletionGuard {
+            _lock: self
+                .store
+                .artifact_lock(artifact_key(artifact))?
+                .try_write_owned()
+                .map_err(|_| Error::Conflict)?,
+        };
         let raw = self.store.raw().await?;
         let header = raw.get(HEADER).ok_or(Error::Conflict)?;
         self.header(&Some(header.clone()))?;
@@ -112,22 +165,20 @@ impl Session {
                 end
                 if redis.call('HLEN',KEYS[k]) ~= count then return 0 end
             end
-            redis.call('HSET',KEYS[4],ARGV[4],'deleting'); return 1
+            return 1
         "#,
         )
-        .arg(4)
+        .arg(3)
         .arg(&self.store.key)
         .arg(self.snapshots_key())
         .arg(format!("{}:input-holds", self.store.key))
-        .arg(format!("{}:artifact-gc", self.store.key))
         .arg(header)
         .arg(encode(&snapshots)?)
-        .arg(encode(&holds)?)
-        .arg(artifact_key(artifact));
+        .arg(encode(&holds)?);
         if self.store.query::<u64>(cmd).await? != 1 {
             return Err(Error::Conflict);
         }
-        Ok(())
+        Ok(guard)
     }
     pub async fn forget_artifact(&self, artifact: &CheckpointArtifact) -> Result<()> {
         let [header] = self.store.fields([HEADER.into()]).await?;
