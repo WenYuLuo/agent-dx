@@ -326,51 +326,35 @@ impl JiuwenApi {
         let context = Arc::new(RequestContext::new(Duration::from_secs(
             self.config.request_timeout_seconds,
         )));
-        // Only the first binding creation provisions a credential. Warm reuse and
-        // downloads are independent of the LiteLLM management API.
-        match context.run(self.managed.binding(&context, &scope)).await {
-            Ok(_) => {}
-            Err(Error::NotFound) => {
-                let launch = match tokio::time::timeout_at(
-                    context.deadline(),
-                    self.auth.launch_config(&principal),
-                )
-                .await
-                {
-                    Ok(Ok(v)) => v,
-                    Ok(Err(e)) => return auth_error(e),
-                    Err(_) => return auth_error(accounts::Error::Unavailable),
-                };
-                let parameters = match self.config.parameters(&principal.user_id) {
-                    Ok(parameters) => parameters,
-                    Err(e) => return agent_error(e),
-                };
-                if let Err(e) = context
-                    .run(
-                        self.managed
-                            .prepare_binding(&context, &scope, &launch, &parameters),
-                    )
-                    .await
-                {
-                    return agent_error(e);
-                }
-            }
-            Err(e) => return agent_error(e),
-        }
         let access = AgentV2Access::new(self.managed.clone());
+        let initialization = async {
+            let mut parameters = self.auth.model_parameters(&principal).await?;
+            parameters.extend(
+                self.config
+                    .parameters(&principal.user_id)
+                    .map_err(|_| accounts::Error::Invalid)?,
+            );
+            Ok::<_, accounts::Error>(parameters)
+        };
         let selection = match access
-            .select(
+            .select_with_initializer(
                 context.clone(),
                 scope.clone(),
                 ServiceSelector {
                     protocol: Protocol::Ws,
                     port: self.config.service_port,
                 },
+                initialization,
             )
             .await
         {
             Ok(value) => value,
-            Err(e) => return agent_error(e),
+            Err(crate::ingress::agent_service::InitializationError::Agent(error)) => {
+                return agent_error(error)
+            }
+            Err(crate::ingress::agent_service::InitializationError::Source(error)) => {
+                return auth_error(error)
+            }
         };
         let connection = match Connection::connect(&ingress, &access, selection).await {
             Ok(value) => value,

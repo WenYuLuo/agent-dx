@@ -618,10 +618,10 @@ impl crate::ingress::accounts::BusinessAuth for TestAuth {
             },
         })
     }
-    async fn launch_config(
+    async fn model_parameters(
         &self,
         _: &crate::ingress::accounts::Principal,
-    ) -> crate::ingress::accounts::Result<adx_agent_core::launch::LaunchConfig> {
+    ) -> crate::ingress::accounts::Result<adx_agent_core::mounts::Parameters> {
         Err(crate::ingress::accounts::Error::Unavailable)
     }
 }

@@ -75,23 +75,15 @@ Agent 继续通过公共 Sandbox capability 的 HTTP 或同进程适配器访问
 
 /mnt/sfs/workspaces 是 SFS 在 adx-node 上的本地路径，不是远端 NFS 地址。模板挂载规则由受信任的模板发布方配置。
 
-Jiuwen 准备 Binding 时提交：
+Jiuwen 首次访问通用入口时提交初始化参数，例如：
 
-```json
-{
-  "scope": {
-    "tenant": "tenant-A",
-    "template": "coding",
-    "version": "v2",
-    "binding_id": "jiuwen-example"
-  },
-  "parameters": {
-    "workspace": "w-0123456789abcdef"
-  }
-}
+```http
+GET /agent/ws?target=urn:adx:binding:coding:v2:jiuwen-example
+Authorization: Bearer <ADX platform key>
+X-ADX-Parameters: workspace=w-0123456789abcdef
 ```
 
-示例省略现有 launch 配置。parameters 是通用字符串映射；workspace 是模板约定的参数名，Agent 不给它附加用户含义。
+Header 使用 URL 表单编码的字符串键值对。parameters 是通用字符串映射；workspace 是模板约定的参数名，Agent 不给它附加用户含义。Binding 不存在时，共享解析/激活流程才解析参数并原子创建 Binding；不提供独立准备接口。
 
 建议 Jiuwen 首版采用固定算法生成目录名，例如 w- 加 SHA256(JSON([tenant, template, user_id])) 的完整十六进制编码，示例值仅作缩写。使用认证后的内部 user_id，不使用用户可任意提交的身份字符串。算法编码和字段顺序固定，不包含 version、binding_id、generation、sandbox_id 或 agent_type；同一模板的不同 agent_type 因而可以选到同一目录，这一点需与业务权限一致。
 
@@ -101,14 +93,14 @@ Jiuwen 准备 Binding 时提交：
 
 ## 5 占位符渲染契约
 
-首版只在挂载的 host_path 字段支持 ${parameter_name} 字符串占位符，不执行表达式、Shell、环境变量读取或递归展开；本设计不扩展到 env、command 等其他模板字段。
+Template 的 mounts[].host_path 与 env 值支持 ${parameter_name} 字符串占位符，不执行表达式、Shell、环境变量读取或递归展开；command 等其他字段不参与渲染。
 
 - 模板发布时校验占位符语法、挂载目标和 source 互斥。host_path 保留固定的绝对根路径前缀，参数用于卷内相对路径。
-- 准备 Binding 时，所有被引用的参数必须存在且非空；缺失时报错，不能把占位符替换为空后挂载整个根目录。
+- 首次激活创建 Binding 时，所有被引用的参数必须存在；挂载路径参数还必须非空，不能把占位符替换为空后挂载整个根目录。env 值允许普通字符串，不套用路径限制。
 - 路径参数不得含绝对路径、空路径分量、点路径分量、反斜杠或控制字符；拒绝含 .. 的路径分量，不能靠清理路径将越界输入变为合法值。
 - 渲染后校验规范化结果位于模板的固定根路径下。路径字符串校验不代替节点上的符号链接与实际挂载检查。
-- parameters 在创建 Binding 时与 generation 一起持久化；重复准备时参数一致则幂等，不一致返回冲突，不能覆盖已存在绑定的数据目录。
-- 模板版本不可变。激活、重试、缓存恢复均使用保存的参数；已有 ActivationRequest 继续只携带 Scope、expected_generation、bypasscache，不追加用户身份或临时参数。
+- parameters 在创建 Binding 时与 generation 一起持久化；已有 Binding 完全忽略新请求的初始化参数，包括缺失、不同或格式错误的参数。并发首次创建以原子写入获胜者为准，不能覆盖已有绑定的数据目录。
+- 模板版本不可变。激活、重试、缓存恢复均使用保存的参数；ActivationRequest 透传原始初始化参数，仅缺失 Binding 时消费。删除 Binding 后再次访问使用新参数初始化。
 
 这是通用模板渲染能力。Activator 不反解 workspace 参数，也不据此查用户或计算目录。
 
@@ -119,14 +111,12 @@ Jiuwen 准备 Binding 时提交：
    │ Principal(tenant, user_id)
    ▼
 Jiuwen
-   │ Scope + launch + parameters.workspace
+   │ 通用 /agent/ws + X-ADX-Parameters
    ▼
-Agent PrepareBinding
-   │ 保存 Scope、generation、sandbox_id、parameters
-   ▼
-Activator Activate
-   │ 读取不可变模板 + Binding parameters
-   │ 渲染 mounts
+共享解析 → Activator Activate
+   │ 首次原子保存 Scope、generation、environment_id、parameters
+   │ 读取不可变模板 + 已保存 Binding parameters
+   │ 渲染 mounts 和 env
    ▼
 Sandbox capability（HTTP 或同进程）
    │ Create Sandbox JSON，mounts 已没有占位符
@@ -227,7 +217,7 @@ Local/rw 本身不提供互斥。本方案要求**同一工作区任何时刻最
 
 | 阶段 | 待实施事项与验证 |
 | --- | --- |
-| 1 契约（已实现） | TemplateVersion mounts、Binding parameters、准备请求和不可变存储；测试参数缺失、非法路径和重复请求冲突 |
+| 1 契约（已实现） | TemplateVersion mounts/env、Binding parameters、首次激活原子存储；测试参数缺失、非法路径、热请求忽略输入与并发首次创建 |
 | 2 渲染与传输（已实现） | Activator 渲染 mounts，扩展 ExecutionSpec，统一 HTTP/同进程请求；测试跨版本同路径、跨用户及模板不同路径 |
 | 3 Local 入口（已实现） | API source 三选一转换、SDK/API 文档；host_path/hostPath 接受、rw 保留及全量 source 互斥组合已有契约测试 |
 | 4 节点部署 | SFS 挂载、namespace 可见性、受管目录准备、权限、调度范围和管理入口授权；缺失挂载必须失败 |

@@ -68,3 +68,19 @@ fn mount_options_and_rendered_size_are_bounded() {
         "/mnt/sfs/user-abc/data"
     );
 }
+
+#[test]
+fn environment_parameters_are_strings_while_mount_parameters_remain_relative_paths() {
+    let mut template = template("/mnt/users/${workspace}");
+    template
+        .env
+        .insert("API_BASE".into(), "${model_url}".into());
+    template.env.insert("API_KEY".into(), "${key}".into());
+    let parameters = adx_agent_core::parameters::parse(b"workspace=user&model_url=https%3A%2F%2Fmodel.example%2Fv1&key=a%26b%3Dc%2B%24%7Bliteral%7D").unwrap();
+    let env = template.render_env(&parameters).unwrap();
+    assert_eq!(env["API_BASE"], "https://model.example/v1");
+    assert_eq!(env["API_KEY"], "a&b=c+${literal}");
+    assert!(template.render_mounts(&parameters).is_ok());
+    let bad = adx_agent_core::parameters::parse(b"workspace=%2Fetc&model_url=x&key=y").unwrap();
+    assert!(template.render_mounts(&bad).is_err());
+}

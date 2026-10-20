@@ -1,9 +1,11 @@
 //! Business accounts and sessions. Independent of ADX tenant/service authentication.
+mod credentials;
 mod providers;
 mod store;
-use adx_agent_core::launch::{CredentialCipher, LaunchConfig};
+use adx_agent_core::mounts::Parameters;
 use async_trait::async_trait;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use credentials::CredentialCipher;
 use http::{header, HeaderMap, StatusCode};
 pub use providers::{Agc, AgcIdentityProvider, Huawei, IdentityProvider, LiteLlm, ModelProvider};
 use ring::rand::{SecureRandom, SystemRandom};
@@ -124,7 +126,7 @@ pub trait BusinessAuth: Send + Sync {
     async fn check(&self, principal: &Principal) -> Result<()>;
     async fn logout(&self, token: &str) -> Result<()>;
     async fn quota(&self, principal: &Principal) -> Result<QuotaResponse>;
-    async fn launch_config(&self, principal: &Principal) -> Result<LaunchConfig>;
+    async fn model_parameters(&self, principal: &Principal) -> Result<Parameters>;
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -361,14 +363,14 @@ impl BusinessAuth for AccountService {
         self.store.logout(&self.config.tenant, &digest(token)).await
     }
     async fn quota(&self, principal: &Principal) -> Result<QuotaResponse> {
-        let launch = self.launch_config(principal).await?;
-        let key = launch.env.get("API_KEY").ok_or(Error::Unavailable)?;
+        let launch = self.model_parameters(principal).await?;
+        let key = launch.get("model_api_key").ok_or(Error::Unavailable)?;
         let owner = litellm_user(&principal.tenant, &principal.user_id);
         let quota = self.models.quota(&owner, key).await?;
         self.check(principal).await?;
         Ok(quota)
     }
-    async fn launch_config(&self, principal: &Principal) -> Result<LaunchConfig> {
+    async fn model_parameters(&self, principal: &Principal) -> Result<Parameters> {
         self.check(principal).await?;
         let aad = serde_json::to_vec(&("litellm", &principal.tenant, &principal.user_id))
             .map_err(|_| Error::Unavailable)?;
@@ -394,13 +396,13 @@ impl BusinessAuth for AccountService {
             self.store.mark_ready(principal, &record.version).await?;
         }
         self.check(principal).await?;
-        Ok(LaunchConfig {
-            credential_version: record.version,
-            env: BTreeMap::from([
-                ("API_KEY".into(), key),
-                ("API_BASE".into(), self.config.litellm.api_base.clone()),
-            ]),
-        })
+        Ok(BTreeMap::from([
+            ("model_api_key".into(), key),
+            (
+                "model_api_base".into(),
+                self.config.litellm.api_base.clone(),
+            ),
+        ]))
     }
 }
 fn valid_agc_access_token(value: &str) -> bool {
