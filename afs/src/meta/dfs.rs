@@ -5925,7 +5925,7 @@ mod read_recovery_tests {
     use crate::dfs::{
         DfsReadValidation, Extent, LayoutRootId, StorageDeviceDescriptor, ValidateDfsReadGrants,
     };
-    use crate::meta::store::{NodeSessionLease, Store, memory::MemoryBackend};
+    use crate::meta::store::{NodeSessionLease, Store, journal::MemoryLog};
     use crate::node::chunk::{ChunkStore, LocalChunkStore, StagedChunk};
 
     struct Fixture {
@@ -6015,7 +6015,7 @@ mod read_recovery_tests {
         RequestKey,
     ) {
         let store = Arc::new(
-            Store::open(Arc::new(MemoryBackend::default()))
+            Store::open_log(Arc::new(MemoryLog::new(Default::default()).unwrap()))
                 .await
                 .unwrap(),
         );
@@ -6094,7 +6094,7 @@ mod read_recovery_tests {
         let temp = tempfile::tempdir().unwrap();
         let local = LocalChunkStore::open(temp.path(), "receiver").unwrap();
         let store = Arc::new(
-            Store::open(Arc::new(MemoryBackend::default()))
+            Store::open_log(Arc::new(MemoryLog::new(Default::default()).unwrap()))
                 .await
                 .unwrap(),
         );
@@ -7431,7 +7431,7 @@ mod external_policy_tests {
         ChunkReceipt, CommitMetadataDelta, DfsDurabilityPolicy, Extent, ExternalCommitReceipt,
         LayoutRootId,
     };
-    use crate::meta::store::{NodeSessionLease, Store, local_file::LocalFileBackend};
+    use crate::meta::store::{NodeSessionLease, Store, local_log::LocalLog};
     use crate::node::chunk::StagedChunk;
 
     fn external_policy() -> DfsDurabilityPolicy {
@@ -7544,8 +7544,8 @@ mod external_policy_tests {
 
     async fn current_read_fixture() -> CurrentReadFixture {
         let temp = tempfile::tempdir().unwrap();
-        let backend = Arc::new(LocalFileBackend::open(temp.path()).unwrap());
-        let store = Arc::new(Store::open(backend).await.unwrap());
+        let backend = Arc::new(LocalLog::open(temp.path(), Default::default()).unwrap());
+        let store = Arc::new(Store::open_log(backend).await.unwrap());
         register(&store, "writer").await;
         register(&store, "reader").await;
         let service = DfsService::with_durability_policy(
@@ -7998,8 +7998,8 @@ mod external_policy_tests {
     #[tokio::test]
     async fn external_receipt_rejects_wrong_store_key_length_digest_without_publication() {
         let temp = tempfile::tempdir().unwrap();
-        let backend = Arc::new(LocalFileBackend::open(temp.path()).unwrap());
-        let store = Arc::new(Store::open(backend).await.unwrap());
+        let backend = Arc::new(LocalLog::open(temp.path(), Default::default()).unwrap());
+        let store = Arc::new(Store::open_log(backend).await.unwrap());
         register(&store, "writer").await;
         let service = DfsService::with_durability_policy(
             store.clone(),
@@ -8088,8 +8088,8 @@ mod external_policy_tests {
     #[tokio::test]
     async fn external_policy_and_published_reference_survive_local_file_store_reload() {
         let temp = tempfile::tempdir().unwrap();
-        let backend = Arc::new(LocalFileBackend::open(temp.path()).unwrap());
-        let store = Arc::new(Store::open(backend.clone()).await.unwrap());
+        let backend = Arc::new(LocalLog::open(temp.path(), Default::default()).unwrap());
+        let store = Arc::new(Store::open_log(backend.clone()).await.unwrap());
         register(&store, "writer").await;
         register(&store, "reader").await;
         let service = DfsService::with_durability_policy(
@@ -8135,7 +8135,7 @@ mod external_policy_tests {
         ));
         drop(service);
         drop(store);
-        let reopened = Arc::new(Store::open(backend).await.unwrap());
+        let reopened = Arc::new(Store::open_log(backend).await.unwrap());
         let restored = DfsService::with_durability_policy(
             reopened.clone(),
             ReplicationConfig::local_single_copy(),
@@ -8242,8 +8242,8 @@ mod external_policy_tests {
     #[tokio::test]
     async fn existing_node_replication_authority_cannot_be_reclassified_as_external() {
         let store = Arc::new(
-            Store::open(Arc::new(
-                crate::meta::store::memory::MemoryBackend::default(),
+            Store::open_log(Arc::new(
+                crate::meta::store::journal::MemoryLog::new(Default::default()).unwrap(),
             ))
             .await
             .unwrap(),
@@ -8295,8 +8295,8 @@ mod external_policy_tests {
     #[tokio::test]
     async fn external_publication_has_one_external_copy_and_no_replication_debt() {
         let store = Arc::new(
-            Store::open(Arc::new(
-                crate::meta::store::memory::MemoryBackend::default(),
+            Store::open_log(Arc::new(
+                crate::meta::store::journal::MemoryLog::new(Default::default()).unwrap(),
             ))
             .await
             .unwrap(),

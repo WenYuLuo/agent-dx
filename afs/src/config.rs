@@ -24,12 +24,6 @@ pub enum Role {
 /// loses root/session authority whenever afs-meta exits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 pub enum MetaStoreBackend {
-    #[serde(rename = "etcd")]
-    #[value(name = "etcd")]
-    Etcd,
-    #[serde(rename = "redis")]
-    #[value(name = "redis")]
-    Redis,
     #[serde(rename = "local-file")]
     #[value(name = "local-file")]
     LocalFile,
@@ -173,15 +167,49 @@ pub struct Cli {
     pub rest_listen: Option<SocketAddr>,
     #[arg(long)]
     pub meta_endpoint: Option<String>,
-    /// etcd 后端的连接端点；memory 后端不使用。
-    #[arg(long)]
-    pub etcd_endpoint: Option<String>,
-    /// Redis 持久 Meta 后端的连接 URI；例如 redis://127.0.0.1:6379/0。
-    #[arg(long)]
-    pub redis_endpoint: Option<String>,
-    /// Meta 后端：etcd（默认）、local-file 或 memory。
+    /// Meta authority: local-file (default, new-format directory) or volatile memory.
+    /// Retired etcd/Redis data requires its original binary; it is not imported.
     #[arg(long, value_enum)]
     pub meta_store: Option<MetaStoreBackend>,
+    /// Maximum bytes of one framed Meta operation-log record.
+    #[arg(long)]
+    pub meta_record_max_bytes: Option<usize>,
+    /// Maximum bytes of a durable Meta operation-log batch.
+    #[arg(long)]
+    pub meta_batch_max_bytes: Option<usize>,
+    /// Total WAL byte limit; writes fail closed when no space remains.
+    #[arg(long)]
+    pub meta_wal_max_bytes: Option<u64>,
+    /// Background checkpoint WAL byte threshold.
+    #[arg(long)]
+    pub meta_checkpoint_wal_bytes: Option<u64>,
+    /// Background checkpoint record threshold.
+    #[arg(long)]
+    pub meta_checkpoint_wal_records: Option<u64>,
+    /// Background checkpoint interval in milliseconds.
+    #[arg(long)]
+    pub meta_checkpoint_interval_ms: Option<u64>,
+    /// Soft segment rotation size, no greater than the WAL limit.
+    #[arg(long)]
+    pub meta_wal_segment_bytes: Option<u64>,
+    /// Idempotent outcome retention in milliseconds.
+    #[arg(long)]
+    pub meta_request_retention_ms: Option<u64>,
+    /// Maximum retained idempotent outcomes.
+    #[arg(long)]
+    pub meta_request_outcomes_max: Option<usize>,
+    /// Maximum retained outcome bytes (owned capacities).
+    #[arg(long)]
+    pub meta_request_bytes_max: Option<u64>,
+    /// Maximum retained watch events.
+    #[arg(long)]
+    pub meta_watch_events_max: Option<usize>,
+    /// Maximum retained watch bytes (owned capacities).
+    #[arg(long)]
+    pub meta_watch_bytes_max: Option<u64>,
+    /// Watch event retention in milliseconds.
+    #[arg(long)]
+    pub meta_watch_retention_ms: Option<u64>,
     /// Allow a node to become functionally ready with a healthy volatile Meta.
     #[arg(long)]
     pub allow_volatile_meta: Option<bool>,
@@ -323,6 +351,45 @@ pub struct Cli {
     #[arg(long)]
     pub print_config: bool,
 }
+impl Cli {
+    /// Parse the process arguments with standard Clap exit codes and formatting.
+    /// Retired backend options get a migration hint before the original error;
+    /// they are never accepted or mapped to a different authority implicitly.
+    pub fn parse_process() -> Self {
+        let arguments: Vec<_> = std::env::args_os().collect();
+        match Self::try_parse_from(&arguments) {
+            Ok(cli) => cli,
+            Err(error) => {
+                let retired = arguments.windows(2).any(|pair| {
+                    pair[0] == "--meta-store" && (pair[1] == "etcd" || pair[1] == "redis")
+                }) || arguments.iter().any(|argument| {
+                    let argument = argument.to_string_lossy();
+                    matches!(
+                        argument.as_ref(),
+                        "--meta-store=etcd"
+                            | "--meta-store=redis"
+                            | "--etcd-endpoint"
+                            | "--redis-endpoint"
+                    ) || argument.starts_with("--etcd-endpoint=")
+                        || argument.starts_with("--redis-endpoint=")
+                });
+                if retired
+                    && !matches!(
+                        error.kind(),
+                        clap::error::ErrorKind::DisplayHelp
+                            | clap::error::ErrorKind::DisplayVersion
+                    )
+                {
+                    eprintln!(
+                        "Meta etcd/Redis options are retired. Use local-file with an empty directory; retain the original binary and directory to recover old data. No implicit authority migration is performed."
+                    );
+                }
+                error.exit()
+            }
+        }
+    }
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 /// TOML 输入层。拒绝未知字段，让拼错开关在启动时失败，而不是静默使用默认行为。
@@ -331,9 +398,20 @@ struct FileConfig {
     grpc_listen: Option<SocketAddr>,
     rest_listen: Option<SocketAddr>,
     meta_endpoint: Option<String>,
-    etcd_endpoint: Option<String>,
-    redis_endpoint: Option<String>,
     meta_store: Option<MetaStoreBackend>,
+    meta_record_max_bytes: Option<usize>,
+    meta_batch_max_bytes: Option<usize>,
+    meta_wal_max_bytes: Option<u64>,
+    meta_checkpoint_wal_bytes: Option<u64>,
+    meta_checkpoint_wal_records: Option<u64>,
+    meta_checkpoint_interval_ms: Option<u64>,
+    meta_wal_segment_bytes: Option<u64>,
+    meta_request_retention_ms: Option<u64>,
+    meta_request_outcomes_max: Option<usize>,
+    meta_request_bytes_max: Option<u64>,
+    meta_watch_events_max: Option<usize>,
+    meta_watch_bytes_max: Option<u64>,
+    meta_watch_retention_ms: Option<u64>,
     allow_volatile_meta: Option<bool>,
     peer_endpoint: Option<String>,
     advertise_endpoint: Option<String>,
@@ -403,9 +481,20 @@ pub struct Config {
     pub grpc_listen: SocketAddr,
     pub rest_listen: SocketAddr,
     pub meta_endpoint: Option<String>,
-    pub etcd_endpoint: Option<String>,
-    pub redis_endpoint: Option<String>,
     pub meta_store: MetaStoreBackend,
+    pub meta_record_max_bytes: usize,
+    pub meta_batch_max_bytes: usize,
+    pub meta_wal_max_bytes: u64,
+    pub meta_checkpoint_wal_bytes: u64,
+    pub meta_checkpoint_wal_records: u64,
+    pub meta_checkpoint_interval_ms: u64,
+    pub meta_wal_segment_bytes: u64,
+    pub meta_request_retention_ms: u64,
+    pub meta_request_outcomes_max: usize,
+    pub meta_request_bytes_max: u64,
+    pub meta_watch_events_max: usize,
+    pub meta_watch_bytes_max: u64,
+    pub meta_watch_retention_ms: u64,
     pub allow_volatile_meta: bool,
     pub peer_endpoint: Option<String>,
     pub advertise_endpoint: Option<String>,
@@ -476,8 +565,9 @@ impl Config {
     /// Meta 可以没有文件后端；Node 至少启用一个。未指定 fs 时使用当前编译进去的集合。
     pub fn resolve(role: Role, cli: Cli) -> Result<Self> {
         let file: FileConfig = match cli.config {
-            Some(path) => toml::from_str(&std::fs::read_to_string(path)?)
-                .map_err(|e| invalid(e.to_string()))?,
+            Some(path) => toml::from_str(&std::fs::read_to_string(path)?).map_err(|error| {
+                invalid(format!("{error}; Meta supports local-file (new-format/empty directory) or volatile memory; retired backend data must use its original binary and directory"))
+            })?,
             None => FileConfig::default(),
         };
         let id = cli.id.or(file.id).unwrap_or_else(|| {
@@ -731,6 +821,9 @@ impl Config {
         if dfs_peer_serve_wait_ms > 50 {
             return Err(invalid("DFS Peer serve wait must be 0..=50 ms"));
         }
+        let log_defaults = crate::meta::store::journal::LogLimits::default();
+        let maintenance = crate::meta::store::journal::MaintenancePolicy::default();
+        let history = crate::meta::store::HistoryLimits::default();
         let cfg = Self {
             grpc_listen: cli.grpc_listen.or(file.grpc_listen).unwrap_or_else(|| {
                 ([127, 0, 0, 1], if role == Role::Meta { 7400 } else { 7500 }).into()
@@ -739,12 +832,62 @@ impl Config {
                 ([127, 0, 0, 1], if role == Role::Meta { 7401 } else { 7501 }).into()
             }),
             meta_endpoint: cli.meta_endpoint.or(file.meta_endpoint),
-            etcd_endpoint: cli.etcd_endpoint.or(file.etcd_endpoint),
-            redis_endpoint: cli.redis_endpoint.or(file.redis_endpoint),
             meta_store: cli
                 .meta_store
                 .or(file.meta_store)
-                .unwrap_or(MetaStoreBackend::Etcd),
+                .unwrap_or(MetaStoreBackend::LocalFile),
+            meta_record_max_bytes: cli
+                .meta_record_max_bytes
+                .or(file.meta_record_max_bytes)
+                .unwrap_or(log_defaults.record_max_bytes),
+            meta_batch_max_bytes: cli
+                .meta_batch_max_bytes
+                .or(file.meta_batch_max_bytes)
+                .unwrap_or(log_defaults.batch_max_bytes),
+            meta_wal_max_bytes: cli
+                .meta_wal_max_bytes
+                .or(file.meta_wal_max_bytes)
+                .unwrap_or(log_defaults.wal_max_bytes),
+            meta_checkpoint_wal_bytes: cli
+                .meta_checkpoint_wal_bytes
+                .or(file.meta_checkpoint_wal_bytes)
+                .unwrap_or(maintenance.wal_bytes),
+            meta_checkpoint_wal_records: cli
+                .meta_checkpoint_wal_records
+                .or(file.meta_checkpoint_wal_records)
+                .unwrap_or(maintenance.wal_records),
+            meta_checkpoint_interval_ms: cli
+                .meta_checkpoint_interval_ms
+                .or(file.meta_checkpoint_interval_ms)
+                .unwrap_or(60_000),
+            meta_wal_segment_bytes: cli
+                .meta_wal_segment_bytes
+                .or(file.meta_wal_segment_bytes)
+                .unwrap_or(log_defaults.segment_bytes),
+            meta_request_retention_ms: cli
+                .meta_request_retention_ms
+                .or(file.meta_request_retention_ms)
+                .unwrap_or(86_400_000),
+            meta_request_outcomes_max: cli
+                .meta_request_outcomes_max
+                .or(file.meta_request_outcomes_max)
+                .unwrap_or(history.request_count),
+            meta_request_bytes_max: cli
+                .meta_request_bytes_max
+                .or(file.meta_request_bytes_max)
+                .unwrap_or(history.request_bytes),
+            meta_watch_events_max: cli
+                .meta_watch_events_max
+                .or(file.meta_watch_events_max)
+                .unwrap_or(history.event_count),
+            meta_watch_bytes_max: cli
+                .meta_watch_bytes_max
+                .or(file.meta_watch_bytes_max)
+                .unwrap_or(history.event_bytes),
+            meta_watch_retention_ms: cli
+                .meta_watch_retention_ms
+                .or(file.meta_watch_retention_ms)
+                .unwrap_or(3_600_000),
             allow_volatile_meta: cli
                 .allow_volatile_meta
                 .or(file.allow_volatile_meta)
@@ -906,7 +1049,6 @@ impl Config {
         for endpoint in [
             &cfg.meta_endpoint,
             &cfg.peer_endpoint,
-            &cfg.etcd_endpoint,
             &cfg.advertise_endpoint,
         ]
         .into_iter()
@@ -917,9 +1059,6 @@ impl Config {
             }
             tonic::transport::Endpoint::from_shared(endpoint.clone())
                 .map_err(|e| invalid(e.to_string()))?;
-        }
-        if let Some(endpoint) = &cfg.redis_endpoint {
-            redis::Client::open(endpoint.as_str()).map_err(|e| invalid(e.to_string()))?;
         }
         if !cfg.uds_path.is_absolute() || !cfg.data_dir.is_absolute() {
             return Err(invalid("uds_path and data_dir must be absolute"));
@@ -1047,7 +1186,61 @@ impl Config {
                 return Err(invalid("trusted_node_certs paths must be absolute"));
             }
         }
+        cfg.meta_log_limits()?;
+        cfg.meta_maintenance_policy()?;
+        cfg.meta_history_limits()?;
         Ok(cfg)
+    }
+
+    pub(crate) fn meta_log_limits(&self) -> Result<crate::meta::store::journal::LogLimits> {
+        if self.meta_wal_segment_bytes > self.meta_wal_max_bytes {
+            return Err(invalid(
+                "meta_wal_segment_bytes must not exceed meta_wal_max_bytes",
+            ));
+        }
+        crate::meta::store::journal::LogLimits {
+            record_max_bytes: self.meta_record_max_bytes,
+            batch_max_bytes: self.meta_batch_max_bytes,
+            wal_max_bytes: self.meta_wal_max_bytes,
+            segment_bytes: self.meta_wal_segment_bytes,
+            ..Default::default()
+        }
+        .validate()
+        .map_err(|error| invalid(error.to_string()))
+    }
+
+    pub(crate) fn meta_maintenance_policy(
+        &self,
+    ) -> Result<crate::meta::store::journal::MaintenancePolicy> {
+        use std::time::Duration;
+        let defaults = crate::meta::store::journal::MaintenancePolicy::default();
+        crate::meta::store::journal::MaintenancePolicy {
+            wal_bytes: self.meta_checkpoint_wal_bytes,
+            wal_records: self.meta_checkpoint_wal_records,
+            interval: Duration::from_millis(self.meta_checkpoint_interval_ms),
+            // Short test/operator intervals must also shorten the polling period.
+            poll: defaults
+                .poll
+                .min(Duration::from_millis(self.meta_checkpoint_interval_ms)),
+            ..defaults
+        }
+        .validate()
+        .map_err(|error| invalid(error.to_string()))
+    }
+
+    pub(crate) fn meta_history_limits(&self) -> Result<crate::meta::store::HistoryLimits> {
+        use std::time::Duration;
+        crate::meta::store::HistoryLimits {
+            request_count: self.meta_request_outcomes_max,
+            request_bytes: self.meta_request_bytes_max,
+            request_retention: Duration::from_millis(self.meta_request_retention_ms),
+            event_count: self.meta_watch_events_max,
+            event_bytes: self.meta_watch_bytes_max,
+            event_retention: Duration::from_millis(self.meta_watch_retention_ms),
+            ..Default::default()
+        }
+        .validate()
+        .map_err(|error| invalid(error.to_string()))
     }
 
     /// gRPC builders共用安全配置；只有配置了完整证书集合才启用 mTLS。

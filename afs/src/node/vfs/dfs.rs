@@ -14209,14 +14209,14 @@ mod tests {
     }
 
     #[cfg(feature = "dfs")]
-    struct CountingStoreBackend {
-        inner: Arc<dyn crate::meta::store::StoreBackend>,
+    struct CountingMetaLog {
+        inner: Arc<dyn crate::meta::store::MetaLog>,
         commits: AtomicU64,
     }
 
     #[cfg(feature = "dfs")]
-    impl CountingStoreBackend {
-        fn new(inner: Arc<dyn crate::meta::store::StoreBackend>) -> Self {
+    impl CountingMetaLog {
+        fn new(inner: Arc<dyn crate::meta::store::MetaLog>) -> Self {
             Self {
                 inner,
                 commits: AtomicU64::new(0),
@@ -14229,28 +14229,30 @@ mod tests {
     }
 
     #[cfg(feature = "dfs")]
-    impl crate::meta::store::StoreBackend for CountingStoreBackend {
+    impl crate::meta::store::MetaLog for CountingMetaLog {
         fn health(&self) -> crate::meta::store::MetaFuture<'_, ()> {
             self.inner.health()
         }
-
         fn persistence(&self) -> crate::meta::store::BackendPersistence {
             self.inner.persistence()
         }
-
-        fn load(&self) -> crate::meta::store::MetaFuture<'_, Option<(u64, Vec<u8>)>> {
-            self.inner.load()
+        fn limits(&self) -> crate::meta::store::journal::LogLimits {
+            self.inner.limits()
         }
-
-        fn commit(
+        fn recover(
             &self,
-            expected_version: u64,
-            bytes: Vec<u8>,
-        ) -> crate::meta::store::MetaFuture<'_, u64> {
+        ) -> crate::meta::store::MetaFuture<'_, crate::meta::store::journal::RecoveredLog> {
+            self.inner.recover()
+        }
+        fn append_and_sync(
+            &self,
+            expected: crate::meta::store::journal::LogTip,
+            records: Vec<crate::meta::store::log::Record>,
+        ) -> crate::meta::store::MetaFuture<'_, crate::meta::store::journal::LogTip> {
             Box::pin(async move {
-                let version = self.inner.commit(expected_version, bytes).await?;
+                let tip = self.inner.append_and_sync(expected, records).await?;
                 self.commits.fetch_add(1, Ordering::SeqCst);
-                Ok(version)
+                Ok(tip)
             })
         }
     }
@@ -18660,11 +18662,11 @@ mod tests {
         tokio::task::JoinHandle<()>,
         Arc<dyn crate::meta::store::MetaStore>,
         Arc<LocalChunkStore>,
-        Arc<CountingStoreBackend>,
+        Arc<CountingMetaLog>,
     ) {
         use crate::meta::{
             Meta,
-            store::{MetaRead, NodeSessionLease, RequestKey, Store, memory::MemoryBackend},
+            store::{MetaRead, NodeSessionLease, RequestKey, Store, journal::MemoryLog},
         };
         use tokio::net::TcpListener;
         use tokio_stream::wrappers::TcpListenerStream;
@@ -18673,11 +18675,11 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let local_a =
             Arc::new(LocalChunkStore::open(temp.path().join("node-a"), "node-a").unwrap());
-        let backend = Arc::new(CountingStoreBackend::new(
-            Arc::new(MemoryBackend::default()),
-        ));
+        let backend = Arc::new(CountingMetaLog::new(Arc::new(
+            MemoryLog::new(Default::default()).unwrap(),
+        )));
         let store: Arc<dyn crate::meta::store::MetaStore> =
-            Arc::new(Store::open(backend.clone()).await.unwrap());
+            Arc::new(Store::open_log(backend.clone()).await.unwrap());
         store
             .register_node_session(
                 RequestKey::new("node-a", "register-node-a"),
@@ -19222,7 +19224,7 @@ mod tests {
         let trace_fixture =
             std::env::var_os("AFS_DFS_PENDING_TRACE_FIXTURE_DIR").map(std::path::PathBuf::from);
         if let Some(directory) = &trace_fixture {
-            use crate::meta::store::StoreBackend;
+            use crate::meta::store::MetaLog;
             std::fs::create_dir(directory).unwrap();
             std::fs::copy(&trace_output, directory.join("trace-unknown.jsonl")).unwrap();
             std::fs::write(
@@ -19235,8 +19237,13 @@ mod tests {
                 serde_json::to_vec(&outcome).unwrap(),
             )
             .unwrap();
-            let (revision, bytes) = _backend.load().await.unwrap().unwrap();
-            std::fs::write(directory.join("meta-store-state.raw.json"), bytes).unwrap();
+            let recovered = _backend.recover().await.unwrap();
+            let revision = recovered.tip.sequence;
+            std::fs::write(
+                directory.join("meta-log-records.json"),
+                serde_json::to_vec(&recovered.records).unwrap(),
+            )
+            .unwrap();
             std::fs::write(directory.join("scope.json"), serde_json::to_vec(&serde_json::json!({"status":"HARNESS_ONLY",
                 "test_fixture":true,"backend":"memory","backend_revision":revision,"installed_fault":"NOT_RUN",
                 "reason":"actual Rust emit and Meta outcome; header lacks installed process identity"})).unwrap()).unwrap();

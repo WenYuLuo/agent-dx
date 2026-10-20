@@ -5364,8 +5364,7 @@ mod tests {
         use crate::dfs::*;
         use crate::meta::store::{
             MetaEntity, MetaStore, MetaTxn, NodeSessionLease, OperationResult, RequestKey,
-            RequestOutcome, Store, StoreOperation, TxnCondition, TxnMutation,
-            memory::MemoryBackend,
+            RequestOutcome, Store, StoreOperation, TxnCondition, TxnMutation, journal::MemoryLog,
         };
         use crate::node::chunk::StagedChunk;
 
@@ -5408,7 +5407,7 @@ mod tests {
         };
 
         let store: Arc<dyn MetaStore> = Arc::new(
-            Store::open(Arc::new(MemoryBackend::default()))
+            Store::open_log(Arc::new(MemoryLog::new(Default::default()).unwrap()))
                 .await
                 .unwrap(),
         );
@@ -5487,17 +5486,15 @@ mod tests {
         ]);
         store.compare_and_commit(txn).await.unwrap();
 
-        let meta = Arc::new(crate::meta::Meta {
-            id: "meta-grpc-unknown".into(),
-            observability: crate::runtime::Observability::new().unwrap(),
-            store: Some(store.clone()),
-            owner_roots: Arc::new(crate::meta::owner_roots::StoreOwnerRootAuthority::new(
-                store.clone(),
-            )),
-            dfs: Some(dfs),
-            trusted_nodes_by_der: Arc::new(std::collections::HashMap::new()),
-            enforce_peer_identity: false,
-        });
+        let mut meta = crate::meta::Meta::with_store(
+            "meta-grpc-unknown".into(),
+            crate::runtime::Observability::new().unwrap(),
+            store.clone(),
+        );
+        // Preserve the failure-injecting DFS authority rather than replacing
+        // it with the constructor's ordinary service.
+        meta.dfs = Some(dfs);
+        let meta = Arc::new(meta);
         let meta_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let meta_endpoint = format!("http://{}", meta_listener.local_addr().unwrap());
         let delay_layer = DelayFirstMetaReplyLayer::new(std::time::Duration::from_secs(2));
@@ -5976,8 +5973,7 @@ mod tests {
         use crate::dfs::*;
         use crate::meta::store::{
             MetaEntity, MetaStore, MetaTxn, NodeSessionLease, OperationResult, RequestKey,
-            RequestOutcome, Store, StoreOperation, TxnCondition, TxnMutation,
-            memory::MemoryBackend,
+            RequestOutcome, Store, StoreOperation, TxnCondition, TxnMutation, journal::MemoryLog,
         };
         use crate::node::chunk::StagedChunk;
         let temp = tempfile::tempdir().unwrap();
@@ -5986,7 +5982,7 @@ mod tests {
         local.put(staged.clone()).unwrap();
         let device = local.device_descriptor().unwrap();
         let store = Arc::new(
-            Store::open(Arc::new(MemoryBackend::default()))
+            Store::open_log(Arc::new(MemoryLog::new(Default::default()).unwrap()))
                 .await
                 .unwrap(),
         );

@@ -33,7 +33,10 @@ FUSE 依赖使用根工作区声明的官方固定 `fuser =0.18.0`。
 - `fs = "dfs"`：已提交数据以不可变 chunk/FileVersion 表示，适合一写多读。
 - `fs = "all"`：同一进程启用两种模式，但挂载、状态机和验收结论仍相互独立。
 
-Meta 推荐使用 `local-file` 持久后端。`memory` 仅适合一次性演示；etcd、Redis、
+本工作树 local-file 的操作日志格式、旧目录拒绝及尚未完成的回收限制见
+[Meta 部署合同](../docs/deployment/afs.md#meta-操作日志与数据目录)。
+
+Meta 默认使用唯一持久后端 `local-file`。`memory` 仅适合一次性演示；etcd／Redis适配已移除，
 多 Meta/HA、完整 POSIX、跨节点文件锁、复杂故障矩阵和性能达标不在当前承诺内。
 Operator 负责创建 namespace/root grant、配置挂载和回收引用；Environment 创建尚不会
 自动 provision/mount/reclaim AFS。
