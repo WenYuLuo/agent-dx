@@ -1064,6 +1064,115 @@ fn write_current(dir: &Path, manifest: &Current, limits: CheckpointLimits) -> Re
 }
 /// Only objects explicitly retired by a durable CURRENT are cleanup candidates.
 /// Corrupt/foreign data is retained and continues consuming its finite budget.
+/// A crash after image rename but before CURRENT selection leaves a complete
+/// owned image outside both selected chains. Validate its complete envelope before deletion; foreign,
+/// corrupt and unrecognized files remain counted against disk limits.
+fn cleanup_unreferenced_images(
+    dir: &Path,
+    manifest: &Current,
+    limits: CheckpointLimits,
+    held_bytes: usize,
+) -> Result<()> {
+    let selected = manifest
+        .current
+        .into_iter()
+        .chain(manifest.previous)
+        .chain(manifest.retired_images.iter().copied())
+        .map(image_name)
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut removed = false;
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("checkpoint-")
+            || !name.ends_with(".bin")
+            || selected.contains(name.as_ref())
+            || !fs::symlink_metadata(entry.path())?.is_file()
+        {
+            continue;
+        }
+        let candidate = || -> Result<CheckpointRef> {
+            let mut file = open_file(&entry.path(), false)?;
+            let mut bytes = [0u8; IMAGE_HEADER];
+            file.read_exact(&mut bytes)?;
+            let number = |range: std::ops::Range<usize>| -> Result<u64> {
+                Ok(u64::from_be_bytes(
+                    bytes[range]
+                        .try_into()
+                        .map_err(|_| invalid_log("orphan image header width"))?,
+                ))
+            };
+            let mut record_hash = [0; 32];
+            record_hash.copy_from_slice(&bytes[62..94]);
+            let mut digest = [0; 32];
+            digest.copy_from_slice(&bytes[110..142]);
+            let reference = CheckpointRef {
+                covered: LogTip {
+                    sequence: number(54..62)?,
+                    record_hash,
+                },
+                revision: StoreRevision(number(94..102)?),
+                bytes: number(102..110)?,
+                digest,
+            };
+            if image_name(reference) != name.as_ref()
+                || held_bytes
+                    .checked_add(8192 + IMAGE_HEADER)
+                    .is_none_or(|n| n > limits.capture_charge_max_bytes)
+            {
+                return Err(invalid_log(
+                    "unreferenced image cannot be validated within the existing capture budget",
+                ));
+            }
+            // Cleanup needs proven ownership/integrity, never adoption. Stream
+            // the complete envelope without allocating/decoding another image.
+            if bytes[..6] != *b"AFSC\0\x01"
+                || bytes[6..22] != manifest.identity.store_id
+                || bytes[22..38] != manifest.identity.cluster_id
+                || bytes[38..54] != manifest.identity.incarnation
+                || reference.bytes > limits.image_max_bytes as u64
+                || file.metadata()?.len()
+                    != reference
+                        .bytes
+                        .checked_add(IMAGE_HEADER as u64)
+                        .ok_or_else(|| invalid_log("orphan length overflow"))?
+            {
+                return Err(invalid_log(
+                    "unreferenced image identity or length mismatch",
+                ));
+            }
+            let mut hash = blake3::Hasher::new();
+            hash.update(b"afs.meta.checkpoint.v1");
+            hash.update(&bytes[..110]);
+            let mut crc = crc32c::crc32c(&bytes[..142]);
+            let mut remaining = reference.bytes;
+            let mut buffer = [0u8; 8192];
+            while remaining > 0 {
+                let count = remaining.min(buffer.len() as u64) as usize;
+                file.read_exact(&mut buffer[..count])?;
+                hash.update(&buffer[..count]);
+                crc = crc32c::crc32c_append(crc, &buffer[..count]);
+                remaining -= count as u64;
+            }
+            if hash.finalize().as_bytes() != &reference.digest
+                || crc.to_be_bytes() != bytes[142..146]
+            {
+                return Err(invalid_log("unreferenced image full checksum mismatch"));
+            }
+            Ok(reference)
+        };
+        if candidate().is_ok() {
+            fs::remove_file(entry.path())?;
+            removed = true;
+        }
+    }
+    if removed {
+        sync_dir(dir)?;
+    }
+    Ok(())
+}
+
 fn cleanup_retired(
     dir: &Path,
     manifest: &Current,
@@ -1324,6 +1433,16 @@ impl LocalLog {
         };
         let replay = replay(&dir, identity, limits, checkpoint_limits)?;
         let mut manifest = replay.manifest;
+        cleanup_unreferenced_images(
+            &dir,
+            &manifest,
+            checkpoint_limits,
+            replay
+                .recovered
+                .checkpoint
+                .as_ref()
+                .map_or(0, |image| image.bytes.capacity()),
+        )?;
         let (retired_segments, retired_images) =
             cleanup_retired(&dir, &manifest, limits, checkpoint_limits)?;
         if manifest.retired_segments != retired_segments
@@ -1709,6 +1828,7 @@ impl MetaLog for LocalLog {
                         "prior CURRENT recovery point invalid; originals retained",
                     ));
                 }
+                cleanup_unreferenced_images(&inner.dir, &old, limits, bytes.capacity())?;
                 // The captured prefix is no longer needed after anchors validate.
                 prefix.clear();
                 quarantine_checkpoint_tmp(&inner.dir, "checkpoint.tmp", limits)?;
@@ -2130,6 +2250,61 @@ mod tests {
             fs::read(foreign.path().join("snapshot.json")).unwrap(),
             b"foreign input"
         );
+    }
+
+    #[tokio::test]
+    async fn p3_orphan_image_cleanup_preserves_foreign_corrupt_and_unknown_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = LocalLog::open(dir.path(), LogLimits::default()).unwrap();
+        let identity = log.identity();
+        let bytes =
+            super::super::log::StateImage::encode(&super::super::state::State::default(), 65536)
+                .unwrap();
+        let (own_header, own_ref) =
+            image_header(identity, LogTip::EMPTY, StoreRevision::ZERO, &bytes);
+        fs::write(
+            dir.path().join(image_name(own_ref)),
+            [own_header.as_slice(), &bytes].concat(),
+        )
+        .unwrap();
+        let (foreign_header, foreign_ref) = image_header(
+            StoreIdentity::new().unwrap(),
+            LogTip::EMPTY,
+            StoreRevision::ZERO,
+            &bytes,
+        );
+        let foreign = [foreign_header.as_slice(), &bytes].concat();
+        fs::write(dir.path().join(image_name(foreign_ref)), &foreign).unwrap();
+        let (bad_header, bad_ref) = image_header(
+            identity,
+            LogTip {
+                sequence: 1,
+                record_hash: [7; 32],
+            },
+            StoreRevision::ZERO,
+            &bytes,
+        );
+        let mut bad = [bad_header.as_slice(), &bytes].concat();
+        *bad.last_mut().unwrap() ^= 1;
+        fs::write(dir.path().join(image_name(bad_ref)), &bad).unwrap();
+        fs::write(
+            dir.path().join("checkpoint-unknown.bin"),
+            b"unknown original",
+        )
+        .unwrap();
+        drop(log);
+        let reopened = LocalLog::open(dir.path(), LogLimits::default()).unwrap();
+        assert!(!dir.path().join(image_name(own_ref)).exists());
+        assert_eq!(
+            fs::read(dir.path().join(image_name(foreign_ref))).unwrap(),
+            foreign
+        );
+        assert_eq!(fs::read(dir.path().join(image_name(bad_ref))).unwrap(), bad);
+        assert_eq!(
+            fs::read(dir.path().join("checkpoint-unknown.bin")).unwrap(),
+            b"unknown original"
+        );
+        assert_eq!(reopened.recover().await.unwrap().tip, LogTip::EMPTY);
     }
 
     #[tokio::test]

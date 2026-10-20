@@ -660,3 +660,156 @@ async fn p3_checkpoint_process_crash_matrix() {
         fs::remove_dir_all(directory).unwrap();
     }
 }
+
+fn restored_checkpoint_state(recovered: &super::journal::RecoveredLog) -> super::state::State {
+    let mut state = recovered
+        .checkpoint
+        .as_ref()
+        .map(|c| {
+            super::log::StateImage::decode(&c.bytes, checkpoint_image_limits().image_max_bytes)
+                .unwrap()
+        })
+        .unwrap_or_default();
+    for record in &recovered.records {
+        state = state.replay_record(record).unwrap();
+    }
+    state
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn p3_repeated_unselected_checkpoint_crashes_remain_recoverable() {
+    const REPEATED_TEST: &str =
+        "meta::store::crash_tests::p3_repeated_unselected_checkpoint_crashes_remain_recoverable";
+    if std::env::var_os(CHILD).as_deref() == Some(std::ffi::OsStr::new("1")) {
+        let directory = PathBuf::from(std::env::var_os(DIRECTORY).unwrap());
+        let root = directory.join("meta");
+        let log = LocalLog::open_with_checkpoint_limits(
+            &root,
+            checkpoint_log_limits(),
+            checkpoint_image_limits(),
+        )
+        .unwrap();
+        let recovered = log.recover().await.unwrap();
+        let mut state = restored_checkpoint_state(&recovered);
+        let record = super::journal::test_records(recovered.tip.sequence as usize + 1)
+            .pop()
+            .unwrap();
+        state = state.replay_record(&record).unwrap();
+        let tip = log
+            .append_and_sync(recovered.tip, vec![record])
+            .await
+            .unwrap();
+        fs::write(
+            directory.join("ack.json"),
+            serde_json::to_vec(&CheckpointWitness {
+                tip,
+                identity: fs::read(root.join("IDENTITY")).unwrap(),
+                state: state.snapshot_bytes_with_batch(0).unwrap(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            directory.join("armed"),
+            b"next committed tip; before selector",
+        )
+        .unwrap();
+        log.install_checkpoint(
+            tip,
+            super::log::StateImage::encode(&state, checkpoint_image_limits().image_max_bytes)
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        panic!("unselected-image faultpoint not reached");
+    }
+    let directory = tempfile::tempdir().unwrap().keep();
+    eprintln!(
+        "P3 repeated checkpoint crash evidence={}",
+        directory.display()
+    );
+    let root = directory.join("meta");
+    for round in 0..6 {
+        let reached = directory.join("reached");
+        if reached.exists() {
+            fs::remove_file(&reached).unwrap();
+        }
+        let output = File::create(directory.join(format!("child-{round}.log"))).unwrap();
+        let mut child = ChildGuard(
+            Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", REPEATED_TEST, "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .env(POINT, "checkpoint_image_installed")
+                .env(DIRECTORY, &directory)
+                .stdout(Stdio::from(output.try_clone().unwrap()))
+                .stderr(Stdio::from(output))
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !reached.is_file() {
+            assert!(
+                child.0.try_wait().unwrap().is_none(),
+                "checkpoint round {round} exited before faultpoint: {}",
+                fs::read_to_string(directory.join(format!("child-{round}.log"))).unwrap()
+            );
+            assert!(
+                Instant::now() < deadline,
+                "checkpoint round {round} timed out"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        child.0.kill().unwrap();
+        assert_eq!(child.0.wait().unwrap().signal(), Some(libc::SIGKILL));
+        let witness: CheckpointWitness =
+            serde_json::from_slice(&fs::read(directory.join("ack.json")).unwrap()).unwrap();
+        let log = LocalLog::open_with_checkpoint_limits(
+            &root,
+            checkpoint_log_limits(),
+            checkpoint_image_limits(),
+        )
+        .unwrap();
+        let recovered = log.recover().await.unwrap();
+        assert_eq!(recovered.tip, witness.tip);
+        let mut state = restored_checkpoint_state(&recovered);
+        assert_eq!(state.snapshot_bytes_with_batch(0).unwrap(), witness.state);
+        assert_eq!(fs::read(root.join("IDENTITY")).unwrap(), witness.identity);
+        // Advance before installing: reselecting the same image would hide the
+        // orphan accumulation rather than reproduce repeated interrupted work.
+        let record = super::journal::test_records(witness.tip.sequence as usize + 1)
+            .pop()
+            .unwrap();
+        state = state.replay_record(&record).unwrap();
+        let tip = log
+            .append_and_sync(witness.tip, vec![record])
+            .await
+            .unwrap();
+        log.install_checkpoint(
+            tip,
+            super::log::StateImage::encode(&state, checkpoint_image_limits().image_max_bytes)
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        eprintln!(
+            "P3 repeated checkpoint PASS round={round} tip={} disk={:?}",
+            tip.sequence,
+            disk_accounting(&root)
+        );
+        drop(log);
+        drop(child);
+    }
+    let images = fs::read_dir(&root)
+        .unwrap()
+        .filter(|e| {
+            let n = e.as_ref().unwrap().file_name();
+            let n = n.to_string_lossy();
+            n.starts_with("checkpoint-") && n.ends_with(".bin")
+        })
+        .count();
+    assert!(
+        images <= 2,
+        "only selected current/previous images may remain"
+    );
+    fs::remove_dir_all(directory).unwrap();
+}
