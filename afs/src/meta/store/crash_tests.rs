@@ -287,6 +287,96 @@ async fn p3_process_crash_matrix() {
     }
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn p3_initialization_process_crash() {
+    const INITIALIZATION_TEST: &str = "meta::store::crash_tests::p3_initialization_process_crash";
+    if std::env::var_os(CHILD).as_deref() == Some(std::ffi::OsStr::new("1")) {
+        let directory = PathBuf::from(std::env::var_os(DIRECTORY).unwrap());
+        fs::write(directory.join("armed"), b"no listener or business ACK").unwrap();
+        LocalLog::open(directory.join("meta"), LogLimits::default()).unwrap();
+        panic!("initialization faultpoint was not reached");
+    }
+    let directory = tempfile::tempdir().unwrap().keep();
+    eprintln!("P3 initialization crash evidence={}", directory.display());
+    let output = File::create(directory.join("child.log")).unwrap();
+    let mut child = ChildGuard(
+        Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                INITIALIZATION_TEST,
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .env(POINT, "initialization_wal_installed")
+            .env(DIRECTORY, &directory)
+            .stdout(Stdio::from(output.try_clone().unwrap()))
+            .stderr(Stdio::from(output))
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !directory.join("reached").is_file() {
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "initialization child exited: {}",
+            fs::read_to_string(directory.join("child.log")).unwrap()
+        );
+        assert!(Instant::now() < deadline, "initialization child timeout");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    child.0.kill().unwrap();
+    assert_eq!(child.0.wait().unwrap().signal(), Some(libc::SIGKILL));
+    let root = directory.join("meta");
+    let identity = fs::read(root.join("IDENTITY")).unwrap();
+    assert!(root.join("INITIALIZING").exists());
+    let log = Arc::new(LocalLog::open(&root, LogLimits::default()).unwrap());
+    assert_eq!(fs::read(root.join("IDENTITY")).unwrap(), identity);
+    assert!(!root.join("INITIALIZING").exists());
+    let store = Store::open_log(log.clone()).await.unwrap();
+    let key = RequestKey::new("node-a", "after-initialization");
+    assert!(matches!(
+        store
+            .register_node_session(key.clone(), lease("after-initialization"))
+            .await
+            .unwrap(),
+        TxnOutcome::Committed { .. }
+    ));
+    let original = store
+        .read(MetaRead::RequestOutcome(key.clone()))
+        .await
+        .unwrap()
+        .request_outcome
+        .unwrap();
+    drop(store);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while Arc::strong_count(&log) != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(log);
+    let store = Store::open_log(Arc::new(
+        LocalLog::open(&root, LogLimits::default()).unwrap(),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        store
+            .read(MetaRead::RequestOutcome(key))
+            .await
+            .unwrap()
+            .request_outcome,
+        Some(original)
+    );
+    assert_eq!(fs::read(root.join("IDENTITY")).unwrap(), identity);
+    drop(store);
+    drop(child);
+    // Keep failures intact; only a successful fixture removes its own data.
+    fs::remove_dir_all(directory).unwrap();
+}
+
 fn checkpoint_log_limits() -> LogLimits {
     LogLimits {
         record_max_bytes: 1024,

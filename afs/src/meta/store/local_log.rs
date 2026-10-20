@@ -123,7 +123,10 @@ fn identity_bytes(identity: StoreIdentity) -> Vec<u8> {
     bytes
 }
 fn read_identity(dir: &Path) -> Result<StoreIdentity> {
-    let mut file = open_file(&dir.join(IDENTITY), false)?;
+    read_identity_file(&dir.join(IDENTITY))
+}
+fn read_identity_file(path: &Path) -> Result<StoreIdentity> {
+    let mut file = open_file(path, false)?;
     if file.metadata()?.len() != 90 {
         return Err(invalid_log("IDENTITY length"));
     }
@@ -1048,6 +1051,151 @@ fn cleanup_retired(
     sync_dir(dir)?;
     Ok((segments, images))
 }
+/// The durable empty marker precedes every initialization file. No business
+/// append or listener is admitted until it is removed and the directory synced.
+fn initialize_marked(dir: &Path, limits: CheckpointLimits) -> Result<StoreIdentity> {
+    let marker = open_file(&dir.join("INITIALIZING"), false)?;
+    if marker.metadata()?.len() != 0 {
+        return Err(invalid_log("initialization marker is not empty"));
+    }
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if !matches!(
+            name.to_str(),
+            Some(
+                "LOCK"
+                    | "INITIALIZING"
+                    | "IDENTITY"
+                    | "IDENTITY.tmp"
+                    | "CURRENT"
+                    | "CURRENT.tmp"
+                    | "wal-00000000000000000001.log"
+            )
+        ) || !fs::symlink_metadata(entry.path())?.is_file()
+        {
+            return Err(invalid_log(
+                "unknown data in unfinished initialization; originals retained",
+            ));
+        }
+    }
+    let identity = if dir.join(IDENTITY).try_exists()? {
+        if dir.join("IDENTITY.tmp").try_exists()? {
+            return Err(invalid_log("ambiguous initialization identity files"));
+        }
+        read_identity(dir)?
+    } else {
+        // Identity is installed before any WAL or selector can be created.
+        if dir.join(WAL).try_exists()?
+            || dir.join(CURRENT).try_exists()?
+            || dir.join("CURRENT.tmp").try_exists()?
+        {
+            return Err(invalid_log("initialization data precedes durable identity"));
+        }
+        let tmp = dir.join("IDENTITY.tmp");
+        let identity = if tmp.try_exists()? {
+            let mut file = open_file(&tmp, false)?;
+            let length = file.metadata()?.len();
+            if length == 90 {
+                read_identity_file(&tmp)?
+            } else {
+                if length > 90 {
+                    return Err(invalid_log("initial identity temporary length"));
+                }
+                let mut bytes = vec![0; length as usize];
+                file.read_exact(&mut bytes)?;
+                let n = bytes.len().min(6);
+                if bytes[..n] != b"AFSI\0\x01"[..n] {
+                    return Err(invalid_log("foreign partial identity temporary retained"));
+                }
+                // The marker and absence of all data prove this is only an
+                // interrupted identity write, never an acknowledged authority.
+                drop(file);
+                fs::remove_file(&tmp)?;
+                StoreIdentity::new()?
+            }
+        } else {
+            StoreIdentity::new()?
+        };
+        if !tmp.try_exists()? {
+            let mut file = open_file(&tmp, true)?;
+            file.write_all(&identity_bytes(identity))?;
+            file.sync_all()?;
+        } else {
+            open_file(&tmp, false)?.sync_all()?;
+        }
+        fs::rename(&tmp, dir.join(IDENTITY))?;
+        sync_dir(dir)?;
+        identity
+    };
+    let mut expected = [0u8; LOG_HEADER_BYTES as usize];
+    expected[..STATIC_BYTES].copy_from_slice(&static_header(identity, LogTip::EMPTY));
+    expected[STATIC_BYTES..STATIC_BYTES + SLOT_BYTES].copy_from_slice(&tail_bytes(Tail {
+        generation: 0,
+        tip: LogTip::EMPTY,
+        end: LOG_HEADER_BYTES,
+    }));
+    let mut wal = if dir.join(WAL).try_exists()? {
+        let mut file = open_file(&dir.join(WAL), false)?;
+        let length = file.metadata()?.len();
+        if length > LOG_HEADER_BYTES {
+            return Err(invalid_log(
+                "nonempty WAL in unfinished initialization retained",
+            ));
+        }
+        let mut prefix = vec![0; length as usize];
+        file.read_exact(&mut prefix)?;
+        if prefix != expected[..prefix.len()] {
+            return Err(invalid_log(
+                "unfinished initial WAL identity/header mismatch",
+            ));
+        }
+        file.seek(SeekFrom::Start(0))?;
+        file
+    } else {
+        open_file(&dir.join(WAL), true)?
+    };
+    let initial = Current::initial(identity);
+    let current = dir.join(CURRENT);
+    if current.try_exists()? && read_current(dir, identity)? != Some(initial.clone()) {
+        return Err(invalid_log(
+            "noninitial CURRENT under initialization marker retained",
+        ));
+    }
+    let temporary = dir.join("CURRENT.tmp");
+    if temporary.try_exists()? {
+        let expected = encode_current(&initial)?;
+        let mut file = open_file(&temporary, false)?;
+        let length = file.metadata()?.len();
+        if length > expected.len() as u64 {
+            return Err(invalid_log("initial CURRENT temporary length"));
+        }
+        let mut prefix = vec![0; length as usize];
+        file.read_exact(&mut prefix)?;
+        if prefix != expected[..prefix.len()] {
+            return Err(invalid_log("foreign initial CURRENT temporary retained"));
+        }
+        drop(file);
+        fs::remove_file(&temporary)?;
+    }
+    wal.write_all(&expected)?;
+    wal.sync_all()?;
+    sync_dir(dir)?;
+    #[cfg(test)]
+    super::crash_tests::pause(
+        "initialization_wal_installed",
+        "identity and empty WAL durable; initialization incomplete",
+    );
+    if !current.try_exists()? {
+        write_current(dir, &initial, limits)?;
+    }
+    open_file(&current, false)?.sync_all()?;
+    sync_dir(dir)?;
+    fs::remove_file(dir.join("INITIALIZING"))?;
+    sync_dir(dir)?;
+    Ok(identity)
+}
+
 impl LocalLog {
     /// New directories only; old-format or foreign data is never adopted.
     pub fn open(path: impl AsRef<Path>, limits: LogLimits) -> Result<Self> {
@@ -1090,7 +1238,9 @@ impl LocalLog {
             Err(TryLockError::WouldBlock) => return Err(unavailable("Meta log already locked")),
             Err(TryLockError::Error(error)) => return Err(error.into()),
         }
-        let identity = if dir.join(IDENTITY).exists() {
+        let identity = if dir.join("INITIALIZING").try_exists()? {
+            initialize_marked(&dir, checkpoint_limits)?
+        } else if dir.join(IDENTITY).try_exists()? {
             read_identity(&dir)?
         } else {
             for entry in fs::read_dir(&dir)? {
@@ -1100,24 +1250,10 @@ impl LocalLog {
                     ));
                 }
             }
-            let identity = StoreIdentity::new()?;
-            let mut file = open_file(&dir.join(WAL), true)?;
-            let mut bytes = [0; LOG_HEADER_BYTES as usize];
-            bytes[..STATIC_BYTES].copy_from_slice(&static_header(identity, LogTip::EMPTY));
-            bytes[STATIC_BYTES..STATIC_BYTES + SLOT_BYTES].copy_from_slice(&tail_bytes(Tail {
-                generation: 0,
-                tip: LogTip::EMPTY,
-                end: LOG_HEADER_BYTES,
-            }));
-            file.write_all(&bytes)?;
-            file.sync_all()?;
-            let tmp = dir.join("IDENTITY.tmp");
-            let mut root = open_file(&tmp, true)?;
-            root.write_all(&identity_bytes(identity))?;
-            root.sync_all()?;
-            fs::rename(tmp, dir.join(IDENTITY))?;
+            let marker = open_file(&dir.join("INITIALIZING"), true)?;
+            marker.sync_all()?;
             sync_dir(&dir)?;
-            identity
+            initialize_marked(&dir, checkpoint_limits)?
         };
         let replay = replay(&dir, identity, limits, checkpoint_limits)?;
         let mut manifest = replay.manifest;
@@ -1834,6 +1970,99 @@ mod tests {
         .await
         .unwrap();
         tip
+    }
+
+    #[test]
+    fn p3_initialization_resumes_only_marked_empty_prefixes() {
+        for phase in 0..6 {
+            let dir = tempfile::tempdir().unwrap();
+            let identity = StoreIdentity::new().unwrap();
+            fs::write(dir.path().join("INITIALIZING"), []).unwrap();
+            if phase == 1 {
+                fs::write(
+                    dir.path().join("IDENTITY.tmp"),
+                    &identity_bytes(identity)[..12],
+                )
+                .unwrap();
+            }
+            if phase == 2 {
+                fs::write(dir.path().join("IDENTITY.tmp"), identity_bytes(identity)).unwrap();
+            }
+            if phase >= 3 {
+                fs::write(dir.path().join(IDENTITY), identity_bytes(identity)).unwrap();
+                let mut bytes = [0u8; LOG_HEADER_BYTES as usize];
+                bytes[..STATIC_BYTES].copy_from_slice(&static_header(identity, LogTip::EMPTY));
+                bytes[STATIC_BYTES..STATIC_BYTES + SLOT_BYTES].copy_from_slice(&tail_bytes(Tail {
+                    generation: 0,
+                    tip: LogTip::EMPTY,
+                    end: LOG_HEADER_BYTES,
+                }));
+                fs::write(
+                    dir.path().join(WAL),
+                    if phase == 3 {
+                        &bytes[..100]
+                    } else {
+                        &bytes[..]
+                    },
+                )
+                .unwrap();
+            }
+            if phase == 4 {
+                let current = encode_current(&Current::initial(identity)).unwrap();
+                fs::write(dir.path().join("CURRENT.tmp"), &current[..17]).unwrap();
+            }
+            if phase == 5 {
+                write_current(
+                    dir.path(),
+                    &Current::initial(identity),
+                    CheckpointLimits::default(),
+                )
+                .unwrap();
+            }
+            let log = LocalLog::open(dir.path(), LogLimits::default())
+                .unwrap_or_else(|e| panic!("initialization phase {phase} must resume: {e}"));
+            let found = log.identity();
+            if phase >= 2 {
+                assert_eq!(found, identity);
+            }
+            assert!(!dir.path().join("INITIALIZING").exists());
+            assert_eq!(
+                read_current(dir.path(), found).unwrap(),
+                Some(Current::initial(found))
+            );
+            assert_eq!(log.inner.state.lock().unwrap().tip, LogTip::EMPTY);
+            drop(log);
+            assert_eq!(
+                LocalLog::open(dir.path(), LogLimits::default())
+                    .unwrap()
+                    .identity(),
+                found
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn p3_initialization_marker_never_adopts_committed_or_foreign_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = LocalLog::open(dir.path(), LogLimits::default()).unwrap();
+        let identity = log.identity();
+        log.append_and_sync(LogTip::EMPTY, test_records(1))
+            .await
+            .unwrap();
+        drop(log);
+        fs::write(dir.path().join("INITIALIZING"), []).unwrap();
+        let original = fs::read(dir.path().join(WAL)).unwrap();
+        assert!(LocalLog::open(dir.path(), LogLimits::default()).is_err());
+        assert_eq!(fs::read(dir.path().join(WAL)).unwrap(), original);
+        assert_eq!(read_identity(dir.path()).unwrap(), identity);
+        let foreign = tempfile::tempdir().unwrap();
+        fs::write(foreign.path().join("INITIALIZING"), []).unwrap();
+        fs::write(foreign.path().join("snapshot.json"), b"foreign input").unwrap();
+        assert!(LocalLog::open(foreign.path(), LogLimits::default()).is_err());
+        assert_eq!(
+            fs::read(foreign.path().join("snapshot.json")).unwrap(),
+            b"foreign input"
+        );
     }
 
     #[test]
