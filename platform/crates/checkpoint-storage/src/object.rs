@@ -1,6 +1,6 @@
 //! Immutable objects with a manifest commit marker and a best-effort local LRU.
 mod cache;
-use super::{io_error, CheckpointStore, LocalCheckpointStore, MaterializedCheckpoint};
+use super::{io_error, CheckpointAccess, LocalCheckpointStore, RestoreAccess};
 use adx_core::{CheckpointArtifact, Error, Result};
 use async_trait::async_trait;
 pub(super) use cache::CacheLease;
@@ -35,8 +35,6 @@ struct FileEntry {
 }
 pub struct ObjectCheckpointStore {
     pub(super) owner: Option<super::orphans::UploadOwner>,
-    pub(super) gc_config: super::RemoteGcConfig,
-    pub(super) gc_authority: tokio::sync::Mutex<Option<std::collections::BTreeSet<String>>>,
     pub(super) alias: String,
     pub(super) remote: Arc<dyn ObjectStore>,
     pub(super) prefix: Key,
@@ -90,8 +88,6 @@ impl ObjectCheckpointStore {
         let cache = Cache::recover(&index_root, &cache_root, &staging.root)?;
         Ok(Self {
             owner: None,
-            gc_config: Default::default(),
-            gc_authority: Default::default(),
             alias,
             remote,
             prefix: Key::from(prefix),
@@ -167,25 +163,6 @@ impl ObjectCheckpointStore {
         }
         if size != m.size {
             return Err(invalid("manifest size mismatch"));
-        }
-        Ok(())
-    }
-    pub(super) async fn delete_objects(&self, id: &str) -> Result<()> {
-        let prefix = self.key(id, "");
-        let mut objects = self.remote.list(Some(&prefix));
-        let marker = self.key(id, "owner.json");
-        while let Some(object) = objects.try_next().await.map_err(io_error)? {
-            if object.location == marker {
-                continue;
-            }
-            match self.remote.delete(&object.location).await {
-                Ok(()) | Err(object_store::Error::NotFound { .. }) => (),
-                Err(e) => return Err(io_error(e)),
-            }
-        }
-        match self.remote.delete(&marker).await {
-            Ok(()) | Err(object_store::Error::NotFound { .. }) => (),
-            Err(error) => return Err(io_error(error)),
         }
         Ok(())
     }
@@ -353,12 +330,27 @@ fn inventory(root: &Path) -> Result<FileInventory> {
     Ok((files, dirs))
 }
 #[async_trait]
-impl CheckpointStore for ObjectCheckpointStore {
+impl CheckpointAccess for ObjectCheckpointStore {
     fn storage_alias(&self) -> &str {
         &self.alias
     }
-    async fn allocate(&self) -> Result<PathBuf> {
-        self.staging.allocate().await
+    fn capture_references(&self, staged: &Path) -> Result<Vec<CheckpointArtifact>> {
+        let path = self.staging.owned_path(staged)?;
+        let id = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| invalid("invalid capture path"))?;
+        uuid::Uuid::parse_str(id).map_err(invalid)?;
+        let mut refs = self.staging.capture_references(staged)?;
+        refs.push(CheckpointArtifact {
+            storage: self.alias.clone(),
+            location: id.into(),
+            size_bytes: 0,
+        });
+        Ok(refs)
+    }
+    async fn begin_capture(&self) -> Result<PathBuf> {
+        self.staging.begin_capture().await
     }
     async fn discard_staged(&self, staged: &Path) -> Result<()> {
         self.staging.discard_staged(staged).await?;
@@ -366,62 +358,6 @@ impl CheckpointStore for ObjectCheckpointStore {
             self.remove_index(id).await?;
         }
         Ok(())
-    }
-    async fn duplicate(&self, artifact: &CheckpointArtifact) -> Result<CheckpointArtifact> {
-        if artifact.storage == "local" {
-            return self.staging.duplicate(artifact).await;
-        }
-        let _operation = self.operation(&artifact.location).await;
-        let manifest = self.manifest(artifact).await?;
-        let id = uuid::Uuid::new_v4().to_string();
-        self.mark_upload(&id).await?;
-        let result = async {
-            for file in &manifest.files {
-                let source = self.key(&artifact.location, &format!("files/{}", file.path));
-                let target = self.key(&id, &format!("files/{}", file.path));
-                if file.size <= 5 * 1024 * 1024 * 1024 {
-                    self.remote.copy(&source, &target).await.map_err(io_error)?;
-                } else {
-                    // S3 single-request copies are bounded; stream larger files.
-                    let mut input = self
-                        .remote
-                        .get(&source)
-                        .await
-                        .map_err(io_error)?
-                        .into_stream();
-                    let mut output =
-                        BufWriter::with_capacity(self.remote.clone(), target, 8 * 1024 * 1024)
-                            .with_max_concurrency(2);
-                    let copy = async {
-                        while let Some(chunk) = input.try_next().await.map_err(io_error)? {
-                            output.write_all(&chunk).await.map_err(io_error)?;
-                        }
-                        Ok::<_, Error>(())
-                    }
-                    .await;
-                    if let Err(error) = copy {
-                        let _ = output.abort().await;
-                        return Err(error);
-                    }
-                    output.shutdown().await.map_err(io_error)?;
-                }
-            }
-            let data = serde_json::to_vec(&manifest).map_err(invalid)?;
-            self.remote
-                .put(&self.key(&id, "manifest.json"), data.into())
-                .await
-                .map_err(io_error)?;
-            Ok(CheckpointArtifact {
-                storage: self.alias.clone(),
-                location: id.clone(),
-                size_bytes: artifact.size_bytes,
-            })
-        }
-        .await;
-        if result.is_err() {
-            let _ = self.delete_objects(&id).await;
-        }
-        result
     }
     async fn committed(&self, artifact: &CheckpointArtifact) -> Result<()> {
         if artifact.storage == "local" {
@@ -436,7 +372,7 @@ impl CheckpointStore for ObjectCheckpointStore {
         Ok(())
     }
     async fn retain_staged(&self, staged: &Path) -> Result<CheckpointArtifact> {
-        self.staging.publish(staged).await
+        self.staging.seal(staged).await
     }
     async fn validate_artifact(&self, artifact: &CheckpointArtifact) -> Result<()> {
         if artifact.storage == "local" {
@@ -444,8 +380,8 @@ impl CheckpointStore for ObjectCheckpointStore {
         }
         self.manifest(artifact).await.map(|_| ())
     }
-    async fn publish(&self, staged: &Path) -> Result<CheckpointArtifact> {
-        let local = self.staging.publish(staged).await?;
+    async fn seal(&self, staged: &Path) -> Result<CheckpointArtifact> {
+        let local = self.staging.seal(staged).await?;
         let root = PathBuf::from(&local.location);
         let scan_root = root.clone();
         let (files, directories) = tokio::task::spawn_blocking(move || inventory(&scan_root))
@@ -531,14 +467,11 @@ impl CheckpointStore for ObjectCheckpointStore {
             })
         }
         .await;
-        if result.is_err() {
-            let _ = self.delete_objects(&id).await;
-        }
         result
     }
-    async fn materialize(&self, artifact: &CheckpointArtifact) -> Result<MaterializedCheckpoint> {
+    async fn prepare_restore(&self, artifact: &CheckpointArtifact) -> Result<RestoreAccess> {
         if artifact.storage == "local" {
-            return self.staging.materialize(artifact).await;
+            return self.staging.prepare_restore(artifact).await;
         }
         self.validate(artifact)?;
         let _operation = self.operation(&artifact.location).await;
@@ -565,9 +498,9 @@ impl CheckpointStore for ObjectCheckpointStore {
         // Quotas apply when the execution lease is released, not to restoration.
         self.insert(artifact, path, record).await
     }
-    async fn remove(&self, artifact: &CheckpointArtifact) -> Result<()> {
+    async fn release(&self, artifact: &CheckpointArtifact) -> Result<()> {
         if artifact.storage == "local" {
-            return self.staging.remove(artifact).await;
+            return self.staging.release(artifact).await;
         }
         self.validate(artifact)?;
         let _operation = self.operation(&artifact.location).await;
@@ -579,7 +512,7 @@ impl CheckpointStore for ObjectCheckpointStore {
         {
             return Err(Error::Conflict);
         }
-        self.delete_objects(&artifact.location).await?;
+        // Shared objects are reclaimed by Coordinator; this only releases node-private copies.
         let path = self.cache_root.join(&artifact.location);
         if path.exists() {
             tokio::fs::remove_dir_all(path).await.map_err(io_error)?;
@@ -590,12 +523,6 @@ impl CheckpointStore for ObjectCheckpointStore {
         self.staging
             .discard_staged(&self.staging.root.join(&artifact.location))
             .await
-    }
-    async fn authorize_remote_gc(&self, retained: &[CheckpointArtifact]) -> Result<()> {
-        self.authorize(retained).await
-    }
-    async fn collect_remote_orphans(&self) -> Result<usize> {
-        self.collect().await
     }
     async fn reconcile_local(&self, retained: &[CheckpointArtifact]) -> Result<()> {
         self.reconcile_cache(retained).await

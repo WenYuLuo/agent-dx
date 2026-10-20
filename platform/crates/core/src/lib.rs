@@ -21,6 +21,11 @@ pub enum Error {
     Invalid(String),
     #[error("request conflicts with existing state")]
     Conflict,
+    #[error("snapshot is in use by sandboxes {sandbox_ids:?} or templates {template_ids:?}")]
+    SnapshotInUse {
+        sandbox_ids: Vec<String>,
+        template_ids: Vec<String>,
+    },
     #[error("insufficient resources or node admission closed")]
     NoCapacity,
     #[error("record not found")]
@@ -318,6 +323,13 @@ pub struct EnvironmentRecord {
     pub resources_held: bool,
     #[serde(default)]
     pub checkpoint: Option<RestorePoint>,
+    /// Files used or reserved by the execution, independently of its latest recovery point.
+    /// Size zero reserves an incomplete capture; such inputs are never eligible for restore.
+    #[serde(default)]
+    pub execution_artifacts: Vec<CheckpointArtifact>,
+    /// Borrowed reusable snapshot; it is not an Environment-owned anonymous checkpoint.
+    #[serde(default)]
+    pub snapshot_source: Option<RestorePoint>,
     #[serde(default)]
     pub last_operation: Option<CompletedOperation>,
 }

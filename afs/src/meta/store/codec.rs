@@ -72,6 +72,19 @@ impl EncodedKey {
             MetaKey::DfsCopy(id) => (0x28, vec![id.0.as_bytes()]),
             MetaKey::DfsReplicationTask(id) => (0x29, vec![id.0.as_bytes()]),
             MetaKey::DfsWriteLease(id) => (0x2a, vec![id.0.as_bytes()]),
+            MetaKey::DfsReference {
+                node_id,
+                session_id,
+                reference_id,
+            } => (
+                0x2b,
+                vec![
+                    node_id.as_bytes(),
+                    session_id.as_bytes(),
+                    reference_id.as_bytes(),
+                ],
+            ),
+            MetaKey::DfsGc => (0x2c, vec![]),
             MetaKey::DfsReplicationConfig => (0x25, vec![]),
             MetaKey::DfsDurabilityPolicy => (0x26, vec![]),
             MetaKey::RequestOutcome(key) => (
@@ -134,6 +147,12 @@ impl EncodedKey {
             0x28 => MetaKey::DfsCopy(CopyId(text(&mut tail)?)),
             0x29 => MetaKey::DfsReplicationTask(ReplicationTaskId(text(&mut tail)?)),
             0x2a => MetaKey::DfsWriteLease(InodeId(text(&mut tail)?)),
+            0x2b => MetaKey::DfsReference {
+                node_id: text(&mut tail)?,
+                session_id: text(&mut tail)?,
+                reference_id: text(&mut tail)?,
+            },
+            0x2c => MetaKey::DfsGc,
             0x25 => MetaKey::DfsReplicationConfig,
             0x26 => MetaKey::DfsDurabilityPolicy,
             0x30 => MetaKey::RequestOutcome(RequestKey {
@@ -396,6 +415,12 @@ pub(super) mod tests {
             MetaKey::DfsCopy(CopyId("DfsCopy/中".into())),
             MetaKey::DfsReplicationTask(ReplicationTaskId("DfsReplicationTask/中".into())),
             MetaKey::DfsWriteLease(InodeId("DfsWriteLease/中".into())),
+            MetaKey::DfsReference {
+                node_id: "node/中".into(),
+                session_id: "session\0".into(),
+                reference_id: "reference/中".into(),
+            },
+            MetaKey::DfsGc,
             MetaKey::DfsReplicationConfig,
             MetaKey::DfsDurabilityPolicy,
             MetaKey::RequestOutcome(RequestKey::new("caller", "req")),

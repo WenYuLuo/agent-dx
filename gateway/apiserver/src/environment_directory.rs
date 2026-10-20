@@ -226,6 +226,8 @@ mod tests {
     fn entry(id: &str, generation: u64, revision: u64) -> pb::PublishedEnvironment {
         pb::PublishedEnvironment {
             record: Some(pb::EnvironmentRecord {
+                execution_artifacts: vec![],
+                snapshot_source: None,
                 failure: None,
                 spec: Some(pb::EnvironmentSpec {
                     id: id.into(),

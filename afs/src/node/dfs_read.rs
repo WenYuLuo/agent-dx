@@ -1450,6 +1450,24 @@ impl DfsReadEngine {
         self.local.coarse_diagnostic("meta_publish_rpc", 0)
     }
 
+    pub(crate) fn gc_generation(&self) -> Result<u64> {
+        self.local.gc_generation()
+    }
+    pub(crate) fn gc_inventory(&self) -> Result<Vec<crate::dfs::ChunkObject>> {
+        self.local.gc_inventory()
+    }
+    pub(crate) fn collect_generation(&self, generation: u64, chunks: &[ChunkId]) -> Result<usize> {
+        self.readers
+            .lock()
+            .map_err(|_| unavailable("reader cache poisoned"))?
+            .retain(|id, _| !chunks.contains(id));
+        self.source_cache
+            .lock()
+            .map_err(|_| unavailable("source cache poisoned"))?
+            .retain(|_, _| false);
+        self.local.collect_generation(generation, chunks)
+    }
+
     pub fn new(
         namespace_id: crate::dfs::NamespaceId,
         local_node_id: String,
@@ -6615,11 +6633,14 @@ mod tests {
                         sources: vec![source("b", &chunk_id, "node-b")],
                     }],
                 }));
+                // Opening the durable store can fsync; do it before starting
+                // the short expiry interval exercised inside the transfer.
+                let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
                 let authority = Arc::new(LocalReadAuthority::new(
                     1,
                     Instant::now()
                         + if matches!(action, "expire_then_refresh" | "renew_then_expire") {
-                            Duration::from_millis(20)
+                            Duration::from_millis(250)
                         } else {
                             Duration::from_secs(30)
                         },
@@ -6627,7 +6648,7 @@ mod tests {
                 let engine = DfsReadEngine::new(
                     crate::dfs::NamespaceId::new("default"),
                     "node-a".into(),
-                    Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap()),
+                    local,
                     sources,
                     Arc::new(NativeAuthorityTransfer {
                         authority: authority.clone(),

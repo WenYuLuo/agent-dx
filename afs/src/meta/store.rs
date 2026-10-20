@@ -39,6 +39,7 @@ pub mod journal;
 pub use journal::MetaLog;
 pub mod local_log;
 pub mod log;
+mod profile;
 mod state;
 use state::State;
 #[cfg(test)]
@@ -307,6 +308,8 @@ pub enum MetaEntity {
     DfsWriteLease(WriteLease),
     /// Latest issued OwnerFs incarnation; never removed with a Root.
     RootEpochWatermark(u64),
+    DfsReference(crate::dfs::GcReference),
+    DfsGc(crate::dfs::GcState),
 }
 
 impl MetaEntity {
@@ -330,6 +333,8 @@ impl MetaEntity {
             Self::DfsReplicationTask(_) => "dfs_replication_task",
             Self::DfsWriteLease(_) => "dfs_write_lease",
             Self::RootEpochWatermark(_) => "root_epoch_watermark",
+            Self::DfsReference(_) => "dfs_reference",
+            Self::DfsGc(_) => "dfs_gc",
         }
     }
 }
@@ -396,6 +401,7 @@ pub enum MetaRead {
     DfsReplicationTask(ReplicationTaskId),
     DfsReplicationTasks,
     DfsWriteLease(InodeId),
+    DfsGc,
 }
 
 /// A linearizable read response. Empty results are represented explicitly so
@@ -413,6 +419,7 @@ pub struct MetaSnapshot {
 pub enum TxnCondition {
     /// Compare the allocation floor in the same writer turn as reserving an epoch.
     RootEpochWatermarkEquals(u64),
+    StoreRevisionEquals(StoreRevision),
     Missing(MetaKey),
     RevisionEquals {
         key: MetaKey,
@@ -521,6 +528,12 @@ pub enum MetaKey {
     DfsReplicationTask(ReplicationTaskId),
     DfsWriteLease(InodeId),
     RootEpochWatermark,
+    DfsReference {
+        node_id: String,
+        session_id: String,
+        reference_id: String,
+    },
+    DfsGc,
 }
 
 /// Idempotent result stored in the same transaction as the authority mutation.
@@ -570,6 +583,8 @@ pub enum StoreOperation {
     DfsReportChunkCorruption,
     CleanupRootGrants,
     CleanupRootCommands,
+    DfsUpdateReference,
+    DfsCollectGarbage,
 }
 
 impl StoreOperation {
@@ -603,6 +618,8 @@ impl StoreOperation {
             Self::DfsRenewWriteLease => "dfs_renew_write_lease",
             Self::DfsSyncInodeMetadata => "dfs_sync_inode_metadata",
             Self::DfsCommitFileVersion => "dfs_commit_file_version",
+            Self::DfsUpdateReference => "dfs_update_reference",
+            Self::DfsCollectGarbage => "dfs_collect_garbage",
             Self::DfsInitializeReplicationConfig => "dfs_initialize_replication_config",
             Self::DfsInitializeDurabilityPolicy => "dfs_initialize_durability_policy",
             Self::DfsClaimReplicationTask => "dfs_claim_replication_task",
@@ -863,9 +880,13 @@ pub struct OwnerRootScan {
 
 /// Authority operations required by Meta business services.
 ///
-/// Operations are serialized by Store in the active Meta. Only durable
-/// backends preserve facts across restart; memory is explicitly volatile.
-/// Boxed only on the coarse Meta control path.
+/// Constructs the stable identity reused by filesystem mutation retries.
+pub fn timed_request_id(id: impl std::fmt::Display) -> String {
+    format!("afs1-{}-{id}", now_unix_ms())
+}
+
+/// Boxed only on the coarse Meta control path. Durable logs preserve results
+/// across restart; memory is explicitly volatile.
 pub type MetaFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
 
 #[derive(Clone, Copy)]
@@ -1149,13 +1170,13 @@ impl MetaReadView {
                 .clone(),
         }
     }
-    pub async fn read(&self, read: MetaRead) -> Result<MetaSnapshot> {
+    fn with_state<T>(&self, read: impl FnOnce(&State) -> Result<T>) -> Result<T> {
         match &self.state {
             #[cfg(test)]
-            ReadState::Unmanaged(state) => state.read(read),
+            ReadState::Unmanaged(state) => read(state),
             ReadState::Pinned(pin) => {
                 let held = pin.capture()?;
-                let result = held.allocation.state.read(read);
+                let result = read(&held.allocation.state);
                 pin.check()?;
                 if held.owner.bytes.is_closed() {
                     return Err(unavailable("Meta read budget failed"));
@@ -1163,6 +1184,50 @@ impl MetaReadView {
                 result
             }
         }
+    }
+
+    /// Reads one key from this pinned revision for related-key CAS.
+    pub(crate) fn lookup(&self, key: &MetaKey) -> Result<MetaSnapshot> {
+        self.with_state(|state| {
+            let value = state.entities.get(key);
+            Ok(MetaSnapshot {
+                revision: value.map_or(state.revision, |entry| entry.revision),
+                entity: value.map(|entry| entry.entity.clone()),
+                request_outcome: None,
+                entities: Vec::new(),
+            })
+        })
+    }
+
+    pub(crate) fn snapshot(&self) -> Result<(StoreRevision, Vec<MetaEntity>)> {
+        self.with_state(|state| {
+            Ok((
+                state.revision,
+                state
+                    .entities
+                    .values()
+                    .map(|entry| entry.entity.clone())
+                    .collect(),
+            ))
+        })
+    }
+
+    pub(crate) fn statistics(&self) -> Result<serde_json::Value> {
+        self.with_state(|state| {
+            let mut kinds = std::collections::BTreeMap::new();
+            for entry in state.entities.values() {
+                *kinds.entry(entry.entity.name()).or_insert(0_u64) += 1;
+            }
+            Ok(
+                serde_json::json!({"revision": state.revision.0, "entities": kinds,
+                "requests": state.requests.len(), "events": state.events.len(),
+                "watch_floor": state.compacted_to.0}),
+            )
+        })
+    }
+
+    pub async fn read(&self, read: MetaRead) -> Result<MetaSnapshot> {
+        self.with_state(|state| state.read(read))
     }
 }
 
@@ -2074,8 +2139,11 @@ async fn persist_log_group(
                 _ => 0,
             })
             .sum::<u64>();
+        let append_timer = profile::Timer::start();
         match log.append_and_sync(tip, std::mem::take(records)).await {
             Ok(next) => {
+                let append_sync_ms = append_timer.ms();
+                let publish_timer = profile::Timer::start();
                 #[cfg(test)]
                 crash_tests::pause(
                     "after_sync_before_publish",
@@ -2107,6 +2175,14 @@ async fn persist_log_group(
                 visible.metrics.wal_framed_bytes.inc_by(framed_bytes as u64);
                 visible.metrics.request_evictions.inc_by(request_evictions);
                 visible.metrics.event_evictions.inc_by(event_evictions);
+                if profile::enabled() {
+                    profile::record(serde_json::json!({
+                        "event": "afs_meta_store_profile", "backend": "canonical_log",
+                        "bytes": framed_bytes, "records": record_count,
+                        "revision": staged.revision.0,
+                        "append_sync_ms": append_sync_ms, "publish_ms": publish_timer.ms()
+                    }));
+                }
                 next
             }
             Err(error) => {
@@ -2523,9 +2599,15 @@ pub(crate) fn now_unix_ms() -> u64 {
         })
 }
 
-fn entity_key(entity: &MetaEntity) -> MetaKey {
+pub(super) fn entity_key(entity: &MetaEntity) -> MetaKey {
     match entity {
         MetaEntity::RootEpochWatermark(_) => MetaKey::RootEpochWatermark,
+        MetaEntity::DfsReference(reference) => MetaKey::DfsReference {
+            node_id: reference.node_id.clone(),
+            session_id: reference.session_id.clone(),
+            reference_id: reference.reference_id.clone(),
+        },
+        MetaEntity::DfsGc(_) => MetaKey::DfsGc,
         MetaEntity::NodeSession(session) => MetaKey::NodeSession {
             node_id: session.node_id.clone(),
             session_id: session.session_id.clone(),
@@ -2565,6 +2647,7 @@ fn entity_key(entity: &MetaEntity) -> MetaKey {
 
 fn condition_matches(state: &State, condition: &TxnCondition) -> bool {
     match condition {
+        TxnCondition::StoreRevisionEquals(revision) => state.revision == *revision,
         TxnCondition::RootEpochWatermarkEquals(expected) => {
             state.root_epoch_watermark() == *expected
         }
@@ -4094,6 +4177,9 @@ mod tests {
             "retaining an idle handle must not pin its old state forever"
         );
         assert!(view.read(MetaRead::CurrentNodeSessions).await.is_err());
+        assert!(view.lookup(&MetaKey::CurrentNodeSessions).is_err());
+        assert!(view.snapshot().is_err());
+        assert!(view.statistics().is_err());
         assert_eq!(store.read_budget_stats().views, 0);
         assert_eq!(store.read_budget_stats().bytes, 0);
     }
@@ -6631,6 +6717,26 @@ mod tests {
         assert!(pinned.entity.is_none());
         assert!(current.entity.is_some());
         assert!(current.revision > pinned.revision);
+        let absent_key = MetaKey::CurrentNodeSession {
+            node_id: "node-a".into(),
+        };
+        assert!(view.lookup(&absent_key).unwrap().entity.is_none());
+        let first = store.read_view().await.unwrap();
+        store
+            .register_node_session(
+                RequestKey::new("node-a", "view-register-2"),
+                lease("session-2"),
+            )
+            .await
+            .unwrap();
+        let latest = store.read_view().await.unwrap();
+        let old_key = MetaKey::NodeSession {
+            node_id: "node-a".into(),
+            session_id: "session-1".into(),
+        };
+        let old = first.lookup(&old_key).unwrap();
+        assert!(old.entity.is_some());
+        assert_eq!(old, latest.lookup(&old_key).unwrap());
     }
 
     #[tokio::test]

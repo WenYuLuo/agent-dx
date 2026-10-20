@@ -111,6 +111,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "adx-checkpoint-storage"
+version = "0.1.0"
+dependencies = [
+ "adx-core",
+ "adx-observability",
+ "adx-transport",
+ "async-trait",
+ "futures-util",
+ "object_store",
+ "reqwest 0.13.5",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "adx-cli"
 version = "0.1.0"
 dependencies = [
@@ -131,6 +150,7 @@ dependencies = [
 name = "adx-coordinator"
 version = "0.1.0"
 dependencies = [
+ "adx-checkpoint-storage",
  "adx-core",
  "adx-discovery",
  "adx-observability",
@@ -321,6 +341,7 @@ dependencies = [
 name = "adxlet"
 version = "0.1.0"
 dependencies = [
+ "adx-checkpoint-storage",
  "adx-core",
  "adx-discovery",
  "adx-observability",

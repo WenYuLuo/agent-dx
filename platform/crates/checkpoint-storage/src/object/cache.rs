@@ -1,6 +1,6 @@
 //! Local cache accounting. Execution leases are never subject to cache quotas.
 use super::{invalid, Manifest, ObjectCheckpointStore};
-use crate::checkpoint::{io_error, CheckpointStore, MaterializedCheckpoint};
+use crate::{io_error, CheckpointAccess, RestoreAccess};
 use adx_core::{CheckpointArtifact, Result};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -225,8 +225,8 @@ impl ObjectCheckpointStore {
         }
         result
     }
-    fn files(&self, entry: &CacheEntry) -> MaterializedCheckpoint {
-        MaterializedCheckpoint::pinned(
+    fn files(&self, entry: &CacheEntry) -> RestoreAccess {
+        RestoreAccess::pinned(
             entry.path.clone(),
             CacheLease {
                 pin: Some(entry.pin.clone()),
@@ -241,7 +241,7 @@ impl ObjectCheckpointStore {
         artifact: &CheckpointArtifact,
         path: PathBuf,
         mut record: CacheRecord,
-    ) -> Result<MaterializedCheckpoint> {
+    ) -> Result<RestoreAccess> {
         let disk_bytes = allocated(&path)?;
         let mut cache = self.cache.lock().await;
         record.used = cache.tick();
@@ -266,7 +266,7 @@ impl ObjectCheckpointStore {
     pub(super) async fn cached(
         &self,
         artifact: &CheckpointArtifact,
-    ) -> Result<Option<MaterializedCheckpoint>> {
+    ) -> Result<Option<RestoreAccess>> {
         let cached = {
             let mut cache = self.cache.lock().await;
             let used = cache.tick();

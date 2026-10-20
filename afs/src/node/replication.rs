@@ -435,6 +435,7 @@ impl ReplicationEngine {
 }
 
 pub struct DfsChunkStore {
+    gc_control: Option<Arc<dyn crate::node::gc::GcControl>>,
     local_node_id: String,
     local_node_epoch: Option<u64>,
     local: Arc<LocalChunkStore>,
@@ -443,6 +444,27 @@ pub struct DfsChunkStore {
 }
 
 impl DfsChunkStore {
+    fn reserve_gc_publications(&self, staged: &[StagedChunk]) -> Result<()> {
+        if let Some(control) = &self.gc_control {
+            let mut operations = std::collections::BTreeMap::<_, Vec<_>>::new();
+            for item in staged {
+                operations
+                    .entry(item.operation_id.clone())
+                    .or_default()
+                    .push(item.chunk.clone());
+            }
+            for (operation, chunks) in operations {
+                control.reserve_publication(&operation, chunks)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn with_gc_control(mut self, control: Arc<dyn crate::node::gc::GcControl>) -> Self {
+        self.gc_control = Some(control);
+        self
+    }
+
     pub fn new(
         local_node_id: String,
         local: Arc<LocalChunkStore>,
@@ -450,6 +472,7 @@ impl DfsChunkStore {
         data_plane: Arc<dyn ReplicaDataPlane>,
     ) -> Self {
         Self {
+            gc_control: None,
             local_node_id: local_node_id.clone(),
             local_node_epoch: None,
             local: local.clone(),
@@ -466,6 +489,7 @@ impl DfsChunkStore {
         data_plane: Arc<dyn ReplicaDataPlane>,
     ) -> Self {
         Self {
+            gc_control: None,
             local_node_id: local_node_id.clone(),
             local_node_epoch: Some(local_node_epoch),
             local: local.clone(),
@@ -579,6 +603,7 @@ impl DfsChunkStore {
 
 impl ChunkStore for DfsChunkStore {
     fn put_batch(&self, staged: Vec<StagedChunk>) -> Result<Vec<ChunkReceipt>> {
+        self.reserve_gc_publications(&staged)?;
         let snapshot = self.placement.snapshot()?;
         if snapshot.replication.is_local_fast_path() {
             self.put_local_batch(staged, &snapshot)
@@ -629,6 +654,7 @@ impl ChunkStore for DfsChunkStore {
     }
 
     fn put_native_batch(&self, staged: Vec<StagedChunk>) -> Result<Vec<NativeChunkReceipt>> {
+        self.reserve_gc_publications(&staged)?;
         let snapshot = self.placement.snapshot()?;
         let receipts = if snapshot.replication.is_local_fast_path() {
             self.put_local_batch(staged, &snapshot)?
@@ -1349,6 +1375,78 @@ mod tests {
             min_distinct_failure_domains: 1,
             local_copy: LocalCopyPolicy::Required,
         }
+    }
+
+    #[test]
+    fn native_upload_requires_gc_reservation_before_writing() {
+        struct RejectGc;
+        impl crate::node::gc::GcControl for RejectGc {
+            fn retain(
+                &self,
+                _: &str,
+                _: &crate::dfs::InodeId,
+                _: Option<&crate::dfs::FileVersionId>,
+                _: bool,
+            ) -> Result<()> {
+                Ok(())
+            }
+            fn release(&self, _: &str) -> Result<()> {
+                Ok(())
+            }
+            fn reserve_publication(
+                &self,
+                _: &OperationId,
+                _: Vec<crate::dfs::ChunkObject>,
+            ) -> Result<()> {
+                Err(Error::coded(
+                    afs_error::META_DFS_GC_BUSY,
+                    "deletion in progress",
+                ))
+            }
+            fn collect(
+                &self,
+                _: u64,
+                _: Vec<crate::dfs::ChunkObject>,
+            ) -> Result<crate::dfs::GcState> {
+                Ok(crate::dfs::GcState::default())
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
+        let snapshot = Arc::new(PlacementSnapshot {
+            revision: 1,
+            replication: config(1),
+            replica_groups: vec![ReplicaGroup {
+                id: ReplicaGroupId::new("g"),
+                placement_epoch: 1,
+                targets: vec![target_with_epoch(
+                    "node-a",
+                    1,
+                    local.device_descriptor().unwrap(),
+                )],
+            }],
+        });
+        let store = DfsChunkStore::new_with_epoch(
+            "node-a".into(),
+            1,
+            local.clone(),
+            Arc::new(StaticPlacement { snapshot }),
+            Arc::new(FakeDataPlane::default()),
+        )
+        .with_gc_control(Arc::new(RejectGc));
+        let input = staged("native-gc-rejection");
+        assert_eq!(
+            store
+                .put_native_batch(vec![input.clone()])
+                .err()
+                .unwrap()
+                .code(),
+            afs_error::META_DFS_GC_BUSY
+        );
+        assert!(
+            local.open_receipt_reader(&input.chunk).is_err(),
+            "rejected upload must not install a chunk"
+        );
     }
 
     #[test]

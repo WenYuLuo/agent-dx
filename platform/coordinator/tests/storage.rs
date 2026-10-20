@@ -1,3 +1,5 @@
+#[path = "storage/artifact_lifecycle.rs"]
+mod artifact_lifecycle;
 #[path = "storage/claims.rs"]
 mod claims;
 mod common;
@@ -46,6 +48,8 @@ fn node(id: &str) -> Node {
 }
 fn running(spec: EnvironmentSpec, assignment: Assignment) -> EnvironmentRecord {
     EnvironmentRecord {
+        execution_artifacts: vec![],
+        snapshot_source: None,
         failure: None,
         restart_attempts: 0,
         restart_pending: false,

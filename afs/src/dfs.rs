@@ -8,6 +8,11 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+mod cow;
+mod gc;
+pub use cow::clone_file_layout;
+pub use gc::{GcReference, GcState, UpdateGcReference};
+
 macro_rules! string_id {
     ($name:ident) => {
         #[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -997,6 +1002,14 @@ pub struct CommitMetadataDelta {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CloneFileRange {
+    pub version: FileVersionId,
+    pub source_offset: u64,
+    pub destination_offset: u64,
+    pub length: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CommitFileVersion {
     pub operation_id: OperationId,
     pub inode_id: InodeId,
@@ -1006,6 +1019,9 @@ pub struct CommitFileVersion {
     pub file_version: FileVersion,
     pub layout_root: LayoutRoot,
     pub chunk_receipts: Vec<ChunkReceipt>,
+    /// COW inherits only the specified range of an immutable source version.
+    #[serde(default)]
+    pub clone_source: Option<CloneFileRange>,
     pub metadata_delta: CommitMetadataDelta,
 }
 

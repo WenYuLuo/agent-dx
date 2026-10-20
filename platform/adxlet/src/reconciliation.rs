@@ -33,18 +33,6 @@ fn terminal_without_execution(record: &EnvironmentRecord) -> bool {
 }
 
 impl Adxlet {
-    /// Collection is permitted only after complete authoritative recovery.
-    pub async fn collect_remote_orphans(&self) -> Result<usize> {
-        let ready = self.lifecycle_ready.read().await;
-        if !*ready || self.is_draining() {
-            return Ok(0);
-        }
-        match &self.services.checkpoint {
-            Some(checkpoint) => checkpoint.store.collect_remote_orphans().await,
-            None => Ok(0),
-        }
-    }
-
     /// Called only with a Coordinator-authorized, unreferenced deletion record.
     /// A lost acknowledgement can safely repeat the same artifact removal.
     pub async fn collect_snapshot(&self, snapshot: &Snapshot) -> Result<()> {
@@ -57,7 +45,7 @@ impl Adxlet {
             .checkpoint
             .as_ref()
             .ok_or_else(|| Error::Unavailable("checkpoint storage is not configured".into()))?;
-        checkpoint.store.remove(&snapshot.artifact).await
+        checkpoint.store.release(&snapshot.artifact).await
     }
 
     /// Caller must obtain the entire catalog from the current Coordinator while node
@@ -77,19 +65,19 @@ impl Adxlet {
             .await
             .map(|_| ())
     }
-    /// `retained_checkpoints` must include all globally referenced artifacts,
+    /// `retained_artifacts` must include all globally referenced artifacts,
     /// including other nodes and pending restores. Only this complete catalog
     /// permits reclaiming checkpoints owned by retired local controllers.
     pub async fn reconcile_retained(
         &self,
         records: Vec<EnvironmentRecord>,
         snapshots: Vec<Snapshot>,
-        retained_checkpoints: Vec<adx_core::CheckpointArtifact>,
+        retained_artifacts: Vec<adx_core::CheckpointArtifact>,
     ) -> Result<()> {
         self.reconcile_authority(
             records,
             snapshots,
-            Some(retained_checkpoints),
+            Some(retained_artifacts),
             ReconciliationMode::Recover,
         )
         .await
@@ -100,12 +88,12 @@ impl Adxlet {
         &self,
         records: Vec<EnvironmentRecord>,
         snapshots: Vec<Snapshot>,
-        retained_checkpoints: Vec<adx_core::CheckpointArtifact>,
+        retained_artifacts: Vec<adx_core::CheckpointArtifact>,
     ) -> Result<ReconciliationOutcome> {
         self.reconcile_authority(
             records,
             snapshots,
-            Some(retained_checkpoints),
+            Some(retained_artifacts),
             ReconciliationMode::Compare,
         )
         .await
@@ -114,7 +102,7 @@ impl Adxlet {
         &self,
         records: Vec<EnvironmentRecord>,
         snapshots: Vec<Snapshot>,
-        retained_checkpoints: Option<Vec<adx_core::CheckpointArtifact>>,
+        retained_artifacts: Option<Vec<adx_core::CheckpointArtifact>>,
         mode: ReconciliationMode,
     ) -> Result<ReconciliationOutcome> {
         let mut ready = self.lifecycle_ready.write().await;
@@ -124,8 +112,8 @@ impl Adxlet {
         let was_ready = *ready;
         *ready = false;
         let mut snapshot_ids = BTreeSet::new();
-        let complete_references = retained_checkpoints.is_some();
-        let mut retained = retained_checkpoints.unwrap_or_default();
+        let complete_references = retained_artifacts.is_some();
+        let mut retained = retained_artifacts.unwrap_or_default();
         for snapshot in snapshots {
             snapshot.validate()?;
             if snapshot.source_node_id != self.node_id
@@ -153,6 +141,10 @@ impl Adxlet {
             {
                 return Err(Error::Conflict);
             }
+            retained.extend(r.execution_artifacts.iter().cloned());
+            if let Some(source) = &r.snapshot_source {
+                retained.push(source.artifact.clone());
+            }
             if r.resources_held {
                 scalar.restore(&r.runtime.id, r.spec.resources)?;
                 cards.restore(&r.runtime.id, &r.assignment.devices)?;
@@ -165,11 +157,14 @@ impl Adxlet {
             Arc::new(
                 retained
                     .iter()
-                    .chain(
-                        catalog
-                            .values()
-                            .filter_map(|record| record.checkpoint.as_ref().map(|cp| &cp.artifact)),
-                    )
+                    .chain(catalog.values().flat_map(|record| {
+                        record
+                            .checkpoint
+                            .iter()
+                            .chain(record.snapshot_source.iter())
+                            .map(|cp| &cp.artifact)
+                            .chain(record.execution_artifacts.iter())
+                    }))
                     .map(|artifact| (artifact.storage.clone(), artifact.location.clone()))
                     .collect(),
             )
@@ -313,6 +308,10 @@ impl Adxlet {
                 if let Some((_, _, handle)) = environments.get(&r.spec.id) {
                     handle.clone()
                 } else {
+                    retained.extend(r.execution_artifacts.iter().cloned());
+                    if let Some(source) = &r.snapshot_source {
+                        retained.push(source.artifact.clone());
+                    }
                     if r.resources_held {
                         let mut admission = self
                             .services
@@ -388,9 +387,6 @@ impl Adxlet {
         } else {
             // This only replaces bindings if the Relay session actually changed.
             self.services.routes.ensure_synced().await?;
-        }
-        if let Some(checkpoint) = &self.services.checkpoint {
-            checkpoint.store.authorize_remote_gc(&retained).await?;
         }
         self.local_holds
             .lock()

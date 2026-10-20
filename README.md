@@ -24,7 +24,7 @@ Agent DX (**Agent Distributed eXecutor**) is a distributed execution substrate f
 | Add isolated command, file, terminal, and port operations to one agent service | Standalone | One Linux host, separately managed sandboxd, an ADX release package, and Environment networking |
 | Share execution capacity across agent services and machines | Split-host roles | Persistent Redis, one Coordinator deployment, one or more worker deployments, and a reachable Gateway |
 | Run a production-style cluster with repeatable acceptance | Kubernetes | Linux workers, persistent Redis, component certificates, sandboxd on worker nodes, and the ADX Kubernetes E2E profile |
-| Pause, resume, clone, or recover long-running work | Standalone or distributed | A checkpoint-capable runtime plus local or S3-compatible checkpoint storage |
+| Pause, resume, clone, or recover long-running work | Standalone or distributed | A checkpoint-capable runtime plus local, S3-compatible or AFS checkpoint storage |
 | Schedule accelerator workloads | Distributed | GPU/NPU inventory from workers and matching device requests in the Environment specification |
 
 ## 🧩 How Agent DX fits your stack
@@ -35,7 +35,7 @@ Agent DX (**Agent Distributed eXecutor**) is a distributed execution substrate f
 | Agent DX | Authentication, placement, Environment state, routing, recovery, and observability | Provides one distributed execution contract across nodes and execution backends |
 | sandboxd | Runtime creation, isolation, networking, and checkpoint primitives | Runs as an external service on each worker and is accessed through the adxlet runtime driver |
 | Execd inside the Runtime | Commands, files, terminals, ports, activity, and runtime recovery cooperation | Receives data traffic through Ingress and Relay after ownership and generation checks |
-| Redis and object storage | Authoritative cluster metadata and optional shared checkpoint bytes | Redis stores control state and discovery; object storage enables cross-node checkpoint access |
+| Redis and shared storage | Authoritative cluster metadata and optional shared checkpoint files | Redis stores control state and discovery; S3 or AFS enables cross-node checkpoint access |
 
 ## 🔄 How it works
 
@@ -158,7 +158,7 @@ The fixed control path is Agent/application → Environment SDK/HTTP API → API
 
 Execd can initiate a dedicated bidirectional control stream to adxlet, publishing Ready and checkpoint state while receiving checkpoint commands. Enable it with the [node runtime-control configuration](docs/deployment/runtime-control-stream.md); both the node binary and the Execd inside the runtime image must be updated. Without that configuration, runtime cooperation uses HTTP. The [contract](platform/api/proto/runtime-control.md) and [component validation](docs/testing/runtime-control-stream.md) describe identity fencing, reconnect and acknowledgements after authoritative result submission.
 
-Local-only checkpoint success confirms readable files on the owning node and committed recovery-point metadata; adxlet does not force file writeback or guarantee artifact survival after a host crash or power loss. Object storage requires complete upload before success. Completed uploads reuse their local files in a node LRU (default 500 unreferenced snapshots / 50 GiB); cache quotas do not block resume downloads or execution references. See the [checkpoint storage contract](docs/testing/snapshot-storage.md).
+Checkpoint storage supports local only, S3 with a node cache, and direct AFS filesystem access. Shared publication completes the backend persistence barrier before authoritative metadata is acknowledged; local only retains readable-file semantics without forced writeback. Anonymous recovery points belong to their Environment; active execution inputs remain protected until confirmed cleanup. Coordinator reclaims shared S3/AFS artifacts, while nodes manage local files and cache eviction. Deleting an in-use reusable Snapshot returns `SNAPSHOT_IN_USE` with the Sandbox list. See the [storage contract and validation boundaries](docs/testing/snapshot-storage.md).
 
 [Component names and abstractions](docs/architecture/naming.md).
 
@@ -168,7 +168,7 @@ Local-only checkpoint success confirms readable files on the owning node and com
 - Central and local-first creation with CPU, memory, disk, GPU/NPU device, label, affinity, and preference constraints.
 - API Key administrator and tenant identities plus configurable internal mTLS.
 - Versioned route publication and synchronized local binding checks.
-- Node reconciliation, restart policy, idle deletion/pause, traffic-triggered resume, checkpoint recovery, local/S3-compatible storage, and reference-aware artifact cleanup.
+- Node reconciliation, restart policy, idle deletion/pause, traffic-triggered resume, checkpoint recovery, local/S3/AFS storage adapters, and reference-aware artifact cleanup.
 - Prometheus metrics, OpenTelemetry traces, structured component logs, and external Collector integration. Node runtime stdout/stderr is redirected to per-runtime files with terminated-log compression and GC.
 - Process deployment with managed or external Redis and Kubernetes end-to-end deployment profiles.
 

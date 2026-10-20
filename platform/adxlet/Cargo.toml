@@ -12,6 +12,7 @@ build = "build.rs"
 workspace = true
 
 [dependencies]
+adx-checkpoint-storage = { path = "../crates/checkpoint-storage" }
 adx-observability = { path = "../../crates/observability" }
 adx-transport = { path = "../../crates/transport" }
 data-plane-gateway = { path = "../../gateway" }

@@ -1111,6 +1111,7 @@ impl RuntimeDriver for Sandboxd {
         path: &Path,
         origin: Option<&adx_core::runtime::RuntimeIdentity>,
     ) -> Result<IpAddr> {
+        let started = tokio::time::Instant::now();
         let request = self
             .restore_request(
                 spec,
@@ -1120,7 +1121,16 @@ impl RuntimeDriver for Sandboxd {
                 crate::RestoreSource { path, origin },
             )
             .await?;
-        self.execute_start(runtime_id, request, None).await
+        let request_ms = started.elapsed().as_secs_f64() * 1_000.0;
+        let start = tokio::time::Instant::now();
+        let result = self.execute_start(runtime_id, request, None).await;
+        adx_observability::info!(
+            event = "environment_backend_restore_stages", environment_id = %spec.id,
+            %runtime_id, request_ms, start_rpc_ms = start.elapsed().as_secs_f64() * 1_000.0,
+            total_ms = started.elapsed().as_secs_f64() * 1_000.0,
+            success = result.is_ok(), "backend restore stages completed"
+        );
+        result
     }
     async fn restore_from_with_deadline(
         &self,

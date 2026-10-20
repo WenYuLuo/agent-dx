@@ -1484,6 +1484,7 @@ fn owner_root_messages_keep_location_reservation_and_access_separate() {
 #[test]
 fn dfs_commit_keeps_file_layout_and_durable_chunk_receipt_explicit() {
     let commit = CommitFileVersionRequest {
+        clone_source: None,
         caller_id: "node-a".into(),
         operation_id: "session-a-write-1".into(),
         inode_id: "inode:session-a-create-1".into(),
@@ -2396,6 +2397,7 @@ async fn commit_request_with_copies(
     let inode = created.inode.unwrap();
     let lease = created.write_lease.unwrap();
     CommitFileVersionRequest {
+        clone_source: None,
         caller_id: "node-a".into(),
         operation_id: "commit-lost-result".into(),
         inode_id: inode.inode_id.clone(),
@@ -2540,8 +2542,20 @@ async fn p3_supported_commit_shapes_survive_local_log_reopen() {
             panic!("expected one domain decision");
         };
         let facts = decision.facts().unwrap();
-        let expected_changes = 3 + chunks * (2 + usize::from(copies));
+        // Publishing also releases the in-flight GC reference atomically.
+        let expected_changes = 4 + chunks * (2 + usize::from(copies));
         assert_eq!(facts.events.len(), expected_changes);
+        assert_eq!(
+            facts
+                .events
+                .iter()
+                .filter(|event| {
+                    matches!(event.key, afs::meta::store::MetaKey::DfsReference { .. })
+                        && matches!(event.change, afs::meta::store::WatchChange::Delete)
+                })
+                .count(),
+            1
+        );
         assert_eq!(facts.outcomes.len(), 1);
         let record_bytes = decision
             .encode(LogLimits::default().record_max_bytes)
@@ -3036,6 +3050,7 @@ async fn dfs_commit_accepts_durable_ack_after_unrelated_catalog_advance() {
 
     let committed = dfs
         .commit_file_version(Request::new(CommitFileVersionRequest {
+            clone_source: None,
             caller_id: "node-a".into(),
             operation_id: "commit-old-ack".into(),
             inode_id: inode.inode_id.clone(),
@@ -4144,6 +4159,7 @@ async fn dfs_data_commit_allows_metadata_revision_drift_without_losing_attrs() {
     assert_eq!(renamed.revision, linked.revision + 1);
 
     let commit_request = CommitFileVersionRequest {
+        clone_source: None,
         caller_id: "node-a".into(),
         operation_id: "commit-cas-drift".into(),
         inode_id: initial.inode_id.clone(),
@@ -4258,6 +4274,7 @@ async fn dfs_data_commit_allows_metadata_revision_drift_without_losing_attrs() {
 
     let old_head = dfs
         .commit_file_version(Request::new(CommitFileVersionRequest {
+            clone_source: None,
             caller_id: "node-a".into(),
             operation_id: "commit-cas-old-head".into(),
             inode_id: initial.inode_id.clone(),
@@ -4291,6 +4308,7 @@ async fn dfs_data_commit_allows_metadata_revision_drift_without_losing_attrs() {
 
     let future_revision = dfs
         .commit_file_version(Request::new(CommitFileVersionRequest {
+            clone_source: None,
             caller_id: "node-a".into(),
             operation_id: "commit-cas-future-revision".into(),
             inode_id: initial.inode_id,
@@ -4465,6 +4483,7 @@ async fn dfs_write_lease_reuses_one_owner_and_fences_stale_commits() {
 
     let stale = dfs
         .commit_file_version(Request::new(CommitFileVersionRequest {
+            clone_source: None,
             caller_id: "node-a".into(),
             operation_id: "commit-stale".into(),
             inode_id: inode.inode_id.clone(),
@@ -5230,6 +5249,7 @@ async fn dfs_kernel_killpriv_commit_requires_lease_and_preserves_nonexecutable_s
         let inode = created.inode.unwrap();
         let lease = created.write_lease.unwrap();
         let request = CommitFileVersionRequest {
+            clone_source: None,
             caller_id: "node-a".into(),
             operation_id: format!("commit-killpriv-{index}"),
             inode_id: inode.inode_id.clone(),

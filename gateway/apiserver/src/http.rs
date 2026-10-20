@@ -1236,6 +1236,8 @@ mod error_contract_tests {
     fn instance_view_exposes_record_tenant_without_execution_secrets() {
         let view = instance_view(pb::GetEnvironmentResponse {
             record: Some(pb::EnvironmentRecord {
+                execution_artifacts: vec![],
+                snapshot_source: None,
                 spec: Some(pb::EnvironmentSpec {
                     id: "environment-1".into(),
                     tenant_id: "tenant-a".into(),
@@ -1553,6 +1555,27 @@ mod error_contract_tests {
         assert_eq!(value["instanceInfos"][0]["resources"]["GPU"], "2");
     }
 
+    #[tokio::test]
+    async fn busy_snapshot_delete_returns_complete_blocker_list() {
+        let response = error_response(
+            adx_protocol::status(adx_core::Error::SnapshotInUse {
+                sandbox_ids: vec!["sandbox-a".into(), "source".into()],
+                template_ids: vec![],
+            }),
+            "request-a",
+            None,
+            None,
+            false,
+        );
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = error_body(response).await;
+        assert_eq!(body["error"]["code"], "SNAPSHOT_IN_USE");
+        assert_eq!(
+            body["error"]["sandbox_ids"],
+            serde_json::json!(["sandbox-a", "source"])
+        );
+        assert_eq!(body["error"]["retry"], "never");
+    }
     #[tokio::test]
     async fn submitted_write_error_serializes_the_stable_contract() {
         let response = error_response(

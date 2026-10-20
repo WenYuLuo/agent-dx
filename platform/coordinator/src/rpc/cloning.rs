@@ -88,5 +88,17 @@ pub(super) async fn normalize(
             }
         }
     }
+    if snapshot.artifact.storage != "local" {
+        if policy.required_node.is_empty() {
+            policy.required_node.push(Default::default());
+        }
+        for alternative in &mut policy.required_node {
+            alternative.expressions.push(pb::LabelRequirement {
+                key: "ADX_CHECKPOINT_STORAGE".into(),
+                op: pb::SelectorOp::In as i32,
+                values: vec![snapshot.artifact.storage.clone()],
+            });
+        }
+    }
     request.try_into()
 }

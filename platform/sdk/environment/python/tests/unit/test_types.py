@@ -112,6 +112,37 @@ class TypesTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "non-empty"):
             Mount(target="/mnt/data", image_url="")
 
+    def test_local_mount_carries_shared_workspace_contract(self):
+        mount = Mount(
+            target="/home/jiuwen", host_path="/home/agentos/users/user-1",
+            options=("rw", "nodev"), create_if_missing=True,
+        )
+        self.assertEqual(mount.to_dict(), {
+            "type": "bind", "target": "/home/jiuwen",
+            "host_path": "/home/agentos/users/user-1",
+            "options": ["rw", "nodev"], "create_if_missing": True,
+        })
+
+    def test_local_mount_rejects_ambiguous_or_unsafe_sources(self):
+        for kwargs in (
+            {"host_path": "relative/user"},
+            {"host_path": "/shared/../other"},
+            {"host_path": "/shared/user", "image_url": "image:v1"},
+            {"host_path": "/shared/user", "options": ("ro", "rw")},
+            {"host_path": "/shared/user", "options": ("unknown",)},
+            {"host_path": "/shared/user", "type": "erofs", "create_if_missing": True},
+            {"image_url": "image:v1", "create_if_missing": True},
+        ):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                Mount(target="/workspace", **kwargs)
+
+    def test_mount_options_are_immutable_and_legacy_sources_remain_read_only(self):
+        options = ["rw"]
+        mount = Mount(target="/workspace", host_path="/shared/user", options=options)
+        options.append("ro")
+        self.assertEqual(mount.to_dict()["options"], ["rw"])
+        self.assertEqual(Mount(target="/tool", image_url="image:v1").to_dict()["options"], ["ro"])
+
     def test_resources_uses_process_configuration(self):
         parameters = inspect.signature(resources).parameters
         self.assertEqual(list(parameters), ["connection"])

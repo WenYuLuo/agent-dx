@@ -3,11 +3,61 @@ use crate::{journal::JournalSink, reconciliation::ReconciliationOutcome, Adxlet}
 use adx_core::EnvironmentRecord;
 use adx_protocol::{control as pb, status};
 use adx_transport::rpc::RpcChannel;
-use std::{sync::atomic::Ordering, time::Duration};
+use std::{future::Future, sync::atomic::Ordering, time::Duration};
 use tokio::time::{Instant, MissedTickBehavior};
 use tonic::{Request, Status};
 
 type Coordinator = pb::coordinator_service_client::CoordinatorServiceClient<RpcChannel>;
+
+async fn bounded_rpc<T>(
+    timeout: Duration,
+    future: impl Future<Output = Result<T, Status>>,
+) -> Result<T, Status> {
+    tokio::time::timeout(timeout, future)
+        .await
+        .map_err(|_| Status::deadline_exceeded("node authority RPC timed out"))?
+}
+
+async fn drain_reporting<D, H>(draining: D, reporting: H) -> Result<(), Status>
+where
+    D: Future<Output = ()>,
+    H: Future<Output = Result<(), Status>>,
+{
+    tokio::select! {
+        _ = draining => Ok(()),
+        result = reporting => result,
+    }
+}
+
+/// Close lifecycle admission while continuing bounded reports for accepted work.
+pub async fn pause_lifecycle_reporting(
+    manager: &Adxlet,
+    coordinator: &mut Coordinator,
+    registration: &mut pb::RegisterNodeRequest,
+    timeout: Duration,
+    report_interval: Duration,
+    handshake_required: &mut bool,
+) -> Result<(), Status> {
+    if timeout.is_zero() || report_interval.is_zero() {
+        return Err(Status::invalid_argument(
+            "positive node reporting intervals required",
+        ));
+    }
+    registration.accepting_allocations = false;
+    let mut heartbeat = tokio::time::interval_at(Instant::now() + report_interval, report_interval);
+    heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    drain_reporting(manager.pause_lifecycle(), async {
+        loop {
+            heartbeat.tick().await;
+            if let Err(error) = report(coordinator, registration, timeout, handshake_required).await
+            {
+                // A report failure cannot abandon the drain or reopen lifecycle.
+                adx_observability::warn!(%error, "node report unavailable while lifecycle drains");
+            }
+        }
+    })
+    .await
+}
 
 async fn report(
     coordinator: &mut Coordinator,
@@ -21,10 +71,9 @@ async fn report(
         .ok_or_else(|| Status::internal("heartbeat sequence exhausted"))?;
     let mut request = Request::new(registration.clone());
     request.set_timeout(timeout);
-    let result = match tokio::time::timeout(timeout, coordinator.register_node(request)).await {
-        Ok(response) => response.map(|_| ()),
-        Err(_) => Err(Status::deadline_exceeded("node report timed out")),
-    };
+    let result = bounded_rpc(timeout, coordinator.register_node(request))
+        .await
+        .map(|_| ());
     if result
         .as_ref()
         .is_err_and(|error| error.code() == tonic::Code::FailedPrecondition)
@@ -44,12 +93,9 @@ async fn inspect(
         session_id: registration.session_id.clone(),
     });
     request.set_timeout(timeout);
-    Ok(
-        tokio::time::timeout(timeout, coordinator.inspect_node(request))
-            .await
-            .map_err(|_| Status::deadline_exceeded("authoritative node catalog timed out"))??
-            .into_inner(),
-    )
+    Ok(bounded_rpc(timeout, coordinator.inspect_node(request))
+        .await?
+        .into_inner())
 }
 
 /// Obtain a complete current catalog with admission closed, reconcile every
@@ -72,9 +118,6 @@ pub async fn reconcile_node(
     let periodic = manager.authority_initialized.load(Ordering::Acquire)
         && registration.heartbeat_sequence > 0;
     manager.authority_reconciling.store(true, Ordering::Release);
-    if !periodic {
-        manager.pause_lifecycle().await;
-    }
     // Startup withdraws routability until recovery completes. A validated live
     // session only closes new allocation while refreshing its authority catalog.
     let handshake = !periodic || registration.reconciling;
@@ -88,6 +131,17 @@ pub async fn reconcile_node(
     let mut catalog_received = false;
     let mut catalog_stale = false;
     let mut handshake_required = false;
+    if !periodic {
+        pause_lifecycle_reporting(
+            manager,
+            coordinator,
+            registration,
+            timeout,
+            report_interval,
+            &mut handshake_required,
+        )
+        .await?;
+    }
     let result = async {
         report(coordinator, registration, timeout, &mut handshake_required).await?;
         let mut catalog = inspect(coordinator, registration, timeout).await?;
@@ -118,9 +172,9 @@ pub async fn reconcile_node(
             .collect::<adx_core::Result<Vec<_>>>()
             .map_err(status)?;
         let retained = catalog
-            .retained_checkpoints
+            .retained_artifacts
             .into_iter()
-            .map(|cp| adx_core::RestorePoint::try_from(cp).map(|cp| cp.artifact))
+            .map(adx_core::CheckpointArtifact::try_from)
             .collect::<adx_core::Result<Vec<_>>>()
             .map_err(status)?;
         let recovery = async {
@@ -163,7 +217,15 @@ pub async fn reconcile_node(
     if result.is_err() {
         manager.authority_reconciling.store(true, Ordering::Release);
         if !catalog_stale {
-            manager.pause_lifecycle().await;
+            pause_lifecycle_reporting(
+                manager,
+                coordinator,
+                registration,
+                timeout,
+                report_interval,
+                &mut handshake_required,
+            )
+            .await?;
         }
         // Coordinator restart/ownership invalidation can require a fresh
         // registration handshake, independently of local controller recovery.
@@ -187,4 +249,40 @@ pub async fn reconcile_node(
         registration.accepting_allocations = false;
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn bounded_rpc_releases_a_stalled_heartbeat() {
+        let result = bounded_rpc(
+            Duration::from_millis(10),
+            std::future::pending::<Result<(), Status>>(),
+        )
+        .await;
+        assert_eq!(result.unwrap_err().code(), tonic::Code::DeadlineExceeded);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn draining_a_restore_keeps_reporting_before_the_node_expiry_deadline() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let reports = AtomicU64::new(0);
+        let mut interval = tokio::time::interval(Duration::from_secs(2));
+        drain_reporting(
+            async {
+                tokio::time::sleep(Duration::from_secs(24)).await;
+                assert!(reports.load(Ordering::Relaxed) >= 10);
+            },
+            async {
+                loop {
+                    interval.tick().await;
+                    reports.fetch_add(1, Ordering::Relaxed);
+                }
+            },
+        )
+        .await
+        .unwrap();
+    }
 }

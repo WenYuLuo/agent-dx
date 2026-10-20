@@ -704,6 +704,7 @@ impl State {
             }
             MetaRead::DfsReplicationTasks => None,
             MetaRead::DfsWriteLease(id) => state.entities.get(&MetaKey::DfsWriteLease(id.clone())),
+            MetaRead::DfsGc => state.entities.get(&MetaKey::DfsGc),
         };
         let request_outcome = match &read {
             MetaRead::RequestOutcome(key) => state.requests.get(key).cloned(),
@@ -879,6 +880,7 @@ impl State {
             .iter()
             .all(|condition| condition_matches(state, condition))
         {
+            super::profile::namespace_conflict(state, &txn);
             return Ok(TxnOutcome::ConditionFailed {
                 revision: state.revision,
                 existing_outcome: None,
@@ -896,6 +898,7 @@ impl State {
         state.history_indexed = false;
         state.revision = revision;
         let mut event_index = 0;
+        super::profile::namespace_applied(&txn, revision);
         for mutation in txn.mutations {
             match mutation {
                 TxnMutation::Put(entity) => {

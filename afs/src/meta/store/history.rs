@@ -195,6 +195,7 @@ impl Heap for super::TxnCondition {
     fn heap(&self, c: &mut Charge) -> Result<()> {
         match self {
             Self::RootEpochWatermarkEquals(value) => c.value(value),
+            Self::StoreRevisionEquals(value) => c.value(value),
             Self::Missing(value) => c.value(value),
             Self::RevisionEquals { key, revision } => {
                 c.value(key)?;
@@ -551,7 +552,7 @@ impl Heap for super::MetaKey {
                 c.value(session_id)
             }
             Self::CurrentNodeSession { node_id } => c.value(node_id),
-            Self::CurrentNodeSessions | Self::RootEpochWatermark => Ok(()),
+            Self::CurrentNodeSessions | Self::RootEpochWatermark | Self::DfsGc => Ok(()),
             Self::Root { root_id } | Self::RootReservation { root_id } => c.value(root_id),
             Self::RootGrant {
                 root_id,
@@ -572,6 +573,15 @@ impl Heap for super::MetaKey {
                 c.value(home_node_id)?;
                 c.value(home_session_id)
             }
+            Self::DfsReference {
+                node_id,
+                session_id,
+                reference_id,
+            } => {
+                c.value(node_id)?;
+                c.value(session_id)?;
+                c.value(reference_id)
+            }
             Self::RequestOutcome(value) => c.value(value),
             Self::DfsDentry(value) => c.value(value),
             Self::DfsInode(value) | Self::DfsWriteLease(value) => c.value(value),
@@ -584,6 +594,20 @@ impl Heap for super::MetaKey {
         }
     }
 }
+fields_heap!(crate::dfs::GcReference {
+    node_id,
+    session_id,
+    reference_id,
+    inode_id,
+    publication,
+    chunks,
+    retired_at_unix_ms
+});
+fields_heap!(crate::dfs::GcState {
+    generation,
+    chunks,
+    waiting_nodes
+});
 macro_rules! entity_heap {($($variant:ident),* $(,)?)=>{impl Heap for super::MetaEntity {fn heap(&self,c:&mut Charge)->Result<()>{match self {$(Self::$variant(value)=>c.value(value),)*}}}};}
 entity_heap!(
     NodeSession,
@@ -603,7 +627,9 @@ entity_heap!(
     DfsCopy,
     DfsReplicationTask,
     DfsWriteLease,
-    RootEpochWatermark
+    RootEpochWatermark,
+    DfsReference,
+    DfsGc
 );
 impl Heap for super::WatchChange {
     fn heap(&self, c: &mut Charge) -> Result<()> {

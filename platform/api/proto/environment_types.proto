@@ -162,6 +162,8 @@ message EnvironmentRecord {
   bool resources_held = 6;
   reserved 7;
   RestorePoint checkpoint = 8;
+  repeated CheckpointArtifact execution_artifacts = 13;
+  RestorePoint snapshot_source = 14;
   CompletedOperation last_operation = 9;
   uint32 restart_attempts = 10;
   bool restart_pending = 11;
