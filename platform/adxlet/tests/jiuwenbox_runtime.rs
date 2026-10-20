@@ -711,6 +711,8 @@ fn running_record(class: &str) -> EnvironmentRecord {
             ip: Some("192.0.2.2".parse().unwrap()),
         },
         checkpoint: None,
+        execution_artifacts: vec![],
+        snapshot_source: None,
         last_operation: None,
         resources_held: true,
         failure: None,

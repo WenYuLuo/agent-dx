@@ -2542,8 +2542,20 @@ async fn p3_supported_commit_shapes_survive_local_log_reopen() {
             panic!("expected one domain decision");
         };
         let facts = decision.facts().unwrap();
-        let expected_changes = 3 + chunks * (2 + usize::from(copies));
+        // Publishing also releases the in-flight GC reference atomically.
+        let expected_changes = 4 + chunks * (2 + usize::from(copies));
         assert_eq!(facts.events.len(), expected_changes);
+        assert_eq!(
+            facts
+                .events
+                .iter()
+                .filter(|event| {
+                    matches!(event.key, afs::meta::store::MetaKey::DfsReference { .. })
+                        && matches!(event.change, afs::meta::store::WatchChange::Delete)
+                })
+                .count(),
+            1
+        );
         assert_eq!(facts.outcomes.len(), 1);
         let record_bytes = decision
             .encode(LogLimits::default().record_max_bytes)
