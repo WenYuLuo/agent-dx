@@ -16,9 +16,9 @@ class ProtocolHandler(logging.StreamHandler):
     """Keep protocol failures visible so the client releases its Environments."""
 
     def handleError(self, record):
-        error = sys.exc_info()[1]
-        if error is not None:
-            raise error
+        stream_error = sys.exc_info()[1]
+        if stream_error is not None:
+            raise stream_error
         super().handleError(record)
 
 

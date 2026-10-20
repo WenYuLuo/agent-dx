@@ -112,7 +112,9 @@ class JiuwenboxSafetyTests(unittest.TestCase):
             self.assertTrue(messages[0]["ready"])
             self.assertEqual(messages[1], {"ok": True, "value": True})
             failed_stream = SimpleNamespace(write=Mock(side_effect=BrokenPipeError("closed")), flush=Mock())
-            handler = namespace["ProtocolHandler"](failed_stream)
+            handler_type = namespace.get("ProtocolHandler")
+            self.assertIsNotNone(handler_type)
+            handler = handler_type(failed_stream)
             with self.assertRaisesRegex(BrokenPipeError, "closed"):
                 handler.emit(logging.makeLogRecord({"msg": "response", "args": ()}))
 
