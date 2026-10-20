@@ -611,13 +611,19 @@ when Execd returns the corresponding typed filesystem error. The exception inclu
 both the requested path and the original HTTP error. Other failures remain SDK errors.
 Traversal depth is bounded at 64 by Execd.
 
-Direct file uploads stage bytes in the destination directory and atomically replace
-the destination after the complete body arrives. An interrupted upload retains the
-previous file. Overwriting an existing symlink follows its target and preserves the
-file mode. Each download reads its length and body from one opened inode. Concurrent
-SDK uploads therefore expose complete file versions; external processes that modify
-an inode in place still require application coordination. Atomic replacement changes
-the inode and does not promise hard-link identity or ownership preservation.
+Direct file uploads open the destination in place and truncate it before writing.
+Existing symlinks are followed, including links to a missing target. Overwriting
+retains the existing inode, ownership and hard-link identity, with normal OS
+write-permission checks and mode semantics. An interrupted upload may leave partial data; concurrent readers may observe empty or partial
+content and concurrent writers require application coordination.
+
+Each file download reads metadata and bytes from one opened descriptor. Full
+responses use chunked framing without a fixed Content-Length, so an in-place
+truncation can return fewer bytes with a valid ending chunk. A transfer interrupted
+before that chunk remains an error, allowing the SDK to retry or resume. Reads are
+bounded by the initial file size during concurrent appends. Range downloads retain their
+fixed-length resume contract and require a stable file; they do not provide a
+snapshot of a concurrently modified file. Downloads accept regular files only.
 
 ## Native filename/path search
 

@@ -954,43 +954,13 @@ async fn handle_file_upload(
     }
 
     let open_started = Instant::now();
-    // Publish a completed inode atomically: readers must never observe an
-    // in-place truncation, and an interrupted upload must retain the old file.
-    // Follow existing symlinks as a regular write does, preserving their target.
-    let destination = match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => std::fs::canonicalize(path)?,
-        _ => Path::new(path).to_path_buf(),
-    };
-    let parent = destination
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    let mut builder = tempfile::Builder::new();
-    builder.prefix(".adx-upload-");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        builder.permissions(std::fs::Permissions::from_mode(0o666));
-    }
-    let staged = builder.tempfile_in(parent)?;
-    match std::fs::metadata(&destination) {
-        Ok(metadata) => {
-            // Preserve ordinary overwrite permission checks and file mode.
-            std::fs::OpenOptions::new().write(true).open(&destination)?;
-            staged.as_file().set_permissions(metadata.permissions())?;
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
-    let mut file = tokio::fs::File::from_std(staged.reopen()?);
+    let mut file = tokio::fs::File::create(path).await?;
     let open_ms = open_started.elapsed().as_millis();
     let copy_started = Instant::now();
     let stats = copy_request_body(sock, body_mode, initial_body, tmp, &mut file).await?;
     let copy_ms = copy_started.elapsed().as_millis();
     let flush_started = Instant::now();
     file.flush().await?;
-    drop(file);
-    staged.persist(&destination)?;
     let flush_ms = flush_started.elapsed().as_millis();
     execd_info!(
         "[execd-http] upload type=file path={} bytes={} body_mode={} content_len={} initial_body={} open_ms={} copy_ms={} read_ms={} write_ms={} flush_ms={} reads={} writes={} first_byte_ms={} total_ms={} trace={}",
@@ -1438,7 +1408,13 @@ async fn handle_file_download(
     trace_id: &str,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let started = Instant::now();
-    let mut file = match tokio::fs::File::open(path).await {
+    let mut options = tokio::fs::OpenOptions::new();
+    options.read(true);
+    // Inspect the opened descriptor without waiting for a FIFO peer. Regular
+    // files ignore O_NONBLOCK; special files are rejected below.
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NONBLOCK);
+    let mut file = match options.open(path).await {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return write_resp(sock, 404, &err_json("file not found"))
@@ -1447,8 +1423,8 @@ async fn handle_file_download(
         }
         Err(error) => return Err(error.into()),
     };
-    // Length and bytes belong to the same opened inode, even if an upload
-    // replaces the pathname between the response headers and body.
+    // Use the same descriptor for metadata and bytes, including when another
+    // process replaces the pathname after open.
     let meta = file.metadata().await?;
     if !meta.is_file() {
         return write_resp(sock, 404, &err_json("file not found"))
@@ -1466,7 +1442,10 @@ async fn handle_file_download(
         sock,
         status,
         "application/octet-stream",
-        Some(content_len),
+        // Full reads may reach EOF early after an in-place truncate. Let EOF
+        // finish the chunked response instead of advertising a stale file length.
+        // Range responses retain their fixed-length resume contract.
+        range.map(|_| content_len),
         range.map(|_| (start, end, total)),
     )
     .await?;
@@ -1474,6 +1453,7 @@ async fn handle_file_download(
         file.seek(SeekFrom::Start(start)).await?;
     }
     let mut bytes_sent = 0u64;
+    // Bound growth during a concurrent append to the initial extent.
     let mut remaining = content_len;
     while remaining > 0 {
         let limit = remaining.min(tmp.len() as u64) as usize;
@@ -1481,9 +1461,19 @@ async fn handle_file_download(
         if n == 0 {
             break;
         }
-        sock.write_all(&tmp[..n]).await?;
+        if range.is_some() {
+            sock.write_all(&tmp[..n]).await?;
+        } else {
+            write_chunk(sock, &tmp[..n]).await?;
+        }
         bytes_sent += n as u64;
         remaining -= n as u64;
+    }
+    if range.is_none() {
+        // A file EOF is a valid completion, even after concurrent truncation.
+        // I/O failures return above without this terminator, so clients can
+        // distinguish an interrupted transfer and retry/resume it.
+        write_chunk(sock, &[]).await?;
     }
     sock.flush().await?;
     execd_info!(
@@ -1582,7 +1572,7 @@ async fn write_binary_headers_with_range(
     };
     let len_header = content_len
         .map(|n| format!("Content-Length: {n}\r\n"))
-        .unwrap_or_default();
+        .unwrap_or_else(|| "Transfer-Encoding: chunked\r\n".to_string());
     let range_header = content_range
         .map(|(start, end, total)| format!("Content-Range: bytes {start}-{end}/{total}\r\n"))
         .unwrap_or_default();
@@ -1917,6 +1907,16 @@ mod tests {
         assert!(head.starts_with("HTTP/1.1 200"));
     }
 
+    async fn wait_for_file_contents(path: &std::path::Path, expected: &[u8]) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while std::fs::read(path).unwrap() != expected {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("unexpected file contents: {:?}", std::fs::read(path)));
+    }
+
     async fn read_http_head(stream: &mut tokio::net::TcpStream) -> String {
         let mut bytes = Vec::new();
         let mut byte = [0u8; 1];
@@ -1932,6 +1932,9 @@ mod tests {
 
     async fn read_http_response(stream: &mut tokio::net::TcpStream) -> (String, Vec<u8>) {
         let head = read_http_head(stream).await;
+        if head.contains("Transfer-Encoding: chunked\r\n") {
+            return (head, read_chunked_body(stream).await);
+        }
         let content_length = parse_content_length(&head);
         let mut body = vec![0u8; content_length];
         stream.read_exact(&mut body).await.unwrap();
@@ -1940,6 +1943,10 @@ mod tests {
 
     async fn read_chunked_response(stream: &mut tokio::net::TcpStream) -> (String, Vec<u8>) {
         let head = read_http_head(stream).await;
+        (head, read_chunked_body(stream).await)
+    }
+
+    async fn read_chunked_body(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
         let mut body = Vec::new();
         loop {
             let mut line = Vec::new();
@@ -1965,7 +1972,7 @@ mod tests {
             stream.read_exact(&mut delimiter).await.unwrap();
             assert_eq!(&delimiter, b"\r\n");
         }
-        (head, body)
+        body
     }
 
     async fn invoke_over_http(action: &str, args: serde_json::Value) -> serde_json::Value {
@@ -2213,10 +2220,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn streaming_upload_publishes_only_complete_file() {
+    async fn streaming_upload_preserves_in_place_write_semantics() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("shared.txt");
         std::fs::write(&path, b"old-complete").unwrap();
+        let alias = directory.path().join("alias.txt");
+        std::fs::hard_link(&path, &alias).unwrap();
         let listener = bind(0).await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -2228,20 +2237,20 @@ mod tests {
             "POST /upload?path={}&type=file HTTP/1.1\r\nHost: localhost\r\nContent-Length: 12\r\n\r\nnew-",
             path.display()
         ).as_bytes()).await.unwrap();
-        // Let the receiver consume the partial body, while the upload remains open.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        assert_eq!(std::fs::read(&path).unwrap(), b"old-complete");
+        // Observe the partial body while the upload remains open.
+        wait_for_file_contents(&path, b"new-").await;
         client.write_all(b"complete").await.unwrap();
         let (head, _) = read_http_response(&mut client).await;
         assert!(head.starts_with("HTTP/1.1 200"));
         assert_eq!(std::fs::read(&path).unwrap(), b"new-complete");
+        assert_eq!(std::fs::read(&alias).unwrap(), b"new-complete");
         drop(client);
         server.await.unwrap();
-        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 2);
     }
 
     #[tokio::test]
-    async fn aborted_upload_retains_original_and_removes_staging_file() {
+    async fn aborted_upload_retains_the_partial_in_place_write() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("shared.txt");
         std::fs::write(&path, b"original").unwrap();
@@ -2258,13 +2267,14 @@ mod tests {
         ).as_bytes()).await.unwrap();
         client.shutdown().await.unwrap();
         server.await.unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), b"original");
+        // An aborted upload may still have a Tokio blocking write in flight.
+        wait_for_file_contents(&path, b"short").await;
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn atomic_upload_preserves_target_mode_and_symlink() {
+    async fn upload_preserves_target_mode_and_symlink() {
         use std::os::unix::fs::{symlink, PermissionsExt};
         let directory = tempfile::tempdir().unwrap();
         let target = directory.path().join("target");
@@ -2337,6 +2347,8 @@ mod tests {
             .unwrap();
         let (head, body) = read_http_response(&mut client).await;
         assert!(head.contains("Connection: close\r\n"));
+        assert!(!head.to_ascii_lowercase().contains("\r\ncontent-length:"));
+        assert!(head.contains("Transfer-Encoding: chunked\r\n"));
         assert_eq!(body, [0, 1, 255, 0]);
         let mut byte = [0u8; 1];
         assert_eq!(
@@ -2346,6 +2358,139 @@ mod tests {
                 .unwrap(),
             0
         );
+        server.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn upload_follows_a_symlink_to_a_missing_target() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target");
+        let link = directory.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let listener = bind(0).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            handle_conn(&mut stream, None).await.unwrap();
+        });
+        let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+        client.write_all(format!(
+            "POST /upload?path={}&type=file HTTP/1.1\r\nHost: localhost\r\nContent-Length: 3\r\n\r\nnew",
+            link.display()
+        ).as_bytes()).await.unwrap();
+        let (head, _) = read_http_response(&mut client).await;
+        assert!(head.starts_with("HTTP/1.1 200"));
+        assert!(link.is_symlink());
+        assert_eq!(std::fs::read(&target).unwrap(), b"new");
+        drop(client);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn full_download_accepts_concurrent_in_place_truncation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("data");
+        std::fs::write(&path, vec![b'x'; 16 * 1024 * 1024]).unwrap();
+        let listener = bind(0).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            handle_conn(&mut stream, None).await.unwrap();
+        });
+        let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+        client
+            .write_all(
+                format!(
+                    "GET /download?path={}&type=file HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                    path.display()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let head = read_http_head(&mut client).await;
+        std::fs::write(&path, []).unwrap();
+        let body = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            read_chunked_body(&mut client),
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+        assert!(head.starts_with("HTTP/1.1 200"));
+        assert!(!head.to_ascii_lowercase().contains("\r\ncontent-length:"));
+        assert!(head.contains("Transfer-Encoding: chunked\r\n"));
+        assert!(body.len() < 16 * 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn range_download_retains_fixed_length_and_selected_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("data");
+        std::fs::write(&path, b"0123456789").unwrap();
+        let listener = bind(0).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            handle_conn(&mut stream, None).await.unwrap();
+        });
+        let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+        client.write_all(format!(
+            "GET /download?path={}&type=file HTTP/1.1\r\nHost: localhost\r\nRange: bytes=3-6\r\n\r\n",
+            path.display()
+        ).as_bytes()).await.unwrap();
+        let (head, body) = read_http_response(&mut client).await;
+        assert!(head.starts_with("HTTP/1.1 206 Partial Content"));
+        assert!(head.contains("Content-Length: 4\r\n"));
+        assert!(head.contains("Content-Range: bytes 3-6/10\r\n"));
+        assert_eq!(body, b"3456");
+        server.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fifo_download_is_rejected_without_waiting_for_a_writer() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("fifo");
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .unwrap()
+            .success());
+        let listener = bind(0).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            handle_conn(&mut stream, None).await.unwrap();
+        });
+        let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+        client
+            .write_all(
+                format!(
+                    "GET /download?path={}&type=file HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                    path.display()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            read_http_response(&mut client),
+        )
+        .await;
+        // Release any blocked open even on failure so the test runtime can exit.
+        use std::os::unix::fs::OpenOptionsExt;
+        let _peer = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&path)
+            .unwrap();
+        let (head, _) = response.unwrap();
+        assert!(head.starts_with("HTTP/1.1 404"));
+        drop(client);
         server.await.unwrap();
     }
 
