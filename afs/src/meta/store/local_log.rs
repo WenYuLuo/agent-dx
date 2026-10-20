@@ -797,6 +797,65 @@ struct Replay {
     revision: StoreRevision,
     manifest: Current,
 }
+/// Reject hidden suffixes before replay can truncate or advance any active WAL.
+/// Rotation may leave one exact, empty, identity-checked next segment. Its base
+/// must equal the recovered active tip, checked before any replay mutation.
+fn unselected_prepared_segment(dir: &Path, manifest: &Current) -> Result<Option<LogTip>> {
+    let selected = manifest
+        .segments
+        .iter()
+        .chain(&manifest.retired_segments)
+        .map(|segment| wal_name(segment.base))
+        .collect::<Result<std::collections::BTreeSet<_>>>()?;
+    let mut prepared = None;
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("wal-") || !name.ends_with(".log") || selected.contains(name.as_ref())
+        {
+            continue;
+        }
+        if prepared.is_some() || !fs::symlink_metadata(entry.path())?.is_file() {
+            return Err(invalid_log(
+                "unlisted WAL entries do not form one empty prepared segment; originals retained",
+            ));
+        }
+        let mut file = open_file(&entry.path(), false)?;
+        if file.metadata()?.len() != LOG_HEADER_BYTES {
+            return Err(invalid_log(format!(
+                "{name}: unlisted nonempty/incomplete WAL; CURRENT cannot omit a durable suffix"
+            )));
+        }
+        let mut bytes = [0u8; 94];
+        file.read_exact(&mut bytes)?;
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&bytes[62..94]);
+        let base = LogTip {
+            sequence: u64::from_be_bytes(
+                bytes[54..62]
+                    .try_into()
+                    .map_err(|_| invalid_log("unlisted WAL base width"))?,
+            ),
+            record_hash: hash,
+        };
+        if wal_name(base)? != name.as_ref()
+            || header(&mut file, manifest.identity, base)?
+                != (Tail {
+                    generation: 0,
+                    tip: base,
+                    end: LOG_HEADER_BYTES,
+                })
+        {
+            return Err(invalid_log(format!(
+                "{name}: unlisted WAL is not an exact empty prepared segment"
+            )));
+        }
+        prepared = Some(base);
+    }
+    Ok(prepared)
+}
+
 fn replay(
     dir: &Path,
     identity: StoreIdentity,
@@ -804,8 +863,11 @@ fn replay(
     checkpoint_limits: CheckpointLimits,
 ) -> Result<Replay> {
     wal_budget(dir, limits, 0, 0)?;
-    let manifest = read_current(dir, identity)?.unwrap_or_else(|| Current::initial(identity));
+    let manifest = read_current(dir, identity)?.ok_or_else(|| {
+        invalid_log("CURRENT missing from initialized Meta log; originals retained")
+    })?;
     manifest.validate()?;
+    let prepared_segment = unselected_prepared_segment(dir, &manifest)?;
     let references: Vec<_> = manifest
         .current
         .into_iter()
@@ -933,6 +995,11 @@ fn replay(
             if anchors.iter().any(|matched| !matched) {
                 return Err(invalid_log(
                     "CURRENT checkpoint chain anchor missing or mismatched; no fallback can discard acknowledged history",
+                ));
+            }
+            if prepared_segment.is_some_and(|base| base != tip) {
+                return Err(invalid_log(
+                    "unlisted empty WAL is not the recovered next segment",
                 ));
             }
             let changed = offset != length || tip != declared.tip;
@@ -1307,7 +1374,7 @@ impl LocalLog {
             .last()
             .ok_or_else(|| invalid_log("missing active segment"))?;
         let selected = read_current(&inner.dir, inner.identity)?
-            .unwrap_or_else(|| Current::initial(inner.identity));
+            .ok_or_else(|| invalid_log("live CURRENT missing"))?;
         if selected != state.manifest {
             return Err(invalid_log("live CURRENT changed"));
         }
@@ -2063,6 +2130,61 @@ mod tests {
             fs::read(foreign.path().join("snapshot.json")).unwrap(),
             b"foreign input"
         );
+    }
+
+    #[tokio::test]
+    async fn p3_recovery_missing_current_refuses_acknowledged_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = LocalLog::open(dir.path(), LogLimits::default()).unwrap();
+        log.append_and_sync(LogTip::EMPTY, test_records(1))
+            .await
+            .unwrap();
+        drop(log);
+        fs::remove_file(dir.path().join(CURRENT)).unwrap();
+        let original = fs::read(dir.path().join(WAL)).unwrap();
+        assert!(
+            LocalLog::open(dir.path(), LogLimits::default()).is_err(),
+            "missing CURRENT must not silently choose the initial manifest"
+        );
+        assert_eq!(fs::read(dir.path().join(WAL)).unwrap(), original);
+    }
+    #[tokio::test]
+    async fn p3_recovery_rolled_current_refuses_unlisted_nonempty_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let limits = LogLimits {
+            record_max_bytes: 1024,
+            batch_max_bytes: 4096,
+            wal_max_bytes: 128 * 1024,
+            segment_bytes: 4608,
+            segments_max: 32,
+        };
+        let log = LocalLog::open(dir.path(), limits).unwrap();
+        let initial = fs::read(dir.path().join(CURRENT)).unwrap();
+        let mut tip = LogTip::EMPTY;
+        for record in test_records(12) {
+            tip = log.append_and_sync(tip, vec![record]).await.unwrap();
+        }
+        drop(log);
+        let originals: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with("wal-"))
+            .map(|p| {
+                let bytes = fs::read(&p).unwrap();
+                (p, bytes)
+            })
+            .collect();
+        assert!(originals.iter().any(
+            |(p, bytes)| p.file_name().unwrap() != WAL && bytes.len() as u64 > LOG_HEADER_BYTES
+        ));
+        fs::write(dir.path().join(CURRENT), initial).unwrap();
+        assert!(
+            LocalLog::open(dir.path(), limits).is_err(),
+            "rolled CURRENT must not hide the acknowledged suffix"
+        );
+        for (path, bytes) in originals {
+            assert_eq!(fs::read(path).unwrap(), bytes);
+        }
     }
 
     #[test]
