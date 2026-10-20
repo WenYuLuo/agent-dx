@@ -766,7 +766,11 @@ async fn handle_pty(
                     tokio_tungstenite::tungstenite::Message::Ping(payload) => {
                         websocket.send(tokio_tungstenite::tungstenite::Message::Pong(payload)).await?;
                     }
-                    tokio_tungstenite::tungstenite::Message::Close(_) => { let _ = killer.kill(); break; }
+                    tokio_tungstenite::tungstenite::Message::Close(_) => {
+                        let _ = killer.kill();
+                        websocket.flush().await?;
+                        break;
+                    }
                     _ => {}
                 }
             }
@@ -787,6 +791,19 @@ async fn handle_pty(
                     serde_json::json!({"version":1,"type":"exited","session_id":session_id,"exit_code":status.exit_code()}).to_string()
                 )).await?;
                 websocket.close(None).await?;
+                // A short-lived child can exit before the SDK's initial resize
+                // reaches this task. Dropping TCP with that input unread sends
+                // RST, which can discard the terminal frames through a relay.
+                // Read through the peer's Close reply before releasing TCP. The
+                // terminal status is already sent; an absent/disconnected peer
+                // must not keep this completed session alive indefinitely.
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    while let Some(Ok(message)) = websocket.next().await {
+                        if matches!(message, tokio_tungstenite::tungstenite::Message::Close(_)) {
+                            break;
+                        }
+                    }
+                }).await;
                 break;
             }
         }
@@ -2348,8 +2365,9 @@ mod tests {
             }
         }
         assert!(exited);
-        // Read the underlying TCP socket without another WebSocket poll: a
-        // completed upgraded session must not wait for another HTTP request.
+        // Acknowledge the Close frame, then inspect TCP without another
+        // WebSocket poll: the session must not return to HTTP keep-alive.
+        websocket.flush().await.unwrap();
         let socket = websocket.get_mut();
         let mut buffer = [0; 1024];
         let eof =
@@ -2357,6 +2375,97 @@ mod tests {
         server.abort();
         assert_eq!(
             eof.expect("Execd must close TCP after the PTY closes")
+                .unwrap(),
+            0
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn pty_late_resize_preserves_terminal_frames_and_orderly_tcp_close() {
+        let listener = bind(0).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = serve_listener(listener, None).await;
+        });
+        let uri = format!("ws://{address}/pty?command=%2Fbin%2Fsh&command=-c&command=exit%207");
+        let (mut websocket, _) = tokio_tungstenite::connect_async(uri).await.unwrap();
+        let started = websocket.next().await.unwrap().unwrap();
+        let event: serde_json::Value = serde_json::from_str(started.to_text().unwrap()).unwrap();
+        assert_eq!(event["type"], "started");
+        // The SDK's initial resize can reach a short-lived process after it exits,
+        // while the server is draining the last output. It must not reset TCP and
+        // discard the terminal frames when that client input remains unread.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        websocket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                "RESIZE:80:24".into(),
+            ))
+            .await
+            .unwrap();
+        let mut exited = false;
+        loop {
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(2), websocket.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            match frame {
+                tokio_tungstenite::tungstenite::Message::Text(text) => {
+                    let event: serde_json::Value = serde_json::from_str(&text).unwrap();
+                    assert_eq!(event["type"], "exited");
+                    assert_eq!(event["exit_code"], 7);
+                    exited = true;
+                }
+                tokio_tungstenite::tungstenite::Message::Close(_) => break,
+                _ => {}
+            }
+        }
+        assert!(exited);
+        websocket.flush().await.unwrap();
+        let mut byte = [0];
+        let eof = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            websocket.get_mut().read(&mut byte),
+        )
+        .await;
+        server.abort();
+        assert_eq!(eof.expect("PTY close must finish TCP shutdown").unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn pty_peer_without_close_reply_does_not_hold_tcp_forever() {
+        let listener = bind(0).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = serve_listener(listener, None).await;
+        });
+        let (mut websocket, _) = tokio_tungstenite::connect_async(format!(
+            "ws://{address}/pty?command=%2Fbin%2Fsh&command=-c&command=exit%200"
+        ))
+        .await
+        .unwrap();
+        loop {
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(2), websocket.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            if matches!(frame, tokio_tungstenite::tungstenite::Message::Close(_)) {
+                break;
+            }
+        }
+        // Do not flush tungstenite's automatic Close reply. A peer that vanishes
+        // after receiving the terminal frames cannot retain this socket forever.
+        let mut byte = [0];
+        let eof = tokio::time::timeout(
+            std::time::Duration::from_secs(6),
+            websocket.get_mut().read(&mut byte),
+        )
+        .await;
+        server.abort();
+        assert_eq!(
+            eof.expect("PTY close handshake must have a deadline")
                 .unwrap(),
             0
         );
@@ -2395,7 +2504,7 @@ mod tests {
             let _ = serve_listener(listener, None).await;
         });
         let uri = format!(
-            "ws://{address}/pty?rows=24&cols=80&protocol=environment.pty.v1&command=%2Fbin%2Fsh&command=-lc&command=sleep%200.2%3B%20printf%20pty-ok"
+            "ws://{address}/pty?rows=24&cols=80&protocol=environment.pty.v1&command=%2Fbin%2Fsh&command=-c&command=sleep%200.2%3B%20printf%20pty-ok"
         );
         let (mut websocket, _) = tokio_tungstenite::connect_async(uri).await.unwrap();
 
@@ -2435,7 +2544,12 @@ mod tests {
                 _ => {}
             }
         }
-        assert_eq!(exit_code, Some(0));
+        assert_eq!(
+            exit_code,
+            Some(0),
+            "PTY output: {}",
+            String::from_utf8_lossy(&output)
+        );
         assert!(String::from_utf8_lossy(&output).contains("pty-ok"));
         server.abort();
     }

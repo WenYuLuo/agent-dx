@@ -1,3 +1,5 @@
+#[path = "common/authority.rs"]
+mod authority;
 use adx_core::{
     Assignment, EnvironmentRecord, EnvironmentSpec, EnvironmentState, Resources, Result,
 };
@@ -10,7 +12,11 @@ use std::{
 #[derive(Default)]
 struct Backend {
     actual: Mutex<Vec<RuntimeObservation>>,
+    readiness_calls: std::sync::atomic::AtomicUsize,
+    binding_syncs: std::sync::atomic::AtomicUsize,
+    observations: std::sync::atomic::AtomicUsize,
     fail_inventory: std::sync::atomic::AtomicBool,
+    allow_start: std::sync::atomic::AtomicBool,
     fail_remove: std::sync::atomic::AtomicBool,
     block_remove: std::sync::atomic::AtomicBool,
     remove_entered: tokio::sync::Notify,
@@ -29,6 +35,8 @@ impl RuntimeDriver for Backend {
         Ok(self.actual.lock().unwrap().clone())
     }
     async fn is_running(&self, id: &str) -> Result<bool> {
+        self.observations
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(self
             .actual
             .lock()
@@ -38,12 +46,24 @@ impl RuntimeDriver for Backend {
     }
     async fn start(
         &self,
-        _: &EnvironmentSpec,
-        _: &str,
-        _: u64,
+        spec: &EnvironmentSpec,
+        id: &str,
+        generation: u64,
         _: &[adx_core::scheduling::DeviceAllocation],
     ) -> Result<std::net::IpAddr> {
-        panic!("reconciliation must not recreate an image")
+        assert!(
+            self.allow_start.load(std::sync::atomic::Ordering::SeqCst),
+            "reconciliation must not recreate an image without restart policy"
+        );
+        self.events.lock().unwrap().push(format!("start:{id}"));
+        self.actual.lock().unwrap().push(RuntimeObservation {
+            environment_id: spec.id.clone(),
+            runtime_id: id.into(),
+            generation,
+            tenant_id: spec.tenant_id.clone(),
+            running: true,
+        });
+        Ok("10.0.0.3".parse().unwrap())
     }
     async fn remove(&self, id: &str) -> Result<()> {
         self.events.lock().unwrap().push(format!("remove:{id}"));
@@ -61,11 +81,18 @@ impl RuntimeDriver for Backend {
 #[async_trait]
 impl Readiness for Backend {
     async fn wait_ready(&self, _: &EnvironmentRecord) -> Result<()> {
+        self.readiness_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
 }
 #[async_trait]
 impl Routes for Backend {
+    async fn begin_reconcile(&self) -> Result<()> {
+        self.binding_syncs
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
     async fn activate(&self, r: &EnvironmentRecord) -> Result<()> {
         self.events
             .lock()
@@ -165,6 +192,407 @@ fn manager(b: &Arc<Backend>) -> Adxlet {
     .unwrap();
     n
 }
+
+fn reset_recovery_effects(backend: &Backend) {
+    backend.events.lock().unwrap().clear();
+    backend
+        .readiness_calls
+        .store(0, std::sync::atomic::Ordering::SeqCst);
+    backend
+        .binding_syncs
+        .store(0, std::sync::atomic::Ordering::SeqCst);
+    backend
+        .observations
+        .store(0, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn assert_no_recovery_effects(backend: &Backend) {
+    use std::sync::atomic::Ordering;
+    assert_eq!(backend.readiness_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(backend.binding_syncs.load(Ordering::SeqCst), 0);
+    assert_eq!(backend.observations.load(Ordering::SeqCst), 0);
+    assert!(!backend
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|e| { e.starts_with("bind:") || e.starts_with("commit:") }));
+}
+
+#[tokio::test]
+async fn periodic_matching_execution_has_no_recovery_side_effects() {
+    let backend = Arc::new(Backend::default());
+    *backend.actual.lock().unwrap() = vec![observed("kept")];
+    let node = manager(&backend);
+    let mut authority = authority::Fixture::new().await;
+    authority.authority.records.lock().unwrap().push(
+        record("kept", EnvironmentState::Running)
+            .try_into()
+            .unwrap(),
+    );
+    authority.cycle(&node).await.unwrap();
+    assert!(
+        backend
+            .readiness_calls
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 0
+    );
+    reset_recovery_effects(&backend);
+    for _ in 0..3 {
+        authority.cycle(&node).await.unwrap();
+    }
+    assert_no_recovery_effects(&backend);
+    assert!(backend.events.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn periodic_orphan_retry_and_late_create_preserve_healthy_execution() {
+    use std::sync::atomic::Ordering;
+    let backend = Arc::new(Backend::default());
+    *backend.actual.lock().unwrap() = vec![observed("kept")];
+    let node = manager(&backend);
+    let mut authority = authority::Fixture::new().await;
+    authority.authority.records.lock().unwrap().push(
+        record("kept", EnvironmentState::Running)
+            .try_into()
+            .unwrap(),
+    );
+    authority.cycle(&node).await.unwrap();
+    reset_recovery_effects(&backend);
+    backend.actual.lock().unwrap().push(observed("orphan"));
+    backend.fail_remove.store(true, Ordering::SeqCst);
+    assert!(authority.cycle(&node).await.is_err());
+    backend.fail_remove.store(false, Ordering::SeqCst);
+    authority.cycle(&node).await.unwrap();
+    authority.cycle(&node).await.unwrap();
+    backend.actual.lock().unwrap().push(observed("late"));
+    authority.cycle(&node).await.unwrap();
+    assert_eq!(*backend.actual.lock().unwrap(), vec![observed("kept")]);
+    assert_no_recovery_effects(&backend);
+    assert!(node.accepting_allocations());
+}
+
+#[tokio::test]
+async fn periodic_missing_execution_still_publishes_loss_and_releases_resources() {
+    let backend = Arc::new(Backend::default());
+    *backend.actual.lock().unwrap() = vec![observed("lost")];
+    let node = manager(&backend);
+    let mut authority = authority::Fixture::new().await;
+    authority.authority.records.lock().unwrap().push(
+        record("lost", EnvironmentState::Running)
+            .try_into()
+            .unwrap(),
+    );
+    authority.cycle(&node).await.unwrap();
+    backend.actual.lock().unwrap().clear();
+    reset_recovery_effects(&backend);
+    authority.cycle(&node).await.unwrap();
+    assert_eq!(node.used(), Resources::default());
+    assert!(backend
+        .events
+        .lock()
+        .unwrap()
+        .contains(&"commit:Failed".into()));
+    assert!(!backend
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|e| e.starts_with("bind:")));
+}
+#[tokio::test]
+async fn periodic_retry_after_ready_report_failure_does_not_repeat_recovery() {
+    use std::sync::atomic::Ordering;
+    let backend = Arc::new(Backend::default());
+    *backend.actual.lock().unwrap() = vec![observed("kept")];
+    let node = manager(&backend);
+    let mut authority = authority::Fixture::new().await;
+    authority.authority.records.lock().unwrap().push(
+        record("kept", EnvironmentState::Running)
+            .try_into()
+            .unwrap(),
+    );
+    authority
+        .authority
+        .reject_ready
+        .store(true, Ordering::SeqCst);
+    assert!(authority.cycle(&node).await.is_err());
+    assert!(!node.accepting_allocations());
+    reset_recovery_effects(&backend);
+    authority
+        .authority
+        .reject_ready
+        .store(false, Ordering::SeqCst);
+    authority.cycle(&node).await.unwrap();
+    assert_no_recovery_effects(&backend);
+    assert!(node.accepting_allocations());
+}
+
+#[tokio::test]
+async fn periodic_stale_catalog_cannot_reactivate_a_published_deletion() {
+    let backend = Arc::new(Backend::default());
+    *backend.actual.lock().unwrap() = vec![observed("kept")];
+    let node = manager(&backend);
+    let mut authority = authority::Fixture::new().await;
+    let running = record("kept", EnvironmentState::Running);
+    authority
+        .authority
+        .records
+        .lock()
+        .unwrap()
+        .push(running.clone().try_into().unwrap());
+    authority.cycle(&node).await.unwrap();
+    let deleted = node
+        .environment(running.spec, running.assignment)
+        .unwrap()
+        .delete()
+        .await
+        .unwrap()
+        .record;
+    reset_recovery_effects(&backend);
+    assert!(authority.cycle(&node).await.is_err());
+    assert_no_recovery_effects(&backend);
+    assert_eq!(node.used(), Resources::default());
+    *authority.authority.records.lock().unwrap() = vec![deleted.try_into().unwrap()];
+    authority.cycle(&node).await.unwrap();
+    reset_recovery_effects(&backend);
+    backend.actual.lock().unwrap().push(observed("kept"));
+    authority.cycle(&node).await.unwrap();
+    authority.cycle(&node).await.unwrap();
+    assert!(backend.actual.lock().unwrap().is_empty());
+    assert_no_recovery_effects(&backend);
+    assert!(node.accepting_allocations());
+}
+
+#[tokio::test]
+async fn periodic_stale_terminal_catalog_cannot_delete_newer_published_execution() {
+    let backend = Arc::new(Backend::default());
+    *backend.actual.lock().unwrap() = vec![observed("kept")];
+    let node = manager(&backend);
+    let mut authority = authority::Fixture::new().await;
+    authority.authority.records.lock().unwrap().push(
+        record("kept", EnvironmentState::Running)
+            .try_into()
+            .unwrap(),
+    );
+    authority.cycle(&node).await.unwrap();
+    let mut stale = record("kept", EnvironmentState::Failed);
+    stale.resources_held = false;
+    stale.revision = 1;
+    *authority.authority.records.lock().unwrap() = vec![stale.try_into().unwrap()];
+    reset_recovery_effects(&backend);
+    assert!(authority.cycle(&node).await.is_err());
+    assert_eq!(*backend.actual.lock().unwrap(), vec![observed("kept")]);
+    assert_no_recovery_effects(&backend);
+    assert!(backend.events.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn periodic_coordinator_restart_renews_handshake_without_recovering_healthy_controller() {
+    use std::sync::atomic::Ordering;
+    let backend = Arc::new(Backend::default());
+    *backend.actual.lock().unwrap() = vec![observed("kept")];
+    let node = manager(&backend);
+    let mut authority = authority::Fixture::new().await;
+    authority.authority.records.lock().unwrap().push(
+        record("kept", EnvironmentState::Running)
+            .try_into()
+            .unwrap(),
+    );
+    authority.cycle(&node).await.unwrap();
+    reset_recovery_effects(&backend);
+    authority
+        .authority
+        .requires_handshake
+        .store(true, Ordering::SeqCst);
+    assert!(authority.cycle(&node).await.is_err());
+    authority.cycle(&node).await.unwrap();
+    assert_no_recovery_effects(&backend);
+    assert!(node.accepting_allocations());
+}
+
+#[tokio::test]
+async fn periodic_catalog_fetch_preserves_known_lifecycle_operations() {
+    use std::sync::atomic::Ordering;
+    let backend = Arc::new(Backend::default());
+    *backend.actual.lock().unwrap() = vec![observed("kept")];
+    let node = Arc::new(manager(&backend));
+    let mut authority = authority::Fixture::new().await;
+    authority.authority.records.lock().unwrap().push(
+        record("kept", EnvironmentState::Running)
+            .try_into()
+            .unwrap(),
+    );
+    authority.cycle(&node).await.unwrap();
+    reset_recovery_effects(&backend);
+    let server = authority.authority.clone();
+    server.block_inspect.store(true, Ordering::SeqCst);
+    let task = tokio::spawn({
+        let node = node.clone();
+        async move { authority.cycle(&node).await }
+    });
+    tokio::time::timeout(Duration::from_secs(1), server.inspect_entered.notified())
+        .await
+        .unwrap();
+    assert!(!node.accepting_allocations());
+    tokio::time::timeout(Duration::from_secs(1), node.monitor_environments())
+        .await
+        .unwrap()
+        .unwrap();
+    let observed = backend.observations.load(Ordering::SeqCst);
+    server.inspect_release.notify_one();
+    task.await.unwrap().unwrap();
+    assert!(
+        observed > 0,
+        "known lifecycle was disabled during catalog fetch"
+    );
+    assert_eq!(backend.readiness_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(backend.binding_syncs.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn periodic_stale_pending_catalog_preserves_lifecycle_without_restarting_handshake() {
+    use std::sync::atomic::Ordering;
+    let backend = Arc::new(Backend::default());
+    *backend.actual.lock().unwrap() = vec![observed("kept")];
+    let node = manager(&backend);
+    let mut authority = authority::Fixture::new().await;
+    let running = record("kept", EnvironmentState::Running);
+    authority
+        .authority
+        .records
+        .lock()
+        .unwrap()
+        .push(running.clone().try_into().unwrap());
+    authority.cycle(&node).await.unwrap();
+    let mut stale = record("kept", EnvironmentState::Pending);
+    stale.runtime.ip = None;
+    *authority.authority.records.lock().unwrap() = vec![stale.try_into().unwrap()];
+    reset_recovery_effects(&backend);
+    assert_eq!(
+        authority.cycle(&node).await.unwrap_err().code(),
+        tonic::Code::Aborted
+    );
+    assert!(!authority.registration.reconciling);
+    assert!(!node.accepting_allocations());
+    assert_no_recovery_effects(&backend);
+    node.monitor_environments().await.unwrap();
+    assert!(backend.observations.load(Ordering::SeqCst) > 0);
+    *authority.authority.records.lock().unwrap() = vec![running.try_into().unwrap()];
+    reset_recovery_effects(&backend);
+    authority.cycle(&node).await.unwrap();
+    assert_no_recovery_effects(&backend);
+    assert!(node.accepting_allocations());
+}
+
+#[tokio::test]
+async fn periodic_current_authority_retires_expired_execution_and_releases_resources() {
+    let backend = Arc::new(Backend::default());
+    *backend.actual.lock().unwrap() = vec![observed("kept")];
+    let node = manager(&backend);
+    let mut authority = authority::Fixture::new().await;
+    authority.authority.records.lock().unwrap().push(
+        record("kept", EnvironmentState::Running)
+            .try_into()
+            .unwrap(),
+    );
+    authority.cycle(&node).await.unwrap();
+    let mut expired = record("kept", EnvironmentState::Failed);
+    expired.revision = 3;
+    expired.resources_held = false;
+    expired.runtime.ip = None;
+    *authority.authority.records.lock().unwrap() = vec![expired.try_into().unwrap()];
+    reset_recovery_effects(&backend);
+    authority.cycle(&node).await.unwrap();
+    assert!(backend.actual.lock().unwrap().is_empty());
+    assert_eq!(node.used(), Resources::default());
+    assert_no_recovery_effects(&backend);
+    reset_recovery_effects(&backend);
+    authority.cycle(&node).await.unwrap();
+    assert!(backend.events.lock().unwrap().is_empty());
+    let owner = record("kept", EnvironmentState::Running);
+    assert_eq!(
+        node.environment(owner.spec, owner.assignment)
+            .unwrap()
+            .delete()
+            .await
+            .unwrap()
+            .record
+            .state,
+        EnvironmentState::Deleted
+    );
+}
+
+#[tokio::test]
+async fn periodic_stale_catalog_after_controller_collection_preserves_published_delete() {
+    let backend = Arc::new(Backend::default());
+    *backend.actual.lock().unwrap() = vec![observed("kept")];
+    let node = manager(&backend);
+    let mut authority = authority::Fixture::new().await;
+    let running = record("kept", EnvironmentState::Running);
+    authority
+        .authority
+        .records
+        .lock()
+        .unwrap()
+        .push(running.clone().try_into().unwrap());
+    authority.cycle(&node).await.unwrap();
+    node.environment(running.spec, running.assignment)
+        .unwrap()
+        .delete()
+        .await
+        .unwrap();
+    node.monitor_environments().await.unwrap();
+    reset_recovery_effects(&backend);
+    assert_eq!(
+        authority.cycle(&node).await.unwrap_err().code(),
+        tonic::Code::Aborted
+    );
+    assert!(!authority.registration.reconciling);
+    assert_no_recovery_effects(&backend);
+    assert!(backend.actual.lock().unwrap().is_empty());
+    assert_eq!(node.used(), Resources::default());
+    authority.authority.records.lock().unwrap().clear();
+    authority.cycle(&node).await.unwrap();
+    assert_no_recovery_effects(&backend);
+    assert!(node.accepting_allocations());
+}
+
+#[tokio::test]
+async fn periodic_new_authoritative_execution_recovers_only_its_missing_controller() {
+    let backend = Arc::new(Backend::default());
+    *backend.actual.lock().unwrap() = vec![observed("kept")];
+    let node = manager(&backend);
+    let mut authority = authority::Fixture::new().await;
+    authority.authority.records.lock().unwrap().push(
+        record("kept", EnvironmentState::Running)
+            .try_into()
+            .unwrap(),
+    );
+    authority.cycle(&node).await.unwrap();
+    reset_recovery_effects(&backend);
+    backend.actual.lock().unwrap().push(observed("new"));
+    authority
+        .authority
+        .records
+        .lock()
+        .unwrap()
+        .push(record("new", EnvironmentState::Running).try_into().unwrap());
+    authority.cycle(&node).await.unwrap();
+    let events = backend.events.lock().unwrap().clone();
+    assert!(events.contains(&"bind:new-7".into()));
+    assert!(!events.contains(&"bind:kept-7".into()));
+    assert_eq!(
+        backend
+            .readiness_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    reset_recovery_effects(&backend);
+    authority.cycle(&node).await.unwrap();
+    assert_no_recovery_effects(&backend);
+}
+
 #[tokio::test]
 async fn restores_running_usage_without_start_and_cleans_uncommitted_orphans() {
     let b = Arc::new(Backend::default());
@@ -385,4 +813,201 @@ async fn restart_after_interrupted_reconciliation_retries_physical_cleanup() {
         .unwrap()
         .iter()
         .any(|event| event.starts_with("bind:")));
+}
+
+#[tokio::test(start_paused = true)]
+async fn missing_running_execution_reconciles_into_bounded_cold_restart() {
+    let backend = Arc::new(Backend::default());
+    backend
+        .allow_start
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let node = manager(&backend);
+    node.update_capacity(
+        Resources {
+            cpu_millis: 4,
+            memory_bytes: 4,
+            disk_bytes: 0,
+        },
+        Duration::from_secs(30),
+    )
+    .unwrap();
+    let mut original = record("reboot", EnvironmentState::Running);
+    original.spec.lifecycle.restart = Some(adx_core::lifecycle::RestartPolicy {
+        max_attempts: 2,
+        initial_backoff_seconds: 1,
+        max_backoff_seconds: 1,
+    });
+    node.reconcile(vec![original.clone()]).await.unwrap();
+    let handle = node
+        .environment(original.spec.clone(), original.assignment.clone())
+        .unwrap();
+    let failed = handle.sync().await.unwrap().record;
+    assert_eq!(failed.state, EnvironmentState::Failed);
+    assert!(
+        failed.restart_pending,
+        "confirmed runtime loss during boot must retain configured restart intent"
+    );
+    assert_eq!(failed.restart_attempts, 0);
+    assert!(!failed.resources_held);
+    assert_eq!(node.used(), Resources::default());
+    tokio::time::advance(Duration::from_secs(2)).await;
+    handle.tick().await.unwrap();
+    let recovered = handle.sync().await.unwrap().record;
+    assert_eq!(recovered.state, EnvironmentState::Running);
+    assert_eq!(recovered.assignment, original.assignment);
+    assert_ne!(recovered.runtime.id, original.runtime.id);
+    assert_eq!(recovered.restart_attempts, 1);
+    assert!(!recovered.restart_pending);
+    assert_eq!(backend.actual.lock().unwrap().len(), 1);
+    let events = backend.events.lock().unwrap().clone();
+    let removed = events
+        .iter()
+        .position(|event| event == "remove:reboot-7")
+        .unwrap();
+    let started = events
+        .iter()
+        .position(|event| event.starts_with("start:"))
+        .unwrap();
+    assert!(removed < started);
+    handle.delete().await.unwrap();
+    assert_eq!(node.used(), Resources::default());
+}
+
+#[tokio::test]
+async fn boot_reconciliation_preserves_exhausted_restart_budget() {
+    let backend = Arc::new(Backend::default());
+    let node = manager(&backend);
+    let mut original = record("exhausted", EnvironmentState::Running);
+    original.spec.lifecycle.restart = Some(adx_core::lifecycle::RestartPolicy {
+        max_attempts: 2,
+        initial_backoff_seconds: 1,
+        max_backoff_seconds: 1,
+    });
+    original.restart_attempts = 2;
+    node.reconcile(vec![original.clone()]).await.unwrap();
+    let handle = node
+        .environment(original.spec, original.assignment)
+        .unwrap();
+    let failed = handle.sync().await.unwrap().record;
+    assert_eq!(failed.state, EnvironmentState::Failed);
+    assert_eq!(failed.restart_attempts, 2);
+    assert!(!failed.restart_pending);
+    assert!(!failed.resources_held);
+    assert!(!backend
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|event| event.starts_with("start:")));
+}
+
+#[tokio::test]
+async fn boot_restart_waits_for_confirmed_cleanup() {
+    let backend = Arc::new(Backend::default());
+    backend
+        .allow_start
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    backend
+        .fail_remove
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let node = manager(&backend);
+    let mut original = record("blocked", EnvironmentState::Running);
+    original.spec.lifecycle.restart = Some(adx_core::lifecycle::RestartPolicy {
+        max_attempts: 2,
+        initial_backoff_seconds: 1,
+        max_backoff_seconds: 1,
+    });
+    assert!(node.reconcile(vec![original.clone()]).await.is_err());
+    assert!(!backend
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|event| event.starts_with("start:")));
+    backend
+        .fail_remove
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    node.reconcile(vec![original.clone()]).await.unwrap();
+    let handle = node
+        .environment(original.spec, original.assignment)
+        .unwrap();
+    let failed = handle.sync().await.unwrap().record;
+    assert_eq!(failed.state, EnvironmentState::Failed);
+    assert!(failed.restart_pending);
+    assert_eq!(failed.restart_attempts, 0);
+    assert!(!failed.resources_held);
+}
+
+#[tokio::test]
+async fn periodic_authority_outage_keeps_known_lifecycle_but_blocks_new_allocations() {
+    let backend = Arc::new(Backend::default());
+    *backend.actual.lock().unwrap() = vec![observed("kept")];
+    let node = authority::manager(backend.clone());
+    node.reconcile(vec![record("kept", EnvironmentState::Running)])
+        .await
+        .unwrap();
+    let mut authority = authority::Fixture::new().await;
+    authority
+        .authority
+        .unavailable
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(authority.cycle(&node).await.is_err());
+    assert!(!node.accepting_allocations());
+    let new = record("new", EnvironmentState::Pending);
+    assert!(node.reserve_local(&new.spec).is_err());
+    assert!(node.environment(new.spec, new.assignment).is_err());
+    assert!(matches!(
+        node.recover_environment(record("new", EnvironmentState::Running))
+            .await,
+        Err(adx_core::Error::Unavailable(_))
+    ));
+    // Existing failure/idle cleanup retains its established degradation path.
+    backend.actual.lock().unwrap().clear();
+    backend.events.lock().unwrap().clear();
+    node.monitor_environments().await.unwrap();
+    assert!(backend
+        .events
+        .lock()
+        .unwrap()
+        .contains(&"remove:kept-7".into()));
+}
+
+#[tokio::test]
+async fn public_authority_cycles_preserve_valid_execution_while_collecting_orphans() {
+    let backend = Arc::new(Backend::default());
+    *backend.actual.lock().unwrap() = vec![observed("kept")];
+    let node = manager(&backend);
+    let kept = record("kept", EnvironmentState::Running);
+    node.reconcile(vec![kept.clone()]).await.unwrap();
+    let mut authority = authority::Fixture::new().await;
+    authority
+        .authority
+        .records
+        .lock()
+        .unwrap()
+        .push(kept.clone().try_into().unwrap());
+    authority.cycle(&node).await.unwrap();
+    backend.actual.lock().unwrap().push(observed("orphan"));
+    authority.cycle(&node).await.unwrap();
+    {
+        let actual = backend.actual.lock().unwrap();
+        assert_eq!(actual.len(), 1);
+        assert_eq!(actual[0].runtime_id, "kept-7");
+    }
+    assert_eq!(node.used(), kept.spec.resources);
+    assert!(!backend
+        .events
+        .lock()
+        .unwrap()
+        .contains(&"remove:kept-7".into()));
+    assert_eq!(
+        node.environment(kept.spec, kept.assignment)
+            .unwrap()
+            .create()
+            .await
+            .unwrap()
+            .record
+            .state,
+        EnvironmentState::Running
+    );
 }

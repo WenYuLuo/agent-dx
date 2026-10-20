@@ -1,5 +1,8 @@
-//! Restore only an authoritative complete node catalog. No local directory is required.
-use crate::{controller, Adxlet};
+//! Recover or compare a complete authoritative node catalog.
+use crate::{
+    controller::{self, AuthorityComparison},
+    Adxlet,
+};
 use adx_core::{
     scheduling::{validate_device_assignment, DeviceLedger},
     snapshots::{Snapshot, SnapshotState},
@@ -9,6 +12,26 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
 };
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReconciliationMode {
+    Recover,
+    Compare,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReconciliationOutcome {
+    Complete,
+    StaleCatalog,
+}
+
+fn terminal_without_execution(record: &EnvironmentRecord) -> bool {
+    matches!(
+        record.state,
+        EnvironmentState::Failed | EnvironmentState::Deleted
+    ) && !record.resources_held
+        && !record.restart_pending
+}
+
 impl Adxlet {
     /// Collection is permitted only after complete authoritative recovery.
     pub async fn collect_remote_orphans(&self) -> Result<usize> {
@@ -50,7 +73,9 @@ impl Adxlet {
         records: Vec<EnvironmentRecord>,
         snapshots: Vec<Snapshot>,
     ) -> Result<()> {
-        self.reconcile_authority(records, snapshots, None).await
+        self.reconcile_authority(records, snapshots, None, ReconciliationMode::Recover)
+            .await
+            .map(|_| ())
     }
     /// `retained_checkpoints` must include all globally referenced artifacts,
     /// including other nodes and pending restores. Only this complete catalog
@@ -61,19 +86,42 @@ impl Adxlet {
         snapshots: Vec<Snapshot>,
         retained_checkpoints: Vec<adx_core::CheckpointArtifact>,
     ) -> Result<()> {
-        self.reconcile_authority(records, snapshots, Some(retained_checkpoints))
-            .await
+        self.reconcile_authority(
+            records,
+            snapshots,
+            Some(retained_checkpoints),
+            ReconciliationMode::Recover,
+        )
+        .await
+        .map(|_| ())
+    }
+    /// Periodic comparison preserves healthy controllers and their live routes.
+    pub(crate) async fn compare_retained(
+        &self,
+        records: Vec<EnvironmentRecord>,
+        snapshots: Vec<Snapshot>,
+        retained_checkpoints: Vec<adx_core::CheckpointArtifact>,
+    ) -> Result<ReconciliationOutcome> {
+        self.reconcile_authority(
+            records,
+            snapshots,
+            Some(retained_checkpoints),
+            ReconciliationMode::Compare,
+        )
+        .await
     }
     async fn reconcile_authority(
         &self,
         records: Vec<EnvironmentRecord>,
         snapshots: Vec<Snapshot>,
         retained_checkpoints: Option<Vec<adx_core::CheckpointArtifact>>,
-    ) -> Result<()> {
+        mode: ReconciliationMode,
+    ) -> Result<ReconciliationOutcome> {
         let mut ready = self.lifecycle_ready.write().await;
         if self.is_draining() {
             return Err(Error::Unavailable("node is draining".into()));
         }
+        let was_ready = *ready;
         *ready = false;
         let mut snapshot_ids = BTreeSet::new();
         let complete_references = retained_checkpoints.is_some();
@@ -126,6 +174,27 @@ impl Adxlet {
                     .collect(),
             )
         });
+        if mode == ReconciliationMode::Compare {
+            for record in catalog.values() {
+                // A published Delete can remove its controller while InspectNode
+                // is in flight. The existing replay cache still fences that old
+                // catalog; do not reconstruct and republish a retired execution.
+                if self
+                    .retired_environment(&record.spec.id)
+                    .is_some_and(|retired| {
+                        retired.generation > record.assignment.generation
+                            || (retired.generation == record.assignment.generation
+                                && retired.result.as_ref().is_some_and(|result| {
+                                    result.durability == crate::Durability::Published
+                                        && result.record.revision > record.revision
+                                }))
+                    })
+                {
+                    *ready = was_ready;
+                    return Ok(ReconciliationOutcome::StaleCatalog);
+                }
+            }
+        }
         let controllers = self
             .environments
             .lock()
@@ -144,14 +213,31 @@ impl Adxlet {
         // Restore can finish after its RPC caller timed out. Align only an
         // uncommitted execution with the durable pause point; a newer published
         // result rejects this stale catalog so the heartbeat fetches it again.
+        let mut retired_by_authority = BTreeSet::new();
         for (id, (_, assignment, handle)) in &controllers {
             if let Some(record) = catalog.get(id).filter(|r| r.assignment == *assignment) {
+                let comparison = if mode == ReconciliationMode::Compare {
+                    handle.compare_authority(record.clone()).await?
+                } else {
+                    AuthorityComparison::Unpublished
+                };
+                if comparison == AuthorityComparison::RetiredByAuthority {
+                    retired_by_authority.insert(id.clone());
+                }
+                if comparison == AuthorityComparison::StaleCatalog {
+                    // An accepted operation published after InspectNode. No
+                    // difference is confirmed yet; keep known lifecycle usable
+                    // and retry a fresh catalog before adoption or deletion.
+                    *ready = was_ready;
+                    return Ok(ReconciliationOutcome::StaleCatalog);
+                }
                 handle.align_authority(record.clone()).await?;
             }
         }
+        let runtime_catalog: Vec<_> = catalog.values().cloned().collect();
         let actual = tokio::time::timeout(
             self.services.operation_timeout,
-            self.services.runtime.inventory(),
+            self.services.runtime.reconcile_inventory(&runtime_catalog),
         )
         .await
         .map_err(|_| Error::Unavailable("inventory timed out".into()))??;
@@ -176,20 +262,22 @@ impl Adxlet {
             }
         }
         // Validate everything before any destructive action or partial ledger update.
-        self.services.routes.begin_reconcile().await?;
+        if mode == ReconciliationMode::Recover {
+            self.services.routes.begin_reconcile().await?;
+        }
         for (id, (_, assignment, handle)) in controllers {
-            if catalog.get(&id).is_none_or(|r| {
-                r.assignment != assignment
-                    || (matches!(
-                        r.state,
-                        EnvironmentState::Failed | EnvironmentState::Deleted
-                    ) && !r.resources_held
-                        && !r.restart_pending)
-            }) {
+            let ownership_retired = catalog.get(&id).is_none_or(|r| r.assignment != assignment);
+            if ownership_retired
+                || retired_by_authority.contains(&id)
+                || (mode == ReconciliationMode::Recover
+                    && catalog.get(&id).is_some_and(terminal_without_execution))
+            {
                 // Drain accepted operations, then clean locally without inventing a
                 // cluster record for an identity the authority does not own.
                 handle.discard(references.clone()).await?;
-                self.remember_retired(&assignment, None);
+                if ownership_retired {
+                    self.remember_retired(&assignment, None);
+                }
                 self.environments
                     .lock()
                     .expect("shared state lock poisoned")
@@ -199,7 +287,7 @@ impl Adxlet {
         for runtime in &actual {
             if catalog
                 .get(&runtime.environment_id)
-                .is_none_or(|r| r.runtime.id != runtime.runtime_id)
+                .is_none_or(|r| r.runtime.id != runtime.runtime_id || terminal_without_execution(r))
             {
                 tokio::time::timeout(self.services.operation_timeout, async {
                     // A stale execution under current ownership must not publish a
@@ -237,11 +325,51 @@ impl Adxlet {
                             .devices
                             .restore(&r.runtime.id, &r.assignment.devices)?;
                     }
-                    let handle = controller::spawn_restored(r.clone(), self.services.clone());
-                    environments.insert(r.spec.id.clone(), (r.spec, r.assignment, handle.clone()));
+                    let handle =
+                        if mode == ReconciliationMode::Compare && terminal_without_execution(&r) {
+                            controller::spawn_terminal(r.clone(), self.services.clone())?
+                        } else {
+                            controller::spawn_restored(r.clone(), self.services.clone())
+                        };
+                    environments.insert(
+                        r.spec.id.clone(),
+                        (r.spec.clone(), r.assignment.clone(), handle.clone()),
+                    );
                     handle
                 }
             };
+            if mode == ReconciliationMode::Compare && terminal_without_execution(&r) {
+                if let Some(checkpoint) = r.checkpoint {
+                    retained.push(checkpoint.artifact);
+                }
+                continue;
+            }
+            let comparison = if mode == ReconciliationMode::Compare {
+                handle.compare_authority(r.clone()).await?
+            } else {
+                AuthorityComparison::Unpublished
+            };
+            if comparison == AuthorityComparison::StaleCatalog {
+                *ready = was_ready;
+                return Ok(ReconciliationOutcome::StaleCatalog);
+            }
+            if comparison == AuthorityComparison::Published {
+                let execution_matches = match r.state {
+                    EnvironmentState::Running => actual
+                        .iter()
+                        .any(|runtime| runtime.runtime_id == r.runtime.id && runtime.running),
+                    EnvironmentState::Paused => !actual
+                        .iter()
+                        .any(|runtime| runtime.runtime_id == r.runtime.id),
+                    _ => false,
+                };
+                if execution_matches {
+                    if let Some(checkpoint) = r.checkpoint {
+                        retained.push(checkpoint.artifact);
+                    }
+                    continue;
+                }
+            }
             let result = handle.reconcile().await?;
             if result.durability != crate::Durability::Published {
                 return Err(Error::Unavailable(
@@ -255,7 +383,12 @@ impl Adxlet {
         if let Some(checkpoint) = &self.services.checkpoint {
             checkpoint.store.reconcile_local(&retained).await?;
         }
-        self.services.routes.finish_reconcile().await?;
+        if mode == ReconciliationMode::Recover {
+            self.services.routes.finish_reconcile().await?;
+        } else {
+            // This only replaces bindings if the Relay session actually changed.
+            self.services.routes.ensure_synced().await?;
+        }
         if let Some(checkpoint) = &self.services.checkpoint {
             checkpoint.store.authorize_remote_gc(&retained).await?;
         }
@@ -264,7 +397,9 @@ impl Adxlet {
             .expect("shared state lock poisoned")
             .clear();
         *ready = true;
-        Ok(())
+        self.authority_initialized
+            .store(true, std::sync::atomic::Ordering::Release);
+        Ok(ReconciliationOutcome::Complete)
     }
 }
 
@@ -275,6 +410,14 @@ impl Adxlet {
         &self,
         record: EnvironmentRecord,
     ) -> Result<crate::OperationResult> {
+        if self
+            .authority_reconciling
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(Error::Unavailable(
+                "node authority reconciliation pending".into(),
+            ));
+        }
         let gate = self.lifecycle_ready.read().await;
         if !*gate || self.is_draining() {
             return Err(Error::Unavailable("node is reconciling or draining".into()));

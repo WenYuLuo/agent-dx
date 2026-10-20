@@ -15,6 +15,14 @@ use super::checkpoint::{PauseRequest, ResumeRequest};
 
 pub(super) type CheckpointReferences = BTreeSet<(String, String)>;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum AuthorityComparison {
+    Published,
+    Unpublished,
+    StaleCatalog,
+    RetiredByAuthority,
+}
+
 enum Command {
     Snapshot(
         super::checkpoint::SnapshotRequest,
@@ -43,6 +51,10 @@ enum Command {
     Sync,
     Reconcile,
     AlignAuthority(Box<EnvironmentRecord>, oneshot::Sender<Result<()>>),
+    CompareAuthority(
+        Box<EnvironmentRecord>,
+        oneshot::Sender<Result<AuthorityComparison>>,
+    ),
     Discard(
         Option<Arc<CheckpointReferences>>,
         oneshot::Sender<Result<()>>,
@@ -184,6 +196,23 @@ impl EnvironmentHandle {
         rx.await
             .map_err(|_| Error::Unavailable("environment controller stopped".into()))?
     }
+    /// Compare after accepted serial operations without probing, rebinding or publishing.
+    pub(crate) async fn compare_authority(
+        &self,
+        record: EnvironmentRecord,
+    ) -> Result<AuthorityComparison> {
+        let (tx, rx) = oneshot::channel();
+        let (unused, _) = oneshot::channel();
+        self.tx
+            .send(Envelope::new(
+                Command::CompareAuthority(Box::new(record), tx),
+                unused,
+            ))
+            .await
+            .map_err(|_| Error::Unavailable("environment controller stopped".into()))?;
+        rx.await
+            .map_err(|_| Error::Unavailable("environment controller stopped".into()))?
+    }
     pub(crate) async fn discard(
         &self,
         references: Option<Arc<CheckpointReferences>>,
@@ -268,6 +297,34 @@ pub(crate) fn spawn_restored(
     record: EnvironmentRecord,
     services: Arc<Services>,
 ) -> EnvironmentHandle {
+    spawn_controller(record, services, None)
+}
+
+/// Retain explicit deletion/replay for an already published, released terminal record.
+pub(crate) fn spawn_terminal(
+    record: EnvironmentRecord,
+    services: Arc<Services>,
+) -> Result<EnvironmentHandle> {
+    if !matches!(
+        record.state,
+        EnvironmentState::Failed | EnvironmentState::Deleted
+    ) || record.resources_held
+        || record.restart_pending
+    {
+        return Err(Error::Conflict);
+    }
+    Ok(spawn_controller(
+        record,
+        services,
+        Some(Durability::Published),
+    ))
+}
+
+fn spawn_controller(
+    record: EnvironmentRecord,
+    services: Arc<Services>,
+    durability: Option<Durability>,
+) -> EnvironmentHandle {
     let (tx, mut rx) = mpsc::channel::<Envelope>(32);
     let demand = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let mut controller = Controller {
@@ -275,7 +332,7 @@ pub(crate) fn spawn_restored(
         held: record.resources_held,
         record,
         services,
-        durability: None,
+        durability,
         retired: false,
         obsolete_checkpoints: Vec::new(),
         idle: None,
@@ -309,6 +366,35 @@ pub(crate) fn spawn_restored(
 impl Controller {
     async fn dispatch(&mut self, command: Command, reply: Reply) {
         let command = match command {
+            Command::CompareAuthority(record, ack) => {
+                let result = if self.retired {
+                    Err(Error::Conflict)
+                } else if self.durability == Some(Durability::Published) {
+                    // A published operation can finish after InspectNode. Fetch a
+                    // fresh catalog rather than recover from that stale snapshot.
+                    if self.record == *record {
+                        Ok(AuthorityComparison::Published)
+                    } else if self.record.revision > record.revision {
+                        Ok(AuthorityComparison::StaleCatalog)
+                    } else if record.revision > self.record.revision
+                        && matches!(
+                            record.state,
+                            EnvironmentState::Failed | EnvironmentState::Deleted
+                        )
+                        && !record.resources_held
+                        && !record.restart_pending
+                    {
+                        // Coordinator can retire ownership after node expiry.
+                        Ok(AuthorityComparison::RetiredByAuthority)
+                    } else {
+                        Err(Error::Conflict)
+                    }
+                } else {
+                    Ok(AuthorityComparison::Unpublished)
+                };
+                let _ = ack.send(result);
+                return;
+            }
             Command::AlignAuthority(record, ack) => {
                 let result = self.align_authority(*record).await;
                 let _ = ack.send(result);
@@ -388,6 +474,7 @@ impl Controller {
         let result = match command {
             Command::Snapshot(_, _)
             | Command::AlignAuthority(_, _)
+            | Command::CompareAuthority(_, _)
             | Command::Discard(_, _)
             | Command::Expire(_, _)
             | Command::Tick(_)
@@ -601,6 +688,7 @@ impl Controller {
                 Err(error) => return Err(error),
             }
         } else {
+            let lost_running = self.record.state == EnvironmentState::Running;
             if let Some(status) = observation {
                 self.record.failure = status.failure;
             }
@@ -615,6 +703,12 @@ impl Controller {
             } else if self.record.state == EnvironmentState::Failed {
                 self.record.revision =
                     self.record.revision.checked_add(1).ok_or(Error::Conflict)?;
+            }
+            // A boot/reconnect can confirm the same loss that a live monitor
+            // would detect. Keep the existing bounded restart policy after
+            // physical cleanup, without restoring a snapshot or resetting attempts.
+            if lost_running && !self.record.spec.execution.failover {
+                self.schedule_restart();
             }
         }
         self.sync().await

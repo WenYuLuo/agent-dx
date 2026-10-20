@@ -224,7 +224,9 @@ paths:
         server frames are PTY output. JSON text frames report the started and
         exited lifecycle events; `RESIZE:<cols>:<rows>` and `STDIN_EOF` are
         client control frames. OpenAPI does not standardize WebSocket frames,
-        so the extension records the complete framing boundary.
+        so the extension records the complete framing boundary. After sending
+        exited and Close, Execd completes the peer Close handshake before closing
+        TCP, with a five-second deadline for an unresponsive peer.
       parameters:
         - $ref: "#/components/parameters/InstanceId"
         - $ref: "#/components/parameters/ProcessingTimeout"
