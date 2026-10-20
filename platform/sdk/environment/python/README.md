@@ -723,3 +723,19 @@ optional `weight` and `preferredPriority`. `node_id` remains a hard requirement
 when combined with alternatives. See [placement rules](https://gitcode.com/openJiuwen/agent-dx/blob/refactor/docs/testing/http-node-placement.md)
 for the matching, ranking and label contracts. Caller-provided option lists are
 copied before the SDK adds a node constraint.
+
+
+## Tool execution identity
+
+`Environment(image="tools:v1", runtime="conch", user="1001", group="1002")`
+selects the POSIX identity used to launch Execd. Commands, native file operations,
+and files created on Local/MooseFS mounts use that identity. Supply both fields
+as POSIX names or decimal IDs; Conch resolves names on the worker. The shared
+filesystem must already grant that UID/GID access; ADX does not recursively chown
+mounted data. Omitted fields preserve the runtime deployment's identity.
+
+This override currently requires Conch. Other runtime backends reject it. It
+cannot be combined with `inherit_entrypoint=True` or a snapshot identity override;
+image entrypoint `process.user` retains its separate meaning. Use matching API
+Server, Coordinator, adxlet, and SDK versions so the typed identity is preserved
+across the complete create path. Unknown account resolution fails creation.

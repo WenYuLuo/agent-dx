@@ -1069,3 +1069,63 @@ async fn supervisor_tunnel_acl_survives_create_and_routed_policy_update() {
         assert_eq!(network["egress"]["blocked_ports"], json!([]));
     }
 }
+
+#[tokio::test]
+async fn conch_environment_identity_reaches_native_policy() {
+    let fixture = Fixture::new();
+    let driver = fixture.driver().await;
+    let mut raw = serde_json::to_value(spec("conch")).unwrap();
+    raw["execution"]["user"] = json!("1001");
+    raw["execution"]["group"] = json!("1002");
+    raw["execution"]["inherit_entrypoint"] = json!(false);
+    let wanted: EnvironmentSpec = serde_json::from_value(raw).unwrap();
+    driver
+        .start_with_deadline(
+            &wanted,
+            "tenant-agent-1",
+            1,
+            &[],
+            Instant::now() + Duration::from_secs(3),
+        )
+        .await
+        .unwrap();
+    {
+        let calls = fixture.backend.calls.lock().unwrap();
+        let body = &calls
+            .iter()
+            .find(|(m, p, _)| m == "POST" && p == "/api/v1/sandboxes")
+            .unwrap()
+            .2;
+        assert_eq!(body["policy"]["conch"]["run_as_user"], "1001");
+        assert_eq!(body["policy"]["conch"]["run_as_group"], "1002");
+    }
+    driver.remove("tenant-agent-1").await.unwrap();
+}
+
+#[tokio::test]
+async fn identity_override_is_not_silently_ignored_by_supervisor() {
+    let fixture = Fixture::new();
+    let driver = fixture.driver().await;
+    let mut raw = serde_json::to_value(spec("supervisor")).unwrap();
+    raw["execution"]["user"] = json!("1001");
+    raw["execution"]["group"] = json!("1002");
+    raw["execution"]["inherit_entrypoint"] = json!(false);
+    let wanted: EnvironmentSpec = serde_json::from_value(raw).unwrap();
+    assert!(driver
+        .start_with_deadline(
+            &wanted,
+            "tenant-agent-1",
+            1,
+            &[],
+            Instant::now() + Duration::from_secs(3)
+        )
+        .await
+        .is_err());
+    assert!(!fixture
+        .backend
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(m, p, _)| m == "POST" && p == "/api/v1/sandboxes"));
+}

@@ -474,6 +474,15 @@ impl Jiuwenbox {
         devices: &[DeviceAllocation],
         root: &Path,
     ) -> Result<(Value, Value)> {
+        adx_core::execution::validate_process_identity(
+            spec.execution.user.as_deref(),
+            spec.execution.group.as_deref(),
+        )?;
+        if spec.execution.user.is_some() && spec.execution.inherit_entrypoint {
+            return Err(Error::Invalid(
+                "tool identity cannot override an inherited image process".into(),
+            ));
+        }
         let class = self
             .config
             .classes
@@ -600,8 +609,17 @@ impl Jiuwenbox {
             {
                 conch[key] = value.clone();
             }
+            if let (Some(user), Some(group)) = (&spec.execution.user, &spec.execution.group) {
+                conch["run_as_user"] = json!(user);
+                conch["run_as_group"] = json!(group);
+            }
             backend_policy["conch"] = conch;
         } else {
+            if spec.execution.user.is_some() {
+                return Err(Error::Invalid(
+                    "tool identity override currently requires the Conch runtime".into(),
+                ));
+            }
             backend_policy["filesystem_policy"]["bind_mounts"] = json!(mounts);
             // A scalar replaces Jiuwenbox's base cpu_max tuple in append mode;
             // sending a list would concatenate/deduplicate the quota and period.

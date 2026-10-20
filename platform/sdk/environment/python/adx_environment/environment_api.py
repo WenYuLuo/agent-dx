@@ -334,6 +334,8 @@ class Environment:
         create_timeout: Optional[int] = None,
         connection: Optional[ConnectionConfig] = None,
         extra_config: Optional[Dict[str, Any]] = None,
+        user: Optional[str] = None,
+        group: Optional[str] = None,
         _snapshot_resource_fields: Optional[frozenset[str]] = None,
     ):
         """Create a new environment.
@@ -345,6 +347,10 @@ class Environment:
                 ``readonly`` default. Omitting it inherits the deployment
                 setting, including when replacing the source with *image* or
                 *rootfs*.
+            user: Tool runtime POSIX user name or decimal UID; requires group.
+                Supported by Conch; unsupported runtimes fail explicitly.
+            group: Tool runtime POSIX group name or decimal GID. Cannot combine
+                with an inherited entrypoint or a snapshot identity override.
             runtime: Environment isolation runtime identifier. Defaults to
                 ``runsc`` and is validated by the runtime layer.
             cpu: CPU scheduling request in milli-cores (default 1000).
@@ -424,6 +430,16 @@ class Environment:
             raise TypeError("rootfs_readonly must be a boolean or None")
         if snapshot_id is not None and (not isinstance(snapshot_id, str) or not snapshot_id.strip()):
             raise ValueError("snapshot_id must be a non-empty string")
+        if (user is None) != (group is None):
+            raise ValueError("user and group must both be configured")
+        if user is not None:
+            for value in (user, group):
+                if (not isinstance(value, str) or not value or len(value) > 256
+                        or not all(c.isascii() and (c.isalnum() or c in "_-." ) for c in value)
+                        or (value.isdecimal() and int(value) >= 4294967295)):
+                    raise ValueError("user/group require a POSIX name or numeric ID below 4294967295")
+            if inherit_entrypoint or snapshot_id is not None:
+                raise ValueError("tool identity cannot override an inherited entrypoint or snapshot")
         if not isinstance(failover, bool):
             raise TypeError("failover must be a boolean")
         if not isinstance(inherit_entrypoint, bool):
@@ -546,6 +562,9 @@ class Environment:
             if not isinstance(restart_policy, RestartPolicy):
                 raise TypeError("restart_policy must be a RestartPolicy")
             body["restartPolicy"] = restart_policy.to_dict()
+        if user is not None:
+            body["user"] = user
+            body["group"] = group
         if cwd is not None:
             body["cwd"] = cwd
         if inherit_entrypoint:
