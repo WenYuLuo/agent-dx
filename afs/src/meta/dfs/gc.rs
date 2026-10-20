@@ -648,11 +648,11 @@ mod tests {
         entities: Vec<MetaEntity>,
     ) -> (
         Arc<crate::meta::store::Store>,
-        Arc<crate::meta::store::memory::MemoryBackend>,
+        Arc<crate::meta::store::journal::MemoryLog>,
     ) {
-        use crate::meta::store::{NodeSessionLease, Store, memory::MemoryBackend};
-        let backend = Arc::new(MemoryBackend::default());
-        let store = Arc::new(Store::open(backend.clone()).await.unwrap());
+        use crate::meta::store::{NodeSessionLease, Store, journal::MemoryLog};
+        let backend = Arc::new(MemoryLog::new(Default::default()).unwrap());
+        let store = Arc::new(Store::open_log(backend.clone()).await.unwrap());
         store
             .register_node_session(
                 RequestKey::new("n", "session"),
@@ -1001,7 +1001,7 @@ mod tests {
         drop(service);
         drop(store);
         // The backend image includes pending deletion and reference records.
-        let reopened = Arc::new(Store::open(backend).await.unwrap());
+        let reopened = Arc::new(Store::open_log(backend).await.unwrap());
         let service =
             DfsService::with_replication_config(reopened, ReplicationConfig::local_single_copy())
                 .with_gc_grace_ms(0);
@@ -1123,7 +1123,7 @@ mod tests {
         service.update_gc_reference(release).await.unwrap();
         drop(service);
         drop(store);
-        let service = DfsService::new(Arc::new(Store::open(backend).await.unwrap()));
+        let service = DfsService::new(Arc::new(Store::open_log(backend).await.unwrap()));
         assert!(
             service
                 .update_gc_reference(update("late-open"))

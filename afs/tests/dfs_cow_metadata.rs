@@ -8,7 +8,7 @@ use afs::{
         dfs::{CreateFileRequest, DfsService},
         store::{
             MetaEntity, MetaRead, MetaStore, MetaTxn, OperationResult, RequestKey, RequestOutcome,
-            Store, StoreOperation, TxnCondition, TxnMutation, memory::MemoryBackend,
+            Store, StoreOperation, TxnCondition, TxnMutation, journal::MemoryLog,
         },
     },
 };
@@ -77,7 +77,7 @@ fn empty_commit(
 
 async fn fixture() -> (DfsService, Arc<Store>, CommitFileVersion) {
     let store = Arc::new(
-        Store::open(Arc::new(MemoryBackend::default()))
+        Store::open_log(Arc::new(MemoryLog::new(Default::default()).unwrap()))
             .await
             .unwrap(),
     );

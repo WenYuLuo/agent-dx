@@ -641,15 +641,11 @@ inode、FileVersion、LayoutRoot 与数据块，两层职责不混用。
 
 ## Meta 保留窗口与 Watch 重新同步
 
-生产 Meta 默认保留 24 小时幂等结果和最近 4096 个提交 revision 的 Watch 事件。
-`[meta_retention]` 的 `request_window_ms`、`watch_revisions` 必须大于零。
-写入时推进持久化清理水位；结果扫描最多约 10 秒一次，Watch 按完整 revision 截断。
-一次提交批次可能暂时多保留至多 64 个 revision；单个 revision 的事件不会被拆开。
-
-变更请求使用 `afs1-<Unix毫秒>-<原请求身份>`，重试复用完整身份。超过清理水位返回
-`META_REQUEST_EXPIRED`，不得换身份重做不确定结果的操作；缺少时间或超前超过 30 秒返回
-`META_REQUEST_TIME_INVALID`。文件系统固定初始化记录单独保留。水位随 WAL／检查点持久化，
-重启不会让过期请求重新执行；扩大窗口不会降低已有水位。
+Meta 沿用 canonical log 的有限历史策略：默认幂等结果最长保留 24 小时，Watch 历史最长保留
+1 小时，条数与字节预算可提前触发清理。配置使用 `meta_request_retention_ms`、
+`meta_watch_retention_ms`、`meta_watch_events_max` 等平坦字段，具体默认与恢复合同见
+[部署说明](../deployment/afs.md#meta-操作日志有限策略)。清理决定经日志持久化后发布，Watch 按完整
+revision 截断；快照 GC 的读视图和相关键 CAS 保留 canonical 的期限与容量检查。
 
 旧 Watch 游标得到 Compacted 与恢复游标。RootCommand 调用自动从同一份只读视图取得
 当前 session 的待处理命令和 revision，随后从该 revision 增量跟进；历史截断不会丢掉

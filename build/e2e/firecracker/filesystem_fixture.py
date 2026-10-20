@@ -70,7 +70,7 @@ class FilesystemFixture:
             config = self.core.run.root / "etc/meta.toml"
             config.write_text(
                 config.read_text()
-                + "\n[meta_retention]\nrequest_window_ms = 30000\nwatch_revisions = 16\n"
+                + "\nmeta_request_retention_ms = 30000\nmeta_watch_events_max = 16\n"
             )
         if self.trace_cow:
             # Only the traced diagnostic needs the COW operation witness.

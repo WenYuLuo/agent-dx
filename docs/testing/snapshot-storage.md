@@ -173,7 +173,8 @@ Coordinator 重启后的目录进度与排空心跳，并检查目标节点未�
 ## 分段 profile 与性能对比
 
 在已准备好的 Firecracker / AFS fixture 中，为 Meta 进程及其启动父进程设置
-`AFS_META_PROFILE=1` 可记录批次提交、排队、旧状态释放及后台完整检查点的分段耗时。先保留整份脱敏 `export/`
+`AFS_META_PROFILE=1` 可记录 canonical log 批次的 append＋sync 和状态发布耗时，`bytes` 是该批次的 framed 字节数。
+这些计时不包含排队、准备或完整检查点；checkpoint 与历史保留另通过 Meta 的固定指标观察。先保留整份脱敏 `export/`
 （包括两个 Ingress 的服务日志），再汇总：
 
 ```bash

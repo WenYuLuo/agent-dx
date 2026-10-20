@@ -584,10 +584,9 @@ dfs_read_diagnostics_enabled = true
 
 ## Meta 快照升级与回滚边界
 
-OwnerFs 与 DFS 共享 Meta store 的持久化机制，业务记录分开。local-file 使用已应用状态的增量 WAL，
-持久确认后才应答；后台检查点保存完整状态并保留后来提交的 WAL。etcd、Redis 和 memory 仍保存完整快照。
-完整检查点、历史幂等结果与 watch 事件仍会增长，应保留足够的磁盘及内存空间；本次不裁剪历史。
-AFSD 增量帧只能由支持该格式的版本重放，不能用旧二进制直接打开该目录回滚。
+OwnerFs 与 DFS 共享 canonical Meta 操作日志，业务记录分开。local-file 持久确认后才发布应答；
+后台检查点和历史退休沿用本文件的有限策略。旧 JSON/AFSD 快照、etcd、Redis 后端不再接入，
+升级／回滚必须使用匹配的二进制和完整数据目录，参见 [Meta 操作日志有限策略](#meta-操作日志有限策略)。
 
 本版本新增 DFS durability policy、外部对象回执等持久化表示。旧二进制可能无法解析新快照；
 不能把替换为旧二进制直接当成可用的回滚。升级前应正常停止相关写入、保留并核验原 Meta 和

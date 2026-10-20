@@ -1115,16 +1115,16 @@ fn now_unix_ms() -> u64 {
 #[cfg(test)]
 mod retention_tests {
     use super::*;
-    use crate::meta::store::{NodeSessionLease, RetentionPolicy, Store, memory::MemoryBackend};
+    use crate::meta::store::{HistoryLimits, NodeSessionLease, Store, journal::MemoryLog};
     #[tokio::test]
     async fn compacted_watch_resynchronizes_pending_commands_without_losing_new_events() {
         let store = Arc::new(
-            Store::open_with_retention(
-                Arc::new(MemoryBackend::default()),
-                Some(RetentionPolicy {
-                    request_window_ms: 60_000,
-                    watch_revisions: 2,
-                }),
+            Store::open_log_with_history(
+                Arc::new(MemoryLog::new(Default::default()).unwrap()),
+                HistoryLimits {
+                    event_count: 8,
+                    ..Default::default()
+                },
             )
             .await
             .unwrap(),
@@ -1173,20 +1173,50 @@ mod retention_tests {
             ));
         }
         command(&store, key(), "old-pending").await;
-        for _ in 0..6 {
-            let key = key();
-            let mut txn = MetaTxn::new(key.clone(), StoreOperation::BeginRootRevocation);
-            txn.conditions
-                .push(TxnCondition::RequestAbsent(key.clone()));
-            txn.mutations.push(TxnMutation::RecordRequestOutcome(
-                super::super::store::RequestOutcome {
-                    request: key,
-                    operation: StoreOperation::BeginRootRevocation,
-                    result: OperationResult::Empty,
-                },
-            ));
-            store.compare_and_commit(txn).await.unwrap();
+        // Manually seeded commands need the same durable epoch floor that
+        // normal root admission establishes before history can be retired.
+        let bootstrap_key = key();
+        let mut bootstrap = MetaTxn::new(bootstrap_key.clone(), StoreOperation::CleanupRootGrants);
+        bootstrap.conditions.extend([
+            TxnCondition::RequestAbsent(bootstrap_key.clone()),
+            TxnCondition::Missing(MetaKey::RootEpochWatermark),
+            TxnCondition::RootEpochWatermarkEquals(1),
+        ]);
+        bootstrap
+            .mutations
+            .push(TxnMutation::Put(MetaEntity::RootEpochWatermark(1)));
+        bootstrap.mutations.push(TxnMutation::RecordRequestOutcome(
+            super::super::store::RequestOutcome {
+                request: bootstrap_key,
+                operation: StoreOperation::CleanupRootGrants,
+                result: OperationResult::Empty,
+            },
+        ));
+        assert!(matches!(
+            store.compare_and_commit(bootstrap).await.unwrap(),
+            TxnOutcome::Committed { .. }
+        ));
+        for index in 0..8 {
+            store
+                .register_node_session(
+                    key(),
+                    NodeSessionLease {
+                        node_id: "unrelated".into(),
+                        session_id: format!("session-{index}"),
+                        grpc_addr: "http://other:1".into(),
+                        data_addr: "http://other:2".into(),
+                        rest_addr: "http://other:3".into(),
+                        storage_devices: vec![],
+                        lease_ttl: std::time::Duration::from_secs(30),
+                    },
+                )
+                .await
+                .unwrap();
         }
+        assert!(matches!(
+            store.watch(StoreRevision(0), 16).await.unwrap(),
+            WatchBatch::Compacted { .. }
+        ));
         let authority = StoreOwnerRootAuthority::new(store.clone());
         let RootCommandBatch::Events {
             commands,

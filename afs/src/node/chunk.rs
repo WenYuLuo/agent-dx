@@ -8501,7 +8501,19 @@ mod replica_replay_tests {
                 }
                 "missing" => fs::remove_file(store.chunk_path(&staged.chunk.id)).unwrap(),
                 "corrupt" => {
-                    fs::write(store.chunk_path(&staged.chunk.id), vec![1; bytes.len()]).unwrap()
+                    let path = store.chunk_path(&staged.chunk.id);
+                    let modified = fs::metadata(&path).unwrap().modified().unwrap();
+                    fs::write(&path, vec![1; bytes.len()]).unwrap();
+                    // Same-size writes can share one filesystem timestamp tick.
+                    // Exercise revalidation with a deterministically new identity.
+                    File::options()
+                        .write(true)
+                        .open(path)
+                        .unwrap()
+                        .set_times(
+                            fs::FileTimes::new().set_modified(modified + Duration::from_secs(1)),
+                        )
+                        .unwrap();
                 }
                 _ => {
                     let mut catalog = store.catalog.lock().unwrap();

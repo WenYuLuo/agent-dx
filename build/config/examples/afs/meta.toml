@@ -49,8 +49,3 @@ node-a = "/opt/adx/config/afs/tls/node-a.pem"
 # bucket = "afs-chunks"
 # region = "us-east-1"
 # allow_http = false
-
-# Bound replay outcomes and Watch history; keep the result window longer than retries.
-[meta_retention]
-request_window_ms = 86400000
-watch_revisions = 4096

@@ -15,7 +15,7 @@ use afs::{
             BackendReadiness, MetaEntity, MetaFuture, MetaRead, MetaReadView, MetaStore, MetaTxn,
             OperationResult, OwnerRootScan, RecoveryScan, RequestKey, RequestOutcome, Store,
             StoreOperation, StoreRevision, TxnCondition, TxnMutation, TxnOutcome, WatchBatch,
-            memory::MemoryBackend,
+            journal::MemoryLog,
         },
     },
 };
@@ -370,7 +370,7 @@ fn create_request(operation: impl Into<String>, name: impl Into<Vec<u8>>) -> Cre
 async fn commit_survives_same_identity_lease_renewal_between_validation_and_cas() {
     let store = Arc::new(LeaseInterferenceStore {
         inner: Arc::new(
-            Store::open(Arc::new(MemoryBackend::default()))
+            Store::open_log(Arc::new(MemoryLog::new(Default::default()).unwrap()))
                 .await
                 .unwrap(),
         ),
@@ -431,7 +431,7 @@ async fn commit_survives_same_identity_lease_renewal_between_validation_and_cas(
 async fn metadata_sync_survives_same_identity_lease_renewal_between_validation_and_cas() {
     let store = Arc::new(LeaseInterferenceStore {
         inner: Arc::new(
-            Store::open(Arc::new(MemoryBackend::default()))
+            Store::open_log(Arc::new(MemoryLog::new(Default::default()).unwrap()))
                 .await
                 .unwrap(),
         ),
@@ -471,7 +471,7 @@ async fn pending_commit(
 ) -> (DfsService, Arc<LeaseInterferenceStore>, CommitFileVersion) {
     let store = Arc::new(LeaseInterferenceStore {
         inner: Arc::new(
-            Store::open(Arc::new(MemoryBackend::default()))
+            Store::open_log(Arc::new(MemoryLog::new(Default::default()).unwrap()))
                 .await
                 .unwrap(),
         ),
@@ -575,7 +575,7 @@ fn unlink_request(operation: &str, name: &[u8]) -> afs::dfs::UnlinkRequest {
 async fn unlink_fixture(mode: Interference) -> (DfsService, Arc<LeaseInterferenceStore>, InodeId) {
     let store = Arc::new(LeaseInterferenceStore {
         inner: Arc::new(
-            Store::open(Arc::new(MemoryBackend::default()))
+            Store::open_log(Arc::new(MemoryLog::new(Default::default()).unwrap()))
                 .await
                 .unwrap(),
         ),

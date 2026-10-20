@@ -54,7 +54,7 @@ fn inode_identity(inode: &crate::dfs::InodeRecord) -> serde_json::Value {
     })
 }
 
-pub(super) fn namespace_conflict(state: &super::MemoryState, txn: &super::MetaTxn) {
+pub(super) fn namespace_conflict(state: &super::State, txn: &super::MetaTxn) {
     if !namespace_trace_enabled() {
         return;
     }
