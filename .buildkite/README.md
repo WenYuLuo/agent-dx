@@ -48,7 +48,7 @@ Set these variables on a Buildkite build or in that pipeline's environment setti
 | `ADX_ARM_OBS_UPLOAD` | inherits `ADX_OBS_UPLOAD` | Base: override only ARM final OBS publication; ARM Buildkite artifacts remain available |
 | `ADX_OBS_UPLOAD_CHANNEL` | `daily` | Base/SDK: `daily` or `release` |
 | `ADX_RELEASE_VERSION` | tag-derived | OBS release path version |
-| `ADX_OBS_BUCKET` / `ADX_OBS_ENDPOINT` | `openyuanrong` / `obs.cn-southwest-2.myhuaweicloud.com` | OBS intermediate transport and final publication destination |
+| `ADX_OBS_BUCKET` / `ADX_OBS_ENDPOINT` | `agent-dx` / `obs.cn-southwest-2.myhuaweicloud.com` | OBS intermediate transport and final publication destination |
 | `ADX_ARTIFACT_TRANSPORT` | `obs` | Base components: `obs` staging or explicit `buildkite` transport |
 | `ADX_ADMIN_PYPI_UPLOAD` | `0` | Base/admin: `1` enables adxadmin publication on a repository release tag |
 | `ADX_ADMIN_PYPI_REPOSITORY` | `pypi` | Base/admin: `pypi` or `testpypi` |
@@ -555,6 +555,9 @@ Workers read `AK` and `SK` from the `obs-credentials` Secret into
 creation so Buildkite-only builds can run; selecting OBS without credentials fails
 explicitly. Credentials are never passed on argv or written to artifacts.
 `ADX_OBS_BUCKET` and `ADX_OBS_ENDPOINT` override the documented defaults.
+The base and Environment SDK pipeline bootstraps explicitly select the `agent-dx`
+bucket in `cn-southwest-2`. Published `adx/daily/` and `adx/release/` objects allow
+anonymous downloads; `adx/ci/` intermediate objects require authentication.
 
 The default channel is `daily`:
 
