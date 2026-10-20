@@ -9,6 +9,7 @@ import argparse
 import asyncio
 import hashlib
 import json
+import logging
 from pathlib import Path
 import signal
 import subprocess
@@ -23,7 +24,7 @@ class UnitProcess:
 
     def poll(self):
         state = subprocess.run(
-            ["systemctl", "is-active", self.unit], capture_output=True, text=True
+            ["/usr/bin/systemctl", "is-active", self.unit], capture_output=True, text=True
         ).stdout.strip()
         return None if state in ("active", "activating") else 0
 
@@ -77,7 +78,8 @@ class HostRecovery(FullSDK):
             "",
         ]
         path = Path("/etc/systemd/system") / unit
-        assert not path.exists(), path
+        if not (not path.exists()):
+            raise AssertionError(path)
         path.write_text("\n".join(lines))
         command("systemctl", "daemon-reload")
         command("systemctl", "enable", "--now", unit)
@@ -114,12 +116,13 @@ class HostRecovery(FullSDK):
             value["record"] = self.record(value["id"])
             (self.run / ("before-" + backend + ".json")).write_text(json.dumps(value, indent=2))
         detached = await self.sdk_rpc("detach")
-        assert detached == ids
+        if not (detached == ids):
+            raise AssertionError("acceptance condition failed")
         self.sdk.stdin.close()
         await self.sdk.wait()
         state = {
             "ids": ids,
-            "records": {backend: self.record(id) for backend, id in ids.items()},
+            "records": {backend: self.record(environment_id) for backend, environment_id in ids.items()},
             "namespace": self.namespace,
             "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
             "units": {name: process.unit for name, process in self.children.items()},
@@ -133,39 +136,45 @@ class HostRecovery(FullSDK):
         }
         (self.run / "host-state.json").write_text(json.dumps(state, indent=2))
         command("sync")
-        print(json.dumps({"status": "prepared", "boot_id": state["boot_id"], "ids": ids}), flush=True)
+        logging.info("%s", json.dumps({"status": "prepared", "boot_id": state["boot_id"], "ids": ids}))
 
     async def verify(self, state):
         current_boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
         report = {"status": "failed", "before_boot_id": state["boot_id"], "after_boot_id": current_boot}
         try:
-            assert current_boot != state["boot_id"], "kernel boot ID did not change"
+            if not (current_boot != state["boot_id"]):
+                raise AssertionError("kernel boot ID did not change")
             await self.until(self.node_ready, "boot restores node admission", 240)
-            records = {backend: self.record(id) for backend, id in state["ids"].items()}
+            records = {
+                backend: self.record(environment_id) for backend, environment_id in state["ids"].items()
+            }
             for record in records.values():
-                assert record["result"]["state"] != "Failed" or record["result"]["restart_pending"], (
-                    "boot lost configured restart intent"
-                )
+                if not (record["result"]["state"] != "Failed" or record["result"]["restart_pending"]):
+                    raise AssertionError("boot lost configured restart intent")
             await self.until(
                 lambda: self.new_runtimes_ready(state["ids"], state["records"]), "boot cold recovery", 180
             )
             await self.start_sdk()
             attached = await self.sdk_rpc("attach", ids=state["ids"])
-            assert set(attached) == set(state["ids"])
+            if not (set(attached) == set(state["ids"])):
+                raise AssertionError("acceptance condition failed")
             await self.check_all("host-reboot", state["ids"])
-            for backend, id in state["ids"].items():
-                record = self.record(id)
-                assert record["assignment"] == state["records"][backend]["assignment"], record
-                assert (
+            for backend, environment_id in state["ids"].items():
+                record = self.record(environment_id)
+                if not (record["assignment"] == state["records"][backend]["assignment"]):
+                    raise AssertionError(record)
+                if not (
                     record["result"]["restart_attempts"]
                     == state["records"][backend]["result"]["restart_attempts"] + 1
-                ), record
-                assert (
+                ):
+                    raise AssertionError(record)
+                if not (
                     hashlib.sha256((self.run / "workspace" / (backend + ".bin")).read_bytes()).hexdigest()
                     == state["workspace_sha256"][backend]
-                )
+                ):
+                    raise AssertionError("acceptance condition failed")
                 await self.sdk_rpc("delete", backend)
-                await self.until(lambda: self.record(id) is None, "delete commit after reboot")
+                await self.until(lambda: self.record(environment_id) is None, "delete commit after reboot")
             await self.until(
                 self.managed_backends_absent,
                 "reboot native cleanup",
@@ -178,7 +187,9 @@ class HostRecovery(FullSDK):
             report["cases"] = self.results
         except Exception as error:
             report["error"] = f"{type(error).__name__}: {error}"
-            report["records"] = {backend: self.record(id) for backend, id in state["ids"].items()}
+            report["records"] = {
+                backend: self.record(environment_id) for backend, environment_id in state["ids"].items()
+            }
             raise
         finally:
             (self.run / "host-result.json").write_text(json.dumps(report, indent=2))
@@ -199,8 +210,9 @@ class HostRecovery(FullSDK):
         command("systemctl", "daemon-reload")
         # conchd is stopped; perform the final host-level resource audit.
         host = self.host_audit()
-        assert not host["leftovers"] and not host["conch_bridge_ports"], host
-        print(json.dumps({"cleanup": "passed", "host_audit": host}), flush=True)
+        if not (not host["leftovers"] and not host["conch_bridge_ports"]):
+            raise AssertionError(host)
+        logging.info("%s", json.dumps({"cleanup": "passed", "host_audit": host}))
 
 
 async def main(args):
@@ -215,6 +227,7 @@ async def main(args):
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     parser = argparse.ArgumentParser()
     parser.add_argument("phase", choices=["prepare", "check", "cleanup"])
     parser.add_argument("--root", type=Path, required=True)

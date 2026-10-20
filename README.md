@@ -54,7 +54,7 @@ API Server embeds Ingress by default, and adxlet embeds Relay by default. Both p
 
 ADX release packages target Linux and contain `adx-coordinator`, `adxlet` (embedded Relay by default), `adx-apiserver` (embedded Ingress by default), the optional standalone `adx-ingress` and `adx-relay` binaries, `adxctl`, the read-only [`adx-inspect`](docs/deployment/adx-inspect.md), Execd, the Python Environment SDK, and managed Redis with `redis-cli`. The debug forwarder is a source-build tool. sandboxd remains independently managed and is pinned by [`third_party/sandboxd/source.json`](third_party/sandboxd/source.json).
 
-The opt-in [Jiuwenbox adapter](docs/testing/jiuwenbox-runtime.md) supports the `supervisor` and `conch` classes using independently managed Jiuwenbox/Conch services. Execd remains a separately mounted EROFS artifact; this path has component contracts, real Linux runtime integration, and installed public SDK acceptance for lifecycle, files, EROFS, process recovery, Redis outages and dedicated Linux VM host reboot. See the [recovery acceptance record](docs/testing/jiuwenbox-recovery-20261019.md) for storage requirements and the tested boundary.
+The opt-in [Jiuwenbox adapter](docs/testing/jiuwenbox-runtime.md) supports the `supervisor` and `conch` classes using independently managed Jiuwenbox/Conch services. Execd uses a separately mounted EROFS artifact. See the [runtime acceptance tools](build/e2e/jiuwenbox/README.md) for deployment prerequisites and reproducible checks.
 
 ```sh
 mkdir adx-release

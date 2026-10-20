@@ -21,14 +21,8 @@ The fixture root supplies `backend-fixture.json` with `conch_backend` set to
 `stratovirt` and `conch_template_selector` set to `id`; template creation resolves
 the immutable content ID into ADX's `template_id` image binding. Runtime paths
 under `conch/` and `jiuwenbox/src/` point to the extracted RPM and installed wheel.
-See [prebuilt acceptance evidence](../../../docs/testing/jiuwenbox-prebuilt-20261019.md)
-for preparation, scope and the successful run identities.
-
-The latest lock validation uses `final-runtime003` (9/9) and `final-sdk003`
-(11/11), with the PTY-close-fixed Execd supplied by an independent EROFS.
-It records the ADX package/source manifests, installed public SDK wheel and
-Execd identities, plus the actual Conch CLI/daemon binary SHA256 values.
-The external wheel/RPM payloads remain byte-for-byte unchanged.
+The lock records the ADX package/source manifests, installed public SDK wheel,
+independent Execd EROFS, and Conch CLI/daemon SHA256 values.
 
 ## Source-built fixture
 

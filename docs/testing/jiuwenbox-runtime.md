@@ -116,23 +116,9 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 python3 build/docs/check.py
 ```
 
-当前变更的组件检查结果见 [检视修改验证](jiuwenbox-review-20261019.md)。
-预编译 wheel/RPM 的完整部署与安装后 SDK 结果见
-[预编译产物验收](jiuwenbox-prebuilt-20261019.md)，包含固定版本、SHA256 与缓存位置。
-原 SQLite/宿主过滤实现曾通过 Linux 单机运行时、完整部署与公开 SDK 验收；这些是历史证据，
-不代表本次对账、原生 ACL 与常驻 EROFS 变更已经通过真实 Linux 验收。历史版本、制品摘要
-见 [Linux 验收记录](jiuwenbox-linux-20261016.md)，复现入口见
-[验收驱动](../../build/e2e/jiuwenbox/README.md)。
+完整部署、公开 SDK 和故障恢复的复现入口见
+[验收工具](../../build/e2e/jiuwenbox/README.md)。预编译依赖的版本和 SHA256 见
+[产物锁文件](../../build/e2e/jiuwenbox/prebuilt-lock.json)。
 
 本驱动暂未上报后端实际资源用量和精确作业退出码；节点容量仍由 Auto/File 采样，
 业务故障由 Execd 探针和现有恢复策略处理。
-
-修改前完整 ADX 单机部署与安装后公开 SDK 验收 11/11 通过，覆盖两个后端的创建、命令、文件、
-删除、独立 EROFS，以及 ADXlet/Coordinator/API Server/Ingress/Jiuwenbox/conchd 进程恢复。
-原 SDK handle 在重启后继续可用；可写卷文件在冷重建后保留。具体身份变化、存储配置
-和证据见 [完整部署与 SDK 验收记录](jiuwenbox-sdk-20261016.md)。
-
-修改前 Redis SIGKILL/35 秒中断恢复，以及独立 Linux VM 宿主强制 OS 重启后的冷重建、
-卷文件保留和无孤儿审计均已通过，见 [宿主重启与 Redis 验收](jiuwenbox-recovery-20261019.md)。
-CPU/内存实际约束、IPv4 双向及跨沙箱隔离、显式 WebSocket 矩阵、跨节点、断电/丢盘及
-Redis 数据丢失/HA 仍须独立验证。

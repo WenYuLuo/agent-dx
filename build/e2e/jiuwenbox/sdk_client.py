@@ -6,13 +6,17 @@ import hashlib
 import importlib.metadata
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import sys
 import traceback
 
 config = json.loads(Path(sys.argv[1]).read_text())
 os.environ["SSL_CERT_FILE"] = config["ca"]
-from adx_environment import ConnectionConfig, Environment, EnvironmentNotFound, RestartPolicy
+sdk_module = importlib.import_module("adx_environment")
+ConnectionConfig = sdk_module.ConnectionConfig
+Environment = sdk_module.Environment
+EnvironmentNotFound = sdk_module.EnvironmentNotFound
+RestartPolicy = sdk_module.RestartPolicy
 
 connection = ConnectionConfig(
     server_address=config["endpoint"],
@@ -24,23 +28,36 @@ environments = {}
 payload = b"adx-sdk-binary\x00\xff\n" * 10000
 
 
-def check(backend):
-    s = environments[backend]
-    assert s.get_info().state == "running"
-    result = s.commands.run("printf 'adx-sdk'; printf 'stderr-sdk' >&2; exit 7")
-    assert (result.stdout, result.stderr, result.exit_code) == ("adx-sdk", "stderr-sdk", 7), repr(result)
-    assert s.files.read("/workspace/" + backend + ".bin", format="bytes") == payload
-    s.files.write("/workspace/" + backend + ".txt", "SDK 文件读写\n")
-    assert s.files.read("/workspace/" + backend + ".txt") == "SDK 文件读写\n"
-    probe = s.commands.run(
-        "sha256sum /__adx/usr/local/bin/adx-execd; grep ' /__adx ' /proc/mounts; if touch /__adx/SHOULD_NOT_WRITE 2>/dev/null; then exit 9; fi; echo EROFS_READONLY_OK"
+def check(runtime_class):
+    environment = environments[runtime_class]
+    if not (environment.get_info().state == "running"):
+        raise AssertionError("acceptance condition failed")
+    result = environment.commands.run("printf 'adx-sdk'; printf 'stderr-sdk' >&2; exit 7")
+    if not ((result.stdout, result.stderr, result.exit_code) == ("adx-sdk", "stderr-sdk", 7)):
+        raise AssertionError(repr(result))
+    if not (
+        environment.files.read(str(PurePosixPath("/workspace") / f"{runtime_class}.bin"), format="bytes")
+        == payload
+    ):
+        raise AssertionError("acceptance condition failed")
+    environment.files.write(str(PurePosixPath("/workspace") / f"{runtime_class}.txt"), "SDK 文件读写\n")
+    if not (
+        environment.files.read(str(PurePosixPath("/workspace") / f"{runtime_class}.txt")) == "SDK 文件读写\n"
+    ):
+        raise AssertionError("acceptance condition failed")
+    probe = environment.commands.run(
+        (
+            "sha256sum /__adx/usr/local/bin/adx-execd; grep ' /__adx ' /proc/mounts; "
+            "if touch /__adx/SHOULD_NOT_WRITE 2>/dev/null; then exit 9; fi; echo EROFS_READONLY_OK"
+        )
     )
-    assert (
+    if not (
         probe.exit_code == 0 and config["execd_sha"] in probe.stdout and "EROFS_READONLY_OK" in probe.stdout
-    ), repr(probe)
+    ):
+        raise AssertionError(repr(probe))
     return {
-        "id": s.id,
-        "info": dataclasses.asdict(s.get_info()),
+        "id": environment.id,
+        "info": dataclasses.asdict(environment.get_info()),
         "binary_bytes": len(payload),
         "binary_sha256": hashlib.sha256(payload).hexdigest(),
         "guest_erofs": probe.stdout,
@@ -48,16 +65,17 @@ def check(backend):
     }
 
 
-print(
+sys.stdout.write(
     json.dumps(
         {
             "ready": True,
             "sdk_version": importlib.metadata.version("adx-environment"),
             "sdk_location": str(Path(sys.modules["adx_environment"].__file__).resolve()),
         }
-    ),
-    flush=True,
+    )
+    + "\n"
 )
+sys.stdout.flush()
 try:
     for line in sys.stdin:
         try:
@@ -78,7 +96,7 @@ try:
                     ),
                 )
                 environments[backend] = s
-                s.files.write("/workspace/" + backend + ".bin", payload)
+                s.files.write(str(PurePosixPath("/workspace") / f"{backend}.bin"), payload)
                 value = check(backend)
             elif action == "attach":
                 for runtime, environment_id in request["ids"].items():
@@ -117,10 +135,12 @@ try:
                 value = True
             else:
                 raise ValueError(action)
-            print(json.dumps({"ok": True, "value": value}, ensure_ascii=False), flush=True)
+            sys.stdout.write(json.dumps({"ok": True, "value": value}, ensure_ascii=False) + "\n")
+            sys.stdout.flush()
         except Exception as error:
             traceback.print_exc(file=sys.stderr)
-            print(json.dumps({"ok": False, "error": f"{type(error).__name__}: {error}"}), flush=True)
+            sys.stdout.write(json.dumps({"ok": False, "error": f"{type(error).__name__}: {error}"}) + "\n")
+            sys.stdout.flush()
 finally:
     for s in environments.values():
         try:

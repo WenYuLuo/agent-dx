@@ -5,6 +5,7 @@ import argparse
 import asyncio
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 import secrets
@@ -49,9 +50,8 @@ class FullSDK(Acceptance):
             command, "python3", str(self.root / "adx/build/release/package.py"), "verify", str(self.package)
         )
         manifest = json.loads((self.package / "manifest.json").read_text())
-        assert manifest["files"]["runtime/adx-runtime-rootfs.img"] == self.sha, (
-            "bootstrap differs from verified package"
-        )
+        if not (manifest["files"]["runtime/adx-runtime-rootfs.img"] == self.sha):
+            raise AssertionError("bootstrap differs from verified package")
         self.config_path = self.run / "deployment.yaml"
         self.namespace = "jbx-" + self.name
         self.tls_dir = self.run / "tls"
@@ -75,10 +75,10 @@ class FullSDK(Acceptance):
 
         services = []
 
-        def add(id, role, config, env=None):
+        def add(environment_id, role, config, env=None):
             services.append(
                 {
-                    "id": id,
+                    "id": environment_id,
                     "role": role,
                     "config": config,
                     "env": dict(RUST_LOG="info", ADX_LOG_FORMAT="json", **(env or {})),
@@ -247,18 +247,20 @@ class FullSDK(Acceptance):
         await self.start_sdk()
 
     async def start_sdk(self):
-        self.sdk = await asyncio.create_subprocess_exec(
-            str(self.root / "sdk-venv/bin/python"),
-            "-I",
-            "-u",
-            str(self.root / "adx/build/e2e/jiuwenbox/sdk_client.py"),
-            str(self.run / "sdk-client.json"),
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=(self.run / "sdk-client.log").open("ab"),
-        )
+        with (self.run / "sdk-client.log").open("ab") as log:
+            self.sdk = await asyncio.create_subprocess_exec(
+                str(self.root / "sdk-venv/bin/python"),
+                "-I",
+                "-u",
+                str(self.root / "adx/build/e2e/jiuwenbox/sdk_client.py"),
+                str(self.run / "sdk-client.json"),
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=log,
+            )
         self.sdk_info = json.loads(await asyncio.wait_for(self.sdk.stdout.readline(), 30))
-        assert self.sdk_info["ready"] and "/sdk-venv/" in self.sdk_info["sdk_location"], self.sdk_info
+        if not (self.sdk_info["ready"] and "/sdk-venv/" in self.sdk_info["sdk_location"]):
+            raise AssertionError(self.sdk_info)
         (self.run / "sdk-installation.json").write_text(json.dumps(self.sdk_info, indent=2))
 
     def catalog(self):
@@ -282,15 +284,17 @@ class FullSDK(Acceptance):
             )
         )
 
-    def record(self, id):
-        value = self.catalog().get("environment:" + id)
+    def record(self, environment_id):
+        value = self.catalog().get("environment:" + environment_id)
         record = json.loads(value) if value else None
         if record and record.get("result"):
             runtime = record["result"]["runtime"]
             runtime_id = runtime["id"]
             self.expected.setdefault(self.runtime_config.parent, {})[runtime_id] = dict(
-                runtime_id=runtime_id, sandbox_id="adx-"+hashlib.sha256(runtime_id.encode()).hexdigest()[:28],
-                spec=record["spec"], ip=runtime["ip"],
+                runtime_id=runtime_id,
+                sandbox_id="adx-" + hashlib.sha256(runtime_id.encode()).hexdigest()[:28],
+                spec=record["spec"],
+                ip=runtime["ip"],
             )
         return record
 
@@ -300,34 +304,39 @@ class FullSDK(Acceptance):
         if "conch" in self.backends:
             native = await self.uds(self.conch_socket, "GET", "/api/v1/sandboxes?state=running&limit=5000")
             native.raise_for_status()
-            assert len(native.json()) < 5000
+            if not (len(native.json()) < 5000):
+                raise AssertionError("acceptance condition failed")
             running = {v.get("sandboxID", v.get("id")) for v in native.json()}
         for record in records:
             runtime = record["result"]["runtime"]
-            id = "adx-"+hashlib.sha256(runtime["id"].encode()).hexdigest()[:28]
-            response = await self.uds(self.jw_socket, "GET", "/api/v1/sandboxes/"+id)
+            environment_id = "adx-" + hashlib.sha256(runtime["id"].encode()).hexdigest()[:28]
+            response = await self.uds(self.jw_socket, "GET", f"/api/v1/sandboxes/{environment_id}")
             response.raise_for_status()
             ref = response.json()
-            assert ref["phase"] == "ready" and ref["ip_address"] == runtime["ip"], ref
+            if not (ref["phase"] == "ready" and ref["ip_address"] == runtime["ip"]):
+                raise AssertionError(ref)
             if record["spec"]["runtime_class"] == "conch":
-                assert id in running, id
+                if environment_id not in running:
+                    raise AssertionError(environment_id)
             else:
-                unified, memory, cpu, pids = [root/id for root in cgroup_roots()]
+                unified, memory, cpu, pids = [root / environment_id for root in cgroup_roots()]
                 groups = [unified] if unified.is_dir() else [memory, cpu]
                 if not unified.is_dir() and pids.is_dir():
                     groups.append(pids)
                 for group in groups:
-                    assert (group/"cgroup.procs").read_text().strip(), str(group)
-            evidence.append(dict(runtime_id=runtime["id"], sandbox_id=id, backend=ref))
+                    if not ((group / "cgroup.procs").read_text().strip()):
+                        raise AssertionError(str(group))
+            evidence.append(dict(runtime_id=runtime["id"], sandbox_id=environment_id, backend=ref))
         return evidence
 
     async def node_ready(self):
         try:
             catalog = self.catalog()
             node = json.loads(catalog.get("node:node1", "null"))
+            if not node:
+                return False
             if (
-                not node
-                or not node["node"]["available"]
+                not node["node"]["available"]
                 or set(node["node"]["runtime_classes"]) != set(self.backends)
                 or not node["session"]["routable"]
             ):
@@ -362,23 +371,26 @@ class FullSDK(Acceptance):
         self.sdk.stdin.write((json.dumps({"action": action, "backend": backend, **options}) + "\n").encode())
         await self.sdk.stdin.drain()
         line = await asyncio.wait_for(self.sdk.stdout.readline(), 210)
-        assert line, "SDK client exited"
+        if not (line):
+            raise AssertionError("SDK client exited")
         result = json.loads(line)
-        assert result["ok"], result
+        if not (result["ok"]):
+            raise AssertionError(result)
         return result["value"]
 
     async def check_all(self, label, ids):
-        for backend, id in ids.items():
+        for backend, environment_id in ids.items():
             value = await self.until(
                 lambda: self.sdk_rpc("check", backend), label + " public SDK recovery", 60
             )
-            assert value["id"] == id, value
-            value["record"] = self.record(id)
+            if not (value["id"] == environment_id):
+                raise AssertionError(value)
+            value["record"] = self.record(environment_id)
             (self.run / (label + "-" + backend + ".json")).write_text(
                 json.dumps(value, indent=2, ensure_ascii=False)
             )
         self.results.append({"case": label, "status": "passed"})
-        print("PASS", label, flush=True)
+        logging.info("%s %s", "PASS", label)
 
     async def restart_service(self, service):
         status = json.loads(
@@ -391,7 +403,8 @@ class FullSDK(Acceptance):
         entries = status["services"]
         entry = next(item for item in entries if item["id"] == service)
         pid = entry["pid"]
-        assert pid and str(self.package / "bin") in Path(f"/proc/{pid}/exe").resolve().as_posix(), entry
+        if not (pid and str(self.package / "bin") in Path(f"/proc/{pid}/exe").resolve().as_posix()):
+            raise AssertionError(entry)
         os.kill(pid, signal.SIGKILL)
 
         async def replaced():
@@ -411,14 +424,15 @@ class FullSDK(Acceptance):
             ids[backend] = value["id"]
             value["record"] = self.record(value["id"])
             mount = command("findmnt", "-J", "-T", str(self.run / "runtime/state/bootstrap" / self.sha))
-            assert "erofs" in mount and "ro," in mount, mount
+            if not ("erofs" in mount and "ro," in mount):
+                raise AssertionError(mount)
             value["host_erofs"] = json.loads(mount)
             (self.run / ("create-" + backend + ".json")).write_text(
                 json.dumps(value, indent=2, ensure_ascii=False)
             )
             self.results.append({"case": backend + "-create-exec-files-erofs", "status": "passed"})
-            print("PASS", backend, "create-exec-files-erofs", flush=True)
-        before = {backend: self.record(id) for backend, id in ids.items()}
+            logging.info("%s %s %s", "PASS", backend, "create-exec-files-erofs")
+        before = {backend: self.record(environment_id) for backend, environment_id in ids.items()}
         await self.restart_service("node1")
         await self.until(lambda: self.same_runtimes_ready(ids, before), "adxlet adopts original runtimes")
         await self.check_all("adxlet-restart", ids)
@@ -431,7 +445,7 @@ class FullSDK(Acceptance):
         await self.check_all("apiserver-restart", ids)
         await self.restart_service("ingress")
         await self.check_all("ingress-restart", ids)
-        old = {backend: self.record(id) for backend, id in ids.items()}
+        old = {backend: self.record(environment_id) for backend, environment_id in ids.items()}
         await self.stop(self.jw, signal.SIGKILL)
         await self.start_jw()
         await self.until(lambda: self.new_runtimes_ready(ids, old), "Jiuwenbox restart cold recovery", 240)
@@ -446,9 +460,9 @@ class FullSDK(Acceptance):
                 240,
             )
             await self.check_all("conchd-restart", ids)
-        for backend, id in ids.items():
+        for backend, environment_id in ids.items():
             await self.sdk_rpc("delete", backend)
-            await self.until(lambda: self.record(id) is None, "public deletion committed")
+            await self.until(lambda: self.record(environment_id) is None, "public deletion committed")
             self.results.append({"case": backend + "-delete", "status": "passed"})
         await self.until(
             self.managed_backends_absent,
@@ -499,8 +513,9 @@ class FullSDK(Acceptance):
                     traceback.print_exc()
                     status = "failed"
             for name in ("jw", "conch"):
-                if hasattr(self, name):
-                    await self.stop(getattr(self, name))
+                process = getattr(self, name, None)
+                if process is not None:
+                    await self.stop(process)
             host = self.host_audit()
             if host["leftovers"] or host["conch_bridge_ports"]:
                 status = "failed"
@@ -519,8 +534,8 @@ class FullSDK(Acceptance):
                 raise RuntimeError("full SDK acceptance failed")
 
     def same_runtimes_ready(self, ids, before):
-        for backend, id in ids.items():
-            record = self.record(id)
+        for backend, environment_id in ids.items():
+            record = self.record(environment_id)
             if (
                 not record
                 or record["result"]["state"] != "Running"
@@ -530,8 +545,8 @@ class FullSDK(Acceptance):
         return True
 
     def new_runtimes_ready(self, ids, before):
-        for backend, id in ids.items():
-            record = self.record(id)
+        for backend, environment_id in ids.items():
+            record = self.record(environment_id)
             if (
                 not record
                 or record["result"]["state"] != "Running"
@@ -542,6 +557,7 @@ class FullSDK(Acceptance):
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--run", required=True)

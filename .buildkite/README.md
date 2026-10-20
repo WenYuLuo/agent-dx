@@ -287,7 +287,7 @@ Stack requests/limits are: each Platform/Gateway/EXECD/source-gate compiler
 `4/8 GiB`. The target
 kubeconfig selects a second cluster where the ADX Pods are deployed.
 
-Linux container steps use the existing `default` queue with `os=linux`, `arch=amd64`
+All product steps use the existing `default` queue with `os=linux`, `arch=amd64`
 and the Kubernetes plugin. Worker images follow the existing CI profiles:
 
 | Step | Reused worker image |
