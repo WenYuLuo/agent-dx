@@ -734,7 +734,8 @@ as POSIX names or decimal IDs; Conch resolves names on the worker. The shared
 filesystem must already grant that UID/GID access; ADX does not recursively chown
 mounted data. Omitted fields preserve the runtime deployment's identity.
 
-This override currently requires Conch. Other runtime backends reject it. It
+This override currently requires Conch and `python3` in the guest template's PATH
+for its native privilege-drop wrapper. Other runtime backends reject it. It
 cannot be combined with `inherit_entrypoint=True` or a snapshot identity override;
 image entrypoint `process.user` retains its separate meaning. Use matching API
 Server, Coordinator, adxlet, and SDK versions so the typed identity is preserved

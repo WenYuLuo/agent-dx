@@ -35,6 +35,9 @@ def build(binary, output, busybox=Path('/usr/bin/busybox')):
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='adx-runtime-') as temporary:
         root = Path(temporary)
+        # EROFS preserves the source root mode; mkdtemp defaults to 0700.
+        # The immutable payload must also be executable by non-root workloads.
+        root.chmod(0o755)
         for name in (
             'usr/bin',
             'usr/local/bin',
