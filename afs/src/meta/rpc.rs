@@ -729,21 +729,36 @@ impl OwnerRootsService for OwnerRootsRpc {
         let request = request.into_inner();
         require_text(&request.node_id, "node_id")?;
         require_text(&request.session_id, "session_id")?;
-        let commands = self
+        let ownership = self
             .0
-            .owner_roots
-            .watch_root_commands(super::owner_roots::WatchRootCommandsInput {
-                node_id: request.node_id,
-                session_id: request.session_id,
-                after_revision: request.after_revision,
-            })
-            .await
+            .watch_budget
+            .reserve()
             .map_err(afs_transport::grpc::error_status::error_to_status)?;
+        let commands = tokio::time::timeout_at(
+            ownership.deadline,
+            self.0
+                .owner_roots
+                .watch_root_commands(super::owner_roots::WatchRootCommandsInput {
+                    node_id: request.node_id,
+                    session_id: request.session_id,
+                    after_revision: request.after_revision,
+                }),
+        )
+        .await
+        .map_err(|_| {
+            afs_transport::grpc::error_status::error_to_status(super::watch::unavailable(
+                "watch response construction expired",
+            ))
+        })?
+        .map_err(afs_transport::grpc::error_status::error_to_status)?;
         let commands = commands
             .into_iter()
-            .map(|command| Ok(command_from_record(command.command, command.revision)))
+            .map(|command| command_from_record(command.command, command.revision))
             .collect::<Vec<_>>();
-        Ok(Response::new(Box::pin(tokio_stream::iter(commands))))
+        let stream = ownership
+            .stream(commands)
+            .map_err(afs_transport::grpc::error_status::error_to_status)?;
+        Ok(Response::new(Box::pin(stream)))
     }
 
     async fn poll_root_command_batch(
@@ -762,17 +777,39 @@ impl OwnerRootsService for OwnerRootsRpc {
                 request.node_id
             )));
         }
-        let batch = self
+        let ownership = self
             .0
-            .owner_roots
-            .poll_root_command_batch(super::owner_roots::WatchRootCommandsInput {
-                node_id: request.node_id,
-                session_id: request.session_id,
-                after_revision: request.after_revision,
-            })
-            .await
+            .watch_budget
+            .reserve()
             .map_err(afs_transport::grpc::error_status::error_to_status)?;
-        Ok(Response::new(root_command_batch_reply_from_domain(batch)))
+        let batch = tokio::time::timeout_at(
+            ownership.deadline,
+            self.0.owner_roots.poll_root_command_batch(
+                super::owner_roots::WatchRootCommandsInput {
+                    node_id: request.node_id,
+                    session_id: request.session_id,
+                    after_revision: request.after_revision,
+                },
+            ),
+        )
+        .await
+        .map_err(|_| {
+            afs_transport::grpc::error_status::error_to_status(super::watch::unavailable(
+                "watch poll construction expired",
+            ))
+        })?
+        .map_err(afs_transport::grpc::error_status::error_to_status)?;
+        let reply = root_command_batch_reply_from_domain(batch);
+        if let Some(afs_protocol::meta::root_command_batch_reply::Result::Events(events)) =
+            &reply.result
+        {
+            super::watch::wire_charge(&events.commands)
+                .map_err(afs_transport::grpc::error_status::error_to_status)?;
+        }
+        ownership
+            .check()
+            .map_err(afs_transport::grpc::error_status::error_to_status)?;
+        Ok(Response::new(reply))
     }
 
     async fn ack_revocation(
@@ -2719,6 +2756,66 @@ mod tests {
     use super::*;
     use tonic::Code;
 
+    #[tokio::test]
+    async fn p3_watch_rpc_idle_response_expires_without_delivering_old_commands() {
+        use super::super::store::{
+            MetaEntity, MetaStore, MetaTxn, OperationResult, RequestOutcome, Store, StoreOperation,
+            TxnCondition, TxnMutation,
+            journal::{LogLimits, MemoryLog},
+        };
+        use tokio_stream::StreamExt;
+        let store = Arc::new(
+            Store::open_log(Arc::new(MemoryLog::new(LogLimits::default()).unwrap()))
+                .await
+                .unwrap(),
+        );
+        let key = RequestKey::new("watch-test", "install");
+        let command = RootCommandRecord {
+            command_id: "command".into(),
+            home_node_id: "node".into(),
+            home_session_id: "session".into(),
+            root_id: "root".into(),
+            root_epoch: 1,
+            old_access_generation: 1,
+            command_type: StoreRootCommandType::InvalidateCache,
+        };
+        let mut txn = MetaTxn::new(key.clone(), StoreOperation::BeginRootRevocation);
+        txn.conditions
+            .push(TxnCondition::RequestAbsent(key.clone()));
+        txn.mutations.extend([
+            TxnMutation::Put(MetaEntity::RootCommand(command.clone())),
+            TxnMutation::RecordRequestOutcome(RequestOutcome {
+                request: key,
+                operation: StoreOperation::BeginRootRevocation,
+                result: OperationResult::RootCommand(command),
+            }),
+        ]);
+        store.compare_and_commit(txn).await.unwrap();
+        let meta = Arc::new(super::super::Meta::with_store(
+            "watch-test".into(),
+            crate::runtime::Observability::new().unwrap(),
+            store.clone(),
+        ));
+        let mut stream = OwnerRootsRpc(meta)
+            .watch_root_commands(Request::new(WatchRootCommandsRequest {
+                node_id: "node".into(),
+                session_id: "session".into(),
+                after_revision: 0,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        // Keep the response entirely unpolled: deadline must also detach idle
+        // application queues, not only be checked after a consumer wakes it.
+        tokio::time::sleep(Duration::from_secs(31)).await;
+        let result = stream.next().await;
+        assert!(
+            matches!(result, Some(Err(_))),
+            "an expired response must not serve old commands"
+        );
+        assert!(stream.next().await.is_none());
+        store.health().await.unwrap();
+    }
     #[test]
     fn registration_reply_uses_remaining_actual_lease_after_readiness_probe() {
         let session = super::super::store::NodeSession {
