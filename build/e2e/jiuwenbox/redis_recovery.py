@@ -4,6 +4,7 @@
 import argparse
 import asyncio
 import json
+import logging
 import os
 from pathlib import Path
 import signal
@@ -68,6 +69,7 @@ class RedisRecovery(FullSDK):
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--run", required=True)
