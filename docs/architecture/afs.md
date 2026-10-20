@@ -33,6 +33,51 @@ Agent DX 平台内部 gRPC 仍按 Environment、Runtime、Snapshot、Route 和 N
 
 Meta 是可恢复状态的权威，不代理稳定数据流。Meta 校验已提交状态并准备候选状态，只有持久后端接受后才发布提交结果。读请求先固定一致视图，再选择本地副本、远端副本或缓存来源，避免一次复合读混用多个 revision。
 
+Meta 的 `local-file`／`memory` 路径通过 `Store::open_log` 重放确定的提交记录，
+再建立一致的已发布视图。提交在私有结构共享状态中准备，记录持久成功后整体切换视图；
+查询只固定已确认版本。日志的独立身份、顺序、前置 hash、CRC 和已声明持久尾都参与恢复核验。
+本地重开再次同步 WAL／目录，避免把仅在页缓存里可读的旧进程写入当成持久确认。
+旧 JSON 快照目录拒绝自动接管；生产仅local-file／memory日志后端，旧快照／etcd／Redis适配及依赖已删除；每个 Store
+只选择一条权威路径，不双写。`Store::checkpoint` 可捕获同一已发布 State 及日志位置，
+在后台任务中编码自包含状态，持久安装带身份、位置、摘要及 CRC 的快照和 `CURRENT`。
+`CURRENT` 同时选择快照和连续日志段；每段头绑定原身份、起始位置及前置 hash，
+活跃段的已同步尾标记承接后续提交。重启核对保留恢复链后，从有效快照只应用后续记录；
+最新快照损坏时，只有上一快照及所需全部已确认历史均有效才回退，否则拒绝。
+调用方取消不会释放仍在工作的安装任务额度。写批次不跨段拆开，段按软阈值轮转；
+先持久更新恢复清单，再验证并删除两恢复点均不需要的封口段及旧快照。退休清单支持
+删除中断后接续，损坏／外来对象保留并计入有限额度；校验旧正文不持写者锁。
+后台按记录数、保守段字节量或时间软阈值捕获快照，容量压力也可唤醒。只有写前只读准入
+确认尚未追加时才做有界等待，超时拒绝该组且不发布；实际追加错误仍失败关闭，不能按
+容量错误码重试未知结果。观察超时不取消仍在工作的快照任务或释放其额度。
+易失 memory 安装自包含快照后移除覆盖记录，仍不承诺进程退出恢复。
+工作集仍是逻辑计账；六点进程故障、捕获超限拒绝和实际槽位压力下继续提交已有有限回归。
+确定的历史清理使用独立管理记录或业务记录中的关联清理，保存原请求完成代际及完整事件
+revision 水位；不复制实体正文，不伪造用户操作。纯管理记录只推进物理日志位置。
+恢复核对并应用这些决定，不按重启时钟重新选择；自包含快照保存原事件完成时间、保留集、
+压缩水位及已移除事件总数，避免清理后重置后续 Node 事件序号。旧 watch 游标明确返回
+`Compacted` 和重扫位置，有限请求只复制选中的完整 revision。
+canonical单写者按实际owned容量及保守结构预留计量历史，派生索引在恢复时重建，
+正常提交只增量计入本次新增项。时间／条数／字节任一先到即选择确定清理；业务关联清理
+与业务结果同屏障发布，空闲及持续重复请求期间也由独立到期计时推进管理记录。
+待处理输入和准备身份有独立的有限字节准入，调用方取消不能提前退还写者仍持有的额度；
+未知ACK后的失败关闭同时阻止后续业务和管理追加。
+canonical读视图另有数量、所持状态字节和期限准入；同一不可变状态共享计账，
+不同代际保守独立计账。过期空闲视图主动解除状态引用，正在执行的读仍持有额度直到结束，
+过期或已知权威失效后不交付成功。此约束不改变业务授权或Node／S3预算，也不覆盖
+已返回的独立结果对象。LocalLog只允许创建进程使用写者句柄；最后真实持有者显式释放
+文件锁，继承的句柄不能读写权威或解开父进程的锁。
+运行时清理后checkpoint／重开，以及降额后先持久清理再准入已有有限回归。
+watch在复制前按独立条数／owned字节上限选取完整revision；请求limit为0也不取消硬上限。
+超限时只返回此前完整revision，首个revision本身超限则明确报容量错误，不修改持久水位、
+不伪造Compacted。已有断档仍通过原Compacted和RecoveryCursor重扫。
+Meta的watch RPC在取数前取得独立响应额度；流式队列有固定槽位、代际与期限，并由单个
+回收任务主动释放无人读取的过期队列。尚未退出的构建请求仍保留额度，旧流不能释放新代际。
+正常EOF／取消退账，超时返回错误，不能把不完整流当成已完成批次推进游标。
+上述约束不计入Node/S3预算，也不代表整个进程、调用方已取走结果或tonic/h2缓冲的内存保证。
+历史策略配置／固定指标已接线，旧Snapshot后端及etcd／Redis适配已移除。物理掉电、
+大场景资源及完整真实产品验收仍未完成，不能宣称持续增长部署已交付。
+配置与当前限制见[部署说明](../deployment/afs.md#meta-操作日志与数据目录)。
+
 OwnerFs 面向小规模 Agent workspace。Home 节点把 workspace 保存为普通本地目录；远端节点通过受控 peer 回到 Home 访问文件。远端传输会话本身不授予文件访问权限，每次打开、读写、flush、sync 和 close 都必须校验授权、句柄、权限、root grant、session、Home session 和 fence。
 
 DFS 把已提交数据表示为不可变 chunk。普通写入先进入 inode 的 dirty 状态；sync、同步写标志、close-time flush 或后台策略触发提交，形成新的 `FileVersion`。复制发生在文件布局之下，Meta 只在收到可验证持久 receipt 后提交新版本和副本目录。验证缓存不能自动算作持久副本。
@@ -44,6 +89,30 @@ DFS 把已提交数据表示为不可变 chunk。普通写入先进入 inode 的
 Node 的 Meta、peer control 和 data 诊断请求复用生产 TLS 配置，诊断不建立明文旁路。
 这里的 Node ID 绑定发生在服务端对调用方的校验中；客户端仍按 CA 和
 `tls_server_name` 验证服务端，不承诺按目标 Node ID 对服务端证书逐一 pinning。
+
+### OwnerFs Root 授权的代际与回收
+
+RootGrant 按 Root、holder node/session 保存。同 session 的重新 acquire 更新原条目；
+Root 不存在、epoch/Home session 不匹配或 holder session 被替代时，旧授权不能用于新准入。
+新 reservation 使用同一 Meta 写者原子持久分配 epoch：最新分配水位、reservation 和原结果
+属于同一事务。abort、停用和 grant GC 不回退水位；同 intent 重试保持原 epoch。
+此前没有水位的操作日志，从仍保留的 Root/reservation/grant/command/结果引导：
+首次分配直接原子保存；若后台维护先运行，则先把已有最大值与本批 grant 清理原子保存。
+水位保存前暂停旧结果退休，避免删除最后的 epoch 依据。无法推断旧版本早已删除的历史。
+之后水位为独立的 singleton，不为每个已删 Root 保留无界代际列表。
+
+停用精确核对当前 Home grant（包含 Home session/generation），一笔事务移除活动 Root、
+写对应撤权命令及原结果，不再枚举全部历史 grant。Root 移除后的 Meta 校验立即拒绝旧授权；
+同名新 Root 使用新 epoch，不继承旧权限。Home 的本地拒绝、缓存失效、控制断链处理和
+排空顺序保持；这不代表所有 Node 同时收到通知，也不承诺已打开 native FD/mmap 即时撤权。
+
+后台清理在原持久化写者中有界扫描，仅删除已被 Root incarnation、Home 身份或后继
+holder session 替代的记录。当前 Root 引用的 Home grant即使到期也保留，以供恢复推进
+其 generation；普通 holder 到期可清理，因为现有注册状态机禁止过期 session ID 续回；
+不改变该租约合同。选择与准备之间没有 await，删除携带条目 revision
+条件，排队的新 acquire/recover/recreate 不能插入其间；后续请求仍按写者顺序执行。
+清理也经 canonical 日志、原有历史预算及持久后公开，重启继续收敛。
+逻辑清理不是立即回收旧 WAL 字节，物理回收仍由 checkpoint/退休协议负责。
 
 ## DFS 原生写正文所有权
 
@@ -494,7 +563,7 @@ Meta 纯传输断链时，已打开视图的未到期合法范围可读本地 ca
 
 ## OwnerFs workspace bind mount
 
-OwnerFs workspace bind mount 是当前实际试用场景的优先能力，默认 OFF。开启后，它把 Home 上 workspace 的底层真实目录 bind 到 OwnerFs FUSE 根目录下对应的一级目录，例如 `/mnt/afs/ownerfs/agent1`。把 FUSE 目录自身 bind 到别处不满足此设计。
+OwnerFs workspace bind mount 是当前实际试用场景的优先能力，默认 OFF。开启后，它把 Home 上 workspace 的底层真实目录 bind 到独立原生 `ownerfs_workspace_egress_root` 下的同名一级目录。egress root 必须在 OwnerFs FUSE 挂载和 Node 数据目录之外；FUSE 子树仍保留，不以 bind 覆盖。把 FUSE 目录自身 bind 到别处不满足此设计。
 
 核心实现只负责挂载、身份核验和卸载；runc、容器启动、执行、停止和探针属于适配层。ON 场景仍需保留授权、Home/root/epoch 核验、数据新鲜度、close-to-open、权限、错误传播、正常卸载和受管引用排空。当前不承诺已有 native FD、mmap、描述符转移或二级 clone 的即时撤权。
 
