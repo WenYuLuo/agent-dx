@@ -1,5 +1,7 @@
 # Firecracker checkpoint 验收
 
+JuiceFS / AFS 的从零准备、双执行节点命令、用例和性能对比见[部署与验证手册](../../../docs/testing/shared-filesystem-runbook.md)。
+
 这组脚本由独立 Linux VM 或 Kubernetes Pod 内的进程部署共用。运行完整 ADX 发布包、外部 sandboxd/Firecracker、真实 S3 服务与公共 Environment SDK。不会用模拟后端替代 checkpoint。运行前要求 `/dev/kvm` 支持 API 12；Linux 内核、EROFS、网络及 FC 制品还需符合所选 sandboxd 版本。
 
 ## 运行布局

@@ -1,5 +1,7 @@
 # Checkpoint 存储与快照生命周期
 
+同事部署和复现请先阅读[JuiceFS / AFS 部署与双节点验证手册](shared-filesystem-runbook.md)，其中包含环境、制品、完整命令、用例和结果判定。本页保留实现合同与历史验证记录。
+
 `adx-checkpoint-storage` 提供节点文件访问接口 `CheckpointAccess` 和 Coordinator
 共享回收接口 `ArtifactReclaimer`。adxlet 处理捕获、恢复和本机缓存；Coordinator
 管理 Environment/Snapshot 的保留关系并回收共享文件。默认 ADX 构建不依赖 AFS/FUSE。
