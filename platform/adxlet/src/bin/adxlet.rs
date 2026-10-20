@@ -1,5 +1,6 @@
 use adx_process::{read_config, shutdown};
 use adx_protocol::control as pb;
+use adx_transport::rpc::{RpcChannel, RpcClient};
 use adx_transport::tls::TlsFiles;
 use adxlet::resources::{PressureGate, PressurePolicy, ResourceSource};
 use adxlet::{
@@ -111,6 +112,21 @@ async fn sample(
     source.sample(timeout).await
 }
 
+fn coordinator_channel(
+    transport: &RpcClient,
+    address: &str,
+    timeout: Duration,
+) -> Result<RpcChannel, std::io::Error> {
+    // ForwardCreate can wait for new capacity beyond the ordinary RPC budget.
+    // Response deadlines belong to each call; keep connection setup bounded.
+    Ok(transport.wrap(
+        transport
+            .endpoint(address)?
+            .connect_timeout(timeout)
+            .connect_lazy(),
+    ))
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config: Config = read_config()?;
@@ -172,17 +188,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     };
-    let channel_for =
-        |address: String| -> Result<adx_transport::rpc::RpcChannel, Box<dyn std::error::Error>> {
-            Ok(client_tls.wrap(
-                client_tls
-                    .endpoint(&address)?
-                    .connect_timeout(timeout)
-                    .timeout(timeout)
-                    .connect_lazy(),
-            ))
-        };
-    let channel = channel_for(endpoint.clone())?;
+    let channel = coordinator_channel(&client_tls, &endpoint, timeout)?;
     let session_id = uuid::Uuid::new_v4().to_string();
     // Leave part of the operation deadline for a durable fallback after RPC timeout.
     let commit_timeout = if config.degradation_journal.is_some() {
@@ -410,7 +416,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(discovery) = &discovery {
                 match discovery.lookup().await {
                     Ok(found) if found.address != endpoint => {
-                        let channel = channel_for(found.address.clone())?;
+                        let channel = coordinator_channel(&client_tls, &found.address, timeout)?;
                         sink.reconnect(channel.clone());
                         coordinator =
                             pb::coordinator_service_client::CoordinatorServiceClient::new(channel);
@@ -617,6 +623,73 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A single-method service probes the production Coordinator channel without
+    // requiring Redis or reproducing Coordinator scheduling in this fixture.
+    struct DelayedResponse;
+
+    #[tonic::async_trait]
+    impl pb::auth_service_server::AuthService for DelayedResponse {
+        async fn verify_api_key(
+            &self,
+            _: tonic::Request<pb::VerifyApiKeyRequest>,
+        ) -> Result<tonic::Response<pb::VerifyApiKeyResponse>, tonic::Status> {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            Ok(tonic::Response::new(pb::VerifyApiKeyResponse::default()))
+        }
+    }
+
+    #[tokio::test]
+    async fn coordinator_channel_honors_long_and_short_request_deadlines() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(pb::auth_service_server::AuthServiceServer::new(
+                    DelayedResponse,
+                ))
+                .serve_with_incoming_shutdown(
+                    tokio_stream::wrappers::TcpListenerStream::new(listener),
+                    async {
+                        let _ = stopped.await;
+                    },
+                )
+                .await
+                .unwrap();
+        });
+        let transport = RpcClient::network(adx_protocol::auth::Principal::Node("n".into()));
+        let channel =
+            coordinator_channel(&transport, &address.to_string(), Duration::from_millis(100))
+                .unwrap();
+        let mut client = pb::auth_service_client::AuthServiceClient::new(channel);
+
+        // ForwardCreate already supplies its full remaining create budget.
+        // The channel must allow a response later than the ordinary RPC cap.
+        let mut long = tonic::Request::new(pb::VerifyApiKeyRequest::default());
+        long.set_timeout(Duration::from_secs(2));
+        let long_result = client.verify_api_key(long).await;
+
+        // Removing the channel cap must still respect each short RPC deadline.
+        let mut short = tonic::Request::new(pb::VerifyApiKeyRequest::default());
+        short.set_timeout(Duration::from_millis(50));
+        let short_result = client.verify_api_key(short).await;
+        let _ = stop.send(());
+        server.await.unwrap();
+
+        assert!(
+            long_result.is_ok(),
+            "long request was cut short: {long_result:?}"
+        );
+        let error = short_result.unwrap_err();
+        assert!(
+            matches!(
+                error.code(),
+                tonic::Code::Cancelled | tonic::Code::DeadlineExceeded
+            ),
+            "{error}"
+        );
+    }
 
     #[test]
     fn jiuwenbox_example_configures_a_node_without_sandboxd() {
