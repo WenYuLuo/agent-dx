@@ -8,7 +8,7 @@ import os
 import sys
 from pathlib import Path
 import tempfile
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
@@ -18,7 +18,10 @@ SOURCE = ROOT / "build/e2e/jiuwenbox/accept.py"
 
 def load_acceptance(optimize=0):
     namespace = {"__name__": "acceptance_fixture", "__file__": str(SOURCE)}
-    exec(compile(SOURCE.read_text(), str(SOURCE), "exec", optimize=optimize), namespace)
+    # Process/root safety checks do not use the live runner's HTTP or YAML APIs.
+    # Empty modules keep this unit suite stdlib-only and fail on accidental use.
+    with patch.dict(sys.modules, {"httpx": ModuleType("httpx"), "yaml": ModuleType("yaml")}):
+        exec(compile(SOURCE.read_text(), str(SOURCE), "exec", optimize=optimize), namespace)
     return SimpleNamespace(**namespace)
 
 
