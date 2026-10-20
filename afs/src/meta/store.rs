@@ -569,12 +569,14 @@ pub enum StoreOperation {
     DfsReportReplicationTask,
     DfsReportChunkCorruption,
     CleanupRootGrants,
+    CleanupRootCommands,
 }
 
 impl StoreOperation {
     fn as_str(self) -> &'static str {
         match self {
             Self::CleanupRootGrants => "cleanup_root_grants",
+            Self::CleanupRootCommands => "cleanup_root_commands",
             Self::RegisterNode => "register_node",
             Self::ReserveRoot => "reserve_root",
             Self::AbortRoot => "abort_root",
@@ -2126,34 +2128,48 @@ async fn persist_log_group(
 }
 
 /// Resource deferral must not suppress request/event retention on the same tick.
-async fn persist_root_grant_cleanup(
+enum AuthorityCleanup<'a> {
+    Grants(&'a mut Option<MetaKey>),
+    Commands(&'a mut Option<MetaKey>),
+}
+
+async fn persist_authority_cleanup(
     visible: &Arc<Visible>,
     log: &Arc<dyn journal::MetaLog>,
     tip: journal::LogTip,
-    cursor: &mut Option<MetaKey>,
+    cleanup: AuthorityCleanup<'_>,
     history: history::Limits,
     in_flight: &Arc<InFlight>,
 ) -> Result<journal::LogTip> {
     let limits = log.limits();
     let current = visible.committed.load_full();
-    let prepared = current.prepare_root_grant_cleanup(
-        cursor,
-        now_unix_ms(),
-        limits.record_max_bytes,
-        history.event_count.min(history.cleanup_items),
-    );
+    let max_deletes = history.event_count.min(history.cleanup_items);
+    let prepared = match cleanup {
+        AuthorityCleanup::Commands(cursor) => current.prepare_root_command_cleanup(
+            cursor,
+            now_unix_ms(),
+            limits.record_max_bytes,
+            max_deletes,
+        ),
+        AuthorityCleanup::Grants(cursor) => current.prepare_root_grant_cleanup(
+            cursor,
+            now_unix_ms(),
+            limits.record_max_bytes,
+            max_deletes,
+        ),
+    };
     let (mut next, decision) = match prepared {
         Ok(Some(prepared)) => prepared,
         Ok(None) => return Ok(tip),
         Err(error) => {
-            afs_logging::warn!("meta.root_grant_cleanup_deferred"; "error" => error.to_string());
+            afs_logging::warn!("meta.authority_cleanup_deferred"; "error" => error.to_string());
             return Ok(tip);
         }
     };
     let retention = match in_flight.prepare_history(&next, now_unix_ms(), history) {
         Ok(retention) => retention,
         Err(error) => {
-            afs_logging::warn!("meta.root_grant_cleanup_deferred"; "error" => error.to_string());
+            afs_logging::warn!("meta.authority_cleanup_deferred"; "error" => error.to_string());
             return Ok(tip);
         }
     };
@@ -2174,7 +2190,7 @@ async fn persist_root_grant_cleanup(
     let size = match journal::frame_size(tip, &record) {
         Ok(size) if size <= limits.record_max_bytes => size,
         _ => {
-            afs_logging::warn!("meta.root_grant_cleanup_deferred"; "reason" => "framed record exceeds configured limit");
+            afs_logging::warn!("meta.authority_cleanup_deferred"; "reason" => "framed record exceeds configured limit");
             return Ok(tip);
         }
     };
@@ -2201,11 +2217,15 @@ async fn run_log_commit_loop(
     let mut cleanup_tick = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
     cleanup_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut grant_cleanup_cursor = None;
+    let mut command_cleanup_cursor = None;
     'receive: loop {
         let first = tokio::select! {
             biased;
             _=cleanup_tick.tick()=>{
-                match persist_root_grant_cleanup(&visible, &log, tip, &mut grant_cleanup_cursor, history, &in_flight).await {
+                match persist_authority_cleanup(&visible, &log, tip, AuthorityCleanup::Grants(&mut grant_cleanup_cursor), history, &in_flight).await {
+                    Ok(next) => tip = next, Err(_) => break,
+                }
+                match persist_authority_cleanup(&visible, &log, tip, AuthorityCleanup::Commands(&mut command_cleanup_cursor), history, &in_flight).await {
                     Ok(next) => tip = next, Err(_) => break,
                 }
                 let current=visible.committed.load_full();
@@ -4494,6 +4514,178 @@ mod tests {
         .unwrap();
         pump.abort();
         assert!(pump.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn p3_lifecycle_completed_commands_reclaimed_pending_and_failed_preserved() {
+        use journal::MetaLog;
+        let backend = Arc::new(journal::MemoryLog::new(Default::default()).unwrap());
+        let policy = history::Limits {
+            request_count: 128,
+            event_count: 512,
+            cleanup_items: 32,
+            request_retention: Duration::from_millis(50),
+            event_retention: Duration::from_millis(50),
+            ..Default::default()
+        };
+        let store = Store::open_log_with_history(backend.clone(), policy)
+            .await
+            .unwrap();
+        let mut old_lease = lease("expired-id");
+        old_lease.lease_ttl = Duration::from_millis(1);
+        store
+            .register_node_session(RequestKey::new("lifecycle", "old-session"), old_lease)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        store
+            .register_node_session(
+                RequestKey::new("lifecycle", "current-session"),
+                lease("current-id"),
+            )
+            .await
+            .unwrap();
+        let make_command = |id: &str| RootCommandRecord {
+            command_id: id.into(),
+            home_node_id: "old-home".into(),
+            home_session_id: "old-session".into(),
+            root_id: "removed-root".into(),
+            root_epoch: 7,
+            old_access_generation: 3,
+            command_type: RootCommandType::RevokeAccess,
+        };
+        let make_ack = |id: &str, success| RootCommandAck {
+            command_id: id.into(),
+            node_id: "old-home".into(),
+            session_id: "old-session".into(),
+            root_id: "removed-root".into(),
+            root_epoch: 7,
+            access_generation: 3,
+            success,
+            message: String::new(),
+        };
+        let mut active_command = make_command("active");
+        active_command.root_id = "active-root".into();
+        let mut active_ack = make_ack("active", true);
+        active_ack.root_id = "active-root".into();
+        let mut mismatched_ack = make_ack("mismatch", true);
+        mismatched_ack.root_id = "wrong-root".into();
+        let key = RequestKey::new("lifecycle", "seed");
+        let mut txn = MetaTxn::new(key.clone(), StoreOperation::AckRootCommand);
+        txn.conditions
+            .push(TxnCondition::RequestAbsent(key.clone()));
+        txn.mutations.extend([
+            TxnMutation::Put(MetaEntity::RootCommand(make_command("done"))),
+            TxnMutation::Put(MetaEntity::RootCommandAck(make_ack("done", true))),
+            TxnMutation::Put(MetaEntity::RootCommand(make_command("failed"))),
+            TxnMutation::Put(MetaEntity::RootCommandAck(make_ack("failed", false))),
+            TxnMutation::Put(MetaEntity::RootCommand(make_command("pending"))),
+            TxnMutation::Put(MetaEntity::RootCommand(active_command)),
+            TxnMutation::Put(MetaEntity::RootCommandAck(active_ack)),
+            TxnMutation::Put(MetaEntity::Root(RootRecord {
+                root_id: "active-root".into(),
+                root_epoch: 7,
+                home_node_id: "old-home".into(),
+                home_session_id: "old-session".into(),
+                local_prepare_id: "prepare".into(),
+                created_at_revision: StoreRevision(1),
+                updated_at_revision: StoreRevision(1),
+            })),
+            TxnMutation::Put(MetaEntity::RootGrant(RootAccessGrant {
+                root_id: "active-root".into(),
+                root_epoch: 7,
+                home_node_id: "old-home".into(),
+                home_session_id: "old-session".into(),
+                holder_node_id: "old-home".into(),
+                holder_session_id: "old-session".into(),
+                access_generation: 3,
+                rights: vec![RootRight::Read],
+                fencing_token: "current-barrier".into(),
+                issued_at_revision: StoreRevision(1),
+            })),
+            TxnMutation::Put(MetaEntity::RootCommand(make_command("mismatch"))),
+            TxnMutation::Put(MetaEntity::RootCommandAck(mismatched_ack)),
+            TxnMutation::Put(MetaEntity::RootCommandAck(make_ack("orphan", true))),
+            TxnMutation::RecordRequestOutcome(RequestOutcome {
+                request: key.clone(),
+                operation: StoreOperation::AckRootCommand,
+                result: OperationResult::RootCommandAck(make_ack("done", true)),
+            }),
+        ]);
+        assert!(matches!(
+            store.compare_and_commit(txn).await.unwrap(),
+            TxnOutcome::Committed { .. }
+        ));
+        let done = MetaKey::RootCommand {
+            command_id: "done".into(),
+        };
+        assert!(
+            store.visible.committed.load().entities.contains_key(&done),
+            "retained outcome/watch still protect completed command"
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while store.visible.committed.load().entities.contains_key(&done)
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let state = store.visible.committed.load_full();
+        assert!(
+            !state.entities.contains_key(&done),
+            "completed command remained after outcome and watch retention expired"
+        );
+        assert!(!state.entities.contains_key(&MetaKey::RootCommandAck {
+            command_id: "done".into(),
+            home_node_id: "old-home".into(),
+            home_session_id: "old-session".into()
+        }));
+        for id in ["failed", "pending", "active", "mismatch"] {
+            assert!(state.entities.contains_key(&MetaKey::RootCommand {
+                command_id: id.into()
+            }));
+        }
+        assert!(state.entities.contains_key(&MetaKey::RootCommandAck {
+            command_id: "failed".into(),
+            home_node_id: "old-home".into(),
+            home_session_id: "old-session".into()
+        }));
+        assert!(state.entities.contains_key(&MetaKey::RootCommandAck {
+            command_id: "orphan".into(),
+            home_node_id: "old-home".into(),
+            home_session_id: "old-session".into()
+        }));
+        assert_eq!(state.root_epoch_watermark(), 7);
+        assert!(
+            state.entities.contains_key(&MetaKey::NodeSession {
+                node_id: "node-a".into(),
+                session_id: "expired-id".into()
+            }),
+            "expired-ID rejection record must remain"
+        );
+        assert!(
+            store
+                .register_node_session(
+                    RequestKey::new("lifecycle", "reuse-expired"),
+                    lease("expired-id")
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store.visible.committed.load().node_epochs.get("node-a"),
+            Some(&2)
+        );
+        let recovered = backend.recover().await.unwrap();
+        let mut replay = State::default();
+        for record in recovered.records {
+            replay = replay.replay_record(&record).unwrap();
+        }
+        assert!(!replay.entities.contains_key(&done));
+        assert_eq!(replay.root_epoch_watermark(), 7);
+        let image = log::StateImage::encode(&replay, 1024 * 1024).unwrap();
+        let restored = log::StateImage::decode(&image, 1024 * 1024).unwrap();
+        assert_eq!(restored.root_epoch_watermark(), 7);
+        assert_eq!(restored.pin_charge().unwrap(), replay.pin_charge().unwrap());
     }
 
     #[tokio::test]

@@ -1246,8 +1246,11 @@ impl StateImage {
         .into_iter()
         .try_fold(0usize, usize::checked_add)
         .ok_or_else(|| invalid_contract("checkpoint item charge overflow"))?;
+        let command_index = usize::try_from(state.command_index_charge()?)
+            .map_err(|_| invalid_contract("checkpoint command index charge overflow"))?;
         bytes
             .checked_mul(4)
+            .and_then(|size| size.checked_add(command_index))
             .and_then(|size| {
                 items
                     .checked_mul(512)

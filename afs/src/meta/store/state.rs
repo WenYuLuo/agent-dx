@@ -118,6 +118,54 @@ pub(super) struct RequestCompletion {
     pub(super) revision: StoreRevision,
 }
 
+/// Only retained outcomes reference command IDs after watch compaction. This is
+/// a derived index, rebuilt from canonical outcomes, never another authority.
+fn command_result_id(mut result: &OperationResult) -> Option<&str> {
+    loop {
+        match result {
+            OperationResult::DfsNamespace { result: inner, .. } => result = inner,
+            OperationResult::RootCommand(command) => return Some(&command.command_id),
+            OperationResult::RootCommandAck(ack) => return Some(&ack.command_id),
+            _ => return None,
+        }
+    }
+}
+fn account_command_result(
+    index: &mut im::OrdMap<String, u64>,
+    bytes: &mut u64,
+    result: &OperationResult,
+    add: bool,
+) -> Result<()> {
+    let Some(id) = command_result_id(result) else {
+        return Ok(());
+    };
+    let count = index.get(id).copied().unwrap_or(0);
+    let charge = (id.len() as u64)
+        .checked_add(256)
+        .ok_or_else(|| invalid_contract("command outcome index charge overflow"))?;
+    if add {
+        let next = count
+            .checked_add(1)
+            .ok_or_else(|| invalid_contract("command outcome reference overflow"))?;
+        if count == 0 {
+            *bytes = bytes
+                .checked_add(charge)
+                .ok_or_else(|| invalid_contract("command outcome index charge overflow"))?;
+        }
+        index.insert(id.to_owned(), next);
+    } else if count == 1 {
+        index.remove(id);
+        *bytes = bytes
+            .checked_sub(charge)
+            .ok_or_else(|| invalid_contract("command outcome index charge underflow"))?;
+    } else if count > 1 {
+        index.insert(id.to_owned(), count - 1);
+    } else {
+        return Err(invalid_contract("missing command outcome reference"));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Default)]
 pub(super) struct State {
     /// Runtime recovery anchor paired with this immutable published state.
@@ -134,6 +182,8 @@ pub(super) struct State {
     /// Derived capacity-aware retention index; never serialized as authority.
     pub(super) history: super::history::Index,
     pub(super) history_indexed: bool,
+    pub(super) command_history: im::OrdMap<String, u64>,
+    pub(super) command_history_bytes: u64,
     /// Derived full authority capacity, incremented only for changed keys.
     pub(super) authority_bytes: u64,
     pub(super) authority_indexed: bool,
@@ -1131,14 +1181,25 @@ impl State {
 
 // Prepare privately; only Store publishes after its selected log acknowledges.
 impl State {
+    pub(super) fn command_index_charge(&self) -> Result<u64> {
+        self.command_history_bytes
+            .checked_add(if self.command_history.is_empty() {
+                0
+            } else {
+                4096
+            })
+            .ok_or_else(|| invalid_contract("command index root charge overflow"))
+    }
     pub(super) fn pin_charge(&self) -> Result<u64> {
         if !self.authority_indexed || !self.history_indexed {
             return Err(invalid_contract("Meta read capacity index is not ready"));
         }
+        let command_bytes = self.command_index_charge()?;
         self.history
             .stats()
             .total_bytes()
             .and_then(|bytes| bytes.checked_add(self.authority_bytes))
+            .and_then(|bytes| bytes.checked_add(command_bytes))
             .and_then(|bytes| bytes.checked_add(std::mem::size_of::<Self>() as u64))
             .ok_or_else(|| invalid_contract("Meta pinned state byte charge overflow"))
     }
@@ -1218,6 +1279,8 @@ impl State {
                 "history outcome completion coverage mismatch",
             ));
         }
+        let mut command_history = im::OrdMap::new();
+        let mut command_history_bytes = 0;
         let mut index = history::Index::default();
         for (key, outcome) in self.requests.iter() {
             let completion = self
@@ -1232,6 +1295,12 @@ impl State {
                     "history original request identity/revision invalid",
                 ));
             }
+            account_command_result(
+                &mut command_history,
+                &mut command_history_bytes,
+                &outcome.result,
+                true,
+            )?;
             index.track_request(
                 key.clone(),
                 completion.clone(),
@@ -1256,11 +1325,14 @@ impl State {
             previous = revision;
         }
         self.history = index;
+        self.command_history = command_history;
+        self.command_history_bytes = command_history_bytes;
         self.history_indexed = true;
         Ok(())
     }
     fn account_history_changes(
         &mut self,
+        previous: &Self,
         keys: impl Iterator<Item = RequestKey>,
         events_from: usize,
         completed_at: u64,
@@ -1275,6 +1347,20 @@ impl State {
                 .request_completion
                 .get(&key)
                 .ok_or_else(|| invalid_contract("history new completion missing"))?;
+            if let Some(old) = previous.requests.get(&key) {
+                account_command_result(
+                    &mut self.command_history,
+                    &mut self.command_history_bytes,
+                    &old.result,
+                    false,
+                )?;
+            }
+            account_command_result(
+                &mut self.command_history,
+                &mut self.command_history_bytes,
+                &outcome.result,
+                true,
+            )?;
             self.history.track_request(
                 key,
                 completion.clone(),
@@ -1396,6 +1482,16 @@ impl State {
             .history
             .apply(history, self.revision, self.compacted_to)?;
         for request in &history.requests {
+            let outcome = next
+                .requests
+                .get(&request.key)
+                .ok_or_else(|| invalid_contract("retiring command outcome missing"))?;
+            account_command_result(
+                &mut next.command_history,
+                &mut next.command_history_bytes,
+                &outcome.result,
+                false,
+            )?;
             next.requests.remove(&request.key);
             next.request_completion.remove(&request.key);
         }
@@ -1545,6 +1641,163 @@ impl State {
         }
     }
 
+    /// At most128 command candidates/16 atomic pairs per pass. Expired sessions
+    /// remain durable rejection tombstones; pending/failed/orphan ACKs remain.
+    pub(super) fn prepare_root_command_cleanup(
+        &self,
+        cursor: &mut Option<MetaKey>,
+        now: u64,
+        byte_limit: usize,
+        max_deletes: usize,
+    ) -> Result<Option<(Self, super::log::RecordDecision)>> {
+        if max_deletes < 2
+            || !self.history_indexed
+            || !self.entities.contains_key(&MetaKey::RootEpochWatermark)
+        {
+            return Ok(None);
+        }
+        let start = cursor.clone().unwrap_or(MetaKey::RootCommand {
+            command_id: String::new(),
+        });
+        let previous = cursor.clone();
+        let mut pairs = Vec::new();
+        let mut key_bytes = 0usize;
+        let mut scanned = 0;
+        let mut exhausted = true;
+        for (key, entry) in self.entities.starting_at(start) {
+            let MetaKey::RootCommand { command_id } = key else {
+                break;
+            };
+            if previous.as_ref().is_some_and(|old| key <= old) {
+                continue;
+            }
+            if scanned == 128 || pairs.len() == 16.min(max_deletes / 2) || key_bytes >= 64 * 1024 {
+                exhausted = false;
+                break;
+            }
+            scanned += 1;
+            *cursor = Some(key.clone());
+            let MetaEntity::RootCommand(command) = &entry.entity else {
+                return Err(invalid_contract("command key has wrong entity type"));
+            };
+            if !matches!(self.entities.get(&MetaKey::RootEpochWatermark).map(|v| &v.entity), Some(MetaEntity::RootEpochWatermark(value)) if *value >= command.root_epoch)
+            {
+                continue;
+            }
+            if entry.revision > self.compacted_to
+                || self.command_history.contains_key(command_id)
+                || self.entities.contains_key(&MetaKey::RootReservation {
+                    root_id: command.root_id.clone(),
+                })
+            {
+                continue;
+            }
+            let ack_key = MetaKey::RootCommandAck {
+                command_id: command_id.clone(),
+                home_node_id: command.home_node_id.clone(),
+                home_session_id: command.home_session_id.clone(),
+            };
+            let Some(ack_entry) = self.entities.get(&ack_key) else {
+                continue;
+            };
+            let MetaEntity::RootCommandAck(ack) = &ack_entry.entity else {
+                return Err(invalid_contract("ack key has wrong entity type"));
+            };
+            if ack_entry.revision > self.compacted_to
+                || !ack.success
+                || ack.command_id != command.command_id
+                || ack.node_id != command.home_node_id
+                || ack.session_id != command.home_session_id
+                || ack.root_id != command.root_id
+                || ack.root_epoch != command.root_epoch
+                || ack.access_generation != command.old_access_generation
+            {
+                continue;
+            }
+            let safe = match self
+                .entities
+                .get(&MetaKey::Root {
+                    root_id: command.root_id.clone(),
+                })
+                .map(|v| &v.entity)
+            {
+                None => true,
+                Some(MetaEntity::Root(root))
+                    if root.root_epoch != command.root_epoch
+                        || root.home_node_id != command.home_node_id
+                        || root.home_session_id != command.home_session_id =>
+                {
+                    true
+                }
+                Some(MetaEntity::Root(root)) => {
+                    matches!(self.entities.get(&MetaKey::RootGrant { root_id: root.root_id.clone(), holder_node_id: root.home_node_id.clone(), holder_session_id: root.home_session_id.clone() }).map(|v| &v.entity), Some(MetaEntity::RootGrant(grant)) if grant.root_epoch == root.root_epoch && grant.home_session_id == root.home_session_id && grant.access_generation > command.old_access_generation)
+                }
+                _ => false,
+            };
+            if !safe {
+                continue;
+            }
+            key_bytes = key_bytes
+                .checked_add(super::codec::encoded_size(key)?)
+                .and_then(|n| n.checked_add(super::codec::encoded_size(&ack_key).ok()?))
+                .ok_or_else(|| invalid_contract("command cleanup key charge overflow"))?;
+            pairs.push(((key.clone(), entry.revision), (ack_key, ack_entry.revision)));
+        }
+        if exhausted {
+            *cursor = None;
+        }
+        while !pairs.is_empty() {
+            let request = RequestKey::new(
+                "meta-maintenance/root-commands",
+                format!("after-{}", self.revision.0),
+            );
+            let mut txn = MetaTxn::new(request.clone(), StoreOperation::CleanupRootCommands);
+            txn.conditions
+                .push(super::TxnCondition::RequestAbsent(request.clone()));
+            for (command, ack) in &pairs {
+                for (key, revision) in [command, ack] {
+                    txn.conditions.push(super::TxnCondition::RevisionEquals {
+                        key: key.clone(),
+                        revision: *revision,
+                    });
+                    txn.mutations.push(TxnMutation::Delete(key.clone()));
+                }
+            }
+            txn.mutations
+                .push(TxnMutation::RecordRequestOutcome(RequestOutcome {
+                    request,
+                    operation: txn.operation,
+                    result: OperationResult::Empty,
+                }));
+            let result =
+                self.prepare_txn_record(txn, now, byte_limit)
+                    .and_then(|(next, _, record)| {
+                        let record = record.ok_or_else(|| {
+                            invalid_contract("new command cleanup unexpectedly replayed")
+                        })?;
+                        if super::journal::frame_size(
+                            self.log_tip,
+                            &super::log::Record::from(record.clone()),
+                        )? > byte_limit
+                        {
+                            return Err(super::journal::full(
+                                "command cleanup exceeds framed byte limit",
+                            ));
+                        }
+                        Ok(Some((next, record)))
+                    });
+            match result {
+                Ok(done) => return Ok(done),
+                Err(error) if pairs.len() == 1 => return Err(error),
+                Err(_) => {
+                    pairs.truncate(pairs.len() / 2);
+                    *cursor = pairs.last().map(|(command, _)| command.0.clone());
+                }
+            }
+        }
+        Ok(None)
+    }
+
     fn obsolete_root_grant(&self, grant: &super::RootAccessGrant, now: u64) -> bool {
         let root = self.entities.get(&MetaKey::Root {
             root_id: grant.root_id.clone(),
@@ -1639,6 +1892,7 @@ impl State {
                 prepared.event_completion.insert(*revision, completed_at);
             }
             prepared.account_history_changes(
+                self,
                 outcomes.iter().map(|outcome| outcome.request.clone()),
                 self.events.len(),
                 completed_at,
@@ -1706,6 +1960,7 @@ impl State {
                 prepared.event_completion.insert(*revision, completed_at);
             }
             prepared.account_history_changes(
+                self,
                 std::iter::once(reply.request.clone()),
                 self.events.len(),
                 completed_at,
@@ -1794,6 +2049,7 @@ impl State {
         }
         prepared.revision = facts.revision_after;
         prepared.account_history_changes(
+            self,
             history_keys.into_iter(),
             self.events.len(),
             facts.completed_at_unix_ms,
@@ -1816,6 +2072,73 @@ mod completion_tests {
             lease_ttl: std::time::Duration::from_secs(60),
         }
     }
+    #[test]
+    fn p3_lifecycle_command_reference_index_rebuilds_and_retires_exactly() {
+        let command = super::super::RootCommandRecord {
+            command_id: "shared-command".into(),
+            home_node_id: "home".into(),
+            home_session_id: "session".into(),
+            root_id: "removed".into(),
+            root_epoch: 7,
+            old_access_generation: 1,
+            command_type: super::super::RootCommandType::RevokeAccess,
+        };
+        let key = RequestKey::new("index", "first");
+        let mut txn = MetaTxn::new(key.clone(), StoreOperation::BeginRootRevocation);
+        txn.conditions
+            .push(super::super::TxnCondition::RequestAbsent(key.clone()));
+        for request in [key.clone(), RequestKey::new("index", "second")] {
+            txn.mutations
+                .push(TxnMutation::RecordRequestOutcome(RequestOutcome {
+                    request,
+                    operation: txn.operation,
+                    result: OperationResult::RootCommand(command.clone()),
+                }));
+        }
+        let (state, _, first) = State::default().prepare_txn_record(txn, 1, 65536).unwrap();
+        assert_eq!(state.command_history.get("shared-command"), Some(&2));
+        let (state, bootstrap) = state
+            .prepare_root_grant_cleanup(&mut None, 2, 65536, 32)
+            .unwrap()
+            .unwrap();
+        let limits = super::super::history::Limits {
+            cleanup_items: 1,
+            request_retention: std::time::Duration::from_millis(1),
+            event_retention: std::time::Duration::from_millis(1),
+            ..Default::default()
+        };
+        let (once, delta1) = state
+            .prepare_history(100, limits, &Default::default())
+            .unwrap()
+            .unwrap();
+        assert_eq!(once.command_history.get("shared-command"), Some(&1));
+        assert!(once.command_index_charge().unwrap() >= 4096 + 256);
+        let bytes = super::super::log::StateImage::encode(&once, 65536).unwrap();
+        let restored = super::super::log::StateImage::decode(&bytes, 65536).unwrap();
+        assert_eq!(restored.command_history, once.command_history);
+        assert_eq!(
+            restored.command_index_charge().unwrap(),
+            once.command_index_charge().unwrap()
+        );
+        let (twice, delta2) = once
+            .prepare_history(100, limits, &Default::default())
+            .unwrap()
+            .unwrap();
+        assert!(twice.command_history.is_empty());
+        assert_eq!(twice.command_index_charge().unwrap(), 0);
+        let mut replay = State::default();
+        for record in [
+            super::super::log::Record::from(first.unwrap()),
+            super::super::log::Record::from(bootstrap),
+            super::super::log::Record::History(delta1),
+            super::super::log::Record::History(delta2),
+        ] {
+            replay = replay.replay_record(&record).unwrap();
+        }
+        assert!(replay.command_history.is_empty());
+        assert_eq!(replay.root_epoch_watermark(), 7);
+    }
+
     #[test]
     fn p3_replay_register_label_preserves_generic_and_dedicated_event_bases() {
         let empty = State::default();
