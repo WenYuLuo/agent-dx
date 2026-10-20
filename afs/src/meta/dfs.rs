@@ -37,6 +37,7 @@ pub struct DfsService {
     durability_policy: DfsDurabilityPolicy,
     read_grant_key: Arc<Option<[u8; 32]>>,
     gc_grace_ms: u64,
+    gc_reference_updates: Arc<[tokio::sync::Mutex<()>; GC_REFERENCE_LOCK_SHARDS]>,
 }
 
 struct MissingExternalReadContext<'a> {
@@ -56,6 +57,7 @@ struct MissingExternalReadContext<'a> {
 const CREATE_PARENT_DRIFT_RETRY_LIMIT: usize = 64;
 const FILE_COMMIT_RETRY_LIMIT: usize = 64;
 const NAMESPACE_REMOVE_RETRY_LIMIT: usize = 64;
+const GC_REFERENCE_LOCK_SHARDS: usize = 64;
 
 enum NamespaceRemoveAttempt {
     Removed(InodeRecord),
@@ -108,6 +110,7 @@ impl DfsService {
             durability_policy,
             read_grant_key: Arc::new(read_grant_key),
             gc_grace_ms: 60_000,
+            gc_reference_updates: Arc::new(std::array::from_fn(|_| tokio::sync::Mutex::new(()))),
         }
     }
 

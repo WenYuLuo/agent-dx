@@ -1186,6 +1186,19 @@ impl MetaReadView {
         }
     }
 
+    /// Reads one key from this pinned revision for related-key CAS.
+    pub(crate) fn lookup(&self, key: &MetaKey) -> Result<MetaSnapshot> {
+        self.with_state(|state| {
+            let value = state.entities.get(key);
+            Ok(MetaSnapshot {
+                revision: value.map_or(state.revision, |entry| entry.revision),
+                entity: value.map(|entry| entry.entity.clone()),
+                request_outcome: None,
+                entities: Vec::new(),
+            })
+        })
+    }
+
     pub(crate) fn snapshot(&self) -> Result<(StoreRevision, Vec<MetaEntity>)> {
         self.with_state(|state| Ok((state.revision,
             state.entities.values().map(|entry| entry.entity.clone()).collect())))

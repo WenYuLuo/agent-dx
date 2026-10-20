@@ -11960,6 +11960,12 @@ impl Backend for DistributedFs {
     }
 
     fn write_admission_mode(&self, handle: FileHandle) -> WriteAdmissionMode {
+        // Native admission may wait for mutation/publication or shared body
+        // capacity. Keep those waits on a worker so the FUSE receiver can
+        // admit unrelated reads and writeback needed to make progress.
+        if self.native_pipeline.is_some() {
+            return WriteAdmissionMode::Queued;
+        }
         if !self.deferred_publication_enabled()
             && self
                 .handle_snapshot(handle)
@@ -17036,6 +17042,49 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    #[test]
+    fn native_stalled_upload_keeps_ordinary_write_off_the_fuse_receiver() {
+        let (_temp, _meta, fs, _runtime, store) = native_pipeline_fixture(true, 4 * 1024 * 1024, 8);
+        let fs = Arc::new(fs);
+        let created = fs
+            .create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new("stalled-write-admission"),
+                0o600,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        let body = vec![0x5b; 64 * 1024];
+        fs.write(&context(), created.handle, 0, &body).unwrap();
+        let pause = Arc::new(CommitPause::new(0));
+        *store.pause.lock().unwrap() = Some(pause.clone());
+        let writer_fs = fs.clone();
+        let writer =
+            std::thread::spawn(move || writer_fs.fsync(&context(), created.handle, SyncMode::Full));
+        pause.wait_until_reached();
+        // Another ordinary write can wait for this inode's mutation/publication.
+        // Its admission contract must keep that wait off the receive thread.
+        let admission = fs.write_admission_mode(created.handle);
+        pause.release();
+        writer.join().unwrap().unwrap();
+        let mut actual = vec![0; body.len()];
+        assert_eq!(
+            fs.read(&context(), created.handle, 0, &mut actual).unwrap(),
+            body.len()
+        );
+        fs.release(&context(), created.handle).unwrap();
+        assert_eq!(
+            actual, body,
+            "queued admission must retain the durability barrier"
+        );
+        assert_eq!(
+            admission,
+            WriteAdmissionMode::Queued,
+            "ordinary native writes can wait for publication and must not hold the FUSE receiver"
+        );
     }
 
     #[test]

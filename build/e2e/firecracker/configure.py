@@ -10,6 +10,8 @@ import time
 
 from fc_runtime_profile import resolve as resolve_runtime_profile
 from storage_fixture import external as external_storage, public as public_storage
+from storage_workload import io_engine as storage_io_engine
+from storage_workload import checkpoint_mode as storage_checkpoint_mode
 
 
 def _executable(command_name, environment=None, cwd=None):
@@ -370,9 +372,9 @@ kvm_device = "/dev/kvm"
 default_vcpu_count = 1
 default_memory_mib = 512
 default_overlay_size_bytes = {32 * 1024**2 if os.getenv('ADX_FC_SUITE') in ('demand', 'autoscaling', 'cache', 'storage') else 536870912}
-{'''writable_io_engine = "Sync"
+{f'''writable_io_engine = "{storage_io_engine(os.environ)}"
 writable_cache_type = "Writeback"''' if os.getenv('ADX_FC_SUITE') == 'storage' else ''}
-checkpoint_mode = "full"
+checkpoint_mode = "{storage_checkpoint_mode(os.environ) if os.getenv('ADX_FC_SUITE') == 'storage' else 'full'}"
 virtiofs_enabled = true
 virtiofsd_path = "{BASE}/tools/virtiofsd"
 [plugin.runtime.basic_spec]
@@ -438,14 +440,20 @@ coordinator_service['config']['checkpoint_reclaimers'] = [{
     if key in ('kind', 'alias', 'bucket', 'region', 'endpoint', 'allow_http', 'prefix')
 }]
 coordinator_service['env'].update({key: value for key, value in node_service['env'].items() if key.startswith('AWS_')})
-if os.getenv('ADX_FC_AFS_ROOT'):
+if os.getenv('ADX_FC_AFS_ROOT') or os.getenv('ADX_FC_JUICEFS_CONFIG'):
     from filesystem_fixture import storage_config
 
-    node_service['config']['checkpoint_storage'] = storage_config(os.environ['ADX_FC_AFS_ROOT'], 'node1', RUN.name)
-    coordinator_service['config']['checkpoint_reclaimers'] = [storage_config(os.environ['ADX_FC_AFS_ROOT'], 'coordinator', RUN.name)]
+    node_service['config']['checkpoint_storage'] = storage_config(os.environ.get('ADX_FC_AFS_ROOT', ''), 'node1', RUN.name)
+    coordinator_service['config']['checkpoint_reclaimers'] = [storage_config(os.environ.get('ADX_FC_AFS_ROOT', ''), 'coordinator', RUN.name)]
     for service in (node_service, coordinator_service):
         service['env'] = {key: value for key, value in service['env'].items() if not key.startswith('AWS_')}
-    (EVIDENCE / 'storage.json').write_text(json.dumps({'kind': 'afs', 'alias': 'afs', 'prefix': 'adx/' + RUN.name}, indent=2))
+    (EVIDENCE / 'storage.json').write_text(json.dumps({'kind': ('juicefs' if os.getenv('ADX_FC_JUICEFS_CONFIG') else 'afs'), 'alias': node_service['config']['checkpoint_storage']['alias'], 'prefix': 'adx/' + RUN.name}, indent=2))
+if os.getenv('ADX_STORAGE_NATIVE_XFS_ROOT'):
+    from native_xfs import verify_mount
+    native_root=pathlib.Path(os.environ['ADX_STORAGE_NATIVE_XFS_ROOT'])
+    observed=verify_mount(native_root,json.loads(subprocess.check_output(
+        ['findmnt','-J','--mountpoint',str(native_root),'-o','TARGET,SOURCE,FSTYPE'],text=True)))
+    (EVIDENCE/'storage.json').write_text(json.dumps({'kind':'native_xfs','scope':'direct sandboxd control only','mount':observed}))
 config_path.write_text(json.dumps(deployment, indent=2))
 
 if os.environ.get('ADX_FC_PROXY_MODE', 'embedded') == 'embedded':

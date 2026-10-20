@@ -19,7 +19,14 @@ def main():
     errors = []
     status = 1
     try:
-        if env.get('ADX_FC_AFS_ROOT'):
+        if env.get('ADX_FC_JUICEFS_CONFIG'):
+            from juicefs_fixture import JuicefsFixture
+            fixture = JuicefsFixture(env['ADX_FC_JUICEFS_CONFIG'], root.parent / (root.name + '-juicefs-evidence'))
+            fixture.start()
+            fixture.metrics('start')
+            env['ADX_FC_JUICEFS_METRICS_PORTS'] = json.dumps(fixture.ports)
+            fixture.verify_filesystem()
+        elif env.get('ADX_FC_AFS_ROOT'):
             fixture = FilesystemFixture(Path(env['ADX_FC_SOURCE']), base / 'package/bin',
                                         Path(env['ADX_FC_AFS_ROOT']), root.parent / (root.name + '-afs-evidence'),
                                         trace_cow=env.get('ADX_STORAGE_TRACE_RESTORE') == '1')
@@ -44,7 +51,7 @@ def main():
             if (root / 'evidence').exists():
                 (root / 'evidence/storage-cleanup.json').write_text(cleanup)
                 if fixture:
-                    shutil.copytree(fixture.evidence, root / 'evidence/afs', dirs_exist_ok=True)
+                    shutil.copytree(fixture.evidence, root / ('evidence/juicefs' if env.get('ADX_FC_JUICEFS_CONFIG') else 'evidence/afs'), dirs_exist_ok=True)
                 subprocess.run([sys.executable, str(base / 'e2e/firecracker/collect.py'), str(root)], check=True)
     return status if not errors else 1
 

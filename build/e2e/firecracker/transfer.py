@@ -227,7 +227,7 @@ def main():
                 ],
             )
             wait(lambda: urllib.request.urlopen('http://127.0.0.1:19090/minio/health/ready', timeout=2).status == 200)
-        if public_storage(root)['kind'] != 'afs':
+        if public_storage(root)['kind'] not in ('afs', 'juicefs', 'native_xfs'):
             call(['python3', base / 'e2e/firecracker/s3_probe.py', root, '--create'])
         spawn('registry', ['docker-registry', 'serve', root / 'registry.yaml'])
         sys.path.insert(0, str(base / 'e2e'))
@@ -306,12 +306,19 @@ def main():
         wait(ready)
         (root / 'backend-pids.json').write_text(json.dumps(backend_pids))
         print('TWO FIRECRACKER NODES READY', flush=True)
-        driver = 'sdk_' + suite + '.py'
-        call([base / 'client/bin/python', '-u', base / 'e2e/firecracker' / driver, root, image], timeout=14400 if suite in ('demand', 'storage') else 900)
-        result.update(json.loads((evidence / sdk_result_name).read_text()))
+        if suite == 'storage' and env.get('ADX_STORAGE_PROBE'):
+            call(['python3', base / 'e2e/firecracker/direct_storage.py', root, image], timeout=7200)
+            result['direct_baseline'] = json.loads((evidence / 'direct-storage.json').read_text())
+        if public_storage(root)['kind']=='native_xfs':
+            if 'direct_baseline' not in result:raise ValueError('native control requires direct sandboxd probe')
+            result.update(status='passed',native_control_only=True,storage=public_storage(root))
+        else:
+            driver = 'sdk_' + suite + '.py'
+            call([base / 'client/bin/python', '-u', base / 'e2e/firecracker' / driver, root, image], timeout=14400 if suite in ('demand', 'storage') else 900)
+            result.update(json.loads((evidence / sdk_result_name).read_text()))
         for name in namespaces:
             result['inventories'][name] = inventory(name)
-        if public_storage(root)['kind'] != 'afs':
+        if public_storage(root)['kind'] not in ('afs', 'juicefs', 'native_xfs'):
             call(['python3', base / 'e2e/firecracker/s3_probe.py', root])
         result['obs_empty'] = public_storage(root)['kind'] == 'real_obs'
     except BaseException as error:
@@ -401,7 +408,11 @@ def main():
             if demand_suite and result['status'] == 'passed':
                 proof = audit_demand(evidence, result)
                 (evidence / 'physical-restore-audit.json').write_text(json.dumps(proof, indent=2))
-            verify(result)
+            if result.get('native_control_only'):
+                from native_xfs import verify_result
+                verify_result(result)
+            else:
+                verify(result)
         except (ValueError, KeyError, OSError) as error:
             result['status'] = 'failed'
             result['validation_error'] = str(error)

@@ -133,8 +133,9 @@ sudo env ADX_FC_BASE=/opt/adx-checkpoint-cache ADX_FC_SUITE=cache \
 `storage.py` 在专用 Linux KVM 主机运行，沿用 `transfer.py` 的两个隔离网络命名空间。
 需要同一候选构建的发布包（`ADX_WITH_AFS=1`）、匹配锁定 revision 的 sandboxd、
 Firecracker/virtiofsd/kernel，以及含 Python HTTP 服务的工作负载镜像。
-存储套件对所有后端统一设置 `writable_io_engine = "Sync"` 与
-`writable_cache_type = "Writeback"`，以兼容 AFS 的文件 I/O 能力；运行时默认
+存储套件默认设置 `writable_io_engine = "Sync"`，可用
+`ADX_STORAGE_IO_ENGINE=Async` 对齐文档中的异步磁盘基线；对比后端必须使用相同值。
+`writable_cache_type = "Writeback"` 保持一致；运行时默认
 `AsyncDirect` 在该 AFS 挂载上会因缺少 direct I/O 对齐信息而拒绝创建磁盘。
 
 ```bash
@@ -167,8 +168,71 @@ AFS 模式额外保存实际挂载来源、直接捕获路径、分阶段文件�
 另将已停止写入的未完成捕获加入持久清单，确认大小为 0、未发布 manifest 的目录也能回收。
 原始样本及汇总在 `evidence/sdk-storage.json`，最终完整生命周期裁决在 `evidence/result.json`。
 
+#### 原生 XFS 与读预取对照
+
+仅运行直接 sandboxd 对照时，设置 `ADX_STORAGE_NATIVE_XFS_ROOT` 为已经挂载的原生
+XFS 挂载点，并取消 AFS/JuiceFS 配置。驱动通过 `findmnt` 核对文件系统，执行相同的
+Full／Incremental 捕获、恢复、真实 HTTP、512 MiB 全量 SHA 和进程连续性校验。
+它跳过 ADX SDK 与流量唤醒，结果标记 `native_control_only`；同机可见的 XFS 目录
+不能作为生产共享存储后端或跨物理主机恢复证明。
+
+```bash
+sudo env ADX_FC_BASE=/opt/adx-storage ADX_FC_SOURCE=/source \
+  ADX_STORAGE_NATIVE_XFS_ROOT=/mnt/dedicated-native-xfs \
+  ADX_STORAGE_IO_ENGINE=Async ADX_STORAGE_DIRECT_HTTP=1 \
+  ADX_STORAGE_PROBE=/opt/adx-fc/bin/checkpoint-probe-http \
+  python3 -u build/e2e/firecracker/storage.py /var/lib/adx-xfs-control-RUN
+```
+
+JuiceFS 私有 fixture 配置可选 `max_readahead_mib`（整数 0–32），映射到客户端
+`--max-readahead`。未设置时保留所测版本的默认值；配置与挂载身份均记录实际参数。
+预读对照须同时报告首次响应、完整触页和 GET 数据量，避免将少读数据造成的延迟转移
+误判为整体加速。当前 cache-size=0 基线下，固定版本已自动禁用块 prefetch。
+对比脚本会核对各轮导出的块尺寸、预读与缓存参数，拒绝将同一后端的不同设置混入
+一个中位数。
+CPU／等待诊断及其测量边界见 [diagnostics/README.md](diagnostics/README.md)。
+
+### 原生盘与完整内存基线探针
+
+`ADX_STORAGE_IO_ENGINE=Async ADX_STORAGE_BENCHMARK=1` 运行存储计时集合，
+覆盖冷、热两组及双 Ingress 的 12 路并发唤醒；它不声明完成上述六项生命周期验证。
+工作负载为 1 vCPU / 1024 MiB VM，包含 512 MiB 确定性内存；首次 HTTP 不触发
+checksum，随后读取全部 512 MiB 并核对宿主机独立计算的 SHA-256，校验耗时单独记录。
+ADX 的 `first_http_seconds` 为 12 个请求中最短的请求耗时；`remote_read_bytes.first`、
+`first_finished_unix_ns` 和首次 VMM 映射在整组 12 个响应完成后采集，不能作为精确的首个响应边界。
+`ADX_STORAGE_REPETITIONS=1` 可保留单次 fresh-client 试验，不能据单次样本计算 P95。
+
+额外设置 `ADX_STORAGE_PROBE=/absolute/path/checkpoint-probe` 时，ADX 创建
+Environment 前先运行 `direct_storage.py`。该工具由同一个固定 sandboxd revision 的
+`test/e2e/checkpoint-restore` 构建，直接调用 sandboxd；使用同一 guest 镜像、
+512 MiB payload、VM 资源和 I/O 配置，验证全量捕获、跨节点恢复、修改 64 MiB、
+增量捕获及再次跨节点恢复，并校验完整内存。默认探针通过 `sbox exec` 访问内部 HTTP。
+设置 `ADX_STORAGE_DIRECT_HTTP=1` 并提供支持 `-response-file` 的诊断 helper 时，
+探针取得实际 SandboxIP，恢复后直接访问 guest HTTP；初始化校验仍使用 `sbox exec`。
+证据记录探针类型及 helper SHA-256，两种探针的首次响应耗时分别报告。
+证据为 `direct-storage.json`，底层每阶段耗时来自 sandboxd 日志。
+直接探针以 Python HTTP 服务作为初始进程，ADX 路径由 Execd 启动同一服务；
+两条路径的 guest 启动状态不同，不能用首响应总耗时相减计算 ADX 控制面开销。
+全量到增量的直接探针还需要 `ADX_STORAGE_CHECKPOINT_MODE=incremental`；
+默认 `full` 模式会拒绝显式增量捕获。该参数在工作负载身份中记录，对照后端必须一致。
+
+原生盘由调用方预先准备，记录 `findmnt`、块设备序列号及运行目录与 OSD 的映射。
+驱动不会自动格式化设备；loop/file-backed OSD 和 tmpfs 运行目录不属于原生盘基线。
+JuiceFS 的 fresh-client 样本要求每次启动新的客户端；跨节点无该制品缓存与重挂载
+客户端是两种不同条件，应分别记录。存储服务端缓存不主动清空。
+
+`diagnostics/rgw_observer.go` 为独立诊断轮提供流式 S3 转发，记录 GET 路径、Range、
+Content-Range、实际响应字节及完成状态，不记录 Authorization。
+`object_read_profile.py` 按对象计算唯一读取范围与重复读取字节；COW 共享块保留
+多个文件归属。尚无文件关联的读量单独标记，不能全部算为 memory 文件读放大。
+带 `ADX_STORAGE_FILESYSTEM_TRACE=1` 的诊断轮不参与性能对比。
+
 多个完整成功轮次可使用 `compare_storage.py AFS_EVIDENCE S3_EVIDENCE --output comparison.json`
 汇总；该工具拒绝不同发布包、外部运行时或 guest 工作负载混用。
+每轮独立重启客户端且 `ADX_STORAGE_REPETITIONS=1` 时，可传入各轮的 `evidence/`；
+同一后端会合并冷、热样本，每组仍须至少三次。带直接 sandboxd 探针的轮次还要匹配
+探针类型与 helper SHA-256，并通过 Full／Incremental 的完整内存校验。
+直接 RPC、直接 HTTP、ADX 首个 HTTP 分别汇总；诊断轮不能混入性能结果。
 
 使用 `ADX_STORAGE_REPETITIONS=1 ADX_STORAGE_TRACE_RESTORE=1` 可运行独立 AFS 诊断，
 跟踪目标 sandboxd 及其 Firecracker 子进程对快照 `memory` 的读取和复制，

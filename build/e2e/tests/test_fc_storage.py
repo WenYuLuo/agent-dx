@@ -12,6 +12,81 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'firecracker'))
 
 
 class StorageFixtureTests(unittest.TestCase):
+    def test_juicefs_read_metrics_distinguish_empty_family_from_missing_evidence(self):
+        from filesystem_metrics import juicefs_read_bytes
+        family = '# TYPE juicefs_object_request_data_bytes counter\n'
+        self.assertEqual(juicefs_read_bytes(family), 0)
+        self.assertEqual(juicefs_read_bytes('# TYPE juicefs_blockcache_miss counter\njuicefs_blockcache_miss 0\n'), 0)
+        self.assertEqual(juicefs_read_bytes(family + 'juicefs_object_request_data_bytes{method="PUT",storage_class=""} 99\n'
+            + 'juicefs_object_request_data_bytes{method="GET",storage_class=""} 42\n'
+            + 'juicefs_object_request_data_bytes{method="GET",storage_class="cold"} 5\n'), 47)
+        with self.assertRaisesRegex(ValueError, 'unavailable'):
+            juicefs_read_bytes('unrelated_metric 0\n')
+
+    def test_juicefs_mounts_keep_adx_storage_configuration_generic(self):
+        from juicefs_fixture import load_config, storage_config
+        from filesystem_fixture import storage_config as select_storage
+        with TemporaryDirectory() as directory:
+            root=Path(directory)
+            config={'binary':'/opt/juicefs/juicefs', 'metadata_url':'postgres://adx@127.0.0.1:15432/juicefs?sslmode=disable',
+                    'metadata_password_file':'/private/pg-password', 'mount_root':str(root/'mounts'),
+                    'identity_file':'/evidence/storage-identities.json', 'alias':'shared', 'volume':'adx-test'}
+            path=root/'juicefs.json';path.write_text(json.dumps(config));path.chmod(0o600)
+            loaded=load_config(path)
+            for role in ('node1','node2','coordinator'):
+                expected={'kind':'distributed_fs','alias':'shared','mount_root':str(root/'mounts'/role),'prefix':'adx/run-a'}
+                self.assertEqual(storage_config(loaded,role,'run-a'),expected)
+                with patch.dict('os.environ',{'ADX_FC_JUICEFS_CONFIG':str(path)}):
+                    self.assertEqual(select_storage('/unused',role,'run-a'),expected)
+            for role,run in [('node1','../escape'),('other','run-a')]:
+                with self.assertRaises(ValueError):storage_config(loaded,role,run)
+            config['metadata_url']='postgres://adx:secret@127.0.0.1/juicefs'
+            path.write_text(json.dumps(config))
+            with self.assertRaisesRegex(ValueError,'password_file'):load_config(path)
+
+    def test_native_xfs_control_is_explicit_and_direct_only(self):
+        from native_xfs import storage_config, verify_mount, verify_result
+        with TemporaryDirectory() as directory:
+            mount=Path(directory)
+            self.assertEqual(storage_config(mount,'node2','run-a')['mount_root'],str(mount))
+            info={'filesystems':[{'target':str(mount),'fstype':'xfs','source':'/dev/test'}]}
+            self.assertEqual(verify_mount(mount,info)['fstype'],'xfs')
+            info['filesystems'][0]['fstype']='ext4'
+            with self.assertRaises(ValueError):verify_mount(mount,info)
+            with self.assertRaises(ValueError):storage_config(mount,'node1','../escape')
+        from storage_workload import identity
+        work=identity({})
+        samples=[{'snapshot_type':kind,'sha256':work[digest],'checked_bytes':work['payload_bytes'],'continuity':True}
+                 for kind,digest in [('Full','expected_full_sha256'),('Incremental','expected_dirty_sha256')]]
+        result={'native_control_only':True,'status':'passed','inventories':{'node1':0,'node2':0},'cleanup_errors':[],
+                'direct_baseline':{'status':'passed','cleanup_errors':[],'workload':work,'samples':samples}}
+        verify_result(result)
+        result['direct_baseline']['samples'][1]['continuity']=False
+        with self.assertRaises(ValueError):verify_result(result)
+
+    def test_juicefs_readahead_override_is_typed_and_recorded(self):
+        from juicefs_fixture import mount_options
+        self.assertEqual(mount_options({}),([],True,32))
+        self.assertEqual(mount_options({'max_readahead_mib':0}),(['--max-readahead','0'],False,0))
+        for value in [-1,33,True,'0',0.5]:
+            with self.assertRaises(ValueError):mount_options({'max_readahead_mib':value})
+
+    def test_comparison_never_pools_different_juicefs_geometry(self):
+        from compare_storage import aggregate
+        samples=[{'mode':'juicefs','cache':cache,'request_count':12,'restore_count':1,
+                  'continuity':True,'artifact_bytes':1,'pause_seconds':1,
+                  'first_http_seconds':1,'touch_seconds':1}
+                 for cache in ('cold','warm') for _ in range(3)]
+        run={'storage':{'kind':'juicefs','alias':'shared'},'samples':samples,'repetitions':3,
+             'benchmark_only':True,'fixture_cleanup':{'exit_code':0,'errors':[]},'cases':[],
+             'filesystem_parameters':{'block_size_kib':4096,'max_readahead_mib':4}}
+        peer=copy.deepcopy(run)
+        self.assertEqual(len(aggregate([(run,{}),(peer,{})])),1)
+        for key,value in [('block_size_kib',1024),('max_readahead_mib',32)]:
+            changed=copy.deepcopy(peer);changed['filesystem_parameters'][key]=value
+            with self.assertRaisesRegex(ValueError,'filesystem parameters'):
+                aggregate([(run,{}),(changed,{})])
+
     def test_gc_observation_tolerates_files_deleted_after_inventory(self):
         from storage_gc import file_usage
         with TemporaryDirectory() as directory:

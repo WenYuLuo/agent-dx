@@ -133,8 +133,9 @@ NodeSession 保留拒绝过期 session ID 重用所需的记录；待确认、�
 
 ## DFS 原生写正文所有权
 
-普通 FUSE 到本地 inode owner 的 NodeReplicated 写入按 inode FIFO 接纳借用输入，
-直接复制到最终 `ChunkBuilder` 分配。正文准入等待不持 inode 锁或 operation 门禁，
+启用原生写入管线时，普通 FUSE 写入和内核页写回先取得 owned 输入，再由有界 callback
+worker 按同 fh FIFO 执行，避免上传、发布或正文背压占住接收线程。
+worker 将请求正文复制到最终 `ChunkBuilder` 分配。正文准入等待不持 inode 锁或 operation 门禁，
 重新取得短操作门禁后复核 generation、序号、位置和 builder，避免等待期间后台提交造成错接。
 顺序写优先使用4MiB容量块；满块冻结原分配并排队预上传，不触发 Meta 发布。
 提交前仍可原地覆盖可写 builder；已冻结／已提交内容的小覆盖形成普通小 Chunk，
@@ -147,6 +148,14 @@ NodeSession 保留拒绝过期 session ID 重用所需的记录；待确认、�
 已有布局并存份数不增加，其capacity与transport临时分配仍须另行计量，不能宣称全部Node元数据受此限制。
 空闲池默认128MiB，独立于 live，不能借作额外接纳额度。共享范围按父分配实际 capacity
 计费一次，最后一个读者、上传／复制／RDMA或冻结提交持有者释放后才退账。
+FUSE owned 输入使用独立的每 mount 32MiB 预算，复制前取得额度，后端执行结束或未准入
+任务丢弃时释放；它不计入原生 ChunkBuilder 的64MiB live账，也不是进程RSS上限。
+额度或队列耗尽时接收端仍会背压；worker 排队消除的是单次后端等待直接占用接收线程，
+不承诺负载超过限额时仍能立即接纳。关闭时唤醒额度等待者并拒绝新任务。
+
+`afs_fuse_write_duration_seconds{filesystem,source,stage}` 将内核页写回和普通 write 分开，
+分别记录输入复制／准入／排队以及后端执行的墙钟耗时。并发调用的累计时间不能与
+pause 或恢复的总墙钟时间直接相加，也不能将 execute 全部解释为存储 I/O。
 
 每一代在首次接纳时固定 OperationId，按 `through_seq` 冻结提交；准备旧代上传时可接纳
 下一代。进入 File／Metadata 或结果未知阶段后，新的 mutation 不能越过；保留原请求、
@@ -170,9 +179,10 @@ AFS live/idle、allocator allocated/active/resident/retained 与进程 RSS 是�
 保留虚拟映射不等于保留同量物理页。S3 原有窗口、正文和 descriptor 预算独立保持，
 尾块也按保留的真实 capacity 计费；本节不引入正文 RAM 内容缓存或变更读授权。
 
-正文一次复制只指上述本地写接纳到提交正文的用户态范围；内核、远端接收、读回和完整 hash
-另列。借用写会占用发生该回调的 FUSE receiver 至接纳／原同步触发结束；其它接收线程
-受线程配置和有界队列限制，不能据 worker 测试声称新请求总能立即接收。
+原生管线的 FUSE 路径包含接收缓冲到 owned 输入、再到 ChunkBuilder 的两次复制；
+冻结后不复制提交正文。内核、远端接收、读回和完整 hash 另列。
+独立构造且未启用管线的本地 Backend 仍可选择借用写，它会占用该回调的 receiver。
+接收线程、worker、任务数与输入字节预算均可形成背压，不能声称新请求总能立即接收。
 具体功能、回收及平台验证边界见[测试说明](../testing/afs.md#原生写-buffer-验证)。
 
 ## DFS 原生节点读取上下文
@@ -417,7 +427,9 @@ Header后失败中止，不切换来源或伪造完成。观察到的坏可选si
 
 Node通过公共挂载配置控制接收线程、descriptor clone和callback worker；队列满时等待
 容量，普通完成分别唤醒worker或容量等待者，不在接收线程内执行尚未准入的owned任务。
-借用写仍在原回调生命周期内接纳，并保留同fh顺序和排空；不能把借用输入放进后台队列。
+原生管线写入与页写回拥有输入后入队，保留同fh顺序和排空；输入字节预算耗尽时等待，
+关闭时唤醒等待者并返回错误。仍选择借用写的 Backend 必须在原回调生命周期内完成，
+不能把借用输入放进后台队列。
 
 后端动态确认安全的native只读句柄允许同fh连续READ形成并发批次，排队的write、resize、
 flush、fsync及release仍为排他屏障，后续READ不能越过。OwnerFs、S3和可写句柄维持原

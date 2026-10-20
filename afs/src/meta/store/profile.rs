@@ -80,10 +80,37 @@ pub(super) fn namespace_conflict(state: &super::MemoryState, txn: &super::MetaTx
             Some(serde_json::json!({"expected":inode_identity(expected),"observed":observed}))
         })
         .collect();
+    let reference_conditions: Vec<_> = if txn.operation == super::StoreOperation::DfsUpdateReference
+    {
+        txn.conditions
+            .iter()
+            .filter(|condition| !super::condition_matches(state, condition))
+            .filter_map(|condition| match condition {
+                super::TxnCondition::RevisionEquals { key, revision } => {
+                    Some(serde_json::json!({"condition":"revision", "key":key,
+                        "expected_revision":revision.0,
+                        "observed_revision":state.entities.get(key).map(|value|value.revision.0)}))
+                }
+                super::TxnCondition::Missing(key) => {
+                    Some(serde_json::json!({"condition":"missing", "key":key,
+                        "observed_revision":state.entities.get(key).map(|value|value.revision.0)}))
+                }
+                super::TxnCondition::NodeSessionCurrent {
+                    node_id,
+                    session_id,
+                } => Some(serde_json::json!({"condition":"current_session",
+                        "node":node_id,"session":session_id})),
+                _ => None,
+            })
+            .take(8)
+            .collect()
+    } else {
+        Vec::new()
+    };
     record(serde_json::json!({"event":"meta_namespace_conflict",
         "operation":txn.operation.as_str(), "caller":txn.request.caller_id,
         "request":txn.request.request_id, "store_revision":state.revision.0,
-        "changed_inodes":inodes}));
+        "changed_inodes":inodes,"reference_conditions":reference_conditions}));
 }
 
 pub(super) fn namespace_applied(txn: &super::MetaTxn, revision: super::StoreRevision) {

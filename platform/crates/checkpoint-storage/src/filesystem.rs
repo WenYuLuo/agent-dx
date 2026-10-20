@@ -1,7 +1,9 @@
 //! Direct filesystem access: capture and restore keep the same pathname.
+mod mount;
 use super::{io_error, scan, CheckpointAccess, RestoreAccess};
 use adx_core::{CheckpointArtifact, Error, Result};
 use async_trait::async_trait;
+use mount::MountGuard;
 use serde::{Deserialize, Serialize};
 use std::path::{Component, Path, PathBuf};
 
@@ -15,9 +17,8 @@ struct Manifest {
 
 pub struct FilesystemCheckpointStore {
     alias: String,
-    mount: PathBuf,
     root: PathBuf,
-    check_mount: bool,
+    mount_guard: Option<MountGuard>,
 }
 impl FilesystemCheckpointStore {
     pub fn new(alias: String, mount: PathBuf, prefix: PathBuf) -> Result<Self> {
@@ -39,9 +40,11 @@ impl FilesystemCheckpointStore {
             ));
         }
         let mount = std::fs::canonicalize(mount).map_err(io_error)?;
-        if check_mount {
-            verify_mount(&mount)?;
-        }
+        let mount_guard = if check_mount {
+            Some(MountGuard::open(mount.clone())?)
+        } else {
+            None
+        };
         let root = mount.join(prefix);
         std::fs::create_dir_all(root.join("artifacts")).map_err(io_error)?;
         std::fs::create_dir_all(root.join("manifests")).map_err(io_error)?;
@@ -68,14 +71,13 @@ impl FilesystemCheckpointStore {
         }
         Ok(Self {
             alias,
-            mount,
             root,
-            check_mount,
+            mount_guard,
         })
     }
     fn ready(&self) -> Result<()> {
-        if self.check_mount {
-            verify_mount(&self.mount)?;
+        if let Some(guard) = &self.mount_guard {
+            guard.verify()?;
         }
         Ok(())
     }
@@ -127,30 +129,6 @@ impl FilesystemCheckpointStore {
         })
         .await
         .map_err(io_error)?
-    }
-}
-fn verify_mount(root: &Path) -> Result<()> {
-    let info = std::fs::read_to_string("/proc/self/mountinfo").map_err(io_error)?;
-    let encoded = root
-        .to_string_lossy()
-        .replace('\\', "\\134")
-        .replace(' ', "\\040");
-    if info.lines().any(|line| {
-        let Some((left, right)) = line.split_once(" - ") else {
-            return false;
-        };
-        left.split_whitespace().nth(4) == Some(encoded.as_str())
-            && right
-                .split_whitespace()
-                .next()
-                .is_some_and(|t| t == "fuse" || t.starts_with("fuse."))
-            && right.split_whitespace().nth(1) == Some("afs-dfs")
-    }) {
-        Ok(())
-    } else {
-        Err(Error::Unavailable(
-            "configured AFS DFS mount is missing or has changed".into(),
-        ))
     }
 }
 pub(crate) fn sync_inventory(
@@ -308,7 +286,7 @@ impl CheckpointAccess for FilesystemCheckpointStore {
         }
         let mut seen = std::collections::BTreeSet::new();
         let mut total = 0u64;
-        // No content scan or copying: AFS resolves file data on demand.
+        // No content scan or copying: the filesystem resolves data on demand.
         for (file, size) in &manifest.files {
             if file.as_os_str().is_empty()
                 || !file.components().all(|c| matches!(c, Component::Normal(_)))
@@ -347,6 +325,18 @@ impl CheckpointAccess for FilesystemCheckpointStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn shared_filesystem_configuration_is_independent_of_mounted_implementation() {
+        let config = serde_json::json!({"kind":"distributed_fs", "alias":"shared-checkpoints",
+            "mount_root":"/mnt/shared", "prefix":"adx/checkpoints"});
+        assert!(serde_json::from_value::<crate::StorageConfig>(config.clone()).is_ok());
+        assert!(serde_json::from_value::<crate::reclaim::ReclaimerConfig>(config.clone()).is_ok());
+        let mut invalid = config;
+        invalid["filesystem"] = serde_json::json!("juicefs");
+        assert!(serde_json::from_value::<crate::StorageConfig>(invalid.clone()).is_err());
+        assert!(serde_json::from_value::<crate::reclaim::ReclaimerConfig>(invalid).is_err());
+    }
+
     #[tokio::test]
     async fn filesystem_keeps_paths_and_node_release_never_deletes_shared_data() {
         let tmp = tempfile::tempdir().unwrap();

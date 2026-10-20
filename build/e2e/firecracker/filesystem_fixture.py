@@ -11,6 +11,13 @@ from pathlib import Path
 
 
 def storage_config(root, role, run_name):
+    import os
+    if os.environ.get('ADX_STORAGE_NATIVE_XFS_ROOT'):
+        from native_xfs import storage_config as native_config
+        return native_config(os.environ['ADX_STORAGE_NATIVE_XFS_ROOT'],role,run_name)
+    if os.environ.get('ADX_FC_JUICEFS_CONFIG'):
+        from juicefs_fixture import load_config, storage_config as juicefs_storage_config
+        return juicefs_storage_config(load_config(os.environ['ADX_FC_JUICEFS_CONFIG']), role, run_name)
     if not re.fullmatch(r'[A-Za-z0-9_-]+', run_name):
         raise ValueError('a single run name is required')
     node = {'node1': 'node-a', 'node2': 'node-b', 'coordinator': 'node-c'}[role]

@@ -42,6 +42,29 @@ def summarize(samples, repetitions):
 
 
 def verify(result):
+    if result.get('benchmark_only'):
+        if (result.get('status') != 'passed' or result.get('cleanup_errors') != []
+                or result.get('inventories') != {'node1': 0, 'node2': 0}
+                or [c.get('name') for c in result.get('cases', [])] != list(CASES[:2])
+                or any(c.get('passed') is not True for c in result['cases'])):
+            raise ValueError('incomplete storage benchmark evidence')
+        repetitions = result['repetitions']
+        samples = result['samples']
+        if repetitions < 1 or len(samples) != repetitions * 2:
+            raise ValueError('missing benchmark samples')
+        for cache in ('cold', 'warm'):
+            if len([s for s in samples if s['cache'] == cache]) != repetitions:
+                raise ValueError('incomplete benchmark group')
+        workload = result['workload']
+        if workload.get('name') != 'deterministic-512m-v1':
+            raise ValueError('matched full-memory workload required')
+        for row in samples:
+            if (row['request_count'] != 12 or row['restore_count'] != 1
+                    or row.get('full_memory_verified') is not True or row['continuity'] is not True
+                    or row.get('checked_bytes') != workload['payload_bytes']
+                    or row.get('sha256') != workload['expected_full_sha256']):
+                raise ValueError('missing full-memory or single-restore traffic proof')
+        return
     if (result.get('status') != 'passed' or result.get('cleanup_errors') != []
             or result.get('inventories') != {'node1': 0, 'node2': 0}
             or [c.get('name') for c in result.get('cases', [])] != list(CASES)

@@ -38,10 +38,10 @@ def configure(root):
             c['tls'][key] = str(root / 'secrets/tls' / f'{cert}.{suffix}')
         if public_storage(root)['kind'] == 'minio':
             c['checkpoint_storage']['endpoint'] = f'http://{HOST}:19090'
-        if public_storage(root)['kind'] == 'afs':
+        if public_storage(root)['kind'] in ('afs', 'juicefs'):
             from filesystem_fixture import storage_config
 
-            c['checkpoint_storage'] = storage_config(os.environ['ADX_FC_AFS_ROOT'], name, root.name)
+            c['checkpoint_storage'] = storage_config(os.environ.get('ADX_FC_AFS_ROOT', ''), name, root.name)
         env = service['env']
         env['ADX_DATA_PLANE_RELAY_TLS_CERT'] = c['tls']['certificate']
         env['ADX_DATA_PLANE_RELAY_TLS_KEY'] = c['tls']['private_key']
@@ -64,10 +64,11 @@ def configure(root):
         if name == 'node2':
             text = text.replace('ip_range = "10.231.16.1/20"', 'ip_range = "10.231.32.1/20"')
         text = text.replace('cgroup_root_name = "/adx-fc-', f'cgroup_root_name = "/{name}-adx-fc-')
-        if public_storage(root)['kind'] == 'afs':
+        if public_storage(root)['kind'] in ('afs', 'juicefs', 'native_xfs'):
             # Private writable runtime files share the filesystem, but never
             # share the immutable checkpoint directory or another executor's state.
-            runtime = Path(c['checkpoint_storage']['mount_root']) / 'runtime' / root.name / name
+            runtime_root = os.environ['ADX_STORAGE_NATIVE_XFS_ROOT'] if public_storage(root)['kind']=='native_xfs' else c['checkpoint_storage']['mount_root']
+            runtime = Path(runtime_root) / 'runtime' / root.name / name
             runtime.mkdir(parents=True, exist_ok=True)
             text = text.replace(f'filestore_dir = "{backend}/filestore"', f'filestore_dir = "{runtime}"')
         (backend / 'config.toml').write_text(text)
