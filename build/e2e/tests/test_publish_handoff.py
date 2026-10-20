@@ -95,7 +95,10 @@ if tool == 'obs-python':
             ('release/adx-release.tar.gz', 'adx-release.tar.gz'),
             ('execd/execd.tar.gz', 'adx-execd.tar.gz'),
         ):
-            self.assertEqual((self.fixtures / original).read_bytes(), (self.root / 'out/buildkite' / output).read_bytes())
+            self.assertEqual(
+                (self.fixtures / original).read_bytes(),
+                (self.root / 'out/buildkite' / output).read_bytes(),
+            )
         self.assertEqual((self.root / 'out/buildkite/release-manifest.json').read_bytes(), self.manifest)
         checksum = (self.root / 'out/buildkite/adx-execd.tar.gz.sha256').read_text().split()[0]
         self.assertEqual(checksum, hashlib.sha256((self.fixtures / 'execd/execd.tar.gz').read_bytes()).hexdigest())
