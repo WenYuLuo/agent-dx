@@ -279,6 +279,7 @@ impl EnvironmentService {
         // Repeated inconclusive retries do not renew that window.
         if result.as_ref().is_err_and(|error| {
             adx_protocol::deadline_failure(error).is_none()
+                && adx_protocol::scheduling_failure(error).is_none()
                 && matches!(
                     error.code(),
                     Code::Cancelled
@@ -483,11 +484,12 @@ fn existing_running_response(
     });
     if input.pointer("/tunnel/enabled").and_then(Value::as_bool) == Some(true) {
         let port = confirmed_spec
-            .env
-            .get("EXECD_TUNNEL_HTTP_PORT")
-            .and_then(|port| port.parse::<u16>().ok())
+            .execution
+            .as_ref()
+            .and_then(|options| options.tunnel_http_port)
+            .and_then(|port| u16::try_from(port).ok())
             .filter(|port| *port > 1)
-            .unwrap_or(8766);
+            .ok_or_else(|| Status::data_loss("environment tunnel configuration is missing"))?;
         let safe_id = confirmed_spec
             .id
             .replace('@', "-at-")
@@ -720,8 +722,13 @@ mod tests {
             tenant_id: "tenant".into(),
             ..Default::default()
         };
+        spec.execution = Some(pb::ExecutionOptions {
+            tunnel_http_port: Some(18766),
+            ..Default::default()
+        });
+        // Raw environment values cannot redirect the public response either.
         spec.env
-            .insert("EXECD_TUNNEL_HTTP_PORT".into(), "18766".into());
+            .insert("EXECD_TUNNEL_HTTP_PORT".into(), "12345".into());
         let record = pb::EnvironmentRecord {
             failure: None,
             spec: Some(spec.clone()),

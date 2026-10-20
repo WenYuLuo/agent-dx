@@ -125,6 +125,44 @@ impl ShardScheduler {
             );
         }
     }
+    pub fn diagnose(
+        &self,
+        spec: &EnvironmentSpec,
+        snapshot: &Snapshot,
+        failure: &mut adx_core::scheduling::SchedulingFailure,
+    ) -> Result<()> {
+        let prepared = Prepared::new(spec, snapshot);
+        for state in self.nodes.values() {
+            failure.node_count += 1;
+            let available = state.scalar.available();
+            for (max, value) in [
+                (&mut failure.max_capacity, state.scalar.capacity()),
+                (&mut failure.max_available, available),
+            ] {
+                max.cpu_millis = max.cpu_millis.max(value.cpu_millis);
+                max.memory_bytes = max.memory_bytes.max(value.memory_bytes);
+                max.disk_bytes = max.disk_bytes.max(value.disk_bytes);
+            }
+            let reasons = self.framework.rejections(
+                spec,
+                &Candidate {
+                    node: &state.node,
+                    available,
+                    devices: &state.free_devices,
+                    snapshot,
+                    prepared: Some(&prepared),
+                },
+            )?;
+            if reasons.is_empty() {
+                failure.eligible_nodes += 1;
+            }
+            for reason in reasons {
+                *failure.rejections.entry(reason).or_default() += 1;
+            }
+        }
+        Ok(())
+    }
+
     pub fn node_count(&self) -> usize {
         self.nodes.len()
     }

@@ -308,6 +308,9 @@ pub struct ExecutionOptions {
     pub data_plane: DataPlanePolicy,
     #[serde(default)]
     pub ports: Vec<u16>,
+    /// Server-owned reverse-tunnel HTTP listener; the WS listener is one port lower.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tunnel_http_port: Option<u16>,
     pub failover: bool,
     pub inherit_entrypoint: bool,
     #[serde(default)]
@@ -317,6 +320,28 @@ pub struct ExecutionOptions {
 }
 
 impl ExecutionOptions {
+    pub fn validate_tunnel_network(&self, network: Option<&NetworkPolicy>) -> Result<()> {
+        if let Some(port) = self.tunnel_http_port {
+            if port < 2
+                || [port, port - 1]
+                    .iter()
+                    .any(|p| *p == 50090 || self.ports.contains(p))
+            {
+                return Err(Error::Invalid(
+                    "tunnel listeners must be distinct from control and published ports".into(),
+                ));
+            }
+            if network
+                .and_then(|policy| policy.traffic.as_ref())
+                .is_some_and(|traffic| traffic.mode == TrafficMode::Stateless)
+            {
+                return Err(Error::Invalid(
+                    "reverse tunnels require a stateful traffic policy".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
     pub fn probe_config(&self) -> crate::probes::ProbeConfig {
         crate::probes::ProbeConfig {
             readiness: self.readiness_probe.clone(),
@@ -353,6 +378,7 @@ impl ExecutionOptions {
         if let Some(network) = &self.network {
             network.validate()?;
         }
+        self.validate_tunnel_network(self.network.as_ref())?;
         if self.ports.contains(&0) {
             return Err(Error::Invalid("published port must be positive".into()));
         }

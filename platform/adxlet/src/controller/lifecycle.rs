@@ -86,12 +86,17 @@ impl Controller {
         if let Some(policy) = &policy {
             policy.validate()?;
         }
+        self.record
+            .spec
+            .execution
+            .validate_tunnel_network(policy.as_ref())?;
         self.services
             .runtime
             .set_network_policy(
                 &self.record.runtime.id,
                 policy.as_ref(),
                 &self.record.spec.execution.ports,
+                self.record.spec.execution.tunnel_http_port,
             )
             .await?;
         self.record.spec.execution.network = policy;
