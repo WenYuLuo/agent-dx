@@ -71,6 +71,7 @@ pub struct Resources {
 }
 
 impl Resources {
+    /// Validate a resource request. Observed node capacities may contain zeros.
     pub fn validate(&self) -> Result<()> {
         if self.cpu_millis == 0 || self.memory_bytes == 0 {
             return Err(Error::Invalid("CPU and memory must be positive".into()));
