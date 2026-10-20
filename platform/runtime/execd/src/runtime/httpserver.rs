@@ -846,6 +846,7 @@ async fn execute_invoke(
                     "COMMAND_NOT_FOUND" => 404,
                     "COMMAND_EXPIRED" => 410,
                     "COMMAND_CONFLICT" => 409,
+                    "DEADLINE_EXCEEDED" => 408,
                     "RESOURCE_EXHAUSTED" => 429,
                     "UNSUPPORTED_FEATURE" => 501,
                     _ if normalized_action == Some("cmd_start") => 400,
@@ -953,13 +954,43 @@ async fn handle_file_upload(
     }
 
     let open_started = Instant::now();
-    let mut file = tokio::fs::File::create(path).await?;
+    // Publish a completed inode atomically: readers must never observe an
+    // in-place truncation, and an interrupted upload must retain the old file.
+    // Follow existing symlinks as a regular write does, preserving their target.
+    let destination = match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => std::fs::canonicalize(path)?,
+        _ => Path::new(path).to_path_buf(),
+    };
+    let parent = destination
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(".adx-upload-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o666));
+    }
+    let staged = builder.tempfile_in(parent)?;
+    match std::fs::metadata(&destination) {
+        Ok(metadata) => {
+            // Preserve ordinary overwrite permission checks and file mode.
+            std::fs::OpenOptions::new().write(true).open(&destination)?;
+            staged.as_file().set_permissions(metadata.permissions())?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let mut file = tokio::fs::File::from_std(staged.reopen()?);
     let open_ms = open_started.elapsed().as_millis();
     let copy_started = Instant::now();
     let stats = copy_request_body(sock, body_mode, initial_body, tmp, &mut file).await?;
     let copy_ms = copy_started.elapsed().as_millis();
     let flush_started = Instant::now();
     file.flush().await?;
+    drop(file);
+    staged.persist(&destination)?;
     let flush_ms = flush_started.elapsed().as_millis();
     execd_info!(
         "[execd-http] upload type=file path={} bytes={} body_mode={} content_len={} initial_body={} open_ms={} copy_ms={} read_ms={} write_ms={} flush_ms={} reads={} writes={} first_byte_ms={} total_ms={} trace={}",
@@ -986,7 +1017,6 @@ async fn handle_file_upload(
         trace_id
     );
 
-    let meta = std::fs::metadata(path).ok();
     let name = Path::new(path)
         .file_name()
         .and_then(|n| n.to_str())
@@ -996,7 +1026,7 @@ async fn handle_file_upload(
         "name": name,
         "path": path,
         "type": "file",
-        "size": meta.map(|m| m.len()).unwrap_or(stats.bytes as u64),
+        "size": stats.bytes,
         "bytes_written": stats.bytes,
     })
     .to_string();
@@ -1408,14 +1438,23 @@ async fn handle_file_download(
     trace_id: &str,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let started = Instant::now();
-    let meta = match std::fs::metadata(path) {
-        Ok(m) if m.is_file() => m,
-        _ => {
+    let mut file = match tokio::fs::File::open(path).await {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return write_resp(sock, 404, &err_json("file not found"))
                 .await
                 .map(|_| false)
         }
+        Err(error) => return Err(error.into()),
     };
+    // Length and bytes belong to the same opened inode, even if an upload
+    // replaces the pathname between the response headers and body.
+    let meta = file.metadata().await?;
+    if !meta.is_file() {
+        return write_resp(sock, 404, &err_json("file not found"))
+            .await
+            .map(|_| false);
+    }
     let total = meta.len();
     let range = parse_range_header(head, total);
     let (status, start, end) = match range {
@@ -1431,7 +1470,6 @@ async fn handle_file_download(
         range.map(|_| (start, end, total)),
     )
     .await?;
-    let mut file = tokio::fs::File::open(path).await?;
     if start > 0 {
         file.seek(SeekFrom::Start(start)).await?;
     }
@@ -1931,6 +1969,14 @@ mod tests {
     }
 
     async fn invoke_over_http(action: &str, args: serde_json::Value) -> serde_json::Value {
+        invoke_over_http_status(action, args, 200).await
+    }
+
+    async fn invoke_over_http_status(
+        action: &str,
+        args: serde_json::Value,
+        status: u16,
+    ) -> serde_json::Value {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
             .unwrap();
@@ -1952,7 +1998,7 @@ mod tests {
         .await
         .unwrap();
         assert!(
-            head.starts_with("HTTP/1.1 200"),
+            head.starts_with(&format!("HTTP/1.1 {status}")),
             "{head}: {}",
             String::from_utf8_lossy(&body)
         );
@@ -1987,6 +2033,98 @@ mod tests {
         let response =
             invoke_over_http("file.read", serde_json::json!({"path":path,"binary":true})).await;
         assert_eq!(response["data"], "000aff80");
+    }
+
+    #[tokio::test]
+    async fn http_native_file_search_matches_names_paths_and_exclusions() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        std::fs::create_dir_all(root.join("sub/deep")).unwrap();
+        for name in [
+            "a.py",
+            "secret.py",
+            "case.PY",
+            "sub/b.py",
+            "sub/deep/中文.py",
+            "content.txt",
+        ] {
+            std::fs::write(root.join(name), b"needle-in-content").unwrap();
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root, root.join("sub/loop")).unwrap();
+        let result = invoke_over_http(
+            "file.search",
+            serde_json::json!({
+                "path":root,"pattern":"*.py","exclude_patterns":["secret*"],"depth":64
+            }),
+        )
+        .await;
+        let names = result["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["a.py", "b.py", "中文.py"]);
+        let result = invoke_over_http(
+            "file.search",
+            serde_json::json!({
+                "path":root,"pattern":format!("{}/sub/[b].py", root.display())
+            }),
+        )
+        .await;
+        assert_eq!(result["entries"].as_array().unwrap().len(), 1);
+        let result = invoke_over_http(
+            "file.search",
+            serde_json::json!({"path":root,"pattern":"needle*"}),
+        )
+        .await;
+        assert!(result["entries"].as_array().unwrap().is_empty());
+        let shallow = invoke_over_http(
+            "file.search",
+            serde_json::json!({"path":root,"pattern":"*.py","depth":1}),
+        )
+        .await;
+        assert_eq!(shallow["entries"].as_array().unwrap().len(), 2);
+        let missing = invoke_over_http(
+            "file.search",
+            serde_json::json!({"path":root.join("missing"),"pattern":"*"}),
+        )
+        .await;
+        assert!(missing["entries"].as_array().unwrap().is_empty());
+        let file = invoke_over_http(
+            "file.search",
+            serde_json::json!({"path":root.join("a.py"),"pattern":"*"}),
+        )
+        .await;
+        assert!(file["entries"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn http_native_file_search_limits_reject_partial_results_and_invalid_input() {
+        let directory = tempfile::tempdir().unwrap();
+        for name in ["one", "two"] {
+            std::fs::write(directory.path().join(name), b"data").unwrap();
+        }
+        for field in ["max_results", "max_entries"] {
+            let mut args = serde_json::json!({"path":directory.path(),"pattern":"*"});
+            args[field] = serde_json::json!(1);
+            let result = invoke_over_http_status("file.search", args, 429).await;
+            assert_eq!(result["error_code"], "RESOURCE_EXHAUSTED");
+            assert!(result["entries"].as_array().unwrap().is_empty());
+        }
+        for (field, value) in [
+            ("depth", serde_json::json!(0)),
+            ("max_results", serde_json::json!(true)),
+            ("timeout_ms", serde_json::json!(30001)),
+            ("pattern", serde_json::json!("[z-a]")),
+            ("exclude_patterns", serde_json::json!("*.tmp")),
+        ] {
+            let mut args = serde_json::json!({"path":directory.path(),"pattern":"*"});
+            args[field] = value;
+            let result = invoke_over_http_status("file.search", args, 400).await;
+            assert_eq!(result["error_code"], "INVALID_ARGUMENT");
+        }
     }
 
     #[tokio::test]
@@ -2072,6 +2210,107 @@ mod tests {
 
         drop(client);
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn streaming_upload_publishes_only_complete_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("shared.txt");
+        std::fs::write(&path, b"old-complete").unwrap();
+        let listener = bind(0).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            handle_conn(&mut stream, None).await.unwrap();
+        });
+        let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+        client.write_all(format!(
+            "POST /upload?path={}&type=file HTTP/1.1\r\nHost: localhost\r\nContent-Length: 12\r\n\r\nnew-",
+            path.display()
+        ).as_bytes()).await.unwrap();
+        // Let the receiver consume the partial body, while the upload remains open.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(std::fs::read(&path).unwrap(), b"old-complete");
+        client.write_all(b"complete").await.unwrap();
+        let (head, _) = read_http_response(&mut client).await;
+        assert!(head.starts_with("HTTP/1.1 200"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"new-complete");
+        drop(client);
+        server.await.unwrap();
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn aborted_upload_retains_original_and_removes_staging_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("shared.txt");
+        std::fs::write(&path, b"original").unwrap();
+        let listener = bind(0).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            assert!(handle_conn(&mut stream, None).await.is_err());
+        });
+        let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+        client.write_all(format!(
+            "POST /upload?path={}&type=file HTTP/1.1\r\nHost: localhost\r\nContent-Length: 12\r\n\r\nshort",
+            path.display()
+        ).as_bytes()).await.unwrap();
+        client.shutdown().await.unwrap();
+        server.await.unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"original");
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn atomic_upload_preserves_target_mode_and_symlink() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target");
+        let link = directory.path().join("link");
+        std::fs::write(&target, b"original").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+        symlink(&target, &link).unwrap();
+        let listener = bind(0).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            handle_conn(&mut stream, None).await.unwrap();
+        });
+        let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+        client.write_all(format!(
+            "POST /upload?path={}&type=file HTTP/1.1\r\nHost: localhost\r\nContent-Length: 3\r\n\r\nnew",
+            link.display()
+        ).as_bytes()).await.unwrap();
+        let (head, _) = read_http_response(&mut client).await;
+        assert!(head.starts_with("HTTP/1.1 200"));
+        drop(client);
+        server.await.unwrap();
+        assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
+        assert_eq!(std::fs::read(&target).unwrap(), b"new");
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+    }
+
+    #[tokio::test]
+    async fn http_list_preserves_typed_filesystem_errors_and_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing");
+        let response =
+            invoke_over_http_status("file.list", serde_json::json!({"path":missing}), 400).await;
+        assert_eq!(response["error_code"], "FILE_NOT_FOUND");
+        assert!(response["error"]
+            .as_str()
+            .unwrap()
+            .contains(missing.to_str().unwrap()));
+        let file = directory.path().join("file");
+        std::fs::write(&file, b"data").unwrap();
+        let response =
+            invoke_over_http_status("file.list", serde_json::json!({"path":file}), 400).await;
+        assert_eq!(response["error_code"], "NOT_A_DIRECTORY");
     }
 
     #[tokio::test]

@@ -267,6 +267,34 @@ fn spec(class: &str) -> EnvironmentSpec {
 }
 
 #[tokio::test]
+async fn native_runtime_response_field_keeps_reconciliation_and_deletion_available() {
+    for class in ["supervisor", "conch"] {
+        let fixture = Fixture::new();
+        let driver = fixture.driver().await;
+        driver
+            .start(&spec(class), "tenant-agent-1", 1, &[])
+            .await
+            .unwrap();
+        {
+            let mut references = fixture.backend.refs.lock().unwrap();
+            for reference in references.values_mut() {
+                let runtime = reference
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("sandbox_runtime")
+                    .unwrap();
+                reference["runtime"] = runtime;
+            }
+        }
+        // Native GET/list uses `runtime`; `sandbox_runtime` belongs to create.
+        // A ready backend must not close node admission at the next inventory.
+        assert_eq!(driver.inventory().await.unwrap().len(), 1);
+        driver.remove("tenant-agent-1").await.unwrap();
+        assert!(driver.inventory().await.unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
 async fn creates_conch_with_erofs_volume_and_fenced_execd_identity() {
     let fixture = Fixture::new();
     let driver = fixture.driver().await;

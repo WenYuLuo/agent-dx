@@ -432,6 +432,7 @@ pub(crate) fn normalize_environment_action(action: &str) -> Option<&'static str>
             Some("fs_read_chunk")
         }
         "fs_list" | "file.list" | "fs.list" => Some("fs_list"),
+        "file.search" => Some("fs_search"),
         "fs_exists" | "file.exists" | "fs.exists" => Some("fs_exists"),
         "fs_remove" | "file.remove" | "fs.remove" => Some("fs_remove"),
         "fs_rename" | "file.rename" | "fs.rename" => Some("fs_rename"),
@@ -470,19 +471,22 @@ pub(crate) fn dispatch_runtime_action_with_trace(
                 trace_id,
             ))
         }
-        "fs_read" | "fs_write" | "fs_write_chunk" | "fs_read_chunk" | "fs_list" | "fs_exists"
-        | "fs_remove" | "fs_rename" | "fs_make_dir" | "fs_get_info" => Some(match method {
-            "fs_read" => super::fs::fs_read(kw),
-            "fs_write" => super::fs::fs_write(kw),
-            "fs_write_chunk" => super::fs::fs_write_chunk(kw),
-            "fs_read_chunk" => super::fs::fs_read_chunk(kw),
-            "fs_list" => super::fs::fs_list(kw),
-            "fs_exists" => super::fs::fs_exists(kw),
-            "fs_remove" => super::fs::fs_remove(kw),
-            "fs_rename" => super::fs::fs_rename(kw),
-            "fs_make_dir" => super::fs::fs_make_dir(kw),
-            _ => super::fs::fs_get_info(kw),
-        }),
+        "fs_read" | "fs_write" | "fs_write_chunk" | "fs_read_chunk" | "fs_list" | "fs_search"
+        | "fs_exists" | "fs_remove" | "fs_rename" | "fs_make_dir" | "fs_get_info" => {
+            Some(match method {
+                "fs_read" => super::fs::fs_read(kw),
+                "fs_write" => super::fs::fs_write(kw),
+                "fs_write_chunk" => super::fs::fs_write_chunk(kw),
+                "fs_read_chunk" => super::fs::fs_read_chunk(kw),
+                "fs_list" => super::fs::fs_list(kw),
+                "fs_search" => super::file_search::search(kw),
+                "fs_exists" => super::fs::fs_exists(kw),
+                "fs_remove" => super::fs::fs_remove(kw),
+                "fs_rename" => super::fs::fs_rename(kw),
+                "fs_make_dir" => super::fs::fs_make_dir(kw),
+                _ => super::fs::fs_get_info(kw),
+            })
+        }
         "cmd_start" | "cmd_get" | "cmd_poll" | "cmd_wait" | "cmd_kill" | "cmd_list"
         | "cmd_capabilities" | "cmd_send_stdin" => Some(match method {
             "cmd_start" => super::cmd::cmd_start(kw),

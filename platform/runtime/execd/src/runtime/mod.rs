@@ -34,6 +34,7 @@ pub mod control;
 pub mod control_stream;
 mod dispatch;
 mod entrypoint;
+mod file_search;
 mod fs;
 mod httpserver;
 mod probes;

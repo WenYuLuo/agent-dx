@@ -363,7 +363,12 @@ impl Jiuwenbox {
             if !id.starts_with("adx-") {
                 continue;
             }
-            let backend = match value["sandbox_runtime"].as_str() {
+            // Native list/get responses use `runtime`; some distributions
+            // expose the create selector `sandbox_runtime` in responses too.
+            let runtime = value["runtime"]
+                .as_str()
+                .or_else(|| value["sandbox_runtime"].as_str());
+            let backend = match runtime {
                 Some("conch") => "conch",
                 Some("process" | "bwrap" | "supervisor") => "supervisor",
                 _ if value["phase"] == "provisioning" => "",

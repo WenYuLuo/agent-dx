@@ -217,6 +217,22 @@ async fn jiuwen_auth_is_transport_independent_while_management_requires_tls() {
             json!({"ok":true,"available":true,"quota":{"total":5.0,"balance":3.75,"used":1.25,"low_balance":false,"exhausted":false,"reset_period":"","reset_at":""}})
         );
 
+        let session = sender
+            .send_request(
+                Request::get("/api/v1/auth/session")
+                    .header("host", "localhost")
+                    .header("authorization", "Bearer alice-session")
+                    .body(Full::new(Bytes::new()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(session.status(), StatusCode::OK);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&session.collect().await.unwrap().to_bytes()).unwrap()
+                ["userId"],
+            "alice"
+        );
         // Business credentials must not authorize management requests. A scheme
         // header also cannot promote a plaintext request to the TLS listener.
         let response = sender
