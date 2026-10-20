@@ -1470,13 +1470,198 @@ impl Mutation {
     }
 }
 
+/// Admission identities survive caller cancellation until the writer settles.
+/// The same short mutex serializes admission and retirement selection; it is
+/// never held across backend I/O. All copies use the existing protection budget.
+#[derive(Default)]
+struct InFlightState {
+    active: std::collections::BTreeMap<Arc<RequestKey>, usize>,
+    retiring: std::collections::BTreeSet<Arc<RequestKey>>,
+    bytes: u64,
+    failed: bool,
+}
+struct InFlight {
+    state: Mutex<InFlightState>,
+    limit: usize,
+}
+struct InFlightGuard {
+    owner: Arc<InFlight>,
+    keys: Vec<Arc<RequestKey>>,
+    retirement: bool,
+    holder_bytes: u64,
+}
+impl InFlight {
+    fn charge(key: &RequestKey) -> Result<u64> {
+        // Registry, queued holder, selection snapshot and retirement holder.
+        history::protection_charge(key)?
+            .checked_mul(4)
+            .ok_or_else(|| unavailable("in-flight identity charge overflow"))
+    }
+    fn admit(self: &Arc<Self>, operation: &Mutation) -> Result<InFlightGuard> {
+        let mut keys = std::collections::BTreeSet::new();
+        operation.protect(&mut keys, &mut 0, self.limit)?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| unavailable("in-flight identity lock poisoned"))?;
+        let holder_bytes = 128u64 + keys.len() as u64 * 32;
+        if state.failed {
+            return Err(unavailable("in-flight identity invariant failed"));
+        }
+        let mut extra = holder_bytes;
+        let mut count = 0;
+        for key in &keys {
+            if state.retiring.contains(key) {
+                return Err(unavailable(
+                    "request outcome retirement in progress; retry admission",
+                ));
+            }
+            if !state.active.contains_key(key) {
+                count += 1;
+                extra += Self::charge(key)?;
+            }
+        }
+        if state.active.len() + state.retiring.len() + count > self.limit
+            || state
+                .bytes
+                .checked_add(extra)
+                .is_none_or(|n| n > PROTECTED_KEY_BYTES)
+        {
+            return Err(unavailable(
+                "in-flight request protection capacity exhausted",
+            ));
+        }
+        state.bytes += extra;
+        let held = keys
+            .into_iter()
+            .map(|key| {
+                let key = state
+                    .active
+                    .get_key_value(&key)
+                    .map(|(key, _)| Arc::clone(key))
+                    .unwrap_or_else(|| Arc::new(key));
+                *state.active.entry(Arc::clone(&key)).or_default() += 1;
+                key
+            })
+            .collect();
+        Ok(InFlightGuard {
+            owner: Arc::clone(self),
+            keys: held,
+            retirement: false,
+            holder_bytes,
+        })
+    }
+    fn prepare_history(
+        self: &Arc<Self>,
+        current: &State,
+        now: u64,
+        mut limits: history::Limits,
+    ) -> Result<Option<(State, history::Delta, InFlightGuard)>> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| unavailable("in-flight identity lock poisoned"))?;
+        if state.failed {
+            return Err(unavailable("in-flight identity invariant failed"));
+        }
+        let protected = state
+            .active
+            .keys()
+            .chain(state.retiring.iter())
+            .map(|key| key.as_ref().clone())
+            .collect();
+        let slots = self
+            .limit
+            .saturating_sub(state.active.len() + state.retiring.len());
+        if slots == 0 {
+            return Ok(None);
+        }
+        limits.cleanup_items = limits.cleanup_items.min(slots);
+        loop {
+            let Some((next, delta)) = current.prepare_history(now, limits, &protected)? else {
+                return Ok(None);
+            };
+            let extra = delta.requests.iter().try_fold(0u64, |sum, entry| {
+                sum.checked_add(Self::charge(&entry.key)?)
+                    .ok_or_else(|| unavailable("retirement identity charge overflow"))
+            })?;
+            if state
+                .bytes
+                .checked_add(extra)
+                .is_some_and(|n| n <= PROTECTED_KEY_BYTES)
+            {
+                let keys: Vec<_> = delta
+                    .requests
+                    .iter()
+                    .map(|entry| Arc::new(entry.key.clone()))
+                    .collect();
+                state.retiring.extend(keys.iter().cloned());
+                state.bytes += extra;
+                return Ok(Some((
+                    next,
+                    delta,
+                    InFlightGuard {
+                        owner: Arc::clone(self),
+                        keys,
+                        retirement: true,
+                        holder_bytes: 0,
+                    },
+                )));
+            }
+            if limits.cleanup_items <= 1 {
+                return Ok(None);
+            }
+            limits.cleanup_items /= 2;
+        }
+    }
+}
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        // Poisoning is fail-closed at the next admission/cleanup; never panic
+        // while dropping an already-settled caller's protection.
+        if let Ok(mut state) = self.owner.state.lock() {
+            if let Some(bytes) = state.bytes.checked_sub(self.holder_bytes) {
+                state.bytes = bytes;
+            } else {
+                state.failed = true;
+            }
+            for key in &self.keys {
+                let removed = if self.retirement {
+                    state.retiring.remove(key)
+                } else if let Some(count) = state.active.get_mut(key) {
+                    *count -= 1;
+                    if *count == 0 {
+                        state.active.remove(key);
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                if removed {
+                    match InFlight::charge(key)
+                        .ok()
+                        .and_then(|charge| state.bytes.checked_sub(charge))
+                    {
+                        Some(bytes) => state.bytes = bytes,
+                        None => state.failed = true,
+                    }
+                }
+            }
+        }
+    }
+}
+
 struct Pending {
+    identity: InFlightGuard,
     capacity: Option<OwnedSemaphorePermit>,
     operation: Mutation,
     reply: oneshot::Sender<Result<TxnOutcome>>,
 }
 
 pub struct Store {
+    in_flight: Arc<InFlight>,
     read_budget: Arc<ReadBudget>,
     pending_bytes: Arc<Semaphore>,
     visible: Arc<Visible>,
@@ -1591,6 +1776,10 @@ impl Store {
                 policy,
             ));
         }
+        let in_flight = Arc::new(InFlight {
+            state: Mutex::new(InFlightState::default()),
+            limit: history.protected_requests,
+        });
         let (writes, receiver) = mpsc::channel(1024);
         tokio::spawn(run_log_commit_loop(
             receiver,
@@ -1598,8 +1787,10 @@ impl Store {
             Arc::clone(&log),
             recovered_tip,
             history,
+            Arc::clone(&in_flight),
         ));
         Ok(Self {
+            in_flight,
             read_budget: ReadBudget::new(reads)?,
             pending_bytes: Arc::new(Semaphore::new(PENDING_INPUT_BYTES)),
             visible,
@@ -1662,9 +1853,11 @@ impl Store {
                     .try_acquire_many_owned(bytes)
                     .map_err(|_| journal::full("queued Meta input byte capacity exhausted"))?,
             );
+            let identity = self.in_flight.admit(&operation)?;
             let (reply, result) = oneshot::channel();
             self.writes
                 .send(Pending {
+                    identity,
                     capacity,
                     operation,
                     reply,
@@ -1939,6 +2132,7 @@ async fn persist_root_grant_cleanup(
     tip: journal::LogTip,
     cursor: &mut Option<MetaKey>,
     history: history::Limits,
+    in_flight: &Arc<InFlight>,
 ) -> Result<journal::LogTip> {
     let limits = log.limits();
     let current = visible.committed.load_full();
@@ -1956,21 +2150,20 @@ async fn persist_root_grant_cleanup(
             return Ok(tip);
         }
     };
-    let retention = match next.prepare_history(
-        now_unix_ms(),
-        history,
-        &std::collections::BTreeSet::new(),
-    ) {
+    let retention = match in_flight.prepare_history(&next, now_unix_ms(), history) {
         Ok(retention) => retention,
         Err(error) => {
             afs_logging::warn!("meta.root_grant_cleanup_deferred"; "error" => error.to_string());
             return Ok(tip);
         }
     };
-    let delta = retention.map(|(cleaned, delta)| {
-        next = cleaned;
-        delta
-    });
+    let (delta, _retirement) = match retention {
+        Some((cleaned, delta, guard)) => {
+            next = cleaned;
+            (Some(delta), Some(guard))
+        }
+        None => (None, None),
+    };
     if !next.history_fits(history) {
         return Ok(tip);
     }
@@ -1999,6 +2192,7 @@ async fn run_log_commit_loop(
     log: Arc<dyn journal::MetaLog>,
     mut tip: journal::LogTip,
     history: history::Limits,
+    in_flight: Arc<InFlight>,
 ) {
     let limits = log.limits();
     // The deadline must survive ready requests, including retries that produce
@@ -2011,12 +2205,12 @@ async fn run_log_commit_loop(
         let first = tokio::select! {
             biased;
             _=cleanup_tick.tick()=>{
-                match persist_root_grant_cleanup(&visible, &log, tip, &mut grant_cleanup_cursor, history).await {
+                match persist_root_grant_cleanup(&visible, &log, tip, &mut grant_cleanup_cursor, history, &in_flight).await {
                     Ok(next) => tip = next, Err(_) => break,
                 }
                 let current=visible.committed.load_full();
-                match current.prepare_history(now_unix_ms(),history,&std::collections::BTreeSet::new()) {
-                    Ok(Some((next,delta)))=>{
+                match in_flight.prepare_history(&current,now_unix_ms(),history) {
+                    Ok(Some((next,delta,_retirement)))=>{
                         let record=log::Record::History(delta);
                         let size=match journal::frame_size(tip,&record) {Ok(size) if size<=limits.record_max_bytes=>size,_=>continue};
                         let mut records=vec![record];let mut replies=Vec::new();
@@ -2039,23 +2233,7 @@ async fn run_log_commit_loop(
                 Err(_) => break,
             }
         }
-        let mut protected = std::collections::BTreeSet::new();
-        let mut protected_bytes = 0;
-        let protection = batch.iter().try_for_each(|pending| {
-            pending.operation.protect(
-                &mut protected,
-                &mut protected_bytes,
-                history.protected_requests,
-            )
-        });
-        if let Err(error) = protection {
-            for pending in batch {
-                let _ = pending.reply.send(Err(unavailable(format!(
-                    "prepared protection rejected: {error}"
-                ))));
-            }
-            continue;
-        }
+        let mut retirements = Vec::new();
         let mut input_holds = Vec::new();
         let mut staged = visible.committed.load_full().as_ref().clone();
         let mut records = Vec::new();
@@ -2064,7 +2242,7 @@ async fn run_log_commit_loop(
         while let Some(item) = batch.pop_front() {
             // A cancelled caller cannot release queued input capacity or its
             // prepared identity before this writer has settled the group.
-            input_holds.push(item.capacity);
+            input_holds.push((item.capacity, item.identity));
             let prepared = match item.operation {
                 Mutation::Transaction(txn) => {
                     staged.prepare_txn_record(txn, now_unix_ms(), limits.record_max_bytes)
@@ -2085,14 +2263,15 @@ async fn run_log_commit_loop(
             };
             let record = match record {
                 Some(decision) => {
-                    let cleanup = match next.prepare_history(now_unix_ms(), history, &protected) {
+                    let cleanup = match in_flight.prepare_history(&next, now_unix_ms(), history) {
                         Ok(cleanup) => cleanup,
                         Err(error) => {
                             replies.push((item.reply, Err(error)));
                             continue;
                         }
                     };
-                    let delta = cleanup.map(|(cleaned, delta)| {
+                    let delta = cleanup.map(|(cleaned, delta, guard)| {
+                        retirements.push(guard);
                         next = cleaned;
                         delta
                     });
@@ -4171,6 +4350,152 @@ mod tests {
         assert_eq!(restored.history_stats().request_bytes, stats.request_bytes);
         assert_eq!(restored.history_stats().event_bytes, stats.event_bytes);
     }
+    #[test]
+    fn p3_retention_in_flight_capacity_and_retirement_admission_bounds() {
+        let registry = Arc::new(InFlight {
+            state: Mutex::new(InFlightState::default()),
+            limit: 1,
+        });
+        let key = RequestKey::new("admission", "original");
+        let operation = Mutation::RegisterNode(key.clone(), lease("one"));
+        let first = registry.admit(&operation).unwrap();
+        let duplicate = registry.admit(&operation).unwrap();
+        assert!(
+            registry
+                .admit(&Mutation::RegisterNode(
+                    RequestKey::new("admission", "other"),
+                    lease("two")
+                ))
+                .is_err()
+        );
+        drop(first);
+        assert_eq!(registry.state.lock().unwrap().active.get(&key), Some(&1));
+        drop(duplicate);
+        assert_eq!(registry.state.lock().unwrap().bytes, 0);
+        let (state, _, _) = State::default()
+            .prepare_node_record(key.clone(), lease("one"), 1, 65536)
+            .unwrap();
+        let limits = history::Limits {
+            request_retention: Duration::from_millis(1),
+            event_retention: Duration::from_millis(1),
+            ..Default::default()
+        };
+        let (_, delta, retiring) = registry
+            .prepare_history(&state, 100, limits)
+            .unwrap()
+            .unwrap();
+        assert_eq!(delta.requests.len(), 1);
+        assert!(
+            registry.admit(&operation).is_err(),
+            "admission cannot race a selected durable retirement"
+        );
+        drop(retiring);
+        let admitted = registry.admit(&operation).unwrap();
+        drop(admitted);
+        assert_eq!(registry.state.lock().unwrap().bytes, 0);
+        let large = Mutation::RegisterNode(
+            RequestKey::new("admission", "x".repeat(PROTECTED_KEY_BYTES as usize / 4)),
+            lease("large"),
+        );
+        assert!(
+            registry.admit(&large).is_err(),
+            "all identity copies must fit the existing4MiB protection budget"
+        );
+        let state = registry.state.lock().unwrap();
+        assert_eq!(state.bytes, 0);
+        assert!(state.active.is_empty() && state.retiring.is_empty() && !state.failed);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn p3_retention_queued_retry_survives_cleanup_deadline() {
+        let log = Arc::new(GatedLog {
+            inner: Arc::new(journal::MemoryLog::new(Default::default()).unwrap()),
+            started: Notify::new(),
+            release: Notify::new(),
+            fail: false,
+            persist_before_error: false,
+        });
+        let mut policy = retention_limits();
+        policy.request_retention = Duration::from_millis(100);
+        policy.event_retention = Duration::from_millis(100);
+        let store = Arc::new(
+            Store::open_log_with_history(log.clone(), policy)
+                .await
+                .unwrap(),
+        );
+        let key = RequestKey::new("queued-retained", "same-operation");
+        log.release.notify_one();
+        let first = store
+            .register_node_session(key.clone(), lease("original"))
+            .await
+            .unwrap();
+        log.started.notified().await;
+        let TxnOutcome::Committed {
+            outcome: expected, ..
+        } = first
+        else {
+            panic!("seed was not committed");
+        };
+        let writer = store.clone();
+        let blocker = tokio::spawn(async move {
+            let mut other = lease("blocked");
+            other.node_id = "node-blocked".into();
+            writer
+                .register_node_session(RequestKey::new("queued-retained", "blocker"), other)
+                .await
+        });
+        log.started.notified().await;
+        let mut retry = store.register_node_session(key.clone(), lease("must-not-execute"));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(retry.as_mut().poll(&mut context).is_pending());
+        assert_eq!(
+            store.writes.capacity(),
+            1023,
+            "retry must actually be queued while the prior ACK is blocked"
+        );
+        // Unlike blocking the executor, this lets the timer driver mark expiry
+        // ready while the writer is still inside the preceding durable ACK.
+        tokio::time::sleep(Duration::from_millis(220)).await;
+        let pump_log = log.clone();
+        let pump = tokio::spawn(async move {
+            loop {
+                pump_log.started.notified().await;
+                pump_log.release.notify_one();
+            }
+        });
+        log.release.notify_one();
+        let actual = retry.await.unwrap();
+        blocker.await.unwrap().unwrap();
+        assert!(
+            matches!(actual, TxnOutcome::ConditionFailed { existing_outcome: Some(outcome), .. } if outcome == expected),
+            "queued retry lost its admitted outcome and executed again"
+        );
+        assert_eq!(
+            store.visible.committed.load().node_epochs.get("node-a"),
+            Some(&1)
+        );
+        tokio::time::sleep(Duration::from_millis(220)).await;
+        assert!(
+            store
+                .read(MetaRead::RequestOutcome(key))
+                .await
+                .unwrap()
+                .request_outcome
+                .is_none(),
+            "settled admission protection must not become permanent retention"
+        );
+        drop(store);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while Arc::strong_count(&log) > 2 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        pump.abort();
+        assert!(pump.await.unwrap_err().is_cancelled());
+    }
+
     #[tokio::test]
     async fn p3_retention_runtime_idle_expiry_is_a_durable_management_change() {
         use journal::MetaLog;
@@ -4425,6 +4750,16 @@ mod tests {
             budget.available_permits(),
             charged,
             "caller cancellation cannot return writer-owned input quota"
+        );
+        assert!(
+            store
+                .in_flight
+                .state
+                .lock()
+                .unwrap()
+                .active
+                .contains_key(&key),
+            "cancelled queued caller must retain its request identity"
         );
         log.release.notify_one();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
