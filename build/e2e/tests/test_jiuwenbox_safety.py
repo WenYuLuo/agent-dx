@@ -3,13 +3,14 @@
 import asyncio
 import io
 import json
+import logging
 import os
 import sys
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[3]
 SOURCE = ROOT / "build/e2e/jiuwenbox/accept.py"
@@ -105,10 +106,15 @@ class JiuwenboxSafetyTests(unittest.TestCase):
                 patch.object(sys, "stdout", output),
                 patch.object(importlib.metadata, "version", return_value="0.1.0"),
             ):
-                exec(compile(source.read_text(), str(source), "exec"), {"__name__": "sdk_fixture"})
+                namespace = {"__name__": "sdk_fixture"}
+                exec(compile(source.read_text(), str(source), "exec"), namespace)
             messages = [json.loads(line) for line in output.getvalue().splitlines()]
             self.assertTrue(messages[0]["ready"])
             self.assertEqual(messages[1], {"ok": True, "value": True})
+            failed_stream = SimpleNamespace(write=Mock(side_effect=BrokenPipeError("closed")), flush=Mock())
+            handler = namespace["ProtocolHandler"](failed_stream)
+            with self.assertRaisesRegex(BrokenPipeError, "closed"):
+                handler.emit(logging.makeLogRecord({"msg": "response", "args": ()}))
 
 
 if __name__ == "__main__":

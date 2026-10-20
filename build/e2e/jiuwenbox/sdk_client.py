@@ -5,10 +5,37 @@ import dataclasses
 import hashlib
 import importlib.metadata
 import json
+import logging
 import os
 from pathlib import Path, PurePosixPath
 import sys
 import traceback
+
+
+class ProtocolHandler(logging.StreamHandler):
+    """Keep protocol failures visible so the client releases its Environments."""
+
+    def handleError(self, record):
+        error = sys.exc_info()[1]
+        if error is not None:
+            raise error
+        super().handleError(record)
+
+
+protocol_logger = logging.getLogger("adx.jiuwenbox.sdk_protocol")
+for previous_handler in list(protocol_logger.handlers):
+    protocol_logger.removeHandler(previous_handler)
+    previous_handler.close()
+protocol_handler = ProtocolHandler(sys.stdout)
+protocol_handler.setFormatter(logging.Formatter("%(message)s"))
+protocol_logger.addHandler(protocol_handler)
+protocol_logger.setLevel(logging.INFO)
+protocol_logger.propagate = False
+
+
+def send_message(message):
+    protocol_logger.info("%s", json.dumps(message, ensure_ascii=False))
+
 
 config = json.loads(Path(sys.argv[1]).read_text())
 os.environ["SSL_CERT_FILE"] = config["ca"]
@@ -65,17 +92,13 @@ def check(runtime_class):
     }
 
 
-sys.stdout.write(
-    json.dumps(
-        {
-            "ready": True,
-            "sdk_version": importlib.metadata.version("adx-environment"),
-            "sdk_location": str(Path(sys.modules["adx_environment"].__file__).resolve()),
-        }
-    )
-    + "\n"
+send_message(
+    {
+        "ready": True,
+        "sdk_version": importlib.metadata.version("adx-environment"),
+        "sdk_location": str(Path(sys.modules["adx_environment"].__file__).resolve()),
+    }
 )
-sys.stdout.flush()
 try:
     for line in sys.stdin:
         try:
@@ -135,12 +158,10 @@ try:
                 value = True
             else:
                 raise ValueError(action)
-            sys.stdout.write(json.dumps({"ok": True, "value": value}, ensure_ascii=False) + "\n")
-            sys.stdout.flush()
+            send_message({"ok": True, "value": value})
         except Exception as error:
             traceback.print_exc(file=sys.stderr)
-            sys.stdout.write(json.dumps({"ok": False, "error": f"{type(error).__name__}: {error}"}) + "\n")
-            sys.stdout.flush()
+            send_message({"ok": False, "error": f"{type(error).__name__}: {error}"})
 finally:
     for s in environments.values():
         try:
