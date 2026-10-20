@@ -88,6 +88,10 @@ class StorageFixtureTests(unittest.TestCase):
         from storage_workload import identity
 
         work = identity({})
+        snapshot_kinds = (
+            ("Full", "expected_full_sha256"),
+            ("Incremental", "expected_dirty_sha256"),
+        )
         samples = [
             {
                 "snapshot_type": kind,
@@ -95,10 +99,7 @@ class StorageFixtureTests(unittest.TestCase):
                 "checked_bytes": work["payload_bytes"],
                 "continuity": True,
             }
-            for kind, digest in [
-                ("Full", "expected_full_sha256"),
-                ("Incremental", "expected_dirty_sha256"),
-            ]
+            for kind, digest in snapshot_kinds
         ]
         result = {
             "native_control_only": True,

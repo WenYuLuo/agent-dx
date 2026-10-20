@@ -135,9 +135,12 @@ def report(root):
                     if backend not in physical[node]:
                         physical[node].append(backend)
                     runtime[backend] = re.search(r'key:"adx.runtime_id" value:"([^"]+)"', line)[1]
-        capture = next(
-            line for line in logs["node1"] if "checkpointed sandbox " + physical["node1"][0] in line
-        )
+        source_lines = logs.get("node1")
+        source_backends = physical.get("node1")
+        if source_lines is None or not source_backends:
+            raise ValueError("missing capture source in benchmark evidence")
+        capture_marker = "checkpointed sandbox " + source_backends[0]
+        capture = next(line for line in source_lines if capture_marker in line)
         target = sample["target"]
         target_lines = logs.get(target)
         target_backends = physical.get(target)
@@ -164,12 +167,15 @@ def report(root):
             "sandboxd_capture": backend_phase(capture),
             "sandboxd_restore": backend_phase(restore),
         }
-        for name in (
-            "environment_resume_stages",
-            "environment_restore_execution_stages",
-            "environment_backend_restore_stages",
-        ):
-            row[name] = event(managers, name, "runtime_id", runtime_id)
+        row["environment_resume_stages"] = event(
+            managers, "environment_resume_stages", "runtime_id", runtime_id
+        )
+        row["environment_restore_execution_stages"] = event(
+            managers, "environment_restore_execution_stages", "runtime_id", runtime_id
+        )
+        row["environment_backend_restore_stages"] = event(
+            managers, "environment_backend_restore_stages", "runtime_id", runtime_id
+        )
         row["sandboxd_rpc_outside_restore_ms"] = (
             row["environment_backend_restore_stages"]["start_rpc_ms"]
             - row["sandboxd_restore"]["total_ms"]

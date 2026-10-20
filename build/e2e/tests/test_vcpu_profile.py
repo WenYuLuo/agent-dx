@@ -35,15 +35,13 @@ class VcpuProfileTests(unittest.TestCase):
     def test_wait_estimates_clip_to_phase_and_exclude_sampling_gaps(self):
         from agent_cpu import wait_window
 
-        points = [
-            {"time_ns": t * 1000000, "wchan": w}
-            for t, w in [
-                (0, "fuse_wait_on_page_writeback"),
-                (10, "0"),
-                (20, "fuse_flush"),
-                (1000, "0"),
-            ]
-        ]
+        observations = (
+            (0, "fuse_wait_on_page_writeback"),
+            (10, "0"),
+            (20, "fuse_flush"),
+            (1000, "0"),
+        )
+        points = [{"time_ns": t * 1000000, "wchan": w} for t, w in observations]
         self.assertEqual(
             wait_window(points, 5000000, 25000000),
             {

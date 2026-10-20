@@ -177,7 +177,7 @@ def main():
     try:
         call(["ip", "link", "add", bridge, "type", "bridge"])
         bridge_created = True
-        call(["ip", "addr", "add", HOST + "/24", "dev", bridge])
+        call(["ip", "addr", "add", f"{HOST}/24", "dev", bridge])
         call(["ip", "link", "set", bridge, "up"])
         for i, (node, address) in enumerate(ADDRESSES.items()):
             ns = namespaces[node]
@@ -192,7 +192,7 @@ def main():
             for args in (
                 ["link", "set", "lo", "up"],
                 ["link", "set", peer, "name", "eth0"],
-                ["addr", "add", address + "/24", "dev", "eth0"],
+                ["addr", "add", f"{address}/24", "dev", "eth0"],
                 ["link", "set", "eth0", "up"],
                 ["route", "add", "default", "via", HOST],
             ):
@@ -263,7 +263,7 @@ def main():
         if public_storage(root)["kind"] not in ("afs", "juicefs", "native_xfs"):
             call(["python3", base / "e2e/firecracker/s3_probe.py", root, "--create"])
         spawn("registry", ["docker-registry", "serve", root / "registry.yaml"])
-        sys.path.insert(0, str(base / "e2e"))
+        sys.path.append(str(base / "e2e"))
         import publish
 
         digest = publish.publish(str(base / "execd.tar"))

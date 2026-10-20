@@ -353,13 +353,15 @@ def afs_metrics(phase):
         ) as reply:
             text = reply.read().decode()
         (evidence / f"afs-{phase}-{name}.prom").write_text(text)
-        values[name] = sum(
-            float(line.split()[-1])
-            for line in text.splitlines()
-            if line.startswith("afs_dfs_payload_bytes_total{")
-            and 'direction="send"' in line
-            and 'operation="read"' in line
-        )
+        read_bytes = 0.0
+        for line in text.splitlines():
+            if (
+                line.startswith("afs_dfs_payload_bytes_total{")
+                and 'direction="send"' in line
+                and 'operation="read"' in line
+            ):
+                read_bytes += float(line.split()[-1])
+        values[name] = read_bytes
     return values
 
 
@@ -797,7 +799,8 @@ def fault_case():
     recovery_replays = []
     drain_heartbeats = []
     for path in (root / record(environment)["assignment"]["node_id"] / "state/logs").glob("*.log"):
-        for line in path.read_bytes()[target_log_sizes.get(path, 0) :].decode().splitlines():
+        offset = target_log_sizes.get(path, 0)
+        for line in path.read_bytes()[offset:].decode().splitlines():
             if "node_admission_drain_heartbeat" in line:
                 drain_heartbeats.append(line)
             try:

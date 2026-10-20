@@ -35,21 +35,19 @@ def load(directory):
     result["fixture_cleanup"] = cleanup
     if result["storage"]["kind"] == "juicefs":
         fixture = json.loads((root / "juicefs/juicefs-identities.json").read_text())
+        parameter_names = (
+            "max_readahead_mib",
+            "cache_size_mib",
+            "cache_dir",
+            "writeback",
+            "binary_sha256",
+            "ceph",
+            "postgres",
+            "postgres_synchronous_commit",
+        )
         result["filesystem_parameters"] = {
             "block_size_kib": fixture.get("juicefs_block_size_kib"),
-            **{
-                key: fixture.get(key)
-                for key in (
-                    "max_readahead_mib",
-                    "cache_size_mib",
-                    "cache_dir",
-                    "writeback",
-                    "binary_sha256",
-                    "ceph",
-                    "postgres",
-                    "postgres_synchronous_commit",
-                )
-            },
+            **{key: fixture.get(key) for key in parameter_names},
         }
     identities = {
         "package": json.loads((root / "package-manifest.json").read_text()),

@@ -526,4 +526,5 @@ finally:
         result["cleanup_error"] = str(error)
     (out / "result.json").write_text(json.dumps(result, indent=2) + "\n")
 print(json.dumps(result), flush=True)
-raise SystemExit(0 if result["status"] == "passed" and "cleanup_error" not in result else 1)
+if __name__ == "__main__":
+    raise SystemExit(0 if result["status"] == "passed" and "cleanup_error" not in result else 1)

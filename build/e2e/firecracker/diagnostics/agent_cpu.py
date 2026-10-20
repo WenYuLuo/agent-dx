@@ -30,15 +30,13 @@ def summarize(logs):
             if "firecracker: guest agent CPU profile" not in line:
                 continue
             fields = parse_line(line)
-            row = {
-                key: float(fields[key])
-                for key in (
-                    "guest_handler_wall_ms",
-                    "guest_process_user_ms",
-                    "guest_process_system_ms",
-                    "host_response_ms",
-                )
-            }
+            timing_names = (
+                "guest_handler_wall_ms",
+                "guest_process_user_ms",
+                "guest_process_system_ms",
+                "host_response_ms",
+            )
+            row = {key: float(fields[key]) for key in timing_names}
             if any(not math.isfinite(v) or v < 0 for v in row.values()):
                 raise ValueError("invalid guest CPU timing")
             row.update(
