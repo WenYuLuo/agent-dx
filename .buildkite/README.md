@@ -65,6 +65,12 @@ there is no silent transport fallback. AMD64 temporary artifacts use
 checked before extraction. Configure bucket retention for this temporary prefix
 separately from `adx/daily/` and `adx/release/`.
 
+AMD64 publication honors the same transport choice: with `obs` it consumes the
+verified staged release and the exact Execd component from this build. Small
+SDK/admin candidates still come from Buildkite artifacts. Explicit `buildkite`
+retains the complete Buildkite handoff. A failed OBS transfer or identity/hash
+check stops publication without falling back to another transport.
+
 ## Parallel Linux ARM64 packages
 
 The base pipeline defaults to two symmetric, independent Linux architecture flows.
