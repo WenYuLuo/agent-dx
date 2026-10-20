@@ -149,8 +149,10 @@ impl OwnerRootAuthority for StoreOwnerRootAuthority {
                 };
                 let root_epoch = previous
                     .checked_add(1)
-                    .ok_or_else(|| invalid("root epoch exhausted"))?
-                    .max(input.expected_root_epoch.max(1));
+                    .ok_or_else(|| invalid("root epoch exhausted"))?;
+                if input.expected_root_epoch > root_epoch {
+                    return Err(invalid("expected root epoch exceeds next allocated epoch"));
+                }
                 let reservation = RootReservationRecord {
                     root_id: input.root_id.clone(),
                     root_epoch,
@@ -836,6 +838,8 @@ pub struct ReserveRootInput {
     pub preferred_home_node_id: String,
     pub session_id: String,
     pub rights: Vec<RootRight>,
+    /// Zero selects automatic allocation; a nonzero floor must not exceed the
+    /// authority's next epoch. The caller cannot advance the global watermark.
     pub expected_root_epoch: u64,
     pub create_intent_id: String,
 }

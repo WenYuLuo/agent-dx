@@ -7404,9 +7404,11 @@ mod grant_lifecycle_tests {
         assert_eq!(epochs.len(), 16);
     }
     #[tokio::test]
-    async fn grant_lifecycle_epoch_exhaustion_rejects_without_publishing() {
+    async fn grant_lifecycle_expected_epoch_cannot_exhaust_authority() {
         let (store, log, authority) = fixture().await;
-        let first = authority
+        let tip = log.recover().await.unwrap().tip;
+        let before = store.committed().await.unwrap();
+        let rejected = authority
             .reserve_root(ReserveRootInput {
                 request_id: "max".into(),
                 root_id: "other".into(),
@@ -7416,27 +7418,16 @@ mod grant_lifecycle_tests {
                 expected_root_epoch: u64::MAX,
                 create_intent_id: "max".into(),
             })
-            .await
-            .unwrap();
-        assert_eq!(first.reservation.root_epoch, u64::MAX);
-        let tip = log.recover().await.unwrap().tip;
-        let before = store.committed().await.unwrap();
+            .await;
         assert!(
-            authority
-                .reserve_root(ReserveRootInput {
-                    request_id: "exhausted".into(),
-                    root_id: "new".into(),
-                    preferred_home_node_id: "home".into(),
-                    session_id: "s".into(),
-                    rights: vec![],
-                    expected_root_epoch: 0,
-                    create_intent_id: "new".into()
-                })
-                .await
-                .is_err()
+            rejected.is_err(),
+            "caller must not raise the allocation watermark"
         );
         assert_eq!(log.recover().await.unwrap().tip, tip);
         assert!(Arc::ptr_eq(&before, &store.committed().await.unwrap()));
+        let allocated = reserve(&authority, "after-invalid").await;
+        assert_eq!(allocated.root_epoch, 1);
+        assert_eq!(reserve(&authority, "after-invalid").await, allocated);
     }
     #[tokio::test]
     async fn grant_lifecycle_background_cleanup_local_wal_and_checkpoint_recovery() {
