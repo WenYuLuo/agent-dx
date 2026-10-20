@@ -464,7 +464,6 @@ impl Adxlet {
     }
 
     pub fn update_capacity(&self, resources: Resources, valid_for: Duration) -> Result<()> {
-        resources.validate()?;
         if valid_for.is_zero() {
             return Err(Error::Invalid("capacity lifetime must be positive".into()));
         }

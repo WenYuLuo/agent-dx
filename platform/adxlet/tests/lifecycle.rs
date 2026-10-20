@@ -760,6 +760,104 @@ async fn wrong_node_or_generation_cannot_acquire_existing_controller() {
     assert!(node.environment(spec("b"), other).is_err());
 }
 
+#[tokio::test(start_paused = true)]
+async fn zero_capacity_replaces_live_observations_without_releasing_running_work() {
+    let deps = Dependencies::new(false);
+    let node = node(&deps);
+    let first = node
+        .environment(spec("running"), assignment("running"))
+        .unwrap();
+    first.create().await.unwrap();
+    let events = deps.events.lock().unwrap().clone();
+    tokio::time::advance(Duration::from_secs(20)).await;
+    for (cpu_millis, memory_bytes) in [(0, 1024), (1, 0), (0, 0)] {
+        node.update_capacity(
+            Resources {
+                cpu_millis,
+                memory_bytes,
+                disk_bytes: 1024,
+            },
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        // A valid zero observation refreshes freshness, not the reservation ledger.
+        tokio::time::advance(Duration::from_secs(11)).await;
+        assert!(node.accepting_allocations());
+        assert_eq!(node.used(), resources());
+        assert_eq!(
+            node.reserve_local(&spec("new")).unwrap_err(),
+            Error::NoCapacity
+        );
+        assert_eq!(
+            first.create().await.unwrap().record.state,
+            EnvironmentState::Running
+        );
+        let metrics = node.metrics();
+        assert!(metrics.contains(&format!("adx_node_capacity_cpu_millis {cpu_millis}\n")));
+        assert!(metrics.contains(&format!("adx_node_capacity_memory_bytes {memory_bytes}\n")));
+        assert!(metrics.contains("adx_node_resource_observation_fresh 1\n"));
+    }
+    assert_eq!(*deps.events.lock().unwrap(), events);
+    node.update_capacity(resources(), Duration::from_secs(30))
+        .unwrap();
+    assert_eq!(
+        node.reserve_local(&spec("new")).unwrap_err(),
+        Error::NoCapacity
+    );
+    first.delete().await.unwrap();
+    assert_eq!(node.used(), Resources::default());
+    let hold = node.reserve_local(&spec("new")).unwrap();
+    node.release_local("new", &hold).unwrap();
+}
+
+#[tokio::test]
+async fn capacity_below_used_recovers_by_growth_or_normal_release() {
+    let deps = Dependencies::new(false);
+    let node = node(&deps);
+    let capacity = Resources {
+        cpu_millis: 3,
+        memory_bytes: 3072,
+        disk_bytes: 3072,
+    };
+    node.update_capacity(capacity, Duration::from_secs(30))
+        .unwrap();
+    let a = node.reserve_local(&spec("a")).unwrap();
+    let b = node.reserve_local(&spec("b")).unwrap();
+    node.update_capacity(resources(), Duration::from_secs(30))
+        .unwrap();
+    assert_eq!(
+        node.used(),
+        Resources {
+            cpu_millis: 2,
+            memory_bytes: 2048,
+            disk_bytes: 2048
+        }
+    );
+    assert_eq!(
+        node.reserve_local(&spec("c")).unwrap_err(),
+        Error::NoCapacity
+    );
+    assert!(node
+        .metrics()
+        .contains("adx_node_overcommitted_cpu_millis 1\n"));
+    node.update_capacity(capacity, Duration::from_secs(30))
+        .unwrap();
+    let c = node.reserve_local(&spec("c")).unwrap();
+    node.release_local("c", &c).unwrap();
+    node.update_capacity(resources(), Duration::from_secs(30))
+        .unwrap();
+    node.release_local("a", &a).unwrap();
+    assert_eq!(node.used(), resources());
+    assert_eq!(
+        node.reserve_local(&spec("c")).unwrap_err(),
+        Error::NoCapacity
+    );
+    node.release_local("b", &b).unwrap();
+    let c = node.reserve_local(&spec("c")).unwrap();
+    node.release_local("c", &c).unwrap();
+    assert_eq!(node.used(), Resources::default());
+}
+
 #[tokio::test]
 async fn local_device_admission_is_atomic_and_failed_cleanup_keeps_cards_reserved() {
     use adx_core::scheduling::*;

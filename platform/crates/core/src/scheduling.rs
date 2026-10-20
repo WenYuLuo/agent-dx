@@ -31,6 +31,7 @@ pub struct DeviceRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Node {
     pub id: String,
+    /// Latest observed budget; may be zero or smaller than existing reservations.
     pub capacity: Resources,
     pub available: bool,
     #[serde(default)]
@@ -44,7 +45,6 @@ pub struct Node {
 impl Node {
     pub fn validate(&self) -> Result<()> {
         nonempty(&self.id)?;
-        self.capacity.validate()?;
         validate_labels(&self.labels)?;
         validate_inventory(&self.devices)?;
         let mut seen = BTreeSet::new();
