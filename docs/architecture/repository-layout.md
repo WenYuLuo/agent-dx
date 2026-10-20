@@ -19,7 +19,7 @@ Agent API 在 Gateway Ingress 内处理产品请求。独立模式通过 Activat
 
 API Server 仍保留原有九条 `/api/agent` 兼容转发路由，由 `agent_address` 指向外部 Agent 服务；这是平台侧既有入口，不属于当前 Ingress Agent API／Activator 链路，本轮保持不变。
 
-平台内部以 **Environment + Runtime** 建模。Environment 是跨节点、暂停恢复和故障接管期间保持不变的逻辑身份，持有期望规格、生命周期、归属和 checkpoint 引用；Runtime 是 sandboxd 在某个节点创建的一次物理执行，具有独立 `runtime_id`，重启、恢复或接管时可以替换。二者通过 `RuntimeIdentity { environment_id, runtime_id, ownership_generation }` 绑定，adxlet 只允许当前 generation 的 Runtime 对外提供服务。
+平台内部以 **Environment + Runtime** 建模。Environment 是跨节点、暂停恢复和故障接管期间保持不变的逻辑身份，持有期望规格、生命周期、归属和 checkpoint 引用；Runtime 是运行时后端在某个节点创建的一次物理执行，具有独立 `runtime_id`，重启、恢复或接管时可以替换。二者通过 `RuntimeIdentity { environment_id, runtime_id, ownership_generation }` 绑定，adxlet 只允许当前 generation 的 Runtime 对外提供服务。
 
 Environment 自动暂停复用 idle timeout，策略为 delete/pause；匿名恢复点可按配置发布到共享对象存储。Ingress 认证首请求后与 API Server 手动 resume 共用 Coordinator `EnsureRunning`。Coordinator 持久化恢复意图、优先原节点准入，仅在明确资源不足或执行已失效时调度兼容目标；adxlet 执行恢复并提交 Running。节点失效保留 Paused，等待需求或到期/删除。Ingress 获得该执行的已发布路由后才转发业务字节。详见 [节点生命周期](../testing/node-lifecycle.md)。
 
@@ -108,9 +108,10 @@ agent-dx/
 | Coordinator | `storage.rs`、`storage/`、`rpc.rs`、`rpc/` | Redis 条件提交、原子归属、目录、节点失效、快照克隆、共享恢复协调；不执行节点普通生命周期 |
 | Coordinator | `auth.rs`、`routes.rs`、`metrics.rs` | API Key 摘要、路由发布、集群指标 |
 | adxlet | `controller.rs`、`controller/{lifecycle,monitor,snapshots}.rs` | 每 Environment 串行任务、暂停/恢复/删除、空闲回收与重启 |
-| adxlet | `sandboxd.rs`、`runtime_control.rs`、`readiness.rs` | RuntimeDriver 适配；本地 EROFS／OCI image 环境；Execd 双向控制流／HTTP 协作与就绪 |
+| adxlet | `runtime_router.rs`、`sandboxd.rs`、`jiuwenbox/` | 按 runtime class 创建、按执行归属分发；Jiuwenbox 从权威目录重建内存关联，复用独立 EROFS 和原生 ACL；后端源码不变 |
+| adxlet | `runtime_control.rs`、`readiness.rs` | Execd 双向控制流／HTTP 协作与就绪 |
 | adxlet | `checkpoint.rs`、`checkpoint/` | 可扩展 CheckpointStore、本地/S3、缓存引用和远端孤儿回收 |
-| adxlet | `journal.rs`、`reconciliation.rs` | SQLite 故障降级日志与 Coordinator 权威目录对账 |
+| adxlet | `node_reconciliation.rs`、`reconciliation.rs`、`journal.rs` | 全后端共用启动和周期性权威对账、孤儿/晚到资源清理、准入及心跳协调；既有可选 SQLite 结果降级日志 |
 | adxlet | `resources.rs`、`routes.rs`、`activity.rs`、`proxy.rs` | 容量源/准入、绑定同步、活动采集、代理进程组合 |
 | Rust API Server | `contract.rs`、`http.rs`、`clients.rs`、`operations.rs` | HTTP 兼容字段到 Environment RPC；认证、版本化 Environment 目录订阅、入口节点轮转、直达节点、快照目录 |
 
@@ -155,3 +156,5 @@ Rust 共用根 Cargo workspace，Python 工具独立打包；外部 sandboxd 按
 ## 可观测
 
 Coordinator/adxlet 的 Environment 数、资源预留与使用量，Ingress/Relay 的连接、流量与请求指标由各自 `/metrics` 导出。Trace 由组件 OpenTelemetry SDK 经 OTLP/HTTP 发往外部 Collector；结构化 stdout 由 supervisor 滚动压缩，Collector filelog 采集。Pod 可部署 Collector sidecar，进程环境独立托管。统一实时 Trace 队列丢弃指标已后置，不能与已有导出失败计数混同。
+
+Jiuwenbox 接入路径和验收边界见 [Jiuwenbox P0](../testing/jiuwenbox-runtime.md)。正常创建经 Jiuwenbox，Conch 原生 UDS 仅用于失联后的发现和清理。此驱动不提供 checkpoint；EROFS 先挂载到宿主，再通过 bind／virtiofs 暴露给沙箱。

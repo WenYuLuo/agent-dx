@@ -1,4 +1,6 @@
 //! Local gRPC/UDS contract tests against the pinned protocol, not sandboxd E2E.
+#[path = "common/authority.rs"]
+mod authority;
 use adx_core::{Assignment, EnvironmentRecord, EnvironmentSpec, EnvironmentState, Resources};
 use adxlet::{
     sandboxd::{connect_when_ready, proto::*, start_request, Config, Sandboxd},
@@ -1574,6 +1576,101 @@ async fn backend_transport_failure_remains_unavailable() {
 }
 
 #[tokio::test]
+async fn mixed_router_delete_before_start_fences_jiuwenbox_too() {
+    let (sandboxd, _harness) = connect(Server::default()).await;
+    let directory = tempfile::tempdir().unwrap();
+    let config = serde_json::from_value(serde_json::json!({
+        "socket": directory.path().join("unused.sock"),
+        "state_dir": directory.path().join("journal"),
+        "bootstrap": {"image":directory.path().join("unused.erofs"),"sha256":"a".repeat(64),"target":"/__adx","command":["/__adx/usr/local/bin/adx-execd"]},
+        "classes": {"supervisor":{"images":{"execd:test":{}}}}
+    })).unwrap();
+    let jiuwenbox = adxlet::jiuwenbox::Jiuwenbox::with_host(
+        config,
+        Config::default(),
+        Arc::new(adxlet::jiuwenbox::host::LinuxHost),
+    )
+    .await
+    .unwrap();
+    let router =
+        adxlet::runtime_router::RuntimeRouter::new(Some(sandboxd), Some(jiuwenbox.clone()))
+            .unwrap();
+    router.remove("i-1").await.unwrap();
+    assert!(jiuwenbox.owns("i-1").await.unwrap());
+    let mut wanted = spec();
+    wanted.runtime_class = "supervisor".into();
+    wanted.resources.disk_bytes = 0;
+    assert!(matches!(
+        router.start(&wanted, "i-1", 1, &[]).await,
+        Err(adx_core::Error::Conflict)
+    ));
+}
+
+#[tokio::test]
+async fn public_authority_cycle_collects_sandboxd_orphan_without_local_controller() {
+    let server = Server::default();
+    let (creator, harness) = connect(server.clone()).await;
+    let adapter = Sandboxd::connect(
+        harness._directory.path().join("rpc.sock"),
+        Config::default(),
+    )
+    .await
+    .unwrap();
+    let router = adxlet::runtime_router::RuntimeRouter::new(Some(adapter), None).unwrap();
+    let node = authority::manager(Arc::new(router));
+    let mut authority = authority::Fixture::new().await;
+    authority.cycle(&node).await.unwrap();
+    // An external successful create has no corresponding node controller/catalog entry.
+    creator.start(&spec(), "i-1", 1, &[]).await.unwrap();
+    assert!(*server.running.lock().unwrap());
+    authority.cycle(&node).await.unwrap();
+    assert!(!*server.running.lock().unwrap());
+    assert_eq!(server.starts.lock().unwrap().len(), 1);
+    assert_eq!(node.used(), Resources::default());
+    assert!(node.accepting_allocations());
+    assert!(
+        authority
+            .authority
+            .reports
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .accepting_allocations
+    );
+}
+
+#[tokio::test]
+async fn public_authority_cycle_reaps_transport_lost_create_after_empty_scan() {
+    let server = Server {
+        transport_error: true,
+        ..Default::default()
+    };
+    let (creator, harness) = connect(server.clone()).await;
+    let adapter = Sandboxd::connect(
+        harness._directory.path().join("rpc.sock"),
+        Config::default(),
+    )
+    .await
+    .unwrap();
+    let node = authority::manager(Arc::new(adapter));
+    assert!(creator.start(&spec(), "i-1", 1, &[]).await.is_err());
+    let mut authority = authority::Fixture::new().await;
+    authority.cycle(&node).await.unwrap();
+    // The first complete inventory was empty; the failed create materializes later.
+    *server.running.lock().unwrap() = true;
+    authority.cycle(&node).await.unwrap();
+    assert!(!*server.running.lock().unwrap());
+    assert!(server
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|r| r == "delete:generated-backend-id"));
+    assert_eq!(server.starts.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn blocked_tunnel_listeners_are_trusted_and_never_add_an_egress_exception() {
     use adx_core::execution as model;
     let policy = model::NetworkPolicy {
@@ -1594,7 +1691,8 @@ async fn blocked_tunnel_listeners_are_trusted_and_never_add_an_egress_exception(
         let server = Server::default();
         let (adapter, _harness) = connect(server.clone()).await;
         adapter.start(&spec, "i-1", 1, &[]).await.unwrap();
-        adapter
+        let router = adxlet::runtime_router::RuntimeRouter::new(Some(adapter), None).unwrap();
+        router
             .set_network_policy("i-1", Some(&policy), &[], Some(http_port))
             .await
             .unwrap();
