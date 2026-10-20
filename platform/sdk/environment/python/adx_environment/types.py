@@ -722,7 +722,9 @@ class Mount:
         for label, path in (("target", self.target), ("host_path", self.host_path)):
             if path is None and label == "host_path":
                 continue
-            if not isinstance(path, str) or not path.startswith("/") or "\0" in path or ".." in path.split("/"):
+            if not isinstance(path, str) or not path.startswith("/"):
+                raise ValueError(f"{label} must be an absolute path without parent traversal or NUL")
+            if "\0" in path or ".." in path.split("/"):
                 raise ValueError(f"{label} must be an absolute path without parent traversal or NUL")
         count = sum(source is not None for source in (self.image_url, self.s3_config, self.host_path))
         if count != 1:

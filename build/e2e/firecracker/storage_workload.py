@@ -6,9 +6,11 @@ from functools import lru_cache
 MIB = 1024**2
 PAYLOAD_BYTES = 512 * MIB
 DIRTY_BYTES = 64 * MIB
+
+
 def data_block(offset, dirty=False):
-    seed = b'adx-storage-dirty-v1' if dirty else b'adx-storage-full-v1'
-    return hashlib.shake_256(seed + offset.to_bytes(8, 'little')).digest(MIB)
+    seed = b"adx-storage-dirty-v1" if dirty else b"adx-storage-full-v1"
+    return hashlib.shake_256(seed + offset.to_bytes(8, "little")).digest(MIB)
 
 
 def expected_digest(dirty=False):
@@ -19,36 +21,38 @@ def expected_digest(dirty=False):
 def _expected_digest(payload_bytes, dirty_bytes, block_size, dirty):
     digest = hashlib.sha256()
     for offset in range(0, payload_bytes, block_size):
-        seed = b'adx-storage-dirty-v1' if dirty and offset < dirty_bytes else b'adx-storage-full-v1'
-        digest.update(hashlib.shake_256(seed + offset.to_bytes(8, 'little')).digest(block_size))
+        seed = b"adx-storage-dirty-v1" if dirty and offset < dirty_bytes else b"adx-storage-full-v1"
+        digest.update(hashlib.shake_256(seed + offset.to_bytes(8, "little")).digest(block_size))
     return digest.hexdigest()
 
 
 def io_engine(environ):
-    value = environ.get('ADX_STORAGE_IO_ENGINE', 'Sync')
-    if value not in ('Sync', 'Async'):
-        raise ValueError('ADX_STORAGE_IO_ENGINE must be Sync or Async')
+    value = environ.get("ADX_STORAGE_IO_ENGINE", "Sync")
+    if value not in ("Sync", "Async"):
+        raise ValueError("ADX_STORAGE_IO_ENGINE must be Sync or Async")
     return value
 
 
 def checkpoint_mode(environ):
-    value = environ.get('ADX_STORAGE_CHECKPOINT_MODE', 'full')
-    if value not in ('full', 'incremental'):
-        raise ValueError('ADX_STORAGE_CHECKPOINT_MODE must be full or incremental')
+    value = environ.get("ADX_STORAGE_CHECKPOINT_MODE", "full")
+    if value not in ("full", "incremental"):
+        raise ValueError("ADX_STORAGE_CHECKPOINT_MODE must be full or incremental")
     return value
 
 
 def verify_checksum(answer, dirty=False):
-    if (answer.get('checked_bytes') != PAYLOAD_BYTES
-            or answer.get('sha256') != expected_digest(dirty)
-            or answer.get('dirty_bytes') != (DIRTY_BYTES if dirty else 0)):
-        raise AssertionError('full guest memory checksum mismatch')
+    if (
+        answer.get("checked_bytes") != PAYLOAD_BYTES
+        or answer.get("sha256") != expected_digest(dirty)
+        or answer.get("dirty_bytes") != (DIRTY_BYTES if dirty else 0)
+    ):
+        raise AssertionError("full guest memory checksum mismatch")
 
 
 # Construct in-place; a temporary 512 MiB bytes copy would exceed the guest budget.
 # Status/first HTTP never computes the checksum, so first-response and full-touch
 # timings remain separate. A single lock makes dirtying and hashing consistent.
-GUEST = '''import hashlib, json, os, threading
+GUEST = """import hashlib, json, os, threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 def block(offset, dirty=False):
@@ -84,14 +88,21 @@ class Server(ThreadingHTTPServer):
 server = Server(('0.0.0.0',8088), Handler)
 open('/tmp/storage-ready', 'w').write(str(os.getpid()))
 server.serve_forever()
-'''
+"""
 
 
 def identity(environ):
-    return {'name': 'deterministic-512m-v1', 'memory_mib': 1024, 'cpu_millis': 1000,
-            'storage_mib': 32, 'payload_bytes': PAYLOAD_BYTES, 'dirty_bytes': DIRTY_BYTES,
-            'source_sha256': hashlib.sha256(GUEST.encode()).hexdigest(),
-            'expected_full_sha256': expected_digest(),
-            'expected_dirty_sha256': expected_digest(True),
-            'writable_io_engine': io_engine(environ), 'writable_cache_type': 'Writeback',
-            'checkpoint_mode': checkpoint_mode(environ)}
+    return {
+        "name": "deterministic-512m-v1",
+        "memory_mib": 1024,
+        "cpu_millis": 1000,
+        "storage_mib": 32,
+        "payload_bytes": PAYLOAD_BYTES,
+        "dirty_bytes": DIRTY_BYTES,
+        "source_sha256": hashlib.sha256(GUEST.encode()).hexdigest(),
+        "expected_full_sha256": expected_digest(),
+        "expected_dirty_sha256": expected_digest(True),
+        "writable_io_engine": io_engine(environ),
+        "writable_cache_type": "Writeback",
+        "checkpoint_mode": checkpoint_mode(environ),
+    }
