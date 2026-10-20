@@ -773,6 +773,10 @@ handle错误cursor与对象尝试错误分别验证；恢复后仍可能消费�
 Linux 上复用 workspace Cargo 入口：
 
 ```sh
+cargo test --locked -p afs --lib p3_initialization
+cargo test --locked -p afs --lib p3_recovery_
+cargo test --locked -p afs --lib p3_lifecycle
+cargo test --locked -p afs --lib grant_lifecycle
 cargo test --locked -p afs --lib p3_configured
 cargo test --locked -p afs --lib p3_production_recovery
 cargo test --locked -p afs --lib p3_checkpoint
@@ -787,6 +791,13 @@ cargo test --locked -p afs --lib p3_watch_
 cargo test --locked -p afs --test meta_log_contract
 cargo test --locked -p afs --test config_contract
 ```
+
+`p3_initialization` 覆盖初始化中断后的身份保持，以及未知／非空残留拒绝；
+`p3_recovery_` 覆盖缺 CURRENT、新非空 WAL 未列入选择集及精确空预备段。
+重复六次 image rename 后 SIGKILL 另验证孤儿镜像不会耗尽后续安装额度，
+外来／损坏镜像不被误删。`p3_lifecycle` 验证已完成命令／ACK 的有界成对回收、
+引用退休和恢复重建，保留 pending／failed／活动屏障及旧 session 拒绝记录。
+这些新增例不构成完整权威实体回收或物理掉电认证。
 
 `meta.rs` 共享启动工厂测试检查实际后端选择、原会话／原结果重开、易失 memory、
 坏完整记录及旧格式拒绝。占用端口的反例确保恢复失败先于 bind；身份策略仍先于后端访问。
@@ -819,7 +830,9 @@ P3-4修改成组后已执行完整默认AFS库门禁；后续P3-5已补管理历
 并核对后续事件序号、Compacted重扫及错误关联清理不部分发布业务前缀。
 `p3_retention` 检查 owned String／Vec capacity 的完整计账及独立结构预留、计数／字节
 拒绝、恢复重建索引、业务关联清理持久后可见、空闲及持续重复请求期间的定时清理，
-以及取消调用者仍由写者持有额度、未知ACK后停止后续管理记录。新事件计账只访问本次
+以及取消调用者仍由写者持有额度、未知ACK后停止后续管理记录。
+排队重试回归通过持久 ACK 门控使历史清理与待组批重试确定性交错，核对原结果不被
+再次执行；另检查同身份引用计数、末引用释放、退休冲突和身份字节上限。新事件计账只访问本次
 新增尾部，不遍历旧历史前缀；原完成时间不因查询、重试或重启而延长。
 `p3_retention_local_runtime` 在真实LocalLog上运行Store actor，检查空闲到期的管理记录
 持久后checkpoint／重开不复活结果，以及降额启动时先持久清理、再次放宽后仍保持原水位。

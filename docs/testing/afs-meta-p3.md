@@ -54,7 +54,7 @@ S夹具为十万业务文件、700001实体、每chunk一份copy元数据，不�
 
 ## 功能证据和交付边界
 
-最新功能候选已在Linux通过Meta253、OwnerFs root25及RootCommand9，包含3个WAL和
+整改前候选 `714f814` 的历史证据在Linux通过Meta253、OwnerFs root25及RootCommand9，包含3个WAL和
 6个checkpoint／轮转的实际子进程SIGKILL及ACK恢复；新增领域形状后Meta合同60、
 namespace LocalLog合同1、fmt和受影响严格Clippy通过。原workspace全targets/allfeatures
 严格Clippy按未变范围复用，不称每轮重新执行整套工程门禁。
@@ -75,9 +75,33 @@ namespace LocalLog合同1、fmt和受影响严格Clippy通过。原workspace全t
   旧目录不自动导入。保留原二进制和匹配目录用于回退，不让旧程序覆盖新日志。
 - requests／events有限保留，窗口外不承诺永久exactly-once；旧watch游标返回Compacted。
   Root停用立即按权威失效，旧grant物理清理由后台完成，不能手工删除水位或恢复链。
-- 当前有限功能范围未发现待修的确定阻断。所有合法拓扑／累计大inode和placement、
+- 对 `714f814` 的独立 review 确认 epoch 和恢复选择等阻断，下表记录本轮整改；
+  不能沿用整改前“未发现确定阻断”的判断。所有合法拓扑／累计大inode和placement、
   Full FSx／完整FUN/REL、M/L、正式性能／恢复时间及完整RSS仍未验收；24h长稳暂停。
   已有有限检查不能替这些项目签署通过，原失败和未完成结论保留。
 
 本PR的出口是上述功能版本和可审查实现，不是完整P3性能／规模验收。下一轮优化与合入
 另行安排；不为本次收尾追加正式性能campaign。
+
+## PR70 有限功能整改
+
+本轮保持原性能数据、失败和41项验收身份，不补性能 campaign。
+各项先以命中风险的 Linux 失败例验证，再执行受影响回归；失败原件保留在本地证据索引。
+
+| 项 | 修正及有限证据 |
+| --- | --- |
+| F1 | epoch仅前水位加一；MAX expected拒绝且水位不变，后续创建／原请求重试正常；grant11 |
+| F2 | 已初始化目录缺CURRENT、新非空WAL未列入清单均拒绝；只接受精确空预备段；LocalLog22及checkpoint六点 |
+| F3 | 完整核验后回收未被恢复点引用的本库镜像；重复六次安装后崩溃仍可checkpoint；LocalLog23 |
+| F4 | 持久INITIALIZING标记及精确前缀恢复；真实初始化SIGKILL后身份保持；初始化3及LocalLog20 |
+| F5 | 入队至处理终态的身份保护与退休互斥，不持锁跨持久I/O；确定性排队重试RED→GREEN，retention14／history11／grant11 |
+| F6 | 成对回收安全完成的命令／ACK，派生引用索引恢复重建且纳入原计账；lifecycle2／retention14／history11／grant11／RootCommand9 |
+
+F6按用户决定保留旧NodeSession持久拒绝记录，不引入退休协议。未ACK、失败、孤立及仍引用
+的命令／ACK保留；现有bind消费者不自动ACK。因此F6只关闭安全完成命令的回收子项，
+NodeSession及未完成命令的长期增长仍未关闭，不增加实体cap或宣称所有权威实体有界。
+F2不检测没有外部见证的整目录自洽回滚。故障测试是同内核SIGKILL，不是物理掉电。
+
+最终集成候选另执行fmt、workspace全targets／allfeatures严格Clippy、原三点WAL及六点
+checkpoint进程故障、meta_log_contract和meta_contract；实际提交、原始结果及未过项以
+原PR70正文为准，不将本节的分项通过当成完整P3、真实FUSE或性能验收。

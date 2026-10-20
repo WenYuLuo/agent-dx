@@ -36,6 +36,9 @@ FUSE 依赖使用根工作区声明的官方固定 `fuser =0.18.0`。
 本工作树 local-file 的操作日志格式、旧目录拒绝及尚未完成的回收限制见
 [Meta 部署合同](../docs/deployment/afs.md#meta-操作日志与数据目录)。
 
+历史结果／watch 有界不表示全部权威实体有界：旧 NodeSession 拒绝记录、未完成及失败
+命令仍保留；安全回收范围和限制见上述部署合同。
+
 Meta 默认使用唯一持久后端 `local-file`。`memory` 仅适合一次性演示；etcd／Redis适配已移除，
 多 Meta/HA、完整 POSIX、跨节点文件锁、复杂故障矩阵和性能达标不在当前承诺内。
 Operator 负责创建 namespace/root grant、配置挂载和回收引用；Environment 创建尚不会
