@@ -27,7 +27,7 @@ pub struct Mount {
     pub create_if_missing: bool,
 }
 
-fn parameter_name(name: &str) -> bool {
+pub(crate) fn parameter_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
         && name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
@@ -58,7 +58,7 @@ fn absolute_path(path: &str) -> ValidationResult {
     )
 }
 
-/// Parameters are bounded, non-secret relative path values. Missing references fail at render time.
+/// Parameters are bounded strings. Each template field validates its rendered value.
 pub fn validate_parameters(parameters: &Parameters) -> ValidationResult {
     if parameters.len() > 64 {
         return Err("at most 64 binding parameters are allowed".into());
@@ -67,7 +67,9 @@ pub fn validate_parameters(parameters: &Parameters) -> ValidationResult {
         if !parameter_name(key) {
             return Err("invalid binding parameter name".into());
         }
-        relative_path(value)?;
+        if value.len() > 8192 || value.contains('\0') {
+            return Err("invalid parameter value".into());
+        }
     }
     Ok(())
 }
@@ -96,9 +98,13 @@ impl Mount {
                 return Err("invalid mount parameter name".into());
             }
             output.push_str(match parameters {
-                Some(parameters) => parameters
-                    .get(name)
-                    .ok_or_else(|| format!("missing mount parameter: {name}"))?,
+                Some(parameters) => {
+                    let value = parameters
+                        .get(name)
+                        .ok_or_else(|| format!("missing mount parameter: {name}"))?;
+                    relative_path(value)?;
+                    value
+                }
                 None => "parameter",
             });
             remaining = &rest[end + 1..];

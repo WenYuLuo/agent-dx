@@ -1099,7 +1099,7 @@ async fn shared_service_access_retries_only_unsent_generation_and_checks_tenant(
     use adx_agent_core::{Protocol, Scope};
     let (gateway, _, routes) = fixture_with_routes().await;
     let state = AgentState::new(Arc::new(MemoryRepository::default()));
-    let template = serde_json::from_value(serde_json::json!({"name":"demo","version":"1","image":"app:1","isolation_runtime":"runc","resources":{"cpu_millis":1000,"memory_mib":512},"service":[{"protocol":"ws","port":8080}]})).unwrap();
+    let template = serde_json::from_value(serde_json::json!({"name":"demo","version":"1","image":"app:1","isolation_runtime":"runc","resources":{"cpu_millis":1000,"memory_mib":512},"service":[{"protocol":"ws","port":8080},{"protocol":"http","port":8080}]})).unwrap();
     state.publish("tenant", &template).await.unwrap();
     let backend = Arc::new(Backend::default());
     let managed = Arc::new(adx_agent_api::managed::ManagedService::new(Arc::new(
@@ -1184,11 +1184,15 @@ async fn shared_service_access_retries_only_unsent_generation_and_checks_tenant(
         "expired deadline cannot trigger activation retry"
     );
 
+    // HTTP retains its generation fence even before any request bytes are sent.
     let pending = access
         .select(
             Arc::new(RequestContext::new(std::time::Duration::from_secs(2))),
             scope.clone(),
-            selector,
+            ServiceSelector {
+                protocol: Protocol::Http,
+                port: None,
+            },
         )
         .await
         .unwrap();
@@ -1773,3 +1777,165 @@ mod jiuwen_http_tests;
 #[cfg(feature = "mock-e2e")]
 #[path = "jiuwen_entrypoint_tests.rs"]
 mod jiuwen_entrypoint_tests;
+
+#[tokio::test]
+async fn managed_ws_consumes_parameters_only_for_the_first_activation() {
+    let state = AgentState::new(Arc::new(MemoryRepository::default()));
+    let activator = Arc::new(adx_activator::Activator::new(
+        state.clone(),
+        Arc::new(Backend::default()),
+    ));
+    let template = serde_json::from_value(serde_json::json!({
+        "name":"params", "version":"1", "image":"app:1", "isolation_runtime":"runc",
+        "resources":{"cpu_millis":250,"memory_mib":256}, "service":[{"protocol":"ws","port":8080}],
+        "env":{"API_BASE":"${model_api_base}"},
+        "mounts":[{"type":"bind","host_path":"/mnt/users/${workspace}","target":"/home/agent"}]
+    }))
+    .unwrap();
+    activator.publish("tenant", &template).await.unwrap();
+    let api = AgentApi {
+        managed: Arc::new(adx_agent_api::managed::ManagedService::new(Arc::new(
+            adx_agent_api::local::LocalControl::new(activator),
+        ))),
+        request_timeout: adx_agent_core::limits::AGENT_REQUEST_TIMEOUT,
+    };
+    let mut selected = None;
+    for parameters in [
+        Some("workspace=alice&model_api_base=https%3A%2F%2Fmodel.example"),
+        None,
+        Some("%malformed"),
+        Some("workspace=../../wrong"),
+    ] {
+        let mut request = Request::builder()
+            .uri("/agent/ws?target=urn:adx:binding:params:1:alice")
+            .header("upgrade", "websocket")
+            .body(())
+            .unwrap();
+        if let Some(value) = parameters {
+            request
+                .headers_mut()
+                .insert(adx_agent_core::parameters::HEADER, value.parse().unwrap());
+        }
+        let access = crate::ingress::agent_access::AccessRequest::parse(&request)
+            .unwrap()
+            .unwrap();
+        api.prepare_data(&mut request, "tenant", access)
+            .await
+            .unwrap();
+        assert!(!request
+            .headers()
+            .contains_key(adx_agent_core::parameters::HEADER));
+        if let Some(uri) = &selected {
+            assert_eq!(request.uri(), uri);
+        } else {
+            selected = Some(request.uri().clone());
+        }
+    }
+    let scope = adx_agent_core::Scope {
+        tenant: "tenant".into(),
+        template: "params".into(),
+        version: "1".into(),
+        binding_id: "alice".into(),
+    };
+    let binding = state.binding(&scope).await.unwrap().unwrap();
+    assert_eq!(binding.parameters["workspace"], "alice");
+    assert_eq!(
+        binding.parameters["model_api_base"],
+        "https://model.example"
+    );
+}
+
+#[tokio::test]
+async fn websocket_retry_refreshes_deleted_or_rebuilt_binding_before_writes() {
+    use crate::ingress::agent_service::{AgentV2Access, ServiceSelector};
+    use adx_agent_api::{local::LocalControl, managed::ManagedService, request::RequestContext};
+    use adx_agent_core::{Protocol, Scope};
+    use std::time::Duration;
+    for protocol in [Protocol::Ws, Protocol::Http] {
+        for rebuilt in [false, true] {
+            let state = AgentState::new(Arc::new(MemoryRepository::default()));
+            let backend = Arc::new(Backend::default());
+            let first = Arc::new(adx_activator::Activator::new(
+                state.clone(),
+                backend.clone(),
+            ));
+            let other = adx_activator::Activator::new(state.clone(), backend);
+            let template = serde_json::from_value(serde_json::json!({
+                "name":"refresh", "version":"1", "image":"app:1", "isolation_runtime":"runc",
+                "resources":{"cpu_millis":250,"memory_mib":256},
+                "service":[{"protocol":"ws","port":8080},{"protocol":"http","port":8080}],
+                "env":{"WORKSPACE":"${workspace}"}
+            }))
+            .unwrap();
+            first.publish("tenant", &template).await.unwrap();
+            let scope = Scope {
+                tenant: "tenant".into(),
+                template: "refresh".into(),
+                version: "1".into(),
+                binding_id: "alice".into(),
+            };
+            let access = AgentV2Access::new(Arc::new(ManagedService::new(Arc::new(
+                LocalControl::new(first),
+            ))));
+            let selector = ServiceSelector {
+                protocol,
+                port: None,
+            };
+            access
+                .select_with_parameters(
+                    Arc::new(RequestContext::new(Duration::from_secs(2))),
+                    scope.clone(),
+                    selector,
+                    Some(b"workspace=old"),
+                )
+                .await
+                .unwrap();
+            let old = state.binding(&scope).await.unwrap().unwrap();
+            other.delete_binding(&scope).await.unwrap();
+            if rebuilt {
+                other
+                    .activate_with_parameters(
+                        &scope,
+                        None,
+                        adx_agent_core::unix_time_millis() + 2000,
+                        false,
+                        Some(b"workspace=other"),
+                    )
+                    .await
+                    .unwrap();
+            }
+            let mut selected = access
+                .select_with_parameters(
+                    Arc::new(RequestContext::new(Duration::from_secs(2))),
+                    scope.clone(),
+                    selector,
+                    Some(b"workspace=new"),
+                )
+                .await
+                .unwrap();
+            assert!(selected
+                .forwarding_uri(&"/".parse().unwrap())
+                .unwrap()
+                .path()
+                .contains(&old.environment_id));
+            let result = access.retry(&mut selected).await;
+            if protocol == Protocol::Http {
+                assert!(matches!(result, Err(adx_agent_api::Error::Conflict(_))));
+                continue;
+            }
+            assert!(result.unwrap());
+            let current = state.binding(&scope).await.unwrap().unwrap();
+            assert_ne!(current.generation, old.generation);
+            assert_eq!(
+                current.parameters["workspace"],
+                if rebuilt { "other" } else { "new" }
+            );
+            assert!(selected
+                .forwarding_uri(&"/".parse().unwrap())
+                .unwrap()
+                .path()
+                .contains(&current.environment_id));
+            assert!(!access.retry(&mut selected).await.unwrap());
+        }
+    }
+}

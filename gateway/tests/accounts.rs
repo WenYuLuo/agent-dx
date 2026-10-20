@@ -370,16 +370,16 @@ async fn postgres_sessions_and_litellm_credentials_survive_retries_and_replicas(
     let bob = b.authenticate(&bob.token).await.unwrap();
     assert_ne!(bob.user_id, pa.user_id);
     assert!(
-        a.launch_config(&pa).await.is_err(),
+        a.model_parameters(&pa).await.is_err(),
         "provider response was lost after key creation"
     );
-    let alice_key = b.launch_config(&pb).await.unwrap();
+    let alice_key = b.model_parameters(&pb).await.unwrap();
     assert_eq!(model.creates.load(Ordering::SeqCst), 1);
     assert_eq!(b.quota(&pb).await.unwrap().quota.balance, 1.0);
-    let (left, right) = tokio::join!(a.launch_config(&pa), b.launch_config(&pb));
+    let (left, right) = tokio::join!(a.model_parameters(&pa), b.model_parameters(&pb));
     assert_eq!(left.unwrap(), right.unwrap());
     assert_eq!(model.creates.load(Ordering::SeqCst), 1);
-    let alice_hash = hex::encode(Sha256::digest(alice_key.env["API_KEY"].as_bytes()));
+    let alice_hash = hex::encode(Sha256::digest(alice_key["model_api_key"].as_bytes()));
     let short_id = &pa.user_id[..8];
     assert_eq!(
         model.keys.lock().unwrap()[&alice_hash]["key_alias"],
@@ -388,24 +388,24 @@ async fn postgres_sessions_and_litellm_credentials_survive_retries_and_replicas(
     let relogin = b.login(login("alice|新昵称")).await.unwrap();
     assert_eq!(relogin.user_id, pa.user_id);
     // Already-issued sessions read the latest stored nickname when reconciling.
-    assert_eq!(a.launch_config(&pa).await.unwrap(), alice_key);
+    assert_eq!(a.model_parameters(&pa).await.unwrap(), alice_key);
     assert_eq!(
         model.keys.lock().unwrap()[&alice_hash]["key_alias"],
         format!("huawei-新昵称-{short_id}")
     );
     b.login(login("alice")).await.unwrap();
-    a.launch_config(&pa).await.unwrap();
+    a.model_parameters(&pa).await.unwrap();
     assert_eq!(
         model.keys.lock().unwrap()[&alice_hash]["key_alias"],
         format!("huawei-新昵称-{short_id}")
     );
-    let bob_key = a.launch_config(&bob).await.unwrap();
-    assert_ne!(alice_key.env["API_KEY"], bob_key.env["API_KEY"]);
+    let bob_key = a.model_parameters(&bob).await.unwrap();
+    assert_ne!(alice_key["model_api_key"], bob_key["model_api_key"]);
     let row=client.query_one("SELECT encrypted_key FROM adx_accounts.model_credentials WHERE tenant=$1 AND user_id=$2",&[&tenant,&pa.user_id]).await.unwrap();
     let encrypted: Vec<u8> = row.get(0);
     assert!(!encrypted
         .windows(8)
-        .any(|v| v == &alice_key.env["API_KEY"].as_bytes()[..8]));
+        .any(|v| v == &alice_key["model_api_key"].as_bytes()[..8]));
     assert_eq!(
         client
             .query_one(
@@ -423,7 +423,7 @@ async fn postgres_sessions_and_litellm_credentials_survive_retries_and_replicas(
         Err(Error::Unauthorized)
     ));
     b.check(&pb).await.unwrap();
-    assert_eq!(b.launch_config(&pb).await.unwrap(), alice_key);
+    assert_eq!(b.model_parameters(&pb).await.unwrap(), alice_key);
     client
         .execute(
             "UPDATE adx_accounts.sessions SET expires_at=0 WHERE tenant=$1 AND user_id=$2",

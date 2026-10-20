@@ -1,42 +1,8 @@
-//! Private, immutable per-binding startup configuration. Never returned in public metadata.
-use crate::{identifier, ValidationResult};
+//! Existing account-database credential protection; unrelated to Binding initialization.
 use ring::{
     aead,
     rand::{SecureRandom, SystemRandom},
 };
-use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, fmt};
-
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct LaunchConfig {
-    pub credential_version: String,
-    pub env: BTreeMap<String, String>,
-}
-impl fmt::Debug for LaunchConfig {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("LaunchConfig([REDACTED])")
-    }
-}
-impl LaunchConfig {
-    pub fn validate(&self) -> ValidationResult {
-        identifier(&self.credential_version, "credential version")?;
-        if self.env.is_empty()
-            || self.env.len() > 4
-            || self.env.iter().any(|(key, value)| {
-                !matches!(
-                    key.as_str(),
-                    "API_KEY" | "API_BASE" | "MODEL_NAME" | "MODEL_PROVIDER"
-                ) || value.is_empty()
-                    || value.len() > 8192
-                    || value.contains('\0')
-            })
-        {
-            return Err("invalid private model configuration".into());
-        }
-        Ok(())
-    }
-}
 
 /// AES-256-GCM envelope; associated data binds ciphertext to its purpose and owner.
 pub struct CredentialCipher(aead::LessSafeKey);

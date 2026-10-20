@@ -1,6 +1,6 @@
 # beegent 接入 ADX Ingress 的 Jiuwen 协议模块设计
 
-状态：已实现 Jiuwen 协议适配、华为 Account Kit 与 AGC Auth 登录、共享业务会话、用户级 LiteLLM 凭据、绑定专属启动配置和 AgentServer 端口 readiness 配置。真实华为授权码登录、真实 AGC 换票、鸿蒙双账号隔离、实机及生产额度控制仍待验收。固定身份 local_fixed 已移除。账户接入契约和验证边界统一记录在本文。
+状态：已实现 Jiuwen 协议适配、华为 Account Kit 与 AGC Auth 登录、共享业务会话、用户级 LiteLLM 凭据、通用模板参数注入和 AgentServer 端口 readiness 配置。真实华为授权码登录、真实 AGC 换票、鸿蒙双账号隔离、实机及生产额度控制仍待验收。固定身份 local_fixed 已移除。账户接入契约和验证边界统一记录在本文。
 
 ## 1. 范围
 
@@ -32,7 +32,7 @@ flowchart TB
         I -->|/api/v1/auth/huawei/login、/api/v1/auth/agc/login 与 /api/v1/auth/logout| AU[账号模块：外部身份验证与业务会话]
         AU --> DB[(PostgreSQL：账号、会话、加密 Key)]
         U -->|验证业务 Token| AU
-        U -->|首次绑定准备| MK[用户模型凭据模块]
+        U -->|共享激活按需取得参数| MK[用户模型凭据模块]
         MK --> DB
         MK --> LL[LiteLLM 管理 API]
         I -->|/ws 与 /file-api/download、/file-api/upload| U
@@ -78,7 +78,7 @@ connect_service(ingress, ServiceSelection) -> IngressStream
 Scope 中的 tenant 必须来自调用方已验证的身份。`ServiceSelection` 是字段不公开的目标选择结果，携带原始 deadline、绑定 generation 及一次未发送重试预算。选择阶段复用 ManagedService 完成 Template 和服务校验、绑定解析及目标激活；建连阶段复用 Ingress 的路由授权、RouteResolver、Connector 与 Relay。调用方不取得 Activator 凭据、Relay 地址或 Execd token。
 
 现有 `/agent/ws` 已走共享建连方法；`/agent/http` 使用相同的目标选择和 generation 重试实现，同时保留 BackendHttpPool，避免将 HTTP 改成每次新建连接。Jiuwen 的 connection.rs 消费共享选择结果，通过 connect_service_when_ready 取得授权 Relay 流，在流上执行受原始 deadline 限制的 WebSocket 握手；不经公开 HTTP/WS 路由回环。握手完成后接入连接内驱动，路由撤销覆盖握手及整个驱动生命周期。同一 binding 可以建立多条独立连接，并发会话语义由业务处理；入口按已验证业务用户选择目标。连接失败保留 Agent 或 Ingress 的类型化错误，租户不匹配、认证拒绝及 draining 不触发目标重新激活。原始 deadline 覆盖 WS 的目标选择与建连，建立后的业务流不使用该短期 deadline。Jiuwen 对尚未监听的业务端口在同一 deadline 内每 250 ms 重试 TCP 建连；这发生在发送 WebSocket 握手和业务字节之前，不重复查询或激活目标。认证拒绝、draining 和握手失败不进入该等待。
-同一次请求的目标失效重试沿用请求 deadline 和绑定 generation；若已开始向后端写入，传输中断、绑定删除或重新创建导致目标变化时直接报错，不自动重放。建立后的业务流由连接本身管理。
+目标失效重试沿用原请求 deadline。HTTP/SSH 固定绑定 generation；WS 在尚未发送后端握手或业务字节时，若权威元数据确认 Binding 已删除或换代，可重新解析一次，缺失时复用本次初始化参数，已有绑定忽略新参数。Deleting、鉴权失败、draining 和同 generation 的冲突不触发重选。若已开始向后端写入，传输中断、绑定删除或重新创建导致目标变化时直接报错，不自动重放。建立后的业务流由连接本身管理。
 
 文件读写由 `gateway/src/ingress/environment_files.rs` 的 `Files` 统一实现：文件元数据、限量读取、上传暂存与提交。Jiuwen `download_runtime::Reader` 保留下载 token 和资产登记验证，上传 handler 保留 multipart、workspace 和用户检查。两者调用通用文件能力；`Environment` 生命周期接口不再提供 runtime 凭据读取。`PlatformEnvironment` 与 `EnvironmentRequestMapper` 已删除。
 
@@ -153,7 +153,7 @@ Ingress 新增账号模块：华为 Account Kit 授权码兑换可信 UnionID，
 
 binding_id 为紧凑 JSON 数组 `[tenant,userId,agent_type]` 的 SHA-256 小写十六进制加 `jiuwen-` 前缀。模板版本只进入完整 Scope。请求的身份字段不能改选目标；`/ws` 忽略客户端查询参数 `user_id` 的值，所有身份与实例路由仍取自业务会话。下载中的 user_id 仅做一致性核对。
 
-登录不创建实例或调用 LiteLLM。首次 WS 为用户注册/复用 LiteLLM 模型 Key，并通过内部 `bindings/prepare` 原子提交绑定与加密私有启动配置。Activator 将私有模型环境变量覆盖到模板配置后创建 Environment；重试、跨副本创建和重建复用该 Binding 的同一份配置。公开 Binding/Template 不返回用户 Key。用户可在自己的 Environment 中读取自己的 Key。
+登录不创建实例或调用 LiteLLM。首次 WS 的共享解析/激活流程按需向 Jiuwen 业务参数提供方取得用户模型 Key、推理地址和工作区参数，原子创建 Binding，并使用 parameters 渲染 Template.env 和 mounts。热绑定复用持久化参数，不再请求模型管理入口。独立 Activator 与内嵌 Activator 使用同一激活契约；独立 prepare 接口和 Binding 私有 launch 快照已移除。parameters 当前明文保存，后续模型凭据加解密由业务 Gateway/AgentServer 承担。
 
 详细接口、数据库 schema、凭据签发重试、加密与密钥部署、会话撤销和验证范围见本文第 8 节。退出不销毁绑定或更换模型 Key。密钥热轮换、账号禁用到 LiteLLM 的自动联动后置。
 
@@ -270,9 +270,9 @@ PostgreSQL 独立 schema `adx_accounts` 保存：
 
 登录不依赖 LiteLLM，也不创建 Environment。首次 WS 需要新 Binding 或首次查询额度时，先在 PostgreSQL 原子保存候选 Key，再调用 LiteLLM `/user/info`、`/user/new`、`/key/info`、`/key/generate`。每次重试使用同一已保存 Key；未知结果通过 key/info 对账，不换 Key。管理 API 使用受保护的管理凭据，密钥查询使用 Key 的 SHA-256，不将可用 Key 放在查询 URL。用户 Key 指定 user_id、llm_api 类型、模型白名单、max_budget 和 RPM/TPM；budget_duration 为 null 时 Key 预算不重置，配置周期后按 LiteLLM 周期重置。额度接口按 Jiuwenswarm 的结构返回 quota.total、balance、used、low_balance、exhausted、reset_period、reset_at；max_budget/spend 1:1 显示为积分，底层仍是 LiteLLM 的预算记账，不是独立的精确 token 计数。账号示例使用 5 积分、1d 周期；配合 [MaaS 统一计价配置](../../build/config/examples/litellm-maas.md)，每百万输入加输出 token（含缓存输入）计 1 积分，形成每日 500 万 token 的折算额度。该模式的 spend 不代表真实美元成本；LiteLLM 1.104.2 按 UTC 零点重置，并发调用可能超额。已有 Key 的预算需通过管理 API 单独更新。生产需选用支持这些 API 参数的 LiteLLM 版本并真实验收。
 
-Jiuwen 经 `ManagedService.prepare_binding` 调用内部 `/internal/adx/v1/bindings/prepare`，私有 LaunchConfig 仅包含 API_KEY、API_BASE；模型展示与选择由 Template 环境配置。AgentState 将加密配置与新 Binding 在同一个 Redis 事务内提交，AAD 绑定完整 Scope 与 generation。配置不出现在公开 Binding/Target/列表中；Debug 隐去明文。重复准备相同配置返回同一 Binding，不同配置返回冲突。Environment 删除成功或明确返回 NotFound 后，按绑定 generation 条件同时删除绑定与私有配置；鉴权失败、超时及未知结果保留记录。
+Jiuwen 将工作区和用户模型访问值提供为通用 parameters：workspace、model_api_key、model_api_base。Template 通过 mounts.host_path 和 env 占位符声明使用方式。共享解析/激活流程在缺少 Binding 时取得这些值、校验并原子保存；已有 Binding 不解析或校验新的参数，继续使用持久化值。并发首次创建以落库成功的记录为准。参数以明文保存并出现在 Binding 元数据中，模型 Key 后续保护由业务 Gateway/AgentServer 负责，不提供独立 launch 存储或 prepare 接口。
 
-Activator 将私有配置覆盖到模板环境变量，再调用已有 Environment 能力。独立及嵌入式模式共用这一实现。配置在 Binding 生命周期内不可变；冷启动重试和重建复用它，热实例访问不查询 LiteLLM 管理服务。当前不实现密钥热轮换；需要显式处理相关 Binding 和 Environment。用户可以在自己的 Environment 中取得自己的模型 Key；管理密钥和上游共享密钥不注入。
+Activator 对参数做通用模板渲染，再调用已有 Environment 能力。独立及嵌入式模式共用实现。热实例访问不查询 LiteLLM 管理服务；用户模型 Key 和 API_BASE 的值通过模板 env 注入，而非额外覆盖模板配置。用户可以在自己的 Environment 中取得自己的模型 Key；管理密钥和上游共享密钥不注入。
 
 退出仅撤销当前业务会话。将账号设为 disabled/deleted 会拒绝登录和业务访问，但不会自动调用 LiteLLM 撤销已发 Key；若需要同时停止独立模型调用，运维需在 LiteLLM 阻断该 Key。自动账号状态联动不在本期实现中。
 
@@ -294,10 +294,10 @@ HUAWEI_OAUTH_CLIENT_SECRET=<应用 Client Secret>
 ADX_AGC_API_CLIENT_SECRET=<AGC 中国区项目 API client secret>
 ADX_ACCOUNT_DATABASE_URL=<PostgreSQL URL>
 ADX_LITELLM_ADMIN_KEY=<LiteLLM 管理凭据>
-ADX_CREDENTIAL_KEY_FILE=/run/secrets/adx-credential-key
+ADX_CREDENTIAL_KEY_FILE=/run/secrets/adx-account-credential-key
 ```
 
-credential-key 文件包含 32 字节随机密钥的 64 位十六进制文本，保护文件读取权限，并备份密钥。所有 Ingress 和独立 Activator 必须挂载相同密钥；独立 Activator 也配置 ADX_CREDENTIAL_KEY_FILE。未配置时，通用 Agent 功能可继续使用，但私有绑定配置准备与读取失败。不要随进程重启重新生成，否则已有凭据无法解密。
+ADX_CREDENTIAL_KEY_FILE 仅供内置账号模块保护 PostgreSQL 中的用户模型凭据，所有账号模块副本使用相同的 32 字节密钥（64 位十六进制文本）。独立 Activator 不读取该文件；Binding.parameters 不加密，不再有独立私有启动快照。
 
 PostgreSQL 默认强制 TLS 并验证证书，database_ca_file 可增加内部 CA；database_allow_plaintext 仅用于明确受信的隔离网络。LiteLLM 默认要求 HTTPS，allow_plaintext 仅用于同类内部网络。华为 Account Kit 与 AGC 中国区目标地址固定，不接受请求覆盖。配置 AGC 后缺少 API client secret、其他生产凭据缺失或数据库 schema 不匹配时启动失败，不回退到本地身份。
 

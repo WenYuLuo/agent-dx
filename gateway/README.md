@@ -377,7 +377,7 @@ With `agent-api`, `AgentApi::service_access()` supplies `AgentV2Access` backed b
 its existing ManagedService. `select` validates the authenticated tenant's binding
 scope and declared service, retaining the request deadline and binding generation.
 `connect_service` opens an authorized Relay stream and can refresh the same
-generation once after an unsent route/connection failure. Authorization failures do
+generation once after an unsent route/connection failure. Before any backend WS handshake or business bytes are sent, WS admission may refresh once when authoritative metadata confirms that the Binding was deleted or rebuilt, retaining its original deadline and initialization input. HTTP/SSH remain generation-fenced. Authorization failures do
 not reactivate the target. Returned streams never replay application writes.
 Managed WS uses this path; managed HTTP shares selection/retry while retaining the
 backend HTTP pool. The Jiuwen codecs, bounded session/request state and E2A socket
@@ -573,33 +573,25 @@ PostgreSQL schema. Apply [schema.sql](src/ingress/accounts/schema.sql) before
 startup for a fresh database. The unpublished schema remains version 1. For an existing
 development database created from an older version of that definition, the schema owner
 adds the nullable `users.display_name` column directly before starting the updated Ingress;
-no version-2 marker or migration file is used. Ingress and standalone Activators share `ADX_CREDENTIAL_KEY_FILE`, a
-protected file containing a persistent 32-byte encryption key as 64 hex characters.
-Huawei application secrets, the AGC API client secret, and LiteLLM administrative keys
-remain on Ingress. Account rows use an explicit provider and provider scope. AGC identity
-is keyed by tenant, `agc`, configured project ID, and verified UID; Huawei identity retains
-its existing tenant/developer-scope/UnionID key. Equal external identifier strings across
-the two providers do not link accounts or resources.
+no version-2 marker or migration file is used. Only the built-in account module reads `ADX_CREDENTIAL_KEY_FILE` to protect its PostgreSQL credentials. Activators no longer keep a private launch snapshot. First access supplies ordinary parameters for Template.env and mounts.host_path rendering; parameters are currently stored as plaintext Binding metadata. Existing Bindings ignore subsequent initialization input, including malformed values.
 
-The first WS for a new binding, or the first quota query, provisions/reconciles
-a user model key. The WS then
-prepares an immutable private binding launch configuration. Activator overlays
-that configuration on the shared template environment before Environment creation.
-Retries and rebuilds reuse it; public Binding metadata does not return it.
-The private launch environment supplies only `API_KEY` and `API_BASE`. Model
-selection belongs to the template, not `accounts.litellm`; the account configuration
-has no `model` field. Jiuwen templates may declare `JIUWEN_PLATFORM_MODELS` as a
-JSON array in `TemplateVersion.env`, consumed by their image's startup adapter.
-ADX forwards that public environment unchanged; it does not parse Jiuwen's model
-configuration or add model names to the image.
+The first WS for a missing binding, or a quota query, provisions/reconciles
+an account model key. The shared activation path obtains ordinary rendering parameters
+from the business adapter only for a missing Binding. Jiuwen supplies `workspace`,
+`model_api_key` and `model_api_base`; its Template declares `API_KEY: "${model_api_key}"`
+and `API_BASE: "${model_api_base}"`. Activator renders the Template using persisted
+parameters instead of overlaying a second private launch configuration. Parameters are
+currently plaintext metadata; future application encryption belongs to the business
+Gateway and AgentServer. Warm access does not fetch new model credentials. Model names
+and `JIUWEN_PLATFORM_MODELS` remain deployment Template values, interpreted by the image.
 
 User keys are created with `models: ["all-proxy-models"]`, covering current and
-future LiteLLM proxy models. Preparing a launch or querying quota also reconciles
+future LiteLLM proxy models. Initializing a Binding or querying quota also reconciles
 an existing owner's key through `/key/update`, changing only model access and the display alias. Key
 identity, spend, budget and rate limits remain unchanged. Ownership mismatch or a
 blocked key is rejected before an update; failed or lost responses are retried with
 the same key. Warm binding access does not call LiteLLM management: existing warm
-users acquire expanded access on a quota query, new binding preparation, or an
+users acquire expanded access on a quota query, new Binding initialization, or an
 explicit reconciliation. The template's list controls the models shown
 in Jiuwen, not the LiteLLM key's authorization boundary.
 
