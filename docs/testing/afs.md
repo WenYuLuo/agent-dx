@@ -590,12 +590,10 @@ RSS允许偏差和观测窗口，完成原提交入口、释放所有引用后�
 
 ## Peer HTTP/2接收帧验证
 
-`cp05v2_actual_compact_rpc_reduces_http2_data_frames`用实际PeerConnectionPool Channel
-与显式16KiB控制Channel交付相同128KiB紧凑结果，先核正文、原解码器、EOF和单次RPC，
-正常退出测试server/proxy后再比较透明代理按HTTP/2头长度读取的真实DATA帧。
-代理只用于机制断言，不以代理下耗时/CPU当产品收益；不把SETTINGS上限当减帧结果。
-OwnerFiles接收上限、Node监听端、原流控/消息/载荷/控制/并发预算保持；相关RPC回归仍需
-覆盖大范围、proof、取消、晚到Status、错误与排空。Linux功能与性能通过范围各自绑定输入。
+`dfs_peer_receive_cap_reduces_actual_http2_data_frames`用原有64KiB业务流式协议分别经
+显式16KiB控制Channel和生产PeerConnectionPool交付同一128KiB正文，先核正文、原解码器、
+EOF和单次RPC，再比较透明代理按HTTP/2头读取的非空DATA帧。代理只用于机制断言，不以其
+耗时或CPU作为产品收益；流控、消息、正文、控制和并发预算必须保持。
 
 ## Peer 完整对象唯一核根回归
 

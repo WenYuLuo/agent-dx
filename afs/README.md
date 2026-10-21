@@ -8,10 +8,8 @@ OwnerFs 与 DistributedFs（DFS）两种文件访问模式。`afs-meta` 管理�
 
 AFS 默认不进入普通 ADX 构建和发布包；通过 `ADX_WITH_AFS=1` 显式启用。
 当前部署必须使用 mTLS，并把每张受信节点证书精确绑定到一个 Node ID。
-
-DFS 对不带 proof、长度不超过 128 KiB 的普通 Peer 范围读使用单条有界业务消息，
-并允许 Peer 客户端接收 128 KiB HTTP/2 DATA 帧。更大范围和带 proof 的请求继续
-使用原有有界流式协议；消息、正文、流控窗口及并发预算保持不变。
+DFS Peer 客户端允许接收 128 KiB HTTP/2 DATA 帧；业务消息、流控窗口、正文预算、
+并发和校验合同保持不变，对端仍可发送更小的帧。
 
 ![AFS 架构总览](../assets/architecture/afs.svg)
 
