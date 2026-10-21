@@ -1,5 +1,5 @@
-//! Snapshot creation uses ordinary scheduling; the reference protects its source
-//! until the node commits its independently owned recovery artifact.
+//! Creation from a Snapshot uses ordinary scheduling; its reference protects
+//! the borrowed artifact while the node restores the new execution.
 use super::*;
 use adx_core::snapshots::{Reference, SnapshotState};
 
@@ -89,16 +89,58 @@ pub(super) async fn normalize(
         }
     }
     if snapshot.artifact.storage != "local" {
-        if policy.required_node.is_empty() {
-            policy.required_node.push(Default::default());
-        }
-        for alternative in &mut policy.required_node {
-            alternative.expressions.push(pb::LabelRequirement {
-                key: "ADX_CHECKPOINT_STORAGE".into(),
-                op: pb::SelectorOp::In as i32,
-                values: vec![snapshot.artifact.storage.clone()],
-            });
-        }
+        require_shared_storage(policy, &snapshot.artifact.storage);
     }
     request.try_into()
+}
+
+fn require_shared_storage(policy: &mut pb::SchedulingPolicy, storage: &str) {
+    if policy.required_node.is_empty() {
+        policy.required_node.push(Default::default());
+    }
+    let required = pb::LabelRequirement {
+        key: "ADX_CHECKPOINT_STORAGE".into(),
+        op: pb::SelectorOp::In as i32,
+        values: vec![storage.into()],
+    };
+    for alternative in &mut policy.required_node {
+        if !alternative.expressions.contains(&required) {
+            alternative.expressions.push(required.clone());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shared_snapshot_normalization_is_idempotent_for_every_placement_alternative() {
+        let mut policy = pb::SchedulingPolicy::default();
+        // Cover both unrestricted scheduling and an explicit cross-node target.
+        for target in [None, Some("target-node")] {
+            if let Some(node) = target {
+                policy.required_node.push(pb::LabelSelector {
+                    expressions: vec![pb::LabelRequirement {
+                        key: "NODE_ID".into(),
+                        op: pb::SelectorOp::In as i32,
+                        values: vec![node.into()],
+                    }],
+                    ..Default::default()
+                });
+            }
+            require_shared_storage(&mut policy, "shared-fs");
+            let normalized = policy.clone();
+            require_shared_storage(&mut policy, "shared-fs");
+            assert_eq!(policy, normalized);
+            assert!(policy.required_node.iter().all(|alternative| {
+                alternative
+                    .expressions
+                    .iter()
+                    .filter(|requirement| requirement.key == "ADX_CHECKPOINT_STORAGE")
+                    .count()
+                    == 1
+            }));
+        }
+    }
 }
