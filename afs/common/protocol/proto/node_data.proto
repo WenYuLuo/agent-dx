@@ -234,11 +234,22 @@ message DfsReadRangesCompletion {
   DfsDigestAlgorithm range_checksum_algorithm = 7;
 }
 
+// One complete ordinary range, at most 128KiB. The RPC and operation_index
+// bind it to the request; there is no separate header or completion. The
+// checksum retains the ordinary range contract, not an original-root proof.
+// Requests for outboard metadata and larger ranges use the bounded stream.
+message DfsReadRangeReply {
+  uint32 operation_index = 1;
+  bytes data = 2;
+  bytes range_checksum = 3; // BLAKE3, exactly 32 bytes.
+}
+
 message DfsReadRangesFrame {
   oneof body {
     DfsReadRangesHeader header = 1;
     bytes data = 2;
     DfsReadRangesCompletion completion = 3;
+    DfsReadRangeReply compact = 4;
   }
 }
 

@@ -99,6 +99,7 @@ use crate::node::vfs::{
 };
 
 const MAX_TRANSFER_BYTES: usize = crate::node::storage::MAX_TRANSFER_BYTES;
+const DFS_PEER_RECEIVE_FRAME_BYTES: u32 = 128 * 1024;
 #[cfg(feature = "ownerfs")]
 const MAX_PENDING_RELEASES: usize = 64;
 #[cfg(feature = "ownerfs")]
@@ -986,13 +987,14 @@ impl PeerConnectionPool {
         } else {
             self.config.configure_long_wait_client(endpoint)
         };
-        // This bounds each incoming frame, not the message/flow-control window.
-        // Smaller frames remain valid; TLS, deadlines and message limits remain.
-        let endpoint = if owner_files {
-            endpoint.max_frame_size(256 * 1024)
+        // Only the client's receive cap changes; the Node listener retains its
+        // existing policy. Frames still consume the original flow-control window,
+        // and message limits, payload budgets, TLS and deadlines are unchanged.
+        let endpoint = endpoint.max_frame_size(if owner_files {
+            256 * 1024
         } else {
-            endpoint
-        };
+            DFS_PEER_RECEIVE_FRAME_BYTES
+        });
         let endpoint = self.security.configure_client(endpoint).map_err(|error| {
             afs_error::Error::coded(afs_error::CLIENT_ARGUMENT_INVALID, error.to_string())
         })?;
@@ -1525,7 +1527,7 @@ fn peer_stream_control_capacity(
             *data = prost::bytes::Bytes::new();
             0
         }
-        Some(dfs_read_ranges_frame::Body::Data(_)) => {
+        Some(dfs_read_ranges_frame::Body::Data(_) | dfs_read_ranges_frame::Body::Compact(_)) => {
             return Err(dfs_protocol_error(
                 "Peer data cannot enter the control queue",
             ));
@@ -2719,6 +2721,7 @@ where
         let frame = frame.map_err(afs_transport::grpc::error_status::status_to_error)?;
         let copied = match &frame.body {
             Some(dfs_read_ranges_frame::Body::Data(bytes)) => bytes.len() as u64,
+            Some(dfs_read_ranges_frame::Body::Compact(reply)) => reply.data.len() as u64,
             _ => 0,
         };
         decoder.accept(frame, out)?;
@@ -2981,6 +2984,9 @@ impl<'a> ReadFrameDecoder<'a> {
         observation: PeerConsumerObservation<'_>,
     ) -> afs_error::Result<()> {
         match frame.body {
+            Some(dfs_read_ranges_frame::Body::Compact(reply)) => {
+                self.accept_compact(reply, output_length, write, observation)?;
+            }
             Some(dfs_read_ranges_frame::Body::Header(header)) => {
                 let index = header.operation_index as usize;
                 let op = self
@@ -3109,6 +3115,58 @@ impl<'a> ReadFrameDecoder<'a> {
             }
             None => return Err(dfs_protocol_error("empty peer frame")),
         }
+        Ok(())
+    }
+
+    fn accept_compact(
+        &mut self,
+        reply: afs_protocol::node_data::DfsReadRangeReply,
+        output_length: usize,
+        mut write: impl FnMut(usize, &[u8]) -> afs_error::Result<()>,
+        observation: PeerConsumerObservation<'_>,
+    ) -> afs_error::Result<()> {
+        // A compact reply is a complete ordinary operation, never a substitute
+        // for a full-object proof or a control frame in the disk pipeline.
+        if self.request.include_blake3_outboard
+            || self.verified_object.is_some()
+            || self.active.is_some()
+            || reply.data.is_empty()
+            || reply.data.len() > afs_protocol::node_data::DFS_COMPACT_RANGE_MAX_BYTES
+        {
+            return Err(dfs_protocol_error("unexpected compact Peer range reply"));
+        }
+        let index = usize::try_from(reply.operation_index)
+            .map_err(|_| dfs_protocol_error("compact Peer operation index overflow"))?;
+        let op = self
+            .request
+            .operations
+            .get(index)
+            .ok_or_else(|| dfs_protocol_error("unknown compact Peer read operation"))?;
+        if op.operation_index != reply.operation_index
+            || self.completed[index]
+            || op.length != reply.data.len() as u64
+        {
+            return Err(dfs_protocol_error("compact Peer operation/length mismatch"));
+        }
+        let start = usize::try_from(op.destination_offset)
+            .map_err(|_| dfs_protocol_error("compact Peer destination overflow"))?;
+        start
+            .checked_add(reply.data.len())
+            .filter(|end| *end <= output_length)
+            .ok_or_else(|| dfs_protocol_error("compact Peer reply exceeds destination"))?;
+        let digest = observation.measure(
+            ReadDiagnosticConsumerStage::RootBlake3,
+            reply.data.len() as u64,
+            || blake3::hash(&reply.data),
+        );
+        if let Some(metrics) = observation.metrics {
+            metrics.hash("peer_range_in_receive", reply.data.len() as u64);
+        }
+        if reply.range_checksum.as_slice() != digest.as_bytes() {
+            return Err(dfs_corrupt_error("compact Peer range checksum mismatch"));
+        }
+        write(start, &reply.data)?;
+        self.completed[index] = true;
         Ok(())
     }
 
@@ -6824,6 +6882,17 @@ mod tests {
         ) -> Result<Response<Self::ReadRangesStream>, Status> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let request = request.into_inner();
+            if self.mode == 17 {
+                assert!(!request.include_blake3_outboard);
+                assert_eq!(request.operations.len(), 1);
+                assert_eq!(request.operations[0].length as usize, self.body.len());
+                return Ok(Response::new(Box::pin(tokio_stream::iter([Ok(
+                    compact_range_frame(
+                        request.operations[0].operation_index,
+                        self.body.as_ref().clone(),
+                    ),
+                )]))));
+            }
             if let Some(objects) = &self.fetch_objects {
                 if let Some((target, gate)) = &self.fetch_gate
                     && request.operations.iter().any(|operation| {
@@ -8888,6 +8957,268 @@ mod tests {
     }
 
     #[cfg(feature = "dfs")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cp05v2_actual_compact_rpc_reduces_http2_data_frames() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut observations = Vec::new();
+        for production in [false, true] {
+            let payload = vec![37; 128 * 1024];
+            let chunk = crate::node::chunk::StagedChunk::new(
+                crate::dfs::OperationId::new("cp05v2-frames"),
+                payload.clone(),
+            )
+            .chunk;
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let server_address = listener.local_addr().unwrap();
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let fixture = DiskStreamFixture {
+                chunk,
+                body: Arc::new(payload.clone()),
+                mode: 17,
+                calls: calls.clone(),
+                fetch_objects: None,
+                fetch_gate: None,
+            };
+            let (stop_server, server_done) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(
+                Server::builder()
+                    .add_service(
+                        afs_protocol::node_data::dfs_chunks_server::DfsChunksServer::new(fixture),
+                    )
+                    .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
+                        let _ = server_done.await;
+                    }),
+            );
+            let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}", proxy_listener.local_addr().unwrap());
+            let data_frames = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let frames = data_frames.clone();
+            let (stop_proxy, proxy_done) = tokio::sync::oneshot::channel();
+            let proxy = tokio::spawn(async move {
+                let (client, _) = proxy_listener.accept().await.unwrap();
+                let upstream = tokio::net::TcpStream::connect(server_address)
+                    .await
+                    .unwrap();
+                let (mut client_read, mut client_write) = client.into_split();
+                let (mut upstream_read, mut upstream_write) = upstream.into_split();
+                let responses = async {
+                    loop {
+                        let mut header = [0; 9];
+                        if let Err(error) = upstream_read.read_exact(&mut header).await {
+                            assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+                            break;
+                        }
+                        let length = (usize::from(header[0]) << 16)
+                            | (usize::from(header[1]) << 8)
+                            | usize::from(header[2]);
+                        assert!(length <= 2 * 1024 * 1024);
+                        let mut body = vec![0; length];
+                        upstream_read.read_exact(&mut body).await.unwrap();
+                        let stream_id =
+                            u32::from_be_bytes([header[5] & 0x7f, header[6], header[7], header[8]]);
+                        if header[3] == 0 && stream_id != 0 && length != 0 {
+                            frames.lock().unwrap().push(length);
+                        }
+                        client_write.write_all(&header).await.unwrap();
+                        client_write.write_all(&body).await.unwrap();
+                    }
+                };
+                tokio::select! {
+                    result = tokio::io::copy(&mut client_read, &mut upstream_write) => { result.unwrap(); }
+                    () = responses => {}
+                    _ = proxy_done => {}
+                }
+            });
+            let config = afs_transport::GrpcConfig::default();
+            assert_eq!(config.initial_connection_window_size, 2 * 1024 * 1024);
+            assert_eq!(config.initial_stream_window_size, 2 * 1024 * 1024);
+            let pool =
+                PeerConnectionPool::new(config.clone(), afs_transport::TlsConfig::Disabled, 1)
+                    .unwrap();
+            let channel = if production {
+                pool.channel("node-a", 1, &endpoint).await.unwrap()
+            } else {
+                config
+                    .configure_client(Endpoint::from_shared(endpoint).unwrap())
+                    .max_frame_size(16 * 1024)
+                    .connect_lazy()
+            };
+            let mut client =
+                afs_protocol::node_data::dfs_chunks_client::DfsChunksClient::new(channel);
+            let mut request = range_request();
+            request.operations.truncate(1);
+            request.operations[0].length = payload.len() as u64;
+            let stream = client
+                .read_ranges(request.clone())
+                .await
+                .unwrap()
+                .into_inner();
+            let mut output = vec![0; payload.len()];
+            consume_peer_read_stream(&request, None, &mut output, stream, None, None)
+                .await
+                .unwrap();
+            assert_eq!(output, payload);
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            let lengths = data_frames.lock().unwrap().clone();
+            assert!(!lengths.is_empty());
+            observations.push(lengths);
+            drop(client);
+            drop(pool);
+            let _ = stop_proxy.send(());
+            tokio::time::timeout(Duration::from_secs(3), proxy)
+                .await
+                .unwrap()
+                .unwrap();
+            let _ = stop_server.send(());
+            tokio::time::timeout(Duration::from_secs(3), server)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        }
+        eprintln!(
+            "cp05v2 actual HTTP2 DATA payload lengths: control={:?}, production={:?}",
+            observations[0], observations[1]
+        );
+        assert!(observations[0].iter().all(|length| *length <= 16 * 1024));
+        assert!(
+            observations[1].len() < observations[0].len(),
+            "production must reduce actual HTTP2 DATA frames, after identical complete application delivery"
+        );
+        assert!(observations[1].iter().any(|length| *length > 16 * 1024));
+    }
+
+    #[cfg(feature = "dfs")]
+    fn compact_range_frame(
+        index: u32,
+        data: Vec<u8>,
+    ) -> afs_protocol::node_data::DfsReadRangesFrame {
+        afs_protocol::node_data::DfsReadRangesFrame {
+            body: Some(dfs_read_ranges_frame::Body::Compact(
+                afs_protocol::node_data::DfsReadRangeReply {
+                    operation_index: index,
+                    range_checksum: blake3::hash(&data).as_bytes().to_vec(),
+                    data: data.into(),
+                },
+            )),
+        }
+    }
+
+    #[cfg(feature = "dfs")]
+    #[test]
+    fn cp04v2_compact_codec_bounds_share_backing_and_exclude_disk_controls() {
+        use prost::Message;
+        let maximum = afs_protocol::node_data::DFS_COMPACT_RANGE_MAX_BYTES;
+        let frame = compact_range_frame(u32::MAX, vec![37; maximum]);
+        let encoded = prost::bytes::Bytes::from(frame.encode_to_vec());
+        assert!(encoded.len() > STREAM_MESSAGE_BYTES);
+        assert!(encoded.len() <= maximum + 64);
+        let mut decoded =
+            afs_protocol::node_data::DfsReadRangesFrame::decode(encoded.clone()).unwrap();
+        let Some(dfs_read_ranges_frame::Body::Compact(reply)) = &decoded.body else {
+            panic!("compact tag must round-trip");
+        };
+        let start = encoded.as_ptr() as usize;
+        let body_start = reply.data.as_ptr() as usize;
+        assert!(body_start >= start);
+        assert!(body_start + reply.data.len() <= start + encoded.len());
+        assert_eq!(reply.data.as_ref(), &[37; 128 * 1024]);
+        assert!(peer_stream_control_capacity(&mut decoded).is_err());
+    }
+
+    #[cfg(feature = "dfs")]
+    #[test]
+    fn cp04v2_compact_decoder_preserves_mixed_operations_eof_and_duplicate_checks() {
+        let request = range_request();
+        let compact = compact_range_frame(0, vec![b'a']);
+        let mut decoder = ReadFrameDecoder::new(&request);
+        let mut out = [0; 2];
+        decoder.accept(compact.clone(), &mut out).unwrap();
+        assert!(decoder.check_finished().is_err());
+        assert!(decoder.accept(compact, &mut out).is_err());
+        for frame in range_frames(&request, 1) {
+            decoder.accept(frame, &mut out).unwrap();
+        }
+        decoder.finish().unwrap();
+        assert_eq!(&out, b"ab");
+    }
+
+    #[cfg(feature = "dfs")]
+    #[test]
+    fn cp04v2_compact_decoder_rejects_invalid_shapes_without_writing() {
+        for case in 0..9 {
+            let mut request = range_request();
+            let mut frame = compact_range_frame(0, vec![b'a']);
+            let Some(dfs_read_ranges_frame::Body::Compact(reply)) = &mut frame.body else {
+                unreachable!();
+            };
+            match case {
+                0 => reply.operation_index = 9,
+                1 => reply.data = vec![b'a'; 2].into(),
+                2 => {
+                    let length = afs_protocol::node_data::DFS_COMPACT_RANGE_MAX_BYTES + 1;
+                    request.operations[0].length = length as u64;
+                    reply.data = vec![b'a'; length].into();
+                    reply.range_checksum = blake3::hash(&reply.data).as_bytes().to_vec();
+                }
+                3 => reply.range_checksum[0] ^= 1,
+                4 => request.include_blake3_outboard = true,
+                5 => request.operations[0].destination_offset = u64::MAX,
+                6 => reply.data = Default::default(),
+                7 => request.operations[0].operation_index = 1,
+                _ => {}
+            }
+            let mut decoder = ReadFrameDecoder::new(&request);
+            let mut out = [0x93; 2];
+            if case == 8 {
+                decoder
+                    .accept(range_frames(&request, 0).remove(0), &mut out)
+                    .unwrap();
+            }
+            let error = decoder.accept(frame, &mut out).unwrap_err();
+            assert_eq!(out, [0x93; 2], "case {case}");
+            assert_eq!(
+                error.code(),
+                if case == 3 {
+                    afs_error::NODE_TRANSFER_CORRUPT_DATA
+                } else {
+                    afs_error::CLIENT_PROTOCOL_VIOLATION
+                }
+            );
+        }
+        let body = vec![7; 32];
+        let (chunk, mut request, _) = verified_object_frames(&body);
+        request.include_blake3_outboard = false;
+        let mut decoder = ReadFrameDecoder::for_object(&request, &chunk).unwrap();
+        let mut out = vec![0x93; body.len()];
+        assert!(
+            decoder
+                .accept(compact_range_frame(0, body), &mut out)
+                .is_err()
+        );
+        assert!(out.iter().all(|byte| *byte == 0x93));
+    }
+
+    #[cfg(feature = "dfs")]
+    #[tokio::test]
+    async fn cp04v2_compact_reply_never_hides_late_grpc_status() {
+        let mut request = range_request();
+        request.operations.truncate(1);
+        let stream = tokio_stream::iter([
+            Ok(compact_range_frame(0, vec![b'a'])),
+            Err(tonic::Status::unavailable(
+                "late failure after compact result",
+            )),
+        ]);
+        let mut output = [0; 1];
+        assert!(
+            consume_peer_read_stream(&request, None, &mut output, stream, None, None)
+                .await
+                .is_err()
+        );
+    }
+
+    #[cfg(feature = "dfs")]
     fn verified_object_frames(
         body: &[u8],
     ) -> (
@@ -9544,7 +9875,7 @@ mod tests {
 
     #[cfg(feature = "dfs")]
     #[test]
-    fn range_frame_bytes_preserve_vec_wire_compatibility() {
+    fn legacy_stream_frames_preserve_vec_wire_compatibility() {
         use afs_protocol::node_data::{
             DfsReadRangesCompletion, DfsReadRangesFrame, DfsReadRangesHeader,
         };
@@ -9593,6 +9924,9 @@ mod tests {
                     }
                     dfs_read_ranges_frame::Body::Completion(completion) => {
                         LegacyBody::Completion(completion.clone())
+                    }
+                    dfs_read_ranges_frame::Body::Compact(_) => {
+                        panic!("legacy stream representation has no compact tag")
                     }
                 }),
             };

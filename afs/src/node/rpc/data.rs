@@ -35,8 +35,8 @@ use afs_protocol::node_data::{
 use afs_protocol::node_data::{
     DfsCloseRdmaReply, DfsCloseRdmaRequest, DfsConfirmReplicaRequest, DfsNegotiateRdmaReply,
     DfsNegotiateRdmaRequest, DfsPutReplicaFrame, DfsPutReplicaRdmaRequest, DfsPutReplicaReply,
-    DfsReadRangesCompletion, DfsReadRangesFrame, DfsReadRangesHeader, DfsReadRangesRdmaReply,
-    DfsReadRangesRdmaRequest, DfsReadRangesRequest, DfsReplicaAck,
+    DfsReadRangeReply, DfsReadRangesCompletion, DfsReadRangesFrame, DfsReadRangesHeader,
+    DfsReadRangesRdmaReply, DfsReadRangesRdmaRequest, DfsReadRangesRequest, DfsReplicaAck,
     dfs_chunks_server::{DfsChunks, DfsChunksServer},
     dfs_read_ranges_frame,
 };
@@ -1637,6 +1637,40 @@ fn stream_dfs_ranges_until(
         // caller's grant or bypasses a known Node stop; no new Meta RPC here.
         validate_dfs_read_request(request)?;
         local.ensure_peer_serve_open().map_err(error_to_status)?;
+        if !request.include_blake3_outboard
+            && verified.len() <= afs_protocol::node_data::DFS_COMPACT_RANGE_MAX_BYTES
+        {
+            // This range is already fully verified and budgeted. Its Bytes
+            // retains that same owner through queueing and encoding; neither
+            // a second body nor repeated request identity is needed.
+            let digest = whole_digest.map_or_else(
+                || {
+                    local.record_read_hash("stream_range_hash", verified.len() as u64);
+                    blake3::hash(&verified).as_bytes().to_vec()
+                },
+                |digest| digest.bytes.to_vec(),
+            );
+            let length = verified.len();
+            let first_enqueue = local.coarse_diagnostic("peer_first_frame_enqueue", length as u64);
+            send(dfs_read_ranges_frame::Body::Compact(DfsReadRangeReply {
+                operation_index: op.operation_index,
+                data: verified,
+                range_checksum: digest,
+            }))?;
+            drop(first_enqueue);
+            if let Some(token) = &diagnostic_token {
+                token.first_data();
+            }
+            local.record_peer_read_event("data_frame");
+            local.record_peer_read_event("shared_frame");
+            if let Some(metrics) = metrics {
+                metrics.record("grpc", "send", "read", length as u64);
+            }
+            if let Some(diagnostic) = diagnostic {
+                diagnostic.finish(true);
+            }
+            continue;
+        }
         send(dfs_read_ranges_frame::Body::Header(DfsReadRangesHeader {
             read_id: request.read_id.clone(),
             attempt_id: request.attempt_id.clone(),
@@ -6376,6 +6410,15 @@ mod tests {
             match frame.unwrap().body.unwrap() {
                 dfs_read_ranges_frame::Body::Data(data) => received.extend(data),
                 dfs_read_ranges_frame::Body::Completion(_) => completions += 1,
+                dfs_read_ranges_frame::Body::Compact(reply) => {
+                    assert_eq!(reply.operation_index, 0);
+                    assert_eq!(
+                        reply.range_checksum.as_slice(),
+                        blake3::hash(&reply.data).as_bytes()
+                    );
+                    received.extend(reply.data);
+                    completions += 1;
+                }
                 _ => {}
             }
         }
@@ -7202,6 +7245,9 @@ mod tests {
                         dfs_read_ranges_frame::Body::Header(header) => {
                             assert!(!header.blake3_outboard.is_empty())
                         }
+                        dfs_read_ranges_frame::Body::Compact(_) => {
+                            panic!("outboard requests must keep incremental proof delivery")
+                        }
                     },
                     Ok(Err(error)) => panic!("direct producer must return its error: {error}"),
                     Err(_) => std::thread::yield_now(),
@@ -7255,7 +7301,7 @@ mod tests {
 
     #[cfg(feature = "dfs")]
     #[test]
-    fn dfs_stream_whole_digest_reuse_preserves_wire_and_partial_hash_work() {
+    fn dfs_whole_digest_reuse_preserves_checksums_and_partial_hash_work() {
         use crate::node::chunk::StagedChunk;
         let temp = tempfile::tempdir().unwrap();
         let registry = afs_metrics::Registry::new();
@@ -7302,6 +7348,7 @@ mod tests {
                 let mut received = Vec::new();
                 let mut header_count = 0;
                 let mut completions = 0;
+                let mut compact = 0;
                 while let Some(frame) = receiver.blocking_recv() {
                     match frame.unwrap().body.unwrap() {
                         dfs_read_ranges_frame::Body::Header(header) => {
@@ -7323,6 +7370,17 @@ mod tests {
                             }
                         }
                         dfs_read_ranges_frame::Body::Data(data) => received.extend(data),
+                        dfs_read_ranges_frame::Body::Compact(reply) => {
+                            assert!(!want_proof);
+                            assert_eq!(reply.operation_index, 0);
+                            assert_eq!(reply.data.len(), length);
+                            assert_eq!(
+                                reply.range_checksum.as_slice(),
+                                blake3::hash(&reply.data).as_bytes()
+                            );
+                            received.extend(reply.data);
+                            compact += 1;
+                        }
                         dfs_read_ranges_frame::Body::Completion(completion) => {
                             completions += 1;
                             assert_eq!(completion.transferred_bytes, length as u64);
@@ -7337,8 +7395,10 @@ mod tests {
                         }
                     }
                 }
-                assert_eq!(header_count, 1);
-                assert_eq!(completions, 1);
+                let expected_compact = usize::from(!want_proof && length <= 128 * 1024);
+                assert_eq!(compact, expected_compact);
+                assert_eq!(header_count, 1 - expected_compact);
+                assert_eq!(completions, 1 - expected_compact);
                 assert_eq!(received, bytes[offset..offset + length]);
                 assert_eq!(
                     hash_bytes() - before,
@@ -7439,6 +7499,10 @@ mod tests {
                 dfs_read_ranges_frame::Body::Data(data) => received.extend(data),
                 dfs_read_ranges_frame::Body::Completion(_) => completions += 1,
                 dfs_read_ranges_frame::Body::Header(_) => {}
+                dfs_read_ranges_frame::Body::Compact(reply) => {
+                    received.extend(reply.data);
+                    completions += 1;
+                }
             }
         }
         assert_eq!(received, staged.bytes());
@@ -7551,6 +7615,160 @@ mod tests {
 
     #[cfg(feature = "dfs")]
     #[tokio::test]
+    async fn dfs_small_ranges_use_one_delivery_without_expanding_large_streams() {
+        use crate::node::chunk::StagedChunk;
+        use tokio_stream::StreamExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let local = Arc::new(LocalChunkStore::open(temp.path(), "node").unwrap());
+        let bytes: Vec<u8> = (0..1024 * 1024).map(|n| (n % 251) as u8).collect();
+        let staged = StagedChunk::new(
+            crate::dfs::OperationId::new("small-delivery"),
+            bytes.clone(),
+        );
+        local.put(staged.clone()).unwrap();
+        let service = dfs_reuse_test_service(local, Arc::new(AllowDfsTestGrant));
+        let mut frame_counts = Vec::new();
+        for length in [128 * 1024, 1, 64 * 1024, 128 * 1024 + 1, bytes.len()] {
+            let request = dfs_read_request(staged.chunk.id.0.clone(), length as u64);
+            let frames: Vec<_> = service
+                .read_ranges(Request::new(request))
+                .await
+                .unwrap()
+                .into_inner()
+                .collect()
+                .await;
+            frame_counts.push(frames.len());
+            let mut received = Vec::new();
+            for frame in frames {
+                match frame.unwrap().body.unwrap() {
+                    dfs_read_ranges_frame::Body::Data(data) => received.extend(data),
+                    dfs_read_ranges_frame::Body::Compact(reply) => {
+                        assert_eq!(reply.operation_index, 0);
+                        assert_eq!(
+                            reply.range_checksum.as_slice(),
+                            blake3::hash(&reply.data).as_bytes()
+                        );
+                        received.extend(reply.data);
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(received, bytes[..length]);
+        }
+        // Small complete replies need no independent header or completion.
+        // Larger ranges keep the original bounded incremental delivery.
+        assert_eq!(frame_counts, [1, 1, 1, 5, 18]);
+        assert_eq!(service.read_permits.available_permits(), 8);
+    }
+
+    #[cfg(feature = "dfs")]
+    #[tokio::test]
+    async fn cp04v2_compact_reply_crosses_grpc_with_bounded_encoded_size() {
+        use crate::node::chunk::StagedChunk;
+        use afs_protocol::node_data::dfs_chunks_client::DfsChunksClient;
+        use tokio_stream::StreamExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let local = Arc::new(LocalChunkStore::open(temp.path(), "node").unwrap());
+        let body = vec![37; afs_protocol::node_data::DFS_COMPACT_RANGE_MAX_BYTES];
+        let staged = StagedChunk::new(crate::dfs::OperationId::new("compact-grpc"), body.clone());
+        local.put(staged.clone()).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let service = make_dfs_chunks_server(
+            Some(local),
+            Arc::new(AllowDfsTestPeer),
+            Arc::new(AllowDfsTestGrant),
+        );
+        let server = tokio::spawn(async move {
+            Server::builder()
+                .add_service(service)
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        // Include protobuf overhead. The disk-stream 128KiB *encoded* limit
+        // deliberately cannot accept this ordinary 128KiB body reply.
+        let mut client = DfsChunksClient::connect(endpoint)
+            .await
+            .unwrap()
+            .max_decoding_message_size(body.len() + 64);
+        let mut stream = client
+            .read_ranges(dfs_read_request(staged.chunk.id.0, body.len() as u64))
+            .await
+            .unwrap()
+            .into_inner();
+        let frame = stream.next().await.unwrap().unwrap();
+        let dfs_read_ranges_frame::Body::Compact(reply) = frame.body.unwrap() else {
+            panic!("ordinary small range must use one compact reply");
+        };
+        assert_eq!(reply.operation_index, 0);
+        assert_eq!(reply.data.as_ref(), body.as_slice());
+        assert_eq!(
+            reply.range_checksum.as_slice(),
+            blake3::hash(&body).as_bytes()
+        );
+        assert!(stream.next().await.is_none());
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+    }
+
+    #[cfg(feature = "dfs")]
+    #[tokio::test]
+    async fn cp04v2_compact_reply_pins_its_original_payload_after_cancel() {
+        use crate::node::chunk::StagedChunk;
+        use tokio_stream::StreamExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let local = Arc::new(
+            LocalChunkStore::open(temp.path(), "node")
+                .unwrap()
+                .with_peer_serve_config(1, 8 * 1024 * 1024)
+                .unwrap(),
+        );
+        let first = StagedChunk::new(
+            crate::dfs::OperationId::new("compact-held"),
+            vec![7; 4 * 1024 * 1024],
+        );
+        let other = StagedChunk::new(
+            crate::dfs::OperationId::new("compact-replace"),
+            vec![9; 4 * 1024 * 1024],
+        );
+        local.put(first.clone()).unwrap();
+        local.put(other.clone()).unwrap();
+        let service = dfs_reuse_test_service(local.clone(), Arc::new(AllowDfsTestGrant));
+        let mut stream = service
+            .read_ranges(Request::new(dfs_read_request(first.chunk.id.0, 128 * 1024)))
+            .await
+            .unwrap()
+            .into_inner();
+        let frame = stream.next().await.unwrap().unwrap();
+        let dfs_read_ranges_frame::Body::Compact(reply) = frame.body.unwrap() else {
+            panic!("small range must retain its payload in the compact reply");
+        };
+        drop(stream);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while service.read_permits.available_permits() != 8 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(
+            local
+                .read_peer_range(&other.chunk.id, 0, 64 * 1024)
+                .unwrap(),
+        );
+        assert_eq!(reply.data.as_ref(), &[7; 128 * 1024]);
+        // A copied 128KiB body would wrongly release the original 4MiB lease.
+        assert!(local.reserve_peer_read_payload(5 * 1024 * 1024).is_err());
+        drop(reply);
+        drop(local.reserve_peer_read_payload(8 * 1024 * 1024).unwrap());
+    }
+
+    #[cfg(feature = "dfs")]
+    #[tokio::test]
     async fn dfs_peer_object_reuse_scans_once_and_still_checks_authority() {
         use crate::node::chunk::StagedChunk;
         use tokio_stream::StreamExt;
@@ -7593,6 +7811,9 @@ mod tests {
                         completions += 1;
                     }
                     dfs_read_ranges_frame::Body::Header(_) => {}
+                    dfs_read_ranges_frame::Body::Compact(_) => {
+                        panic!("large ranges must keep bounded incremental delivery")
+                    }
                 }
             }
             assert_eq!(received, bytes[start..start + 1024 * 1024]);
@@ -7743,8 +7964,14 @@ mod tests {
             while let Some(frame) = leader.next().await {
                 if stop {
                     assert!(frame.is_err());
-                } else if let Some(dfs_read_ranges_frame::Body::Data(data)) = frame.unwrap().body {
-                    bytes.extend_from_slice(&data);
+                } else {
+                    match frame.unwrap().body.unwrap() {
+                        dfs_read_ranges_frame::Body::Data(data) => bytes.extend_from_slice(&data),
+                        dfs_read_ranges_frame::Body::Compact(reply) => {
+                            bytes.extend_from_slice(&reply.data)
+                        }
+                        _ => {}
+                    }
                 }
             }
             if !stop {
@@ -8066,6 +8293,9 @@ mod tests {
                     completions += 1;
                 }
                 dfs_read_ranges_frame::Body::Header(_) => {}
+                dfs_read_ranges_frame::Body::Compact(_) => {
+                    panic!("large ranges must keep bounded incremental delivery")
+                }
             }
         }
         assert_eq!(received, bytes);

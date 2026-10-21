@@ -412,13 +412,30 @@ ready文件的4096B header、正文、trailer与staging实际分配计入磁盘�
 Header后失败中止，不切换来源或伪造完成。观察到的坏可选sidecar在既有修复锁下精确退休，
 不删除更新后的proof或健康正文。组读验仍可能与发送和回压交叠，不以累计时长承诺性能收益。
 
-其余原生gRPC路径的64KiB正文帧以Bytes共享已验证对象的合法范围；A附带proof也以Bytes
-共享原proof owner，B仅在同ledger准入后复制小proof元数据。生成的Rust API中
-`DfsReadRangesHeader.blake3_outboard`与`DfsPutReplicaFrame.data`均使用`Bytes`；这属于
-源码API变化，不改变既有wire tag，不能宣称完全无兼容变化。载荷、proof及各自租约
-不能因缓存淘汰、producer退出或取消提前退账；最后真实持有者释放后才释放额度。
-授权与帧生产继续在同一blocking任务，拒绝在返回stream前传播；原4帧队列、8 read slots、
-单RPC总截止和排空合同保持。Bytes共享不等于整个Prost／TLS／网络栈零复制。
+普通范围读取在A完整核验后交付：不请求outboard、正文不超过128KiB时，一条
+`DfsReadRangeReply`携带operation index、共享正文和BLAKE3范围摘要，不再分别发送
+Header、64KiB Data分片与Completion。RPC本身及operation index绑定原请求，接收方
+保留范围/目标缓冲区/重复结果检查，所有操作完成且实际EOF成功后才返回；晚到Status
+仍失败。范围摘要沿用原合同，不是原始根证明，也不替代存储/系统交付边界的原根核验。
+
+较大普通范围继续64KiB Data流式；请求outboard的完整对象及其回退都保持原Header、
+有界Data和Completion，disk sink的128KiB编码上限、64KiB Data上限、两256KiB块及
+背压保持。128KiB紧凑正文加protobuf开销会超过这一路编码上限，不能送入其控制队列。
+普通接收仍用原配置的编码/解码上限，不扩大总预算。四项发送队列可能持有不同对象，
+所有正文仍受原共享payload额度约束；紧凑结果没有另分配正文副本或工作线程。
+
+正文Data及紧凑结果以Bytes共享已验证对象的合法范围，附带proof也共享原proof owner；
+B在原ledger准入后复制小proof元数据。生成Rust的紧凑data同样使用Bytes，共享解码
+backing。紧凑结果新增wire tag4，需要配套升级收发Node；原流式tag1–3保持。
+载荷、proof及各自租约不能因缓存淘汰、producer退出或取消提前退账，最后真实持有者
+释放后才释放额度。授权与生产仍在同一blocking任务，拒绝在返回stream前传播；
+4项队列、8 read slots、单RPC总截止和排空保持。Bytes共享不等于整个网络栈零复制。
+
+普通Peer客户端（含DFS）协商128KiB HTTP/2接收帧上限，OwnerFiles客户端仍为256KiB。
+本策略只作用于客户端接收响应，Node监听端的Owner-only 256KiB与其它模式默认策略不变。
+帧从原connection/stream窗口扣除，消息编码/解码上限、载荷/控制额度和并发不变；
+旧对端可以继续发送小帧。紧凑128KiB正文还有protobuf/gRPC开销，并不保证只占一帧。
+实际DATA帧数量须观察完整RPC；帧减少不等于TLS记录、TCP分段、CPU或墙钟同比减少。
 
 以上描述当前实现及受影响回归边界；具体通过范围须绑定Linux输入和证据，
 不代表WI-6正式验收或性能目标已经通过。
