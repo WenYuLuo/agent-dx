@@ -264,7 +264,7 @@ impl Controller {
         let retained = self
             .services
             .runtime
-            .retains_checkpoint_files(&self.record.spec.runtime_class);
+            .retains_capture_files(&self.record.spec.runtime_class);
         if retained {
             let original = services.store.retain_staged(&staged).await?;
             self.hold_artifact(
@@ -305,7 +305,7 @@ impl Controller {
         if self
             .services
             .runtime
-            .retains_checkpoint_files(&self.record.spec.runtime_class)
+            .retains_capture_files(&self.record.spec.runtime_class)
         {
             self.hold_artifact(
                 artifact.clone(),
