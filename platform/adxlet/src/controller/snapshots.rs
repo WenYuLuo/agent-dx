@@ -151,13 +151,23 @@ impl Controller {
             self.capture_preparation = None;
             return Err(error);
         }
-        // Keep the original capture pathname durable even if S3 upload fails.
-        let captured = services.store.retain_staged(&staged).await?;
-        let original = services.store.prepare_restore(&captured).await?;
-        self.hold_artifact(captured, original);
+        let retains_capture = self
+            .services
+            .runtime
+            .retains_capture_files(&self.record.spec.runtime_class);
+        // Firecracker may still use a running capture as its incremental base.
+        // runsc captures do not replace the input held by background restore.
+        if retains_capture {
+            let captured = services.store.retain_staged(&staged).await?;
+            let original = services.store.prepare_restore(&captured).await?;
+            self.hold_artifact(captured, original);
+        }
         self.record.revision = self.record.revision.checked_add(1).ok_or(Error::Conflict)?;
         self.sync().await?;
         snapshot.artifact = services.store.seal(&staged).await?;
+        // Publication requires a durable temporary hold even when the runtime
+        // does not retain capture output. Existing restore inputs move into
+        // execution_files and remain protected when this temporary hold drops.
         let access = services.store.prepare_restore(&snapshot.artifact).await?;
         self.hold_artifact(snapshot.artifact.clone(), access);
         self.record.revision = self.record.revision.checked_add(1).ok_or(Error::Conflict)?;
@@ -168,11 +178,7 @@ impl Controller {
         }
         let snapshot = catalog.publish(snapshot.clone()).await?;
         services.store.committed(&snapshot.artifact).await?;
-        if !self
-            .services
-            .runtime
-            .retains_checkpoint_files(&self.record.spec.runtime_class)
-        {
+        if !retains_capture {
             self.record
                 .execution_artifacts
                 .retain(|a| a != &snapshot.artifact && a.location != staged.to_string_lossy());

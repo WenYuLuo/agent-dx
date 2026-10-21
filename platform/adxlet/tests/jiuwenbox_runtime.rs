@@ -987,6 +987,14 @@ async fn supervisor_tunnel_acl_survives_create_and_routed_policy_update() {
     use adx_core::execution::{NetworkAction, NetworkPolicy, TrafficMode, TrafficPolicy};
     let fixture = Fixture::new();
     let driver = fixture.driver().await;
+    // A create operation may outlive the fixture's short per-RPC timeout.
+    fixture.backend.release.acquire().await.unwrap().forget();
+    let backend = fixture.backend.clone();
+    let release = tokio::spawn(async move {
+        backend.entered.acquire().await.unwrap().forget();
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        backend.release.add_permits(1);
+    });
     let mut spec = spec("supervisor");
     let policy = NetworkPolicy {
         dns: None,
@@ -1001,7 +1009,17 @@ async fn supervisor_tunnel_acl_survives_create_and_routed_policy_update() {
     spec.execution.tunnel_http_port = Some(18766);
     spec.env
         .insert("EXECD_TUNNEL_WS_PORT".into(), "12345".into());
-    driver.start(&spec, "tenant-agent-1", 1, &[]).await.unwrap();
+    driver
+        .start_with_deadline(
+            &spec,
+            "tenant-agent-1",
+            1,
+            &[],
+            Instant::now() + Duration::from_secs(3),
+        )
+        .await
+        .unwrap();
+    release.await.unwrap();
     let router = adxlet::runtime_router::RuntimeRouter::new(None, Some(driver)).unwrap();
     router
         .set_network_policy("tenant-agent-1", Some(&policy), &[], Some(18766))

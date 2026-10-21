@@ -21,6 +21,7 @@ struct Backend {
     checkpoint_gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
     checkpoint_entered: tokio::sync::Notify,
     snapshots: Mutex<BTreeMap<String, adx_core::snapshots::Snapshot>>,
+    committed_records: Mutex<BTreeMap<String, EnvironmentRecord>>,
     fail_snapshot_publish: Mutex<bool>,
     running: Mutex<BTreeSet<String>>,
     events: Mutex<Vec<String>>,
@@ -39,6 +40,7 @@ struct Backend {
     workload_checkpoint_timeouts: Mutex<Vec<Duration>>,
     fail_workload_checkpoint: Mutex<bool>,
     workload_prepared: Mutex<bool>,
+    background_restore: Mutex<bool>,
 }
 impl Backend {
     fn event(&self, e: &str) {
@@ -48,6 +50,9 @@ impl Backend {
 #[async_trait]
 impl RuntimeDriver for Backend {
     fn retains_checkpoint_files(&self, runtime_class: &str) -> bool {
+        *self.background_restore.lock().unwrap() || runtime_class != "runsc"
+    }
+    fn retains_capture_files(&self, runtime_class: &str) -> bool {
         runtime_class != "runsc"
     }
     async fn inventory(&self) -> Result<Vec<adxlet::RuntimeObservation>> {
@@ -271,6 +276,10 @@ impl StateSink for Backend {
         {
             Err(Error::Unavailable("Coordinator unavailable".into()))
         } else {
+            self.committed_records
+                .lock()
+                .unwrap()
+                .insert(r.spec.id.clone(), r.clone());
             Ok(Durability::Published)
         }
     }
@@ -1098,6 +1107,20 @@ impl adxlet::checkpoint::SnapshotCatalog for Backend {
     ) -> Result<adx_core::snapshots::Snapshot> {
         if *self.fail_snapshot_publish.lock().unwrap() {
             return Err(Error::Unavailable("catalog unavailable".into()));
+        }
+        // Match Coordinator's real publication precondition: a source must
+        // commit its temporary artifact hold before the catalog accepts it.
+        if !self
+            .committed_records
+            .lock()
+            .unwrap()
+            .get(&snapshot.template.id)
+            .is_some_and(|record| {
+                record.runtime.id == snapshot.source_runtime_id
+                    && record.execution_artifacts.contains(&snapshot.artifact)
+            })
+        {
+            return Err(Error::Conflict);
         }
         self.snapshots
             .lock()
@@ -1929,8 +1952,9 @@ async fn retired_shared_checkpoint(retained: Option<bool>) {
 #[tokio::test]
 async fn object_restore_over_quota_releases_runsc_files_and_protects_firecracker() {
     use adxlet::checkpoint::ObjectCheckpointStore;
-    for runtime_class in ["runsc", "firecracker"] {
+    for (runtime_class, background) in [("runsc", false), ("runsc", true), ("firecracker", false)] {
         let (root, backend, _, mut spec, assignment) = fixture();
+        *backend.background_restore.lock().unwrap() = background;
         spec.runtime_class = runtime_class.into();
         let store = Arc::new(
             ObjectCheckpointStore::new(
@@ -1963,7 +1987,7 @@ async fn object_restore_over_quota_releases_runsc_files_and_protects_firecracker
         let running = h.resume(resume(paused.record.revision)).await.unwrap();
         assert_eq!(running.record.state, EnvironmentState::Running);
         store.evict_unreferenced(0).await.unwrap();
-        if runtime_class == "runsc" {
+        if runtime_class == "runsc" && !background {
             assert!(
                 !restored_path.exists(),
                 "synchronous runsc restore releases its inputs"
@@ -1971,7 +1995,7 @@ async fn object_restore_over_quota_releases_runsc_files_and_protects_firecracker
         } else {
             assert!(
                 restored_path.join("memory").exists(),
-                "Firecracker base remains pinned despite quota pressure"
+                "background restore input or Firecracker base remains pinned despite quota pressure"
             );
         }
         h.delete().await.unwrap();
@@ -2117,4 +2141,74 @@ async fn unsupported_snapshot_does_not_stop_source_or_allocate_capture() {
         .contains(&created.record.runtime.id));
     assert_eq!(h.sync().await.unwrap().record, created.record);
     assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+}
+
+#[tokio::test]
+async fn runsc_capture_preserves_background_restore_input_without_pinning_new_capture() {
+    let (root, backend, _, mut spec, assignment) = fixture();
+    let store = Arc::new(
+        adxlet::checkpoint::ObjectCheckpointStore::new(
+            "shared".into(),
+            Arc::new(object_store::memory::InMemory::new()),
+            "test".into(),
+            root.path().into(),
+            1,
+        )
+        .unwrap()
+        .with_max_entries(1)
+        .unwrap(),
+    );
+    let node = Adxlet::new(
+        "node".into(),
+        backend.clone(),
+        backend.clone(),
+        backend.clone(),
+        backend.clone(),
+    )
+    .with_checkpointing(store.clone(), backend.clone())
+    .unwrap()
+    .with_snapshot_catalog(backend.clone())
+    .unwrap();
+    node.update_capacity(spec.resources, Duration::from_secs(300))
+        .unwrap();
+    spec.runtime_class = "runsc".into();
+    *backend.background_restore.lock().unwrap() = true;
+    let h = node.environment(spec, assignment).unwrap();
+    let created = h.create().await.unwrap();
+    let paused = h.pause(pause(created.record.revision)).await.unwrap();
+    let input = paused.record.checkpoint.as_ref().unwrap().artifact.clone();
+    let running = h.resume(resume(paused.record.revision)).await.unwrap();
+    assert!(running.record.execution_artifacts.contains(&input));
+    let snapshot = h
+        .snapshot(adxlet::checkpoint::SnapshotRequest {
+            operation_id: "capture-after-background-restore".into(),
+            expected_revision: running.record.revision,
+            names: vec![],
+            timeout_seconds: 60,
+        })
+        .await
+        .unwrap();
+    assert!(snapshot
+        .environment
+        .record
+        .execution_artifacts
+        .contains(&input));
+    assert!(!snapshot
+        .environment
+        .record
+        .execution_artifacts
+        .contains(&snapshot.snapshot.artifact));
+    store.evict_unreferenced(0).await.unwrap();
+    let input_path = root.path().join("cache").join(&input.location);
+    assert!(
+        input_path.join("memory").exists(),
+        "new capture must not unpin an ongoing background restore"
+    );
+    let deleted = h.delete().await.unwrap();
+    assert!(deleted.record.execution_artifacts.is_empty());
+    store.evict_unreferenced(0).await.unwrap();
+    assert!(
+        !input_path.exists(),
+        "stopped execution releases the cache input"
+    );
 }

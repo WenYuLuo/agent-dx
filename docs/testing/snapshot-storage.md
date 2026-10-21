@@ -108,6 +108,17 @@ Coordinator 的 S3 身份需要 prefix 下的 List/Delete；共享文件系统�
    adxlet 在执行仍依赖文件时保留访问对象及持久化输入记录，确认停止后释放。
 6. 节点 `release()` 只处理本地文件/缓存，共享文件系统不在此删除共享文件。
 
+外部 sandboxd 可以独立开启 runsc 后台内存恢复，Start RPC 成功返回不再证明所有输入页
+已经加载。adxlet 因此将 runsc 的恢复输入和 Firecracker 的运行中输入一样保留至执行停止；
+同步 runsc 恢复也采用此保守期限，因为当前协议没有后台加载全部完成的通知。
+S3 的本地缓存 pin 和 Coordinator 的持久化执行引用共同保护输入；adxlet 重新对账时
+重建访问保护。代价是恢复输入的缓存占用时间更长，活跃输入可以暂时超过缓存预算。
+
+运行中创建新 checkpoint 时，runsc 不把新捕获输出作为后续执行输入；已有后台恢复
+输入继续受到保护。Firecracker 仍保留可能作为增量基线的新捕获文件。
+可复用 Snapshot 发布前仍先提交新制品的临时输入引用，发布成功后 runsc 释放该临时引用。
+后台恢复需要配套的外部 sandboxd 开关与未压缩 split pages；它不改变本页的捕获和持久化发布合同。
+
 `seal()` 完成不代表 Environment/Snapshot 元数据已经提交；对外成功需要两者完成。
 local-only 沿用异步写回语义，不强制 fsync，也不承诺主机断电/丢失后的文件耐久性。
 共享文件系统 restore 检查 manifest、路径、文件类型和长度，不扫描完整文件内容；数据读取由对应文件系统执行。

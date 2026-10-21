@@ -293,6 +293,23 @@ async fn discovers_runtime_classes_from_sandboxd_uds() {
         ["runsc"]
     );
 }
+
+#[tokio::test]
+async fn running_runsc_retains_input_after_restore_acknowledgement() {
+    let (adapter, _server) = connect(Server::default()).await;
+    let mut source = spec();
+    source.runtime_class = "runsc".into();
+    let checkpoint = tempfile::tempdir().unwrap();
+    adapter
+        .restore(&source, "background-restore", 1, &[], checkpoint.path())
+        .await
+        .unwrap();
+    // Start may acknowledge before background page loading has finished.
+    // The controller must retain its file access and durable input reference.
+    assert!(adapter.retains_checkpoint_files(&source.runtime_class));
+    assert!(!adapter.retains_capture_files(&source.runtime_class));
+    adapter.remove("background-restore").await.unwrap();
+}
 fn spec() -> EnvironmentSpec {
     EnvironmentSpec {
         runtime_profile: None,

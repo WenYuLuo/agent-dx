@@ -80,6 +80,10 @@ impl RuntimeDriver for RuntimeRouter {
         self.class(class)
             .is_ok_and(|r| r.retains_checkpoint_files(class))
     }
+    fn retains_capture_files(&self, class: &str) -> bool {
+        self.class(class)
+            .is_ok_and(|r| r.retains_capture_files(class))
+    }
     async fn start(
         &self,
         spec: &EnvironmentSpec,
