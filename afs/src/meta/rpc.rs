@@ -899,7 +899,19 @@ impl DfsMetaService for DfsMetaRpc {
         let authenticated = authenticated_node_id(&self.0, &request)?;
         let request = request.into_inner();
         validate_caller(authenticated.as_deref(), &request.node_id)?;
-        dfs_service(&self.0)?
+        if request.capture_gc_fence
+            && (request.release
+                || !request.publication
+                || request.inode_id.is_empty()
+                || !request.chunks.is_empty())
+        {
+            return Err(Status::invalid_argument(
+                "GC fence requires initial publication retain",
+            ));
+        }
+        let capture = request.capture_gc_fence;
+        let service = dfs_service(&self.0)?;
+        service
             .update_gc_reference(crate::dfs::UpdateGcReference {
                 node_id: request.node_id,
                 session_id: request.session_id,
@@ -917,8 +929,20 @@ impl DfsMetaService for DfsMetaRpc {
             })
             .await
             .map_err(afs_transport::grpc::error_status::error_to_status)?;
+        // No payload is admitted by the Node until this response is received.
+        let gc_fence = if capture {
+            Some(
+                service
+                    .current_gc_fence()
+                    .await
+                    .map_err(afs_transport::grpc::error_status::error_to_status)?
+                    .wire(),
+            )
+        } else {
+            None
+        };
         Ok(Response::new(
-            afs_protocol::meta::UpdateDfsGcReferenceReply {},
+            afs_protocol::meta::UpdateDfsGcReferenceReply { gc_fence },
         ))
     }
     async fn collect_garbage(
@@ -2008,6 +2032,11 @@ impl DfsMetaService for DfsMetaRpc {
             .commit_file_version(
                 request.caller_id,
                 crate::dfs::CommitFileVersion {
+                    gc_fence: request
+                        .gc_fence
+                        .map(crate::dfs::GcFence::from_wire)
+                        .transpose()
+                        .map_err(afs_transport::grpc::error_status::error_to_status)?,
                     operation_id: crate::dfs::OperationId::new(request.operation_id),
                     inode_id: crate::dfs::InodeId::new(request.inode_id),
                     write_lease,

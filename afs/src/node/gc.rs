@@ -14,6 +14,18 @@ pub trait GcControl: Send + Sync {
         version: Option<&FileVersionId>,
         publication: bool,
     ) -> Result<()>;
+    /// Fails closed if the authority cannot capture a pre-write GC fence.
+    fn retain_fenced(
+        &self,
+        _id: &str,
+        _inode: &InodeId,
+        _version: Option<&FileVersionId>,
+    ) -> Result<crate::dfs::GcFence> {
+        Err(Error::coded(
+            afs_error::NODE_VFS_UNIMPLEMENTED,
+            "fenced GC retain is unsupported",
+        ))
+    }
     fn release(&self, id: &str) -> Result<()>;
     fn reserve_publication(
         &self,
@@ -28,8 +40,14 @@ pub struct GcReferences {
     sequence: AtomicU64,
 }
 pub struct GcPin {
+    fence: Option<crate::dfs::GcFence>,
     id: String,
     owner: Arc<GcReferences>,
+}
+impl GcPin {
+    pub(crate) fn fence(&self) -> Option<crate::dfs::GcFence> {
+        self.fence
+    }
 }
 impl Drop for GcPin {
     fn drop(&mut self) {
@@ -53,6 +71,23 @@ impl GcReferences {
         version: Option<&FileVersionId>,
         publication: Option<&crate::dfs::OperationId>,
     ) -> Result<Arc<GcPin>> {
+        self.pin_mode(inode, version, publication, false)
+    }
+    pub(crate) fn pin_fenced(
+        self: &Arc<Self>,
+        inode: &InodeId,
+        version: Option<&FileVersionId>,
+        operation: &crate::dfs::OperationId,
+    ) -> Result<Arc<GcPin>> {
+        self.pin_mode(inode, version, Some(operation), true)
+    }
+    fn pin_mode(
+        self: &Arc<Self>,
+        inode: &InodeId,
+        version: Option<&FileVersionId>,
+        publication: Option<&crate::dfs::OperationId>,
+        fenced: bool,
+    ) -> Result<Arc<GcPin>> {
         let id = match publication {
             Some(operation) => format!("publish:{}", operation.0),
             None => format!(
@@ -65,13 +100,19 @@ impl GcReferences {
             ),
         };
         // Queue cleanup even when an admission reply is lost.
-        let pin = Arc::new(GcPin {
+        let mut pin = GcPin {
+            fence: None,
             id,
             owner: self.clone(),
-        });
-        self.control
-            .retain(&pin.id, inode, version, publication.is_some())?;
-        Ok(pin)
+        };
+        pin.fence = if fenced {
+            Some(self.control.retain_fenced(&pin.id, inode, version)?)
+        } else {
+            self.control
+                .retain(&pin.id, inode, version, publication.is_some())?;
+            None
+        };
+        Ok(Arc::new(pin))
     }
     pub fn flush(&self) -> Result<()> {
         let pending = {

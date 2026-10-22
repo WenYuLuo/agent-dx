@@ -435,6 +435,7 @@ impl ReplicationEngine {
 }
 
 pub struct DfsChunkStore {
+    optimistic_gc_commit: bool,
     gc_control: Option<Arc<dyn crate::node::gc::GcControl>>,
     local_node_id: String,
     local_node_epoch: Option<u64>,
@@ -460,6 +461,11 @@ impl DfsChunkStore {
         Ok(())
     }
 
+    pub(crate) fn with_optimistic_gc_commit(mut self, enabled: bool) -> Self {
+        self.optimistic_gc_commit = enabled;
+        self
+    }
+
     pub fn with_gc_control(mut self, control: Arc<dyn crate::node::gc::GcControl>) -> Self {
         self.gc_control = Some(control);
         self
@@ -472,6 +478,7 @@ impl DfsChunkStore {
         data_plane: Arc<dyn ReplicaDataPlane>,
     ) -> Self {
         Self {
+            optimistic_gc_commit: false,
             gc_control: None,
             local_node_id: local_node_id.clone(),
             local_node_epoch: None,
@@ -489,6 +496,7 @@ impl DfsChunkStore {
         data_plane: Arc<dyn ReplicaDataPlane>,
     ) -> Self {
         Self {
+            optimistic_gc_commit: false,
             gc_control: None,
             local_node_id: local_node_id.clone(),
             local_node_epoch: Some(local_node_epoch),
@@ -654,8 +662,15 @@ impl ChunkStore for DfsChunkStore {
     }
 
     fn put_native_batch(&self, staged: Vec<StagedChunk>) -> Result<Vec<NativeChunkReceipt>> {
-        self.reserve_gc_publications(&staged)?;
+        if !self.optimistic_gc_commit {
+            self.reserve_gc_publications(&staged)?;
+        }
         let snapshot = self.placement.snapshot()?;
+        if self.optimistic_gc_commit && !snapshot.replication.is_local_fast_path() {
+            return Err(invalid(
+                "optimistic GC commit requires native local single-copy placement",
+            ));
+        }
         let receipts = if snapshot.replication.is_local_fast_path() {
             self.put_local_batch(staged, &snapshot)?
         } else {

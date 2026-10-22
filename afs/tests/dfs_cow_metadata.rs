@@ -50,6 +50,7 @@ fn empty_commit(
         inline_extents: vec![],
     };
     CommitFileVersion {
+        gc_fence: None,
         operation_id: OperationId::new(operation),
         inode_id: inode.inode_id.clone(),
         write_lease: lease,

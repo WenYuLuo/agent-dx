@@ -521,6 +521,7 @@ fsync依赖原持久副本与Meta屏障。S3原有窗口、载荷／descriptor�
 | `dfs_dirty_budget_bytes` | `67108864` | 4..64MiB，Node实际live正文capacity，含仍被持有的已上传正文 |
 | `dfs_unpublished_descriptors` | `1024` | 1..1024，且受固定4MiB元数据总额限制，不能靠增大计数绕过字节上限 |
 | `dfs_upload_inflight_chunks` | `8` | 1..8，整个Node的真实任务上限，共享live正文 |
+| `dfs_optimistic_gc_commit` | `false` | 实验性原生 required-local 单副本写：开始固定GC状态版本，省略逐chunk登记，FullSync原子核对；GC状态改变会使整个写入代次报错，不自动刷新凭据或恢复 |
 | `dfs_background_commit_ms` | `5000` | 1..60000ms，后台发布调度周期，非严格可见时间 |
 
 优先级 CLI＞TOML＞默认，非法值启动报错；仅无外部后端的 DFS 接入此流水线。

@@ -2189,6 +2189,7 @@ impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
                 self.client()
                     .commit_file_version(afs_tracing::request_with_current_context(
                         afs_protocol::meta::CommitFileVersionRequest {
+                            gc_fence: commit.gc_fence.map(crate::dfs::GcFence::wire),
                             caller_id: self.node_id.clone(),
                             operation_id: commit.operation_id.0,
                             inode_id: commit.inode_id.0,
@@ -4351,6 +4352,7 @@ mod tests {
     fn test_commit() -> crate::dfs::CommitFileVersion {
         let layout_id = crate::dfs::LayoutRootId::new("layout:test");
         crate::dfs::CommitFileVersion {
+            gc_fence: None,
             operation_id: crate::dfs::OperationId::new("op:commit"),
             inode_id: crate::dfs::InodeId::new("inode:test"),
             write_lease: test_lease(),
@@ -4600,6 +4602,20 @@ impl crate::node::gc::GcControl for GrpcDfsMeta {
     ) -> Result<()> {
         self.update_gc(id, Some(inode), version, publication, Vec::new(), false)
     }
+    fn retain_fenced(
+        &self,
+        id: &str,
+        inode: &crate::dfs::InodeId,
+        version: Option<&crate::dfs::FileVersionId>,
+    ) -> Result<crate::dfs::GcFence> {
+        self.update_gc_with_fence(id, Some(inode), version, true, Vec::new(), false, true)?
+            .ok_or_else(|| {
+                Error::coded(
+                    afs_error::NODE_VFS_UNIMPLEMENTED,
+                    "Meta did not return a GC fence",
+                )
+            })
+    }
     fn release(&self, id: &str) -> Result<()> {
         self.update_gc(id, None, None, false, Vec::new(), true)
     }
@@ -4670,25 +4686,46 @@ impl GrpcDfsMeta {
         chunks: Vec<crate::dfs::ChunkObject>,
         release: bool,
     ) -> Result<()> {
+        self.update_gc_with_fence(id, inode, version, publication, chunks, release, false)
+            .map(|_| ())
+    }
+
+    #[allow(clippy::too_many_arguments)] // Mirrors the existing fixed GC request shape.
+    fn update_gc_with_fence(
+        &self,
+        id: &str,
+        inode: Option<&crate::dfs::InodeId>,
+        version: Option<&crate::dfs::FileVersionId>,
+        publication: bool,
+        chunks: Vec<crate::dfs::ChunkObject>,
+        release: bool,
+        capture_gc_fence: bool,
+    ) -> Result<Option<crate::dfs::GcFence>> {
         let mut client =
             afs_protocol::meta::dfs_meta_client::DfsMetaClient::new(self.channel.clone());
-        self.run(
-            client.update_gc_reference(afs_protocol::meta::UpdateDfsGcReferenceRequest {
-                node_id: self.node_id.clone(),
-                session_id: self.session_id.clone(),
-                reference_id: id.into(),
-                admission_deadline_unix_ms: if inode.is_some() && !release {
-                    crate::meta::store::now_unix_ms().saturating_add(30_000)
-                } else {
-                    0
-                },
-                inode_id: inode.map(|id| id.0.clone()).unwrap_or_default(),
-                version_id: version.map(|id| id.0.clone()).unwrap_or_default(),
-                publication,
-                chunks: chunks.into_iter().map(wire_chunk_object).collect(),
-                release,
-            }),
-        )?;
-        Ok(())
+        let reply = self
+            .run(
+                client.update_gc_reference(afs_protocol::meta::UpdateDfsGcReferenceRequest {
+                    capture_gc_fence,
+                    node_id: self.node_id.clone(),
+                    session_id: self.session_id.clone(),
+                    reference_id: id.into(),
+                    admission_deadline_unix_ms: if inode.is_some() && !release {
+                        crate::meta::store::now_unix_ms().saturating_add(30_000)
+                    } else {
+                        0
+                    },
+                    inode_id: inode.map(|id| id.0.clone()).unwrap_or_default(),
+                    version_id: version.map(|id| id.0.clone()).unwrap_or_default(),
+                    publication,
+                    chunks: chunks.into_iter().map(wire_chunk_object).collect(),
+                    release,
+                }),
+            )?
+            .into_inner();
+        reply
+            .gc_fence
+            .map(crate::dfs::GcFence::from_wire)
+            .transpose()
     }
 }

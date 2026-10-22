@@ -77,6 +77,7 @@ catalog! {
     META_REQUEST_EXPIRED = 0x03010002 => FailedPrecondition;
     META_REQUEST_TIME_INVALID = 0x03010003 => InvalidArgument;
     META_DFS_CONFLICT = 0x03030001 => FailedPrecondition;
+    META_DFS_GC_CHANGED = 0x03030005 => Aborted;
     META_DFS_NAMESPACE_RETRY = 0x03030004 => Aborted;
     META_DFS_GC_BUSY = 0x03030002 => Unavailable;
     META_DFS_REFERENCE_ADMISSION_EXPIRED = 0x03030003 => FailedPrecondition;

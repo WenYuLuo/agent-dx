@@ -338,6 +338,9 @@ pub struct Cli {
     /// Bounded coarse read timing for explicit diagnosis only; disabled by default.
     #[arg(long)]
     pub dfs_read_diagnostics_enabled: Option<bool>,
+    /// Experimental local R1 commit fencing; GC conflicts fail the write generation.
+    #[arg(long)]
+    pub dfs_optimistic_gc_commit: Option<bool>,
     #[arg(long)]
     pub timeout_ms: Option<u64>,
     #[arg(long)]
@@ -468,6 +471,7 @@ struct FileConfig {
     dfs_source_lookahead_chunks: Option<usize>,
     dfs_source_cache_bytes: Option<usize>,
     dfs_read_diagnostics_enabled: Option<bool>,
+    dfs_optimistic_gc_commit: Option<bool>,
     timeout_ms: Option<u64>,
     log_level: Option<String>,
     trace_enabled: Option<bool>,
@@ -552,6 +556,7 @@ pub struct Config {
     pub dfs_source_lookahead_chunks: usize,
     pub dfs_source_cache_bytes: usize,
     pub dfs_read_diagnostics_enabled: bool,
+    pub dfs_optimistic_gc_commit: bool,
     pub timeout_ms: u64,
     pub log_level: String,
     pub trace_enabled: bool,
@@ -973,6 +978,10 @@ impl Config {
             dfs_read_diagnostics_enabled: cli
                 .dfs_read_diagnostics_enabled
                 .or(file.dfs_read_diagnostics_enabled)
+                .unwrap_or(false),
+            dfs_optimistic_gc_commit: cli
+                .dfs_optimistic_gc_commit
+                .or(file.dfs_optimistic_gc_commit)
                 .unwrap_or(false),
             timeout_ms: cli.timeout_ms.or(file.timeout_ms).unwrap_or(5000),
             log_level: cli

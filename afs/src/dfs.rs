@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 mod cow;
 mod gc;
 pub use cow::clone_file_layout;
-pub use gc::{GcReference, GcState, UpdateGcReference};
+pub use gc::{GcFence, GcReference, GcState, UpdateGcReference};
 
 macro_rules! string_id {
     ($name:ident) => {
@@ -1011,6 +1011,9 @@ pub struct CloneFileRange {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CommitFileVersion {
+    /// Frozen before uploads start; never refreshed when retrying a commit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gc_fence: Option<GcFence>,
     pub operation_id: OperationId,
     pub inode_id: InodeId,
     pub write_lease: WriteLease,

@@ -1484,6 +1484,7 @@ fn owner_root_messages_keep_location_reservation_and_access_separate() {
 #[test]
 fn dfs_commit_keeps_file_layout_and_durable_chunk_receipt_explicit() {
     let commit = CommitFileVersionRequest {
+        gc_fence: None,
         clone_source: None,
         caller_id: "node-a".into(),
         operation_id: "session-a-write-1".into(),
@@ -2397,6 +2398,7 @@ async fn commit_request_with_copies(
     let inode = created.inode.unwrap();
     let lease = created.write_lease.unwrap();
     CommitFileVersionRequest {
+        gc_fence: None,
         clone_source: None,
         caller_id: "node-a".into(),
         operation_id: "commit-lost-result".into(),
@@ -3050,6 +3052,7 @@ async fn dfs_commit_accepts_durable_ack_after_unrelated_catalog_advance() {
 
     let committed = dfs
         .commit_file_version(Request::new(CommitFileVersionRequest {
+            gc_fence: None,
             clone_source: None,
             caller_id: "node-a".into(),
             operation_id: "commit-old-ack".into(),
@@ -4159,6 +4162,7 @@ async fn dfs_data_commit_allows_metadata_revision_drift_without_losing_attrs() {
     assert_eq!(renamed.revision, linked.revision + 1);
 
     let commit_request = CommitFileVersionRequest {
+        gc_fence: None,
         clone_source: None,
         caller_id: "node-a".into(),
         operation_id: "commit-cas-drift".into(),
@@ -4274,6 +4278,7 @@ async fn dfs_data_commit_allows_metadata_revision_drift_without_losing_attrs() {
 
     let old_head = dfs
         .commit_file_version(Request::new(CommitFileVersionRequest {
+            gc_fence: None,
             clone_source: None,
             caller_id: "node-a".into(),
             operation_id: "commit-cas-old-head".into(),
@@ -4308,6 +4313,7 @@ async fn dfs_data_commit_allows_metadata_revision_drift_without_losing_attrs() {
 
     let future_revision = dfs
         .commit_file_version(Request::new(CommitFileVersionRequest {
+            gc_fence: None,
             clone_source: None,
             caller_id: "node-a".into(),
             operation_id: "commit-cas-future-revision".into(),
@@ -4483,6 +4489,7 @@ async fn dfs_write_lease_reuses_one_owner_and_fences_stale_commits() {
 
     let stale = dfs
         .commit_file_version(Request::new(CommitFileVersionRequest {
+            gc_fence: None,
             clone_source: None,
             caller_id: "node-a".into(),
             operation_id: "commit-stale".into(),
@@ -5249,6 +5256,7 @@ async fn dfs_kernel_killpriv_commit_requires_lease_and_preserves_nonexecutable_s
         let inode = created.inode.unwrap();
         let lease = created.write_lease.unwrap();
         let request = CommitFileVersionRequest {
+            gc_fence: None,
             clone_source: None,
             caller_id: "node-a".into(),
             operation_id: format!("commit-killpriv-{index}"),

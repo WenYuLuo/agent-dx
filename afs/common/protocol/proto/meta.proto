@@ -1144,6 +1144,12 @@ message DfsCloneFileRange {
   uint64 length = 4;
 }
 
+message DfsGcFence {
+  oneof kind {
+    uint64 state_revision = 1;
+    bool absent = 2;
+  }
+}
 message CommitFileVersionRequest {
   string caller_id = 1;
   string operation_id = 2;
@@ -1156,6 +1162,7 @@ message CommitFileVersionRequest {
   DfsWriteLease write_lease = 9;
   DfsCommitMetadataDelta metadata_delta = 10;
   DfsCloneFileRange clone_source = 11;
+  DfsGcFence gc_fence = 12;
 }
 
 message CommitFileVersionReply {
@@ -1247,8 +1254,10 @@ message UpdateDfsGcReferenceRequest {
   bool release = 8;
   // Fixed by the sender; a replay never refreshes this admission deadline.
   uint64 admission_deadline_unix_ms = 9;
+  // Capture once before the caller starts producing native receipts.
+  bool capture_gc_fence = 10;
 }
-message UpdateDfsGcReferenceReply {}
+message UpdateDfsGcReferenceReply { DfsGcFence gc_fence = 1; }
 message CollectDfsGarbageRequest {
   string node_id = 1;
   string session_id = 2;

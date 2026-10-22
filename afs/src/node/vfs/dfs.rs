@@ -225,6 +225,7 @@ pub struct DistributedFs {
     remote_owner_factory: Option<Arc<dyn DfsRemoteOwnerFactory>>,
     handles: DfsHandleTable,
     gc_references: Option<Arc<crate::node::gc::GcReferences>>,
+    optimistic_gc_commit: bool,
     gc_gate: Mutex<()>,
     dir_handles: Mutex<HashMap<u64, DfsDirectoryHandle>>,
     inode_writes: ShardedMap<InodeId, SharedInodeWriteState>,
@@ -2655,6 +2656,7 @@ impl DistributedFs {
             remote_owner_factory: None,
             handles: DfsHandleTable::default(),
             gc_references: None,
+            optimistic_gc_commit: false,
             gc_gate: Mutex::new(()),
             dir_handles: Mutex::new(HashMap::new()),
             inode_writes: ShardedMap::default(),
@@ -2721,6 +2723,10 @@ impl DistributedFs {
         references: Option<Arc<crate::node::gc::GcReferences>>,
     ) -> Self {
         self.gc_references = references;
+        self
+    }
+    pub(crate) fn with_optimistic_gc_commit(mut self, enabled: bool) -> Self {
+        self.optimistic_gc_commit = enabled;
         self
     }
     pub fn flush_gc_releases(&self) -> Result<()> {
@@ -3128,7 +3134,13 @@ impl DistributedFs {
             let gc_pin = if generation.is_none() {
                 self.gc_references
                     .as_ref()
-                    .map(|references| references.pin(&snapshot.inode_id, None, Some(&operation_id)))
+                    .map(|references| {
+                        if self.optimistic_gc_commit {
+                            references.pin_fenced(&snapshot.inode_id, None, &operation_id)
+                        } else {
+                            references.pin(&snapshot.inode_id, None, Some(&operation_id))
+                        }
+                    })
                     .transpose()?
             } else {
                 None
@@ -6056,7 +6068,16 @@ impl DistributedFs {
             layout_root: layout_root.id.clone(),
             created_at_unix_ms: now,
         };
+        let gc_fence = gc_pin.as_ref().and_then(|pin| pin.fence());
+        if self.optimistic_gc_commit && gc_fence.is_none() {
+            return Err(PrepareCommitError {
+                error: unavailable("optimistic commit has no frozen GC fence"),
+                publication_window: None,
+                budget_reservations: Vec::new(),
+            });
+        }
         let commit = CommitFileVersion {
+            gc_fence,
             operation_id,
             inode_id: frozen.inode.inode_id.clone(),
             write_lease: frozen.write_lease.clone(),
@@ -12559,6 +12580,7 @@ impl Backend for DistributedFs {
                 kill_suidgid_dirty: state.kill_suidgid_dirty,
             };
             let commit = CommitFileVersion {
+                gc_fence: None,
                 operation_id: self.operation_id("cow-copy"),
                 inode_id: destination.inode_id.clone(),
                 write_lease: state.write_lease.clone(),
@@ -14430,7 +14452,9 @@ fn unavailable(message: impl Into<String>) -> Error {
 fn is_definite_commit_rejection(error: &Error) -> bool {
     matches!(
         error.code(),
-        afs_error::META_CATALOG_INVALID_REQUEST | afs_error::META_DFS_CONFLICT
+        afs_error::META_CATALOG_INVALID_REQUEST
+            | afs_error::META_DFS_CONFLICT
+            | afs_error::META_DFS_GC_CHANGED
     )
 }
 
@@ -14843,6 +14867,7 @@ mod tests {
                 created_at_unix_ms: now,
             };
             let commit = CommitFileVersion {
+                gc_fence: None,
                 operation_id: OperationId::new(format!("external-commit-{generation}")),
                 inode_id: inode.inode_id.clone(),
                 write_lease: self.lease.lock().unwrap().clone(),
