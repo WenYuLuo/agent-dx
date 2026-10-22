@@ -25,6 +25,8 @@ use std::{
 };
 use tokio::{net::UnixListener, sync::Semaphore, task::JoinHandle, time::Instant};
 
+const CREATE_BUDGET: Duration = Duration::from_secs(10);
+
 #[derive(Default)]
 struct Host {
     prepares: AtomicUsize,
@@ -273,6 +275,19 @@ impl Fixture {
             .await
             .unwrap()
     }
+    async fn expire_blocked_create(&self, deadline: Instant) {
+        tokio::time::timeout(CREATE_BUDGET, self.backend.entered.acquire())
+            .await
+            .expect("create did not reach the blocked backend")
+            .unwrap()
+            .forget();
+        // Expire the caller only after the real HTTP handler owns the request.
+        // Setup includes fsync, so a short wall-clock deadline can expire before
+        // reaching the race this test is meant to exercise on a busy CI host.
+        tokio::time::pause();
+        tokio::time::advance(deadline.saturating_duration_since(Instant::now())).await;
+        tokio::time::resume();
+    }
     fn restart(&mut self) {
         self.listeners[0].abort();
         std::fs::remove_file(&self.config.socket).unwrap();
@@ -297,7 +312,13 @@ async fn native_runtime_response_field_keeps_reconciliation_and_deletion_availab
         let fixture = Fixture::new();
         let driver = fixture.driver().await;
         driver
-            .start(&spec(class), "tenant-agent-1", 1, &[])
+            .start_with_deadline(
+                &spec(class),
+                "tenant-agent-1",
+                1,
+                &[],
+                Instant::now() + CREATE_BUDGET,
+            )
             .await
             .unwrap();
         {
@@ -393,21 +414,16 @@ async fn inventory_keeps_timed_out_creation_tracked_until_its_worker_finishes() 
     let fixture = Fixture::new();
     let driver = fixture.driver_with_timeout(Duration::from_secs(5)).await;
     fixture.backend.release.acquire().await.unwrap().forget();
+    let deadline = Instant::now() + CREATE_BUDGET;
     let creating = {
         let driver = driver.clone();
         tokio::spawn(async move {
             driver
-                .start_with_deadline(
-                    &spec("conch"),
-                    "tenant-agent-1",
-                    1,
-                    &[],
-                    Instant::now() + Duration::from_millis(100),
-                )
+                .start_with_deadline(&spec("conch"), "tenant-agent-1", 1, &[], deadline)
                 .await
         })
     };
-    fixture.backend.entered.acquire().await.unwrap().forget();
+    fixture.expire_blocked_create(deadline).await;
     assert!(matches!(
         creating.await.unwrap(),
         Err(Error::DeadlineExceeded(_))
@@ -654,7 +670,13 @@ async fn periodic_reclaims_failed_execution_through_environment_work() {
     let mut authority = authority::Fixture::new().await;
     authority.cycle(&node).await.unwrap();
     driver
-        .start(&spec("conch"), "tenant-agent-1", 1, &[])
+        .start_with_deadline(
+            &spec("conch"),
+            "tenant-agent-1",
+            1,
+            &[],
+            Instant::now() + CREATE_BUDGET,
+        )
         .await
         .unwrap();
     fixture.backend.reject_delete.store(true, Ordering::SeqCst);
@@ -694,7 +716,13 @@ async fn periodic_backend_epoch_change_is_cleaned_by_its_controller() {
     let driver = fixture.driver().await;
     let record = running_record("conch");
     driver
-        .start(&record.spec, &record.runtime.id, 1, &[])
+        .start_with_deadline(
+            &record.spec,
+            &record.runtime.id,
+            1,
+            &[],
+            Instant::now() + CREATE_BUDGET,
+        )
         .await
         .unwrap();
     let node = authority::manager(Arc::new(driver.clone()));
@@ -809,23 +837,14 @@ async fn deadline_keeps_late_create_owned_and_delete_waits_for_completion() {
     let fixture = Fixture::new();
     let driver = fixture.driver().await;
     fixture.backend.release.acquire().await.unwrap().forget();
+    let deadline = Instant::now() + CREATE_BUDGET;
     let worker = driver.clone();
     let create = tokio::spawn(async move {
         worker
-            .start_with_deadline(
-                &spec("conch"),
-                "tenant-agent-1",
-                1,
-                &[],
-                Instant::now() + Duration::from_millis(200),
-            )
+            .start_with_deadline(&spec("conch"), "tenant-agent-1", 1, &[], deadline)
             .await
     });
-    tokio::time::timeout(Duration::from_secs(5), fixture.backend.entered.acquire())
-        .await
-        .unwrap()
-        .unwrap()
-        .forget();
+    fixture.expire_blocked_create(deadline).await;
     assert!(matches!(
         create.await.unwrap(),
         Err(Error::DeadlineExceeded(_))
