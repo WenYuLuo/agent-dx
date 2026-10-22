@@ -157,6 +157,15 @@ impl RuntimeDriver for RuntimeRouter {
         }
         Ok(inventory)
     }
+    async fn reconcile_unowned_executions(&self) -> Result<()> {
+        if let Some(r) = &self.sandboxd {
+            r.reconcile_unowned_executions().await?;
+        }
+        if let Some(r) = &self.jiuwenbox {
+            r.reconcile_unowned_executions().await?;
+        }
+        Ok(())
+    }
     async fn inventory(&self) -> Result<Vec<RuntimeObservation>> {
         let mut inventory = vec![];
         if let Some(r) = &self.sandboxd {

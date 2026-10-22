@@ -101,10 +101,10 @@ impl Adxlet {
         wait: std::time::Duration,
     ) -> Result<ReconciliationOutcome> {
         let catalog = Catalog::new(&self.node_id, records, snapshots, Some(retained))?;
-        let actual = tokio::time::timeout(
-            self.services.operation_timeout,
-            self.services.runtime.inventory(),
-        )
+        let actual = tokio::time::timeout(self.services.operation_timeout, async {
+            self.services.runtime.reconcile_unowned_executions().await?;
+            self.services.runtime.inventory().await
+        })
         .await
         .map_err(|_| Error::Unavailable("inventory timed out".into()))??;
         validate_inventory(&actual, &catalog.records)?;
