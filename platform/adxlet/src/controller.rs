@@ -76,8 +76,11 @@ struct Envelope {
 }
 impl Envelope {
     fn new(command: Command, reply: Reply) -> Self {
-        let trace = (!matches!(command, Command::Tick(_) | Command::Expire(_, _)))
-            .then(|| adx_observability::trace::Trace::child("environment.queue"));
+        let trace = (!matches!(
+            command,
+            Command::Tick(_) | Command::Expire(_, _) | Command::CheckAuthority(_, _)
+        ))
+        .then(|| adx_observability::trace::Trace::child("environment.queue"));
         Self {
             command,
             reply,
@@ -370,6 +373,10 @@ fn spawn_controller(
             trace,
         }) = rx.recv().await
         {
+            let trace = match &command {
+                Command::CheckAuthority(check, _) => controller.authority_trace(check),
+                _ => trace,
+            };
             if let Some(trace) = trace {
                 trace.attribute("environment.id", controller.record.spec.id.clone());
                 trace
@@ -395,6 +402,9 @@ impl Controller {
             Command::CheckAuthority(check, ack) => {
                 self.authority_fenced = true;
                 let result = self.check_authority(*check).await;
+                if result.is_err() {
+                    adx_observability::trace::error();
+                }
                 self.authority_fenced = result.is_err();
                 let _ = ack.send(result);
                 return;
@@ -442,6 +452,7 @@ impl Controller {
                 } else {
                     self.tick().await
                 };
+                self.trace_observation_error("tick", &result);
                 let _ = ack.send(result);
                 return;
             }
@@ -451,6 +462,7 @@ impl Controller {
                 } else {
                     self.expire_checkpoint(now).await
                 };
+                self.trace_observation_error("checkpoint_expiry", &result);
                 let _ = ack.send(result);
                 return;
             }
@@ -604,6 +616,17 @@ impl Controller {
         }
         if let Some(previous) = self.recovery_files.replace(access) {
             self.execution_files.push(previous);
+        }
+    }
+
+    fn trace_observation_error<T>(&self, observation: &'static str, result: &Result<T>) {
+        if result.is_err() {
+            // Emit only a failure event after a passive check fails. Successful
+            // checks never allocate a span; lifecycle work has its own spans.
+            let trace = adx_observability::trace::Trace::child("environment.observation_failed");
+            trace.attribute("environment.id", self.record.spec.id.clone());
+            trace.attribute("environment.observation", observation.into());
+            trace.scope(adx_observability::trace::error);
         }
     }
     async fn discard_execution(&mut self, references: Option<&CheckpointReferences>) -> Result<()> {

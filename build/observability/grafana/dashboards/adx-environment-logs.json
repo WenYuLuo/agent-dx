@@ -103,7 +103,7 @@
             "type": "loki",
             "uid": "loki"
           },
-          "expr": "{adx_env=~\"$adx_env\",component_name=\"adx-runtime\"} | runtime_id =~ ${runtime_id:doublequote} |= ${log_search:doublequote}",
+          "expr": "{adx_env=~\"$adx_env\",component_name=\"adx-runtime\"} | runtime_id =~ `${runtime_id:raw}` |= ${log_search:doublequote}",
           "refId": "A",
           "maxLines": 500
         }
@@ -330,6 +330,7 @@
       {
         "name": "runtime_id",
         "label": "Runtime ID regex",
+        "description": "RE2 regex. Use \\x60 to match a backtick.",
         "type": "textbox",
         "query": ".*",
         "current": {
@@ -359,6 +360,6 @@
   "timezone": "browser",
   "title": "ADX Environment Logs",
   "uid": "adx-environment-logs",
-  "version": 1,
+  "version": 2,
   "weekStart": ""
 }

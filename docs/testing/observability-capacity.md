@@ -89,7 +89,10 @@ Environment 明细页使用采样年龄过滤当前 CPU/内存，Paused 列表�
 
 ## 巡检 Trace
 
-普通 Tick 和恢复点有效期扫描不创建 `environment.queue` / `environment.execute`。
+普通 Tick、恢复点有效期扫描和周期性权限核对不创建 `environment.queue` / `environment.execute`。
+Running、Paused 及已释放的终态实例在权限记录与执行状态一致时不生成 Span。
+权限核对发现记录差异、残留执行或需要恢复时创建 `environment.authority_reconcile`，
+失败结果带错误状态；Tick 或有效期扫描失败时记录 `environment.observation_failed`。
 用户生命周期命令继续携带入队和执行上下文。巡检实际发现退出时创建
 `environment.unexpected_exit`；触发自动暂停时创建 `environment.auto_pause`；
 实际状态提交和运行时启动仍创建既有生命周期 Span。采样、巡检周期、健康检测和
@@ -101,8 +104,10 @@ Execd 的无入站 Trace 上下文健康检查、指标抓取和 HTTP 状态轮�
 
 Schedule 自动刷新统计数据。`ADX Environment Logs` 独立页默认最近 15 分钟、关闭
 自动刷新，日志每次最多返回 500 行；runtime 正则支持 `.*environment-id.*`，正文
-关键词按字面匹配。输入通过双引号格式转义。该页同时提供有返回上限的 HTTP Trace
-明细；日志与 Trace 内容查询不会随 Schedule 总览自动执行。
+关键词按字面匹配。Environment、runtime 正则使用 PromQL/LogQL 原始字符串，
+保留 `env-\d+` 等正则及双引号的含义；匹配反引号时使用 RE2 的 `\x60` 写法。
+该页同时提供有返回上限的 HTTP Trace 明细；日志与 Trace 内容查询不会随 Schedule
+总览自动执行。
 
 总览只查询日志速率、控制日志告警/错误量、Collector 队列比例和拒收/入队失败速率。
 两项日志统计使用 instant 查询，分别固定回看 1 分钟和 5 分钟，避免随总览时间范围
@@ -115,6 +120,8 @@ Schedule 自动刷新统计数据。`ADX Environment Logs` 独立页默认最近
 
 - `cargo test -p adxlet --lib metrics::tests`：汇总累计值、runtime 重置、实例回收、过期样本和分层入口。
 - `cargo test -p adxlet --test background_traces`：多次普通巡检/过期扫描不新增 Span，实际失败保留生命周期 Span，失败后旧资源样本移除。
+- `cargo test -p adxlet --test authority_traces`：真实 gRPC 周期核对下，Running/Paused 正常巡检不新增 Span；异常清理、失败和恢复保留 Span，恢复后的正常巡检重新静默。
+- `python3 -m unittest discover -s build/e2e/tests -p test_fc_metrics.py`：Firecracker 生命周期验收分别读取 `/metrics` 和 `/metrics/environments`，要求节点账本与指定实例的资源样本均可用。
 - `cargo test -p adx-apiserver --test create_replay`：响应前进行中计数、完成后响应计数、幂等重放不产生第二次创建。
 - `cargo test -p adx-execd --lib passive_polls_do_not_export_but_requests_keep_context`：真实 HTTP 轮询不导出 Span，诊断上下文、控制写操作和业务请求继续导出。
 - Coordinator `control-rpc` 套件：真实 Redis/mTLS 下创建、重复提交、暂停/恢复及计数。

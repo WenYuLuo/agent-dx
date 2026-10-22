@@ -8,10 +8,15 @@ use std::sync::{
 };
 
 #[derive(Default)]
-struct Backend(AtomicBool);
+struct Backend(AtomicBool, AtomicBool);
 #[async_trait]
 impl RuntimeDriver for Backend {
     async fn is_running(&self, _: &str) -> Result<bool> {
+        if self.1.load(Ordering::Relaxed) {
+            return Err(adx_core::Error::Unavailable(
+                "observation unavailable".into(),
+            ));
+        }
         Ok(self.0.load(Ordering::Relaxed))
     }
     async fn start(
@@ -113,6 +118,25 @@ async fn passive_observation_is_silent_but_real_failure_keeps_lifecycle_spans() 
     assert!(node
         .environment_metrics()
         .contains("environment_id=\"trace-test\""));
+    backend.1.store(true, Ordering::Relaxed);
+    assert!(node.monitor_environments().await.is_err());
+    provider.force_flush().unwrap();
+    let after_error = exporter.get_finished_spans().unwrap();
+    let error = after_error[initial.len()..]
+        .iter()
+        .find(|s| s.name == "environment.observation_failed")
+        .expect("failed observation must remain diagnosable");
+    assert!(matches!(
+        error.status,
+        opentelemetry::trace::Status::Error { .. }
+    ));
+    backend.1.store(false, Ordering::Relaxed);
+    node.monitor_environments().await.unwrap();
+    provider.force_flush().unwrap();
+    assert_eq!(
+        exporter.get_finished_spans().unwrap().len(),
+        after_error.len()
+    );
     backend.0.store(false, Ordering::Relaxed);
     node.monitor_environments().await.unwrap();
     provider.force_flush().unwrap();

@@ -2,7 +2,7 @@
   "uid": "adx-environments",
   "title": "ADX Environments",
   "id": null,
-  "version": 1,
+  "version": 2,
   "schemaVersion": 40,
   "editable": true,
   "refresh": "",
@@ -46,6 +46,7 @@
       {
         "name": "environment_id",
         "label": "Environment ID regex",
+        "description": "RE2 regex. Use \\x60 to match a backtick.",
         "type": "textbox",
         "query": ".*",
         "current": {
@@ -82,7 +83,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "max by (adx_env,environment_id,node_id,state) (adx_environment_info{adx_env=~\"$adx_env\",state=~\"$state\",environment_id=~${environment_id:doublequote}})",
+          "expr": "max by (adx_env,environment_id,node_id,state) (adx_environment_info{adx_env=~\"$adx_env\",state=~\"$state\",environment_id=~`${environment_id:raw}`})",
           "instant": true,
           "format": "table"
         }
@@ -137,7 +138,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "rate(adx_environment_cpu_usage_seconds_total{adx_env=~\"$adx_env\",environment_id=~${environment_id:doublequote}}[2m]) and on(adx_env,instance,environment_id,runtime_id) (adx_environment_stats_age_seconds{adx_env=~\"$adx_env\"} <= 45) and on (adx_env,environment_id) max by (adx_env,environment_id) (adx_environment_info{adx_env=~\"$adx_env\",state=~\"$state\"})",
+          "expr": "rate(adx_environment_cpu_usage_seconds_total{adx_env=~\"$adx_env\",environment_id=~`${environment_id:raw}`}[2m]) and on(adx_env,instance,environment_id,runtime_id) (adx_environment_stats_age_seconds{adx_env=~\"$adx_env\"} <= 45) and on (adx_env,environment_id) max by (adx_env,environment_id) (adx_environment_info{adx_env=~\"$adx_env\",state=~\"$state\"})",
           "instant": false,
           "format": "time_series",
           "legendFormat": "{{environment_id}} / {{runtime_id}}"
@@ -170,7 +171,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "adx_environment_memory_usage_bytes{adx_env=~\"$adx_env\",environment_id=~${environment_id:doublequote}} and on(adx_env,instance,environment_id,runtime_id) (adx_environment_stats_age_seconds{adx_env=~\"$adx_env\"} <= 45) and on (adx_env,environment_id) max by (adx_env,environment_id) (adx_environment_info{adx_env=~\"$adx_env\",state=~\"$state\"})",
+          "expr": "adx_environment_memory_usage_bytes{adx_env=~\"$adx_env\",environment_id=~`${environment_id:raw}`} and on(adx_env,instance,environment_id,runtime_id) (adx_environment_stats_age_seconds{adx_env=~\"$adx_env\"} <= 45) and on (adx_env,environment_id) max by (adx_env,environment_id) (adx_environment_info{adx_env=~\"$adx_env\",state=~\"$state\"})",
           "instant": false,
           "format": "time_series",
           "legendFormat": "{{environment_id}} / {{runtime_id}}"

@@ -16,6 +16,35 @@ pub(crate) enum AuthorityResult {
 }
 
 impl Controller {
+    pub(super) fn authority_trace(
+        &self,
+        check: &AuthorityCheck,
+    ) -> Option<adx_observability::trace::Trace> {
+        // Classify only telemetry here. Every check still executes the same
+        // ownership, publication and cleanup logic below in the serial queue.
+        let execution_current = match self.record.state {
+            EnvironmentState::Running => {
+                check.actual.len() == 1
+                    && check.actual[0].runtime_id == self.record.runtime.id
+                    && check.actual[0].running
+            }
+            EnvironmentState::Paused => check.actual.is_empty(),
+            _ if terminal(&self.record) => check.actual.is_empty(),
+            _ => false,
+        };
+        if !self.authority_fenced
+            && !self.retired
+            && self.durability == Some(Durability::Published)
+            && check.record.as_ref() == Some(&self.record)
+            && execution_current
+        {
+            return None;
+        }
+        let trace = adx_observability::trace::Trace::child("environment.authority_reconcile");
+        trace.attribute("environment.id", self.record.spec.id.clone());
+        Some(trace)
+    }
+
     fn compare_authority(&self, record: &EnvironmentRecord) -> Result<AuthorityComparison> {
         if self.durability != Some(Durability::Published) {
             return Ok(AuthorityComparison::Unpublished);
