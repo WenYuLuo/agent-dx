@@ -129,7 +129,7 @@ pub async fn reconcile_node(
         ));
     }
     let mut catalog_received = false;
-    let mut catalog_stale = false;
+    let mut catalog_retry = false;
     let mut handshake_required = false;
     if !periodic {
         pause_lifecycle_reporting(
@@ -179,11 +179,16 @@ pub async fn reconcile_node(
             .map_err(status)?;
         let recovery = async {
             if periodic {
-                if manager.compare_retained(records, snapshots, retained).await.map_err(status)?
-                    == ReconciliationOutcome::StaleCatalog
-                {
-                    catalog_stale = true;
-                    return Err(Status::aborted("node authority catalog advanced"));
+                match manager.compare_retained(records, snapshots, retained).await.map_err(status)? {
+                    ReconciliationOutcome::Complete => (),
+                    ReconciliationOutcome::StaleCatalog => {
+                        catalog_retry = true;
+                        return Err(Status::aborted("node authority catalog advanced"));
+                    }
+                    ReconciliationOutcome::Busy => {
+                        catalog_retry = true;
+                        return Err(Status::aborted("node lifecycle work active; retry authority catalog"));
+                    }
                 }
                 Ok(())
             } else {
@@ -216,7 +221,7 @@ pub async fn reconcile_node(
     .await;
     if result.is_err() {
         manager.authority_reconciling.store(true, Ordering::Release);
-        if !catalog_stale {
+        if !catalog_retry {
             pause_lifecycle_reporting(
                 manager,
                 coordinator,

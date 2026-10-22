@@ -22,6 +22,7 @@ enum ReconciliationMode {
 pub(crate) enum ReconciliationOutcome {
     Complete,
     StaleCatalog,
+    Busy,
 }
 
 fn terminal_without_execution(record: &EnvironmentRecord) -> bool {
@@ -33,6 +34,34 @@ fn terminal_without_execution(record: &EnvironmentRecord) -> bool {
 }
 
 impl Adxlet {
+    fn can_defer_comparison(&self, records: &[EnvironmentRecord]) -> bool {
+        if self.is_draining()
+            || !self
+                .authority_initialized
+                .load(std::sync::atomic::Ordering::Acquire)
+            || !self.lifecycle_ready.try_read().is_ok_and(|ready| *ready)
+        {
+            return false;
+        }
+        let controllers = self
+            .environments
+            .lock()
+            .expect("shared state lock poisoned");
+        let mut seen = BTreeSet::new();
+        controllers.len() == records.len()
+            && records.iter().all(|record| {
+                seen.insert(&record.spec.id)
+                    && matches!(
+                        record.state,
+                        EnvironmentState::Running | EnvironmentState::Paused
+                    )
+                    && controllers
+                        .get(&record.spec.id)
+                        .is_some_and(|(spec, assignment, _)| {
+                            *spec == record.spec && *assignment == record.assignment
+                        })
+            })
+    }
     /// Called only with a Coordinator-authorized, unreferenced deletion record.
     /// A lost acknowledgement can safely repeat the same artifact removal.
     pub async fn collect_snapshot(&self, snapshot: &Snapshot) -> Result<()> {
@@ -105,7 +134,21 @@ impl Adxlet {
         retained_artifacts: Option<Vec<adx_core::CheckpointArtifact>>,
         mode: ReconciliationMode,
     ) -> Result<ReconciliationOutcome> {
-        let mut ready = self.lifecycle_ready.write().await;
+        let mut ready = if mode == ReconciliationMode::Compare {
+            match self.lifecycle_ready.try_write() {
+                Ok(ready) => ready,
+                // A queued writer blocks later lifecycle readers until the
+                // longest admitted restore finishes. Retry a healthy catalog
+                // without enqueueing that global barrier. Ownership changes,
+                // terminal authority and closed admission still drain below.
+                Err(_) if self.can_defer_comparison(&records) => {
+                    return Ok(ReconciliationOutcome::Busy);
+                }
+                Err(_) => self.lifecycle_ready.write().await,
+            }
+        } else {
+            self.lifecycle_ready.write().await
+        };
         if self.is_draining() {
             return Err(Error::Unavailable("node is draining".into()));
         }
