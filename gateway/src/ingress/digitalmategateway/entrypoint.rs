@@ -31,15 +31,19 @@ use tracing::Instrument;
 
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct JiuwenConfig {
+pub struct DigitalMateGatewayConfig {
     pub tenant: String,
+    pub jiuwen: JiuwenTarget,
+    pub orbit: Option<super::orbit_ws::OrbitWsConfig>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JiuwenTarget {
     pub agent_type: String,
     pub template: String,
     pub version: String,
     pub service_port: Option<u16>,
-    pub allowed_hosts: Vec<String>,
-    #[serde(default)]
-    pub allowed_origins: Vec<String>,
     #[serde(default = "queue_capacity")]
     pub queue_capacity: usize,
     #[serde(default = "request_timeout")]
@@ -58,7 +62,20 @@ pub struct JiuwenConfig {
 fn queue_capacity() -> usize {
     64
 }
-fn request_timeout() -> u64 {
+/// Shared business workspace identity, independent of template version.
+pub(super) fn workspace_parameters(
+    tenant: &str,
+    template: &str,
+    user_id: &str,
+) -> Result<adx_agent_core::mounts::Parameters, Error> {
+    let tuple = serde_json::to_vec(&[tenant, template, user_id]).map_err(|_| invalid())?;
+    Ok(std::collections::BTreeMap::from([(
+        "workspace".into(),
+        format!("w-{}", hex::encode(Sha256::digest(tuple))),
+    )]))
+}
+
+pub(super) fn request_timeout() -> u64 {
     60
 }
 fn download_timeout() -> u64 {
@@ -77,77 +94,61 @@ fn ping_interval() -> u64 {
     20
 }
 fn invalid() -> Error {
-    Error::Invalid("invalid Jiuwen configuration".into())
+    Error::Invalid("invalid DigitalMateGateway configuration".into())
 }
-impl JiuwenConfig {
+impl DigitalMateGatewayConfig {
     /// Identity comes only from the authenticated business session.
     /// Template version stays outside binding_id, inside the complete binding scope.
     pub fn scope(&self, user_id: &str) -> Result<Scope, Error> {
         for value in [
             &self.tenant,
             user_id,
-            &self.agent_type,
-            &self.template,
-            &self.version,
+            &self.jiuwen.agent_type,
+            &self.jiuwen.template,
+            &self.jiuwen.version,
         ] {
             adx_agent_core::identifier(value, "Jiuwen identity").map_err(Error::Invalid)?;
         }
         if user_id.len() > 256 {
             return Err(invalid());
         }
-        let tuple = serde_json::to_vec(&[&self.tenant, user_id, &self.agent_type])
+        let tuple = serde_json::to_vec(&[&self.tenant, user_id, &self.jiuwen.agent_type])
             .map_err(|_| invalid())?;
         Ok(Scope {
             tenant: self.tenant.clone(),
-            template: self.template.clone(),
-            version: self.version.clone(),
+            template: self.jiuwen.template.clone(),
+            version: self.jiuwen.version.clone(),
             binding_id: format!("jiuwen-{}", hex::encode(Sha256::digest(tuple))),
         })
     }
     /// Stable workspace identity across template versions and agent types.
     pub fn parameters(&self, user_id: &str) -> Result<adx_agent_core::mounts::Parameters, Error> {
         self.scope(user_id)?;
-        let tuple = serde_json::to_vec(&[self.tenant.as_str(), self.template.as_str(), user_id])
-            .map_err(|_| invalid())?;
-        Ok(std::collections::BTreeMap::from([(
-            "workspace".into(),
-            format!("w-{}", hex::encode(Sha256::digest(tuple))),
-        )]))
+        workspace_parameters(&self.tenant, &self.jiuwen.template, user_id)
     }
+
     pub fn validate(&self) -> Result<(), Error> {
+        if let Some(orbit) = &self.orbit {
+            orbit.validate(&self.tenant)?;
+        }
         self.scope("validation")?
             .validate()
             .map_err(Error::Invalid)?;
-        if self.allowed_hosts.is_empty()
-            || self.service_port == Some(0)
-            || !(1..=1024).contains(&self.queue_capacity)
-            || self.ping_interval_seconds >= self.idle_timeout_seconds
+        if self.jiuwen.service_port == Some(0)
+            || !(1..=1024).contains(&self.jiuwen.queue_capacity)
+            || self.jiuwen.ping_interval_seconds >= self.jiuwen.idle_timeout_seconds
         {
             return Err(invalid());
         }
         for seconds in [
-            self.request_timeout_seconds,
-            self.download_timeout_seconds,
-            self.write_timeout_seconds,
-            self.output_queue_timeout_seconds,
-            self.idle_timeout_seconds,
-            self.ping_interval_seconds,
+            self.jiuwen.request_timeout_seconds,
+            self.jiuwen.download_timeout_seconds,
+            self.jiuwen.write_timeout_seconds,
+            self.jiuwen.output_queue_timeout_seconds,
+            self.jiuwen.idle_timeout_seconds,
+            self.jiuwen.ping_interval_seconds,
         ] {
             if seconds == 0 || seconds > 86400 {
-                return Err(invalid());
-            }
-        }
-        for host in &self.allowed_hosts {
-            let authority: http::uri::Authority = host.parse().map_err(|_| invalid())?;
-            if authority.port().is_some() || authority.host() != host || host.contains('@') {
-                return Err(invalid());
-            }
-        }
-        for origin in &self.allowed_origins {
-            let url = url::Url::parse(origin).map_err(|_| invalid())?;
-            if !matches!(url.scheme(), "http" | "https")
-                || url.origin().ascii_serialization() != *origin
-            {
                 return Err(invalid());
             }
         }
@@ -155,35 +156,35 @@ impl JiuwenConfig {
     }
     fn frontend(&self) -> FrontendConfig {
         FrontendConfig {
-            queue_capacity: self.queue_capacity,
-            write_timeout: Duration::from_secs(self.write_timeout_seconds),
-            idle_timeout: Duration::from_secs(self.idle_timeout_seconds),
-            ping_interval: Duration::from_secs(self.ping_interval_seconds),
+            queue_capacity: self.jiuwen.queue_capacity,
+            write_timeout: Duration::from_secs(self.jiuwen.write_timeout_seconds),
+            idle_timeout: Duration::from_secs(self.jiuwen.idle_timeout_seconds),
+            ping_interval: Duration::from_secs(self.jiuwen.ping_interval_seconds),
         }
     }
     fn driver(&self) -> DriverConfig {
         DriverConfig {
             limits: SessionLimits {
-                pending: self.queue_capacity,
+                pending: self.jiuwen.queue_capacity,
                 recent: 1024,
                 busy: 1024,
             },
-            write_timeout: Duration::from_secs(self.write_timeout_seconds),
-            output_queue_timeout: Duration::from_secs(self.output_queue_timeout_seconds),
-            idle_timeout: Duration::from_secs(self.idle_timeout_seconds),
-            ping_interval: Duration::from_secs(self.ping_interval_seconds),
-            request_timeout: Duration::from_secs(self.request_timeout_seconds),
+            write_timeout: Duration::from_secs(self.jiuwen.write_timeout_seconds),
+            output_queue_timeout: Duration::from_secs(self.jiuwen.output_queue_timeout_seconds),
+            idle_timeout: Duration::from_secs(self.jiuwen.idle_timeout_seconds),
+            ping_interval: Duration::from_secs(self.jiuwen.ping_interval_seconds),
+            request_timeout: Duration::from_secs(self.jiuwen.request_timeout_seconds),
         }
     }
 }
-pub struct JiuwenApi {
-    config: JiuwenConfig,
+pub struct DigitalMateGatewayApi {
+    config: DigitalMateGatewayConfig,
     auth: Arc<dyn BusinessAuth>,
     managed: Arc<ManagedService>,
 }
-impl JiuwenApi {
+impl DigitalMateGatewayApi {
     pub fn new(
-        config: JiuwenConfig,
+        config: DigitalMateGatewayConfig,
         managed: Arc<ManagedService>,
         auth: Arc<dyn BusinessAuth>,
     ) -> Result<Self, Error> {
@@ -198,6 +199,7 @@ impl JiuwenApi {
         matches!(
             path,
             "/ws"
+                | "/orbit/ws"
                 | "/file-api/download"
                 | "/file-api/upload"
                 | "/api/v1/auth/huawei/login"
@@ -206,44 +208,13 @@ impl JiuwenApi {
                 | "/api/v1/auth/quota"
         )
     }
-    fn admitted(&self, request: &Request<Incoming>) -> bool {
-        if request.headers().get_all(header::HOST).iter().count() != 1
-            || request.headers().get_all(header::ORIGIN).iter().count() > 1
-        {
-            return false;
-        }
-        let host = request
-            .headers()
-            .get(header::HOST)
-            .and_then(|h| h.to_str().ok())
-            .and_then(|h| h.parse::<http::uri::Authority>().ok());
-        if !host.is_some_and(|h| {
-            self.config
-                .allowed_hosts
-                .iter()
-                .any(|allowed| h.host().eq_ignore_ascii_case(allowed))
-        }) {
-            return false;
-        }
-        if let Some(origin) = request.headers().get(header::ORIGIN) {
-            if !origin.to_str().ok().is_some_and(|value| {
-                self.config
-                    .allowed_origins
-                    .iter()
-                    .any(|allowed| allowed == value)
-            }) {
-                return false;
-            }
-        }
-        true
-    }
     pub(crate) async fn handle(
         &self,
         mut request: Request<Incoming>,
         ingress: Arc<Ingress>,
     ) -> Response<ProxyBody> {
-        if !self.admitted(&request) {
-            return error(StatusCode::FORBIDDEN, "ACCESS_DENIED");
+        if request.uri().path() == "/orbit/ws" && self.config.orbit.is_none() {
+            return error(StatusCode::NOT_FOUND, "NOT_FOUND");
         }
         if matches!(
             request.uri().path(),
@@ -261,10 +232,27 @@ impl JiuwenApi {
         )
         .await
         {
-            Ok(Ok(p)) if p.tenant == self.config.tenant => p,
+            Ok(Ok(p)) => p,
             Ok(Err(e)) => return auth_error(e),
             _ => return auth_error(accounts::Error::Unavailable),
         };
+        if let Some(orbit) = self
+            .config
+            .orbit
+            .as_ref()
+            .filter(|_| request.uri().path() == "/orbit/ws")
+        {
+            return orbit
+                .handle(
+                    request,
+                    ingress,
+                    self.managed.clone(),
+                    self.auth.clone(),
+                    principal,
+                    &self.config.tenant,
+                )
+                .await;
+        }
         if request.uri().path() == "/api/v1/auth/quota" {
             if request.method() != http::Method::GET {
                 return error(StatusCode::METHOD_NOT_ALLOWED, "METHOD_NOT_ALLOWED");
@@ -324,7 +312,7 @@ impl JiuwenApi {
             Err(_) => return error(StatusCode::BAD_REQUEST, "INVALID_WEBSOCKET_HANDSHAKE"),
         };
         let context = Arc::new(RequestContext::new(Duration::from_secs(
-            self.config.request_timeout_seconds,
+            self.config.jiuwen.request_timeout_seconds,
         )));
         let access = AgentV2Access::new(self.managed.clone());
         let initialization = async {
@@ -342,7 +330,7 @@ impl JiuwenApi {
                 scope.clone(),
                 ServiceSelector {
                     protocol: Protocol::Ws,
-                    port: self.config.service_port,
+                    port: self.config.jiuwen.service_port,
                 },
                 initialization,
             )
@@ -509,7 +497,7 @@ impl JiuwenApi {
             return error(StatusCode::FORBIDDEN, "USER_MISMATCH");
         }
         let context = Arc::new(RequestContext::new(Duration::from_secs(
-            self.config.download_timeout_seconds,
+            self.config.jiuwen.download_timeout_seconds,
         )));
         let template = match self
             .managed
@@ -546,7 +534,7 @@ impl JiuwenApi {
             environment_id: target.environment_id,
             workspace,
             user_id,
-            agent_type: self.config.agent_type.clone(),
+            agent_type: self.config.jiuwen.agent_type.clone(),
         };
         tokio::select! {
             response = upload.respond(request.into_body(), &content_type) => response,
@@ -584,7 +572,7 @@ impl JiuwenApi {
             return error(StatusCode::BAD_REQUEST, "MISSING_TOKEN");
         };
         let context = Arc::new(RequestContext::new(Duration::from_secs(
-            self.config.download_timeout_seconds,
+            self.config.jiuwen.download_timeout_seconds,
         )));
         let config = match DownloadConfig::load(&self.managed, &context, &scope).await {
             Ok(v) => v,
@@ -636,10 +624,10 @@ impl JiuwenApi {
         )
     }
 }
-fn auth_error(error: accounts::Error) -> Response<ProxyBody> {
+pub(super) fn auth_error(error: accounts::Error) -> Response<ProxyBody> {
     self::error(error.status(), error.code())
 }
-fn agent_error(e: Error) -> Response<ProxyBody> {
+pub(super) fn agent_error(e: Error) -> Response<ProxyBody> {
     let (status, code) = match e {
         Error::Invalid(_) => (StatusCode::BAD_REQUEST, "INVALID_REQUEST"),
         Error::NotFound => (StatusCode::NOT_FOUND, "NOT_FOUND"),
@@ -654,7 +642,7 @@ fn body(bytes: Bytes) -> ProxyBody {
         .map_err(|never| match never {})
         .boxed_unsync()
 }
-fn error(status: StatusCode, code: &str) -> Response<ProxyBody> {
+pub(super) fn error(status: StatusCode, code: &str) -> Response<ProxyBody> {
     Response::builder()
         .status(status)
         .header("content-type", "application/json")

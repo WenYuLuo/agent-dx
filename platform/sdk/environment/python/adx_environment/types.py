@@ -701,6 +701,25 @@ class S3Config:
 
 
 @dataclass(frozen=True)
+class CreateOptions:
+    """Ownership and permissions for a newly created Local bind directory only."""
+
+    uid: int
+    gid: int
+    mode: str
+
+    def __post_init__(self) -> None:
+        for label, value in (("uid", self.uid), ("gid", self.gid)):
+            if type(value) is not int or not 0 <= value < 4294967295:
+                raise ValueError(f"create_options {label} must be an integer from 0 to 4294967294")
+        if not isinstance(self.mode, str) or re.fullmatch(r"0[0-7]{3}", self.mode) is None:
+            raise ValueError("create_options mode must be four octal digits from 0000 to 0777")
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"uid": self.uid, "gid": self.gid, "mode": self.mode}
+
+
+@dataclass(frozen=True)
 class Mount:
     """Image/S3 read-only mount or a node-local bind mount.
 
@@ -717,6 +736,7 @@ class Mount:
     host_path: Optional[str] = None
     options: Sequence[str] = ("ro",)
     create_if_missing: bool = False
+    create_options: Optional[CreateOptions] = None
 
     def __post_init__(self) -> None:
         for label, path in (("target", self.target), ("host_path", self.host_path)):
@@ -750,6 +770,11 @@ class Mount:
             raise ValueError("create_if_missing must be a boolean")
         if self.create_if_missing and (self.host_path is None or self.type != "bind"):
             raise ValueError("create_if_missing requires a local bind mount")
+        if self.create_options is not None:
+            if not isinstance(self.create_options, CreateOptions):
+                raise ValueError("create_options must be CreateOptions")
+            if not self.create_if_missing:
+                raise ValueError("create_options requires create_if_missing")
         object.__setattr__(self, "options", options)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -761,6 +786,8 @@ class Mount:
         if self.host_path is not None:
             d["host_path"] = self.host_path
             d["create_if_missing"] = self.create_if_missing
+        if self.create_options is not None:
+            d["create_options"] = self.create_options.to_dict()
         return d
 
 

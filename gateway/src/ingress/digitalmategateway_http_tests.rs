@@ -2,7 +2,7 @@
 use super::*;
 use crate::{
     common::protocol::GatewayPolicy,
-    ingress::jiuwen::{download_config::DownloadConfig, download_http::Download},
+    ingress::digitalmategateway::{download_config::DownloadConfig, download_http::Download},
     node::Relay,
 };
 use adx_agent_api::request::RequestContext;

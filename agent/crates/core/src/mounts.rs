@@ -12,6 +12,31 @@ pub enum MountType {
     Bind,
 }
 
+/// Ownership and permissions applied only when a Local source directory is created.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateOptions {
+    pub uid: u32,
+    pub gid: u32,
+    /// Four octal digits, from "0000" through "0777".
+    pub mode: String,
+}
+
+impl CreateOptions {
+    fn validate(&self) -> ValidationResult {
+        if self.uid == u32::MAX || self.gid == u32::MAX {
+            return Err("create_options uid/gid must be below 4294967295".into());
+        }
+        if self.mode.len() != 4
+            || !self.mode.starts_with('0')
+            || !self.mode.bytes().all(|value| matches!(value, b'0'..=b'7'))
+        {
+            return Err("create_options mode must be four octal digits from 0000 to 0777".into());
+        }
+        Ok(())
+    }
+}
+
 /// Agent templates currently expose Local bind mounts; Platform also supports other sources.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -25,6 +50,8 @@ pub struct Mount {
     /// Create a missing Local source directory on the execution node.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub create_if_missing: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub create_options: Option<CreateOptions>,
 }
 
 pub(crate) fn parameter_name(name: &str) -> bool {
@@ -118,6 +145,12 @@ impl Mount {
     }
 
     fn validate_options(&self) -> ValidationResult {
+        if let Some(options) = &self.create_options {
+            if !self.create_if_missing {
+                return Err("create_options requires create_if_missing".into());
+            }
+            options.validate()?;
+        }
         absolute_path(&self.target)?;
         let mut seen = BTreeSet::new();
         for option in &self.options {

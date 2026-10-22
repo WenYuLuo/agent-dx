@@ -70,9 +70,11 @@ mounts:
 
 挂载可声明 `create_if_missing`（默认 false）。为 true 时，adxlet 在创建或恢复沙箱前幂等创建缺失的源目录；父目录必须预先存在，拒绝符号链接路径，已有目录不清空或改变权限。该字段由模板经 Activator 原样传到 Platform，不需要节点目录配置。
 
+需要为非 root 应用创建目录时，可同时声明 `create_options: {"uid":10001,"gid":10001,"mode":"0700"}`。三个字段均必填，UID/GID 为 0–4294967294 的整数，mode 为 `0000`–`0777` 的四位八进制字符串。仅允许与 `create_if_missing: true` 一起使用；只对新目录设置所有权和权限，已有目录保持原状，不递归 chown。未声明时保持原有 0755（受节点 umask 影响）及节点进程所有权。节点直接创建最终源目录，再通过目录描述符设置所有权和权限；设置失败则本次启动失败并保留目录，需修正残留权限。该过程不承诺原子初始化，并发首次使用可能看到尚未设置完成的权限。需要包含该能力的 adxlet；单独更新 Ingress 或模板不能使旧节点支持它。
+
 Activator 在准备和激活时渲染 mounts；HTTP 与嵌入式 Sandbox 适配器发送相同的具体挂载，不传 parameters、user_id 或 owner_id。Jiuwen 根据认证身份的 `[tenant, template, user_id]` JSON 数组 SHA-256 生成 `w-<完整十六进制摘要>`，版本、Binding 和 Sandbox ID 不参与目录标识。
 
-[Jiuwen 模板例子](activator/examples/jiuwen-sfs-template.json)将应用数据和 HOME 收敛到 `/home/jiuwen`。当前没有 SFS 自动挂载、受管目录自动创建或跨 Binding 的工作区独占协调。使用 SQLite/WAL 的工作区必须保证旧 Sandbox 完全停止访问后才启用后继，不能同时运行新旧版本。详见[工作区设计](../docs/development/user-workspace-volumes-design.md)。
+[Jiuwen 模板例子](activator/examples/jiuwen-sfs-template.json)将应用数据和 HOME 收敛到 `/home/jiuwen`。当前没有 SFS 自动挂载或跨 Binding 的工作区独占协调；目录创建由上述挂载声明控制。使用 SQLite/WAL 的工作区必须保证旧 Sandbox 完全停止访问后才启用后继，不能同时运行新旧版本。详见[工作区设计](../docs/development/user-workspace-volumes-design.md)。
 
 ## 进程配置
 

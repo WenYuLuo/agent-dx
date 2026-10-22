@@ -36,7 +36,7 @@ impl fmt::Debug for DownloadConfig {
 impl DownloadConfig {
     /// Fetch the same tenant/template/version used for binding activation through
     /// ManagedService's existing immutable-template cache. This does not resolve or
-    /// create a binding or Environment. Scope tenant must come from verified identity.
+    /// create a binding or Environment. Scope tenant comes from the gateway configuration.
     /// Returns scope/configuration, missing-template, control or deadline errors.
     pub async fn load(
         managed: &ManagedService,

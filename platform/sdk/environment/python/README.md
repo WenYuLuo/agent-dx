@@ -460,7 +460,7 @@ writable-layer enforcement.
 `Mount` supports image-backed read-only bind mounts, S3-backed bind or EROFS
 mounts, and Local bind mounts through `host_path`. Local mounts accept `options`
 (`ro` by default, or `rw`, plus `nosuid`/`nodev`/`noexec`) and `create_if_missing`
-for leaf-directory creation. The shared filesystem must already be mounted in
+for leaf-directory creation. Optional `create_options=CreateOptions(uid=10001, gid=10001, mode="0700")` requires `create_if_missing=True` and sets ownership/permissions only for newly created directories; existing directories remain unchanged. IDs must be integers from 0 to 4294967294; mode is a four-digit octal string from `0000` to `0777`. Import `CreateOptions` from `adx_environment`. The shared filesystem must already be mounted in
 the worker runtime namespace. For example, an SFS/MooseFS user workspace uses
 `Mount(target="/home/jiuwen", host_path="/home/agentos/users/user-1",
 options=("rw",), create_if_missing=True)`. Credentials are sent to the control plane and sandboxd; callers should

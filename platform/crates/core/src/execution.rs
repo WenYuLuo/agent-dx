@@ -62,6 +62,38 @@ impl Rootfs {
     }
 }
 
+/// Creation attributes for a new Local bind source; existing directories are unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateOptions {
+    pub uid: u32,
+    pub gid: u32,
+    /// Four octal digits, from "0000" through "0777".
+    pub mode: String,
+}
+
+impl CreateOptions {
+    /// Validate numeric ownership and return the requested Unix permission bits.
+    /// Invalid IDs or a mode outside 0000..0777 return Invalid.
+    pub fn mode_bits(&self) -> Result<u32> {
+        if self.uid == u32::MAX || self.gid == u32::MAX {
+            return Err(Error::Invalid(
+                "create_options uid/gid must be below 4294967295".into(),
+            ));
+        }
+        if self.mode.len() != 4
+            || !self.mode.starts_with('0')
+            || !self.mode.bytes().all(|value| matches!(value, b'0'..=b'7'))
+        {
+            return Err(Error::Invalid(
+                "create_options mode must be four octal digits from 0000 to 0777".into(),
+            ));
+        }
+        u32::from_str_radix(&self.mode, 8)
+            .map_err(|error| Error::Invalid(format!("invalid create_options mode: {error}")))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Mount {
     pub kind: String,
@@ -71,10 +103,20 @@ pub struct Mount {
     pub source: StorageSource,
     #[serde(default)]
     pub create_if_missing: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub create_options: Option<CreateOptions>,
 }
 
 impl Mount {
     pub fn validate(&self) -> Result<()> {
+        if let Some(options) = &self.create_options {
+            if !self.create_if_missing {
+                return Err(Error::Invalid(
+                    "create_options requires create_if_missing".into(),
+                ));
+            }
+            options.mode_bits()?;
+        }
         if self.create_if_missing
             && (self.kind != "bind" || !matches!(self.source, StorageSource::Local(_)))
         {
