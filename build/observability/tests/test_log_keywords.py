@@ -6,6 +6,7 @@ python3 -m unittest discover -s build/observability/tests -v
 
 import json
 import re
+import shutil
 import subprocess
 import time
 import unittest
@@ -46,7 +47,9 @@ def interpolate(expr, keyword, runtime):
 
     def replace(match):
         name, fmt, short = match.groups()
-        value = values[name or short]
+        value = values.get(name or short)
+        if value is None:
+            raise AssertionError(f'Unsupported Grafana variable: {name or short}')
         if fmt in (None, 'raw'):
             return value
         if fmt == 'doublequote':
@@ -65,22 +68,25 @@ class LogKeywordTests(unittest.TestCase):
         panel = next(p for p in dashboard['panels'] if p['title'] == 'Environment Logs')
         cls.target = panel['targets'][0]
         cls.name = 'adx-log-keywords-' + uuid.uuid4().hex[:12]
+        docker_path = shutil.which('docker')
+        if docker_path is None:
+            raise FileNotFoundError('Docker is required for the Loki keyword regression')
+        docker_executable = str(Path(docker_path).resolve())
         subprocess.run([
-            'docker', 'run', '--pull', 'never', '--rm', '-d', '--name', cls.name,
+            docker_executable, 'run', '--pull', 'never', '--rm', '-d', '--name', cls.name,
             '-p', '127.0.0.1::3100', 'grafana/loki:3.4.2',
             '-config.file=/etc/loki/local-config.yaml',
         ], check=True, capture_output=True, text=True)
-        cls.addClassCleanup(subprocess.run, ['docker', 'rm', '-f', cls.name],
+        cls.addClassCleanup(subprocess.run, [docker_executable, 'rm', '-f', cls.name],
                             check=True, capture_output=True, text=True)
-        address = subprocess.check_output(['docker', 'port', cls.name, '3100/tcp'], text=True).strip()
-        cls.url = 'http://' + address
+        cls.address = subprocess.check_output([docker_executable, 'port', cls.name, '3100/tcp'], text=True).strip()
         deadline = time.monotonic() + 60
         while time.monotonic() < deadline:
             try:
-                with urllib.request.urlopen(cls.url + '/ready', timeout=2) as response:
+                with urllib.request.urlopen(cls.loki_url('/ready'), timeout=2) as response:
                     if response.status == 200:
                         break
-            except (OSError, urllib.error.URLError):
+            except OSError:
                 time.sleep(0.5)
         else:
             raise AssertionError('Loki did not become ready')
@@ -96,12 +102,16 @@ class LogKeywordTests(unittest.TestCase):
                 'values': [[str(cls.now + i), line, {'runtime_id': runtime}]
                            for i, line in enumerate(cls.lines)],
             })
-        request = urllib.request.Request(cls.url + '/loki/api/v1/push',
+        request = urllib.request.Request(cls.loki_url('/loki/api/v1/push'),
                                          data=json.dumps({'streams': streams}).encode(),
                                          headers={'Content-Type': 'application/json'})
         with urllib.request.urlopen(request, timeout=10) as response:
             if response.status != 204:
                 raise AssertionError(response.status)
+
+    @classmethod
+    def loki_url(cls, path, query=''):
+        return urllib.parse.urlunsplit(('http', cls.address, path, query, ''))
 
     def query(self, keyword, runtime=r'env-\d+-1'):
         expr = interpolate(self.target['expr'], keyword, runtime)
@@ -110,7 +120,7 @@ class LogKeywordTests(unittest.TestCase):
             'end': str(self.now + 1_000_000_000), 'limit': self.target['maxLines'],
         })
         try:
-            with urllib.request.urlopen(self.url + '/loki/api/v1/query_range?' + params, timeout=10) as response:
+            with urllib.request.urlopen(self.loki_url('/loki/api/v1/query_range', params), timeout=10) as response:
                 body = json.load(response)
         except urllib.error.HTTPError as error:
             self.fail(f'{expr}\nHTTP {error.code}: {error.read().decode()}')
