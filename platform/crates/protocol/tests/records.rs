@@ -22,6 +22,7 @@ fn environment_options_roundtrip_preserves_backend_contract() {
         }),
         mounts: vec![model::Mount {
             create_if_missing: false,
+            create_options: None,
             kind: "bind".into(),
             target: "/workspace".into(),
             options: vec!["ro".into()],
@@ -197,6 +198,11 @@ fn local_directory_creation_survives_mount_protocol_roundtrip() {
         options: vec!["rw".into()],
         source: model::StorageSource::Local("/mnt/sfs/workspaces/user".into()),
         create_if_missing: true,
+        create_options: Some(model::CreateOptions {
+            uid: 10001,
+            gid: 10001,
+            mode: "0700".into(),
+        }),
     };
     let wire: adx_protocol::control::MountSpec = mount.clone().into();
     let restored: model::Mount = wire.try_into().unwrap();

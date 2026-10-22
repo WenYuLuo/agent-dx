@@ -361,6 +361,7 @@ fn kata_start_preserves_explicit_terminal_mount() {
     spec.runtime_class = "kata".into();
     spec.execution.mounts.push(adx_core::execution::Mount {
         create_if_missing: false,
+        create_options: None,
         kind: "bind".into(),
         target: "/dev/pts".into(),
         options: vec!["rbind".into()],
@@ -404,6 +405,7 @@ fn start_maps_public_environment_contract_to_backend_protocol() {
         }),
         mounts: vec![model::Mount {
             create_if_missing: false,
+            create_options: None,
             kind: "bind".into(),
             target: "/workspace".into(),
             options: vec!["ro".into()],

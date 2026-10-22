@@ -178,7 +178,7 @@ SFS 必须在 sandboxd 执行挂载的 mount namespace 中可见。本环境 nod
 
 目录创建由每个挂载的 `create_if_missing` 布尔字段控制，默认 false。模板声明该字段，Activator 将它与渲染后的具体路径一同传入 Sandbox capability，Platform 在 EnvironmentSpec 和内部 RPC 中保留它；adxlet 在 start/restore 前执行。Jiuwen 与 Activator 不直接 mkdir，也不增加节点受管目录配置项。
 
-为 true 时只创建最终一级源目录，父目录须由部署预先准备。节点逐级使用目录描述符和 O_NOFOLLOW 解析路径，拒绝符号链接；已有目录复用，不递归 chown 或清理。新目录 mode 为 0755（受节点 umask 影响），属主是节点进程，当前 test 的 AgentServer 使用 root。其他应用 UID 需另行准备权限。SFS 类型、来源和读写选项由现有节点启动检查确认。
+为 true 时只创建最终一级源目录，父目录须由部署预先准备。节点逐级使用目录描述符和 O_NOFOLLOW 解析路径，拒绝符号链接；已有目录复用，不递归 chown 或清理。未指定创建属性时，新目录 mode 为 0755（受节点 umask 影响），属主是节点进程。非 root 应用可在挂载内声明 `create_options: {"uid":10001,"gid":10001,"mode":"0700"}`，与 `create_if_missing: true` 配合使用。三个属性均必填；UID/GID 为 0–4294967294 的整数，mode 为 0000–0777 的四位八进制字符串，不解析镜像用户名。节点直接 mkdir 最终源目录，仅本次创建成功的调用者通过目录描述符设置所有权和权限。并发 mkdir 返回已存在时复用目录，不重复设置。创建与属性设置不是一个原子操作；并发首次使用或进程中断可能看到未完成的属性。设置失败返回错误、阻止本次启动，保留目录供修正，不自动删除、重命名或修复已有目录。已有目录不变，不递归修改；不引入工作区所有者字段或迁移逻辑。共享文件系统需允许节点设置所有权和权限；不要求 renameat2 或额外目录发布协议。Orbit 示例使用 UID/GID 10001、0700；当前仅完成本地组件验证，需要升级 adxlet 后才能使用，尚未进行 SFS/Orbit 云端验收。SFS 类型、来源和读写选项由现有节点启动检查确认。
 
 该开关采用显式“缺失即创建”语义，不保存工作区初始化登记，也不能区分首次创建和已存在数据被外部删除。需要禁止数据丢失后自动创建的场景，应在目录已准备后使用 false，或另行实现数据完整性策略。此能力不新增独立 Volume 资源 API，不解决多实例并发访问 SQLite 的互斥。
 
@@ -335,7 +335,7 @@ prepare_runtime_workspace 会补齐和迁移配置并清理旧 team 文件，平
 
 - [Agent 核心模型](../../agent/crates/core/src/lib.rs)与[准备和激活契约](../../agent/crates/core/src/activator.rs)：已新增 mounts 和 parameters，保持 Scope 和执行生命周期分离。
 - [Agent 存储](../../agent/crates/store/src/state.rs)：模板不可变、绑定条件创建及 generation 约束。
-- [Jiuwen 入口](../../gateway/src/ingress/jiuwen/entrypoint.rs)：可信 Principal、binding_id 和 Scope 的现有映射。
+- [Jiuwen 入口](../../gateway/src/ingress/digitalmategateway/entrypoint.rs)：可信 Principal、binding_id 和 Scope 的现有映射。
 - [Agent Environment 请求转换](../../agent/activator/src/environment_request.rs)：统一公共请求生成，已传递渲染后的 mounts。
 - [公共 Environment 挂载校验](../../gateway/apiserver/src/contract.rs)、[平台 Mount 模型](../../platform/crates/core/src/execution.rs)、[adxlet 挂载转换](../../platform/adxlet/src/sandboxd.rs)：公共入口将 host_path 转 Local，经现有节点转换传给 sandboxd。
 - [sandboxd 锁定版本](../../third_party/sandboxd/source.json)与[运行时协议](../../third_party/sandboxd/sandbox-api.proto)：协议已有 HostPath。

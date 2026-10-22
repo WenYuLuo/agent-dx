@@ -1213,7 +1213,9 @@ async fn shared_service_access_retries_only_unsent_generation_and_checks_tenant(
 #[cfg(feature = "mock-e2e")]
 #[tokio::test]
 async fn jiuwen_cold_start_waits_for_backend_listener_before_ws_handshake() {
-    use crate::ingress::{agent_service::ServiceSelector, jiuwen::connection::Connection};
+    use crate::ingress::{
+        agent_service::ServiceSelector, digitalmategateway::connection::Connection,
+    };
     use crate::{common::protocol::GatewayPolicy, node::Relay};
     use adx_agent_api::request::RequestContext;
     use adx_agent_core::{Protocol, Scope};
@@ -1328,7 +1330,7 @@ async fn jiuwen_cold_start_waits_for_backend_listener_before_ws_handshake() {
 async fn jiuwen_concurrent_connections_obey_handshake_deadline_and_revocation() {
     use crate::ingress::{
         agent_service::ServiceSelector,
-        jiuwen::{
+        digitalmategateway::{
             connection::{Connection, ConnectionError},
             driver::DriverConfig,
             session::SessionLimits,
@@ -1493,7 +1495,7 @@ async fn jiuwen_concurrent_connections_obey_handshake_deadline_and_revocation() 
     assert!(frames.try_recv().is_err(), "ACK must stay on its frontend");
     second_send
         .send(
-            crate::ingress::jiuwen::protocol::Request::parse(
+            crate::ingress::digitalmategateway::protocol::Request::parse(
                 br#"{"type":"req","id":"first","method":"session.list","params":{}}"#,
             )
             .unwrap(),
@@ -1537,7 +1539,7 @@ async fn jiuwen_concurrent_connections_obey_handshake_deadline_and_revocation() 
     // The same request ID on the surviving frontend has independent state.
     for id in ["first", "second"] {
         send.send(
-            crate::ingress::jiuwen::protocol::Request::parse(
+            crate::ingress::digitalmategateway::protocol::Request::parse(
                 serde_json::json!({"type":"req","id":id,"method":"session.list","params":{}})
                     .to_string()
                     .as_bytes(),
@@ -1564,7 +1566,7 @@ async fn jiuwen_concurrent_connections_obey_handshake_deadline_and_revocation() 
     assert_eq!(gateway.active_sessions(), 0);
     assert!(send
         .send(
-            crate::ingress::jiuwen::protocol::Request::parse(
+            crate::ingress::digitalmategateway::protocol::Request::parse(
                 br#"{"type":"req","id":"late","method":"session.list","params":{}}"#
             )
             .unwrap()
@@ -1706,7 +1708,7 @@ async fn jiuwen_concurrent_connections_obey_handshake_deadline_and_revocation() 
 
 #[tokio::test]
 async fn jiuwen_download_config_reads_the_scoped_template_without_activation() {
-    use crate::ingress::jiuwen::download_config::DownloadConfig;
+    use crate::ingress::digitalmategateway::download_config::DownloadConfig;
     use adx_agent_api::{managed::ManagedService, request::RequestContext};
     use adx_agent_core::Scope;
     let state = AgentState::new(Arc::new(MemoryRepository::default()));
@@ -1767,16 +1769,16 @@ async fn jiuwen_download_config_reads_the_scoped_template_without_activation() {
 }
 
 #[cfg(feature = "mock-e2e")]
-#[path = "jiuwen_download_tests.rs"]
-mod jiuwen_download_tests;
+#[path = "digitalmategateway_download_tests.rs"]
+mod digitalmategateway_download_tests;
 
 #[cfg(feature = "mock-e2e")]
-#[path = "jiuwen_http_tests.rs"]
-mod jiuwen_http_tests;
+#[path = "digitalmategateway_http_tests.rs"]
+mod digitalmategateway_http_tests;
 
 #[cfg(feature = "mock-e2e")]
-#[path = "jiuwen_entrypoint_tests.rs"]
-mod jiuwen_entrypoint_tests;
+#[path = "digitalmategateway_entrypoint_tests.rs"]
+mod digitalmategateway_entrypoint_tests;
 
 #[tokio::test]
 async fn managed_ws_consumes_parameters_only_for_the_first_activation() {

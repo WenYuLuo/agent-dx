@@ -205,7 +205,7 @@ async fn jiuwen_execd_reads_are_authorized_bounded_and_cancelled() {
     assert_eq!(gateway.active_sessions(), 0);
 
     // Compose the same-template config, real Relay reads and token/asset checks.
-    use crate::ingress::jiuwen::{
+    use crate::ingress::digitalmategateway::{
         download_config::DownloadConfig, download_runtime::AdmissionError,
         download_token::TokenError,
     };
@@ -235,9 +235,10 @@ async fn jiuwen_execd_reads_are_authorized_bounded_and_cancelled() {
         format!("{body}.{}", hex::encode(mac))
     };
     let verified = sign(&payload);
-    let verifier =
-        crate::ingress::jiuwen::download_runtime::Reader::new(&gateway, &context, "tenant", &id)
-            .unwrap();
+    let verifier = crate::ingress::digitalmategateway::download_runtime::Reader::new(
+        &gateway, &context, "tenant", &id,
+    )
+    .unwrap();
     for explicit in [false, true] {
         if explicit {
             template

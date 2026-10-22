@@ -2,7 +2,7 @@
 use super::*;
 use crate::{
     common::protocol::GatewayPolicy,
-    ingress::jiuwen::entrypoint::{JiuwenApi, JiuwenConfig},
+    ingress::digitalmategateway::entrypoint::{DigitalMateGatewayApi, DigitalMateGatewayConfig},
     node::Relay,
 };
 use adx_agent_api::{local::LocalControl, managed::ManagedService};
@@ -15,9 +15,41 @@ use tokio_tungstenite::{
     WebSocketStream,
 };
 
-fn settings() -> JiuwenConfig {
-    serde_json::from_value(json!({"tenant":"tenant","agent_type":"assistant","template":"demo","version":"1","allowed_hosts":["localhost"],"allowed_origins":["https://localhost"]})).unwrap()
+#[path = "digitalmategateway_orbit_ws_tests.rs"]
+mod orbit_ws_tests;
+
+fn settings() -> DigitalMateGatewayConfig {
+    serde_json::from_value(json!({"tenant":"tenant","jiuwen":{"agent_type":"assistant","template":"demo","version":"1"}})).unwrap()
 }
+#[test]
+fn orbit_ws_configuration_is_optional_and_independent() {
+    let config: DigitalMateGatewayConfig = serde_json::from_value(json!({
+        "tenant":"tenant",
+        "jiuwen":{"agent_type":"assistant", "template":"demo", "version":"1"},
+        "orbit":{"template":"orbit", "version":"fixed", "backend_path":"/ws", "service_port":18092}
+    }))
+    .unwrap();
+    config.validate().unwrap();
+    assert_eq!(config.scope("alice").unwrap().template, "demo");
+    assert_eq!(config.scope("alice").unwrap().version, "1");
+}
+
+#[test]
+fn jiuwen_binding_identity_preserves_the_existing_namespace() {
+    let mut config = settings();
+    let existing_id = "jiuwen-1486b47e22b26e782eff8d71cde45f379e73a3b843877ecb84170798bd6d4b0c";
+    assert_eq!(config.scope("alice").unwrap().binding_id, existing_id);
+    let parameters = config.parameters("alice").unwrap();
+    assert_eq!(
+        parameters["workspace"],
+        "w-d540594a065f26c77b61bcc692e8d40fa77b069cfcaa3a502e505472cb72888f"
+    );
+    assert_eq!(config.scope("alice").unwrap().template, "demo");
+    config.jiuwen.version = "2".into();
+    assert_eq!(config.scope("alice").unwrap().binding_id, existing_id);
+    assert_eq!(config.parameters("alice").unwrap(), parameters);
+}
+
 fn upgrade_request() -> Request<Full<Bytes>> {
     Request::get("/ws")
         .header("host", "localhost")
@@ -47,6 +79,81 @@ async fn ws_frame<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
 }
 
 #[tokio::test]
+async fn enabling_jiuwen_keeps_generic_agent_dispatch_on_both_listeners() {
+    let (gateway, backend) = fixture().await;
+    let managed = Arc::new(ManagedService::new(Arc::new(LocalControl::new(Arc::new(
+        adx_activator::Activator::new(
+            AgentState::new(Arc::new(MemoryRepository::default())),
+            backend,
+        ),
+    )))));
+    let gateway = Arc::new(
+        Arc::try_unwrap(gateway)
+            .ok()
+            .unwrap()
+            .with_agent_api(Arc::new(AgentApi {
+                managed: managed.clone(),
+                request_timeout: Duration::from_secs(5),
+            }))
+            .with_digitalmategateway_api(Arc::new(
+                DigitalMateGatewayApi::new(
+                    settings(),
+                    managed,
+                    Arc::new(TestAuth(std::sync::atomic::AtomicBool::new(false))),
+                )
+                .unwrap(),
+            )),
+    );
+    for security in [IngressSecurity::Plaintext, IngressSecurity::Tls] {
+        let (mut sender, server, client) = connection(gateway.clone(), security).await;
+        for host in ["localhost", "generic.example"] {
+            let response = sender
+                .send_request(
+                    Request::get("/agent/http?target=urn:adx:template:demo:1")
+                        .header("host", host)
+                        .header("authorization", "Bearer tenant")
+                        .body(Full::new(Bytes::new()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                if security == IngressSecurity::Plaintext {
+                    StatusCode::UPGRADE_REQUIRED
+                } else {
+                    StatusCode::NOT_FOUND
+                },
+                "Jiuwen must not select generic Agent authentication or target policy"
+            );
+            response.collect().await.unwrap();
+            let response = sender
+                .send_request(
+                    Request::get("/agent/http?target=urn:adx:template:demo:1")
+                        .header("host", host)
+                        .header("authorization", "Bearer alice-session")
+                        .body(Full::new(Bytes::new()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                if security == IngressSecurity::Plaintext {
+                    StatusCode::UPGRADE_REQUIRED
+                } else {
+                    StatusCode::UNAUTHORIZED
+                },
+                "API Key mode must not accept a business session"
+            );
+            response.collect().await.unwrap();
+        }
+        server.abort();
+        client.abort();
+    }
+}
+
+#[tokio::test]
 async fn jiuwen_auth_is_transport_independent_while_management_requires_tls() {
     let (gateway, backend) = fixture().await;
     let managed = Arc::new(ManagedService::new(Arc::new(LocalControl::new(Arc::new(
@@ -63,8 +170,8 @@ async fn jiuwen_auth_is_transport_independent_while_management_requires_tls() {
                 managed: managed.clone(),
                 request_timeout: adx_agent_core::limits::AGENT_REQUEST_TIMEOUT,
             }))
-            .with_jiuwen_api(Arc::new(
-                JiuwenApi::new(
+            .with_digitalmategateway_api(Arc::new(
+                DigitalMateGatewayApi::new(
                     settings(),
                     managed,
                     Arc::new(TestAuth(std::sync::atomic::AtomicBool::new(false))),
@@ -239,8 +346,8 @@ async fn jiuwen_public_routes_share_one_e2a_and_download_on_another_replica() {
         routes.put(route.clone());
         let mut configured = with_files(&gateway, backend.clone());
         configured.default_direct_port = port;
-        gateways.push(Arc::new(configured.with_jiuwen_api(Arc::new(
-            JiuwenApi::new(settings(), managed.clone(), auth.clone()).unwrap(),
+        gateways.push(Arc::new(configured.with_digitalmategateway_api(Arc::new(
+            DigitalMateGatewayApi::new(settings(), managed.clone(), auth.clone()).unwrap(),
         ))));
     }
     let (mut sender, server, client) = connection(gateways[0].clone(), security).await;
@@ -253,14 +360,6 @@ async fn jiuwen_public_routes_share_one_e2a_and_download_on_another_replica() {
     assert_eq!(
         sender.send_request(spoofed).await.unwrap().status(),
         StatusCode::UNAUTHORIZED
-    );
-    let mut wrong_host = upgrade_request();
-    wrong_host
-        .headers_mut()
-        .insert("host", "untrusted.example".parse().unwrap());
-    assert_eq!(
-        sender.send_request(wrong_host).await.unwrap().status(),
-        StatusCode::FORBIDDEN
     );
     let login = Request::post("/api/v1/auth/huawei/login")
         .header("host", "localhost")
@@ -313,14 +412,6 @@ async fn jiuwen_public_routes_share_one_e2a_and_download_on_another_replica() {
             StatusCode::BAD_REQUEST
         );
     }
-    let mut denied = upgrade_request();
-    denied
-        .headers_mut()
-        .insert("origin", "https://untrusted.example".parse().unwrap());
-    assert_eq!(
-        sender.send_request(denied).await.unwrap().status(),
-        StatusCode::FORBIDDEN
-    );
     let mut invalid_upgrade = upgrade_request();
     invalid_upgrade
         .headers_mut()
@@ -577,12 +668,13 @@ impl crate::ingress::accounts::BusinessAuth for TestAuth {
         &self,
         token: &str,
     ) -> crate::ingress::accounts::Result<crate::ingress::accounts::Principal> {
-        if token != "alice-session" {
-            return Err(crate::ingress::accounts::Error::Unauthorized);
-        }
+        let user_id = match token {
+            "alice-session" => "alice",
+            "bob-session" => "bob",
+            _ => return Err(crate::ingress::accounts::Error::Unauthorized),
+        };
         Ok(crate::ingress::accounts::Principal {
-            tenant: "tenant".into(),
-            user_id: "alice".into(),
+            user_id: user_id.into(),
             token_digest: "digest".into(),
             expires_at: 4102444800,
         })

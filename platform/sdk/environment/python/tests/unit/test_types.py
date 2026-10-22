@@ -8,6 +8,7 @@ from adx_environment import (
     CommandInfo,
     ConnectionConfig,
     Mount,
+    CreateOptions,
     NodeInfo,
     S3Config,
     EnvironmentInfo,
@@ -116,11 +117,13 @@ class TypesTests(unittest.TestCase):
         mount = Mount(
             target="/home/jiuwen", host_path="/home/agentos/users/user-1",
             options=("rw", "nodev"), create_if_missing=True,
+            create_options=CreateOptions(uid=10001, gid=10001, mode="0700"),
         )
         self.assertEqual(mount.to_dict(), {
             "type": "bind", "target": "/home/jiuwen",
             "host_path": "/home/agentos/users/user-1",
             "options": ["rw", "nodev"], "create_if_missing": True,
+            "create_options": {"uid": 10001, "gid": 10001, "mode": "0700"},
         })
 
     def test_local_mount_rejects_ambiguous_or_unsafe_sources(self):
@@ -132,9 +135,19 @@ class TypesTests(unittest.TestCase):
             {"host_path": "/shared/user", "options": ("unknown",)},
             {"host_path": "/shared/user", "type": "erofs", "create_if_missing": True},
             {"image_url": "image:v1", "create_if_missing": True},
+            {"host_path": "/shared/user", "create_options": CreateOptions(10001, 10001, "0700")},
+            {"host_path": "/shared/user", "create_if_missing": True, "create_options": {}},
         ):
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 Mount(target="/workspace", **kwargs)
+
+        for invalid in (
+            {"uid": -1}, {"gid": 4294967295}, {"uid": True}, {"uid": "10001"},
+            {"mode": "755"}, {"mode": "0788"}, {"mode": "1777"}, {"mode": 700},
+        ):
+            values = {"uid": 10001, "gid": 10001, "mode": "0700", **invalid}
+            with self.subTest(values=values), self.assertRaises(ValueError):
+                CreateOptions(**values)
 
     def test_mount_options_are_immutable_and_legacy_sources_remain_read_only(self):
         options = ["rw"]

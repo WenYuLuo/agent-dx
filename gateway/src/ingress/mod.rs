@@ -47,7 +47,7 @@ pub mod ssh;
 mod agent_response;
 
 #[cfg(feature = "agent-api")]
-pub mod jiuwen;
+pub mod digitalmategateway;
 
 #[cfg(feature = "agent-api")]
 pub mod agent_service;

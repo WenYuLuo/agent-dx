@@ -40,12 +40,18 @@ message StorageSource {
 }
 
 message RootfsSpec { bool readonly = 1; StorageSource source = 2; }
+message MountCreateOptions {
+  uint32 uid = 1;
+  uint32 gid = 2;
+  string mode = 3;
+}
 message MountSpec {
   string type = 1;
   string target = 2;
   repeated string options = 3;
   StorageSource source = 4;
   bool create_if_missing = 5;
+  MountCreateOptions create_options = 6;
 }
 
 enum NetworkAction { NETWORK_ACTION_UNSPECIFIED = 0; NETWORK_ACTION_ALLOW = 1; NETWORK_ACTION_DENY = 2; }

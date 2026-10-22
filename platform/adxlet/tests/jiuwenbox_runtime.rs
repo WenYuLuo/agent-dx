@@ -932,6 +932,7 @@ async fn conch_reserved_mount_targets_are_rejected_before_side_effects() {
             options: vec!["ro".into()],
             source: adx_core::execution::StorageSource::Local("/tmp".into()),
             create_if_missing: false,
+            create_options: None,
         });
         assert!(matches!(
             driver.start(&wanted, "tenant-agent-1", 1, &[]).await,

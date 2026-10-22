@@ -239,6 +239,7 @@ struct Mount {
     #[serde(alias = "hostPath")]
     host_path: String,
     create_if_missing: bool,
+    create_options: Option<adx_core::execution::CreateOptions>,
 }
 #[derive(Default, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -481,6 +482,7 @@ fn mount(value: Value) -> Result<adx_core::execution::Mount, Status> {
     let result = adx_core::execution::Mount {
         kind: value.r#type,
         create_if_missing: value.create_if_missing,
+        create_options: value.create_options,
         target: value.target,
         options: value.options,
         source,
