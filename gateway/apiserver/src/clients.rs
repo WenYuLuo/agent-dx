@@ -132,6 +132,9 @@ impl Clients {
         let budget = adx_transport::deadline::create_response_timeout(budget);
         if request.expected_assignment.is_none()
             && self.config.create_mode == crate::config::CreateMode::LocalFirst
+            // Only the Coordinator can resolve a Snapshot's source-node hint
+            // and compare eligible nodes across shards before admission.
+            && request.spec.as_ref().is_none_or(|spec| spec.snapshot_id.is_none())
         {
             let node = match request.spec.as_ref() {
                 Some(spec) => self.directory.lock().await.select_for(spec),

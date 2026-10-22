@@ -140,6 +140,15 @@ local-only 沿用异步写回语义，不强制 fsync，也不承诺主机断电
 不自动复制第二份快照。`snapshot_source` 与匿名 `checkpoint` 分开记录。
 目标暂停生成自己的匿名恢复点，且停止原执行后，才释放旧 Snapshot 的使用关系。
 
+从 S3、AFS、JuiceFS Snapshot 创建时，调用方未指定放置策略则自动弱亲和
+`source_node_id`。Coordinator 在选择分片时也比较该偏好；原节点不可用、资源不足或
+不满足硬约束时，立即选择其他符合约束的节点。排队期间资源被其他请求占用时，
+可转移到其他分片，保留 Environment ID、排队期限及已拒绝节点列表。
+全部节点均不满足时才等待容量变化。显式放置策略覆盖自动偏好；local-only 仍强制来源节点。
+来源节点只是缓存命中的线索，缓存淘汰后仍从共享存储恢复。
+API Server 即使配置 `local_first`，带 `snapshotId` 的创建也直接进入 Coordinator，
+避免任意入口节点绕过偏好。SDK 调用保持 `Environment.create(snapshot_id, ...)`。
+
 Snapshot 使用中删除立即返回 HTTP 409：
 
 ```json
