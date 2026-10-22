@@ -331,7 +331,8 @@ pub struct Ingress {
     #[cfg(feature = "agent-api")]
     pub(super) agent_api: Option<Arc<super::agent_api::AgentApi>>,
     #[cfg(feature = "agent-api")]
-    jiuwen_api: Option<Arc<super::jiuwen::entrypoint::JiuwenApi>>,
+    digitalmategateway_api:
+        Option<Arc<super::digitalmategateway::entrypoint::DigitalMateGatewayApi>>,
     resolver: Arc<IngressRouteResolver>,
     connector: DataPlaneL4Connector,
     http_pool: BackendHttpPool,
@@ -371,7 +372,7 @@ impl Ingress {
             #[cfg(feature = "agent-api")]
             agent_api: None,
             #[cfg(feature = "agent-api")]
-            jiuwen_api: None,
+            digitalmategateway_api: None,
             resolver,
             connector,
             http_pool: BackendHttpPool::new(BackendHttpPoolConfig::default()),
@@ -397,8 +398,11 @@ impl Ingress {
     }
 
     #[cfg(feature = "agent-api")]
-    pub fn with_jiuwen_api(mut self, api: Arc<super::jiuwen::entrypoint::JiuwenApi>) -> Self {
-        self.jiuwen_api = Some(api);
+    pub fn with_digitalmategateway_api(
+        mut self,
+        api: Arc<super::digitalmategateway::entrypoint::DigitalMateGatewayApi>,
+    ) -> Self {
+        self.digitalmategateway_api = Some(api);
         self
     }
 
@@ -1002,12 +1006,13 @@ impl Ingress {
         } else {
             match request.uri().path() {
                 #[cfg(feature = "agent-api")]
-                path if super::jiuwen::entrypoint::JiuwenApi::matches(path)
-                    && self.jiuwen_api.is_some() =>
+                path if super::digitalmategateway::entrypoint::DigitalMateGatewayApi::matches(
+                    path,
+                ) && self.digitalmategateway_api.is_some() =>
                 {
-                    self.jiuwen_api
+                    self.digitalmategateway_api
                         .as_ref()
-                        .expect("configured Jiuwen API")
+                        .expect("configured DigitalMateGateway API")
                         .handle(request, self.clone())
                         .await
                 }
@@ -2238,7 +2243,7 @@ pub(super) async fn wait_for_route_cancellation(cancelled: Option<watch::Receive
     }
 }
 
-async fn proxy_http<T>(
+pub(super) async fn proxy_http<T>(
     mut request: Request<Incoming>,
     stream: T,
     upstream_name: &'static str,

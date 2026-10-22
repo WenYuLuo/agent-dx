@@ -78,7 +78,7 @@ fn burst_limits_reach_the_public_sandbox_contract_independently_of_requests() {
 #[test]
 fn rendered_mounts_reach_the_shared_public_request() {
     let mut wire = serde_json::to_value(request()).unwrap();
-    let mounts = json!([{"type":"bind","host_path":"/mnt/sfs/w-user","create_if_missing":true,"target":"/home/jiuwen","options":["rw"]}]);
+    let mounts = json!([{"type":"bind","host_path":"/mnt/sfs/w-user","create_if_missing":true,"create_options":{"uid":10001,"gid":10001,"mode":"0700"},"target":"/home/jiuwen","options":["rw"]}]);
     wire["execution"]["mounts"] = mounts.clone();
     let request = serde_json::from_value(wire).unwrap();
     let input = create_input(&request, Duration::from_secs(60), &network_policy()).unwrap();
