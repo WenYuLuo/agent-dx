@@ -433,11 +433,14 @@ class Environment:
         if (user is None) != (group is None):
             raise ValueError("user and group must both be configured")
         if user is not None:
-            for value in (user, group):
-                if (not isinstance(value, str) or not value or len(value) > 256
-                        or not all(c.isascii() and (c.isalnum() or c in "_-." ) for c in value)
-                        or (value.isdecimal() and int(value) >= 4294967295)):
-                    raise ValueError("user/group require a POSIX name or numeric ID below 4294967295")
+            identity_error = "user/group require a POSIX name or numeric ID below 4294967295"
+            for identity in (user, group):
+                if not isinstance(identity, str) or not identity or len(identity) > 256:
+                    raise ValueError(identity_error)
+                if not all(c.isascii() and (c.isalnum() or c in "_-.") for c in identity):
+                    raise ValueError(identity_error)
+                if identity.isdecimal() and int(identity) >= 4294967295:
+                    raise ValueError(identity_error)
             if inherit_entrypoint or snapshot_id is not None:
                 raise ValueError("tool identity cannot override an inherited entrypoint or snapshot")
         if not isinstance(failover, bool):

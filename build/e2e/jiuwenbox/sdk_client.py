@@ -43,7 +43,7 @@ sdk_module = importlib.import_module("adx_environment")
 ConnectionConfig = sdk_module.ConnectionConfig
 Environment = sdk_module.Environment
 EnvironmentNotFound = sdk_module.EnvironmentNotFound
-EnvironmentError = sdk_module.EnvironmentError
+AdxEnvironmentError = sdk_module.EnvironmentError
 RestartPolicy = sdk_module.RestartPolicy
 
 connection = ConnectionConfig(
@@ -94,9 +94,9 @@ def check(runtime_class):
         os.environ["ADX_DIRECT_UPLOAD_TIMEOUT"] = "3"
         try:
             environment.files.read(fifo)
-        except EnvironmentError as error:
-            if getattr(error, "status_code", None) != 404:
-                raise AssertionError(f"FIFO download was not rejected: {error}") from error
+        except AdxEnvironmentError as fifo_error:
+            if getattr(fifo_error, "status_code", None) != 404:
+                raise AssertionError(f"FIFO download was not rejected: {fifo_error}") from fifo_error
         else:
             raise AssertionError("FIFO download unexpectedly succeeded")
     finally:
