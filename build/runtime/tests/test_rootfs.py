@@ -1,5 +1,6 @@
 """The immutable runtime payload must be traversable by a non-root workload."""
 import importlib.util
+import os
 from pathlib import Path
 import stat
 import tempfile
@@ -13,6 +14,15 @@ SPEC.loader.exec_module(ROOTFS)
 
 class RuntimePayloadPermissions(unittest.TestCase):
     def test_non_root_can_traverse_payload_to_execd(self):
+        for mask in (0o022, 0o027, 0o077):
+            with self.subTest(umask=oct(mask)):
+                previous = os.umask(mask)
+                try:
+                    self.check_payload_permissions()
+                finally:
+                    os.umask(previous)
+
+    def check_payload_permissions(self):
         observed = []
 
         def inspect_image_input(command, **_kwargs):
@@ -20,8 +30,11 @@ class RuntimePayloadPermissions(unittest.TestCase):
                 root = Path(command[-1])
                 # EROFS copies these modes into /__adx; root-owned 0700 blocks
                 # every non-root execution even when adx-execd itself is 0755.
-                for path in (root, root / "usr", root / "usr/local", root / "usr/local/bin"):
-                    observed.append(stat.S_IMODE(path.stat().st_mode) & stat.S_IXOTH)
+                for directory, _, _ in os.walk(root, followlinks=False):
+                    path = Path(directory)
+                    mode = stat.S_IMODE(path.stat().st_mode)
+                    expected = 0o1777 if path in (root / "tmp", root / "var/tmp") else 0o755
+                    observed.append((str(path.relative_to(root)), mode, expected))
 
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
@@ -37,7 +50,8 @@ class RuntimePayloadPermissions(unittest.TestCase):
             ):
                 ROOTFS.build(binary, base / "runtime.img", busybox=busybox)
         self.assertTrue(observed)
-        self.assertTrue(all(observed), "runtime payload denies traversal to non-root Execd")
+        for path, mode, expected in observed:
+            self.assertEqual(mode, expected, f"incorrect runtime directory permissions: {path}")
 
 
 if __name__ == "__main__":
