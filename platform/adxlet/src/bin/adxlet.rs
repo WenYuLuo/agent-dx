@@ -443,23 +443,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 timeout,
                 Duration::from_secs(config.report_interval_seconds),
                 valid_until,
-            ).await {
-                Ok(()) => {
-                    if let Some(journal) = &journal {
-                        if let Err(error) = journal.flush().await {
-                            let mut handshake_required = false;
-                            adxlet::node_reconciliation::pause_lifecycle_reporting(
-                                &manager, &mut coordinator, &mut last, timeout,
-                                Duration::from_secs(config.report_interval_seconds),
-                                &mut handshake_required,
-                            ).await?;
-                            last.reconciling |= handshake_required;
-                            adx_observability::warn!("degradation journal publication incomplete: {error}");
-                            continue;
-                        }
-                    }
-                },
-                Err(error) => adx_observability::warn!("authoritative node reconciliation incomplete; new admission remains closed: {error}"),
+            )
+            .await
+            {
+                Ok(()) => (),
+                Err(error) => {
+                    adx_observability::warn!(accepting_allocations=manager.accepting_allocations(), %error, "authoritative node reconciliation incomplete")
+                }
             }
         }
         #[allow(unreachable_code)]

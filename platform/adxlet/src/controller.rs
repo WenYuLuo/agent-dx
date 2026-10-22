@@ -7,7 +7,9 @@ use std::{collections::BTreeSet, sync::Arc, time::Instant};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 
+mod authority;
 mod lifecycle;
+pub(super) use authority::{AuthorityCheck, AuthorityResult};
 mod monitor;
 mod snapshots;
 mod workload_checkpoint;
@@ -51,9 +53,9 @@ enum Command {
     Sync,
     Reconcile,
     AlignAuthority(Box<EnvironmentRecord>, oneshot::Sender<Result<()>>),
-    CompareAuthority(
-        Box<EnvironmentRecord>,
-        oneshot::Sender<Result<AuthorityComparison>>,
+    CheckAuthority(
+        Box<AuthorityCheck>,
+        oneshot::Sender<Result<AuthorityResult>>,
     ),
     Discard(
         Option<Arc<CheckpointReferences>>,
@@ -196,22 +198,22 @@ impl EnvironmentHandle {
         rx.await
             .map_err(|_| Error::Unavailable("environment controller stopped".into()))?
     }
-    /// Compare after accepted serial operations without probing, rebinding or publishing.
-    pub(crate) async fn compare_authority(
-        &self,
-        record: EnvironmentRecord,
-    ) -> Result<AuthorityComparison> {
+    /// Compare and clean as one serial operation, with no lifecycle command in between.
+    pub(crate) async fn check_authority(&self, check: AuthorityCheck) -> Result<AuthorityResult> {
         let (tx, rx) = oneshot::channel();
         let (unused, _) = oneshot::channel();
         self.tx
             .send(Envelope::new(
-                Command::CompareAuthority(Box::new(record), tx),
+                Command::CheckAuthority(Box::new(check), tx),
                 unused,
             ))
             .await
             .map_err(|_| Error::Unavailable("environment controller stopped".into()))?;
         rx.await
             .map_err(|_| Error::Unavailable("environment controller stopped".into()))?
+    }
+    pub(crate) fn same_controller(&self, other: &Self) -> bool {
+        self.tx.same_channel(&other.tx)
     }
     pub(crate) async fn discard(
         &self,
@@ -299,7 +301,16 @@ pub(crate) fn spawn_restored(
     record: EnvironmentRecord,
     services: Arc<Services>,
 ) -> EnvironmentHandle {
-    spawn_controller(record, services, None)
+    spawn_controller(record, services, None, false)
+}
+
+pub(crate) fn spawn_comparison(
+    record: EnvironmentRecord,
+    services: Arc<Services>,
+) -> EnvironmentHandle {
+    // The registry exposes the handle before its authority command is queued.
+    // Only that command may open lifecycle admission for an adopted execution.
+    spawn_controller(record, services, None, true)
 }
 
 /// Retain explicit deletion/replay for an already published, released terminal record.
@@ -319,6 +330,7 @@ pub(crate) fn spawn_terminal(
         record,
         services,
         Some(Durability::Published),
+        true,
     ))
 }
 
@@ -326,6 +338,7 @@ fn spawn_controller(
     record: EnvironmentRecord,
     services: Arc<Services>,
     durability: Option<Durability>,
+    authority_fenced: bool,
 ) -> EnvironmentHandle {
     let (tx, mut rx) = mpsc::channel::<Envelope>(32);
     let demand = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -338,6 +351,7 @@ fn spawn_controller(
         services,
         durability,
         retired: false,
+        authority_fenced,
         obsolete_checkpoints: Vec::new(),
         idle: None,
         restart_after: None,
@@ -370,42 +384,23 @@ fn spawn_controller(
 impl Controller {
     async fn dispatch(&mut self, command: Command, reply: Reply) {
         let command = match command {
-            Command::CompareAuthority(record, ack) => {
-                let result = if self.retired {
-                    Err(Error::Conflict)
-                } else if self.durability == Some(Durability::Published) {
-                    // A published operation can finish after InspectNode. Fetch a
-                    // fresh catalog rather than recover from that stale snapshot.
-                    if self.record == *record {
-                        Ok(AuthorityComparison::Published)
-                    } else if self.record.revision > record.revision {
-                        Ok(AuthorityComparison::StaleCatalog)
-                    } else if record.revision > self.record.revision
-                        && matches!(
-                            record.state,
-                            EnvironmentState::Failed | EnvironmentState::Deleted
-                        )
-                        && !record.resources_held
-                        && !record.restart_pending
-                    {
-                        // Coordinator can retire ownership after node expiry.
-                        Ok(AuthorityComparison::RetiredByAuthority)
-                    } else {
-                        Err(Error::Conflict)
-                    }
-                } else {
-                    Ok(AuthorityComparison::Unpublished)
-                };
+            Command::CheckAuthority(check, ack) => {
+                self.authority_fenced = true;
+                let result = self.check_authority(*check).await;
+                self.authority_fenced = result.is_err();
                 let _ = ack.send(result);
                 return;
             }
             Command::AlignAuthority(record, ack) => {
                 let result = self.align_authority(*record).await;
+                if result.is_ok() {
+                    self.authority_fenced = false;
+                }
                 let _ = ack.send(result);
                 return;
             }
             Command::Snapshot(request, ack) => {
-                let result = if self.retired {
+                let result = if self.retired || self.authority_fenced {
                     Err(Error::Conflict)
                 } else {
                     self.snapshot(request).await
@@ -415,6 +410,7 @@ impl Controller {
             }
             Command::RuntimeEvent(identity, ack) => {
                 let result = if self.retired
+                    || self.authority_fenced
                     || identity
                         != super::runtime_control::RuntimeControlClient::identity(&self.record)
                     || self.record.state != EnvironmentState::Running
@@ -433,7 +429,7 @@ impl Controller {
                 return;
             }
             Command::Tick(ack) => {
-                let result = if self.retired {
+                let result = if self.retired || self.authority_fenced {
                     Err(Error::Conflict)
                 } else {
                     self.tick().await
@@ -442,7 +438,7 @@ impl Controller {
                 return;
             }
             Command::Expire(now, ack) => {
-                let result = if self.retired {
+                let result = if self.retired || self.authority_fenced {
                     Err(Error::Conflict)
                 } else {
                     self.expire_checkpoint(now).await
@@ -459,6 +455,12 @@ impl Controller {
         };
         if self.retired {
             let _ = reply.send(Err(Error::Conflict));
+            return;
+        }
+        if self.authority_fenced {
+            let _ = reply.send(Err(Error::Unavailable(
+                "environment authority reconciliation pending".into(),
+            )));
             return;
         }
         let operation = match &command {
@@ -478,7 +480,7 @@ impl Controller {
         let result = match command {
             Command::Snapshot(_, _)
             | Command::AlignAuthority(_, _)
-            | Command::CompareAuthority(_, _)
+            | Command::CheckAuthority(_, _)
             | Command::Discard(_, _)
             | Command::Expire(_, _)
             | Command::Tick(_)
@@ -573,6 +575,7 @@ struct Controller {
     held: bool,
     durability: Option<Durability>,
     retired: bool,
+    authority_fenced: bool,
     obsolete_checkpoints: Vec<adx_core::CheckpointArtifact>,
     idle: Option<((String, u64, u64), tokio::time::Instant)>,
     restart_after: Option<tokio::time::Instant>,

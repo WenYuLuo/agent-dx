@@ -1,5 +1,7 @@
 #[path = "common/authority.rs"]
 mod authority;
+#[path = "reconciliation/isolation.rs"]
+mod isolation;
 use adx_core::{
     Assignment, EnvironmentRecord, EnvironmentSpec, EnvironmentState, Resources, Result,
 };
@@ -25,9 +27,54 @@ struct Backend {
     remove_entered: tokio::sync::Notify,
     remove_release: tokio::sync::Notify,
     events: Mutex<Vec<String>>,
+    block_restore: std::sync::atomic::AtomicBool,
+    restore_entered: tokio::sync::Notify,
+    restore_release: tokio::sync::Notify,
+    block_checkpoint: std::sync::atomic::AtomicBool,
+    checkpoint_entered: tokio::sync::Notify,
+    checkpoint_release: tokio::sync::Notify,
+    checkpoint_path: Mutex<Option<std::path::PathBuf>>,
+    block_commit: std::sync::atomic::AtomicBool,
+    commit_entered: tokio::sync::Notify,
+    commit_release: tokio::sync::Notify,
 }
 #[async_trait]
 impl RuntimeDriver for Backend {
+    async fn checkpoint_supported(&self, _: &str) -> Result<()> {
+        Ok(())
+    }
+    async fn checkpoint(&self, id: &str, path: &std::path::Path, _: Duration) -> Result<()> {
+        std::fs::write(path.join("state"), b"checkpoint data").unwrap();
+        *self.checkpoint_path.lock().unwrap() = Some(path.to_owned());
+        if id == "busy-7"
+            && self
+                .block_checkpoint
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            self.checkpoint_entered.notify_one();
+            self.checkpoint_release.notified().await;
+        }
+        self.actual.lock().unwrap().retain(|r| r.runtime_id != id);
+        Ok(())
+    }
+    async fn restore(
+        &self,
+        spec: &EnvironmentSpec,
+        id: &str,
+        generation: u64,
+        devices: &[adx_core::scheduling::DeviceAllocation],
+        path: &std::path::Path,
+    ) -> Result<std::net::IpAddr> {
+        assert_eq!(
+            std::fs::read(path.join("state")).unwrap(),
+            b"checkpoint data"
+        );
+        if spec.id == "busy" && self.block_restore.load(std::sync::atomic::Ordering::SeqCst) {
+            self.restore_entered.notify_one();
+            self.restore_release.notified().await;
+        }
+        self.start(spec, id, generation, devices).await
+    }
     async fn inventory(&self) -> Result<Vec<RuntimeObservation>> {
         if self
             .fail_inventory
@@ -129,6 +176,10 @@ impl Routes for Backend {
 #[async_trait]
 impl StateSink for Backend {
     async fn commit(&self, r: &EnvironmentRecord) -> Result<Durability> {
+        if r.spec.id == "busy" && self.block_commit.load(std::sync::atomic::Ordering::SeqCst) {
+            self.commit_entered.notify_one();
+            self.commit_release.notified().await;
+        }
         self.events
             .lock()
             .unwrap()
@@ -464,7 +515,78 @@ async fn periodic_catalog_fetch_preserves_known_lifecycle_operations() {
 }
 
 #[tokio::test]
-async fn periodic_busy_lifecycle_does_not_queue_an_exclusive_barrier() {
+async fn periodic_busy_environment_does_not_close_other_environment_admission() {
+    use std::sync::atomic::Ordering;
+    let backend = Arc::new(Backend::default());
+    *backend.actual.lock().unwrap() = vec![observed("busy"), observed("other")];
+    backend.allow_start.store(true, Ordering::SeqCst);
+    let node = Arc::new(authority::manager(backend.clone()));
+    let mut authority = authority::Fixture::new().await;
+    for id in ["busy", "other"] {
+        authority
+            .authority
+            .records
+            .lock()
+            .unwrap()
+            .push(record(id, EnvironmentState::Running).try_into().unwrap());
+    }
+    authority.cycle(&node).await.unwrap();
+    backend.block_observation.store(true, Ordering::SeqCst);
+    let monitor = tokio::spawn({
+        let node = node.clone();
+        async move { node.monitor_environments().await }
+    });
+    backend.observation_entered.notified().await;
+    let reports = authority.authority.reports.clone();
+    reports.lock().unwrap().clear();
+    let mut refresh = tokio::spawn({
+        let node = node.clone();
+        async move { authority.cycle(&node).await }
+    });
+    let admitted = tokio::time::timeout(Duration::from_millis(300), async {
+        loop {
+            if reports
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| r.accepting_allocations)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let new = record("new", EnvironmentState::Pending);
+        node.environment(new.spec, new.assignment)
+            .unwrap()
+            .create()
+            .await
+            .unwrap();
+        node.observe_runtime_event(&adx_core::runtime::RuntimeIdentity {
+            environment_id: "other".into(),
+            runtime_id: "other-7".into(),
+            ownership_generation: 7,
+        })
+        .await
+        .unwrap();
+    })
+    .await;
+    backend.block_observation.store(false, Ordering::SeqCst);
+    backend.observation_release.notify_one();
+    monitor.await.unwrap().unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(2), &mut refresh).await;
+    admitted.expect("busy A must not close node admission or block B");
+    result.unwrap().unwrap().unwrap();
+    assert!(node.accepting_allocations());
+    assert!(backend
+        .actual
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|r| r.runtime_id == "new-7"));
+}
+
+#[tokio::test]
+async fn repeated_overlapping_monitor_rounds_do_not_starve_admission() {
     use std::sync::atomic::Ordering;
     let backend = Arc::new(Backend::default());
     *backend.actual.lock().unwrap() = vec![observed("busy"), observed("other")];
@@ -479,62 +601,54 @@ async fn periodic_busy_lifecycle_does_not_queue_an_exclusive_barrier() {
             .push(record(id, EnvironmentState::Running).try_into().unwrap());
     }
     authority.cycle(&node).await.unwrap();
-    reset_recovery_effects(&backend);
-    backend.block_observation.store(true, Ordering::SeqCst);
-    let busy = tokio::spawn({
-        let node = node.clone();
-        async move { node.monitor_environments().await }
-    });
-    tokio::time::timeout(
-        Duration::from_secs(1),
-        backend.observation_entered.notified(),
-    )
-    .await
-    .unwrap();
-    let refresh = tokio::time::timeout(Duration::from_millis(200), authority.cycle(&node)).await;
-    // Always release the accepted work, including when checking the old behavior.
-    let other = tokio::time::timeout(
-        Duration::from_millis(200),
-        node.observe_runtime_event(&adx_core::runtime::RuntimeIdentity {
-            environment_id: "other".into(),
-            runtime_id: "other-7".into(),
-            ownership_generation: 7,
-        }),
-    )
-    .await;
-    backend.block_observation.store(false, Ordering::SeqCst);
-    backend.observation_release.notify_one();
-    busy.await.unwrap().unwrap();
-    assert_eq!(
-        refresh
-            .expect("periodic refresh waited behind accepted work")
-            .unwrap_err()
-            .code(),
-        tonic::Code::Aborted
-    );
-    other
-        .expect("independent lifecycle waited behind periodic refresh")
-        .unwrap();
-    assert!(
-        !node.accepting_allocations(),
-        "deferred refresh must not reopen new allocation"
-    );
-    assert!(
-        !authority.registration.reconciling,
-        "known routes remain usable"
-    );
-    assert_eq!(backend.readiness_calls.load(Ordering::SeqCst), 0);
-    assert!(!backend
-        .events
-        .lock()
+    for _ in 0..16 {
+        backend.block_observation.store(true, Ordering::SeqCst);
+        let monitor = tokio::spawn({
+            let node = node.clone();
+            async move { node.monitor_environments().await }
+        });
+        backend.observation_entered.notified().await;
+        let reports = authority.authority.reports.clone();
+        reports.lock().unwrap().clear();
+        let refresh = tokio::spawn({
+            let node = node.clone();
+            async move {
+                let result = authority.cycle(&node).await;
+                (authority, result)
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !reports
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| r.accepting_allocations)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("each busy cycle must keep reporting allocation readiness");
+        assert!(node.accepting_allocations());
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            node.observe_runtime_event(&adx_core::runtime::RuntimeIdentity {
+                environment_id: "other".into(),
+                runtime_id: "other-7".into(),
+                ownership_generation: 7,
+            }),
+        )
+        .await
         .unwrap()
-        .iter()
-        .any(|e| e.starts_with("remove:")));
-    authority.cycle(&node).await.unwrap();
-    assert!(
-        node.accepting_allocations(),
-        "a fresh quiet cycle completes admission"
-    );
+        .unwrap();
+        backend.block_observation.store(false, Ordering::SeqCst);
+        backend.observation_release.notify_one();
+        monitor.await.unwrap().unwrap();
+        let (next, result) = refresh.await.unwrap();
+        result.unwrap();
+        authority = next;
+        assert!(node.accepting_allocations());
+    }
 }
 
 #[tokio::test]
@@ -543,7 +657,8 @@ async fn periodic_revoked_ownership_still_drains_accepted_work() {
         use std::sync::atomic::Ordering;
         let backend = Arc::new(Backend::default());
         *backend.actual.lock().unwrap() = vec![observed("busy")];
-        let node = Arc::new(manager(&backend));
+        let node = Arc::new(authority::manager(backend.clone()));
+        backend.allow_start.store(true, Ordering::SeqCst);
         let mut authority = authority::Fixture::new().await;
         authority.authority.records.lock().unwrap().push(
             record("busy", EnvironmentState::Running)
@@ -575,23 +690,51 @@ async fn periodic_revoked_ownership_still_drains_accepted_work() {
                 .unwrap()
                 .push(expired.try_into().unwrap());
         }
-        let mut refresh = tokio::spawn({
-            let node = node.clone();
-            async move { authority.cycle(&node).await }
-        });
-        let still_draining = tokio::time::timeout(Duration::from_millis(200), &mut refresh)
+        // Reporting and unrelated admission continue, but this environment's
+        // accepted operation must finish before its queued ownership cleanup.
+        tokio::time::timeout(Duration::from_millis(200), authority.cycle(&node))
             .await
-            .is_err();
+            .unwrap()
+            .unwrap();
+        assert!(backend
+            .actual
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| r.runtime_id == "busy-7"));
+        assert!(node.accepting_allocations());
+        let old = record("busy", EnvironmentState::Running);
+        let handle = node.environment(old.spec, old.assignment).unwrap();
+        let delayed = tokio::spawn(async move { handle.ensure_running("late".into()).await });
+        let new = record("new", EnvironmentState::Pending);
+        let new = tokio::time::timeout(
+            Duration::from_secs(1),
+            node.environment(new.spec, new.assignment).unwrap().create(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .record;
+        authority
+            .authority
+            .records
+            .lock()
+            .unwrap()
+            .push(new.try_into().unwrap());
         backend.block_observation.store(false, Ordering::SeqCst);
         backend.observation_release.notify_one();
         busy.await.unwrap().unwrap();
-        assert!(still_draining, "revoked ownership must not defer its fence");
-        tokio::time::timeout(Duration::from_secs(2), refresh)
-            .await
+        assert!(
+            delayed.await.unwrap().is_err(),
+            "work queued after revocation must be fenced"
+        );
+        authority.cycle(&node).await.unwrap();
+        assert!(!backend
+            .actual
+            .lock()
             .unwrap()
-            .unwrap()
-            .unwrap();
-        assert!(backend.actual.lock().unwrap().is_empty());
+            .iter()
+            .any(|r| r.runtime_id == "busy-7"));
         assert!(node.accepting_allocations());
     }
 }
@@ -620,7 +763,7 @@ async fn periodic_stale_pending_catalog_preserves_lifecycle_without_restarting_h
         tonic::Code::Aborted
     );
     assert!(!authority.registration.reconciling);
-    assert!(!node.accepting_allocations());
+    assert!(node.accepting_allocations());
     assert_no_recovery_effects(&backend);
     node.monitor_environments().await.unwrap();
     assert!(backend.observations.load(Ordering::SeqCst) > 0);
