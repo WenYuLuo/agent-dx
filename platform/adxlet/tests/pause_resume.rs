@@ -49,6 +49,13 @@ impl Backend {
 }
 #[async_trait]
 impl RuntimeDriver for Backend {
+    async fn stats(&self, _: &str) -> Result<adxlet::metrics::RuntimeUsage> {
+        Ok(adxlet::metrics::RuntimeUsage {
+            cpu_usage_ns: 1_000_000,
+            memory_usage_bytes: 100,
+            memory_limit_bytes: 1024,
+        })
+    }
     fn retains_checkpoint_files(&self, runtime_class: &str) -> bool {
         *self.background_restore.lock().unwrap() || runtime_class != "runsc"
     }
@@ -429,9 +436,16 @@ async fn pause_resume_preserves_environment_changes_execution_and_fences_delayed
     let (_temp, backend, node, spec, assignment) = fixture();
     let h = node.environment(spec.clone(), assignment).unwrap();
     let created = h.create().await.unwrap();
+    h.tick().await.unwrap();
+    assert!(node
+        .environment_metrics()
+        .contains("adx_environment_memory_usage_bytes"));
     backend.events.lock().unwrap().clear();
     let paused = h.pause(pause(created.record.revision)).await.unwrap();
     assert_eq!(paused.record.state, EnvironmentState::Paused);
+    assert!(!node
+        .environment_metrics()
+        .contains("adx_environment_memory_usage_bytes"));
     assert!(!paused.record.resources_held);
     assert_eq!(node.used(), Resources::default());
     assert!(

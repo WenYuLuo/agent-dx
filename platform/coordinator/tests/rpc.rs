@@ -448,6 +448,18 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
     assert_eq!(backend.started.load(Ordering::SeqCst), 1);
     let first_record = first.record.unwrap();
     let metrics = scrape_metrics(metrics_address).await;
+    assert!(metrics.contains("adx_environment_created_total 1\n"));
+    // Re-publishing the same durable Running result must not create a second event.
+    node_coordinator
+        .commit_environment(pb::CommitEnvironmentRequest {
+            node_session_id: "boot-1".into(),
+            record: Some(first_record.clone()),
+        })
+        .await
+        .unwrap();
+    assert!(scrape_metrics(metrics_address)
+        .await
+        .contains("adx_environment_created_total 1\n"));
     assert!(metrics.contains(
         "adx_coordinator_environments{shard_id=\"0\",node_id=\"node\",state=\"Running\"} 1\n"
     ));

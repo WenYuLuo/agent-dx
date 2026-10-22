@@ -72,14 +72,16 @@ type Reply = oneshot::Sender<Result<OperationResult>>;
 struct Envelope {
     command: Command,
     reply: Reply,
-    trace: adx_observability::trace::Trace,
+    trace: Option<adx_observability::trace::Trace>,
 }
 impl Envelope {
     fn new(command: Command, reply: Reply) -> Self {
+        let trace = (!matches!(command, Command::Tick(_) | Command::Expire(_, _)))
+            .then(|| adx_observability::trace::Trace::child("environment.queue"));
         Self {
             command,
             reply,
-            trace: adx_observability::trace::Trace::child("environment.queue"),
+            trace,
         }
     }
 }
@@ -368,14 +370,20 @@ fn spawn_controller(
             trace,
         }) = rx.recv().await
         {
-            trace.attribute("environment.id", controller.record.spec.id.clone());
-            trace
-                .run(async {
-                    adx_observability::trace::Trace::child("environment.execute")
-                        .run(controller.dispatch(command, reply))
-                        .await;
-                })
-                .await;
+            if let Some(trace) = trace {
+                trace.attribute("environment.id", controller.record.spec.id.clone());
+                trace
+                    .run(async {
+                        adx_observability::trace::Trace::child("environment.execute")
+                            .run(controller.dispatch(command, reply))
+                            .await;
+                    })
+                    .await;
+            } else {
+                // Observation is passive. State-changing work below creates its
+                // own lifecycle spans only when that work actually occurs.
+                controller.dispatch(command, reply).await;
+            }
         }
     });
     EnvironmentHandle { tx, demand }

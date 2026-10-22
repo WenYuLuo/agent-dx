@@ -316,6 +316,101 @@ async fn cancelled_schedule_is_cached_without_resubmission_or_runtime_start() {
 }
 
 #[tokio::test]
+async fn creation_metrics_wait_for_result_and_count_replay_as_a_response() {
+    let fixture = Fixture::new().await;
+    fixture.state.block_response.store(true, Ordering::SeqCst);
+    let service = fixture.service.clone();
+    let pending = tokio::spawn(async move {
+        service
+            .create(
+                spec("observed"),
+                json!({"name":"observed"}),
+                "observed",
+                &caller(),
+            )
+            .await
+    });
+    fixture.wait_starts(1).await;
+    let metrics = fixture.service.metrics();
+    assert!(metrics.contains("adx_environment_create_in_flight 1\n"));
+    assert!(metrics.contains("adx_environment_create_responses_total{outcome=\"success\"} 0\n"));
+    fixture.state.release.notify_one();
+    pending.await.unwrap().unwrap();
+    fixture.create("observed", "observed").await.unwrap();
+    let metrics = fixture.service.metrics();
+    assert!(metrics.contains("adx_environment_create_in_flight 0\n"));
+    assert!(metrics.contains("adx_environment_create_responses_total{outcome=\"success\"} 2\n"));
+    assert!(!metrics.contains("environment_id="));
+    assert_eq!(fixture.state.starts.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn private_metrics_include_rejected_http_arrivals_without_reporting_success() {
+    adx_transport::install_crypto_provider();
+    let fixture = Fixture::new().await;
+    let api = adx_apiserver::http::Api::new(fixture.clients.clone()).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let api_service = api.clone();
+    let http = tokio::spawn(async move {
+        loop {
+            let (socket, _) = listener.accept().await.unwrap();
+            let api = api_service.clone();
+            tokio::spawn(async move {
+                let service = hyper::service::service_fn(move |request| api.clone().serve(request));
+                hyper::server::conn::http1::Builder::new()
+                    .serve_connection(hyper_util::rt::TokioIo::new(socket), service)
+                    .await
+                    .unwrap();
+            });
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let monitoring = listener.local_addr().unwrap();
+    let metrics = tokio::spawn(adx_apiserver::metrics::serve(
+        listener,
+        api.environment_service.clone(),
+    ));
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    for path in [
+        "/api/environment/v1/environments",
+        "/api/environment/create/",
+        "/api/%65nvironment/v1/environments",
+    ] {
+        let response = client
+            .post(format!("http://{address}{path}"))
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert!(!response.status().is_success());
+    }
+    let text = client
+        .get(format!("http://{monitoring}/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(text.contains("adx_environment_create_requests_total{source=\"http\"} 3\n"));
+    assert!(text.contains("adx_environment_create_responses_total{outcome=\"success\"} 0\n"));
+    assert!(text.contains("adx_environment_create_in_flight 0\n"));
+    assert_eq!(
+        client
+            .post(format!("http://{monitoring}/metrics"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::NOT_FOUND
+    );
+    assert_eq!(fixture.state.starts.load(Ordering::SeqCst), 0);
+    http.abort();
+    metrics.abort();
+}
+
+#[tokio::test]
 async fn confirmed_timeout_survives_rpc_timers_and_replay() {
     let phase = "backend preparation/runtime start";
     let fixture = Fixture::new().await;

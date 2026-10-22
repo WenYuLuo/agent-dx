@@ -63,6 +63,7 @@ impl CreateReplays {
 
 /// Owns Environment lifecycle semantics independently of any transport adapter.
 pub struct EnvironmentService {
+    pub(crate) creation_metrics: crate::metrics::CreationMetrics,
     clients: Arc<Clients>,
     operations: Operations,
     creates: Mutex<CreateReplays>,
@@ -74,6 +75,7 @@ impl EnvironmentService {
         let retention = Duration::from_secs(clients.config.create_unknown_retention_seconds);
         let period = retention.min(Duration::from_secs(60));
         let service = Arc::new(Self {
+            creation_metrics: Default::default(),
             operations: Operations::new(clients.clone()),
             creates: Mutex::new(CreateReplays {
                 pending: HashMap::new(),
@@ -115,6 +117,10 @@ impl EnvironmentService {
             .await
     }
 
+    pub fn metrics(&self) -> String {
+        self.creation_metrics.render()
+    }
+
     /// Inspect the caller-visible Environment through the same versioned
     /// ownership directory used by REST lifecycle requests.
     pub async fn inspect(
@@ -153,11 +159,25 @@ impl EnvironmentService {
         request_id: &str,
         caller: &pb::CallerContext,
     ) -> Result<Value, Status> {
+        self.creation_metrics.embedded_request();
         let spec = self.prepare_create(input.clone(), caller)?;
         Box::pin(self.create(spec, input, request_id, caller)).await
     }
 
     pub async fn create(
+        &self,
+        spec: pb::EnvironmentSpec,
+        input: Value,
+        request_id: &str,
+        caller: &pb::CallerContext,
+    ) -> Result<Value, Status> {
+        let mut attempt = self.creation_metrics.attempt();
+        let result = self.create_inner(spec, input, request_id, caller).await;
+        attempt.finish(&result);
+        result
+    }
+
+    async fn create_inner(
         &self,
         spec: pb::EnvironmentSpec,
         input: Value,

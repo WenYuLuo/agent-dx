@@ -7,9 +7,10 @@ ADX 使用 OpenTelemetry SDK 和 W3C `traceparent` / `tracestate`。采样与导
 - Ingress 接收 HTTP 上下文、创建 `HTTP 方法 + 路由模板` Span，并将子上下文传给 Environment API、Execd HTTP 或 Relay CONNECT。
 - Rust API Server 创建以 HTTP 方法和接口模板命名的服务端 Span，gRPC 客户端拦截器携带上下文；节点地址缓存命中后的直达操作也经过同一拦截器。
 - Coordinator 在创建、查询、提交和快照 RPC 入口接收上下文；独立创建/提交任务显式携带子 Span。周期节点注册/心跳及内部调度轮次不创建 Span。中心排队耗时仍包含在该请求的 `coordinator.create` Span 中，不额外导出服务多个请求的调度轮次。
-- adxlet 在每个 Environment 命令封装中保存 `environment.queue` Span，串行执行时创建 `environment.execute`。创建链路在执行 Span 内继续划分 `environment.runtime.start`、`environment.runtime.ready`、`environment.route.activate` 和 `environment.state.commit`，分别覆盖执行后端启动、Execd 就绪、本机路由绑定和持久化提交。调用方断开后，已接受操作继续保持原上下文；状态提交继续向 Coordinator 透传。
+- adxlet 对用户生命周期命令在封装中保存 `environment.queue` Span，串行执行时创建 `environment.execute`。创建链路在执行 Span 内继续划分 `environment.runtime.start`、`environment.runtime.ready`、`environment.route.activate` 和 `environment.state.commit`，分别覆盖执行后端启动、Execd 就绪、本机路由绑定和持久化提交。调用方断开后，已接受操作继续保持原上下文；状态提交继续向 Coordinator 透传。
+- 周期 Tick 和恢复点有效期扫描不生成 queue/execute Span。巡检确认退出时创建 `environment.unexpected_exit`，触发自动暂停时创建 `environment.auto_pause`，实际状态提交、恢复和启动保留生命周期 Span。
 - Relay 为 CONNECT 生命周期记录 Span。它转发的是字节流，Execd 的 HTTP Span 延续 Ingress 注入的上下文；两者可能是同一请求的并列子 Span。
-- Execd 在解析 HTTP 头后创建以 HTTP 方法和接口模板命名的 Span，Environment ID 作为属性；`/invoke` 另外记录有界的 `rpc.method` 操作名。此 Span 覆盖 HTTP 操作处理；异步提交命令之后的用户进程运行时间尚不属于该 HTTP Span。
+- Execd 对没有入站 Trace 上下文的 `GET /healthz`、`GET /metrics` 和 `GET /control/v1/status` 不创建 Span；带上下文的诊断请求和其他操作继续跟踪。Execd 在解析 HTTP 头后创建以 HTTP 方法和接口模板命名的 Span，Environment ID 作为属性；`/invoke` 另外记录有界的 `rpc.method` 操作名。此 Span 覆盖 HTTP 操作处理；异步提交命令之后的用户进程运行时间尚不属于该 HTTP Span。
 
 HTTP Span 包含 `http.request.method`、`http.route`，Ingress/API Server 返回后记录 `http.response.status_code`。HTTP Span 当前覆盖生成响应的处理阶段；创建等流式响应可能先返回，而后台任务继续运行。Span 时长不等于 SDK 等待完整操作的总耗时，完整链路与后台执行阶段需打开 Trace 查看。实例/快照/密钥 ID 使用 `{id}` 占位，不记录查询参数、用户端口路径或文件路径。未知接口统一使用 `/unmatched`。
 

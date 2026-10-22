@@ -54,6 +54,18 @@ impl Api {
         self: Arc<Self>,
         request: Request<Incoming>,
     ) -> Result<Response<Body>, Infallible> {
+        if request.method() == hyper::Method::POST
+            && percent_encoding::percent_decode_str(request.uri().path())
+                .decode_utf8()
+                .is_ok_and(|path| {
+                    matches!(
+                        path.trim_end_matches('/'),
+                        "/api/environment/v1/environments" | "/api/environment/create"
+                    )
+                })
+        {
+            self.environment_service.creation_metrics.http_request();
+        }
         let trace = trace::Trace::http(
             request.method().as_str(),
             trace::http_route(request.uri().path()),

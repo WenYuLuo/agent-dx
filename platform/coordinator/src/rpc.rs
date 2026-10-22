@@ -213,6 +213,7 @@ impl State {
     }
 }
 struct Inner {
+    created: std::sync::atomic::AtomicU64,
     reclaimers: std::sync::RwLock<adx_checkpoint_storage::reclaim::Reclaimers>,
     resume_admission: Arc<tokio::sync::Semaphore>,
     resume_locks: std::sync::Mutex<BTreeMap<String, std::sync::Weak<Mutex<()>>>>,
@@ -390,6 +391,7 @@ impl CoordinatorRpc {
         let (claim_sender, claim_requests) = mpsc::channel(CLAIM_BATCH_CAPACITY);
         tokio::spawn(run_claim_batches(session.clone(), claim_requests));
         Ok(Self(Arc::new(Inner {
+            created: Default::default(),
             reclaimers: Default::default(),
             resume_admission: Arc::new(tokio::sync::Semaphore::new(1024)),
             resume_locks: std::sync::Mutex::new(BTreeMap::new()),
@@ -807,7 +809,20 @@ impl CoordinatorRpc {
         {
             return Err(Error::Conflict);
         }
+        let first_create = record.state == EnvironmentState::Running
+            && record.restart_attempts == 0
+            && state
+                .environments
+                .get(&record.spec.id)
+                .is_some_and(|stored| {
+                    stored.result.is_none() && stored.recovery.is_none() && !stored.invalidated
+                });
         let accepted = state.session.commit(record).await?;
+        if first_create {
+            self.0
+                .created
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         if accepted.state == EnvironmentState::Failed {
             let durable = state.session.get(&accepted.spec.id).await?;
             state.remember_environment(durable);
