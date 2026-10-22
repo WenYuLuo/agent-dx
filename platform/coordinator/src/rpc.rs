@@ -144,7 +144,10 @@ impl State {
         };
         // A round may serve multiple requests; it has no single request parent.
         let round = self.scheduler.schedule_round(shard)?;
-        let progress = round.yielded || !round.assignments.is_empty();
+        // A Snapshot may have moved to another shard without an assignment.
+        // Keep driving ready work instead of waiting for an unrelated event.
+        let progress =
+            round.yielded || !round.assignments.is_empty() || !self.scheduler.ready.is_empty();
         for assignment in round.assignments {
             let spec = self
                 .specs

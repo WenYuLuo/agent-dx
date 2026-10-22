@@ -15,6 +15,7 @@ use tonic::{Request, Response, Status};
 
 #[derive(Default)]
 struct State {
+    entry_node: Mutex<Option<pb::NodeEndpoint>>,
     owners: Mutex<HashMap<String, pb::GetEnvironmentResponse>>,
     starts: AtomicUsize,
     create_calls: AtomicUsize,
@@ -41,9 +42,12 @@ macro_rules! service_impl {
     };
 }
 service_impl!(pb::coordinator_service_server::CoordinatorService, {
-    type WatchNodesStream = futures_util::stream::Empty<Result<pb::NodeDirectory, Status>>;
+    type WatchNodesStream = std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<pb::NodeDirectory, Status>> + Send>>;
     async fn watch_nodes(&self, _: Request<pb::WatchNodesRequest>) -> Result<Response<Self::WatchNodesStream>, Status> {
-        Err(Status::unimplemented("central create fixture"))
+        let node = self.0.entry_node.lock().unwrap().clone().ok_or_else(|| Status::unimplemented("central create fixture"))?;
+        Ok(Response::new(Box::pin(futures_util::stream::once(async move {
+            Ok(pb::NodeDirectory { epoch: 1, valid_for_millis: 5000, nodes: vec![node] })
+        }).chain(futures_util::stream::pending()))))
     }
     async fn get_environment(&self, request: Request<pb::GetEnvironmentRequest>) -> Result<Response<pb::GetEnvironmentResponse>, Status> {
         self.0.lookups.fetch_add(1, Ordering::SeqCst);
@@ -167,9 +171,22 @@ impl Fixture {
         Self::with_retention(600).await
     }
     async fn with_retention(retention: u64) -> Self {
+        Self::with_mode(retention, false).await
+    }
+    async fn with_mode(retention: u64, local_first: bool) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap().to_string();
         let state = Arc::new(State::default());
+        if local_first {
+            *state.entry_node.lock().unwrap() = Some(pb::NodeEndpoint {
+                node_id: "arbitrary-entry".into(),
+                address: address.clone(),
+                relay_address: address.clone(),
+                session_id: "boot".into(),
+                accepting_allocations: true,
+                ..Default::default()
+            });
+        }
         let endpoint = Service(state.clone());
         let server = tokio::spawn(async move {
             let incoming = futures_util::stream::unfold(listener, |listener| async {
@@ -184,6 +201,7 @@ impl Fixture {
         let config: Config = serde_json::from_value(json!({
             "listen":"127.0.0.1:0", "coordinator_address":address, "internal_security":"network", "ingress_mode":"standalone",
             "rpc_timeout_seconds":2, "cache_entries":1, "auth_cache_ttl_seconds":1,
+            "create_mode":if local_first { "local_first" } else { "central" },
             "create_unknown_retention_seconds":retention
         })).unwrap();
         let clients = Clients::new(config).unwrap();
@@ -218,6 +236,40 @@ impl Fixture {
         .await
         .unwrap();
     }
+}
+
+#[tokio::test]
+async fn snapshot_create_uses_coordinator_even_with_a_live_local_first_entry() {
+    let fixture = Fixture::with_mode(600, true).await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while fixture.clients.nodes().await.is_err() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        fixture.clients.nodes().await.unwrap()[0].node_id,
+        "arbitrary-entry"
+    );
+    let mut spec = spec("snapshot-clone");
+    spec.snapshot_id = Some("snapshot".into());
+    let request = pb::CreateEnvironmentRequest {
+        spec: Some(spec),
+        caller: Some(caller()),
+        ..Default::default()
+    };
+    let (first, replay) = tokio::join!(
+        fixture
+            .clients
+            .create_environment(request.clone(), Duration::from_secs(2)),
+        fixture
+            .clients
+            .create_environment(request, Duration::from_secs(2)),
+    );
+    assert_eq!(first.unwrap(), replay.unwrap());
+    assert_eq!(fixture.state.create_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(fixture.state.starts.load(Ordering::SeqCst), 1);
 }
 fn spec(id: &str) -> pb::EnvironmentSpec {
     pb::EnvironmentSpec {

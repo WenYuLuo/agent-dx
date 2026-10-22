@@ -13,6 +13,7 @@ API Server 配置 `create_mode: "local_first"` 开启；默认 `"central"` 保�
 | `central` | Global 轮转进入 ShardScheduler，按租户轮转、租户内优先级/FIFO 排队；Filter/Score 执行 Pack/Spread 和放置规则 |
 | `local_first` 本地成功 | API Server 轮转一个可用入口；节点暂留资源，Coordinator 对该节点检查全部硬约束并原子确认归属；不做跨节点 Score、不进入中心队列 |
 | 本地不足或硬约束不满足 | 释放可确认属于本次申请的暂留，使用原 Environment ID/规格进入 ShardScheduler；中心排队和评分在这里生效 |
+| 从 Snapshot 创建 | 两种模式均直接进入 Coordinator；共享制品默认弱亲和来源节点，跨分片比较可用候选，local-only 保留来源节点硬约束 |
 
 因此本地优先不提供集群级 Pack/Spread、软偏好最优选择或全局队列公平性承诺。
 已进入中心队列的同 ID 请求继续使用原队列，不通过本地重试插队。
@@ -31,7 +32,8 @@ API Server：WatchNodes 全量目录 → 轮转入口
   → sandboxd → Execd 就绪 → 本机路由绑定 → Coordinator 提交 Running → 返回成功
 ```
 
-快照创建先通过 `PrepareCreate` 解析模板资源和环境，再按相同链路申请。
+带 `snapshotId` 的公开创建由 Coordinator 解析模板并选分片、节点，
+不经过任意入口节点的本地优先路径；显式放置策略覆盖共享 Snapshot 的默认来源偏好。
 Coordinator 持有恢复引用；CAS 同时比较快照原始记录，防止引用检查和归属登记之间的竞态。
 
 Coordinator 的 `ForwardCreate` 仅接受受信节点调用；原有中心 `CreateEnvironment` 仍接受 API Server。

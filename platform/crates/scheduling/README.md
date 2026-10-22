@@ -1,6 +1,6 @@
 # Scheduling rules
 
-`adx-scheduling` contains read-only Filter/Score rules and their composition. It uses `adx-core` contracts and `im` persistent collections. Global chooses a Shard by round robin; Shard selects nodes and reserves resources; Adxlet performs final local admission.
+`adx-scheduling` contains read-only Filter/Score rules and their composition. It uses `adx-core` contracts and `im` persistent collections. Global chooses a Shard by round robin for ordinary creates and by eligible candidate scores for Snapshot-based creates; Shard selects nodes and reserves resources; Adxlet performs final local admission.
 
 ## Modules and static registration
 
@@ -42,7 +42,9 @@ Eligible topology values come from available nodes matching the request's requir
 
 ScheduleAnyway prefers less-populated values but does not reject placement for skew; missing topology labels receive zero score. The default profile combines this preference with other scores, rather than claiming it overrides every other preference.
 
-Coordinator incrementally publishes a coherent snapshot across all embedded Shards. Bounded rounds share its persistent roots; each reservation updates the view before the next request. Peer and spread checks see all recorded assignments. Selection remains within the Shard chosen by Global; these rules do not add cross-Shard retry or migration. The waiting queue is memory-only and is not restored after restart. Coordinator restores persisted assignments and ledger occupancy from Redis before node reconciliation and new admission.
+Coordinator incrementally publishes a coherent snapshot across all embedded Shards. Bounded rounds share its persistent roots; each reservation updates the view before the next request. Peer and spread checks see all recorded assignments. Each Shard makes the final node selection and reservation. The waiting queue is memory-only and is not restored after restart. Coordinator restores persisted assignments and ledger occupancy from Redis before node reconciliation and new admission.
+
+Snapshot-based creates default to a source-node soft preference for shared storage unless the caller supplies placement rules. Local-only artifacts retain a hard source-node requirement. Before enqueueing a Snapshot create, Global evaluates eligible candidates across Shards using the same filters, scores and held reservations as final selection. If a queued Snapshot no longer fits its Shard, Global transfers it to another eligible Shard, retaining its Environment identity, original queue deadline and rejected-node exclusions. All-full queues sleep until scheduling state changes. Ordinary image creates retain round-robin Shard selection. Source preference is a cache hint; it neither reserves source capacity in advance nor promises cached bytes are still present.
 
 ## Contract and configuration
 

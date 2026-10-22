@@ -141,7 +141,7 @@ There are three deliberately different checkpoint paths:
 
 | Path | Public SDK API | Artifact and placement | When to use it |
 | --- | --- | --- | --- |
-| Reusable Snapshot | `create_snapshot()` then `Environment.create()` | New Environment identity; shared storage allows fresh placement, local-only pins the source node. | Independent clones from a prepared source. |
+| Reusable Snapshot | `create_snapshot()` then `Environment.create()` | New Environment identity; shared storage prefers the source node with eligible-node fallback, local-only pins it. | Independent clones from a prepared source. |
 | Pause / resume | `pause()` then `resume()` | Same Environment ID; Coordinator first tries the owner, then schedules a compatible node after definitive resource rejection or owner loss. | Stop and resume one logical environment. |
 | Failure recovery | `failover=True` | Same Environment and node; restores the latest unexpired checkpoint after unexpected backend exit. | Workloads that must recover execution state rather than cold-start. |
 | Explicit reload | `reload()` | Same Environment; replaces a Running backend from its latest unexpired checkpoint. | Operator-requested reset to a known recovery point. |
@@ -212,7 +212,11 @@ clone = Environment.create(
 )
 ```
 
-The new Coordinator inherits omitted image/runtime/scalar resources and validates explicit values against the source geometry. It does not resize a restored VM. Environment overrides and placement constraints are carried into the new Environment; local-only snapshots require the source node. Shared snapshots use normal scheduling. The source briefly pauses during snapshot creation and resumes before success. A reusable snapshot is not consumed by cloning; deletion blocks new references and waits for existing references to be released. See [storage and cloning](https://gitcode.com/openJiuwen/agent-dx/blob/refactor/docs/testing/snapshot-storage.md).
+The Coordinator inherits omitted image/runtime/scalar resources and validates explicit values against the source geometry. It does not resize a restored VM. Environment overrides and placement constraints are carried into the new Environment; local-only snapshots require the source node.
+
+For S3, AFS and JuiceFS snapshots, omitting placement constraints automatically adds a soft preference for the snapshot's source node, including selection of its scheduling shard. This can reuse a node-local cache, but does not guarantee a cache hit. If the source is unavailable, lacks resources or fails a hard constraint, another eligible node can restore from shared storage without waiting for the source. Explicit placement policies take precedence over this default. Snapshot-based creates use Coordinator scheduling even when the API Server enables `local_first`; no extra SDK argument is required. Concurrent creates retain independent identities and reservations, while retries of one identity reuse its assignment.
+
+The source briefly pauses during snapshot creation and resumes before success. A reusable snapshot is not consumed by cloning; deletion returns `SNAPSHOT_IN_USE` while references remain. See [storage and cloning](../../../../docs/testing/snapshot-storage.md).
 
 Later dual-clone FC runs exposed a network failure, tracked in the [investigation](https://gitcode.com/openJiuwen/agent-dx/blob/refactor/docs/testing/2026-09-16-fc-clone-network.md); successful earlier batches do not close that issue.
 
