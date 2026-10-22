@@ -1400,6 +1400,42 @@ async fn handle_download(
     }
 }
 
+#[cfg(target_os = "linux")]
+async fn open_regular_download(path: &str) -> std::io::Result<tokio::fs::File> {
+    use std::os::fd::AsRawFd;
+
+    // O_PATH pins the inode without opening a FIFO reader or touching a device.
+    // Reopen that inode only after checking its type, even if the pathname changes.
+    let pinned = tokio::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
+        .open(path)
+        .await?;
+    if !pinned.metadata().await?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "file not found",
+        ));
+    }
+    tokio::fs::File::open(format!("/proc/self/fd/{}", pinned.as_raw_fd())).await
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn open_regular_download(path: &str) -> std::io::Result<tokio::fs::File> {
+    // Reject known special files before opening them on development hosts too.
+    if !tokio::fs::metadata(path).await?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "file not found",
+        ));
+    }
+    let mut options = tokio::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NONBLOCK);
+    options.open(path).await
+}
+
 async fn handle_file_download(
     sock: &mut tokio::net::TcpStream,
     path: &str,
@@ -1408,13 +1444,7 @@ async fn handle_file_download(
     trace_id: &str,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let started = Instant::now();
-    let mut options = tokio::fs::OpenOptions::new();
-    options.read(true);
-    // Inspect the opened descriptor without waiting for a FIFO peer. Regular
-    // files ignore O_NONBLOCK; special files are rejected below.
-    #[cfg(unix)]
-    options.custom_flags(libc::O_NONBLOCK);
-    let mut file = match options.open(path).await {
+    let mut file = match open_regular_download(path).await {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return write_resp(sock, 404, &err_json("file not found"))
@@ -2446,6 +2476,75 @@ mod tests {
         assert!(head.contains("Content-Range: bytes 3-6/10\r\n"));
         assert_eq!(body, b"3456");
         server.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fifo_download_does_not_wake_a_waiting_writer() {
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("fifo");
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .unwrap()
+            .success());
+        let writer_path = path.clone();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (opened_tx, opened_rx) = mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(writer_path)
+                .unwrap();
+            opened_tx.send(()).unwrap();
+            file
+        });
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let blocked_before_request = opened_rx.recv_timeout(Duration::from_millis(50)).is_err();
+
+        let listener = bind(0).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            handle_conn(&mut stream, None).await.unwrap();
+        });
+        let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+        client
+            .write_all(
+                format!(
+                    "GET /download?path={}&type=file HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                    path.display()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let response =
+            tokio::time::timeout(Duration::from_secs(2), read_http_response(&mut client)).await;
+        let writer_woken = opened_rx.recv_timeout(Duration::from_millis(100)).is_ok();
+        // Always release the producer before asserting, including on regressions.
+        let peer = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&path)
+            .unwrap();
+        drop(writer.join().unwrap());
+        drop(peer);
+        let (head, _) = response.unwrap();
+        drop(client);
+        server.await.unwrap();
+        assert!(blocked_before_request);
+        assert!(head.starts_with("HTTP/1.1 404"));
+        assert!(
+            !writer_woken,
+            "rejected download opened a FIFO read endpoint"
+        );
     }
 
     #[cfg(unix)]
