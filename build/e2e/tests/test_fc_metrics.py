@@ -1,13 +1,13 @@
 """Exercise the lifecycle acceptance probe against separately served metric tiers."""
 
 import ast
-import http.server
 import threading
 import unittest
 import urllib.request
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+from wsgiref.simple_server import WSGIRequestHandler, make_server
 
 
 class LifecycleMetricsTests(unittest.TestCase):
@@ -23,18 +23,18 @@ class LifecycleMetricsTests(unittest.TestCase):
         bodies = {'/metrics': summary, '/metrics/environments': detail}
         requests = []
 
-        class Handler(http.server.BaseHTTPRequestHandler):
-            # BaseHTTPRequestHandler dispatches GET requests to this exact method name.
-            def do_GET(self):  # pylint: disable=invalid-name
-                requests.append(self.path)
-                self.send_response(200 if self.path in bodies else 404)
-                self.end_headers()
-                self.wfile.write(bodies.get(self.path, '').encode())
+        def serve_metrics(environ, start_response):
+            request_path = environ.get('PATH_INFO', '')
+            requests.append(request_path)
+            status = '200 OK' if request_path in bodies else '404 Not Found'
+            start_response(status, [('Content-Type', 'text/plain')])
+            return [bodies.get(request_path, '').encode()]
 
+        class Handler(WSGIRequestHandler):
             def log_message(self, *_args):
                 pass
 
-        server = http.server.HTTPServer(('127.0.0.1', 0), Handler)
+        server = make_server('127.0.0.1', 0, serve_metrics, handler_class=Handler)
         worker = threading.Thread(target=server.serve_forever, daemon=True)
         worker.start()
         urlopen = urllib.request.urlopen

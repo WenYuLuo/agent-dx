@@ -23,6 +23,7 @@
 - Root Cargo workspace includes the API Server; Python packages build independently.
 - Use Makefile/native package commands. `build/` contains tracked scripts; outputs go to `out/` or explicitly configured external caches.
 - Run focused checks for changed components; report runtime/cluster validation separately.
+- Before committing Python changes, run `make python-check PYTHON_CHECK_BASE=<target-branch-ref>` against the PR's updated target branch, then the affected tests. See [Python precheck](docs/development/python-checks.md) for coverage and remote CodeCheck verification.
 - Delegate long builds/tests/packaging to a narrow-context subagent when available: exact repo, commands, concurrency, success criteria and log path. The worker does not edit source. Keep complete logs, poll every 60–180 seconds and return compact results.
 
 ## Programming standards

@@ -135,13 +135,17 @@ try:
     )
 
     def sampled_stats():
-        summary_metrics = urllib.request.urlopen('http://127.0.0.1:17003/metrics', timeout=5).read().decode()
-        detail_metrics = urllib.request.urlopen('http://127.0.0.1:17003/metrics/environments', timeout=5).read().decode()
+        with urllib.request.urlopen('http://127.0.0.1:17003/metrics', timeout=5) as response:
+            summary_metrics = response.read().decode()
+        with urllib.request.urlopen('http://127.0.0.1:17003/metrics/environments', timeout=5) as response:
+            detail_metrics = response.read().decode()
         sampled = any(
             line.startswith('adx_environment_memory_usage_bytes{') and f'environment_id="{s.id}"' in line
             for line in detail_metrics.splitlines()
         )
-        return (summary_metrics, detail_metrics) if sampled and 'adx_node_reserved_cpu_millis ' in summary_metrics else None
+        if sampled and 'adx_node_reserved_cpu_millis ' in summary_metrics:
+            return summary_metrics, detail_metrics
+        return None
 
     summary, detail = wait(sampled_stats, 30)
     (out / 'metrics.txt').write_text(summary)
