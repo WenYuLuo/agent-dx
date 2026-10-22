@@ -356,16 +356,24 @@ pub(crate) struct Services {
     health_failure_threshold: Option<u32>,
 }
 
+type EnvironmentDirectory = BTreeMap<String, (EnvironmentSpec, Assignment, EnvironmentHandle)>;
+type AuthorityTasks =
+    BTreeMap<String, tokio::sync::oneshot::Receiver<Result<controller::AuthorityResult>>>;
+
+#[derive(Clone)]
 pub struct Adxlet {
     node_id: String,
-    local_holds: Mutex<BTreeMap<String, local::LocalHold>>,
-    draining: std::sync::atomic::AtomicBool,
-    lifecycle_ready: tokio::sync::RwLock<bool>,
-    authority_reconciling: std::sync::atomic::AtomicBool,
-    authority_initialized: std::sync::atomic::AtomicBool,
-    retired_environments: Mutex<BTreeMap<String, RetiredEnvironment>>,
+    local_holds: Arc<Mutex<BTreeMap<String, local::LocalHold>>>,
+    draining: Arc<std::sync::atomic::AtomicBool>,
+    lifecycle_ready: Arc<tokio::sync::RwLock<bool>>,
+    authority_reconciling: Arc<std::sync::atomic::AtomicBool>,
+    authority_initialized: Arc<std::sync::atomic::AtomicBool>,
+    retired_environments: Arc<Mutex<BTreeMap<String, RetiredEnvironment>>>,
     services: Arc<Services>,
-    environments: Mutex<BTreeMap<String, (EnvironmentSpec, Assignment, EnvironmentHandle)>>,
+    environments: Arc<Mutex<EnvironmentDirectory>>,
+    orphan_cleanup: Arc<Mutex<BTreeMap<String, Vec<RuntimeObservation>>>>,
+    authority_tasks: Arc<Mutex<AuthorityTasks>>,
+    authority_progress: Arc<tokio::sync::Notify>,
 }
 
 impl Adxlet {
@@ -384,12 +392,12 @@ impl Adxlet {
     ) -> Self {
         Self {
             node_id,
-            local_holds: Mutex::default(),
-            draining: std::sync::atomic::AtomicBool::new(false),
-            lifecycle_ready: tokio::sync::RwLock::new(true),
-            authority_reconciling: std::sync::atomic::AtomicBool::new(false),
-            authority_initialized: std::sync::atomic::AtomicBool::new(false),
-            retired_environments: Mutex::default(),
+            local_holds: Arc::default(),
+            draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            lifecycle_ready: Arc::new(tokio::sync::RwLock::new(true)),
+            authority_reconciling: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            authority_initialized: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            retired_environments: Arc::default(),
             services: Arc::new(Services {
                 runtime,
                 runtime_control: None,
@@ -411,7 +419,10 @@ impl Adxlet {
                 metrics: metrics::Metrics::default(),
                 health_failure_threshold: None,
             }),
-            environments: Mutex::default(),
+            environments: Arc::default(),
+            orphan_cleanup: Arc::default(),
+            authority_tasks: Arc::default(),
+            authority_progress: Arc::default(),
         }
     }
 
@@ -689,6 +700,7 @@ impl Adxlet {
             .environments
             .lock()
             .expect("shared state lock poisoned");
+        self.ensure_not_cleaning(&spec.id)?;
         if let Some((existing, owner, handle)) = environments.get(&spec.id) {
             if *existing == spec && *owner == assignment {
                 return Ok(handle.clone());
@@ -722,6 +734,22 @@ impl Adxlet {
         );
         environments.insert(spec.id.clone(), (spec, assignment, handle.clone()));
         Ok(handle)
+    }
+
+    // Call while holding the environment registry lock so orphan collection and
+    // admission cannot race for the same ID. Other IDs remain independent.
+    fn ensure_not_cleaning(&self, id: &str) -> Result<()> {
+        if self
+            .orphan_cleanup
+            .lock()
+            .expect("shared state lock poisoned")
+            .contains_key(id)
+        {
+            return Err(Error::Unavailable(
+                "environment orphan cleanup pending".into(),
+            ));
+        }
+        Ok(())
     }
 }
 

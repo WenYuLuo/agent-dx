@@ -188,11 +188,18 @@ impl Fixture {
         }
     }
     pub async fn cycle(&mut self, manager: &Adxlet) -> Result<(), Status> {
+        self.cycle_with_journal(manager, None).await
+    }
+    pub async fn cycle_with_journal(
+        &mut self,
+        manager: &Adxlet,
+        journal: Option<&adxlet::journal::JournalSink>,
+    ) -> Result<(), Status> {
         adxlet::node_reconciliation::reconcile_node(
             &mut self.client,
             &mut self.registration,
             manager,
-            None,
+            journal,
             Duration::from_secs(2),
             Duration::from_millis(10),
             Instant::now() + Duration::from_secs(60),

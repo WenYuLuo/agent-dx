@@ -31,6 +31,7 @@ impl Adxlet {
             .environments
             .lock()
             .expect("shared state lock poisoned");
+        self.ensure_not_cleaning(&spec.id)?;
         if let Some((old, assignment, _)) = environments.get(&spec.id) {
             if old != spec {
                 return Err(Error::Conflict);

@@ -100,9 +100,10 @@ async fn inspect(
 
 /// Obtain a complete current catalog with admission closed, reconcile every
 /// configured runtime, and publish readiness before the next reporting interval.
-/// Any failure keeps new admission closed; an unavailable catalog is never empty.
-/// Before receiving fresh authority, transport failure preserves known controllers'
-/// existing degradation path. Partial reconciliation or fencing keeps lifecycle closed.
+/// Startup and session fencing drain the node. Live comparisons enqueue at most
+/// one task per Environment and reopen admission after catalog validation, so a
+/// slow or failed controller cannot close other Environments' admission. An
+/// unavailable catalog is never empty and still closes new node allocation.
 pub async fn reconcile_node(
     coordinator: &mut Coordinator,
     registration: &mut pb::RegisterNodeRequest,
@@ -129,7 +130,7 @@ pub async fn reconcile_node(
         ));
     }
     let mut catalog_received = false;
-    let mut catalog_stale = false;
+    let mut catalog_retry = false;
     let mut handshake_required = false;
     if !periodic {
         pause_lifecycle_reporting(
@@ -144,9 +145,10 @@ pub async fn reconcile_node(
     }
     let result = async {
         report(coordinator, registration, timeout, &mut handshake_required).await?;
+        let basis = periodic.then(|| manager.comparison_basis());
         let mut catalog = inspect(coordinator, registration, timeout).await?;
         catalog_received = true;
-        if let Some(journal) = journal {
+        if let Some(journal) = journal.filter(|_| !periodic) {
             let records = catalog
                 .records
                 .iter()
@@ -178,18 +180,28 @@ pub async fn reconcile_node(
             .collect::<adx_core::Result<Vec<_>>>()
             .map_err(status)?;
         let recovery = async {
-            if periodic {
-                if manager.compare_retained(records, snapshots, retained).await.map_err(status)?
-                    == ReconciliationOutcome::StaleCatalog
+            if let Some(basis) = basis {
+                match manager
+                    .compare_retained(basis, records, snapshots, retained, report_interval)
+                    .await
+                    .map_err(status)?
                 {
-                    catalog_stale = true;
-                    return Err(Status::aborted("node authority catalog advanced"));
+                    ReconciliationOutcome::Complete | ReconciliationOutcome::Pending => (),
+                    ReconciliationOutcome::StaleCatalog => {
+                        catalog_retry = true;
+                        return Err(Status::aborted("node authority catalog advanced"));
+                    }
+                    ReconciliationOutcome::Incomplete(error) => {
+                        catalog_retry = true;
+                        return Err(status(error));
+                    }
                 }
                 Ok(())
             } else {
                 manager
                     .reconcile_retained(records, snapshots, retained)
-                    .await.map_err(status)
+                    .await
+                    .map_err(status)
             }
         };
         tokio::pin!(recovery);
@@ -199,7 +211,14 @@ pub async fn reconcile_node(
         loop {
             tokio::select! {
                 result = &mut recovery => { result?; break; },
-                _ = heartbeat.tick() => { report(coordinator, registration, timeout, &mut handshake_required).await?; },
+                _ = heartbeat.tick() => {
+                    if periodic && !manager.authority_reconciling.load(Ordering::Acquire) {
+                        registration.reconciling = false;
+                        registration.accepting_allocations = manager.accepting_allocations()
+                            && !manager.is_draining() && Instant::now() < capacity_valid_until;
+                    }
+                    report(coordinator, registration, timeout, &mut handshake_required).await?;
+                },
             }
         }
         registration.reconciling = false;
@@ -215,18 +234,41 @@ pub async fn reconcile_node(
     }
     .await;
     if result.is_err() {
-        manager.authority_reconciling.store(true, Ordering::Release);
-        if !catalog_stale {
-            pause_lifecycle_reporting(
-                manager,
-                coordinator,
-                registration,
-                timeout,
-                report_interval,
-                &mut handshake_required,
-            )
-            .await?;
+        if catalog_retry {
+            // Even a fast local failure must publish restored node admission;
+            // otherwise Coordinator only sees the earlier closed report.
+            registration.reconciling = false;
+            registration.accepting_allocations = manager.accepting_allocations()
+                && !manager.is_draining()
+                && Instant::now() < capacity_valid_until;
+            if let Err(error) =
+                report(coordinator, registration, timeout, &mut handshake_required).await
+            {
+                manager.authority_reconciling.store(true, Ordering::Release);
+                pause_lifecycle_reporting(
+                    manager,
+                    coordinator,
+                    registration,
+                    timeout,
+                    report_interval,
+                    &mut handshake_required,
+                )
+                .await?;
+                registration.reconciling = handshake_required;
+                return Err(error);
+            }
+            return result;
         }
+        manager.authority_reconciling.store(true, Ordering::Release);
+        pause_lifecycle_reporting(
+            manager,
+            coordinator,
+            registration,
+            timeout,
+            report_interval,
+            &mut handshake_required,
+        )
+        .await?;
         // Coordinator restart/ownership invalidation can require a fresh
         // registration handshake, independently of local controller recovery.
         registration.reconciling = handshake || handshake_required;
