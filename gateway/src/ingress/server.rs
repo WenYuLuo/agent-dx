@@ -2028,21 +2028,25 @@ impl CommandWatchHub {
             entry.clone()
         } else {
             use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-            let mut request = "ws://execd/commands/watch"
+            let request = "ws://execd/commands/watch"
                 .into_client_request()
                 .map_err(|error| io::Error::other(error.to_string()))?;
             #[cfg(feature = "agent-api")]
-            if let Some(access) = &gateway.execd_access {
-                access
-                    .apply(_tenant_id, &route.target.instance_id, &mut request)
-                    .await
-                    .map_err(|_| {
-                        io::Error::new(
-                            io::ErrorKind::PermissionDenied,
-                            "Environment runtime access unavailable",
-                        )
-                    })?;
-            }
+            let request = {
+                let mut request = request;
+                if let Some(access) = &gateway.execd_access {
+                    access
+                        .apply(_tenant_id, &route.target.instance_id, &mut request)
+                        .await
+                        .map_err(|_| {
+                            io::Error::new(
+                                io::ErrorKind::PermissionDenied,
+                                "Environment runtime access unavailable",
+                            )
+                        })?;
+                }
+                request
+            };
             let stream = gateway
                 .open_authorized_stream_with_activity(route, true)
                 .await?;
