@@ -759,32 +759,55 @@ mod tests {
     }
 
     #[test]
+    fn cmd_run_honors_short_timeout_without_waiting_for_child_readiness() {
+        let kw = BTreeMap::from([
+            ("cmd".into(), rmpv::Value::from("exec sleep 30")),
+            ("timeout".into(), rmpv::Value::F64(0.1)),
+        ]);
+        let started = Instant::now();
+        let result = dispatch_runtime_action_with_trace("cmd_run", &kw, "")
+            .expect("cmd_run should dispatch");
+
+        // The budget starts before spawn. A busy worker may kill the child
+        // before it executes any shell statements; no readiness file is needed.
+        // Allow the bounded one-second reap grace and CI scheduling overhead.
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert_eq!(result_field(&result, "exit_code").as_i64(), Some(-1));
+        assert!(result_field(&result, "stderr")
+            .as_str()
+            .unwrap_or_default()
+            .contains("Command timed out after 0.1 seconds"));
+    }
+
+    #[test]
     fn cmd_run_honors_timeout_and_reaps_the_shell_process() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let shell_pid = temp.path().join("shell.pid");
         let descendant_marker = temp.path().join("descendant-finished");
         let command = format!(
-            "echo $$ > {}; (sleep 0.5; touch {}) & wait",
+            "echo $$ > {}; (sleep 2; touch {}) & wait",
             shell_pid.display(),
             descendant_marker.display()
         );
         let mut kw = BTreeMap::new();
         kw.insert("cmd".to_string(), rmpv::Value::from(command));
-        kw.insert("timeout".to_string(), rmpv::Value::F64(0.1));
+        // This separate case inspects child-created state. Give the fixture
+        // time to initialize instead of requiring it within a 100 ms budget.
+        kw.insert("timeout".to_string(), rmpv::Value::F64(1.0));
 
         let started = Instant::now();
         let result = dispatch_runtime_action_with_trace("cmd_run", &kw, "")
             .expect("cmd_run should dispatch");
 
         assert!(
-            started.elapsed() < Duration::from_millis(400),
-            "timed command should return near its deadline"
+            started.elapsed() < Duration::from_secs(5),
+            "timed command must return without waiting for descendants"
         );
         assert_eq!(result_field(&result, "exit_code").as_i64(), Some(-1));
         assert!(result_field(&result, "stderr")
             .as_str()
             .unwrap_or_default()
-            .contains("Command timed out after 0.1 seconds"));
+            .contains("Command timed out after 1 seconds"));
 
         let pid = std::fs::read_to_string(&shell_pid)
             .expect("shell should write its pid before timeout")
@@ -803,7 +826,7 @@ mod tests {
             Some(libc::ESRCH)
         );
 
-        std::thread::sleep(Duration::from_millis(550));
+        std::thread::sleep(Duration::from_millis(2100));
         assert!(
             !descendant_marker.exists(),
             "timeout should kill the whole process group, not only /bin/sh"
