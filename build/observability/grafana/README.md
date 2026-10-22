@@ -21,10 +21,22 @@ Schedule 每 30 秒刷新汇总统计；两项日志统计分别固定回看最�
 
 日志页只查询 `component_name="adx-runtime"` 的主进程 stdout/stderr，保留原文。
 Runtime ID 使用正则过滤，`.*` 选择全部，`.*environment-id.*` 选择该实例的执行代次；
-正文关键词为区分大小写的字面匹配。两个输入均使用 `doublequote` 插值转义，
-不再从逐实例资源指标枚举运行记录。Runtime ID 保持 Loki 结构化元数据，
+正文关键词为区分大小写的字面匹配，可直接输入反斜杠、引号和反引号，空值匹配全部。
+Runtime ID 使用原始字符串保留正则语义；正文关键词通过 Grafana `percentencode`
+传入 Loki，由 `urldecode` 还原后用 `contains` 匹配原始日志。runtime 过滤先执行，
+匹配用的临时标签在返回前移除。Runtime ID 保持 Loki 结构化元数据，
 不增加逐实例索引；SDK command 返回的 stdout/stderr 不会自动归档为主进程日志。
 Environment 明细清单独立于资源样本，因此 Paused 和无资源采样的实例仍能展示。
+
+关键词查询回归使用隔离 Loki 容器，覆盖特殊字符、字面匹配、原文保留及 runtime/环境隔离：
+
+```sh
+docker pull grafana/loki:3.4.2
+python3 -m unittest discover -s build/observability/tests -v
+```
+
+测试使用 Grafana 11.5.2 的标量变量格式规则和仓库内大盘查询，Loki 负责真实解析和匹配。
+修改插值方式时还应在 Grafana 页面验证输入框到数据源的完整链路。
 
 ## 导入与采集前提
 

@@ -103,7 +103,7 @@
             "type": "loki",
             "uid": "loki"
           },
-          "expr": "{adx_env=~\"$adx_env\",component_name=\"adx-runtime\"} | runtime_id =~ `${runtime_id:raw}` |= ${log_search:doublequote}",
+          "expr": "{adx_env=~\"$adx_env\",component_name=\"adx-runtime\"} | runtime_id =~ `${runtime_id:raw}` | label_format adx_keyword_match=`{{ contains (urldecode \"${log_search:percentencode}\") (__line__) }}` | adx_keyword_match=\"true\" | drop adx_keyword_match",
           "refId": "A",
           "maxLines": 500
         }
@@ -348,7 +348,8 @@
           "text": "",
           "value": ""
         },
-        "hide": 0
+        "hide": 0,
+        "description": "Case-sensitive literal text. Enter backslashes and quotes directly; leave empty to match all lines."
       }
     ]
   },
@@ -360,6 +361,6 @@
   "timezone": "browser",
   "title": "ADX Environment Logs",
   "uid": "adx-environment-logs",
-  "version": 2,
+  "version": 3,
   "weekStart": ""
 }

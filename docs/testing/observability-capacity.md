@@ -104,7 +104,9 @@ Execd 的无入站 Trace 上下文健康检查、指标抓取和 HTTP 状态轮�
 
 Schedule 自动刷新统计数据。`ADX Environment Logs` 独立页默认最近 15 分钟、关闭
 自动刷新，日志每次最多返回 500 行；runtime 正则支持 `.*environment-id.*`，正文
-关键词按字面匹配。Environment、runtime 正则使用 PromQL/LogQL 原始字符串，
+关键词按字面匹配，可直接输入反斜杠、引号和反引号。关键词先进行 URL 编码，
+在 Loki 查询模板中还原并匹配原文；runtime 过滤先执行，临时匹配标签在返回前移除。
+Environment、runtime 正则使用 PromQL/LogQL 原始字符串，
 保留 `env-\d+` 等正则及双引号的含义；匹配反引号时使用 RE2 的 `\x60` 写法。
 该页同时提供有返回上限的 HTTP Trace 明细；日志与 Trace 内容查询不会随 Schedule
 总览自动执行。
@@ -118,6 +120,7 @@ Schedule 自动刷新统计数据。`ADX Environment Logs` 独立页默认最近
 
 ## 验证入口
 
+- 预先拉取 `grafana/loki:3.4.2` 后运行 `python3 -m unittest discover -s build/observability/tests -v`：使用隔离 Loki 验证大盘关键词的特殊字符、空值、大小写、原文保留和 runtime/环境隔离，容器由测试自动清理。
 - `cargo test -p adxlet --lib metrics::tests`：汇总累计值、runtime 重置、实例回收、过期样本和分层入口。
 - `cargo test -p adxlet --test background_traces`：多次普通巡检/过期扫描不新增 Span，实际失败保留生命周期 Span，失败后旧资源样本移除。
 - `cargo test -p adxlet --test authority_traces`：真实 gRPC 周期核对下，Running/Paused 正常巡检不新增 Span；异常清理、失败和恢复保留 Span，恢复后的正常巡检重新静默。
