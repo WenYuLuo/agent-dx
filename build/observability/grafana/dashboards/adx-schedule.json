@@ -89,32 +89,28 @@
               {
                 "color": "green",
                 "value": 0
-              },
-              {
-                "color": "yellow",
-                "value": 50
-              },
-              {
-                "color": "red",
-                "value": 100
               }
             ]
           },
-          "unit": "short"
+          "unit": "short",
+          "min": 0,
+          "decimals": 0
         },
         "overrides": []
       },
       "gridPos": {
         "x": 0,
         "y": 0,
-        "w": 4,
+        "w": 6,
         "h": 4
       },
       "id": 1,
       "options": {
-        "minVizHeight": 75,
-        "minVizWidth": 75,
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
         "orientation": "auto",
+        "percentChangeColorMode": "standard",
         "reduceOptions": {
           "calcs": [
             "lastNotNull"
@@ -122,10 +118,10 @@
           "fields": "",
           "values": false
         },
-        "showThresholdLabels": false,
-        "showThresholdMarkers": true,
-        "sizing": "auto",
-        "text": {}
+        "showPercentChange": false,
+        "text": {},
+        "textMode": "value",
+        "wideLayout": true
       },
       "pluginVersion": "12.3.1",
       "targets": [
@@ -135,12 +131,14 @@
             "uid": "prometheus"
           },
           "expr": "sum(adx_coordinator_environments{adx_env=~\"$adx_env\",state=\"Running\"})",
-          "legendFormat": "Total Running Instances",
-          "refId": "A"
+          "legendFormat": "Running",
+          "refId": "A",
+          "instant": false
         }
       ],
       "title": "Running Environments",
-      "type": "gauge"
+      "type": "stat",
+      "description": "Committed Running state."
     },
     {
       "datasource": {
@@ -167,7 +165,7 @@
         "overrides": []
       },
       "gridPos": {
-        "x": 8,
+        "x": 12,
         "y": 0,
         "w": 4,
         "h": 4
@@ -217,7 +215,7 @@
         "overrides": []
       },
       "gridPos": {
-        "x": 12,
+        "x": 16,
         "y": 0,
         "w": 4,
         "h": 4
@@ -251,7 +249,7 @@
         "overrides": []
       },
       "gridPos": {
-        "x": 16,
+        "x": 20,
         "y": 0,
         "w": 4,
         "h": 4
@@ -1852,75 +1850,59 @@
         "uid": "prometheus"
       },
       "gridPos": {
-        "x": 4,
+        "x": 6,
         "y": 0,
-        "w": 4,
+        "w": 6,
         "h": 4
       },
       "fieldConfig": {
         "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
           "unit": "short",
-          "min": 0
+          "min": 0,
+          "decimals": 0
         },
         "overrides": []
       },
       "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "percentChangeColorMode": "standard",
         "reduceOptions": {
           "calcs": [
             "lastNotNull"
           ],
           "fields": "",
           "values": false
-        }
+        },
+        "showPercentChange": false,
+        "text": {},
+        "textMode": "value",
+        "wideLayout": true
       },
       "targets": [
         {
           "refId": "A",
           "expr": "sum(adx_coordinator_environments{adx_env=~\"$adx_env\",state=\"Paused\"})",
           "instant": false,
-          "legendFormat": "{{adx_env}}"
+          "legendFormat": "Paused"
         }
-      ]
-    },
-    {
-      "id": 24,
-      "title": "Running + Paused Environments",
-      "type": "stat",
-      "description": "Running plus Paused only; transitional and failed states are shown separately.",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "gridPos": {
-        "x": 20,
-        "y": 0,
-        "w": 4,
-        "h": 4
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "min": 0
-        },
-        "overrides": []
-      },
-      "options": {
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        }
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "expr": "sum(adx_coordinator_environments{adx_env=~\"$adx_env\",state=~\"Running|Paused\"})",
-          "instant": false,
-          "legendFormat": "{{adx_env}}"
-        }
-      ]
+      ],
+      "pluginVersion": "12.3.1"
     },
     {
       "id": 25,
@@ -2629,6 +2611,6 @@
   "timezone": "browser",
   "title": "ADX Schedule",
   "uid": "adx-schedule",
-  "version": 9,
+  "version": 10,
   "weekStart": ""
 }
