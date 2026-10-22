@@ -99,6 +99,7 @@ use crate::node::vfs::{
 };
 
 const MAX_TRANSFER_BYTES: usize = crate::node::storage::MAX_TRANSFER_BYTES;
+const DFS_PEER_RECEIVE_FRAME_BYTES: u32 = 128 * 1024;
 #[cfg(feature = "ownerfs")]
 const MAX_PENDING_RELEASES: usize = 64;
 #[cfg(feature = "ownerfs")]
@@ -988,11 +989,14 @@ impl PeerConnectionPool {
         };
         // This bounds each incoming frame, not the message/flow-control window.
         // Smaller frames remain valid; TLS, deadlines and message limits remain.
-        let endpoint = if owner_files {
-            endpoint.max_frame_size(256 * 1024)
+        // This only changes the client's receive cap. Frames still consume the
+        // existing flow-control windows; message limits, budgets and deadlines
+        // remain unchanged. Peers may continue to send smaller frames.
+        let endpoint = endpoint.max_frame_size(if owner_files {
+            256 * 1024
         } else {
-            endpoint
-        };
+            DFS_PEER_RECEIVE_FRAME_BYTES
+        });
         let endpoint = self.security.configure_client(endpoint).map_err(|error| {
             afs_error::Error::coded(afs_error::CLIENT_ARGUMENT_INVALID, error.to_string())
         })?;
@@ -8885,6 +8889,143 @@ mod tests {
                 )),
             },
         ]
+    }
+
+    #[cfg(feature = "dfs")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dfs_peer_receive_cap_reduces_actual_http2_data_frames() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut observations = Vec::new();
+        for production in [false, true] {
+            let payload = vec![37; 128 * 1024];
+            let chunk = crate::node::chunk::StagedChunk::new(
+                crate::dfs::OperationId::new("dfs-peer-receive-frames"),
+                payload.clone(),
+            )
+            .chunk;
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let server_address = listener.local_addr().unwrap();
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let fixture = DiskStreamFixture {
+                chunk: chunk.clone(),
+                body: Arc::new(payload.clone()),
+                mode: 0,
+                calls: calls.clone(),
+                fetch_objects: None,
+                fetch_gate: None,
+            };
+            let (stop_server, server_done) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(
+                Server::builder()
+                    .add_service(
+                        afs_protocol::node_data::dfs_chunks_server::DfsChunksServer::new(fixture),
+                    )
+                    .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
+                        let _ = server_done.await;
+                    }),
+            );
+
+            let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}", proxy_listener.local_addr().unwrap());
+            let data_frames = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let frames = data_frames.clone();
+            let (stop_proxy, proxy_done) = tokio::sync::oneshot::channel();
+            let proxy = tokio::spawn(async move {
+                let (client, _) = proxy_listener.accept().await.unwrap();
+                let upstream = tokio::net::TcpStream::connect(server_address)
+                    .await
+                    .unwrap();
+                let (mut client_read, mut client_write) = client.into_split();
+                let (mut upstream_read, mut upstream_write) = upstream.into_split();
+                let responses = async {
+                    loop {
+                        let mut header = [0; 9];
+                        if let Err(error) = upstream_read.read_exact(&mut header).await {
+                            assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+                            break;
+                        }
+                        let length = (usize::from(header[0]) << 16)
+                            | (usize::from(header[1]) << 8)
+                            | usize::from(header[2]);
+                        assert!(length <= 2 * 1024 * 1024);
+                        let mut body = vec![0; length];
+                        upstream_read.read_exact(&mut body).await.unwrap();
+                        let stream_id =
+                            u32::from_be_bytes([header[5] & 0x7f, header[6], header[7], header[8]]);
+                        if header[3] == 0 && stream_id != 0 && length != 0 {
+                            frames.lock().unwrap().push(length);
+                        }
+                        client_write.write_all(&header).await.unwrap();
+                        client_write.write_all(&body).await.unwrap();
+                    }
+                };
+                tokio::select! {
+                    result = tokio::io::copy(&mut client_read, &mut upstream_write) => { result.unwrap(); }
+                    () = responses => {}
+                    _ = proxy_done => {}
+                }
+            });
+
+            let config = afs_transport::GrpcConfig::default();
+            assert_eq!(config.initial_connection_window_size, 2 * 1024 * 1024);
+            assert_eq!(config.initial_stream_window_size, 2 * 1024 * 1024);
+            let pool =
+                PeerConnectionPool::new(config.clone(), afs_transport::TlsConfig::Disabled, 1)
+                    .unwrap();
+            let channel = if production {
+                pool.channel("node-a", 1, &endpoint).await.unwrap()
+            } else {
+                config
+                    .configure_client(Endpoint::from_shared(endpoint).unwrap())
+                    .max_frame_size(16 * 1024)
+                    .connect_lazy()
+            };
+            let mut client =
+                afs_protocol::node_data::dfs_chunks_client::DfsChunksClient::new(channel);
+            let mut request = range_request();
+            request.operations.truncate(1);
+            request.operations[0].chunk_id = chunk.id.0;
+            request.operations[0].length = payload.len() as u64;
+            let stream = client
+                .read_ranges(request.clone())
+                .await
+                .unwrap()
+                .into_inner();
+            let mut output = vec![0; payload.len()];
+            consume_peer_read_stream(&request, None, &mut output, stream, None, None)
+                .await
+                .unwrap();
+            assert_eq!(output, payload);
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            observations.push(data_frames.lock().unwrap().clone());
+
+            drop(client);
+            drop(pool);
+            let _ = stop_proxy.send(());
+            tokio::time::timeout(Duration::from_secs(3), proxy)
+                .await
+                .unwrap()
+                .unwrap();
+            let _ = stop_server.send(());
+            tokio::time::timeout(Duration::from_secs(3), server)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        }
+
+        eprintln!(
+            "actual HTTP2 DATA payload lengths: control={:?}, production={:?}",
+            observations[0], observations[1]
+        );
+        assert!(observations[0].iter().all(|length| *length <= 16 * 1024));
+        assert!(observations[1].len() < observations[0].len());
+        assert!(observations[1].iter().any(|length| *length > 16 * 1024));
+        assert_eq!(
+            observations[0].iter().sum::<usize>(),
+            observations[1].iter().sum::<usize>()
+        );
     }
 
     #[cfg(feature = "dfs")]

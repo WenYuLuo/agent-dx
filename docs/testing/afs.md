@@ -588,6 +588,13 @@ RSS允许偏差和观测窗口，完成原提交入口、释放所有引用后�
 未知 Meta ACK 精确重试、停止排空，以及受影响 OwnerFs／RN／RDMA／S3 回归。完整BLAKE3、授权、
 成功 fsync 和 close-to-open 不因这些优化放松；RDMA仍按现有独立注册 endpoint 缓冲合同验证。
 
+## Peer HTTP/2接收帧验证
+
+`dfs_peer_receive_cap_reduces_actual_http2_data_frames`用原有64KiB业务流式协议分别经
+显式16KiB控制Channel和生产PeerConnectionPool交付同一128KiB正文，先核正文、原解码器、
+EOF和单次RPC，再比较透明代理按HTTP/2头读取的非空DATA帧。代理只用于机制断言，不以其
+耗时或CPU作为产品收益；流控、消息、正文、控制和并发预算必须保持。
+
 ## Peer 完整对象唯一核根回归
 
 Header固定consumer Tree或producer/plain checksum，之后不切换。分别验证新Peer证明、
