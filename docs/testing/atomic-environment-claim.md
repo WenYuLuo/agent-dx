@@ -83,6 +83,7 @@ Environment 字段；generation 在 Rust 中按 `u64` 计算。Coordinator 释�
 
 入口 adxlet 只有在本地资源或硬约束明确不满足时，才使用剩余整体预算向 Coordinator 的中心调度提交**同一 ID 和规格**。API Server 不会在入口连接失败、超时或会话前置条件失效后自行发起第二条中心创建；这些错误可能对应已接受的本地操作，调用方必须使用同一请求和 Environment ID 重试或查询。
 Coordinator 将中心请求与仍在途的 claim 串行协调。API 不把结果未知缓存成最终失败；保留的创建操作可继续使用原规格重试。`scheduleTimeoutSeconds` 仅约束中心队列等待 Assignment，本地入口使用完整的 `createTimeoutSeconds`，不做固定比例切分。
+adxlet 到 Coordinator 的连接仅以 `rpc_timeout_seconds` 限制建连，不再统一截断所有 RPC 的响应等待。`ForwardCreate` 使用原创建期限的剩余时间，额外 3 秒仅供下游返回超时诊断，不延长创建或排队期限；claim、心跳、对账和状态提交继续使用各自的短 RPC 超时。启动和发现 Coordinator 地址变化后的重连使用相同规则。
 这里保证同 Environment ID 的收敛，不提供跨 API Server 的匿名 HTTP 请求 ID 全局持久化服务。
 
 ## 验证分层
