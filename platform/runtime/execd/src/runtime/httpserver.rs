@@ -1402,22 +1402,35 @@ async fn handle_download(
 
 #[cfg(target_os = "linux")]
 async fn open_regular_download(path: &str) -> std::io::Result<tokio::fs::File> {
-    use std::os::fd::AsRawFd;
+    use std::os::fd::{AsRawFd, FromRawFd};
 
     // O_PATH pins the inode without opening a FIFO reader or touching a device.
     // Reopen that inode only after checking its type, even if the pathname changes.
-    let pinned = tokio::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
-        .open(path)
-        .await?;
-    if !pinned.metadata().await?.is_file() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "file not found",
-        ));
-    }
-    tokio::fs::File::open(format!("/proc/self/fd/{}", pinned.as_raw_fd())).await
+    let path = std::ffi::CString::new(path)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    let file = tokio::task::spawn_blocking(move || {
+        // musl includes O_PATH in O_ACCMODE, which Rust's OpenOptions masks out
+        // of custom_flags. Call open directly to preserve the path-only access.
+        // SAFETY: path is NUL-terminated and valid throughout this call; the
+        // flags do not create a file, so open does not need a variadic mode.
+        let fd = unsafe { libc::open(path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: open returned a valid, uniquely owned descriptor. File closes
+        // it on every path, including metadata errors and failed reopen calls.
+        let pinned = unsafe { std::fs::File::from_raw_fd(fd) };
+        if !pinned.metadata()?.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "file not found",
+            ));
+        }
+        std::fs::File::open(format!("/proc/self/fd/{}", pinned.as_raw_fd()))
+    })
+    .await
+    .map_err(std::io::Error::other)??;
+    Ok(tokio::fs::File::from_std(file))
 }
 
 #[cfg(not(target_os = "linux"))]

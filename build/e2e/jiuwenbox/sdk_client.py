@@ -43,6 +43,7 @@ sdk_module = importlib.import_module("adx_environment")
 ConnectionConfig = sdk_module.ConnectionConfig
 Environment = sdk_module.Environment
 EnvironmentNotFound = sdk_module.EnvironmentNotFound
+EnvironmentError = sdk_module.EnvironmentError
 RestartPolicy = sdk_module.RestartPolicy
 
 connection = ConnectionConfig(
@@ -82,12 +83,35 @@ def check(runtime_class):
         probe.exit_code == 0 and config["execd_sha"] in probe.stdout and "EROFS_READONLY_OK" in probe.stdout
     ):
         raise AssertionError(repr(probe))
+    # Exercise the installed static payload too: musl's O_ACCMODE includes O_PATH,
+    # so a host-libc unit test alone cannot catch flags masked by OpenOptions.
+    fifo = str(PurePosixPath("/workspace") / f"{runtime_class}.fifo")
+    created = environment.commands.run(f"mkfifo {fifo}")
+    if created.exit_code != 0:
+        raise AssertionError(repr(created))
+    previous_timeout = os.environ.get("ADX_DIRECT_UPLOAD_TIMEOUT")
+    try:
+        os.environ["ADX_DIRECT_UPLOAD_TIMEOUT"] = "3"
+        try:
+            environment.files.read(fifo)
+        except EnvironmentError as error:
+            if getattr(error, "status_code", None) != 404:
+                raise AssertionError(f"FIFO download was not rejected: {error}") from error
+        else:
+            raise AssertionError("FIFO download unexpectedly succeeded")
+    finally:
+        if previous_timeout is None:
+            os.environ.pop("ADX_DIRECT_UPLOAD_TIMEOUT", None)
+        else:
+            os.environ["ADX_DIRECT_UPLOAD_TIMEOUT"] = previous_timeout
+        environment.files.remove(fifo)
     return {
         "id": environment.id,
         "info": dataclasses.asdict(environment.get_info()),
         "binary_bytes": len(payload),
         "binary_sha256": hashlib.sha256(payload).hexdigest(),
         "guest_erofs": probe.stdout,
+        "fifo_download_status": 404,
         "command": {"stdout": result.stdout, "stderr": result.stderr, "exit_code": result.exit_code},
     }
 
