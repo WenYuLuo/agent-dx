@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     net::IpAddr,
     path::{Path, PathBuf},
     sync::{
@@ -363,7 +363,12 @@ impl Jiuwenbox {
             if !id.starts_with("adx-") {
                 continue;
             }
-            let backend = match value["sandbox_runtime"].as_str() {
+            // Native list/get responses use `runtime`; some distributions
+            // expose the create selector `sandbox_runtime` in responses too.
+            let runtime = value["runtime"]
+                .as_str()
+                .or_else(|| value["sandbox_runtime"].as_str());
+            let backend = match runtime {
                 Some("conch") => "conch",
                 Some("process" | "bwrap" | "supervisor") => "supervisor",
                 _ if value["phase"] == "provisioning" => "",
@@ -469,6 +474,15 @@ impl Jiuwenbox {
         devices: &[DeviceAllocation],
         root: &Path,
     ) -> Result<(Value, Value)> {
+        adx_core::execution::validate_process_identity(
+            spec.execution.user.as_deref(),
+            spec.execution.group.as_deref(),
+        )?;
+        if spec.execution.user.is_some() && spec.execution.inherit_entrypoint {
+            return Err(Error::Invalid(
+                "tool identity cannot override an inherited image process".into(),
+            ));
+        }
         let class = self
             .config
             .classes
@@ -595,8 +609,17 @@ impl Jiuwenbox {
             {
                 conch[key] = value.clone();
             }
+            if let (Some(user), Some(group)) = (&spec.execution.user, &spec.execution.group) {
+                conch["run_as_user"] = json!(user);
+                conch["run_as_group"] = json!(group);
+            }
             backend_policy["conch"] = conch;
         } else {
+            if spec.execution.user.is_some() {
+                return Err(Error::Invalid(
+                    "tool identity override currently requires the Conch runtime".into(),
+                ));
+            }
             backend_policy["filesystem_policy"]["bind_mounts"] = json!(mounts);
             // A scalar replaces Jiuwenbox's base cpu_max tuple in append mode;
             // sending a list would concatenate/deduplicate the quota and period.
@@ -744,14 +767,58 @@ impl Jiuwenbox {
         Ok(())
     }
 
+    fn start_cleanup(
+        &self,
+        id: String,
+        lock: tokio::sync::OwnedMutexGuard<()>,
+    ) -> tokio::task::JoinHandle<Result<()>> {
+        let driver = self.clone();
+        tokio::spawn(async move {
+            let _lock = lock;
+            let result = driver.cleanup(&id).await;
+            if let Err(error) = &result {
+                adx_observability::warn!(runtime_id=%id, %error, "Jiuwenbox execution cleanup pending");
+            }
+            result
+        })
+    }
+
+    async fn running_conch(&self) -> Result<BTreeSet<String>> {
+        let running = self
+            .conch()?
+            .request(
+                Method::GET,
+                "/api/v1/sandboxes?state=running&limit=5000",
+                None,
+                false,
+            )
+            .await?;
+        let running = running
+            .as_array()
+            .ok_or_else(|| unavailable("invalid Conch running inventory"))?;
+        if running.len() >= 5000 {
+            return Err(unavailable("Conch running inventory may be truncated"));
+        }
+        running
+            .iter()
+            .map(|v| {
+                v["sandboxID"]
+                    .as_str()
+                    .or_else(|| v["id"].as_str())
+                    .map(str::to_owned)
+                    .ok_or_else(|| unavailable("Conch running inventory record has no ID"))
+            })
+            .collect()
+    }
+
     async fn observation(&self, r: &Record) -> Result<bool> {
         if r.phase == Phase::Deleted {
             return Ok(false);
         }
         if r.epoch != self.client.epoch().await? {
-            return Err(unavailable(
-                "backend epoch changed; reconciliation required",
-            ));
+            // This execution's backend binding is no longer usable. Its
+            // controller must confirm physical cleanup before releasing it.
+            return Ok(false);
         }
         if r.phase != Phase::Ready {
             return Err(unavailable("execution has not settled"));
@@ -806,27 +873,7 @@ impl Jiuwenbox {
                         Err(Error::NotFound) => return Ok(false),
                         Err(error) => return Err(error),
                         Ok(_) => {
-                            let running = self
-                                .conch()?
-                                .request(
-                                    Method::GET,
-                                    "/api/v1/sandboxes?state=running&limit=5000",
-                                    None,
-                                    false,
-                                )
-                                .await?;
-                            let running = running
-                                .as_array()
-                                .ok_or_else(|| unavailable("invalid Conch running inventory"))?;
-                            if running.len() >= 5000 {
-                                return Err(unavailable(
-                                    "Conch running inventory may be truncated",
-                                ));
-                            }
-                            if running.iter().any(|v| {
-                                v["sandboxID"].as_str().or_else(|| v["id"].as_str())
-                                    == Some(r.sandbox_id.as_str())
-                            }) {
+                            if self.running_conch().await?.contains(&r.sandbox_id) {
                                 return Ok(true);
                             }
                         }
@@ -1029,67 +1076,97 @@ impl RuntimeDriver for Jiuwenbox {
                 .await?;
         }
         self.authority_loaded.store(true, Ordering::Release);
+        // Startup recovery drains unfinished executions before node admission.
+        // Live cleanup belongs to the corresponding controller queue.
+        for r in
+            self.state.all().await?.into_values().filter(|r| {
+                r.phase != Phase::Deleted && (r.phase != Phase::Ready || r.epoch != epoch)
+            })
+        {
+            let lock = self.gate(&r.runtime_id).lock_owned().await;
+            self.start_cleanup(r.runtime_id, lock)
+                .await
+                .map_err(unavailable)??;
+        }
+        self.reconcile_unowned_executions().await?;
         self.inventory().await
+    }
+
+    async fn reconcile_unowned_executions(&self) -> Result<()> {
+        let seen = self.backend_inventory().await?;
+        let records = self.state.all().await?;
+        for (id, backend) in seen {
+            let record = records.values().find(|r| r.sandbox_id == id);
+            if record.is_some_and(|r| !r.environment_id.is_empty()) {
+                continue;
+            }
+            if !self.authority_loaded.load(Ordering::Acquire) {
+                return Err(unavailable(
+                    "authoritative catalog required before orphan collection",
+                ));
+            }
+            if let Some(record) = record {
+                // A delete-before-create fence has no Environment controller.
+                self.remove(&record.runtime_id).await?;
+            } else {
+                // Unidentified native resources cannot enter a controller queue.
+                // Serialize their recovery and retain it if the caller times out.
+                let lock = self.gate(&format!("native-orphan:{id}")).lock_owned().await;
+                let driver = self.clone();
+                tokio::spawn(async move {
+                    let _lock = lock;
+                    driver.cleanup_backend(&id, &backend).await
+                })
+                .await
+                .map_err(unavailable)??;
+            }
+        }
+        Ok(())
     }
 
     async fn inventory(&self) -> Result<Vec<RuntimeObservation>> {
         let current = self.client.epoch().await?;
         let seen = self.backend_inventory().await?;
-        let mut records = self.state.all().await?;
-        let unknown: Vec<_> = seen
-            .iter()
-            .filter(|(id, _)| !records.values().any(|r| r.sandbox_id == **id))
-            .collect();
-        if !unknown.is_empty() && !self.authority_loaded.load(Ordering::Acquire) {
+        let records = self.state.all().await?;
+        if seen.keys().any(|id| {
+            !records
+                .values()
+                .any(|r| r.sandbox_id == *id && !r.environment_id.is_empty())
+        }) {
             return Err(unavailable(
-                "authoritative catalog required before orphan collection",
+                "unidentified native execution requires authoritative reconciliation",
             ));
         }
-        for (id, backend) in unknown {
-            self.cleanup_backend(id, backend).await?;
-        }
-        for r in records
-            .values_mut()
-            .filter(|r| r.phase == Phase::Deleted && seen.contains_key(&r.sandbox_id))
+        // Inventory describes backend executions. Execd identity/readiness is
+        // observed in each controller's queue, never serially across the node.
+        let running_conch = if records
+            .values()
+            .any(|r| r.phase == Phase::Ready && r.epoch == current && r.backend == "conch")
         {
-            if r.backend.is_empty() {
-                r.backend = seen[&r.sandbox_id].clone();
-                let backend = r.backend.clone();
-                self.state
-                    .update(&r.runtime_id, move |r| r.backend = backend)
-                    .await?;
-            }
-            *r = self
-                .state
-                .update(&r.runtime_id, |r| r.phase = Phase::Deleting)
-                .await?;
+            self.running_conch().await?
+        } else {
+            BTreeSet::new()
+        };
+        if self.client.epoch().await? != current {
+            return Err(unavailable("backend epoch changed during inventory"));
         }
         let mut observations = vec![];
-        for r in records.values().filter(|r| r.phase != Phase::Deleted) {
-            if r.phase == Phase::Creating {
-                let gate = self.gate(&r.runtime_id);
-                if let Ok(_lock) = gate.try_lock() {
-                    self.cleanup(&r.runtime_id).await?;
-                    continue;
-                };
-            }
-            if r.epoch != current || matches!(r.phase, Phase::Failed | Phase::Deleting) {
-                let gate = self.gate(&r.runtime_id);
-                let _lock = gate
-                    .try_lock()
-                    .map_err(|_| unavailable("start cleanup is still executing"))?;
-                self.cleanup(&r.runtime_id).await?;
-                continue;
-            }
+        for r in records
+            .values()
+            .filter(|r| r.phase != Phase::Deleted || seen.contains_key(&r.sandbox_id))
+        {
+            let ready = r.phase == Phase::Ready && r.epoch == current;
             observations.push(RuntimeObservation {
                 environment_id: r.environment_id.clone(),
                 runtime_id: r.runtime_id.clone(),
                 tenant_id: r.tenant_id.clone(),
                 generation: r.generation,
-                running: if r.phase == Phase::Creating {
+                running: if !ready {
                     false
+                } else if r.backend == "conch" {
+                    running_conch.contains(&r.sandbox_id)
                 } else {
-                    self.observation(r).await?
+                    !self.host.supervisor_absent(&r.sandbox_id).await?
                 },
             });
         }
@@ -1097,12 +1174,19 @@ impl RuntimeDriver for Jiuwenbox {
     }
     async fn remove(&self, id: &str) -> Result<()> {
         let gate = self.gate(id);
-        let _lock = gate.lock().await;
+        let lock = gate.lock_owned().await;
         if let Some(r) = self.state.get(id).await? {
-            if r.phase == Phase::Ready {
-                self.state.update(id, |r| r.phase = Phase::Deleting).await?;
+            if r.phase == Phase::Deleted {
+                let seen = self.backend_inventory().await?;
+                let Some(backend) = seen.get(&r.sandbox_id).cloned() else {
+                    return Ok(());
+                };
+                self.state.update(id, |r| r.backend = backend).await?;
             }
-            self.cleanup(id).await?;
+            self.state.update(id, |r| r.phase = Phase::Deleting).await?;
+            self.start_cleanup(id.into(), lock)
+                .await
+                .map_err(unavailable)??;
         } else {
             // Fence accepted operations for this process; recovery uses the authority catalog.
             self.state

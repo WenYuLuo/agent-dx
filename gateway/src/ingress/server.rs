@@ -1500,7 +1500,7 @@ impl Ingress {
         }
         let mut subscription = self
             .command_watch
-            .subscribe(self, route, command.command_id.clone())
+            .subscribe(self, route, command.command_id.clone(), tenant_id)
             .await
             .map_err(IngressOpenError::Connect)?;
         let environment_id = command.environment_id.clone();
@@ -2018,6 +2018,7 @@ impl CommandWatchHub {
         gateway: &Ingress,
         route: RouteHandle,
         command_id: String,
+        _tenant_id: &str,
     ) -> io::Result<HubSubscription> {
         let key = WatchKey {
             environment_id: route.target.instance_id.clone(),
@@ -2026,13 +2027,32 @@ impl CommandWatchHub {
         let entry = if let Some(entry) = entries.get(&key) {
             entry.clone()
         } else {
+            use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+            let request = "ws://execd/commands/watch"
+                .into_client_request()
+                .map_err(|error| io::Error::other(error.to_string()))?;
+            #[cfg(feature = "agent-api")]
+            let request = {
+                let mut request = request;
+                if let Some(access) = &gateway.execd_access {
+                    access
+                        .apply(_tenant_id, &route.target.instance_id, &mut request)
+                        .await
+                        .map_err(|_| {
+                            io::Error::new(
+                                io::ErrorKind::PermissionDenied,
+                                "Environment runtime access unavailable",
+                            )
+                        })?;
+                }
+                request
+            };
             let stream = gateway
                 .open_authorized_stream_with_activity(route, true)
                 .await?;
-            let (websocket, _) =
-                tokio_tungstenite::client_async("ws://execd/commands/watch", stream)
-                    .await
-                    .map_err(|error| io::Error::other(error.to_string()))?;
+            let (websocket, _) = tokio_tungstenite::client_async(request, stream)
+                .await
+                .map_err(|error| io::Error::other(error.to_string()))?;
             let (control, controls) = mpsc::channel(self.config.queue_capacity);
             let (events, _) = broadcast::channel(self.config.queue_capacity);
             let entry = WatchEntry {

@@ -137,6 +137,8 @@ pub struct TemplateVersion {
     pub init_timeout_seconds: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub readiness_probe: Option<probes::ReadinessProbe>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub healthcheck: Option<probes::Healthcheck>,
 }
 
 impl TemplateVersion {
@@ -205,6 +207,9 @@ impl TemplateVersion {
             return Err("init_timeout_seconds must be between 1 and 86400".into());
         }
         if let Some(probe) = &self.readiness_probe {
+            probe.validate()?;
+        }
+        if let Some(probe) = &self.healthcheck {
             probe.validate()?;
         }
         self.resources.validate()

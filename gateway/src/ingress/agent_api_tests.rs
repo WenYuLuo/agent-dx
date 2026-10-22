@@ -1941,3 +1941,6 @@ async fn websocket_retry_refreshes_deleted_or_rebuilt_binding_before_writes() {
         }
     }
 }
+#[cfg(feature = "mock-e2e")]
+#[path = "command_watch_auth_tests.rs"]
+mod command_watch_auth_tests;

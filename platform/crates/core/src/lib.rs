@@ -148,6 +148,11 @@ impl EnvironmentSpec {
                 "image or runtime environment is required".into(),
             ));
         }
+        if self.snapshot_id.is_some() && self.execution.user.is_some() {
+            return Err(Error::Invalid(
+                "tool identity cannot override a snapshot".into(),
+            ));
+        }
         self.lifecycle.validate()?;
         self.resources.validate()?;
         self.scheduling.validate()?;
