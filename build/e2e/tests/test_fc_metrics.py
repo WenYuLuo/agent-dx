@@ -24,7 +24,8 @@ class LifecycleMetricsTests(unittest.TestCase):
         requests = []
 
         class Handler(http.server.BaseHTTPRequestHandler):
-            def do_GET(self):
+            # BaseHTTPRequestHandler dispatches GET requests to this exact method name.
+            def do_GET(self):  # pylint: disable=invalid-name
                 requests.append(self.path)
                 self.send_response(200 if self.path in bodies else 404)
                 self.end_headers()
