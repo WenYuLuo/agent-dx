@@ -229,13 +229,17 @@ impl Coordinator {
                 Err(Error::Conflict)
             };
         }
-        let shard = if spec.snapshot_id.is_some() {
+        let preferred = if spec.snapshot_id.is_some() {
             self.snapshot_shard(&spec, &BTreeSet::new(), None)?
-                .unwrap_or(self.next_shard)
         } else {
-            self.next_shard
+            None
         };
-        self.next_shard = (shard + 1) % self.shards.len();
+        let shard = preferred.unwrap_or_else(|| {
+            // Affinity-selected requests do not advance ordinary shard rotation.
+            let shard = self.next_shard;
+            self.next_shard = (shard + 1) % self.shards.len();
+            shard
+        });
         self.requests.insert(spec.id.clone(), (shard, spec.clone()));
         self.shards[shard].enqueue(spec);
         self.wake(shard);

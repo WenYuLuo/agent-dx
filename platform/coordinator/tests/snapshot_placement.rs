@@ -71,6 +71,45 @@ fn snapshot_source_preference_selects_its_shard_before_node_scoring() {
 }
 
 #[test]
+fn snapshot_source_preference_preserves_rotation_for_interleaved_creates() {
+    for placement in [Placement::Pack, Placement::Spread] {
+        for nodes in [
+            &["other-a", "source"][..],
+            &["other-a", "source", "other-b"][..],
+        ] {
+            let mut coordinator = Coordinator::new(nodes.len(), placement).unwrap();
+            for id in nodes {
+                coordinator.register(node(id, 100)).unwrap();
+            }
+            let mut ordinary_nodes = std::collections::BTreeMap::new();
+            for index in 0..nodes.len() * 2 {
+                let clone = request(&format!("clone-{index}"));
+                let mut ordinary = request(&format!("ordinary-{index}"));
+                ordinary.snapshot_id = None;
+                ordinary.scheduling = Default::default();
+                coordinator.submit(clone.clone()).unwrap();
+                coordinator.submit(ordinary.clone()).unwrap();
+                let assignments = drain(&mut coordinator);
+                assert_eq!(assignments.len(), 2);
+                for assignment in assignments {
+                    if assignment.environment_id == clone.id {
+                        assert_eq!(assignment.node_id, "source");
+                    } else {
+                        assert_eq!(assignment.environment_id, ordinary.id);
+                        *ordinary_nodes.entry(assignment.node_id).or_insert(0) += 1;
+                    }
+                }
+            }
+            assert_eq!(
+                ordinary_nodes,
+                nodes.iter().map(|id| ((*id).into(), 2)).collect(),
+                "snapshot affinity must not concentrate ordinary creates on one shard"
+            );
+        }
+    }
+}
+
+#[test]
 fn snapshot_explicit_preference_and_local_only_pin_select_the_right_shard() {
     for required in [false, true] {
         let mut coordinator = Coordinator::new(2, Placement::Pack).unwrap();
