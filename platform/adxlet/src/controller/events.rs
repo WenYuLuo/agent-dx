@@ -173,6 +173,9 @@ impl Controller {
         self.events.proxy.clone()
     }
     pub(super) fn retry_lifecycle(&mut self) {
+        if self.events.retry.is_some() {
+            return;
+        }
         self.events.retry_attempts = self.events.retry_attempts.saturating_add(1);
         let seconds = 1_u64 << self.events.retry_attempts.saturating_sub(1).min(5);
         self.events.retry = Some(Deadline::now() + std::time::Duration::from_secs(seconds));

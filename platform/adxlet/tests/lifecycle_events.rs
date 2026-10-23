@@ -558,6 +558,32 @@ async fn restart_deadline_is_bounded_and_does_not_require_a_monitor_tick() {
 }
 
 #[tokio::test]
+async fn passive_commands_do_not_postpone_a_pending_restart() {
+    let test = Fixture::with_lifecycle(serde_json::json!({
+        "restart":{"max_attempts":1,"initial_backoff_seconds":1,"max_backoff_seconds":1}
+    }))
+    .await;
+    let record = test.backend.records.borrow().as_ref().unwrap().clone();
+    let handle = test
+        .node
+        .environment(record.spec, record.assignment)
+        .unwrap();
+    test.backend.live.send_replace(false);
+    assert!(test.failed().await.restart_pending);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let record = handle.sync().await.unwrap().record;
+            if record.state == EnvironmentState::Running && record.restart_attempts == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("passive commands must not keep moving the restart deadline");
+}
+
+#[tokio::test]
 async fn lost_idle_barrier_reply_reopens_runtime_before_proxy_after_reconnect() {
     let test = Fixture::with_lifecycle(serde_json::json!({"idle_timeout_seconds":1})).await;
     let (send, mut commands) = test.connect(test.status()).await;
