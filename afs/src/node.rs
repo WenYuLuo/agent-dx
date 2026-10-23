@@ -13,6 +13,7 @@
 
 pub mod api;
 pub mod chunk;
+pub(crate) mod chunk_crc32c;
 #[cfg(feature = "dfs")]
 mod dfs_fetch;
 #[cfg(feature = "dfs")]
@@ -1649,7 +1650,14 @@ async fn run_node(
         } else {
             read_engine
         };
-        if cfg.dfs_optimistic_gc_commit
+        if cfg.dfs_crc32c_writes && !cfg.dfs_optimistic_gc_commit {
+            return Err(afs_error::Error::coded(
+                afs_error::CONFIG_INVALID,
+                "dfs_crc32c_writes requires dfs_optimistic_gc_commit",
+            )
+            .into());
+        }
+        if (cfg.dfs_optimistic_gc_commit || cfg.dfs_crc32c_writes)
             && (cfg.dfs_external_backend.is_some()
                 || cfg.dfs_desired_copies != 1
                 || cfg.dfs_sync_required_copies != 1
@@ -1683,6 +1691,7 @@ async fn run_node(
         )
         .with_gc_references(gc_references)
         .with_optimistic_gc_commit(cfg.dfs_optimistic_gc_commit)
+        .with_crc32c_writes(cfg.dfs_crc32c_writes)
         .with_remote_owner_factory(remote_factory)
         .with_version_cache_capacity(cfg.dfs_version_cache_entries)
         .with_version_cache_bytes(cfg.dfs_version_cache_bytes)

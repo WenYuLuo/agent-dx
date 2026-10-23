@@ -582,6 +582,8 @@ message ReportDfsChunkCorruptionReply {}
 enum DfsDigestAlgorithm {
   DFS_DIGEST_ALGORITHM_UNSPECIFIED = 0;
   DFS_DIGEST_ALGORITHM_BLAKE3 = 1;
+  // Descriptor binding of a versioned CRC32C segment table; not a body hash.
+  DFS_DIGEST_ALGORITHM_CRC32C_SEGMENTS_V1 = 2;
 }
 
 enum DfsInodeKind {

@@ -742,3 +742,17 @@ for address pools, public egress and explicit internal service exceptions.
 Jiuwen prepares each new AgentBinding with `parameters.workspace = "w-" + SHA256(JSON([tenant, template, user_id]))`, using the authenticated internal user ID and the full hexadecimal digest. The directory identity excludes template version, agent_type, Binding generation and Sandbox ID. Activator receives a generic parameter map; it does not receive a new user/owner identity. Existing Bindings reuse their stored parameters.
 
 Use the [Jiuwen SFS template example](../agent/activator/examples/jiuwen-sfs-template.json) to render a node-visible Local source into `/home/jiuwen`. Different template versions can refer to the same directory, but this mapping does not enforce exclusive access. Until workspace admission is implemented, the caller must stop the previous Sandbox completely before starting another with the same directory. The source directories must already exist; this code does not provision storage or migrate existing user data.
+
+`jiuwen.workspace_identity` in `ADX_JIUWEN_CONFIG` defaults to `scoped` (the existing tenant/template/user
+hash). AgentOS deployments can explicitly set `user` to reuse
+`/home/agentos/users/${workspace}` in a template. In this mode an authenticated user
+must be a safe single directory component; template/version/agent type changes
+keep the same user directory while each binding retains its execution identity.
+Configure a tenant-specific mount root when user IDs are not globally unique.
+
+
+`GET /api/v1/auth/session` requires a valid business Bearer session and returns
+its `userId` without starting an Environment. It follows DigitalMateGateway's
+business authentication; management API keys remain separate from business sessions.
+
+命令状态订阅 `/api/environment/v1/commands/watch` 在已配置 Execd access 时，会在后端 WebSocket 握手前检查 Environment 归属并注入服务端 Execd 令牌；调用方的业务凭据不会转发给 Execd。该认证与 `/direct` HTTP 路径共用同一配置。

@@ -338,7 +338,10 @@ pub struct Cli {
     /// Bounded coarse read timing for explicit diagnosis only; disabled by default.
     #[arg(long)]
     pub dfs_read_diagnostics_enabled: Option<bool>,
-    /// Experimental local R1 commit fencing; GC conflicts fail the write generation.
+    /// Write new native required-local R1 objects with segmented CRC32C; off by default.
+    #[arg(long)]
+    pub dfs_crc32c_writes: Option<bool>,
+    /// Local R1 commit fencing; GC conflicts fail the write generation.
     #[arg(long)]
     pub dfs_optimistic_gc_commit: Option<bool>,
     #[arg(long)]
@@ -471,6 +474,7 @@ struct FileConfig {
     dfs_source_lookahead_chunks: Option<usize>,
     dfs_source_cache_bytes: Option<usize>,
     dfs_read_diagnostics_enabled: Option<bool>,
+    dfs_crc32c_writes: Option<bool>,
     dfs_optimistic_gc_commit: Option<bool>,
     timeout_ms: Option<u64>,
     log_level: Option<String>,
@@ -556,6 +560,7 @@ pub struct Config {
     pub dfs_source_lookahead_chunks: usize,
     pub dfs_source_cache_bytes: usize,
     pub dfs_read_diagnostics_enabled: bool,
+    pub dfs_crc32c_writes: bool,
     pub dfs_optimistic_gc_commit: bool,
     pub timeout_ms: u64,
     pub log_level: String,
@@ -979,6 +984,10 @@ impl Config {
                 .dfs_read_diagnostics_enabled
                 .or(file.dfs_read_diagnostics_enabled)
                 .unwrap_or(false),
+            dfs_crc32c_writes: cli
+                .dfs_crc32c_writes
+                .or(file.dfs_crc32c_writes)
+                .unwrap_or(false),
             dfs_optimistic_gc_commit: cli
                 .dfs_optimistic_gc_commit
                 .or(file.dfs_optimistic_gc_commit)
@@ -1195,10 +1204,27 @@ impl Config {
                 return Err(invalid("trusted_node_certs paths must be absolute"));
             }
         }
+        cfg.validate_crc32c_writes()?;
         cfg.meta_log_limits()?;
         cfg.meta_maintenance_policy()?;
         cfg.meta_history_limits()?;
         Ok(cfg)
+    }
+
+    pub(crate) fn validate_crc32c_writes(&self) -> Result<()> {
+        if self.dfs_crc32c_writes
+            && (!self.dfs
+                || self.dfs_external_backend.is_some()
+                || self.dfs_desired_copies != 1
+                || self.dfs_sync_required_copies != 1
+                || self.dfs_local_copy != "required"
+                || !self.dfs_optimistic_gc_commit)
+        {
+            return Err(invalid(
+                "dfs_crc32c_writes requires native required-local R1 and dfs_optimistic_gc_commit",
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn meta_log_limits(&self) -> Result<crate::meta::store::journal::LogLimits> {
@@ -1461,5 +1487,31 @@ unsigned_payload = true
         )
         .unwrap();
         assert!(explicit.unsigned_payload);
+    }
+}
+
+#[cfg(test)]
+mod crc32c_config_tests {
+    use super::*;
+    #[test]
+    fn crc32c_default_off_and_invalid_scopes_rejected() {
+        let mut cfg =
+            Config::resolve(Role::Node, Cli::parse_from(["afs-node", "--fs", "dfs"])).unwrap();
+        assert!(!cfg.dfs_crc32c_writes);
+        cfg.dfs_crc32c_writes = true;
+        assert!(cfg.validate_crc32c_writes().is_err());
+        cfg.dfs_optimistic_gc_commit = true;
+        cfg.dfs_desired_copies = 1;
+        cfg.dfs_sync_required_copies = 1;
+        cfg.dfs_local_copy = "required".into();
+        assert!(cfg.validate_crc32c_writes().is_ok());
+        cfg.dfs_desired_copies = 2;
+        assert!(cfg.validate_crc32c_writes().is_err());
+        cfg.dfs_desired_copies = 1;
+        cfg.dfs_local_copy = "optional".into();
+        assert!(cfg.validate_crc32c_writes().is_err());
+        cfg.dfs_local_copy = "required".into();
+        cfg.dfs = false;
+        assert!(cfg.validate_crc32c_writes().is_err());
     }
 }

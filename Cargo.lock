@@ -252,6 +252,7 @@ dependencies = [
  "hyper-util",
  "libc",
  "portable-pty",
+ "regex",
  "rmp",
  "rmp-serde",
  "rmpv",
@@ -450,6 +451,7 @@ dependencies = [
  "toml",
  "tonic 0.14.6",
  "tower 0.5.3",
+ "uuid",
 ]
 
 [[package]]

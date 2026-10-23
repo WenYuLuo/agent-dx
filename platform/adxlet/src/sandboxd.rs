@@ -222,6 +222,11 @@ impl Sandboxd {
         generation: u64,
         devices: &[adx_core::scheduling::DeviceAllocation],
     ) -> Result<Request<proto::StartRequest>> {
+        if spec.execution.user.is_some() || spec.execution.group.is_some() {
+            return Err(Error::Invalid(
+                "this sandboxd backend does not support tool user/group overrides".into(),
+            ));
+        }
         let mut config = self.config.clone();
         // Runtime capability metadata owns the guest paths. Never inherit caller
         // values that could redirect the privileged checkpoint handoff.
@@ -859,10 +864,19 @@ fn environment_mount(value: &adx_core::execution::Mount) -> Result<proto::Mount>
         StorageSource::S3(value) => proto::mount::Source::S3Config(environment_s3(value)),
         StorageSource::Local(value) => proto::mount::Source::HostPath(value.clone()),
     };
+    let mut options = value.options.clone();
+    // OCI bind mounts require an explicit mount flag as well as type="bind".
+    // Public Local mount options describe access flags such as ro/rw.
+    if value.kind == "bind"
+        && matches!(&value.source, StorageSource::Local(_))
+        && !options.iter().any(|flag| flag == "bind" || flag == "rbind")
+    {
+        options.push("rbind".into());
+    }
     Ok(proto::Mount {
         r#type: value.kind.clone(),
         target: value.target.clone(),
-        options: value.options.clone(),
+        options,
         source: Some(source),
     })
 }

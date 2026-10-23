@@ -909,6 +909,15 @@ impl DfsMetaService for DfsMetaRpc {
                 "GC fence requires initial publication retain",
             ));
         }
+        let observation = if request.release {
+            "dfs_gc_release"
+        } else if !request.chunks.is_empty() {
+            "dfs_gc_register"
+        } else if request.capture_gc_fence {
+            "dfs_gc_capture"
+        } else {
+            "dfs_gc_retain"
+        };
         let capture = request.capture_gc_fence;
         let service = dfs_service(&self.0)?;
         service
@@ -941,6 +950,7 @@ impl DfsMetaService for DfsMetaRpc {
         } else {
             None
         };
+        self.0.observability.record("meta", observation, true);
         Ok(Response::new(
             afs_protocol::meta::UpdateDfsGcReferenceReply { gc_fence },
         ))
@@ -966,6 +976,7 @@ impl DfsMetaService for DfsMetaRpc {
             )
             .await
             .map_err(afs_transport::grpc::error_status::error_to_status)?;
+        self.0.observability.record("meta", "dfs_gc_collect", true);
         Ok(Response::new(afs_protocol::meta::CollectDfsGarbageReply {
             generation: state.generation,
             pending_for_node: state.waiting_nodes.contains(&node),
@@ -1340,7 +1351,7 @@ impl DfsMetaService for DfsMetaRpc {
         let _authenticated = authenticated_node_id(&self.0, &request)?;
         let request = request.into_inner();
         require_text(&request.inode_id, "inode_id")?;
-        let value = dfs_service(&self.0)?
+        let result = dfs_service(&self.0)?
             .get_xattr(crate::dfs::GetXattrRequest {
                 caller: domain_caller_context(
                     request
@@ -1350,8 +1361,11 @@ impl DfsMetaService for DfsMetaRpc {
                 inode_id: crate::dfs::InodeId::new(request.inode_id),
                 name: request.name,
             })
-            .await
-            .map_err(afs_transport::grpc::error_status::error_to_status)?;
+            .await;
+        self.0
+            .observability
+            .record("meta", "dfs_get_xattr", result.is_ok());
+        let value = result.map_err(afs_transport::grpc::error_status::error_to_status)?;
         Ok(Response::new(DfsGetXattrReply { value }))
     }
 
@@ -2059,6 +2073,9 @@ impl DfsMetaService for DfsMetaRpc {
             )
             .await
             .map_err(afs_transport::grpc::error_status::error_to_status)?;
+        self.0
+            .observability
+            .record("meta", "dfs_commit_file_version", true);
         Ok(Response::new(CommitFileVersionReply {
             inode: Some(wire_dfs_inode(inode)),
         }))
@@ -2292,6 +2309,9 @@ fn wire_replica_write_grant(
             crate::dfs::DigestAlgorithm::Blake3 => {
                 afs_protocol::meta::DfsDigestAlgorithm::Blake3 as i32
             }
+            crate::dfs::DigestAlgorithm::Crc32cSegmentsV1 => {
+                afs_protocol::meta::DfsDigestAlgorithm::Crc32cSegmentsV1 as i32
+            }
         },
         placement_revision: grant.placement_revision,
         placement_epoch: grant.placement_epoch,
@@ -2313,6 +2333,9 @@ fn wire_chunk_object(chunk: crate::dfs::ChunkObject) -> afs_protocol::meta::DfsC
         content_digest_algorithm: match chunk.content_digest.algorithm {
             crate::dfs::DigestAlgorithm::Blake3 => {
                 afs_protocol::meta::DfsDigestAlgorithm::Blake3 as i32
+            }
+            crate::dfs::DigestAlgorithm::Crc32cSegmentsV1 => {
+                afs_protocol::meta::DfsDigestAlgorithm::Crc32cSegmentsV1 as i32
             }
         },
     }
@@ -2835,6 +2858,9 @@ fn domain_digest_algorithm(value: i32) -> Result<crate::dfs::DigestAlgorithm, St
         .map_err(|_| invalid("DFS digest algorithm is invalid"))?
     {
         afs_protocol::meta::DfsDigestAlgorithm::Blake3 => Ok(crate::dfs::DigestAlgorithm::Blake3),
+        afs_protocol::meta::DfsDigestAlgorithm::Crc32cSegmentsV1 => {
+            Ok(crate::dfs::DigestAlgorithm::Crc32cSegmentsV1)
+        }
         afs_protocol::meta::DfsDigestAlgorithm::Unspecified => {
             Err(invalid("DFS digest algorithm is required"))
         }

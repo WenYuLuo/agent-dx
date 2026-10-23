@@ -666,7 +666,9 @@ impl ChunkStore for DfsChunkStore {
             self.reserve_gc_publications(&staged)?;
         }
         let snapshot = self.placement.snapshot()?;
-        if self.optimistic_gc_commit && !snapshot.replication.is_local_fast_path() {
+        if (self.optimistic_gc_commit || staged.iter().any(|s| s.chunk.is_segment_crc32c()))
+            && !snapshot.replication.is_local_fast_path()
+        {
             return Err(invalid(
                 "optimistic GC commit requires native local single-copy placement",
             ));
@@ -1126,6 +1128,15 @@ impl ReplicationWorker {
         &self,
         claim: &crate::dfs::ReplicationClaim,
     ) -> std::result::Result<Vec<ReplicaAck>, (Error, bool)> {
+        if claim.chunk.is_segment_crc32c() {
+            return Err((
+                afs_error::Error::coded(
+                    afs_error::IO_NOT_SUPPORTED,
+                    "CRC32C replica repair is unsupported",
+                ),
+                false,
+            ));
+        }
         let length = usize::try_from(claim.chunk.length)
             .map_err(|_| (invalid("repair chunk length overflows this node"), false))?;
         if length == 0 || length > crate::node::chunk::MAX_STAGED_CHUNK_BYTES {

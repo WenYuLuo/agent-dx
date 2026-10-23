@@ -458,7 +458,7 @@ impl DfsService {
                 return Ok(gc);
             }
             for chunk in &inventory {
-                if ChunkObject::from_content_addressed_id(&chunk.id).as_ref() != Some(chunk) {
+                if !chunk.valid_immutable_identity() {
                     return Err(invalid(
                         "GC inventory requires canonical content identities",
                     ));

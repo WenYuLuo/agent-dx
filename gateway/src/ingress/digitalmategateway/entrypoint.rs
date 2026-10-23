@@ -29,6 +29,16 @@ use tokio_tungstenite::{
 };
 use tracing::Instrument;
 
+/// Select how a trusted business identity maps to a pre-mounted workspace.
+#[derive(Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceIdentity {
+    #[default]
+    Scoped,
+    /// Existing AgentOS user directory; template deployment selects the tenant's root.
+    User,
+}
+
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DigitalMateGatewayConfig {
@@ -43,6 +53,8 @@ pub struct JiuwenTarget {
     pub agent_type: String,
     pub template: String,
     pub version: String,
+    #[serde(default)]
+    pub workspace_identity: WorkspaceIdentity,
     pub service_port: Option<u16>,
     #[serde(default = "queue_capacity")]
     pub queue_capacity: usize,
@@ -124,6 +136,22 @@ impl DigitalMateGatewayConfig {
     /// Stable workspace identity across template versions and agent types.
     pub fn parameters(&self, user_id: &str) -> Result<adx_agent_core::mounts::Parameters, Error> {
         self.scope(user_id)?;
+        if matches!(self.jiuwen.workspace_identity, WorkspaceIdentity::User) {
+            // Do not silently sanitize collisions or traverse outside the configured root.
+            if matches!(user_id, "." | "..")
+                || !user_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+            {
+                return Err(Error::Invalid(
+                    "workspace user requires a safe directory component".into(),
+                ));
+            }
+            return Ok(std::collections::BTreeMap::from([(
+                "workspace".into(),
+                user_id.into(),
+            )]));
+        }
         workspace_parameters(&self.tenant, &self.jiuwen.template, user_id)
     }
 
@@ -204,6 +232,7 @@ impl DigitalMateGatewayApi {
                 | "/file-api/upload"
                 | "/api/v1/auth/huawei/login"
                 | "/api/v1/auth/agc/login"
+                | "/api/v1/auth/session"
                 | "/api/v1/auth/logout"
                 | "/api/v1/auth/quota"
         )
@@ -252,6 +281,19 @@ impl DigitalMateGatewayApi {
                     &self.config.tenant,
                 )
                 .await;
+        }
+        if request.uri().path() == "/api/v1/auth/session" {
+            if request.method() != http::Method::GET || request.uri().query().is_some() {
+                return error(StatusCode::BAD_REQUEST, "INVALID_REQUEST");
+            }
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/json")
+                .header("cache-control", "no-store")
+                .body(body(Bytes::from(
+                    serde_json::json!({"userId": principal.user_id}).to_string(),
+                )))
+                .unwrap_or_else(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "RESPONSE_ERROR"));
         }
         if request.uri().path() == "/api/v1/auth/quota" {
             if request.method() != http::Method::GET {

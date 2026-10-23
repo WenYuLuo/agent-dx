@@ -550,3 +550,25 @@ fn tunnel_listeners_roundtrip_with_default_and_custom_ports() {
         );
     }
 }
+
+#[test]
+fn tool_identity_is_preserved_and_invalid_pairs_are_rejected() {
+    let spec = create_spec(
+        json!({"image":"tools:1","runtime":"conch","user":"1001","group":"1002"}),
+        &caller(),
+    )
+    .unwrap();
+    let execution = spec.execution.unwrap();
+    assert_eq!(execution.user.as_deref(), Some("1001"));
+    assert_eq!(execution.group.as_deref(), Some("1002"));
+    for body in [
+        json!({"image":"tools:1","user":"1001"}),
+        json!({"image":"tools:1","group":"1002"}),
+        json!({"image":"tools:1","user":"","group":"1002"}),
+        json!({"image":"tools:1","user":"a:b","group":"1002"}),
+        json!({"image":"tools:1","user":"4294967295","group":"1002"}),
+        json!({"image":"tools:1","user":"1001","group":"1002","inheritEntrypoint":true}),
+    ] {
+        assert!(create_spec(body.clone(), &caller()).is_err(), "{body}");
+    }
+}

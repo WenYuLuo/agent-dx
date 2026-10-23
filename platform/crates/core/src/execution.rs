@@ -335,6 +335,11 @@ pub struct ResourceLimits {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionOptions {
+    /// Identity for the runtime daemon and its tool operations. Backend support is required.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
     pub readiness_probe: Option<crate::probes::ProbeSpec>,
     pub healthcheck_probe: Option<crate::probes::ProbeSpec>,
     #[serde(default = "crate::probes::default_init_timeout")]
@@ -399,6 +404,12 @@ impl ExecutionOptions {
         }
     }
     pub fn validate(&self, requests: &crate::Resources) -> Result<()> {
+        validate_process_identity(self.user.as_deref(), self.group.as_deref())?;
+        if self.user.is_some() && self.inherit_entrypoint {
+            return Err(Error::Invalid(
+                "tool identity cannot override an inherited image process".into(),
+            ));
+        }
         self.probe_config().validate()?;
         if self.readiness_probe.is_some() || self.healthcheck_probe.is_some() {
             if !self.inherit_entrypoint {
@@ -453,6 +464,36 @@ pub fn validate_cwd(cwd: &str) -> Result<()> {
         return Err(Error::Invalid(
             "environment cwd must be an absolute path without control characters".into(),
         ));
+    }
+    Ok(())
+}
+
+/// Validate a paired POSIX user/group selector without resolving node-local accounts.
+pub fn validate_process_identity(user: Option<&str>, group: Option<&str>) -> Result<()> {
+    match (user, group) {
+        (None, None) => return Ok(()),
+        (Some(user), Some(group)) => {
+            for value in [user, group] {
+                if value.is_empty()
+                    || value.len() > 256
+                    || !value
+                        .bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.'))
+                    || (value.bytes().all(|c| c.is_ascii_digit())
+                        && value.parse::<u32>().ok().is_none_or(|id| id == u32::MAX))
+                {
+                    return Err(Error::Invalid(
+                        "user/group require a valid POSIX name or numeric ID below 4294967295"
+                            .into(),
+                    ));
+                }
+            }
+        }
+        _ => {
+            return Err(Error::Invalid(
+                "user and group must both be configured".into(),
+            ))
+        }
     }
     Ok(())
 }

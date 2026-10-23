@@ -25,6 +25,8 @@ use std::{
 };
 use tokio::{net::UnixListener, sync::Semaphore, task::JoinHandle, time::Instant};
 
+const CREATE_BUDGET: Duration = Duration::from_secs(10);
+
 #[derive(Default)]
 struct Host {
     prepares: AtomicUsize,
@@ -61,6 +63,12 @@ struct Backend {
     release: Semaphore,
     reject_create: AtomicBool,
     reject_delete: AtomicBool,
+    block_delete: AtomicBool,
+    delete_entered: Semaphore,
+    delete_release: Semaphore,
+    block_running_list: AtomicBool,
+    running_list_entered: Semaphore,
+    running_list_release: Semaphore,
     conch: bool,
 }
 impl Backend {
@@ -73,6 +81,12 @@ impl Backend {
             release: Semaphore::new(1),
             reject_create: AtomicBool::new(false),
             reject_delete: AtomicBool::new(false),
+            block_delete: AtomicBool::new(false),
+            delete_entered: Semaphore::new(0),
+            delete_release: Semaphore::new(0),
+            block_running_list: AtomicBool::new(false),
+            running_list_entered: Semaphore::new(0),
+            running_list_release: Semaphore::new(0),
             conch,
         })
     }
@@ -82,6 +96,7 @@ impl Backend {
     ) -> Result<Response<Full<Bytes>>, Infallible> {
         let method = request.method().to_string();
         let path = request.uri().path().to_owned();
+        let query = request.uri().query().unwrap_or_default().to_owned();
         let bytes = request.into_body().collect().await.unwrap().to_bytes();
         let body: Value = if bytes.is_empty() {
             Value::Null
@@ -122,6 +137,11 @@ impl Backend {
             }
         } else if path == "/api/v1/sandboxes" && method == "GET" {
             if self.conch {
+                if query.contains("state=running") && self.block_running_list.load(Ordering::SeqCst)
+                {
+                    self.running_list_entered.add_permits(1);
+                    self.running_list_release.acquire().await.unwrap().forget();
+                }
                 json!(self
                     .physical
                     .lock()
@@ -145,6 +165,10 @@ impl Backend {
         } else if path.starts_with("/api/v1/sandboxes/") {
             let id = path.trim_start_matches("/api/v1/sandboxes/");
             if method == "DELETE" {
+                if self.block_delete.load(Ordering::SeqCst) {
+                    self.delete_entered.add_permits(1);
+                    self.delete_release.acquire().await.unwrap().forget();
+                }
                 if self.reject_delete.load(Ordering::SeqCst) {
                     code = StatusCode::SERVICE_UNAVAILABLE;
                     json!({})
@@ -239,14 +263,30 @@ impl Fixture {
         }
     }
     async fn driver(&self) -> Jiuwenbox {
+        self.driver_with_timeout(Duration::from_millis(150)).await
+    }
+    async fn driver_with_timeout(&self, timeout: Duration) -> Jiuwenbox {
         let mut launch = LaunchConfig {
-            rpc_timeout: Duration::from_millis(150),
+            rpc_timeout: timeout,
             ..Default::default()
         };
         launch.env.insert("EXECD_HTTP_PORT".into(), "1".into());
         Jiuwenbox::with_host(self.config.clone(), launch, self.host.clone())
             .await
             .unwrap()
+    }
+    async fn expire_blocked_create(&self, deadline: Instant) {
+        tokio::time::timeout(CREATE_BUDGET, self.backend.entered.acquire())
+            .await
+            .expect("create did not reach the blocked backend")
+            .unwrap()
+            .forget();
+        // Expire the caller only after the real HTTP handler owns the request.
+        // Setup includes fsync, so a short wall-clock deadline can expire before
+        // reaching the race this test is meant to exercise on a busy CI host.
+        tokio::time::pause();
+        tokio::time::advance(deadline.saturating_duration_since(Instant::now())).await;
+        tokio::time::resume();
     }
     fn restart(&mut self) {
         self.listeners[0].abort();
@@ -264,6 +304,440 @@ impl Drop for Fixture {
 }
 fn spec(class: &str) -> EnvironmentSpec {
     serde_json::from_value(json!({"id":"tenant-agent","tenant_id":"t","image":"agent:v1","runtime_class":class,"resources":{"cpu_millis":1000,"memory_bytes":134217728,"disk_bytes":0},"priority":0,"execution":{"failover":false,"inherit_entrypoint":true,"rootfs":{"readonly":false,"source":{"Image":"agent:v1"}}}})).unwrap()
+}
+
+#[tokio::test]
+async fn native_runtime_response_field_keeps_reconciliation_and_deletion_available() {
+    for class in ["supervisor", "conch"] {
+        let fixture = Fixture::new();
+        let driver = fixture.driver().await;
+        driver
+            .start_with_deadline(
+                &spec(class),
+                "tenant-agent-1",
+                1,
+                &[],
+                Instant::now() + CREATE_BUDGET,
+            )
+            .await
+            .unwrap();
+        {
+            let mut references = fixture.backend.refs.lock().unwrap();
+            for reference in references.values_mut() {
+                let runtime = reference
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("sandbox_runtime")
+                    .unwrap();
+                reference["runtime"] = runtime;
+            }
+        }
+        // Native GET/list uses `runtime`; `sandbox_runtime` belongs to create.
+        // A ready backend must not close node admission at the next inventory.
+        assert_eq!(driver.inventory().await.unwrap().len(), 1);
+        driver.remove("tenant-agent-1").await.unwrap();
+        assert!(driver.inventory().await.unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn inventory_keeps_active_deletion_visible_without_blocking_other_runtimes() {
+    for class in ["supervisor", "conch"] {
+        let fixture = Fixture::new();
+        fixture.host.process_alive.store(true, Ordering::SeqCst);
+        let driver = fixture.driver_with_timeout(Duration::from_secs(5)).await;
+        driver
+            .start(&spec(class), "tenant-agent-1", 1, &[])
+            .await
+            .unwrap();
+        let mut other = spec(class);
+        other.id = "tenant-other".into();
+        fixture.backend.release.add_permits(1);
+        driver
+            .start(&other, "tenant-other-1", 1, &[])
+            .await
+            .unwrap();
+        fixture.backend.block_delete.store(true, Ordering::SeqCst);
+        let removing = {
+            let driver = driver.clone();
+            tokio::spawn(async move { driver.remove("tenant-agent-1").await })
+        };
+        fixture
+            .backend
+            .delete_entered
+            .acquire()
+            .await
+            .unwrap()
+            .forget();
+        let observed = tokio::time::timeout(Duration::from_secs(1), driver.inventory()).await;
+        let deletes = fixture
+            .backend
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(method, _, _)| method == "DELETE")
+            .count();
+        // Always release the real HTTP handler, including when inventory fails.
+        fixture.backend.block_delete.store(false, Ordering::SeqCst);
+        fixture.backend.delete_release.add_permits(1);
+        removing.await.unwrap().unwrap();
+        let observed = observed
+            .expect("inventory waited for the unrelated delete")
+            .unwrap();
+        assert_eq!(observed.len(), 2);
+        assert!(
+            !observed
+                .iter()
+                .find(|r| r.runtime_id == "tenant-agent-1")
+                .unwrap()
+                .running
+        );
+        assert!(
+            observed
+                .iter()
+                .find(|r| r.runtime_id == "tenant-other-1")
+                .unwrap()
+                .running
+        );
+        assert_eq!(deletes, 1, "inventory must not issue a duplicate delete");
+        let observed = driver.inventory().await.unwrap();
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].runtime_id, "tenant-other-1");
+        driver.remove("tenant-other-1").await.unwrap();
+        assert!(driver.inventory().await.unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn inventory_keeps_timed_out_creation_tracked_until_its_worker_finishes() {
+    let fixture = Fixture::new();
+    let driver = fixture.driver_with_timeout(Duration::from_secs(5)).await;
+    fixture.backend.release.acquire().await.unwrap().forget();
+    let deadline = Instant::now() + CREATE_BUDGET;
+    let creating = {
+        let driver = driver.clone();
+        tokio::spawn(async move {
+            driver
+                .start_with_deadline(&spec("conch"), "tenant-agent-1", 1, &[], deadline)
+                .await
+        })
+    };
+    fixture.expire_blocked_create(deadline).await;
+    assert!(matches!(
+        creating.await.unwrap(),
+        Err(Error::DeadlineExceeded(_))
+    ));
+    let observed = tokio::time::timeout(Duration::from_secs(1), driver.inventory()).await;
+    fixture.backend.release.add_permits(1);
+    driver.remove("tenant-agent-1").await.unwrap();
+    let observed = observed
+        .expect("inventory waited for a late create")
+        .unwrap();
+    assert_eq!(observed.len(), 1);
+    assert!(!observed[0].running);
+    assert!(fixture.native.physical.lock().unwrap().is_empty());
+    assert!(driver.inventory().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn inventory_only_reports_failed_deletion_without_starting_a_retry() {
+    for class in ["supervisor", "conch"] {
+        let fixture = Fixture::new();
+        let driver = fixture.driver_with_timeout(Duration::from_secs(5)).await;
+        driver
+            .start(&spec(class), "tenant-agent-1", 1, &[])
+            .await
+            .unwrap();
+        fixture.backend.reject_delete.store(true, Ordering::SeqCst);
+        assert!(driver.remove("tenant-agent-1").await.is_err());
+        fixture.backend.reject_delete.store(false, Ordering::SeqCst);
+        fixture.backend.block_delete.store(true, Ordering::SeqCst);
+        let observed = tokio::time::timeout(Duration::from_millis(500), driver.inventory()).await;
+        let retried = tokio::time::timeout(
+            Duration::from_millis(100),
+            fixture.backend.delete_entered.acquire(),
+        )
+        .await
+        .is_ok();
+        fixture.backend.block_delete.store(false, Ordering::SeqCst);
+        fixture.backend.delete_release.add_permits(1);
+        driver.remove("tenant-agent-1").await.unwrap();
+        let observed = observed
+            .expect("inventory waited for cleanup retry")
+            .unwrap();
+        assert_eq!(observed.len(), 1);
+        assert!(!observed[0].running);
+        assert!(
+            !retried,
+            "inventory must not start cleanup outside the controller queue"
+        );
+        assert!(driver.inventory().await.unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn cancelling_delete_keeps_cleanup_owned_and_retry_waits_for_it() {
+    let fixture = Fixture::new();
+    let driver = fixture.driver_with_timeout(Duration::from_secs(5)).await;
+    driver
+        .start(&spec("conch"), "tenant-agent-1", 1, &[])
+        .await
+        .unwrap();
+    fixture.backend.block_delete.store(true, Ordering::SeqCst);
+    let deleting = {
+        let driver = driver.clone();
+        tokio::spawn(async move { driver.remove("tenant-agent-1").await })
+    };
+    fixture
+        .backend
+        .delete_entered
+        .acquire()
+        .await
+        .unwrap()
+        .forget();
+    deleting.abort();
+    assert!(deleting.await.unwrap_err().is_cancelled());
+    let retry = {
+        let driver = driver.clone();
+        tokio::spawn(async move { driver.remove("tenant-agent-1").await })
+    };
+    for _ in 0..3 {
+        let observed = driver.inventory().await.unwrap();
+        assert_eq!(observed.len(), 1);
+        assert!(!observed[0].running);
+        assert!(!retry.is_finished());
+    }
+    let deletes = fixture
+        .backend
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(method, _, _)| method == "DELETE")
+        .count();
+    fixture.backend.block_delete.store(false, Ordering::SeqCst);
+    fixture.backend.delete_release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(2), retry)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        deletes, 1,
+        "cancelled HTTP callers must not release the execution gate"
+    );
+    assert!(driver.inventory().await.unwrap().is_empty());
+    assert!(driver
+        .start(&spec("conch"), "tenant-agent-1", 1, &[])
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn inventory_cannot_clean_creation_that_completed_after_its_snapshot() {
+    let fixture = Fixture::new();
+    let driver = fixture.driver_with_timeout(Duration::from_secs(5)).await;
+    driver
+        .start(&spec("conch"), "tenant-agent-1", 1, &[])
+        .await
+        .unwrap();
+    fixture.backend.entered.acquire().await.unwrap().forget();
+    let creating = {
+        let driver = driver.clone();
+        let mut other = spec("conch");
+        other.id = "tenant-other".into();
+        tokio::spawn(async move { driver.start(&other, "tenant-other-1", 1, &[]).await })
+    };
+    fixture.backend.entered.acquire().await.unwrap().forget();
+    fixture
+        .native
+        .block_running_list
+        .store(true, Ordering::SeqCst);
+    let inventory = {
+        let driver = driver.clone();
+        tokio::spawn(async move { driver.inventory().await })
+    };
+    fixture
+        .native
+        .running_list_entered
+        .acquire()
+        .await
+        .unwrap()
+        .forget();
+    fixture.backend.release.add_permits(1);
+    creating.await.unwrap().unwrap();
+    fixture
+        .native
+        .block_running_list
+        .store(false, Ordering::SeqCst);
+    fixture.native.running_list_release.add_permits(1);
+    let observed = inventory.await.unwrap().unwrap();
+    assert_eq!(
+        observed.len(),
+        2,
+        "the newly completed execution remains owned"
+    );
+    assert!(driver.is_running("tenant-other-1").await.unwrap());
+    assert_eq!(fixture.native.physical.lock().unwrap().len(), 2);
+    for id in ["tenant-agent-1", "tenant-other-1"] {
+        driver.remove(id).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn periodic_native_cleanup_keeps_other_environment_lifecycle_available() {
+    for class in ["supervisor", "conch"] {
+        let fixture = Fixture::new();
+        fixture.host.process_alive.store(true, Ordering::SeqCst);
+        let driver = fixture.driver_with_timeout(Duration::from_secs(5)).await;
+        let first = running_record(class);
+        let mut other = running_record(class);
+        other.spec.id = "tenant-other".into();
+        other.assignment.environment_id = other.spec.id.clone();
+        other.runtime.id = "tenant-other-1".into();
+        fixture.backend.release.add_permits(1);
+        for record in [&first, &other] {
+            driver
+                .start(&record.spec, &record.runtime.id, 1, &[])
+                .await
+                .unwrap();
+        }
+        let node = authority::manager(Arc::new(driver.clone()));
+        let mut authority = authority::Fixture::new().await;
+        *authority.authority.records.lock().unwrap() = [&first, &other]
+            .into_iter()
+            .map(|r| r.clone().try_into().unwrap())
+            .collect();
+        authority.cycle(&node).await.unwrap();
+        let deleting = {
+            let handle = node.environment(first.spec, first.assignment).unwrap();
+            fixture.backend.block_delete.store(true, Ordering::SeqCst);
+            tokio::spawn(async move { handle.delete().await })
+        };
+        fixture
+            .backend
+            .delete_entered
+            .acquire()
+            .await
+            .unwrap()
+            .forget();
+        for _ in 0..3 {
+            tokio::time::timeout(Duration::from_millis(500), authority.cycle(&node))
+                .await
+                .expect("native cleanup stalled the whole node")
+                .unwrap();
+            assert!(node.accepting_allocations());
+            let peer = node
+                .environment(other.spec.clone(), other.assignment.clone())
+                .unwrap();
+            assert_eq!(
+                peer.ensure_running("keep-peer".into())
+                    .await
+                    .unwrap()
+                    .record
+                    .state,
+                EnvironmentState::Running
+            );
+        }
+        let mut new = running_record(class);
+        new.spec.id = "tenant-new".into();
+        new.assignment.environment_id = new.spec.id.clone();
+        fixture.backend.release.add_permits(1);
+        let new_handle = node.environment(new.spec, new.assignment).unwrap();
+        assert_eq!(
+            new_handle.create().await.unwrap().record.state,
+            EnvironmentState::Running
+        );
+        fixture.backend.block_delete.store(false, Ordering::SeqCst);
+        fixture.backend.delete_release.add_permits(1);
+        deleting.await.unwrap().unwrap();
+        node.environment(other.spec, other.assignment)
+            .unwrap()
+            .delete()
+            .await
+            .unwrap();
+        new_handle.delete().await.unwrap();
+        assert!(driver.inventory().await.unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn periodic_reclaims_failed_execution_through_environment_work() {
+    let fixture = Fixture::new();
+    let driver = fixture.driver().await;
+    let node = authority::manager(Arc::new(driver.clone()));
+    let mut authority = authority::Fixture::new().await;
+    authority.cycle(&node).await.unwrap();
+    driver
+        .start_with_deadline(
+            &spec("conch"),
+            "tenant-agent-1",
+            1,
+            &[],
+            Instant::now() + CREATE_BUDGET,
+        )
+        .await
+        .unwrap();
+    fixture.backend.reject_delete.store(true, Ordering::SeqCst);
+    assert!(driver.remove("tenant-agent-1").await.is_err());
+    let deletes = fixture
+        .backend
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(method, _, _)| method == "DELETE")
+        .count();
+    assert_eq!(driver.inventory().await.unwrap().len(), 1);
+    assert_eq!(
+        fixture
+            .backend
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(method, _, _)| method == "DELETE")
+            .count(),
+        deletes
+    );
+    // There is no retained controller: the existing per-Environment orphan
+    // work queue owns this retry, rather than the inventory implementation.
+    fixture.backend.reject_delete.store(false, Ordering::SeqCst);
+    authority.cycle(&node).await.unwrap();
+    assert!(node.accepting_allocations());
+    assert!(driver.inventory().await.unwrap().is_empty());
+    assert!(fixture.native.physical.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn periodic_backend_epoch_change_is_cleaned_by_its_controller() {
+    let mut fixture = Fixture::new();
+    let driver = fixture.driver().await;
+    let record = running_record("conch");
+    driver
+        .start_with_deadline(
+            &record.spec,
+            &record.runtime.id,
+            1,
+            &[],
+            Instant::now() + CREATE_BUDGET,
+        )
+        .await
+        .unwrap();
+    let node = authority::manager(Arc::new(driver.clone()));
+    let mut authority = authority::Fixture::new().await;
+    *authority.authority.records.lock().unwrap() = vec![record.clone().try_into().unwrap()];
+    authority.cycle(&node).await.unwrap();
+    fixture.restart();
+    let observed = driver.inventory().await.unwrap();
+    assert_eq!(observed.len(), 1);
+    assert!(!observed[0].running);
+    assert_eq!(fixture.native.physical.lock().unwrap().len(), 1);
+    authority.cycle(&node).await.unwrap();
+    assert!(node.accepting_allocations());
+    assert!(fixture.native.physical.lock().unwrap().is_empty());
+    assert!(driver.inventory().await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -363,23 +837,14 @@ async fn deadline_keeps_late_create_owned_and_delete_waits_for_completion() {
     let fixture = Fixture::new();
     let driver = fixture.driver().await;
     fixture.backend.release.acquire().await.unwrap().forget();
+    let deadline = Instant::now() + CREATE_BUDGET;
     let worker = driver.clone();
     let create = tokio::spawn(async move {
         worker
-            .start_with_deadline(
-                &spec("conch"),
-                "tenant-agent-1",
-                1,
-                &[],
-                Instant::now() + Duration::from_millis(200),
-            )
+            .start_with_deadline(&spec("conch"), "tenant-agent-1", 1, &[], deadline)
             .await
     });
-    tokio::time::timeout(Duration::from_secs(5), fixture.backend.entered.acquire())
-        .await
-        .unwrap()
-        .unwrap()
-        .forget();
+    fixture.expire_blocked_create(deadline).await;
     assert!(matches!(
         create.await.unwrap(),
         Err(Error::DeadlineExceeded(_))
@@ -574,6 +1039,32 @@ async fn unknown_managed_vm_is_deleted_after_authority_while_foreign_vm_is_prese
 }
 
 #[tokio::test]
+async fn inventory_only_reports_unknown_executions_after_authority_is_loaded() {
+    let fixture = Fixture::new();
+    let driver = fixture.driver().await;
+    driver.reconcile_inventory(&[]).await.unwrap();
+    fixture.native.physical.lock().unwrap().insert(
+        "adx-late-unowned".into(),
+        json!({"sandboxID":"adx-late-unowned"}),
+    );
+    assert!(driver.inventory().await.is_err());
+    assert!(fixture
+        .native
+        .physical
+        .lock()
+        .unwrap()
+        .contains_key("adx-late-unowned"));
+    assert_eq!(
+        fixture
+            .native
+            .count("DELETE", "/api/v1/sandboxes/adx-late-unowned"),
+        0
+    );
+    assert!(driver.reconcile_inventory(&[]).await.unwrap().is_empty());
+    assert!(fixture.native.physical.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn erofs_is_mounted_once_and_retained_after_all_generations_are_deleted() {
     let fixture = Fixture::new();
     let driver = fixture.driver().await;
@@ -622,6 +1113,10 @@ async fn late_physical_runtime_for_deleted_id_is_cleaned_not_adopted() {
         .unwrap();
     driver.remove("tenant-agent-1").await.unwrap();
     fixture.native.physical.lock().unwrap().insert(id, record);
+    let observed = driver.inventory().await.unwrap();
+    assert_eq!(observed.len(), 1);
+    assert!(!observed[0].running);
+    driver.remove("tenant-agent-1").await.unwrap();
     assert!(driver.inventory().await.unwrap().is_empty());
     assert!(fixture.native.physical.lock().unwrap().is_empty());
 }
@@ -1040,4 +1535,64 @@ async fn supervisor_tunnel_acl_survives_create_and_routed_policy_update() {
         assert_eq!(network["egress"]["allowed_ports"], json!([]));
         assert_eq!(network["egress"]["blocked_ports"], json!([]));
     }
+}
+
+#[tokio::test]
+async fn conch_environment_identity_reaches_native_policy() {
+    let fixture = Fixture::new();
+    let driver = fixture.driver().await;
+    let mut raw = serde_json::to_value(spec("conch")).unwrap();
+    raw["execution"]["user"] = json!("1001");
+    raw["execution"]["group"] = json!("1002");
+    raw["execution"]["inherit_entrypoint"] = json!(false);
+    let wanted: EnvironmentSpec = serde_json::from_value(raw).unwrap();
+    driver
+        .start_with_deadline(
+            &wanted,
+            "tenant-agent-1",
+            1,
+            &[],
+            Instant::now() + Duration::from_secs(3),
+        )
+        .await
+        .unwrap();
+    {
+        let calls = fixture.backend.calls.lock().unwrap();
+        let body = &calls
+            .iter()
+            .find(|(m, p, _)| m == "POST" && p == "/api/v1/sandboxes")
+            .unwrap()
+            .2;
+        assert_eq!(body["policy"]["conch"]["run_as_user"], "1001");
+        assert_eq!(body["policy"]["conch"]["run_as_group"], "1002");
+    }
+    driver.remove("tenant-agent-1").await.unwrap();
+}
+
+#[tokio::test]
+async fn identity_override_is_not_silently_ignored_by_supervisor() {
+    let fixture = Fixture::new();
+    let driver = fixture.driver().await;
+    let mut raw = serde_json::to_value(spec("supervisor")).unwrap();
+    raw["execution"]["user"] = json!("1001");
+    raw["execution"]["group"] = json!("1002");
+    raw["execution"]["inherit_entrypoint"] = json!(false);
+    let wanted: EnvironmentSpec = serde_json::from_value(raw).unwrap();
+    assert!(driver
+        .start_with_deadline(
+            &wanted,
+            "tenant-agent-1",
+            1,
+            &[],
+            Instant::now() + Duration::from_secs(3)
+        )
+        .await
+        .is_err());
+    assert!(!fixture
+        .backend
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(m, p, _)| m == "POST" && p == "/api/v1/sandboxes"));
 }

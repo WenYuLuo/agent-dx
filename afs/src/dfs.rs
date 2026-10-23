@@ -378,6 +378,8 @@ pub struct LayoutRoot {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum DigestAlgorithm {
     Blake3,
+    /// BLAKE3 binding of a versioned 32KiB CRC32C table, never a body BLAKE3 root.
+    Crc32cSegmentsV1,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -400,6 +402,23 @@ pub struct ChunkObject {
 }
 
 impl ChunkObject {
+    pub fn is_segment_crc32c(&self) -> bool {
+        self.content_digest.algorithm == DigestAlgorithm::Crc32cSegmentsV1
+    }
+    pub fn valid_immutable_identity(&self) -> bool {
+        if !self.is_segment_crc32c() {
+            return Self::from_content_addressed_id(&self.id).as_ref() == Some(self);
+        }
+        self.length > 0
+            && self.length <= 4 * 1024 * 1024
+            && self.encoding == ChunkEncoding::Raw
+            && self.id.0.strip_prefix("crc32c-v1-").is_some_and(|s| {
+                s.len() == 32
+                    && s.bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            })
+    }
+
     /// Recover the standard root and length committed by a canonical ChunkId.
     /// Other historical IDs have no content-addressed authority; callers must
     /// retain their complete verification fallback rather than infer a root.
@@ -1129,5 +1148,21 @@ mod external_identity_tests {
         ] {
             assert!(external_object_key("store", "generation", &ChunkId::new(identity)).is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod crc32c_format_tests {
+    #[test]
+    fn crc32c_descriptor_has_distinct_persisted_algorithm() {
+        let descriptor: super::ContentDigest = serde_json::from_value(serde_json::json!({
+            "algorithm":"Crc32cSegmentsV1", "bytes":vec![7_u8;32]
+        }))
+        .unwrap();
+        assert_ne!(descriptor.algorithm, super::DigestAlgorithm::Blake3);
+        assert_eq!(
+            serde_json::to_value(descriptor).unwrap()["algorithm"],
+            "Crc32cSegmentsV1"
+        );
     }
 }

@@ -733,3 +733,14 @@ NodeReplicated DFS 默认启动每 5 秒一次的安全回收；关闭引用有�
 调用节点、候选事务版本，以及修改或发生冲突的 inode 版本、head、链接数和属性；
 不记录文件内容、xattr 或凭据。`meta_namespace_applied` 只表示候选批次已应用，
 不能当成持久化成功回执。默认关闭该诊断，开启后应限制日志访问并在定位后关闭。
+
+
+## 本地单副本分段CRC32C（默认关闭）
+
+`dfs_crc32c_writes = true`只改变本节点新写native对象的格式，必须同时设置`dfs_optimistic_gc_commit = true`，配置为desired/sync-required均1且local-copy为`required`，不得使用外部后端。配置错误在监听服务前拒绝。旧格式仍走原BLAKE3/Bao路径；关闭新写开关不会关闭既有CRC对象的本地读取、恢复或GC。
+
+新对象使用随机128位独立ID，32KiB分段CRC32C表与长度、版本一起进入原catalog WAL持久化链。`Crc32cSegmentsV1`算法标记承载CRC描述表的小BLAKE3绑定摘要，**不是正文BLAKE3根**。正文及目录/catalog屏障全部完成后才返回原durable ACK；FullSync收齐收据后沿用最终GC验号事务。CRC检测意外损坏，不提供Bao内容证明或按正文相同自动去重。
+
+首版仅支持本地native required-R1；跨节点对象读取、复制/修复、S3写入明确拒绝，不把CRC描述解释成旧hash。重试必须沿用原不可变对象ID及描述，已落盘未入catalog的正文先按CRC核验再登记。读取按持久化算法标记分流，缺表、错表、损坏或截断不返回成功。旧二进制不认识新算法会拒绝，回退部署前须确认数据格式；本次不提供批量迁移。
+
+`security.capability`在原inode映射检查后本地返回既有不支持错误，其余xattr保留Meta权限与错误语义。Meta的`afs_requests_total`补充`dfs_gc_capture/register/retain/release/collect`、`dfs_commit_file_version`和`dfs_get_xattr`标签，用于核对真实访问次数；不增加逐chunk正文扫描或详细调度采集。

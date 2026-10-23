@@ -323,6 +323,8 @@ fn security_pb(value: core::DataPlaneSecurityMode) -> i32 {
 impl From<core::ExecutionOptions> for pb::ExecutionOptions {
     fn from(value: core::ExecutionOptions) -> Self {
         Self {
+            user: value.user,
+            group: value.group,
             cwd: value.cwd,
             tunnel_http_port: value.tunnel_http_port.map(u32::from),
             rootfs: value.rootfs.map(Into::into),
@@ -353,6 +355,8 @@ impl TryFrom<pb::ExecutionOptions> for core::ExecutionOptions {
         let data_plane = value.data_plane.unwrap_or_default();
         let limits = value.limits.unwrap_or_default();
         Ok(Self {
+            user: value.user,
+            group: value.group,
             cwd: value.cwd,
             tunnel_http_port: value
                 .tunnel_http_port

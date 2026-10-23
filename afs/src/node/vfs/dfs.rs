@@ -226,6 +226,7 @@ pub struct DistributedFs {
     handles: DfsHandleTable,
     gc_references: Option<Arc<crate::node::gc::GcReferences>>,
     optimistic_gc_commit: bool,
+    crc32c_writes: bool,
     gc_gate: Mutex<()>,
     dir_handles: Mutex<HashMap<u64, DfsDirectoryHandle>>,
     inode_writes: ShardedMap<InodeId, SharedInodeWriteState>,
@@ -2657,6 +2658,7 @@ impl DistributedFs {
             handles: DfsHandleTable::default(),
             gc_references: None,
             optimistic_gc_commit: false,
+            crc32c_writes: false,
             gc_gate: Mutex::new(()),
             dir_handles: Mutex::new(HashMap::new()),
             inode_writes: ShardedMap::default(),
@@ -2724,6 +2726,17 @@ impl DistributedFs {
     ) -> Self {
         self.gc_references = references;
         self
+    }
+    pub(crate) fn with_crc32c_writes(mut self, enabled: bool) -> Self {
+        self.crc32c_writes = enabled;
+        self
+    }
+    fn stage_native_chunk(&self, op: OperationId, bytes: SharedChunkBytes) -> Result<StagedChunk> {
+        if self.crc32c_writes {
+            StagedChunk::from_shared_crc32c(op, bytes)
+        } else {
+            Ok(StagedChunk::from_shared(op, bytes))
+        }
     }
     pub(crate) fn with_optimistic_gc_commit(mut self, enabled: bool) -> Self {
         self.optimistic_gc_commit = enabled;
@@ -3284,7 +3297,7 @@ impl DistributedFs {
             }
             // The immutable allocation stays the same. Staging performs the
             // standard BLAKE3 scan; no body concatenation or clone is involved.
-            let staged = StagedChunk::from_shared(operation_id.clone(), body.clone());
+            let staged = self.stage_native_chunk(operation_id.clone(), body.clone())?;
             let upload = Arc::new(NativeUpload {
                 _gc_pin: state.dirty_extents.native_gc_pin.clone(),
                 operation_id: operation_id.clone(),
@@ -3425,10 +3438,15 @@ impl DistributedFs {
         }
         let permit = NativeUploadPermit(pipeline.metadata.clone());
         let store = self.chunk_store.clone();
-        let staged = state
-            .staged
-            .take()
-            .unwrap_or_else(|| StagedChunk::from_shared(upload.operation_id.clone(), body));
+        let staged = match state.staged.take() {
+            Some(staged) => staged,
+            None if upload.chunk.is_segment_crc32c() => StagedChunk::from_shared_crc32c_id(
+                upload.operation_id.clone(),
+                body,
+                upload.chunk.id.clone(),
+            )?,
+            None => StagedChunk::from_shared(upload.operation_id.clone(), body),
+        };
         if staged.chunk != upload.chunk {
             return Err(invalid("native upload changed its immutable object"));
         }
@@ -5829,7 +5847,12 @@ impl DistributedFs {
         layout_id: LayoutRootId,
         retained_uploads: &mut Vec<Arc<NativeUpload>>,
     ) -> Result<(LayoutRoot, Vec<ChunkReceipt>)> {
-        let mut plan = CommitPlanner.plan(frozen, operation_id.clone(), layout_id)?;
+        let mut plan = CommitPlanner.plan_with_integrity(
+            frozen,
+            operation_id.clone(),
+            layout_id,
+            self.crc32c_writes,
+        )?;
         let mut receipts: Vec<ChunkReceipt> = Vec::new();
         for extent in frozen.dirty_extents.extents.values() {
             if let Some(upload) = &extent.native_upload {
@@ -9551,6 +9574,16 @@ impl CommitPlanner {
         operation_id: OperationId,
         layout_id: LayoutRootId,
     ) -> Result<CommitPlan> {
+        self.plan_with_integrity(frozen, operation_id, layout_id, false)
+    }
+
+    fn plan_with_integrity(
+        &self,
+        frozen: &FrozenCommit,
+        operation_id: OperationId,
+        layout_id: LayoutRootId,
+        crc32c_writes: bool,
+    ) -> Result<CommitPlan> {
         let overlay = normalized_overlay(&frozen.dirty_extents, frozen.logical_length)?;
         let mut extents = frozen
             .base_layout
@@ -9620,10 +9653,12 @@ impl CommitPlanner {
                     Some(index) => *index,
                     None => {
                         let index = staged_chunks.len();
-                        staged_chunks.push(StagedChunk::from_shared(
-                            operation_id.clone(),
-                            bytes.slice(start..end),
-                        ));
+                        let body = bytes.slice(start..end);
+                        staged_chunks.push(if crc32c_writes {
+                            StagedChunk::from_shared_crc32c(operation_id.clone(), body)?
+                        } else {
+                            StagedChunk::from_shared(operation_id.clone(), body)
+                        });
                         staged_by_source.insert(key, index);
                         index
                     }
@@ -12907,9 +12942,16 @@ impl Backend for DistributedFs {
     }
 
     fn getxattr(&self, ctx: &RequestContext, inode: BackendInode, name: &OsStr) -> Result<Vec<u8>> {
+        let inode_id = self.inode_id(inode)?;
+        if name.as_encoded_bytes() == b"security.capability" {
+            return Err(Error::coded(
+                afs_error::IO_NOT_SUPPORTED,
+                "DFS currently supports only user.* xattrs",
+            ));
+        }
         self.meta.get_xattr(GetXattrRequest {
             caller: caller_context(ctx),
-            inode_id: self.inode_id(inode)?,
+            inode_id,
             name: name.as_encoded_bytes().to_vec(),
         })
     }
@@ -14468,6 +14510,76 @@ fn bad_file_descriptor(message: impl Into<String>) -> Error {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn meta_capability_local_rejection_skips_authority() {
+        let (_temp, meta, fs) = test_fs();
+        let inode_id = meta.inode.lock().unwrap().inode_id.clone();
+        let inode = fs.backend_inode(&inode_id).unwrap();
+        for uid in [0, 1000, 2000] {
+            let mut caller = context();
+            caller.uid = uid;
+            let error = fs
+                .getxattr(&caller, inode, OsStr::new("security.capability"))
+                .unwrap_err();
+            assert_eq!(error.code(), afs_error::IO_NOT_SUPPORTED);
+            assert_eq!(error.message(), "DFS currently supports only user.* xattrs");
+        }
+        assert_eq!(meta.xattr_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn meta_capability_other_names_keep_authority_and_errors() {
+        let (_temp, meta, fs) = test_fs();
+        let inode_id = {
+            let mut inode = meta.inode.lock().unwrap();
+            inode
+                .xattrs
+                .insert(b"user.meta-capability".to_vec(), b"value".to_vec());
+            inode.inode_id.clone()
+        };
+        let inode = fs.backend_inode(&inode_id).unwrap();
+        assert_eq!(
+            fs.getxattr(&context(), inode, OsStr::new("user.meta-capability"))
+                .unwrap(),
+            b"value"
+        );
+        *meta.next_xattr_error.lock().unwrap() = Some(Error::coded(
+            afs_error::IO_PERMISSION_DENIED,
+            "authority denied",
+        ));
+        let error = fs
+            .getxattr(&context(), inode, OsStr::new("user.meta-capability"))
+            .unwrap_err();
+        assert_eq!(error.code(), afs_error::IO_PERMISSION_DENIED);
+        assert_eq!(error.message(), "authority denied");
+        for name in [
+            "security.selinux",
+            "security.capability.extra",
+            "user.missing",
+        ] {
+            assert_eq!(
+                fs.getxattr(&context(), inode, OsStr::new(name))
+                    .unwrap_err()
+                    .code(),
+                afs_error::NODE_VFS_NOT_FOUND
+            );
+        }
+        assert_eq!(meta.xattr_calls.load(Ordering::SeqCst), 5);
+    }
+
+    #[test]
+    fn meta_capability_invalid_inode_keeps_local_failure_order() {
+        let (_temp, meta, fs) = test_fs();
+        let inode = BackendInode { value: u64::MAX };
+        let expected = fs.inode_id(inode).unwrap_err();
+        let actual = fs
+            .getxattr(&context(), inode, OsStr::new("security.capability"))
+            .unwrap_err();
+        assert_eq!(actual.code(), expected.code());
+        assert_eq!(actual.message(), expected.message());
+        assert_eq!(meta.xattr_calls.load(Ordering::SeqCst), 0);
+    }
+
     use super::*;
     use crate::{
         dfs::{
@@ -14652,6 +14764,8 @@ mod tests {
         resolve_lock_calls: AtomicUsize,
         resolve_write_calls: AtomicUsize,
         get_inode_calls: AtomicUsize,
+        xattr_calls: AtomicUsize,
+        next_xattr_error: Mutex<Option<Error>>,
     }
 
     impl RecordingMeta {
@@ -14714,6 +14828,8 @@ mod tests {
                 resolve_lock_calls: AtomicUsize::new(0),
                 resolve_write_calls: AtomicUsize::new(0),
                 get_inode_calls: AtomicUsize::new(0),
+                xattr_calls: AtomicUsize::new(0),
+                next_xattr_error: Mutex::new(None),
             }
         }
 
@@ -15201,6 +15317,10 @@ mod tests {
         }
 
         fn get_xattr(&self, request: GetXattrRequest) -> Result<Vec<u8>> {
+            self.xattr_calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(error) = self.next_xattr_error.lock().unwrap().take() {
+                return Err(error);
+            }
             self.inode
                 .lock()
                 .unwrap()
@@ -15269,6 +15389,60 @@ mod tests {
             umask: 0,
             supplementary_gids: Vec::new(),
         }
+    }
+
+    #[test]
+    fn crc32c_vfs_partial_overwrite_and_truncate() {
+        let (_temp, meta, fs) = test_fs();
+        let fs = fs.with_crc32c_writes(true);
+        let file = fs
+            .create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new("crc-range.bin"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        let mut expected = vec![11; 65549];
+        fs.write(&context(), file.handle, 0, &expected).unwrap();
+        fs.fsync(&context(), file.handle, SyncMode::Full).unwrap();
+        fs.write(&context(), file.handle, 32760, &[29; 30]).unwrap();
+        expected[32760..32790].fill(29);
+        fs.fsync(&context(), file.handle, SyncMode::Full).unwrap();
+        let mut got = vec![0; expected.len()];
+        assert_eq!(
+            fs.read(&context(), file.handle, 0, &mut got).unwrap(),
+            expected.len()
+        );
+        assert_eq!(got, expected);
+        fs.setattr(
+            &context(),
+            file.entry.inode,
+            Some(file.handle),
+            &AttributeChange {
+                size: Some(32775),
+                ..AttributeChange::default()
+            },
+        )
+        .unwrap();
+        fs.fsync(&context(), file.handle, SyncMode::Full).unwrap();
+        expected.truncate(32775);
+        let mut got = vec![0; 65549];
+        assert_eq!(
+            fs.read(&context(), file.handle, 0, &mut got).unwrap(),
+            expected.len()
+        );
+        assert_eq!(&got[..expected.len()], &expected);
+        assert!(
+            meta.commits
+                .lock()
+                .unwrap()
+                .iter()
+                .flat_map(|c| &c.chunk_receipts)
+                .all(|r| r.chunk.is_segment_crc32c())
+        );
+        fs.release(&context(), file.handle).unwrap();
     }
 
     fn test_fs() -> (tempfile::TempDir, Arc<RecordingMeta>, DistributedFs) {
@@ -18484,6 +18658,13 @@ mod tests {
     #[cfg(feature = "dfs")]
     #[test]
     fn native_builder_preupload_retry_preserves_object_but_layout_excludes_old_tail_and_patch() {
+        native_preupload_retry_with_integrity(false);
+    }
+    #[test]
+    fn crc32c_native_preupload_retry_preserves_immutable_id() {
+        native_preupload_retry_with_integrity(true);
+    }
+    fn native_preupload_retry_with_integrity(crc: bool) {
         struct FailOnceStore {
             inner: Arc<LocalChunkStore>,
             fail: AtomicBool,
@@ -18524,7 +18705,8 @@ mod tests {
             store.clone(),
             DEFAULT_DIRTY_DATA_BUDGET_BYTES,
         )
-        .with_write_buffer_pool(pool.clone());
+        .with_write_buffer_pool(pool.clone())
+        .with_crc32c_writes(crc);
         let created = fs
             .create(
                 &context(),
@@ -18571,14 +18753,34 @@ mod tests {
         );
         assert_eq!(attempts[2].len(), 1);
         assert_eq!(attempts[2][0].length, 4096);
-        assert_eq!(
-            attempts[1][0].content_digest.bytes,
-            *blake3::hash(&original).as_bytes()
-        );
-        assert_eq!(
-            attempts[2][0].content_digest.bytes,
-            *blake3::hash(&[7; 4096]).as_bytes()
-        );
+        if crc {
+            assert!(
+                attempts
+                    .iter()
+                    .flatten()
+                    .all(ChunkObject::is_segment_crc32c)
+            );
+            for (chunk, body) in [
+                (&attempts[1][0], original.as_slice()),
+                (&attempts[2][0], [7; 4096].as_slice()),
+            ] {
+                assert_eq!(
+                    chunk.content_digest,
+                    crate::node::chunk_crc32c::CrcTable::build(body)
+                        .unwrap()
+                        .descriptor_digest()
+                );
+            }
+        } else {
+            assert_eq!(
+                attempts[1][0].content_digest.bytes,
+                *blake3::hash(&original).as_bytes()
+            );
+            assert_eq!(
+                attempts[2][0].content_digest.bytes,
+                *blake3::hash(&[7; 4096]).as_bytes()
+            );
+        }
         let original_id = attempts[0][0].id.clone();
         drop(attempts);
         let commits = meta.commits.lock().unwrap();

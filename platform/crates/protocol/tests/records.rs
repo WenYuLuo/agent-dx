@@ -8,6 +8,8 @@ fn environment_options_roundtrip_preserves_backend_contract() {
     use adx_core::execution as model;
 
     let options = model::ExecutionOptions {
+        user: Some("1001".into()),
+        group: Some("1002".into()),
         cwd: Some("/workspace/task".into()),
         tunnel_http_port: Some(18766),
         rootfs: Some(model::Rootfs {

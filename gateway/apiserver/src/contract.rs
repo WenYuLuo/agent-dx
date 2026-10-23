@@ -12,6 +12,8 @@ struct Create {
     namespace: String,
     image: String,
     runtime: String,
+    user: Option<String>,
+    group: Option<String>,
     cwd: Option<String>,
     rootfs: Value,
     cpu: i64,
@@ -781,6 +783,8 @@ pub fn create_spec_with_environment(
             .map_err(|_| invalid("invalid environment extra_config"))?
     };
     let environment = adx_core::execution::ExecutionOptions {
+        user: r.user,
+        group: r.group,
         cwd: r.cwd,
         tunnel_http_port: if r.tunnel.enabled {
             Some(

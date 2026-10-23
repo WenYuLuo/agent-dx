@@ -89,6 +89,7 @@ class JiuwenboxSafetyTests(unittest.TestCase):
             ConnectionConfig=lambda **options: options,
             Environment=object,
             EnvironmentNotFound=LookupError,
+            EnvironmentError=RuntimeError,
             RestartPolicy=object,
         )
         source = ROOT / "build/e2e/jiuwenbox/sdk_client.py"

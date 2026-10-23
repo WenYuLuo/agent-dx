@@ -298,3 +298,43 @@ fn gc_fence_wire_is_explicit_and_rejects_missing_kind() {
     }
     assert!(GcFence::from_wire(afs_protocol::meta::DfsGcFence { kind: None }).is_err());
 }
+
+#[tokio::test]
+async fn crc32c_meta_commit_and_gc_preserve_typed_live_object() {
+    let mut f = fixture().await;
+    let item =
+        StagedChunk::new_crc32c(f.staged.operation_id.clone(), f.staged.bytes().to_vec()).unwrap();
+    let snapshot = f.service.placement_snapshot("writer".into()).await.unwrap();
+    let group = snapshot
+        .replica_groups
+        .iter()
+        .find(|g| g.targets[0].node_id == "writer")
+        .unwrap();
+    let ack = f
+        .local
+        .persist(
+            &item,
+            &group.targets[0],
+            snapshot.revision,
+            group.placement_epoch,
+        )
+        .unwrap();
+    f.commit.layout_root.inline_extents[0].chunk_id = item.chunk.id.clone();
+    f.commit.chunk_receipts[0].chunk = item.chunk.clone();
+    f.commit.chunk_receipts[0].durable_acks = vec![ack];
+    f.service
+        .commit_file_version("writer".into(), f.commit.clone())
+        .await
+        .unwrap();
+    let gc = f
+        .service
+        .collect_garbage(
+            "writer".into(),
+            "writer-session".into(),
+            0,
+            vec![item.chunk.clone()],
+        )
+        .await
+        .unwrap();
+    assert!(!gc.chunks.contains(&item.chunk.id));
+}

@@ -2621,6 +2621,9 @@ fn wire_digest_algorithm(algorithm: crate::dfs::DigestAlgorithm) -> i32 {
         crate::dfs::DigestAlgorithm::Blake3 => {
             afs_protocol::meta::DfsDigestAlgorithm::Blake3 as i32
         }
+        crate::dfs::DigestAlgorithm::Crc32cSegmentsV1 => {
+            afs_protocol::meta::DfsDigestAlgorithm::Crc32cSegmentsV1 as i32
+        }
     }
 }
 
@@ -2629,6 +2632,9 @@ fn domain_digest_algorithm(value: i32) -> afs_error::Result<crate::dfs::DigestAl
     match afs_protocol::meta::DfsDigestAlgorithm::try_from(value) {
         Ok(afs_protocol::meta::DfsDigestAlgorithm::Blake3) => {
             Ok(crate::dfs::DigestAlgorithm::Blake3)
+        }
+        Ok(afs_protocol::meta::DfsDigestAlgorithm::Crc32cSegmentsV1) => {
+            Ok(crate::dfs::DigestAlgorithm::Crc32cSegmentsV1)
         }
         _ => Err(Error::coded(
             CLIENT_PROTOCOL_VIOLATION,
@@ -4727,5 +4733,28 @@ impl GrpcDfsMeta {
             .gc_fence
             .map(crate::dfs::GcFence::from_wire)
             .transpose()
+    }
+}
+
+#[cfg(all(test, feature = "dfs"))]
+mod crc32c_wire_tests {
+    use super::*;
+    #[test]
+    fn crc32c_meta_descriptor_roundtrip() {
+        let chunk = crate::dfs::ChunkObject {
+            id: crate::dfs::ChunkId::new("crc32c-v1-00112233445566778899aabbccddeeff"),
+            length: 32769,
+            content_digest: crate::dfs::ContentDigest {
+                algorithm: crate::dfs::DigestAlgorithm::Crc32cSegmentsV1,
+                bytes: [7; 32],
+            },
+            encoding: crate::dfs::ChunkEncoding::Raw,
+        };
+        assert_eq!(
+            domain_chunk_object(wire_chunk_object(chunk.clone())).unwrap(),
+            chunk
+        );
+        assert_eq!(wire_digest_algorithm(chunk.content_digest.algorithm), 2);
+        assert!(domain_digest_algorithm(99).is_err());
     }
 }
