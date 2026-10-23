@@ -5440,8 +5440,8 @@ impl DistributedFs {
             let pending_reuse = matches!(&action, CommitAction::Send(_));
             let pending = match action {
                 CommitAction::Send(pending) => pending,
-                CommitAction::Prepare(frozen, publication_window) => {
-                    match self.prepare_commit(&frozen, reason, publication_window) {
+                CommitAction::Prepare(mut frozen, publication_window) => {
+                    match self.prepare_commit(&mut frozen, reason, publication_window) {
                         Ok(batch) => {
                             let pending_file = PendingFileCommit {
                                 frozen: *frozen,
@@ -5842,7 +5842,7 @@ impl DistributedFs {
 
     fn prepare_native_generation(
         &self,
-        frozen: &FrozenCommit,
+        frozen: &mut FrozenCommit,
         operation_id: &OperationId,
         layout_id: LayoutRootId,
         retained_uploads: &mut Vec<Arc<NativeUpload>>,
@@ -5911,6 +5911,33 @@ impl DistributedFs {
                 cv: Condvar::new(),
                 _descriptor: descriptor,
             });
+            if upload.chunk.is_segment_crc32c() {
+                // Preserve the immutable tail identity before any fallible I/O.
+                // Failed preparation restores this map, including successful
+                // receipts. Dispatch keeps the original sequential order.
+                for extent in plan
+                    .layout_root
+                    .inline_extents
+                    .iter()
+                    .filter(|extent| extent.chunk_id == upload.chunk.id)
+                {
+                    frozen.dirty_extents.insert_native(DirtyExtent {
+                        file_offset: extent.file_offset,
+                        length: extent.length,
+                        write_seq: frozen.through_seq,
+                        data: None,
+                        builder: None,
+                        source_offset: usize::try_from(extent.chunk_offset)
+                            .map_err(|_| invalid("native tail offset is too large"))?,
+                        native_reuse_end: extent.file_offset + extent.length,
+                        uploaded: None,
+                        native_upload: Some(upload.clone()),
+                        native_descriptor: Some(upload._descriptor.clone()),
+                        budget_reservations: Vec::new(),
+                    });
+                }
+            }
+            retained_uploads.push(upload.clone());
             let receipt = self.wait_native_upload(&upload)?;
             if !receipts
                 .iter()
@@ -5918,7 +5945,6 @@ impl DistributedFs {
             {
                 receipts.push(receipt);
             }
-            retained_uploads.push(upload);
         }
         plan.layout_root
             .inline_extents
@@ -5942,7 +5968,7 @@ impl DistributedFs {
 
     fn prepare_commit(
         &self,
-        frozen: &FrozenCommit,
+        frozen: &mut FrozenCommit,
         reason: CommitReason,
         publication_window: Option<PublicationWindow>,
     ) -> std::result::Result<CommitBatch, PrepareCommitError> {
@@ -5986,20 +6012,32 @@ impl DistributedFs {
         let gc_pin = match (&frozen.dirty_extents.native_gc_pin, &self.gc_references) {
             (Some(pin), _) => Some(pin.clone()),
             (None, Some(references)) => Some(
-                references
-                    .pin(
+                (if self.optimistic_gc_commit {
+                    references.pin_fenced(
+                        &frozen.inode.inode_id,
+                        frozen.inode.head_version.as_ref(),
+                        &operation_id,
+                    )
+                } else {
+                    references.pin(
                         &frozen.inode.inode_id,
                         frozen.inode.head_version.as_ref(),
                         Some(&operation_id),
                     )
-                    .map_err(|error| PrepareCommitError {
-                        error,
-                        publication_window: None,
-                        budget_reservations: Vec::new(),
-                    })?,
+                })
+                .map_err(|error| PrepareCommitError {
+                    error,
+                    publication_window: None,
+                    budget_reservations: Vec::new(),
+                })?,
             ),
             (None, None) => None,
         };
+        if self.optimistic_gc_commit {
+            // Length-only generations have no write-time pin. Freeze their
+            // captured fence as well; preparation retries never refresh it.
+            frozen.dirty_extents.native_gc_pin = gc_pin.clone();
+        }
         let generation = self.next_operation.fetch_add(1, Ordering::Relaxed);
         let layout_id = LayoutRootId::new(format!("{}-layout-{generation}", self.session_id));
 
@@ -15389,6 +15427,267 @@ mod tests {
             umask: 0,
             supplementary_gids: Vec::new(),
         }
+    }
+
+    #[derive(Default)]
+    struct Pr88GcControl {
+        captures: AtomicUsize,
+        unfenced_publications: AtomicUsize,
+    }
+    impl crate::node::gc::GcControl for Pr88GcControl {
+        fn retain(
+            &self,
+            _: &str,
+            _: &InodeId,
+            _: Option<&FileVersionId>,
+            publication: bool,
+        ) -> Result<()> {
+            if publication {
+                self.unfenced_publications.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(())
+        }
+        fn retain_fenced(
+            &self,
+            _: &str,
+            _: &InodeId,
+            _: Option<&FileVersionId>,
+        ) -> Result<crate::dfs::GcFence> {
+            self.captures.fetch_add(1, Ordering::SeqCst);
+            Ok(crate::dfs::GcFence::Absent)
+        }
+        fn release(&self, _: &str) -> Result<()> {
+            Ok(())
+        }
+        fn reserve_publication(&self, _: &OperationId, _: Vec<ChunkObject>) -> Result<()> {
+            Ok(())
+        }
+        fn collect(&self, _: u64, _: Vec<ChunkObject>) -> Result<crate::dfs::GcState> {
+            Ok(crate::dfs::GcState::default())
+        }
+    }
+
+    #[test]
+    fn pr88_fix_crc32c_meta_resize_after_fullsync_keeps_fence() {
+        let (_temp, meta, fs) = test_fs();
+        let control = Arc::new(Pr88GcControl::default());
+        let references = crate::node::gc::GcReferences::new(control.clone());
+        let fs = fs
+            .with_gc_references(Some(references.clone()))
+            .with_optimistic_gc_commit(true)
+            .with_crc32c_writes(true);
+        let file = fs
+            .create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new("pr88-resize"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        let mut expected = vec![11; 65549];
+        fs.write(&context(), file.handle, 0, &expected).unwrap();
+        fs.fsync(&context(), file.handle, SyncMode::Full).unwrap();
+        for length in [32775, 70001] {
+            fs.setattr(
+                &context(),
+                file.entry.inode,
+                Some(file.handle),
+                &AttributeChange {
+                    size: Some(length),
+                    ..AttributeChange::default()
+                },
+            )
+            .unwrap();
+            fs.fsync(&context(), file.handle, SyncMode::Full).unwrap();
+            expected.resize(length as usize, 0);
+            let mut got = vec![0; 80000];
+            assert_eq!(
+                fs.read(&context(), file.handle, 0, &mut got).unwrap(),
+                expected.len()
+            );
+            assert_eq!(&got[..expected.len()], expected.as_slice());
+        }
+        let commits = meta.commits.lock().unwrap();
+        assert_eq!(commits.len(), 3);
+        assert!(
+            commits
+                .iter()
+                .all(|c| c.gc_fence == Some(crate::dfs::GcFence::Absent))
+        );
+        assert_eq!(commits.last().unwrap().file_version.length, 70001);
+        drop(commits);
+        assert_eq!(control.captures.load(Ordering::SeqCst), 3);
+        assert_eq!(control.unfenced_publications.load(Ordering::SeqCst), 0);
+        fs.release(&context(), file.handle).unwrap();
+        references.flush().unwrap();
+    }
+
+    #[test]
+    fn pr88_fix_crc32c_tail_partial_success_retry_keeps_ids_and_receipts() {
+        struct LostSecondReceipt {
+            inner: Arc<LocalChunkStore>,
+            attempts: Mutex<Vec<ChunkObject>>,
+        }
+        impl ChunkStore for LostSecondReceipt {
+            fn put_batch(&self, staged: Vec<StagedChunk>) -> Result<Vec<ChunkReceipt>> {
+                assert_eq!(staged.len(), 1);
+                let call = {
+                    let mut attempts = self.attempts.lock().unwrap();
+                    attempts.push(staged[0].chunk.clone());
+                    attempts.len()
+                };
+                let receipts = self.inner.put_batch(staged)?;
+                if call == 2 {
+                    return Err(unavailable("injected lost second durable receipt"));
+                }
+                Ok(receipts)
+            }
+            fn put_native_batch(
+                &self,
+                staged: Vec<StagedChunk>,
+            ) -> Result<Vec<crate::node::chunk::NativeChunkReceipt>> {
+                self.put_batch(staged).map(|receipts| {
+                    receipts
+                        .into_iter()
+                        .map(|receipt| crate::node::chunk::NativeChunkReceipt {
+                            receipt,
+                            local_required_and_durable: true,
+                        })
+                        .collect()
+                })
+            }
+            fn read_native_uploaded_at(
+                &self,
+                receipt: &ChunkReceipt,
+                offset: u64,
+                out: &mut [u8],
+            ) -> Result<usize> {
+                self.inner
+                    .open_receipt_reader(&receipt.chunk)?
+                    .read_at(offset, out)
+            }
+            fn read_at(
+                &self,
+                id: &crate::dfs::ChunkId,
+                offset: u64,
+                out: &mut [u8],
+            ) -> Result<usize> {
+                self.inner.read_at(id, offset, out)
+            }
+        }
+        let meta = Arc::new(RecordingMeta::new());
+        let temp = tempfile::tempdir().unwrap();
+        let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
+        let store = Arc::new(LostSecondReceipt {
+            inner: local.clone(),
+            attempts: Mutex::new(Vec::new()),
+        });
+        let control = Arc::new(Pr88GcControl::default());
+        let references = crate::node::gc::GcReferences::new(control.clone());
+        let fs = distributed_fs_with_chunk_store(
+            meta.clone(),
+            local.clone(),
+            store.clone(),
+            DEFAULT_DIRTY_DATA_BUDGET_BYTES,
+        )
+        .with_gc_references(Some(references.clone()))
+        .with_optimistic_gc_commit(true)
+        .with_crc32c_writes(true);
+        let file = fs
+            .create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new("pr88-tail-retry"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        let offset = 2 * COMMIT_CHUNK_BYTES;
+        fs.write(&context(), file.handle, 0, &[17; 65549]).unwrap();
+        fs.write(&context(), file.handle, offset, &[29; 65549])
+            .unwrap();
+        assert!(fs.fsync(&context(), file.handle, SyncMode::Full).is_err());
+        assert_eq!(meta.commit_count(), 0);
+        assert_eq!(
+            local.gc_inventory().unwrap().len(),
+            2,
+            "both tails reached real durable storage"
+        );
+        let inode_id = meta.inode.lock().unwrap().inode_id.clone();
+        let cell = fs.write_state(&inode_id).unwrap().unwrap();
+        {
+            let state = cell.lock().unwrap();
+            let upload = state.dirty_extents.extents[&0]
+                .native_upload
+                .as_ref()
+                .unwrap();
+            assert!(
+                upload.state.lock().unwrap().body.is_none(),
+                "successful local R1 tail retires its memory body"
+            );
+        }
+        let mut first_tail = vec![0; 65549];
+        assert_eq!(
+            fs.read(&context(), file.handle, 0, &mut first_tail)
+                .unwrap(),
+            first_tail.len()
+        );
+        assert_eq!(
+            first_tail,
+            vec![17; 65549],
+            "failed preparation retains an anchored durable read"
+        );
+        fs.fsync(&context(), file.handle, SyncMode::Full).unwrap();
+        let attempts = store.attempts.lock().unwrap();
+        assert_eq!(
+            attempts.len(),
+            3,
+            "successful first tail must not be submitted again"
+        );
+        assert_eq!(
+            attempts[2], attempts[1],
+            "lost receipt retry must keep the same CRC object"
+        );
+        assert_ne!(attempts[0].id, attempts[1].id);
+        assert!(attempts.iter().all(ChunkObject::is_segment_crc32c));
+        let original = [attempts[0].id.clone(), attempts[1].id.clone()];
+        drop(attempts);
+        assert_eq!(
+            local.gc_inventory().unwrap().len(),
+            2,
+            "retry must not create duplicate physical objects"
+        );
+        let commits = meta.commits.lock().unwrap();
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].gc_fence, Some(crate::dfs::GcFence::Absent));
+        assert_eq!(commits[0].chunk_receipts.len(), 2);
+        assert!(
+            commits[0]
+                .chunk_receipts
+                .iter()
+                .all(|r| original.contains(&r.chunk.id))
+        );
+        drop(commits);
+        let mut expected = vec![0; offset as usize + 65549];
+        expected[..65549].fill(17);
+        expected[offset as usize..].fill(29);
+        let mut got = vec![0; expected.len()];
+        for (index, out) in got.chunks_mut(1024 * 1024).enumerate() {
+            assert_eq!(
+                fs.read(&context(), file.handle, (index * 1024 * 1024) as u64, out)
+                    .unwrap(),
+                out.len()
+            );
+        }
+        assert_eq!(got, expected);
+        assert_eq!(
+            control.captures.load(Ordering::SeqCst),
+            1,
+            "retry must not refresh the frozen GC fence"
+        );
+        fs.release(&context(), file.handle).unwrap();
+        references.flush().unwrap();
     }
 
     #[test]
