@@ -54,7 +54,7 @@ sandboxd 是独立运行时服务。本版本在 adxlet→sandboxd 的 gRPC 边�
 使用最近 6 小时、50 条 Trace、每条最多 3 个匹配 Span 的查询。入口固定
 `Table Format = Spans`，选择 `name`、`resource.service.name`、
 `span.http.response.status_code`、`span.rpc.method`、`span.environment.create.outcome`；排除 `/unmatched`、健康和指标请求。
-创建行显示 `environment.create` 总耗时，创建 HTTP 响应头行不混入该列表；打开完整 Trace 仍可查看 HTTP 阶段。
+创建行显示 `environment.create` 总耗时，成功创建的 HTTP 响应头行不混入该列表；HTTP 4xx/5xx 行仍保留，认证或参数校验失败、尚未进入创建服务的请求也可查询。打开完整 Trace 仍可查看 HTTP 阶段。
 Name 显示 HTTP 方法和接口模板，rpc.method 区分 Execd 的 `/invoke` 操作；点击 Span ID
 查看整条链路。Span 表不生成 Traces 表的 nested JSON 列。
 

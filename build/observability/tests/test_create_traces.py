@@ -58,7 +58,7 @@ class CreateTraceTests(unittest.TestCase):
     def url(address, path, query=''):
         return urllib.parse.urlunsplit(('http', address, path, query, ''))
 
-    def test_explore_shows_total_create_and_hides_header_only_rows(self):
+    def test_explore_shows_total_create_and_rejections(self):
         queries = []
         for name in ('adx-schedule.json', 'adx-environment-logs.json'):
             dashboard = json.loads((ROOT / 'build/observability/grafana/dashboards' / name).read_text())
@@ -73,21 +73,29 @@ class CreateTraceTests(unittest.TestCase):
         now = time.time_ns() - 1_000_000_000
         expected = set()
         resources = []
-        for name, route, wanted, environment in [
-            ('environment.create', None, True, 'trace-timing-regression'),
+        for name, route, wanted, environment, status in [
+            ('environment.create', None, True, 'trace-timing-regression', 200),
             ('POST /api/environment/v1/environments', '/api/environment/v1/environments',
-             False, 'trace-timing-regression'),
-            ('POST /api/environment/create', '/api/environment/create', False, 'trace-timing-regression'),
+             False, 'trace-timing-regression', 200),
+            ('POST /api/environment/create', '/api/environment/create', False, 'trace-timing-regression', 200),
             ('GET /api/environment/v1/environments/{id}', '/api/environment/v1/environments/{id}',
-             True, 'trace-timing-regression'),
-            ('GET /healthz', '/healthz', False, 'trace-timing-regression'),
-            ('GET /unmatched', '/unmatched', False, 'trace-timing-regression'),
-            ('environment.create', None, False, 'different-cluster'),
+             True, 'trace-timing-regression', 200),
+            ('POST /api/environment/v1/environments', '/api/environment/v1/environments',
+             True, 'trace-timing-regression', 401),
+            ('POST /api/environment/create', '/api/environment/create', True, 'trace-timing-regression', 400),
+            ('POST /api/environment/v1/environments', '/api/environment/v1/environments',
+             True, 'trace-timing-regression', 500),
+            ('GET /healthz', '/healthz', False, 'trace-timing-regression', 200),
+            ('GET /unmatched', '/unmatched', False, 'trace-timing-regression', 200),
+            ('environment.create', None, False, 'different-cluster', 200),
         ]:
             trace_id = uuid.uuid4().hex
             if wanted:
                 expected.add(trace_id)
-            attributes = [] if route is None else [{'key': 'http.route', 'value': {'stringValue': route}}]
+            attributes = [] if route is None else [
+                {'key': 'http.route', 'value': {'stringValue': route}},
+                {'key': 'http.response.status_code', 'value': {'stringValue': str(status)}},
+            ]
             resources.append({
                 'resource': {'attributes': [
                     {'key': 'adx_env', 'value': {'stringValue': environment}},
