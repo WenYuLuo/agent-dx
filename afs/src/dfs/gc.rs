@@ -36,6 +36,8 @@ pub struct UpdateGcReference {
 pub enum GcFence {
     Absent,
     Revision(u64),
+    /// The caller's admitted write reference, independent of unrelated GC work.
+    WriteGeneration,
 }
 impl GcFence {
     pub(crate) fn wire(self) -> afs_protocol::meta::DfsGcFence {
@@ -44,6 +46,7 @@ impl GcFence {
             kind: Some(match self {
                 Self::Absent => Kind::Absent(true),
                 Self::Revision(value) => Kind::StateRevision(value),
+                Self::WriteGeneration => Kind::WriteGeneration(true),
             }),
         }
     }
@@ -52,20 +55,22 @@ impl GcFence {
         match value.kind {
             Some(Kind::Absent(true)) => Ok(Self::Absent),
             Some(Kind::StateRevision(value)) if value > 0 => Ok(Self::Revision(value)),
+            Some(Kind::WriteGeneration(true)) => Ok(Self::WriteGeneration),
             _ => Err(afs_error::Error::coded(
                 afs_error::CLIENT_ARGUMENT_INVALID,
                 "invalid GC fence",
             )),
         }
     }
-    pub(crate) fn condition(self) -> crate::meta::store::TxnCondition {
+    pub(crate) fn condition(self) -> Option<crate::meta::store::TxnCondition> {
         use crate::meta::store::{MetaKey, StoreRevision, TxnCondition};
         match self {
-            Self::Absent => TxnCondition::Missing(MetaKey::DfsGc),
-            Self::Revision(value) => TxnCondition::RevisionEquals {
+            Self::Absent => Some(TxnCondition::Missing(MetaKey::DfsGc)),
+            Self::Revision(value) => Some(TxnCondition::RevisionEquals {
                 key: MetaKey::DfsGc,
                 revision: StoreRevision(value),
-            },
+            }),
+            Self::WriteGeneration => None,
         }
     }
 }

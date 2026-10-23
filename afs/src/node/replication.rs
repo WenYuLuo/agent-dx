@@ -666,13 +666,6 @@ impl ChunkStore for DfsChunkStore {
             self.reserve_gc_publications(&staged)?;
         }
         let snapshot = self.placement.snapshot()?;
-        if (self.optimistic_gc_commit || staged.iter().any(|s| s.chunk.is_segment_crc32c()))
-            && !snapshot.replication.is_local_fast_path()
-        {
-            return Err(invalid(
-                "optimistic GC commit requires native local single-copy placement",
-            ));
-        }
         let receipts = if snapshot.replication.is_local_fast_path() {
             self.put_local_batch(staged, &snapshot)?
         } else {
@@ -1128,15 +1121,6 @@ impl ReplicationWorker {
         &self,
         claim: &crate::dfs::ReplicationClaim,
     ) -> std::result::Result<Vec<ReplicaAck>, (Error, bool)> {
-        if claim.chunk.is_segment_crc32c() {
-            return Err((
-                afs_error::Error::coded(
-                    afs_error::IO_NOT_SUPPORTED,
-                    "CRC32C replica repair is unsupported",
-                ),
-                false,
-            ));
-        }
         let length = usize::try_from(claim.chunk.length)
             .map_err(|_| (invalid("repair chunk length overflows this node"), false))?;
         if length == 0 || length > crate::node::chunk::MAX_STAGED_CHUNK_BYTES {
@@ -1172,7 +1156,8 @@ impl ReplicationWorker {
             }
             offset += count;
         }
-        let staged = StagedChunk::new(claim.operation_id.clone(), bytes);
+        let staged = StagedChunk::from_replica(claim.operation_id.clone(), &claim.chunk, bytes)
+            .map_err(|error| (error, true))?;
         if staged.chunk != claim.chunk {
             return Err((invalid("repair source identity or digest differs"), true));
         }
@@ -2387,6 +2372,54 @@ mod tests {
         );
         op.repair_claim.as_mut().unwrap().worker_node_epoch += 1;
         assert!(crate::node::rpc::peer::replica_header(&op, &staged).is_err());
+    }
+
+    #[test]
+    fn crc32c_replica_header_and_repair_preserve_birth_identity() {
+        let (_temp, local, mut authority, plane) = repair_fixture("crc-repair");
+        let item =
+            StagedChunk::new_crc32c(OperationId::new("original-write"), b"crc-repair".to_vec())
+                .unwrap();
+        let claim = &mut Arc::get_mut(&mut authority).unwrap().claim;
+        claim.chunk = item.chunk.clone();
+        local
+            .persist_batch(
+                std::slice::from_ref(&item),
+                &claim.replica_group.targets[0],
+                claim.placement_revision,
+                claim.replica_group.placement_epoch,
+            )
+            .unwrap();
+        let plan = ReplicationPlan {
+            chunk_id: item.chunk.id.clone(),
+            placement_revision: claim.placement_revision,
+            placement_epoch: claim.replica_group.placement_epoch,
+            replica_group_id: claim.replica_group.id.clone(),
+            config: claim.replication.clone(),
+            ordered_targets: claim.replica_group.targets.clone(),
+        };
+        let op = plan.selected_peer_op("a", 1).unwrap().unwrap();
+        let header = crate::node::rpc::peer::replica_header(&op, &item).unwrap();
+        assert_eq!(header.chunk_id, item.chunk.id.0);
+        assert_eq!(
+            header.content_digest_algorithm,
+            afs_protocol::node_data::DfsDigestAlgorithm::Crc32cSegmentsV1 as i32
+        );
+        let worker = repair_worker(local, authority.clone(), plane);
+        assert_eq!(
+            worker.run_once().unwrap().unwrap().state,
+            crate::dfs::ReplicationTaskState::Completed
+        );
+        let reports = authority.reports.lock().unwrap();
+        assert_eq!(reports[0].claim.chunk, item.chunk);
+        assert_eq!(reports[0].durable_acks.len(), 2);
+        assert!(
+            reports[0]
+                .durable_acks
+                .iter()
+                .all(|ack| ack.chunk_id == item.chunk.id
+                    && ack.verified_digest == item.chunk.content_digest)
+        );
     }
 
     #[test]

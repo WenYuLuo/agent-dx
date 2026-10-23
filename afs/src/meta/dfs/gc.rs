@@ -84,6 +84,38 @@ fn plan_collection(
     }) {
         chunks.extend(reference.chunks.iter().map(|chunk| chunk.id.clone()));
     }
+    // Inventory can arrive from any replica before CommitFileVersion. One
+    // admitted write generation protects all of its independently named objects.
+    let generations: BTreeSet<_> = references
+        .iter()
+        .filter(|reference| {
+            reference.publication
+                && reference
+                    .retired_at_unix_ms
+                    .is_none_or(|time| time.saturating_add(grace) > now)
+        })
+        .filter_map(|reference| {
+            reference
+                .reference_id
+                .strip_prefix("write:")
+                .map(str::to_owned)
+                .or_else(|| {
+                    reference
+                        .reference_id
+                        .strip_prefix("publish:")
+                        .map(|operation| ChunkObject::generation_id(&OperationId::new(operation)))
+                })
+        })
+        .collect();
+    for entity in entities {
+        if let MetaEntity::DfsChunk(chunk) = entity
+            && chunk
+                .write_generation()
+                .is_some_and(|generation| generations.contains(generation))
+        {
+            chunks.insert(chunk.id.clone());
+        }
+    }
     let reclaim: BTreeSet<_> = entities
         .iter()
         .filter_map(|entity| match entity {
@@ -110,9 +142,15 @@ fn plan_collection(
             MetaEntity::DfsCopy(copy) => reclaim.contains(&copy.chunk_id),
             MetaEntity::DfsReplicationTask(task) => reclaim.contains(&task.chunk_id),
             MetaEntity::DfsWriteLease(lease) => lease.expires_at_unix_ms <= now,
-            MetaEntity::DfsReference(reference) => reference
-                .retired_at_unix_ms
-                .is_some_and(|time| time.saturating_add(grace) <= now),
+            MetaEntity::DfsReference(reference) => {
+                reference.retired_at_unix_ms.is_some_and(|time| {
+                    time.saturating_add(if reference.reference_id.starts_with("write:") {
+                        grace.max(120_000)
+                    } else {
+                        grace
+                    }) <= now
+                })
+            }
             _ => false,
         };
         if dead {
@@ -177,7 +215,7 @@ impl DfsService {
         self.gc_grace_ms = grace;
         self
     }
-    pub async fn update_gc_reference(&self, update: UpdateGcReference) -> Result<()> {
+    pub async fn update_gc_reference(&self, mut update: UpdateGcReference) -> Result<()> {
         require_id(&update.node_id, "node_id")?;
         require_id(&update.session_id, "session_id")?;
         require_id(&update.reference_id, "reference_id")?;
@@ -185,6 +223,18 @@ impl DfsService {
             return Err(invalid(
                 "native GC references require NodeReplicated storage",
             ));
+        }
+        // On the wire the original timestamped operation fixes admission age.
+        // Persist the hash key that immutable chunk identities can address.
+        let write_operation = update
+            .reference_id
+            .strip_prefix("write:")
+            .map(str::to_owned);
+        if let Some(operation) = &write_operation {
+            update.reference_id = format!(
+                "write:{}",
+                ChunkObject::generation_id(&OperationId::new(operation))
+            );
         }
         let key = ref_key(&update.node_id, &update.session_id, &update.reference_id);
         let mut hasher = DefaultHasher::new();
@@ -246,6 +296,23 @@ impl DfsService {
                         afs_error::META_DFS_REFERENCE_ADMISSION_EXPIRED,
                         "reference admission deadline expired",
                     ));
+                }
+                if let Some(operation) = &write_operation {
+                    let created = operation
+                        .strip_prefix("afs1-")
+                        .and_then(|value| value.split_once('-'))
+                        .and_then(|(time, _)| time.parse::<u64>().ok())
+                        .ok_or_else(|| {
+                            invalid("write generation requires a timestamped operation identity")
+                        })?;
+                    if created > now.saturating_add(60_000)
+                        || update.admission_deadline_unix_ms > created.saturating_add(60_000)
+                    {
+                        return Err(afs_error::Error::coded(
+                            afs_error::META_DFS_REFERENCE_ADMISSION_EXPIRED,
+                            "write generation admission deadline cannot be refreshed",
+                        ));
+                    }
                 }
                 if update.admission_deadline_unix_ms > now.saturating_add(60_000) {
                     return Err(invalid("reference admission exceeds the 60s cleanup fence"));
@@ -625,6 +692,54 @@ mod tests {
             "both versions become unreachable only after close and grace"
         );
     }
+    fn generation_chunk(operation: &str, suffix: char) -> MetaEntity {
+        let generation = blake3::hash(operation.as_bytes()).to_hex()[..32].to_string();
+        let mut staged = crate::node::chunk::StagedChunk::new_crc32c(
+            OperationId::new(operation),
+            b"uncommitted inventory".to_vec(),
+        )
+        .unwrap();
+        staged.chunk.id = ChunkId::new(format!(
+            "crc32c-v2-{generation}-{}",
+            suffix.to_string().repeat(32)
+        ));
+        MetaEntity::DfsChunk(staged.chunk)
+    }
+
+    #[test]
+    fn generation_reference_protects_unregistered_inventory_on_all_replicas() {
+        let mut reference = pin("writer");
+        reference.publication = true;
+        reference.reference_id = "publish:generation-A".into();
+        let entities = vec![
+            generation_chunk("generation-A", 'a'),
+            generation_chunk("generation-A", 'b'),
+        ];
+        let plan = plan_collection(&entities, &[reference], 100, 10);
+        assert!(
+            plan.chunks.is_empty(),
+            "one generation admission must protect new replica inventories without per-chunk registration"
+        );
+    }
+
+    #[test]
+    fn generation_reference_does_not_protect_another_write() {
+        let mut reference = pin("writer");
+        reference.publication = true;
+        reference.reference_id = "publish:generation-A".into();
+        let a = generation_chunk("generation-A", 'a');
+        let b = generation_chunk("generation-B", 'b');
+        let MetaEntity::DfsChunk(expected) = &b else {
+            unreachable!()
+        };
+        let plan = plan_collection(&[a, b.clone()], &[reference], 100, 10);
+        assert_eq!(
+            plan.chunks,
+            vec![expected.id.clone()],
+            "unrelated orphan still must be reclaimable"
+        );
+    }
+
     #[test]
     fn active_publication_retains_uploaded_but_uncommitted_chunks() {
         let entities = vec![chunk("pending")];

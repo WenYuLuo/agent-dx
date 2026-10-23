@@ -338,10 +338,10 @@ pub struct Cli {
     /// Bounded coarse read timing for explicit diagnosis only; disabled by default.
     #[arg(long)]
     pub dfs_read_diagnostics_enabled: Option<bool>,
-    /// Write new native required-local R1 objects with segmented CRC32C; off by default.
+    /// Write native objects with segmented CRC32C; native DFS Nodes default to true.
     #[arg(long)]
     pub dfs_crc32c_writes: Option<bool>,
-    /// Local R1 commit fencing; GC conflicts fail the write generation.
+    /// Omit per-chunk GC registration; CRC commits fence their own write generations.
     #[arg(long)]
     pub dfs_optimistic_gc_commit: Option<bool>,
     #[arg(long)]
@@ -834,6 +834,14 @@ impl Config {
         let log_defaults = crate::meta::store::journal::LogLimits::default();
         let maintenance = crate::meta::store::journal::MaintenancePolicy::default();
         let history = crate::meta::store::HistoryLimits::default();
+        let dfs_crc32c_writes = cli
+            .dfs_crc32c_writes
+            .or(file.dfs_crc32c_writes)
+            .unwrap_or(role == Role::Node && dfs && file.dfs_external_backend.is_none());
+        let dfs_optimistic_gc_commit = cli
+            .dfs_optimistic_gc_commit
+            .or(file.dfs_optimistic_gc_commit)
+            .unwrap_or(dfs_crc32c_writes);
         let cfg = Self {
             grpc_listen: cli.grpc_listen.or(file.grpc_listen).unwrap_or_else(|| {
                 ([127, 0, 0, 1], if role == Role::Meta { 7400 } else { 7500 }).into()
@@ -984,14 +992,8 @@ impl Config {
                 .dfs_read_diagnostics_enabled
                 .or(file.dfs_read_diagnostics_enabled)
                 .unwrap_or(false),
-            dfs_crc32c_writes: cli
-                .dfs_crc32c_writes
-                .or(file.dfs_crc32c_writes)
-                .unwrap_or(false),
-            dfs_optimistic_gc_commit: cli
-                .dfs_optimistic_gc_commit
-                .or(file.dfs_optimistic_gc_commit)
-                .unwrap_or(false),
+            dfs_crc32c_writes,
+            dfs_optimistic_gc_commit,
             timeout_ms: cli.timeout_ms.or(file.timeout_ms).unwrap_or(5000),
             log_level: cli
                 .log_level
@@ -1213,15 +1215,10 @@ impl Config {
 
     pub(crate) fn validate_crc32c_writes(&self) -> Result<()> {
         if self.dfs_crc32c_writes
-            && (!self.dfs
-                || self.dfs_external_backend.is_some()
-                || self.dfs_desired_copies != 1
-                || self.dfs_sync_required_copies != 1
-                || self.dfs_local_copy != "required"
-                || !self.dfs_optimistic_gc_commit)
+            && (!self.dfs || self.dfs_external_backend.is_some() || !self.dfs_optimistic_gc_commit)
         {
             return Err(invalid(
-                "dfs_crc32c_writes requires native required-local R1 and dfs_optimistic_gc_commit",
+                "dfs_crc32c_writes requires native storage and dfs_optimistic_gc_commit",
             ));
         }
         Ok(())
@@ -1494,23 +1491,62 @@ unsigned_payload = true
 mod crc32c_config_tests {
     use super::*;
     #[test]
-    fn crc32c_default_off_and_invalid_scopes_rejected() {
+    fn crc32c_native_defaults_cover_replica_and_local_copy_policies() {
+        for policy in ["required", "preferred", "none"] {
+            let cfg = Config::resolve(
+                Role::Node,
+                Cli::parse_from([
+                    "afs-node",
+                    "--fs",
+                    "dfs",
+                    "--dfs-desired-copies",
+                    "3",
+                    "--dfs-sync-required-copies",
+                    "2",
+                    "--dfs-min-distinct-nodes",
+                    "2",
+                    "--dfs-local-copy",
+                    policy,
+                ]),
+            )
+            .unwrap();
+            assert!(cfg.dfs_crc32c_writes && cfg.dfs_optimistic_gc_commit);
+        }
+        let cfg =
+            Config::resolve(Role::Node, Cli::parse_from(["afs-node", "--fs", "dfs"])).unwrap();
+        assert!(cfg.dfs_crc32c_writes && cfg.dfs_optimistic_gc_commit);
+    }
+
+    #[test]
+    fn crc32c_defaults_exclude_other_backends_and_explicit_disable_is_coherent() {
+        for role in [Role::Node, Role::Meta] {
+            let cfg = Config::resolve(role, Cli::parse_from(["afs", "--fs", "ownerfs"])).unwrap();
+            assert!(!cfg.dfs_crc32c_writes && !cfg.dfs_optimistic_gc_commit);
+        }
+        let cfg = Config::resolve(
+            Role::Node,
+            Cli::parse_from(["afs-node", "--fs", "dfs", "--dfs-crc32c-writes", "false"]),
+        )
+        .unwrap();
+        assert!(!cfg.dfs_crc32c_writes && !cfg.dfs_optimistic_gc_commit);
+        assert!(
+            Config::resolve(
+                Role::Node,
+                Cli::parse_from([
+                    "afs-node",
+                    "--fs",
+                    "dfs",
+                    "--dfs-optimistic-gc-commit",
+                    "false",
+                ])
+            )
+            .is_err()
+        );
         let mut cfg =
             Config::resolve(Role::Node, Cli::parse_from(["afs-node", "--fs", "dfs"])).unwrap();
-        assert!(!cfg.dfs_crc32c_writes);
-        cfg.dfs_crc32c_writes = true;
+        cfg.dfs_optimistic_gc_commit = false;
         assert!(cfg.validate_crc32c_writes().is_err());
         cfg.dfs_optimistic_gc_commit = true;
-        cfg.dfs_desired_copies = 1;
-        cfg.dfs_sync_required_copies = 1;
-        cfg.dfs_local_copy = "required".into();
-        assert!(cfg.validate_crc32c_writes().is_ok());
-        cfg.dfs_desired_copies = 2;
-        assert!(cfg.validate_crc32c_writes().is_err());
-        cfg.dfs_desired_copies = 1;
-        cfg.dfs_local_copy = "optional".into();
-        assert!(cfg.validate_crc32c_writes().is_err());
-        cfg.dfs_local_copy = "required".into();
         cfg.dfs = false;
         assert!(cfg.validate_crc32c_writes().is_err());
     }

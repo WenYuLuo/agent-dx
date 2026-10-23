@@ -1,4 +1,4 @@
-//! Versioned local-R1 CRC32C descriptors. They are not cryptographic body proofs.
+//! Versioned native CRC32C descriptors. They are not cryptographic body proofs.
 use crate::dfs::{ContentDigest, DigestAlgorithm};
 use afs_error::{Error, Result};
 use serde::{Deserialize, Serialize};
@@ -40,7 +40,7 @@ impl CrcTable {
         if bytes.is_empty() || bytes.len() > 4 * 1024 * 1024 {
             return Err(Error::coded(
                 afs_error::NODE_STORAGE_INVALID,
-                "CRC32C chunk size is outside local-R1 bounds",
+                "CRC32C chunk size is outside native 4MiB bounds",
             ));
         }
         Ok(Self {

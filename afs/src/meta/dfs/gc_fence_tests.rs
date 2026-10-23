@@ -11,6 +11,243 @@ struct Fixture {
     staged: StagedChunk,
     commit: CommitFileVersion,
 }
+
+async fn generation_fixture() -> Fixture {
+    let mut f = fixture().await;
+    f.commit.operation_id = OperationId::new(crate::meta::store::timed_request_id("generation"));
+    f.commit.chunk_receipts[0].operation_id = f.commit.operation_id.clone();
+    let staged =
+        StagedChunk::new_crc32c(f.commit.operation_id.clone(), f.staged.bytes().to_vec()).unwrap();
+    let placement = f.service.placement_snapshot("writer".into()).await.unwrap();
+    let group = placement
+        .replica_groups
+        .iter()
+        .find(|g| g.targets[0].node_id == "writer")
+        .unwrap();
+    let ack = f
+        .local
+        .persist(
+            &staged,
+            &group.targets[0],
+            placement.revision,
+            group.placement_epoch,
+        )
+        .unwrap();
+    f.commit.gc_fence = Some(GcFence::WriteGeneration);
+    f.commit.chunk_receipts[0].chunk = staged.chunk.clone();
+    f.commit.chunk_receipts[0].durable_acks = vec![ack];
+    f.commit.layout_root.inline_extents[0].chunk_id = staged.chunk.id.clone();
+    f.staged = staged;
+    f.service
+        .update_gc_reference(generation_admission(&f, false))
+        .await
+        .unwrap();
+    f
+}
+
+fn generation_admission(f: &Fixture, release: bool) -> crate::dfs::UpdateGcReference {
+    crate::dfs::UpdateGcReference {
+        node_id: "writer".into(),
+        session_id: "writer-session".into(),
+        reference_id: format!("write:{}", f.commit.operation_id.0),
+        inode_id: Some(f.commit.inode_id.clone()),
+        version_id: None,
+        publication: true,
+        chunks: vec![],
+        release,
+        admission_deadline_unix_ms: now_unix_ms().saturating_add(30_000),
+    }
+}
+
+#[tokio::test]
+async fn generation_commit_survives_unrelated_gc_and_reply_loss() {
+    let f = generation_fixture().await;
+    let garbage =
+        StagedChunk::new_crc32c(OperationId::new("unrelated"), b"unreferenced".to_vec()).unwrap();
+    let gc = f
+        .service
+        .collect_garbage(
+            "writer".into(),
+            "writer-session".into(),
+            0,
+            vec![f.staged.chunk.clone(), garbage.chunk.clone()],
+        )
+        .await
+        .unwrap();
+    assert!(gc.chunks.contains(&garbage.chunk.id));
+    assert!(!gc.chunks.contains(&f.staged.chunk.id));
+    let committed = f
+        .service
+        .commit_file_version("writer".into(), f.commit.clone())
+        .await
+        .unwrap();
+    let replay = f
+        .service
+        .commit_file_version("writer".into(), f.commit.clone())
+        .await
+        .unwrap();
+    assert_eq!(committed, replay);
+    assert!(
+        f.service
+            .update_gc_reference(generation_admission(&f, false))
+            .await
+            .is_err(),
+        "finished generations cannot be readmitted"
+    );
+}
+
+#[tokio::test]
+async fn generation_retirement_prevents_late_commit_and_readmission() {
+    let f = generation_fixture().await;
+    f.service
+        .update_gc_reference(generation_admission(&f, true))
+        .await
+        .unwrap();
+    assert_eq!(
+        f.service
+            .commit_file_version("writer".into(), f.commit.clone())
+            .await
+            .unwrap_err()
+            .code(),
+        afs_error::META_DFS_GC_CHANGED
+    );
+    assert!(
+        f.service
+            .update_gc_reference(generation_admission(&f, false))
+            .await
+            .is_err()
+    );
+    assert!(
+        f.service
+            .get_inode(f.commit.inode_id)
+            .await
+            .unwrap()
+            .head_version
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn generation_retry_can_publish_retained_receipts_only_while_all_birth_generations_live() {
+    for retire_old in [false, true] {
+        let mut f = generation_fixture().await;
+        let old_operation = f.commit.operation_id.clone();
+        if retire_old {
+            f.service
+                .update_gc_reference(generation_admission(&f, true))
+                .await
+                .unwrap();
+        }
+        f.commit.operation_id = OperationId::new(crate::meta::store::timed_request_id(
+            "retry-with-new-writes",
+        ));
+        f.service
+            .update_gc_reference(generation_admission(&f, false))
+            .await
+            .unwrap();
+        let result = f
+            .service
+            .commit_file_version("writer".into(), f.commit.clone())
+            .await;
+        if retire_old {
+            assert_eq!(result.unwrap_err().code(), afs_error::META_DFS_GC_CHANGED);
+        } else {
+            result.unwrap();
+            for operation in [old_operation, f.commit.operation_id] {
+                let key = MetaKey::DfsReference {
+                    node_id: "writer".into(),
+                    session_id: "writer-session".into(),
+                    reference_id: format!("write:{}", ChunkObject::generation_id(&operation)),
+                };
+                let Some(MetaEntity::DfsReference(reference)) = f
+                    .store
+                    .read_view()
+                    .await
+                    .unwrap()
+                    .lookup(&key)
+                    .unwrap()
+                    .entity
+                else {
+                    panic!("retirement marker missing")
+                };
+                assert!(reference.retired_at_unix_ms.is_some());
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn generation_expired_identity_cannot_refresh_admission_after_tombstone_cleanup() {
+    let f = fixture().await;
+    let mut request = generation_admission(&f, false);
+    request.reference_id = format!(
+        "write:afs1-{}-old-generation",
+        now_unix_ms().saturating_sub(60_001)
+    );
+    assert_eq!(
+        f.service
+            .update_gc_reference(request)
+            .await
+            .unwrap_err()
+            .code(),
+        afs_error::META_DFS_REFERENCE_ADMISSION_EXPIRED
+    );
+}
+
+#[tokio::test]
+async fn generation_atomic_publication_condition_rejects_retirement_race() {
+    let f = generation_fixture().await;
+    let key = MetaKey::DfsReference {
+        node_id: "writer".into(),
+        session_id: "writer-session".into(),
+        reference_id: format!(
+            "write:{}",
+            ChunkObject::generation_id(&f.commit.operation_id)
+        ),
+    };
+    let reference = f
+        .store
+        .read_view()
+        .await
+        .unwrap()
+        .lookup(&key)
+        .unwrap()
+        .entity
+        .unwrap();
+    let mut txn = MetaTxn::new(
+        RequestKey::new("race", "generation-publish"),
+        StoreOperation::DfsCommitFileVersion,
+    );
+    txn.conditions.push(TxnCondition::EntityEquals(reference));
+    txn.conditions
+        .push(TxnCondition::RequestAbsent(txn.request.clone()));
+    txn.mutations
+        .push(TxnMutation::Put(MetaEntity::DfsFileVersion(
+            f.commit.file_version.clone(),
+        )));
+    txn.mutations
+        .push(TxnMutation::RecordRequestOutcome(RequestOutcome {
+            request: txn.request.clone(),
+            operation: StoreOperation::DfsCommitFileVersion,
+            result: OperationResult::Empty,
+        }));
+    f.service
+        .update_gc_reference(generation_admission(&f, true))
+        .await
+        .unwrap();
+    assert!(matches!(
+        f.store.compare_and_commit(txn).await.unwrap(),
+        TxnOutcome::ConditionFailed { .. }
+    ));
+    assert!(
+        f.store
+            .read(MetaRead::DfsFileVersion(f.commit.file_version.id))
+            .await
+            .unwrap()
+            .entity
+            .is_none()
+    );
+}
 async fn fixture() -> Fixture {
     let temp = tempfile::tempdir().unwrap();
     let local = LocalChunkStore::open(temp.path(), "writer").unwrap();
@@ -224,7 +461,8 @@ async fn gc_fence_atomic_condition_rejects_gc_between_check_and_publish() {
             operation: StoreOperation::DfsCommitFileVersion,
             result: OperationResult::Empty,
         }));
-    txn.conditions.push(f.commit.gc_fence.unwrap().condition());
+    txn.conditions
+        .push(f.commit.gc_fence.unwrap().condition().unwrap());
     txn.mutations
         .push(TxnMutation::Put(MetaEntity::DfsFileVersion(
             f.commit.file_version.clone(),

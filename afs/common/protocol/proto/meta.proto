@@ -1150,6 +1150,7 @@ message DfsGcFence {
   oneof kind {
     uint64 state_revision = 1;
     bool absent = 2;
+    bool write_generation = 3;
   }
 }
 message CommitFileVersionRequest {

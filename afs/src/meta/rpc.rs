@@ -919,6 +919,7 @@ impl DfsMetaService for DfsMetaRpc {
             "dfs_gc_retain"
         };
         let capture = request.capture_gc_fence;
+        let generation = request.reference_id.starts_with("write:");
         let service = dfs_service(&self.0)?;
         service
             .update_gc_reference(crate::dfs::UpdateGcReference {
@@ -941,11 +942,15 @@ impl DfsMetaService for DfsMetaRpc {
         // No payload is admitted by the Node until this response is received.
         let gc_fence = if capture {
             Some(
-                service
-                    .current_gc_fence()
-                    .await
-                    .map_err(afs_transport::grpc::error_status::error_to_status)?
-                    .wire(),
+                (if generation {
+                    crate::dfs::GcFence::WriteGeneration
+                } else {
+                    service
+                        .current_gc_fence()
+                        .await
+                        .map_err(afs_transport::grpc::error_status::error_to_status)?
+                })
+                .wire(),
             )
         } else {
             None

@@ -521,7 +521,8 @@ fsync依赖原持久副本与Meta屏障。S3原有窗口、载荷／descriptor�
 | `dfs_dirty_budget_bytes` | `67108864` | 4..64MiB，Node实际live正文capacity，含仍被持有的已上传正文 |
 | `dfs_unpublished_descriptors` | `1024` | 1..1024，且受固定4MiB元数据总额限制，不能靠增大计数绕过字节上限 |
 | `dfs_upload_inflight_chunks` | `8` | 1..8，整个Node的真实任务上限，共享live正文 |
-| `dfs_optimistic_gc_commit` | `false` | 实验性原生 required-local 单副本写：开始固定GC状态版本，省略逐chunk登记，FullSync原子核对；GC状态改变会使整个写入代次报错，不自动刷新凭据或恢复 |
+| `dfs_optimistic_gc_commit` | 随原生CRC新写默认`true` | 首次写入登记一次代次，省略逐chunk登记；FullSync只原子核对相关代次及session，无关GC变化不拒绝提交 |
+| `dfs_crc32c_writes` | 原生DFS Node为`true` | 独立ID＋32KiB分段CRC；支持原复制策略、跨节点读和副本修复。OwnerFs-only、Meta及外部后端缺省不启用 |
 | `dfs_background_commit_ms` | `5000` | 1..60000ms，后台发布调度周期，非严格可见时间 |
 
 优先级 CLI＞TOML＞默认，非法值启动报错；仅无外部后端的 DFS 接入此流水线。
@@ -735,12 +736,18 @@ NodeReplicated DFS 默认启动每 5 秒一次的安全回收；关闭引用有�
 不能当成持久化成功回执。默认关闭该诊断，开启后应限制日志访问并在定位后关闭。
 
 
-## 本地单副本分段CRC32C（默认关闭）
+## 原生DFS分段CRC32C与写入代次保护
 
-`dfs_crc32c_writes = true`只改变本节点新写native对象的格式，必须同时设置`dfs_optimistic_gc_commit = true`，配置为desired/sync-required均1且local-copy为`required`，不得使用外部后端。配置错误在监听服务前拒绝。旧格式仍走原BLAKE3/Bao路径；关闭新写开关不会关闭既有CRC对象的本地读取、恢复或GC。
+原生DFS Node默认启用`dfs_crc32c_writes`及`dfs_optimistic_gc_commit`。后者在CRC路径表示写入代次保护，不再固定全局GC版本。支持既有desired/sync-required、副本分布及local-copy策略；CRC要求原生存储及代次保护，非法组合在监听服务前拒绝。OwnerFs-only、Meta和外部S3后端的缺省值为false，S3仍走原完整hash路径。本次不提供旧版本数据兼容或迁移。
 
-新对象使用随机128位独立ID，32KiB分段CRC32C表与长度、版本一起进入原catalog WAL持久化链。`Crc32cSegmentsV1`算法标记承载CRC描述表的小BLAKE3绑定摘要，**不是正文BLAKE3根**。正文及目录/catalog屏障全部完成后才返回原durable ACK；FullSync收齐收据后沿用最终GC验号事务。CRC检测意外损坏，不提供Bao内容证明或按正文相同自动去重。
+例如在Node的顶层配置中保留缺省值即可；需要显式选择BLAKE3新写时设置`dfs_crc32c_writes = false`，未单独配置的`dfs_optimistic_gc_commit`随之为false。关闭新写CRC不关闭按持久化算法标记的CRC读取。不要把CRC对象的描述摘要当作正文hash。
 
-首版仅支持本地native required-R1；跨节点对象读取、复制/修复、S3写入明确拒绝，不把CRC描述解释成旧hash。重试必须沿用原不可变对象ID及描述，已落盘未入catalog的正文先按CRC核验再登记。读取按持久化算法标记分流，缺表、错表、损坏或截断不返回成功。旧二进制不认识新算法会拒绝，回退部署前须确认数据格式；本次不提供批量迁移。
+新对象ID为`crc32c-v2-<32hex出生代次>-<32hex对象号>`，32KiB分段CRC表与长度、格式一起进入原catalog WAL持久化链。`Crc32cSegmentsV1`承载描述表的小BLAKE3绑定摘要，**不是正文BLAKE3根**；不生成正文Bao/proof，也不按相同正文自动去重。复制接收端重新核验CRC描述后，完成正文、目录及catalog屏障再返回durable ACK。FullSync等待原策略要求的同步收据和Meta持久事务。
 
-`security.capability`在原inode映射检查后本地返回既有不支持错误，其余xattr保留Meta权限与错误语义。Meta的`afs_requests_total`补充`dfs_gc_capture/register/retain/release/collect`、`dfs_commit_file_version`和`dfs_get_xattr`标签，用于核对真实访问次数；不增加逐chunk正文扫描或详细调度采集。
+首次写入通过已有retain RPC登记一次代次，库存中的同代次chunk在任意副本上均被保护，无需逐chunk登记。FullSync原子核对相关代次引用与owner session，在同一事务内发布版本并退休引用。无关GC状态变化不作废写入；确切代次退休、缺失或session失效仍返回错误。准入有固定时间窗口，退休墓碑覆盖迟到窗口，延迟请求不能复活旧代次；已提交但回复丢失按原operation重放。正常GC、读引用、修复claim和删除代次屏障保持启用。
+
+跨节点读取绑定可信Meta对象及CRC表。服务端验证覆盖到的存储段，只发送获准范围；客户端检查范围CRC，对完整段额外核对Meta绑定的CRC表。非对齐边界依赖可信认证服务端的存储段验证，不扩大发给客户端的grant，也不提供针对恶意服务端的密码学内容证明。缺表、错表、坏正文、截断、错身份、缺Completion均拒绝。复制和修复保持原对象ID及描述，沿用原claim、epoch、收据和幂等重试。
+
+可选BLAKE3 Peer驻留/proof及磁盘缓存不适用于CRC对象；CRC直接走分段验证的范围传输。gRPC与RDMA协议均携带CRC描述，RDMA硬件运行单独验收，不能用全feature编译替代。S3及其缓存策略不在本次变更范围。
+
+`security.capability`在原inode映射检查后本地返回既有不支持错误，其余xattr保留Meta权限与错误语义。Meta的`afs_requests_total`提供`dfs_gc_capture/register/retain/release/collect`、`dfs_commit_file_version`和`dfs_get_xattr`标签，用于核对真实访问次数；不增加逐chunk正文扫描或详细调度采集。
