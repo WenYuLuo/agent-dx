@@ -1161,111 +1161,120 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
         &self,
         request: Request<pb::InspectNodeRequest>,
     ) -> std::result::Result<Response<pb::InspectNodeResponse>, Status> {
-        let trace = adx_observability::trace::Trace::rpc("coordinator.inspect_node", &request);
-        trace
-            .run_result(async {
-                let principal = self.0.peers.authenticate(&request)?;
-                let r = request.into_inner();
-                if principal != Principal::Node(r.node_id.clone()) {
-                    return Err(Status::permission_denied("node identity mismatch"));
+        let trace = request
+            .metadata()
+            .contains_key("traceparent")
+            .then(|| adx_observability::trace::Trace::rpc("coordinator.inspect_node", &request));
+        let observation = async {
+            let principal = self.0.peers.authenticate(&request)?;
+            let r = request.into_inner();
+            if principal != Principal::Node(r.node_id.clone()) {
+                return Err(Status::permission_denied("node identity mismatch"));
+            }
+            let mut state = self.0.state.lock().await;
+            state.recover_authoritative_state().await.map_err(status)?;
+            state.healthy().map_err(status)?;
+            let live = state.live.get(&r.node_id).ok_or_else(|| {
+                Status::failed_precondition("register node before reconciliation")
+            })?;
+            if live.session != r.session_id || live.report.accepting_allocations {
+                return Err(Status::failed_precondition(
+                    "node must close allocation admission before inspection",
+                ));
+            }
+            let (cached_snapshots, holds) =
+                state.session.inspection_inventory().await.map_err(status)?;
+            let mut retained = BTreeMap::new();
+            let mut retain = |artifact: &adx_core::CheckpointArtifact| {
+                if artifact.storage == "local" {
+                    return;
                 }
-                let mut state = self.0.state.lock().await;
-                state.recover_authoritative_state().await.map_err(status)?;
-                state.healthy().map_err(status)?;
-                let live = state.live.get(&r.node_id).ok_or_else(|| {
-                    Status::failed_precondition("register node before reconciliation")
-                })?;
-                if live.session != r.session_id || live.report.accepting_allocations {
-                    return Err(Status::failed_precondition(
-                        "node must close allocation admission before inspection",
-                    ));
+                let key = (artifact.storage.clone(), artifact.location.clone());
+                let entry = retained.entry(key).or_insert_with(|| artifact.clone());
+                if artifact.size_bytes > entry.size_bytes {
+                    *entry = artifact.clone();
                 }
-                let (cached_snapshots, holds) =
-                    state.session.inspection_inventory().await.map_err(status)?;
-                let mut retained = BTreeMap::new();
-                let mut retain = |artifact: &adx_core::CheckpointArtifact| {
-                    if artifact.storage == "local" {
-                        return;
+            };
+            for environment in state.environments.values() {
+                if let Some(record) = &environment.result {
+                    for point in record
+                        .checkpoint
+                        .iter()
+                        .chain(record.snapshot_source.iter())
+                    {
+                        retain(&point.artifact);
                     }
-                    let key = (artifact.storage.clone(), artifact.location.clone());
-                    let entry = retained.entry(key).or_insert_with(|| artifact.clone());
-                    if artifact.size_bytes > entry.size_bytes {
-                        *entry = artifact.clone();
-                    }
-                };
-                for environment in state.environments.values() {
-                    if let Some(record) = &environment.result {
-                        for point in record
-                            .checkpoint
-                            .iter()
-                            .chain(record.snapshot_source.iter())
-                        {
-                            retain(&point.artifact);
-                        }
-                        for artifact in &record.execution_artifacts {
-                            retain(artifact);
-                        }
-                    }
-                }
-                for hold in holds {
-                    for artifact in hold.artifacts {
-                        retain(&artifact);
+                    for artifact in &record.execution_artifacts {
+                        retain(artifact);
                     }
                 }
-                let retained_artifacts = retained.into_values().map(Into::into).collect();
-                let records = state
-                    .environments
-                    .values()
-                    .filter(|i| {
-                        i.assignment.node_id == r.node_id && requires_node_reconciliation(i)
-                    })
-                    .cloned()
-                    .map(|i| {
-                        i.result
-                            .unwrap_or_else(|| EnvironmentRecord {
-                                execution_artifacts: vec![],
-                                snapshot_source: None,
-                                failure: None,
-                                restart_attempts: 0,
-                                restart_pending: false,
-                                runtime: adx_core::Runtime {
-                                    id: format!("{}-{}", i.spec.id, i.assignment.generation),
-                                    ip: None,
-                                },
-                                spec: i.spec,
-                                assignment: i.assignment,
-                                state: EnvironmentState::Pending,
-                                revision: 0,
-                                resources_held: true,
-                                checkpoint: None,
-                                last_operation: None,
-                            })
-                            .try_into()
-                    })
-                    .collect::<Result<Vec<_>>>()
-                    .map_err(status)?;
-                let snapshots = cached_snapshots
-                    .into_iter()
-                    .filter(|snapshot| {
-                        snapshot.source_node_id == r.node_id
-                            && snapshot.state != adx_core::snapshots::SnapshotState::Deleted
-                    })
-                    .map(TryInto::try_into)
-                    .collect::<Result<Vec<_>>>()
-                    .map_err(status)?;
-                state
-                    .live
-                    .get_mut(&r.node_id)
-                    .ok_or_else(|| Status::unavailable("node heartbeat state disappeared"))?
-                    .inspected = true;
-                Ok(Response::new(pb::InspectNodeResponse {
-                    records,
-                    snapshots,
-                    retained_artifacts,
-                    coordinator_epoch: state.session.epoch(),
-                }))
-            })
-            .await
+            }
+            for hold in holds {
+                for artifact in hold.artifacts {
+                    retain(&artifact);
+                }
+            }
+            let retained_artifacts = retained.into_values().map(Into::into).collect();
+            let records = state
+                .environments
+                .values()
+                .filter(|i| i.assignment.node_id == r.node_id && requires_node_reconciliation(i))
+                .cloned()
+                .map(|i| {
+                    i.result
+                        .unwrap_or_else(|| EnvironmentRecord {
+                            execution_artifacts: vec![],
+                            snapshot_source: None,
+                            failure: None,
+                            restart_attempts: 0,
+                            restart_pending: false,
+                            runtime: adx_core::Runtime {
+                                id: format!("{}-{}", i.spec.id, i.assignment.generation),
+                                ip: None,
+                            },
+                            spec: i.spec,
+                            assignment: i.assignment,
+                            state: EnvironmentState::Pending,
+                            revision: 0,
+                            resources_held: true,
+                            checkpoint: None,
+                            last_operation: None,
+                        })
+                        .try_into()
+                })
+                .collect::<Result<Vec<_>>>()
+                .map_err(status)?;
+            let snapshots = cached_snapshots
+                .into_iter()
+                .filter(|snapshot| {
+                    snapshot.source_node_id == r.node_id
+                        && snapshot.state != adx_core::snapshots::SnapshotState::Deleted
+                })
+                .map(TryInto::try_into)
+                .collect::<Result<Vec<_>>>()
+                .map_err(status)?;
+            state
+                .live
+                .get_mut(&r.node_id)
+                .ok_or_else(|| Status::unavailable("node heartbeat state disappeared"))?
+                .inspected = true;
+            Ok(Response::new(pb::InspectNodeResponse {
+                records,
+                snapshots,
+                retained_artifacts,
+                coordinator_epoch: state.session.epoch(),
+            }))
+        };
+        if let Some(trace) = trace {
+            trace.run_result(observation).await
+        } else {
+            let result = observation.await;
+            if result.is_err() {
+                let trace = adx_observability::trace::Trace::child("coordinator.inspect_node");
+                trace.scope(adx_observability::trace::error);
+            }
+            result
+        }
     }
 
     async fn register_node(
