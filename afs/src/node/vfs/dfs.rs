@@ -6006,6 +6006,15 @@ impl DistributedFs {
             .native_operation_id
             .clone()
             .or_else(|| {
+                // Length-only preparation can fail after admission. The pin
+                // already owns its exact operation; never mint a replacement.
+                frozen
+                    .dirty_extents
+                    .native_gc_pin
+                    .as_ref()
+                    .and_then(|pin| pin.write_operation_id())
+            })
+            .or_else(|| {
                 publication_window
                     .as_ref()
                     .map(|window| window.operation_id.clone())
@@ -16198,6 +16207,7 @@ mod tests {
         inner: Arc<dyn ChunkStore>,
         put_batches: AtomicUsize,
         capacity_calls: AtomicUsize,
+        fail_empty_prepare: AtomicBool,
     }
 
     #[cfg(feature = "dfs")]
@@ -16207,6 +16217,7 @@ mod tests {
                 inner,
                 put_batches: AtomicUsize::new(0),
                 capacity_calls: AtomicUsize::new(0),
+                fail_empty_prepare: AtomicBool::new(false),
             }
         }
 
@@ -16223,6 +16234,11 @@ mod tests {
     impl ChunkStore for CountingChunkStore {
         fn put_batch(&self, staged: Vec<StagedChunk>) -> Result<Vec<crate::dfs::ChunkReceipt>> {
             self.put_batches.fetch_add(1, Ordering::SeqCst);
+            if staged.is_empty() && self.fail_empty_prepare.swap(false, Ordering::SeqCst) {
+                return Err(unavailable(
+                    "injected PR93 preparation failure after admission",
+                ));
+            }
             self.inner.put_batch(staged)
         }
 
@@ -19724,6 +19740,208 @@ mod tests {
                 .unwrap();
         });
         (temp, meta_endpoint, gate, server, store, local_a, backend)
+    }
+
+    #[cfg(feature = "dfs")]
+    async fn pr93_resize_prepare_retry(new_length: usize) {
+        use crate::meta::store::{MetaEntity, MetaRead};
+        let (_temp, endpoint, gate, server, store, local, _backend) =
+            real_grpc_meta_fixture().await;
+        // This case injects a preparation failure, not a lost commit reply.
+        gate.gate.hits.store(2, Ordering::SeqCst);
+        let (meta, chunks, raw) = grpc_dfs_test_fs(
+            "node-a",
+            "session-a",
+            &endpoint,
+            local,
+            Duration::from_secs(2),
+        )
+        .await;
+        let references = crate::node::gc::GcReferences::new(meta.inner.clone());
+        let fs = Arc::new(
+            raw.with_gc_references(Some(references.clone()))
+                .with_optimistic_gc_commit(true)
+                .with_crc32c_writes(true),
+        );
+        let file = {
+            let fs = fs.clone();
+            run_blocking(move || {
+                let file = fs
+                    .create(
+                        &context(),
+                        fs.root_inode(),
+                        OsStr::new("pr93-resize"),
+                        0o640,
+                        libc::O_RDWR,
+                    )
+                    .unwrap();
+                fs.write(&context(), file.handle, 0, &vec![11; 65549])
+                    .unwrap();
+                fs.fsync(&context(), file.handle, SyncMode::Full).unwrap();
+                file
+            })
+            .await
+        };
+        let handle = file.handle;
+        let inode = file.entry.inode;
+        let inode_id = fs.inode_id(inode).unwrap();
+        let before = meta.commits();
+        assert_eq!(before.len(), 1);
+        assert!(
+            before[0]
+                .chunk_receipts
+                .iter()
+                .all(|receipt| receipt.chunk.is_segment_crc32c())
+        );
+        {
+            let fs = fs.clone();
+            let chunks = chunks.clone();
+            run_blocking(move || {
+                fs.setattr(
+                    &context(),
+                    inode,
+                    Some(handle),
+                    &AttributeChange {
+                        size: Some(new_length as u64),
+                        ..AttributeChange::default()
+                    },
+                )
+                .unwrap();
+                chunks.fail_empty_prepare.store(true, Ordering::SeqCst);
+                let error = fs.fsync(&context(), handle, SyncMode::Full).unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("injected PR93 preparation failure")
+                );
+                assert!(!chunks.fail_empty_prepare.load(Ordering::SeqCst));
+            })
+            .await;
+        }
+        assert_eq!(
+            meta.commits().len(),
+            1,
+            "failed preparation must not publish"
+        );
+        let (_, entities) = store.read_view().await.unwrap().snapshot().unwrap();
+        let active: Vec<_> = entities
+            .into_iter()
+            .filter_map(|entity| match entity {
+                MetaEntity::DfsReference(reference)
+                    if reference.inode_id.as_ref() == Some(&inode_id)
+                        && reference.publication
+                        && reference.retired_at_unix_ms.is_none()
+                        && reference.reference_id.starts_with("write:") =>
+                {
+                    Some(reference)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            active.len(),
+            1,
+            "real Meta must have admitted one pending generation"
+        );
+        let admitted = active[0].clone();
+        assert!(
+            admitted.chunks.is_empty(),
+            "per-chunk registration stays absent"
+        );
+        assert_eq!(
+            store
+                .read(MetaRead::DfsInode(inode_id.clone()))
+                .await
+                .unwrap()
+                .entity
+                .and_then(|entity| match entity {
+                    MetaEntity::DfsInode(inode) => inode.head_version,
+                    _ => None,
+                }),
+            Some(before[0].file_version.id.clone())
+        );
+        {
+            let fs = fs.clone();
+            run_blocking(move || fs.fsync(&context(), handle, SyncMode::Full))
+                .await
+                .unwrap();
+        }
+        let commits = meta.commits();
+        assert_eq!(commits.len(), 2);
+        let committed = &commits[1];
+        assert_eq!(
+            admitted.reference_id,
+            format!(
+                "write:{}",
+                ChunkObject::generation_id(&committed.operation_id)
+            ),
+            "retry must use the identity admitted before the preparation failure"
+        );
+        assert_eq!(
+            committed.gc_fence,
+            Some(crate::dfs::GcFence::WriteGeneration)
+        );
+        let (_, entities) = store.read_view().await.unwrap().snapshot().unwrap();
+        let references_after: Vec<_> = entities
+            .into_iter()
+            .filter_map(|entity| match entity {
+                MetaEntity::DfsReference(reference)
+                    if reference.inode_id.as_ref() == Some(&inode_id)
+                        && reference.reference_id.starts_with("write:") =>
+                {
+                    Some(reference)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            references_after.len(),
+            2,
+            "retry must not obtain a replacement generation"
+        );
+        assert!(
+            references_after
+                .iter()
+                .any(|reference| reference.reference_id == admitted.reference_id
+                    && reference.retired_at_unix_ms.is_some())
+        );
+        let version = store
+            .read(MetaRead::DfsFileVersion(committed.file_version.id.clone()))
+            .await
+            .unwrap();
+        assert!(
+            matches!(version.entity, Some(MetaEntity::DfsFileVersion(version)) if version.length == new_length as u64)
+        );
+        {
+            let fs = fs.clone();
+            run_blocking(move || {
+                let mut got = vec![0; 80000];
+                assert_eq!(
+                    fs.read(&context(), handle, 0, &mut got).unwrap(),
+                    new_length
+                );
+                let mut expected = vec![11; 65549];
+                expected.resize(new_length, 0);
+                assert_eq!(&got[..new_length], expected.as_slice());
+                fs.release(&context(), handle).unwrap();
+                references.flush().unwrap();
+            })
+            .await;
+        }
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+    }
+
+    #[cfg(feature = "dfs")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pr93_fix_truncate_prepare_retry_uses_real_meta_generation() {
+        pr93_resize_prepare_retry(32775).await;
+    }
+
+    #[cfg(feature = "dfs")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pr93_fix_extend_prepare_retry_uses_real_meta_generation() {
+        pr93_resize_prepare_retry(70001).await;
     }
 
     #[cfg(feature = "dfs")]

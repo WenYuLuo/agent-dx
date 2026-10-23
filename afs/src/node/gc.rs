@@ -48,6 +48,12 @@ impl GcPin {
     pub(crate) fn fence(&self) -> Option<crate::dfs::GcFence> {
         self.fence
     }
+    /// Recover the immutable operation admitted by this generation pin.
+    pub(crate) fn write_operation_id(&self) -> Option<crate::dfs::OperationId> {
+        self.id
+            .strip_prefix("write:")
+            .map(crate::dfs::OperationId::new)
+    }
 }
 impl Drop for GcPin {
     fn drop(&mut self) {
