@@ -223,7 +223,7 @@ SSH 首版只提供一个连接一个交互式终端，要求 PTY 和 shell 请�
 
 Template 的 service 声明 HTTP/WS/SSH 协议及端口，例如 `[{"protocol":"http","port":8080},{"protocol":"ws","port":8080},{"protocol":"ssh","port":22}]`。受管 SSH 无端口参数时必须恰好匹配一个 SSH service。用户直接调用 Harness 自定义接口，审计轨迹能力暂缓。
 
-预装镜像、Execd 与匹配的启动 profile 仍可用于验证。删除 Environment 明确返回 NotFound 时，Activator 条件清理对应 generation 的 Binding 及其 parameters；删除成功返回 Deleted 同样清理。超时、断连、权限错误或其他未知结果保留记录供重试。元数据清理不证明迟到的平台创建已被取消。pause/resume 完全由 Platform 负责，不属于 ADX 适配范围。模板可配置 `init_timeout_seconds` 和一次性 `readiness_probe`；Activator 通过 Environment 能力接口透传，Platform 在成功后才发布 Running 和绑定路由。Jiuwen 当前使用 TCP 18092 探针，只保证 AgentServer 前端监听，不保证内部 Runtime 已完成 warming；周期 healthcheck 尚未开放到 Agent 模板。
+预装镜像、Execd 与匹配的启动 profile 仍可用于验证。删除 Environment 明确返回 NotFound 时，Activator 条件清理对应 generation 的 Binding 及其 parameters；删除成功返回 Deleted 同样清理。超时、断连、权限错误或其他未知结果保留记录供重试。元数据清理不证明迟到的平台创建已被取消。pause/resume 完全由 Platform 负责，不属于 ADX 适配范围。模板可配置 `init_timeout_seconds` 和一次性 `readiness_probe`；Activator 通过 Environment 能力接口透传，Platform 在成功后才发布 Running 和绑定路由。Jiuwen 当前使用 TCP 18092 探针，只保证 AgentServer 前端监听，不保证内部 Runtime 已完成 warming；模板也可配置周期 `healthcheck`（同样的 action/timing 字段，加正整数 `failure_threshold`，默认 3），由 Platform 执行并处理失败。
 
 流量激活时会先保存稳定身份，再提交平台创建。创建失败、响应丢失或进程中断可能留下尚未激活成功的 AgentBinding；该记录供原身份重试，并非独立的创建功能。如果删除明确返回不存在，则清理绑定；如果删除结果未知，则保留 Deleting 记录并沿用原身份重试。冷启动还可能遇到 Running 与共享路由发布之间的短暂窗口；HTTP/WS 或 SSH 已返回 AgentBinding 身份后，调用方应使用该身份重试，不能通过换用新身份重试来绕过该绑定的生命周期。
 

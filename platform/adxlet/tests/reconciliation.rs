@@ -38,9 +38,19 @@ struct Backend {
     block_commit: std::sync::atomic::AtomicBool,
     commit_entered: tokio::sync::Notify,
     commit_release: tokio::sync::Notify,
+    journal_only: std::sync::atomic::AtomicBool,
 }
 #[async_trait]
 impl RuntimeDriver for Backend {
+    async fn set_network_policy(
+        &self,
+        _: &str,
+        _: Option<&adx_core::execution::NetworkPolicy>,
+        _: &[u16],
+        _: Option<u16>,
+    ) -> Result<()> {
+        Ok(())
+    }
     async fn checkpoint_supported(&self, _: &str) -> Result<()> {
         Ok(())
     }
@@ -188,7 +198,13 @@ impl StateSink for Backend {
             .lock()
             .unwrap()
             .push(format!("commit:{:?}", r.state));
-        Ok(Durability::Published)
+        Ok(
+            if self.journal_only.load(std::sync::atomic::Ordering::SeqCst) {
+                Durability::Journaled
+            } else {
+                Durability::Published
+            },
+        )
     }
 }
 fn record(id: &str, state: EnvironmentState) -> EnvironmentRecord {
@@ -457,6 +473,145 @@ async fn periodic_stale_terminal_catalog_cannot_delete_newer_published_execution
     assert_eq!(*backend.actual.lock().unwrap(), vec![observed("kept")]);
     assert_no_recovery_effects(&backend);
     assert!(backend.events.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn periodic_stale_network_policy_does_not_fence_delete() {
+    use adx_core::execution::{NetworkAction, NetworkPolicy, TrafficMode, TrafficPolicy};
+    for clear_policy in [false, true] {
+        let backend = Arc::new(Backend::default());
+        *backend.actual.lock().unwrap() = vec![observed("kept")];
+        let node = manager(&backend);
+        let mut authority = authority::Fixture::new().await;
+        let initial = record("kept", EnvironmentState::Running);
+        authority
+            .authority
+            .records
+            .lock()
+            .unwrap()
+            .push(initial.clone().try_into().unwrap());
+        authority.cycle(&node).await.unwrap();
+        let handle = node.environment(initial.spec, initial.assignment).unwrap();
+        let policy = NetworkPolicy {
+            traffic: Some(TrafficPolicy {
+                ingress_default_action: NetworkAction::Deny,
+                egress_default_action: NetworkAction::Deny,
+                rules: vec![],
+                mode: TrafficMode::Stateful,
+            }),
+            dns: None,
+        };
+        let mut current = handle.sync().await.unwrap().record;
+        if clear_policy {
+            current = handle
+                .update_network_policy(Some(policy.clone()), "block".into(), current.revision)
+                .await
+                .unwrap()
+                .record;
+        }
+        // InspectNode has read this catalog before the serialized update commits.
+        *authority.authority.records.lock().unwrap() = vec![current.clone().try_into().unwrap()];
+        let updated = handle
+            .update_network_policy(
+                if clear_policy { None } else { Some(policy) },
+                "update".into(),
+                current.revision,
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.durability, Durability::Published);
+        assert!(
+            authority.cycle(&node).await.is_err(),
+            "the old catalog requires a refresh"
+        );
+        assert_eq!(handle.sync().await.unwrap().record, updated.record);
+        assert_eq!(*backend.actual.lock().unwrap(), vec![observed("kept")]);
+        // A stale catalog must not block cleanup while waiting for the next cycle.
+        assert_eq!(
+            handle.delete().await.unwrap().record.state,
+            EnvironmentState::Deleted
+        );
+        assert!(backend.actual.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn periodic_current_spec_conflict_remains_fenced_until_authority_matches() {
+    let backend = Arc::new(Backend::default());
+    *backend.actual.lock().unwrap() = vec![observed("kept")];
+    let node = manager(&backend);
+    let mut authority = authority::Fixture::new().await;
+    let initial = record("kept", EnvironmentState::Running);
+    authority
+        .authority
+        .records
+        .lock()
+        .unwrap()
+        .push(initial.clone().try_into().unwrap());
+    authority.cycle(&node).await.unwrap();
+    let handle = node.environment(initial.spec, initial.assignment).unwrap();
+    let current = handle.sync().await.unwrap().record;
+    let mut conflict = current.clone();
+    conflict.spec.image = "conflicting-image".into();
+    *authority.authority.records.lock().unwrap() = vec![conflict.try_into().unwrap()];
+    assert!(authority.cycle(&node).await.is_err());
+    assert!(matches!(
+        handle.delete().await,
+        Err(adx_core::Error::Unavailable(_))
+    ));
+    assert_eq!(*backend.actual.lock().unwrap(), vec![observed("kept")]);
+    *authority.authority.records.lock().unwrap() = vec![current.try_into().unwrap()];
+    authority.cycle(&node).await.unwrap();
+    assert_eq!(
+        handle.delete().await.unwrap().record.state,
+        EnvironmentState::Deleted
+    );
+    assert!(backend.actual.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn periodic_network_update_must_publish_before_dismissing_stale_authority() {
+    use std::sync::atomic::Ordering;
+    let backend = Arc::new(Backend::default());
+    *backend.actual.lock().unwrap() = vec![observed("kept")];
+    let node = manager(&backend);
+    let mut authority = authority::Fixture::new().await;
+    let initial = record("kept", EnvironmentState::Running);
+    authority
+        .authority
+        .records
+        .lock()
+        .unwrap()
+        .push(initial.clone().try_into().unwrap());
+    authority.cycle(&node).await.unwrap();
+    let handle = node.environment(initial.spec, initial.assignment).unwrap();
+    let current = handle.sync().await.unwrap().record;
+    *authority.authority.records.lock().unwrap() = vec![current.clone().try_into().unwrap()];
+    backend.journal_only.store(true, Ordering::SeqCst);
+    let updated = handle
+        .update_network_policy(Some(Default::default()), "update".into(), current.revision)
+        .await
+        .unwrap();
+    assert_eq!(updated.durability, Durability::Journaled);
+    assert!(authority.cycle(&node).await.is_err());
+    assert!(matches!(
+        handle.delete().await,
+        Err(adx_core::Error::Unavailable(_))
+    ));
+    assert_eq!(*backend.actual.lock().unwrap(), vec![observed("kept")]);
+    backend.journal_only.store(false, Ordering::SeqCst);
+    assert!(
+        authority.cycle(&node).await.is_err(),
+        "the old catalog still needs a refresh"
+    );
+    let published = handle.sync().await.unwrap();
+    assert_eq!(published.durability, Durability::Published);
+    assert_eq!(published.record, updated.record);
+    assert_eq!(
+        handle.delete().await.unwrap().record.state,
+        EnvironmentState::Deleted
+    );
+    assert!(backend.actual.lock().unwrap().is_empty());
 }
 
 #[tokio::test]

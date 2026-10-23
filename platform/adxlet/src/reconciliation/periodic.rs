@@ -101,6 +101,7 @@ impl Adxlet {
         wait: std::time::Duration,
     ) -> Result<ReconciliationOutcome> {
         let catalog = Catalog::new(&self.node_id, records, snapshots, Some(retained))?;
+
         if self.is_draining() {
             return Err(Error::Unavailable("node is draining".into()));
         }

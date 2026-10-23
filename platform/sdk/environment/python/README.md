@@ -604,10 +604,84 @@ runnable SDK examples.
 
 See [`TODO.md`](TODO.md) for remaining SDK work.
 
+## File listing and concurrent transfers
+
+`files.list()` raises `FileNotFoundError`, `NotADirectoryError`, or `PermissionError`
+when Execd returns the corresponding typed filesystem error. The exception includes
+both the requested path and the original HTTP error. Other failures remain SDK errors.
+Traversal depth is bounded at 64 by Execd.
+
+Direct file uploads open the destination in place and truncate it before writing.
+Existing symlinks are followed, including links to a missing target. Overwriting
+retains the existing inode, ownership and hard-link identity, with normal OS
+write-permission checks and mode semantics. An interrupted upload may leave partial data; concurrent readers may observe empty or partial
+content and concurrent writers require application coordination.
+
+Each file download reads metadata and bytes from one opened descriptor. Full
+responses use chunked framing without a fixed Content-Length, so an in-place
+truncation can return fewer bytes with a valid ending chunk. A transfer interrupted
+before that chunk remains an error, allowing the SDK to retry or resume. Reads are
+bounded by the initial file size during concurrent appends. Range downloads retain their
+fixed-length resume contract and require a stable file; they do not provide a
+snapshot of a concurrently modified file. Downloads accept regular files only.
+
+## Native filename/path search
+
+```python
+matches = environment.files.search(
+    "/workspace", "*.py", exclude_patterns=["test_*", "*/.git/*"],
+    depth=64, max_results=1000, max_entries=100000, timeout_ms=10000,
+)
+for entry in matches:
+    print(entry.path)
+```
+
+This invokes Execd's `file.search` action in the Environment. Traversal and matching
+run in Execd; the SDK receives matching `EntryInfo` values in full-path order and
+does not fetch the directory tree to filter locally. Search matches names/paths,
+not file contents. Case-sensitive globs support `*`, `?`, `[abc]`, `[a-z]`, and
+`[!abc]`; `*` can match separators and leading dots. Braces and backslashes are
+literal, unmatched `[` is literal, and invalid character ranges are rejected.
+Both the basename and full path are tested. Exclusions filter results, so excluding
+a directory's basename alone does not exclude its descendants. Descendant directory
+symlinks are never followed. Missing roots and non-directory roots return `[]`;
+permission/I/O failures remain errors.
+
+| Parameter | Default | Allowed range |
+| --- | --- | --- |
+| `depth` | 64 | 1–64 listing levels, including the root listing |
+| `max_results` | 1000 | 1–10000 matches |
+| `max_entries` | 100000 | 1–1000000 inspected entries |
+| `timeout_ms` | 10000 | 1–30000 ms, checked between filesystem operations |
+
+`path` is a nonempty string of at most 4096 UTF-8 bytes. Patterns are at most 1024
+UTF-8 bytes, with at most 64 exclusion patterns. A conservative 4 MiB response
+budget also bounds result metadata. Exceeding a match/scan/response budget returns
+HTTP 429 with `error_code=RESOURCE_EXHAUSTED`; deadline expiry returns HTTP 408
+with `error_code=DEADLINE_EXCEEDED`. Invalid parameters/patterns return HTTP 400
+with `error_code=INVALID_ARGUMENT`. Errors carry an empty `entries` array and never
+masquerade as successful partial results. SDK callers receive `EnvironmentHTTPError`
+and can inspect `error.payload["error_code"]`. Filesystem errors retain their
+`FILE_NOT_FOUND`, `PERMISSION_DENIED`, `NOT_A_DIRECTORY` or `FILESYSTEM_ERROR` code.
+
+The HTTP contract is `POST /invoke` with
+`{"action":"file.search","args":{"path":"/workspace","pattern":"*.py"}}`.
+Success contains `entries`, `scanned_entries`, and `error:null`. Use an Execd build
+that implements this action together with the matching SDK; unsupported runtimes
+fail explicitly.
+
 ## Recover a background command
 
 Background commands run without an execution deadline by default. Pass
 `timeout` to set one explicitly; foreground commands default to 60 seconds.
+
+Command output is bounded. The API Server supplies defaults of 4 MiB per stdout/stderr
+stream. Operators can configure `ADX_EXECD_COMMAND_STDOUT_LIMIT_BYTES` and
+`ADX_EXECD_COMMAND_STDERR_LIMIT_BYTES` on the API Server; these override request
+Environment variables. `CommandResult.truncated`, `stdout_truncated`, and
+`stderr_truncated` indicate retained prefixes. To retrieve larger output reliably,
+redirect it to a file and download that file. Increasing the stream limits retains
+the independent command-registry memory budget.
 
 The SDK process does not persist command handles. Generate a command ID and
 persist the `(environment_id, command_id)` pair in the caller's own database before
@@ -655,3 +729,20 @@ optional `weight` and `preferredPriority`. `node_id` remains a hard requirement
 when combined with alternatives. See [placement rules](https://gitcode.com/openJiuwen/agent-dx/blob/refactor/docs/testing/http-node-placement.md)
 for the matching, ranking and label contracts. Caller-provided option lists are
 copied before the SDK adds a node constraint.
+
+
+## Tool execution identity
+
+`Environment(image="tools:v1", runtime="conch", user="1001", group="1002")`
+selects the POSIX identity used to launch Execd. Commands, native file operations,
+and files created on Local/MooseFS mounts use that identity. Supply both fields
+as POSIX names or decimal IDs; Conch resolves names on the worker. The shared
+filesystem must already grant that UID/GID access; ADX does not recursively chown
+mounted data. Omitted fields preserve the runtime deployment's identity.
+
+This override currently requires Conch and `python3` in the guest template's PATH
+for its native privilege-drop wrapper. Other runtime backends reject it. It
+cannot be combined with `inherit_entrypoint=True` or a snapshot identity override;
+image entrypoint `process.user` retains its separate meaning. Use matching API
+Server, Coordinator, adxlet, and SDK versions so the typed identity is preserved
+across the complete create path. Unknown account resolution fails creation.

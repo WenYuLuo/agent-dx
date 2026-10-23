@@ -101,3 +101,25 @@ fn each_application_validates_its_own_timeout() {
     config["orbit"]["tenant"] = json!("other");
     assert!(serde_json::from_value::<DigitalMateGatewayConfig>(config).is_err());
 }
+
+#[test]
+fn agentos_workspace_uses_existing_user_directory_across_templates() {
+    let mut value = settings();
+    value["jiuwen"]["workspace_identity"] = json!("user");
+    let config: DigitalMateGatewayConfig = serde_json::from_value(value.clone()).unwrap();
+    let expected = config.parameters("alice").unwrap();
+    assert_eq!(expected["workspace"], "alice");
+    for field in ["template", "version", "agent_type"] {
+        let mut other = value.clone();
+        other["jiuwen"][field] = json!("other");
+        let other: DigitalMateGatewayConfig = serde_json::from_value(other).unwrap();
+        assert_eq!(expected, other.parameters("alice").unwrap());
+        assert_ne!(
+            config.scope("alice").unwrap(),
+            other.scope("alice").unwrap()
+        );
+    }
+    for unsafe_user in ["..", "/root", "a/b", "a\\b", "a${b}"] {
+        assert!(config.parameters(unsafe_user).is_err());
+    }
+}

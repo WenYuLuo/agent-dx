@@ -254,6 +254,7 @@ dependencies = [
  "opentelemetry 0.31.0",
  "opentelemetry_sdk 0.31.0",
  "portable-pty",
+ "regex",
  "rmp",
  "rmp-serde",
  "rmpv",

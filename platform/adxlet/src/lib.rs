@@ -178,11 +178,17 @@ pub trait RuntimeDriver: Send + Sync {
         self.restore(spec, runtime_id, generation, devices, path)
             .await
     }
-    /// Complete inventory of managed runtimes. Failure is never an empty list.
+    /// Read-only inventory of managed runtimes. Failure is never an empty list.
     async fn inventory(&self) -> Result<Vec<RuntimeObservation>> {
         Err(Error::Unavailable(
             "runtime inventory is unsupported".into(),
         ))
+    }
+    /// Reclaim native executions whose platform identity cannot be recovered.
+    /// Called only after validating a complete current node catalog, with new
+    /// admission closed. Known executions are handled by their controller queues.
+    async fn reconcile_unowned_executions(&self) -> Result<()> {
+        Ok(())
     }
     /// Rediscover executions using the validated, complete current node catalog.
     /// The caller closes admission and drains accepted operations before this call.

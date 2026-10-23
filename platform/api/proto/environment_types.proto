@@ -120,6 +120,9 @@ message ExecutionOptions {
   // Execd creates this constructor directory before reporting Ready.
   optional string cwd = 13;
   optional uint32 tunnel_http_port = 14;
+  // Paired runtime identity; unsupported backends reject rather than ignore it.
+  optional string user = 15;
+  optional string group = 16;
 }
 
 enum IdleAction { IDLE_ACTION_DELETE = 0; IDLE_ACTION_PAUSE = 1; }

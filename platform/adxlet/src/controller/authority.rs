@@ -65,9 +65,6 @@ impl Controller {
             self.discard_execution(check.references.as_deref()).await?;
             return Ok(AuthorityResult::Retired);
         }
-        if record.spec != self.record.spec {
-            return Err(Error::Conflict);
-        }
         // A live controller owns its pending journal results. Replay them in
         // this queue before comparing revisions, without a node-wide journal
         // writer waiting behind another environment's in-flight commit.
@@ -80,6 +77,12 @@ impl Controller {
         let comparison = self.compare_authority(&record)?;
         if comparison == AuthorityComparison::StaleCatalog {
             return Ok(AuthorityResult::Stale);
+        }
+        // A published update may have changed mutable spec fields after
+        // InspectNode read this catalog. Compare revisions before rejecting
+        // that old spec, while still fencing unpublished or current conflicts.
+        if record.spec != self.record.spec {
+            return Err(Error::Conflict);
         }
         if terminal(&record) {
             if comparison != AuthorityComparison::Published || self.retired {

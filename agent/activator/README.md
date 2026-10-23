@@ -66,7 +66,7 @@ cargo test --locked -p adx-activator --lib binding_cache_memory_profile -- --ign
 
 ## 模板沙箱网络隔离
 
-独立 Activator 的配置必须提供 `sandbox_network`；嵌入式模式在 `ADX_AGENT_CONFIG` 的 `embedded.sandbox_network` 使用同一结构。所有经模板创建的新 Environment 统一使用该策略，模板和用户启动环境变量不能覆盖它。直接调用 Environment API 的其他场景不受此配置影响；已有 Environment 不更新。
+独立 Activator 的配置必须提供 `sandbox_network`；嵌入式模式在 `ADX_AGENT_CONFIG` 的 `embedded.sandbox_network` 使用同一结构。缺省情况下，所有经模板创建的新 Environment 统一使用该策略。部署者可通过 `runtime_policies` 为指定 runtime 作出显式选择，模板和用户启动环境变量不能覆盖它。直接调用 Environment API 的其他场景不受此配置影响；已有 Environment 不更新。
 
 ```json
 {
@@ -88,6 +88,8 @@ cargo test --locked -p adx-activator --lib binding_cache_memory_profile -- --ign
 模板 service 端口会作为 Environment `ports` 提交，Platform 保留 Execd 及这些业务端口的管理/转发访问。Platform 的保留规则优先级高于上述规则，因此隔离依靠所有 Environment 的出站限制，不能仅依赖目的端入站；不能据此声称共享 Execd token 或所有恶意流量绕过风险已解决。不要给用户开放网络策略更新的管理凭据。
 
 本地测试覆盖规则优先级、公网与内网区分、模型/DNS 端口例外、错误配置、HTTP/同进程映射及 API Server 规格转换。这些测试不覆盖外部网络设施或业务服务的连通性。
+
+`runtime_policies` 是可选的 runtime 名称到策略的映射：`deployment`（也是未配置 runtime 的缺省行为）使用上述严格 ACL；`unrestricted` 不向 Environment 请求写入 ADX 网络过滤策略，原生运行时部署策略仍然生效。例如，部署者显式设置 `"runtime_policies":{"supervisor":"unrestricted"}`，可运行使用原生网络策略的 supervisor Agent，而其他 runtime 保持严格 ACL。此选项会放弃该 runtime 的 ADX 沙箱间/内网过滤；它不保证与上述隔离语义等价。仅在部署者明确接受此网络边界时启用，且不得把管理凭据交给最终用户。ADX 不会根据 backend 拒绝自动改用 unrestricted。配置仍整体校验；修改策略不会更新已有 Environment，未完成创建也须遵循同一身份/规格的幂等约束。
 
 当前 sandboxd ACL 后端仅支持 IPv4。`sandbox_network` 的地址池、内部地址段和服务例外均须使用 IPv4 CIDR；启动校验拒绝 IPv6 配置，公网放行也仅生成 IPv4 规则。
 

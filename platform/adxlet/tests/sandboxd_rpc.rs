@@ -356,6 +356,31 @@ fn kata_start_prepares_guest_pty_without_privileged_guest_capabilities() {
 }
 
 #[test]
+fn local_bind_mount_includes_the_oci_bind_flag() {
+    let mut spec = spec();
+    spec.execution.mounts.push(adx_core::execution::Mount {
+        create_if_missing: false,
+        create_options: None,
+        kind: "bind".into(),
+        target: "/workspace".into(),
+        options: vec!["rw".into(), "nosuid".into()],
+        source: adx_core::execution::StorageSource::Local("/shared/workspace".into()),
+    });
+    let request = start_request(&spec, "i-1", 1, &[], &Config::default()).unwrap();
+    let mount = request
+        .mounts
+        .iter()
+        .find(|mount| mount.target == "/workspace")
+        .unwrap();
+    assert!(mount
+        .options
+        .iter()
+        .any(|option| option == "bind" || option == "rbind"));
+    assert!(mount.options.iter().any(|option| option == "rw"));
+    assert!(mount.options.iter().any(|option| option == "nosuid"));
+}
+
+#[test]
 fn kata_start_preserves_explicit_terminal_mount() {
     let mut spec = spec();
     spec.runtime_class = "kata".into();
