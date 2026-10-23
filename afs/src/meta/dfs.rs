@@ -3648,6 +3648,15 @@ impl DfsService {
         )
     }
 
+    pub(crate) async fn current_gc_fence(&self) -> Result<crate::dfs::GcFence> {
+        let snapshot = self.store.read(MetaRead::DfsGc).await?;
+        Ok(if snapshot.entity.is_some() {
+            crate::dfs::GcFence::Revision(snapshot.revision.0)
+        } else {
+            crate::dfs::GcFence::Absent
+        })
+    }
+
     pub async fn commit_file_version(
         &self,
         caller_id: String,
@@ -3701,6 +3710,19 @@ impl DfsService {
             return Ok(FileCommitAttempt::Committed(inode));
         }
         let gc_snapshot = self.store.read(MetaRead::DfsGc).await?;
+        if let Some(expected) = commit.gc_fence {
+            let actual = if gc_snapshot.entity.is_some() {
+                crate::dfs::GcFence::Revision(gc_snapshot.revision.0)
+            } else {
+                crate::dfs::GcFence::Absent
+            };
+            if expected != actual {
+                return Err(Error::coded(
+                    afs_error::META_DFS_GC_CHANGED,
+                    "GC state changed during this write generation; old receipts cannot be refreshed",
+                ));
+            }
+        }
         let current = self.get_inode(commit.inode_id.clone()).await?;
         if commit.write_lease.inode_id != commit.inode_id
             || commit.write_lease.owner_node_id != caller_id
@@ -3871,7 +3893,10 @@ impl DfsService {
             TxnCondition::Missing(MetaKey::DfsFileVersion(commit.file_version.id.clone())),
             TxnCondition::Missing(MetaKey::DfsLayoutRoot(commit.layout_root.id.clone())),
         ]);
-        txn.conditions.push(if gc_snapshot.entity.is_some() {
+        txn.conditions.push(if let Some(fence) = commit.gc_fence {
+            // Frozen before uploads, including on every commit retry.
+            fence.condition()
+        } else if gc_snapshot.entity.is_some() {
             TxnCondition::RevisionEquals {
                 key: MetaKey::DfsGc,
                 revision: gc_snapshot.revision,
@@ -6242,6 +6267,7 @@ mod read_recovery_tests {
         layout: LayoutRoot,
     ) -> CommitFileVersion {
         CommitFileVersion {
+            gc_fence: None,
             operation_id,
             inode_id: inode.inode_id.clone(),
             write_lease: WriteLease {
@@ -7690,6 +7716,7 @@ mod external_policy_tests {
             }],
         };
         CommitFileVersion {
+            gc_fence: None,
             operation_id,
             inode_id: inode.inode_id.clone(),
             write_lease,
@@ -8538,3 +8565,6 @@ mod external_policy_tests {
         );
     }
 }
+
+#[cfg(all(test, feature = "dfs"))]
+mod gc_fence_tests;

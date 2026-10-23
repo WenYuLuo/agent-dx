@@ -390,6 +390,7 @@ async fn commit_survives_same_identity_lease_renewal_between_validation_and_cas(
         inline_extents: vec![],
     };
     let commit = CommitFileVersion {
+        gc_fence: None,
         operation_id: OperationId::new("commit"),
         inode_id: inode.inode_id.clone(),
         write_lease: lease,
@@ -491,6 +492,7 @@ async fn pending_commit(
         inline_extents: vec![],
     };
     let commit = CommitFileVersion {
+        gc_fence: None,
         operation_id: OperationId::new("commit"),
         inode_id: inode.inode_id.clone(),
         write_lease: lease,

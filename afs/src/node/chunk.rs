@@ -814,8 +814,9 @@ pub struct StagedChunk {
     pub chunk: ChunkObject,
     bytes: SharedChunkBytes,
     outboard: Option<SharedOutboard>,
-    // This private identity is produced only by the complete initial hash. Public
-    // metadata remains compatible with replica callers, but is not itself proof.
+    segment_crc: Option<Arc<super::chunk_crc32c::CrcTable>>,
+    // This private identity binds the immutable allocation to its initial integrity
+    // descriptor. CRC descriptors are local-only and are not peer content proofs.
     #[cfg(feature = "dfs")]
     sealed_chunk: ChunkObject,
     #[cfg(feature = "dfs")]
@@ -881,9 +882,58 @@ impl StagedChunk {
                 chunk,
                 bytes,
                 outboard,
+                segment_crc: None,
                 #[cfg(feature = "dfs")]
                 write_budget: Vec::new(),
             }
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_crc32c(operation_id: OperationId, bytes: Vec<u8>) -> Result<Self> {
+        Self::from_shared_crc32c(
+            operation_id,
+            SharedChunkBytes::from_buffer(ChunkBuffer::unpooled(bytes)),
+        )
+    }
+
+    /// Immutable local-R1 payload, bound to its persisted CRC descriptor.
+    pub(crate) fn from_shared_crc32c(
+        operation_id: OperationId,
+        bytes: SharedChunkBytes,
+    ) -> Result<Self> {
+        Self::from_shared_crc32c_id(
+            operation_id,
+            bytes,
+            ChunkId::new(format!("crc32c-v1-{}", uuid::Uuid::new_v4().simple())),
+        )
+    }
+
+    pub(crate) fn from_shared_crc32c_id(
+        operation_id: OperationId,
+        bytes: SharedChunkBytes,
+        id: ChunkId,
+    ) -> Result<Self> {
+        let table = super::chunk_crc32c::CrcTable::build(&bytes)?;
+        let chunk = ChunkObject {
+            id,
+            length: bytes.len() as u64,
+            content_digest: table.descriptor_digest(),
+            encoding: ChunkEncoding::Raw,
+        };
+        if !chunk.valid_immutable_identity() {
+            return Err(invalid("invalid CRC32C object identity"));
+        }
+        Ok(Self {
+            operation_id,
+            #[cfg(feature = "dfs")]
+            sealed_chunk: chunk.clone(),
+            chunk,
+            bytes,
+            outboard: None,
+            segment_crc: Some(Arc::new(table)),
+            #[cfg(feature = "dfs")]
+            write_budget: Vec::new(),
         })
     }
 
@@ -923,6 +973,11 @@ impl StagedChunk {
             .capacity()
             .saturating_add(self.chunk.id.0.capacity())
             .saturating_add(self.sealed_chunk.id.0.capacity())
+            .saturating_add(self.segment_crc.as_ref().map_or(0, |t| {
+                std::mem::size_of::<super::chunk_crc32c::CrcTable>()
+                    + 16
+                    + t.checksums.capacity() * 4
+            }))
             .saturating_add(
                 self.write_budget
                     .capacity()
@@ -1140,6 +1195,8 @@ pub struct LocalChunkRecord {
     pub encoding: PhysicalEncoding,
     pub state: LocalChunkState,
     pub catalog_revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) segment_crc: Option<super::chunk_crc32c::CrcTable>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -1151,6 +1208,7 @@ pub struct RecoveryReport {
 
 #[derive(Debug)]
 pub struct PinnedChunkReader {
+    segment_crc: Option<super::chunk_crc32c::CrcTable>,
     file: File,
     chunk: ChunkObject,
     outboard_path: PathBuf,
@@ -1169,6 +1227,70 @@ pub(crate) struct VerifiedRangeCopy {
 }
 
 impl PinnedChunkReader {
+    fn crc_ranges(&self, ranges: &[VerifiedRangeCopy], out: &mut [u8]) -> Result<Vec<usize>> {
+        let table = self
+            .segment_crc
+            .as_ref()
+            .ok_or_else(|| invalid("CRC descriptor missing"))?;
+        if !self.chunk.is_segment_crc32c()
+            || !self.chunk.valid_immutable_identity()
+            || !table.valid_shape(self.chunk.length)
+            || table.descriptor_digest() != self.chunk.content_digest
+        {
+            return Err(corrupt(&self.chunk.id, "CRC descriptor identity differs"));
+        }
+        let before = PeerFileIdentity::read(&self.file)?;
+        if before.length != self.chunk.length {
+            return Err(corrupt(&self.chunk.id, "CRC body length differs"));
+        }
+        let mut scratch = vec![0u8; super::chunk_crc32c::SEGMENT];
+        let mut counts = Vec::with_capacity(ranges.len());
+        for r in ranges {
+            let allowed =
+                (self.chunk.length.saturating_sub(r.chunk_offset)).min(r.length as u64) as usize;
+            let output_end = r
+                .output_offset
+                .checked_add(allowed)
+                .ok_or_else(|| invalid("CRC output overflow"))?;
+            if output_end > out.len() {
+                return Err(invalid("CRC output exceeds buffer"));
+            }
+            if allowed == 0 {
+                counts.push(0);
+                continue;
+            }
+            let end = r.chunk_offset + allowed as u64;
+            for index in (r.chunk_offset as usize / super::chunk_crc32c::SEGMENT)
+                ..=((end as usize - 1) / super::chunk_crc32c::SEGMENT)
+            {
+                let begin = index * super::chunk_crc32c::SEGMENT;
+                let n = (self.chunk.length as usize - begin).min(scratch.len());
+                let mut read = 0;
+                while read < n {
+                    let got =
+                        read_positioned(&self.file, (begin + read) as u64, &mut scratch[read..n])?;
+                    if got == 0 {
+                        return Err(corrupt(&self.chunk.id, "short CRC body"));
+                    }
+                    read += got;
+                }
+                if super::chunk_crc32c::checksum(&scratch[..n]) != table.checksums[index] {
+                    return Err(corrupt(&self.chunk.id, "CRC32C segment mismatch"));
+                }
+                let a = (begin as u64).max(r.chunk_offset);
+                let b = ((begin + n) as u64).min(end);
+                let dest = r.output_offset + (a - r.chunk_offset) as usize;
+                out[dest..dest + (b - a) as usize]
+                    .copy_from_slice(&scratch[(a as usize - begin)..(b as usize - begin)]);
+            }
+            counts.push(allowed);
+        }
+        if PeerFileIdentity::read(&self.file)? != before {
+            return Err(corrupt(&self.chunk.id, "CRC body identity changed"));
+        }
+        Ok(counts)
+    }
+
     #[cfg(feature = "dfs")]
     pub(crate) fn chunk(&self) -> &ChunkObject {
         &self.chunk
@@ -1220,6 +1342,9 @@ impl PinnedChunkReader {
         force: bool,
         build_outboard: bool,
     ) -> Result<Vec<usize>> {
+        if self.segment_crc.is_some() {
+            return self.crc_ranges(ranges, out);
+        }
         let before = PeerFileIdentity::read(&self.file)?;
         let builder = (build_outboard
             && ChunkObject::from_content_addressed_id(&self.chunk.id).as_ref()
@@ -1249,6 +1374,24 @@ impl PinnedChunkReader {
     }
 
     fn verify_full_and_build(&self) -> Result<()> {
+        if self.segment_crc.is_some() {
+            let mut out = vec![0; super::chunk_crc32c::SEGMENT];
+            let mut offset = 0;
+            while offset < self.chunk.length {
+                let length = (self.chunk.length - offset).min(out.len() as u64) as usize;
+                self.crc_ranges(
+                    &[VerifiedRangeCopy {
+                        chunk_offset: offset,
+                        length,
+                        output_offset: 0,
+                    }],
+                    &mut out,
+                )?;
+                offset += length as u64;
+            }
+            return Ok(());
+        }
+
         self.full_scan(&[], &mut [], true, true).map(|_| ())
     }
 
@@ -1377,6 +1520,9 @@ impl PinnedChunkReader {
         ranges: &[VerifiedRangeCopy],
         out: &mut [u8],
     ) -> Result<Vec<usize>> {
+        if self.segment_crc.is_some() {
+            return self.crc_ranges(ranges, out);
+        }
         verified_ranges_into(
             &self.file,
             &self.chunk,
@@ -1524,6 +1670,7 @@ mod catalog_tail_recovery_tests {
     fn record(revision: u64, label: &str) -> LocalChunkRecord {
         let staged = StagedChunk::new(OperationId::new(label), label.as_bytes().to_vec());
         LocalChunkRecord {
+            segment_crc: None,
             stored_length: staged.chunk.length,
             stored_checksum: staged.chunk.content_digest.clone(),
             location: PhysicalLocation::PerChunkFile {
@@ -3620,6 +3767,18 @@ impl LocalChunkStore {
             .map_err(|_| invalid("local chunk catalog lock is poisoned"))?;
         let mut damaged = Vec::new();
         for record in catalog.records.values() {
+            if record.chunk.is_segment_crc32c()
+                && (!record.chunk.valid_immutable_identity()
+                    || !record.segment_crc.as_ref().is_some_and(|t| {
+                        t.valid_shape(record.chunk.length)
+                            && t.descriptor_digest() == record.chunk.content_digest
+                    }))
+            {
+                return Err(corrupt(
+                    &record.chunk.id,
+                    "invalid persisted CRC32C descriptor",
+                ));
+            }
             if record.device_id != self.device_id
                 || record.device_epoch != self.device_epoch
                 || record.stored_length != record.chunk.length
@@ -3753,7 +3912,17 @@ impl LocalChunkStore {
                     if existing.state == LocalChunkState::Quarantined {
                         replace_existing = true;
                     } else {
-                        match verify_file(&self.path_for_record(existing)?, &item.chunk) {
+                        match if existing.segment_crc.is_some() {
+                            self.verify_crc_file(
+                                &self.path_for_record(existing)?,
+                                &item.chunk,
+                                existing.segment_crc.as_ref().ok_or_else(|| {
+                                    corrupt(&item.chunk.id, "CRC descriptor missing")
+                                })?,
+                            )
+                        } else {
+                            verify_file(&self.path_for_record(existing)?, &item.chunk)
+                        } {
                             Ok(()) => continue,
                             Err(error) if verified_copy_is_invalid(&error) => {
                                 replace_existing = true
@@ -3793,7 +3962,14 @@ impl LocalChunkStore {
                     match fs::hard_link(&temp_path, &final_path) {
                         Ok(()) => admission.namespace_changed(),
                         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                            verify_file(&final_path, &item.chunk)?;
+                            if let Some(table) = &item.segment_crc {
+                                self.verify_crc_file(&final_path, &item.chunk, table)?;
+                                // Adopting a synced but unpublished orphan still
+                                // requires the namespace barrier before its ACK.
+                                admission.namespace_changed();
+                            } else {
+                                verify_file(&final_path, &item.chunk)?;
+                            }
                         }
                         Err(error) => return Err(Error::from(error)),
                     }
@@ -3804,6 +3980,7 @@ impl LocalChunkStore {
                         location: PhysicalLocation::PerChunkFile {
                             relative_path: format!("chunks/{}", item.chunk.id.0),
                         },
+                        segment_crc: item.segment_crc.as_deref().cloned(),
                         stored_length: item.chunk.length,
                         stored_checksum: item.chunk.content_digest.clone(),
                         device_id: self.device_id.clone(),
@@ -4046,6 +4223,12 @@ impl LocalChunkStore {
             .get(chunk_id)
             .cloned()
             .ok_or_else(|| invalid(format!("local Chunk '{}' is not cataloged", chunk_id.0)))?;
+        if record.chunk.is_segment_crc32c() {
+            return Err(Error::coded(
+                afs_error::IO_NOT_SUPPORTED,
+                "CRC32C objects are local-only; peer reads are unsupported",
+            ));
+        }
         if record.state != LocalChunkState::Durable {
             return Err(corrupt(chunk_id, "local copy is quarantined"));
         }
@@ -4694,6 +4877,30 @@ impl LocalChunkStore {
 
     // Pin the cataloged inode without claiming its integrity. Callers must
     // verify requested coverage groups or the complete object before delivery.
+    // Direct verifier also handles unregistered orphans and missing files. It must
+    // not call open_cataloged, whose read-error quarantine hook would recurse.
+    fn verify_crc_file(
+        &self,
+        path: &Path,
+        chunk: &ChunkObject,
+        table: &super::chunk_crc32c::CrcTable,
+    ) -> Result<()> {
+        let file = File::open(path).map_err(Error::from)?;
+        let identity = PeerFileIdentity::read(&file)?;
+        let reader = PinnedChunkReader {
+            segment_crc: Some(table.clone()),
+            file,
+            chunk: chunk.clone(),
+            outboard_path: PathBuf::new(),
+            outboard_budget: self.outboard_budget.clone(),
+            outboard_repairs: self.outboard_repairs.clone(),
+            outboard: Mutex::new(None),
+            proof_identity: Mutex::new(identity),
+            read_work: None,
+        };
+        reader.verify_full_and_build()
+    }
+
     fn open_cataloged(&self, chunk_id: &ChunkId) -> Result<PinnedChunkReader> {
         let record = self
             .catalog
@@ -4721,8 +4928,26 @@ impl LocalChunkStore {
                 "catalog differs from content-addressed identity",
             ));
         }
+        if record.chunk.is_segment_crc32c() != record.segment_crc.is_some() {
+            return Err(corrupt(
+                chunk_id,
+                "CRC32C format and checksum descriptor differ",
+            ));
+        }
+        if record.chunk.is_segment_crc32c() {
+            let table = record
+                .segment_crc
+                .as_ref()
+                .ok_or_else(|| corrupt(chunk_id, "CRC descriptor missing"))?;
+            if !table.valid_shape(record.chunk.length)
+                || table.descriptor_digest() != record.chunk.content_digest
+            {
+                return Err(corrupt(chunk_id, "CRC descriptor identity differs"));
+            }
+        }
         let proof_identity = Mutex::new(PeerFileIdentity::read(&file)?);
         Ok(PinnedChunkReader {
+            segment_crc: record.segment_crc.clone(),
             file,
             proof_identity,
             outboard_path: self
@@ -4756,7 +4981,18 @@ impl LocalChunkStore {
         if record.state == LocalChunkState::Quarantined {
             return Ok(());
         }
-        match verify_file(&self.path_for_record(&record)?, &record.chunk) {
+        match if record.segment_crc.is_some() {
+            self.verify_crc_file(
+                &self.path_for_record(&record)?,
+                &record.chunk,
+                record
+                    .segment_crc
+                    .as_ref()
+                    .ok_or_else(|| corrupt(&record.chunk.id, "CRC descriptor missing"))?,
+            )
+        } else {
+            verify_file(&self.path_for_record(&record)?, &record.chunk)
+        } {
             Ok(()) => Ok(()),
             Err(error) if verified_copy_is_invalid(&error) => {
                 record.state = LocalChunkState::Quarantined;
@@ -6218,6 +6454,7 @@ mod replica_replay_tests {
             body.sync_all().unwrap();
             let record = LocalChunkRecord {
                 chunk: unconfirmed.chunk.clone(),
+                segment_crc: None,
                 stored_length: unconfirmed.chunk.length,
                 stored_checksum: unconfirmed.chunk.content_digest.clone(),
                 device_id: store.device_id.clone(),
@@ -9929,5 +10166,149 @@ mod write_buffer_tests {
         assert_eq!(patch.stage(OperationId::new("patch")).bytes(), b"zz");
         assert_eq!(staged.bytes(), b"abXYef");
         assert_eq!(pool.snapshot().copied_bytes, 10);
+    }
+}
+
+#[cfg(test)]
+mod crc32c_storage_tests {
+    use super::*;
+    fn staged() -> StagedChunk {
+        StagedChunk::from_shared_crc32c(
+            OperationId::new("crc-check"),
+            SharedChunkBytes::from_buffer(ChunkBuffer::unpooled(vec![73; 2 * 32768 + 13])),
+        )
+        .unwrap()
+    }
+    #[test]
+    fn crc32c_known_vector_and_tail() {
+        assert_eq!(
+            super::super::chunk_crc32c::checksum(b"123456789"),
+            0xe3069283
+        );
+        for n in [0, 1, 7, 8, 31, 32768, 32781] {
+            let bytes = vec![73; n];
+            assert_eq!(
+                super::super::chunk_crc32c::checksum(&bytes),
+                crc32c::crc32c(&bytes)
+            );
+        }
+    }
+    #[test]
+    fn crc32c_unique_id_and_stable_retry() {
+        let first = staged();
+        let second = staged();
+        assert_ne!(first.chunk.id, second.chunk.id);
+        let retry = StagedChunk::from_shared_crc32c_id(
+            first.operation_id.clone(),
+            first.bytes.clone(),
+            first.chunk.id.clone(),
+        )
+        .unwrap();
+        assert_eq!(retry.chunk, first.chunk);
+        assert!(first.chunk.valid_immutable_identity());
+        assert!(first.outboard.is_none());
+    }
+    #[test]
+    fn crc32c_persist_reopen_range_and_gc_without_writer_switch() {
+        let temp = tempfile::tempdir().unwrap();
+        let item = staged();
+        let id = item.chunk.id.clone();
+        let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+        store.put(item.clone()).unwrap();
+        drop(store);
+        let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+        store.recover().unwrap();
+        let mut out = [0; 30];
+        assert_eq!(store.read_at(&id, 32760, &mut out).unwrap(), 30);
+        assert_eq!(out, [73; 30]);
+        assert!(
+            store
+                .gc_inventory()
+                .unwrap()
+                .iter()
+                .any(|c| c == &item.chunk)
+        );
+        assert_eq!(
+            store.peer_catalog_record(&id).unwrap_err().code(),
+            afs_error::IO_NOT_SUPPORTED
+        );
+        store
+            .collect_generation(1, std::slice::from_ref(&id))
+            .unwrap();
+        assert!(!store.chunk_path(&id).exists());
+    }
+    #[test]
+    fn crc32c_retry_adopts_synced_orphan_and_replays_durable_object() {
+        let temp = tempfile::tempdir().unwrap();
+        let item = staged();
+        let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+        let mut file = File::create(store.chunk_path(&item.chunk.id)).unwrap();
+        file.write_all(item.bytes()).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        store.put(item.clone()).unwrap();
+        drop(store);
+        let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+        store.recover().unwrap();
+        store.put(item.clone()).unwrap();
+        let mut out = [0; 20];
+        assert_eq!(store.read_at(&item.chunk.id, 32760, &mut out).unwrap(), 20);
+        assert_eq!(out, [73; 20]);
+        assert_eq!(store.gc_inventory().unwrap().len(), 1);
+    }
+    #[test]
+    fn crc32c_rejects_corrupt_orphan_without_catalog_publication() {
+        let temp = tempfile::tempdir().unwrap();
+        let item = staged();
+        let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+        std::fs::write(
+            store.chunk_path(&item.chunk.id),
+            vec![74; item.bytes().len()],
+        )
+        .unwrap();
+        assert!(store.put(item.clone()).is_err());
+        assert!(store.gc_inventory().unwrap().is_empty());
+    }
+    #[test]
+    fn crc32c_missing_or_damaged_descriptor_and_body_fail_closed() {
+        for damage in 0..4 {
+            let temp = tempfile::tempdir().unwrap();
+            let item = staged();
+            let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+            store.put(item.clone()).unwrap();
+            if damage < 2 {
+                let mut catalog = store.catalog.lock().unwrap();
+                let record = catalog.records.get_mut(&item.chunk.id).unwrap();
+                if damage == 0 {
+                    record.segment_crc = None;
+                } else {
+                    record.segment_crc.as_mut().unwrap().checksums[1] ^= 1;
+                }
+            } else {
+                let body = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(store.chunk_path(&item.chunk.id))
+                    .unwrap();
+                if damage == 2 {
+                    body.set_len(10).unwrap();
+                } else {
+                    body.write_at(&[99], 32770).unwrap();
+                }
+            }
+            assert!(store.read_at(&item.chunk.id, 32760, &mut [0; 30]).is_err());
+        }
+    }
+    #[test]
+    fn crc32c_missing_body_recovery_quarantines_without_recursion() {
+        let temp = tempfile::tempdir().unwrap();
+        let item = staged();
+        let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+        store.put(item.clone()).unwrap();
+        std::fs::remove_file(store.chunk_path(&item.chunk.id)).unwrap();
+        store.recover().unwrap();
+        assert_eq!(
+            store.catalog.lock().unwrap().records[&item.chunk.id].state,
+            LocalChunkState::Quarantined
+        );
     }
 }

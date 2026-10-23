@@ -2189,6 +2189,7 @@ impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
                 self.client()
                     .commit_file_version(afs_tracing::request_with_current_context(
                         afs_protocol::meta::CommitFileVersionRequest {
+                            gc_fence: commit.gc_fence.map(crate::dfs::GcFence::wire),
                             caller_id: self.node_id.clone(),
                             operation_id: commit.operation_id.0,
                             inode_id: commit.inode_id.0,
@@ -2620,6 +2621,9 @@ fn wire_digest_algorithm(algorithm: crate::dfs::DigestAlgorithm) -> i32 {
         crate::dfs::DigestAlgorithm::Blake3 => {
             afs_protocol::meta::DfsDigestAlgorithm::Blake3 as i32
         }
+        crate::dfs::DigestAlgorithm::Crc32cSegmentsV1 => {
+            afs_protocol::meta::DfsDigestAlgorithm::Crc32cSegmentsV1 as i32
+        }
     }
 }
 
@@ -2628,6 +2632,9 @@ fn domain_digest_algorithm(value: i32) -> afs_error::Result<crate::dfs::DigestAl
     match afs_protocol::meta::DfsDigestAlgorithm::try_from(value) {
         Ok(afs_protocol::meta::DfsDigestAlgorithm::Blake3) => {
             Ok(crate::dfs::DigestAlgorithm::Blake3)
+        }
+        Ok(afs_protocol::meta::DfsDigestAlgorithm::Crc32cSegmentsV1) => {
+            Ok(crate::dfs::DigestAlgorithm::Crc32cSegmentsV1)
         }
         _ => Err(Error::coded(
             CLIENT_PROTOCOL_VIOLATION,
@@ -4351,6 +4358,7 @@ mod tests {
     fn test_commit() -> crate::dfs::CommitFileVersion {
         let layout_id = crate::dfs::LayoutRootId::new("layout:test");
         crate::dfs::CommitFileVersion {
+            gc_fence: None,
             operation_id: crate::dfs::OperationId::new("op:commit"),
             inode_id: crate::dfs::InodeId::new("inode:test"),
             write_lease: test_lease(),
@@ -4600,6 +4608,20 @@ impl crate::node::gc::GcControl for GrpcDfsMeta {
     ) -> Result<()> {
         self.update_gc(id, Some(inode), version, publication, Vec::new(), false)
     }
+    fn retain_fenced(
+        &self,
+        id: &str,
+        inode: &crate::dfs::InodeId,
+        version: Option<&crate::dfs::FileVersionId>,
+    ) -> Result<crate::dfs::GcFence> {
+        self.update_gc_with_fence(id, Some(inode), version, true, Vec::new(), false, true)?
+            .ok_or_else(|| {
+                Error::coded(
+                    afs_error::NODE_VFS_UNIMPLEMENTED,
+                    "Meta did not return a GC fence",
+                )
+            })
+    }
     fn release(&self, id: &str) -> Result<()> {
         self.update_gc(id, None, None, false, Vec::new(), true)
     }
@@ -4670,25 +4692,69 @@ impl GrpcDfsMeta {
         chunks: Vec<crate::dfs::ChunkObject>,
         release: bool,
     ) -> Result<()> {
+        self.update_gc_with_fence(id, inode, version, publication, chunks, release, false)
+            .map(|_| ())
+    }
+
+    #[allow(clippy::too_many_arguments)] // Mirrors the existing fixed GC request shape.
+    fn update_gc_with_fence(
+        &self,
+        id: &str,
+        inode: Option<&crate::dfs::InodeId>,
+        version: Option<&crate::dfs::FileVersionId>,
+        publication: bool,
+        chunks: Vec<crate::dfs::ChunkObject>,
+        release: bool,
+        capture_gc_fence: bool,
+    ) -> Result<Option<crate::dfs::GcFence>> {
         let mut client =
             afs_protocol::meta::dfs_meta_client::DfsMetaClient::new(self.channel.clone());
-        self.run(
-            client.update_gc_reference(afs_protocol::meta::UpdateDfsGcReferenceRequest {
-                node_id: self.node_id.clone(),
-                session_id: self.session_id.clone(),
-                reference_id: id.into(),
-                admission_deadline_unix_ms: if inode.is_some() && !release {
-                    crate::meta::store::now_unix_ms().saturating_add(30_000)
-                } else {
-                    0
-                },
-                inode_id: inode.map(|id| id.0.clone()).unwrap_or_default(),
-                version_id: version.map(|id| id.0.clone()).unwrap_or_default(),
-                publication,
-                chunks: chunks.into_iter().map(wire_chunk_object).collect(),
-                release,
-            }),
-        )?;
-        Ok(())
+        let reply = self
+            .run(
+                client.update_gc_reference(afs_protocol::meta::UpdateDfsGcReferenceRequest {
+                    capture_gc_fence,
+                    node_id: self.node_id.clone(),
+                    session_id: self.session_id.clone(),
+                    reference_id: id.into(),
+                    admission_deadline_unix_ms: if inode.is_some() && !release {
+                        crate::meta::store::now_unix_ms().saturating_add(30_000)
+                    } else {
+                        0
+                    },
+                    inode_id: inode.map(|id| id.0.clone()).unwrap_or_default(),
+                    version_id: version.map(|id| id.0.clone()).unwrap_or_default(),
+                    publication,
+                    chunks: chunks.into_iter().map(wire_chunk_object).collect(),
+                    release,
+                }),
+            )?
+            .into_inner();
+        reply
+            .gc_fence
+            .map(crate::dfs::GcFence::from_wire)
+            .transpose()
+    }
+}
+
+#[cfg(all(test, feature = "dfs"))]
+mod crc32c_wire_tests {
+    use super::*;
+    #[test]
+    fn crc32c_meta_descriptor_roundtrip() {
+        let chunk = crate::dfs::ChunkObject {
+            id: crate::dfs::ChunkId::new("crc32c-v1-00112233445566778899aabbccddeeff"),
+            length: 32769,
+            content_digest: crate::dfs::ContentDigest {
+                algorithm: crate::dfs::DigestAlgorithm::Crc32cSegmentsV1,
+                bytes: [7; 32],
+            },
+            encoding: crate::dfs::ChunkEncoding::Raw,
+        };
+        assert_eq!(
+            domain_chunk_object(wire_chunk_object(chunk.clone())).unwrap(),
+            chunk
+        );
+        assert_eq!(wire_digest_algorithm(chunk.content_digest.algorithm), 2);
+        assert!(domain_digest_algorithm(99).is_err());
     }
 }

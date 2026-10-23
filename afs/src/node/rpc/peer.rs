@@ -282,6 +282,12 @@ pub(crate) fn replica_header(
     op: &crate::node::replication::ReplicaPeerOp,
     staged: &crate::node::chunk::StagedChunk,
 ) -> afs_error::Result<afs_protocol::node_data::DfsPutReplicaHeader> {
+    if staged.chunk.is_segment_crc32c() {
+        return Err(afs_error::Error::coded(
+            afs_error::IO_NOT_SUPPORTED,
+            "CRC32C remote replica writes are unsupported",
+        ));
+    }
     op.validate_shape()?;
     Ok(afs_protocol::node_data::DfsPutReplicaHeader {
         operation_id: staged.operation_id.0.clone(),
