@@ -157,14 +157,12 @@ async fn authority_cycles_are_silent_until_cleanup_failure_or_state_change() {
         "healthy Paused cycles must be silent"
     );
 
-    // A runtime left behind for a paused instance is real cleanup work.
-    backend.actual.lock().unwrap().push(RuntimeObservation {
-        environment_id: "trace-authority".into(),
-        tenant_id: "tenant".into(),
-        runtime_id: "trace-authority-1-r2".into(),
-        generation: 1,
-        running: true,
-    });
+    // A newly committed terminal record requires real cleanup, independent of a backend scan.
+    let mut deleted = paused;
+    deleted.state = EnvironmentState::Deleted;
+    deleted.revision += 1;
+    deleted.checkpoint = None;
+    *authority.authority.records.lock().unwrap() = vec![deleted.try_into().unwrap()];
     backend.fail_remove.store(true, Ordering::Relaxed);
     assert!(authority.cycle(&node).await.is_err());
     provider.force_flush().unwrap();
@@ -201,18 +199,7 @@ async fn authority_cycles_are_silent_until_cleanup_failure_or_state_change() {
         after_cleanup,
         "normal cycles must become silent again after recovery"
     );
-    let mut deleted = paused;
-    deleted.state = EnvironmentState::Deleted;
-    deleted.revision += 1;
-    deleted.checkpoint = None;
-    *authority.authority.records.lock().unwrap() = vec![deleted.try_into().unwrap()];
-    authority.cycle(&node).await.unwrap();
-    provider.force_flush().unwrap();
-    let spans = exporter.get_finished_spans().unwrap();
-    assert!(spans[after_cleanup..]
-        .iter()
-        .any(|s| s.name == "environment.authority_reconcile"));
-    let after_deletion = spans.len();
+    let after_deletion = after_cleanup;
     for _ in 0..3 {
         authority.cycle(&node).await.unwrap();
     }

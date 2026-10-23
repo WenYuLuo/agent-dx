@@ -8,6 +8,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 
 mod authority;
+mod events;
 mod lifecycle;
 pub(super) use authority::{AuthorityCheck, AuthorityResult};
 mod monitor;
@@ -63,6 +64,7 @@ enum Command {
     ),
     Expire(u64, oneshot::Sender<Result<Option<OperationResult>>>),
     Tick(oneshot::Sender<Result<Option<OperationResult>>>),
+    Usage(String, crate::metrics::RuntimeUsage, oneshot::Sender<()>),
     RuntimeEvent(
         adx_core::runtime::RuntimeIdentity,
         oneshot::Sender<Result<()>>,
@@ -78,7 +80,10 @@ impl Envelope {
     fn new(command: Command, reply: Reply) -> Self {
         let trace = (!matches!(
             command,
-            Command::Tick(_) | Command::Expire(_, _) | Command::CheckAuthority(_, _)
+            Command::Tick(_)
+                | Command::Usage(_, _, _)
+                | Command::Expire(_, _)
+                | Command::CheckAuthority(_, _)
         ))
         .then(|| adx_observability::trace::Trace::child("environment.queue"));
         Self {
@@ -93,9 +98,46 @@ impl Envelope {
 pub struct EnvironmentHandle {
     tx: mpsc::Sender<Envelope>,
     demand: Arc<std::sync::atomic::AtomicU64>,
+    current: tokio::sync::watch::Receiver<(EnvironmentRecord, Option<Durability>)>,
+    cleanup_pending: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl EnvironmentHandle {
+    pub(crate) async fn record_usage(
+        &self,
+        runtime_id: String,
+        usage: crate::metrics::RuntimeUsage,
+    ) -> Result<()> {
+        let (ack, receive) = oneshot::channel();
+        let (unused, _) = oneshot::channel();
+        self.tx
+            .send(Envelope::new(
+                Command::Usage(runtime_id, usage, ack),
+                unused,
+            ))
+            .await
+            .map_err(|_| Error::Unavailable("environment controller stopped".into()))?;
+        receive
+            .await
+            .map_err(|_| Error::Unavailable("environment controller stopped".into()))
+    }
+    pub(crate) fn view(&self) -> (EnvironmentRecord, Option<Durability>) {
+        self.current.borrow().clone()
+    }
+    pub(crate) fn retained_runtime_id(&self) -> Option<String> {
+        let view = self.current.borrow();
+        let record = &view.0;
+        (record.resources_held
+            || self
+                .cleanup_pending
+                .load(std::sync::atomic::Ordering::Acquire)
+            || matches!(
+                record.state,
+                EnvironmentState::Starting | EnvironmentState::Resuming | EnvironmentState::Pausing
+            ))
+        .then(|| record.runtime.id.clone())
+    }
+
     pub async fn snapshot(
         &self,
         request: super::checkpoint::SnapshotRequest,
@@ -346,7 +388,9 @@ fn spawn_controller(
     authority_fenced: bool,
 ) -> EnvironmentHandle {
     let (tx, mut rx) = mpsc::channel::<Envelope>(32);
+    let (observed, current) = tokio::sync::watch::channel((record.clone(), durability));
     let demand = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let cleanup_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut controller = Controller {
         capture_preparation: None,
         recovery_files: None,
@@ -361,18 +405,103 @@ fn spawn_controller(
         idle: None,
         restart_after: None,
         health_failures: 0,
+        events: events::LifecycleEvents::default(),
+        observed: observed.clone(),
+        cleanup_pending: cleanup_pending.clone(),
         demand: demand.clone(),
         observed_demand: 0,
         auto_pause_guard: None,
         create_deadline: None,
     };
     tokio::spawn(async move {
-        while let Some(Envelope {
-            command,
-            reply,
-            trace,
-        }) = rx.recv().await
-        {
+        let mut observers = events::Observers::default();
+        loop {
+            observed.send_replace((controller.record.clone(), controller.durability));
+            observers.refresh(&mut controller);
+            let deadline = controller.lifecycle_deadline();
+            let record = controller.record.clone();
+            let routes = controller.services.routes.clone();
+            let proxy_stamp = controller.proxy_stamp();
+            let running = record.state == EnvironmentState::Running
+                && !controller.authority_fenced
+                && !controller.retired;
+            enum Wake {
+                Command(Option<Envelope>),
+                Control(Option<adx_core::runtime::RuntimeStatus>),
+                Exit(Result<adx_core::RuntimeFailure>),
+                Proxy(Result<(String, u64, u64)>),
+                Deadline,
+            }
+            let wake = tokio::select! {
+                command = rx.recv() => Wake::Command(command),
+                status = async {
+                    let Some(changes) = observers.control.as_mut() else { return std::future::pending().await; };
+                    if !observers.initial && changes.changed().await.is_err() { return None; }
+                    changes.borrow_and_update().clone()
+                } => Wake::Control(status),
+                result = async {
+                    match observers.exit.as_mut() { Some(wait) => wait.await, None => std::future::pending().await }
+                } => Wake::Exit(result),
+                proxy = async {
+                    if !running || record.spec.lifecycle.idle_timeout_seconds == 0 { return std::future::pending().await; }
+                    routes.activity_changed(&record, proxy_stamp).await
+                } => Wake::Proxy(proxy),
+                _ = async { match deadline { Some(deadline) => tokio::time::sleep_until(deadline).await, None => std::future::pending().await } } => Wake::Deadline,
+            };
+            let envelope = match wake {
+                Wake::Command(command) => {
+                    let Some(command) = command else {
+                        break;
+                    };
+                    command
+                }
+                Wake::Control(status) => {
+                    observers.initial = false;
+                    if observers
+                        .control
+                        .as_ref()
+                        .is_some_and(|changes| changes.has_changed().is_err())
+                    {
+                        observers.control = None;
+                    }
+                    let result = controller.control_observed(status).await;
+                    controller.trace_observation_error("runtime.control", &result);
+                    if let Err(error) = result {
+                        controller.retry_lifecycle();
+                        adx_observability::warn!(%error, "runtime control event incomplete");
+                    }
+                    continue;
+                }
+                Wake::Exit(result) => {
+                    observers.exit = None;
+                    let result = controller.backend_exited(result).await;
+                    controller.trace_observation_error("runtime.exit", &result);
+                    if let Err(error) = result {
+                        controller.retry_lifecycle();
+                        adx_observability::warn!(%error, "runtime exit observation incomplete");
+                    }
+                    continue;
+                }
+                Wake::Proxy(status) => {
+                    controller.proxy_observed(status);
+                    continue;
+                }
+                Wake::Deadline => {
+                    let result = controller.lifecycle_due().await;
+                    controller.trace_observation_error("lifecycle.deadline", &result);
+                    if let Err(error) = result {
+                        controller.retry_lifecycle();
+                        adx_observability::warn!(%error, "lifecycle deadline incomplete");
+                    }
+                    observers.arm_exit(&controller);
+                    continue;
+                }
+            };
+            let Envelope {
+                command,
+                reply,
+                trace,
+            } = envelope;
             let trace = match &command {
                 Command::CheckAuthority(check, _) => controller.authority_trace(check),
                 _ => trace,
@@ -391,14 +520,38 @@ fn spawn_controller(
                 // own lifecycle spans only when that work actually occurs.
                 controller.dispatch(command, reply).await;
             }
+            if controller.record.state == EnvironmentState::Failed {
+                controller.retry_lifecycle();
+            }
         }
     });
-    EnvironmentHandle { tx, demand }
+    EnvironmentHandle {
+        tx,
+        demand,
+        current,
+        cleanup_pending,
+    }
 }
 
 impl Controller {
     async fn dispatch(&mut self, command: Command, reply: Reply) {
         let command = match command {
+            Command::Usage(runtime_id, usage, ack) => {
+                if self.record.runtime.id == runtime_id
+                    && self.record.state == EnvironmentState::Running
+                    && !self.retired
+                    && !self.authority_fenced
+                {
+                    self.services.metrics.record(
+                        &self.record.spec.id,
+                        &runtime_id,
+                        &self.record.spec.runtime_class,
+                        usage,
+                    );
+                }
+                let _ = ack.send(());
+                return;
+            }
             Command::CheckAuthority(check, ack) => {
                 self.authority_fenced = true;
                 let result = self.check_authority(*check).await;
@@ -500,6 +653,7 @@ impl Controller {
         let result = match command {
             Command::Snapshot(_, _)
             | Command::AlignAuthority(_, _)
+            | Command::Usage(_, _, _)
             | Command::CheckAuthority(_, _)
             | Command::Discard(_, _)
             | Command::Expire(_, _)
@@ -600,6 +754,9 @@ struct Controller {
     idle: Option<((String, u64, u64), tokio::time::Instant)>,
     restart_after: Option<tokio::time::Instant>,
     health_failures: u32,
+    events: events::LifecycleEvents,
+    observed: tokio::sync::watch::Sender<(EnvironmentRecord, Option<Durability>)>,
+    cleanup_pending: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Controller {
@@ -749,6 +906,12 @@ impl Controller {
             }
             tokio::time::timeout(self.services.operation_timeout, async {
                 self.services.readiness.wait_ready(&self.record).await?;
+                if let Some(control) = &self.services.runtime_control {
+                    if control.uses_stream() {
+                        // A previous node process may have lost the idle barrier reply.
+                        control.reopen_idle(&self.record).await?;
+                    }
+                }
                 self.services.routes.activate(&self.record).await
             })
             .await
@@ -813,6 +976,8 @@ impl Controller {
         self.idle = None;
         self.health_failures = 0;
         self.durability = None;
+        self.observed
+            .send_replace((self.record.clone(), self.durability));
         Ok(())
     }
 
@@ -835,6 +1000,8 @@ impl Controller {
         .await
         .map_err(|_| Error::Unavailable("state commit timed out".into()))??;
         self.durability = Some(durability);
+        self.observed
+            .send_replace((self.record.clone(), self.durability));
         self.clean_obsolete_checkpoints().await?;
         Ok(OperationResult {
             record: self.record.clone(),
@@ -1092,6 +1259,8 @@ impl Controller {
                         probe_failure: None,
                     });
                 }
+                self.cleanup_pending
+                    .store(true, std::sync::atomic::Ordering::Release);
                 self.transition(Event::Fail)?;
                 self.release_capacity()?;
                 self.record.restart_pending = restart
@@ -1183,6 +1352,8 @@ impl Controller {
     }
 
     async fn cleanup(&mut self) -> Result<()> {
+        self.cleanup_pending
+            .store(true, std::sync::atomic::Ordering::Release);
         timeout(self.services.operation_timeout, async {
             self.services.routes.retire(&self.record).await?;
             if let Some(control) = &self.services.runtime_control {
@@ -1192,6 +1363,8 @@ impl Controller {
         })
         .await
         .map_err(|_| Error::Unavailable("environment cleanup timed out".into()))??;
+        self.cleanup_pending
+            .store(false, std::sync::atomic::Ordering::Release);
         self.capture_preparation = None;
         self.recovery_files = None;
         self.execution_files.clear();

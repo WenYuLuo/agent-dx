@@ -867,7 +867,7 @@ async fn policy_updates_use_jiuwenbox_api_and_reject_unsupported_before_mutation
 }
 
 #[tokio::test]
-async fn public_authority_cycle_reaps_late_supervisor_and_conch_without_local_records() {
+async fn recovery_reaps_late_supervisor_and_conch_without_local_records() {
     for class in ["supervisor", "conch"] {
         let fixture = Fixture::new();
         let driver = fixture.driver().await;
@@ -894,7 +894,11 @@ async fn public_authority_cycle_reaps_late_supervisor_and_conch_without_local_re
             fixture.host.supervisors.lock().unwrap().push(id);
             fixture.host.process_alive.store(true, Ordering::SeqCst);
         }
-        // Both backends appeared after an empty authority cycle, without driver records.
+        // Ordinary data reconciliation does not scan backend execution state.
+        authority.cycle(&node).await.unwrap();
+        assert!(!fixture.backend.refs.lock().unwrap().is_empty(), "{class}");
+        // A new recovery handshake performs complete orphan cleanup.
+        authority.registration.reconciling = true;
         authority.cycle(&node).await.unwrap();
         assert!(fixture.backend.refs.lock().unwrap().is_empty(), "{class}");
         assert!(

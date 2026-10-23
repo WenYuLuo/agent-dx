@@ -89,14 +89,8 @@ Environment 明细页使用采样年龄过滤当前 CPU/内存，Paused 列表�
 
 ## 巡检 Trace
 
-普通 Tick、恢复点有效期扫描和周期性权限核对不创建 `environment.queue` / `environment.execute`。
-Running、Paused 及已释放的终态实例在权限记录与执行状态一致时不生成 Span。
-权限核对发现记录差异、残留执行或需要恢复时创建 `environment.authority_reconcile`，
-失败结果带错误状态；Tick 或有效期扫描失败时记录 `environment.observation_failed`。
-用户生命周期命令继续携带入队和执行上下文。巡检实际发现退出时创建
-`environment.unexpected_exit`；触发自动暂停时创建 `environment.auto_pause`；
-实际状态提交和运行时启动仍创建既有生命周期 Span。采样、巡检周期、健康检测和
-自动暂停判定逻辑保持各自原有配置。
+正常权限核对只比较 Coordinator 缓存与节点记录；一致的 Running、Paused 和已释放终态记录不创建 `environment.queue` / `environment.execute`。记录差异、恢复和清理保留 `environment.authority_reconcile`，失败结果标记错误。
+生命周期由主动控制流、后端退出通知和实例截止时间推进。退出保留 `environment.unexpected_exit`，自动暂停保留 `environment.auto_pause`，状态提交和运行时启动继续记录原有 Span。CPU、内存采集独立运行，不查询生命周期或触发状态变更。
 Execd 的无入站 Trace 上下文健康检查、指标抓取和 HTTP 状态轮询同样不创建 Span；
 带上下文的诊断请求、业务请求和控制写操作保留 HTTP Trace。
 
@@ -130,3 +124,7 @@ Environment、runtime 正则使用 PromQL/LogQL 原始字符串，
 - Coordinator `control-rpc` 套件：真实 Redis/mTLS 下创建、重复提交、暂停/恢复及计数。
 - 在 `build/observability` 执行 `promtool check config prometheus.json`、
   `promtool check config prometheus-environments.json` 和 `promtool test rules rules.test.yaml`。
+
+## 节点采集与生命周期
+
+`metrics_interval_seconds` 默认为 15 秒，控制节点对运行中实例的资源采样；Prometheus 抓取周期独立配置。采样不查询生命周期状态，也不触发暂停、重启或故障处理。生命周期依赖 Execd 主动控制流、代理活动增量、后端退出通知和实例截止时间；正常权威记录对账从 Coordinator 缓存读取，不重复扫描 Redis 或后端执行。

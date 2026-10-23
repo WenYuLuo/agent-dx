@@ -173,7 +173,7 @@ impl Controller {
         Ok(())
     }
 
-    fn published_delete(&self) -> Option<crate::OperationResult> {
+    pub(super) fn published_delete(&self) -> Option<crate::OperationResult> {
         (self.record.state == EnvironmentState::Deleted
             && !self.record.resources_held
             && self.durability == Some(crate::Durability::Published))
@@ -201,7 +201,7 @@ impl Controller {
         self.unexpected_exit().await?;
         Ok(true)
     }
-    async fn unexpected_exit(&mut self) -> Result<()> {
+    pub(super) async fn unexpected_exit(&mut self) -> Result<()> {
         let trace = adx_observability::trace::Trace::child("environment.unexpected_exit");
         trace.attribute("environment.id", self.record.spec.id.clone());
         trace.run_result(self.unexpected_exit_inner()).await
