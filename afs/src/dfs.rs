@@ -402,6 +402,22 @@ pub struct ChunkObject {
 }
 
 impl ChunkObject {
+    /// Birth generation of an independently named CRC object. Repairs retain it.
+    pub fn write_generation(&self) -> Option<&str> {
+        let value = self.id.0.strip_prefix("crc32c-v2-")?;
+        let (generation, object) = value.split_once('-')?;
+        let hex = |s: &str| {
+            s.len() == 32
+                && s.bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        };
+        (hex(generation) && hex(object)).then_some(generation)
+    }
+
+    pub fn generation_id(operation: &OperationId) -> String {
+        blake3::hash(operation.0.as_bytes()).to_hex()[..32].to_string()
+    }
+
     pub fn is_segment_crc32c(&self) -> bool {
         self.content_digest.algorithm == DigestAlgorithm::Crc32cSegmentsV1
     }
@@ -412,11 +428,7 @@ impl ChunkObject {
         self.length > 0
             && self.length <= 4 * 1024 * 1024
             && self.encoding == ChunkEncoding::Raw
-            && self.id.0.strip_prefix("crc32c-v1-").is_some_and(|s| {
-                s.len() == 32
-                    && s.bytes()
-                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-            })
+            && self.write_generation().is_some()
     }
 
     /// Recover the standard root and length committed by a canonical ChunkId.

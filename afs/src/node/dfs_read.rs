@@ -496,6 +496,20 @@ pub trait ChunkTransfer: Send + Sync {
     /// resources before returning, including on cancellation or timeout.
     fn read_ranges(&self, batch: &PeerReadBatch, out: &mut [u8]) -> Result<()>;
 
+    /// One exact authorized CRC range. Server verifies covering storage segments;
+    /// the consumer verifies its descriptor and authenticated range checksum.
+    fn read_crc32c_range(
+        &self,
+        _batch: &PeerReadBatch,
+        _chunk: &ChunkObject,
+        _out: &mut [u8],
+    ) -> Result<()> {
+        Err(Error::coded(
+            afs_error::NODE_TRANSFER_UNSUPPORTED,
+            "CRC range transport is unavailable",
+        ))
+    }
+
     /// Capability check before creating or admitting a private cache file.
     /// Unsupported runtimes/transports preserve the original cache path.
     fn supports_verified_object_sink(&self) -> bool {
@@ -3353,6 +3367,9 @@ impl DfsReadEngine {
         let Some(chunk) = &set.chunk else {
             return Ok(false);
         };
+        if chunk.is_segment_crc32c() {
+            return Ok(false);
+        }
         if chunk.id != op.chunk_id
             || chunk.length == 0
             || set.allowed_ranges.len() > MAX_DFS_READ_OPS
@@ -4092,7 +4109,8 @@ impl DfsReadEngine {
                 let Some(chunk) = &set.chunk else {
                     return true;
                 };
-                chunk.id != op.chunk_id
+                chunk.is_segment_crc32c()
+                    || chunk.id != op.chunk_id
                     || chunk.length == 0
                     || chunk.length > crate::node::chunk::MAX_STAGED_CHUNK_BYTES as u64
                     || !range_covered(&set.allowed_ranges, 0, chunk.length)
@@ -4326,7 +4344,14 @@ impl DfsReadEngine {
                 };
                 if let Some(group) = groups.iter_mut().find(|group| {
                     let first = group[0];
-                    same_peer_context(&candidates[first][next[first]], source)
+                    !sources.iter().any(|set| {
+                        (set.chunk_id == batch.ops[index].chunk_id
+                            || set.chunk_id == batch.ops[first].chunk_id)
+                            && set
+                                .chunk
+                                .as_ref()
+                                .is_some_and(ChunkObject::is_segment_crc32c)
+                    }) && same_peer_context(&candidates[first][next[first]], source)
                 }) {
                     group.push(index);
                 } else {
@@ -4362,10 +4387,16 @@ impl DfsReadEngine {
                     && batch.ops[0].output_offset == 0
                     && length == out.len();
                 let mut scratch = if direct { Vec::new() } else { vec![0; length] };
-                let result = if direct {
-                    self.transfer.read_ranges(&attempt, out)
+                let integrity = sources
+                    .iter()
+                    .find(|set| set.chunk_id == batch.ops[group[0]].chunk_id)
+                    .and_then(|set| set.chunk.as_ref())
+                    .filter(|chunk| chunk.is_segment_crc32c());
+                let target = if direct { &mut *out } else { &mut scratch };
+                let result = if let Some(chunk) = integrity {
+                    self.transfer.read_crc32c_range(&attempt, chunk, target)
                 } else {
-                    self.transfer.read_ranges(&attempt, &mut scratch)
+                    self.transfer.read_ranges(&attempt, target)
                 };
                 match result {
                     Ok(()) => {

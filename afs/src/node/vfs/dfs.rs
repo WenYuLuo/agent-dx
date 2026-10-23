@@ -3148,7 +3148,9 @@ impl DistributedFs {
                 self.gc_references
                     .as_ref()
                     .map(|references| {
-                        if self.optimistic_gc_commit {
+                        if self.optimistic_gc_commit && self.crc32c_writes {
+                            references.pin_generation(&snapshot.inode_id, None, &operation_id)
+                        } else if self.optimistic_gc_commit {
                             references.pin_fenced(&snapshot.inode_id, None, &operation_id)
                         } else {
                             references.pin(&snapshot.inode_id, None, Some(&operation_id))
@@ -6012,7 +6014,13 @@ impl DistributedFs {
         let gc_pin = match (&frozen.dirty_extents.native_gc_pin, &self.gc_references) {
             (Some(pin), _) => Some(pin.clone()),
             (None, Some(references)) => Some(
-                (if self.optimistic_gc_commit {
+                (if self.optimistic_gc_commit && self.crc32c_writes {
+                    references.pin_generation(
+                        &frozen.inode.inode_id,
+                        frozen.inode.head_version.as_ref(),
+                        &operation_id,
+                    )
+                } else if self.optimistic_gc_commit {
                     references.pin_fenced(
                         &frozen.inode.inode_id,
                         frozen.inode.head_version.as_ref(),
@@ -15449,12 +15457,16 @@ mod tests {
         }
         fn retain_fenced(
             &self,
-            _: &str,
+            id: &str,
             _: &InodeId,
             _: Option<&FileVersionId>,
         ) -> Result<crate::dfs::GcFence> {
             self.captures.fetch_add(1, Ordering::SeqCst);
-            Ok(crate::dfs::GcFence::Absent)
+            Ok(if id.starts_with("write:") {
+                crate::dfs::GcFence::WriteGeneration
+            } else {
+                crate::dfs::GcFence::Absent
+            })
         }
         fn release(&self, _: &str) -> Result<()> {
             Ok(())
@@ -15513,7 +15525,7 @@ mod tests {
         assert!(
             commits
                 .iter()
-                .all(|c| c.gc_fence == Some(crate::dfs::GcFence::Absent))
+                .all(|c| c.gc_fence == Some(crate::dfs::GcFence::WriteGeneration))
         );
         assert_eq!(commits.last().unwrap().file_version.length, 70001);
         drop(commits);
@@ -15660,7 +15672,10 @@ mod tests {
         );
         let commits = meta.commits.lock().unwrap();
         assert_eq!(commits.len(), 1);
-        assert_eq!(commits[0].gc_fence, Some(crate::dfs::GcFence::Absent));
+        assert_eq!(
+            commits[0].gc_fence,
+            Some(crate::dfs::GcFence::WriteGeneration)
+        );
         assert_eq!(commits[0].chunk_receipts.len(), 2);
         assert!(
             commits[0]

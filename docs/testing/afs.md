@@ -956,36 +956,40 @@ Full FSx和FUN/REL完整harness的未执行状态保持，已有标准、组件�
 版本及改动影响复用；该有限出口不等于完整P3、完整POSIX或正式性能通过。
 
 
-## 实验性原生单副本 GC 提交检查
+## 原生CRC与写入代次GC定向检查
 
-`dfs_optimistic_gc_commit = true` 是默认关闭的穿刺入口，只允许原生
-required-local 单副本配置。默认 `false` 保留逐 chunk 的 publication 登记。
-打开后，首次写入已有的 retain RPC 返回明确的 GC 状态版本标记，Node 在任何
-原生上传开始前固定它；本代次所有本地正文、目录与 catalog 的真实持久化继续执行，
-但 native 上传不再逐 chunk 追加 GC 引用。最终 `CommitFileVersion` 携带原始标记，
-Meta 将版本条件、现有待删除检查和正式版本发布放在同一事务边界。
+原生DFS Node默认启用CRC和写入代次保护，保留capability本地处理及省略逐chunk登记。`generation_`检查覆盖库存保护、无关GC变化、确切代次退休、检查后退休竞态、回复丢失重放、迟到准入与墓碑清理，以及重试保留旧收据时所有出生代次仍须有效。`META_DFS_GC_CHANGED`在CRC路径指相关代次缺失/退休；不再把无关全局GC变化当作失败。`meta::dfs::gc_fence_tests::`同时保留显式BLAKE3对照路径的原条件事务检查。
 
-`META_DFS_GC_CHANGED` 表示本代次的旧落盘凭据不能直接用于提交。它不证明本文件
-真的被删除：无关 GC 状态变化也可能保守拒绝写入。Node 将其作为本代次的明确失败，
-FullSync 返回错误；不会给旧凭据刷新标记、自动重写或透明恢复。调用方应放弃该失败
-写入并重新准备数据。已成功提交但回复丢失时，仍按原 operation 身份重放已提交结果。
-正常 GC worker 与删除代次重放屏障保持启用，正文 hash/Bao/proof 和持久屏障不变。
+`crc32c_`检查覆盖描述及Meta wire、CRC向量/末段、独立ID、原ID复制/修复、catalog重开、跨段读取、损坏/缺表/错表/截断拒绝、局部覆盖、截短/扩容、部分成功后失败重试，以及远端Header/Completion身份和范围。all-features还核对RDMA CRC Completion与Meta绑定；这不是RDMA硬件运行。`meta_capability_`保持原inode映射及错误顺序，`pr88_fix_`保留组合开关和尾块重试检查。Rust检查只在Linux执行。
 
-针对性检查：`cargo test --release -p afs --lib gc_fence_ -- --test-threads=1`。
-这些检查覆盖真实本地落盘后的正常提交、删除完成清单清空、旧删除任务在途、
-条件事务检查后冲突、发布先成功以及回复丢失后的重放。它们不是断电恢复或多副本验收，
-也不代表性能收益；性能与失败率须由固定同条件 E2E 单独报告。
+```sh
+cargo test --release -p afs --lib generation_ -- --test-threads=1
+cargo test --release -p afs --lib crc32c_ --all-features -- --test-threads=1
+cargo test --release -p afs --lib meta::dfs::gc_fence_tests:: -- --test-threads=1
+cargo test --release -p afs --lib pr88_fix_ -- --test-threads=1
+cargo test --release -p afs --lib meta_capability_ -- --test-threads=1
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+```
 
+### 1GiB多副本、跨节点读与正常修复
 
-### 本地R1 CRC32C与Meta优化定向验收
+`build/e2e/afs/scripts/dfs/crc32c_general.py`复用现有OwnerFs TLS/生命周期和三节点DFS工具。在独立Linux网络及挂载namespace内启动Meta与A/B/C；写入1GiB单文件（1024次串行1MiB pwrite），同fd真实fsync，desired=3、sync-required=2、min-distinct-nodes=2、local-copy=required。正常GC始终启用，修复worker补齐第三份；不手工复制或停GC。随后启动空数据目录的D，完整读回1GiB及非对齐/EOF范围，核对数据面流量、内容SHA和三份物理正文/catalog。正常退出必须真实wait0并无遗留挂载。
 
-CRC默认关闭；新格式启用要求native required-local R1和原最终GC验号。`crc32c_`定向检查覆盖独立格式及Meta wire、CRC向量/末段、独立ID与原ID重试、catalog重开与跨段读取、同步正文孤儿登记/持久对象重放、坏正文/缺表/错表/截断拒绝、丢正文恢复隔离、GC库存/删除与peer拒绝、局部覆盖与截断，以及首次上传失败后的身份保持。`meta_capability_`保持精确名称和原inode错误顺序，既有`gc_fence_`复验最终原子条件。
+```sh
+sudo unshare --mount --net --propagation private sh -c '
+  ip link set lo up
+  exec python3 build/e2e/afs/scripts/dfs/crc32c_general.py \
+    --repo "$PWD" --binary-dir "$PWD/out/bin" \
+    --work-root /path/to/fresh-crc-general-run --require-defaults
+'
+```
 
-性能合同为同一候选二进制、同一boot的AB/BA/AB恰好六次：两组启用Meta最终验号并本地处理capability，只切换`dfs_crc32c_writes=false/true`。每次新建1GiB单文件、1024次串行1MiB pwrite、单副本、正常GC和同fd真实FullSync，完整读回在计时外；失败不替换，结果不稳定如实保留。不得据此宣称跨节点或旧数据迁移完成，不引入FullSync补投或调度实验修复。
+需预先构建Linux产品二进制，work-root必须全新，具备`/dev/fuse`、OpenSSL、iproute2和至少5GiB可用空间；运行前排除端口及已有服务冲突。证据目录包含配置、二进制身份、公共指标、实际字节、修复完成日志、物理副本内容及结果。背景提交周期在此固定60000ms以避免定时发布切分单次验收。该驱动是限定功能/持久化E2E，不是吞吐前后对照，也不证明多VM、物理故障域、断电或HA。性能收益须另有相同完整业务完成点的比较，不能引用历史单副本倍率当作本轮结果。
 
 
 ### PR88审阅修复：组合开关和尾块重试
 
-`pr88_fix_`定向检查同时开启Meta最终验号和CRC新写：先写入并FullSync，再单独截短、扩容并FullSync，检查长度、已有内容、扩容补零和每代固定GC凭据。纯长度变更在准备提交时取得凭据，并在准备失败后的重试中保留它。
+`pr88_fix_`定向检查同时开启Meta最终验号和CRC新写：先写入并FullSync，再单独截短、扩容并FullSync，检查长度、已有内容、扩容补零和每代固定写入保护凭据。纯长度变更在准备提交时取得凭据，并在准备失败后的重试中保留它。
 
 尾块检查将两个小块真实持久化，模拟第二份收据丢失，再次FullSync；要求第一块不重复提交、第二块沿用原ID、最终只有两个本地对象且完整内容正确，重试不重新获取GC凭据。尾块的不可变上传状态在等待I/O前保存在冻结范围中；仍按原顺序等待，不增加后台可见范围或并行补投。这些是定向正确性检查，本轮未重跑1GiB性能实验。

@@ -14,6 +14,12 @@
 //! 当前 client/session，后续复用必须失败，避免重复写或顺序错乱。
 
 #[cfg(feature = "dfs")]
+mod crc32c;
+
+#[cfg(all(feature = "dfs", feature = "rdma"))]
+use crate::node::dfs_read::ChunkTransfer;
+
+#[cfg(feature = "dfs")]
 use crate::{
     dfs::ChunkObject,
     node::{
@@ -282,19 +288,13 @@ pub(crate) fn replica_header(
     op: &crate::node::replication::ReplicaPeerOp,
     staged: &crate::node::chunk::StagedChunk,
 ) -> afs_error::Result<afs_protocol::node_data::DfsPutReplicaHeader> {
-    if staged.chunk.is_segment_crc32c() {
-        return Err(afs_error::Error::coded(
-            afs_error::IO_NOT_SUPPORTED,
-            "CRC32C remote replica writes are unsupported",
-        ));
-    }
     op.validate_shape()?;
     Ok(afs_protocol::node_data::DfsPutReplicaHeader {
         operation_id: staged.operation_id.0.clone(),
         chunk_id: staged.chunk.id.0.clone(),
         chunk_length: staged.chunk.length,
         content_digest: staged.chunk.content_digest.bytes.to_vec(),
-        content_digest_algorithm: afs_protocol::node_data::DfsDigestAlgorithm::Blake3 as i32,
+        content_digest_algorithm: wire_data_digest(staged.chunk.content_digest.algorithm),
         placement_revision: op.placement_revision,
         placement_epoch: op.placement_epoch,
         replica_group_id: op.replica_group_id.0.clone(),
@@ -324,14 +324,32 @@ pub(crate) fn replica_header(
 }
 
 #[cfg(feature = "dfs")]
+pub(super) fn wire_data_digest(algorithm: crate::dfs::DigestAlgorithm) -> i32 {
+    use afs_protocol::node_data::DfsDigestAlgorithm;
+    match algorithm {
+        crate::dfs::DigestAlgorithm::Blake3 => DfsDigestAlgorithm::Blake3 as i32,
+        crate::dfs::DigestAlgorithm::Crc32cSegmentsV1 => {
+            DfsDigestAlgorithm::Crc32cSegmentsV1 as i32
+        }
+    }
+}
+#[cfg(feature = "dfs")]
+pub(super) fn domain_data_digest(algorithm: i32) -> afs_error::Result<crate::dfs::DigestAlgorithm> {
+    use afs_protocol::node_data::DfsDigestAlgorithm;
+    match DfsDigestAlgorithm::try_from(algorithm) {
+        Ok(DfsDigestAlgorithm::Blake3) => Ok(crate::dfs::DigestAlgorithm::Blake3),
+        Ok(DfsDigestAlgorithm::Crc32cSegmentsV1) => {
+            Ok(crate::dfs::DigestAlgorithm::Crc32cSegmentsV1)
+        }
+        _ => Err(dfs_protocol_error("unsupported object digest algorithm")),
+    }
+}
+
+#[cfg(feature = "dfs")]
 fn domain_replica_ack(
     ack: afs_protocol::node_data::DfsReplicaAck,
 ) -> afs_error::Result<crate::dfs::ReplicaAck> {
-    if ack.verified_digest_algorithm != afs_protocol::node_data::DfsDigestAlgorithm::Blake3 as i32 {
-        return Err(dfs_protocol_error(
-            "replica acknowledgement digest algorithm is unsupported",
-        ));
-    }
+    let algorithm = domain_data_digest(ack.verified_digest_algorithm)?;
     let bytes: [u8; 32] = ack
         .verified_digest
         .try_into()
@@ -347,10 +365,7 @@ fn domain_replica_ack(
         device_epoch: ack.device_epoch,
         catalog_revision: ack.catalog_revision,
         persisted_bytes: ack.persisted_bytes,
-        verified_digest: crate::dfs::ContentDigest {
-            algorithm: crate::dfs::DigestAlgorithm::Blake3,
-            bytes,
-        },
+        verified_digest: crate::dfs::ContentDigest { algorithm, bytes },
     })
 }
 
@@ -2506,6 +2521,15 @@ impl GrpcChunkTransfer {
 
 #[cfg(feature = "dfs")]
 impl crate::node::dfs_read::ChunkTransfer for GrpcChunkTransfer {
+    fn read_crc32c_range(
+        &self,
+        batch: &crate::node::dfs_read::PeerReadBatch,
+        chunk: &ChunkObject,
+        out: &mut [u8],
+    ) -> afs_error::Result<()> {
+        self.read_crc32c_impl(batch, chunk, out)
+    }
+
     fn supports_verified_object_sink(&self) -> bool {
         self.stream_sink_supported()
     }
@@ -2619,6 +2643,7 @@ fn peer_disk_test_frames(
     };
     let mut frames = vec![DfsReadRangesFrame {
         body: Some(dfs_read_ranges_frame::Body::Header(DfsReadRangesHeader {
+            crc32c_table: Default::default(),
             read_id: request.read_id.clone(),
             attempt_id: request.attempt_id.clone(),
             operation_index: 0,
@@ -2638,6 +2663,7 @@ fn peer_disk_test_frames(
     frames.push(DfsReadRangesFrame {
         body: Some(dfs_read_ranges_frame::Body::Completion(
             DfsReadRangesCompletion {
+                crc32c_table: Default::default(),
                 read_id: request.read_id.clone(),
                 attempt_id: request.attempt_id.clone(),
                 operation_index: 0,
@@ -3311,15 +3337,40 @@ impl crate::node::dfs_read::ChunkTransfer for RdmaChunkTransfer {
     fn verification_metrics(&self) -> Option<&ReadWorkMetrics> {
         self.pool.peers.read_work_metrics.as_ref()
     }
-
     fn read_ranges(
         &self,
         batch: &crate::node::dfs_read::PeerReadBatch,
         out: &mut [u8],
     ) -> afs_error::Result<()> {
+        self.read_ranges_integrity(batch, out, None)
+    }
+    fn read_crc32c_range(
+        &self,
+        batch: &crate::node::dfs_read::PeerReadBatch,
+        chunk: &ChunkObject,
+        out: &mut [u8],
+    ) -> afs_error::Result<()> {
+        self.read_ranges_integrity(batch, out, Some(chunk))
+    }
+}
+#[cfg(feature = "dfs")]
+impl RdmaChunkTransfer {
+    fn read_ranges_integrity(
+        &self,
+        batch: &crate::node::dfs_read::PeerReadBatch,
+        out: &mut [u8],
+        expected: Option<&ChunkObject>,
+    ) -> afs_error::Result<()> {
         #[cfg(not(feature = "rdma"))]
         {
-            let _ = (batch, out, &self.pool, &self.runtime, &self.next_read);
+            let _ = (
+                batch,
+                out,
+                expected,
+                &self.pool,
+                &self.runtime,
+                &self.next_read,
+            );
             Err(afs_error::Error::coded(
                 afs_error::NODE_TRANSFER_UNSUPPORTED,
                 "DFS RDMA is not compiled",
@@ -3328,6 +3379,7 @@ impl crate::node::dfs_read::ChunkTransfer for RdmaChunkTransfer {
         #[cfg(feature = "rdma")]
         {
             batch.validate(out.len())?;
+            let integrity = expected.cloned();
             let first = &batch.operations[0].source;
             let crate::dfs::CopyLocation::Node {
                 node_id,
@@ -3374,6 +3426,7 @@ impl crate::node::dfs_read::ChunkTransfer for RdmaChunkTransfer {
                             }
                         };
                         let cancel_guard = CancelPoisonGuard::new(lease.session.poisoned.clone());
+                        let integrity = integrity.clone();
                         let task = tokio::spawn(async move {
                             validate_open(false, &lease.session.poisoned).map_err(|error| error.0)?;
                             let mut client = lease.session.client.clone();
@@ -3397,6 +3450,7 @@ impl crate::node::dfs_read::ChunkTransfer for RdmaChunkTransfer {
                             .map_err(dfs_rdma_join_error)?
                             .map_err(dfs_rdma_error)?;
                             validate_dfs_rdma_read_reply(&request, &reply, &bytes)?;
+                            if let Some(chunk) = &integrity { crc32c::validate_rdma_crc(&request, &reply, &bytes, chunk)?; }
                             validate_open(false, &lease.session.poisoned).map_err(|error| error.0)?;
                             Ok::<_, afs_error::Error>(bytes)
                         });
@@ -3431,7 +3485,12 @@ impl crate::node::dfs_read::ChunkTransfer for RdmaChunkTransfer {
                         "dfs.rdma_read_fallback";
                         "reason" => "peer reported RDMA unsupported before dispatch"
                     );
-                    GrpcChunkTransfer::new(fallback.peers.clone(), timeout)?.read_ranges(batch, out)
+                    let grpc = GrpcChunkTransfer::new(fallback.peers.clone(), timeout)?;
+                    if let Some(chunk) = expected {
+                        grpc.read_crc32c_range(batch, chunk, out)
+                    } else {
+                        grpc.read_ranges(batch, out)
+                    }
                 }
             }
         }
@@ -3528,14 +3587,25 @@ fn validate_dfs_rdma_read_reply(
             || completion.operation_index != op.operation_index
             || completion.source_copy_id != op.source_copy_id
             || completion.transferred_bytes != op.length
-            || completion.range_checksum_algorithm
-                != afs_protocol::node_data::DfsDigestAlgorithm::Blake3 as i32
         {
             return Err(dfs_protocol_error(
                 "RDMA read completion identity/length differs",
             ));
         }
-        if completion.range_checksum.as_slice() != blake3::hash(range).as_bytes() {
+        let checksum = match afs_protocol::node_data::DfsDigestAlgorithm::try_from(
+            completion.range_checksum_algorithm,
+        ) {
+            Ok(afs_protocol::node_data::DfsDigestAlgorithm::Blake3) => {
+                blake3::hash(range).as_bytes().to_vec()
+            }
+            Ok(afs_protocol::node_data::DfsDigestAlgorithm::Crc32c) => {
+                crate::node::chunk_crc32c::checksum(range)
+                    .to_le_bytes()
+                    .to_vec()
+            }
+            _ => return Err(dfs_protocol_error("unsupported RDMA range checksum")),
+        };
+        if completion.range_checksum != checksum {
             return Err(dfs_corrupt_error("RDMA read completion checksum differs"));
         }
     }
@@ -6745,6 +6815,7 @@ mod tests {
             let full = start == 0 && operation.length == chunk.length;
             frames.push(DfsReadRangesFrame {
                 body: Some(dfs_read_ranges_frame::Body::Header(DfsReadRangesHeader {
+                    crc32c_table: Default::default(),
                     read_id: request.read_id.clone(),
                     attempt_id: request.attempt_id.clone(),
                     operation_index: operation.operation_index,
@@ -6767,6 +6838,7 @@ mod tests {
             frames.push(DfsReadRangesFrame {
                 body: Some(dfs_read_ranges_frame::Body::Completion(
                     DfsReadRangesCompletion {
+                        crc32c_table: Default::default(),
                         read_id: request.read_id.clone(),
                         attempt_id: request.attempt_id.clone(),
                         operation_index: operation.operation_index,
@@ -8865,6 +8937,7 @@ mod tests {
         vec![
             DfsReadRangesFrame {
                 body: Some(dfs_read_ranges_frame::Body::Header(DfsReadRangesHeader {
+                    crc32c_table: Default::default(),
                     read_id: request.read_id.clone(),
                     attempt_id: request.attempt_id.clone(),
                     operation_index: op.operation_index,
@@ -8883,6 +8956,7 @@ mod tests {
             DfsReadRangesFrame {
                 body: Some(dfs_read_ranges_frame::Body::Completion(
                     DfsReadRangesCompletion {
+                        crc32c_table: Default::default(),
                         read_id: request.read_id.clone(),
                         attempt_id: request.attempt_id.clone(),
                         operation_index: op.operation_index,
@@ -9063,6 +9137,7 @@ mod tests {
         frames.push(DfsReadRangesFrame {
             body: Some(dfs_read_ranges_frame::Body::Completion(
                 DfsReadRangesCompletion {
+                    crc32c_table: Default::default(),
                     read_id: request.read_id.clone(),
                     attempt_id: request.attempt_id.clone(),
                     operation_index: 0,
@@ -10137,6 +10212,7 @@ mod tests {
                 attempt_id: request.attempt_id.clone(),
                 transferred_bytes: 3,
                 completions: vec![afs_protocol::node_data::DfsReadRangesCompletion {
+                    crc32c_table: Default::default(),
                     read_id: request.read_id.clone(),
                     attempt_id: request.attempt_id.clone(),
                     operation_index: 0,

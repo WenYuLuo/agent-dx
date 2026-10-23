@@ -1658,14 +1658,11 @@ async fn run_node(
             .into());
         }
         if (cfg.dfs_optimistic_gc_commit || cfg.dfs_crc32c_writes)
-            && (cfg.dfs_external_backend.is_some()
-                || cfg.dfs_desired_copies != 1
-                || cfg.dfs_sync_required_copies != 1
-                || cfg.dfs_local_copy != "required")
+            && cfg.dfs_external_backend.is_some()
         {
             return Err(afs_error::Error::coded(
                 afs_error::CONFIG_INVALID,
-                "dfs_optimistic_gc_commit requires native required-local R1",
+                "dfs_optimistic_gc_commit requires native storage",
             )
             .into());
         }

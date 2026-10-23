@@ -71,7 +71,7 @@ impl GcReferences {
         version: Option<&FileVersionId>,
         publication: Option<&crate::dfs::OperationId>,
     ) -> Result<Arc<GcPin>> {
-        self.pin_mode(inode, version, publication, false)
+        self.pin_mode(inode, version, publication, false, false)
     }
     pub(crate) fn pin_fenced(
         self: &Arc<Self>,
@@ -79,7 +79,15 @@ impl GcReferences {
         version: Option<&FileVersionId>,
         operation: &crate::dfs::OperationId,
     ) -> Result<Arc<GcPin>> {
-        self.pin_mode(inode, version, Some(operation), true)
+        self.pin_mode(inode, version, Some(operation), true, false)
+    }
+    pub(crate) fn pin_generation(
+        self: &Arc<Self>,
+        inode: &InodeId,
+        version: Option<&FileVersionId>,
+        operation: &crate::dfs::OperationId,
+    ) -> Result<Arc<GcPin>> {
+        self.pin_mode(inode, version, Some(operation), true, true)
     }
     fn pin_mode(
         self: &Arc<Self>,
@@ -87,9 +95,14 @@ impl GcReferences {
         version: Option<&FileVersionId>,
         publication: Option<&crate::dfs::OperationId>,
         fenced: bool,
+        generation: bool,
     ) -> Result<Arc<GcPin>> {
         let id = match publication {
-            Some(operation) => format!("publish:{}", operation.0),
+            Some(operation) => format!(
+                "{}:{}",
+                if generation { "write" } else { "publish" },
+                operation.0
+            ),
             None => format!(
                 "open:{}",
                 crate::meta::store::timed_request_id(format!(
@@ -112,6 +125,12 @@ impl GcReferences {
                 .retain(&pin.id, inode, version, publication.is_some())?;
             None
         };
+        if generation && pin.fence != Some(crate::dfs::GcFence::WriteGeneration) {
+            return Err(Error::coded(
+                afs_error::NODE_VFS_UNIMPLEMENTED,
+                "Meta did not admit the write generation",
+            ));
+        }
         Ok(Arc::new(pin))
     }
     pub fn flush(&self) -> Result<()> {

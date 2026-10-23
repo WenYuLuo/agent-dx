@@ -3,7 +3,7 @@
 mod gc;
 
 use std::{
-    collections::HashSet,
+    collections::{BTreeSet, HashSet},
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -3710,7 +3710,10 @@ impl DfsService {
             return Ok(FileCommitAttempt::Committed(inode));
         }
         let gc_snapshot = self.store.read(MetaRead::DfsGc).await?;
-        if let Some(expected) = commit.gc_fence {
+        if let Some(expected) = commit
+            .gc_fence
+            .filter(|f| *f != crate::dfs::GcFence::WriteGeneration)
+        {
             let actual = if gc_snapshot.entity.is_some() {
                 crate::dfs::GcFence::Revision(gc_snapshot.revision.0)
             } else {
@@ -3761,6 +3764,53 @@ impl DfsService {
         } else {
             None
         };
+        let mut generation_references = Vec::new();
+        if commit.gc_fence == Some(crate::dfs::GcFence::WriteGeneration) {
+            let session = self.current_live_session(&caller_id, now_unix_ms()).await?;
+            if session.session_id != commit.write_lease.owner_session_id {
+                return Err(conflict("write generation owner session changed"));
+            }
+            let view = self.store.read_view().await?;
+            let mut generations =
+                BTreeSet::from([ChunkObject::generation_id(&commit.operation_id)]);
+            for receipt in &commit.chunk_receipts {
+                let generation = receipt
+                    .chunk
+                    .write_generation()
+                    .ok_or_else(|| invalid("generation receipts require CRC identities"))?;
+                if generation != ChunkObject::generation_id(&receipt.operation_id) {
+                    return Err(invalid(
+                        "receipt operation differs from its birth generation",
+                    ));
+                }
+                generations.insert(generation.to_owned());
+            }
+            for generation in generations {
+                let key = MetaKey::DfsReference {
+                    node_id: caller_id.clone(),
+                    session_id: commit.write_lease.owner_session_id.clone(),
+                    reference_id: format!("write:{generation}"),
+                };
+                let Some(MetaEntity::DfsReference(reference)) = view.lookup(&key)?.entity else {
+                    return Err(Error::coded(
+                        afs_error::META_DFS_GC_CHANGED,
+                        "write generation is not admitted",
+                    ));
+                };
+                if !reference.publication
+                    || reference.retired_at_unix_ms.is_some()
+                    || reference.inode_id.as_ref() != Some(&commit.inode_id)
+                    || reference.node_id != caller_id
+                    || reference.session_id != commit.write_lease.owner_session_id
+                {
+                    return Err(Error::coded(
+                        afs_error::META_DFS_GC_CHANGED,
+                        "write generation has been retired",
+                    ));
+                }
+                generation_references.push(reference);
+            }
+        }
         let expected_base_layout = match commit.expected_head_version.as_ref() {
             Some(version_id) => Some(self.get_file_version(version_id.clone()).await?.1),
             None => None,
@@ -3798,7 +3848,9 @@ impl DfsService {
         let mut accepted_copies = Vec::with_capacity(commit.chunk_receipts.len());
         let mut receipt_chunks = HashSet::new();
         for receipt in &commit.chunk_receipts {
-            if receipt.operation_id != commit.operation_id {
+            if receipt.operation_id != commit.operation_id
+                && commit.gc_fence != Some(crate::dfs::GcFence::WriteGeneration)
+            {
                 return Err(invalid("ChunkReceipt operation does not match commit"));
             }
             if !receipt_chunks.insert(receipt.chunk.id.clone()) {
@@ -3893,17 +3945,27 @@ impl DfsService {
             TxnCondition::Missing(MetaKey::DfsFileVersion(commit.file_version.id.clone())),
             TxnCondition::Missing(MetaKey::DfsLayoutRoot(commit.layout_root.id.clone())),
         ]);
-        txn.conditions.push(if let Some(fence) = commit.gc_fence {
-            // Frozen before uploads, including on every commit retry.
-            fence.condition()
+        if !generation_references.is_empty() {
+            for reference in &generation_references {
+                txn.conditions
+                    .push(TxnCondition::EntityEquals(MetaEntity::DfsReference(
+                        reference.clone(),
+                    )));
+            }
+            txn.conditions.push(TxnCondition::NodeSessionCurrent {
+                node_id: caller_id.clone(),
+                session_id: commit.write_lease.owner_session_id.clone(),
+            });
+        } else if let Some(condition) = commit.gc_fence.and_then(crate::dfs::GcFence::condition) {
+            txn.conditions.push(condition);
         } else if gc_snapshot.entity.is_some() {
-            TxnCondition::RevisionEquals {
+            txn.conditions.push(TxnCondition::RevisionEquals {
                 key: MetaKey::DfsGc,
                 revision: gc_snapshot.revision,
-            }
+            });
         } else {
-            TxnCondition::Missing(MetaKey::DfsGc)
-        });
+            txn.conditions.push(TxnCondition::Missing(MetaKey::DfsGc));
+        }
         if let Some(MetaEntity::DfsGc(gc)) = gc_snapshot.entity
             && commit
                 .layout_root
@@ -3913,12 +3975,22 @@ impl DfsService {
         {
             return Err(conflict("commit references a chunk pending deletion"));
         }
-        txn.mutations
-            .push(TxnMutation::Delete(MetaKey::DfsReference {
-                node_id: caller_id.clone(),
-                session_id: commit.write_lease.owner_session_id.clone(),
-                reference_id: format!("publish:{}", commit.operation_id.0),
-            }));
+        if !generation_references.is_empty() {
+            for mut reference in generation_references {
+                // The version becomes reachable in this same transaction. Retain a
+                // retirement marker through the maximum delayed-admission window.
+                reference.retired_at_unix_ms = Some(now_unix_ms());
+                txn.mutations
+                    .push(TxnMutation::Put(MetaEntity::DfsReference(reference)));
+            }
+        } else {
+            txn.mutations
+                .push(TxnMutation::Delete(MetaKey::DfsReference {
+                    node_id: caller_id.clone(),
+                    session_id: commit.write_lease.owner_session_id.clone(),
+                    reference_id: format!("publish:{}", commit.operation_id.0),
+                }));
+        }
         if let Some(session) = external_session {
             txn.conditions.extend([
                 TxnCondition::EntityEquals(MetaEntity::DfsDurabilityPolicy(durability_policy)),

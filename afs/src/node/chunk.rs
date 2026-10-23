@@ -816,7 +816,7 @@ pub struct StagedChunk {
     outboard: Option<SharedOutboard>,
     segment_crc: Option<Arc<super::chunk_crc32c::CrcTable>>,
     // This private identity binds the immutable allocation to its initial integrity
-    // descriptor. CRC descriptors are local-only and are not peer content proofs.
+    // descriptor. CRC descriptors bind segment checksums, not cryptographic body proofs.
     #[cfg(feature = "dfs")]
     sealed_chunk: ChunkObject,
     #[cfg(feature = "dfs")]
@@ -824,6 +824,30 @@ pub struct StagedChunk {
 }
 
 impl StagedChunk {
+    /// Rebuild a received/repaired body under its original immutable identity.
+    pub(crate) fn from_replica(
+        operation_id: OperationId,
+        expected: &ChunkObject,
+        bytes: Vec<u8>,
+    ) -> Result<Self> {
+        let staged = if expected.is_segment_crc32c() {
+            Self::from_shared_crc32c_id(
+                operation_id,
+                SharedChunkBytes::from_buffer(ChunkBuffer::unpooled(bytes)),
+                expected.id.clone(),
+            )?
+        } else {
+            Self::new(operation_id, bytes)
+        };
+        if &staged.chunk != expected {
+            return Err(corrupt(
+                &expected.id,
+                "replica body differs from immutable descriptor",
+            ));
+        }
+        Ok(staged)
+    }
+
     pub fn new(operation_id: OperationId, bytes: Vec<u8>) -> Self {
         Self::from_shared(
             operation_id,
@@ -897,16 +921,17 @@ impl StagedChunk {
         )
     }
 
-    /// Immutable local-R1 payload, bound to its persisted CRC descriptor.
+    /// Immutable native payload, bound to its persisted CRC descriptor.
     pub(crate) fn from_shared_crc32c(
         operation_id: OperationId,
         bytes: SharedChunkBytes,
     ) -> Result<Self> {
-        Self::from_shared_crc32c_id(
-            operation_id,
-            bytes,
-            ChunkId::new(format!("crc32c-v1-{}", uuid::Uuid::new_v4().simple())),
-        )
+        let id = ChunkId::new(format!(
+            "crc32c-v2-{}-{}",
+            ChunkObject::generation_id(&operation_id),
+            uuid::Uuid::new_v4().simple()
+        ));
+        Self::from_shared_crc32c_id(operation_id, bytes, id)
     }
 
     pub(crate) fn from_shared_crc32c_id(
@@ -4223,12 +4248,6 @@ impl LocalChunkStore {
             .get(chunk_id)
             .cloned()
             .ok_or_else(|| invalid(format!("local Chunk '{}' is not cataloged", chunk_id.0)))?;
-        if record.chunk.is_segment_crc32c() {
-            return Err(Error::coded(
-                afs_error::IO_NOT_SUPPORTED,
-                "CRC32C objects are local-only; peer reads are unsupported",
-            ));
-        }
         if record.state != LocalChunkState::Durable {
             return Err(corrupt(chunk_id, "local copy is quarantined"));
         }
@@ -4253,6 +4272,27 @@ impl LocalChunkStore {
             ));
         }
         Ok(record)
+    }
+
+    #[cfg(feature = "dfs")]
+    pub(crate) fn peer_crc32c_table(
+        &self,
+        chunk_id: &ChunkId,
+    ) -> Result<Option<super::chunk_crc32c::CrcTable>> {
+        let record = self.peer_catalog_record(chunk_id)?;
+        if record.chunk.is_segment_crc32c() {
+            let table = record
+                .segment_crc
+                .ok_or_else(|| corrupt(chunk_id, "CRC descriptor missing"))?;
+            if !table.valid_shape(record.chunk.length)
+                || table.descriptor_digest() != record.chunk.content_digest
+            {
+                return Err(corrupt(chunk_id, "CRC descriptor identity differs"));
+            }
+            Ok(Some(table))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Enter streaming only before any header is sent. Missing/legacy proofs
@@ -4604,6 +4644,47 @@ impl LocalChunkStore {
                     .min(length as u64),
             )
             .map_err(|_| invalid("Chunk read length is too large"))?;
+            if record.chunk.is_segment_crc32c() {
+                let scratch = super::chunk_crc32c::SEGMENT;
+                let mut reservation = self
+                    .reserve_peer_read_payload_until(allowed.saturating_add(scratch), deadline)?;
+                let mut bytes = Vec::new();
+                bytes
+                    .try_reserve_exact(allowed)
+                    .map_err(|_| peer_payload_capacity())?;
+                reservation.retain_capacity(bytes.capacity().saturating_add(scratch))?;
+                bytes.resize(allowed, 0);
+                let reader = self.open_cataloged(chunk_id)?;
+                if reader.read_ranges_at_uncommitted(
+                    &[VerifiedRangeCopy {
+                        chunk_offset: offset,
+                        length: allowed,
+                        output_offset: 0,
+                    }],
+                    &mut bytes,
+                )? != vec![allowed]
+                    || self.peer_catalog_record(chunk_id)? != record
+                    || PeerFileIdentity::read(&file)? != before
+                    || PeerFileIdentity::read(&File::open(self.path_for_record(&record)?)?)?
+                        != before
+                {
+                    return Err(corrupt(
+                        chunk_id,
+                        "CRC peer range changed during verification",
+                    ));
+                }
+                return Ok(PeerReadPayload {
+                    object: Arc::new(PeerVerifiedObject {
+                        bytes,
+                        outboard: None,
+                        _reservation: reservation,
+                        identity: None,
+                        _control: self.peer_object_control(None, deadline)?,
+                    }),
+                    start: 0,
+                    length: allowed,
+                });
+            }
             if let Some(object) = slot.as_ref()
                 && object.identity.as_ref() == Some(&(record.clone(), before.clone()))
             {
@@ -10208,6 +10289,24 @@ mod crc32c_storage_tests {
         assert!(first.chunk.valid_immutable_identity());
         assert!(first.outboard.is_none());
     }
+
+    #[test]
+    fn crc32c_replica_receiver_preserves_identity_and_rejects_changed_body() {
+        let original = staged();
+        let received = StagedChunk::from_replica(
+            OperationId::new("repair-attempt"),
+            &original.chunk,
+            original.bytes().to_vec(),
+        )
+        .unwrap();
+        assert_eq!(received.chunk, original.chunk);
+        assert_ne!(received.operation_id, original.operation_id);
+        let mut damaged = original.bytes().to_vec();
+        damaged[32770] ^= 1;
+        assert!(
+            StagedChunk::from_replica(OperationId::new("retry"), &original.chunk, damaged).is_err()
+        );
+    }
     #[test]
     fn crc32c_persist_reopen_range_and_gc_without_writer_switch() {
         let temp = tempfile::tempdir().unwrap();
@@ -10228,15 +10327,30 @@ mod crc32c_storage_tests {
                 .iter()
                 .any(|c| c == &item.chunk)
         );
-        assert_eq!(
-            store.peer_catalog_record(&id).unwrap_err().code(),
-            afs_error::IO_NOT_SUPPORTED
-        );
+        assert_eq!(store.peer_catalog_record(&id).unwrap().chunk, item.chunk);
         store
             .collect_generation(1, std::slice::from_ref(&id))
             .unwrap();
         assert!(!store.chunk_path(&id).exists());
     }
+    #[test]
+    fn crc32c_peer_range_preserves_exact_grant_and_detects_boundary_corruption() {
+        let temp = tempfile::tempdir().unwrap();
+        let item = staged();
+        let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+        store.put(item.clone()).unwrap();
+        let payload = store.read_peer_range(&item.chunk.id, 32760, 30).unwrap();
+        assert_eq!(payload.as_slice(), &[73; 30]);
+        drop(payload);
+        // This byte is outside the returned range but in its covering segment.
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(store.chunk_path(&item.chunk.id))
+            .unwrap();
+        file.write_at(&[99], 32759).unwrap();
+        assert!(store.read_peer_range(&item.chunk.id, 32760, 30).is_err());
+    }
+
     #[test]
     fn crc32c_retry_adopts_synced_orphan_and_replays_durable_object() {
         let temp = tempfile::tempdir().unwrap();
