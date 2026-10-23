@@ -3064,4 +3064,8 @@ async fn inspect_node_uses_committed_cache_when_redis_is_unavailable() {
     redis.crash();
     let after = node.inspect_node(request).await.unwrap().into_inner();
     assert_eq!(after, before);
+    // Empty background sweeps use the same committed inventory; neither a
+    // recovery check nor dormant expiration needs a fresh durable catalog.
+    assert_eq!(rpc.resume_pending().await.unwrap(), 0);
+    assert_eq!(rpc.expire_dormant().await.unwrap(), 0);
 }
