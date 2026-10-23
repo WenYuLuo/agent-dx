@@ -508,13 +508,22 @@ fn spawn_controller(
             };
             if let Some(trace) = trace {
                 trace.attribute("environment.id", controller.record.spec.id.clone());
-                trace
-                    .run(async {
+                let reconciliation = matches!(&command, Command::CheckAuthority(_, _));
+                let work = trace.scope(|| {
+                    adx_observability::trace::with_current_context(async {
                         adx_observability::trace::Trace::child("environment.execute")
                             .run(controller.dispatch(command, reply))
                             .await;
                     })
-                    .await;
+                });
+                if reconciliation {
+                    trace.run(work).await;
+                } else {
+                    // Queue time ends at dispatch. The captured context keeps
+                    // execution linked even after the queue span has ended.
+                    drop(trace);
+                    work.await;
+                }
             } else {
                 // Observation is passive. State-changing work below creates its
                 // own lifecycle spans only when that work actually occurs.

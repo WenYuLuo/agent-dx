@@ -171,10 +171,35 @@ impl EnvironmentService {
         request_id: &str,
         caller: &pb::CallerContext,
     ) -> Result<Value, Status> {
-        let mut attempt = self.creation_metrics.attempt();
-        let result = self.create_inner(spec, input, request_id, caller).await;
-        attempt.finish(&result);
-        result
+        let trace = adx_observability::trace::Trace::child("environment.create");
+        trace.attribute("environment.id", spec.id.clone());
+        trace.attribute("environment.create.outcome", "cancelled".into());
+        trace
+            .run_result(async {
+                let environment_id = spec.id.clone();
+                let mut attempt = self.creation_metrics.attempt();
+                let result = self.create_inner(spec, input, request_id, caller).await;
+                attempt.finish(&result);
+                adx_observability::trace::attribute(
+                    "environment.create.outcome",
+                    attempt.outcome().into(),
+                );
+                adx_observability::info!(
+                    event = "environment_create_completed",
+                    request_id,
+                    environment_id,
+                    duration_ms = attempt.elapsed().as_secs_f64() * 1_000.0,
+                    outcome = attempt.outcome(),
+                    succeeded = result.is_ok(),
+                    status_code = result
+                        .as_ref()
+                        .err()
+                        .map_or("OK", |error| error.code().description()),
+                    "Environment create completed"
+                );
+                result
+            })
+            .await
     }
 
     async fn create_inner(

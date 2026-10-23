@@ -106,6 +106,19 @@ async fn passive_observation_is_silent_but_real_failure_keeps_lifecycle_spans() 
     handle.create().await.unwrap();
     provider.force_flush().unwrap();
     let initial = exporter.get_finished_spans().unwrap();
+    let execution = initial
+        .iter()
+        .find(|span| span.name == "environment.execute")
+        .unwrap();
+    let queue = initial
+        .iter()
+        .find(|span| span.span_context.span_id() == execution.parent_span_id)
+        .unwrap();
+    assert_eq!(queue.name, "environment.queue");
+    assert!(
+        queue.end_time <= execution.start_time,
+        "queue duration must stop before execution begins"
+    );
     assert!(initial.iter().any(|s| s.name == "environment.queue"));
     assert!(initial.iter().any(|s| s.name == "environment.execute"));
     for _ in 0..3 {

@@ -31,6 +31,12 @@ pub(crate) struct Attempt<'a> {
     outcome: usize,
 }
 impl Attempt<'_> {
+    pub fn elapsed(&self) -> std::time::Duration {
+        self.started.elapsed()
+    }
+    pub fn outcome(&self) -> &'static str {
+        ["success", "failure", "unknown", "cancelled"][self.outcome]
+    }
     pub fn finish<T>(&mut self, result: &Result<T, Status>) {
         self.outcome = match result {
             Ok(_) => 0,
