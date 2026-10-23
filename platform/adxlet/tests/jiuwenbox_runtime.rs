@@ -663,7 +663,7 @@ async fn periodic_native_cleanup_keeps_other_environment_lifecycle_available() {
 }
 
 #[tokio::test]
-async fn periodic_reclaims_failed_execution_through_environment_work() {
+async fn recovery_reclaims_failed_execution_without_a_retained_controller() {
     let fixture = Fixture::new();
     let driver = fixture.driver().await;
     let node = authority::manager(Arc::new(driver.clone()));
@@ -701,9 +701,11 @@ async fn periodic_reclaims_failed_execution_through_environment_work() {
             .count(),
         deletes
     );
-    // There is no retained controller: the existing per-Environment orphan
-    // work queue owns this retry, rather than the inventory implementation.
+    // An external execution has no lifecycle controller; recovery owns cleanup.
     fixture.backend.reject_delete.store(false, Ordering::SeqCst);
+    authority.cycle(&node).await.unwrap();
+    assert_eq!(driver.inventory().await.unwrap().len(), 1);
+    authority.registration.reconciling = true;
     authority.cycle(&node).await.unwrap();
     assert!(node.accepting_allocations());
     assert!(driver.inventory().await.unwrap().is_empty());
@@ -711,7 +713,7 @@ async fn periodic_reclaims_failed_execution_through_environment_work() {
 }
 
 #[tokio::test]
-async fn periodic_backend_epoch_change_is_cleaned_by_its_controller() {
+async fn backend_epoch_change_is_cleaned_during_session_recovery() {
     let mut fixture = Fixture::new();
     let driver = fixture.driver().await;
     let record = running_record("conch");
@@ -734,6 +736,9 @@ async fn periodic_backend_epoch_change_is_cleaned_by_its_controller() {
     assert_eq!(observed.len(), 1);
     assert!(!observed[0].running);
     assert_eq!(fixture.native.physical.lock().unwrap().len(), 1);
+    authority.cycle(&node).await.unwrap();
+    assert_eq!(fixture.native.physical.lock().unwrap().len(), 1);
+    authority.registration.reconciling = true;
     authority.cycle(&node).await.unwrap();
     assert!(node.accepting_allocations());
     assert!(fixture.native.physical.lock().unwrap().is_empty());
