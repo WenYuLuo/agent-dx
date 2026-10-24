@@ -1242,6 +1242,8 @@ pub struct PinnedChunkReader {
     outboard: Mutex<Option<SharedOutboard>>,
     proof_identity: Mutex<PeerFileIdentity>,
     read_work: Option<super::read_work::ReadWorkMetrics>,
+    // Only a private peer-serving reader may opt out; local/recovery readers stay checked.
+    verify_crc_body: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1253,6 +1255,15 @@ pub(crate) struct VerifiedRangeCopy {
 
 impl PinnedChunkReader {
     fn crc_ranges(&self, ranges: &[VerifiedRangeCopy], out: &mut [u8]) -> Result<Vec<usize>> {
+        self.crc_ranges_with_body_check(ranges, out, self.verify_crc_body)
+    }
+
+    fn crc_ranges_with_body_check(
+        &self,
+        ranges: &[VerifiedRangeCopy],
+        out: &mut [u8],
+        verify_body: bool,
+    ) -> Result<Vec<usize>> {
         let table = self
             .segment_crc
             .as_ref()
@@ -1302,17 +1313,19 @@ impl PinnedChunkReader {
                     }
                     read += got;
                 }
-                let crc_scope = self
-                    .read_work
-                    .as_ref()
-                    .and_then(|metrics| metrics.coarse_diagnostic("crc_storage", n as u64));
-                if let Some(metrics) = &self.read_work {
-                    metrics.crc_read("storage_segments", n as u64);
-                }
-                let actual_crc = super::chunk_crc32c::checksum(&scratch[..n]);
-                drop(crc_scope);
-                if actual_crc != table.checksums[index] {
-                    return Err(corrupt(&self.chunk.id, "CRC32C segment mismatch"));
+                if verify_body {
+                    let crc_scope = self
+                        .read_work
+                        .as_ref()
+                        .and_then(|metrics| metrics.coarse_diagnostic("crc_storage", n as u64));
+                    if let Some(metrics) = &self.read_work {
+                        metrics.crc_read("storage_segments", n as u64);
+                    }
+                    let actual_crc = super::chunk_crc32c::checksum(&scratch[..n]);
+                    drop(crc_scope);
+                    if actual_crc != table.checksums[index] {
+                        return Err(corrupt(&self.chunk.id, "CRC32C segment mismatch"));
+                    }
                 }
                 let a = (begin as u64).max(r.chunk_offset);
                 let b = ((begin + n) as u64).min(end);
@@ -3191,6 +3204,7 @@ pub struct LocalChunkStore {
     catalog_committer: CatalogCommitter,
     next_staging: AtomicU64,
     gc_inventory_cursor: AtomicU64,
+    peer_read_crc_mode: crate::config::DfsReadCrcMode,
     read_work: Option<super::read_work::ReadWorkMetrics>,
     sidecar_installer: SidecarInstaller,
     #[cfg(test)]
@@ -3268,6 +3282,7 @@ impl LocalChunkStore {
             catalog_committer: CatalogCommitter::default(),
             next_staging: AtomicU64::new(1),
             gc_inventory_cursor: AtomicU64::new(0),
+            peer_read_crc_mode: crate::config::DfsReadCrcMode::Both,
             read_work: None,
             sidecar_installer: SidecarInstaller::default(),
             #[cfg(test)]
@@ -3612,6 +3627,15 @@ impl LocalChunkStore {
     }
 
     #[cfg(any(feature = "dfs", test))]
+    pub(crate) fn with_peer_read_crc_mode(mut self, mode: crate::config::DfsReadCrcMode) -> Self {
+        self.peer_read_crc_mode = mode;
+        self
+    }
+
+    pub(crate) fn peer_read_crc_mode(&self) -> crate::config::DfsReadCrcMode {
+        self.peer_read_crc_mode
+    }
+
     pub(crate) fn with_read_work_metrics(
         mut self,
         metrics: super::read_work::ReadWorkMetrics,
@@ -4676,7 +4700,15 @@ impl LocalChunkStore {
                     .map_err(|_| peer_payload_capacity())?;
                 reservation.retain_capacity(bytes.capacity().saturating_add(scratch))?;
                 bytes.resize(allowed, 0);
-                let reader = self.open_cataloged(chunk_id)?;
+                let mut reader = self.open_cataloged(chunk_id)?;
+                let segment = super::chunk_crc32c::SEGMENT as u64;
+                let complete = offset.is_multiple_of(segment)
+                    && ((allowed as u64).is_multiple_of(segment)
+                        || offset + allowed as u64 == record.chunk.length);
+                let verify_body = self.peer_read_crc_mode == crate::config::DfsReadCrcMode::Both
+                    || (self.peer_read_crc_mode == crate::config::DfsReadCrcMode::Receiver
+                        && !complete);
+                reader.verify_crc_body = verify_body;
                 if reader.read_ranges_at_uncommitted(
                     &[VerifiedRangeCopy {
                         chunk_offset: offset,
@@ -4991,6 +5023,7 @@ impl LocalChunkStore {
         let file = File::open(path).map_err(Error::from)?;
         let identity = PeerFileIdentity::read(&file)?;
         let reader = PinnedChunkReader {
+            verify_crc_body: true,
             segment_crc: Some(table.clone()),
             file,
             chunk: chunk.clone(),
@@ -5050,6 +5083,7 @@ impl LocalChunkStore {
         }
         let proof_identity = Mutex::new(PeerFileIdentity::read(&file)?);
         Ok(PinnedChunkReader {
+            verify_crc_body: true,
             segment_crc: record.segment_crc.clone(),
             file,
             proof_identity,
@@ -10446,5 +10480,45 @@ mod crc32c_storage_tests {
             store.catalog.lock().unwrap().records[&item.chunk.id].state,
             LocalChunkState::Quarantined
         );
+    }
+}
+
+#[cfg(test)]
+mod crc_read_modes_storage_tests {
+    use super::*;
+    use crate::config::DfsReadCrcMode;
+    #[test]
+    fn crc_read_modes_storage_checks_and_exact_boundary_fallback() {
+        for (mode, offset, len, detects) in [
+            (DfsReadCrcMode::Both, 0, 32768, true),
+            (DfsReadCrcMode::Receiver, 0, 32768, false),
+            (DfsReadCrcMode::Receiver, 1, 7, true),
+            (DfsReadCrcMode::Off, 0, 32768, false),
+            (DfsReadCrcMode::Off, 1, 7, false),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let store = LocalChunkStore::open(temp.path(), "node-a")
+                .unwrap()
+                .with_peer_read_crc_mode(mode);
+            let item = StagedChunk::new_crc32c(OperationId::new("modes"), vec![73; 65536]).unwrap();
+            store.put(item.clone()).unwrap();
+            let mut changed = item.bytes().to_vec();
+            changed[2] ^= 1;
+            std::fs::write(temp.path().join("chunks").join(&item.chunk.id.0), &changed).unwrap();
+            let result = store.read_peer_range_until(
+                &item.chunk.id,
+                offset,
+                len,
+                Instant::now() + Duration::from_secs(1),
+            );
+            if detects {
+                assert!(result.is_err(), "mode={mode:?}");
+            } else {
+                assert_eq!(
+                    result.unwrap().as_slice(),
+                    &changed[offset as usize..offset as usize + len]
+                );
+            }
+        }
     }
 }

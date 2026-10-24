@@ -134,13 +134,19 @@ impl GrpcChunkTransfer {
                 if let Some(metrics) = &self.peers.read_work_metrics {
                     metrics.read_rpc("peer_read_ranges");
                 }
+                let mut wire_request = tonic::Request::new(request.clone());
+                wire_request.metadata_mut().insert(
+                    "x-afs-read-crc-mode",
+                    tonic::metadata::MetadataValue::from_static(self.peers.read_crc_mode.as_str()),
+                );
                 let mut stream = client
-                    .read_ranges(request.clone())
+                    .read_ranges(wire_request)
                     .await
                     .map_err(peer_status_error)?
                     .into_inner();
                 let mut decoder = CrcRangeDecoder::new(&request, chunk, out)?;
                 decoder.metrics = self.peers.read_work_metrics.clone();
+                decoder.mode = self.peers.read_crc_mode;
                 while let Some(frame) = stream.message().await.map_err(peer_status_error)? {
                     decoder.accept(frame)?;
                 }
@@ -166,6 +172,7 @@ struct CrcRangeDecoder<'a> {
     chunk: &'a ChunkObject,
     out: &'a mut [u8],
     table: Option<CrcTable>,
+    mode: crate::config::DfsReadCrcMode,
     cursor: usize,
     complete: bool,
     metrics: Option<ReadWorkMetrics>,
@@ -185,6 +192,7 @@ impl<'a> CrcRangeDecoder<'a> {
             chunk,
             out,
             table: None,
+            mode: crate::config::DfsReadCrcMode::Both,
             cursor: 0,
             complete: false,
             metrics: None,
@@ -262,6 +270,23 @@ impl<'a> CrcRangeDecoder<'a> {
                     == afs_protocol::node_data::DfsDigestAlgorithm::Crc32cSegmentsV1 as i32;
                 let legacy_range = done.range_checksum_algorithm
                     == afs_protocol::node_data::DfsDigestAlgorithm::Crc32c as i32;
+                let receiver_only = done.range_checksum_algorithm
+                    == afs_protocol::node_data::DfsDigestAlgorithm::Crc32cReceiverOnly as i32;
+                let unchecked = done.range_checksum_algorithm
+                    == afs_protocol::node_data::DfsDigestAlgorithm::ReadUnchecked as i32;
+                let policy_matches = match self.mode {
+                    crate::config::DfsReadCrcMode::Both => {
+                        legacy_range || (segment_only && complete_segments)
+                    }
+                    crate::config::DfsReadCrcMode::Receiver => {
+                        if complete_segments {
+                            receiver_only
+                        } else {
+                            legacy_range
+                        }
+                    }
+                    crate::config::DfsReadCrcMode::Off => unchecked,
+                };
                 if self.table.is_none()
                     || done.read_id != self.request.read_id
                     || done.attempt_id != self.request.attempt_id
@@ -269,8 +294,9 @@ impl<'a> CrcRangeDecoder<'a> {
                     || done.source_copy_id != op.source_copy_id
                     || done.transferred_bytes != op.length
                     || self.cursor as u64 != op.length
-                    || (!legacy_range && !segment_only)
-                    || (segment_only && (!complete_segments || !done.range_checksum.is_empty()))
+                    || !policy_matches
+                    || ((segment_only || receiver_only || unchecked)
+                        && !done.range_checksum.is_empty())
                 {
                     return Err(dfs_protocol_error(
                         "CRC completion identity/length mismatch",
@@ -298,7 +324,7 @@ impl<'a> CrcRangeDecoder<'a> {
                 // Complete segments can additionally bind directly to Meta's
                 // table. Boundary fragments rely on the authenticated server's
                 // storage verification, without expanding the read grant.
-                if complete_segments {
+                if complete_segments && self.mode != crate::config::DfsReadCrcMode::Off {
                     let table = self
                         .table
                         .as_ref()
@@ -336,6 +362,143 @@ impl<'a> CrcRangeDecoder<'a> {
 
 #[cfg(test)]
 mod tests {
+    fn mode_frames(
+        offset: usize,
+        len: usize,
+        mode: crate::config::DfsReadCrcMode,
+        damaged: bool,
+    ) -> (
+        ChunkObject,
+        DfsReadRangesRequest,
+        Vec<DfsReadRangesFrame>,
+        Vec<u8>,
+    ) {
+        let (chunk, request, mut frames, expected) = fixture(offset, len);
+        let Some(dfs_read_ranges_frame::Body::Completion(done)) =
+            frames.last_mut().unwrap().body.as_mut()
+        else {
+            panic!("completion absent")
+        };
+        done.range_checksum.clear();
+        done.range_checksum_algorithm = match mode {
+            crate::config::DfsReadCrcMode::Both => {
+                afs_protocol::node_data::DfsDigestAlgorithm::Crc32cSegmentsV1
+            }
+            crate::config::DfsReadCrcMode::Receiver => {
+                afs_protocol::node_data::DfsDigestAlgorithm::Crc32cReceiverOnly
+            }
+            crate::config::DfsReadCrcMode::Off => {
+                afs_protocol::node_data::DfsDigestAlgorithm::ReadUnchecked
+            }
+        } as i32;
+        if damaged {
+            for frame in &mut frames {
+                if let Some(dfs_read_ranges_frame::Body::Data(data)) = &mut frame.body {
+                    let mut changed = data.to_vec();
+                    changed[0] ^= 1;
+                    *data = changed.into();
+                    break;
+                }
+            }
+        }
+        (chunk, request, frames, expected)
+    }
+    #[test]
+    fn crc_read_modes_receiver_detects_corruption_off_explicitly_does_not() {
+        for (mode, offset, len, damaged, succeeds) in [
+            (
+                crate::config::DfsReadCrcMode::Receiver,
+                0,
+                SEGMENT,
+                false,
+                true,
+            ),
+            (
+                crate::config::DfsReadCrcMode::Receiver,
+                0,
+                SEGMENT,
+                true,
+                false,
+            ),
+            (
+                crate::config::DfsReadCrcMode::Receiver,
+                2 * SEGMENT,
+                13,
+                false,
+                true,
+            ),
+            (crate::config::DfsReadCrcMode::Off, 0, SEGMENT, true, true),
+            (crate::config::DfsReadCrcMode::Off, 1, 7, true, true),
+        ] {
+            let (chunk, request, frames, expected) = mode_frames(offset, len, mode, damaged);
+            let mut out = vec![0; len];
+            let mut decoder = CrcRangeDecoder::new(&request, &chunk, &mut out).unwrap();
+            decoder.mode = mode;
+            let result = frames
+                .into_iter()
+                .try_for_each(|f| decoder.accept(f))
+                .and_then(|()| decoder.finish());
+            assert_eq!(result.is_ok(), succeeds, "mode={mode:?}");
+            if succeeds {
+                assert_eq!(out == expected, !damaged);
+            }
+        }
+    }
+    #[test]
+    fn crc_read_modes_policy_tags_cannot_silently_downgrade() {
+        use crate::config::DfsReadCrcMode::*;
+        for caller in [Both, Receiver, Off] {
+            for sender in [Both, Receiver, Off] {
+                let (chunk, request, frames, _) = mode_frames(0, SEGMENT, sender, false);
+                let mut out = vec![0; SEGMENT];
+                let mut decoder = CrcRangeDecoder::new(&request, &chunk, &mut out).unwrap();
+                decoder.mode = caller;
+                let result = frames
+                    .into_iter()
+                    .try_for_each(|f| decoder.accept(f))
+                    .and_then(|()| decoder.finish());
+                assert_eq!(result.is_ok(), caller == sender);
+            }
+        }
+    }
+    #[test]
+    fn crc_read_modes_off_still_requires_descriptor_identity_length_and_completion() {
+        for defect in 0..4 {
+            let (chunk, request, mut frames, _) =
+                mode_frames(0, SEGMENT, crate::config::DfsReadCrcMode::Off, false);
+            match defect {
+                0 => {
+                    frames.pop();
+                }
+                1 => {
+                    if let Some(dfs_read_ranges_frame::Body::Header(h)) = frames[0].body.as_mut() {
+                        h.crc32c_table = b"{}".to_vec();
+                    }
+                }
+                2 => {
+                    if let Some(dfs_read_ranges_frame::Body::Completion(c)) =
+                        frames.last_mut().unwrap().body.as_mut()
+                    {
+                        c.transferred_bytes -= 1;
+                    }
+                }
+                _ => {
+                    if let Some(dfs_read_ranges_frame::Body::Header(h)) = frames[0].body.as_mut() {
+                        h.chunk_id = "other".into();
+                    }
+                }
+            }
+            let mut out = vec![0; SEGMENT];
+            let mut decoder = CrcRangeDecoder::new(&request, &chunk, &mut out).unwrap();
+            decoder.mode = crate::config::DfsReadCrcMode::Off;
+            let result = frames
+                .into_iter()
+                .try_for_each(|f| decoder.accept(f))
+                .and_then(|()| decoder.finish());
+            assert!(result.is_err());
+        }
+    }
+
     use super::*;
     use afs_protocol::node_data::{
         DfsReadRangesCompletion, DfsReadRangesFrame, DfsReadRangesHeader,

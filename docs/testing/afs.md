@@ -1002,3 +1002,15 @@ sudo unshare --mount --net --propagation private sh -c '
 ```sh
 cargo test --release -p afs --lib pr93_fix_ -- --test-threads=1
 ```
+
+## Experimental native gRPC read CRC modes
+
+The isolated CRC read candidate adds `dfs_read_crc_mode = "both" | "receiver" | "off"` (CLI `--dfs-read-crc-mode`). Default `both` preserves the existing read checks. This setting affects native CRC-format peer reads over gRPC; it does not disable CRC generation, replica verification, fsync, local read verification, or recovery checks. Non-default modes require native DFS and explicit `data_mode = "grpc"`.
+
+- `both`: A verifies stored segments; B verifies complete trusted segments. Exact boundary fragments retain the existing range checksum.
+- `receiver`: aligned complete segments are verified at B; fragments retain A covering-segment verification plus the exact-range check at B. This mode does not claim B can independently verify an incomplete stored segment.
+- `off`: peer-read body CRC is deliberately skipped at A and B. Corrupt stored bytes may be delivered successfully. Descriptor binding, authenticated identity, authorization, bounds, frame order, lengths, completion, resource limits and close behavior remain checked.
+
+A/B must agree via the explicit `x-afs-read-crc-mode` request metadata. New read-only completion algorithm tags prevent silent downgrade; old receivers reject unsupported modes. These tags are never accepted as stored object digests or replica durable-ACK digests. A configured mode mismatch fails before data delivery. Mixed-version rollout and non-CRC object support for the new modes are not admitted by this experiment.
+
+Moving detection from A to B also moves the point where a corrupted copy becomes visible. This experiment retains existing candidate fallback, but its R1 corruption test proves detection/EIO or explicit unchecked delivery, not multi-replica quarantine, repair or self-healing. Previously recorded open-handle EOF and GC qualification boundaries remain separate.

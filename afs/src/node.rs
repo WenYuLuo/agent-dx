@@ -1232,6 +1232,7 @@ async fn run_node(
                 )?
                 .with_peer_serve_wait(std::time::Duration::from_millis(cfg.dfs_peer_serve_wait_ms))?
                 .with_read_work_metrics(dfs_read_work_metrics.clone())
+                .with_peer_read_crc_mode(cfg.dfs_read_crc_mode)
                 .with_sidecar_install_queue(cfg.dfs_sidecar_install_queue)?
                 .with_catalog_commit_queue(cfg.dfs_catalog_commit_queue)?,
         ))
@@ -1346,7 +1347,9 @@ async fn run_node(
         64,
     )?;
     #[cfg(feature = "dfs")]
-    let peer_connections = peer_connections.with_read_work_metrics(dfs_read_work_metrics.clone());
+    let peer_connections = peer_connections
+        .with_read_work_metrics(dfs_read_work_metrics.clone())
+        .with_read_crc_mode(cfg.dfs_read_crc_mode);
     #[cfg(any(feature = "ownerfs", feature = "dfs"))]
     let peer_connections = Arc::new(peer_connections);
 

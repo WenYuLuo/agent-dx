@@ -1271,6 +1271,13 @@ impl DfsChunks for DfsChunksService {
             .as_ref()
             .map_or_else(std::time::Instant::now, |local| local.peer_serve_deadline());
         let authenticated_peer = authenticate_peer(self.authenticator.as_ref(), &request)?;
+        let configured_mode = self
+            .local_chunks
+            .as_ref()
+            .map_or(crate::config::DfsReadCrcMode::Both, |local| {
+                local.peer_read_crc_mode()
+            });
+        validate_crc_read_mode_metadata(request.metadata(), configured_mode)?;
         let request = request.into_inner();
         validate_dfs_read_request(&request)?;
         for operation in &request.operations {
@@ -1569,6 +1576,28 @@ fn stream_dfs_ranges(
 }
 
 #[cfg(feature = "dfs")]
+fn validate_crc_read_mode_metadata(
+    metadata: &tonic::metadata::MetadataMap,
+    configured: crate::config::DfsReadCrcMode,
+) -> Result<(), Status> {
+    let requested = metadata
+        .get("x-afs-read-crc-mode")
+        .map(|v| v.to_str())
+        .transpose()
+        .map_err(|_| Status::invalid_argument("invalid read CRC mode metadata"))?
+        .unwrap_or("both");
+    if !matches!(requested, "both" | "receiver" | "off") {
+        return Err(Status::invalid_argument("unknown read CRC mode"));
+    }
+    if requested != configured.as_str() {
+        return Err(Status::failed_precondition(
+            "read CRC mode differs between caller and server",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "dfs")]
 fn stream_dfs_ranges_until(
     local: &LocalChunkStore,
     request: &DfsReadRangesRequest,
@@ -1613,7 +1642,8 @@ fn stream_dfs_ranges_until(
             let segment_only = op.chunk_offset.is_multiple_of(segment_bytes)
                 && (op.length.is_multiple_of(segment_bytes)
                     || op.chunk_offset.checked_add(op.length) == Some(table.length));
-            let checksum = if segment_only {
+            let read_mode = local.peer_read_crc_mode();
+            let checksum = if segment_only || read_mode == crate::config::DfsReadCrcMode::Off {
                 None
             } else {
                 let crc_scope = local.coarse_diagnostic("crc_range_send", verified.len() as u64);
@@ -1660,7 +1690,11 @@ fn stream_dfs_ranges_until(
                     range_checksum: checksum
                         .map(|value| value.to_le_bytes().to_vec())
                         .unwrap_or_default(),
-                    range_checksum_algorithm: if segment_only {
+                    range_checksum_algorithm: if read_mode == crate::config::DfsReadCrcMode::Off {
+                        afs_protocol::node_data::DfsDigestAlgorithm::ReadUnchecked as i32
+                    } else if segment_only && read_mode == crate::config::DfsReadCrcMode::Receiver {
+                        afs_protocol::node_data::DfsDigestAlgorithm::Crc32cReceiverOnly as i32
+                    } else if segment_only {
                         afs_protocol::node_data::DfsDigestAlgorithm::Crc32cSegmentsV1 as i32
                     } else {
                         afs_protocol::node_data::DfsDigestAlgorithm::Crc32c as i32
@@ -8468,5 +8502,33 @@ mod tests {
             service.validate_read_grants(borrowed).await.is_err(),
             "replacement process cannot borrow the old session pin"
         );
+    }
+}
+
+#[cfg(all(test, feature = "dfs"))]
+mod crc_read_modes_metadata_tests {
+    use super::*;
+    #[test]
+    fn crc_read_modes_require_exact_configured_peer_agreement() {
+        use crate::config::DfsReadCrcMode;
+        for configured in [
+            DfsReadCrcMode::Both,
+            DfsReadCrcMode::Receiver,
+            DfsReadCrcMode::Off,
+        ] {
+            for requested in ["both", "receiver", "off", "unknown"] {
+                let mut metadata = tonic::metadata::MetadataMap::new();
+                metadata.insert("x-afs-read-crc-mode", requested.parse().unwrap());
+                assert_eq!(
+                    validate_crc_read_mode_metadata(&metadata, configured).is_ok(),
+                    requested == configured.as_str()
+                );
+            }
+            assert_eq!(
+                validate_crc_read_mode_metadata(&tonic::metadata::MetadataMap::new(), configured)
+                    .is_ok(),
+                configured == DfsReadCrcMode::Both
+            );
+        }
     }
 }

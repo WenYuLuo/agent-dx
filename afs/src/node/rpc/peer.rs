@@ -862,6 +862,7 @@ pub fn make_replica_data_plane(
 type PeerChannelKey = (String, u64, String, bool);
 
 pub struct PeerConnectionPool {
+    read_crc_mode: crate::config::DfsReadCrcMode,
     #[cfg(feature = "dfs")]
     read_work_metrics: Option<crate::node::read_work::ReadWorkMetrics>,
     config: afs_transport::GrpcConfig,
@@ -904,6 +905,7 @@ impl PeerConnectionPool {
             security,
             capacity,
             state: tokio::sync::Mutex::new(PeerPoolState::default()),
+            read_crc_mode: crate::config::DfsReadCrcMode::Both,
             #[cfg(feature = "dfs")]
             stream_work: Arc::new(PeerStreamWorkPool::default()),
             #[cfg(feature = "dfs")]
@@ -917,6 +919,11 @@ impl PeerConnectionPool {
         metrics: crate::node::read_work::ReadWorkMetrics,
     ) -> Self {
         self.read_work_metrics = Some(metrics);
+        self
+    }
+
+    pub(crate) fn with_read_crc_mode(mut self, mode: crate::config::DfsReadCrcMode) -> Self {
+        self.read_crc_mode = mode;
         self
     }
 
