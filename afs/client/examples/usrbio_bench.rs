@@ -60,8 +60,8 @@ async fn main() -> Result<(), LocalClientError> {
     let mut written_blocks = 0_u64;
     while written_blocks < blocks {
         let batch = (blocks - written_blocks).min(wave as u64) as usize;
-        for slot in 0..batch {
-            payloads[slot] = payload_for(written_blocks + slot as u64);
+        for (slot, payload) in payloads.iter_mut().enumerate().take(batch) {
+            *payload = payload_for(written_blocks + slot as u64);
         }
         let items: Vec<(u64, &[u8])> = (0..batch)
             .map(|slot| {

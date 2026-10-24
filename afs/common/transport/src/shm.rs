@@ -203,7 +203,11 @@ impl SharedRegion {
         if len == 0 || len > limit {
             return Err(ShmError::InvalidArgument {
                 field: "len",
-                reason: "must be within 1..=limit",
+                reason: if limit == MAX_REGION_BYTES {
+                    "must be within 1..=1 MiB"
+                } else {
+                    "must be positive and no larger than the caller-provided limit"
+                },
             });
         }
         let fd = create_memfd(name)?;

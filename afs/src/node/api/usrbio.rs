@@ -35,9 +35,8 @@ use afs_transport::{
 
 use crate::node::vfs::{Backend, types};
 
-/// 单条 iov 的字节上限。40 GiB 远大于任何合理批次，但能挡住明显的越界请求。
+/// 单条 iov 的字节上限。64 GiB 远大于任何合理批次，但能挡住明显的越界请求。
 const MAX_IOV_BYTES: usize = 64 * 1024 * 1024 * 1024;
-/// 环 worker 的轮询间隔。没有门铃通知时的折中：足够短以免增加明显延迟，又不空转。
 /// 单批处理上限，避免一条环长时间独占 worker 而让同进程其它环饿死。
 const MAX_BATCH: u32 = 256;
 
@@ -311,16 +310,16 @@ impl UsrbioHub {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// 打开一个路径，返回不透明句柄值、文件长度。
-    ///
-    /// 路径从后端根 inode 逐段 `lookup` 解析，与 FUSE 走同一条后端路径，因此权限和目录项
-    /// 语义完全一致；`..` 与空段被拒绝，避免 SDK 用路径穿越绕过挂载边界。
     /// 装配指标导出；未调用时 [`RingStats`] 仍然可用，只是不导出到 registry。
     pub(crate) fn with_metrics(mut self, metrics: RingMetrics) -> Self {
         self.metrics = Some(metrics);
         self
     }
 
+    /// 打开一个路径，返回不透明句柄值、文件长度。
+    ///
+    /// 路径从后端根 inode 逐段 `lookup` 解析，与 FUSE 走同一条后端路径，因此权限和目录项
+    /// 语义完全一致；`..` 与空段被拒绝，避免 SDK 用路径穿越绕过挂载边界。
     pub(crate) fn open(
         &self,
         namespace: &str,
@@ -480,6 +479,10 @@ impl UsrbioHub {
         io_depth: i32,
         timeout_ms: u32,
     ) -> Result<u64, Error> {
+        // 「必须攒满」的目标大于环项数时永远凑不满一批，环只能永久停摆，创建时直接拒绝。
+        layout
+            .validate_io_depth(io_depth)
+            .map_err(|error| invalid(format!("ring io_depth rejected: {error}")))?;
         let RingFds {
             region: fd,
             doorbell: doorbell_fd,
@@ -845,6 +848,10 @@ impl RingWorker {
         if !completions.is_empty() {
             let _ = consumer.complete_batch(&completions);
             consumer.doorbell();
+            // 完成通知 eventfd 是 SDK 唯一的唤醒通道。destroy_ring 在 join 前敲的那一下
+            // 可能已经在这批 CQE 写入前被 SDK 读掉，这里必须再敲一次，否则 SDK 只能等到
+            // 自己的上界，把已经失败完成的提交当成「结果未知」处理。
+            self.completion.ring();
         }
     }
 }
@@ -1211,6 +1218,137 @@ pub(crate) mod tests {
         hub.unregister_file(reg_id).expect("unregister");
         hub.close(&handle).expect("close");
         hub.destroy_ring(ring_id).expect("destroy ring");
+        hub.destroy_iov(iov_id).expect("destroy iov");
+    }
+
+    #[test]
+    fn create_ring_rejects_io_depth_beyond_the_entry_count() {
+        // io_depth > 0 是「必须攒满」：目标大于环项数时这批永远凑不满，环会永久停摆，
+        // 创建时就拒绝，而不是留一条永远不工作的环。
+        let backend = Arc::new(MemoryBackend::new(64));
+        let hub = UsrbioHub::new(backend, None);
+        let layout = IovLayout::new(4096, 2).expect("iov layout");
+        let iov_region = TestRegion::new("usrbio-iov-depth", layout.total_bytes());
+        // SAFETY: mapping 覆盖 layout.total_bytes() 字节。
+        let view =
+            unsafe { SharedIov::from_raw_parts(iov_region.mapping.as_ptr(), layout) }.expect("iov");
+        view.initialize().expect("init");
+        let iov_id = hub
+            .create_iov(iov_region.handle_fd(), layout)
+            .expect("create iov");
+
+        let ring_layout = RingLayout::new(4).expect("ring layout");
+        let ring_region = TestRegion::new("usrbio-ring-depth", ring_layout.total_bytes());
+        let doorbell = EventFd::create().expect("doorbell");
+        let error = hub
+            .create_ring(
+                RingFds {
+                    region: ring_region.handle_fd(),
+                    doorbell: doorbell.try_clone_fd().expect("dup doorbell"),
+                    completion: test_completion_fd(),
+                },
+                ring_layout,
+                iov_id,
+                8,
+                200,
+            )
+            .expect_err("io_depth beyond entries must be rejected");
+        assert_eq!(error.code(), afs_error::NODE_VFS_INVALID);
+
+        // 边界值：io_depth == entries 恰好能攒满一批，仍然合法。
+        let ring_region = TestRegion::new("usrbio-ring-depth-ok", ring_layout.total_bytes());
+        // SAFETY: mapping 覆盖 ring_layout.total_bytes() 字节。
+        let ring = unsafe { SharedRing::from_raw_parts(ring_region.mapping.as_ptr(), ring_layout) }
+            .expect("ring");
+        ring.initialize().expect("ring init");
+        let ring_id = hub
+            .create_ring(
+                RingFds {
+                    region: ring_region.handle_fd(),
+                    doorbell: doorbell.try_clone_fd().expect("dup doorbell"),
+                    completion: test_completion_fd(),
+                },
+                ring_layout,
+                iov_id,
+                4,
+                200,
+            )
+            .expect("io_depth equal to entries is allowed");
+        hub.destroy_ring(ring_id).expect("destroy ring");
+        hub.destroy_iov(iov_id).expect("destroy iov");
+    }
+
+    #[test]
+    fn destroy_ring_fails_pending_submissions_with_a_completion_doorbell() {
+        // 提交不敲门铃，worker 睡在门铃上；io_depth = entries 让它即使扫到这项提交也不会
+        // 处理（必须攒满 4 个，只有 1 个）。destroy_ring 必须把这项提交以失败完成，并且在
+        // 写入 CQE 之后再敲一次完成 eventfd——join 前那一下可能已被 SDK 读掉。
+        let backend = Arc::new(MemoryBackend::new(64));
+        let hub = UsrbioHub::new(backend, None);
+        let layout = IovLayout::new(4096, 2).expect("iov layout");
+        let iov_region = TestRegion::new("usrbio-iov-failpending", layout.total_bytes());
+        // SAFETY: mapping 覆盖 layout.total_bytes() 字节。
+        let view =
+            unsafe { SharedIov::from_raw_parts(iov_region.mapping.as_ptr(), layout) }.expect("iov");
+        view.initialize().expect("init");
+        let iov_id = hub
+            .create_iov(iov_region.handle_fd(), layout)
+            .expect("create iov");
+
+        let ring_layout = RingLayout::new(4).expect("ring layout");
+        let ring_region = TestRegion::new("usrbio-ring-failpending", ring_layout.total_bytes());
+        // SAFETY: mapping 覆盖 ring_layout.total_bytes() 字节。
+        let ring = unsafe { SharedRing::from_raw_parts(ring_region.mapping.as_ptr(), ring_layout) }
+            .expect("ring");
+        ring.initialize().expect("init");
+        let doorbell = EventFd::create().expect("doorbell");
+        let completion = EventFd::create().expect("completion");
+        let ring_id = hub
+            .create_ring(
+                RingFds {
+                    region: ring_region.handle_fd(),
+                    doorbell: doorbell.try_clone_fd().expect("dup doorbell"),
+                    completion: completion.try_clone_fd().expect("dup completion"),
+                },
+                ring_layout,
+                iov_id,
+                4,
+                200,
+            )
+            .expect("create ring");
+
+        ring.submission_producer()
+            .push(&Submission {
+                op: OP_WRITE,
+                flags: 0,
+                reg_id: 7,
+                len: 4,
+                offset: 0,
+                iov_offset: 0,
+                userdata: 42,
+            })
+            .expect("push pending submission");
+
+        hub.destroy_ring(ring_id).expect("destroy ring");
+
+        // join 返回后计数必须是 2：destroy_ring join 前一次 + fail_pending 写完 CQE 后一次。
+        // 只有 1 说明 fail_pending 没敲门，SDK 只能靠超时兜底才拿得到这批失败完成项。
+        let mut counter = [0_u8; 8];
+        // SAFETY: counter 是本栈帧内 8 字节数组，eventfd 的 read 恰好要求 8 字节缓冲。
+        let read = unsafe { libc::read(completion.raw_fd(), counter.as_mut_ptr().cast(), 8) };
+        assert_eq!(read, 8, "completion counter read");
+        assert_eq!(
+            u64::from_ne_bytes(counter),
+            2,
+            "fail_pending must ring the completion doorbell after writing CQEs"
+        );
+
+        let consumer = ring.completion_consumer();
+        let failed = wait_for_completion(&consumer);
+        assert_eq!(failed.userdata, 42);
+        assert_eq!(failed.status, afs_error::NODE_VFS_UNAVAILABLE.raw());
+        assert_eq!(failed.result, -1);
+
         hub.destroy_iov(iov_id).expect("destroy iov");
     }
 

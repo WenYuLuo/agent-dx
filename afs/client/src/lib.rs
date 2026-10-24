@@ -57,8 +57,8 @@
 pub mod connection;
 
 pub use connection::{
-    DfsAccess, DfsFileHandle, DfsFileVersion, DfsIov, DfsLocalClient, DfsLocalClientConfig,
-    DfsOpenFile, DfsRegistration, DfsRing, DfsSyncMode, DfsSyncResult, DiagnosticLocalClient,
+    DfsAccess, DfsFileHandle, DfsIov, DfsLocalClient, DfsLocalClientConfig, DfsOpenFile,
+    DfsRegistration, DfsRing, DfsSyncMode, DfsSyncResult, DiagnosticLocalClient,
     DiagnosticLocalClientConfig, LocalClient, LocalClientConfig, LocalClientError,
     max_parallel_shm_operations,
 };

@@ -121,32 +121,6 @@ impl DfsFileHandle {
     }
 }
 
-/// 固定的 immutable FileVersion 读取身份。
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct DfsFileVersion {
-    namespace_id: String,
-    inode_id: String,
-    file_version_id: String,
-}
-
-impl DfsFileVersion {
-    pub fn new(
-        namespace_id: impl Into<String>,
-        inode_id: impl Into<String>,
-        file_version_id: impl Into<String>,
-    ) -> Result<Self, LocalClientError> {
-        let value = Self {
-            namespace_id: namespace_id.into(),
-            inode_id: inode_id.into(),
-            file_version_id: file_version_id.into(),
-        };
-        require_non_empty("namespace_id", &value.namespace_id)?;
-        require_non_empty("inode_id", &value.inode_id)?;
-        require_non_empty("file_version_id", &value.file_version_id)?;
-        Ok(value)
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DfsAccess {
     ReadOnly,
@@ -219,7 +193,6 @@ pub fn max_parallel_shm_operations() -> usize {
     SDK_SHM_SLOTS
 }
 
-/// 提交/完成队列的轮询间隔：本机环的往返在微秒级，50µs 足够低延迟且不会空转烧 CPU。
 /// 环等待完成项的默认上界。`timeout_ms == 0` 表示 node 侧「有多少处理多少」，SDK 仍需要
 /// 一个上界，避免 node 异常时调用方无限等待。
 const DEFAULT_RING_TIMEOUT: Duration = Duration::from_secs(5);
@@ -793,8 +766,12 @@ impl DfsRing {
         let free = usize::try_from(iov.allocator.free_blocks()).unwrap_or(0);
         let wave = remaining.min(entries).min(free);
         if wave == 0 {
-            // 空闲区块为零说明上一波还没结算，属于调用顺序错误而不是瞬时背压。
-            return Err(LocalClientError::RingTimeout);
+            // 空闲区块为零说明上一波还没结算（或已被 forfeit）：这是调用顺序/iov 状态问题，
+            // 不是可以重试的瞬时背压，不能伪装成 RingTimeout。
+            return Err(LocalClientError::InvalidArgument {
+                field: "iov",
+                reason: "no free blocks; settle the previous batch before submitting more",
+            });
         }
         Ok(wave)
     }
@@ -859,14 +836,36 @@ impl DfsRing {
             }
         };
         let mut completed = Vec::with_capacity(completions.len());
+        let mut failure = None;
         for completion in &completions {
-            let index = submissions
+            let index = match submissions
                 .iter()
                 .position(|submission| submission.userdata == completion.userdata)
-                .ok_or_else(|| {
-                    protocol_violation("batch completion did not match any submission")
-                })?;
-            completed.push((index, completion_bytes(completion)?));
+            {
+                Some(index) => index,
+                None => {
+                    // 完成项对不上号：这批结果未知，node 仍可能对区块做后端读写。
+                    // forfeit_all 之后 Drop 不再归还，区块保持占用，不会被下一批复用。
+                    batch.forfeit_all();
+                    return Err(protocol_violation(
+                        "batch completion did not match any submission",
+                    ));
+                }
+            };
+            let bytes = match completion_bytes(completion) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    // 先记下失败继续扫完整批：只有确认每一项都对得上号，失败才是「明确
+                    // 失败」，走 Drop 归还区块才是安全的。
+                    failure.get_or_insert(error);
+                    0
+                }
+            };
+            completed.push((index, bytes));
+        }
+        if let Some(error) = failure {
+            // 整批都对上了号：node 报错也是明确结果，区块按约定归还（Drop 路径）。
+            return Err(error);
         }
         Ok(completed)
     }
@@ -1450,13 +1449,15 @@ impl DfsLocalClient {
 
     /// 在已创建的 iov 上绑定一条共享环，node 会为该环启动唯一的消费 worker。
     ///
-    /// `io_depth` 与 `timeout_ms` 是 node 侧的批量策略：`>0` 攒够这么多才处理，`<0` 最多等
-    /// 这么多（受 `timeout_ms` 约束），`0` 有多少处理多少。`timeout_ms` 同时是 SDK 等待完成项
-    /// 的上界，传 0 时使用 [`DEFAULT_RING_TIMEOUT`]。
+    /// `io_depth` 是 node 侧的凑批策略：`>0` 必须攒够这么多提交才处理，凑不满会**无限期
+    /// 等待**，不受 `timeout_ms` 约束；`<0` 最多凑 `|io_depth|` 个，凑不满时最多等
+    /// `timeout_ms`；`0` 有多少处理多少。`io_depth > 0` 且大于 `entries` 的组合在本地直接
+    /// 拒绝：这样的环永远凑不满一批，只能永久停摆。
     ///
-    /// 注意两者的相互作用：`io_depth > 0` 时 node 会为凑批等到 `timeout_ms`，单发接口
-    /// （[`DfsRing::write_from`]/[`DfsRing::read_into`]）因此应当在 `io_depth <= 0` 的环上使用，
-    /// 或者给足够大的 `timeout_ms`，否则一次提交可能刚好在 SDK 放弃等待后才被处理。
+    /// 因此单发接口（[`DfsRing::write_from`]/[`DfsRing::read_into`]）不要用在 `io_depth > 0`
+    /// 的环上：一次提交凑不满一批，node 不会处理它，SDK 先等到的只有「结果未知」超时。
+    ///
+    /// `timeout_ms` 同时是 SDK 等待完成项的上界，传 0 时使用 [`DEFAULT_RING_TIMEOUT`]。
     pub async fn create_ring(
         &self,
         iov: &DfsIov,
@@ -1465,6 +1466,7 @@ impl DfsLocalClient {
         timeout_ms: u32,
     ) -> Result<DfsRing, LocalClientError> {
         let layout = RingLayout::new(entries)?;
+        layout.validate_io_depth(io_depth)?;
         let total_bytes = layout.total_bytes();
         let region = SharedRegion::create_with_limit("afs-local-ring", total_bytes, total_bytes)?;
         let mapped = MappedRegion::map(region.duplicate_fd_owned()?, total_bytes)?;
@@ -1816,6 +1818,176 @@ mod tests {
         assert_eq!(
             LocalClientError::from(RingError::NotInitialized).code(),
             afs_error::CLIENT_PROTOCOL_VIOLATION
+        );
+    }
+
+    #[test]
+    fn ring_io_depth_beyond_entries_is_rejected_upfront() {
+        // 「必须攒满」的目标大于环项数时永远凑不满一批：这样的组合必须在创建前被拒绝。
+        let layout = RingLayout::new(8).expect("ring layout");
+        assert!(layout.validate_io_depth(16).is_err());
+        // 边界与另外两种策略不受影响。
+        assert!(layout.validate_io_depth(8).is_ok());
+        assert!(layout.validate_io_depth(-16).is_ok());
+        assert!(layout.validate_io_depth(0).is_ok());
+    }
+
+    /// 构造一对本地 iov + 环，不经过控制面：门铃与完成 eventfd 都在本进程内，
+    /// `client` 是从不连接的惰性 channel（dispatch 路径不碰它）。
+    fn local_ring_pair(entries: u32) -> (DfsIov, DfsRing) {
+        let iov_layout = IovLayout::new(4096, 4).expect("iov layout");
+        let iov_region = SharedRegion::create_with_limit(
+            "afs-client-test-iov",
+            iov_layout.total_bytes(),
+            iov_layout.total_bytes(),
+        )
+        .expect("iov region");
+        let iov_mapped = MappedRegion::map(
+            iov_region.duplicate_fd_owned().expect("dup iov fd"),
+            iov_layout.total_bytes(),
+        )
+        .expect("map iov");
+        // SAFETY: mapping 覆盖 iov_layout.total_bytes() 字节，基址来自 MappedRegion。
+        let view = unsafe { SharedIov::from_raw_parts(iov_mapped.as_ptr(), iov_layout) }
+            .expect("iov view");
+        view.initialize().expect("iov init");
+
+        let ring_layout = RingLayout::new(entries).expect("ring layout");
+        let ring_region = SharedRegion::create_with_limit(
+            "afs-client-test-ring",
+            ring_layout.total_bytes(),
+            ring_layout.total_bytes(),
+        )
+        .expect("ring region");
+        let ring_mapped = MappedRegion::map(
+            ring_region.duplicate_fd_owned().expect("dup ring fd"),
+            ring_layout.total_bytes(),
+        )
+        .expect("map ring");
+        // SAFETY: mapping 覆盖 ring_layout.total_bytes() 字节，基址来自 MappedRegion。
+        let ring = unsafe { SharedRing::from_raw_parts(ring_mapped.as_ptr(), ring_layout) }
+            .expect("ring view");
+        ring.initialize().expect("ring init");
+
+        let doorbell = EventFd::create().expect("doorbell");
+        let completion = EventFd::create().expect("completion");
+        let ready_fd = completion.try_clone_fd().expect("dup completion");
+        completion
+            .set_nonblocking()
+            .expect("completion nonblocking");
+        let completion_ready =
+            tokio::io::unix::AsyncFd::new(ready_fd).expect("completion async fd");
+        let client = DfsLocalDataClient::new(traced_channel(
+            Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+        ));
+        let request_timeout = Duration::from_secs(1);
+        (
+            DfsIov {
+                client: client.clone(),
+                request_timeout,
+                region: iov_mapped,
+                view,
+                allocator: IovAllocator::new(iov_layout),
+                iov_id: 1,
+            },
+            DfsRing {
+                client,
+                request_timeout,
+                region: ring_mapped,
+                ring,
+                ring_id: 1,
+                iov_id: 1,
+                wait_timeout: Duration::from_secs(1),
+                next_userdata: 1,
+                doorbell,
+                completion,
+                completion_ready,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn batched_completion_mismatch_forfeits_the_reserved_blocks() {
+        // 预埋两个陈旧完成项（userdata 999/998），再提交两项新请求（userdata 1/2）。
+        // wait_for 取回的是陈旧完成项：对不上号 = 结果未知，区块必须整体 forfeit，不能走
+        // Drop 的归还路径——node 仍可能对它们做后端读写，归还会让内存被下一批复用。
+        let (mut iov, mut ring) = local_ring_pair(8);
+
+        // 预埋两个陈旧完成项（userdata 999/998），模拟「上一波超时留下的完成项」：
+        // CQ 的完成数不能超过已消费的提交数，因此先把旧提交推入 SQ、由 node 侧消费者
+        // 完成它们；客户端不取走，留给这一批的 wait_for 先撞上。
+        let stale_submissions = [
+            Submission {
+                op: OP_WRITE,
+                flags: 0,
+                reg_id: 1,
+                len: 16,
+                offset: 0,
+                iov_offset: 0,
+                userdata: 999,
+            },
+            Submission {
+                op: OP_WRITE,
+                flags: 0,
+                reg_id: 1,
+                len: 16,
+                offset: 0,
+                iov_offset: 0,
+                userdata: 998,
+            },
+        ];
+        let producer = ring.ring.submission_producer();
+        for submission in &stale_submissions {
+            producer.push(submission).expect("push stale submission");
+        }
+        let stale_completions = [
+            Completion {
+                userdata: 999,
+                ..Completion::default()
+            },
+            Completion {
+                userdata: 998,
+                ..Completion::default()
+            },
+        ];
+        ring.ring
+            .ring_consumer()
+            .complete_batch(&stale_completions)
+            .expect("preload stale completions");
+
+        let lengths = [16_usize, 16];
+        let mut batch = ReservedBatch::reserve(&mut iov.allocator, &lengths).expect("reserve");
+        let submissions: Vec<Submission> = batch
+            .slices()
+            .iter()
+            .enumerate()
+            .map(|(index, slice)| Submission {
+                op: OP_WRITE,
+                flags: 0,
+                reg_id: 1,
+                len: slice.len,
+                offset: 0,
+                iov_offset: slice.iov_offset,
+                userdata: index as u64 + 1,
+            })
+            .collect();
+
+        let error = ring
+            .dispatch_batch(&submissions, &mut batch)
+            .await
+            .expect_err("mismatched completions must fail");
+        // batch 仍持有分配器的可变借用；先显式结清再读计数，否则通不过借用检查。
+        drop(batch);
+        assert_eq!(error.code(), afs_error::CLIENT_PROTOCOL_VIOLATION);
+        assert_eq!(
+            iov.allocator.free_blocks(),
+            2,
+            "forfeited blocks stay occupied"
+        );
+        assert_eq!(
+            iov.allocator.in_flight(),
+            2,
+            "forfeited blocks are in flight"
         );
     }
 }

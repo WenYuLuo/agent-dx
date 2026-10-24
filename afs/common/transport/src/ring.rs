@@ -136,6 +136,22 @@ impl RingLayout {
         })
     }
 
+    /// 校验攒批策略与这条环的匹配性。
+    ///
+    /// `io_depth > 0` 表示「必须攒满」：目标大于项数时这批永远凑不满，环会永久停摆，
+    /// 应当在创建时拒绝，而不是留下一条永远不工作的环。`io_depth <= 0` 的策略总能处理
+    /// 已有提交，与项数无关。
+    pub fn validate_io_depth(self, io_depth: i32) -> Result<(), RingError> {
+        // io_depth 已限定为正数，i32 正值转 u32 不会溢出。
+        if io_depth > 0 && io_depth as u32 > self.entries {
+            return Err(RingError::InvalidArgument {
+                field: "io_depth",
+                reason: "must-fill batching cannot exceed the ring entry count",
+            });
+        }
+        Ok(())
+    }
+
     /// 项数。
     pub fn entries(self) -> u32 {
         self.entries
