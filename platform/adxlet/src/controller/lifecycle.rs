@@ -396,7 +396,7 @@ impl Controller {
             control.retire(&self.record);
         }
         // The stop barrier has completed; pre-pause usage is no longer current.
-        self.services.metrics.remove(&self.record.spec.id);
+        self.services.metrics.remove(&self.metrics_registration);
         self.recovery_files = None;
         self.execution_files.clear();
         self.record.execution_artifacts.clear();

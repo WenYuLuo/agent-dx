@@ -48,9 +48,9 @@ impl Controller {
             .await
             {
                 self.services.metrics.record(
-                    &self.record.spec.id,
+                    &self.metrics_registration,
                     &self.record.runtime.id,
-                    &self.record.spec.runtime_class,
+                    self.record.assignment.generation,
                     usage,
                 );
             }

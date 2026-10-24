@@ -856,7 +856,7 @@ impl Adxlet {
                     )
                     .await
                     {
-                        let _ = handle.record_usage(record.runtime.id, usage).await;
+                        handle.record_usage(&services.metrics, &record, usage);
                     }
                 });
             }

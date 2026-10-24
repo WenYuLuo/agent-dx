@@ -64,7 +64,6 @@ enum Command {
     ),
     Expire(u64, oneshot::Sender<Result<Option<OperationResult>>>),
     Tick(oneshot::Sender<Result<Option<OperationResult>>>),
-    Usage(String, crate::metrics::RuntimeUsage, oneshot::Sender<()>),
     RuntimeEvent(
         adx_core::runtime::RuntimeIdentity,
         oneshot::Sender<Result<()>>,
@@ -80,10 +79,7 @@ impl Envelope {
     fn new(command: Command, reply: Reply) -> Self {
         let trace = (!matches!(
             command,
-            Command::Tick(_)
-                | Command::Usage(_, _, _)
-                | Command::Expire(_, _)
-                | Command::CheckAuthority(_, _)
+            Command::Tick(_) | Command::Expire(_, _) | Command::CheckAuthority(_, _)
         ))
         .then(|| adx_observability::trace::Trace::child("environment.queue"));
         Self {
@@ -100,26 +96,22 @@ pub struct EnvironmentHandle {
     demand: Arc<std::sync::atomic::AtomicU64>,
     current: tokio::sync::watch::Receiver<(EnvironmentRecord, Option<Durability>)>,
     cleanup_pending: Arc<std::sync::atomic::AtomicBool>,
+    metrics_registration: crate::metrics::Registration,
 }
 
 impl EnvironmentHandle {
-    pub(crate) async fn record_usage(
+    pub(crate) fn record_usage(
         &self,
-        runtime_id: String,
+        metrics: &crate::metrics::Metrics,
+        record: &EnvironmentRecord,
         usage: crate::metrics::RuntimeUsage,
-    ) -> Result<()> {
-        let (ack, receive) = oneshot::channel();
-        let (unused, _) = oneshot::channel();
-        self.tx
-            .send(Envelope::new(
-                Command::Usage(runtime_id, usage, ack),
-                unused,
-            ))
-            .await
-            .map_err(|_| Error::Unavailable("environment controller stopped".into()))?;
-        receive
-            .await
-            .map_err(|_| Error::Unavailable("environment controller stopped".into()))
+    ) {
+        metrics.record(
+            &self.metrics_registration,
+            &record.runtime.id,
+            record.assignment.generation,
+            usage,
+        );
     }
     pub(crate) fn view(&self) -> (EnvironmentRecord, Option<Durability>) {
         self.current.borrow().clone()
@@ -391,6 +383,7 @@ fn spawn_controller(
     let (observed, current) = tokio::sync::watch::channel((record.clone(), durability));
     let demand = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let cleanup_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let metrics_registration = services.metrics.register(&record.spec.id);
     let mut controller = Controller {
         capture_preparation: None,
         recovery_files: None,
@@ -406,17 +399,19 @@ fn spawn_controller(
         restart_after: None,
         health_failures: 0,
         events: events::LifecycleEvents::default(),
-        observed: observed.clone(),
+        observed,
+        metrics_registration: metrics_registration.clone(),
         cleanup_pending: cleanup_pending.clone(),
         demand: demand.clone(),
         observed_demand: 0,
         auto_pause_guard: None,
         create_deadline: None,
     };
+    controller.publish_view();
     tokio::spawn(async move {
         let mut observers = events::Observers::default();
         loop {
-            observed.send_replace((controller.record.clone(), controller.durability));
+            controller.publish_view();
             observers.refresh(&mut controller);
             let deadline = controller.lifecycle_deadline();
             let record = controller.record.clone();
@@ -539,28 +534,13 @@ fn spawn_controller(
         demand,
         current,
         cleanup_pending,
+        metrics_registration,
     }
 }
 
 impl Controller {
     async fn dispatch(&mut self, command: Command, reply: Reply) {
         let command = match command {
-            Command::Usage(runtime_id, usage, ack) => {
-                if self.record.runtime.id == runtime_id
-                    && self.record.state == EnvironmentState::Running
-                    && !self.retired
-                    && !self.authority_fenced
-                {
-                    self.services.metrics.record(
-                        &self.record.spec.id,
-                        &runtime_id,
-                        &self.record.spec.runtime_class,
-                        usage,
-                    );
-                }
-                let _ = ack.send(());
-                return;
-            }
             Command::CheckAuthority(check, ack) => {
                 self.authority_fenced = true;
                 let result = self.check_authority(*check).await;
@@ -568,6 +548,7 @@ impl Controller {
                     adx_observability::trace::error();
                 }
                 self.authority_fenced = result.is_err();
+                self.publish_view();
                 let _ = ack.send(result);
                 return;
             }
@@ -576,6 +557,7 @@ impl Controller {
                 if result.is_ok() {
                     self.authority_fenced = false;
                 }
+                self.publish_view();
                 let _ = ack.send(result);
                 return;
             }
@@ -662,7 +644,6 @@ impl Controller {
         let result = match command {
             Command::Snapshot(_, _)
             | Command::AlignAuthority(_, _)
-            | Command::Usage(_, _, _)
             | Command::CheckAuthority(_, _)
             | Command::Discard(_, _)
             | Command::Expire(_, _)
@@ -765,10 +746,31 @@ struct Controller {
     health_failures: u32,
     events: events::LifecycleEvents,
     observed: tokio::sync::watch::Sender<(EnvironmentRecord, Option<Durability>)>,
+    metrics_registration: crate::metrics::Registration,
     cleanup_pending: Arc<std::sync::atomic::AtomicBool>,
 }
 
+impl Drop for Controller {
+    fn drop(&mut self) {
+        self.services.metrics.unregister(&self.metrics_registration);
+    }
+}
+
 impl Controller {
+    fn publish_view(&self) {
+        let eligible = self.record.state == EnvironmentState::Running
+            && !self.retired
+            && !self.authority_fenced
+            && !self
+                .cleanup_pending
+                .load(std::sync::atomic::Ordering::Acquire);
+        self.services
+            .metrics
+            .observe(&self.metrics_registration, eligible.then_some(&self.record));
+        self.observed
+            .send_replace((self.record.clone(), self.durability));
+    }
+
     pub(super) fn hold_artifact(
         &mut self,
         artifact: adx_core::CheckpointArtifact,
@@ -985,8 +987,7 @@ impl Controller {
         self.idle = None;
         self.health_failures = 0;
         self.durability = None;
-        self.observed
-            .send_replace((self.record.clone(), self.durability));
+        self.publish_view();
         Ok(())
     }
 
@@ -1009,8 +1010,7 @@ impl Controller {
         .await
         .map_err(|_| Error::Unavailable("state commit timed out".into()))??;
         self.durability = Some(durability);
-        self.observed
-            .send_replace((self.record.clone(), self.durability));
+        self.publish_view();
         self.clean_obsolete_checkpoints().await?;
         Ok(OperationResult {
             record: self.record.clone(),
@@ -1361,6 +1361,7 @@ impl Controller {
     }
 
     async fn cleanup(&mut self) -> Result<()> {
+        self.services.metrics.remove(&self.metrics_registration);
         self.cleanup_pending
             .store(true, std::sync::atomic::Ordering::Release);
         timeout(self.services.operation_timeout, async {
@@ -1378,7 +1379,7 @@ impl Controller {
         self.recovery_files = None;
         self.execution_files.clear();
         self.record.execution_artifacts.clear();
-        self.services.metrics.remove(&self.record.spec.id);
+        self.services.metrics.remove(&self.metrics_registration);
         self.release_capacity()
     }
 

@@ -13,6 +13,12 @@ pub(super) struct LifecycleEvents {
     retry: Option<Deadline>,
     retry_attempts: u32,
     reopen_idle: bool,
+    workload: Option<PendingWorkload>,
+}
+struct PendingWorkload {
+    identity: RuntimeIdentity,
+    operation_id: String,
+    deadline: Deadline,
 }
 #[derive(Default)]
 pub(super) struct Observers {
@@ -33,7 +39,14 @@ impl Observers {
         *self = Self::default();
         let retry = controller.events.retry;
         let retry_attempts = controller.events.retry_attempts;
+        let workload = controller.events.workload.take().filter(|pending| {
+            controller.record.state == EnvironmentState::Running
+                && !controller.retired
+                && pending.identity
+                    == crate::runtime_control::RuntimeControlClient::identity(&controller.record)
+        });
         controller.events = LifecycleEvents {
+            workload,
             retry,
             retry_attempts,
             ..LifecycleEvents::default()
@@ -99,6 +112,9 @@ impl Controller {
                 );
             }
         }
+        if self.events.workload.is_some() && self.events.runtime.is_some() {
+            include(Deadline::now());
+        }
         if self.events.reopen_idle {
             include(Deadline::now());
         }
@@ -128,12 +144,86 @@ impl Controller {
             self.record.failure = status.failure.clone().map(Into::into);
             return self.unexpected_exit().await;
         }
-        self.events.runtime = Some(status.clone());
-        if status.requested_checkpoint.is_some() {
-            self.workload_checkpoint().await?;
-        }
+        self.remember_workload(&status);
+        self.events.runtime = Some(status);
+        self.continue_workload().await?;
         self.update_idle();
         Ok(())
+    }
+    fn remember_workload(&mut self, status: &RuntimeStatus) {
+        let Some(operation_id) = status
+            .requested_checkpoint
+            .as_ref()
+            .filter(|_| self.services.checkpoint.is_some())
+        else {
+            self.events.workload = None;
+            return;
+        };
+        if self.events.workload.as_ref().is_some_and(|pending| {
+            pending.identity == status.identity && pending.operation_id == *operation_id
+        }) {
+            return;
+        }
+        // Capture the budget once. Replayed status notifications cannot extend it.
+        let deadline = super::workload_checkpoint::checkpoint_deadline(
+            status.requested_checkpoint_deadline_unix_millis,
+        )
+        .unwrap_or(Some(Deadline::now()))
+        .unwrap_or_else(|| {
+            Deadline::now() + super::workload_checkpoint::DEFAULT_BACKEND_CHECKPOINT_TIMEOUT
+        });
+        self.events.workload = Some(PendingWorkload {
+            identity: status.identity.clone(),
+            operation_id: operation_id.clone(),
+            deadline,
+        });
+    }
+    pub(super) fn workload_deadline(
+        &self,
+        identity: &RuntimeIdentity,
+        operation_id: &str,
+    ) -> Option<Deadline> {
+        self.events
+            .workload
+            .as_ref()
+            .filter(|pending| pending.identity == *identity && pending.operation_id == operation_id)
+            .map(|pending| pending.deadline)
+    }
+    async fn continue_workload(&mut self) -> Result<()> {
+        let Some(pending) = self.events.workload.as_ref() else {
+            return Ok(());
+        };
+        if pending.identity != crate::runtime_control::RuntimeControlClient::identity(&self.record)
+        {
+            self.events.workload = None;
+            return Ok(());
+        }
+        // Read the latest pushed snapshot. A missing connection is not evidence
+        // that Execd has completed the operation, so retain the pending request.
+        let Some(status) = self
+            .services
+            .runtime_control
+            .as_ref()
+            .ok_or_else(|| Error::Unavailable("runtime control unavailable".into()))?
+            .pending_checkpoint(&self.record)?
+        else {
+            self.events.runtime = None;
+            self.idle = None;
+            self.events.disconnected.get_or_insert_with(Deadline::now);
+            return Ok(());
+        };
+        self.remember_workload(&status);
+        if self.events.workload.is_none() {
+            return Ok(());
+        }
+        if self.workload_checkpoint().await? {
+            self.events.workload = None;
+            Ok(())
+        } else {
+            Err(Error::Unavailable(
+                "pending checkpoint observation unavailable".into(),
+            ))
+        }
     }
     pub(super) fn proxy_observed(&mut self, status: Result<(String, u64, u64)>) {
         self.events.proxy = status.ok();
@@ -189,6 +279,10 @@ impl Controller {
             self.expire_checkpoint(now).await?;
         }
         if self.record.state == EnvironmentState::Running {
+            self.continue_workload().await?;
+            if self.record.state != EnvironmentState::Running {
+                return Ok(());
+            }
             if self
                 .events
                 .disconnected
