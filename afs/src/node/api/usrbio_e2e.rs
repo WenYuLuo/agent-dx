@@ -73,8 +73,7 @@ fn context() -> types::RequestContext {
 async fn real_dfs(temp: &tempfile::TempDir) -> (Arc<DistributedFs>, tokio::task::JoinHandle<()>) {
     let store = Arc::new(
         Store::open_log(Arc::new(
-            LocalLog::open(temp.path().join("meta"), LogLimits::default())
-                .expect("open meta log"),
+            LocalLog::open(temp.path().join("meta"), LogLimits::default()).expect("open meta log"),
         ))
         .await
         .expect("open log-backed meta store"),

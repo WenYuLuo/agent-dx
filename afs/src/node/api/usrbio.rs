@@ -38,7 +38,9 @@ use crate::node::vfs::{Backend, types};
 /// 单条 iov 的字节上限。64 GiB 远大于任何合理批次，但能挡住明显的越界请求。
 const MAX_IOV_BYTES: usize = 64 * 1024 * 1024 * 1024;
 /// 单批处理上限，避免一条环长时间独占 worker 而让同进程其它环饿死。
-const MAX_BATCH: u32 = 256;
+/// 单个执行周期最多消费多少提交。数值与 [`afs_transport::ring::MAX_IO_DEPTH`] 同源：
+/// 「必须攒满」目标的支持上限由「单周期能执行多少」决定，两端必须一起变。
+const MAX_BATCH: u32 = afs_transport::ring::MAX_IO_DEPTH as u32;
 
 /// 环活动计数导出到 Prometheus registry 的形状。
 ///
@@ -479,7 +481,9 @@ impl UsrbioHub {
         io_depth: i32,
         timeout_ms: u32,
     ) -> Result<u64, Error> {
-        // 「必须攒满」的目标大于环项数时永远凑不满一批，环只能永久停摆，创建时直接拒绝。
+        // 凑批策略在创建时校验：「必须攒满」的目标大于环项数时永远凑不满一批，环只能
+        // 永久停摆；绝对值超过单周期执行批量（ring::MAX_IO_DEPTH）的目标同样拒绝，
+        // 攒满后的剩余提交到不了下一轮门槛。两种情况都直接拒绝，不静默截断。
         layout
             .validate_io_depth(io_depth)
             .map_err(|error| invalid(format!("ring io_depth rejected: {error}")))?;
@@ -754,6 +758,8 @@ impl RingWorker {
     /// 此刻可处理的提交数与攒批目标。
     ///
     /// `io_depth > 0` 必须等满；`< 0` 等满但有 `timeout` 上界；`0` 有多少处理多少。
+    /// 凑批目标不做主动截断——创建环时已拒绝绝对值超过 [`MAX_BATCH`] 的目标，这里的
+    /// `.min` 只是布局被破坏时的防御，正常路径上不会触发。
     fn snapshot(&self, consumer: &afs_transport::ring::RingConsumer<'_>) -> (u32, u32) {
         let target = match self.io_depth {
             depth if depth > 0 => (depth as u32).min(MAX_BATCH),
@@ -2038,6 +2044,16 @@ pub(crate) mod tests {
 
     impl RingFixture {
         fn new(name: &str, io_depth: i32, timeout_ms: u32, blocks: u32) -> Self {
+            Self::new_with_entries(name, 8, io_depth, timeout_ms, blocks)
+        }
+
+        fn new_with_entries(
+            name: &str,
+            entries: u32,
+            io_depth: i32,
+            timeout_ms: u32,
+            blocks: u32,
+        ) -> Self {
             let backend = Arc::new(MemoryBackend::new(16 * 1024));
             let hub = UsrbioHub::new(backend.clone(), None);
             let layout = IovLayout::new(4096, blocks).expect("iov layout");
@@ -2050,7 +2066,7 @@ pub(crate) mod tests {
                 .create_iov(iov_region.handle_fd(), layout)
                 .expect("create iov");
 
-            let ring_layout = RingLayout::new(8).expect("ring layout");
+            let ring_layout = RingLayout::new(entries).expect("ring layout");
             let ring_region = TestRegion::new(&format!("{name}-ring"), ring_layout.total_bytes());
             // SAFETY: mapping 覆盖 ring_layout.total_bytes() 字节。
             let ring =
@@ -2179,6 +2195,117 @@ pub(crate) mod tests {
         seen.sort_unstable();
         assert_eq!(seen, vec![11, 12]);
         assert!(consumer.ready() == 0, "不应多出完成项");
+
+        fixture.hub.unregister_file(reg_id).expect("unregister");
+        fixture.hub.close(&handle).expect("close");
+    }
+
+    /// `io_depth` 的绝对值超过 worker 单周期执行批量上限（256）时，创建即拒绝：
+    /// 「必须攒满」的目标一旦高于单周期执行批量，攒满后剩下的提交永远到不了下一轮
+    /// 的门槛，环会停摆；把目标截断成 256 则是静默改写参数语义，同样不可接受。
+    #[test]
+    fn create_ring_rejects_io_depth_beyond_the_execution_batch_limit() {
+        let backend = Arc::new(MemoryBackend::new(64));
+        let hub = UsrbioHub::new(backend, None);
+        let layout = IovLayout::new(4096, 2).expect("iov layout");
+        let iov_region = TestRegion::new("usrbio-iov-depth-limit", layout.total_bytes());
+        // SAFETY: mapping 覆盖 layout.total_bytes() 字节。
+        let view =
+            unsafe { SharedIov::from_raw_parts(iov_region.mapping.as_ptr(), layout) }.expect("iov");
+        view.initialize().expect("init");
+        let iov_id = hub
+            .create_iov(iov_region.handle_fd(), layout)
+            .expect("create iov");
+
+        // 项数给足（1024），排除 entries 上限的干扰：超范围的凑批目标仍必须被拒绝。
+        // 环必须先初始化，否则失败会来自头部校验而不是 io_depth 校验。
+        let ring_layout = RingLayout::new(1024).expect("ring layout");
+        for io_depth in [512, 257, -257, -512, i32::MAX, i32::MIN] {
+            let ring_region = TestRegion::new(
+                &format!("usrbio-ring-depth-limit-{io_depth}"),
+                ring_layout.total_bytes(),
+            );
+            // SAFETY: mapping 覆盖 ring_layout.total_bytes() 字节。
+            let ring =
+                unsafe { SharedRing::from_raw_parts(ring_region.mapping.as_ptr(), ring_layout) }
+                    .expect("ring");
+            ring.initialize().expect("ring init");
+            let doorbell = EventFd::create().expect("doorbell");
+            let error = hub
+                .create_ring(
+                    RingFds {
+                        region: ring_region.handle_fd(),
+                        doorbell: doorbell.try_clone_fd().expect("dup doorbell"),
+                        completion: test_completion_fd(),
+                    },
+                    ring_layout,
+                    iov_id,
+                    io_depth,
+                    200,
+                )
+                .expect_err("io_depth beyond the execution batch limit must be rejected");
+            assert_eq!(
+                error.code(),
+                afs_error::NODE_VFS_INVALID,
+                "io_depth {io_depth}"
+            );
+        }
+
+        // 边界：绝对值恰为 256（单周期执行批量上限）仍然合法。
+        let ring_region = TestRegion::new("usrbio-ring-depth-limit-ok", ring_layout.total_bytes());
+        // SAFETY: mapping 覆盖 ring_layout.total_bytes() 字节。
+        let ring = unsafe { SharedRing::from_raw_parts(ring_region.mapping.as_ptr(), ring_layout) }
+            .expect("ring");
+        ring.initialize().expect("ring init");
+        let doorbell = EventFd::create().expect("doorbell");
+        let ring_id = hub
+            .create_ring(
+                RingFds {
+                    region: ring_region.handle_fd(),
+                    doorbell: doorbell.try_clone_fd().expect("dup doorbell"),
+                    completion: test_completion_fd(),
+                },
+                ring_layout,
+                iov_id,
+                256,
+                200,
+            )
+            .expect("io_depth at the execution batch limit is allowed");
+        hub.destroy_ring(ring_id).expect("destroy ring");
+        hub.destroy_iov(iov_id).expect("destroy iov");
+    }
+
+    /// 边界行为：`io_depth = 256`（单周期执行批量上限）时「必须攒满」逐字生效——
+    /// 255 个不处理，第 256 个一到整批放行。
+    #[test]
+    fn io_depth_at_the_execution_batch_limit_fills_exactly() {
+        let fixture = RingFixture::new_with_entries("usrbio-depth-256", 512, 256, 0, 512);
+        let (handle, _) = fixture
+            .hub
+            .open("default", "/data.bin", OpenAccess::ReadWrite)
+            .expect("open");
+        let reg_id = fixture.hub.register_file(&handle).expect("register");
+        let mut allocator = IovAllocator::new(fixture.layout);
+        let consumer = fixture.ring.completion_consumer();
+
+        for userdata in 1..=255_u64 {
+            fixture.queue_write(&mut allocator, reg_id, (userdata - 1) * 3, b"xyz", userdata);
+        }
+        fixture.doorbell.ring();
+        // 255 < 256：worker 必须继续等，不能拿半批就走。
+        thread::sleep(Duration::from_millis(200));
+        assert_eq!(consumer.ready(), 0, "未满 256 不得产生完成项");
+
+        fixture.queue_write(&mut allocator, reg_id, 255 * 3, b"xyz", 256);
+        fixture.doorbell.ring();
+        let mut seen = Vec::new();
+        for _ in 0..256 {
+            let completion = wait_for_completion(&consumer);
+            assert_eq!(completion.status, 0, "batch status");
+            seen.push(completion.userdata);
+        }
+        seen.sort_unstable();
+        assert_eq!(seen, (1..=256_u64).collect::<Vec<_>>());
 
         fixture.hub.unregister_file(reg_id).expect("unregister");
         fixture.hub.close(&handle).expect("close");

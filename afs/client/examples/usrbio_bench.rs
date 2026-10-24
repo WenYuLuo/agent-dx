@@ -13,6 +13,42 @@ use std::time::{Duration, Instant};
 
 use afs_client::{DfsAccess, DfsLocalClient, DfsLocalClientConfig, DfsSyncMode, LocalClientError};
 
+/// 为绝对块号生成确定性的块内容。
+///
+/// 内容必须随**绝对块号**变化：全零、常数填充或周期性图案会被存储层的块去重吞掉
+/// （实测 6 GiB 只占 106 MB），测出来的就不是真实写入量。生成在写侧计时**内部**进行
+/// （与历史版本一致，保证口径可比）；混合器成本见 [`mix64`] 的说明。
+fn payload_for(block: u64, block_bytes: usize) -> Vec<u8> {
+    (0..block_bytes)
+        .map(|index| {
+            let mixed = (index as u64)
+                .wrapping_mul(2_654_435_761)
+                .wrapping_add(block.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            mix64(mixed) as u8
+        })
+        .collect()
+}
+
+/// splitmix64 终结器：雪崩混合，让每个输出位都依赖输入的所有位。
+///
+/// 前面的线性混合（乘加）保留输入的加性结构：块号相差 2^21 时混合值恰好相差
+/// 「奇数 × 2^21」，bit 13..20 完全不变——旧实现直接取 bit 13..20 当字节，整块内容
+/// 便以 2^21 个块为周期重复（4 KiB 档每 8 GiB 一次、1 MiB 档每 2 TiB 一次），
+/// 同样会被去重吞掉。终结器先把高位折叠回低位、再乘散，结构周期随之消失
+/// （回归测试 `payload_breaks_the_two_pow21_period` 钉住这一点）。
+///
+/// 成本：每字节从「2 次乘法 + 1 次移位」变为「3 次乘法 + 3 次移位异或」，指令数
+/// 约为此前的一倍半。生成本来就在写侧计时内部进行，跨版本对比的口径不变；但
+/// 「写吞吐」读数里生成器占的比重比旧版更高，对比 dd 时要记得这层偏差。
+fn mix64(mut x: u64) -> u64 {
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^= x >> 31;
+    x
+}
+
 #[tokio::main]
 async fn main() -> Result<(), LocalClientError> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -39,21 +75,10 @@ async fn main() -> Result<(), LocalClientError> {
     let mut ring = client.create_ring(&iov, 128, 0, 30_000).await?;
     let registration = client.register_file(&file).await?;
 
-    // 每个块填不同内容：全零或重复图案会被存储层压掉（实测 6 GiB 只占 106 MB），
-    // 那样测出来的就不是真实写入量。
-    // 内容必须随**绝对块号**变化：图案只要周期性重复，块哈希就会把它们判成同一块，
-    // 1 GiB 会被去重成几 MB，测出来的就不是磁盘写入。
-    let payload_for = |block: u64| -> Vec<u8> {
-        (0..block_bytes)
-            .map(|index| {
-                let mixed = (index as u64)
-                    .wrapping_mul(2_654_435_761)
-                    .wrapping_add(block.wrapping_mul(0x9E37_79B9_7F4A_7C15));
-                (mixed >> 13) as u8
-            })
-            .collect()
-    };
-    let mut payloads: Vec<Vec<u8>> = (0..wave).map(|slot| payload_for(slot as u64)).collect();
+    // 每个块填不同内容：内容必须随**绝对块号**变化（见 `payload_for` 的说明）。
+    let mut payloads: Vec<Vec<u8>> = (0..wave)
+        .map(|slot| payload_for(slot as u64, block_bytes))
+        .collect();
 
     // ---- 写入（不含落盘）----
     let started = Instant::now();
@@ -61,7 +86,7 @@ async fn main() -> Result<(), LocalClientError> {
     while written_blocks < blocks {
         let batch = (blocks - written_blocks).min(wave as u64) as usize;
         for (slot, payload) in payloads.iter_mut().enumerate().take(batch) {
-            *payload = payload_for(written_blocks + slot as u64);
+            *payload = payload_for(written_blocks + slot as u64, block_bytes);
         }
         let items: Vec<(u64, &[u8])> = (0..batch)
             .map(|slot| {
@@ -143,4 +168,48 @@ fn mib_per_second(bytes: u64, elapsed: Duration) -> f64 {
         return 0.0;
     }
     bytes as f64 / elapsed.as_secs_f64() / (1024.0 * 1024.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 旧实现把线性混合截到 bit 13..20：块号相差 2^21 的两块**逐字节相同**
+    /// （4 KiB 档每 8 GiB 重复一次、1 MiB 档每 2 TiB 一次），会被块去重吞掉。
+    /// 生成器必须打破这个结构周期。
+    #[test]
+    fn payload_breaks_the_two_pow21_period() {
+        const BLOCK: usize = 4096;
+        for block in [0_u64, 1, 2, 12345, (1 << 21) - 1, 1 << 40] {
+            assert_ne!(
+                payload_for(block, BLOCK),
+                payload_for(block + (1 << 21), BLOCK),
+                "blocks {block} and {} share the same payload",
+                block + (1 << 21)
+            );
+        }
+    }
+
+    /// 采样验证：前 1024 块互不相同、块内非常数、同参数确定性复现。
+    ///
+    /// 这不是「永不重复」的数学证明——任意确定性 8 位/字节生成器都存在整块碰撞的
+    /// 可能；这里钉住的是「无结构周期 + 采样范围内无整块碰撞 + 确定性」。
+    /// e2e 的跨版本 md5 一致性对比依赖确定性。
+    #[test]
+    fn payload_blocks_are_distinct_within_the_sampled_range() {
+        const BLOCK: usize = 4096;
+        let mut seen = std::collections::HashSet::new();
+        for block in 0..1024_u64 {
+            assert!(
+                seen.insert(payload_for(block, BLOCK)),
+                "block {block} duplicates an earlier block"
+            );
+        }
+        let payload = payload_for(7, BLOCK);
+        assert!(
+            payload.iter().any(|byte| *byte != payload[0]),
+            "payload must not be a constant fill"
+        );
+        assert_eq!(payload_for(7, BLOCK), payload, "determinism");
+    }
 }

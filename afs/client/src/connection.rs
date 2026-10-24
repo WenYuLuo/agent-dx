@@ -618,8 +618,16 @@ impl DfsRing {
             userdata: self.next_userdata(),
         };
         let completion = self.submit_and_wait(submission, &mut guard).await?;
-        let written = completion_bytes(&completion)?;
+        let written = match completion_bytes(&completion) {
+            Ok(written) => written,
+            Err(error) => {
+                // 对上号的 node 错误是明确结果：归还区块，调用方可以立即重试。
+                let _ = guard.release();
+                return Err(error);
+            }
+        };
         if written > slice.len as usize {
+            let _ = guard.release();
             return Err(protocol_violation(
                 "DFS write completion exceeded the submitted length",
             ));
@@ -655,16 +663,33 @@ impl DfsRing {
             userdata: self.next_userdata(),
         };
         let completion = self.submit_and_wait(submission, &mut guard).await?;
-        let read = completion_bytes(&completion)?;
+        let read = match completion_bytes(&completion) {
+            Ok(read) => read,
+            Err(error) => {
+                // 对上号的 node 错误是明确结果：归还区块，调用方可以立即重试。
+                let _ = guard.release();
+                return Err(error);
+            }
+        };
         if read > slice.len as usize {
+            let _ = guard.release();
             return Err(protocol_violation(
                 "DFS read completion exceeded the requested length",
             ));
         }
-        let source = iov.view.slice(slice.iov_offset, read as u64)?;
-        let destination = out
-            .get_mut(..read)
-            .ok_or_else(|| protocol_violation("DFS read did not fit the destination buffer"))?;
+        let source = match iov.view.slice(slice.iov_offset, read as u64) {
+            Ok(source) => source,
+            Err(error) => {
+                let _ = guard.release();
+                return Err(error.into());
+            }
+        };
+        let Some(destination) = out.get_mut(..read) else {
+            let _ = guard.release();
+            return Err(protocol_violation(
+                "DFS read did not fit the destination buffer",
+            ));
+        };
         destination.copy_from_slice(source);
         guard.release()?;
         Ok(read)
@@ -745,12 +770,25 @@ impl DfsRing {
                 Err(error) => return Err(error),
             };
             for (index, bytes) in completed {
-                let source = iov
+                // 完成项已对上号：node 对这批区块的动作已经结束，后续客户端侧失败
+                // （iov 切片 / 目标缓冲不匹配）也必须归还，而不是让 Drop 按
+                // 「结果未知」把区块永久扣住。
+                let source = match iov
                     .view
-                    .slice(batch.slices()[index].iov_offset, bytes as u64)?;
-                let destination = items[cursor + index].1.get_mut(..bytes).ok_or_else(|| {
-                    protocol_violation("DFS read did not fit the destination buffer")
-                })?;
+                    .slice(batch.slices()[index].iov_offset, bytes as u64)
+                {
+                    Ok(source) => source,
+                    Err(error) => {
+                        let _ = batch.release_all();
+                        return Err(error.into());
+                    }
+                };
+                let Some(destination) = items[cursor + index].1.get_mut(..bytes) else {
+                    let _ = batch.release_all();
+                    return Err(protocol_violation(
+                        "DFS read did not fit the destination buffer",
+                    ));
+                };
                 destination.copy_from_slice(source);
                 results[cursor + index] = bytes;
             }
@@ -813,13 +851,26 @@ impl DfsRing {
 
     /// 提交一批并等它们全部完成；返回 `(波内序号, 字节数)`。
     ///
-    /// 失败路径的区块归属：结果明确（node 报错）→ 归还；结果未知（超时/对不上）→ forfeit。
+    /// 失败路径的区块归属：结果明确（node 报错）→ 归还；结果未知（超时/对不上/提交后
+    /// 取消/部分提交）→ forfeit。**提交一旦发起**，`Drop` 就不再归还区块——外层把整个
+    /// future 取消（`timeout`/`select!` 丢弃）时结果同样未知，必须保持占用。
     async fn dispatch_batch(
         &mut self,
         submissions: &[Submission],
         batch: &mut ReservedBatch<'_>,
     ) -> Result<Vec<(usize, usize)>, LocalClientError> {
-        let pushed = self.submit_batch(submissions).await?;
+        // 先标记再提交：取消可能落在提交过程的任何 await 点上，标记晚于推入会漏掉
+        // 「已进环但未标记」的窗口。宁可多 forfeit，不能让 node 正在读写的内存被复用。
+        batch.mark_submitted();
+        let pushed = match self.submit_batch(submissions).await {
+            Ok(pushed) => pushed,
+            Err(error) => {
+                // 批量提交的失败无法区分「一点没进环」与「进了一半后出错」（部分提交），
+                // 一律按结果未知处理：整批保持占用。
+                batch.forfeit_all();
+                return Err(error);
+            }
+        };
         if pushed != submissions.len() {
             // 防御性分支：wave_size 已把 SQ 容量算进去，正常不会发生。此时哪些提交真的进了环
             // 无法确定，因此不归还任何区块。
@@ -864,7 +915,8 @@ impl DfsRing {
             completed.push((index, bytes));
         }
         if let Some(error) = failure {
-            // 整批都对上了号：node 报错也是明确结果，区块按约定归还（Drop 路径）。
+            // 整批都对上了号：node 报错也是明确结果，归还整批，调用方可以重试。
+            let _ = batch.release_all();
             return Err(error);
         }
         Ok(completed)
@@ -901,13 +953,21 @@ impl DfsRing {
     }
 
     // 提交并等待自己那一项完成。等待超时或完成项对不上时结果未知：区块**故意不释放**，
-    // 因为 node 仍可能对它做后端读写，立即复用会让它读到被改写的数据。
+    // 因为 node 仍可能对它做后端读写，立即复用会让它读到被改写的数据；外层把整个
+    // future 取消（timeout/select! 丢弃）同样是结果未知，走同一条保留路径。
     async fn submit_and_wait(
         &mut self,
         submission: Submission,
         guard: &mut ReservedBlock<'_>,
     ) -> Result<Completion, LocalClientError> {
-        self.submit(submission).await?;
+        // 先标记再提交（见 dispatch_batch 的说明）。
+        guard.mark_submitted();
+        if let Err(error) = self.submit(submission).await {
+            // 单发的提交失败必然发生在推入 SQ 之前（submit 只有一项：要么推入成功，
+            // 要么没推）：请求确定没进环，归还区块让调用方可以重试。
+            let _ = guard.release();
+            return Err(error);
+        }
         match self.wait_for(1).await {
             Ok(mut completions) => match completions.pop() {
                 Some(completion) if completion.userdata == submission.userdata => Ok(completion),
@@ -926,15 +986,29 @@ impl DfsRing {
     }
 }
 
+/// 已预约区块的归属状态。
+///
+/// 区分前两态是取消安全的关键：提交一旦发起，结果就对调用方不可知了——node 可能已经
+/// 在对区块做后端读写（读路径往区块写、写路径从区块读），此时归还会让下一批请求复用
+/// 同一块内存，造成跨请求数据串扰。
+enum Ownership {
+    /// 预约成功但尚未提交：请求确定没进环，`Drop` 可以安全归还。
+    Reserved,
+    /// 提交已发起（含部分提交）：结果未知，`Drop` 必须保留区块。
+    Submitted,
+    /// 归属已处理（已归还或决定永久保留），`Drop` 不再动它。
+    Settled,
+}
+
 /// 已预约区块的 RAII 守卫。
 ///
-/// 正常完成走 [`Self::release`]；结果未知走 [`Self::forfeit`]（区块保持占用）；其它错误与
-/// future 取消路径由 `Drop` 归还区块，避免一次失败把环的容量永久吃掉。
+/// 正常完成走 [`Self::release`]；结果未知（等待超时、完成项不匹配、提交后被取消）走
+/// [`Self::forfeit`] 或保持 `Submitted` 态由 `Drop` 保留区块；只有**预约之后、提交之前**
+/// 的失败由 `Drop` 归还，避免一次失败把环的容量永久吃掉。
 struct ReservedBlock<'a> {
     allocator: &'a mut IovAllocator,
     slice: IovSlice,
-    /// true 表示区块归属已经处理过（归还或故意保留），`Drop` 不再动它。
-    settled: bool,
+    ownership: Ownership,
 }
 
 impl<'a> ReservedBlock<'a> {
@@ -943,7 +1017,7 @@ impl<'a> ReservedBlock<'a> {
         Ok(Self {
             allocator,
             slice,
-            settled: false,
+            ownership: Ownership::Reserved,
         })
     }
 
@@ -951,24 +1025,33 @@ impl<'a> ReservedBlock<'a> {
         self.slice
     }
 
-    /// 操作确有结果（成功或 node 明确报错）：区块可以安全复用。
-    fn release(mut self) -> Result<(), LocalClientError> {
-        self.settled = true;
-        self.allocator.release(&self.slice)?;
-        Ok(())
+    /// 操作确有结果（成功或 node 明确报错）：区块可以安全复用。已结清后调用是 no-op。
+    fn release(&mut self) -> Result<(), LocalClientError> {
+        if matches!(self.ownership, Ownership::Settled) {
+            return Ok(());
+        }
+        self.ownership = Ownership::Settled;
+        self.allocator.release(&self.slice).map_err(Into::into)
     }
 
     /// 结果未知（等待超时 / 完成项不匹配）：保留区块，宁可少一块也不能让 node 正在读写的
     /// 内存被复用。这块区块会一直算作在途，直到 iov 被销毁。
     fn forfeit(&mut self) {
-        self.settled = true;
+        self.ownership = Ownership::Settled;
+    }
+
+    /// 提交即将发起。必须在任何推入 SQ 的尝试**之前**调用：调用方随后的取消可能落在
+    /// 提交过程的任何 await 点，标记晚于推入会漏掉「已进环但未标记」的窗口，让取消
+    /// 走 `Drop` 的归还路径。宁可多保留一块，不能错放一块。
+    fn mark_submitted(&mut self) {
+        self.ownership = Ownership::Submitted;
     }
 }
 
 impl Drop for ReservedBlock<'_> {
     fn drop(&mut self) {
-        if !self.settled {
-            // 预约之后、提交之前失败（或 future 被取消）：请求从未进入环，归还区块。
+        if matches!(self.ownership, Ownership::Reserved) {
+            // 预约之后、提交之前失败（或被取消）：请求从未进入环，归还区块。
             let _ = self.allocator.release(&self.slice);
         }
     }
@@ -978,14 +1061,13 @@ impl Drop for ReservedBlock<'_> {
 ///
 /// 归还规则与单发的 [`ReservedBlock`] 逐条一致，只是数量从 1 变成 N：
 /// - 结果明确（成功或 node 报错）→ 全部归还，可安全复用；
-/// - 结果未知（等待超时 / 完成项对不上）→ 全部故意保留，宁可少几块也不让 node 正在读写的
-///   内存被复用；
-/// - 预约中途失败或被取消 → `Drop` 归还已拿到的部分，不留下悬挂区块。
+/// - 结果未知（等待超时 / 完成项对不上 / 提交后被取消 / 部分提交失败）→ 全部故意
+///   保留，宁可少几块也不让 node 正在读写的内存被复用；
+/// - 预约中途失败或提交前被取消 → `Drop` 归还已拿到的部分，不留下悬挂区块。
 struct ReservedBatch<'a> {
     allocator: &'a mut IovAllocator,
     slices: Vec<IovSlice>,
-    /// true 表示归属已经处理过（归还或故意保留），`Drop` 不再动它们。
-    settled: bool,
+    ownership: Ownership,
 }
 
 impl<'a> ReservedBatch<'a> {
@@ -1009,7 +1091,7 @@ impl<'a> ReservedBatch<'a> {
         Ok(Self {
             allocator,
             slices,
-            settled: false,
+            ownership: Ownership::Reserved,
         })
     }
 
@@ -1017,8 +1099,12 @@ impl<'a> ReservedBatch<'a> {
         &self.slices
     }
 
-    fn release_all(mut self) -> Result<(), LocalClientError> {
-        self.settled = true;
+    /// 全部归还；已结清后调用是 no-op。
+    fn release_all(&mut self) -> Result<(), LocalClientError> {
+        if matches!(self.ownership, Ownership::Settled) {
+            return Ok(());
+        }
+        self.ownership = Ownership::Settled;
         let mut outcome = Ok(());
         for slice in &self.slices {
             if let Err(error) = self.allocator.release(slice) {
@@ -1030,13 +1116,18 @@ impl<'a> ReservedBatch<'a> {
 
     /// 结果未知时保留全部区块；它们会一直算作在途，直到 iov 被销毁。
     fn forfeit_all(&mut self) {
-        self.settled = true;
+        self.ownership = Ownership::Settled;
+    }
+
+    /// 提交即将发起；语义与 [`ReservedBlock::mark_submitted`] 一致。
+    fn mark_submitted(&mut self) {
+        self.ownership = Ownership::Submitted;
     }
 }
 
 impl Drop for ReservedBatch<'_> {
     fn drop(&mut self) {
-        if !self.settled {
+        if matches!(self.ownership, Ownership::Reserved) {
             for slice in &self.slices {
                 let _ = self.allocator.release(slice);
             }
@@ -1451,8 +1542,10 @@ impl DfsLocalClient {
     ///
     /// `io_depth` 是 node 侧的凑批策略：`>0` 必须攒够这么多提交才处理，凑不满会**无限期
     /// 等待**，不受 `timeout_ms` 约束；`<0` 最多凑 `|io_depth|` 个，凑不满时最多等
-    /// `timeout_ms`；`0` 有多少处理多少。`io_depth > 0` 且大于 `entries` 的组合在本地直接
-    /// 拒绝：这样的环永远凑不满一批，只能永久停摆。
+    /// `timeout_ms`；`0` 有多少处理多少。两类组合在本地直接拒绝：
+    /// `io_depth > 0` 且大于 `entries`（永远凑不满一批，只能永久停摆）；`io_depth` 绝对值
+    /// 大于单周期执行批量上限 256（攒满后剩下的提交永远到不了下一轮门槛，环同样停摆，
+    /// 见 [`afs_transport::ring::MAX_IO_DEPTH`]）。
     ///
     /// 因此单发接口（[`DfsRing::write_from`]/[`DfsRing::read_into`]）不要用在 `io_depth > 0`
     /// 的环上：一次提交凑不满一批，node 不会处理它，SDK 先等到的只有「结果未知」超时。
@@ -1775,7 +1868,8 @@ mod tests {
         let layout = IovLayout::new(4096, 2).expect("iov layout");
         let mut allocator = IovAllocator::new(layout);
 
-        // 预约后走到作用域末尾（提交前失败或 future 取消）：区块必须还回空闲池。
+        // 预约之后、提交之前走到作用域末尾（预留失败 / 提交前被取消）：请求从未进环，
+        // 区块必须还回空闲池。
         let slice = {
             let guard = ReservedBlock::reserve(&mut allocator, 16).expect("reserve");
             guard.slice()
@@ -1786,19 +1880,28 @@ mod tests {
 
         // 操作有明确结果：显式释放。
         {
-            let guard = ReservedBlock::reserve(&mut allocator, 16).expect("reserve");
+            let mut guard = ReservedBlock::reserve(&mut allocator, 16).expect("reserve");
             guard.release().expect("release");
         }
         assert_eq!(allocator.free_blocks(), 2);
         assert_eq!(allocator.in_flight(), 0);
+
+        // 提交后（哪怕还没等到结果）走作用域末尾（外层取消 future）：结果未知，
+        // Drop 不得归还，区块保持占用——这是取消安全的关键钉子。
+        {
+            let mut guard = ReservedBlock::reserve(&mut allocator, 16).expect("reserve");
+            guard.mark_submitted();
+        }
+        assert_eq!(allocator.free_blocks(), 1);
+        assert_eq!(allocator.in_flight(), 1);
 
         // 结果未知：区块保持占用，避免 node 正在读写的内存被复用。
         {
             let mut guard = ReservedBlock::reserve(&mut allocator, 16).expect("reserve");
             guard.forfeit();
         }
-        assert_eq!(allocator.free_blocks(), 1);
-        assert_eq!(allocator.in_flight(), 1);
+        assert_eq!(allocator.free_blocks(), 0);
+        assert_eq!(allocator.in_flight(), 2);
     }
 
     #[test]
@@ -1989,5 +2092,333 @@ mod tests {
             2,
             "forfeited blocks are in flight"
         );
+    }
+
+    /// 提交后 future 被取消（外层 `timeout`/`select!` 丢弃）：结果未知，区块必须保持占用。
+    /// node 可能仍在对这些区块做后端读写（读路径往区块写、写路径从区块读），提前归还
+    /// 会让下一批请求复用同一块内存，造成跨请求数据串扰。
+    #[tokio::test]
+    async fn cancelled_batch_after_submit_keeps_blocks_occupied() {
+        let (mut iov, mut ring) = local_ring_pair(8);
+        let reg = DfsRegistration {
+            reg_id: 1,
+            file_version_id: String::new(),
+        };
+        let payloads = [vec![1_u8; 16], vec![2_u8; 16]];
+        let items: Vec<(u64, &[u8])> = payloads
+            .iter()
+            .map(|payload| (0_u64, payload.as_slice()))
+            .collect();
+
+        // 没有 worker 消费这条环：write_batch 只会停在等完成项上，被外层超时取消。
+        // 300ms 足够提交先落地（进程内只有一次共享环写入与门铃）。
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(300),
+            ring.write_batch(&mut iov, &reg, &items),
+        )
+        .await;
+        assert!(
+            outcome.is_err(),
+            "no worker exists; the outer timeout must cancel the write"
+        );
+        assert_eq!(
+            ring.ring.ring_consumer().available(),
+            2,
+            "submissions are in the ring"
+        );
+        assert_eq!(
+            iov.allocator.free_blocks(),
+            2,
+            "cancelled blocks stay occupied"
+        );
+        assert_eq!(
+            iov.allocator.in_flight(),
+            2,
+            "cancelled blocks are in flight"
+        );
+    }
+
+    /// 单发路径的同一切取消语义。
+    #[tokio::test]
+    async fn cancelled_single_after_submit_keeps_block_occupied() {
+        let (mut iov, mut ring) = local_ring_pair(8);
+        let reg = DfsRegistration {
+            reg_id: 1,
+            file_version_id: String::new(),
+        };
+        let data = vec![7_u8; 16];
+
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(300),
+            ring.write_from(&mut iov, &reg, 0, &data),
+        )
+        .await;
+        assert!(
+            outcome.is_err(),
+            "no worker exists; the outer timeout must cancel the write"
+        );
+        assert_eq!(
+            ring.ring.ring_consumer().available(),
+            1,
+            "the submission is in the ring"
+        );
+        assert_eq!(
+            iov.allocator.free_blocks(),
+            3,
+            "cancelled block stays occupied"
+        );
+        assert_eq!(iov.allocator.in_flight(), 1, "cancelled block is in flight");
+    }
+
+    /// 提交前失败仍能回收：SQ 满等不到空间时提交从未进环，区块必须归还，调用方才能重试。
+    #[tokio::test]
+    async fn submit_failure_before_entering_the_ring_recycles_the_block() {
+        let (mut iov, mut ring) = local_ring_pair(2);
+        let reg = DfsRegistration {
+            reg_id: 1,
+            file_version_id: String::new(),
+        };
+        // 先用两项陈旧提交把 SQ 填满（entries = 2），submit 只能在「等空间」上超时。
+        let stale = Submission {
+            op: OP_WRITE,
+            flags: 0,
+            reg_id: 1,
+            len: 16,
+            offset: 0,
+            iov_offset: 0,
+            userdata: 900,
+        };
+        {
+            let producer = ring.ring.submission_producer();
+            producer.push(&stale).expect("push stale submission 1");
+            producer.push(&stale).expect("push stale submission 2");
+        }
+
+        let data = vec![7_u8; 16];
+        let error = ring
+            .write_from(&mut iov, &reg, 0, &data)
+            .await
+            .expect_err("SQ is full; submit must time out");
+        assert!(matches!(error, LocalClientError::RingTimeout));
+        assert_eq!(
+            ring.ring.ring_consumer().available(),
+            2,
+            "our submission never entered the ring"
+        );
+        assert_eq!(
+            iov.allocator.free_blocks(),
+            4,
+            "pre-submit failure recycles the block"
+        );
+        assert_eq!(iov.allocator.in_flight(), 0);
+    }
+
+    /// 正常完成必须归还：预埋与提交 userdata 匹配的完成项，成功返回后区块回空闲池。
+    #[tokio::test]
+    async fn matched_completion_releases_the_block() {
+        let (mut iov, mut ring) = local_ring_pair(8);
+        let reg = DfsRegistration {
+            reg_id: 1,
+            file_version_id: String::new(),
+        };
+        // 载体提交让 CQ 有权收到完成项；预埋的完成项 userdata=1 与 write_from 的
+        // 第一项提交（next_userdata 从 1 起）对上号。
+        let carrier = Submission {
+            op: OP_WRITE,
+            flags: 0,
+            reg_id: 1,
+            len: 16,
+            offset: 0,
+            iov_offset: 0,
+            userdata: 999,
+        };
+        {
+            let producer = ring.ring.submission_producer();
+            producer.push(&carrier).expect("push carrier submission");
+        }
+        ring.ring
+            .ring_consumer()
+            .complete_batch(&[Completion {
+                userdata: 1,
+                result: 16,
+                ..Completion::default()
+            }])
+            .expect("preload matching completion");
+
+        let data = vec![7_u8; 16];
+        let written = ring
+            .write_from(&mut iov, &reg, 0, &data)
+            .await
+            .expect("write completes against the preloaded completion");
+        assert_eq!(written, 16);
+        assert_eq!(
+            iov.allocator.free_blocks(),
+            4,
+            "completed block returns to the pool"
+        );
+        assert_eq!(iov.allocator.in_flight(), 0);
+    }
+
+    /// 匹配的 node 错误是明确结果：区块必须归还（不是 forfeit），调用方能立即重试。
+    #[tokio::test]
+    async fn matched_node_error_releases_the_block() {
+        let (mut iov, mut ring) = local_ring_pair(8);
+        let reg = DfsRegistration {
+            reg_id: 1,
+            file_version_id: String::new(),
+        };
+        let carrier = Submission {
+            op: OP_WRITE,
+            flags: 0,
+            reg_id: 1,
+            len: 16,
+            offset: 0,
+            iov_offset: 0,
+            userdata: 999,
+        };
+        {
+            let producer = ring.ring.submission_producer();
+            producer.push(&carrier).expect("push carrier submission");
+        }
+        ring.ring
+            .ring_consumer()
+            .complete_batch(&[Completion {
+                userdata: 1,
+                result: -1,
+                status: afs_error::NODE_VFS_INVALID.raw(),
+                ..Completion::default()
+            }])
+            .expect("preload failing completion");
+
+        let data = vec![7_u8; 16];
+        let error = ring
+            .write_from(&mut iov, &reg, 0, &data)
+            .await
+            .expect_err("the node-side error must surface");
+        assert_eq!(error.code(), afs_error::NODE_VFS_INVALID);
+        assert_eq!(
+            iov.allocator.free_blocks(),
+            4,
+            "a definite node error recycles the block"
+        );
+        assert_eq!(iov.allocator.in_flight(), 0);
+    }
+
+    /// 一批完成项先出现匹配的 node 错误、后出现对不上号的完成项：结果整体未知，
+    /// 整批 forfeit。错误累积模式不能让先到的「明确失败」掩盖后到的 mismatch。
+    #[tokio::test]
+    async fn node_error_then_mismatch_forfeits_the_whole_batch() {
+        let (mut iov, mut ring) = local_ring_pair(8);
+        let carrier = Submission {
+            op: OP_WRITE,
+            flags: 0,
+            reg_id: 1,
+            len: 16,
+            offset: 0,
+            iov_offset: 0,
+            userdata: 777,
+        };
+        let carriers = [carrier, carrier];
+        {
+            let producer = ring.ring.submission_producer();
+            for carrier in &carriers {
+                producer.push(carrier).expect("push carrier submission");
+            }
+        }
+        // 第一项对上 submissions[0]（userdata 1）但带 node 错误码；第二项对不上任何提交。
+        ring.ring
+            .ring_consumer()
+            .complete_batch(&[
+                Completion {
+                    userdata: 1,
+                    result: -1,
+                    status: afs_error::NODE_VFS_INVALID.raw(),
+                    ..Completion::default()
+                },
+                Completion {
+                    userdata: 999,
+                    ..Completion::default()
+                },
+            ])
+            .expect("preload mixed completions");
+
+        let lengths = [16_usize, 16];
+        let mut batch = ReservedBatch::reserve(&mut iov.allocator, &lengths).expect("reserve");
+        let submissions: Vec<Submission> = batch
+            .slices()
+            .iter()
+            .enumerate()
+            .map(|(index, slice)| Submission {
+                op: OP_WRITE,
+                flags: 0,
+                reg_id: 1,
+                len: slice.len,
+                offset: 0,
+                iov_offset: slice.iov_offset,
+                userdata: index as u64 + 1,
+            })
+            .collect();
+
+        let error = ring
+            .dispatch_batch(&submissions, &mut batch)
+            .await
+            .expect_err("the mismatched completion must fail the batch");
+        drop(batch);
+        assert_eq!(error.code(), afs_error::CLIENT_PROTOCOL_VIOLATION);
+        assert_eq!(
+            iov.allocator.free_blocks(),
+            2,
+            "unknown outcome keeps the whole batch occupied"
+        );
+        assert_eq!(iov.allocator.in_flight(), 2);
+    }
+
+    /// `io_depth` 的支持范围：绝对值不得超过 worker 的单周期执行批量上限（256）。
+    /// 超出范围必须创建前拒绝，而不是被 worker 截断成 256 后静默改写语义。
+    #[test]
+    fn io_depth_outside_the_supported_range_is_rejected_upfront() {
+        let layout = RingLayout::new(1024).expect("ring layout");
+        for io_depth in [512, 257, -257, -512, i32::MAX, i32::MIN] {
+            assert!(
+                layout.validate_io_depth(io_depth).is_err(),
+                "io_depth {io_depth} must be rejected"
+            );
+        }
+        // 边界与三种策略不受影响。
+        assert!(layout.validate_io_depth(256).is_ok());
+        assert!(layout.validate_io_depth(-256).is_ok());
+        assert!(layout.validate_io_depth(0).is_ok());
+        // 原有规则照旧：大于 entries 的正数仍然拒绝。
+        let small = RingLayout::new(8).expect("ring layout");
+        assert!(small.validate_io_depth(16).is_err());
+        assert!(small.validate_io_depth(8).is_ok());
+    }
+
+    /// SDK 建环入口本身必须在本地拒绝非法 `io_depth`：不触发控制面 RPC、不碰 fd broker。
+    /// 删掉 `create_ring` 里的校验调用时，错误会变成连接/传输类，这个测试必须变红。
+    #[tokio::test]
+    async fn create_ring_rejects_invalid_io_depth_locally_without_control_plane() {
+        let (iov, _ring) = local_ring_pair(8);
+        let client = DfsLocalClient {
+            inner: DfsLocalDataClient::new(traced_channel(
+                Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+            )),
+            request_timeout: Duration::from_secs(1),
+            namespace_id: DEFAULT_NAMESPACE.to_owned(),
+        };
+
+        // 大于 entries：原有规则，走 SDK 入口必须本地拒绝。
+        let error = client
+            .create_ring(&iov, 8, 16, 0)
+            .await
+            .expect_err("io_depth beyond entries must be rejected locally");
+        assert_eq!(error.code(), afs_error::CLIENT_ARGUMENT_INVALID);
+
+        // 超出执行批量上限（entries 给足）：同样必须本地拒绝。
+        let error = client
+            .create_ring(&iov, 1024, 512, 0)
+            .await
+            .expect_err("io_depth beyond the execution batch limit must be rejected locally");
+        assert_eq!(error.code(), afs_error::CLIENT_ARGUMENT_INVALID);
     }
 }

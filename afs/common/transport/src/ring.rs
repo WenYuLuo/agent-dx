@@ -33,6 +33,13 @@ pub const SLOT_BYTES: usize = 64;
 pub const MIN_ENTRIES: u32 = 2;
 /// 环最多的项数，防止一次映射过大或索引掩码溢出。
 pub const MAX_ENTRIES: u32 = 65_536;
+/// 攒批目标（`io_depth` 的绝对值）的支持上限。
+///
+/// 环 worker 每个执行周期最多消费这么多提交（node 侧的 `MAX_BATCH` 与之同源）。
+/// 「必须攒满」的目标一旦超过单周期执行批量，攒满后剩下的提交永远到不了下一轮的
+/// 门槛，环会停摆；把目标静默截断成上限则是改写参数语义。因此两端创建环时都直接
+/// 拒绝绝对值超出该上限的 `io_depth`。
+pub const MAX_IO_DEPTH: i32 = 256;
 
 /// 提交项操作码：读。
 pub const OP_READ: u32 = 1;
@@ -140,8 +147,16 @@ impl RingLayout {
     ///
     /// `io_depth > 0` 表示「必须攒满」：目标大于项数时这批永远凑不满，环会永久停摆，
     /// 应当在创建时拒绝，而不是留下一条永远不工作的环。`io_depth <= 0` 的策略总能处理
-    /// 已有提交，与项数无关。
+    /// 已有提交，与项数无关。任何模式的绝对值都不得超过 [`MAX_IO_DEPTH`]（见该常量的
+    /// 说明），超范围的值同样在创建时拒绝。
     pub fn validate_io_depth(self, io_depth: i32) -> Result<(), RingError> {
+        // 绝对值用 unsigned_abs：i32::MIN 的 |x| 超出 i32 正数域，普通取反会溢出。
+        if io_depth.unsigned_abs() > MAX_IO_DEPTH as u32 {
+            return Err(RingError::InvalidArgument {
+                field: "io_depth",
+                reason: "batching target must not exceed 256 in absolute value",
+            });
+        }
         // io_depth 已限定为正数，i32 正值转 u32 不会溢出。
         if io_depth > 0 && io_depth as u32 > self.entries {
             return Err(RingError::InvalidArgument {
