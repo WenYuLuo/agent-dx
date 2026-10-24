@@ -1005,12 +1005,14 @@ cargo test --release -p afs --lib pr93_fix_ -- --test-threads=1
 
 ## Experimental native gRPC read CRC modes
 
-The isolated CRC read candidate adds `dfs_read_crc_mode = "both" | "receiver" | "off"` (CLI `--dfs-read-crc-mode`). Default `both` preserves the existing read checks. This setting affects native CRC-format peer reads over gRPC; it does not disable CRC generation, replica verification, fsync, local read verification, or recovery checks. Non-default modes require native DFS and explicit `data_mode = "grpc"`.
+The isolated CRC read candidate adds `dfs_read_crc_mode = "both" | "receiver" | "off"` (CLI `--dfs-read-crc-mode`). Native DFS with `data_mode = "grpc"` defaults to `off`; native writes continue to generate CRC32C by default. Set `receiver` to opt in to B-side verification, or `both` for diagnostic checks at both ends. This setting affects native CRC-format peer reads over gRPC; it does not disable CRC generation, replica verification, fsync, local read verification, or recovery checks. Other backends and transports retain their existing `both` setting; explicit `off` or `receiver` overrides require native DFS and `data_mode = "grpc"`. The default data mode is already `grpc`; this change does not select a different transport.
 
 - `both`: A verifies stored segments; B verifies complete trusted segments. Exact boundary fragments retain the existing range checksum.
 - `receiver`: aligned complete segments are verified at B; fragments retain A covering-segment verification plus the exact-range check at B. This mode does not claim B can independently verify an incomplete stored segment.
 - `off`: peer-read body CRC is deliberately skipped at A and B. Corrupt stored bytes may be delivered successfully. Descriptor binding, authenticated identity, authorization, bounds, frame order, lengths, completion, resource limits and close behavior remain checked.
 
 A/B must agree via the explicit `x-afs-read-crc-mode` request metadata. New read-only completion algorithm tags prevent silent downgrade; old receivers reject unsupported modes. These tags are never accepted as stored object digests or replica durable-ACK digests. A configured mode mismatch fails before data delivery. Mixed-version rollout and non-CRC object support for the new modes are not admitted by this experiment.
+
+To enable optional B verification, set `dfs_read_crc_mode = "receiver"` on both A and B. A only needs to serve the matching policy for aligned complete segments; those segments are checked at B. A standalone B-only configuration change is not negotiated by the current implementation. Requests without the policy metadata retain the legacy `both` interpretation and therefore fail against an `off` server rather than silently changing their verification contract.
 
 Moving detection from A to B also moves the point where a corrupted copy becomes visible. This experiment retains existing candidate fallback, but its R1 corruption test proves detection/EIO or explicit unchecked delivery, not multi-replica quarantine, repair or self-healing. Previously recorded open-handle EOF and GC qualification boundaries remain separate.

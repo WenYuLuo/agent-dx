@@ -340,7 +340,8 @@ pub struct Cli {
     pub dfs_read_diagnostics_enabled: Option<bool>,
     #[arg(long)]
     pub dfs_native_open_read_authority: Option<bool>,
-    /// Read-side CRC policy; all serving peers must use the same mode.
+    /// Native gRPC read CRC policy (default off); receiver opts in to B checks.
+    /// All serving peers must use the same mode.
     #[arg(long)]
     pub dfs_read_crc_mode: Option<DfsReadCrcMode>,
     /// Write native objects with segmented CRC32C; native DFS Nodes default to true.
@@ -493,9 +494,9 @@ struct FileConfig {
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum DfsReadCrcMode {
-    #[default]
     Both,
     Receiver,
+    #[default]
     Off,
 }
 impl DfsReadCrcMode {
@@ -652,6 +653,18 @@ impl Config {
         if data_mode == "rdma" && !cfg!(feature = "rdma") {
             return Err(invalid("rdma feature is not compiled in"));
         }
+        // This policy is implemented only for native CRC-format gRPC reads.
+        // Keep unrelated backends and transports on their existing path.
+        let default_read_crc_mode =
+            if dfs && file.dfs_external_backend.is_none() && data_mode == "grpc" {
+                DfsReadCrcMode::default()
+            } else {
+                DfsReadCrcMode::Both
+            };
+        let dfs_read_crc_mode = cli
+            .dfs_read_crc_mode
+            .or(file.dfs_read_crc_mode)
+            .unwrap_or(default_read_crc_mode);
         let dfs_desired_copies = cli
             .dfs_desired_copies
             .or(file.dfs_desired_copies)
@@ -1016,10 +1029,7 @@ impl Config {
             dfs_source_cache_max_ms,
             dfs_source_lookahead_chunks,
             dfs_source_cache_bytes,
-            dfs_read_crc_mode: cli
-                .dfs_read_crc_mode
-                .or(file.dfs_read_crc_mode)
-                .unwrap_or_default(),
+            dfs_read_crc_mode,
             dfs_native_open_read_authority: cli
                 .dfs_native_open_read_authority
                 .or(file.dfs_native_open_read_authority)
@@ -1643,7 +1653,7 @@ mod crc_read_modes_validation_tests {
         }
         let cfg =
             Config::resolve(Role::Node, Cli::parse_from(["afs-node", "--fs", "dfs"])).unwrap();
-        assert_eq!(cfg.dfs_read_crc_mode, DfsReadCrcMode::Both);
+        assert_eq!(cfg.dfs_read_crc_mode, DfsReadCrcMode::Off);
         assert!(Cli::try_parse_from(["afs-node", "--dfs-read-crc-mode", "maybe"]).is_err());
         assert!(
             Config::resolve(
@@ -1660,5 +1670,70 @@ mod crc_read_modes_validation_tests {
             )
             .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod crc_read_default_off_tests {
+    use super::*;
+
+    #[test]
+    fn crc_read_default_off_keeps_native_write_checks_and_optional_receiver() {
+        let cfg =
+            Config::resolve(Role::Node, Cli::parse_from(["afs-node", "--fs", "dfs"])).unwrap();
+        assert_eq!(cfg.dfs_read_crc_mode, DfsReadCrcMode::Off);
+        assert_eq!(DfsReadCrcMode::default(), DfsReadCrcMode::Off);
+        assert!(cfg.dfs_crc32c_writes && cfg.dfs_optimistic_gc_commit);
+        assert_eq!(
+            serde_json::to_value(&cfg).unwrap()["dfs_read_crc_mode"],
+            "off"
+        );
+        for mode in ["receiver", "both", "off"] {
+            let cfg = Config::resolve(
+                Role::Node,
+                Cli::parse_from(["afs-node", "--fs", "dfs", "--dfs-read-crc-mode", mode]),
+            )
+            .unwrap();
+            assert_eq!(cfg.dfs_read_crc_mode.as_str(), mode);
+            assert!(cfg.dfs_crc32c_writes);
+        }
+    }
+
+    #[test]
+    fn crc_read_default_off_does_not_activate_native_policy_on_other_backends() {
+        for role in [Role::Node, Role::Meta] {
+            let cfg = Config::resolve(role, Cli::parse_from(["afs", "--fs", "ownerfs"])).unwrap();
+            assert_eq!(cfg.dfs_read_crc_mode, DfsReadCrcMode::Both);
+            assert!(!cfg.dfs_crc32c_writes);
+        }
+        let cfg = Config::resolve(
+            Role::Node,
+            Cli::parse_from(["afs-node", "--fs", "dfs", "--data-mode", "auto"]),
+        )
+        .unwrap();
+        assert_eq!(cfg.dfs_read_crc_mode, DfsReadCrcMode::Both);
+        assert!(cfg.dfs_crc32c_writes);
+    }
+
+    #[test]
+    fn crc_read_default_off_respects_toml_and_cli_precedence() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            file.path(),
+            "fs = \"dfs\"\ndata_mode = \"grpc\"\ndfs_read_crc_mode = \"receiver\"\n",
+        )
+        .unwrap();
+        let path = file.path().to_str().unwrap();
+        let from_file =
+            Config::resolve(Role::Node, Cli::parse_from(["afs-node", "--config", path])).unwrap();
+        assert_eq!(from_file.dfs_read_crc_mode, DfsReadCrcMode::Receiver);
+        assert!(from_file.dfs_crc32c_writes);
+        let cli = Config::resolve(
+            Role::Node,
+            Cli::parse_from(["afs-node", "--config", path, "--dfs-read-crc-mode", "off"]),
+        )
+        .unwrap();
+        assert_eq!(cli.dfs_read_crc_mode, DfsReadCrcMode::Off);
+        assert!(cli.dfs_crc32c_writes);
     }
 }
