@@ -2,6 +2,8 @@
 
 mod gc;
 
+mod open_read;
+
 use std::{
     collections::{BTreeSet, HashSet},
     sync::Arc,
@@ -3281,6 +3283,8 @@ impl DfsService {
             };
             return Ok(crate::dfs::DfsExternalAuthorizedRead {
                 authorized: crate::dfs::DfsAuthorizedRead {
+                    open_sources: Vec::new(),
+
                     validation: crate::dfs::DfsReadValidation {
                         grant,
                         chunk_id: missing.chunk_id.clone(),
@@ -3398,6 +3402,8 @@ impl DfsService {
             };
             result.push(crate::dfs::DfsExternalAuthorizedRead {
                 authorized: crate::dfs::DfsAuthorizedRead {
+                    open_sources: Vec::new(),
+
                     expires_at_unix_ms: now
                         .saturating_add(5_000)
                         .min(grant.expires_at_unix_ms)
@@ -3448,6 +3454,13 @@ impl DfsService {
         &self,
         request: crate::dfs::ValidateDfsReadGrants,
     ) -> Result<Vec<crate::dfs::DfsAuthorizedRead>> {
+        if request
+            .validations
+            .first()
+            .is_some_and(|v| v.grant.token.starts_with("dfs-open-v1:"))
+        {
+            return self.validate_open_read_context(request).await;
+        }
         if request.validations.is_empty() || request.validations.len() > 128 {
             return Err(invalid(
                 "read grant validation batch requires 1..128 entries",
@@ -3552,6 +3565,8 @@ impl DfsService {
                 .min(caller.expires_at_unix_ms)
                 .min(receiver.expires_at_unix_ms);
             result.push(crate::dfs::DfsAuthorizedRead {
+                open_sources: Vec::new(),
+
                 validation,
                 allowed_ranges,
                 expires_at_unix_ms,

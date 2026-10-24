@@ -16,6 +16,9 @@
 //!
 //! CQ completion 只证明 DMA 完成，不证明文件落盘；文件成功标准仍由 Storage/业务层决定。
 
+#[cfg(feature = "dfs")]
+mod open_read;
+
 use afs_transport::grpc::error_status::{coded_status, error_to_status};
 #[cfg(feature = "dfs")]
 use std::pin::Pin;
@@ -533,6 +536,9 @@ pub struct DfsChunksService {
 /// authority snapshot and its expiry; it must not turn each range into a Meta RPC.
 #[cfg(feature = "dfs")]
 pub trait DfsReadAuthorizer: Send + Sync + 'static {
+    fn close_open_context(&self, _peer: &str, _context: &str) -> afs_error::Result<()> {
+        Err(replica_denied("file read context close unsupported"))
+    }
     fn authorize(
         &self,
         authenticated_peer: &str,
@@ -542,6 +548,9 @@ pub trait DfsReadAuthorizer: Send + Sync + 'static {
 
 #[cfg(feature = "dfs")]
 pub trait DfsReadGrantValidator: Send + Sync + 'static {
+    fn authorization_metrics(&self) -> Option<super::super::read_work::ReadWorkMetrics> {
+        None
+    }
     fn validate(
         &self,
         request: crate::dfs::ValidateDfsReadGrants,
@@ -549,6 +558,9 @@ pub trait DfsReadGrantValidator: Send + Sync + 'static {
 }
 #[cfg(feature = "dfs")]
 impl DfsReadGrantValidator for super::meta::GrpcDfsMeta {
+    fn authorization_metrics(&self) -> Option<super::super::read_work::ReadWorkMetrics> {
+        self.authorization_metrics()
+    }
     fn validate(
         &self,
         request: crate::dfs::ValidateDfsReadGrants,
@@ -561,6 +573,7 @@ impl DfsReadGrantValidator for super::meta::GrpcDfsMeta {
 /// fallback. Cache hits keep their original expiry and cannot renew a lease.
 #[cfg(feature = "dfs")]
 pub struct CachedDfsReadAuthorizer {
+    open_cache: std::sync::Mutex<open_read::OpenAuthorityState>,
     validator: Arc<dyn DfsReadGrantValidator>,
     node_id: String,
     node_epoch: u64,
@@ -583,6 +596,7 @@ impl CachedDfsReadAuthorizer {
             node_id,
             node_epoch,
             cache: std::sync::Mutex::new(HashMap::new()),
+            open_cache: std::sync::Mutex::new(open_read::OpenAuthorityState::default()),
         }
     }
 }
@@ -622,7 +636,22 @@ fn authorized_read_range(entry: &crate::dfs::DfsAuthorizedRead, offset: u64, len
 
 #[cfg(feature = "dfs")]
 impl DfsReadAuthorizer for CachedDfsReadAuthorizer {
+    fn close_open_context(&self, peer: &str, context: &str) -> afs_error::Result<()> {
+        self.close_open_context(peer, context)
+    }
     fn authorize(&self, peer: &str, request: &DfsReadRangesRequest) -> afs_error::Result<()> {
+        let metrics = self.validator.authorization_metrics();
+        let _authorization_scope = metrics.as_ref().map(|m| m.authorization_scope("total"));
+        if request
+            .operations
+            .first()
+            .and_then(|op| op.grant.as_ref())
+            .is_some_and(|g| g.token.starts_with("dfs-open-v1:"))
+        {
+            validate_dfs_read_request(request)
+                .map_err(afs_transport::grpc::error_status::status_to_error)?;
+            return self.authorize_open_context(peer, request, metrics.as_ref());
+        }
         validate_dfs_read_request(request)
             .map_err(afs_transport::grpc::error_status::status_to_error)?;
         let now = std::time::SystemTime::now()
@@ -661,10 +690,14 @@ impl DfsReadAuthorizer for CachedDfsReadAuthorizer {
                 .cache
                 .lock()
                 .map_err(|_| replica_denied("read authority cache is poisoned"))?;
+            let maintenance = metrics
+                .as_ref()
+                .map(|m| m.authorization_scope("cache_maintenance"));
             cache.retain(|_, entry| {
                 entry.deadline > std::time::Instant::now()
                     && entry.authorization.expires_at_unix_ms > now
             });
+            drop(maintenance);
             checks
                 .iter()
                 .filter(|(key, check)| {
@@ -682,12 +715,14 @@ impl DfsReadAuthorizer for CachedDfsReadAuthorizer {
         if missing.is_empty() {
             return Ok(());
         }
+        let meta_scope = metrics.as_ref().map(|m| m.authorization_scope("meta_rpc"));
         let authorized = self.validator.validate(crate::dfs::ValidateDfsReadGrants {
             receiver_node_id: self.node_id.clone(),
             receiver_node_epoch: self.node_epoch,
             peer_node_id: peer.into(),
             validations: missing.clone(),
         })?;
+        drop(meta_scope);
         if authorized.len() != missing.len() {
             return Err(replica_denied("read authority reply is incomplete"));
         }
@@ -819,6 +854,19 @@ pub fn make_dfs_chunks_server_with_transport(
 #[cfg(feature = "dfs")]
 #[tonic::async_trait]
 impl DfsChunks for DfsChunksService {
+    async fn close_read_context(
+        &self,
+        request: Request<afs_protocol::node_data::DfsCloseReadContextRequest>,
+    ) -> Result<Response<afs_protocol::node_data::DfsCloseReadContextReply>, Status> {
+        let peer = authenticate_peer(self.authenticator.as_ref(), &request)?;
+        self.authorizer
+            .close_open_context(&peer, &request.into_inner().context)
+            .map_err(error_to_status)?;
+        Ok(Response::new(
+            afs_protocol::node_data::DfsCloseReadContextReply {},
+        ))
+    }
+
     type ReadRangesStream =
         Pin<Box<dyn Stream<Item = Result<DfsReadRangesFrame, Status>> + Send + 'static>>;
 
@@ -6020,6 +6068,8 @@ mod tests {
                         validation.copy_id = crate::dfs::CopyId::new("another-copy");
                     }
                     crate::dfs::DfsAuthorizedRead {
+                        open_sources: Vec::new(),
+
                         validation,
                         allowed_ranges,
                         expires_at_unix_ms,
@@ -8210,5 +8260,213 @@ mod tests {
             .expires_at_unix_ms = u64::MAX;
         request.operations[0].length = MAX_DFS_READ_BYTES + 1;
         assert!(validate_dfs_read_request(&request).is_err());
+    }
+    #[cfg(feature = "dfs")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn open_authority_file_cache_close_and_immutable_identity() {
+        use crate::dfs::*;
+        let (meta, _local, _temp, mut request) = memory_read_authority_fixture().await;
+        let service = meta.dfs.as_ref().unwrap().clone();
+        let reference = "read-open:unit-open";
+        let mut pin = UpdateGcReference {
+            open_read: Some(OpenReadIdentity {
+                version_id: FileVersionId::new("version"),
+                layout_root_id: LayoutRootId::new("layout"),
+                closed: false,
+            }),
+            close_open_read: false,
+            node_id: "reader".into(),
+            session_id: "session-reader".into(),
+            reference_id: reference.into(),
+            inode_id: Some(InodeId::new("read-inode")),
+            version_id: Some(FileVersionId::new("version")),
+            publication: false,
+            chunks: vec![],
+            release: false,
+            admission_deadline_unix_ms: crate::meta::store::now_unix_ms() + 30_000,
+        };
+        service.update_gc_reference(pin.clone()).await.unwrap();
+        request.operations[0].grant.as_mut().unwrap().token = format!("dfs-open-v1:{reference}");
+        request.operations[0]
+            .grant
+            .as_mut()
+            .unwrap()
+            .expires_at_unix_ms = crate::meta::store::now_unix_ms() + 30_000;
+        let validator = Arc::new(MemoryReadGrantValidator {
+            service: service.clone(),
+            runtime: tokio::runtime::Handle::current(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            unavailable: std::sync::atomic::AtomicBool::new(false),
+        });
+        let authorizer = Arc::new(CachedDfsReadAuthorizer::new(
+            validator.clone(),
+            "receiver".into(),
+            1,
+        ));
+        let a = authorizer.clone();
+        let r = request.clone();
+        tokio::task::spawn_blocking(move || {
+            a.authorize("reader", &r).unwrap();
+            let mut next = r.clone();
+            next.operations[0].chunk_offset += 1024;
+            next.operations[0].length = 1024;
+            a.authorize("reader", &next).unwrap();
+            let mut bad = next.clone();
+            bad.operations[0].grant.as_mut().unwrap().namespace_id = "another".into();
+            assert!(a.authorize("reader", &bad).is_err());
+            let mut bad = next.clone();
+            bad.operations[0].grant.as_mut().unwrap().file_version_id = "another".into();
+            bad.file_version_id = "another".into();
+            assert!(a.authorize("reader", &bad).is_err());
+            assert!(a.authorize("other-peer", &next).is_err());
+        })
+        .await
+        .unwrap();
+        assert_eq!(validator.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        validator
+            .unavailable
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        // The file authority keeps the same immutable identity after its five-second lease.
+        tokio::time::sleep(std::time::Duration::from_millis(5_100)).await;
+        let a = authorizer.clone();
+        let r = request.clone();
+        assert!(
+            tokio::task::spawn_blocking(move || a.authorize("reader", &r))
+                .await
+                .unwrap()
+                .is_err()
+        );
+        validator
+            .unavailable
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let a = authorizer.clone();
+        let r = request.clone();
+        tokio::task::spawn_blocking(move || a.authorize("reader", &r))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(validator.calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+        let a = authorizer.clone();
+        let mut bad = request.clone();
+        bad.operations[0].source_copy_id = "wrong-copy".into();
+        assert!(
+            tokio::task::spawn_blocking(move || a.authorize("reader", &bad))
+                .await
+                .unwrap()
+                .is_err()
+        );
+        let a = authorizer.clone();
+        let mut bad = request.clone();
+        bad.operations[0].chunk_offset = 0;
+        assert!(
+            tokio::task::spawn_blocking(move || a.authorize("reader", &bad))
+                .await
+                .unwrap()
+                .is_err()
+        );
+        pin.open_read = None;
+        pin.close_open_read = true;
+        service.update_gc_reference(pin.clone()).await.unwrap();
+        authorizer
+            .close_open_context("reader", &format!("dfs-open-v1:{reference}"))
+            .unwrap();
+        let a = authorizer.clone();
+        let r = request.clone();
+        assert!(
+            tokio::task::spawn_blocking(move || a.authorize("reader", &r))
+                .await
+                .unwrap()
+                .is_err()
+        );
+        // A fresh serving cache also cannot revive a closed durable reference.
+        let a = CachedDfsReadAuthorizer::new(validator, "receiver".into(), 1);
+        assert!(
+            tokio::task::spawn_blocking(move || a.authorize("reader", &request))
+                .await
+                .unwrap()
+                .is_err()
+        );
+        pin.close_open_read = false;
+        pin.release = true;
+        service.update_gc_reference(pin).await.unwrap();
+    }
+    #[cfg(feature = "dfs")]
+    #[tokio::test]
+    async fn open_authority_replacement_session_cannot_reuse_old_context() {
+        use crate::dfs::*;
+        let (meta, _local, _temp, mut request) = memory_read_authority_fixture().await;
+        let service = meta.dfs.as_ref().unwrap();
+        service
+            .update_gc_reference(UpdateGcReference {
+                open_read: Some(OpenReadIdentity {
+                    version_id: FileVersionId::new("version"),
+                    layout_root_id: LayoutRootId::new("layout"),
+                    closed: false,
+                }),
+                close_open_read: false,
+                node_id: "reader".into(),
+                session_id: "session-reader".into(),
+                reference_id: "read-open:old-process".into(),
+                inode_id: Some(InodeId::new("read-inode")),
+                version_id: Some(FileVersionId::new("version")),
+                publication: false,
+                chunks: vec![],
+                release: false,
+                admission_deadline_unix_ms: crate::meta::store::now_unix_ms() + 30_000,
+            })
+            .await
+            .unwrap();
+        request.operations[0].grant.as_mut().unwrap().token =
+            "dfs-open-v1:read-open:old-process".into();
+        let grant = request.operations[0].grant.as_ref().unwrap();
+        let check = ValidateDfsReadGrants {
+            receiver_node_id: "receiver".into(),
+            receiver_node_epoch: 1,
+            peer_node_id: "reader".into(),
+            validations: vec![DfsReadValidation {
+                grant: DfsReadGrant {
+                    namespace_id: NamespaceId::new(grant.namespace_id.clone()),
+                    file_version_id: FileVersionId::new("version"),
+                    layout_root_id: LayoutRootId::new("layout"),
+                    caller_node_id: "reader".into(),
+                    caller_node_epoch: 1,
+                    expires_at_unix_ms: grant.expires_at_unix_ms,
+                    fence: grant.fence,
+                    token: grant.token.clone(),
+                },
+                chunk_id: ChunkId::new(request.operations[0].chunk_id.clone()),
+                copy_id: CopyId::new("copy"),
+                chunk_offset: 1024,
+                length: 1024,
+            }],
+        };
+        service.validate_read_grants(check.clone()).await.unwrap();
+        meta.store
+            .as_ref()
+            .unwrap()
+            .register_node_session(
+                crate::meta::store::RequestKey::new("reader", "replacement"),
+                crate::meta::store::NodeSessionLease {
+                    node_id: "reader".into(),
+                    session_id: "new-reader-process".into(),
+                    grpc_addr: "http://127.0.0.1:1".into(),
+                    data_addr: "http://127.0.0.1:1".into(),
+                    rest_addr: "http://127.0.0.1:1".into(),
+                    storage_devices: vec![],
+                    lease_ttl: std::time::Duration::from_secs(30),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            service.validate_read_grants(check.clone()).await.is_err(),
+            "old process epoch must be fenced"
+        );
+        let mut borrowed = check;
+        borrowed.validations[0].grant.caller_node_epoch = 2;
+        assert!(
+            service.validate_read_grants(borrowed).await.is_err(),
+            "replacement process cannot borrow the old session pin"
+        );
     }
 }

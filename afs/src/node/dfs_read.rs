@@ -491,6 +491,9 @@ fn validate_local_object_identity(expected: &ChunkObject, local: &ChunkObject) -
 }
 
 pub trait ChunkTransfer: Send + Sync {
+    fn close_open_read_context(&self, _reference: &str) -> Result<()> {
+        Ok(())
+    }
     /// `out` belongs to this attempt; the scheduler publishes it only after
     /// every operation completes. An adapter must drain or retain any DMA
     /// resources before returning, including on cancellation or timeout.
@@ -1669,13 +1672,60 @@ impl DfsReadEngine {
             }
         }
         let authority = self.capture_native_read_authority()?;
-        self.read_batch_into_private(batch, out, true, deadline)
+        self.read_batch_into_private(batch, out, true, deadline, None)
             .inspect_err(|error| {
                 self.invalidate_native_batch_on_error(batch, error);
             })?;
         self.check_native_read_authority(&authority)
     }
 
+    pub(super) fn read_batch_native_open_into_private_before(
+        &self,
+        batch: &ReadBatch,
+        out: &mut [u8],
+        deadline: Option<Instant>,
+        open_reference: Option<&str>,
+    ) -> Result<()> {
+        self.validate_native_read_size(out.len())?;
+        batch.validate_for_output(out.len(), &self.config)?;
+        if self.external_backend.is_some() {
+            return Err(Error::coded(
+                afs_error::NODE_TRANSFER_UNSUPPORTED,
+                "private native read cannot use an external backend",
+            ));
+        }
+        // Native layout operations are disjoint. Reject overlaps explicitly:
+        // direct local grouping must not change the old scatter precedence.
+        for (index, left) in batch.ops.iter().enumerate() {
+            if left.length == 0 {
+                continue;
+            }
+            let left_end = left.output_offset + left.length as usize;
+            if batch.ops[index + 1..].iter().any(|right| {
+                right.length != 0
+                    && left.output_offset < right.output_offset + right.length as usize
+                    && right.output_offset < left_end
+            }) {
+                return Err(invalid("private native read output ranges overlap"));
+            }
+        }
+        let authority = self.capture_native_read_authority()?;
+        self.read_batch_into_private(batch, out, true, deadline, open_reference)
+            .inspect_err(|error| {
+                self.invalidate_native_batch_on_error(batch, error);
+            })?;
+        self.check_native_read_authority(&authority)
+    }
+    pub(super) fn close_open_read_context(&self, reference: &str) -> Result<()> {
+        self.transfer.close_open_read_context(reference)
+    }
+    pub(super) fn check_open_read_epoch(&self, opened: &NativeReadAuthoritySnapshot) -> Result<()> {
+        let current = self.capture_native_read_authority()?;
+        if current.epoch != opened.epoch {
+            return Err(external_denied("opened read node epoch changed"));
+        }
+        Ok(())
+    }
     pub fn has_external_backend(&self) -> bool {
         self.external_backend.is_some()
     }
@@ -1766,6 +1816,15 @@ impl DfsReadEngine {
         output_len: usize,
         deadline: Option<Instant>,
     ) -> Result<Option<Vec<u8>>> {
+        self.read_batch_native_open_owned_before(batch, output_len, deadline, None)
+    }
+    pub(super) fn read_batch_native_open_owned_before(
+        &self,
+        batch: &ReadBatch,
+        output_len: usize,
+        deadline: Option<Instant>,
+        open_reference: Option<&str>,
+    ) -> Result<Option<Vec<u8>>> {
         if output_len as u64 > self.config.max_inflight_bytes {
             return Err(invalid("DFS owned read exceeds inflight byte budget"));
         }
@@ -1788,7 +1847,7 @@ impl DfsReadEngine {
         let _entered = span.enter();
         let authority = self.capture_native_read_authority()?;
         let mut result = vec![0; output_len];
-        self.read_batch_into_private(batch, &mut result, true, deadline)
+        self.read_batch_into_private(batch, &mut result, true, deadline, open_reference)
             .inspect_err(|error| {
                 self.invalidate_native_batch_on_error(batch, error);
             })?;
@@ -2251,6 +2310,8 @@ impl DfsReadEngine {
     ) -> DfsExternalAuthorizedRead {
         DfsExternalAuthorizedRead {
             authorized: crate::dfs::DfsAuthorizedRead {
+                open_sources: Vec::new(),
+
                 validation: DfsReadValidation {
                     grant: entry.grant.clone(),
                     chunk_id: entry.chunk.id.clone(),
@@ -2782,7 +2843,7 @@ impl DfsReadEngine {
     }
 
     fn read_batch_into(&self, batch: &ReadBatch, out: &mut [u8]) -> Result<()> {
-        self.read_batch_into_private(batch, out, false, None)
+        self.read_batch_into_private(batch, out, false, None, None)
     }
 
     fn read_batch_into_private(
@@ -2791,6 +2852,7 @@ impl DfsReadEngine {
         out: &mut [u8],
         final_owned: bool,
         deadline: Option<Instant>,
+        open_reference: Option<&str>,
     ) -> Result<()> {
         let mut groups: Vec<(ChunkId, Vec<usize>)> = Vec::new();
         let mut positions: HashMap<ChunkId, usize> = HashMap::new();
@@ -2886,7 +2948,12 @@ impl DfsReadEngine {
             layout_root_id: batch.layout_root_id.clone(),
             ops: remote_ops,
         };
-        let sources = self.sources_for(&remote_batch)?;
+        let mut sources = self.sources_for(&remote_batch)?;
+        if let Some(reference) = open_reference {
+            for source in sources.iter_mut().flat_map(|set| &mut set.sources) {
+                source.read_grant.token = format!("dfs-open-v1:{reference}");
+            }
+        }
         let authority = self.capture_native_read_authority()?;
         if authority.epoch != 0
             && sources
@@ -9726,6 +9793,8 @@ mod tests {
                 .map(|validation| {
                     let mut entry = crate::dfs::DfsExternalAuthorizedRead {
                         authorized: crate::dfs::DfsAuthorizedRead {
+                            open_sources: Vec::new(),
+
                             validation,
                             allowed_ranges: vec![(0, self.chunk.length)],
                             expires_at_unix_ms: expires_at,

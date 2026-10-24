@@ -270,6 +270,8 @@ impl DfsService {
                 // Persist a tombstone even when admission has not become visible.
                 // This CAS fences a queued/lost-reply retain on the same key.
                 let tombstone = GcReference {
+                    open_read: None,
+
                     node_id: update.node_id.clone(),
                     session_id: update.session_id.clone(),
                     reference_id: update.reference_id.clone(),
@@ -335,6 +337,17 @@ impl DfsService {
                         "open version was collected before reference admission",
                     ));
                 }
+                if let Some(identity) = &update.open_read
+                    && (identity.closed
+                        || update.publication
+                        || update.close_open_read
+                        || update.version_id.as_ref() != Some(&identity.version_id)
+                        || !matches!(view.lookup(&MetaKey::DfsFileVersion(identity.version_id.clone()))?.entity, Some(MetaEntity::DfsFileVersion(v)) if v.inode_id == inode_id && v.layout_root == identity.layout_root_id))
+                {
+                    return Err(invalid(
+                        "open read registration differs from its immutable version",
+                    ));
+                }
                 GcReference {
                     node_id: update.node_id.clone(),
                     session_id: update.session_id.clone(),
@@ -343,6 +356,7 @@ impl DfsService {
                     publication: update.publication,
                     chunks: Vec::new(),
                     retired_at_unix_ms: None,
+                    open_read: update.open_read.clone(),
                 }
             };
             if reference.retired_at_unix_ms.is_some() {
@@ -360,6 +374,20 @@ impl DfsService {
                     || update.publication != reference.publication)
             {
                 return Err(invalid("reference identity was reused for another access"));
+            }
+            if update
+                .open_read
+                .as_ref()
+                .is_some_and(|identity| reference.open_read.as_ref() != Some(identity))
+            {
+                return Err(invalid("open read reference identity changed"));
+            }
+            if update.close_open_read {
+                let identity = reference
+                    .open_read
+                    .as_mut()
+                    .ok_or_else(|| invalid("reference is not an open read context"))?;
+                identity.closed = true;
             }
             let gc = match reference_entity(&view, MetaKey::DfsGc, &mut conditions)? {
                 Some(MetaEntity::DfsGc(gc)) => gc,
@@ -637,6 +665,8 @@ mod tests {
     }
     fn pin(id: &str) -> GcReference {
         GcReference {
+            open_read: None,
+
             node_id: "reader".into(),
             session_id: "session".into(),
             reference_id: "open".into(),
@@ -645,6 +675,35 @@ mod tests {
             chunks: vec![],
             retired_at_unix_ms: None,
         }
+    }
+    #[test]
+    fn open_authority_closed_context_keeps_gc_pin_until_last_user_and_grace() {
+        let mut entities = vec![inode("mapped", 0, "v2"), chunk("old"), chunk("new")];
+        entities.extend(version("v1", "mapped", "old"));
+        entities.extend(version("v2", "mapped", "new"));
+        let mut reference = pin("mapped");
+        reference.open_read = Some(crate::dfs::OpenReadIdentity {
+            version_id: FileVersionId::new("v1"),
+            layout_root_id: LayoutRootId::new("v1"),
+            closed: true,
+        });
+        assert!(
+            plan_collection(&entities, &[reference.clone()], 100, 10)
+                .chunks
+                .is_empty()
+        );
+        reference.retired_at_unix_ms = Some(100);
+        assert!(
+            plan_collection(&entities, &[reference.clone()], 109, 10)
+                .chunks
+                .is_empty()
+        );
+        assert_eq!(
+            plan_collection(&entities, &[reference], 110, 10)
+                .chunks
+                .len(),
+            2
+        );
     }
     #[test]
     fn cow_clone_retains_shared_chunks_after_source_is_unlinked() {
@@ -806,6 +865,9 @@ mod tests {
     }
     fn update(id: &str) -> UpdateGcReference {
         UpdateGcReference {
+            open_read: None,
+            close_open_read: false,
+
             node_id: "n".into(),
             session_id: "s".into(),
             reference_id: id.into(),
@@ -819,6 +881,8 @@ mod tests {
     }
     fn pending_reference(id: &str) -> MetaEntity {
         MetaEntity::DfsReference(GcReference {
+            open_read: None,
+
             node_id: "n".into(),
             session_id: "s".into(),
             reference_id: id.into(),

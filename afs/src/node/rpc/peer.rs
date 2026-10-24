@@ -16,6 +16,9 @@
 #[cfg(feature = "dfs")]
 mod crc32c;
 
+#[cfg(feature = "dfs")]
+mod open_read;
+
 #[cfg(all(feature = "dfs", feature = "rdma"))]
 use crate::node::dfs_read::ChunkTransfer;
 
@@ -1188,6 +1191,7 @@ impl PeerConnectionPool {
 
 #[cfg(feature = "dfs")]
 pub struct GrpcChunkTransfer {
+    open_read_peers: std::sync::Mutex<open_read::OpenReadPeers>,
     peers: Arc<PeerConnectionPool>,
     runtime: PeerRuntime,
     timeout: Duration,
@@ -1202,6 +1206,7 @@ impl GrpcChunkTransfer {
             runtime: PeerRuntime::current_or_new().map_err(|error| error.0)?,
             timeout,
             next_read: std::sync::atomic::AtomicU64::new(1),
+            open_read_peers: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
 }
@@ -1224,6 +1229,7 @@ impl GrpcChunkTransfer {
             None => batch.validate(out.len())?,
         }
         let first = &batch.operations[0].source;
+        self.remember_open_read(first)?;
         let crate::dfs::CopyLocation::Node {
             node_id,
             node_epoch,
@@ -2521,6 +2527,9 @@ impl GrpcChunkTransfer {
 
 #[cfg(feature = "dfs")]
 impl crate::node::dfs_read::ChunkTransfer for GrpcChunkTransfer {
+    fn close_open_read_context(&self, reference: &str) -> afs_error::Result<()> {
+        self.close_open_context_impl(reference)
+    }
     fn read_crc32c_range(
         &self,
         batch: &crate::node::dfs_read::PeerReadBatch,
@@ -6857,6 +6866,14 @@ mod tests {
     #[cfg(feature = "dfs")]
     #[tonic::async_trait]
     impl afs_protocol::node_data::dfs_chunks_server::DfsChunks for DiskStreamFixture {
+        async fn close_read_context(
+            &self,
+            _request: tonic::Request<afs_protocol::node_data::DfsCloseReadContextRequest>,
+        ) -> Result<tonic::Response<afs_protocol::node_data::DfsCloseReadContextReply>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("fixture has no open context"))
+        }
+
         type ReadRangesStream = std::pin::Pin<
             Box<
                 dyn tokio_stream::Stream<

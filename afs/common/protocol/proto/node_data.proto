@@ -49,6 +49,7 @@ message DataWriteReply {
 // DistributedFs replica commands. gRPC streaming and one-sided RDMA are two
 // byte movers below the same immutable Chunk/ReplicaAck state machine.
 service DfsChunks {
+  rpc CloseReadContext(DfsCloseReadContextRequest) returns (DfsCloseReadContextReply);
   rpc PutReplicaStream(stream DfsPutReplicaFrame) returns (DfsPutReplicaReply);
   rpc PutReplicaRdma(DfsPutReplicaRdmaRequest) returns (DfsPutReplicaReply);
   rpc ConfirmReplica(DfsConfirmReplicaRequest) returns (DfsReplicaAck);
@@ -805,3 +806,6 @@ message DfsOwnerSyncReply {
   uint64 durable_write_seq = 1;
   string file_version_id = 2;
 }
+
+message DfsCloseReadContextRequest { string context = 1; }
+message DfsCloseReadContextReply {}

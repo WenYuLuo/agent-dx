@@ -77,6 +77,7 @@ impl GrpcChunkTransfer {
             ));
         }
         let item = &batch.operations[0];
+        self.remember_open_read(&item.source)?;
         if item.op.chunk_id != chunk.id
             || item.source.chunk_id != chunk.id
             || item

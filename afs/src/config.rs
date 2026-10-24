@@ -338,6 +338,8 @@ pub struct Cli {
     /// Bounded coarse read timing for explicit diagnosis only; disabled by default.
     #[arg(long)]
     pub dfs_read_diagnostics_enabled: Option<bool>,
+    #[arg(long)]
+    pub dfs_native_open_read_authority: Option<bool>,
     /// Write native objects with segmented CRC32C; native DFS Nodes default to true.
     #[arg(long)]
     pub dfs_crc32c_writes: Option<bool>,
@@ -474,6 +476,7 @@ struct FileConfig {
     dfs_source_lookahead_chunks: Option<usize>,
     dfs_source_cache_bytes: Option<usize>,
     dfs_read_diagnostics_enabled: Option<bool>,
+    dfs_native_open_read_authority: Option<bool>,
     dfs_crc32c_writes: Option<bool>,
     dfs_optimistic_gc_commit: Option<bool>,
     timeout_ms: Option<u64>,
@@ -560,6 +563,7 @@ pub struct Config {
     pub dfs_source_lookahead_chunks: usize,
     pub dfs_source_cache_bytes: usize,
     pub dfs_read_diagnostics_enabled: bool,
+    pub dfs_native_open_read_authority: bool,
     pub dfs_crc32c_writes: bool,
     pub dfs_optimistic_gc_commit: bool,
     pub timeout_ms: u64,
@@ -988,6 +992,10 @@ impl Config {
             dfs_source_cache_max_ms,
             dfs_source_lookahead_chunks,
             dfs_source_cache_bytes,
+            dfs_native_open_read_authority: cli
+                .dfs_native_open_read_authority
+                .or(file.dfs_native_open_read_authority)
+                .unwrap_or(false),
             dfs_read_diagnostics_enabled: cli
                 .dfs_read_diagnostics_enabled
                 .or(file.dfs_read_diagnostics_enabled)

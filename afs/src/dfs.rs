@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 mod cow;
 mod gc;
 pub use cow::clone_file_layout;
-pub use gc::{GcFence, GcReference, GcState, UpdateGcReference};
+pub use gc::{GcFence, GcReference, GcState, OpenReadIdentity, UpdateGcReference};
 
 macro_rules! string_id {
     ($name:ident) => {
@@ -898,6 +898,7 @@ pub struct DfsMissingReadSource {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DfsAuthorizedRead {
+    pub open_sources: Vec<u8>,
     pub validation: DfsReadValidation,
     pub allowed_ranges: Vec<(u64, u64)>,
     pub expires_at_unix_ms: u64,
@@ -1067,6 +1068,15 @@ pub struct SyncInodeMetadata {
     pub expected_inode_revision: u64,
     pub expected_head_version: Option<FileVersionId>,
     pub metadata_delta: CommitMetadataDelta,
+}
+
+/// One bounded page of file-level authorization, delivered directly by Meta to
+/// the authenticated serving Node. It is never accepted from a reading Node.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct OpenReadSource {
+    pub chunk_id: ChunkId,
+    pub copy_ids: Vec<CopyId>,
+    pub ranges: Vec<(u64, u64)>,
 }
 
 #[cfg(test)]

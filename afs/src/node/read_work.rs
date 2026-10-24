@@ -110,6 +110,8 @@ pub struct ReadWorkMetrics {
     hashes: afs_metrics::IntCounterVec,
     crc_read_bytes: afs_metrics::IntCounterVec,
     crc_read_calls: afs_metrics::IntCounterVec,
+    authorization_ns: afs_metrics::IntCounterVec,
+    authorization_calls: afs_metrics::IntCounterVec,
     outboard_total_bytes: afs_metrics::IntGauge,
     outboard_resident_bytes: afs_metrics::IntGauge,
     outboard_total_limit: afs_metrics::IntGauge,
@@ -215,6 +217,11 @@ impl ReadWorkMetrics {
                 "afs_dfs_read_scan_bytes_total",
                 "Logical file bytes read and hashed by complete immutable Chunk verification.",
             )?;
+            let authorization_ns = afs_metrics::IntCounterVec::new(afs_metrics::Opts::new("afs_dfs_read_authorization_nanoseconds_total", "Complete authorization scope wall time; scopes can nest and overlap."), &["stage"])?;
+            let authorization_calls = afs_metrics::IntCounterVec::new(afs_metrics::Opts::new("afs_dfs_read_authorization_calls_total", "Authorization scope calls, including cache hits and failures."), &["stage"])?;
+            for stage in ["total", "cache_maintenance", "meta_rpc", "open_meta", "close_meta", "close_peer"] { authorization_ns.with_label_values(&[stage]); authorization_calls.with_label_values(&[stage]); }
+            afs_metrics::register_collector(registry, &authorization_ns)?;
+            afs_metrics::register_collector(registry, &authorization_calls)?;
             let crc_read_bytes = afs_metrics::IntCounterVec::new(
                 afs_metrics::Opts::new("afs_dfs_crc32c_read_bytes_total", "Actual CRC32C read input bytes, including failed work; descriptor hashes are separate."), &["stage"],
             )?;
@@ -565,6 +572,8 @@ impl ReadWorkMetrics {
                 hashes,
                 crc_read_bytes,
                 crc_read_calls,
+                authorization_ns,
+                authorization_calls,
                 outboard_total_bytes,
                 outboard_resident_bytes,
                 outboard_total_limit,
@@ -698,6 +707,14 @@ impl ReadWorkMetrics {
     #[cfg(any(feature = "dfs", test))]
     pub(crate) fn diagnostics_snapshot(&self) -> Option<ReadDiagnosticsSnapshot> {
         self.diagnostics.as_ref().map(|journal| journal.snapshot())
+    }
+
+    pub(crate) fn authorization_scope(&self, stage: &'static str) -> ReadAuthorizationScope {
+        ReadAuthorizationScope {
+            metrics: self.clone(),
+            stage,
+            started: std::time::Instant::now(),
+        }
     }
 
     pub(crate) fn crc_read(&self, stage: &'static str, bytes: u64) {
@@ -1135,6 +1152,10 @@ impl ReadWorkMetrics {
                 | "get_file_version"
                 | "get_chunk_sources"
                 | "validate_read_grants"
+                | "validate_open_read_context"
+                | "open_read_context"
+                | "close_open_read_context"
+                | "peer_close_open_read_context"
                 | "peer_read_ranges"
         ) {
             self.read_rpc_calls.with_label_values(&[method]).inc();
@@ -2143,6 +2164,25 @@ impl Drop for ReadDiagnosticSpan {
     }
 }
 
+/// Cumulative counters independent of the bounded per-request journal.
+pub(crate) struct ReadAuthorizationScope {
+    metrics: ReadWorkMetrics,
+    stage: &'static str,
+    started: std::time::Instant,
+}
+impl Drop for ReadAuthorizationScope {
+    fn drop(&mut self) {
+        self.metrics
+            .authorization_ns
+            .with_label_values(&[self.stage])
+            .inc_by(self.started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+        self.metrics
+            .authorization_calls
+            .with_label_values(&[self.stage])
+            .inc();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::ReadWorkMetrics;
@@ -2630,6 +2670,7 @@ mod tests {
         metrics.hash("segment_index_bytes", 4096);
         metrics.hash("outboard_body_hash", 8192);
         metrics.hash("outboard_parent_hash", 64);
+        metrics.hash("crc_descriptor_hash", 128);
         metrics.hash("request-id-must-not-be-a-label", 1);
         metrics.peer_cache_metadata(256, 512);
         assert_eq!(
@@ -2663,7 +2704,13 @@ mod tests {
             .into_iter()
             .find(|family| family.name() == "afs_dfs_read_hash_bytes_total")
             .unwrap();
-        assert_eq!(hashes.get_metric().len(), 10);
+        assert_eq!(
+            same.hashes
+                .with_label_values(&["crc_descriptor_hash"])
+                .get(),
+            128
+        );
+        assert_eq!(hashes.get_metric().len(), 11);
     }
 
     #[test]
