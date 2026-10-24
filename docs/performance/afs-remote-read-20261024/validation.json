@@ -1,0 +1,123 @@
+{
+  "validation_reuse": "Tracking commits reproduce the delivered Rust/protobuf/Cargo inputs exactly. Documentation-only additions do not constitute a fresh Linux test or performance run.",
+  "latest_default_off": {
+    "source_manifest_sha256": "029e9ad2cc0dcf47b6cf37d402574d69453a0ec68d43fa7cce427da07eeabe6b",
+    "test_counts": {
+      "config": 10,
+      "modes": 7,
+      "crc": 23
+    },
+    "gates": {
+      "green01-fmt": [
+        {
+          "step": "command",
+          "exit": 0,
+          "cmd": "cargo fmt --all -- --check",
+          "seconds": 1.6981477737426758
+        }
+      ],
+      "green01-config": [
+        {
+          "step": "command",
+          "exit": 0,
+          "cmd": "cargo test --release --locked --offline -p afs --lib config:: -j2 -- --test-threads=2",
+          "seconds": 112.95405411720276
+        }
+      ],
+      "green01-modes": [
+        {
+          "step": "command",
+          "exit": 0,
+          "cmd": "cargo test --release --locked --offline -p afs --lib crc_read_modes -j2 -- --test-threads=2",
+          "seconds": 0.30439186096191406
+        }
+      ],
+      "green01-crc": [
+        {
+          "step": "command",
+          "exit": 0,
+          "cmd": "cargo test --release --locked --offline -p afs --lib crc32c_ -j2 -- --test-threads=2",
+          "seconds": 0.28508424758911133
+        }
+      ],
+      "green01-clippy": [
+        {
+          "step": "command",
+          "exit": 0,
+          "cmd": "cargo clippy --locked --offline --workspace --all-targets --all-features -j2 -- -D warnings",
+          "seconds": 35.82475805282593
+        }
+      ],
+      "green01-release": [
+        {
+          "step": "command",
+          "exit": 0,
+          "cmd": "cargo build --release --locked --offline -p afs --bin afs-node --bin afs-meta -j2",
+          "seconds": 86.49386692047119
+        }
+      ]
+    },
+    "actual_print_config": {
+      "passed": true,
+      "cases": {
+        "node-default": {
+          "dfs_read_crc_mode": "off",
+          "dfs_crc32c_writes": true
+        },
+        "node-receiver": {
+          "dfs_read_crc_mode": "receiver",
+          "dfs_crc32c_writes": true
+        },
+        "node-both": {
+          "dfs_read_crc_mode": "both",
+          "dfs_crc32c_writes": true
+        },
+        "meta-default": {
+          "dfs_read_crc_mode": "off",
+          "dfs_crc32c_writes": false
+        }
+      }
+    }
+  },
+  "inherited_open_authority": {
+    "specialized_tests": 11,
+    "meta_dfs_tests": 67,
+    "meta_store_tests": 163,
+    "node_gc_tests": 3,
+    "common_read_metrics_tests": 20,
+    "scope": "same production source inherited; tests executed in parent Linux phases, not newly rerun here"
+  },
+  "known_baseline_failure": {
+    "test": "node::rpc::data::tests::dfs_replica_grpc_stream_durable_retry_and_malformed_body",
+    "actual": "DataLoss",
+    "expected": "InvalidArgument",
+    "cargo_exit": 101,
+    "original_pr93_reproduced": true,
+    "assertion_unchanged": true
+  },
+  "logs_sha256": {
+    "afs-read-crc-default-off-20261024/green01-config-command.log": "46a3175a83a3a97721768d5d17ef2ac6b7364b1ecb84074cc837d894ff73cb9f",
+    "afs-read-crc-default-off-20261024/green01-modes-command.log": "d9a45a586d2aab325dc5e2b59889e617aa49cdcf46a90d06f57a9362ec57f52f",
+    "afs-read-crc-default-off-20261024/green01-crc-command.log": "9a631ec8f0259e7f14c8041233d5829b9481e8389b56148a84993d124f38b3bd",
+    "afs-read-crc-default-off-20261024/green01-clippy-command.log": "b8445a64fba3e11602dce9102eeae5c7eb77dac97774c16b0a0107071d271349",
+    "afs-read-crc-default-off-20261024/green01-release-command.log": "296478fb6410a4a40c2790fc326d05f8f690539b2030af0a6362fd38e5f8bd0a",
+    "afs-open-read-authority-20261024/pristine-failure-command.log": "25a17f41ff45557670785379468b32dd3ac8839f0fd523a0d91329086d3d5635"
+  },
+  "tracking_preparation": {
+    "documents_checked": 158,
+    "local_links_checked": 790,
+    "json_examples_checked": 52,
+    "svg_checked": 5,
+    "errors": [],
+    "code_input_equivalence": {
+      "validated_candidate_files": 1328,
+      "differences_from_validated_candidate": [
+        "docs/testing/afs.md"
+      ],
+      "all_rust_protocol_cargo_and_build_inputs_identical": true,
+      "new_changes": "Tracking documents and evidence summaries only",
+      "validation_reused": "Latest Linux default-off config10/modes7/CRC23, fmt, strict all-target/all-features workspace Clippy and release; inherited parent checks kept distinct",
+      "new_rust_or_performance_runs": false
+    }
+  }
+}

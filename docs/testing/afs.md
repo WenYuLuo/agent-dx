@@ -1016,3 +1016,12 @@ A/B must agree via the explicit `x-afs-read-crc-mode` request metadata. New read
 To enable optional B verification, set `dfs_read_crc_mode = "receiver"` on both A and B. A only needs to serve the matching policy for aligned complete segments; those segments are checked at B. A standalone B-only configuration change is not negotiated by the current implementation. Requests without the policy metadata retain the legacy `both` interpretation and therefore fail against an `off` server rather than silently changing their verification contract.
 
 Moving detection from A to B also moves the point where a corrupted copy becomes visible. This experiment retains existing candidate fallback, but its R1 corruption test proves detection/EIO or explicit unchecked delivery, not multi-replica quarantine, repair or self-healing. Previously recorded open-handle EOF and GC qualification boundaries remain separate.
+
+
+## Experimental native readonly open authority
+
+The isolated read candidate supports `dfs_native_open_read_authority = true` only with explicit native `data_mode = "grpc"`. The switch defaults to false. Eligible regular O_RDONLY handles with no dirty/proxy view pin their opened version/layout and reuse file-scoped authorization. A validates the context against Meta on first admission or lease renewal and keeps local range/copy/session checks. Close prevents new admission; in-flight owners keep the existing durable GC pin until their last release.
+
+This is an experimental data-version contract, not an admitted per-fd length snapshot: a truncate followed by a new open can change the shared kernel inode EOF before an old-fd tail read reaches FUSE. The new persisted GC context schema has only been checked with fresh isolated stores and same-version Meta/A/B. Migration, mixed versions and integration with prefetch/cache are not admitted.
+
+The [remote read candidate ledger](../performance/afs-remote-read-20261024/README.md) records the exact cohorts, Linux validation, retained failures and future work. Benchmark settings explicitly enable this switch, set `dfs_fuse_keep_cache=false` and `dfs_readahead_max_bytes=0`; merely using a new binary does not activate all candidate optimizations.

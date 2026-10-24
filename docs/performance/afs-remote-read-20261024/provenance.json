@@ -1,0 +1,83 @@
+{
+  "base": "e2136e2d64cd5520b2cd431d3c68371672a93d12",
+  "base_tree_equals_pr93": "b4b0a8a2142f18c4ac1fa9636cd66d9209428793",
+  "commits": [
+    {
+      "stage": "range-crc-dedup",
+      "commit": "b8c779bd0a6be1e93c75b66462f16665d7a95463",
+      "subject": "perf(afs): deduplicate aligned remote read CRC scans",
+      "changed_files": [
+        "afs/src/node/chunk.rs",
+        "afs/src/node/chunk_crc32c.rs",
+        "afs/src/node/read_work.rs",
+        "afs/src/node/rpc/data.rs",
+        "afs/src/node/rpc/peer/crc32c.rs"
+      ]
+    },
+    {
+      "stage": "open-authority",
+      "commit": "99d485520b0f594ba4ee502c5ce81d4d894bb4c3",
+      "subject": "perf(afs): reuse native readonly file authorization contexts",
+      "changed_files": [
+        "afs/common/protocol/proto/meta.proto",
+        "afs/common/protocol/proto/node_data.proto",
+        "afs/src/config.rs",
+        "afs/src/dfs.rs",
+        "afs/src/dfs/gc.rs",
+        "afs/src/meta/dfs.rs",
+        "afs/src/meta/dfs/gc.rs",
+        "afs/src/meta/dfs/gc_fence_tests.rs",
+        "afs/src/meta/dfs/open_read.rs",
+        "afs/src/meta/rpc.rs",
+        "afs/src/meta/store/history.rs",
+        "afs/src/node.rs",
+        "afs/src/node/dfs_read.rs",
+        "afs/src/node/gc.rs",
+        "afs/src/node/read_work.rs",
+        "afs/src/node/rpc/data.rs",
+        "afs/src/node/rpc/data/open_read.rs",
+        "afs/src/node/rpc/meta.rs",
+        "afs/src/node/rpc/peer.rs",
+        "afs/src/node/rpc/peer/crc32c.rs",
+        "afs/src/node/rpc/peer/open_read.rs",
+        "afs/src/node/vfs/dfs.rs"
+      ]
+    },
+    {
+      "stage": "crc-modes",
+      "commit": "4c77448d0d8d473d5b34549922cbc63a4f121b06",
+      "subject": "feat(afs): add explicit native remote read CRC modes",
+      "changed_files": [
+        "afs/common/protocol/proto/node_data.proto",
+        "afs/src/config.rs",
+        "afs/src/node.rs",
+        "afs/src/node/chunk.rs",
+        "afs/src/node/rpc/data.rs",
+        "afs/src/node/rpc/peer.rs",
+        "afs/src/node/rpc/peer/crc32c.rs",
+        "docs/testing/afs.md"
+      ]
+    },
+    {
+      "stage": "default-off",
+      "commit": "9cdd1501dc855812d1bcfc325f0953b714fdcad2",
+      "subject": "feat(afs): default native grpc read CRC to off",
+      "changed_files": [
+        "afs/src/config.rs",
+        "docs/testing/afs.md"
+      ]
+    }
+  ],
+  "latest_delivered_binaries": {
+    "afs-node": {
+      "sha256": "bd6804f4bd5a61d0e58e8190d1f76c84c5b8867faebcae3f256621032d310dc2",
+      "bytes": 34170304
+    },
+    "afs-meta": {
+      "sha256": "0fa17e14df3cd8edece45c546a513d4b3ec97463339e775921c311fe9f7add6b",
+      "bytes": 15874024
+    }
+  },
+  "default_off_candidate_source_manifest_sha256": "029e9ad2cc0dcf47b6cf37d402574d69453a0ec68d43fa7cce427da07eeabe6b",
+  "note": "Binary identity belongs to the frozen validated candidate, not a newly rebuilt publication artifact."
+}
