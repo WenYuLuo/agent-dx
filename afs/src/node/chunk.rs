@@ -1257,6 +1257,9 @@ impl PinnedChunkReader {
             .segment_crc
             .as_ref()
             .ok_or_else(|| invalid("CRC descriptor missing"))?;
+        if let Some(metrics) = &self.read_work {
+            metrics.hash("crc_descriptor_hash", table.descriptor_input_bytes());
+        }
         if !self.chunk.is_segment_crc32c()
             || !self.chunk.valid_immutable_identity()
             || !table.valid_shape(self.chunk.length)
@@ -1299,12 +1302,24 @@ impl PinnedChunkReader {
                     }
                     read += got;
                 }
-                if super::chunk_crc32c::checksum(&scratch[..n]) != table.checksums[index] {
+                let crc_scope = self
+                    .read_work
+                    .as_ref()
+                    .and_then(|metrics| metrics.coarse_diagnostic("crc_storage", n as u64));
+                if let Some(metrics) = &self.read_work {
+                    metrics.crc_read("storage_segments", n as u64);
+                }
+                let actual_crc = super::chunk_crc32c::checksum(&scratch[..n]);
+                drop(crc_scope);
+                if actual_crc != table.checksums[index] {
                     return Err(corrupt(&self.chunk.id, "CRC32C segment mismatch"));
                 }
                 let a = (begin as u64).max(r.chunk_offset);
                 let b = ((begin + n) as u64).min(end);
                 let dest = r.output_offset + (a - r.chunk_offset) as usize;
+                if let Some(metrics) = &self.read_work {
+                    metrics.copy("crc_storage_to_range", b - a);
+                }
                 out[dest..dest + (b - a) as usize]
                     .copy_from_slice(&scratch[(a as usize - begin)..(b as usize - begin)]);
             }
@@ -3726,6 +3741,13 @@ impl LocalChunkStore {
     ) {
         if let Some(metrics) = &self.read_work {
             metrics.source_cache_resources(entries, bytes, peak, limit);
+        }
+    }
+
+    #[cfg(feature = "dfs")]
+    pub(crate) fn record_crc_read(&self, stage: &'static str, bytes: u64) {
+        if let Some(metrics) = &self.read_work {
+            metrics.crc_read(stage, bytes);
         }
     }
 

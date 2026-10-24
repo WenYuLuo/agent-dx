@@ -130,12 +130,16 @@ impl GrpcChunkTransfer {
                 let mut client = DfsChunksClient::new(channel)
                     .max_encoding_message_size(self.peers.config.max_encoding_message_bytes)
                     .max_decoding_message_size(self.peers.config.max_decoding_message_bytes);
+                if let Some(metrics) = &self.peers.read_work_metrics {
+                    metrics.read_rpc("peer_read_ranges");
+                }
                 let mut stream = client
                     .read_ranges(request.clone())
                     .await
                     .map_err(peer_status_error)?
                     .into_inner();
                 let mut decoder = CrcRangeDecoder::new(&request, chunk, out)?;
+                decoder.metrics = self.peers.read_work_metrics.clone();
                 while let Some(frame) = stream.message().await.map_err(peer_status_error)? {
                     decoder.accept(frame)?;
                 }
@@ -163,6 +167,7 @@ struct CrcRangeDecoder<'a> {
     table: Option<CrcTable>,
     cursor: usize,
     complete: bool,
+    metrics: Option<ReadWorkMetrics>,
 }
 
 impl<'a> CrcRangeDecoder<'a> {
@@ -181,6 +186,7 @@ impl<'a> CrcRangeDecoder<'a> {
             table: None,
             cursor: 0,
             complete: false,
+            metrics: None,
         })
     }
     fn accept(
@@ -211,6 +217,9 @@ impl<'a> CrcRangeDecoder<'a> {
                 }
                 let table: CrcTable = serde_json::from_slice(&header.crc32c_table)
                     .map_err(|_| dfs_corrupt_error("invalid CRC descriptor"))?;
+                if let Some(metrics) = &self.metrics {
+                    metrics.hash("crc_descriptor_hash", table.descriptor_input_bytes());
+                }
                 if !table.valid_shape(self.chunk.length)
                     || table.descriptor_digest() != self.chunk.content_digest
                 {
@@ -239,9 +248,19 @@ impl<'a> CrcRangeDecoder<'a> {
                     .get_mut(start + self.cursor..start + next)
                     .ok_or_else(|| dfs_protocol_error("CRC output exceeds destination"))?;
                 target.copy_from_slice(&data);
+                if let Some(metrics) = &self.metrics {
+                    metrics.copy("frame_to_attempt", data.len() as u64);
+                }
                 self.cursor = next;
             }
             Some(dfs_read_ranges_frame::Body::Completion(done)) => {
+                let complete_segments = op.chunk_offset.is_multiple_of(SEGMENT as u64)
+                    && (op.length.is_multiple_of(SEGMENT as u64)
+                        || op.chunk_offset.checked_add(op.length) == Some(self.chunk.length));
+                let segment_only = done.range_checksum_algorithm
+                    == afs_protocol::node_data::DfsDigestAlgorithm::Crc32cSegmentsV1 as i32;
+                let legacy_range = done.range_checksum_algorithm
+                    == afs_protocol::node_data::DfsDigestAlgorithm::Crc32c as i32;
                 if self.table.is_none()
                     || done.read_id != self.request.read_id
                     || done.attempt_id != self.request.attempt_id
@@ -249,8 +268,8 @@ impl<'a> CrcRangeDecoder<'a> {
                     || done.source_copy_id != op.source_copy_id
                     || done.transferred_bytes != op.length
                     || self.cursor as u64 != op.length
-                    || done.range_checksum_algorithm
-                        != afs_protocol::node_data::DfsDigestAlgorithm::Crc32c as i32
+                    || (!legacy_range && !segment_only)
+                    || (segment_only && (!complete_segments || !done.range_checksum.is_empty()))
                 {
                     return Err(dfs_protocol_error(
                         "CRC completion identity/length mismatch",
@@ -262,23 +281,38 @@ impl<'a> CrcRangeDecoder<'a> {
                     .out
                     .get(start..start + self.cursor)
                     .ok_or_else(|| dfs_protocol_error("CRC output exceeds destination"))?;
-                if done.range_checksum.as_slice() != checksum(body).to_le_bytes() {
-                    return Err(dfs_corrupt_error("CRC transport checksum mismatch"));
+                if legacy_range {
+                    let crc_scope = self.metrics.as_ref().and_then(|metrics| {
+                        metrics.coarse_diagnostic("crc_range_receive", body.len() as u64)
+                    });
+                    if let Some(metrics) = &self.metrics {
+                        metrics.crc_read("range_receive", body.len() as u64);
+                    }
+                    let actual_crc = checksum(body);
+                    drop(crc_scope);
+                    if done.range_checksum.as_slice() != actual_crc.to_le_bytes() {
+                        return Err(dfs_corrupt_error("CRC transport checksum mismatch"));
+                    }
                 }
                 // Complete segments can additionally bind directly to Meta's
                 // table. Boundary fragments rely on the authenticated server's
                 // storage verification, without expanding the read grant.
-                if op.chunk_offset.is_multiple_of(SEGMENT as u64)
-                    && (op.length.is_multiple_of(SEGMENT as u64)
-                        || op.chunk_offset + op.length == self.chunk.length)
-                {
+                if complete_segments {
                     let table = self
                         .table
                         .as_ref()
                         .ok_or_else(|| dfs_protocol_error("CRC table missing"))?;
                     let index = (op.chunk_offset / SEGMENT as u64) as usize;
                     for (relative, bytes) in body.chunks(SEGMENT).enumerate() {
-                        if table.checksums.get(index + relative) != Some(&checksum(bytes)) {
+                        let crc_scope = self.metrics.as_ref().and_then(|metrics| {
+                            metrics.coarse_diagnostic("crc_trusted_receive", bytes.len() as u64)
+                        });
+                        if let Some(metrics) = &self.metrics {
+                            metrics.crc_read("trusted_segments_receive", bytes.len() as u64);
+                        }
+                        let actual_crc = checksum(bytes);
+                        drop(crc_scope);
+                        if table.checksums.get(index + relative) != Some(&actual_crc) {
                             return Err(dfs_corrupt_error(
                                 "CRC range differs from trusted segment",
                             ));
@@ -400,6 +434,69 @@ mod tests {
             )),
         });
         (staged.chunk, request, frames, expected)
+    }
+
+    #[test]
+    fn crc32c_segment_only_completion_keeps_trusted_segments() {
+        for (offset, length) in [(0, SEGMENT), (SEGMENT, SEGMENT), (2 * SEGMENT, 13)] {
+            let (chunk, request, mut frames, expected) = fixture(offset, length);
+            for frame in &mut frames {
+                if let Some(dfs_read_ranges_frame::Body::Completion(done)) = &mut frame.body {
+                    done.range_checksum_algorithm =
+                        afs_protocol::node_data::DfsDigestAlgorithm::Crc32cSegmentsV1 as i32;
+                    done.range_checksum.clear();
+                }
+            }
+            let mut out = vec![0; length];
+            let mut decoder = CrcRangeDecoder::new(&request, &chunk, &mut out).unwrap();
+            let result = frames
+                .into_iter()
+                .try_for_each(|frame| decoder.accept(frame))
+                .and_then(|()| decoder.finish());
+            assert!(
+                result.is_ok(),
+                "segment-only completion must verify original segments without a range checksum: {result:?}"
+            );
+            assert_eq!(out, expected);
+        }
+    }
+
+    #[test]
+    fn crc32c_segment_only_rejects_fragments_damage_and_ambiguous_checksum() {
+        for damage in 0..4 {
+            let (offset, length) = if damage == 0 { (13, 79) } else { (0, SEGMENT) };
+            let (chunk, request, mut frames, _) = fixture(offset, length);
+            for frame in &mut frames {
+                if let Some(dfs_read_ranges_frame::Body::Completion(done)) = &mut frame.body {
+                    done.range_checksum_algorithm =
+                        afs_protocol::node_data::DfsDigestAlgorithm::Crc32cSegmentsV1 as i32;
+                    done.range_checksum.clear();
+                    if damage == 2 {
+                        done.range_checksum = vec![0; 4];
+                    }
+                }
+                if damage == 1
+                    && let Some(dfs_read_ranges_frame::Body::Data(data)) = &mut frame.body
+                {
+                    let mut body = data.to_vec();
+                    body[0] ^= 1;
+                    *data = body.into();
+                }
+            }
+            if damage == 3 {
+                frames.pop();
+            }
+            let mut out = vec![0; length];
+            let mut decoder = CrcRangeDecoder::new(&request, &chunk, &mut out).unwrap();
+            assert!(
+                frames
+                    .into_iter()
+                    .try_for_each(|frame| decoder.accept(frame))
+                    .and_then(|()| decoder.finish())
+                    .is_err(),
+                "segment-only damage {damage} accepted"
+            );
+        }
     }
 
     #[test]

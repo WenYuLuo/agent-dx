@@ -108,6 +108,8 @@ pub struct ReadWorkMetrics {
     catalog_commit_resources: afs_metrics::IntGaugeVec,
     scan_bytes: afs_metrics::IntCounter,
     hashes: afs_metrics::IntCounterVec,
+    crc_read_bytes: afs_metrics::IntCounterVec,
+    crc_read_calls: afs_metrics::IntCounterVec,
     outboard_total_bytes: afs_metrics::IntGauge,
     outboard_resident_bytes: afs_metrics::IntGauge,
     outboard_total_limit: afs_metrics::IntGauge,
@@ -213,6 +215,18 @@ impl ReadWorkMetrics {
                 "afs_dfs_read_scan_bytes_total",
                 "Logical file bytes read and hashed by complete immutable Chunk verification.",
             )?;
+            let crc_read_bytes = afs_metrics::IntCounterVec::new(
+                afs_metrics::Opts::new("afs_dfs_crc32c_read_bytes_total", "Actual CRC32C read input bytes, including failed work; descriptor hashes are separate."), &["stage"],
+            )?;
+            let crc_read_calls = afs_metrics::IntCounterVec::new(
+                afs_metrics::Opts::new("afs_dfs_crc32c_read_calls_total", "Actual CRC32C read checksum invocations, including failed work."), &["stage"],
+            )?;
+            for stage in ["storage_segments", "range_send", "range_receive", "trusted_segments_receive"] {
+                crc_read_bytes.with_label_values(&[stage]);
+                crc_read_calls.with_label_values(&[stage]);
+            }
+            afs_metrics::register_collector(registry, &crc_read_bytes)?;
+            afs_metrics::register_collector(registry, &crc_read_calls)?;
             let hashes = afs_metrics::IntCounterVec::new(
                 afs_metrics::Opts::new(
                     "afs_dfs_read_hash_bytes_total",
@@ -224,7 +238,7 @@ impl ReadWorkMetrics {
                 "root_local_scan", "stream_range_hash", "peer_range_in_receive",
                 "root_in_receive", "root_fallback", "segment_index_bytes",
                 "cache_segment_hash", "cache_full_hash", "outboard_body_hash",
-                "outboard_parent_hash",
+                "outboard_parent_hash", "crc_descriptor_hash",
             ] { hashes.with_label_values(&[stage]); }
             #[cfg(any(feature = "dfs", test))]
             let disk_cache_metadata_bytes = afs_metrics::IntGauge::new(
@@ -534,6 +548,7 @@ impl ReadWorkMetrics {
                 "scan_to_range",
                 "pinned_range_to_output",
                 "range_to_frame",
+                "crc_storage_to_range",
                 "frame_to_attempt",
                 "attempt_to_staging",
                 "staging_to_output",
@@ -548,6 +563,8 @@ impl ReadWorkMetrics {
                 catalog_commit_resources,
                 scan_bytes,
                 hashes,
+                crc_read_bytes,
+                crc_read_calls,
                 outboard_total_bytes,
                 outboard_resident_bytes,
                 outboard_total_limit,
@@ -683,6 +700,13 @@ impl ReadWorkMetrics {
         self.diagnostics.as_ref().map(|journal| journal.snapshot())
     }
 
+    pub(crate) fn crc_read(&self, stage: &'static str, bytes: u64) {
+        self.crc_read_bytes
+            .with_label_values(&[stage])
+            .inc_by(bytes);
+        self.crc_read_calls.with_label_values(&[stage]).inc();
+    }
+
     pub(crate) fn hash(&self, stage: &'static str, bytes: u64) {
         if matches!(
             stage,
@@ -696,6 +720,7 @@ impl ReadWorkMetrics {
                 | "cache_full_hash"
                 | "outboard_body_hash"
                 | "outboard_parent_hash"
+                | "crc_descriptor_hash"
         ) {
             self.hashes.with_label_values(&[stage]).inc_by(bytes);
         }
@@ -1372,7 +1397,11 @@ impl ReadDiagnosticConsumerWork {
 // One fixed entry per phase, not one event per frame or syscall. First/last
 // endpoints describe the aggregate envelope, not a contiguous critical path.
 #[cfg(any(feature = "dfs", test))]
-const READ_COARSE_PHASES: [&str; 24] = [
+const READ_COARSE_PHASES: [&str; 28] = [
+    "crc_storage",
+    "crc_range_send",
+    "crc_range_receive",
+    "crc_trusted_receive",
     "peer_slot_wait",
     "peer_read_verify",
     "peer_first_frame_enqueue",

@@ -1558,7 +1558,22 @@ fn stream_dfs_ranges_until(
             }
             // Exact grants never disclose prefix/suffix bytes of a covering
             // storage segment. read_peer_range verified those segments first.
-            let checksum = crate::node::chunk_crc32c::checksum(verified.as_slice());
+            // The persisted segment table already binds these complete segments
+            // to Meta. Signal that mode explicitly; old receivers fail closed.
+            // Fragments retain their original exact-range transport checksum.
+            let segment_bytes = crate::node::chunk_crc32c::SEGMENT as u64;
+            let segment_only = op.chunk_offset.is_multiple_of(segment_bytes)
+                && (op.length.is_multiple_of(segment_bytes)
+                    || op.chunk_offset.checked_add(op.length) == Some(table.length));
+            let checksum = if segment_only {
+                None
+            } else {
+                let crc_scope = local.coarse_diagnostic("crc_range_send", verified.len() as u64);
+                local.record_crc_read("range_send", verified.len() as u64);
+                let checksum = crate::node::chunk_crc32c::checksum(verified.as_slice());
+                drop(crc_scope);
+                Some(checksum)
+            };
             let descriptor =
                 serde_json::to_vec(&table).map_err(|error| Status::internal(error.to_string()))?;
             validate_dfs_read_request(request)?;
@@ -1579,6 +1594,8 @@ fn stream_dfs_ranges_until(
                 validate_dfs_read_request(request)?;
                 local.ensure_peer_serve_open().map_err(error_to_status)?;
                 let data = body.slice(start..(start + DFS_REPLICA_FRAME_BYTES).min(body.len()));
+                local.record_peer_read_event("data_frame");
+                local.record_peer_read_event("shared_frame");
                 if let Some(metrics) = metrics {
                     metrics.record("grpc", "send", "read", data.len() as u64);
                 }
@@ -1592,9 +1609,14 @@ fn stream_dfs_ranges_until(
                     operation_index: op.operation_index,
                     source_copy_id: op.source_copy_id.clone(),
                     transferred_bytes: op.length,
-                    range_checksum: checksum.to_le_bytes().to_vec(),
-                    range_checksum_algorithm: afs_protocol::node_data::DfsDigestAlgorithm::Crc32c
-                        as i32,
+                    range_checksum: checksum
+                        .map(|value| value.to_le_bytes().to_vec())
+                        .unwrap_or_default(),
+                    range_checksum_algorithm: if segment_only {
+                        afs_protocol::node_data::DfsDigestAlgorithm::Crc32cSegmentsV1 as i32
+                    } else {
+                        afs_protocol::node_data::DfsDigestAlgorithm::Crc32c as i32
+                    },
                 },
             ))?;
             if let Some(diagnostic) = diagnostic {
