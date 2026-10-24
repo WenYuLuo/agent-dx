@@ -10,11 +10,11 @@ use afs_error::{Error, Result};
 
 use crate::{
     dfs::{
-        ChunkId, ChunkReceipt, LocalCopyPolicy, PlacementSnapshot, ReplicaAck, ReplicaGroup,
-        ReplicaGroupId, ReplicaTarget, ReplicaWriteGrant, ReplicationConfig,
+        ChunkId, ChunkReceipt, LocalCopyPolicy, OperationId, PlacementSnapshot, ReplicaAck,
+        ReplicaGroup, ReplicaGroupId, ReplicaTarget, ReplicaWriteGrant, ReplicationConfig,
     },
     node::{
-        chunk::{ChunkStore, LocalChunkStore, StagedChunk},
+        chunk::{ChunkStore, LocalChunkStore, NativeChunkReceipt, StagedChunk},
         vfs::types::FilesystemCapacity,
     },
 };
@@ -435,6 +435,8 @@ impl ReplicationEngine {
 }
 
 pub struct DfsChunkStore {
+    optimistic_gc_commit: bool,
+    gc_control: Option<Arc<dyn crate::node::gc::GcControl>>,
     local_node_id: String,
     local_node_epoch: Option<u64>,
     local: Arc<LocalChunkStore>,
@@ -443,6 +445,32 @@ pub struct DfsChunkStore {
 }
 
 impl DfsChunkStore {
+    fn reserve_gc_publications(&self, staged: &[StagedChunk]) -> Result<()> {
+        if let Some(control) = &self.gc_control {
+            let mut operations = std::collections::BTreeMap::<_, Vec<_>>::new();
+            for item in staged {
+                operations
+                    .entry(item.operation_id.clone())
+                    .or_default()
+                    .push(item.chunk.clone());
+            }
+            for (operation, chunks) in operations {
+                control.reserve_publication(&operation, chunks)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn with_optimistic_gc_commit(mut self, enabled: bool) -> Self {
+        self.optimistic_gc_commit = enabled;
+        self
+    }
+
+    pub fn with_gc_control(mut self, control: Arc<dyn crate::node::gc::GcControl>) -> Self {
+        self.gc_control = Some(control);
+        self
+    }
+
     pub fn new(
         local_node_id: String,
         local: Arc<LocalChunkStore>,
@@ -450,6 +478,8 @@ impl DfsChunkStore {
         data_plane: Arc<dyn ReplicaDataPlane>,
     ) -> Self {
         Self {
+            optimistic_gc_commit: false,
+            gc_control: None,
             local_node_id: local_node_id.clone(),
             local_node_epoch: None,
             local: local.clone(),
@@ -466,6 +496,8 @@ impl DfsChunkStore {
         data_plane: Arc<dyn ReplicaDataPlane>,
     ) -> Self {
         Self {
+            optimistic_gc_commit: false,
+            gc_control: None,
             local_node_id: local_node_id.clone(),
             local_node_epoch: Some(local_node_epoch),
             local: local.clone(),
@@ -579,6 +611,7 @@ impl DfsChunkStore {
 
 impl ChunkStore for DfsChunkStore {
     fn put_batch(&self, staged: Vec<StagedChunk>) -> Result<Vec<ChunkReceipt>> {
+        self.reserve_gc_publications(&staged)?;
         let snapshot = self.placement.snapshot()?;
         if snapshot.replication.is_local_fast_path() {
             self.put_local_batch(staged, &snapshot)
@@ -586,6 +619,118 @@ impl ChunkStore for DfsChunkStore {
             self.replication
                 .put_replicated_batch(staged, snapshot.revision)
         }
+    }
+
+    fn native_descriptor_reservation_bytes(&self, operation_id: &OperationId) -> Result<usize> {
+        let snapshot = self.placement.snapshot()?;
+        if !snapshot.replication.is_valid() || snapshot.replica_groups.is_empty() {
+            return Err(invalid(
+                "native descriptor admission needs valid placement authority",
+            ));
+        }
+        let synchronous = usize::from(snapshot.replication.sync_required_copies);
+        let mut receipt = 0usize;
+        for group in &snapshot.replica_groups {
+            if group.targets.len() < synchronous {
+                return Err(invalid("native placement has too few synchronous targets"));
+            }
+            let ack_bytes = group.targets.iter().try_fold(0usize, |sum, target| {
+                sum.checked_add(
+                    std::mem::size_of::<ReplicaAck>()
+                        + operation_id.0.capacity()
+                        + 128
+                        + target.node_id.capacity()
+                        + target.device.device_id.capacity(),
+                )
+                .ok_or_else(|| invalid("native descriptor capacity overflow"))
+            })?;
+            receipt = receipt.max(
+                std::mem::size_of::<ChunkReceipt>()
+                    + operation_id.0.capacity()
+                    + 128
+                    + group.id.0.capacity()
+                    + ack_bytes,
+            );
+        }
+        // This is a pre-admission reservation, not an actual-capacity metric.
+        // It includes owned descriptor state, layout/domain clones and bounded
+        // publication scratch while keeping the original 4MiB envelope fixed.
+        receipt
+            .checked_mul(8)
+            .and_then(|bytes| bytes.checked_add(8192))
+            .ok_or_else(|| invalid("native descriptor reservation overflow"))
+    }
+
+    fn put_native_batch(&self, staged: Vec<StagedChunk>) -> Result<Vec<NativeChunkReceipt>> {
+        if !self.optimistic_gc_commit {
+            self.reserve_gc_publications(&staged)?;
+        }
+        let snapshot = self.placement.snapshot()?;
+        let receipts = if snapshot.replication.is_local_fast_path() {
+            self.put_local_batch(staged, &snapshot)?
+        } else {
+            self.replication
+                .put_replicated_batch(staged, snapshot.revision)?
+        };
+        let required = snapshot.replication.local_copy == LocalCopyPolicy::Required;
+        let device = if required {
+            Some(self.local.device_descriptor()?)
+        } else {
+            None
+        };
+        receipts
+            .into_iter()
+            .map(|receipt| {
+                if let Some(device) = &device {
+                    let local_ack = receipt
+                        .durable_acks
+                        .iter()
+                        .find(|ack| {
+                            ack.node_id == self.local_node_id
+                                && self
+                                    .local_node_epoch
+                                    .is_none_or(|epoch| ack.node_epoch == epoch)
+                                && ack.device_id == device.device_id
+                                && ack.device_epoch == device.device_epoch
+                        })
+                        .ok_or_else(|| {
+                            invalid("native Required receipt has no matching local durable ACK")
+                        })?;
+                    if local_ack.operation_id != receipt.operation_id
+                        || local_ack.chunk_id != receipt.chunk.id
+                        || local_ack.placement_revision != receipt.placement_revision
+                        || local_ack.placement_epoch != receipt.placement_epoch
+                        || local_ack.persisted_bytes != receipt.chunk.length
+                        || local_ack.verified_digest != receipt.chunk.content_digest
+                    {
+                        return Err(invalid("native local ACK does not match its exact receipt"));
+                    }
+                    // Pinning checks catalog and content-addressed identity without
+                    // another full scan. Every later local read verifies its groups.
+                    self.local.open_receipt_reader(&receipt.chunk)?;
+                }
+                Ok(NativeChunkReceipt {
+                    receipt,
+                    local_required_and_durable: required,
+                })
+            })
+            .collect()
+    }
+
+    fn read_native_uploaded_at(
+        &self,
+        receipt: &ChunkReceipt,
+        offset: u64,
+        out: &mut [u8],
+    ) -> Result<usize> {
+        let reader = self.local.open_receipt_reader(&receipt.chunk)?;
+        let result = reader.read_at(offset, out);
+        if result.is_err() {
+            // This rechecks the actual local object before quarantining; a
+            // caller's expected-root mismatch above never quarantines it.
+            let _ = self.local.quarantine_if_invalid(&receipt.chunk.id);
+        }
+        result
     }
 
     fn read_at(&self, chunk_id: &ChunkId, offset: u64, out: &mut [u8]) -> Result<usize> {
@@ -1011,7 +1156,8 @@ impl ReplicationWorker {
             }
             offset += count;
         }
-        let staged = StagedChunk::new(claim.operation_id.clone(), bytes);
+        let staged = StagedChunk::from_replica(claim.operation_id.clone(), &claim.chunk, bytes)
+            .map_err(|error| (error, true))?;
         if staged.chunk != claim.chunk {
             return Err((invalid("repair source identity or digest differs"), true));
         }
@@ -1240,6 +1386,199 @@ mod tests {
             min_distinct_failure_domains: 1,
             local_copy: LocalCopyPolicy::Required,
         }
+    }
+
+    #[test]
+    fn native_upload_requires_gc_reservation_before_writing() {
+        struct RejectGc;
+        impl crate::node::gc::GcControl for RejectGc {
+            fn retain(
+                &self,
+                _: &str,
+                _: &crate::dfs::InodeId,
+                _: Option<&crate::dfs::FileVersionId>,
+                _: bool,
+            ) -> Result<()> {
+                Ok(())
+            }
+            fn release(&self, _: &str) -> Result<()> {
+                Ok(())
+            }
+            fn reserve_publication(
+                &self,
+                _: &OperationId,
+                _: Vec<crate::dfs::ChunkObject>,
+            ) -> Result<()> {
+                Err(Error::coded(
+                    afs_error::META_DFS_GC_BUSY,
+                    "deletion in progress",
+                ))
+            }
+            fn collect(
+                &self,
+                _: u64,
+                _: Vec<crate::dfs::ChunkObject>,
+            ) -> Result<crate::dfs::GcState> {
+                Ok(crate::dfs::GcState::default())
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
+        let snapshot = Arc::new(PlacementSnapshot {
+            revision: 1,
+            replication: config(1),
+            replica_groups: vec![ReplicaGroup {
+                id: ReplicaGroupId::new("g"),
+                placement_epoch: 1,
+                targets: vec![target_with_epoch(
+                    "node-a",
+                    1,
+                    local.device_descriptor().unwrap(),
+                )],
+            }],
+        });
+        let store = DfsChunkStore::new_with_epoch(
+            "node-a".into(),
+            1,
+            local.clone(),
+            Arc::new(StaticPlacement { snapshot }),
+            Arc::new(FakeDataPlane::default()),
+        )
+        .with_gc_control(Arc::new(RejectGc));
+        let input = staged("native-gc-rejection");
+        assert_eq!(
+            store
+                .put_native_batch(vec![input.clone()])
+                .err()
+                .unwrap()
+                .code(),
+            afs_error::META_DFS_GC_BUSY
+        );
+        assert!(
+            local.open_receipt_reader(&input.chunk).is_err(),
+            "rejected upload must not install a chunk"
+        );
+    }
+
+    #[test]
+    fn p2_w2_required_receipt_releases_only_for_exact_local_durable_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
+        let snapshot = Arc::new(PlacementSnapshot {
+            revision: 11,
+            replication: config(1),
+            replica_groups: vec![ReplicaGroup {
+                id: ReplicaGroupId::new("native-local"),
+                placement_epoch: 12,
+                targets: vec![target_with_epoch(
+                    "node-a",
+                    1,
+                    local.device_descriptor().unwrap(),
+                )],
+            }],
+        });
+        let store = DfsChunkStore::new_with_epoch(
+            "node-a".into(),
+            1,
+            local.clone(),
+            Arc::new(StaticPlacement { snapshot }),
+            Arc::new(FakeDataPlane::default()),
+        );
+        let input = staged("native-durable-body");
+        let mut receipts = store.put_native_batch(vec![input.clone()]).unwrap();
+        let receipt = receipts.remove(0);
+        assert!(receipt.local_required_and_durable);
+        assert_eq!(receipt.receipt.chunk, input.chunk);
+        let mut output = [0; 7];
+        assert_eq!(
+            store
+                .read_native_uploaded_at(&receipt.receipt, 0, &mut output)
+                .unwrap(),
+            output.len()
+        );
+        assert_eq!(&output, b"native-");
+        let mut wrong = receipt.receipt.clone();
+        wrong.chunk.length += 1;
+        let mut untouched = [0x81; 7];
+        assert!(
+            store
+                .read_native_uploaded_at(&wrong, 0, &mut untouched)
+                .is_err()
+        );
+        assert_eq!(untouched, [0x81; 7]);
+        assert!(
+            local.open_receipt_reader(&receipt.receipt.chunk).is_ok(),
+            "a caller expected-root mismatch must not quarantine a healthy local object"
+        );
+    }
+
+    #[test]
+    fn p2_w2_nonrequired_remote_receipt_never_claims_local_body_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let local = Arc::new(LocalChunkStore::open(temp.path(), "writer").unwrap());
+        let mut policy = config(1);
+        policy.local_copy = LocalCopyPolicy::Preferred;
+        let snapshot = Arc::new(PlacementSnapshot {
+            revision: 7,
+            replication: policy,
+            replica_groups: vec![ReplicaGroup {
+                id: ReplicaGroupId::new("remote-only"),
+                placement_epoch: 8,
+                targets: vec![target("node-b", remote_device("remote-b"))],
+            }],
+        });
+        let store = DfsChunkStore::new_with_epoch(
+            "writer".into(),
+            1,
+            local,
+            Arc::new(StaticPlacement { snapshot }),
+            Arc::new(FakeDataPlane::default()),
+        );
+        let receipt = store
+            .put_native_batch(vec![staged("remote-native")])
+            .unwrap()
+            .remove(0);
+        assert!(!receipt.local_required_and_durable);
+        assert!(
+            receipt
+                .receipt
+                .durable_acks
+                .iter()
+                .all(|ack| ack.node_id != "writer")
+        );
+    }
+
+    #[test]
+    fn p2_w2_descriptor_reservation_accounts_for_all_possible_authority_targets() {
+        let temp = tempfile::tempdir().unwrap();
+        let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
+        let mut long_node = String::with_capacity(8192);
+        long_node.push_str("remote-b");
+        let mut remote = target(&long_node, remote_device("remote-b"));
+        remote.node_id = long_node;
+        let snapshot = Arc::new(PlacementSnapshot {
+            revision: 7,
+            replication: config(1),
+            replica_groups: vec![ReplicaGroup {
+                id: ReplicaGroupId::new("reservation"),
+                placement_epoch: 8,
+                targets: vec![target("node-a", local.device_descriptor().unwrap()), remote],
+            }],
+        });
+        let store = DfsChunkStore::new_with_epoch(
+            "node-a".into(),
+            1,
+            local,
+            Arc::new(StaticPlacement { snapshot }),
+            Arc::new(FakeDataPlane::default()),
+        );
+        let reserved = store
+            .native_descriptor_reservation_bytes(&OperationId::new("native-reservation"))
+            .unwrap();
+        assert!(
+            reserved >= 8192 * 8,
+            "authority beyond the minimum synchronous prefix must still be reserved"
+        );
     }
 
     #[test]
@@ -2033,6 +2372,54 @@ mod tests {
         );
         op.repair_claim.as_mut().unwrap().worker_node_epoch += 1;
         assert!(crate::node::rpc::peer::replica_header(&op, &staged).is_err());
+    }
+
+    #[test]
+    fn crc32c_replica_header_and_repair_preserve_birth_identity() {
+        let (_temp, local, mut authority, plane) = repair_fixture("crc-repair");
+        let item =
+            StagedChunk::new_crc32c(OperationId::new("original-write"), b"crc-repair".to_vec())
+                .unwrap();
+        let claim = &mut Arc::get_mut(&mut authority).unwrap().claim;
+        claim.chunk = item.chunk.clone();
+        local
+            .persist_batch(
+                std::slice::from_ref(&item),
+                &claim.replica_group.targets[0],
+                claim.placement_revision,
+                claim.replica_group.placement_epoch,
+            )
+            .unwrap();
+        let plan = ReplicationPlan {
+            chunk_id: item.chunk.id.clone(),
+            placement_revision: claim.placement_revision,
+            placement_epoch: claim.replica_group.placement_epoch,
+            replica_group_id: claim.replica_group.id.clone(),
+            config: claim.replication.clone(),
+            ordered_targets: claim.replica_group.targets.clone(),
+        };
+        let op = plan.selected_peer_op("a", 1).unwrap().unwrap();
+        let header = crate::node::rpc::peer::replica_header(&op, &item).unwrap();
+        assert_eq!(header.chunk_id, item.chunk.id.0);
+        assert_eq!(
+            header.content_digest_algorithm,
+            afs_protocol::node_data::DfsDigestAlgorithm::Crc32cSegmentsV1 as i32
+        );
+        let worker = repair_worker(local, authority.clone(), plane);
+        assert_eq!(
+            worker.run_once().unwrap().unwrap().state,
+            crate::dfs::ReplicationTaskState::Completed
+        );
+        let reports = authority.reports.lock().unwrap();
+        assert_eq!(reports[0].claim.chunk, item.chunk);
+        assert_eq!(reports[0].durable_acks.len(), 2);
+        assert!(
+            reports[0]
+                .durable_acks
+                .iter()
+                .all(|ack| ack.chunk_id == item.chunk.id
+                    && ack.verified_digest == item.chunk.content_digest)
+        );
     }
 
     #[test]

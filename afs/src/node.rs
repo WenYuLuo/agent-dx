@@ -13,11 +13,16 @@
 
 pub mod api;
 pub mod chunk;
+pub(crate) mod chunk_crc32c;
+#[cfg(feature = "dfs")]
+mod dfs_fetch;
 #[cfg(feature = "dfs")]
 pub mod dfs_read;
 #[cfg(feature = "dfs")]
 pub mod external_chunk;
 pub mod fuse;
+#[cfg(feature = "dfs")]
+pub mod gc;
 #[cfg(feature = "ownerfs")]
 mod native_workspace;
 #[cfg(feature = "dfs")]
@@ -34,8 +39,9 @@ use crate::{
     runtime::{BoxError, Observability, Services, cancelled},
 };
 use rpc::meta::{MetaPersistenceCapability, NodeRegistrationReadiness};
+#[cfg(feature = "ownerfs")]
+use std::collections::HashSet;
 use std::{
-    collections::HashSet,
     future::Future,
     os::unix::ffi::OsStrExt,
     path::{Component, Path, PathBuf},
@@ -332,6 +338,7 @@ pub struct AfsMountIdentity {
 }
 
 impl AfsMountIdentity {
+    #[cfg(any(feature = "ownerfs", feature = "dfs"))]
     fn from_mounted(mounted: &fuse::MountedFuse, expected_source: &str) -> Self {
         let (path, mount_id) = mounted.identity();
         Self {
@@ -1209,15 +1216,34 @@ async fn run_node(
     #[cfg(feature = "dfs")]
     let dfs_read_work_metrics = read_work::ReadWorkMetrics::register(&obs.registry)?
         .with_read_diagnostics(cfg.dfs_read_diagnostics_enabled);
+    // A single metadata ledger follows outboards across builders, local
+    // readers, Peer frames and the disposable disk cache. Payload and existing
+    // transport windows remain separately bounded by their original limits.
+    #[cfg(feature = "dfs")]
+    let dfs_outboard_budget = chunk::outboard::OutboardBudget::new_with_metrics_and_work_wait(
+        usize::try_from(peer_cache::MAX_PEER_CACHE_PROOF_BYTES)?,
+        dfs_read_work_metrics.clone(),
+        std::time::Duration::from_millis(cfg.dfs_outboard_work_wait_ms),
+    );
     #[cfg(feature = "dfs")]
     let local_chunk_store = if cfg.dfs {
         Some(Arc::new(
             chunk::LocalChunkStore::open(cfg.data_dir.join("dfs"), cfg.id.clone())?
-                .with_read_work_metrics(dfs_read_work_metrics.clone()),
+                .with_outboard_budget(dfs_outboard_budget.clone())
+                .with_peer_serve_config(
+                    cfg.dfs_peer_serve_resident_objects,
+                    cfg.dfs_peer_serve_payload_bytes,
+                )?
+                .with_peer_serve_wait(std::time::Duration::from_millis(cfg.dfs_peer_serve_wait_ms))?
+                .with_read_work_metrics(dfs_read_work_metrics.clone())
+                .with_sidecar_install_queue(cfg.dfs_sidecar_install_queue)?
+                .with_catalog_commit_queue(cfg.dfs_catalog_commit_queue)?,
         ))
     } else {
         None
     };
+    #[cfg(feature = "dfs")]
+    let dfs_sidecar_store_for_shutdown = local_chunk_store.clone();
     let node_descriptor = meta_endpoint.map(|endpoint| {
         let advertised = advertised
             .clone()
@@ -1303,11 +1329,13 @@ async fn run_node(
         })?;
         Some(Arc::new(dfs_read::LocalReadAuthority::new(
             registration.lease_epoch,
-            dfs_reader_session_deadline(registration, Instant::now()),
+            registration.session_deadline,
         )))
     } else {
         None
     };
+    #[cfg(feature = "dfs")]
+    let dfs_shutting_down = Arc::new(AtomicBool::new(false));
     #[cfg(not(feature = "dfs"))]
     let _ = registered_node_epoch;
 
@@ -1495,14 +1523,25 @@ async fn run_node(
     #[cfg(feature = "dfs")]
     let mut dfs_peer_cache_for_shutdown: Option<Arc<peer_cache::DiskPeerCache>> = None;
     #[cfg(feature = "dfs")]
-    let dfs_write_buffers = chunk::WriteBufferPool::new(
+    let mut dfs_fetcher_for_shutdown: Option<Arc<dfs_fetch::ObjectFetcher>> = None;
+    #[cfg(feature = "dfs")]
+    let dfs_write_buffer_idle_bytes =
         usize::try_from(cfg.dfs_write_buffer_idle_bytes).map_err(|_| {
             afs_error::Error::coded(
                 afs_error::CONFIG_INVALID,
                 "write buffer idle baseline does not fit this platform",
             )
-        })?,
-    );
+        })?;
+    #[cfg(feature = "dfs")]
+    let dfs_write_buffers = if cfg.dfs_external_backend.is_some() {
+        // S3 keeps its existing sealed-body and bounded-window pipeline.
+        chunk::WriteBufferPool::new(dfs_write_buffer_idle_bytes)
+    } else {
+        chunk::WriteBufferPool::new_with_outboard_budget(
+            dfs_write_buffer_idle_bytes,
+            dfs_outboard_budget.clone(),
+        )
+    };
     #[cfg(feature = "dfs")]
     dfs_write_buffers.register_metrics(&obs.registry)?;
     #[cfg(feature = "dfs")]
@@ -1555,18 +1594,25 @@ async fn run_node(
         dfs_external_store_for_shutdown = external_store.clone();
         let chunk_store: Arc<dyn chunk::ChunkStore> = match &external_store {
             Some(store) => store.clone(),
-            None => Arc::new(replication::DfsChunkStore::new_with_epoch(
-                cfg.id.clone(),
-                registered_node_epoch,
-                chunks.clone(),
-                meta.clone(),
-                dfs_replica_plane.clone(),
-            )),
+            None => Arc::new(
+                replication::DfsChunkStore::new_with_epoch(
+                    cfg.id.clone(),
+                    registered_node_epoch,
+                    chunks.clone(),
+                    meta.clone(),
+                    dfs_replica_plane.clone(),
+                )
+                .with_gc_control(meta.clone())
+                .with_optimistic_gc_commit(cfg.dfs_optimistic_gc_commit),
+            ),
         };
         let read_config = dfs_read::DfsReadConfig {
             max_ops_per_batch: cfg.dfs_read_max_ops_per_batch,
             max_inflight_bytes: cfg.dfs_read_max_inflight_bytes,
-            source_cache_ttl: std::time::Duration::from_millis(cfg.dfs_read_source_cache_ttl_ms),
+            source_cache_ttl: std::time::Duration::from_millis(cfg.dfs_source_cache_max_ms),
+            source_lookahead_chunks: cfg.dfs_source_lookahead_chunks,
+            source_cache_bytes: cfg.dfs_source_cache_bytes,
+            readahead_max_bytes: cfg.dfs_readahead_max_bytes,
         };
         read_config.validate()?;
         let read_engine = dfs_read::DfsReadEngine::new(
@@ -1593,9 +1639,12 @@ async fn run_node(
                 namespace_id: namespace.clone(),
             };
             let cache_metrics = dfs_read_work_metrics.clone();
+            let outboard_budget = dfs_outboard_budget.clone();
+            let max_inflight_objects = cfg.dfs_fetch_max_inflight_objects;
             let cache = Arc::new(
                 tokio::task::spawn_blocking(move || {
-                    peer_cache::DiskPeerCache::open(options)
+                    peer_cache::DiskPeerCache::open_with_outboard_budget(options, outboard_budget)
+                        .and_then(|cache| cache.with_max_inflight_objects(max_inflight_objects))
                         .map(|cache| cache.with_read_work_metrics(cache_metrics))
                 })
                 .await??,
@@ -1605,26 +1654,70 @@ async fn run_node(
         } else {
             read_engine
         };
+        if cfg.dfs_crc32c_writes && !cfg.dfs_optimistic_gc_commit {
+            return Err(afs_error::Error::coded(
+                afs_error::CONFIG_INVALID,
+                "dfs_crc32c_writes requires dfs_optimistic_gc_commit",
+            )
+            .into());
+        }
+        if (cfg.dfs_optimistic_gc_commit || cfg.dfs_crc32c_writes)
+            && cfg.dfs_external_backend.is_some()
+        {
+            return Err(afs_error::Error::coded(
+                afs_error::CONFIG_INVALID,
+                "dfs_optimistic_gc_commit requires native storage",
+            )
+            .into());
+        }
+        let gc_references = external_store
+            .is_none()
+            .then(|| gc::GcReferences::new(meta.clone()));
         let read_engine = Arc::new(match external_store {
             Some(store) => read_engine.with_external_backend(store, meta.clone()),
             None => read_engine,
         });
+        dfs_fetcher_for_shutdown = read_engine.object_fetcher();
         let remote_factory = Arc::new(rpc::peer::GrpcDfsOwnerFactory::new(
             peer_connections.clone(),
             timeout,
         ));
-        Some(Arc::new(
-            vfs::dfs::DistributedFs::new(
-                namespace,
-                cfg.id.clone(),
-                session_id.clone(),
-                meta,
-                chunk_store,
-                read_engine,
-            )
-            .with_remote_owner_factory(remote_factory)
-            .with_write_buffer_pool(dfs_write_buffers.clone()),
-        ))
+        let fs = vfs::dfs::DistributedFs::new(
+            namespace,
+            cfg.id.clone(),
+            session_id.clone(),
+            meta,
+            chunk_store,
+            read_engine,
+        )
+        .with_gc_references(gc_references)
+        .with_optimistic_gc_commit(cfg.dfs_optimistic_gc_commit)
+        .with_crc32c_writes(cfg.dfs_crc32c_writes)
+        .with_remote_owner_factory(remote_factory)
+        .with_version_cache_capacity(cfg.dfs_version_cache_entries)
+        .with_version_cache_bytes(cfg.dfs_version_cache_bytes)
+        .with_write_buffer_pool(dfs_write_buffers.clone());
+        let fs = if cfg.dfs_external_backend.is_none() {
+            fs.with_native_write_pipeline(
+                chunk::NativeWriteBudget::new(
+                    usize::try_from(cfg.dfs_dirty_budget_bytes).map_err(|_| {
+                        afs_error::Error::coded(
+                            afs_error::CONFIG_INVALID,
+                            "native dirty budget does not fit this platform",
+                        )
+                    })?,
+                ),
+                vfs::dfs::NativeWriteConfig {
+                    unpublished_descriptors: cfg.dfs_unpublished_descriptors,
+                    upload_inflight_chunks: cfg.dfs_upload_inflight_chunks,
+                },
+                tokio::runtime::Handle::current(),
+                Some(dfs_read_work_metrics.clone()),
+            )?
+        } else {
+            fs
+        };
+        Some(Arc::new(fs))
     } else {
         None
     };
@@ -1656,10 +1749,11 @@ async fn run_node(
 
     #[cfg(feature = "ownerfs")]
     let mounted_ownerfs = match (&cfg.ownerfs_mount, &ownerfs_instance) {
-        (Some(path), Some(ownerfs)) => match fuse::mount_ownerfs_with_metrics(
+        (Some(path), Some(ownerfs)) => match fuse::mount_ownerfs_with_metrics_and_options(
             ownerfs.clone(),
             path,
             fuse_request_metrics.clone(),
+            fuse::FuseMountOptions::from(&cfg),
         ) {
             Ok(session) => Some(session),
             Err(error) => {
@@ -1681,11 +1775,12 @@ async fn run_node(
     #[cfg(feature = "dfs")]
     let mounted_dfs = match (&cfg.dfs_mount, &dfs_instance) {
         (Some(path), Some(dfs)) => {
-            match fuse::mount_dfs_with_read_diagnostics(
+            match fuse::mount_dfs_with_read_diagnostics_and_options(
                 dfs.clone(),
                 path,
                 fuse_request_metrics.clone(),
                 dfs_read_work_metrics.clone(),
+                fuse::FuseMountOptions::from(&cfg),
             ) {
                 Ok(session) => Some(session),
                 Err(error) => {
@@ -1778,6 +1873,8 @@ async fn run_node(
         let readiness = readiness.clone();
         #[cfg(feature = "dfs")]
         let read_authority = dfs_read_authority.clone();
+        #[cfg(feature = "dfs")]
+        let shutting_down = Arc::clone(&dfs_shutting_down);
         services.spawn(async move {
             // The Meta lease lasts longer than one refresh interval. A brief
             // Meta restart must not tear down the FUSE mount and all open FDs
@@ -1791,7 +1888,6 @@ async fn run_node(
                 tokio::select! {
                     _ = &mut shutdown => return Ok(()),
                     _ = tokio::time::sleep(next_delay) => {
-                        let registration_started_at = Instant::now();
                         match rpc::meta::register_node_with_readiness(
                             &endpoint,
                             descriptor.clone(),
@@ -1816,18 +1912,15 @@ async fn run_node(
                                 }
                                 #[cfg(feature = "dfs")]
                                 if let Some(authority) = &read_authority
-                                    && let Err(error) = authority.refresh(
+                                    && let Err(error) = refresh_running_read_authority(
+                                        authority,
                                         registration.lease_epoch,
-                                        dfs_reader_session_deadline(
-                                            &registration,
-                                            registration_started_at,
-                                        ),
+                                        registration.session_deadline,
+                                        &shutting_down,
                                     ) {
                                     authority.stop();
                                     return Err(error.into());
                                 }
-                                #[cfg(not(feature = "dfs"))]
-                                let _ = registration_started_at;
                                 readiness.note_registration_capability(&registration);
                                 last_success = tokio::time::Instant::now();
                                 next_delay = std::time::Duration::from_secs(10);
@@ -1885,26 +1978,93 @@ async fn run_node(
     }
     #[cfg(feature = "dfs")]
     if let Some(dfs) = state.dfs.clone() {
-        let stop = services.stop.subscribe();
+        let gc_fs = dfs.clone();
+        let gc_stop = services.stop.subscribe();
         services.spawn(async move {
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
-            tick.tick().await;
-            let shutdown = cancelled(stop);
+            let mut tick=tokio::time::interval(std::time::Duration::from_secs(5));
+            let shutdown=cancelled(gc_stop);tokio::pin!(shutdown);
+            loop {tokio::select!{_=&mut shutdown=>return Ok(()),_=tick.tick()=>{
+                let fs=gc_fs.clone();match tokio::task::spawn_blocking(move||fs.collect_garbage()).await {
+                    Ok(Ok(count)) if count>0=>afs_logging::info!("dfs.gc_collected";"chunks"=>count),
+                    Ok(Ok(_))=>{},Ok(Err(error))=>afs_logging::warn!("dfs.gc_retry";"error"=>error.to_string()),
+                    Err(error)=>afs_logging::warn!("dfs.gc_worker_failed";"error"=>error.to_string()),
+                }
+            }}}
+        });
+        let renew_fs = dfs.clone();
+        let renew_stop = services.stop.subscribe();
+        services.spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+            let shutdown = cancelled(renew_stop);
             tokio::pin!(shutdown);
             loop {
                 tokio::select! {
                     _ = &mut shutdown => return Ok(()),
                     _ = tick.tick() => {
+                        let fs = renew_fs.clone();
+                        match tokio::task::spawn_blocking(move || fs.renew_active_write_leases()).await {
+                            Ok(Ok(_)) => {},
+                            Ok(Err(error)) => afs_logging::warn!("dfs.writer_renewal_retry"; "error" => error.to_string()),
+                            Err(error) => afs_logging::warn!("dfs.writer_renewal_worker_failed"; "error" => error.to_string()),
+                        }
+                    }
+                }
+            }
+        });
+        let stop = services.stop.subscribe();
+        let native_notify = dfs.native_writeback_notify();
+        let native_commit_period = std::time::Duration::from_millis(cfg.dfs_background_commit_ms);
+        services.spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+            tick.tick().await;
+            let mut native_tick = tokio::time::interval(native_commit_period);
+            native_tick.tick().await;
+            let has_native_pipeline = native_notify.is_some();
+            let shutdown = cancelled(stop);
+            tokio::pin!(shutdown);
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown => return Ok(()),
+                    due = async {
+                        match native_notify.as_ref() {
+                            Some(notify) => tokio::select! {
+                                _ = notify.notified() => false,
+                                _ = native_tick.tick() => true,
+                            },
+                            None => std::future::pending::<bool>().await,
+                        }
+                    }, if has_native_pipeline => {
+                        let fs = dfs.clone();
+                        match tokio::task::spawn_blocking(move || {
+                            if due {
+                                fs.writeback_pending()
+                            } else {
+                                fs.progress_native_writeback()
+                            }
+                        }).await {
+                            Ok(Ok(count)) if count > 0 => {
+                                afs_logging::debug!("dfs.native_write_progress"; "count" => count, "timer_due" => due);
+                            }
+                            Ok(Ok(_)) => {}
+                            Ok(Err(error)) => {
+                                afs_logging::warn!("dfs.native_write_retry"; "error" => error.to_string());
+                            }
+                            Err(error) => {
+                                afs_logging::warn!("dfs.native_write_worker_failed"; "error" => error.to_string());
+                            }
+                        }
+                    }
+                    _ = tick.tick() => {
                         let fs = dfs.clone();
                         match tokio::task::spawn_blocking(move || {
                             let mut first_error = None;
-                            let committed = match fs.writeback_pending() {
+                            let committed = if has_native_pipeline { 0 } else { match fs.writeback_pending() {
                                 Ok(count) => count,
                                 Err(error) => {
                                     first_error.get_or_insert(error);
                                     0
                                 }
-                            };
+                            }};
                             let remote_releases = match fs.retry_pending_remote_releases() {
                                 Ok(count) => count,
                                 Err(error) => {
@@ -2214,8 +2374,31 @@ async fn run_node(
     // shutdown. A cached object must not outlive a known Node/session stop.
     let on_shutdown = || {
         #[cfg(feature = "dfs")]
+        dfs_shutting_down.store(true, Ordering::Release);
+        #[cfg(feature = "dfs")]
+        if let Some(dfs) = &state.dfs {
+            dfs.close_native_write_admission();
+        }
+        #[cfg(feature = "dfs")]
+        if let Some(store) = &dfs_sidecar_store_for_shutdown {
+            // Keep catalog admission available for the existing DFS drain below.
+            store.note_catalog_stop();
+            store.stop_sidecar_installation();
+            store.close_peer_serve_admission();
+        }
+        #[cfg(feature = "dfs")]
+        dfs_outboard_budget.stop_range_work();
+        #[cfg(feature = "dfs")]
         if let Some(authority) = &dfs_read_authority {
             authority.stop();
+        }
+        #[cfg(feature = "dfs")]
+        if let Some(cache) = &dfs_peer_cache_for_shutdown {
+            cache.close_admission();
+        }
+        #[cfg(feature = "dfs")]
+        if let Some(fetcher) = &dfs_fetcher_for_shutdown {
+            fetcher.close();
         }
         on_shutdown();
     };
@@ -2320,6 +2503,9 @@ async fn run_node(
                     0
                 }
             };
+            if let Err(error) = dfs.flush_gc_releases() {
+                first_error.get_or_insert(error);
+            }
             if let Some(error) = first_error {
                 return Err(error);
             }
@@ -2356,6 +2542,34 @@ async fn run_node(
                 remember_shutdown_error(&mut shutdown_error, error.into());
             }
         }
+    }
+    #[cfg(feature = "dfs")]
+    if let Some(store) = dfs_sidecar_store_for_shutdown {
+        match tokio::task::spawn_blocking(move || {
+            // Attempt both drains even if the first one reports a failure.
+            (
+                store.shutdown_catalog_committer(),
+                store.shutdown_peer_serve(),
+                store.shutdown_sidecar_installer(),
+            )
+        })
+        .await
+        {
+            Ok(results) => {
+                for result in [results.0, results.1, results.2] {
+                    if let Err(error) = result {
+                        remember_shutdown_error(&mut shutdown_error, error.into());
+                    }
+                }
+            }
+            Err(error) => remember_shutdown_error(&mut shutdown_error, error.into()),
+        }
+    }
+    #[cfg(feature = "dfs")]
+    if let Some(fetcher) = dfs_fetcher_for_shutdown
+        && let Err(error) = fetcher.shutdown().await
+    {
+        remember_shutdown_error(&mut shutdown_error, error.into());
     }
     #[cfg(feature = "dfs")]
     if let Some(cache) = dfs_peer_cache_for_shutdown {
@@ -2717,27 +2931,6 @@ async fn drain_started_services(
     shutdown_error.expect("startup error is preserved")
 }
 
-/// Conservative local session cutoff. Replies cannot restore an expired local
-/// read authority; each object authorization has its own shorter, fixed cutoff.
-#[cfg(feature = "dfs")]
-fn dfs_reader_session_deadline(
-    registration: &NodeRegistrationReadiness,
-    request_started_at: Instant,
-) -> Instant {
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .min(u64::MAX as u128) as u64;
-    // Registration requests use a 30-second lease. Anchor to request start,
-    // conservatively deducting response latency rather than adding it back.
-    let remaining_ms = registration
-        .expires_at_unix_ms
-        .saturating_sub(now_ms)
-        .min(30_000);
-    request_started_at + Duration::from_millis(remaining_ms)
-}
-
 fn heartbeat_error_is_retryable(error: &afs_error::Error) -> bool {
     !matches!(
         error.kind(),
@@ -2755,6 +2948,23 @@ fn initial_registration_error_is_retryable(error: &afs_error::Error) -> bool {
             | afs_error::ErrorKind::ResourceExhausted
             | afs_error::ErrorKind::Aborted
     )
+}
+
+#[cfg(feature = "dfs")]
+fn refresh_running_read_authority(
+    authority: &dfs_read::LocalReadAuthority,
+    epoch: u64,
+    deadline: Instant,
+    shutting_down: &AtomicBool,
+) -> afs_error::Result<()> {
+    match authority.refresh(epoch, deadline) {
+        // SIGTERM closes read admission immediately. A heartbeat already in
+        // flight may return after that stop; it cannot reopen authority and
+        // must not turn a normal shutdown into a service failure. Epoch/expiry
+        // failures while serving remain fatal.
+        Err(_) if shutting_down.load(Ordering::Acquire) => Ok(()),
+        result => result,
+    }
 }
 
 fn remember_shutdown_error(first: &mut Option<BoxError>, error: BoxError) {
@@ -2820,24 +3030,18 @@ fn dfs_rdma_startup_device(
 mod shutdown_tests {
     #[cfg(feature = "dfs")]
     #[test]
-    fn dfs_reader_session_cutoff_is_bounded_and_request_anchored() {
-        let mut registration = super::rpc::meta::registration_readiness_from_reply(
-            afs_protocol::meta::RegisterNodeReply {
-                lease_epoch: 7,
-                expires_at_unix_ms: u64::MAX,
-                ..Default::default()
-            },
-        );
-        let sent = std::time::Instant::now() - std::time::Duration::from_secs(2);
-        assert_eq!(
-            super::dfs_reader_session_deadline(&registration, sent),
-            sent + std::time::Duration::from_secs(30),
-        );
-        registration.expires_at_unix_ms = 0;
-        assert_eq!(
-            super::dfs_reader_session_deadline(&registration, sent),
-            sent
-        );
+    fn registration_refresh_preserves_expired_and_changed_epoch_fail_closed() {
+        use super::dfs_read::LocalReadAuthority;
+        use std::time::Instant;
+
+        let now = Instant::now();
+        let expired = LocalReadAuthority::new(7, now);
+        assert!(expired.refresh(7, now + Duration::from_secs(30)).is_err());
+        assert!(expired.refresh(7, now + Duration::from_secs(30)).is_err());
+
+        let current = LocalReadAuthority::new(7, now + Duration::from_secs(30));
+        assert!(current.refresh(8, now + Duration::from_secs(30)).is_err());
+        assert!(current.refresh(7, now + Duration::from_secs(30)).is_err());
     }
 
     use std::time::Duration;
@@ -2955,6 +3159,43 @@ mod shutdown_tests {
         .unwrap_err();
         assert_eq!(error.kind(), afs_error::ErrorKind::Cancelled);
         assert!(error.to_string().contains("cancelled"));
+    }
+
+    #[cfg(feature = "dfs")]
+    #[test]
+    fn normal_shutdown_late_heartbeat_does_not_fail_or_reopen_authority() {
+        use std::{
+            sync::atomic::{AtomicBool, Ordering},
+            time::Instant,
+        };
+        let authority =
+            super::dfs_read::LocalReadAuthority::new(1, Instant::now() + Duration::from_secs(30));
+        let stopping = AtomicBool::new(true);
+        authority.stop();
+        super::refresh_running_read_authority(
+            &authority,
+            1,
+            Instant::now() + Duration::from_secs(30),
+            &stopping,
+        )
+        .unwrap();
+        assert!(
+            authority
+                .refresh(1, Instant::now() + Duration::from_secs(30))
+                .is_err(),
+            "late heartbeat must not reopen stopped authority"
+        );
+        stopping.store(false, Ordering::Release);
+        assert!(
+            super::refresh_running_read_authority(
+                &authority,
+                1,
+                Instant::now() + Duration::from_secs(30),
+                &stopping
+            )
+            .is_err(),
+            "stopped authority outside normal shutdown must fail closed"
+        );
     }
 
     #[test]

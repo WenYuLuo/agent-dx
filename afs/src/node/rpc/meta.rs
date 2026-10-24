@@ -32,7 +32,7 @@ use std::error::Error as StdError;
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "dfs")]
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 #[cfg(feature = "ownerfs")]
 use tonic::transport::Channel;
 use tonic::transport::Endpoint;
@@ -131,6 +131,78 @@ mod ping_tls_tests {
 
         assert_eq!(error.code(), CLIENT_ARGUMENT_INVALID);
         assert!(error.to_string().contains("server_name"));
+    }
+}
+
+#[cfg(test)]
+mod registration_lease_tests {
+    use super::*;
+    use std::time::Instant;
+
+    fn reply(remaining_ms: u64, absolute_expiry_ms: u64) -> RegisterNodeReply {
+        RegisterNodeReply {
+            lease_epoch: 7,
+            expires_at_unix_ms: absolute_expiry_ms,
+            lease_remaining_ms: remaining_ms,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn registration_lease_ignores_cross_machine_wall_clock_offsets() {
+        let sent = Instant::now();
+        let received = sent + Duration::from_secs(2);
+        for absolute_expiry in [0, 1, u64::MAX] {
+            let registration =
+                checked_registration_readiness(reply(30_000, absolute_expiry), sent, received)
+                    .unwrap();
+            assert_eq!(
+                registration.session_deadline,
+                sent + Duration::from_secs(30)
+            );
+            assert_eq!(
+                registration.session_deadline.duration_since(received),
+                Duration::from_secs(28)
+            );
+        }
+    }
+
+    #[test]
+    fn registration_lease_rejects_missing_ttl_or_zero_epoch() {
+        let sent = Instant::now();
+        assert!(checked_registration_readiness(reply(0, u64::MAX), sent, sent).is_err());
+        let mut missing_epoch = reply(30_000, u64::MAX);
+        missing_epoch.lease_epoch = 0;
+        assert!(checked_registration_readiness(missing_epoch, sent, sent).is_err());
+    }
+
+    #[test]
+    fn registration_lease_deducts_slow_response_and_rejects_exhausted_ttl() {
+        let sent = Instant::now();
+        let deadline = sent + Duration::from_secs(5);
+        let registration = checked_registration_readiness(
+            reply(5_000, u64::MAX),
+            sent,
+            sent + Duration::from_secs(4),
+        )
+        .unwrap();
+        assert_eq!(registration.session_deadline, deadline);
+        for received in [deadline, deadline + Duration::from_secs(1)] {
+            assert!(
+                checked_registration_readiness(reply(5_000, u64::MAX), sent, received).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn registration_lease_does_not_exceed_requested_ttl() {
+        let sent = Instant::now();
+        let registration =
+            checked_registration_readiness(reply(u64::MAX, u64::MAX), sent, sent).unwrap();
+        assert_eq!(
+            registration.session_deadline,
+            sent + Duration::from_secs(30)
+        );
     }
 }
 
@@ -366,6 +438,8 @@ impl From<MetaBackendPersistence> for MetaPersistenceCapability {
 pub struct NodeRegistrationReadiness {
     pub lease_epoch: u64,
     pub expires_at_unix_ms: u64,
+    /// Conservative local cutoff, independent of Node/Meta wall-clock skew.
+    pub session_deadline: Instant,
     pub meta_backend_persistence: MetaPersistenceCapability,
     pub meta_backend_healthy: bool,
     pub meta_persistence_ready: bool,
@@ -373,6 +447,17 @@ pub struct NodeRegistrationReadiness {
 }
 
 pub fn registration_readiness_from_reply(reply: RegisterNodeReply) -> NodeRegistrationReadiness {
+    registration_readiness_from_reply_at(reply, Instant::now())
+}
+
+const NODE_REGISTRATION_LEASE_SECONDS: u64 = 30;
+
+fn registration_readiness_from_reply_at(
+    reply: RegisterNodeReply,
+    request_started_at: Instant,
+) -> NodeRegistrationReadiness {
+    let remaining = Duration::from_millis(reply.lease_remaining_ms)
+        .min(Duration::from_secs(NODE_REGISTRATION_LEASE_SECONDS));
     let persistence = MetaBackendPersistence::try_from(reply.meta_backend_persistence)
         .unwrap_or(MetaBackendPersistence::Unspecified)
         .into();
@@ -382,11 +467,33 @@ pub fn registration_readiness_from_reply(reply: RegisterNodeReply) -> NodeRegist
     NodeRegistrationReadiness {
         lease_epoch: reply.lease_epoch,
         expires_at_unix_ms: reply.expires_at_unix_ms,
+        session_deadline: request_started_at + remaining,
         meta_backend_persistence: persistence,
         meta_backend_healthy: reply.meta_backend_healthy,
         meta_persistence_ready,
         meta_persistence_detail: reply.meta_persistence_detail,
     }
+}
+
+fn checked_registration_readiness(
+    reply: RegisterNodeReply,
+    request_started_at: Instant,
+    received_at: Instant,
+) -> Result<NodeRegistrationReadiness> {
+    if reply.lease_epoch == 0 {
+        return Err(Error::coded(
+            CLIENT_ARGUMENT_INVALID,
+            "Meta returned a zero Node registration epoch",
+        ));
+    }
+    let registration = registration_readiness_from_reply_at(reply, request_started_at);
+    if registration.session_deadline <= received_at {
+        return Err(Error::coded(
+            afs_error::IO_PERMISSION_DENIED,
+            "Meta Node registration lifetime is missing or expired",
+        ));
+    }
+    Ok(registration)
 }
 
 /// 同步 VFS/FUSE 回调的 Meta adapter。调用方必须在 FUSE 线程或
@@ -436,11 +543,11 @@ impl GrpcRootMeta {
     }
 
     fn request_id(&self) -> String {
-        format!(
+        crate::meta::store::timed_request_id(format!(
             "{}-{}",
             self.session_id,
             self.sequence.fetch_add(1, Ordering::Relaxed)
-        )
+        ))
     }
 
     fn client(&self) -> OwnerRootsClient<Channel> {
@@ -826,7 +933,8 @@ pub async fn register_node(
 }
 
 /// Registers the Node and returns Meta persistence readiness as observed by the
-/// server. Missing fields from an older Meta decode as unknown/false.
+/// server. Missing persistence fields decode as unknown/false. A missing or
+/// exhausted relative session lifetime fails closed, including on heartbeat.
 pub async fn register_node_with_readiness(
     endpoint: &str,
     node: afs_protocol::meta::NodeDescriptor,
@@ -834,6 +942,9 @@ pub async fn register_node_with_readiness(
     tls: TlsConfig,
 ) -> Result<NodeRegistrationReadiness> {
     static REGISTER_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+    // Include connection setup and the full response in the conservative lease
+    // budget. Both startup and heartbeat consume this exact monotonic cutoff.
+    let request_started_at = Instant::now();
     let config = GrpcConfig {
         connect_timeout: timeout,
         request_timeout: timeout,
@@ -853,24 +964,18 @@ pub async fn register_node_with_readiness(
     let mut client = MetaClient::new(afs_tracing::traced_channel(channel));
     let reply = client
         .register_node(RegisterNodeRequest {
-            request_id: format!(
+            request_id: crate::meta::store::timed_request_id(format!(
                 "register-{}-{}",
                 node.session_id,
                 REGISTER_SEQUENCE.fetch_add(1, Ordering::Relaxed),
-            ),
+            )),
             node: Some(node),
-            lease_seconds: 30,
+            lease_seconds: NODE_REGISTRATION_LEASE_SECONDS,
         })
         .await
         .map_err(afs_transport::grpc::error_status::status_to_error)?
         .into_inner();
-    if reply.lease_epoch == 0 {
-        return Err(Error::coded(
-            CLIENT_ARGUMENT_INVALID,
-            "Meta returned a zero Node registration epoch",
-        ));
-    }
-    Ok(registration_readiness_from_reply(reply))
+    checked_registration_readiness(reply, request_started_at, Instant::now())
 }
 
 /// Synchronous adapter used by the DFS Backend on FUSE worker threads.
@@ -944,10 +1049,25 @@ impl GrpcDfsMeta {
         stage: crate::node::read_work::ReadDiagnosticStage,
         call: impl FnOnce() -> afs_error::Result<T>,
     ) -> afs_error::Result<T> {
+        use crate::node::read_work::ReadDiagnosticStage;
         let diagnostic = self
             .read_work
             .as_ref()
             .and_then(|metrics| metrics.diagnostic(stage));
+        let phase = match stage {
+            ReadDiagnosticStage::MetaPlacementSnapshot => Some("meta_placement_rpc"),
+            ReadDiagnosticStage::MetaCreate => Some("meta_create_rpc"),
+            ReadDiagnosticStage::MetaOpenWrite => Some("meta_open_write_rpc"),
+            ReadDiagnosticStage::MetaResolveWriteAuthority => Some("meta_resolve_write_rpc"),
+            ReadDiagnosticStage::MetaRenewWriteLease => Some("meta_renew_write_lease_rpc"),
+            ReadDiagnosticStage::MetaSyncInodeMetadata => Some("meta_sync_inode_metadata_rpc"),
+            _ => None,
+        };
+        let _coarse = phase.and_then(|phase| {
+            self.read_work
+                .as_ref()
+                .and_then(|metrics| metrics.coarse_diagnostic(phase, 0))
+        });
         let result = call();
         if let Some(diagnostic) = diagnostic {
             diagnostic.finish(result.is_ok());
@@ -956,11 +1076,11 @@ impl GrpcDfsMeta {
     }
 
     fn request_id(&self) -> String {
-        format!(
+        crate::meta::store::timed_request_id(format!(
             "{}-dfs-{}",
             self.session_id,
             self.sequence.fetch_add(1, Ordering::Relaxed)
-        )
+        ))
     }
 
     fn run<T>(
@@ -1326,25 +1446,30 @@ impl crate::node::replication::PlacementProvider for GrpcDfsMeta {
         &self,
         minimum_revision: u64,
     ) -> afs_error::Result<Arc<crate::dfs::PlacementSnapshot>> {
-        let reply = self
-            .run(self.client().get_placement_snapshot(
-                afs_protocol::meta::GetDfsPlacementSnapshotRequest {
-                    caller_id: self.node_id.clone(),
-                    minimum_revision,
-                },
-            ))?
-            .into_inner();
-        let snapshot = Arc::new(domain_placement_snapshot(required(
-            reply.snapshot,
-            "GetPlacementSnapshot.snapshot",
-        )?)?);
-        *self.placement.lock().map_err(|_| {
-            Error::coded(
-                afs_error::CLIENT_PROTOCOL_VIOLATION,
-                "DFS placement cache lock poisoned",
-            )
-        })? = Some(snapshot.clone());
-        Ok(snapshot)
+        self.read_diagnostic(
+            crate::node::read_work::ReadDiagnosticStage::MetaPlacementSnapshot,
+            || {
+                let reply = self
+                    .run(self.client().get_placement_snapshot(
+                        afs_protocol::meta::GetDfsPlacementSnapshotRequest {
+                            caller_id: self.node_id.clone(),
+                            minimum_revision,
+                        },
+                    ))?
+                    .into_inner();
+                let snapshot = Arc::new(domain_placement_snapshot(required(
+                    reply.snapshot,
+                    "GetPlacementSnapshot.snapshot",
+                )?)?);
+                *self.placement.lock().map_err(|_| {
+                    Error::coded(
+                        afs_error::CLIENT_PROTOCOL_VIOLATION,
+                        "DFS placement cache lock poisoned",
+                    )
+                })? = Some(snapshot.clone());
+                Ok(snapshot)
+            },
+        )
     }
 }
 
@@ -1478,22 +1603,27 @@ impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
         name: &[u8],
         attributes: crate::dfs::InodeAttributes,
     ) -> afs_error::Result<(crate::dfs::InodeRecord, crate::dfs::WriteLease)> {
-        let reply = self
-            .run(self.client().create(afs_protocol::meta::DfsCreateRequest {
-                caller_id: self.node_id.clone(),
-                operation_id: operation_id.0.clone(),
-                namespace_id: self.namespace_id.0.clone(),
-                parent_inode_id: parent.0.clone(),
-                name: name.to_vec(),
-                attributes: Some(wire_dfs_attributes(attributes)),
-                owner_session_id: self.session_id.clone(),
-                lease_seconds: crate::node::vfs::dfs::DFS_WRITE_LEASE_SECONDS,
-            }))?
-            .into_inner();
-        Ok((
-            domain_dfs_inode(required(reply.inode, "DfsCreate.inode")?)?,
-            domain_dfs_write_lease(required(reply.write_lease, "DfsCreate.write_lease")?),
-        ))
+        self.read_diagnostic(
+            crate::node::read_work::ReadDiagnosticStage::MetaCreate,
+            || {
+                let reply = self
+                    .run(self.client().create(afs_protocol::meta::DfsCreateRequest {
+                        caller_id: self.node_id.clone(),
+                        operation_id: operation_id.0.clone(),
+                        namespace_id: self.namespace_id.0.clone(),
+                        parent_inode_id: parent.0.clone(),
+                        name: name.to_vec(),
+                        attributes: Some(wire_dfs_attributes(attributes)),
+                        owner_session_id: self.session_id.clone(),
+                        lease_seconds: crate::node::vfs::dfs::DFS_WRITE_LEASE_SECONDS,
+                    }))?
+                    .into_inner();
+                Ok((
+                    domain_dfs_inode(required(reply.inode, "DfsCreate.inode")?)?,
+                    domain_dfs_write_lease(required(reply.write_lease, "DfsCreate.write_lease")?),
+                ))
+            },
+        )
     }
 
     fn mkdir(
@@ -1689,22 +1819,27 @@ impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
         &self,
         inode_id: &crate::dfs::InodeId,
     ) -> afs_error::Result<(crate::dfs::InodeRecord, crate::dfs::WriteLease)> {
-        let reply = self
-            .run(
-                self.client()
-                    .open_write(afs_protocol::meta::OpenDfsWriteRequest {
-                        caller_id: self.node_id.clone(),
-                        owner_session_id: self.session_id.clone(),
-                        operation_id: self.request_id(),
-                        inode_id: inode_id.0.clone(),
-                        lease_seconds: crate::node::vfs::dfs::DFS_WRITE_LEASE_SECONDS,
-                    }),
-            )?
-            .into_inner();
-        Ok((
-            domain_dfs_inode(required(reply.inode, "OpenWrite.inode")?)?,
-            domain_dfs_write_lease(required(reply.write_lease, "OpenWrite.write_lease")?),
-        ))
+        self.read_diagnostic(
+            crate::node::read_work::ReadDiagnosticStage::MetaOpenWrite,
+            || {
+                let reply = self
+                    .run(
+                        self.client()
+                            .open_write(afs_protocol::meta::OpenDfsWriteRequest {
+                                caller_id: self.node_id.clone(),
+                                owner_session_id: self.session_id.clone(),
+                                operation_id: self.request_id(),
+                                inode_id: inode_id.0.clone(),
+                                lease_seconds: crate::node::vfs::dfs::DFS_WRITE_LEASE_SECONDS,
+                            }),
+                    )?
+                    .into_inner();
+                Ok((
+                    domain_dfs_inode(required(reply.inode, "OpenWrite.inode")?)?,
+                    domain_dfs_write_lease(required(reply.write_lease, "OpenWrite.write_lease")?),
+                ))
+            },
+        )
     }
 
     fn resolve_lock_authority(
@@ -1735,24 +1870,29 @@ impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
         &self,
         inode_id: &crate::dfs::InodeId,
     ) -> afs_error::Result<(crate::dfs::InodeRecord, crate::dfs::WriteLease)> {
-        let reply = self
-            .run(self.client().resolve_write_authority(
-                afs_protocol::meta::ResolveDfsWriteAuthorityRequest {
-                    caller_id: self.node_id.clone(),
-                    owner_session_id: self.session_id.clone(),
-                    operation_id: self.request_id(),
-                    inode_id: inode_id.0.clone(),
-                    lease_seconds: crate::node::vfs::dfs::DFS_WRITE_LEASE_SECONDS,
-                },
-            ))?
-            .into_inner();
-        Ok((
-            domain_dfs_inode(required(reply.inode, "ResolveWriteAuthority.inode")?)?,
-            domain_dfs_write_lease(required(
-                reply.write_lease,
-                "ResolveWriteAuthority.write_lease",
-            )?),
-        ))
+        self.read_diagnostic(
+            crate::node::read_work::ReadDiagnosticStage::MetaResolveWriteAuthority,
+            || {
+                let reply = self
+                    .run(self.client().resolve_write_authority(
+                        afs_protocol::meta::ResolveDfsWriteAuthorityRequest {
+                            caller_id: self.node_id.clone(),
+                            owner_session_id: self.session_id.clone(),
+                            operation_id: self.request_id(),
+                            inode_id: inode_id.0.clone(),
+                            lease_seconds: crate::node::vfs::dfs::DFS_WRITE_LEASE_SECONDS,
+                        },
+                    ))?
+                    .into_inner();
+                Ok((
+                    domain_dfs_inode(required(reply.inode, "ResolveWriteAuthority.inode")?)?,
+                    domain_dfs_write_lease(required(
+                        reply.write_lease,
+                        "ResolveWriteAuthority.write_lease",
+                    )?),
+                ))
+            },
+        )
     }
 
     fn renew_write_lease(
@@ -1767,23 +1907,29 @@ impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
         lease: crate::dfs::WriteLease,
         timeout: Duration,
     ) -> afs_error::Result<crate::dfs::WriteLease> {
-        let reply = self
-            .run_with_timeout(
-                self.client()
-                    .renew_write_lease(afs_protocol::meta::RenewDfsWriteLeaseRequest {
-                        caller_id: self.node_id.clone(),
-                        owner_session_id: self.session_id.clone(),
-                        operation_id: self.request_id(),
-                        current_lease: Some(wire_dfs_write_lease(lease)),
-                        lease_seconds: crate::node::vfs::dfs::DFS_WRITE_LEASE_SECONDS,
-                    }),
-                timeout,
-            )?
-            .into_inner();
-        Ok(domain_dfs_write_lease(required(
-            reply.write_lease,
-            "RenewWriteLease.write_lease",
-        )?))
+        self.read_diagnostic(
+            crate::node::read_work::ReadDiagnosticStage::MetaRenewWriteLease,
+            || {
+                let reply = self
+                    .run_with_timeout(
+                        self.client().renew_write_lease(
+                            afs_protocol::meta::RenewDfsWriteLeaseRequest {
+                                caller_id: self.node_id.clone(),
+                                owner_session_id: self.session_id.clone(),
+                                operation_id: self.request_id(),
+                                current_lease: Some(wire_dfs_write_lease(lease)),
+                                lease_seconds: crate::node::vfs::dfs::DFS_WRITE_LEASE_SECONDS,
+                            },
+                        ),
+                        timeout,
+                    )?
+                    .into_inner();
+                Ok(domain_dfs_write_lease(required(
+                    reply.write_lease,
+                    "RenewWriteLease.write_lease",
+                )?))
+            },
+        )
     }
 
     fn get_inode(
@@ -1846,25 +1992,30 @@ impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
         sync: crate::dfs::SyncInodeMetadata,
         timeout: Duration,
     ) -> afs_error::Result<crate::dfs::InodeRecord> {
-        let reply = self
-            .run_with_timeout(
-                self.client().sync_inode_metadata(
-                    afs_protocol::meta::SyncDfsInodeMetadataRequest {
-                        caller_id: self.node_id.clone(),
-                        operation_id: sync.operation_id.0,
-                        inode_id: sync.inode_id.0,
-                        write_lease: Some(wire_dfs_write_lease(sync.write_lease)),
-                        expected_inode_revision: sync.expected_inode_revision,
-                        expected_head_version_id: sync
-                            .expected_head_version
-                            .map_or_else(String::new, |id| id.0),
-                        metadata_delta: Some(wire_dfs_metadata_delta(sync.metadata_delta)),
-                    },
-                ),
-                timeout,
-            )?
-            .into_inner();
-        required(reply.inode, "SyncInodeMetadata.inode").and_then(domain_dfs_inode)
+        self.read_diagnostic(
+            crate::node::read_work::ReadDiagnosticStage::MetaSyncInodeMetadata,
+            || {
+                let reply = self
+                    .run_with_timeout(
+                        self.client().sync_inode_metadata(
+                            afs_protocol::meta::SyncDfsInodeMetadataRequest {
+                                caller_id: self.node_id.clone(),
+                                operation_id: sync.operation_id.0,
+                                inode_id: sync.inode_id.0,
+                                write_lease: Some(wire_dfs_write_lease(sync.write_lease)),
+                                expected_inode_revision: sync.expected_inode_revision,
+                                expected_head_version_id: sync
+                                    .expected_head_version
+                                    .map_or_else(String::new, |id| id.0),
+                                metadata_delta: Some(wire_dfs_metadata_delta(sync.metadata_delta)),
+                            },
+                        ),
+                        timeout,
+                    )?
+                    .into_inner();
+                required(reply.inode, "SyncInodeMetadata.inode").and_then(domain_dfs_inode)
+            },
+        )
     }
 
     fn set_inode_attributes(
@@ -2038,6 +2189,7 @@ impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
                 self.client()
                     .commit_file_version(afs_tracing::request_with_current_context(
                         afs_protocol::meta::CommitFileVersionRequest {
+                            gc_fence: commit.gc_fence.map(crate::dfs::GcFence::wire),
                             caller_id: self.node_id.clone(),
                             operation_id: commit.operation_id.0,
                             inode_id: commit.inode_id.0,
@@ -2054,6 +2206,14 @@ impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
                                 .map(wire_chunk_receipt)
                                 .collect(),
                             metadata_delta: Some(wire_dfs_metadata_delta(commit.metadata_delta)),
+                            clone_source: commit.clone_source.map(|source| {
+                                afs_protocol::meta::DfsCloneFileRange {
+                                    version_id: source.version.0,
+                                    source_offset: source.source_offset,
+                                    destination_offset: source.destination_offset,
+                                    length: source.length,
+                                }
+                            }),
                         },
                     )),
                 timeout,
@@ -2461,6 +2621,9 @@ fn wire_digest_algorithm(algorithm: crate::dfs::DigestAlgorithm) -> i32 {
         crate::dfs::DigestAlgorithm::Blake3 => {
             afs_protocol::meta::DfsDigestAlgorithm::Blake3 as i32
         }
+        crate::dfs::DigestAlgorithm::Crc32cSegmentsV1 => {
+            afs_protocol::meta::DfsDigestAlgorithm::Crc32cSegmentsV1 as i32
+        }
     }
 }
 
@@ -2469,6 +2632,9 @@ fn domain_digest_algorithm(value: i32) -> afs_error::Result<crate::dfs::DigestAl
     match afs_protocol::meta::DfsDigestAlgorithm::try_from(value) {
         Ok(afs_protocol::meta::DfsDigestAlgorithm::Blake3) => {
             Ok(crate::dfs::DigestAlgorithm::Blake3)
+        }
+        Ok(afs_protocol::meta::DfsDigestAlgorithm::Crc32cSegmentsV1) => {
+            Ok(crate::dfs::DigestAlgorithm::Crc32cSegmentsV1)
         }
         _ => Err(Error::coded(
             CLIENT_PROTOCOL_VIOLATION,
@@ -4065,6 +4231,104 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_write_diagnostics_cover_controls_and_keep_cached_placement_local() {
+        use crate::node::read_work::{ReadDiagnosticStage, ReadWorkMetrics};
+        let (endpoint, server) = hanging_endpoint().await;
+        for enabled in [false, true] {
+            let registry = afs_metrics::Registry::new();
+            let metrics = ReadWorkMetrics::register(&registry)
+                .unwrap()
+                .with_read_diagnostics(enabled);
+            let meta = test_meta(&endpoint, Duration::from_millis(30))
+                .with_read_work_metrics(metrics.clone());
+            tokio::task::spawn_blocking(move || {
+                use crate::node::{replication::PlacementProvider, vfs::dfs::DfsMeta};
+                let cached = Arc::new(crate::dfs::PlacementSnapshot {
+                    revision: 9,
+                    replication: crate::dfs::ReplicationConfig::local_single_copy(),
+                    replica_groups: Vec::new(),
+                });
+                *meta.placement.lock().unwrap() = Some(cached.clone());
+                assert!(Arc::ptr_eq(&meta.snapshot().unwrap(), &cached));
+                if let Some(snapshot) = meta.read_work.as_ref().unwrap().diagnostics_snapshot() {
+                    assert!(
+                        snapshot.records.is_empty(),
+                        "cached placement is local work"
+                    );
+                }
+                // Refresh really invokes the transport; its failure leaves the
+                // previously cached placement usable without another RPC.
+                assert!(meta.refresh(10).is_err());
+                assert!(Arc::ptr_eq(&meta.snapshot().unwrap(), &cached));
+                assert!(
+                    meta.create(
+                        &crate::dfs::OperationId::new("diagnostic-create"),
+                        &crate::dfs::InodeId::new("root"),
+                        b"missing",
+                        crate::dfs::InodeAttributes {
+                            mode: 0o644,
+                            uid: 1,
+                            gid: 1,
+                            nlink: 1,
+                            atime_unix_ms: 0,
+                            mtime_unix_ms: 0,
+                            ctime_unix_ms: 0,
+                        },
+                    )
+                    .is_err()
+                );
+                let inode = crate::dfs::InodeId::new("missing");
+                assert!(meta.open_write(&inode).is_err());
+                assert!(meta.resolve_write_authority(&inode).is_err());
+                assert!(meta.renew_write_lease(test_lease()).is_err());
+                assert!(meta.sync_inode_metadata(test_metadata_sync()).is_err());
+            })
+            .await
+            .unwrap();
+            match metrics.diagnostics_snapshot() {
+                None => assert!(!enabled),
+                Some(snapshot) => {
+                    let expected = [
+                        (
+                            ReadDiagnosticStage::MetaPlacementSnapshot,
+                            "meta_placement_rpc",
+                        ),
+                        (ReadDiagnosticStage::MetaCreate, "meta_create_rpc"),
+                        (ReadDiagnosticStage::MetaOpenWrite, "meta_open_write_rpc"),
+                        (
+                            ReadDiagnosticStage::MetaResolveWriteAuthority,
+                            "meta_resolve_write_rpc",
+                        ),
+                        (
+                            ReadDiagnosticStage::MetaRenewWriteLease,
+                            "meta_renew_write_lease_rpc",
+                        ),
+                        (
+                            ReadDiagnosticStage::MetaSyncInodeMetadata,
+                            "meta_sync_inode_metadata_rpc",
+                        ),
+                    ];
+                    assert_eq!(snapshot.records.len(), expected.len());
+                    assert_eq!(snapshot.overflow, 0);
+                    for (record, (stage, phase)) in snapshot.records.iter().zip(expected) {
+                        assert_eq!(record.stage, stage);
+                        assert!(record.completed && !record.success);
+                        assert!(record.end_ns >= record.start_ns);
+                        let aggregate = snapshot
+                            .coarse_phases
+                            .iter()
+                            .find(|entry| entry.phase == phase)
+                            .unwrap();
+                        assert_eq!(aggregate.calls, 1, "{phase}");
+                        assert!(aggregate.last_end_ns >= aggregate.first_start_ns);
+                    }
+                }
+            }
+        }
+        server.abort();
+    }
+
     fn test_lease() -> crate::dfs::WriteLease {
         crate::dfs::WriteLease {
             inode_id: crate::dfs::InodeId::new("inode:test"),
@@ -4094,6 +4358,7 @@ mod tests {
     fn test_commit() -> crate::dfs::CommitFileVersion {
         let layout_id = crate::dfs::LayoutRootId::new("layout:test");
         crate::dfs::CommitFileVersion {
+            gc_fence: None,
             operation_id: crate::dfs::OperationId::new("op:commit"),
             inode_id: crate::dfs::InodeId::new("inode:test"),
             write_lease: test_lease(),
@@ -4113,6 +4378,7 @@ mod tests {
                 inline_extents: Vec::new(),
             },
             chunk_receipts: Vec::new(),
+            clone_source: None,
             metadata_delta: crate::dfs::CommitMetadataDelta {
                 mode: crate::dfs::CommitMetadataMode::Full,
                 mtime_unix_ms: Some(1),
@@ -4328,5 +4594,167 @@ mod tests {
         .await;
 
         listener.abort();
+    }
+}
+
+#[cfg(feature = "dfs")]
+impl crate::node::gc::GcControl for GrpcDfsMeta {
+    fn retain(
+        &self,
+        id: &str,
+        inode: &crate::dfs::InodeId,
+        version: Option<&crate::dfs::FileVersionId>,
+        publication: bool,
+    ) -> Result<()> {
+        self.update_gc(id, Some(inode), version, publication, Vec::new(), false)
+    }
+    fn retain_fenced(
+        &self,
+        id: &str,
+        inode: &crate::dfs::InodeId,
+        version: Option<&crate::dfs::FileVersionId>,
+    ) -> Result<crate::dfs::GcFence> {
+        self.update_gc_with_fence(id, Some(inode), version, true, Vec::new(), false, true)?
+            .ok_or_else(|| {
+                Error::coded(
+                    afs_error::NODE_VFS_UNIMPLEMENTED,
+                    "Meta did not return a GC fence",
+                )
+            })
+    }
+    fn release(&self, id: &str) -> Result<()> {
+        self.update_gc(id, None, None, false, Vec::new(), true)
+    }
+    fn reserve_publication(
+        &self,
+        operation: &crate::dfs::OperationId,
+        chunks: Vec<crate::dfs::ChunkObject>,
+    ) -> Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match self.update_gc(
+                &format!("publish:{}", operation.0),
+                None,
+                None,
+                true,
+                chunks.clone(),
+                false,
+            ) {
+                Err(error)
+                    if error.code() == afs_error::META_DFS_GC_BUSY && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(50))
+                }
+                result => return result,
+            }
+        }
+    }
+    fn collect(
+        &self,
+        completed: u64,
+        inventory: Vec<crate::dfs::ChunkObject>,
+    ) -> Result<crate::dfs::GcState> {
+        let mut client =
+            afs_protocol::meta::dfs_meta_client::DfsMetaClient::new(self.channel.clone());
+        let reply = self
+            .run(
+                client.collect_garbage(afs_protocol::meta::CollectDfsGarbageRequest {
+                    node_id: self.node_id.clone(),
+                    session_id: self.session_id.clone(),
+                    completed_generation: completed,
+                    inventory: inventory.into_iter().map(wire_chunk_object).collect(),
+                }),
+            )?
+            .into_inner();
+        Ok(crate::dfs::GcState {
+            generation: reply.generation,
+            chunks: reply
+                .chunk_ids
+                .into_iter()
+                .map(crate::dfs::ChunkId::new)
+                .collect(),
+            waiting_nodes: if reply.pending_for_node {
+                vec![self.node_id.clone()]
+            } else {
+                Vec::new()
+            },
+        })
+    }
+}
+#[cfg(feature = "dfs")]
+impl GrpcDfsMeta {
+    fn update_gc(
+        &self,
+        id: &str,
+        inode: Option<&crate::dfs::InodeId>,
+        version: Option<&crate::dfs::FileVersionId>,
+        publication: bool,
+        chunks: Vec<crate::dfs::ChunkObject>,
+        release: bool,
+    ) -> Result<()> {
+        self.update_gc_with_fence(id, inode, version, publication, chunks, release, false)
+            .map(|_| ())
+    }
+
+    #[allow(clippy::too_many_arguments)] // Mirrors the existing fixed GC request shape.
+    fn update_gc_with_fence(
+        &self,
+        id: &str,
+        inode: Option<&crate::dfs::InodeId>,
+        version: Option<&crate::dfs::FileVersionId>,
+        publication: bool,
+        chunks: Vec<crate::dfs::ChunkObject>,
+        release: bool,
+        capture_gc_fence: bool,
+    ) -> Result<Option<crate::dfs::GcFence>> {
+        let mut client =
+            afs_protocol::meta::dfs_meta_client::DfsMetaClient::new(self.channel.clone());
+        let reply = self
+            .run(
+                client.update_gc_reference(afs_protocol::meta::UpdateDfsGcReferenceRequest {
+                    capture_gc_fence,
+                    node_id: self.node_id.clone(),
+                    session_id: self.session_id.clone(),
+                    reference_id: id.into(),
+                    admission_deadline_unix_ms: if inode.is_some() && !release {
+                        crate::meta::store::now_unix_ms().saturating_add(30_000)
+                    } else {
+                        0
+                    },
+                    inode_id: inode.map(|id| id.0.clone()).unwrap_or_default(),
+                    version_id: version.map(|id| id.0.clone()).unwrap_or_default(),
+                    publication,
+                    chunks: chunks.into_iter().map(wire_chunk_object).collect(),
+                    release,
+                }),
+            )?
+            .into_inner();
+        reply
+            .gc_fence
+            .map(crate::dfs::GcFence::from_wire)
+            .transpose()
+    }
+}
+
+#[cfg(all(test, feature = "dfs"))]
+mod crc32c_wire_tests {
+    use super::*;
+    #[test]
+    fn crc32c_meta_descriptor_roundtrip() {
+        let chunk = crate::dfs::ChunkObject {
+            id: crate::dfs::ChunkId::new("crc32c-v1-00112233445566778899aabbccddeeff"),
+            length: 32769,
+            content_digest: crate::dfs::ContentDigest {
+                algorithm: crate::dfs::DigestAlgorithm::Crc32cSegmentsV1,
+                bytes: [7; 32],
+            },
+            encoding: crate::dfs::ChunkEncoding::Raw,
+        };
+        assert_eq!(
+            domain_chunk_object(wire_chunk_object(chunk.clone())).unwrap(),
+            chunk
+        );
+        assert_eq!(wire_digest_algorithm(chunk.content_digest.algorithm), 2);
+        assert!(domain_digest_algorithm(99).is_err());
     }
 }

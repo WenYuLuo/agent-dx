@@ -8,6 +8,11 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+mod cow;
+mod gc;
+pub use cow::clone_file_layout;
+pub use gc::{GcFence, GcReference, GcState, UpdateGcReference};
+
 macro_rules! string_id {
     ($name:ident) => {
         #[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -373,6 +378,8 @@ pub struct LayoutRoot {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum DigestAlgorithm {
     Blake3,
+    /// BLAKE3 binding of a versioned 32KiB CRC32C table, never a body BLAKE3 root.
+    Crc32cSegmentsV1,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -392,6 +399,72 @@ pub struct ChunkObject {
     pub length: u64,
     pub content_digest: ContentDigest,
     pub encoding: ChunkEncoding,
+}
+
+impl ChunkObject {
+    /// Birth generation of an independently named CRC object. Repairs retain it.
+    pub fn write_generation(&self) -> Option<&str> {
+        let value = self.id.0.strip_prefix("crc32c-v2-")?;
+        let (generation, object) = value.split_once('-')?;
+        let hex = |s: &str| {
+            s.len() == 32
+                && s.bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        };
+        (hex(generation) && hex(object)).then_some(generation)
+    }
+
+    pub fn generation_id(operation: &OperationId) -> String {
+        blake3::hash(operation.0.as_bytes()).to_hex()[..32].to_string()
+    }
+
+    pub fn is_segment_crc32c(&self) -> bool {
+        self.content_digest.algorithm == DigestAlgorithm::Crc32cSegmentsV1
+    }
+    pub fn valid_immutable_identity(&self) -> bool {
+        if !self.is_segment_crc32c() {
+            return Self::from_content_addressed_id(&self.id).as_ref() == Some(self);
+        }
+        self.length > 0
+            && self.length <= 4 * 1024 * 1024
+            && self.encoding == ChunkEncoding::Raw
+            && self.write_generation().is_some()
+    }
+
+    /// Recover the standard root and length committed by a canonical ChunkId.
+    /// Other historical IDs have no content-addressed authority; callers must
+    /// retain their complete verification fallback rather than infer a root.
+    pub fn from_content_addressed_id(chunk_id: &ChunkId) -> Option<Self> {
+        let (hex, length) = content_addressed_parts(chunk_id)?;
+        let mut bytes = [0; 32];
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16).ok()?;
+        }
+        Some(Self {
+            id: chunk_id.clone(),
+            length,
+            content_digest: ContentDigest {
+                algorithm: DigestAlgorithm::Blake3,
+                bytes,
+            },
+            encoding: ChunkEncoding::Raw,
+        })
+    }
+}
+
+fn content_addressed_parts(chunk_id: &ChunkId) -> Option<(&str, u64)> {
+    let content = chunk_id.0.strip_prefix("blake3-")?;
+    let (digest, length) = content.split_once('-')?;
+    let parsed_length = length.parse::<u64>().ok()?;
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || parsed_length.to_string() != length
+    {
+        return None;
+    }
+    Some((digest, parsed_length))
 }
 
 /// Immutable durability contract; external storage never counts as a Node replica.
@@ -449,17 +522,7 @@ pub fn external_object_key(
             "invalid external chunk identity",
         )
     };
-    let content = chunk_id.0.strip_prefix("blake3-").ok_or_else(invalid)?;
-    let (digest, length) = content.split_once('-').ok_or_else(invalid)?;
-    let parsed_length = length.parse::<u64>().map_err(|_| invalid())?;
-    if digest.len() != 64
-        || !digest
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        || parsed_length.to_string() != length
-    {
-        return Err(invalid());
-    }
+    let (digest, _) = content_addressed_parts(chunk_id).ok_or_else(invalid)?;
     Ok(format!(
         "afs/v1/{store_id}/{generation}/chunks/{}/{}",
         &digest[..2],
@@ -970,7 +1033,18 @@ pub struct CommitMetadataDelta {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CloneFileRange {
+    pub version: FileVersionId,
+    pub source_offset: u64,
+    pub destination_offset: u64,
+    pub length: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CommitFileVersion {
+    /// Frozen before uploads start; never refreshed when retrying a commit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gc_fence: Option<GcFence>,
     pub operation_id: OperationId,
     pub inode_id: InodeId,
     pub write_lease: WriteLease,
@@ -979,6 +1053,9 @@ pub struct CommitFileVersion {
     pub file_version: FileVersion,
     pub layout_root: LayoutRoot,
     pub chunk_receipts: Vec<ChunkReceipt>,
+    /// COW inherits only the specified range of an immutable source version.
+    #[serde(default)]
+    pub clone_source: Option<CloneFileRange>,
     pub metadata_delta: CommitMetadataDelta,
 }
 
@@ -995,6 +1072,28 @@ pub struct SyncInodeMetadata {
 #[cfg(test)]
 mod external_identity_tests {
     use super::*;
+
+    #[test]
+    fn committed_content_addressed_id_anchors_standard_root_and_length() {
+        for body in [Vec::new(), vec![19; 32_769]] {
+            let root = blake3::hash(&body);
+            let id = ChunkId::new(format!("blake3-{}-{}", root.to_hex(), body.len()));
+            let chunk = ChunkObject::from_content_addressed_id(&id).unwrap();
+            assert_eq!(chunk.id, id);
+            assert_eq!(chunk.length, body.len() as u64);
+            assert_eq!(chunk.content_digest.bytes, *root.as_bytes());
+            assert_eq!(chunk.encoding, ChunkEncoding::Raw);
+        }
+        for id in [
+            "legacy-object".to_owned(),
+            format!("blake3-{}-01", "a".repeat(64)),
+            format!("blake3-{}-1", "A".repeat(64)),
+            format!("blake3-{}-18446744073709551616", "a".repeat(64)),
+            format!("blake3-{}-1", "é".repeat(32)),
+        ] {
+            assert!(ChunkObject::from_content_addressed_id(&ChunkId::new(id)).is_none());
+        }
+    }
 
     #[test]
     fn node_receipt_preserves_pre_external_exact_replay_digest() {
@@ -1061,5 +1160,21 @@ mod external_identity_tests {
         ] {
             assert!(external_object_key("store", "generation", &ChunkId::new(identity)).is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod crc32c_format_tests {
+    #[test]
+    fn crc32c_descriptor_has_distinct_persisted_algorithm() {
+        let descriptor: super::ContentDigest = serde_json::from_value(serde_json::json!({
+            "algorithm":"Crc32cSegmentsV1", "bytes":vec![7_u8;32]
+        }))
+        .unwrap();
+        assert_ne!(descriptor.algorithm, super::DigestAlgorithm::Blake3);
+        assert_eq!(
+            serde_json::to_value(descriptor).unwrap()["algorithm"],
+            "Crc32cSegmentsV1"
+        );
     }
 }

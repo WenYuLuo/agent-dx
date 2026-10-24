@@ -64,6 +64,7 @@ fn registration(
     NodeRegistrationReadiness {
         lease_epoch: 7,
         expires_at_unix_ms: 123,
+        session_deadline: std::time::Instant::now() + std::time::Duration::from_secs(30),
         meta_backend_persistence: persistence,
         meta_backend_healthy: healthy,
         meta_persistence_ready: persistent_ready,

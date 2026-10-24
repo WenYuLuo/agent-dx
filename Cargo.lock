@@ -51,7 +51,7 @@ name = "adx-agent-core"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "ring",
+ "percent-encoding",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -111,6 +111,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "adx-checkpoint-storage"
+version = "0.1.0"
+dependencies = [
+ "adx-core",
+ "adx-observability",
+ "adx-transport",
+ "async-trait",
+ "futures-util",
+ "object_store",
+ "reqwest 0.13.5",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "adx-cli"
 version = "0.1.0"
 dependencies = [
@@ -131,6 +150,7 @@ dependencies = [
 name = "adx-coordinator"
 version = "0.1.0"
 dependencies = [
+ "adx-checkpoint-storage",
  "adx-core",
  "adx-discovery",
  "adx-observability",
@@ -232,6 +252,7 @@ dependencies = [
  "hyper-util",
  "libc",
  "portable-pty",
+ "regex",
  "rmp",
  "rmp-serde",
  "rmpv",
@@ -321,6 +342,7 @@ dependencies = [
 name = "adxlet"
 version = "0.1.0"
 dependencies = [
+ "adx-checkpoint-storage",
  "adx-core",
  "adx-discovery",
  "adx-observability",
@@ -394,7 +416,6 @@ dependencies = [
 name = "afs"
 version = "0.1.0"
 dependencies = [
- "adx-transport",
  "afs-client",
  "afs-error",
  "afs-logging",
@@ -402,19 +423,23 @@ dependencies = [
  "afs-protocol",
  "afs-tracing",
  "afs-transport",
+ "arc-swap 1.9.2",
  "axum 0.8.9",
+ "bao-tree",
  "blake3",
  "clap",
- "etcd-client 0.20.0",
+ "crc32c",
  "fuser",
  "hyper-util",
+ "im",
  "libc",
  "object_store",
  "opentelemetry-proto 0.32.0",
+ "postcard",
  "prost 0.14.4",
  "rayon-core",
- "redis",
  "reqwest 0.13.5",
+ "rustls",
  "serde",
  "serde_json",
  "tempfile",
@@ -426,6 +451,7 @@ dependencies = [
  "toml",
  "tonic 0.14.6",
  "tower 0.5.3",
+ "uuid",
 ]
 
 [[package]]
@@ -814,6 +840,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "bao-tree"
+version = "0.16.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "149a2a6017771141e2cd5d0c55b3892d8ff1958df5c318b2e496bf3544b426ed"
+dependencies = [
+ "blake3",
+ "bytes",
+ "positioned-io",
+ "range-collections",
+ "self_cell",
+ "smallvec",
+]
+
+[[package]]
 name = "base16ct"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -847,6 +887,12 @@ dependencies = [
  "pbkdf2",
  "sha2 0.11.0",
 ]
+
+[[package]]
+name = "binary-merge"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "597bb81c80a54b6a4381b23faba8d7774b144c94cbd1d6fe3f1329bd776554ab"
 
 [[package]]
 name = "bitflags"
@@ -1065,6 +1111,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c9ea0ac24bc397ab3c98583a3c9ba74fa56b09a4449bbe172b9b1ddb016027a"
 
 [[package]]
+name = "cobs"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0fa961b519f0b462e3a3b4a34b64d119eeaca1d59af726fe450bbba07a9fc0a1"
+dependencies = [
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "colorchoice"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1156,6 +1211,15 @@ checksum = "e75b2483e97a5a7da73ac68a05b629f9c53cff58d8ed1c77866079e18b00dba5"
 dependencies = [
  "digest 0.10.7",
  "spin",
+]
+
+[[package]]
+name = "crc32c"
+version = "0.6.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a47af21622d091a8f0fb295b88bc886ac74efcc613efc19f5d0b21de5c89e47"
+dependencies = [
+ "rustc_version",
 ]
 
 [[package]]
@@ -1312,7 +1376,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "deadpool-postgres",
- "etcd-client 0.14.1",
+ "etcd-client",
  "futures-util",
  "h2",
  "hex",
@@ -1558,6 +1622,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "embedded-io"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ef1a6892d9eef45c8fa6b9e0086428a2cca8491aca8f787c534a3d6d0bcb3ced"
+
+[[package]]
+name = "embedded-io"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "edd0f118536f44f5ccd48bcb8b111bdc3de888b58c74639dfb034a357d0f206d"
+
+[[package]]
 name = "encoding_rs"
 version = "0.8.41"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1631,24 +1707,6 @@ dependencies = [
  "tonic 0.12.3",
  "tonic-build 0.12.3",
  "tower 0.4.13",
- "tower-service",
-]
-
-[[package]]
-name = "etcd-client"
-version = "0.20.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d713f127cf89f965a6988a5a2016bdd7d87652cbffbb82c5ee7c9bbe1a29f589"
-dependencies = [
- "http",
- "prost 0.14.4",
- "tokio",
- "tokio-stream",
- "tonic 0.14.6",
- "tonic-build 0.14.6",
- "tonic-prost",
- "tonic-prost-build",
- "tower 0.5.3",
  "tower-service",
 ]
 
@@ -2395,6 +2453,15 @@ checksum = "4250ce6452e92010fdf7268ccc5d14faa80bb12fc741938534c58f16804e03c7"
 dependencies = [
  "block-padding",
  "hybrid-array",
+]
+
+[[package]]
+name = "inplace-vec-builder"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf64c2edc8226891a71f127587a2861b132d2b942310843814d5001d99a1d307"
+dependencies = [
+ "smallvec",
 ]
 
 [[package]]
@@ -3424,6 +3491,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "positioned-io"
+version = "0.3.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d4ec4b80060f033312b99b6874025d9503d2af87aef2dd4c516e253fbfcdada7"
+dependencies = [
+ "libc",
+ "winapi",
+]
+
+[[package]]
+name = "postcard"
+version = "1.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6764c3b5dd454e283a30e6dfe78e9b31096d9e32036b5d1eaac7a6119ccb9a24"
+dependencies = [
+ "cobs",
+ "embedded-io 0.4.0",
+ "embedded-io 0.6.1",
+ "serde",
+]
+
+[[package]]
 name = "postgres-protocol"
 version = "0.6.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3913,6 +4002,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6f97cdb2a36ed4183de61b2f824cc45c9f1037f28afe0a322e9fff4c108b5aaa"
 dependencies = [
  "rand_core 0.6.4",
+]
+
+[[package]]
+name = "range-collections"
+version = "0.4.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "861706ea9c4aded7584c5cd1d241cec2ea7f5f50999f236c22b65409a1f1a0d0"
+dependencies = [
+ "binary-merge",
+ "inplace-vec-builder",
+ "ref-cast",
+ "smallvec",
 ]
 
 [[package]]
@@ -4462,6 +4563,12 @@ dependencies = [
  "core-foundation-sys",
  "libc",
 ]
+
+[[package]]
+name = "self_cell"
+version = "1.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2ab42ca02749e120097e328d91d415325bdf43b1c72c4c8badf37375fe40a813"
 
 [[package]]
 name = "semver"

@@ -194,10 +194,19 @@ impl RuntimeDriver for Backend {
             _ => (),
         }
         self.started.fetch_add(1, Ordering::SeqCst);
+        if spec.id == "assignment-wins" {
+            // Assignment wins before the queue deadline; runtime readiness may
+            // legitimately finish after that deadline under the create budget.
+            tokio::time::sleep(Duration::from_millis(1200)).await;
+        }
         self.running.lock().unwrap().insert(id.into());
         Ok("10.0.0.2".parse().unwrap())
     }
     async fn checkpoint_supported(&self, _: &str) -> Result<()> {
+        Ok(())
+    }
+    async fn checkpoint_running(&self, _: &str, path: &std::path::Path, _: Duration) -> Result<()> {
+        std::fs::write(path.join("memory"), b"saved runtime state").unwrap();
         Ok(())
     }
     async fn checkpoint(&self, id: &str, path: &std::path::Path, _: Duration) -> Result<()> {
@@ -597,14 +606,17 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
     let mut expires = create("queue-deadline");
     expires.schedule_timeout_seconds = 1;
     let started = tokio::time::Instant::now();
+    let error = frontend.create_environment(expires).await.unwrap_err();
+    assert_eq!(error.code(), tonic::Code::DeadlineExceeded);
+    // Cancellation is acknowledged only before any assignment exists.
     assert_eq!(
-        frontend
-            .create_environment(expires)
-            .await
-            .unwrap_err()
-            .code(),
-        tonic::Code::DeadlineExceeded
+        error.metadata().get("adx-scheduling-cancelled").unwrap(),
+        "true"
     );
+    let failure: serde_json::Value = serde_json::from_slice(error.details()).unwrap();
+    assert_eq!(failure["rejections"]["insufficient_cpu"], 1);
+    assert_eq!(failure["requested"]["cpu_millis"], 100);
+    assert_eq!(failure["maxAvailable"]["cpu_millis"], 0);
     assert!(started.elapsed() >= Duration::from_millis(900));
     assert_eq!(
         session.get("queue-deadline").await.unwrap_err(),
@@ -613,6 +625,28 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
     assert!(scrape_metrics(metrics_address)
         .await
         .contains("adx_coordinator_queued_requests{shard_id=\"0\"} 0\n"));
+
+    for (id, cpu, memory, reason) in [
+        ("cpu-nonfit", 101, 128, "insufficient_cpu"),
+        ("memory-nonfit", 100, 129, "insufficient_memory"),
+    ] {
+        let mut request = create(id);
+        request.schedule_timeout_seconds = 1;
+        let resources = request.spec.as_mut().unwrap().resources.as_mut().unwrap();
+        resources.cpu_millis = cpu;
+        resources.memory_bytes = memory;
+        let error = frontend.create_environment(request).await.unwrap_err();
+        assert_eq!(error.code(), tonic::Code::DeadlineExceeded);
+        let failure = adx_protocol::scheduling_failure(&error).unwrap();
+        assert_eq!(failure.rejections[reason], 1);
+        assert_eq!(failure.max_capacity.cpu_millis, 100);
+        assert_eq!(failure.max_capacity.memory_bytes, 128);
+        assert_eq!(
+            session.get(id).await.unwrap_err(),
+            adx_core::Error::NotFound
+        );
+    }
+    assert_eq!(backend.started.load(Ordering::SeqCst), 1);
 
     let mut pending = Request::new(create("second"));
     pending.set_timeout(Duration::from_millis(80));
@@ -649,6 +683,13 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
     })
     .await
     .unwrap();
+    // Freeing capacity after cancellation must not revive expired requests.
+    for id in ["queue-deadline", "cpu-nonfit", "memory-nonfit"] {
+        assert_eq!(
+            session.get(id).await.unwrap_err(),
+            adx_core::Error::NotFound
+        );
+    }
     assert_eq!(backend.started.load(Ordering::SeqCst), 2);
     assert_eq!(backend.removed.load(Ordering::SeqCst), 1);
     assert_eq!(
@@ -695,6 +736,31 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
     ));
     assert!(!metrics.contains("adx_coordinator_deleted_records"));
     assert!(metrics
+        .contains("adx_coordinator_node_reserved_cpu_millis{shard_id=\"0\",node_id=\"node\"} 0\n"));
+
+    let mut assigned = create("assignment-wins");
+    assigned.schedule_timeout_seconds = 1;
+    let started = tokio::time::Instant::now();
+    let result = frontend
+        .create_environment(assigned)
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(started.elapsed() >= Duration::from_millis(1200));
+    let record = result.record.unwrap();
+    assert_eq!(record.state, pb::EnvironmentState::Running as i32);
+    node_frontend
+        .delete_environment(pb::DeleteEnvironmentRequest {
+            failed_revision: None,
+            node_session_id: String::new(),
+            assignment: record.assignment,
+            caller: caller(),
+        })
+        .await
+        .unwrap();
+    assert!(backend.running.lock().unwrap().is_empty());
+    assert!(scrape_metrics(metrics_address)
+        .await
         .contains("adx_coordinator_node_reserved_cpu_millis{shard_id=\"0\",node_id=\"node\"} 0\n"));
 
     if let Ok(api_binary) = std::env::var("ADX_TEST_APISERVER") {
@@ -789,7 +855,15 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
             "{}",
             String::from_utf8_lossy(&result.stderr)
         );
-        for id in ["t-http-case", "t-http-peer", "t-http-affinity"] {
+        for id in [
+            "t-http-case",
+            "t-http-peer",
+            "t-http-affinity",
+            "t-http-cpu-json",
+            "t-http-cpu-sse",
+            "t-http-memory-json",
+            "t-http-memory-sse",
+        ] {
             assert!(matches!(
                 session.get(id).await,
                 Err(adx_core::Error::NotFound)
@@ -1003,6 +1077,8 @@ async fn heartbeat_expiry_reconciliation_and_old_session_fencing() {
         .await
         .unwrap();
     let running = EnvironmentRecord {
+        execution_artifacts: vec![],
+        snapshot_source: None,
         failure: None,
         restart_attempts: 0,
         restart_pending: false,
@@ -1020,6 +1096,31 @@ async fn heartbeat_expiry_reconciliation_and_old_session_fencing() {
     };
     session.commit(running.clone()).await.unwrap();
     assert_eq!(session.snapshot().await.unwrap().routes().unwrap().len(), 1);
+    assert!(
+        node.inspect_node(pb::InspectNodeRequest {
+            node_id: "node".into(),
+            session_id: report.session_id.clone(),
+        })
+        .await
+        .is_err(),
+        "inspection requires closed allocation admission"
+    );
+    report.heartbeat_sequence = 3;
+    report.accepting_allocations = false;
+    node.register_node(report.clone()).await.unwrap();
+    let catalog = node
+        .inspect_node(pb::InspectNodeRequest {
+            node_id: "node".into(),
+            session_id: report.session_id.clone(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(catalog.records.len(), 1);
+    assert_eq!(session.snapshot().await.unwrap().routes().unwrap().len(), 1);
+    report.heartbeat_sequence = 4;
+    report.accepting_allocations = true;
+    node.register_node(report.clone()).await.unwrap();
     // Duplicate packets acknowledge the same request but cannot extend liveness.
     tokio::time::sleep(Duration::from_millis(180)).await;
     node.register_node(report.clone()).await.unwrap();
@@ -1419,6 +1520,8 @@ async fn coordinator_restart_bounds_re_registration_grace() {
             .await
             .unwrap();
         let running = EnvironmentRecord {
+            execution_artifacts: vec![],
+            snapshot_source: None,
             failure: None,
             spec: spec("held"),
             assignment,
@@ -1655,6 +1758,8 @@ async fn published_routes_drive_real_gateway_streams_and_reconnect_to_new_coordi
         .await
         .unwrap();
     let mut record = EnvironmentRecord {
+        execution_artifacts: vec![],
+        snapshot_source: None,
         failure: None,
         restart_attempts: 0,
         restart_pending: false,
@@ -1764,6 +1869,18 @@ async fn published_routes_drive_real_gateway_streams_and_reconnect_to_new_coordi
         .unwrap()
         .unwrap();
     assert_eq!(echoed, payload);
+    // Periodic authority reconciliation must preserve an established H2 CONNECT stream.
+    for _ in 0..3 {
+        routes.begin_reconcile().await.unwrap();
+        routes.activate(&record).await.unwrap();
+        routes.finish_reconcile().await.unwrap();
+        stream.write_all(payload).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), stream.read_exact(&mut echoed))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(echoed, payload);
+    }
     drop(stream);
     // Exercise an incremental frame on the same stream, including its base cursor.
     record.revision = 3;
@@ -1849,7 +1966,7 @@ async fn published_routes_drive_real_gateway_streams_and_reconnect_to_new_coordi
 
 #[tokio::test]
 #[ignore = "requires isolated Redis and generated mTLS certificates"]
-async fn snapshot_rpc_enforces_component_tenant_and_deferred_deletion() {
+async fn snapshot_rpc_enforces_tenant_and_rejects_busy_deletion() {
     use adx_core::{
         snapshots::{Reference, Snapshot, SnapshotState},
         CheckpointArtifact,
@@ -1969,24 +2086,22 @@ async fn snapshot_rpc_enforces_component_tenant_and_deferred_deletion() {
     let page = client.list_snapshots(next).await.unwrap().into_inner();
     assert_eq!(page.snapshots[0].id, "snapshot-b");
     assert!(page.next_page_token.is_empty());
-    let deleted = client
+    let error = client
         .delete_snapshot(pb::DeleteSnapshotRequest {
             id: snapshot.id.clone(),
             caller: caller(),
         })
         .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(deleted.state, pb::SnapshotState::Deleting as i32);
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    let details: serde_json::Value = serde_json::from_slice(error.details()).unwrap();
+    assert_eq!(details["code"], "SNAPSHOT_IN_USE");
+    assert_eq!(details["sandbox_ids"], serde_json::json!([]));
+    assert_eq!(details["template_ids"], serde_json::json!(["node/base"]));
     assert_eq!(
         session.get_snapshot(&snapshot.id).await.unwrap().state,
-        SnapshotState::Deleting
+        SnapshotState::Ready
     );
-    assert!(!session
-        .get_snapshot(&snapshot.id)
-        .await
-        .unwrap()
-        .collectable());
     drop(servers);
     redis.crash();
 }
@@ -2110,6 +2225,9 @@ async fn tenant_key_rpc_requires_frontend_admin_and_revokes_verification() {
 
 #[async_trait::async_trait]
 impl adxlet::checkpoint::CheckpointCooperation for LocalChecks {
+    async fn resumed(&self, _: &EnvironmentRecord, _: &str) -> Result<()> {
+        Ok(())
+    }
     async fn prepare(&self, _: &EnvironmentRecord, _: &str) -> Result<()> {
         Ok(())
     }
@@ -2122,12 +2240,12 @@ impl adxlet::checkpoint::CheckpointCooperation for LocalChecks {
 #[ignore = "requires isolated Redis and generated mTLS certificates"]
 async fn snapshot_gc_waits_for_node_ack_and_recovers_from_lost_ack() {
     use adx_core::snapshots::{Reference, Snapshot, SnapshotState};
-    use adxlet::checkpoint::{CheckpointStore, LocalCheckpointStore};
+    use adxlet::checkpoint::{CheckpointAccess, LocalCheckpointStore};
     let redis = common::Redis::new().await;
     let session = redis.store().await.begin(1).await.unwrap();
     let root = tempfile::tempdir().unwrap();
     let store = Arc::new(LocalCheckpointStore::new(root.path().into()).unwrap());
-    let path = store.allocate().await.unwrap();
+    let path = store.begin_capture().await.unwrap();
     std::fs::write(path.join("memory"), b"preserve snapshot memory").unwrap();
     let snapshot = Snapshot::new(
         "snapshot-gc".into(),
@@ -2135,7 +2253,7 @@ async fn snapshot_gc_waits_for_node_ack_and_recovers_from_lost_ack() {
         spec("source"),
         "node".into(),
         "source-1".into(),
-        store.publish(&path).await.unwrap(),
+        store.seal(&path).await.unwrap(),
     )
     .unwrap();
     session.publish_snapshot(snapshot.clone()).await.unwrap();
@@ -2258,14 +2376,18 @@ async fn snapshot_gc_waits_for_node_ack_and_recovers_from_lost_ack() {
         .acquire_snapshot(&snapshot.id, "tenant", reference.clone())
         .await
         .unwrap();
-    session
+    assert!(session
         .delete_snapshot(&snapshot.id, "tenant")
         .await
-        .unwrap();
+        .is_err());
     assert_eq!(coordinator.collect_snapshots().await.unwrap(), 0);
     assert!(path.exists());
-    let deleting = session
+    session
         .release_snapshot(&snapshot.id, reference)
+        .await
+        .unwrap();
+    let deleting = session
+        .delete_snapshot(&snapshot.id, "tenant")
         .await
         .unwrap();
     let request = pb::CollectSnapshotRequest {
@@ -2392,41 +2514,25 @@ async fn snapshot_gc_waits_for_node_ack_and_recovers_from_lost_ack() {
         source.spec.as_ref().unwrap().resources
     );
     let clone_artifact = created
-        .checkpoint
+        .snapshot_source
         .as_ref()
         .unwrap()
         .artifact
         .as_ref()
-        .unwrap();
-    assert_ne!(clone_artifact, reusable.artifact.as_ref().unwrap());
-    assert!(session
-        .get_snapshot(&reusable.id)
-        .await
         .unwrap()
-        .references
-        .contains(&Reference::Restore {
-            environment_id: "snapshot-clone".into()
-        }));
+        .clone();
+    assert_eq!(&clone_artifact, reusable.artifact.as_ref().unwrap());
     assert_eq!(coordinator.collect_snapshots().await.unwrap(), 0);
     assert!(session
-        .get_snapshot(&reusable.id)
-        .await
-        .unwrap()
-        .references
-        .is_empty());
-    session
         .delete_snapshot(&reusable.id, "tenant")
         .await
-        .unwrap();
-    assert_eq!(coordinator.collect_snapshots().await.unwrap(), 1);
-    assert!(!std::path::Path::new(&reusable.artifact.as_ref().unwrap().location).exists());
-    assert!(std::path::Path::new(&clone_artifact.location).exists());
-    // Retry a completed create even after its source was collected.
+        .is_err());
+    // Repeating create uses the assigned Sandbox and its retained Snapshot reference.
     assert_eq!(
         frontend
             .create_local_environment(pb::LocalEnvironmentCreateRequest {
                 create: Some(request.clone()),
-                node_session_id: "gc-boot".into(),
+                node_session_id: "gc-boot".into()
             })
             .await
             .unwrap()
@@ -2453,6 +2559,17 @@ async fn snapshot_gc_waits_for_node_ack_and_recovers_from_lost_ack() {
         })
         .await
         .unwrap();
+    assert!(session
+        .get_snapshot(&reusable.id)
+        .await
+        .unwrap()
+        .references
+        .is_empty());
+    session
+        .delete_snapshot(&reusable.id, "tenant")
+        .await
+        .unwrap();
+    assert_eq!(coordinator.collect_snapshots().await.unwrap(), 1);
     assert!(!std::path::Path::new(&clone_artifact.location).exists());
 }
 
@@ -2498,7 +2615,7 @@ async fn coordinator_restart_releases_snapshot_pins_for_lost_memory_queue_only()
         )
         .await
         .unwrap();
-    first.delete_snapshot(&snapshot.id, "tenant").await.unwrap();
+    assert!(first.delete_snapshot(&snapshot.id, "tenant").await.is_err());
     let second = store.begin(1).await.unwrap();
     let _coordinator = CoordinatorRpc::new(
         second.clone(),
@@ -2573,7 +2690,7 @@ impl RuntimeDriver for RecoveryBackend {
 #[ignore = "requires isolated Redis and mTLS certificates"]
 async fn shared_checkpoint_moves_to_new_node_and_old_node_cleans_without_deleting_artifact() {
     use adx_core::{Assignment, EnvironmentState, RestorePoint};
-    use adxlet::checkpoint::{CheckpointStore, ObjectCheckpointStore, RemoteGcConfig};
+    use adxlet::checkpoint::{CheckpointAccess, ObjectCheckpointStore};
     let redis = common::Redis::new().await;
     let session = redis.store().await.begin(2).await.unwrap();
     let test_peers = || {
@@ -2615,15 +2732,11 @@ async fn shared_checkpoint_moves_to_new_node_and_old_node_cleans_without_deletin
         1024,
     )
     .unwrap()
-    .with_owner(
-        "source".into(),
-        "old-upload-session".into(),
-        RemoteGcConfig::default(),
-    )
+    .with_owner("source".into(), "old-upload-session".into())
     .unwrap();
-    let staged = source_store.allocate().await.unwrap();
+    let staged = source_store.begin_capture().await.unwrap();
     std::fs::write(staged.join("memory"), b"saved runtime state").unwrap();
-    let artifact = source_store.publish(&staged).await.unwrap();
+    let artifact = source_store.seal(&staged).await.unwrap();
     let target_dir = tempfile::tempdir().unwrap();
     let target_store = Arc::new(
         ObjectCheckpointStore::new(
@@ -2687,6 +2800,7 @@ async fn shared_checkpoint_moves_to_new_node_and_old_node_cleans_without_deletin
         ..Default::default()
     };
     let mut target_report = pb::RegisterNodeRequest {
+        labels: [("ADX_CHECKPOINT_STORAGE".into(), "shared".into())].into(),
         runtime_classes: vec![
             "runsc".into(),
             "runc".into(),
@@ -2729,6 +2843,8 @@ async fn shared_checkpoint_moves_to_new_node_and_old_node_cleans_without_deletin
         .await
         .unwrap();
     let old = EnvironmentRecord {
+        execution_artifacts: vec![],
+        snapshot_source: None,
         failure: None,
         spec: spec("held"),
         assignment: previous,
@@ -2822,7 +2938,7 @@ async fn shared_checkpoint_moves_to_new_node_and_old_node_cleans_without_deletin
         .unwrap()
         .into_inner();
     assert!(catalog.records.is_empty());
-    assert_eq!(catalog.retained_checkpoints.len(), 1);
+    assert_eq!(catalog.retained_artifacts.len(), 1);
     let returned_dir = tempfile::tempdir().unwrap();
     let returned_store = Arc::new(
         ObjectCheckpointStore::new(
@@ -2833,14 +2949,7 @@ async fn shared_checkpoint_moves_to_new_node_and_old_node_cleans_without_deletin
             1024,
         )
         .unwrap()
-        .with_owner(
-            "source".into(),
-            "new-upload-session".into(),
-            RemoteGcConfig {
-                min_age_seconds: 0,
-                ..Default::default()
-            },
-        )
+        .with_owner("source".into(), "new-upload-session".into())
         .unwrap(),
     );
     let old_backend = Arc::new(Backend {
@@ -2863,17 +2972,16 @@ async fn shared_checkpoint_moves_to_new_node_and_old_node_cleans_without_deletin
     .with_checkpointing(returned_store.clone(), Arc::new(LocalChecks))
     .unwrap();
     let retained = catalog
-        .retained_checkpoints
+        .retained_artifacts
         .into_iter()
-        .map(|cp| RestorePoint::try_from(cp).unwrap().artifact)
+        .map(|cp| adx_core::CheckpointArtifact::try_from(cp).unwrap())
         .collect();
     returned
         .reconcile_retained(vec![], vec![], retained)
         .await
         .unwrap();
     assert!(old_backend.running.lock().unwrap().is_empty());
-    assert_eq!(returned.collect_remote_orphans().await.unwrap(), 0);
-    assert!(returned_store.materialize(&artifact).await.is_ok());
+    assert!(returned_store.prepare_restore(&artifact).await.is_ok());
 }
 
 #[path = "rpc/local_first.rs"]

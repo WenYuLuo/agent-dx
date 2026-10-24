@@ -14,12 +14,17 @@
 //! 当前 client/session，后续复用必须失败，避免重复写或顺序错乱。
 
 #[cfg(feature = "dfs")]
+mod crc32c;
+
+#[cfg(all(feature = "dfs", feature = "rdma"))]
+use crate::node::dfs_read::ChunkTransfer;
+
+#[cfg(feature = "dfs")]
 use crate::{
     dfs::ChunkObject,
     node::{
-        peer_cache::{
-            CompletedPeerDiskRead, PEER_CACHE_SEGMENT_BYTES, PeerStreamSink, VerifiedPeerChunk,
-        },
+        chunk::outboard::{ChunkOutboard, OutboardBudget, OutboardBuilder, SharedOutboard},
+        peer_cache::{CompletedPeerDiskRead, PeerStreamSink, VerifiedPeerChunk},
         read_work::{
             ReadDiagnosticConsumer, ReadDiagnosticConsumerStage, ReadDiagnosticIntervals,
             ReadDiagnosticProducer, ReadDiagnosticStage, ReadWorkMetrics,
@@ -100,6 +105,7 @@ use crate::node::vfs::{
 };
 
 const MAX_TRANSFER_BYTES: usize = crate::node::storage::MAX_TRANSFER_BYTES;
+const DFS_PEER_RECEIVE_FRAME_BYTES: u32 = 128 * 1024;
 #[cfg(feature = "ownerfs")]
 const MAX_PENDING_RELEASES: usize = 64;
 #[cfg(feature = "ownerfs")]
@@ -225,21 +231,7 @@ impl crate::node::replication::ReplicaDataPlane for GrpcReplicaDataPlane {
                         ),
                     },
                 ))
-                .chain(tokio_stream::iter(
-                    (0..staged.bytes().len())
-                        .step_by(super::data::DFS_REPLICA_FRAME_BYTES)
-                        .map(move |offset| {
-                            let end = (offset + super::data::DFS_REPLICA_FRAME_BYTES)
-                                .min(staged.bytes().len());
-                            afs_protocol::node_data::DfsPutReplicaFrame {
-                                body: Some(
-                                    afs_protocol::node_data::dfs_put_replica_frame::Body::Data(
-                                        staged.bytes()[offset..end].to_vec(),
-                                    ),
-                                ),
-                            }
-                        }),
-                ));
+                .chain(tokio_stream::iter(replica_data_frames(staged)));
                 let mut request = request_with_current_context(frames);
                 request.set_timeout(self.timeout);
                 let reply = client
@@ -272,6 +264,26 @@ impl crate::node::replication::ReplicaDataPlane for GrpcReplicaDataPlane {
 }
 
 #[cfg(feature = "dfs")]
+fn replica_data_frames(
+    staged: crate::node::chunk::StagedChunk,
+) -> impl Iterator<Item = afs_protocol::node_data::DfsPutReplicaFrame> {
+    // Retain the complete owner, including deferred-write/descriptor leases,
+    // until the final frame slice is released. Sharing only SharedChunkBytes
+    // would keep the allocation but omit the StagedChunk's separate leases.
+    let bytes = prost::bytes::Bytes::from_owner(staged);
+    (0..bytes.len())
+        .step_by(super::data::DFS_REPLICA_FRAME_BYTES)
+        .map(move |offset| {
+            let end = (offset + super::data::DFS_REPLICA_FRAME_BYTES).min(bytes.len());
+            afs_protocol::node_data::DfsPutReplicaFrame {
+                body: Some(afs_protocol::node_data::dfs_put_replica_frame::Body::Data(
+                    bytes.slice(offset..end),
+                )),
+            }
+        })
+}
+
+#[cfg(feature = "dfs")]
 pub(crate) fn replica_header(
     op: &crate::node::replication::ReplicaPeerOp,
     staged: &crate::node::chunk::StagedChunk,
@@ -282,7 +294,7 @@ pub(crate) fn replica_header(
         chunk_id: staged.chunk.id.0.clone(),
         chunk_length: staged.chunk.length,
         content_digest: staged.chunk.content_digest.bytes.to_vec(),
-        content_digest_algorithm: afs_protocol::node_data::DfsDigestAlgorithm::Blake3 as i32,
+        content_digest_algorithm: wire_data_digest(staged.chunk.content_digest.algorithm),
         placement_revision: op.placement_revision,
         placement_epoch: op.placement_epoch,
         replica_group_id: op.replica_group_id.0.clone(),
@@ -312,14 +324,32 @@ pub(crate) fn replica_header(
 }
 
 #[cfg(feature = "dfs")]
+pub(super) fn wire_data_digest(algorithm: crate::dfs::DigestAlgorithm) -> i32 {
+    use afs_protocol::node_data::DfsDigestAlgorithm;
+    match algorithm {
+        crate::dfs::DigestAlgorithm::Blake3 => DfsDigestAlgorithm::Blake3 as i32,
+        crate::dfs::DigestAlgorithm::Crc32cSegmentsV1 => {
+            DfsDigestAlgorithm::Crc32cSegmentsV1 as i32
+        }
+    }
+}
+#[cfg(feature = "dfs")]
+pub(super) fn domain_data_digest(algorithm: i32) -> afs_error::Result<crate::dfs::DigestAlgorithm> {
+    use afs_protocol::node_data::DfsDigestAlgorithm;
+    match DfsDigestAlgorithm::try_from(algorithm) {
+        Ok(DfsDigestAlgorithm::Blake3) => Ok(crate::dfs::DigestAlgorithm::Blake3),
+        Ok(DfsDigestAlgorithm::Crc32cSegmentsV1) => {
+            Ok(crate::dfs::DigestAlgorithm::Crc32cSegmentsV1)
+        }
+        _ => Err(dfs_protocol_error("unsupported object digest algorithm")),
+    }
+}
+
+#[cfg(feature = "dfs")]
 fn domain_replica_ack(
     ack: afs_protocol::node_data::DfsReplicaAck,
 ) -> afs_error::Result<crate::dfs::ReplicaAck> {
-    if ack.verified_digest_algorithm != afs_protocol::node_data::DfsDigestAlgorithm::Blake3 as i32 {
-        return Err(dfs_protocol_error(
-            "replica acknowledgement digest algorithm is unsupported",
-        ));
-    }
+    let algorithm = domain_data_digest(ack.verified_digest_algorithm)?;
     let bytes: [u8; 32] = ack
         .verified_digest
         .try_into()
@@ -335,10 +365,7 @@ fn domain_replica_ack(
         device_epoch: ack.device_epoch,
         catalog_revision: ack.catalog_revision,
         persisted_bytes: ack.persisted_bytes,
-        verified_digest: crate::dfs::ContentDigest {
-            algorithm: crate::dfs::DigestAlgorithm::Blake3,
-            bytes,
-        },
+        verified_digest: crate::dfs::ContentDigest { algorithm, bytes },
     })
 }
 
@@ -838,6 +865,8 @@ pub struct PeerConnectionPool {
     security: afs_transport::SecurityManager,
     capacity: usize,
     state: tokio::sync::Mutex<PeerPoolState>,
+    #[cfg(feature = "dfs")]
+    stream_work: Arc<PeerStreamWorkPool>,
 }
 
 #[derive(Default)]
@@ -872,6 +901,8 @@ impl PeerConnectionPool {
             security,
             capacity,
             state: tokio::sync::Mutex::new(PeerPoolState::default()),
+            #[cfg(feature = "dfs")]
+            stream_work: Arc::new(PeerStreamWorkPool::default()),
             #[cfg(feature = "dfs")]
             read_work_metrics: None,
         })
@@ -941,6 +972,20 @@ impl PeerConnectionPool {
             owner_files,
         );
         let mut state = self.state.lock().await;
+        self.channel_locked(&mut state, &key, request_timeout)
+    }
+
+    // Both callers already hold the connection metadata lock. Stream admission
+    // also holds its own short lock, so channel creation cannot race active work.
+    fn channel_locked(
+        &self,
+        state: &mut PeerPoolState,
+        key: &PeerChannelKey,
+        request_timeout: bool,
+    ) -> afs_error::Result<Channel> {
+        let (node_id, node_epoch, endpoint, owner_files) = key;
+        let node_epoch = *node_epoch;
+        let owner_files = *owner_files;
         if state
             .high_water_epochs
             .get(node_id)
@@ -951,7 +996,7 @@ impl PeerConnectionPool {
                 "peer candidate has an older Node epoch than the connection pool",
             ));
         }
-        if request_timeout && let Some(entry) = state.channels.get_mut(&key) {
+        if request_timeout && let Some(entry) = state.channels.get_mut(key) {
             entry.touched = std::time::Instant::now();
             return Ok(entry.channel.clone());
         }
@@ -965,21 +1010,146 @@ impl PeerConnectionPool {
         };
         // This bounds each incoming frame, not the message/flow-control window.
         // Smaller frames remain valid; TLS, deadlines and message limits remain.
-        let endpoint = if owner_files {
-            endpoint.max_frame_size(256 * 1024)
+        // This only changes the client's receive cap. Frames still consume the
+        // existing flow-control windows; message limits, budgets and deadlines
+        // remain unchanged. Peers may continue to send smaller frames.
+        let endpoint = endpoint.max_frame_size(if owner_files {
+            256 * 1024
         } else {
-            endpoint
-        };
+            DFS_PEER_RECEIVE_FRAME_BYTES
+        });
         let endpoint = self.security.configure_client(endpoint).map_err(|error| {
             afs_error::Error::coded(afs_error::CLIENT_ARGUMENT_INVALID, error.to_string())
         })?;
         let channel = endpoint.connect_lazy();
         if request_timeout {
-            self.publish_channel(&mut state, key, channel.clone());
+            self.publish_channel(state, key.clone(), channel.clone());
         } else {
-            self.publish_epoch(&mut state, node_id, node_epoch);
+            self.publish_epoch(state, node_id, node_epoch);
         }
         Ok(channel)
+    }
+
+    #[cfg(feature = "dfs")]
+    async fn acquire_stream_work(
+        &self,
+        node_id: &str,
+        node_epoch: u64,
+        endpoint: &str,
+    ) -> afs_error::Result<Arc<PeerStreamActive>> {
+        self.acquire_stream_work_mode(node_id, node_epoch, endpoint, false)
+            .await?
+            .ok_or_else(|| dfs_protocol_error("Peer foreground stream admission stopped"))
+    }
+
+    #[cfg(feature = "dfs")]
+    async fn acquire_stream_work_mode(
+        &self,
+        node_id: &str,
+        node_epoch: u64,
+        endpoint: &str,
+        background: bool,
+    ) -> afs_error::Result<Option<Arc<PeerStreamActive>>> {
+        let _waiting = if background {
+            None
+        } else {
+            Some(PeerStreamWaiter::new(self.stream_work.clone())?)
+        };
+        if node_id.is_empty()
+            || node_epoch == 0
+            || endpoint.is_empty()
+            || node_id.len().saturating_add(endpoint.len()) > STREAM_KEY_BYTES
+        {
+            return Err(dfs_protocol_error(
+                "Peer stream connection identity exceeds its bound",
+            ));
+        }
+        let key = (node_id.to_owned(), node_epoch, endpoint.to_owned(), false);
+        if key.0.capacity().saturating_add(key.2.capacity()) > STREAM_KEY_BYTES {
+            return Err(dfs_protocol_error(
+                "Peer stream connection key allocation exceeds its bound",
+            ));
+        }
+        loop {
+            // Register before checking admission, so the last drop cannot be lost.
+            let changed = self.stream_work.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            // Fence and select under the connection metadata lock. Never ask
+            // the LRU for a replacement while another Channel is active.
+            let mut channels = if background {
+                match self.state.try_lock() {
+                    Ok(channels) => channels,
+                    Err(_) => return Ok(None),
+                }
+            } else {
+                self.state.lock().await
+            };
+            if channels
+                .high_water_epochs
+                .get(node_id)
+                .is_some_and(|epoch| node_epoch < *epoch)
+            {
+                return Err(afs_error::Error::coded(
+                    afs_error::NODE_TRANSFER_UNAVAILABLE,
+                    "peer candidate has an older Node epoch than the connection pool",
+                ));
+            }
+            {
+                let mut state = if background {
+                    match self.stream_work.state.try_lock() {
+                        Ok(state) => state,
+                        Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+                        Err(std::sync::TryLockError::Poisoned(_)) => {
+                            return Err(dfs_protocol_error("Peer stream admission lock poisoned"));
+                        }
+                    }
+                } else {
+                    self.stream_work
+                        .state
+                        .lock()
+                        .map_err(|_| dfs_protocol_error("Peer stream admission lock poisoned"))?
+                };
+                if background && state.foreground_waiters != 0 {
+                    return Ok(None);
+                }
+                if state.active == 0 {
+                    let candidate = self.channel_locked(&mut channels, &key, true)?;
+                    let mut blocks = Vec::with_capacity(2);
+                    for _ in 0..2 {
+                        blocks.push(PeerStreamBlock::new(self.read_work_metrics.as_ref())?);
+                    }
+                    state.session = Some(Arc::new(PeerStreamSession {
+                        key: key.clone(),
+                        channel: candidate,
+                        blocks: std::sync::Mutex::new(blocks),
+                        available: tokio::sync::Notify::new(),
+                        controls: Arc::new(tokio::sync::Semaphore::new(STREAM_FRAME_BACKING_BYTES)),
+                        _work: std::sync::Mutex::new(
+                            self.read_work_metrics
+                                .as_ref()
+                                .map(|metrics| metrics.peer_stream_pipeline(0)),
+                        ),
+                    }));
+                }
+                if let Some(session) = &state.session
+                    && state.active < 2
+                    && session.key == key
+                {
+                    let session = session.clone();
+                    state.active += 1;
+                    return Ok(Some(Arc::new(PeerStreamActive {
+                        pool: self.stream_work.clone(),
+                        session,
+                    })));
+                }
+            }
+            drop(channels);
+            if background {
+                return Ok(None);
+            }
+            changed.await;
+        }
     }
 
     fn publish_epoch(&self, state: &mut PeerPoolState, node_id: &str, node_epoch: u64) {
@@ -1043,6 +1213,7 @@ impl GrpcChunkTransfer {
         batch: &crate::node::dfs_read::PeerReadBatch,
         chunk: Option<&'a ChunkObject>,
         out: &'a mut [u8],
+        proof_budget: Option<Arc<OutboardBudget>>,
     ) -> afs_error::Result<Option<VerifiedPeerChunk<'a>>> {
         match chunk {
             Some(chunk) => crate::node::dfs_read::validate_verified_peer_object_request(
@@ -1065,6 +1236,7 @@ impl GrpcChunkTransfer {
             .next_read
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let request = DfsReadRangesRequest {
+            include_blake3_outboard: chunk.is_some(),
             read_id: format!(
                 "{}-{}-{sequence}",
                 first.read_grant.caller_node_id, first.read_grant.caller_node_epoch
@@ -1118,6 +1290,7 @@ impl GrpcChunkTransfer {
                     out,
                     response.into_inner(),
                     self.peers.read_work_metrics.as_ref(),
+                    proof_budget,
                 )
                 .await
             })
@@ -1138,18 +1311,24 @@ const STREAM_MESSAGE_BYTES: usize = 128 * 1024;
 const STREAM_DATA_BYTES: usize = 64 * 1024;
 #[cfg(feature = "dfs")]
 const STREAM_FRAME_BACKING_BYTES: usize = 256 * 1024;
+#[cfg(feature = "dfs")]
+const STREAM_KEY_BYTES: usize = 8 * 1024;
+#[cfg(feature = "dfs")]
+const STREAM_REQUEST_METADATA_BYTES: usize = 32 * 1024;
 
 #[cfg(feature = "dfs")]
 struct PeerStreamBlock {
     // Drop the actual allocation before retiring its accounting lease.
     bytes: Vec<u8>,
     offset: usize,
-    _work: Option<crate::node::read_work::PeerStreamFrameWork>,
+    // Two small accounting owners are allocated once per shared session,
+    // then move with the same blocks; handing off a block allocates nothing.
+    _work: Option<Box<crate::node::read_work::PeerStreamFrameWork>>,
 }
 
 #[cfg(feature = "dfs")]
 impl PeerStreamBlock {
-    fn new(metrics: Option<&ReadWorkMetrics>) -> afs_error::Result<Box<Self>> {
+    fn new(metrics: Option<&ReadWorkMetrics>) -> afs_error::Result<Self> {
         let bytes = Vec::with_capacity(STREAM_FRAME_BACKING_BYTES);
         if bytes.capacity() > STREAM_FRAME_BACKING_BYTES {
             return Err(dfs_protocol_error(
@@ -1158,18 +1337,181 @@ impl PeerStreamBlock {
         }
         let work = metrics.map(|metrics| {
             metrics.peer_read_event("stream_block_alloc");
-            metrics.peer_stream_frame(bytes.capacity())
+            Box::new(metrics.peer_stream_frame(bytes.capacity()))
         });
-        Ok(Box::new(Self {
+        Ok(Self {
             bytes,
             offset: 0,
             _work: work,
-        }))
+        })
+    }
+}
+
+// One Node owns the original two payload allocations and control allowance.
+// Active operations pin one exact Channel, even if the connection LRU evicts it.
+// Thus two streams share one <=2MiB connection window; a different connection
+// waits. Two bounded decoders add <=256KiB: 2MiB + 512KiB + 256KiB + 256KiB
+// plus <=256KiB bounded request/key/fixed metadata remains below the original
+// 4MiB transport envelope (private output/proof separate). A key owns <=8KiB;
+// each operation retains two <=32KiB request representations. The cache/pool
+// guards admit only two operations and one shared session.
+#[cfg(feature = "dfs")]
+#[derive(Default)]
+struct PeerStreamWorkPool {
+    state: std::sync::Mutex<PeerStreamWorkState>,
+    changed: tokio::sync::Notify,
+}
+#[cfg(feature = "dfs")]
+#[derive(Default)]
+struct PeerStreamWorkState {
+    active: usize,
+    foreground_waiters: usize,
+    session: Option<Arc<PeerStreamSession>>,
+}
+#[cfg(feature = "dfs")]
+struct PeerStreamWaiter {
+    pool: Arc<PeerStreamWorkPool>,
+}
+#[cfg(feature = "dfs")]
+impl PeerStreamWaiter {
+    fn new(pool: Arc<PeerStreamWorkPool>) -> afs_error::Result<Self> {
+        pool.state
+            .lock()
+            .map_err(|_| dfs_protocol_error("Peer stream wait lock poisoned"))?
+            .foreground_waiters += 1;
+        Ok(Self { pool })
+    }
+}
+#[cfg(feature = "dfs")]
+impl Drop for PeerStreamWaiter {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.pool.state.lock() {
+            state.foreground_waiters = state.foreground_waiters.saturating_sub(1);
+        }
+        self.pool.changed.notify_waiters();
+    }
+}
+
+#[cfg(feature = "dfs")]
+struct PeerStreamSession {
+    key: PeerChannelKey,
+    channel: Channel,
+    blocks: std::sync::Mutex<Vec<PeerStreamBlock>>,
+    available: tokio::sync::Notify,
+    controls: Arc<tokio::sync::Semaphore>,
+    // Fields drop in order: all payload owners precede this shared observation.
+    _work: std::sync::Mutex<Option<crate::node::read_work::PeerCacheStreamWork>>,
+}
+#[cfg(feature = "dfs")]
+struct PeerStreamActive {
+    pool: Arc<PeerStreamWorkPool>,
+    session: Arc<PeerStreamSession>,
+}
+#[cfg(feature = "dfs")]
+impl PeerStreamActive {
+    async fn block(self: &Arc<Self>) -> afs_error::Result<PeerStreamBlockLease> {
+        loop {
+            let available = self.session.available.notified();
+            tokio::pin!(available);
+            available.as_mut().enable();
+            if let Some(block) = self
+                .session
+                .blocks
+                .lock()
+                .map_err(|_| dfs_protocol_error("Peer stream block lock poisoned"))?
+                .pop()
+            {
+                return Ok(PeerStreamBlockLease {
+                    block,
+                    active: self.clone(),
+                });
+            }
+            available.await;
+        }
+    }
+}
+#[cfg(feature = "dfs")]
+impl Drop for PeerStreamActive {
+    fn drop(&mut self) {
+        let retired = {
+            let mut state = self
+                .pool
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if state.active == 1 {
+                // Retire the actual allocations and observation before publishing
+                // zero. Waking another admission before our Arc fields drop could
+                // otherwise overlap the old two blocks with two new allocations.
+                self.session
+                    .blocks
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .clear();
+                drop(
+                    self.session
+                        ._work
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .take(),
+                );
+            }
+            state.active = state.active.saturating_sub(1);
+            if state.active == 0 {
+                state.session.take()
+            } else {
+                None
+            }
+        };
+        // Last operation/producer/frame drops before its ticket. Idle blocks are
+        // destroyed here, never kept as a permanent 512KiB Node allocation.
+        drop(retired);
+        self.pool.changed.notify_waiters();
+    }
+}
+#[cfg(feature = "dfs")]
+struct PeerStreamBlockLease {
+    block: PeerStreamBlock,
+    active: Arc<PeerStreamActive>,
+}
+#[cfg(feature = "dfs")]
+impl std::ops::Deref for PeerStreamBlockLease {
+    type Target = PeerStreamBlock;
+    fn deref(&self) -> &Self::Target {
+        &self.block
+    }
+}
+#[cfg(feature = "dfs")]
+impl std::ops::DerefMut for PeerStreamBlockLease {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.block
+    }
+}
+#[cfg(feature = "dfs")]
+impl Drop for PeerStreamBlockLease {
+    fn drop(&mut self) {
+        // Move the existing allocation/lease back without allocating a new body,
+        // including on producer cancellation, failed send and consumer errors.
+        let mut block = PeerStreamBlock {
+            bytes: std::mem::take(&mut self.block.bytes),
+            offset: 0,
+            _work: self.block._work.take(),
+        };
+        block.bytes.clear();
+        self.active
+            .session
+            .blocks
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(block);
+        self.active.session.available.notify_waiters();
     }
 }
 
 #[cfg(feature = "dfs")]
 struct OwnedPeerStreamControl {
+    // Typed, budgeted metadata only; never a decoded opaque Bytes backing.
+    outboard_builder: Option<OutboardBuilder>,
     frame: afs_protocol::node_data::DfsReadRangesFrame,
     _permit: tokio::sync::OwnedSemaphorePermit,
 }
@@ -1177,7 +1519,7 @@ struct OwnedPeerStreamControl {
 #[cfg(feature = "dfs")]
 enum OwnedPeerStreamMessage {
     Control(Box<OwnedPeerStreamControl>),
-    Block(Box<PeerStreamBlock>),
+    Block(PeerStreamBlockLease),
 }
 
 #[cfg(feature = "dfs")]
@@ -1186,6 +1528,11 @@ fn peer_stream_control_capacity(
 ) -> afs_error::Result<usize> {
     let backing = match &mut frame.body {
         Some(dfs_read_ranges_frame::Body::Header(header)) => {
+            if !header.blake3_outboard.is_empty() {
+                return Err(dfs_protocol_error(
+                    "decoded outboard cannot enter the control queue",
+                ));
+            }
             header.read_id.capacity()
                 + header.attempt_id.capacity()
                 + header.chunk_id.capacity()
@@ -1218,10 +1565,99 @@ fn peer_stream_control_capacity(
     Ok(backing)
 }
 
-/// Only the existing async producer owns the complete-object root state.
-/// The receipt retains fixed metadata and the sink identity, never body owners.
+// Metadata is copied once on B, after admission to the Node's shared proof
+// ledger. Decoded Bytes belong to the existing codec reservation and are dropped
+// before any control frame is queued; no decoded backing escapes as proof state.
+#[cfg(feature = "dfs")]
+fn peer_outboard_builder(
+    expected: &ChunkObject,
+    encoded: prost::bytes::Bytes,
+    budget: Option<Arc<OutboardBudget>>,
+    metrics: Option<&ReadWorkMetrics>,
+) -> afs_error::Result<Option<OutboardBuilder>> {
+    const MAX_ENCODED_OUTBOARD_BYTES: usize = 8192;
+    if encoded.len() > MAX_ENCODED_OUTBOARD_BYTES {
+        return Err(dfs_protocol_error("Peer outboard exceeds 8192-byte bound"));
+    }
+    let Some(budget) = budget else {
+        return if encoded.is_empty() {
+            Ok(None)
+        } else {
+            Err(dfs_protocol_error(
+                "Peer outboard has no shared proof budget",
+            ))
+        };
+    };
+    if encoded.is_empty() {
+        return Ok(Some(OutboardBuilder::new(expected.length, budget)));
+    }
+    // Shape/binding are checked even if the optional metadata pool is full.
+    // Unused CVs are never advertised as verified; the original independent
+    // complete-body root remains authoritative on this safe fallback path.
+    ChunkOutboard::validate_encoded_shape(expected, &encoded)?;
+    let charge = ChunkOutboard::resident_charge(encoded.len())?;
+    let Some(mut lease) = budget.try_reserve(charge) else {
+        return Ok(None);
+    };
+    let mut owned = Vec::new();
+    if owned.try_reserve_exact(encoded.len()).is_err()
+        || lease
+            .retain_capacity(ChunkOutboard::resident_charge(owned.capacity())?)
+            .is_err()
+    {
+        return Ok(None);
+    }
+    owned.extend_from_slice(&encoded);
+    if let Some(metrics) = metrics {
+        metrics.copy("peer_outboard_metadata", encoded.len() as u64);
+    }
+    drop(encoded);
+    let proof = ChunkOutboard::from_encoded(expected, owned, lease)?;
+    Ok(Some(OutboardBuilder::validating(
+        expected.clone(),
+        proof,
+        budget,
+    )))
+}
+
+/// The header fixes which local worker authenticates the complete object.
+/// The producer always owns transport order/length/EOF; receipts never own bodies.
+#[cfg(feature = "dfs")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PeerRootMode {
+    Producer,
+    ConsumerTree,
+}
+
+#[cfg(feature = "dfs")]
+impl PeerRootMode {
+    /// Fix one complete-root owner before any body byte is accepted. A locally
+    /// built charged tree is sufficient; optional peer CVs are not required.
+    fn select(builder: &mut Option<OutboardBuilder>) -> Self {
+        if builder.as_ref().is_some_and(OutboardBuilder::has_tree) {
+            Self::ConsumerTree
+        } else {
+            // A root-only builder would hash the same body as the plain root
+            // owner, but cannot install an outboard. Retire it before input.
+            builder.take();
+            Self::Producer
+        }
+    }
+}
+
+#[cfg(feature = "dfs")]
+#[derive(Clone, Copy, Debug)]
+enum PeerRootDigest {
+    Producer([u8; 32]),
+    ConsumerTree,
+}
 #[cfg(feature = "dfs")]
 struct PeerRootProducer {
+    chunk: Option<ChunkObject>,
+    proof_budget: Option<Arc<OutboardBudget>>,
+    outboard_builder: Option<OutboardBuilder>,
+    outboard_header_seen: bool,
+    root_mode: PeerRootMode,
     hasher: blake3::Hasher,
     length: u64,
     expected_length: u64,
@@ -1232,10 +1668,10 @@ struct PeerRootProducer {
 
 #[cfg(feature = "dfs")]
 struct PeerRootReceipt {
-    length: u64,
-    digest: [u8; 32],
-    binding: crate::node::peer_cache::PeerStreamBinding,
     root_intervals: Option<ReadDiagnosticIntervals>,
+    length: u64,
+    digest: PeerRootDigest,
+    binding: crate::node::peer_cache::PeerStreamBinding,
 }
 
 #[cfg(feature = "dfs")]
@@ -1247,6 +1683,11 @@ impl PeerRootProducer {
         deadline: std::time::Instant,
     ) -> Self {
         Self {
+            chunk: None,
+            proof_budget: None,
+            outboard_builder: None,
+            outboard_header_seen: false,
+            root_mode: PeerRootMode::Producer,
             hasher: blake3::Hasher::new(),
             length: 0,
             expected_length,
@@ -1254,6 +1695,45 @@ impl PeerRootProducer {
             diagnostic,
             deadline,
         }
+    }
+
+    fn with_outboard_context(mut self, chunk: ChunkObject, budget: Arc<OutboardBudget>) -> Self {
+        self.chunk = Some(chunk);
+        self.proof_budget = Some(budget);
+        self
+    }
+
+    fn accept_outboard_header(
+        &mut self,
+        header: &mut afs_protocol::node_data::DfsReadRangesHeader,
+        metrics: Option<&ReadWorkMetrics>,
+    ) -> afs_error::Result<()> {
+        if self.outboard_header_seen || self.length != 0 {
+            return Err(dfs_protocol_error("Peer outboard header order differs"));
+        }
+        self.outboard_header_seen = true;
+        let encoded = std::mem::take(&mut header.blake3_outboard);
+        if let Some(chunk) = &self.chunk {
+            if header.chunk_id != chunk.id.0
+                || header.chunk_offset != 0
+                || header.length != chunk.length
+            {
+                return Err(dfs_protocol_error(
+                    "Peer outboard header differs from trusted object",
+                ));
+            }
+            self.outboard_builder =
+                peer_outboard_builder(chunk, encoded, self.proof_budget.clone(), metrics)?;
+            self.root_mode = PeerRootMode::select(&mut self.outboard_builder);
+            if self.root_mode == PeerRootMode::Producer
+                && let Some(metrics) = metrics
+            {
+                metrics.peer_read_event("root_fallback");
+            }
+        } else if !encoded.is_empty() {
+            return Err(dfs_protocol_error("Peer outboard lacks a trusted object"));
+        }
+        Ok(())
     }
 
     fn update(
@@ -1273,50 +1753,61 @@ impl PeerRootProducer {
         if offset as u64 != self.length {
             return Err(dfs_protocol_error("Peer producer root block order differs"));
         }
-        match &self.diagnostic {
-            Some(diagnostic) => diagnostic.measure(bytes.len() as u64, || {
-                self.hasher.update(bytes);
-            }),
-            None => {
-                self.hasher.update(bytes);
+        if self.root_mode == PeerRootMode::Producer {
+            match &self.diagnostic {
+                Some(diagnostic) => diagnostic.measure(bytes.len() as u64, || {
+                    self.hasher.update(bytes);
+                }),
+                None => {
+                    self.hasher.update(bytes);
+                }
+            }
+            if let Some(metrics) = metrics {
+                metrics.hash("root_in_receive", bytes.len() as u64);
             }
         }
         self.length = end;
-        if let Some(metrics) = metrics {
-            metrics.hash("root_in_receive", bytes.len() as u64);
-        }
         // Synchronous hashing is not preempted by timeout_at. Count actual work
         // above even when it consumed the remaining original shared deadline.
         peer_stream_deadline(self.deadline)
     }
 
-    // Called only after actual transport EOF and final block handoff. No wire
-    // Completion or consumer-local checksum can substitute for the joined result.
+    // Called only after actual transport EOF and final block handoff. The
+    // consumer-tree variant attests transport completion, never a computed root.
+    // It must be joined and combined with the consumer's independently computed root.
     fn finish_after_eof(self) -> afs_error::Result<PeerRootReceipt> {
         peer_stream_deadline(self.deadline)?;
         if self.length != self.expected_length {
             return Err(dfs_protocol_error("Peer producer root is truncated"));
         }
-        let digest = match &self.diagnostic {
-            Some(diagnostic) => diagnostic.measure(0, || *self.hasher.finalize().as_bytes()),
-            None => *self.hasher.finalize().as_bytes(),
+        let digest = match self.root_mode {
+            PeerRootMode::Producer => PeerRootDigest::Producer(match &self.diagnostic {
+                Some(diagnostic) => diagnostic.measure(0, || *self.hasher.finalize().as_bytes()),
+                None => *self.hasher.finalize().as_bytes(),
+            }),
+            PeerRootMode::ConsumerTree => PeerRootDigest::ConsumerTree,
         };
+        if self.outboard_builder.is_some() {
+            return Err(dfs_protocol_error(
+                "Peer producer retained outboard work instead of handing it to the consumer",
+            ));
+        }
         peer_stream_deadline(self.deadline)?;
         Ok(PeerRootReceipt {
-            length: self.length,
-            digest,
-            binding: self.binding,
             root_intervals: self
                 .diagnostic
                 .as_ref()
                 .map(ReadDiagnosticProducer::intervals),
+            length: self.length,
+            digest,
+            binding: self.binding,
         })
     }
 }
 
 #[cfg(feature = "dfs")]
 async fn send_peer_stream_block(
-    current: &mut Option<Box<PeerStreamBlock>>,
+    current: &mut Option<PeerStreamBlockLease>,
     sender: &tokio::sync::mpsc::Sender<afs_error::Result<OwnedPeerStreamMessage>>,
     metrics: Option<&ReadWorkMetrics>,
     root: &mut PeerRootProducer,
@@ -1325,12 +1816,17 @@ async fn send_peer_stream_block(
         if block.bytes.is_empty() {
             return Err(dfs_protocol_error("Peer stream handed off an empty block"));
         }
-        // Hash while this producer exclusively owns the block, before handoff.
+        // Check transport order/length before handoff. Hash here only when the
+        // header selected the legacy producer-root fallback.
         root.update(block.offset, &block.bytes, metrics)?;
+        let handoff_wait = metrics.and_then(|metrics| {
+            metrics.coarse_diagnostic("peer_block_handoff_wait", block.bytes.len() as u64)
+        });
         sender
             .send(Ok(OwnedPeerStreamMessage::Block(block)))
             .await
             .map_err(|_| dfs_protocol_error("Peer stream consumer stopped"))?;
+        drop(handoff_wait);
         if let Some(metrics) = metrics {
             metrics.peer_read_event("stream_block_handoff");
         }
@@ -1341,7 +1837,7 @@ async fn send_peer_stream_block(
 #[cfg(feature = "dfs")]
 async fn send_peer_stream_control(
     mut frame: afs_protocol::node_data::DfsReadRangesFrame,
-    current: &mut Option<Box<PeerStreamBlock>>,
+    current: &mut Option<PeerStreamBlockLease>,
     sender: &tokio::sync::mpsc::Sender<afs_error::Result<OwnedPeerStreamMessage>>,
     controls: &Arc<tokio::sync::Semaphore>,
     metrics: Option<&ReadWorkMetrics>,
@@ -1357,9 +1853,15 @@ async fn send_peer_stream_control(
         )
         .await
         .map_err(|_| dfs_protocol_error("Peer stream control admission stopped"))?;
+    let outboard_builder = if matches!(&frame.body, Some(dfs_read_ranges_frame::Body::Header(_))) {
+        root.outboard_builder.take()
+    } else {
+        None
+    };
     sender
         .send(Ok(OwnedPeerStreamMessage::Control(Box::new(
             OwnedPeerStreamControl {
+                outboard_builder,
                 frame,
                 _permit: permit,
             },
@@ -1449,11 +1951,8 @@ fn consume_peer_input_into_sink(
             "Peer stream changed sink or private output during decoding",
         ));
     }
-    let data_length = match &input {
-        PeerSinkInput::Frame(frame) => match &frame.body {
-            Some(dfs_read_ranges_frame::Body::Data(data)) => data.len(),
-            _ => 0,
-        },
+    match &input {
+        PeerSinkInput::Frame(_) => {}
         PeerSinkInput::Block { offset, bytes } => {
             if bytes.is_empty()
                 || bytes.len() > STREAM_FRAME_BACKING_BYTES
@@ -1466,9 +1965,8 @@ fn consume_peer_input_into_sink(
                     "Peer stream block offset/order/length mismatch",
                 ));
             }
-            bytes.len()
         }
-    };
+    }
     let block_write = matches!(&input, PeerSinkInput::Block { .. });
     let full_length = decoder
         .verified_object
@@ -1513,12 +2011,6 @@ fn consume_peer_input_into_sink(
         }
         PeerSinkInput::Block { bytes, .. } => decoder.accept_data(bytes, write, observation)?,
     }
-    if let Some(metrics) = metrics {
-        if !decoder.producer_root_pending {
-            metrics.hash("root_in_receive", data_length as u64);
-        }
-        metrics.hash("segment_index_bytes", data_length as u64);
-    }
     peer_stream_deadline(deadline)
 }
 
@@ -1541,6 +2033,7 @@ impl GrpcChunkTransfer {
         requested_offset: u64,
         out: &'output mut [u8],
         sink: &mut PeerStreamSink<'_>,
+        prefetch: Option<&crate::node::dfs_read::PrefetchControl>,
     ) -> afs_error::Result<Option<CompletedPeerDiskRead<'output>>> {
         if !self.stream_sink_supported()
             || out
@@ -1572,16 +2065,42 @@ impl GrpcChunkTransfer {
         else {
             return Err(dfs_protocol_error("Peer stream source is not a Node"));
         };
-        let node_id = node_id.clone();
-        let node_epoch = *node_epoch;
         let endpoint = source
             .node_data_endpoint()
-            .ok_or_else(|| dfs_protocol_error("Peer stream source endpoint is missing"))?
-            .to_owned();
+            .ok_or_else(|| dfs_protocol_error("Peer stream source endpoint is missing"))?;
+        let grant = &source.read_grant;
+        let metadata = [
+            node_id.as_str(),
+            endpoint,
+            batch.file_version_id.0.as_str(),
+            batch.layout_root_id.0.as_str(),
+            chunk.id.0.as_str(),
+            source.copy_id.0.as_str(),
+            grant.namespace_id.0.as_str(),
+            grant.file_version_id.0.as_str(),
+            grant.layout_root_id.0.as_str(),
+            grant.caller_node_id.as_str(),
+            grant.caller_node_id.as_str(),
+            grant.token.as_str(),
+            node_id.as_str(),
+        ]
+        .iter()
+        .fold(0usize, |total, value| total.saturating_add(value.len()));
+        if metadata > STREAM_REQUEST_METADATA_BYTES / 2
+            || node_id.len().saturating_add(endpoint.len()) > STREAM_KEY_BYTES
+        {
+            // Unsupported before cloning metadata or issuing an RPC; the caller
+            // drains this sink and acquires the original exclusive legacy fill.
+            return Ok(None);
+        }
+        let node_id = node_id.clone();
+        let node_epoch = *node_epoch;
+        let endpoint = endpoint.to_owned();
         let sequence = self
             .next_read
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let request = DfsReadRangesRequest {
+            include_blake3_outboard: true,
             read_id: format!(
                 "{}-{}-{sequence}",
                 source.read_grant.caller_node_id, source.read_grant.caller_node_epoch
@@ -1599,6 +2118,23 @@ impl GrpcChunkTransfer {
                 grant: Some(wire_dfs_read_grant(&source.read_grant)),
             }],
         };
+        let op = &request.operations[0];
+        let request_capacity = request.read_id.capacity()
+            + request.attempt_id.capacity()
+            + request.file_version_id.capacity()
+            + request.layout_root_id.capacity()
+            + op.chunk_id.capacity()
+            + op.source_copy_id.capacity()
+            + op.grant.as_ref().map_or(0, |grant| {
+                grant.namespace_id.capacity()
+                    + grant.file_version_id.capacity()
+                    + grant.layout_root_id.capacity()
+                    + grant.caller_node_id.capacity()
+                    + grant.token.capacity()
+            });
+        if request_capacity > STREAM_REQUEST_METADATA_BYTES {
+            return Ok(None);
+        }
         let handle = match &self.runtime {
             PeerRuntime::Existing(handle) => handle.clone(),
             PeerRuntime::Owned(runtime) => runtime.handle().clone(),
@@ -1610,15 +2146,36 @@ impl GrpcChunkTransfer {
         // Capture tracing metadata on the caller before crossing the task boundary.
         let mut producer_request = request_with_current_context(request.clone());
         producer_request.set_timeout(timeout);
-        // Exactly two reusable payload owners across producer, queue and consumer.
-        // All queued control fields share a separate 256KiB allowance. The current
-        // decoded wire message stays within the existing decoder reservation.
-        let controls = Arc::new(tokio::sync::Semaphore::new(STREAM_FRAME_BACKING_BYTES));
-        let (returned, mut available) = tokio::sync::mpsc::channel::<Box<PeerStreamBlock>>(2);
-        for _ in 0..2 {
-            returned
-                .try_send(PeerStreamBlock::new(self.peers.read_work_metrics.as_ref())?)
-                .map_err(|_| dfs_protocol_error("Peer stream block pool initialization failed"))?;
+        // Acquire before spawning, and retain through producer join and all
+        // queued/consumer blocks. Every block also pins this operation ticket.
+        if let Some(control) = prefetch {
+            control.check()?;
+        }
+        let active = self.runtime.block_on(async {
+            let admit = async {
+                tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
+                    if prefetch.is_some() {
+                        self.peers.acquire_stream_work_mode(&node_id, node_epoch, &endpoint, true).await
+                    } else {
+                        self.peers.acquire_stream_work(&node_id, node_epoch, &endpoint).await.map(Some)
+                    }
+                }).await.map_err(|_| afs_error::Error::coded(afs_error::CLIENT_DEADLINE_EXCEEDED,
+                    "Peer stream admission deadline exceeded"))?
+            };
+            if let Some(control) = prefetch {
+                tokio::select! {
+                    result = admit => result,
+                    _ = control.cancelled() => Err(afs_error::Error::coded(afs_error::IO_UNAVAILABLE, "Peer prefetch cancelled before admission")),
+                }
+            } else { admit.await }
+        })?;
+        let Some(active) = active else {
+            return Ok(None);
+        };
+        let controls = active.session.controls.clone();
+        let producer_active = active.clone();
+        if let Some(metrics) = &self.peers.read_work_metrics {
+            metrics.peer_stream_private_output(out.len());
         }
         let (sender, mut receiver) =
             tokio::sync::mpsc::channel::<afs_error::Result<OwnedPeerStreamMessage>>(1);
@@ -1635,12 +2192,15 @@ impl GrpcChunkTransfer {
         let consumer_diagnostic = diagnostic.as_ref().map(|span| span.token());
         let producer_diagnostic = consumer_diagnostic.clone();
         let expected_body_bytes = chunk.length;
+        let producer_chunk = chunk.clone();
+        let producer_proof_budget = sink.proof_budget();
         let producer_binding = output_binding.clone();
+        let producer_control = prefetch.cloned();
         let producer = handle.spawn(async move {
-            let result: afs_error::Result<PeerRootReceipt> =
+            let receive = async {
                 tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
-                    let channel = peers.channel(&node_id, node_epoch, &endpoint).await?;
-                    let mut client = DfsChunksClient::new(channel)
+                    if let Some(control) = &producer_control { control.check()?; }
+                    let mut client = DfsChunksClient::new(producer_active.session.channel.clone())
                         .max_encoding_message_size(peers.config.max_encoding_message_bytes)
                         .max_decoding_message_size(
                             peers
@@ -1662,17 +2222,41 @@ impl GrpcChunkTransfer {
                         producer_binding,
                         producer_diagnostic.clone().map(ReadDiagnosticProducer::new),
                         deadline,
-                    );
-                    let mut current: Option<Box<PeerStreamBlock>> = None;
+                    )
+                    .with_outboard_context(producer_chunk, producer_proof_budget);
+                    let mut current: Option<PeerStreamBlockLease> = None;
                     let mut received_bytes = 0usize;
                     while let Some(frame) = stream.next().await {
+                        if let Some(control) = &producer_control { control.check()?; }
                         let frame =
                             frame.map_err(afs_transport::grpc::error_status::status_to_error)?;
                         if let Some(metrics) = &peers.read_work_metrics {
                             metrics.peer_read_event("stream_frame");
                         }
                         match frame.body {
+                            Some(dfs_read_ranges_frame::Body::Header(mut header)) => {
+                                root.accept_outboard_header(
+                                    &mut header,
+                                    peers.read_work_metrics.as_ref(),
+                                )?;
+                                send_peer_stream_control(
+                                    afs_protocol::node_data::DfsReadRangesFrame {
+                                        body: Some(dfs_read_ranges_frame::Body::Header(header)),
+                                    },
+                                    &mut current,
+                                    &sender,
+                                    &controls,
+                                    peers.read_work_metrics.as_ref(),
+                                    &mut root,
+                                )
+                                .await?;
+                            }
                             Some(dfs_read_ranges_frame::Body::Data(data)) => {
+                                if !root.outboard_header_seen {
+                                    return Err(dfs_protocol_error(
+                                        "Peer stream body precedes header",
+                                    ));
+                                }
                                 if data.len() > STREAM_DATA_BYTES {
                                     return Err(dfs_protocol_error(
                                         "Peer streaming data frame exceeds 64KiB bound",
@@ -1691,6 +2275,10 @@ impl GrpcChunkTransfer {
                                     )
                                     .await?;
                                     continue;
+                                }
+                                if let Some(diagnostic) = &producer_diagnostic {
+                                    // First nonempty decoded body, before staging/copy/hash.
+                                    diagnostic.first_data();
                                 }
                                 // The transport endpoint is decoded body completion,
                                 // before frame-to-block copying, hashing or cache writes.
@@ -1716,9 +2304,12 @@ impl GrpcChunkTransfer {
                                     .await?;
                                 }
                                 if current.is_none() {
-                                    let mut block = available.recv().await.ok_or_else(|| {
-                                        dfs_protocol_error("Peer stream block admission stopped")
-                                    })?;
+                                    let wait =
+                                        peers.read_work_metrics.as_ref().and_then(|metrics| {
+                                            metrics.coarse_diagnostic("peer_block_wait", 0)
+                                        });
+                                    let mut block = producer_active.block().await?;
+                                    drop(wait);
                                     block.bytes.clear();
                                     block.offset = received_bytes;
                                     current = Some(block);
@@ -1726,7 +2317,16 @@ impl GrpcChunkTransfer {
                                 let block = current.as_mut().ok_or_else(|| {
                                     dfs_protocol_error("Peer stream block is missing")
                                 })?;
-                                block.bytes.extend_from_slice(&data);
+                                {
+                                    let _copy =
+                                        peers.read_work_metrics.as_ref().and_then(|metrics| {
+                                            metrics.coarse_diagnostic(
+                                                "peer_frame_handoff_copy",
+                                                data.len() as u64,
+                                            )
+                                        });
+                                    block.bytes.extend_from_slice(&data);
+                                }
                                 received_bytes =
                                     received_bytes.checked_add(data.len()).ok_or_else(|| {
                                         dfs_protocol_error("Peer stream byte count overflow")
@@ -1778,9 +2378,19 @@ impl GrpcChunkTransfer {
                         afs_error::CLIENT_DEADLINE_EXCEEDED,
                         "Peer stream producer deadline exceeded",
                     )
-                })?;
+                })?
+            };
+            let result: afs_error::Result<PeerRootReceipt> = if let Some(control) = &producer_control {
+                tokio::select! {
+                    result = receive => result,
+                    _ = control.cancelled() => Err(afs_error::Error::coded(afs_error::IO_UNAVAILABLE, "Peer prefetch cancelled")),
+                }
+            } else { receive.await };
             if let Err(error) = &result {
-                let _ = sender.send(Err(error.clone())).await;
+                // The joined producer result carries the same failure. Never
+                // wait again outside its deadline/cancellation boundary merely
+                // to notify a consumer whose bounded queue may already be full.
+                let _ = sender.try_send(Err(error.clone()));
             }
             result
         });
@@ -1793,9 +2403,23 @@ impl GrpcChunkTransfer {
             let mut decoder = ReadFrameDecoder::for_producer_object(&request, chunk)?;
             decoder.stream_binding = Some(output_binding);
             while let Some(message) = receiver.blocking_recv() {
+                if let Some(control) = prefetch {
+                    control.check()?;
+                }
                 match message? {
                     OwnedPeerStreamMessage::Control(control) => {
-                        let OwnedPeerStreamControl { frame, _permit } = *control;
+                        let OwnedPeerStreamControl {
+                            frame,
+                            outboard_builder,
+                            _permit,
+                        } = *control;
+                        if matches!(&frame.body, Some(dfs_read_ranges_frame::Body::Header(_))) {
+                            decoder.install_producer_outboard(outboard_builder)?;
+                        } else if outboard_builder.is_some() {
+                            return Err(dfs_protocol_error(
+                                "outboard metadata must accompany its header",
+                            ));
+                        }
                         let consume_start = consumer_diagnostic
                             .as_ref()
                             .map(|diagnostic| diagnostic.now());
@@ -1837,32 +2461,19 @@ impl GrpcChunkTransfer {
                             diagnostic.consumer(start);
                         }
                         result?;
-                        // Only two owners exist, so returning one cannot fill a live
-                        // pool. Closed means the producer has already drained/ended.
-                        match returned.try_send(block) {
-                            Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
-                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                                return Err(dfs_protocol_error(
-                                    "Peer stream block pool ownership mismatch",
-                                ));
-                            }
-                        }
+                        // RAII returns the shared block on success and every error.
+                        drop(block);
                     }
                 }
             }
             Ok(decoder)
         })();
         drop(receiver);
-        drop(returned);
         if received.is_err() {
             producer.abort();
         }
         // Join/drain before output proof, sink cleanup or ownership retirement.
         let joined = self.runtime.block_on(producer);
-        let segment_intervals = consumer_work
-            .as_ref()
-            .map(ReadDiagnosticConsumer::segment_intervals);
-        drop(consumer_work);
         let decoder = received?;
         let root = joined.map_err(|error| {
             afs_error::Error::coded(
@@ -1870,16 +2481,36 @@ impl GrpcChunkTransfer {
                 format!("Peer stream producer join failed: {error}"),
             )
         })??;
-        if let (Some(diagnostic), Some(root_intervals), Some(segment_intervals)) = (
-            &consumer_diagnostic,
-            &root.root_intervals,
-            &segment_intervals,
-        ) {
+        peer_stream_deadline(deadline)?;
+        let root_intervals = root.root_intervals;
+        let finish_start = consumer_diagnostic
+            .as_ref()
+            .map(|diagnostic| diagnostic.now());
+        let proof = decoder.finish_stream_from_producer(
+            chunk,
+            root,
+            sink,
+            requested_offset,
+            out,
+            observation,
+        );
+        if let (Some(diagnostic), Some(start)) = (&consumer_diagnostic, finish_start) {
+            diagnostic.consumer(start);
+        }
+        let segment_intervals = consumer_work
+            .as_ref()
+            .map(ReadDiagnosticConsumer::segment_intervals);
+        drop(consumer_work);
+        if let (Some(diagnostic), Some(root_intervals), Some(segment_intervals)) =
+            (&consumer_diagnostic, &root_intervals, &segment_intervals)
+        {
             diagnostic.root_segment_overlap(root_intervals, segment_intervals);
         }
+        let proof = proof?;
         peer_stream_deadline(deadline)?;
-        let proof =
-            decoder.finish_stream_from_producer(chunk, root, sink, requested_offset, out)?;
+        if let Some(control) = prefetch {
+            control.check()?;
+        }
         let result = sink.seal_completed(proof, requested_offset, out).map(Some);
         if let Some(diagnostic) = diagnostic {
             diagnostic.finish(result.is_ok());
@@ -1890,6 +2521,15 @@ impl GrpcChunkTransfer {
 
 #[cfg(feature = "dfs")]
 impl crate::node::dfs_read::ChunkTransfer for GrpcChunkTransfer {
+    fn read_crc32c_range(
+        &self,
+        batch: &crate::node::dfs_read::PeerReadBatch,
+        chunk: &ChunkObject,
+        out: &mut [u8],
+    ) -> afs_error::Result<()> {
+        self.read_crc32c_impl(batch, chunk, out)
+    }
+
     fn supports_verified_object_sink(&self) -> bool {
         self.stream_sink_supported()
     }
@@ -1902,7 +2542,26 @@ impl crate::node::dfs_read::ChunkTransfer for GrpcChunkTransfer {
         private_out: &'output mut [u8],
         sink: &mut PeerStreamSink<'_>,
     ) -> afs_error::Result<Option<CompletedPeerDiskRead<'output>>> {
-        self.read_object_to_sink(batch, chunk, requested_offset, private_out, sink)
+        self.read_object_to_sink(batch, chunk, requested_offset, private_out, sink, None)
+    }
+
+    fn try_read_verified_object_to_sink<'output>(
+        &self,
+        batch: &crate::node::dfs_read::PeerReadBatch,
+        chunk: &ChunkObject,
+        requested_offset: u64,
+        private_out: &'output mut [u8],
+        sink: &mut PeerStreamSink<'_>,
+        control: &crate::node::dfs_read::PrefetchControl,
+    ) -> afs_error::Result<Option<CompletedPeerDiskRead<'output>>> {
+        self.read_object_to_sink(
+            batch,
+            chunk,
+            requested_offset,
+            private_out,
+            sink,
+            Some(control),
+        )
     }
 
     fn verification_metrics(&self) -> Option<&ReadWorkMetrics> {
@@ -1914,7 +2573,7 @@ impl crate::node::dfs_read::ChunkTransfer for GrpcChunkTransfer {
         batch: &crate::node::dfs_read::PeerReadBatch,
         out: &mut [u8],
     ) -> afs_error::Result<()> {
-        self.read_ranges_impl(batch, None, out).map(|_| ())
+        self.read_ranges_impl(batch, None, out, None).map(|_| ())
     }
 
     fn read_verified_object<'a>(
@@ -1922,8 +2581,9 @@ impl crate::node::dfs_read::ChunkTransfer for GrpcChunkTransfer {
         batch: &crate::node::dfs_read::PeerReadBatch,
         chunk: &'a ChunkObject,
         out: &'a mut [u8],
+        proof_budget: Arc<OutboardBudget>,
     ) -> afs_error::Result<VerifiedPeerChunk<'a>> {
-        self.read_ranges_impl(batch, Some(chunk), out)?
+        self.read_ranges_impl(batch, Some(chunk), out, Some(proof_budget))?
             .ok_or_else(|| dfs_protocol_error("verified Peer stream omitted its object proof"))
     }
 }
@@ -1933,13 +2593,16 @@ impl crate::node::dfs_read::ChunkTransfer for GrpcChunkTransfer {
 pub(in crate::node) struct CompletedPeerStreamProof {
     chunk: ChunkObject,
     root_digest: [u8; 32],
-    segments: [[u8; 32]; 4],
-    count: usize,
     binding: crate::node::peer_cache::PeerStreamBinding,
+    outboard: Option<SharedOutboard>,
 }
 
 #[cfg(feature = "dfs")]
 impl CompletedPeerStreamProof {
+    pub(in crate::node) fn into_outboard(self) -> Option<SharedOutboard> {
+        self.outboard
+    }
+
     pub(in crate::node) fn binding(&self) -> &crate::node::peer_cache::PeerStreamBinding {
         &self.binding
     }
@@ -1948,9 +2611,6 @@ impl CompletedPeerStreamProof {
     }
     pub(in crate::node) fn root_digest(&self) -> &[u8; 32] {
         &self.root_digest
-    }
-    pub(in crate::node) fn segment_digests(&self) -> &[[u8; 32]] {
-        &self.segments[..self.count]
     }
 }
 
@@ -1966,6 +2626,7 @@ fn peer_disk_test_frames(
         DfsReadRangesCompletion, DfsReadRangesFrame, DfsReadRangesHeader,
     };
     let request = DfsReadRangesRequest {
+        include_blake3_outboard: true,
         read_id: "sink-test-read".into(),
         attempt_id: "sink-test-attempt".into(),
         file_version_id: "version".into(),
@@ -1982,6 +2643,7 @@ fn peer_disk_test_frames(
     };
     let mut frames = vec![DfsReadRangesFrame {
         body: Some(dfs_read_ranges_frame::Body::Header(DfsReadRangesHeader {
+            crc32c_table: Default::default(),
             read_id: request.read_id.clone(),
             attempt_id: request.attempt_id.clone(),
             operation_index: 0,
@@ -1989,6 +2651,7 @@ fn peer_disk_test_frames(
             chunk_offset: 0,
             length: chunk.length,
             source_copy_id: "sink-test-copy".into(),
+            blake3_outboard: Default::default(),
         })),
     }];
     frames.extend(
@@ -2000,6 +2663,7 @@ fn peer_disk_test_frames(
     frames.push(DfsReadRangesFrame {
         body: Some(dfs_read_ranges_frame::Body::Completion(
             DfsReadRangesCompletion {
+                crc32c_table: Default::default(),
                 read_id: request.read_id.clone(),
                 attempt_id: request.attempt_id.clone(),
                 operation_index: 0,
@@ -2023,7 +2687,8 @@ pub(in crate::node) fn complete_peer_disk_read_for_test<'output>(
     sink: &mut PeerStreamSink<'_>,
 ) -> afs_error::Result<CompletedPeerDiskRead<'output>> {
     let (request, frames) = peer_disk_test_frames(chunk, body);
-    let mut decoder = ReadFrameDecoder::for_object(&request, chunk)?;
+    let mut decoder = ReadFrameDecoder::for_object(&request, chunk)?
+        .with_outboard_budget(Some(sink.proof_budget()));
     decoder.stream_binding = Some(sink.bind_output(requested_offset, out)?);
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     for frame in frames {
@@ -2047,22 +2712,21 @@ pub(in crate::node) fn complete_peer_disk_read_for_test<'output>(
 pub(in crate::node) struct CompletedPeerObjectProof<'a> {
     bytes: &'a [u8],
     root_digest: [u8; 32],
-    segment_digests: [[u8; 32]; 4],
-    segment_count: usize,
+    outboard: Option<SharedOutboard>,
 }
 
 #[cfg(feature = "dfs")]
 impl<'a> CompletedPeerObjectProof<'a> {
+    pub(in crate::node) fn into_outboard(self) -> Option<SharedOutboard> {
+        self.outboard
+    }
+
     pub(in crate::node) fn bytes(&self) -> &'a [u8] {
         self.bytes
     }
 
     pub(in crate::node) fn root_digest(&self) -> &[u8; 32] {
         &self.root_digest
-    }
-
-    pub(in crate::node) fn segment_digests(&self) -> &[[u8; 32]] {
-        &self.segment_digests[..self.segment_count]
     }
 }
 
@@ -2073,6 +2737,7 @@ async fn consume_peer_read_stream<'a, S>(
     out: &'a mut [u8],
     mut stream: S,
     metrics: Option<&ReadWorkMetrics>,
+    proof_budget: Option<Arc<OutboardBudget>>,
 ) -> afs_error::Result<Option<VerifiedPeerChunk<'a>>>
 where
     S: tokio_stream::Stream<
@@ -2080,9 +2745,12 @@ where
         > + Unpin,
 {
     let mut decoder = match chunk {
-        Some(chunk) => ReadFrameDecoder::for_object(request, chunk)?,
+        Some(chunk) => {
+            ReadFrameDecoder::for_object(request, chunk)?.with_outboard_budget(proof_budget)
+        }
         None => ReadFrameDecoder::new(request),
     };
+    decoder.work_metrics = metrics.cloned();
     while let Some(frame) = stream.next().await {
         let frame = frame.map_err(afs_transport::grpc::error_status::status_to_error)?;
         let copied = match &frame.body {
@@ -2092,12 +2760,6 @@ where
         decoder.accept(frame, out)?;
         if let Some(metrics) = metrics {
             metrics.copy("frame_to_attempt", copied);
-            if chunk.is_some() {
-                metrics.hash("root_in_receive", copied);
-                metrics.hash("segment_index_bytes", copied);
-            } else {
-                metrics.hash("peer_range_in_receive", copied);
-            }
         }
     }
     // EOF, including a possible late gRPC Status, precedes proof creation.
@@ -2119,41 +2781,48 @@ struct ReadFrameDecoder<'a> {
     verified_object: Option<VerifiedObjectDecode>,
     stream_binding: Option<crate::node::peer_cache::PeerStreamBinding>,
     producer_root_pending: bool,
+    producer_outboard_installed: bool,
+    root_mode: PeerRootMode,
+    work_metrics: Option<ReadWorkMetrics>,
 }
 
 #[cfg(feature = "dfs")]
 struct VerifiedObjectDecode {
+    chunk: ChunkObject,
+    proof_budget: Option<Arc<OutboardBudget>>,
+    outboard_builder: Option<OutboardBuilder>,
+    outboard: Option<SharedOutboard>,
     expected_root: [u8; 32],
     expected_length: usize,
     actual_root: Option<[u8; 32]>,
     buffer: Option<(usize, usize)>,
-    segment_hasher: blake3::Hasher,
-    segment_digests: [[u8; 32]; 4],
-    segment_count: usize,
-    segment_used: usize,
 }
 
 #[cfg(feature = "dfs")]
 impl VerifiedObjectDecode {
-    fn update_segments(&mut self, mut bytes: &[u8]) {
-        while !bytes.is_empty() {
-            let length = bytes
-                .len()
-                .min(PEER_CACHE_SEGMENT_BYTES - self.segment_used);
-            self.segment_hasher.update(&bytes[..length]);
-            self.segment_used += length;
-            bytes = &bytes[length..];
-            if self.segment_used == PEER_CACHE_SEGMENT_BYTES {
-                self.finish_segment();
+    fn finish_outboard(
+        &mut self,
+        observation: PeerConsumerObservation<'_>,
+    ) -> afs_error::Result<Option<[u8; 32]>> {
+        if let Some(builder) = self.outboard_builder.take() {
+            // Legacy diagnostic name: this candidate's SegmentBlake3 lane is
+            // standard-root/outboard work, not the removed v1 segment digest.
+            let built =
+                observation.measure(ReadDiagnosticConsumerStage::SegmentBlake3, 0, || {
+                    builder.finish()
+                })?;
+            if built.digest.bytes != self.expected_root {
+                return Err(dfs_corrupt_error(
+                    "outboard body differs from trusted Meta root",
+                ));
             }
+            if let Some(metrics) = observation.metrics {
+                metrics.hash("outboard_parent_hash", built.parent_hash_bytes);
+            }
+            self.outboard = built.outboard;
+            return Ok(Some(built.digest.bytes));
         }
-    }
-
-    fn finish_segment(&mut self) {
-        self.segment_digests[self.segment_count] = *self.segment_hasher.finalize().as_bytes();
-        self.segment_count += 1;
-        self.segment_used = 0;
-        self.segment_hasher = blake3::Hasher::new();
+        Ok(None)
     }
 }
 
@@ -2176,6 +2845,9 @@ impl<'a> ReadFrameDecoder<'a> {
             verified_object: None,
             stream_binding: None,
             producer_root_pending: false,
+            producer_outboard_installed: false,
+            root_mode: PeerRootMode::Producer,
+            work_metrics: None,
         }
     }
 
@@ -2184,7 +2856,7 @@ impl<'a> ReadFrameDecoder<'a> {
         chunk: &ChunkObject,
     ) -> afs_error::Result<Self> {
         if chunk.length == 0
-            || chunk.length > (PEER_CACHE_SEGMENT_BYTES * 4) as u64
+            || chunk.length > crate::node::chunk::MAX_STAGED_CHUNK_BYTES as u64
             || request.operations.len() != 1
             || request.operations[0].chunk_id != chunk.id.0
             || request.operations[0].chunk_offset != 0
@@ -2197,16 +2869,46 @@ impl<'a> ReadFrameDecoder<'a> {
         }
         let mut decoder = Self::new(request);
         decoder.verified_object = Some(VerifiedObjectDecode {
+            chunk: chunk.clone(),
+            proof_budget: None,
+            outboard_builder: None,
+            outboard: None,
             expected_root: chunk.content_digest.bytes,
             expected_length: chunk.length as usize,
             actual_root: None,
             buffer: None,
-            segment_hasher: blake3::Hasher::new(),
-            segment_digests: [[0; 32]; 4],
-            segment_count: 0,
-            segment_used: 0,
         });
         Ok(decoder)
+    }
+
+    fn with_outboard_budget(mut self, budget: Option<Arc<OutboardBudget>>) -> Self {
+        if let Some(object) = &mut self.verified_object {
+            object.proof_budget = budget;
+        }
+        self
+    }
+
+    fn install_producer_outboard(
+        &mut self,
+        mut builder: Option<OutboardBuilder>,
+    ) -> afs_error::Result<()> {
+        if !self.producer_root_pending || self.active.is_some() || self.producer_outboard_installed
+        {
+            return Err(dfs_protocol_error(
+                "outboard handoff is not before a producer header",
+            ));
+        }
+        let object = self
+            .verified_object
+            .as_mut()
+            .ok_or_else(|| dfs_protocol_error("outboard handoff lacks a trusted object"))?;
+        if object.outboard_builder.is_some() {
+            return Err(dfs_protocol_error("outboard work was already handed off"));
+        }
+        self.root_mode = PeerRootMode::select(&mut builder);
+        object.outboard_builder = builder;
+        self.producer_outboard_installed = true;
+        Ok(())
     }
 
     fn for_producer_object(
@@ -2225,6 +2927,7 @@ impl<'a> ReadFrameDecoder<'a> {
         sink: &PeerStreamSink<'_>,
         offset: u64,
         output: &[u8],
+        observation: PeerConsumerObservation<'_>,
     ) -> afs_error::Result<CompletedPeerStreamProof> {
         self.check_frames_finished()?;
         let object = self
@@ -2232,15 +2935,44 @@ impl<'a> ReadFrameDecoder<'a> {
             .as_ref()
             .ok_or_else(|| dfs_protocol_error("Peer producer receipt has no trusted object"))?;
         if !self.producer_root_pending
+            || !self.producer_outboard_installed
             || receipt.length != object.expected_length as u64
-            || receipt.digest != object.expected_root
-            || Some(receipt.digest) != object.actual_root
             || !sink.accepts_binding(&receipt.binding)
             || !receipt.binding.matches_output(offset, output)
         {
             return Err(dfs_corrupt_error(
-                "Peer joined root receipt differs from trusted object, completion or sink",
+                "Peer joined transport receipt differs from trusted object or sink",
             ));
+        }
+        match (self.root_mode, receipt.digest) {
+            (PeerRootMode::Producer, PeerRootDigest::Producer(digest))
+                if digest == object.expected_root && Some(digest) == object.actual_root =>
+            {
+                if object.outboard_builder.is_some() {
+                    return Err(dfs_protocol_error(
+                        "producer root retained duplicate consumer root work",
+                    ));
+                }
+            }
+            (PeerRootMode::ConsumerTree, PeerRootDigest::ConsumerTree) => {
+                let object = self
+                    .verified_object
+                    .as_mut()
+                    .ok_or_else(|| dfs_protocol_error("consumer root lacks trusted object"))?;
+                // actual_root still holds the wire Completion here. It is only
+                // comparison evidence, never our independently computed root.
+                let completion_root = object.actual_root;
+                let computed_root = object
+                    .finish_outboard(observation)?
+                    .ok_or_else(|| dfs_protocol_error("consumer root work was not completed"))?;
+                if computed_root != object.expected_root || Some(computed_root) != completion_root {
+                    return Err(dfs_corrupt_error(
+                        "Peer consumer root differs from Meta or wire completion",
+                    ));
+                }
+                object.actual_root = Some(computed_root);
+            }
+            _ => return Err(dfs_corrupt_error("Peer root mode or joined digest differs")),
         }
         self.producer_root_pending = false;
         self.finish_stream(chunk)
@@ -2262,6 +2994,7 @@ impl<'a> ReadFrameDecoder<'a> {
             }
             object.buffer = Some(buffer);
         }
+        let work_metrics = self.work_metrics.clone();
         self.accept_into(
             frame,
             out.len(),
@@ -2269,7 +3002,10 @@ impl<'a> ReadFrameDecoder<'a> {
                 out[start..start + data.len()].copy_from_slice(data);
                 Ok(())
             },
-            PeerConsumerObservation::default(),
+            PeerConsumerObservation {
+                metrics: work_metrics.as_ref(),
+                diagnostic: None,
+            },
         )
     }
 
@@ -2302,6 +3038,35 @@ impl<'a> ReadFrameDecoder<'a> {
                         "peer read header identity/order mismatch",
                     ));
                 }
+                if !header.blake3_outboard.is_empty()
+                    && (!self.request.include_blake3_outboard || self.verified_object.is_none())
+                {
+                    // A partial grant returns only its exact range and checksum;
+                    // it can never manufacture a complete-object root capability.
+                    return Err(dfs_protocol_error(
+                        "outboard requires a trusted complete object",
+                    ));
+                }
+                if !self.producer_root_pending {
+                    if let Some(object) = &mut self.verified_object {
+                        object.outboard_builder = peer_outboard_builder(
+                            &object.chunk,
+                            header.blake3_outboard,
+                            object.proof_budget.clone(),
+                            observation.metrics,
+                        )?;
+                        self.root_mode = PeerRootMode::select(&mut object.outboard_builder);
+                        if self.root_mode == PeerRootMode::Producer
+                            && let Some(metrics) = observation.metrics
+                        {
+                            metrics.peer_read_event("root_fallback");
+                        }
+                    }
+                } else if !header.blake3_outboard.is_empty() {
+                    return Err(dfs_protocol_error(
+                        "producer did not retire decoded outboard backing",
+                    ));
+                }
                 let start = usize::try_from(op.destination_offset)
                     .map_err(|_| dfs_protocol_error("read destination overflow"))?;
                 let length = usize::try_from(op.length)
@@ -2315,7 +3080,9 @@ impl<'a> ReadFrameDecoder<'a> {
                     start,
                     end,
                     cursor: start,
-                    checksum: (!self.producer_root_pending).then(blake3::Hasher::new),
+                    checksum: (!self.producer_root_pending
+                        && self.root_mode == PeerRootMode::Producer)
+                        .then(blake3::Hasher::new),
                 });
             }
             Some(dfs_read_ranges_frame::Body::Data(data)) => {
@@ -2340,21 +3107,29 @@ impl<'a> ReadFrameDecoder<'a> {
                         "peer read completion identity/length mismatch",
                     ));
                 }
-                let digest = if self.producer_root_pending {
-                    blake3::Hash::from(
-                        <[u8; 32]>::try_from(completion.range_checksum.as_slice()).map_err(
-                            |_| dfs_corrupt_error("peer read completion checksum mismatch"),
-                        )?,
-                    )
-                } else {
-                    let checksum = active
-                        .checksum
-                        .as_ref()
-                        .ok_or_else(|| dfs_protocol_error("Peer consumer root state is missing"))?;
-                    observation.measure(ReadDiagnosticConsumerStage::RootBlake3, 0, || {
-                        checksum.finalize()
-                    })
-                };
+                let digest =
+                    if self.producer_root_pending {
+                        blake3::Hash::from(
+                            <[u8; 32]>::try_from(completion.range_checksum.as_slice()).map_err(
+                                |_| dfs_corrupt_error("peer read completion checksum mismatch"),
+                            )?,
+                        )
+                    } else if self.root_mode == PeerRootMode::ConsumerTree {
+                        let object = self.verified_object.as_mut().ok_or_else(|| {
+                            dfs_protocol_error("consumer tree lacks trusted object")
+                        })?;
+                        let root = object.finish_outboard(observation)?.ok_or_else(|| {
+                            dfs_protocol_error("consumer tree root was not completed")
+                        })?;
+                        blake3::Hash::from(root)
+                    } else {
+                        let checksum = active.checksum.as_ref().ok_or_else(|| {
+                            dfs_protocol_error("Peer consumer root state is missing")
+                        })?;
+                        observation.measure(ReadDiagnosticConsumerStage::RootBlake3, 0, || {
+                            checksum.finalize()
+                        })
+                    };
                 if completion.range_checksum.as_slice() != digest.as_bytes() {
                     return Err(dfs_corrupt_error("peer read completion checksum mismatch"));
                 }
@@ -2363,11 +3138,6 @@ impl<'a> ReadFrameDecoder<'a> {
                         return Err(dfs_corrupt_error(
                             "peer read object differs from trusted Meta root",
                         ));
-                    }
-                    if object.segment_used != 0 {
-                        observation.measure(ReadDiagnosticConsumerStage::SegmentBlake3, 0, || {
-                            object.finish_segment();
-                        });
                     }
                     object.actual_root = Some(*digest.as_bytes());
                 }
@@ -2402,15 +3172,28 @@ impl<'a> ReadFrameDecoder<'a> {
                     checksum.update(data);
                 },
             );
+            if let Some(metrics) = observation.metrics {
+                metrics.hash(
+                    if self.verified_object.is_some() {
+                        "root_in_receive"
+                    } else {
+                        "peer_range_in_receive"
+                    },
+                    data.len() as u64,
+                );
+            }
         }
-        if let Some(object) = &mut self.verified_object {
+        if let Some(object) = &mut self.verified_object
+            && let Some(builder) = &mut object.outboard_builder
+        {
             observation.measure(
                 ReadDiagnosticConsumerStage::SegmentBlake3,
                 data.len() as u64,
-                || {
-                    object.update_segments(data);
-                },
-            );
+                || builder.update(data),
+            )?;
+            if let Some(metrics) = observation.metrics {
+                metrics.hash("outboard_body_hash", data.len() as u64);
+            }
         }
         active.cursor = next;
         Ok(())
@@ -2450,19 +3233,15 @@ impl<'a> ReadFrameDecoder<'a> {
             || self.request.operations[0].chunk_id != chunk.id.0
             || object.expected_root != chunk.content_digest.bytes
             || object.expected_length as u64 != chunk.length
-            || object.segment_count != object.expected_length.div_ceil(PEER_CACHE_SEGMENT_BYTES)
         {
-            return Err(dfs_protocol_error(
-                "Peer stream proof object or segments differ",
-            ));
+            return Err(dfs_protocol_error("Peer stream proof object differs"));
         }
         Ok(CompletedPeerStreamProof {
             chunk: chunk.clone(),
             root_digest: object
                 .actual_root
                 .ok_or_else(|| dfs_protocol_error("Peer stream root was not completed"))?,
-            segments: object.segment_digests,
-            count: object.segment_count,
+            outboard: object.outboard,
             binding: self
                 .stream_binding
                 .ok_or_else(|| dfs_protocol_error("Peer stream completion has no sink binding"))?,
@@ -2477,20 +3256,15 @@ impl<'a> ReadFrameDecoder<'a> {
         let object = self
             .verified_object
             .ok_or_else(|| dfs_protocol_error("ordinary ranges cannot mint object proofs"))?;
-        if object.buffer != Some((body.as_ptr() as usize, body.len()))
-            || object.segment_count != object.expected_length.div_ceil(PEER_CACHE_SEGMENT_BYTES)
-        {
-            return Err(dfs_protocol_error(
-                "Peer object proof buffer or segments differ",
-            ));
+        if object.buffer != Some((body.as_ptr() as usize, body.len())) {
+            return Err(dfs_protocol_error("Peer object proof buffer differs"));
         }
         Ok(CompletedPeerObjectProof {
             bytes: body,
             root_digest: object
                 .actual_root
                 .ok_or_else(|| dfs_protocol_error("Peer object root was not completed"))?,
-            segment_digests: object.segment_digests,
-            segment_count: object.segment_count,
+            outboard: object.outboard,
         })
     }
 }
@@ -2563,15 +3337,40 @@ impl crate::node::dfs_read::ChunkTransfer for RdmaChunkTransfer {
     fn verification_metrics(&self) -> Option<&ReadWorkMetrics> {
         self.pool.peers.read_work_metrics.as_ref()
     }
-
     fn read_ranges(
         &self,
         batch: &crate::node::dfs_read::PeerReadBatch,
         out: &mut [u8],
     ) -> afs_error::Result<()> {
+        self.read_ranges_integrity(batch, out, None)
+    }
+    fn read_crc32c_range(
+        &self,
+        batch: &crate::node::dfs_read::PeerReadBatch,
+        chunk: &ChunkObject,
+        out: &mut [u8],
+    ) -> afs_error::Result<()> {
+        self.read_ranges_integrity(batch, out, Some(chunk))
+    }
+}
+#[cfg(feature = "dfs")]
+impl RdmaChunkTransfer {
+    fn read_ranges_integrity(
+        &self,
+        batch: &crate::node::dfs_read::PeerReadBatch,
+        out: &mut [u8],
+        expected: Option<&ChunkObject>,
+    ) -> afs_error::Result<()> {
         #[cfg(not(feature = "rdma"))]
         {
-            let _ = (batch, out, &self.pool, &self.runtime, &self.next_read);
+            let _ = (
+                batch,
+                out,
+                expected,
+                &self.pool,
+                &self.runtime,
+                &self.next_read,
+            );
             Err(afs_error::Error::coded(
                 afs_error::NODE_TRANSFER_UNSUPPORTED,
                 "DFS RDMA is not compiled",
@@ -2580,6 +3379,7 @@ impl crate::node::dfs_read::ChunkTransfer for RdmaChunkTransfer {
         #[cfg(feature = "rdma")]
         {
             batch.validate(out.len())?;
+            let integrity = expected.cloned();
             let first = &batch.operations[0].source;
             let crate::dfs::CopyLocation::Node {
                 node_id,
@@ -2626,6 +3426,7 @@ impl crate::node::dfs_read::ChunkTransfer for RdmaChunkTransfer {
                             }
                         };
                         let cancel_guard = CancelPoisonGuard::new(lease.session.poisoned.clone());
+                        let integrity = integrity.clone();
                         let task = tokio::spawn(async move {
                             validate_open(false, &lease.session.poisoned).map_err(|error| error.0)?;
                             let mut client = lease.session.client.clone();
@@ -2649,6 +3450,7 @@ impl crate::node::dfs_read::ChunkTransfer for RdmaChunkTransfer {
                             .map_err(dfs_rdma_join_error)?
                             .map_err(dfs_rdma_error)?;
                             validate_dfs_rdma_read_reply(&request, &reply, &bytes)?;
+                            if let Some(chunk) = &integrity { crc32c::validate_rdma_crc(&request, &reply, &bytes, chunk)?; }
                             validate_open(false, &lease.session.poisoned).map_err(|error| error.0)?;
                             Ok::<_, afs_error::Error>(bytes)
                         });
@@ -2683,7 +3485,12 @@ impl crate::node::dfs_read::ChunkTransfer for RdmaChunkTransfer {
                         "dfs.rdma_read_fallback";
                         "reason" => "peer reported RDMA unsupported before dispatch"
                     );
-                    GrpcChunkTransfer::new(fallback.peers.clone(), timeout)?.read_ranges(batch, out)
+                    let grpc = GrpcChunkTransfer::new(fallback.peers.clone(), timeout)?;
+                    if let Some(chunk) = expected {
+                        grpc.read_crc32c_range(batch, chunk, out)
+                    } else {
+                        grpc.read_ranges(batch, out)
+                    }
                 }
             }
         }
@@ -2705,6 +3512,7 @@ fn pack_dfs_rdma_read_windows(
     let first = &batch.operations[0].source.read_grant;
     let mut windows = Vec::new();
     let mut request = DfsReadRangesRequest {
+        include_blake3_outboard: false,
         read_id: format!(
             "{}-{}-{sequence}",
             first.caller_node_id, first.caller_node_epoch
@@ -2779,14 +3587,25 @@ fn validate_dfs_rdma_read_reply(
             || completion.operation_index != op.operation_index
             || completion.source_copy_id != op.source_copy_id
             || completion.transferred_bytes != op.length
-            || completion.range_checksum_algorithm
-                != afs_protocol::node_data::DfsDigestAlgorithm::Blake3 as i32
         {
             return Err(dfs_protocol_error(
                 "RDMA read completion identity/length differs",
             ));
         }
-        if completion.range_checksum.as_slice() != blake3::hash(range).as_bytes() {
+        let checksum = match afs_protocol::node_data::DfsDigestAlgorithm::try_from(
+            completion.range_checksum_algorithm,
+        ) {
+            Ok(afs_protocol::node_data::DfsDigestAlgorithm::Blake3) => {
+                blake3::hash(range).as_bytes().to_vec()
+            }
+            Ok(afs_protocol::node_data::DfsDigestAlgorithm::Crc32c) => {
+                crate::node::chunk_crc32c::checksum(range)
+                    .to_le_bytes()
+                    .to_vec()
+            }
+            _ => return Err(dfs_protocol_error("unsupported RDMA range checksum")),
+        };
+        if completion.range_checksum != checksum {
             return Err(dfs_corrupt_error("RDMA read completion checksum differs"));
         }
     }
@@ -5759,6 +6578,161 @@ fn owner_lock_transport_unknown() -> afs_error::Error {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "dfs")]
+    #[test]
+    fn replica_data_frames_share_the_staged_allocation_and_legacy_wire() {
+        use afs_protocol::node_data::{
+            DfsPutReplicaFrame, DfsPutReplicaHeader, dfs_put_replica_frame::Body,
+        };
+        use prost::Message;
+
+        #[derive(Clone, PartialEq, prost::Message)]
+        struct LegacyFrame {
+            #[prost(oneof = "LegacyBody", tags = "1, 2")]
+            body: Option<LegacyBody>,
+        }
+
+        #[derive(Clone, PartialEq, prost::Oneof)]
+        enum LegacyBody {
+            #[prost(message, tag = "1")]
+            Header(DfsPutReplicaHeader),
+            #[prost(bytes = "vec", tag = "2")]
+            Data(Vec<u8>),
+        }
+
+        let payload: Vec<u8> = (0..150 * 1024).map(|index| (index % 251) as u8).collect();
+        let staged = crate::node::chunk::StagedChunk::new(
+            crate::dfs::OperationId::new("replica-shared-wire"),
+            payload.clone(),
+        );
+        let start = staged.bytes().as_ptr() as usize;
+        let mut offset = 0;
+        let mut count = 0;
+        for frame in replica_data_frames(staged.clone()) {
+            let Some(Body::Data(data)) = &frame.body else {
+                panic!("replica data iterator returned a control frame");
+            };
+            assert_eq!(data.as_ptr() as usize, start + offset);
+            assert_eq!(
+                data.len(),
+                (payload.len() - offset).min(super::super::data::DFS_REPLICA_FRAME_BYTES)
+            );
+            assert_eq!(&data[..], &payload[offset..offset + data.len()]);
+            let legacy = LegacyFrame {
+                body: Some(LegacyBody::Data(data.to_vec())),
+            };
+            let old_wire = legacy.encode_to_vec();
+            let new_wire = frame.encode_to_vec();
+            assert_eq!(new_wire, old_wire);
+            assert_eq!(
+                DfsPutReplicaFrame::decode(old_wire.as_slice()).unwrap(),
+                frame
+            );
+            assert_eq!(LegacyFrame::decode(new_wire.as_slice()).unwrap(), legacy);
+            offset += data.len();
+            count += 1;
+        }
+        assert_eq!(count, 3);
+        assert_eq!(offset, payload.len());
+    }
+
+    #[cfg(feature = "dfs")]
+    #[test]
+    fn cancelled_replica_frames_retain_allocation_and_all_write_leases_until_last_owner() {
+        use crate::node::chunk::{
+            ChunkBuilder, DeferredWriteBudget, StagedChunk, WriteBudgetReservation, WriteBufferPool,
+        };
+        use afs_protocol::node_data::dfs_put_replica_frame::Body;
+
+        let capacity = 3 * super::super::data::DFS_REPLICA_FRAME_BYTES;
+        for stop_pool in [false, true] {
+            let pool = WriteBufferPool::new(capacity);
+            let mut builder = ChunkBuilder::with_pool(pool.clone(), capacity).unwrap();
+            let payload = vec![37; capacity - 17];
+            builder.write_at(0, &payload).unwrap();
+            let frozen = builder.freeze();
+            let generation = frozen.allocation_id();
+            let pointer = frozen.as_ptr();
+            let mut staged = StagedChunk::from_shared(
+                crate::dfs::OperationId::new("replica-frame-lease"),
+                frozen,
+            );
+            let budget = Arc::new(DeferredWriteBudget::default());
+            {
+                let mut state = budget.state.lock().unwrap();
+                state.normal_bytes = capacity as u64;
+                state.publisher_bytes = 4096;
+                state.descriptor_bytes = 128;
+                state.descriptors = 1;
+            }
+            staged.retain_write_budget(&[WriteBudgetReservation::new(
+                budget.clone(),
+                capacity as u64,
+                4096,
+                128,
+                1,
+            )]);
+            let mut frames = replica_data_frames(staged.clone());
+            let first = frames.next().unwrap();
+            let second = frames.next().unwrap();
+            // Cancel the producer with an unsent tail and release the RPC's
+            // original/ack owners. Queued or slow frame holders remain alive.
+            drop(frames);
+            drop(staged);
+            let last_holder = second.clone();
+            drop(second);
+            assert_eq!(pool.snapshot().live_bytes, capacity);
+            assert_eq!(pool.snapshot().idle_bytes, 0);
+            let Some(Body::Data(data)) = &first.body else {
+                panic!("missing data frame")
+            };
+            assert_eq!(data.as_ptr(), pointer);
+            assert_eq!(&data[..], &payload[..data.len()]);
+            {
+                let state = budget.state.lock().unwrap();
+                assert_eq!(
+                    (
+                        state.normal_bytes,
+                        state.publisher_bytes,
+                        state.descriptor_bytes,
+                        state.descriptors
+                    ),
+                    (capacity as u64, 4096, 128, 1)
+                );
+            }
+            drop(first);
+            assert_eq!(pool.snapshot().live_bytes, capacity);
+            assert_eq!(budget.state.lock().unwrap().normal_bytes, capacity as u64);
+            if stop_pool {
+                pool.stop();
+            }
+            drop(last_holder);
+            assert_eq!(pool.snapshot().live_bytes, 0);
+            {
+                let state = budget.state.lock().unwrap();
+                assert_eq!(
+                    (
+                        state.normal_bytes,
+                        state.publisher_bytes,
+                        state.descriptor_bytes,
+                        state.descriptors
+                    ),
+                    (0, 0, 0, 0)
+                );
+            }
+            if stop_pool {
+                assert_eq!(pool.snapshot().idle_bytes, 0);
+                assert_eq!(pool.snapshot().released_bytes, capacity as u64);
+            } else {
+                assert_eq!(pool.snapshot().idle_bytes, capacity);
+                let reused = ChunkBuilder::with_pool(pool.clone(), capacity).unwrap();
+                assert_eq!(reused.data_ptr(), pointer);
+                assert_ne!(reused.allocation_id(), generation);
+                assert_eq!(pool.snapshot().reuses, 1);
+            }
+        }
+    }
+
     #[test]
     #[cfg(feature = "rdma")]
     fn poisoning_preserves_failure_category() {
@@ -5799,12 +6773,85 @@ mod tests {
     use tonic::{Request, Response, Status, transport::Server};
 
     #[cfg(feature = "dfs")]
+    type FetchFixtureObjects = std::collections::BTreeMap<String, (ChunkObject, Vec<u8>)>;
+
+    #[cfg(feature = "dfs")]
     #[derive(Clone)]
     struct DiskStreamFixture {
         chunk: ChunkObject,
         body: Arc<Vec<u8>>,
         mode: u8,
         calls: Arc<std::sync::atomic::AtomicUsize>,
+        fetch_objects: Option<Arc<FetchFixtureObjects>>,
+        fetch_gate: Option<(String, Arc<FetchRpcGate>)>,
+    }
+
+    #[cfg(feature = "dfs")]
+    #[derive(Default)]
+    struct FetchRpcGate {
+        entered: std::sync::atomic::AtomicUsize,
+        release: std::sync::atomic::AtomicBool,
+        changed: tokio::sync::Notify,
+    }
+
+    #[cfg(feature = "dfs")]
+    fn fetch_fixture_frames(
+        request: &DfsReadRangesRequest,
+        objects: &FetchFixtureObjects,
+    ) -> Result<Vec<afs_protocol::node_data::DfsReadRangesFrame>, Status> {
+        use afs_protocol::node_data::{
+            DfsReadRangesCompletion, DfsReadRangesFrame, DfsReadRangesHeader,
+        };
+        let mut frames = Vec::new();
+        for operation in &request.operations {
+            let (chunk, body) = objects
+                .get(&operation.chunk_id)
+                .ok_or_else(|| Status::not_found("fixture object"))?;
+            let start = operation.chunk_offset as usize;
+            let end = start + operation.length as usize;
+            let range = body
+                .get(start..end)
+                .ok_or_else(|| Status::invalid_argument("fixture range"))?;
+            let full = start == 0 && operation.length == chunk.length;
+            frames.push(DfsReadRangesFrame {
+                body: Some(dfs_read_ranges_frame::Body::Header(DfsReadRangesHeader {
+                    crc32c_table: Default::default(),
+                    read_id: request.read_id.clone(),
+                    attempt_id: request.attempt_id.clone(),
+                    operation_index: operation.operation_index,
+                    chunk_id: operation.chunk_id.clone(),
+                    chunk_offset: operation.chunk_offset,
+                    length: operation.length,
+                    source_copy_id: operation.source_copy_id.clone(),
+                    blake3_outboard: if full && request.include_blake3_outboard {
+                        wi6_encoded_outboard(body).into()
+                    } else {
+                        Default::default()
+                    },
+                })),
+            });
+            for data in range.chunks(STREAM_DATA_BYTES) {
+                frames.push(DfsReadRangesFrame {
+                    body: Some(dfs_read_ranges_frame::Body::Data(data.to_vec().into())),
+                });
+            }
+            frames.push(DfsReadRangesFrame {
+                body: Some(dfs_read_ranges_frame::Body::Completion(
+                    DfsReadRangesCompletion {
+                        crc32c_table: Default::default(),
+                        read_id: request.read_id.clone(),
+                        attempt_id: request.attempt_id.clone(),
+                        operation_index: operation.operation_index,
+                        source_copy_id: operation.source_copy_id.clone(),
+                        transferred_bytes: operation.length,
+                        range_checksum: blake3::hash(range).as_bytes().to_vec(),
+                        range_checksum_algorithm:
+                            afs_protocol::node_data::DfsDigestAlgorithm::Blake3 as i32,
+                    },
+                )),
+            });
+        }
+        Ok(frames)
     }
 
     #[cfg(feature = "dfs")]
@@ -5859,14 +6906,45 @@ mod tests {
         ) -> Result<Response<Self::ReadRangesStream>, Status> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let request = request.into_inner();
+            if let Some(objects) = &self.fetch_objects {
+                if let Some((target, gate)) = &self.fetch_gate
+                    && request.operations.iter().any(|operation| {
+                        (target.is_empty() || &operation.chunk_id == target)
+                            && objects.get(&operation.chunk_id).is_some_and(|(chunk, _)| {
+                                operation.chunk_offset == 0 && operation.length == chunk.length
+                            })
+                    })
+                {
+                    gate.entered
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    gate.changed.notify_waiters();
+                    loop {
+                        let changed = gate.changed.notified();
+                        tokio::pin!(changed);
+                        changed.as_mut().enable();
+                        if gate.release.load(std::sync::atomic::Ordering::Acquire) {
+                            break;
+                        }
+                        changed.await;
+                    }
+                }
+                let frames = fetch_fixture_frames(&request, objects)?;
+                return Ok(Response::new(Box::pin(tokio_stream::iter(
+                    frames.into_iter().map(Ok),
+                ))));
+            }
+
             let mut body = self.body.as_ref().clone();
-            if self.mode == 3 {
+            if matches!(self.mode, 3 | 11) {
                 body[0] ^= 1;
             }
             let (_, mut frames) = peer_disk_test_frames(&self.chunk, &body);
             for frame in &mut frames {
                 match &mut frame.body {
                     Some(dfs_read_ranges_frame::Body::Header(header)) => {
+                        if self.mode >= 9 {
+                            header.blake3_outboard = wi6_encoded_outboard(&self.body).into();
+                        }
                         header.read_id.clone_from(&request.read_id);
                         header.attempt_id.clone_from(&request.attempt_id);
                         header
@@ -5874,6 +6952,11 @@ mod tests {
                             .clone_from(&request.operations[0].source_copy_id);
                     }
                     Some(dfs_read_ranges_frame::Body::Completion(completion)) => {
+                        if self.mode == 14 {
+                            let mut checksum = completion.range_checksum.to_vec();
+                            checksum[0] ^= 1;
+                            completion.range_checksum = checksum;
+                        }
                         completion.read_id.clone_from(&request.read_id);
                         completion.attempt_id.clone_from(&request.attempt_id);
                         completion
@@ -5894,8 +6977,16 @@ mod tests {
                     vec![37; STREAM_DATA_BYTES + 1].into(),
                 ));
             }
+            if self.mode == 13 {
+                frames.retain(|frame| {
+                    !matches!(
+                        &frame.body,
+                        Some(dfs_read_ranges_frame::Body::Completion(_))
+                    )
+                });
+            }
             let mut frames: Vec<_> = frames.into_iter().map(Ok).collect();
-            if self.mode == 2 {
+            if matches!(self.mode, 2 | 12 | 16) {
                 frames.push(Err(Status::unavailable("late status after completion")));
             }
             Ok(Response::new(Box::pin(tokio_stream::iter(frames))))
@@ -5948,13 +7039,394 @@ mod tests {
     }
 
     #[cfg(feature = "dfs")]
+    struct FetchRpcCase {
+        _temp: tempfile::TempDir,
+        engine: Arc<crate::node::dfs_read::DfsReadEngine>,
+        cache: Arc<crate::node::peer_cache::DiskPeerCache>,
+        chunks: Vec<ChunkObject>,
+        gate: Arc<FetchRpcGate>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        source_calls: Arc<std::sync::atomic::AtomicUsize>,
+        registry: afs_metrics::Registry,
+        server: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+    }
+
+    #[cfg(feature = "dfs")]
+    async fn fetch_rpc_case(readahead: u64, gate_all: bool) -> FetchRpcCase {
+        use crate::node::dfs_read::{DfsReadConfig, DfsReadEngine, ReadSourceProvider};
+        struct Sources {
+            reply: crate::dfs::DfsChunkSourcesReply,
+            calls: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl ReadSourceProvider for Sources {
+            fn sources_for(
+                &self,
+                request: crate::dfs::DfsChunkSourcesRequest,
+            ) -> afs_error::Result<crate::dfs::DfsChunkSourcesReply> {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(crate::dfs::DfsChunkSourcesReply {
+                    revision: 1,
+                    chunks: self
+                        .reply
+                        .chunks
+                        .iter()
+                        .filter(|chunk| request.chunk_ids.contains(&chunk.chunk_id))
+                        .cloned()
+                        .collect(),
+                })
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let objects: std::collections::BTreeMap<_, _> = [17, 29]
+            .into_iter()
+            .map(|byte| {
+                let staged = crate::node::chunk::StagedChunk::new(
+                    crate::dfs::OperationId::new(format!("r7-rpc-{byte}")),
+                    vec![byte; 64 * 1024],
+                );
+                (
+                    staged.chunk.id.0.clone(),
+                    (staged.chunk.clone(), staged.bytes().to_vec()),
+                )
+            })
+            .collect();
+        let chunks: Vec<_> = [17, 29]
+            .into_iter()
+            .map(|byte| {
+                objects
+                    .values()
+                    .find(|(_, body)| body[0] == byte)
+                    .unwrap()
+                    .0
+                    .clone()
+            })
+            .collect();
+        let objects = Arc::new(objects);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let gate = Arc::new(FetchRpcGate::default());
+        let service = DiskStreamFixture {
+            chunk: chunks[0].clone(),
+            body: Arc::new(objects[&chunks[0].id.0].1.clone()),
+            mode: 0,
+            calls: calls.clone(),
+            fetch_objects: Some(objects),
+            fetch_gate: Some((
+                if gate_all {
+                    String::new()
+                } else {
+                    chunks[1].id.0.clone()
+                },
+                gate.clone(),
+            )),
+        };
+        let server = tokio::spawn(
+            Server::builder()
+                .add_service(
+                    afs_protocol::node_data::dfs_chunks_server::DfsChunksServer::new(service),
+                )
+                .serve_with_incoming(TcpListenerStream::new(listener)),
+        );
+        let registry = afs_metrics::Registry::new();
+        let metrics = ReadWorkMetrics::register(&registry).unwrap();
+        let pool = Arc::new(
+            PeerConnectionPool::new(
+                afs_transport::GrpcConfig::default(),
+                afs_transport::TlsConfig::Disabled,
+                1,
+            )
+            .unwrap()
+            .with_read_work_metrics(metrics),
+        );
+        let transfer = Arc::new(GrpcChunkTransfer::new(pool, Duration::from_secs(5)).unwrap());
+        let source_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sources = Sources {
+            calls: source_calls.clone(),
+            reply: crate::dfs::DfsChunkSourcesReply {
+                revision: 1,
+                chunks: chunks
+                    .iter()
+                    .map(|chunk| crate::dfs::ChunkSources {
+                        chunk_id: chunk.id.clone(),
+                        chunk: Some(chunk.clone()),
+                        allowed_ranges: vec![(0, chunk.length)],
+                        sources: vec![
+                            disk_stream_batch(chunk, endpoint.clone()).operations[0]
+                                .source
+                                .clone(),
+                        ],
+                    })
+                    .collect(),
+            },
+        };
+        let cache = Arc::new(
+            crate::node::peer_cache::DiskPeerCache::open(
+                crate::node::peer_cache::PeerCacheOptions {
+                    directory: temp.path().join("cache"),
+                    capacity_bytes: 1024 * 1024,
+                    namespace_id: crate::dfs::NamespaceId::new("test"),
+                },
+            )
+            .unwrap(),
+        );
+        let engine = Arc::new(
+            DfsReadEngine::new(
+                crate::dfs::NamespaceId::new("test"),
+                "reader".into(),
+                Arc::new(
+                    crate::node::chunk::LocalChunkStore::open(temp.path().join("local"), "reader")
+                        .unwrap(),
+                ),
+                Arc::new(sources),
+                transfer,
+                DfsReadConfig {
+                    readahead_max_bytes: readahead,
+                    ..DfsReadConfig::default()
+                },
+            )
+            .with_read_authority(Arc::new(crate::node::dfs_read::LocalReadAuthority::new(
+                1,
+                std::time::Instant::now() + Duration::from_secs(30),
+            )))
+            .with_peer_cache(cache.clone()),
+        );
+        FetchRpcCase {
+            _temp: temp,
+            engine,
+            cache,
+            chunks,
+            gate,
+            calls,
+            source_calls,
+            registry,
+            server,
+        }
+    }
+
+    #[cfg(feature = "dfs")]
+    fn fetch_case_batch(case: &FetchRpcCase, cross: bool) -> crate::node::dfs_read::ReadBatch {
+        use crate::node::dfs_read::{ChunkReadOp, ReadBatch};
+        ReadBatch {
+            file_version_id: Some(crate::dfs::FileVersionId::new("version")),
+            layout_root_id: crate::dfs::LayoutRootId::new("layout"),
+            lookahead: if cross {
+                Vec::new()
+            } else {
+                vec![case.chunks[1].id.clone()]
+            },
+            ops: if cross {
+                case.chunks
+                    .iter()
+                    .enumerate()
+                    .map(|(index, chunk)| ChunkReadOp {
+                        chunk_id: chunk.id.clone(),
+                        chunk_offset: if index == 0 { chunk.length - 8 } else { 0 },
+                        length: 8,
+                        output_offset: index * 8,
+                    })
+                    .collect()
+            } else {
+                vec![ChunkReadOp {
+                    chunk_id: case.chunks[0].id.clone(),
+                    chunk_offset: 0,
+                    length: 8,
+                    output_offset: 0,
+                }]
+            },
+        }
+    }
+
+    #[cfg(feature = "dfs")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn r7_actual_rpc_cross_object_read_overlaps_and_keeps_output_atomic() {
+        let mut case = fetch_rpc_case(0, true).await;
+        let batch = fetch_case_batch(&case, true);
+        let engine = case.engine.clone();
+        let reading = tokio::task::spawn_blocking(move || {
+            let mut out = [0; 16];
+            engine
+                .read_batch_native_into_private(&batch, &mut out)
+                .map(|()| out)
+        });
+        let overlapped = tokio::time::timeout(Duration::from_secs(3), async {
+            while case.gate.entered.load(std::sync::atomic::Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .is_ok();
+        let while_active = afs_metrics::encode_text(&case.registry).unwrap();
+        case.gate
+            .release
+            .store(true, std::sync::atomic::Ordering::Release);
+        case.gate.changed.notify_waiters();
+        let output = reading.await.unwrap().unwrap();
+        assert!(
+            overlapped,
+            "both full-object RPCs must enter before either is released"
+        );
+        assert!(
+            while_active.contains("afs_dfs_peer_disk_cache_stream_reserved_bytes 4194304\n"),
+            "{while_active}"
+        );
+        assert!(
+            while_active.contains("afs_dfs_peer_disk_cache_stream_frame_bytes 524288\n"),
+            "{while_active}"
+        );
+        assert_eq!(&output[..8], &[17; 8]);
+        assert_eq!(&output[8..], &[29; 8]);
+        assert_eq!(case.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(case.cache.stats().unwrap().entries, 2);
+        case.engine
+            .object_fetcher()
+            .unwrap()
+            .shutdown()
+            .await
+            .unwrap();
+        case.server.abort();
+        let _ = (&mut case.server).await;
+    }
+
+    #[cfg(feature = "dfs")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn r7_actual_rpc_prefetch_is_sink_only_and_cancel_really_joins() {
+        for mode in ["success", "global", "scope", "expiry"] {
+            let mut case = fetch_rpc_case(8 * 1024 * 1024, false).await;
+            let batch = fetch_case_batch(&case, false);
+            let engine = case.engine.clone();
+            let read_batch = batch.clone();
+            assert_eq!(
+                tokio::task::spawn_blocking(move || engine.read_batch_native_owned(&read_batch, 8))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap(),
+                [17; 8]
+            );
+            let engine = case.engine.clone();
+            let valid = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let scope_valid = valid.clone();
+            let original_deadline = std::time::Instant::now() + Duration::from_millis(500);
+            tokio::task::spawn_blocking(move || {
+                engine.prefetch_cached(
+                    &batch,
+                    1,
+                    Arc::new(move || {
+                        if !scope_valid.load(std::sync::atomic::Ordering::Acquire)
+                            || (mode == "expiry" && std::time::Instant::now() >= original_deadline)
+                        {
+                            return Err(afs_error::Error::coded(
+                                afs_error::IO_UNAVAILABLE,
+                                "test handle scope or original deadline retired",
+                            ));
+                        }
+                        Ok(())
+                    }),
+                )
+            })
+            .await
+            .unwrap();
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while case.gate.entered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+            if mode == "global" {
+                case.engine.object_fetcher().unwrap().close();
+            } else if mode == "success" {
+                case.gate
+                    .release
+                    .store(true, std::sync::atomic::Ordering::Release);
+                case.gate.changed.notify_waiters();
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    while case.cache.stats().unwrap().entries < 2 {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .unwrap();
+            }
+            if mode == "scope" {
+                valid.store(false, std::sync::atomic::Ordering::Release);
+            }
+            // Do not call global shutdown to make scope/expiry cancellation
+            // pass. The quiet server remains gated until this job really ends.
+            let retired_without_shutdown = if matches!(mode, "scope" | "expiry") {
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while case.cache.has_fill_flight_for_test() {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .is_ok()
+            } else {
+                true
+            };
+            if !retired_without_shutdown {
+                case.gate
+                    .release
+                    .store(true, std::sync::atomic::Ordering::Release);
+                case.gate.changed.notify_waiters();
+            }
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                case.engine.object_fetcher().unwrap().shutdown(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                case.cache.stats().unwrap().entries,
+                if mode == "success" { 2 } else { 1 }
+            );
+            assert_eq!(case.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+            assert_eq!(
+                case.source_calls.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "prefetch must use the first R-1 lookup only"
+            );
+            let text = afs_metrics::encode_text(&case.registry).unwrap();
+            assert!(
+                text.contains("afs_dfs_peer_disk_cache_stream_reserved_bytes 0\n"),
+                "{text}"
+            );
+            assert!(
+                text.contains("afs_dfs_peer_disk_cache_stream_frame_bytes 0\n"),
+                "{text}"
+            );
+            assert!(
+                text.contains("afs_dfs_fetch_resources{resource=\"jobs\"} 0\n"),
+                "{text}"
+            );
+            case.gate
+                .release
+                .store(true, std::sync::atomic::Ordering::Release);
+            case.gate.changed.notify_waiters();
+            case.server.abort();
+            let _ = (&mut case.server).await;
+            assert!(
+                retired_without_shutdown,
+                "{mode}: quiet RPC must join before global shutdown"
+            );
+        }
+    }
+
+    #[cfg(feature = "dfs")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn peer_stream_actual_rpc_seals_only_after_eof_and_drains_on_failure() {
         use crate::node::{
             dfs_read::ChunkTransfer,
             peer_cache::{DiskPeerCache, PeerCacheOptions},
         };
-        for mode in 0..9 {
+        // 9/10: peer proof, including disabled disk cache; 11: wrong body;
+        // 12: late transport error; 13: missing Completion; 14: false wire root;
+        // 15/16: exhausted proof budget, with success/late transport failure.
+        for mode in 0..17 {
+            let success = matches!(mode, 0 | 1 | 5 | 9 | 10 | 15);
+            let consumer_root = mode < 15;
             let staged = crate::node::chunk::StagedChunk::new(
                 crate::dfs::OperationId::new("actual-stream"),
                 vec![
@@ -5976,6 +7448,8 @@ mod tests {
                 body: Arc::new(staged.bytes().to_vec()),
                 mode,
                 calls: calls.clone(),
+                fetch_objects: None,
+                fetch_gate: None,
             };
             let server = tokio::spawn(
                 Server::builder()
@@ -6008,11 +7482,14 @@ mod tests {
             tokio::task::spawn_blocking(move || {
                 assert!(transfer.supports_verified_object_sink());
                 let directory = tempfile::tempdir().unwrap();
-                let cache = DiskPeerCache::open(PeerCacheOptions {
-                    directory: directory.path().join("cache"),
-                    capacity_bytes: if mode == 1 { 4096 } else { 8 * 1024 * 1024 },
-                    namespace_id: crate::dfs::NamespaceId::new("test"),
-                })
+                let cache = DiskPeerCache::open_with_outboard_budget(
+                    PeerCacheOptions {
+                        directory: directory.path().join("cache"),
+                        capacity_bytes: if matches!(mode, 1 | 10) { 4096 } else { 8 * 1024 * 1024 },
+                        namespace_id: crate::dfs::NamespaceId::new("test"),
+                    },
+                    OutboardBudget::new(if consumer_root { 1024 * 1024 } else { 0 }),
+                )
                 .unwrap();
                 let mut out = vec![0; 32 * 1024];
                 {
@@ -6028,10 +7505,17 @@ mod tests {
                         &mut out,
                         &mut sink,
                     );
-                    if mode <= 1 || mode == 5 {
+                    if success {
                         let proof = result.unwrap().unwrap();
                         assert!(proof.private_output().iter().all(|byte| *byte == 37));
-                        assert_eq!(sink.commit(proof).unwrap(), mode != 1);
+                        // A zero metadata ledger cannot retain even the cache
+                        // index/entry controls. The same RPC still completes
+                        // full-root verification and private range delivery.
+                        assert_eq!(
+                            sink.commit(proof).unwrap(),
+                            !matches!(mode, 1 | 10 | 15),
+                            "optional cache installation, mode {mode}"
+                        );
                     } else {
                         assert!(
                             result.is_err(),
@@ -6041,8 +7525,13 @@ mod tests {
                 }
                 assert_eq!(
                     cache.stats().unwrap().entries,
-                    usize::from(mode == 0 || mode == 5)
+                    usize::from(matches!(mode, 0 | 5 | 9)),
+                    "only budget-admitted healthy entries are retained, mode {mode}"
                 );
+                if mode >= 15 {
+                    assert_eq!(cache.proof_budget().used(), 0);
+                    assert_eq!(cache.proof_budget().resident_used(), 0);
+                }
                 assert_eq!(
                     calls.load(std::sync::atomic::Ordering::SeqCst),
                     1,
@@ -6055,10 +7544,12 @@ mod tests {
                 let record = &diagnostics.records[0];
                 assert_eq!(record.stage, ReadDiagnosticStage::PeerObject);
                 assert!(record.completed);
-                assert_eq!(record.success, mode <= 1 || mode == 5);
+                assert_eq!(record.success, success, "mode {mode}");
                 assert!(record.end_ns >= record.start_ns);
                 assert!(record.consumer_before_body_ns <= record.consumer_ns);
                 if record.success {
+                    assert!(record.first_data_ns >= record.start_ns);
+                    assert!(record.body_end_ns >= record.first_data_ns);
                     assert!(record.body_end_ns >= record.start_ns);
                     assert!(record.eof_ns >= record.body_end_ns);
                     assert!(record.end_ns >= record.eof_ns);
@@ -6070,30 +7561,21 @@ mod tests {
                     assert_eq!(work.range_extract.bytes, out.len() as u64);
                     assert_eq!(
                         work.root_blake3.calls, 0,
-                        "native pipeline root belongs to the producer, not the consumer"
+                        "plain consumer hash is absent; the selected root owner authenticates the body"
                     );
                     assert_eq!(
                         work.root_blake3.bytes, 0,
-                        "the consumer must not scan the root a second time"
+                        "outboard work owns the consumer root without another plain hasher"
                     );
-                    assert_eq!(record.producer_root_work.calls, blocks + 1);
-                    assert_eq!(record.producer_root_work.bytes, staged.bytes().len() as u64);
+                    assert_eq!(record.producer_root_work.calls, if consumer_root { 0 } else { blocks + 1 });
+                    assert_eq!(record.producer_root_work.bytes, if consumer_root { 0 } else { staged.bytes().len() as u64 });
                     assert_eq!(record.interval_overflow, 0);
                     assert!(
-                        record.root_segment_overlap_ns.is_some(),
-                        "complete diagnostic lanes reconcile after join"
+                        record.root_segment_overlap_ns.is_none(),
+                        "one root owner leaves no duplicate producer/consumer root overlap"
                     );
-                    assert_eq!(work.segment_blake3.bytes, staged.bytes().len() as u64);
-                    assert_eq!(
-                        work.segment_blake3.calls,
-                        blocks
-                            + u64::from(
-                                !staged
-                                    .bytes()
-                                    .len()
-                                    .is_multiple_of(PEER_CACHE_SEGMENT_BYTES)
-                            )
-                    );
+                    assert_eq!(work.segment_blake3.bytes, if consumer_root { staged.bytes().len() as u64 } else { 0 });
+                    assert_eq!(work.segment_blake3.calls, if consumer_root { blocks + 1 } else { 0 });
                     let measured = work.sink_write.wall_ns
                         + work.range_extract.wall_ns
                         + work.root_blake3.wall_ns
@@ -6104,7 +7586,7 @@ mod tests {
                     );
                 }
                 let families = registry.gather();
-                if mode <= 1 || mode == 5 {
+                if success {
                     let events = families
                         .iter()
                         .find(|family| family.name() == "afs_dfs_peer_read_events_total")
@@ -6122,6 +7604,7 @@ mod tests {
                             .map(|metric| metric.get_counter().get_value())
                             .sum::<f64>()
                     };
+                    assert_eq!(event_count("root_fallback"), if consumer_root { 0.0 } else { 1.0 });
                     assert_eq!(
                         event_count("stream_frame"),
                         (staged.bytes().len().div_ceil(STREAM_DATA_BYTES) + 2) as f64,
@@ -6195,92 +7678,131 @@ mod tests {
     #[test]
     fn peer_stream_joined_root_receipt_requires_completion_meta_and_sink_identity() {
         use crate::node::peer_cache::{DiskPeerCache, PeerCacheOptions};
-        for mode in 0..6 {
-            let staged = crate::node::chunk::StagedChunk::new(
-                crate::dfs::OperationId::new("joined-root"),
-                vec![37; 512 * 1024],
-            );
-            let directory = tempfile::tempdir().unwrap();
-            let open_cache = |name| {
-                DiskPeerCache::open(PeerCacheOptions {
-                    directory: directory.path().join(name),
-                    capacity_bytes: 8 * 1024 * 1024,
-                    namespace_id: crate::dfs::NamespaceId::new("test"),
-                })
-                .unwrap()
-            };
-            let cache = open_cache("cache");
-            let other_cache = open_cache("other");
-            let mut operation = cache.operation().unwrap();
-            let mut other_operation = other_cache.operation().unwrap();
-            let mut sink = operation.begin_stream(&staged.chunk).unwrap();
-            let other_sink = other_operation.begin_stream(&staged.chunk).unwrap();
-            let mut out = vec![0; 32 * 1024];
-            let (request, mut frames) = peer_disk_test_frames(&staged.chunk, staged.bytes());
-            if mode == 5 {
-                frames.pop();
-            }
-            let binding = sink.bind_output(13, &out).unwrap();
-            let mut producer = PeerRootProducer::new(
-                staged.chunk.length,
-                binding.clone(),
-                None,
-                std::time::Instant::now() + Duration::from_secs(5),
-            );
-            let mut decoder =
-                ReadFrameDecoder::for_producer_object(&request, &staged.chunk).unwrap();
-            decoder.stream_binding = Some(binding);
-            let mut offset = 0;
-            for frame in frames {
-                if let Some(dfs_read_ranges_frame::Body::Data(data)) = &frame.body {
-                    producer.update(offset, data, None).unwrap();
-                    offset += data.len();
+        for consumer_tree in [false, true] {
+            for mode in 0..6 {
+                let staged = crate::node::chunk::StagedChunk::new(
+                    crate::dfs::OperationId::new("joined-root"),
+                    vec![37; 512 * 1024],
+                );
+                let directory = tempfile::tempdir().unwrap();
+                let open_cache = |name| {
+                    DiskPeerCache::open(PeerCacheOptions {
+                        directory: directory.path().join(name),
+                        capacity_bytes: 8 * 1024 * 1024,
+                        namespace_id: crate::dfs::NamespaceId::new("test"),
+                    })
+                    .unwrap()
+                };
+                let cache = open_cache("cache");
+                let other_cache = open_cache("other");
+                let mut operation = cache.operation().unwrap();
+                let mut other_operation = other_cache.operation().unwrap();
+                let mut sink = operation.begin_stream(&staged.chunk).unwrap();
+                let proof_budget = sink.proof_budget();
+                let proof_baseline = proof_budget.used();
+                let other_sink = other_operation.begin_stream(&staged.chunk).unwrap();
+                let mut out = vec![0; 32 * 1024];
+                let (request, mut frames) = peer_disk_test_frames(&staged.chunk, staged.bytes());
+                if consumer_tree {
+                    let Some(dfs_read_ranges_frame::Body::Header(header)) = &mut frames[0].body
+                    else {
+                        panic!("header");
+                    };
+                    header.blake3_outboard = wi6_encoded_outboard(staged.bytes()).into();
                 }
-                consume_peer_frame_into_sink(
-                    &mut decoder,
-                    frame,
-                    13,
-                    &mut out,
-                    &mut sink,
+                if mode == 5 {
+                    frames.pop();
+                }
+                let binding = sink.bind_output(13, &out).unwrap();
+                let mut producer = PeerRootProducer::new(
+                    staged.chunk.length,
+                    binding.clone(),
+                    None,
                     std::time::Instant::now() + Duration::from_secs(5),
-                    PeerConsumerObservation::default(),
                 )
-                .unwrap();
-                if let Some(active) = &decoder.active {
+                .with_outboard_context(staged.chunk.clone(), sink.proof_budget());
+                let mut decoder =
+                    ReadFrameDecoder::for_producer_object(&request, &staged.chunk).unwrap();
+                decoder.stream_binding = Some(binding);
+                let mut offset = 0;
+                for mut frame in frames {
+                    if let Some(dfs_read_ranges_frame::Body::Header(header)) = &mut frame.body {
+                        producer.accept_outboard_header(header, None).unwrap();
+                        decoder
+                            .install_producer_outboard(producer.outboard_builder.take())
+                            .unwrap();
+                    }
+                    if let Some(dfs_read_ranges_frame::Body::Data(data)) = &frame.body {
+                        producer.update(offset, data, None).unwrap();
+                        offset += data.len();
+                    }
+                    consume_peer_frame_into_sink(
+                        &mut decoder,
+                        frame,
+                        13,
+                        &mut out,
+                        &mut sink,
+                        std::time::Instant::now() + Duration::from_secs(5),
+                        PeerConsumerObservation::default(),
+                    )
+                    .unwrap();
+                    if let Some(active) = &decoder.active {
+                        assert!(
+                            active.checksum.is_none(),
+                            "consumer has no duplicate plain range hasher; its outboard tree is independently verified"
+                        );
+                    }
+                }
+                if mode == 1 {
                     assert!(
-                        active.checksum.is_none(),
-                        "consumer has no whole-object root owner"
+                        decoder.finish_stream(&staged.chunk).is_err(),
+                        "completion alone cannot substitute for joined root/EOF"
+                    );
+                    assert_eq!(
+                        proof_budget.used(),
+                        proof_baseline,
+                        "unjoined metadata must retire without a proof"
+                    );
+                    continue;
+                }
+                let mut receipt = producer.finish_after_eof().unwrap();
+                if mode == 2 {
+                    receipt.length -= 1;
+                }
+                if mode == 3 {
+                    match &mut receipt.digest {
+                        PeerRootDigest::Producer(digest) => digest[0] ^= 1,
+                        PeerRootDigest::ConsumerTree => {
+                            receipt.digest = PeerRootDigest::Producer([0; 32])
+                        }
+                    }
+                }
+                if mode == 4 {
+                    receipt.binding = other_sink.bind_output(13, &out).unwrap();
+                }
+                let proof = decoder.finish_stream_from_producer(
+                    &staged.chunk,
+                    receipt,
+                    &sink,
+                    13,
+                    &out,
+                    PeerConsumerObservation::default(),
+                );
+                if mode == 0 {
+                    let completed = sink.seal_completed(proof.unwrap(), 13, &out).unwrap();
+                    assert!(completed.private_output().iter().all(|byte| *byte == 37));
+                    assert!(sink.commit(completed).unwrap());
+                } else {
+                    assert!(
+                        proof.is_err(),
+                        "wrong/truncated/missing receipt evidence cannot mint output"
+                    );
+                    assert_eq!(
+                        proof_budget.used(),
+                        proof_baseline,
+                        "failed join must retire consumer metadata"
                     );
                 }
-            }
-            if mode == 1 {
-                assert!(
-                    decoder.finish_stream(&staged.chunk).is_err(),
-                    "completion alone cannot substitute for joined root/EOF"
-                );
-                continue;
-            }
-            let mut receipt = producer.finish_after_eof().unwrap();
-            if mode == 2 {
-                receipt.length -= 1;
-            }
-            if mode == 3 {
-                receipt.digest[0] ^= 1;
-            }
-            if mode == 4 {
-                receipt.binding = other_sink.bind_output(13, &out).unwrap();
-            }
-            let proof =
-                decoder.finish_stream_from_producer(&staged.chunk, receipt, &sink, 13, &out);
-            if mode == 0 {
-                let completed = sink.seal_completed(proof.unwrap(), 13, &out).unwrap();
-                assert!(completed.private_output().iter().all(|byte| *byte == 37));
-                assert!(sink.commit(completed).unwrap());
-            } else {
-                assert!(
-                    proof.is_err(),
-                    "wrong/truncated/missing receipt evidence cannot mint output"
-                );
             }
         }
     }
@@ -6339,6 +7861,46 @@ mod tests {
             complete.finish_after_eof().is_err(),
             "expired deadline cannot mint a complete receipt"
         );
+    }
+
+    #[cfg(feature = "dfs")]
+    #[tokio::test]
+    async fn r7_background_admission_first_poll_never_waits_for_metadata_locks() {
+        struct Wake;
+        impl std::task::Wake for Wake {
+            fn wake(self: Arc<Self>) {}
+        }
+        let waker = std::task::Waker::from(Arc::new(Wake));
+        let mut context = std::task::Context::from_waker(&waker);
+        let pool = PeerConnectionPool::new(
+            afs_transport::GrpcConfig::default(),
+            afs_transport::TlsConfig::Disabled,
+            1,
+        )
+        .unwrap();
+        let channels = pool.state.lock().await;
+        let mut background =
+            Box::pin(pool.acquire_stream_work_mode("peer", 1, "http://127.0.0.1:9", true));
+        assert!(matches!(
+            std::future::Future::poll(background.as_mut(), &mut context),
+            std::task::Poll::Ready(Ok(None))
+        ));
+        drop(background);
+        let mut foreground =
+            Box::pin(pool.acquire_stream_work_mode("peer", 1, "http://127.0.0.1:9", false));
+        assert!(std::future::Future::poll(foreground.as_mut(), &mut context).is_pending());
+        drop(channels);
+        let active = foreground.await.unwrap().unwrap();
+        drop(active);
+        let admission = pool.stream_work.state.lock().unwrap();
+        let mut background =
+            Box::pin(pool.acquire_stream_work_mode("peer", 1, "http://127.0.0.1:9", true));
+        assert!(matches!(
+            std::future::Future::poll(background.as_mut(), &mut context),
+            std::task::Poll::Ready(Ok(None))
+        ));
+        drop(background);
+        drop(admission);
     }
 
     #[cfg(feature = "dfs")]
@@ -7344,6 +8906,7 @@ mod tests {
     #[cfg(feature = "dfs")]
     fn range_request() -> DfsReadRangesRequest {
         DfsReadRangesRequest {
+            include_blake3_outboard: false,
             read_id: "read".into(),
             attempt_id: "attempt".into(),
             file_version_id: "version".into(),
@@ -7374,6 +8937,7 @@ mod tests {
         vec![
             DfsReadRangesFrame {
                 body: Some(dfs_read_ranges_frame::Body::Header(DfsReadRangesHeader {
+                    crc32c_table: Default::default(),
                     read_id: request.read_id.clone(),
                     attempt_id: request.attempt_id.clone(),
                     operation_index: op.operation_index,
@@ -7381,6 +8945,7 @@ mod tests {
                     chunk_offset: op.chunk_offset,
                     length: op.length,
                     source_copy_id: op.source_copy_id.clone(),
+                    blake3_outboard: Default::default(),
                 })),
             },
             DfsReadRangesFrame {
@@ -7391,6 +8956,7 @@ mod tests {
             DfsReadRangesFrame {
                 body: Some(dfs_read_ranges_frame::Body::Completion(
                     DfsReadRangesCompletion {
+                        crc32c_table: Default::default(),
                         read_id: request.read_id.clone(),
                         attempt_id: request.attempt_id.clone(),
                         operation_index: op.operation_index,
@@ -7403,6 +8969,143 @@ mod tests {
                 )),
             },
         ]
+    }
+
+    #[cfg(feature = "dfs")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dfs_peer_receive_cap_reduces_actual_http2_data_frames() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut observations = Vec::new();
+        for production in [false, true] {
+            let payload = vec![37; 128 * 1024];
+            let chunk = crate::node::chunk::StagedChunk::new(
+                crate::dfs::OperationId::new("dfs-peer-receive-frames"),
+                payload.clone(),
+            )
+            .chunk;
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let server_address = listener.local_addr().unwrap();
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let fixture = DiskStreamFixture {
+                chunk: chunk.clone(),
+                body: Arc::new(payload.clone()),
+                mode: 0,
+                calls: calls.clone(),
+                fetch_objects: None,
+                fetch_gate: None,
+            };
+            let (stop_server, server_done) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(
+                Server::builder()
+                    .add_service(
+                        afs_protocol::node_data::dfs_chunks_server::DfsChunksServer::new(fixture),
+                    )
+                    .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
+                        let _ = server_done.await;
+                    }),
+            );
+
+            let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}", proxy_listener.local_addr().unwrap());
+            let data_frames = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let frames = data_frames.clone();
+            let (stop_proxy, proxy_done) = tokio::sync::oneshot::channel();
+            let proxy = tokio::spawn(async move {
+                let (client, _) = proxy_listener.accept().await.unwrap();
+                let upstream = tokio::net::TcpStream::connect(server_address)
+                    .await
+                    .unwrap();
+                let (mut client_read, mut client_write) = client.into_split();
+                let (mut upstream_read, mut upstream_write) = upstream.into_split();
+                let responses = async {
+                    loop {
+                        let mut header = [0; 9];
+                        if let Err(error) = upstream_read.read_exact(&mut header).await {
+                            assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+                            break;
+                        }
+                        let length = (usize::from(header[0]) << 16)
+                            | (usize::from(header[1]) << 8)
+                            | usize::from(header[2]);
+                        assert!(length <= 2 * 1024 * 1024);
+                        let mut body = vec![0; length];
+                        upstream_read.read_exact(&mut body).await.unwrap();
+                        let stream_id =
+                            u32::from_be_bytes([header[5] & 0x7f, header[6], header[7], header[8]]);
+                        if header[3] == 0 && stream_id != 0 && length != 0 {
+                            frames.lock().unwrap().push(length);
+                        }
+                        client_write.write_all(&header).await.unwrap();
+                        client_write.write_all(&body).await.unwrap();
+                    }
+                };
+                tokio::select! {
+                    result = tokio::io::copy(&mut client_read, &mut upstream_write) => { result.unwrap(); }
+                    () = responses => {}
+                    _ = proxy_done => {}
+                }
+            });
+
+            let config = afs_transport::GrpcConfig::default();
+            assert_eq!(config.initial_connection_window_size, 2 * 1024 * 1024);
+            assert_eq!(config.initial_stream_window_size, 2 * 1024 * 1024);
+            let pool =
+                PeerConnectionPool::new(config.clone(), afs_transport::TlsConfig::Disabled, 1)
+                    .unwrap();
+            let channel = if production {
+                pool.channel("node-a", 1, &endpoint).await.unwrap()
+            } else {
+                config
+                    .configure_client(Endpoint::from_shared(endpoint).unwrap())
+                    .max_frame_size(16 * 1024)
+                    .connect_lazy()
+            };
+            let mut client =
+                afs_protocol::node_data::dfs_chunks_client::DfsChunksClient::new(channel);
+            let mut request = range_request();
+            request.operations.truncate(1);
+            request.operations[0].chunk_id = chunk.id.0;
+            request.operations[0].length = payload.len() as u64;
+            let stream = client
+                .read_ranges(request.clone())
+                .await
+                .unwrap()
+                .into_inner();
+            let mut output = vec![0; payload.len()];
+            consume_peer_read_stream(&request, None, &mut output, stream, None, None)
+                .await
+                .unwrap();
+            assert_eq!(output, payload);
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            observations.push(data_frames.lock().unwrap().clone());
+
+            drop(client);
+            drop(pool);
+            let _ = stop_proxy.send(());
+            tokio::time::timeout(Duration::from_secs(3), proxy)
+                .await
+                .unwrap()
+                .unwrap();
+            let _ = stop_server.send(());
+            tokio::time::timeout(Duration::from_secs(3), server)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        }
+
+        eprintln!(
+            "actual HTTP2 DATA payload lengths: control={:?}, production={:?}",
+            observations[0], observations[1]
+        );
+        assert!(observations[0].iter().all(|length| *length <= 16 * 1024));
+        assert!(observations[1].len() < observations[0].len());
+        assert!(observations[1].iter().any(|length| *length > 16 * 1024));
+        assert_eq!(
+            observations[0].iter().sum::<usize>(),
+            observations[1].iter().sum::<usize>()
+        );
     }
 
     #[cfg(feature = "dfs")]
@@ -7421,6 +9124,7 @@ mod tests {
         )
         .chunk;
         let mut request = range_request();
+        request.include_blake3_outboard = true;
         request.operations.truncate(1);
         request.operations[0].chunk_id = chunk.id.0.clone();
         request.operations[0].length = chunk.length;
@@ -7433,6 +9137,7 @@ mod tests {
         frames.push(DfsReadRangesFrame {
             body: Some(dfs_read_ranges_frame::Body::Completion(
                 DfsReadRangesCompletion {
+                    crc32c_table: Default::default(),
                     read_id: request.read_id.clone(),
                     attempt_id: request.attempt_id.clone(),
                     operation_index: 0,
@@ -7448,9 +9153,504 @@ mod tests {
     }
 
     #[cfg(feature = "dfs")]
+    fn wi6_encoded_outboard(body: &[u8]) -> Vec<u8> {
+        crate::node::chunk::outboard::build_borrowed(body, &OutboardBudget::new(1024 * 1024))
+            .outboard
+            .unwrap()
+            .encoded()
+            .to_vec()
+    }
+
+    #[cfg(feature = "dfs")]
+    fn wi6_frames_with_outboard(
+        body: &[u8],
+        encoded: &[u8],
+    ) -> (
+        ChunkObject,
+        DfsReadRangesRequest,
+        Vec<afs_protocol::node_data::DfsReadRangesFrame>,
+    ) {
+        let (chunk, request, mut frames) = verified_object_frames(body);
+        let Some(dfs_read_ranges_frame::Body::Header(header)) = &mut frames[0].body else {
+            panic!("header");
+        };
+        header.blake3_outboard = encoded.to_vec().into();
+        (chunk, request, frames)
+    }
+
+    #[cfg(feature = "dfs")]
+    #[test]
+    fn wi6_peer_outboard_binds_actual_body_and_moves_shared_budget_until_last_owner() {
+        let body = vec![71; 96 * 1024 + 17];
+        let encoded = wi6_encoded_outboard(&body);
+        let (chunk, request, frames) = wi6_frames_with_outboard(&body, &encoded);
+        let budget = OutboardBudget::new(1024 * 1024);
+        let registry = afs_metrics::Registry::new();
+        let metrics = ReadWorkMetrics::register(&registry).unwrap();
+        let mut decoder = ReadFrameDecoder::for_object(&request, &chunk)
+            .unwrap()
+            .with_outboard_budget(Some(budget.clone()));
+        decoder.work_metrics = Some(metrics);
+        let mut output = vec![0; body.len()];
+        for frame in frames {
+            decoder.accept(frame, &mut output).unwrap();
+        }
+        let proof = decoder.finish_object(&output).unwrap();
+        assert_eq!(proof.bytes(), body);
+        assert_eq!(proof.root_digest(), &chunk.content_digest.bytes);
+        let outboard = proof.into_outboard().unwrap();
+        assert_eq!(outboard.encoded(), encoded);
+        assert!(budget.used() >= ChunkOutboard::resident_charge(encoded.len()).unwrap());
+        let retained = outboard.clone();
+        drop(outboard);
+        assert!(
+            budget.used() > 0,
+            "cache/slow holders keep the same metadata lease"
+        );
+        drop(retained);
+        assert_eq!(budget.used(), 0);
+        let text = afs_metrics::encode_text(&registry).unwrap();
+        assert!(
+            text.contains(&format!(
+                "afs_dfs_read_hash_bytes_total{{stage=\"outboard_body_hash\"}} {}\n",
+                body.len()
+            )),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "afs_dfs_read_copy_bytes_total{{stage=\"peer_outboard_metadata\"}} {}\n",
+                encoded.len()
+            )),
+            "{text}"
+        );
+    }
+
+    #[cfg(feature = "dfs")]
+    #[test]
+    fn wi6_peer_outboard_rejects_shape_cv_replay_and_partial_capabilities() {
+        let body = vec![71; 96 * 1024 + 17];
+        let encoded = wi6_encoded_outboard(&body);
+        for mode in 0..6 {
+            let mut supplied = encoded.clone();
+            match mode {
+                0 => supplied[0] ^= 1, // unknown format
+                1 => {
+                    supplied.pop();
+                } // truncated parent CVs
+                2 => supplied.resize(8193, 0),
+                3 => supplied[64] ^= 1, // valid shape, wrong body-bound parent
+                _ => {}
+            }
+            let (mut chunk, request, frames) = wi6_frames_with_outboard(&body, &supplied);
+            if mode == 4 {
+                chunk.content_digest.bytes[0] ^= 1;
+            }
+            let budget = OutboardBudget::new(if mode == 5 { 0 } else { 1024 * 1024 });
+            if mode == 5 {
+                // Even a full pool cannot suppress validation of the fixed header.
+                let mut malformed = frames;
+                let Some(dfs_read_ranges_frame::Body::Header(header)) = &mut malformed[0].body
+                else {
+                    panic!("header");
+                };
+                header.blake3_outboard = vec![0; 64].into();
+                let mut decoder = ReadFrameDecoder::for_object(&request, &chunk)
+                    .unwrap()
+                    .with_outboard_budget(Some(budget.clone()));
+                assert!(
+                    decoder
+                        .accept(malformed.remove(0), &mut vec![0; body.len()])
+                        .is_err()
+                );
+                assert_eq!(budget.used(), 0);
+                continue;
+            }
+            let mut output = vec![0; body.len()];
+            let mut decoder = ReadFrameDecoder::for_object(&request, &chunk)
+                .unwrap()
+                .with_outboard_budget(Some(budget.clone()));
+            let rejected = match frames
+                .into_iter()
+                .try_for_each(|frame| decoder.accept(frame, &mut output))
+            {
+                Err(_) => {
+                    drop(decoder);
+                    true
+                }
+                Ok(()) => decoder.finish_object(&output).is_err(),
+            };
+            assert!(rejected, "mode {mode}");
+            assert_eq!(budget.used(), 0, "rejected proof lease must drain");
+        }
+        let mut request = range_request();
+        request.operations.truncate(1);
+        let mut frame = range_frames(&request, 0).remove(0);
+        let Some(dfs_read_ranges_frame::Body::Header(header)) = &mut frame.body else {
+            panic!("header");
+        };
+        header.blake3_outboard = encoded.into();
+        let mut decoder = ReadFrameDecoder::new(&request);
+        let mut output = [99];
+        assert!(decoder.accept(frame, &mut output).is_err());
+        assert_eq!(
+            output,
+            [99],
+            "partial proof rejection must precede body writes"
+        );
+    }
+
+    #[cfg(feature = "dfs")]
+    #[test]
+    fn wi6_peer_producer_retires_wire_backing_and_keeps_standard_root() {
+        use crate::node::peer_cache::{DiskPeerCache, PeerCacheOptions};
+        let body = vec![47; 2 * STREAM_FRAME_BACKING_BYTES + 31];
+        let encoded = wi6_encoded_outboard(&body);
+        let (chunk, request, mut frames) = wi6_frames_with_outboard(&body, &encoded);
+        let directory = tempfile::tempdir().unwrap();
+        let cache = DiskPeerCache::open(PeerCacheOptions {
+            directory: directory.path().join("cache"),
+            capacity_bytes: 8 * 1024 * 1024,
+            namespace_id: crate::dfs::NamespaceId::new("test"),
+        })
+        .unwrap();
+        let mut operation = cache.operation().unwrap();
+        let mut sink = operation.begin_stream(&chunk).unwrap();
+        let mut output = [0; 31];
+        let binding = sink.bind_output(0, &output).unwrap();
+        let budget = sink.proof_budget();
+        let baseline = budget.used();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let registry = afs_metrics::Registry::new();
+        let metrics = ReadWorkMetrics::register(&registry).unwrap();
+        let observation = PeerConsumerObservation {
+            metrics: Some(&metrics),
+            diagnostic: None,
+        };
+        let mut producer = PeerRootProducer::new(chunk.length, binding.clone(), None, deadline)
+            .with_outboard_context(chunk.clone(), budget.clone());
+        let Some(dfs_read_ranges_frame::Body::Header(header)) = &mut frames[0].body else {
+            panic!("header");
+        };
+        producer
+            .accept_outboard_header(header, Some(&metrics))
+            .unwrap();
+        assert!(
+            header.blake3_outboard.is_empty(),
+            "opaque decoder owner must not reach control queue"
+        );
+        peer_stream_control_capacity(&mut frames[0]).unwrap();
+        let mut decoder = ReadFrameDecoder::for_producer_object(&request, &chunk).unwrap();
+        decoder.stream_binding = Some(binding);
+        decoder
+            .install_producer_outboard(producer.outboard_builder.take())
+            .unwrap();
+        assert!(
+            producer.outboard_builder.is_none(),
+            "producer hands metadata work to the consumer"
+        );
+        let mut offset = 0;
+        for frame in frames {
+            if let Some(dfs_read_ranges_frame::Body::Data(data)) = &frame.body {
+                producer.update(offset, data, Some(&metrics)).unwrap();
+                if offset == 0 {
+                    let text = afs_metrics::encode_text(&registry).unwrap();
+                    assert!(
+                        text.contains(
+                            "afs_dfs_read_hash_bytes_total{stage=\"outboard_body_hash\"} 0\n"
+                        ),
+                        "producer root must not execute consumer outboard work: {text}"
+                    );
+                }
+                offset += data.len();
+            }
+            consume_peer_frame_into_sink(
+                &mut decoder,
+                frame,
+                0,
+                &mut output,
+                &mut sink,
+                deadline,
+                observation,
+            )
+            .unwrap();
+        }
+        assert!(
+            decoder.verified_object.as_ref().unwrap().outboard.is_none(),
+            "Completion cannot mint a proof before real EOF/join"
+        );
+        let receipt = producer.finish_after_eof().unwrap();
+        assert!(matches!(receipt.digest, PeerRootDigest::ConsumerTree));
+        let proof = decoder
+            .finish_stream_from_producer(&chunk, receipt, &sink, 0, &output, observation)
+            .unwrap();
+        let outboard = proof.into_outboard().unwrap();
+        assert_eq!(outboard.encoded(), encoded);
+        let text = afs_metrics::encode_text(&registry).unwrap();
+        for (stage, expected) in [("root_in_receive", 0), ("outboard_body_hash", body.len())] {
+            assert!(
+                text.contains(&format!(
+                    "afs_dfs_read_hash_bytes_total{{stage=\"{stage}\"}} {expected}\n"
+                )),
+                "{text}"
+            );
+        }
+        let retained = outboard.clone();
+        drop(outboard);
+        assert!(
+            budget.used() > baseline,
+            "last shared proof holder must retain its lease"
+        );
+        drop(retained);
+        assert_eq!(
+            budget.used(),
+            baseline,
+            "proof retirement preserves the live cache baseline"
+        );
+        assert_eq!(output.as_slice(), &body[..output.len()]);
+        drop(sink);
+        drop(operation);
+        cache.shutdown().unwrap();
+        assert_eq!(
+            budget.used(),
+            0,
+            "shutdown retires the cache's fixed index charge"
+        );
+    }
+
+    #[cfg(feature = "dfs")]
+    #[test]
+    fn wi6_r_producer_hash_is_reserved_for_header_fallbacks() {
+        use crate::node::peer_cache::{DiskPeerCache, PeerCacheOptions};
+        let body = vec![83; 96 * 1024 + 17];
+        let encoded = wi6_encoded_outboard(&body);
+        for mode in 0..4 {
+            let budget = OutboardBudget::new(if mode == 2 { 0 } else { 1024 * 1024 });
+            let directory = tempfile::tempdir().unwrap();
+            let cache = DiskPeerCache::open_with_outboard_budget(
+                PeerCacheOptions {
+                    directory: directory.path().join("cache"),
+                    capacity_bytes: 8 * 1024 * 1024,
+                    namespace_id: crate::dfs::NamespaceId::new("test"),
+                },
+                budget.clone(),
+            )
+            .unwrap();
+            let mut operation = cache.operation().unwrap();
+            let (chunk, _, mut frames) = wi6_frames_with_outboard(&body, &encoded);
+            let sink = operation.begin_stream(&chunk).unwrap();
+            let output = [0; 31];
+            let remaining = budget.limit() - budget.used();
+            let holder = (mode == 3).then(|| budget.try_reserve(remaining).unwrap());
+            let registry = afs_metrics::Registry::new();
+            let metrics = ReadWorkMetrics::register(&registry).unwrap();
+            let mut producer = PeerRootProducer::new(
+                chunk.length,
+                sink.bind_output(0, &output).unwrap(),
+                None,
+                std::time::Instant::now() + Duration::from_secs(5),
+            )
+            .with_outboard_context(chunk.clone(), budget);
+            let Some(dfs_read_ranges_frame::Body::Header(header)) = &mut frames[0].body else {
+                panic!("header");
+            };
+            if mode == 1 {
+                header.blake3_outboard = Default::default();
+            }
+            producer
+                .accept_outboard_header(header, Some(&metrics))
+                .unwrap();
+            producer.update(0, &body, Some(&metrics)).unwrap();
+            let expected = if mode <= 1 { 0 } else { body.len() };
+            let text = afs_metrics::encode_text(&registry).unwrap();
+            assert!(
+                text.contains(&format!(
+                    "afs_dfs_read_hash_bytes_total{{stage=\"root_in_receive\"}} {expected}\n"
+                )),
+                "mode {mode}: consumer tree must replace only eligible duplicate producer work: {text}"
+            );
+            drop(holder);
+        }
+    }
+
+    #[cfg(feature = "dfs")]
+    #[test]
+    fn wi6_peer_outboard_budget_exhaustion_keeps_full_root_and_eof_contract() {
+        let body = vec![71; 96 * 1024 + 17];
+        let encoded = wi6_encoded_outboard(&body);
+        for occupied in [false, true] {
+            let budget = OutboardBudget::new(if occupied { 8192 } else { 0 });
+            let holder = occupied.then(|| budget.try_reserve(8192).unwrap());
+            let (chunk, request, frames) = wi6_frames_with_outboard(&body, &encoded);
+            let mut decoder = ReadFrameDecoder::for_object(&request, &chunk)
+                .unwrap()
+                .with_outboard_budget(Some(budget.clone()));
+            let mut output = vec![0; body.len()];
+            for frame in frames {
+                decoder.accept(frame, &mut output).unwrap();
+            }
+            let proof = decoder.finish_object(&output).unwrap();
+            assert_eq!(proof.bytes(), body);
+            assert!(
+                proof.into_outboard().is_none(),
+                "unused CVs cannot mint a proof"
+            );
+            drop(holder);
+            assert_eq!(budget.used(), 0);
+
+            let (mut wrong, request, mut frames) = wi6_frames_with_outboard(&body, &encoded);
+            wrong.content_digest.bytes[0] ^= 1;
+            // A legacy peer omits optional proof; its self-consistent checksum
+            // still cannot replace the trusted Meta root, even with budget zero.
+            let Some(dfs_read_ranges_frame::Body::Header(header)) = &mut frames[0].body else {
+                panic!("header");
+            };
+            header.blake3_outboard = Default::default();
+            let mut decoder = ReadFrameDecoder::for_object(&request, &wrong)
+                .unwrap()
+                .with_outboard_budget(Some(OutboardBudget::new(0)));
+            let mut output = vec![0; body.len()];
+            assert!(
+                frames
+                    .into_iter()
+                    .try_for_each(|frame| decoder.accept(frame, &mut output))
+                    .is_err()
+            );
+        }
+    }
+
+    #[cfg(feature = "dfs")]
+    async fn r3_assert_legacy_complete_stream_hashes_body_once(budget_limit: usize) {
+        let body: Vec<u8> = (0..(2 * STREAM_FRAME_BACKING_BYTES + 17))
+            .map(|index| (index % 251) as u8)
+            .collect();
+        let (chunk, request, frames) = verified_object_frames(&body);
+        assert!(matches!(
+            &frames[0].body,
+            Some(dfs_read_ranges_frame::Body::Header(header))
+                if header.blake3_outboard.is_empty()
+        ));
+        assert!(matches!(
+            &frames.last().unwrap().body,
+            Some(dfs_read_ranges_frame::Body::Completion(_))
+        ));
+        let registry = afs_metrics::Registry::new();
+        let metrics = ReadWorkMetrics::register(&registry).unwrap();
+        let budget = OutboardBudget::new(budget_limit);
+        let mut out = vec![0xa5; body.len()];
+        // Reuse the complete stream decoder, including Header/body/Completion
+        // and real iterator EOF. This is not producer-only prefix accounting.
+        let verified = consume_peer_read_stream(
+            &request,
+            Some(&chunk),
+            &mut out,
+            tokio_stream::iter(frames.into_iter().map(Ok)),
+            Some(&metrics),
+            Some(budget.clone()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(verified.bytes(), body);
+        assert_eq!(verified.chunk(), &chunk);
+        if budget_limit == 0 {
+            assert_eq!(budget.used(), 0, "root-only fallback needs no proof lease");
+        } else {
+            assert!(budget.used() > 0, "legacy body built a charged cache tree");
+        }
+        let text = afs_metrics::encode_text(&registry).unwrap();
+        let hash_bytes = |stage: &str| {
+            let prefix = format!("afs_dfs_read_hash_bytes_total{{stage=\"{stage}\"}} ");
+            text.lines()
+                .find_map(|line| line.strip_prefix(&prefix))
+                .unwrap()
+                .parse::<u64>()
+                .unwrap()
+        };
+        let plain = hash_bytes("root_in_receive");
+        let builder = hash_bytes("outboard_body_hash");
+        drop(verified);
+        assert_eq!(budget.used(), 0, "last proof holder releases its charge");
+        assert_eq!(
+            plain + builder,
+            body.len() as u64,
+            "legacy complete stream scanned body twice: plain={plain}, builder={builder}, budget={budget_limit}"
+        );
+        assert_eq!(
+            plain,
+            if budget_limit == 0 {
+                body.len() as u64
+            } else {
+                0
+            }
+        );
+        assert_eq!(
+            builder,
+            if budget_limit == 0 {
+                0
+            } else {
+                body.len() as u64
+            }
+        );
+        let fallback_prefix = "afs_dfs_peer_read_events_total{event=\"root_fallback\"} ";
+        let fallbacks: u64 = text
+            .lines()
+            .find_map(|line| line.strip_prefix(fallback_prefix))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(fallbacks, u64::from(budget_limit == 0));
+    }
+
+    #[cfg(feature = "dfs")]
+    #[tokio::test]
+    async fn r3_legacy_complete_stream_with_charged_tree_hashes_body_once() {
+        r3_assert_legacy_complete_stream_hashes_body_once(1024 * 1024).await;
+    }
+
+    #[cfg(feature = "dfs")]
+    #[tokio::test]
+    async fn r3_legacy_complete_stream_with_root_only_budget_hashes_body_once() {
+        r3_assert_legacy_complete_stream_hashes_body_once(0).await;
+    }
+
+    #[cfg(feature = "dfs")]
+    #[tokio::test]
+    async fn r3_legacy_tree_and_plain_roots_cannot_publish_before_real_eof() {
+        let body = vec![29; 2 * STREAM_FRAME_BACKING_BYTES + 17];
+        for budget_limit in [0, 1024 * 1024] {
+            let (chunk, request, frames) = verified_object_frames(&body);
+            let mut stream: Vec<_> = frames.into_iter().map(Ok).collect();
+            stream.push(Err(Status::unavailable(
+                "late status after complete legacy body",
+            )));
+            let budget = OutboardBudget::new(budget_limit);
+            let mut private = vec![0xa5; body.len()];
+            assert!(
+                consume_peer_read_stream(
+                    &request,
+                    Some(&chunk),
+                    &mut private,
+                    tokio_stream::iter(stream),
+                    None,
+                    Some(budget.clone()),
+                )
+                .await
+                .is_err(),
+                "Completion alone cannot return a verified object"
+            );
+            assert_eq!(
+                budget.used(),
+                0,
+                "late failure retires all optional proof owners"
+            );
+        }
+    }
+
+    #[cfg(feature = "dfs")]
     #[tokio::test]
     async fn verified_peer_stream_hashes_once_and_binds_trusted_root() {
-        let body: Vec<u8> = (0..PEER_CACHE_SEGMENT_BYTES + 17)
+        let body: Vec<u8> = (0..(1024 * 1024) + 17)
             .map(|index| (index % 251) as u8)
             .collect();
         let (chunk, request, frames) = verified_object_frames(&body);
@@ -7463,6 +9663,7 @@ mod tests {
             &mut out,
             tokio_stream::iter(frames.into_iter().map(Ok)),
             Some(&metrics),
+            None,
         )
         .await
         .unwrap()
@@ -7470,15 +9671,13 @@ mod tests {
         assert_eq!(verified.bytes(), body);
         assert_eq!(verified.chunk(), &chunk);
         let text = afs_metrics::encode_text(&registry).unwrap();
-        for stage in ["root_in_receive", "segment_index_bytes"] {
-            assert!(
-                text.contains(&format!(
-                    "afs_dfs_read_hash_bytes_total{{stage=\"{stage}\"}} {}\n",
-                    body.len()
-                )),
-                "{text}"
-            );
-        }
+        assert!(
+            text.contains(&format!(
+                "afs_dfs_read_hash_bytes_total{{stage=\"root_in_receive\"}} {}\n",
+                body.len()
+            )),
+            "{text}"
+        );
         assert!(
             text.contains("afs_dfs_read_hash_bytes_total{stage=\"root_fallback\"} 0\n"),
             "{text}"
@@ -7496,6 +9695,7 @@ mod tests {
             Some(&chunk),
             &mut out,
             tokio_stream::iter(frames.into_iter().map(Ok)),
+            None,
             None,
         )
         .await
@@ -7524,6 +9724,7 @@ mod tests {
                     &mut out,
                     tokio_stream::iter(stream),
                     None,
+                    None,
                 )
                 .await
                 .is_err()
@@ -7536,22 +9737,24 @@ mod tests {
 
     #[cfg(feature = "dfs")]
     #[test]
-    fn verified_peer_proof_binds_private_buffer_and_cross_frame_segments() {
-        let body = vec![7; PEER_CACHE_SEGMENT_BYTES + 17];
+    fn verified_peer_proof_binds_private_buffer_and_cross_frame_outboard() {
+        let body = vec![7; (1024 * 1024) + 17];
         let (chunk, request, frames) = verified_object_frames(&body);
         let mut out = vec![0; body.len()];
-        let mut decoder = ReadFrameDecoder::for_object(&request, &chunk).unwrap();
+        let budget = OutboardBudget::new(1024 * 1024);
+        let mut decoder = ReadFrameDecoder::for_object(&request, &chunk)
+            .unwrap()
+            .with_outboard_budget(Some(budget.clone()));
         for frame in frames.clone() {
             decoder.accept(frame, &mut out).unwrap();
         }
         let proof = decoder.finish_object(&out).unwrap();
         assert_eq!(proof.root_digest(), &chunk.content_digest.bytes);
         assert_eq!(proof.bytes().as_ptr(), out.as_ptr());
-        let expected: Vec<_> = body
-            .chunks(PEER_CACHE_SEGMENT_BYTES)
-            .map(|segment| *blake3::hash(segment).as_bytes())
-            .collect();
-        assert_eq!(proof.segment_digests(), expected);
+        let outboard = proof.into_outboard().unwrap();
+        assert_eq!(outboard.digest(), &chunk.content_digest);
+        let official = crate::node::chunk::outboard::build_borrowed(&body, &budget);
+        assert_eq!(outboard.encoded(), official.outboard.unwrap().encoded());
 
         let mut decoder = ReadFrameDecoder::for_object(&request, &chunk).unwrap();
         for frame in frames {
@@ -7681,6 +9884,133 @@ mod tests {
                 assert_eq!(error.code(), afs_error::CLIENT_PROTOCOL_VIOLATION);
             }
         }
+    }
+
+    #[cfg(feature = "dfs")]
+    #[tokio::test]
+    async fn peer_stream_shared_work_pins_one_channel_and_drains_after_last_block() {
+        let registry = afs_metrics::Registry::new();
+        let metrics = ReadWorkMetrics::register(&registry).unwrap();
+        let pool = PeerConnectionPool::new(
+            afs_transport::GrpcConfig::default(),
+            afs_transport::TlsConfig::Disabled,
+            1,
+        )
+        .unwrap()
+        .with_read_work_metrics(metrics.clone());
+        let endpoint = "http://127.0.0.1:9";
+        let first = pool.acquire_stream_work("a", 1, endpoint).await.unwrap();
+        let second = pool.acquire_stream_work("a", 1, endpoint).await.unwrap();
+        assert!(Arc::ptr_eq(&first.session, &second.session));
+        assert_eq!(first.session.blocks.lock().unwrap().len(), 2);
+        let gauge = |name: &str| {
+            let families = registry.gather();
+            families
+                .iter()
+                .find(|family| family.name() == name)
+                .unwrap()
+                .get_metric()[0]
+                .get_gauge()
+                .get_value()
+        };
+        assert_eq!(
+            gauge("afs_dfs_peer_disk_cache_stream_reserved_bytes"),
+            (4 * 1024 * 1024) as f64
+        );
+        assert_eq!(
+            gauge("afs_dfs_peer_disk_cache_stream_frame_bytes"),
+            (2 * STREAM_FRAME_BACKING_BYTES) as f64
+        );
+        assert_eq!(
+            first.session.controls.available_permits(),
+            STREAM_FRAME_BACKING_BYTES
+        );
+        metrics.peer_stream_private_output(32 * 1024);
+        assert_eq!(
+            gauge("afs_dfs_peer_disk_cache_stream_reserved_bytes"),
+            (4 * 1024 * 1024) as f64
+        );
+        assert!(
+            pool.acquire_stream_work(&"a".repeat(STREAM_KEY_BYTES + 1), 1, endpoint)
+                .await
+                .is_err()
+        );
+        let controls = first
+            .session
+            .controls
+            .clone()
+            .acquire_many_owned(u32::try_from(STREAM_FRAME_BACKING_BYTES).unwrap())
+            .await
+            .unwrap();
+        assert!(second.session.controls.clone().try_acquire_owned().is_err());
+        drop(controls);
+        let wait = Duration::from_millis(30);
+        assert!(
+            tokio::time::timeout(wait, pool.acquire_stream_work("a", 1, endpoint))
+                .await
+                .is_err()
+        );
+        // Even LRU eviction must not let a same-key replacement Channel enter
+        // while the old connection still has active streams.
+        pool.channel("b", 1, endpoint).await.unwrap();
+        assert!(
+            tokio::time::timeout(wait, pool.acquire_stream_work("b", 1, endpoint))
+                .await
+                .is_err()
+        );
+        let first_block = first.block().await.unwrap();
+        let second_block = second.block().await.unwrap();
+        assert_eq!(first.session.blocks.lock().unwrap().len(), 0);
+        let waiting = tokio::spawn({
+            let first = first.clone();
+            async move { first.block().await }
+        });
+        tokio::task::yield_now().await;
+        waiting.abort();
+        assert!(waiting.await.is_err());
+        let retired_session = first.session.clone();
+        drop(first);
+        drop(second);
+        assert_eq!(
+            pool.stream_work.state.lock().unwrap().active,
+            2,
+            "consumer-held blocks retain both operation tickets"
+        );
+        drop(first_block);
+        assert_eq!(pool.stream_work.state.lock().unwrap().active, 1);
+        drop(second_block);
+        {
+            let state = pool.stream_work.state.lock().unwrap();
+            assert_eq!(state.active, 0);
+            assert!(
+                state.session.is_none(),
+                "idle body allocations must be destroyed"
+            );
+        }
+        assert!(
+            retired_session.blocks.lock().unwrap().is_empty(),
+            "actual buffers retire before zero admission, even while the session Arc is retained"
+        );
+        assert!(retired_session._work.lock().unwrap().is_none());
+        for name in [
+            "afs_dfs_peer_disk_cache_stream_frame_bytes",
+            "afs_dfs_peer_disk_cache_stream_reserved_bytes",
+        ] {
+            let families = registry.gather();
+            let family = families
+                .iter()
+                .find(|family| family.name() == name)
+                .unwrap();
+            assert_eq!(
+                family.get_metric()[0].get_gauge().get_value(),
+                0.0,
+                "{name}"
+            );
+        }
+        let next = pool.acquire_stream_work("b", 1, endpoint).await.unwrap();
+        assert_eq!(next.session.blocks.lock().unwrap().len(), 2);
+        drop(next);
+        assert!(pool.stream_work.state.lock().unwrap().session.is_none());
     }
 
     #[cfg(feature = "ownerfs")]
@@ -7862,6 +10192,7 @@ mod tests {
         #[test]
         fn read_completion_binds_attempt_copy_range_and_payload_checksum() {
             let request = DfsReadRangesRequest {
+                include_blake3_outboard: false,
                 read_id: "read".into(),
                 attempt_id: "attempt".into(),
                 file_version_id: "version".into(),
@@ -7881,6 +10212,7 @@ mod tests {
                 attempt_id: request.attempt_id.clone(),
                 transferred_bytes: 3,
                 completions: vec![afs_protocol::node_data::DfsReadRangesCompletion {
+                    crc32c_table: Default::default(),
                     read_id: request.read_id.clone(),
                     attempt_id: request.attempt_id.clone(),
                     operation_index: 0,

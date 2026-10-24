@@ -1,0 +1,350 @@
+{
+  "run_id": "replace-wi0",
+  "output": "/absolute/private/evidence/replace-wi0",
+  "size_bytes": 67108864,
+  "rounds": 3,
+  "ready_wait_seconds": 30,
+  "repeat_gap_seconds": 1,
+  "diagnostic": false,
+  "control": {
+    "listen_ip": "192.0.2.12",
+    "peer_ip": "192.0.2.12",
+    "expected_peer": "192.0.2.11",
+    "port": 19612
+  },
+  "nodes": {
+    "a": {
+      "transport": [
+        "limactl",
+        "shell",
+        "replace-a",
+        "--"
+      ],
+      "root": "/srv/dfs-perf-control",
+      "min_free_bytes": 4294967296,
+      "dependencies": [
+        "python3"
+      ],
+      "ports": [],
+      "process_names": [],
+      "binaries": [
+        {
+          "path": "/opt/afs-baseline/afs-node",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      ],
+      "command_prefix": [],
+      "min_available_memory_bytes": 2147483648
+    },
+    "b": {
+      "transport": [
+        "limactl",
+        "shell",
+        "replace-b",
+        "--"
+      ],
+      "root": "/srv/dfs-perf-control",
+      "min_free_bytes": 4294967296,
+      "dependencies": [
+        "python3"
+      ],
+      "ports": [],
+      "process_names": [],
+      "binaries": [
+        {
+          "path": "/opt/afs-baseline/afs-node",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      ],
+      "command_prefix": [],
+      "min_available_memory_bytes": 2147483648
+    },
+    "c": {
+      "transport": [
+        "limactl",
+        "shell",
+        "replace-c",
+        "--"
+      ],
+      "root": "/srv/dfs-perf-control",
+      "min_free_bytes": 4294967296,
+      "dependencies": [
+        "python3"
+      ],
+      "ports": [],
+      "process_names": [],
+      "binaries": [],
+      "command_prefix": []
+    }
+  },
+  "labels": {
+    "afs-baseline": {
+      "identity": {
+        "commit": "REPLACE",
+        "binary_directory": "/opt/afs-baseline"
+      },
+      "mounts": {
+        "a": "/srv/perf-data/{run_id}/mount",
+        "b": "/srv/perf-data/{run_id}/mount"
+      },
+      "settings": {
+        "contract": {
+          "read_ahead_kb": 0,
+          "prefetch": 0
+        },
+        "product": {
+          "read_ahead_kb": "REPLACE_WITH_ACTUAL_DEFAULT",
+          "prefetch": "REPLACE_WITH_ACTUAL_DEFAULT"
+        }
+      },
+      "budgets": {
+        "peer_disk_cache_bytes": 268435456,
+        "other_budgets": "REPLACE_WITH_FROZEN_VALUES"
+      },
+      "page_cache_initial_state": "fresh mount and namespace; verify in external fixture",
+      "external_backend": {
+        "deployment": "external, unchanged; record fixed versions and effective configuration"
+      },
+      "metrics": [
+        {
+          "node": "a",
+          "name": "node-a",
+          "url": "http://127.0.0.1:19080/metrics"
+        },
+        {
+          "node": "b",
+          "name": "node-b",
+          "url": "http://127.0.0.1:19080/metrics"
+        }
+      ],
+      "hooks": {
+        "preflight": [
+          {
+            "node": "controller",
+            "argv": [
+              "python3",
+              "/absolute/external/fixture.py",
+              "--config",
+              "/absolute/private/fixture.json",
+              "preflight",
+              "{label}",
+              "{run_id}",
+              "{series}",
+              "{successful}"
+            ]
+          }
+        ],
+        "start": [
+          {
+            "node": "controller",
+            "argv": [
+              "python3",
+              "/absolute/external/fixture.py",
+              "--config",
+              "/absolute/private/fixture.json",
+              "start",
+              "{label}",
+              "{run_id}",
+              "{series}",
+              "{successful}"
+            ]
+          }
+        ],
+        "ready": [
+          {
+            "node": "controller",
+            "argv": [
+              "python3",
+              "/absolute/external/fixture.py",
+              "--config",
+              "/absolute/private/fixture.json",
+              "ready",
+              "{label}",
+              "{run_id}",
+              "{series}",
+              "{successful}"
+            ]
+          }
+        ],
+        "stop": [
+          {
+            "node": "controller",
+            "argv": [
+              "python3",
+              "/absolute/external/fixture.py",
+              "--config",
+              "/absolute/private/fixture.json",
+              "stop",
+              "{label}",
+              "{run_id}",
+              "{series}",
+              "{successful}"
+            ]
+          }
+        ],
+        "cleanup": [
+          {
+            "node": "controller",
+            "argv": [
+              "python3",
+              "/absolute/external/fixture.py",
+              "--config",
+              "/absolute/private/fixture.json",
+              "cleanup",
+              "{label}",
+              "{run_id}",
+              "{series}",
+              "{successful}"
+            ]
+          }
+        ],
+        "verify_clean": [
+          {
+            "node": "controller",
+            "argv": [
+              "python3",
+              "/absolute/external/fixture.py",
+              "--config",
+              "/absolute/private/fixture.json",
+              "verify_clean",
+              "{label}",
+              "{run_id}",
+              "{series}",
+              "{successful}"
+            ]
+          }
+        ]
+      },
+      "metric_profile": "p2"
+    },
+    "juicefs": {
+      "identity": {
+        "commit": "REPLACE",
+        "binary_directory": "/opt/juicefs"
+      },
+      "mounts": {
+        "a": "/srv/perf-data/{run_id}/mount",
+        "b": "/srv/perf-data/{run_id}/mount"
+      },
+      "settings": {
+        "contract": {
+          "read_ahead_kb": 0,
+          "prefetch": 0
+        },
+        "product": {
+          "read_ahead_kb": "REPLACE_WITH_ACTUAL_DEFAULT",
+          "prefetch": "REPLACE_WITH_ACTUAL_DEFAULT"
+        }
+      },
+      "budgets": {
+        "peer_disk_cache_bytes": 268435456,
+        "other_budgets": "REPLACE_WITH_FROZEN_VALUES"
+      },
+      "page_cache_initial_state": "fresh mount and namespace; verify in external fixture",
+      "external_backend": {
+        "deployment": "external, unchanged; record fixed versions and effective configuration"
+      },
+      "metrics": [],
+      "hooks": {
+        "preflight": [
+          {
+            "node": "controller",
+            "argv": [
+              "python3",
+              "/absolute/external/fixture.py",
+              "--config",
+              "/absolute/private/fixture.json",
+              "preflight",
+              "{label}",
+              "{run_id}",
+              "{series}",
+              "{successful}"
+            ]
+          }
+        ],
+        "start": [
+          {
+            "node": "controller",
+            "argv": [
+              "python3",
+              "/absolute/external/fixture.py",
+              "--config",
+              "/absolute/private/fixture.json",
+              "start",
+              "{label}",
+              "{run_id}",
+              "{series}",
+              "{successful}"
+            ]
+          }
+        ],
+        "ready": [
+          {
+            "node": "controller",
+            "argv": [
+              "python3",
+              "/absolute/external/fixture.py",
+              "--config",
+              "/absolute/private/fixture.json",
+              "ready",
+              "{label}",
+              "{run_id}",
+              "{series}",
+              "{successful}"
+            ]
+          }
+        ],
+        "stop": [
+          {
+            "node": "controller",
+            "argv": [
+              "python3",
+              "/absolute/external/fixture.py",
+              "--config",
+              "/absolute/private/fixture.json",
+              "stop",
+              "{label}",
+              "{run_id}",
+              "{series}",
+              "{successful}"
+            ]
+          }
+        ],
+        "cleanup": [
+          {
+            "node": "controller",
+            "argv": [
+              "python3",
+              "/absolute/external/fixture.py",
+              "--config",
+              "/absolute/private/fixture.json",
+              "cleanup",
+              "{label}",
+              "{run_id}",
+              "{series}",
+              "{successful}"
+            ]
+          }
+        ],
+        "verify_clean": [
+          {
+            "node": "controller",
+            "argv": [
+              "python3",
+              "/absolute/external/fixture.py",
+              "--config",
+              "/absolute/private/fixture.json",
+              "verify_clean",
+              "{label}",
+              "{run_id}",
+              "{series}",
+              "{successful}"
+            ]
+          }
+        ]
+      }
+    }
+  },
+  "scene": "e2e",
+  "write_block_bytes": 4194304
+}

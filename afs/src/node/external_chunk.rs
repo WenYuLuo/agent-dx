@@ -1806,9 +1806,13 @@ impl CacheShared {
         // take ownership of it.
         let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if rc != 0 {
-            return Err(invalid(
-                "S3 cache namespace is already owned by another process",
-            ));
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                return Err(invalid(format!(
+                    "S3 cache namespace is already owned by another process: {error}",
+                )));
+            }
+            return Err(Error::from(error));
         }
         Ok(file)
     }
@@ -2010,14 +2014,30 @@ impl CacheShared {
 
 impl Drop for S3ChunkCache {
     fn drop(&mut self) {
-        if let Ok(mut inner) = self.shared.inner.lock() {
-            inner.stopped = true;
-            self.shared.wake.notify_all();
-        }
-        if let Ok(mut worker) = self.worker.lock()
-            && let Some(worker) = worker.take()
+        // Recover poisoned guards only to stop and join, never to resume cache
+        // operations. No worker may remain active when its namespace unlocks.
+        let mut inner = self
+            .shared
+            .inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        inner.stopped = true;
+        self.shared.wake.notify_all();
+        drop(inner);
+        if let Some(worker) = self
+            .worker
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+            && worker.join().is_err()
         {
-            let _ = worker.join();
+            tracing::warn!("S3 cache worker panicked during shutdown");
+        }
+        // SAFETY: this live File owns the namespace lock. All cache users and
+        // the worker have drained. Explicit unlock also retires the lock when
+        // a fork temporarily retains its open-file description before exec.
+        if unsafe { libc::flock(self._lock.as_raw_fd(), libc::LOCK_UN) } != 0 {
+            tracing::warn!(message = %std::io::Error::last_os_error(), "S3 cache namespace unlock failed");
         }
     }
 }
@@ -2046,7 +2066,9 @@ impl S3ChunkStore {
     pub fn new(options: S3ChunkStoreOptions) -> Result<Self> {
         validate_options(&options)?;
         let credentials = load_credentials(&options.credentials)?;
-        adx_transport::install_crypto_provider();
+        // Select the same public TLS provider as ADX without depending on its
+        // transport and Platform protocol crates. An installed provider wins.
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let retry = RetryConfig {
             max_retries: options.max_retries,
             retry_timeout: options.request_timeout,
@@ -2279,6 +2301,12 @@ impl ChunkStore for S3ChunkStore {
             return Err(invalid("S3 batch allows at most 128 chunks"));
         }
         for value in &staged {
+            if value.chunk.is_segment_crc32c() {
+                return Err(Error::coded(
+                    afs_error::IO_NOT_SUPPORTED,
+                    "CRC32C external object writes are unsupported",
+                ));
+            }
             validate_chunk(&value.chunk)?;
             if !value.has_sealed_identity() {
                 return Err(invalid("staged Chunk metadata changed after sealing"));
@@ -2303,6 +2331,12 @@ impl ChunkStore for S3ChunkStore {
             return Err(invalid("S3 batch allows at most 128 chunks"));
         }
         for value in &staged {
+            if value.chunk.is_segment_crc32c() {
+                return Err(Error::coded(
+                    afs_error::IO_NOT_SUPPORTED,
+                    "CRC32C external object writes are unsupported",
+                ));
+            }
             validate_chunk(&value.chunk)?;
             if !value.has_sealed_identity() {
                 return Err(invalid("staged Chunk metadata changed after sealing"));
@@ -5841,6 +5875,26 @@ mod tests {
                 .code(),
             afs_error::NODE_TRANSFER_CORRUPT_DATA
         );
+    }
+
+    #[test]
+    fn cache_shutdown_releases_namespace_despite_inherited_lock_descriptor() {
+        let backend = Arc::new(object_store::memory::InMemory::new());
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = options();
+        config.cache = Some(cache_options(dir.path(), 1024 * 1024));
+        let store = S3ChunkStore::with_backend(config.clone(), backend.clone()).unwrap();
+        // A concurrent fork can retain the same open-file description before
+        // exec closes CLOEXEC descriptors. Duplicate it to make that lifetime
+        // deterministic without forking a multithreaded Rust test process.
+        let inherited_lock = store.cache.as_ref().unwrap()._lock.try_clone().unwrap();
+        assert!(S3ChunkStore::with_backend(config.clone(), backend.clone()).is_err());
+        drop(store);
+        let reopened = S3ChunkStore::with_backend(config.clone(), backend.clone()).unwrap();
+        assert!(S3ChunkStore::with_backend(config.clone(), backend.clone()).is_err());
+        drop(inherited_lock);
+        assert!(S3ChunkStore::with_backend(config, backend).is_err());
+        drop(reopened);
     }
 
     #[test]

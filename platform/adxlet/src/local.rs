@@ -15,6 +15,14 @@ pub(crate) struct LocalHold {
 }
 impl Adxlet {
     pub fn reserve_local(&self, spec: &EnvironmentSpec) -> Result<LocalReservation> {
+        if self
+            .authority_reconciling
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(Error::Unavailable(
+                "node authority reconciliation pending".into(),
+            ));
+        }
         spec.validate()?;
         if self.is_draining() {
             return Err(Error::Unavailable("node draining".into()));
@@ -23,6 +31,7 @@ impl Adxlet {
             .environments
             .lock()
             .expect("shared state lock poisoned");
+        self.ensure_not_cleaning(&spec.id)?;
         if let Some((old, assignment, _)) = environments.get(&spec.id) {
             if old != spec {
                 return Err(Error::Conflict);

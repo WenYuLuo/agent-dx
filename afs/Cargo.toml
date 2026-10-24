@@ -25,8 +25,16 @@ name = "afs-root-command-meta"
 path = "tests/support/root_command_meta.rs"
 required-features = ["ownerfs"]
 
+[[example]]
+name = "afs-meta-bench"
+path = "tests/support/meta_bench.rs"
+required-features = ["dfs"]
+
+[[example]]
+name = "afs-perf-denominators"
+path = "tests/support/perf_denominators.rs"
+
 [dependencies]
-adx-transport = { path = "../crates/transport" }
 afs-error = { path = "common/error" }
 afs-logging = { path = "common/logging" }
 afs-metrics = { path = "common/metrics" }
@@ -37,8 +45,11 @@ afs-transport = { path = "common/transport", default-features = false, features 
 clap = { version = "4.5.51", features = ["derive"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0"
-etcd-client = { version = "0.20.0", default-features = false, features = ["tls-ring"] }
-redis = { version = "1", default-features = false, features = ["aio", "tokio-comp"] }
+im = "=15.1.0"
+crc32c = "=0.6.8"
+uuid = { version = "1", features = ["v4"] }
+arc-swap = "=1.9.2"
+postcard = { version = "=1.1.3", default-features = false, features = ["alloc"] }
 toml = "0.9.8"
 tokio = { version = "1.47.1", features = ["full"] }
 tokio-stream = { version = "0.1.17", features = ["net"] }
@@ -48,10 +59,12 @@ axum = "0.8"
 thiserror = "2.0.16"
 libc = "0.2"
 blake3 = { version = "=1.8.7", features = ["rayon"] }
+bao-tree = { version = "=0.16.1", default-features = false }
 rayon-core = "=1.13.0"
 object_store = { version = "0.14", default-features = false, features = ["aws-base", "reqwest", "ring"] }
 # Match ADX public TLS wiring; aws-base does not enable reqwest TLS by itself.
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 fuser = { version = "=0.18.0", default-features = false }
 
 [target.'cfg(target_os = "linux")'.dependencies]

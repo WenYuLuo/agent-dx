@@ -8,7 +8,10 @@ fn environment_options_roundtrip_preserves_backend_contract() {
     use adx_core::execution as model;
 
     let options = model::ExecutionOptions {
+        user: Some("1001".into()),
+        group: Some("1002".into()),
         cwd: Some("/workspace/task".into()),
+        tunnel_http_port: Some(18766),
         rootfs: Some(model::Rootfs {
             readonly: true,
             source: model::StorageSource::S3(model::S3Source {
@@ -21,6 +24,7 @@ fn environment_options_roundtrip_preserves_backend_contract() {
         }),
         mounts: vec![model::Mount {
             create_if_missing: false,
+            create_options: None,
             kind: "bind".into(),
             target: "/workspace".into(),
             options: vec!["ro".into()],
@@ -111,6 +115,26 @@ fn record_roundtrip_preserves_identity_state_and_ownership() {
     execution: Default::default(),
     };
     let r = EnvironmentRecord {
+        execution_artifacts: vec![adx_core::CheckpointArtifact {
+            storage: "afs".into(),
+            location: "pending-capture".into(),
+            size_bytes: 0,
+        }],
+        snapshot_source: Some(adx_core::RestorePoint {
+            id: "saved".into(),
+            artifact: adx_core::CheckpointArtifact {
+                storage: "afs".into(),
+                location: "snapshot-input".into(),
+                size_bytes: 8,
+            },
+            origin: Some(adx_core::runtime::RuntimeIdentity {
+                environment_id: "source".into(),
+                ownership_generation: 1,
+                runtime_id: "source-1".into(),
+            }),
+            source_runtime_id: "source-1".into(),
+            expires_at_unix_seconds: None,
+        }),
         restart_attempts: 0,
         restart_pending: false,
         spec,
@@ -176,8 +200,31 @@ fn local_directory_creation_survives_mount_protocol_roundtrip() {
         options: vec!["rw".into()],
         source: model::StorageSource::Local("/mnt/sfs/workspaces/user".into()),
         create_if_missing: true,
+        create_options: Some(model::CreateOptions {
+            uid: 10001,
+            gid: 10001,
+            mode: "0700".into(),
+        }),
     };
     let wire: adx_protocol::control::MountSpec = mount.clone().into();
     let restored: model::Mount = wire.try_into().unwrap();
     assert_eq!(restored, mount);
+}
+
+#[test]
+fn capture_reservation_is_not_a_restorable_checkpoint() {
+    let artifact = control::CheckpointArtifact {
+        storage: "afs".into(),
+        location: "capture".into(),
+        size_bytes: 0,
+    };
+    assert!(adx_core::CheckpointArtifact::try_from(artifact.clone()).is_ok());
+    let point = control::RestorePoint {
+        id: "capture".into(),
+        artifact: Some(artifact),
+        source_runtime_id: "environment-1".into(),
+        origin: None,
+        expires_at_unix_seconds: None,
+    };
+    assert!(adx_core::RestorePoint::try_from(point).is_err());
 }

@@ -1,3 +1,5 @@
+#[path = "storage/artifact_lifecycle.rs"]
+mod artifact_lifecycle;
 #[path = "storage/claims.rs"]
 mod claims;
 mod common;
@@ -46,6 +48,8 @@ fn node(id: &str) -> Node {
 }
 fn running(spec: EnvironmentSpec, assignment: Assignment) -> EnvironmentRecord {
     EnvironmentRecord {
+        execution_artifacts: vec![],
+        snapshot_source: None,
         failure: None,
         restart_attempts: 0,
         restart_pending: false,
@@ -66,6 +70,58 @@ async fn register(s: &adx_coordinator::storage::Session, id: &str) -> StoredNode
     s.register(node(id), "127.0.0.1:9000".into(), "127.0.0.1:9001".into())
         .await
         .unwrap()
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn zero_capacity_survives_restart_with_running_reservations_intact() {
+    let mut rig = common::Redis::new().await;
+    let session = rig.store().await.begin(1).await.unwrap();
+    register(&session, "node").await;
+    let assignment = Assignment {
+        environment_id: "running".into(),
+        node_id: "node".into(),
+        shard_id: 0,
+        generation: 1,
+        devices: vec![],
+    };
+    session
+        .reserve(spec("running"), assignment.clone())
+        .await
+        .unwrap();
+    let record = running(spec("running"), assignment.clone());
+    session.commit(record.clone()).await.unwrap();
+    let mut zero = node("node");
+    zero.capacity = Resources::default();
+    session
+        .register(
+            zero.clone(),
+            "127.0.0.1:9000".into(),
+            "127.0.0.1:9001".into(),
+        )
+        .await
+        .unwrap();
+    let before = session.snapshot().await.unwrap();
+    assert_eq!(before.nodes["node"].node.capacity, Resources::default());
+    assert_eq!(before.environments["running"].result, Some(record.clone()));
+    rig.crash();
+    rig.start().await;
+    let recovered = rig.store().await.begin(1).await.unwrap();
+    let saved = recovered.snapshot().await.unwrap();
+    assert_eq!(saved.nodes["node"].node.capacity, Resources::default());
+    assert_eq!(saved.environments["running"].result, Some(record));
+    let mut scheduler = Coordinator::restore(&saved, Placement::Pack).unwrap();
+    scheduler.register(zero).unwrap();
+    scheduler.submit(spec("waiting")).unwrap();
+    assert!(scheduler.schedule(0).unwrap().is_none());
+    // Capacity recovery cannot forget the reservation recovered from Redis.
+    scheduler.register(node("node")).unwrap();
+    assert!(scheduler.schedule(0).unwrap().is_none());
+    scheduler.release(&assignment).unwrap();
+    assert_eq!(
+        scheduler.schedule(0).unwrap().unwrap().environment_id,
+        "waiting"
+    );
 }
 
 #[tokio::test]

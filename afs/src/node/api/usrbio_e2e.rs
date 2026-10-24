@@ -15,7 +15,7 @@ use crate::{
     meta::{
         Meta,
         rpc::{DfsMetaRpc, MetaRpc},
-        store::{Store, memory::MemoryBackend},
+        store::{Store, journal::LogLimits, local_log::LocalLog},
     },
     node::{
         api::local::{LocalApiOptions, serve_local_api_with_options},
@@ -69,12 +69,15 @@ fn context() -> types::RequestContext {
     }
 }
 
-/// 进程内装配真实 DFS：内存 meta store → tonic meta 服务 → GrpcDfsMeta → DistributedFs。
+/// 进程内装配真实 DFS：本地日志 meta store → tonic meta 服务 → GrpcDfsMeta → DistributedFs。
 async fn real_dfs(temp: &tempfile::TempDir) -> (Arc<DistributedFs>, tokio::task::JoinHandle<()>) {
     let store = Arc::new(
-        Store::open(Arc::new(MemoryBackend::default()))
-            .await
-            .expect("open memory meta store"),
+        Store::open_log(Arc::new(
+            LocalLog::open(temp.path().join("meta"), LogLimits::default())
+                .expect("open meta log"),
+        ))
+        .await
+        .expect("open log-backed meta store"),
     );
     let meta = Arc::new(Meta::with_store(
         "usrbio-e2e".to_owned(),

@@ -2,6 +2,8 @@
 //! atomic hash writes; JSON and u64 counters are validated in Rust, never Lua doubles.
 mod claims;
 pub use claims::{ClaimOutcome, LocalClaim};
+mod artifacts;
+pub use artifacts::ArtifactDeletionGuard;
 mod collection;
 mod credentials;
 mod failure;
@@ -33,6 +35,7 @@ if #ARGV == 2 then
 else
   redis.call('HSET', KEYS[1], 'header', ARGV[2], ARGV[3], ARGV[4])
 end
+for i = 5, #ARGV, 2 do redis.call('HSET', KEYS[2], ARGV[i], ARGV[i+1]) end
 return 1
 "#;
 const RETIRE_FIELDS: &str = r#"
@@ -180,6 +183,8 @@ impl StoredEnvironment {
     }
     pub(crate) fn effective_record(&self) -> EnvironmentRecord {
         self.result.clone().unwrap_or_else(|| EnvironmentRecord {
+            execution_artifacts: vec![],
+            snapshot_source: None,
             failure: None,
             restart_attempts: 0,
             restart_pending: false,
@@ -316,7 +321,7 @@ fn validate_result(r: &EnvironmentRecord) -> Result<()> {
     {
         return Err(Error::Conflict);
     }
-    if let Some(cp) = &r.checkpoint {
+    if let Some(cp) = r.checkpoint.as_ref().or(r.snapshot_source.as_ref()) {
         if cp.id.is_empty()
             || cp.artifact.storage.is_empty()
             || cp.artifact.location.is_empty()
@@ -353,7 +358,9 @@ fn validate_result(r: &EnvironmentRecord) -> Result<()> {
     match r.state {
         EnvironmentState::Running if r.resources_held && r.runtime.ip.is_some() => Ok(()),
         EnvironmentState::Paused
-            if !r.resources_held && r.runtime.ip.is_none() && r.checkpoint.is_some() =>
+            if !r.resources_held
+                && r.runtime.ip.is_none()
+                && (r.checkpoint.is_some() || r.snapshot_source.is_some()) =>
         {
             Ok(())
         }
@@ -404,21 +411,36 @@ fn next_result(old: &StoredEnvironment, r: &EnvironmentRecord) -> Result<bool> {
                 r.state,
                 EnvironmentState::Running | EnvironmentState::Failed
             );
+        let prepared = previous
+            .checkpoint
+            .as_ref()
+            .or(previous.snapshot_source.as_ref())
+            .is_some_and(|point| previous.execution_artifacts.contains(&point.artifact));
+        let resume_completed = previous.state == EnvironmentState::Paused
+            && r.checkpoint == previous.checkpoint
+            && r.snapshot_source == previous.snapshot_source
+            && r.runtime.id != previous.runtime.id
+            && (r.state == EnvironmentState::Failed
+                || r.last_operation.as_ref().is_some_and(|op| {
+                    // Input reservation adds one Paused revision before the backend starts.
+                    let expected = op.expected_revision == previous.revision
+                        || (op.expected_revision.checked_add(1) == Some(previous.revision)
+                            && prepared
+                            && (old
+                                .resume
+                                .as_ref()
+                                .is_none_or(|intent| intent.operation_id == op.id)
+                                || old
+                                    .recovery
+                                    .as_ref()
+                                    .is_some_and(|recovery| recovery.pending)));
+                    op.kind == adx_core::LifecycleKind::Resume && expected
+                }));
         if r.restart_attempts < previous.restart_attempts
             || (r.restart_attempts != previous.restart_attempts && !restarting)
             || r.revision <= previous.revision
             || previous.state == EnvironmentState::Deleted
-            || (!previous.resources_held
-                && r.resources_held
-                && !restarting
-                && !(previous.state == EnvironmentState::Paused
-                    && r.checkpoint == previous.checkpoint
-                    && r.runtime.id != previous.runtime.id
-                    && (r.state == EnvironmentState::Failed
-                        || r.last_operation.as_ref().is_some_and(|op| {
-                            op.kind == adx_core::LifecycleKind::Resume
-                                && op.expected_revision == previous.revision
-                        }))))
+            || (!previous.resources_held && r.resources_held && !restarting && !resume_completed)
         {
             return Err(Error::Conflict);
         }
@@ -431,6 +453,7 @@ struct Connection {
     current: Mutex<Option<MultiplexedConnection>>,
     timeout: Duration,
     committed_changes: broadcast::Sender<ControlChange>,
+    artifact_locks: std::sync::Mutex<BTreeMap<String, std::sync::Weak<tokio::sync::RwLock<()>>>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -472,6 +495,7 @@ impl RedisStore {
                 current: Mutex::new(None),
                 timeout: duration,
                 committed_changes,
+                artifact_locks: Default::default(),
             }),
             key: format!("adx:{{{namespace}}}:control:v1"),
         };
@@ -539,14 +563,30 @@ impl RedisStore {
             .as_ref()
             .map(|(name, _)| vec![(*name).to_owned()])
             .unwrap_or_default();
+        let artifacts = match &field {
+            Some((name, value)) if name.starts_with("environment:") => {
+                decode::<StoredEnvironment>(value)?
+                    .result
+                    .as_ref()
+                    .map(artifacts::record_artifacts)
+                    .unwrap_or_default()
+            }
+            _ => vec![],
+        };
+        let _access = self.lock_artifacts(&artifacts)?;
         let mut cmd = redis::cmd("EVAL");
         cmd.arg(CAS)
-            .arg(1)
+            .arg(2)
             .arg(&self.key)
+            .arg(format!("{}:artifacts", self.key))
             .arg(expected)
             .arg(encode(header)?);
         if let Some((name, value)) = field {
             cmd.arg(name).arg(value);
+            for artifact in artifacts {
+                cmd.arg(artifacts::artifact_key(&artifact))
+                    .arg(encode(&artifact)?);
+            }
         }
         let applied: u8 = self.query(cmd).await?;
         if applied == 1 {
@@ -603,6 +643,9 @@ impl RedisStore {
             .arg(encode(receipt)?)
             .arg(DELETED_RECEIPT_TTL.as_millis() as u64);
         let applied: u8 = self.query(cmd).await?;
+        if applied == 2 {
+            return Err(Error::Conflict);
+        }
         if applied == 1 {
             self.notify_committed_change(header.revision, vec![field.to_owned()]);
         }
@@ -1175,21 +1218,20 @@ impl Session {
     /// One result write: state and the route publication cursor change atomically.
     /// Identical replay is idempotent; older versions never roll state backward.
     pub async fn commit(&self, result: EnvironmentRecord) -> Result<EnvironmentRecord> {
-        if let Some(cp) = &result.checkpoint {
-            if let Some(origin) = cp
-                .origin
-                .as_ref()
-                .filter(|o| o.environment_id != result.spec.id)
+        if let Some(source) = &result.snapshot_source {
+            let snapshot = self
+                .get_snapshot(result.spec.snapshot_id.as_deref().ok_or(Error::Conflict)?)
+                .await?;
+            if snapshot.template.tenant_id != result.spec.tenant_id
+                || snapshot.artifact != source.artifact
+                || source.origin.as_ref() != Some(&snapshot.origin()?)
+                || !snapshot
+                    .references
+                    .contains(&adx_core::snapshots::Reference::Restore {
+                        environment_id: result.spec.id.clone(),
+                    })
             {
-                let snapshot = self
-                    .get_snapshot(result.spec.snapshot_id.as_deref().ok_or(Error::Conflict)?)
-                    .await?;
-                if snapshot.template.tenant_id != result.spec.tenant_id
-                    || snapshot.origin()? != *origin
-                    || cp.artifact == snapshot.artifact
-                {
-                    return Err(Error::Conflict);
-                }
+                return Err(Error::Conflict);
             }
         }
         let field = format!("environment:{}", result.spec.id);
