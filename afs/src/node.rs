@@ -1630,11 +1630,22 @@ async fn run_node(
     let sessions = rpc::control::RdmaSessionRegistry::new(cfg.rdma_device.clone());
     #[cfg(feature = "ownerfs")]
     let owner_rdma_sessions = rpc::control::RdmaSessionRegistry::new(cfg.rdma_device.clone());
+    // 本机 SDK 的数据面直接调用已装配的 DFS 后端；未启用 DFS 时保持 None，
+    // 让 DfsLocalData 明确返回 UNIMPLEMENTED，而不是退回 diagnostics 目录。
+    #[cfg(feature = "dfs")]
+    let dfs_backend: Option<Arc<dyn vfs::Backend>> = dfs_instance
+        .as_ref()
+        .map(|backend| Arc::clone(backend) as Arc<dyn vfs::Backend>);
+    #[cfg(not(feature = "dfs"))]
+    let dfs_backend: Option<Arc<dyn vfs::Backend>> = None;
     let local = api::local::serve_local_api_with_options(
         diagnostic_storage.clone(),
         &cfg.uds_path,
         api::local::LocalApiOptions {
             metrics_registry: Some(obs.registry.clone()),
+            dfs_backend,
+            // 与上面 DFS 后端构造时使用的命名空间保持一致。
+            dfs_namespace: Some("default".to_owned()),
         },
     )
     .await?;
