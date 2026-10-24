@@ -482,11 +482,28 @@ impl DfsRing {
     /// 提交成功后敲一次门铃（共享内存里的计数），node 侧环 worker 用它做廉价的变化判断；
     /// 真正的唤醒由 node 自己的轮询/事件负责。
     pub async fn submit(&mut self, submission: Submission) -> Result<(), LocalClientError> {
+        self.submit_one(&submission, || {}).await
+    }
+
+    /// [`DfsRing::submit`] 的实现；`on_pushed` 在每次成功推入后、任何 await 之前
+    /// **同步**调用，调用方（守卫持有者）据此跟踪真实入队进度。
+    async fn submit_one<F>(
+        &mut self,
+        submission: &Submission,
+        mut on_pushed: F,
+    ) -> Result<(), LocalClientError>
+    where
+        F: FnMut(),
+    {
         let producer = self.ring.submission_producer();
         let deadline = Instant::now() + self.wait_timeout;
         loop {
-            match producer.push(&submission) {
+            match producer.push(submission) {
                 Ok(_) => {
+                    // 推入成功后先记进度再敲铃：两步都是同步的，执行器不可能把
+                    // future 丢弃在两者之间，守卫状态在每个可暂停点都等于真实
+                    // 入队进度。
+                    on_pushed();
                     // 唯一的唤醒通道：node 的环 worker 阻塞在这个 eventfd 上。
                     self.doorbell.ring();
                     return Ok(());
@@ -508,6 +525,18 @@ impl DfsRing {
         &mut self,
         submissions: &[Submission],
     ) -> Result<usize, LocalClientError> {
+        self.submit_batch_tracked(submissions, || {}).await
+    }
+
+    /// [`DfsRing::submit_batch`] 的实现；`on_pushed` 语义同 [`DfsRing::submit_one`]。
+    async fn submit_batch_tracked<F>(
+        &mut self,
+        submissions: &[Submission],
+        mut on_pushed: F,
+    ) -> Result<usize, LocalClientError>
+    where
+        F: FnMut(),
+    {
         if submissions.is_empty() {
             return Ok(0);
         }
@@ -517,7 +546,11 @@ impl DfsRing {
             let mut pushed = 0;
             for submission in submissions {
                 match producer.push(submission) {
-                    Ok(_) => pushed += 1,
+                    Ok(_) => {
+                        pushed += 1;
+                        // 紧跟推入同步记进度：与下一次推入尝试之间没有 await 点。
+                        on_pushed();
+                    }
                     Err(RingError::SubmissionFull) => break,
                     Err(error) => return Err(error.into()),
                 }
@@ -851,25 +884,25 @@ impl DfsRing {
 
     /// 提交一批并等它们全部完成；返回 `(波内序号, 字节数)`。
     ///
-    /// 失败路径的区块归属：结果明确（node 报错）→ 归还；结果未知（超时/对不上/提交后
-    /// 取消/部分提交）→ forfeit。**提交一旦发起**，`Drop` 就不再归还区块——外层把整个
-    /// future 取消（`timeout`/`select!` 丢弃）时结果同样未知，必须保持占用。
+    /// 失败路径的区块归属：结果明确（node 报错）→ 归还；结果未知（入队后超时、
+    /// 对不上号、入队后取消、部分入队）→ 保留。入队进度由 `submit_batch_tracked`
+    /// 在每次成功推入后**同步**写进守卫，因此错误返回或取消发生时，守卫状态就是
+    /// 真实进度：**零入队**（SQ 满等待超时或等待中被取消）守卫仍是 `Reserved`，
+    /// `Drop` 归还整批，调用方可安全重试；**已有入队**守卫是 `Submitted`，`Drop`
+    /// 保留整批——node 可能仍在对已入队部分做后端读写。
     async fn dispatch_batch(
         &mut self,
         submissions: &[Submission],
         batch: &mut ReservedBatch<'_>,
     ) -> Result<Vec<(usize, usize)>, LocalClientError> {
-        // 先标记再提交：取消可能落在提交过程的任何 await 点上，标记晚于推入会漏掉
-        // 「已进环但未标记」的窗口。宁可多 forfeit，不能让 node 正在读写的内存被复用。
-        batch.mark_submitted();
-        let pushed = match self.submit_batch(submissions).await {
+        let pushed = match self
+            .submit_batch_tracked(submissions, || batch.mark_pushed())
+            .await
+        {
             Ok(pushed) => pushed,
-            Err(error) => {
-                // 批量提交的失败无法区分「一点没进环」与「进了一半后出错」（部分提交），
-                // 一律按结果未知处理：整批保持占用。
-                batch.forfeit_all();
-                return Err(error);
-            }
+            // 不在此分支处理区块：错误返回与取消走同一条 `Drop` 路径，守卫状态
+            // 即入队进度（零入队归还、部分入队保留，见上）。
+            Err(error) => return Err(error),
         };
         if pushed != submissions.len() {
             // 防御性分支：wave_size 已把 SQ 容量算进去，正常不会发生。此时哪些提交真的进了环
@@ -952,22 +985,17 @@ impl DfsRing {
         userdata
     }
 
-    // 提交并等待自己那一项完成。等待超时或完成项对不上时结果未知：区块**故意不释放**，
-    // 因为 node 仍可能对它做后端读写，立即复用会让它读到被改写的数据；外层把整个
-    // future 取消（timeout/select! 丢弃）同样是结果未知，走同一条保留路径。
+    // 提交并等待自己那一项完成。入队进度由 submit_one 在推入成功后同步写进守卫：
+    // 单发只有一项，Err 必然零入队，守卫保持 Reserved，由 Drop 归还（错误返回与
+    // 取消同路径）。等待超时或完成项对不上时结果未知：区块**故意不释放**，因为
+    // node 仍可能对它做后端读写，立即复用会让它读到被改写的数据；入队后取消
+    // 同样是结果未知，走同一条保留路径。
     async fn submit_and_wait(
         &mut self,
         submission: Submission,
         guard: &mut ReservedBlock<'_>,
     ) -> Result<Completion, LocalClientError> {
-        // 先标记再提交（见 dispatch_batch 的说明）。
-        guard.mark_submitted();
-        if let Err(error) = self.submit(submission).await {
-            // 单发的提交失败必然发生在推入 SQ 之前（submit 只有一项：要么推入成功，
-            // 要么没推）：请求确定没进环，归还区块让调用方可以重试。
-            let _ = guard.release();
-            return Err(error);
-        }
+        self.submit_one(&submission, || guard.mark_pushed()).await?;
         match self.wait_for(1).await {
             Ok(mut completions) => match completions.pop() {
                 Some(completion) if completion.userdata == submission.userdata => Ok(completion),
@@ -988,13 +1016,17 @@ impl DfsRing {
 
 /// 已预约区块的归属状态。
 ///
-/// 区分前两态是取消安全的关键：提交一旦发起，结果就对调用方不可知了——node 可能已经
-/// 在对区块做后端读写（读路径往区块写、写路径从区块读），此时归还会让下一批请求复用
-/// 同一块内存，造成跨请求数据串扰。
+/// 区分前两态的关键是**真实入队进度**，由提交路径在每次成功推入后同步写入：
+/// 提交一旦入队，结果就对调用方不可知——node 可能已经在对区块做后端读写（读路径
+/// 往区块写、写路径从区块读），此时归还会让下一批请求复用同一块内存，造成跨请求
+/// 数据串扰；而**零入队**（SQ 满、等待空间时超时或被取消）请求确定没交给 node，
+/// 归还完全安全。
 enum Ownership {
-    /// 预约成功但尚未提交：请求确定没进环，`Drop` 可以安全归还。
+    /// 预约成功且没有任何提交入队：请求确定没进环，`Drop` 可以安全归还。
     Reserved,
-    /// 提交已发起（含部分提交）：结果未知，`Drop` 必须保留区块。
+    /// 已有一项以上提交真实入队（含部分入队）：结果未知，`Drop` 必须保留**整批**
+    /// 区块。已入队部分 node 可能仍在访问；未入队部分一并保留——按切片放回空闲池
+    /// 的复杂度不值得，宁可保守。
     Submitted,
     /// 归属已处理（已归还或决定永久保留），`Drop` 不再动它。
     Settled,
@@ -1002,9 +1034,9 @@ enum Ownership {
 
 /// 已预约区块的 RAII 守卫。
 ///
-/// 正常完成走 [`Self::release`]；结果未知（等待超时、完成项不匹配、提交后被取消）走
-/// [`Self::forfeit`] 或保持 `Submitted` 态由 `Drop` 保留区块；只有**预约之后、提交之前**
-/// 的失败由 `Drop` 归还，避免一次失败把环的容量永久吃掉。
+/// 正常完成走 [`Self::release`]；结果未知（入队后等待超时、完成项不匹配、入队后被
+/// 取消）走 [`Self::forfeit`] 或保持 `Submitted` 态由 `Drop` 保留区块；**零入队**的
+/// 失败与取消由 `Drop` 归还，避免一次失败把环的容量永久吃掉。
 struct ReservedBlock<'a> {
     allocator: &'a mut IovAllocator,
     slice: IovSlice,
@@ -1040,10 +1072,11 @@ impl<'a> ReservedBlock<'a> {
         self.ownership = Ownership::Settled;
     }
 
-    /// 提交即将发起。必须在任何推入 SQ 的尝试**之前**调用：调用方随后的取消可能落在
-    /// 提交过程的任何 await 点，标记晚于推入会漏掉「已进环但未标记」的窗口，让取消
-    /// 走 `Drop` 的归还路径。宁可多保留一块，不能错放一块。
-    fn mark_submitted(&mut self) {
+    /// **一项提交已经推入 SQ 之后**同步调用。推入与本调用之间没有 await 点，执行器
+    /// 不可能把 future 丢弃在两者之间，因此守卫在每个可暂停点的状态都等于真实入队
+    /// 进度：停在「等 SQ 空间」上被取消时仍是 `Reserved`（零入队，归还），停在
+    /// 「等完成项」上被取消时已是 `Submitted`（≥1 入队，保留）。
+    fn mark_pushed(&mut self) {
         self.ownership = Ownership::Submitted;
     }
 }
@@ -1051,7 +1084,7 @@ impl<'a> ReservedBlock<'a> {
 impl Drop for ReservedBlock<'_> {
     fn drop(&mut self) {
         if matches!(self.ownership, Ownership::Reserved) {
-            // 预约之后、提交之前失败（或被取消）：请求从未进入环，归还区块。
+            // 零入队（SQ 满等待超时或等待中被取消）：请求从未进入环，归还区块。
             let _ = self.allocator.release(&self.slice);
         }
     }
@@ -1061,9 +1094,9 @@ impl Drop for ReservedBlock<'_> {
 ///
 /// 归还规则与单发的 [`ReservedBlock`] 逐条一致，只是数量从 1 变成 N：
 /// - 结果明确（成功或 node 报错）→ 全部归还，可安全复用；
-/// - 结果未知（等待超时 / 完成项对不上 / 提交后被取消 / 部分提交失败）→ 全部故意
-///   保留，宁可少几块也不让 node 正在读写的内存被复用；
-/// - 预约中途失败或提交前被取消 → `Drop` 归还已拿到的部分，不留下悬挂区块。
+/// - 结果未知（入队后等待超时 / 完成项对不上 / 入队后被取消 / 部分入队）→ 全部
+///   故意保留，宁可少几块也不让 node 正在读写的内存被复用；
+/// - 零入队（SQ 满等待超时或等待中被取消）→ `Drop` 归还全部，不留下悬挂区块。
 struct ReservedBatch<'a> {
     allocator: &'a mut IovAllocator,
     slices: Vec<IovSlice>,
@@ -1119,8 +1152,8 @@ impl<'a> ReservedBatch<'a> {
         self.ownership = Ownership::Settled;
     }
 
-    /// 提交即将发起；语义与 [`ReservedBlock::mark_submitted`] 一致。
-    fn mark_submitted(&mut self) {
+    /// 一项提交已经推入 SQ 之后同步调用；语义与 [`ReservedBlock::mark_pushed`] 一致。
+    fn mark_pushed(&mut self) {
         self.ownership = Ownership::Submitted;
     }
 }
@@ -1128,6 +1161,7 @@ impl<'a> ReservedBatch<'a> {
 impl Drop for ReservedBatch<'_> {
     fn drop(&mut self) {
         if matches!(self.ownership, Ownership::Reserved) {
+            // 零入队（SQ 满等待超时或等待中被取消）：整批从未进入环，全部归还。
             for slice in &self.slices {
                 let _ = self.allocator.release(slice);
             }
@@ -1886,11 +1920,11 @@ mod tests {
         assert_eq!(allocator.free_blocks(), 2);
         assert_eq!(allocator.in_flight(), 0);
 
-        // 提交后（哪怕还没等到结果）走作用域末尾（外层取消 future）：结果未知，
-        // Drop 不得归还，区块保持占用——这是取消安全的关键钉子。
+        // 一项提交入队后（哪怕还没等到结果）走作用域末尾（外层取消 future）：结果
+        // 未知，Drop 不得归还，区块保持占用——这是取消安全的关键钉子。
         {
             let mut guard = ReservedBlock::reserve(&mut allocator, 16).expect("reserve");
-            guard.mark_submitted();
+            guard.mark_pushed();
         }
         assert_eq!(allocator.free_blocks(), 1);
         assert_eq!(allocator.in_flight(), 1);
@@ -2211,6 +2245,179 @@ mod tests {
             "pre-submit failure recycles the block"
         );
         assert_eq!(iov.allocator.in_flight(), 0);
+    }
+
+    /// 把 SQ 填满 `count` 个陈旧提交（无人消费），使新请求一项也进不了环。
+    /// userdata 从 100_000 起，远离 SDK 自己的计数，避免与完成项匹配混淆。
+    fn fill_submission_queue(ring: &DfsRing, count: u32) {
+        let producer = ring.ring.submission_producer();
+        for index in 0..count {
+            producer
+                .push(&Submission {
+                    op: OP_WRITE,
+                    flags: 0,
+                    reg_id: 1,
+                    len: 16,
+                    offset: 0,
+                    iov_offset: 0,
+                    userdata: 100_000 + index as u64,
+                })
+                .expect("push stale submission");
+        }
+    }
+
+    /// 批量零入队超时：SQ 满且无消费者，整批停在「等空间」上直到超时——一项也没进环，
+    /// 区块必须全部归还；重复同样的失败不得逐次吃掉 iov 容量。
+    #[tokio::test]
+    async fn batch_zero_push_timeout_recycles_the_blocks() {
+        let (mut iov, mut ring) = local_ring_pair(8);
+        let reg = DfsRegistration {
+            reg_id: 1,
+            file_version_id: String::new(),
+        };
+        fill_submission_queue(&ring, 8);
+        let payloads = [vec![1_u8; 16], vec![2_u8; 16]];
+        let items: Vec<(u64, &[u8])> = payloads
+            .iter()
+            .map(|payload| (0_u64, payload.as_slice()))
+            .collect();
+
+        for attempt in 1..=2_u32 {
+            let error = ring
+                .write_batch(&mut iov, &reg, &items)
+                .await
+                .expect_err("SQ is full; the batch must time out");
+            assert_eq!(
+                error.code(),
+                afs_error::CLIENT_DEADLINE_EXCEEDED,
+                "attempt {attempt}"
+            );
+            assert_eq!(
+                ring.ring.ring_consumer().available(),
+                8,
+                "no new submissions entered the ring (attempt {attempt})"
+            );
+            assert_eq!(
+                iov.allocator.free_blocks(),
+                4,
+                "zero-push timeout must recycle the whole batch (attempt {attempt})"
+            );
+            assert_eq!(
+                iov.allocator.in_flight(),
+                0,
+                "no blocks stay in flight (attempt {attempt})"
+            );
+        }
+    }
+
+    /// 批量零入队取消：SQ 满、本批停在「等空间」上时被外层丢弃，必须整批归还。
+    ///
+    /// 执行进度的确定性不靠 sleep 猜测：`timeout` 被 await 时同步 poll 内层，
+    /// write_batch 的同步段（预留、填块、首推失败）在第一次 poll 内全部完成，
+    /// future 实际停在等空间的 await 上——不是「从未 poll 就丢弃」的假绿；
+    /// 外层 300ms 严格早于内部约 1s 的等待截止，取消必然落在等待中。
+    #[tokio::test]
+    async fn cancelled_batch_before_any_push_recycles_the_blocks() {
+        let (mut iov, mut ring) = local_ring_pair(8);
+        let reg = DfsRegistration {
+            reg_id: 1,
+            file_version_id: String::new(),
+        };
+        fill_submission_queue(&ring, 8);
+        let payloads = [vec![1_u8; 16], vec![2_u8; 16]];
+        let items: Vec<(u64, &[u8])> = payloads
+            .iter()
+            .map(|payload| (0_u64, payload.as_slice()))
+            .collect();
+
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(300),
+            ring.write_batch(&mut iov, &reg, &items),
+        )
+        .await;
+        assert!(
+            outcome.is_err(),
+            "the outer timeout must cancel the batch mid-wait"
+        );
+        assert_eq!(
+            ring.ring.ring_consumer().available(),
+            8,
+            "no new submissions entered the ring"
+        );
+        assert_eq!(
+            iov.allocator.free_blocks(),
+            4,
+            "zero-push cancellation recycles the whole batch"
+        );
+        assert_eq!(iov.allocator.in_flight(), 0);
+    }
+
+    /// 单发零入队取消：与批量同一条「等空间」等待，取消不得永久扣住区块。
+    /// 确定性论证同 [`Self::cancelled_batch_before_any_push_recycles_the_blocks`]。
+    #[tokio::test]
+    async fn cancelled_single_before_any_push_recycles_the_block() {
+        let (mut iov, mut ring) = local_ring_pair(8);
+        let reg = DfsRegistration {
+            reg_id: 1,
+            file_version_id: String::new(),
+        };
+        fill_submission_queue(&ring, 8);
+        let data = vec![7_u8; 16];
+
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(300),
+            ring.write_from(&mut iov, &reg, 0, &data),
+        )
+        .await;
+        assert!(
+            outcome.is_err(),
+            "the outer timeout must cancel the write mid-wait"
+        );
+        assert_eq!(
+            ring.ring.ring_consumer().available(),
+            8,
+            "no new submissions entered the ring"
+        );
+        assert_eq!(
+            iov.allocator.free_blocks(),
+            4,
+            "zero-push cancellation recycles the block"
+        );
+        assert_eq!(iov.allocator.in_flight(), 0);
+    }
+
+    /// 部分入队契约：SQ 只剩部分空位时，批量的前几项真实入队、其余进不去。
+    /// 已入队项结果未知，整批（含未入队项）保持占用——未入队区块不单独放回，
+    /// 避免按切片释放的复杂度把错误的区块归还空闲池。
+    #[tokio::test]
+    async fn partial_push_keeps_the_whole_batch() {
+        let (mut iov, mut ring) = local_ring_pair(8);
+        let reg = DfsRegistration {
+            reg_id: 1,
+            file_version_id: String::new(),
+        };
+        // 只留 1 个空位：本批第 1 项入队、第 2 项进不去。
+        fill_submission_queue(&ring, 7);
+        let payloads = [vec![1_u8; 16], vec![2_u8; 16]];
+        let items: Vec<(u64, &[u8])> = payloads
+            .iter()
+            .map(|payload| (0_u64, payload.as_slice()))
+            .collect();
+
+        let error = ring
+            .write_batch(&mut iov, &reg, &items)
+            .await
+            .expect_err("partial acceptance must surface as an error");
+        assert_eq!(error.code(), afs_error::CLIENT_PROTOCOL_VIOLATION);
+        // 7 个陈旧提交 + 本批第 1 项；第 2 项从未进环。
+        assert_eq!(
+            ring.ring.ring_consumer().available(),
+            8,
+            "the first item entered, the second never did"
+        );
+        // 整批保持占用：已入队项结果未知；未入队项按契约一并保留。
+        assert_eq!(iov.allocator.free_blocks(), 2);
+        assert_eq!(iov.allocator.in_flight(), 2);
     }
 
     /// 正常完成必须归还：预埋与提交 userdata 匹配的完成项，成功返回后区块回空闲池。
