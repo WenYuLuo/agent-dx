@@ -158,7 +158,7 @@ Local Docker reproduction requires access to the same bind-mounted paths as the 
   require backend cleanup before readiness, and prove node1 remains executable.
 - `sandboxd-restart`: pin one backend to each node, crash each independently
   hosted sandboxd daemon with `SIGKILL` and restart it. Require unchanged
-  backend IDs and readable instance files,
+  backend IDs, sandboxd `SERVING` health, restored node admission, and readable instance files,
   then delete the instances and verify resource release.
 - `restart`: pin one backend to each node, terminate only Adxlet processes,
   wait for fresh node sessions
