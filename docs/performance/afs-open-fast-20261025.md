@@ -10,7 +10,10 @@ For an eligible single native CRC-format range with an open-to-close reference,
 B retains bounded fixed-version routes. A binds a first full request to its
 Meta-authorized open context. Further requests carry a compact context reference
 and range; source-page TTL does not expire a connected open view. The observed
-transport connection is bound at setup; reconnect re-establishes authority. A pins at most
+transport connection is bound at setup by Tonic's per-connection mTLS
+certificate Arc identity (retained weakly), not by a reusable socket address;
+reconnect re-establishes authority. Peers without this transport lifecycle
+identity use the ordinary lane. A pins at most
 64 immutable descriptors per retained context, retaining the existing payload
 budget and buffer owner. Open-context metadata stays within the existing 32MiB
 cache budget; B route metadata has a 4MiB/512-entry bound.
@@ -27,7 +30,24 @@ at most one full-setup retry; range recovery can refresh sources for the same
 version and try its replicas. Recovery never looks up a fresh inode head. Close
 retires cached routes/readers; admitted owners retain their byte leases until
 consumed. Authorized GC also retires weakly registered descriptor caches, so an
-abandoned context cannot indefinitely retain an unlinked file's disk space. CRC off does not detect silent body corruption.
+abandoned context cannot indefinitely retain an unlinked file's disk space.
+A successful durable quarantine invalidates these caches before returning;
+subsequent opens reject the quarantined copy. Readers already admitted may drain.
+A fixed-context cold-open failure invokes quarantine only after releasing the
+reader-cache lock, preventing recursive lock acquisition on a missing file.
+Successful cold open/publication keeps that lock so invalidation cannot race a
+late insertion of an obsolete descriptor.
+
+Explicit close clears A's cached descriptors even if admitted context owners
+remain. Failed B-to-A close notifications remain in the existing bounded peer
+table (128 contexts, 32 peers each) until acknowledged, with an independent
+one-second retry worker. Closing entries reject new peer registration. An
+acknowledged close is idempotent. On transport disconnect, A's one-second
+maintenance worker retires contexts once Tonic releases that connection and its
+in-flight request owners. Detection of a broken network still follows the
+existing transport timers; this does not add grant expiry or per-frame checks.
+Workers hold weak references to their state and stop when its owner disappears.
+CRC off does not detect silent body corruption.
 
 Fixed-open read handles use `FOPEN_DIRECT_IO`, so a new open/truncate updating
 the shared kernel inode cannot clip an older handle's read/pread EOF. Backend

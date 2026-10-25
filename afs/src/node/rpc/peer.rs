@@ -1198,7 +1198,7 @@ impl PeerConnectionPool {
 
 #[cfg(feature = "dfs")]
 pub struct GrpcChunkTransfer {
-    open_read_peers: std::sync::Mutex<open_read::OpenReadPeers>,
+    open_read_peers: Arc<std::sync::Mutex<open_read::OpenReadPeers>>,
     fast_open_ready: std::sync::Mutex<std::collections::HashSet<(String, String, u64)>>,
     peers: Arc<PeerConnectionPool>,
     runtime: PeerRuntime,
@@ -1209,12 +1209,26 @@ pub struct GrpcChunkTransfer {
 #[cfg(feature = "dfs")]
 impl GrpcChunkTransfer {
     pub fn new(peers: Arc<PeerConnectionPool>, timeout: Duration) -> afs_error::Result<Self> {
+        // Standalone synchronous callers also need close retries to progress
+        // while idle. Production reuses its existing Tokio runtime.
+        let runtime = match tokio::runtime::Handle::try_current() {
+            Ok(handle) => PeerRuntime::Existing(handle),
+            Err(_) => PeerRuntime::Owned(Arc::new(
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(1)
+                    .enable_all()
+                    .build()
+                    .map_err(afs_error::Error::from)?,
+            )),
+        };
+        let open_read_peers = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        open_read::start_close_retirement(&runtime, &open_read_peers, peers.clone(), timeout);
         Ok(Self {
             peers,
-            runtime: PeerRuntime::current_or_new().map_err(|error| error.0)?,
+            runtime,
             timeout,
             next_read: std::sync::atomic::AtomicU64::new(1),
-            open_read_peers: std::sync::Mutex::new(std::collections::HashMap::new()),
+            open_read_peers,
             fast_open_ready: std::sync::Mutex::new(std::collections::HashSet::new()),
         })
     }

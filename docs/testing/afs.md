@@ -1026,6 +1026,15 @@ This is an experimental data-version contract, not an admitted per-fd length sna
 
 The [remote read candidate ledger](../performance/afs-remote-read-20261024/README.md) records the exact cohorts, Linux validation, retained failures and future work. Benchmark settings explicitly enable this switch, set `dfs_fuse_keep_cache=false` and `dfs_readahead_max_bytes=0`; merely using a new binary does not activate all candidate optimizations.
 
+The fixed-open retirement regressions also cover durable quarantine invalidating
+cached descriptors, repairing the same object before reopening it, a missing
+cold-open file returning an error without recursive cache locking, explicit
+close releasing the cache while admitted IO drains, real mTLS disconnect cleanup
+without a later read, and background retry after a lost close acknowledgment.
+The fast lane requires transport-provided connection identity; a missing identity
+keeps the ordinary lane. These are Linux component/RPC cases, not a claim of
+mixed-version, long-running or full multi-replica recovery acceptance.
+
 ## Experimental native read buffer reuse
 
 The buffer candidate reads complete CRC segments directly into the final A-side

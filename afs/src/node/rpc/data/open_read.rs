@@ -1,6 +1,62 @@
 use super::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 type Key = (String, String);
+
+/// A weak identity supplied by the accepted mTLS connection. No address reuse
+/// can inherit it, and retaining an open context cannot keep the socket alive.
+#[derive(Clone)]
+pub struct DfsOpenReadConnection(std::sync::Weak<dyn std::any::Any + Send + Sync>);
+impl DfsOpenReadConnection {
+    pub(super) fn from_request<T>(request: &tonic::Request<T>) -> Option<Self> {
+        request.peer_certs().map(|certificates| {
+            let owner: Arc<dyn std::any::Any + Send + Sync> = certificates;
+            Self(Arc::downgrade(&owner))
+        })
+    }
+    fn same_connection(&self, other: &Self) -> bool {
+        std::sync::Weak::ptr_eq(&self.0, &other.0)
+    }
+}
+
+// Tonic 0.14 supplies one certificate Arc per accepted TLS connection. The
+// connection service and in-flight requests own it; we retain only Weak. This
+// maintenance task never validates a range, frame, TTL or Meta grant.
+pub(super) fn start_connection_retirement(state: &Arc<std::sync::Mutex<OpenAuthorityState>>) {
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    {
+        let Ok(mut state) = state.lock() else {
+            return;
+        };
+        if state.retirement_started {
+            return;
+        }
+        state.retirement_started = true;
+    }
+    let state = Arc::downgrade(state);
+    runtime.spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            let Some(state) = state.upgrade() else {
+                break;
+            };
+            if let Ok(mut state) = state.lock() {
+                state.entries.retain(|_, entry| {
+                    let disconnected = entry
+                        .fast
+                        .as_ref()
+                        .is_some_and(|context| context.connection.0.strong_count() == 0);
+                    if disconnected {
+                        entry.retire();
+                    }
+                    !disconnected
+                });
+            }
+        }
+    });
+}
+
 /// The durable B-side open pin, rather than the source-page TTL, owns this view.
 /// Close prevents new admission; requests already holding an Arc may drain.
 pub struct DfsOpenReadContext {
@@ -8,7 +64,7 @@ pub struct DfsOpenReadContext {
     layout: String,
     sources: HashMap<String, crate::dfs::OpenReadSource>,
     active: Arc<AtomicBool>,
-    connection: Option<SocketAddr>,
+    connection: DfsOpenReadConnection,
     readers: crate::node::chunk::FixedPeerReaders,
     readers_registered: AtomicBool,
 }
@@ -47,22 +103,32 @@ impl DfsOpenReadContext {
         op: &afs_protocol::node_data::DfsChunkReadOp,
         deadline: std::time::Instant,
     ) -> afs_error::Result<crate::node::chunk::PeerReadPayload> {
-        if !self.readers_registered.swap(true, Ordering::AcqRel)
-            && let Err(error) = local.register_fixed_peer_readers(&self.readers)
-        {
-            self.readers_registered.store(false, Ordering::Release);
-            return Err(error);
-        }
         let id = crate::dfs::ChunkId::new(op.chunk_id.clone());
         let reader = {
             let mut readers = self
                 .readers
                 .lock()
                 .map_err(|_| replica_denied("fixed open reader cache poisoned"))?;
+            // Register before publishing any reader. Another first request must
+            // not bypass registration while quarantine snapshots the registry.
+            if !self.readers_registered.load(Ordering::Acquire) {
+                local.register_fixed_peer_readers(&self.readers)?;
+                self.readers_registered.store(true, Ordering::Release);
+            }
             if let Some(reader) = readers.get(&id) {
                 reader.clone()
             } else {
-                let reader = Arc::new(local.open_fixed_peer_reader(&id)?);
+                let reader = match local.open_fixed_peer_reader(&id) {
+                    Ok(reader) => Arc::new(reader),
+                    Err(error) => {
+                        // Quarantine can invalidate this cache. Keep successful
+                        // open/publication under its lock, but never reenter
+                        // that lock through the missing-file recovery hook.
+                        drop(readers);
+                        local.try_quarantine(&id);
+                        return Err(error);
+                    }
+                };
                 // 64 bounded descriptors per context, independently of payload budgets.
                 if readers.len() >= 64
                     && let Some(old) = readers.keys().next().cloned()
@@ -91,6 +157,7 @@ impl DfsOpenReadContext {
 
 #[derive(Default)]
 pub(super) struct OpenAuthorityState {
+    retirement_started: bool,
     entries: HashMap<Key, OpenEntry>,
     pending: HashMap<Key, (Arc<AtomicBool>, usize)>,
 }
@@ -102,6 +169,16 @@ struct OpenEntry {
     active: Arc<AtomicBool>,
     bytes: usize,
     fast: Option<Arc<DfsOpenReadContext>>,
+}
+impl OpenEntry {
+    fn retire(&self) {
+        self.active.store(false, Ordering::Release);
+        if let Some(context) = &self.fast
+            && let Ok(mut readers) = context.readers.lock()
+        {
+            readers.clear();
+        }
+    }
 }
 struct Pending<'a> {
     state: &'a std::sync::Mutex<OpenAuthorityState>,
@@ -146,8 +223,13 @@ impl CachedDfsReadAuthorizer {
         &self,
         peer: &str,
         request: &DfsReadRangesRequest,
-        connection: Option<SocketAddr>,
+        connection: Option<DfsOpenReadConnection>,
     ) -> afs_error::Result<Option<Arc<DfsOpenReadContext>>> {
+        // Without transport lifecycle identity use the ordinary lane; an absent
+        // connection must never become a reusable None == None identity.
+        let Some(connection) = connection else {
+            return Ok(None);
+        };
         let Some(grant) = request.operations.first().and_then(|op| op.grant.as_ref()) else {
             return Err(replica_denied("fixed open context is absent"));
         };
@@ -163,20 +245,25 @@ impl CachedDfsReadAuthorizer {
             .get(&key)
             .and_then(|entry| entry.fast.clone());
         if let Some(context) = existing {
-            if context.connection == connection && context.admits(request)? {
+            if context.connection.same_connection(&connection) && context.admits(request)? {
                 if let Some(metrics) = self.validator.authorization_metrics() {
                     metrics.check(crate::node::read_work::ReadCheck::ContextReuse);
                 }
                 return Ok(Some(context));
             }
-            if context.connection != connection && !grant.caller_node_id.is_empty() {
+            if !context.connection.same_connection(&connection) && !grant.caller_node_id.is_empty()
+            {
                 // Reconnect is recovery: re-establish Meta authority instead of
                 // letting a new connection inherit a dead caller's context.
-                self.open_cache
+                if let Some(entry) = self
+                    .open_cache
                     .lock()
                     .map_err(|_| replica_denied("open read cache poisoned"))?
                     .entries
-                    .remove(&key);
+                    .remove(&key)
+                {
+                    entry.retire();
+                }
             }
         }
         if grant.caller_node_id.is_empty() {
@@ -185,6 +272,8 @@ impl CachedDfsReadAuthorizer {
                 "fixed open setup required",
             ));
         }
+        // Also covers authorizers constructed before entering the server runtime.
+        start_connection_retirement(&self.open_cache);
         // First access (or an evicted/missing source page) uses the full Meta-
         // anchored validator. Its TTL never becomes a per-request refresh timer.
         self.authorize(peer, request)?;
@@ -200,10 +289,28 @@ impl CachedDfsReadAuthorizer {
         if needs_context && retained.saturating_add(512 * 1024) > 32 * 1024 * 1024 {
             return Err(replica_denied("fixed open metadata budget exhausted"));
         }
+        if connection.0.strong_count() == 0 {
+            if let Some(entry) = state.entries.remove(&key) {
+                entry.retire();
+            }
+            return Err(replica_denied(
+                "fixed open connection ended during admission",
+            ));
+        }
         let entry = state
             .entries
             .get_mut(&key)
             .ok_or_else(|| replica_denied("open read context disappeared during admission"))?;
+        if entry
+            .fast
+            .as_ref()
+            .is_some_and(|context| !context.connection.same_connection(&connection))
+        {
+            return Err(afs_error::Error::coded(
+                afs_error::NODE_TRANSFER_UNAVAILABLE,
+                "fixed open setup raced a different connection",
+            ));
+        }
         if entry.fast.is_none() {
             // Covers the second bounded source index and up to64 pinned
             // native descriptors, in addition to the original page charge.
@@ -238,7 +345,7 @@ impl CachedDfsReadAuthorizer {
             .lock()
             .map_err(|_| replica_denied("open read cache poisoned"))?;
         if let Some(entry) = state.entries.remove(&key) {
-            entry.active.store(false, Ordering::Release);
+            entry.retire();
         }
         if let Some((active, _)) = state.pending.get(&key) {
             active.store(false, Ordering::Release);
@@ -436,6 +543,9 @@ impl CachedDfsReadAuthorizer {
 }
 
 #[cfg(test)]
+mod test_tls;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::{Barrier, atomic::AtomicUsize};
@@ -467,6 +577,14 @@ mod tests {
             }])
         }
     }
+    fn connection() -> (
+        Arc<dyn std::any::Any + Send + Sync>,
+        Option<DfsOpenReadConnection>,
+    ) {
+        let owner: Arc<dyn std::any::Any + Send + Sync> = Arc::new(());
+        let identity = Some(DfsOpenReadConnection(Arc::downgrade(&owner)));
+        (owner, identity)
+    }
     fn request() -> DfsReadRangesRequest {
         DfsReadRangesRequest {
             include_blake3_outboard: false,
@@ -494,6 +612,265 @@ mod tests {
             }],
         }
     }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retirement_mtls_disconnect_retires_context() {
+        use super::test_tls::*;
+        use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity, ServerTlsConfig};
+        struct Peer;
+        impl PeerAuthenticator for Peer {
+            fn authenticate(
+                &self,
+                _: &tonic::metadata::MetadataMap,
+                _: Option<SocketAddr>,
+                cert: Option<&[u8]>,
+            ) -> afs_error::Result<String> {
+                assert!(
+                    cert.is_some(),
+                    "test must use an authenticated TLS connection"
+                );
+                Ok("reader".into())
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let local = Arc::new(
+            LocalChunkStore::open(temp.path(), "node-a")
+                .unwrap()
+                .with_peer_read_crc_mode(crate::config::DfsReadCrcMode::Off),
+        );
+        let validator = Arc::new(PageValidator {
+            calls: AtomicUsize::new(0),
+            gate: None,
+        });
+        let authorizer = Arc::new(CachedDfsReadAuthorizer::new(
+            validator,
+            "receiver".into(),
+            1,
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!(
+            "https://localhost:{}",
+            listener.local_addr().unwrap().port()
+        );
+        let service = make_dfs_chunks_server(Some(local), Arc::new(Peer), authorizer.clone());
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .tls_config(
+                    ServerTlsConfig::new()
+                        .client_ca_root(Certificate::from_pem(CA_PEM))
+                        .identity(Identity::from_pem(SERVER_CERT_PEM, SERVER_KEY_PEM)),
+                )
+                .unwrap()
+                .add_service(service)
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        let channel = Endpoint::from_shared(endpoint)
+            .unwrap()
+            .tls_config(
+                ClientTlsConfig::new()
+                    .ca_certificate(Certificate::from_pem(CA_PEM))
+                    .identity(Identity::from_pem(CLIENT_CERT_PEM, CLIENT_KEY_PEM))
+                    .domain_name("localhost"),
+            )
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let mut client = afs_protocol::node_data::dfs_chunks_client::DfsChunksClient::new(channel);
+        let mut r = tonic::Request::new(request());
+        r.metadata_mut()
+            .insert("x-afs-open-fast", "1".parse().unwrap());
+        r.metadata_mut()
+            .insert("x-afs-read-crc-mode", "off".parse().unwrap());
+        // The object is intentionally absent: context admission still precedes IO.
+        let mut body = client.read_ranges(r).await.unwrap().into_inner();
+        let _ = body.message().await;
+        assert_eq!(authorizer.open_cache.lock().unwrap().entries.len(), 1);
+        let context = authorizer
+            .open_cache
+            .lock()
+            .unwrap()
+            .entries
+            .values()
+            .next()
+            .unwrap()
+            .fast
+            .clone()
+            .unwrap();
+        drop(body);
+        drop(client);
+        let retired = tokio::time::timeout(std::time::Duration::from_secs(4), async {
+            loop {
+                if authorizer.open_cache.lock().unwrap().entries.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        server.abort();
+        let _ = server.await;
+        assert!(
+            retired.is_ok(),
+            "disconnected context must retire without a later read"
+        );
+        assert!(!context.active.load(Ordering::Acquire));
+        assert!(context.readers.lock().unwrap().is_empty());
+    }
+    #[test]
+    fn retirement_close_drops_cached_descriptors_but_admitted_io_drains() {
+        use crate::node::chunk::{ChunkStore, StagedChunk};
+        let temp = tempfile::tempdir().unwrap();
+        let local = LocalChunkStore::open(temp.path(), "node-a")
+            .unwrap()
+            .with_peer_read_crc_mode(crate::config::DfsReadCrcMode::Off);
+        let staged =
+            StagedChunk::new_crc32c(crate::dfs::OperationId::new("close-drain"), vec![29; 4096])
+                .unwrap();
+        local.put(staged.clone()).unwrap();
+        let reader = Arc::new(local.open_fixed_peer_reader(&staged.chunk.id).unwrap());
+        let weak = Arc::downgrade(&reader);
+        let validator = Arc::new(PageValidator {
+            calls: AtomicUsize::new(0),
+            gate: None,
+        });
+        let authorizer = CachedDfsReadAuthorizer::new(validator, "receiver".into(), 1);
+        let (_owner, connection) = connection();
+        let r = request();
+        let context = authorizer
+            .authorize_fast_open("reader", &r, connection)
+            .unwrap()
+            .unwrap();
+        context
+            .readers
+            .lock()
+            .unwrap()
+            .insert(staged.chunk.id.clone(), reader.clone());
+        authorizer
+            .close_open_context("reader", "dfs-open-v1:read-open:test")
+            .unwrap();
+        assert!(!context.active.load(Ordering::Acquire));
+        assert!(
+            context.readers.lock().unwrap().is_empty(),
+            "close must release descriptor cache even with an admitted context Arc"
+        );
+        let bytes = local
+            .read_fixed_peer_range(
+                &reader,
+                0,
+                4096,
+                std::time::Instant::now() + std::time::Duration::from_secs(5),
+            )
+            .unwrap();
+        assert_eq!(bytes.as_slice(), &[29; 4096]);
+        drop(bytes);
+        drop(reader);
+        assert!(weak.upgrade().is_none());
+        authorizer
+            .close_open_context("reader", "dfs-open-v1:read-open:test")
+            .unwrap(); // idempotent
+    }
+
+    #[test]
+    fn retirement_disconnect_during_meta_setup_cannot_publish_context() {
+        let gate = Arc::new(Barrier::new(2));
+        let validator = Arc::new(PageValidator {
+            calls: AtomicUsize::new(0),
+            gate: Some(gate.clone()),
+        });
+        let authorizer = Arc::new(CachedDfsReadAuthorizer::new(
+            validator,
+            "receiver".into(),
+            1,
+        ));
+        let (owner, connection) = connection();
+        let pending = authorizer.clone();
+        let worker = std::thread::spawn(move || {
+            pending.authorize_fast_open("reader", &request(), connection)
+        });
+        gate.wait();
+        drop(owner);
+        gate.wait();
+        assert!(
+            worker.join().unwrap().is_err(),
+            "disconnected setup cannot publish a reusable context"
+        );
+        assert!(authorizer.open_cache.lock().unwrap().entries.is_empty());
+    }
+
+    #[test]
+    fn retirement_missing_cold_file_quarantines_without_cache_lock_recursion() {
+        use crate::node::chunk::{ChunkStore, StagedChunk};
+        let temp = tempfile::tempdir().unwrap();
+        let local = Arc::new(
+            LocalChunkStore::open(temp.path(), "node-a")
+                .unwrap()
+                .with_peer_read_crc_mode(crate::config::DfsReadCrcMode::Off),
+        );
+        let staged = StagedChunk::new_crc32c(
+            crate::dfs::OperationId::new("missing-cold-file"),
+            vec![29; 4096],
+        )
+        .unwrap();
+        local.put(staged.clone()).unwrap();
+        std::fs::remove_file(temp.path().join("chunks").join(&staged.chunk.id.0)).unwrap();
+        let (_owner, connection) = connection();
+        let context = DfsOpenReadContext {
+            version: "v".into(),
+            layout: "l".into(),
+            sources: HashMap::from([(
+                staged.chunk.id.0.clone(),
+                crate::dfs::OpenReadSource {
+                    chunk_id: staged.chunk.id.clone(),
+                    copy_ids: vec![crate::dfs::CopyId::new("copy")],
+                    ranges: vec![(0, 4096)],
+                },
+            )]),
+            active: Arc::new(AtomicBool::new(true)),
+            connection: connection.unwrap(),
+            readers: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            readers_registered: AtomicBool::new(false),
+        };
+        let mut r = request();
+        r.operations[0].chunk_id = staged.chunk.id.0.clone();
+        assert!(context.admits(&r).unwrap());
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let store = local.clone();
+        let worker = std::thread::spawn(move || {
+            let result = context.payload(
+                &store,
+                &r.operations[0],
+                std::time::Instant::now() + std::time::Duration::from_secs(5),
+            );
+            sender.send(result.is_err()).unwrap();
+        });
+        assert_eq!(
+            receiver.recv_timeout(std::time::Duration::from_secs(2)),
+            Ok(true),
+            "missing cold file must fail without reader-cache lock recursion"
+        );
+        worker.join().unwrap();
+        assert_eq!(local.quarantined_chunks().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn retirement_no_connection_cannot_publish_reusable_authority() {
+        let validator = Arc::new(PageValidator {
+            calls: AtomicUsize::new(0),
+            gate: None,
+        });
+        let authorizer = CachedDfsReadAuthorizer::new(validator.clone(), "receiver".into(), 1);
+        assert!(
+            authorizer
+                .authorize_fast_open("reader", &request(), None)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(validator.calls.load(Ordering::SeqCst), 0);
+        assert!(authorizer.open_cache.lock().unwrap().entries.is_empty());
+    }
+
     #[test]
     fn fast_open_context_survives_source_ttl_and_close_retires_it() {
         let validator = Arc::new(PageValidator {
@@ -501,8 +878,11 @@ mod tests {
             gate: None,
         });
         let authorizer = CachedDfsReadAuthorizer::new(validator.clone(), "receiver".into(), 1);
+        let (_owner, connection) = connection();
         let r = request();
-        let first = authorizer.authorize_fast_open("reader", &r, None).unwrap();
+        let first = authorizer
+            .authorize_fast_open("reader", &r, connection.clone())
+            .unwrap();
         assert!(
             first.is_some(),
             "fast open must publish a reusable fixed context"
@@ -512,7 +892,7 @@ mod tests {
         }
         assert!(
             authorizer
-                .authorize_fast_open("reader", &r, None)
+                .authorize_fast_open("reader", &r, connection.clone())
                 .unwrap()
                 .is_some()
         );
@@ -533,9 +913,10 @@ mod tests {
             gate: None,
         });
         let authorizer = CachedDfsReadAuthorizer::new(validator.clone(), "receiver".into(), 1);
+        let (_owner, connection) = connection();
         let mut r = request();
         let context = authorizer
-            .authorize_fast_open("reader", &r, None)
+            .authorize_fast_open("reader", &r, connection.clone())
             .unwrap()
             .unwrap();
         let token = r.operations[0].grant.as_ref().unwrap().token.clone();
@@ -545,25 +926,33 @@ mod tests {
         });
         assert!(
             authorizer
-                .authorize_fast_open("reader", &r, None)
+                .authorize_fast_open("reader", &r, connection.clone())
                 .unwrap()
                 .is_some()
         );
         assert!(
             authorizer
-                .authorize_fast_open("other-peer", &r, None)
+                .authorize_fast_open("other-peer", &r, connection.clone())
                 .is_err()
         );
         r.file_version_id = "other-version".into();
-        assert!(authorizer.authorize_fast_open("reader", &r, None).is_err());
+        assert!(
+            authorizer
+                .authorize_fast_open("reader", &r, connection.clone())
+                .is_err()
+        );
         r.file_version_id = "v".into();
         r.operations[0].chunk_offset = u64::MAX;
-        assert!(authorizer.authorize_fast_open("reader", &r, None).is_err());
+        assert!(
+            authorizer
+                .authorize_fast_open("reader", &r, connection.clone())
+                .is_err()
+        );
         r.operations[0].chunk_offset = 0;
         r.operations[0].chunk_id = "object-2".into();
         assert!(
             authorizer
-                .authorize_fast_open("reader", &r, None)
+                .authorize_fast_open("reader", &r, connection.clone())
                 .unwrap()
                 .is_some()
         );
@@ -577,18 +966,22 @@ mod tests {
             "close stops new admission while existing Arc may drain"
         );
         assert!(
-            authorizer.authorize_fast_open("reader", &r, None).is_err(),
+            authorizer
+                .authorize_fast_open("reader", &r, connection.clone())
+                .is_err(),
             "compact cache miss requires explicit same-version setup"
         );
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn fast_open_grpc_recovers_lost_context_and_closed_owner_is_denied() {
+        use super::test_tls::*;
         use crate::dfs::*;
         use crate::node::{
             chunk::{ChunkStore, LocalChunkStore, StagedChunk},
             dfs_read::{ChunkReadOp, ChunkTransfer, PeerReadBatch, ResolvedReadOp},
             rpc::peer::{GrpcChunkTransfer, PeerConnectionPool},
         };
+        use tonic::transport::{Certificate, Identity, ServerTlsConfig};
         struct Peer;
         impl PeerAuthenticator for Peer {
             fn authenticate(
@@ -649,19 +1042,39 @@ mod tests {
             1,
         ));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let endpoint = format!(
+            "https://localhost:{}",
+            listener.local_addr().unwrap().port()
+        );
         let service = make_dfs_chunks_server(Some(local), Arc::new(Peer), authorizer.clone());
         let server = tokio::spawn(async move {
             tonic::transport::Server::builder()
+                .tls_config(
+                    ServerTlsConfig::new()
+                        .client_ca_root(Certificate::from_pem(CA_PEM))
+                        .identity(Identity::from_pem(SERVER_CERT_PEM, SERVER_KEY_PEM)),
+                )
+                .unwrap()
                 .add_service(service)
                 .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
                 .await
                 .unwrap();
         });
+        let ca = temp.path().join("ca.pem");
+        let cert = temp.path().join("client.pem");
+        let key = temp.path().join("client-key.pem");
+        std::fs::write(&ca, CA_PEM).unwrap();
+        std::fs::write(&cert, CLIENT_CERT_PEM).unwrap();
+        std::fs::write(&key, CLIENT_KEY_PEM).unwrap();
         let peers = Arc::new(
             PeerConnectionPool::new(
                 afs_transport::GrpcConfig::default(),
-                afs_transport::TlsConfig::Disabled,
+                afs_transport::TlsConfig::MutualTls {
+                    ca_certificate: ca,
+                    identity_certificate: cert,
+                    identity_private_key: key,
+                    server_name: "localhost".into(),
+                },
                 8,
             )
             .unwrap()
@@ -762,9 +1175,11 @@ mod tests {
         });
         let authorizer = CachedDfsReadAuthorizer::new(validator.clone(), "receiver".into(), 1);
         let r = request();
-        let a = Some("127.0.0.1:1001".parse().unwrap());
-        let b = Some("127.0.0.1:1002".parse().unwrap());
-        authorizer.authorize_fast_open("reader", &r, a).unwrap();
+        let (_owner_a, a) = connection();
+        let (_owner_b, b) = connection(); // Even if the same socket address is reused.
+        authorizer
+            .authorize_fast_open("reader", &r, a.clone())
+            .unwrap();
         let mut compact = r.clone();
         compact.operations[0].grant = Some(afs_protocol::node_data::DfsReadGrant {
             token: r.operations[0].grant.as_ref().unwrap().token.clone(),
@@ -772,13 +1187,13 @@ mod tests {
         });
         assert!(
             authorizer
-                .authorize_fast_open("reader", &compact, a)
+                .authorize_fast_open("reader", &compact, a.clone())
                 .unwrap()
                 .is_some()
         );
         assert!(
             authorizer
-                .authorize_fast_open("reader", &compact, b)
+                .authorize_fast_open("reader", &compact, b.clone())
                 .is_err()
         );
         authorizer.authorize_fast_open("reader", &r, b).unwrap();

@@ -5134,7 +5134,10 @@ impl LocalChunkStore {
     /// Called only after a Meta-anchored fixed-open context admits this object.
     #[cfg(any(feature = "dfs", test))]
     pub(crate) fn open_fixed_peer_reader(&self, id: &ChunkId) -> Result<PinnedChunkReader> {
-        let reader = self.open_cataloged(id)?;
+        // The fixed context owns its cache lock while opening. Its caller must
+        // quarantine an open error only after releasing that lock, because
+        // quarantine invalidates the same reader cache.
+        let reader = self.open_cataloged_inner(id, false)?;
         if !reader.chunk.is_segment_crc32c() {
             return Err(invalid("fixed open lane needs native CRC-format object"));
         }
@@ -5185,6 +5188,14 @@ impl LocalChunkStore {
     }
 
     fn open_cataloged(&self, chunk_id: &ChunkId) -> Result<PinnedChunkReader> {
+        self.open_cataloged_inner(chunk_id, true)
+    }
+
+    fn open_cataloged_inner(
+        &self,
+        chunk_id: &ChunkId,
+        quarantine_open_error: bool,
+    ) -> Result<PinnedChunkReader> {
         self.record_read_check(super::read_work::ReadCheck::CatalogOpen);
         let record = self
             .catalog
@@ -5200,7 +5211,7 @@ impl LocalChunkStore {
         let file = File::open(self.path_for_record(&record)?)
             .map_err(Error::from)
             .inspect_err(|error| {
-                if verified_copy_is_invalid(error) {
+                if quarantine_open_error && verified_copy_is_invalid(error) {
                     self.try_quarantine(chunk_id);
                 }
             })?;
@@ -5264,6 +5275,8 @@ impl LocalChunkStore {
             return Ok(());
         };
         if record.state == LocalChunkState::Quarantined {
+            #[cfg(any(feature = "dfs", test))]
+            self.retire_fixed_peer_readers(std::slice::from_ref(chunk_id))?;
             return Ok(());
         }
         match if record.segment_crc.is_some() {
@@ -5281,7 +5294,12 @@ impl LocalChunkStore {
             Ok(()) => Ok(()),
             Err(error) if verified_copy_is_invalid(&error) => {
                 record.state = LocalChunkState::Quarantined;
-                self.commit_catalog(&admission, vec![record]).map(|_| ())
+                self.commit_catalog(&admission, vec![record])?;
+                // Publish the durable quarantine first. Opening a new cache entry
+                // now fails catalog admission; existing IO owners may drain.
+                #[cfg(any(feature = "dfs", test))]
+                self.retire_fixed_peer_readers(std::slice::from_ref(chunk_id))?;
+                Ok(())
             }
             Err(error) => Err(error),
         }
@@ -5290,7 +5308,8 @@ impl LocalChunkStore {
     pub(crate) fn try_quarantine(&self, chunk_id: &ChunkId) {
         if let Err(error) = self.quarantine_if_invalid(chunk_id) {
             // Read fallback can still succeed. No durable quarantine or report
-            // is claimed if its catalog barrier fails; every read rechecks.
+            // is claimed if its catalog barrier fails. A successful quarantine
+            // retires fixed readers rather than adding hot-path catalog checks.
             afs_logging::warn!("dfs.local_quarantine_failed";
                 "chunk" => chunk_id.0.clone(), "error" => error.to_string());
         }
@@ -5875,6 +5894,45 @@ mod replica_replay_tests {
         assert_eq!(store.peer_read_budget.used.load(Ordering::Acquire), 0);
     }
 
+    #[test]
+    fn retirement_quarantine_invalidates_cached_fixed_reader() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = LocalChunkStore::open(temp.path(), "node-a")
+            .unwrap()
+            .with_peer_read_crc_mode(crate::config::DfsReadCrcMode::Off);
+        let staged =
+            StagedChunk::new_crc32c(OperationId::new("quarantine-cache"), vec![31; 4096]).unwrap();
+        store.put(staged.clone()).unwrap();
+        let active = Arc::new(store.open_fixed_peer_reader(&staged.chunk.id).unwrap());
+        let weak = Arc::downgrade(&active);
+        let cache = Arc::new(Mutex::new(HashMap::from([(
+            staged.chunk.id.clone(),
+            active.clone(),
+        )])));
+        store.register_fixed_peer_readers(&cache).unwrap();
+        let record = store.peer_catalog_record(&staged.chunk.id).unwrap();
+        std::fs::write(store.path_for_record(&record).unwrap(), vec![9; 4096]).unwrap();
+        store.quarantine_if_invalid(&staged.chunk.id).unwrap();
+        assert!(
+            cache.lock().unwrap().is_empty(),
+            "quarantine must retire cached fixed readers"
+        );
+        assert!(store.open_fixed_peer_reader(&staged.chunk.id).is_err());
+        drop(active);
+        assert!(
+            weak.upgrade().is_none(),
+            "retired descriptor drains with its admitted owner"
+        );
+        store.put(staged.clone()).unwrap();
+        let repaired = store.open_fixed_peer_reader(&staged.chunk.id).unwrap();
+        assert_eq!(
+            store
+                .read_fixed_peer_range(&repaired, 0, 4096, Instant::now() + Duration::from_secs(5))
+                .unwrap()
+                .as_slice(),
+            &[31; 4096]
+        );
+    }
     #[test]
     fn fast_open_gc_retires_cached_files_and_drains_active_reader() {
         let temp = tempfile::tempdir().unwrap();

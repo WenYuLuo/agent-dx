@@ -19,7 +19,7 @@
 #[cfg(feature = "dfs")]
 mod open_read;
 #[cfg(feature = "dfs")]
-pub use open_read::DfsOpenReadContext;
+pub use open_read::{DfsOpenReadConnection, DfsOpenReadContext};
 
 use afs_transport::grpc::error_status::{coded_status, error_to_status};
 #[cfg(feature = "dfs")]
@@ -549,7 +549,7 @@ pub trait DfsReadAuthorizer: Send + Sync + 'static {
         &self,
         _peer: &str,
         _request: &DfsReadRangesRequest,
-        _connection: Option<SocketAddr>,
+        _connection: Option<DfsOpenReadConnection>,
     ) -> afs_error::Result<Option<Arc<DfsOpenReadContext>>> {
         Ok(None)
     }
@@ -591,7 +591,7 @@ impl DfsReadGrantValidator for super::meta::GrpcDfsMeta {
 /// fallback. Cache hits keep their original expiry and cannot renew a lease.
 #[cfg(feature = "dfs")]
 pub struct CachedDfsReadAuthorizer {
-    open_cache: std::sync::Mutex<open_read::OpenAuthorityState>,
+    open_cache: Arc<std::sync::Mutex<open_read::OpenAuthorityState>>,
     validator: Arc<dyn DfsReadGrantValidator>,
     node_id: String,
     node_epoch: u64,
@@ -609,12 +609,16 @@ impl CachedDfsReadAuthorizer {
         node_id: String,
         node_epoch: u64,
     ) -> Self {
+        let open_cache = Arc::new(std::sync::Mutex::new(
+            open_read::OpenAuthorityState::default(),
+        ));
+        open_read::start_connection_retirement(&open_cache);
         Self {
             validator,
             node_id,
             node_epoch,
             cache: std::sync::Mutex::new(HashMap::new()),
-            open_cache: std::sync::Mutex::new(open_read::OpenAuthorityState::default()),
+            open_cache,
         }
     }
 }
@@ -665,7 +669,7 @@ impl DfsReadAuthorizer for CachedDfsReadAuthorizer {
         &self,
         peer: &str,
         request: &DfsReadRangesRequest,
-        connection: Option<SocketAddr>,
+        connection: Option<DfsOpenReadConnection>,
     ) -> afs_error::Result<Option<Arc<DfsOpenReadContext>>> {
         self.fast_open_context(peer, request, connection)
     }
@@ -1312,7 +1316,9 @@ impl DfsChunks for DfsChunksService {
                 local.peer_read_crc_mode()
             });
         validate_crc_read_mode_metadata(request.metadata(), configured_mode)?;
-        let fast_open = configured_mode == crate::config::DfsReadCrcMode::Off
+        let connection = DfsOpenReadConnection::from_request(&request);
+        let fast_open = connection.is_some()
+            && configured_mode == crate::config::DfsReadCrcMode::Off
             && self.authorizer.supports_fast_open()
             && request
                 .metadata()
@@ -1323,7 +1329,6 @@ impl DfsChunks for DfsChunksService {
                 .grant
                 .as_ref()
                 .is_some_and(|g| g.token.starts_with("dfs-open-v1:read-open:"));
-        let connection = request.remote_addr();
         let request = request.into_inner();
         if fast_open {
             return self
@@ -1638,7 +1643,7 @@ impl DfsChunksService {
         &self,
         peer: String,
         request: DfsReadRangesRequest,
-        connection: Option<SocketAddr>,
+        connection: Option<DfsOpenReadConnection>,
         deadline: std::time::Instant,
     ) -> Result<
         Response<<Self as afs_protocol::node_data::dfs_chunks_server::DfsChunks>::ReadRangesStream>,
