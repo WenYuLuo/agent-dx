@@ -16,7 +16,7 @@ use std::{
     ffi::OsStr,
     os::fd::OwnedFd,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread::{self, JoinHandle},
@@ -41,6 +41,60 @@ const MAX_IOV_BYTES: usize = 64 * 1024 * 1024 * 1024;
 /// 单个执行周期最多消费多少提交。数值与 [`afs_transport::ring::MAX_IO_DEPTH`] 同源：
 /// 「必须攒满」目标的支持上限由「单周期能执行多少」决定，两端必须一起变。
 const MAX_BATCH: u32 = afs_transport::ring::MAX_IO_DEPTH as u32;
+
+/// Advisory residence estimate, isolated to one registration. It only selects
+/// scheduling; backend permission/version/deadline checks remain authoritative.
+#[derive(Default)]
+struct ReadCost {
+    cost_per_mib_ns: AtomicU64,
+    samples: AtomicU64,
+}
+impl ReadCost {
+    fn sample(&self, len: u32) -> Option<Instant> {
+        (len >= 256 * 1024
+            || self
+                .samples
+                .fetch_add(1, Ordering::Relaxed)
+                .is_multiple_of(16))
+        .then(Instant::now)
+    }
+    fn observe(&self, len: u32, elapsed: Duration) {
+        let units = u64::from(len).div_ceil(1024 * 1024).max(1);
+        let cost = u64::try_from(elapsed.as_nanos() / u128::from(units)).unwrap_or(u64::MAX);
+        let _ = self
+            .cost_per_mib_ns
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+                Some(if old == 0 {
+                    cost
+                } else {
+                    old.saturating_mul(3).saturating_add(cost) / 4
+                })
+            });
+    }
+    fn is_slow(&self) -> bool {
+        self.cost_per_mib_ns.load(Ordering::Relaxed) > 250_000
+    }
+}
+/// A Node-local lazy bounded pool, shared by every ring.
+#[derive(Default)]
+struct ReadExecutor {
+    pool: OnceLock<Option<rayon_core::ThreadPool>>,
+}
+impl ReadExecutor {
+    fn pool(&self) -> Option<&rayon_core::ThreadPool> {
+        self.pool.get_or_init(|| {
+            let workers=thread::available_parallelism().map_or(1,usize::from).min(4);
+            if workers<2 {return None;}
+            match rayon_core::ThreadPoolBuilder::new().num_threads(workers)
+                .thread_name(|i|format!("afs-usrbio-read-{i}")).build() {
+                Ok(pool)=>Some(pool),
+                Err(error)=>{afs_logging::warn!("usrbio.read_pool_unavailable";"error"=>error.to_string());None}
+            }
+        }).as_ref()
+    }
+}
+// Residence threshold keeps cheap copies on the ring worker; only sampled
+// slow callbacks pay for parallel dispatch. The budget scales with request size.
 
 /// 环活动计数导出到 Prometheus registry 的形状。
 ///
@@ -123,6 +177,7 @@ struct RegisteredFile {
     ctx: types::RequestContext,
     /// 注册时使用的句柄值，用于拒绝「注册未注销就 close」。
     opened: Vec<u8>,
+    read_cost: Arc<ReadCost>,
 }
 
 /// 一条 iov 及其映射。
@@ -264,6 +319,7 @@ impl BackendThread {
 /// usrbio 注册表。控制面 RPC 与环 worker 共享同一份状态。
 pub(crate) struct UsrbioHub {
     backend: Arc<dyn Backend>,
+    reads: Arc<ReadExecutor>,
     /// 控制面调用后端的唯一通道；环 worker 有自己的 std 线程，不经过这里。
     executor: Arc<BackendThread>,
     metrics: Option<RingMetrics>,
@@ -292,6 +348,7 @@ impl UsrbioHub {
         Self {
             backend,
             executor: Arc::new(BackendThread::spawn()),
+            reads: Arc::new(ReadExecutor::default()),
             metrics: None,
             namespace,
             identity: process_identity(),
@@ -454,6 +511,7 @@ impl UsrbioHub {
                 handle: opened.handle,
                 ctx: opened.ctx,
                 opened: handle.to_vec(),
+                read_cost: Arc::new(ReadCost::default()),
             },
         );
         Ok(registration)
@@ -517,6 +575,7 @@ impl UsrbioHub {
         let stats = Arc::new(RingStats::default());
         let worker = RingWorker {
             backend: self.backend.clone(),
+            reads: self.reads.clone(),
             iov,
             _region: region,
             state: self.state_handle(),
@@ -660,6 +719,7 @@ fn invalid(message: impl Into<String>) -> Error {
 /// 环的消费循环。
 struct RingWorker {
     backend: Arc<dyn Backend>,
+    reads: Arc<ReadExecutor>,
     iov: Arc<IovEntry>,
     /// 环的映射必须由 worker 持有：`SharedRing` 只存裸指针，映射一旦释放就是野指针。
     _region: MappedRegion,
@@ -673,6 +733,12 @@ struct RingWorker {
     metrics: Option<RingMetrics>,
     io_depth: i32,
     timeout: Duration,
+}
+
+// Eligibility has already range-checked both requests against one live iov.
+fn ranges_overlap(a: &Submission, b: &Submission) -> bool {
+    a.iov_offset < b.iov_offset.saturating_add(u64::from(b.len))
+        && b.iov_offset < a.iov_offset.saturating_add(u64::from(a.len))
 }
 
 impl RingWorker {
@@ -710,11 +776,47 @@ impl RingWorker {
             }
 
             let mut completions = Vec::with_capacity(usable as usize);
-            for index in 0..usable {
+            let mut index = 0;
+            while index < usable {
                 let Some(submission) = consumer.peek_at(index) else {
                     break;
                 };
+                if index + 1 < usable && self.parallel_read_allowed(&submission) {
+                    let mut group = vec![submission];
+                    for next in index + 1..usable {
+                        let Some(candidate) = consumer.peek_at(next) else {
+                            break;
+                        };
+                        if !self.parallel_read_allowed(&candidate)
+                            || group.iter().any(|s| ranges_overlap(s, &candidate))
+                        {
+                            break;
+                        }
+                        group.push(candidate);
+                    }
+                    if group.len() > 1 {
+                        let start = completions.len();
+                        completions.resize(start + group.len(), Completion::default());
+                        if let Some(pool) = self.reads.pool() {
+                            let worker = &self;
+                            pool.scope(|scope| {
+                                for (s, out) in group.iter().zip(&mut completions[start..]) {
+                                    scope.spawn(move |_| {
+                                        *out = worker.execute(s);
+                                    });
+                                }
+                            });
+                        } else {
+                            for (s, out) in group.iter().zip(&mut completions[start..]) {
+                                *out = self.execute(s);
+                            }
+                        }
+                        index += group.len() as u32;
+                        continue;
+                    }
+                }
                 completions.push(self.execute(&submission));
+                index += 1;
             }
             for completion in &completions {
                 self.stats.submitted.fetch_add(1, Ordering::Relaxed);
@@ -771,6 +873,27 @@ impl RingWorker {
         (ready.min(space).min(MAX_BATCH), target)
     }
 
+    fn parallel_read_allowed(&self, submission: &Submission) -> bool {
+        if submission.op != OP_READ
+            || self
+                .iov
+                .view
+                .layout()
+                .validate_range(submission.iov_offset, u64::from(submission.len))
+                .is_err()
+        {
+            return false;
+        }
+        let registered = self.state.lock().ok().and_then(|state| {
+            state
+                .registrations
+                .get(&submission.reg_id)
+                .filter(|r| r.read_cost.is_slow())
+                .cloned()
+        });
+        registered.is_some_and(|r| self.backend.supports_parallel_reads(r.handle))
+    }
+
     fn execute(&self, submission: &Submission) -> Completion {
         let mut completion = Completion {
             userdata: submission.userdata,
@@ -801,12 +924,19 @@ impl RingWorker {
                 // 对应完成项被 SDK 取走前不会被复用，因此这里持有的是独占写入权。
                 let buffer =
                     unsafe { std::slice::from_raw_parts_mut(destination, submission.len as usize) };
-                match self.backend.read(
+                let sampled = registered.read_cost.sample(submission.len);
+                let outcome = self.backend.read(
                     &registered.ctx,
                     registered.handle,
                     submission.offset,
                     buffer,
-                ) {
+                );
+                if let Some(start) = sampled {
+                    registered
+                        .read_cost
+                        .observe(submission.len, start.elapsed());
+                }
+                match outcome {
                     Ok(read) => completion.result = read as i64,
                     Err(error) => completion.status = error.code().raw(),
                 }
@@ -2395,6 +2525,259 @@ pub(crate) mod tests {
         fixture.hub.close(&handle).expect("close");
         fixture.hub.destroy_ring(fixture.ring_id).expect("destroy");
         fixture.hub.destroy_ring(second_id).expect("destroy");
+    }
+
+    struct ParallelProbe {
+        inner: MemoryBackend,
+        allowed: bool,
+        active: std::sync::atomic::AtomicUsize,
+        peak: std::sync::atomic::AtomicUsize,
+        released: StdMutex<bool>,
+        entered: std::sync::Condvar,
+    }
+    impl Backend for ParallelProbe {
+        fn root_inode(&self) -> BackendInode {
+            self.inner.root_inode()
+        }
+        fn lookup(
+            &self,
+            c: &types::RequestContext,
+            p: BackendInode,
+            n: &OsStr,
+        ) -> Result<Entry, Error> {
+            self.inner.lookup(c, p, n)
+        }
+        fn getattr(
+            &self,
+            c: &types::RequestContext,
+            i: BackendInode,
+            h: Option<FileHandle>,
+        ) -> Result<FileAttributes, Error> {
+            self.inner.getattr(c, i, h)
+        }
+        fn open_with_options(
+            &self,
+            c: &types::RequestContext,
+            i: BackendInode,
+            f: i32,
+            o: OpenOptions,
+        ) -> Result<FileHandle, Error> {
+            self.inner.open_with_options(c, i, f, o)
+        }
+        fn release(&self, c: &types::RequestContext, h: FileHandle) -> Result<(), Error> {
+            self.inner.release(c, h)
+        }
+        fn supports_parallel_reads(&self, _: FileHandle) -> bool {
+            self.allowed
+        }
+        fn write(
+            &self,
+            c: &types::RequestContext,
+            h: FileHandle,
+            o: u64,
+            b: &[u8],
+        ) -> Result<usize, Error> {
+            self.inner.write(c, h, o, b)
+        }
+        fn read(
+            &self,
+            c: &types::RequestContext,
+            h: FileHandle,
+            o: u64,
+            b: &mut [u8],
+        ) -> Result<usize, Error> {
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(active, Ordering::SeqCst);
+            let mut released = self.released.lock().expect("gate");
+            if active >= 2 {
+                *released = true;
+                self.entered.notify_all();
+            }
+            if !*released {
+                let (mut state, _) = self
+                    .entered
+                    .wait_timeout(released, Duration::from_millis(150))
+                    .expect("gate wait");
+                *state = true;
+                self.entered.notify_all();
+                released = state;
+            }
+            drop(released);
+            let result = self.inner.read(c, h, o, b);
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            result
+        }
+    }
+    fn parallel_read_probe(allowed: bool, overlap: bool, with_write: bool) -> usize {
+        let block = 1024 * 1024;
+        let backend = Arc::new(ParallelProbe {
+            inner: MemoryBackend::new(block * 4),
+            allowed,
+            active: std::sync::atomic::AtomicUsize::new(0),
+            peak: std::sync::atomic::AtomicUsize::new(0),
+            released: StdMutex::new(false),
+            entered: std::sync::Condvar::new(),
+        });
+        {
+            let mut files = backend.inner.files.lock().expect("files");
+            for (i, b) in files
+                .get_mut(&FILE_INODE)
+                .expect("file")
+                .chunks_mut(block)
+                .enumerate()
+            {
+                b.fill((i + 1) as u8);
+            }
+        }
+        let hub = UsrbioHub::new(backend.clone(), None);
+        let layout = IovLayout::new(block, 8).expect("layout");
+        let region = TestRegion::new("parallel-iov", layout.total_bytes());
+        // SAFETY: mapping covers the layout and stays alive until worker join below.
+        let view =
+            unsafe { SharedIov::from_raw_parts(region.mapping.as_ptr(), layout) }.expect("view");
+        view.initialize().expect("init");
+        let iov_id = hub.create_iov(region.handle_fd(), layout).expect("iov");
+        let ring_layout = RingLayout::new(8).expect("ring layout");
+        let ring_region = TestRegion::new("parallel-ring", ring_layout.total_bytes());
+        // SAFETY: ring mapping covers the layout and lives until destroy_ring joins.
+        let ring = unsafe { SharedRing::from_raw_parts(ring_region.mapping.as_ptr(), ring_layout) }
+            .expect("ring");
+        ring.initialize().expect("init");
+        let doorbell = EventFd::create().expect("bell");
+        let ring_id = hub
+            .create_ring(
+                RingFds {
+                    region: ring_region.handle_fd(),
+                    doorbell: doorbell.try_clone_fd().expect("dup"),
+                    completion: test_completion_fd(),
+                },
+                ring_layout,
+                iov_id,
+                4,
+                1000,
+            )
+            .expect("create ring");
+        let (handle, _) = hub
+            .open("default", "/data.bin", OpenAccess::ReadWrite)
+            .expect("open");
+        let reg = hub.register_file(&handle).expect("register");
+        hub.lock().registrations[&reg]
+            .read_cost
+            .observe(block as u32, Duration::from_millis(1));
+        let write_slice = afs_transport::iov::IovSlice {
+            block: 2,
+            iov_offset: layout.block_offset(2) as u64,
+            len: block as u32,
+        };
+        if with_write {
+            view.write_block(&write_slice, &vec![0xEE; block])
+                .expect("write source");
+        }
+        for i in 0..4 {
+            let op = if with_write && i == 2 {
+                OP_WRITE
+            } else {
+                OP_READ
+            };
+            let offset = if with_write && i >= 2 { 0 } else { i * block };
+            let bank = if overlap { 0 } else { i };
+            ring.submission_producer()
+                .push(&Submission {
+                    op,
+                    flags: 0,
+                    reg_id: reg,
+                    len: block as u32,
+                    offset: offset as u64,
+                    iov_offset: layout.block_offset(bank as u32) as u64,
+                    userdata: i as u64,
+                })
+                .expect("submit");
+        }
+        doorbell.ring();
+        let cq = ring.completion_consumer();
+        for _ in 0..4 {
+            let c = wait_for_completion(&cq);
+            assert_eq!(c.status, 0);
+            assert_eq!(c.result, block as i64);
+        }
+        if !overlap {
+            for i in [0usize, 1, 3] {
+                let want = if with_write && i == 3 {
+                    0xEE
+                } else {
+                    (i + 1) as u8
+                };
+                assert!(
+                    view.slice(layout.block_offset(i as u32) as u64, block as u64)
+                        .expect("bytes")
+                        .iter()
+                        .all(|b| *b == want)
+                );
+            }
+        }
+        hub.unregister_file(reg).expect("unregister");
+        hub.close(&handle).expect("close");
+        hub.destroy_ring(ring_id).expect("join");
+        hub.destroy_iov(iov_id).expect("destroy");
+        assert_eq!(
+            backend.active.load(Ordering::SeqCst),
+            0,
+            "all reads joined before unmapping"
+        );
+        backend.peak.load(Ordering::SeqCst)
+    }
+    #[test]
+    fn fast_read_samples_do_not_create_or_enable_the_pool() {
+        let executor = ReadExecutor::default();
+        let cost = ReadCost::default();
+        cost.observe(4 * 1024 * 1024, Duration::from_micros(100));
+        assert!(!cost.is_slow());
+        assert!(executor.pool.get().is_none());
+        cost.observe(4 * 1024 * 1024, Duration::from_millis(8));
+        assert!(cost.is_slow());
+        for _ in 0..64 {
+            cost.observe(4 * 1024 * 1024, Duration::from_micros(100));
+        }
+        assert!(!cost.is_slow());
+        assert!(executor.pool.get().is_none());
+    }
+    #[test]
+    fn read_latency_samples_are_registration_local() {
+        let hub = UsrbioHub::new(Arc::new(MemoryBackend::new(4096)), None);
+        let (handle, _) = hub
+            .open("default", "/data.bin", OpenAccess::ReadOnly)
+            .expect("open");
+        let first = hub.register_file(&handle).expect("first");
+        let second = hub.register_file(&handle).expect("second");
+        let slow = hub.lock().registrations[&first].read_cost.clone();
+        let fast = hub.lock().registrations[&second].read_cost.clone();
+        slow.observe(4 * 1024 * 1024, Duration::from_millis(8));
+        fast.observe(4 * 1024 * 1024, Duration::from_micros(100));
+        assert!(slow.is_slow());
+        assert!(!fast.is_slow());
+        hub.unregister_file(first).expect("unregister");
+        hub.unregister_file(second).expect("unregister");
+        hub.close(&handle).expect("close");
+    }
+    #[test]
+    fn eligible_ring_reads_execute_concurrently() {
+        let peak = parallel_read_probe(true, false, false);
+        assert!(
+            (2..=4).contains(&peak),
+            "bounded actual parallelism, got {peak}"
+        );
+    }
+    #[test]
+    fn unsupported_ring_reads_remain_serial() {
+        assert_eq!(parallel_read_probe(false, false, false), 1);
+    }
+    #[test]
+    fn overlapping_iov_reads_remain_serial() {
+        assert_eq!(parallel_read_probe(true, true, false), 1);
+    }
+    #[test]
+    fn parallel_read_groups_preserve_intervening_write_order() {
+        assert!(parallel_read_probe(true, false, true) >= 2);
     }
 
     /// 批量入口：一次门铃写多项、再批量读回，区块必须全部归还。

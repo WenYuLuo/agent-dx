@@ -425,6 +425,8 @@ pub struct DfsRing {
     wait_timeout: Duration,
     /// 单发接口使用的 userdata 序号，从 1 开始，避免与 node 默认填充的 0 混淆。
     next_userdata: u64,
+    /// Preserve must-fill batching when deciding whether staged writes may overlap.
+    io_depth: i32,
     /// 跨进程门铃：提交后写它唤醒 node 的环 worker。node 持有同一个 eventfd 的副本。
     doorbell: EventFd,
     /// 完成通知：node 每投递一批完成项写一次。这是客户端唯一的阻塞等待通道。
@@ -710,6 +712,10 @@ impl DfsRing {
                 "DFS read completion exceeded the requested length",
             ));
         }
+        if read == 0 {
+            guard.release()?;
+            return Ok(0);
+        }
         let source = match iov.view.slice(slice.iov_offset, read as u64) {
             Ok(source) => source,
             Err(error) => {
@@ -730,8 +736,9 @@ impl DfsRing {
 
     /// 批量写：一次门铃提交一批，等在途全部完成后返回每项实际写入的字节数。
     ///
-    /// 与逐项调用 [`DfsRing::write_from`] 相比只有"门铃次数"的差别，但那是 OS 系统调用的差别。
-    /// 数据仍要拷进 iov（应用缓冲区不在共享内存里），所以拷贝次数与单发相同。
+    /// 数据仍要从应用缓冲复制到 iov。立即消费模式下，至少 8 MiB 的一波会按 4 MiB
+    /// bank 交替复制/提交，使 Node 消费前一 bank 与应用准备后一 bank 重叠；不增加
+    /// 预约区块数，不重排写请求，也不提前复用已提交区块。其它凑批模式保持整波提交。
     ///
     /// 一批的实际大小受 SQ 剩余容量与 iov 空闲区块**双重**限制；装不下时会自动分波，
     /// 每波一次门铃，因此调用方不需要自己算容量。
@@ -751,20 +758,12 @@ impl DfsRing {
                 .map(|(_, data)| data.len())
                 .collect();
             let mut batch = ReservedBatch::reserve(&mut iov.allocator, &lengths)?;
-            for (index, slice) in batch.slices().iter().enumerate() {
-                iov.view.write_block(slice, items[cursor + index].1)?;
-            }
-            let submissions = self.batch_submissions(
-                OP_WRITE,
-                reg,
-                batch.slices(),
-                &items[cursor..cursor + wave],
-            );
-            let completed = match self.dispatch_batch(&submissions, &mut batch).await {
-                Ok(completed) => completed,
-                Err(error) => return Err(error),
-            };
-            for (index, bytes) in completed {
+            let current = &items[cursor..cursor + wave];
+            let submissions = self.batch_submissions(OP_WRITE, reg, batch.slices(), current);
+            let completed = self
+                .dispatch_write_batch(&iov.view, &submissions, current, &mut batch)
+                .await?;
+            for (index, bytes) in completed.into_iter().enumerate() {
                 results[cursor + index] = bytes;
             }
             batch.release_all()?;
@@ -802,7 +801,12 @@ impl DfsRing {
                 Ok(completed) => completed,
                 Err(error) => return Err(error),
             };
-            for (index, bytes) in completed {
+            for (index, bytes) in completed.into_iter().enumerate() {
+                if bytes == 0 {
+                    results[cursor + index] = 0;
+                    continue;
+                }
+
                 // 完成项已对上号：node 对这批区块的动作已经结束，后续客户端侧失败
                 // （iov 切片 / 目标缓冲不匹配）也必须归还，而不是让 Drop 按
                 // 「结果未知」把区块永久扣住。
@@ -882,7 +886,7 @@ impl DfsRing {
             .collect()
     }
 
-    /// 提交一批并等它们全部完成；返回 `(波内序号, 字节数)`。
+    /// 提交一批并等它们全部完成；按提交顺序返回每项字节数。
     ///
     /// 失败路径的区块归属：结果明确（node 报错）→ 归还；结果未知（入队后超时、
     /// 对不上号、入队后取消、部分入队）→ 保留。入队进度由 `submit_batch_tracked`
@@ -894,7 +898,7 @@ impl DfsRing {
         &mut self,
         submissions: &[Submission],
         batch: &mut ReservedBatch<'_>,
-    ) -> Result<Vec<(usize, usize)>, LocalClientError> {
+    ) -> Result<Vec<usize>, LocalClientError> {
         let pushed = match self
             .submit_batch_tracked(submissions, || batch.mark_pushed())
             .await
@@ -912,6 +916,58 @@ impl DfsRing {
                 "batched submissions were not fully accepted by the ring",
             ));
         }
+        self.collect_batch(submissions, batch).await
+    }
+
+    /// Stream immutable input banks while the Node consumes earlier banks. All
+    /// slots stay owned by one guard until every distinct completion is known.
+    async fn dispatch_write_batch(
+        &mut self,
+        view: &SharedIov,
+        submissions: &[Submission],
+        items: &[(u64, &[u8])],
+        batch: &mut ReservedBatch<'_>,
+    ) -> Result<Vec<usize>, LocalClientError> {
+        const BANK_BYTES: usize = 4 * 1024 * 1024;
+        let total = items
+            .iter()
+            .fold(0usize, |n, (_, b)| n.saturating_add(b.len()));
+        if self.io_depth != 0 || items.len() < 2 || total < 2 * BANK_BYTES {
+            for (slice, (_, data)) in batch.slices().iter().zip(items) {
+                view.write_block(slice, data)?;
+            }
+            return self.dispatch_batch(submissions, batch).await;
+        }
+        let mut cursor = 0;
+        while cursor < items.len() {
+            let mut end = cursor;
+            let mut bytes = 0usize;
+            while end < items.len() && bytes < BANK_BYTES {
+                bytes = bytes.saturating_add(items[end].1.len());
+                end += 1;
+            }
+            for (index, (_, data)) in items.iter().enumerate().take(end).skip(cursor) {
+                view.write_block(&batch.slices()[index], data)?;
+            }
+            let pushed = self
+                .submit_batch_tracked(&submissions[cursor..end], || batch.mark_pushed())
+                .await?;
+            if pushed != end - cursor {
+                batch.forfeit_all();
+                return Err(protocol_violation(
+                    "staged write submissions were not fully accepted",
+                ));
+            }
+            cursor = end;
+        }
+        self.collect_batch(submissions, batch).await
+    }
+
+    async fn collect_batch(
+        &mut self,
+        submissions: &[Submission],
+        batch: &mut ReservedBatch<'_>,
+    ) -> Result<Vec<usize>, LocalClientError> {
         let completions = match self.wait_for(submissions.len()).await {
             Ok(completions) => completions,
             Err(error) => {
@@ -919,33 +975,59 @@ impl DfsRing {
                 return Err(error);
             }
         };
-        let mut completed = Vec::with_capacity(completions.len());
+        // A matched userdata is not sufficient: every submitted request needs
+        // exactly one distinct completion before any reserved block is recycled.
+        // usize::MAX cannot be a valid result after the per-submission length check.
+        let mut completed = vec![usize::MAX; submissions.len()];
         let mut failure = None;
         for completion in &completions {
-            let index = match submissions
-                .iter()
-                .position(|submission| submission.userdata == completion.userdata)
-            {
-                Some(index) => index,
-                None => {
-                    // 完成项对不上号：这批结果未知，node 仍可能对区块做后端读写。
-                    // forfeit_all 之后 Drop 不再归还，区块保持占用，不会被下一批复用。
-                    batch.forfeit_all();
-                    return Err(protocol_violation(
-                        "batch completion did not match any submission",
-                    ));
-                }
+            // The public helpers generate contiguous wrapping userdatas. Keep a
+            // fallback for explicitly constructed internal batches.
+            let index = submissions
+                .first()
+                .and_then(|first| {
+                    usize::try_from(completion.userdata.wrapping_sub(first.userdata))
+                        .ok()
+                        .filter(|index| *index < submissions.len())
+                        .filter(|index| submissions[*index].userdata == completion.userdata)
+                })
+                .or_else(|| {
+                    submissions
+                        .iter()
+                        .position(|s| s.userdata == completion.userdata)
+                });
+            let Some(index) = index else {
+                batch.forfeit_all();
+                return Err(protocol_violation(
+                    "batch completion did not match any submission",
+                ));
             };
+            if completed[index] != usize::MAX {
+                batch.forfeit_all();
+                return Err(protocol_violation(
+                    "duplicate batch completion left a request unsettled",
+                ));
+            }
             let bytes = match completion_bytes(completion) {
                 Ok(bytes) => bytes,
                 Err(error) => {
-                    // 先记下失败继续扫完整批：只有确认每一项都对得上号，失败才是「明确
-                    // 失败」，走 Drop 归还区块才是安全的。
                     failure.get_or_insert(error);
                     0
                 }
             };
-            completed.push((index, bytes));
+            if bytes > submissions[index].len as usize {
+                batch.forfeit_all();
+                return Err(protocol_violation(
+                    "batch completion exceeded the submitted length",
+                ));
+            }
+            completed[index] = bytes;
+        }
+        if completed.contains(&usize::MAX) {
+            batch.forfeit_all();
+            return Err(protocol_violation(
+                "batch completion left a request unsettled",
+            ));
         }
         if let Some(error) = failure {
             // 整批都对上了号：node 报错也是明确结果，归还整批，调用方可以重试。
@@ -1669,6 +1751,7 @@ impl DfsLocalClient {
             iov_id: iov.iov_id,
             wait_timeout: ring_wait_timeout(timeout_ms),
             next_userdata: 1,
+            io_depth,
         })
     }
 
@@ -1972,7 +2055,9 @@ mod tests {
     /// 构造一对本地 iov + 环，不经过控制面：门铃与完成 eventfd 都在本进程内，
     /// `client` 是从不连接的惰性 channel（dispatch 路径不碰它）。
     fn local_ring_pair(entries: u32) -> (DfsIov, DfsRing) {
-        let iov_layout = IovLayout::new(4096, 4).expect("iov layout");
+        local_ring_pair_with_layout(entries, IovLayout::new(4096, 4).expect("iov layout"))
+    }
+    fn local_ring_pair_with_layout(entries: u32, iov_layout: IovLayout) -> (DfsIov, DfsRing) {
         let iov_region = SharedRegion::create_with_limit(
             "afs-client-test-iov",
             iov_layout.total_bytes(),
@@ -2036,6 +2121,7 @@ mod tests {
                 iov_id: 1,
                 wait_timeout: Duration::from_secs(1),
                 next_userdata: 1,
+                io_depth: 0,
                 doorbell,
                 completion,
                 completion_ready,
@@ -2578,6 +2664,255 @@ mod tests {
             "unknown outcome keeps the whole batch occupied"
         );
         assert_eq!(iov.allocator.in_flight(), 2);
+    }
+
+    fn preload_probe_completions(ring: &DfsRing, completions: &[Completion]) {
+        let producer = ring.ring.submission_producer();
+        for _ in completions {
+            producer.push(&Submission::default()).expect("carrier");
+        }
+        ring.ring
+            .ring_consumer()
+            .complete_batch(completions)
+            .expect("preload");
+    }
+
+    #[tokio::test]
+    async fn duplicate_batch_completion_keeps_missing_read_block_and_output() {
+        let (mut iov, mut ring) = local_ring_pair(8);
+        preload_probe_completions(
+            &ring,
+            &[
+                Completion {
+                    userdata: 1,
+                    result: 16,
+                    op: OP_READ,
+                    ..Completion::default()
+                },
+                Completion {
+                    userdata: 1,
+                    result: 16,
+                    op: OP_READ,
+                    ..Completion::default()
+                },
+            ],
+        );
+        let reg = DfsRegistration {
+            reg_id: 1,
+            file_version_id: String::new(),
+        };
+        let mut first = [0xA5; 16];
+        let mut second = [0x5A; 16];
+        let mut items = [(0, first.as_mut_slice()), (16, second.as_mut_slice())];
+        let error = ring
+            .read_batch(&mut iov, &reg, &mut items)
+            .await
+            .expect_err("duplicate cannot settle missing request");
+        assert_eq!(error.code(), afs_error::CLIENT_PROTOCOL_VIOLATION);
+        assert_eq!(iov.free_blocks(), 2, "both unknown blocks stay quarantined");
+        assert_eq!(first, [0xA5; 16]);
+        assert_eq!(second, [0x5A; 16]);
+        assert_eq!(
+            ring.ring.ring_consumer().available(),
+            2,
+            "uncompleted requests remain in flight"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_batch_completion_is_protocol_failure_and_keeps_blocks() {
+        let (mut iov, mut ring) = local_ring_pair(8);
+        preload_probe_completions(
+            &ring,
+            &[
+                Completion {
+                    userdata: 1,
+                    result: 17,
+                    op: OP_WRITE,
+                    ..Completion::default()
+                },
+                Completion {
+                    userdata: 2,
+                    result: 16,
+                    op: OP_WRITE,
+                    ..Completion::default()
+                },
+            ],
+        );
+        let reg = DfsRegistration {
+            reg_id: 1,
+            file_version_id: String::new(),
+        };
+        let bytes = [7u8; 16];
+        let error = ring
+            .write_batch(&mut iov, &reg, &[(0, &bytes), (16, &bytes)])
+            .await
+            .expect_err("oversized result");
+        assert_eq!(error.code(), afs_error::CLIENT_PROTOCOL_VIOLATION);
+        assert_eq!(
+            iov.free_blocks(),
+            2,
+            "malformed result leaves outcome unknown"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_completion_order_and_wrapping_userdata_preserve_results() {
+        let (mut iov, mut ring) = local_ring_pair(8);
+        ring.next_userdata = u64::MAX;
+        preload_probe_completions(
+            &ring,
+            &[
+                Completion {
+                    userdata: 0,
+                    result: 4,
+                    op: OP_WRITE,
+                    ..Completion::default()
+                },
+                Completion {
+                    userdata: u64::MAX,
+                    result: 8,
+                    op: OP_WRITE,
+                    ..Completion::default()
+                },
+            ],
+        );
+        let reg = DfsRegistration {
+            reg_id: 1,
+            file_version_id: String::new(),
+        };
+        let bytes = [1; 16];
+        assert_eq!(
+            ring.write_batch(&mut iov, &reg, &[(0, &bytes), (16, &bytes)])
+                .await
+                .expect("ordered lengths"),
+            vec![8, 4]
+        );
+        assert_eq!(iov.free_blocks(), 4);
+    }
+
+    #[tokio::test]
+    async fn eof_single_returns_zero_and_preserves_output() {
+        let (mut iov, mut ring) = local_ring_pair(8);
+        preload_probe_completions(
+            &ring,
+            &[Completion {
+                userdata: 1,
+                result: 0,
+                op: OP_READ,
+                ..Completion::default()
+            }],
+        );
+        let reg = DfsRegistration {
+            reg_id: 1,
+            file_version_id: String::new(),
+        };
+        let mut out = [0xA5; 8];
+        assert_eq!(
+            ring.read_into(&mut iov, &reg, 1024, &mut out)
+                .await
+                .expect("EOF is success"),
+            0
+        );
+        assert_eq!(out, [0xA5; 8]);
+        assert_eq!(iov.free_blocks(), 4);
+    }
+    #[tokio::test]
+    async fn eof_batch_returns_zero_and_recycles_all_known_blocks() {
+        let (mut iov, mut ring) = local_ring_pair(8);
+        preload_probe_completions(
+            &ring,
+            &[
+                Completion {
+                    userdata: 1,
+                    result: 0,
+                    op: OP_READ,
+                    ..Completion::default()
+                },
+                Completion {
+                    userdata: 2,
+                    result: 4,
+                    op: OP_READ,
+                    ..Completion::default()
+                },
+            ],
+        );
+        let slice = IovSlice {
+            block: 1,
+            iov_offset: iov.layout().block_offset(1) as u64,
+            len: 4,
+        };
+        iov.view.write_block(&slice, b"data").expect("data");
+        let reg = DfsRegistration {
+            reg_id: 1,
+            file_version_id: String::new(),
+        };
+        let mut first = [0xA5; 8];
+        let mut second = [0x5A; 8];
+        assert_eq!(
+            ring.read_batch(
+                &mut iov,
+                &reg,
+                &mut [(1024, first.as_mut_slice()), (0, second.as_mut_slice())]
+            )
+            .await
+            .expect("mixed EOF and data"),
+            vec![0, 4]
+        );
+        assert_eq!(first, [0xA5; 8]);
+        assert_eq!(&second[..4], b"data");
+        assert_eq!(&second[4..], &[0x5A; 4]);
+        assert_eq!(iov.free_blocks(), 4);
+    }
+
+    #[tokio::test]
+    async fn staged_write_cancellation_tracks_zero_and_published_prefixes() {
+        let block = 1024 * 1024;
+        for filled in [4, 8] {
+            let layout = IovLayout::new(block, 8).expect("layout");
+            let (mut iov, mut ring) = local_ring_pair_with_layout(8, layout);
+            fill_submission_queue(&ring, filled);
+            let reg = DfsRegistration {
+                reg_id: 1,
+                file_version_id: String::new(),
+            };
+            let payload = vec![0xA5; block];
+            let items: Vec<_> = (0..8)
+                .map(|i| ((i * block) as u64, payload.as_slice()))
+                .collect();
+            let timed = tokio::time::timeout(
+                Duration::from_millis(20),
+                ring.write_batch(&mut iov, &reg, &items),
+            )
+            .await;
+            assert!(timed.is_err(), "wait for space is cancellable");
+            assert_eq!(
+                iov.free_blocks(),
+                if filled == 8 { 8 } else { 0 },
+                "only zero-push cancellation recycles"
+            );
+            assert_eq!(ring.ring.ring_consumer().available(), 8);
+            if filled == 4 {
+                let submitted = ring
+                    .ring
+                    .ring_consumer()
+                    .peek_at(4)
+                    .expect("published prefix");
+                assert!(
+                    iov.view
+                        .slice(submitted.iov_offset, block as u64)
+                        .expect("bytes")
+                        .iter()
+                        .all(|b| *b == 0xA5)
+                );
+                assert!(
+                    ring.write_from(&mut iov, &reg, 0, b"replacement")
+                        .await
+                        .is_err(),
+                    "unknown banks cannot be reused"
+                );
+            }
+        }
     }
 
     /// `io_depth` 的支持范围：绝对值不得超过 worker 的单周期执行批量上限（256）。
