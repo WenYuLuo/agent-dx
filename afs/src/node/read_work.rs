@@ -108,6 +108,9 @@ pub struct ReadWorkMetrics {
     catalog_commit_resources: afs_metrics::IntGaugeVec,
     scan_bytes: afs_metrics::IntCounter,
     hashes: afs_metrics::IntCounterVec,
+    read_buffer_events: afs_metrics::IntCounterVec,
+    read_buffer_bytes: afs_metrics::IntCounterVec,
+    read_buffer_idle: afs_metrics::IntGaugeVec,
     crc_read_bytes: afs_metrics::IntCounterVec,
     crc_read_calls: afs_metrics::IntCounterVec,
     authorization_ns: afs_metrics::IntCounterVec,
@@ -222,6 +225,19 @@ impl ReadWorkMetrics {
             for stage in ["total", "cache_maintenance", "meta_rpc", "open_meta", "close_meta", "close_peer"] { authorization_ns.with_label_values(&[stage]); authorization_calls.with_label_values(&[stage]); }
             afs_metrics::register_collector(registry, &authorization_ns)?;
             afs_metrics::register_collector(registry, &authorization_calls)?;
+            let read_buffer_events = afs_metrics::IntCounterVec::new(afs_metrics::Opts::new("afs_dfs_read_buffer_events_total", "Read buffer allocation/reuse/return events; zero counts explicit initialization."), &["role", "event"])?;
+            let read_buffer_bytes = afs_metrics::IntCounterVec::new(afs_metrics::Opts::new("afs_dfs_read_buffer_bytes_total", "Actual capacity allocated/reused/returned or explicit bytes zeroed."), &["role", "event"])?;
+            let read_buffer_idle = afs_metrics::IntGaugeVec::new(afs_metrics::Opts::new("afs_dfs_read_buffer_idle_bytes", "Idle buffer capacity; bounded to 2MiB per role, additional to active operation budgets."), &["role"])?;
+            for role in ["serve", "reply"] {
+                read_buffer_idle.with_label_values(&[role]);
+                for event in ["allocate", "reuse", "return", "zero"] {
+                    read_buffer_events.with_label_values(&[role,event]);
+                    read_buffer_bytes.with_label_values(&[role,event]);
+                }
+            }
+            afs_metrics::register_collector(registry, &read_buffer_events)?;
+            afs_metrics::register_collector(registry, &read_buffer_bytes)?;
+            afs_metrics::register_collector(registry, &read_buffer_idle)?;
             let crc_read_bytes = afs_metrics::IntCounterVec::new(
                 afs_metrics::Opts::new("afs_dfs_crc32c_read_bytes_total", "Actual CRC32C read input bytes, including failed work; descriptor hashes are separate."), &["stage"],
             )?;
@@ -570,6 +586,9 @@ impl ReadWorkMetrics {
                 catalog_commit_resources,
                 scan_bytes,
                 hashes,
+                read_buffer_events,
+                read_buffer_bytes,
+                read_buffer_idle,
                 crc_read_bytes,
                 crc_read_calls,
                 authorization_ns,
@@ -1054,6 +1073,19 @@ impl ReadWorkMetrics {
         }
     }
 
+    pub(crate) fn read_buffer(&self, role: &'static str, event: &'static str, bytes: u64) {
+        self.read_buffer_events
+            .with_label_values(&[role, event])
+            .inc();
+        self.read_buffer_bytes
+            .with_label_values(&[role, event])
+            .inc_by(bytes);
+    }
+    pub(crate) fn read_buffer_idle(&self, role: &'static str, bytes: u64) {
+        if let Ok(bytes) = i64::try_from(bytes) {
+            self.read_buffer_idle.with_label_values(&[role]).set(bytes);
+        }
+    }
     pub(crate) fn copy(&self, stage: &'static str, bytes: u64) {
         self.copies.with_label_values(&[stage]).inc_by(bytes);
     }

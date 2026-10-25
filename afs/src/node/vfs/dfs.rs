@@ -4686,7 +4686,7 @@ impl DistributedFs {
         snapshot: &DfsFileHandleSnapshot,
         offset: u64,
         size: usize,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<crate::node::read_buffer::ReadBuffer> {
         self.read_engine.validate_native_read_size(size)?;
         if let Some(inode) = snapshot.handle.open_read_inode.as_ref() {
             let opened = snapshot
@@ -4730,7 +4730,9 @@ impl DistributedFs {
             if snapshot.handle.dynamic_read_route.load(Ordering::Acquire)
                 && let Some(remote) = self.remote_provider_visible_for_reads(&snapshot.inode_id)?
             {
-                return self.remote_read_owned(&remote, offset, size);
+                return self
+                    .remote_read_owned(&remote, offset, size)
+                    .map(Into::into);
             }
             if snapshot.handle.dynamic_read_route.load(Ordering::Acquire)
                 && self.write_state(&snapshot.inode_id)?.is_some()
@@ -4744,7 +4746,7 @@ impl DistributedFs {
                     &mut out,
                 )?;
                 out.truncate(count);
-                return Ok(out);
+                return Ok(out.into());
             }
             let (inode, view) = self.native_inode_for_read(handle, snapshot)?;
             let out = self.read_committed_inode_owned_hint(
@@ -4968,6 +4970,7 @@ impl DistributedFs {
         size: usize,
     ) -> Result<Vec<u8>> {
         self.read_committed_inode_owned_hint(inode, offset, size, &mut None, None, None)
+            .map(crate::node::read_buffer::ReadBuffer::into_vec)
     }
 
     fn read_committed_inode_owned_hint(
@@ -4978,11 +4981,11 @@ impl DistributedFs {
         hint: &mut Option<ReadBatch>,
         deadline: Option<Instant>,
         open_reference: Option<&str>,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<crate::node::read_buffer::ReadBuffer> {
         let cached = self.readonly_version_for_inode(inode)?;
         let length = cached.layout.file_length;
         if offset >= length || size == 0 {
-            return Ok(Vec::new());
+            return Ok(Vec::new().into());
         }
         let count = usize::try_from((length - offset).min(size as u64))
             .map_err(|_| invalid("read length is too large"))?;
@@ -5009,7 +5012,7 @@ impl DistributedFs {
         if self.read_engine.readahead_object_limit() != 0 {
             *hint = Some(batch);
         }
-        Ok(result)
+        Ok(result.into())
     }
 
     fn read_visible_resolved(
@@ -12107,6 +12110,24 @@ impl Backend for DistributedFs {
         )
     }
 
+    fn read_reply(
+        &self,
+        ctx: &RequestContext,
+        handle: FileHandle,
+        offset: u64,
+        size: usize,
+    ) -> Result<prost::bytes::Bytes> {
+        if self.read_engine.has_external_backend() {
+            return self.read_owned(ctx, handle, offset, size).map(Into::into);
+        }
+        let snapshot = self.handle_snapshot(handle)?;
+        if snapshot.flags & libc::O_ACCMODE == libc::O_WRONLY {
+            return Err(bad_file_descriptor("DFS handle was not opened for reading"));
+        }
+        self.read_native_owned(handle, &snapshot, offset, size)
+            .map(prost::bytes::Bytes::from_owner)
+    }
+
     fn read_owned(
         &self,
         ctx: &RequestContext,
@@ -12119,7 +12140,9 @@ impl Backend for DistributedFs {
             return Err(bad_file_descriptor("DFS handle was not opened for reading"));
         }
         if !self.read_engine.has_external_backend() {
-            return self.read_native_owned(handle, &snapshot, offset, size);
+            return self
+                .read_native_owned(handle, &snapshot, offset, size)
+                .map(crate::node::read_buffer::ReadBuffer::into_vec);
         }
         let fallback = || {
             let mut out = vec![0; size];

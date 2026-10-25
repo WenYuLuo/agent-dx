@@ -1282,7 +1282,7 @@ impl PinnedChunkReader {
         if before.length != self.chunk.length {
             return Err(corrupt(&self.chunk.id, "CRC body length differs"));
         }
-        let mut scratch = vec![0u8; super::chunk_crc32c::SEGMENT];
+        let mut scratch = Vec::new();
         let mut counts = Vec::with_capacity(ranges.len());
         for r in ranges {
             let allowed =
@@ -1299,6 +1299,43 @@ impl PinnedChunkReader {
                 continue;
             }
             let end = r.chunk_offset + allowed as u64;
+            let segment = super::chunk_crc32c::SEGMENT;
+            let complete = (r.chunk_offset as usize).is_multiple_of(segment)
+                && ((end as usize).is_multiple_of(segment) || end == self.chunk.length);
+            if !verify_body || complete {
+                let target = &mut out[r.output_offset..output_end];
+                let mut read = 0;
+                while read < allowed {
+                    let got = read_positioned(
+                        &self.file,
+                        r.chunk_offset + read as u64,
+                        &mut target[read..],
+                    )?;
+                    if got == 0 {
+                        return Err(corrupt(&self.chunk.id, "short CRC body"));
+                    }
+                    read += got;
+                }
+                if verify_body {
+                    for (relative, bytes) in target.chunks(segment).enumerate() {
+                        let crc_scope = self
+                            .read_work
+                            .as_ref()
+                            .and_then(|m| m.coarse_diagnostic("crc_storage", bytes.len() as u64));
+                        if let Some(m) = &self.read_work {
+                            m.crc_read("storage_segments", bytes.len() as u64);
+                        }
+                        let actual = super::chunk_crc32c::checksum(bytes);
+                        drop(crc_scope);
+                        if actual != table.checksums[r.chunk_offset as usize / segment + relative] {
+                            return Err(corrupt(&self.chunk.id, "CRC32C segment mismatch"));
+                        }
+                    }
+                }
+                counts.push(allowed);
+                continue;
+            }
+            scratch.resize(segment, 0);
             for index in (r.chunk_offset as usize / super::chunk_crc32c::SEGMENT)
                 ..=((end as usize - 1) / super::chunk_crc32c::SEGMENT)
             {
@@ -2299,7 +2336,7 @@ impl PeerFileIdentity {
 #[derive(Debug)]
 #[cfg(any(feature = "dfs", test))]
 struct PeerVerifiedObject {
-    bytes: Vec<u8>,
+    bytes: super::read_buffer::ReadBuffer,
     outboard: Option<SharedOutboard>,
     _reservation: PeerReadReservation,
     // A range fallback is never resident and needs no reusable identity.
@@ -3220,6 +3257,8 @@ pub struct LocalChunkStore {
     #[cfg(any(feature = "dfs", test))]
     peer_read_budget: Arc<PeerReadBudget>,
     #[cfg(any(feature = "dfs", test))]
+    peer_buffer_pool: Arc<super::read_buffer::ReadBufferPool>,
+    #[cfg(any(feature = "dfs", test))]
     peer_read_cache: Mutex<PeerServeState>,
     #[cfg(any(feature = "dfs", test))]
     peer_serve_changed: Condvar,
@@ -3297,6 +3336,8 @@ impl LocalChunkStore {
             peer_payload_test_block: Mutex::new(None),
             #[cfg(any(feature = "dfs", test))]
             peer_read_budget: Arc::new(PeerReadBudget::default()),
+            #[cfg(any(feature = "dfs", test))]
+            peer_buffer_pool: super::read_buffer::ReadBufferPool::new("serve"),
             #[cfg(any(feature = "dfs", test))]
             peer_read_cache: Mutex::new(PeerServeState::default()),
             #[cfg(any(feature = "dfs", test))]
@@ -3634,6 +3675,11 @@ impl LocalChunkStore {
 
     pub(crate) fn peer_read_crc_mode(&self) -> crate::config::DfsReadCrcMode {
         self.peer_read_crc_mode
+    }
+
+    #[cfg(feature = "dfs")]
+    pub(crate) fn read_work_metrics(&self) -> Option<&super::read_work::ReadWorkMetrics> {
+        self.read_work.as_ref()
     }
 
     pub(crate) fn with_read_work_metrics(
@@ -4694,12 +4740,10 @@ impl LocalChunkStore {
                 let scratch = super::chunk_crc32c::SEGMENT;
                 let mut reservation = self
                     .reserve_peer_read_payload_until(allowed.saturating_add(scratch), deadline)?;
-                let mut bytes = Vec::new();
-                bytes
-                    .try_reserve_exact(allowed)
-                    .map_err(|_| peer_payload_capacity())?;
+                let mut bytes = self
+                    .peer_buffer_pool
+                    .take(allowed, self.read_work.clone())?;
                 reservation.retain_capacity(bytes.capacity().saturating_add(scratch))?;
-                bytes.resize(allowed, 0);
                 let mut reader = self.open_cataloged(chunk_id)?;
                 let segment = super::chunk_crc32c::SEGMENT as u64;
                 let complete = offset.is_multiple_of(segment)
@@ -4853,7 +4897,7 @@ impl LocalChunkStore {
                         {
                             return Ok(PeerReadPayload {
                                 object: Arc::new(PeerVerifiedObject {
-                                    bytes,
+                                    bytes: bytes.into(),
                                     outboard: None,
                                     _reservation: reservation,
                                     identity: None,
@@ -4931,7 +4975,7 @@ impl LocalChunkStore {
             let outboard = outboard.filter(|proof| proof.try_mark_resident());
             let control = self.peer_object_control(resident.then_some(&record), deadline)?;
             let object = Arc::new(PeerVerifiedObject {
-                bytes,
+                bytes: bytes.into(),
                 outboard,
                 _reservation: reservation,
                 identity: resident.then_some((record, before)),
@@ -5699,6 +5743,69 @@ struct OutboardPersistIo {
 #[cfg(test)]
 mod replica_replay_tests {
     use super::*;
+
+    #[cfg(feature = "dfs")]
+    #[test]
+    fn buffer_reuse_peer_payload_lease_and_bytes_outlive_last_frame() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = LocalChunkStore::open(temp.path(), "node-a")
+            .unwrap()
+            .with_peer_read_crc_mode(crate::config::DfsReadCrcMode::Off);
+        let staged =
+            StagedChunk::new_crc32c(OperationId::new("pool-lease"), vec![41; 65536]).unwrap();
+        store.put(staged.clone()).unwrap();
+        let payload = store.read_peer_range(&staged.chunk.id, 0, 65536).unwrap();
+        let ptr = payload.as_slice().as_ptr();
+        let bytes = payload.into_shared_bytes();
+        let frame = bytes.slice(7..31);
+        drop(bytes);
+        assert!(store.peer_read_budget.used.load(Ordering::Acquire) > 0);
+        let other = store.read_peer_range(&staged.chunk.id, 0, 65536).unwrap();
+        assert_ne!(other.as_slice().as_ptr(), ptr);
+        assert_eq!(&frame[..], &[41; 24]);
+        drop(frame);
+        let reused = store.read_peer_range(&staged.chunk.id, 0, 65536).unwrap();
+        assert_eq!(reused.as_slice().as_ptr(), ptr);
+        drop(other);
+        drop(reused);
+        assert_eq!(store.peer_read_budget.used.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn buffer_reuse_crc_off_reads_final_payload_without_scratch_copy() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = afs_metrics::Registry::new();
+        let metrics = super::super::read_work::ReadWorkMetrics::register(&registry).unwrap();
+        let store = LocalChunkStore::open(temp.path(), "node-a")
+            .unwrap()
+            .with_peer_read_crc_mode(crate::config::DfsReadCrcMode::Off)
+            .with_read_work_metrics(metrics);
+        let body: Vec<u8> = (0..131085).map(|i| (i % 251) as u8).collect();
+        let staged = StagedChunk::new_crc32c(OperationId::new("direct"), body.clone()).unwrap();
+        store.put(staged.clone()).unwrap();
+        for (offset, length) in [(0, 131085), (9, 70000), (131080, 5)] {
+            let payload = store
+                .read_peer_range(&staged.chunk.id, offset as u64, length)
+                .unwrap();
+            assert_eq!(payload.as_slice(), &body[offset..offset + length]);
+        }
+        let copies: u64 = registry
+            .gather()
+            .iter()
+            .filter(|f| f.name() == "afs_dfs_read_copy_bytes_total")
+            .flat_map(|f| f.get_metric())
+            .filter(|m| {
+                m.get_label()
+                    .iter()
+                    .any(|l| l.value() == "crc_storage_to_range")
+            })
+            .map(|m| m.get_counter().get_value() as u64)
+            .sum();
+        assert_eq!(
+            copies, 0,
+            "off read must fill final owner without scratch copy"
+        );
+    }
 
     #[test]
     fn p2_w3_uncontrolled_sixteen_requests_report_actual_groups_and_barriers() {

@@ -221,8 +221,8 @@ fn backend_read_data(
     handle: FileHandle,
     offset: u64,
     size: usize,
-) -> Result<Vec<u8>> {
-    backend.read_owned(ctx, handle, offset, size)
+) -> Result<prost::bytes::Bytes> {
+    backend.read_reply(ctx, handle, offset, size)
 }
 
 // Keep the diagnostic alive through the actual reply operation. Ending it at
@@ -3841,6 +3841,43 @@ mod dispatch_tests {
     }
 
     #[test]
+    fn buffer_reuse_backend_reply_holds_pool_owner_until_send_returns() {
+        struct PooledBackend {
+            pool: std::sync::Arc<crate::node::read_buffer::ReadBufferPool>,
+        }
+        impl super::Backend for PooledBackend {
+            fn root_inode(&self) -> super::BackendInode {
+                super::BackendInode { value: 1 }
+            }
+            fn read_reply(
+                &self,
+                _: &super::RequestContext,
+                _: super::FileHandle,
+                _: u64,
+                size: usize,
+            ) -> super::Result<prost::bytes::Bytes> {
+                let mut out = self.pool.take(size, None)?;
+                out.fill(23);
+                Ok(prost::bytes::Bytes::from_owner(out))
+            }
+        }
+        let backend = PooledBackend {
+            pool: crate::node::read_buffer::ReadBufferPool::new("reply"),
+        };
+        let reply =
+            super::backend_read_data(&backend, &test_context(), super::FileHandle(9), 0, 1024)
+                .unwrap();
+        let pointer = reply.as_ptr();
+        let held = reply.clone();
+        drop(reply);
+        let other = backend.pool.take(1024, None).unwrap();
+        assert_ne!(other.as_ptr(), pointer);
+        assert_eq!(&held[..], &[23; 1024]);
+        drop(held);
+        assert_eq!(backend.pool.take(1024, None).unwrap().as_ptr(), pointer);
+    }
+
+    #[test]
     fn backend_read_data_prefers_owned_response_without_buffered_read() {
         let backend = OwnedReadBackend {
             owned: b"private".to_vec(),
@@ -3850,7 +3887,7 @@ mod dispatch_tests {
         };
         let data = super::backend_read_data(&backend, &test_context(), super::FileHandle(9), 4, 32)
             .unwrap();
-        assert_eq!(data, b"private");
+        assert_eq!(data.as_ref(), b"private");
         assert_eq!(
             backend
                 .read_owned_calls
@@ -3895,7 +3932,7 @@ mod dispatch_tests {
         };
         let data = super::backend_read_data(&backend, &test_context(), super::FileHandle(9), 4, 32)
             .unwrap();
-        assert_eq!(data, b"fallback");
+        assert_eq!(data.as_ref(), b"fallback");
         assert_eq!(
             backend.read_calls.load(std::sync::atomic::Ordering::SeqCst),
             1

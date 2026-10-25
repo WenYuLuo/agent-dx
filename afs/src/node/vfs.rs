@@ -271,6 +271,18 @@ pub trait Backend: Send + Sync {
         Ok(out)
     }
 
+    /// Keep private response ownership through the synchronous FUSE reply.
+    /// Legacy backends transfer their Vec allocation without copying.
+    fn read_reply(
+        &self,
+        ctx: &types::RequestContext,
+        handle: types::FileHandle,
+        offset: u64,
+        size: usize,
+    ) -> Result<prost::bytes::Bytes> {
+        self.read_owned(ctx, handle, offset, size).map(Into::into)
+    }
+
     /// 返回底层确认的实际字节数；不能把部分成功或未知结果报成整笔成功。
     /// O_APPEND 的末尾定位属于打开句柄语义，后端不能盲信传入 offset。
     fn write(

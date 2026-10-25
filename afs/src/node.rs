@@ -27,6 +27,7 @@ pub mod gc;
 mod native_workspace;
 #[cfg(feature = "dfs")]
 pub mod peer_cache;
+mod read_buffer;
 pub mod read_work;
 #[cfg(feature = "dfs")]
 pub mod replication;

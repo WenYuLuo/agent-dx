@@ -1079,6 +1079,7 @@ impl Drop for PeerFillStage<'_> {
 
 pub struct DfsReadEngine {
     namespace_id: crate::dfs::NamespaceId,
+    reply_buffer_pool: Arc<super::read_buffer::ReadBufferPool>,
     local_node_id: String,
     local: Arc<LocalChunkStore>,
     source_provider: Arc<dyn ReadSourceProvider>,
@@ -1499,6 +1500,7 @@ impl DfsReadEngine {
         );
         source_cache.record(&local);
         Self {
+            reply_buffer_pool: super::read_buffer::ReadBufferPool::new("reply"),
             namespace_id,
             local_node_id,
             local,
@@ -1564,6 +1566,7 @@ impl DfsReadEngine {
 
     fn task_reader(&self) -> Self {
         Self {
+            reply_buffer_pool: self.reply_buffer_pool.clone(),
             namespace_id: self.namespace_id.clone(),
             local_node_id: self.local_node_id.clone(),
             local: self.local.clone(),
@@ -1817,6 +1820,7 @@ impl DfsReadEngine {
         deadline: Option<Instant>,
     ) -> Result<Option<Vec<u8>>> {
         self.read_batch_native_open_owned_before(batch, output_len, deadline, None)
+            .map(|result| result.map(super::read_buffer::ReadBuffer::into_vec))
     }
     pub(super) fn read_batch_native_open_owned_before(
         &self,
@@ -1824,7 +1828,7 @@ impl DfsReadEngine {
         output_len: usize,
         deadline: Option<Instant>,
         open_reference: Option<&str>,
-    ) -> Result<Option<Vec<u8>>> {
+    ) -> Result<Option<super::read_buffer::ReadBuffer>> {
         if output_len as u64 > self.config.max_inflight_bytes {
             return Err(invalid("DFS owned read exceeds inflight byte budget"));
         }
@@ -1846,7 +1850,9 @@ impl DfsReadEngine {
         );
         let _entered = span.enter();
         let authority = self.capture_native_read_authority()?;
-        let mut result = vec![0; output_len];
+        let mut result = self
+            .reply_buffer_pool
+            .take(output_len, self.local.read_work_metrics().cloned())?;
         self.read_batch_into_private(batch, &mut result, true, deadline, open_reference)
             .inspect_err(|error| {
                 self.invalidate_native_batch_on_error(batch, error);

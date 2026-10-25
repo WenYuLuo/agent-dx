@@ -1025,3 +1025,46 @@ The isolated read candidate supports `dfs_native_open_read_authority = true` onl
 This is an experimental data-version contract, not an admitted per-fd length snapshot: a truncate followed by a new open can change the shared kernel inode EOF before an old-fd tail read reaches FUSE. The new persisted GC context schema has only been checked with fresh isolated stores and same-version Meta/A/B. Migration, mixed versions and integration with prefetch/cache are not admitted.
 
 The [remote read candidate ledger](../performance/afs-remote-read-20261024/README.md) records the exact cohorts, Linux validation, retained failures and future work. Benchmark settings explicitly enable this switch, set `dfs_fuse_keep_cache=false` and `dfs_readahead_max_bytes=0`; merely using a new binary does not activate all candidate optimizations.
+
+## Experimental native read buffer reuse
+
+The buffer candidate reads complete CRC segments directly into the final A-side
+send allocation and verifies them there when required. Unchecked peer ranges can
+also read directly; checked partial segments retain covering-segment verification
+and cropping. Catalog, file identity, authorization, descriptor and completion
+checks are retained. This also combines the previous small positioned reads;
+performance changes must not be attributed entirely to removing memcpy.
+
+A `Bytes` frame retains its payload and live budget lease until the last frame
+reference disappears. B assembles frames directly in its final contiguous reply
+allocation. `Backend::read_reply` retains that allocation through the synchronous
+FUSE reply, then returns it for reuse. Legacy `read_owned` Vec callers transfer
+ownership without copying, which deliberately removes that allocation from the
+pool. External, sparse and multi-operation fallbacks retain their existing paths.
+
+Each LocalChunkStore/reader engine has at most two idle allocations of at most
+1MiB actual capacity each; task readers share their parent pool. This is an
+additional idle limit of 2MiB per role, not part of A's existing 16MiB live-payload
+budget. Reused actual capacity remains charged to the live lease. B retains its
+existing per-operation inflight-size check; this change adds no global active-B
+budget. Larger allocations are not retained. Initialized storage is reused only
+for a complete private single-range result that must be overwritten before
+successful publication. Reused memory is not a data cache.
+
+`afs_dfs_read_buffer_events_total` and `afs_dfs_read_buffer_bytes_total` distinguish
+allocation, reuse, return-to-idle and explicit zeroing for `serve` and `reply`.
+`afs_dfs_read_buffer_idle_bytes` reports retained idle capacity. These counters
+cover final body buffers, not all protobuf/descriptor heap allocations. B's
+frame-assembly copy, transport and kernel/FUSE copies still exist; this is not an
+end-to-end zero-copy interface. No concurrency, prefetch, TLS or libfuse setting
+is changed by buffer reuse.
+
+```sh
+cargo test --release -p afs --lib buffer_reuse_ -- --test-threads=1
+```
+
+The targeted tests cover direct off-mode ranges including fragments/short tails,
+last-frame ownership and live leases, FUSE reply ownership, idle capacity, and
+zero-copy Vec ownership transfer. Existing CRC and native-read authority/error
+checks remain required. Performance needs a separate fixed, interleaved complete
+FUSE comparison; old CRC/open-authority timings are not a current baseline.
