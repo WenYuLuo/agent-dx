@@ -11201,6 +11201,14 @@ impl CommitReason {
 }
 
 impl Backend for DistributedFs {
+    fn fixed_read_view(&self, handle: FileHandle) -> bool {
+        self.handles
+            .get(handle.0)
+            .ok()
+            .flatten()
+            .is_some_and(|opened| opened.open_read_inode.is_some())
+    }
+
     fn page_cache_identity(&self, handle: FileHandle) -> Option<PageCacheIdentity> {
         let opened = self.native_read_capability(handle)?;
         let state = opened.state.lock().ok()?;
@@ -11651,6 +11659,10 @@ impl Backend for DistributedFs {
     ) -> Result<FileAttributes> {
         if let Some(handle) = handle {
             let snapshot = self.handle_snapshot(handle)?;
+            if let Some(opened) = snapshot.handle.open_read_inode.as_ref() {
+                let (size, blocks) = self.inode_size_and_blocks(opened)?;
+                return Ok(attributes(opened, size, blocks));
+            }
             if let Some(remote) = self.remote_provider_visible_for_reads(&snapshot.inode_id)? {
                 return self.remote_getattr(&remote).inspect_err(|error| {
                     self.invalidate_native_inode_views_on_error(&snapshot.inode_id, error);
@@ -26303,6 +26315,28 @@ mod tests {
         fs.release(&context(), reader).unwrap();
     }
 
+    #[test]
+    fn fast_open_fixed_eof_and_attributes_survive_new_shorter_open() {
+        let (_temp, meta, fs) = test_fs();
+        let fs = fs.with_native_open_read_authority(true);
+        let inode_id = meta.inode.lock().unwrap().inode_id.clone();
+        publish_external_version_with_bytes(&meta, &fs, "fixed-old", b"old-open-data");
+        let inode = fs.backend_inode(&inode_id).unwrap();
+        let old = fs.open(&context(), inode, libc::O_RDONLY).unwrap();
+        assert!(fs.fixed_read_view(old));
+        publish_external_version_with_bytes(&meta, &fs, "fixed-new", b"new");
+        let new = fs.open(&context(), inode, libc::O_RDONLY).unwrap();
+        assert_eq!(fs.getattr(&context(), inode, Some(old)).unwrap().size, 13);
+        assert_eq!(fs.getattr(&context(), inode, Some(new)).unwrap().size, 3);
+        assert_eq!(
+            fs.read_reply(&context(), old, 3, 32).unwrap().as_ref(),
+            b"-open-data"
+        );
+        assert!(fs.read_reply(&context(), new, 3, 32).unwrap().is_empty());
+        assert!(fs.read_reply(&context(), old, 13, 32).unwrap().is_empty());
+        fs.release(&context(), old).unwrap();
+        fs.release(&context(), new).unwrap();
+    }
     #[test]
     fn open_authority_readonly_keeps_opened_version_after_view_expiry() {
         let (_temp, meta, fs) = test_fs();

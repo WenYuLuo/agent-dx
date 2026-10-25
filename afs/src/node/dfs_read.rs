@@ -1077,9 +1077,15 @@ impl Drop for PeerFillStage<'_> {
     }
 }
 
+#[derive(Default)]
+struct FixedOpenRoutes {
+    entries: HashMap<(String, ChunkId), (Arc<ChunkSources>, usize)>,
+    bytes: usize,
+}
 pub struct DfsReadEngine {
     namespace_id: crate::dfs::NamespaceId,
     reply_buffer_pool: Arc<super::read_buffer::ReadBufferPool>,
+    fixed_open_routes: Arc<Mutex<FixedOpenRoutes>>,
     local_node_id: String,
     local: Arc<LocalChunkStore>,
     source_provider: Arc<dyn ReadSourceProvider>,
@@ -1501,6 +1507,7 @@ impl DfsReadEngine {
         source_cache.record(&local);
         Self {
             reply_buffer_pool: super::read_buffer::ReadBufferPool::new("reply"),
+            fixed_open_routes: Arc::new(Mutex::new(FixedOpenRoutes::default())),
             namespace_id,
             local_node_id,
             local,
@@ -1567,6 +1574,7 @@ impl DfsReadEngine {
     fn task_reader(&self) -> Self {
         Self {
             reply_buffer_pool: self.reply_buffer_pool.clone(),
+            fixed_open_routes: self.fixed_open_routes.clone(),
             namespace_id: self.namespace_id.clone(),
             local_node_id: self.local_node_id.clone(),
             local: self.local.clone(),
@@ -1720,6 +1728,14 @@ impl DfsReadEngine {
         self.check_native_read_authority(&authority)
     }
     pub(super) fn close_open_read_context(&self, reference: &str) -> Result<()> {
+        {
+            let mut cache = self
+                .fixed_open_routes
+                .lock()
+                .map_err(|_| unavailable("fixed open route cache poisoned"))?;
+            cache.entries.retain(|(key, _), _| key != reference);
+            cache.bytes = cache.entries.values().map(|(_, bytes)| *bytes).sum();
+        }
         self.transfer.close_open_read_context(reference)
     }
     pub(super) fn check_open_read_epoch(&self, opened: &NativeReadAuthoritySnapshot) -> Result<()> {
@@ -1853,10 +1869,17 @@ impl DfsReadEngine {
         let mut result = self
             .reply_buffer_pool
             .take(output_len, self.local.read_work_metrics().cloned())?;
-        self.read_batch_into_private(batch, &mut result, true, deadline, open_reference)
-            .inspect_err(|error| {
-                self.invalidate_native_batch_on_error(batch, error);
-            })?;
+        let fast = if let Some(reference) = open_reference {
+            self.read_fixed_open_remote(batch, &mut result, reference)?
+        } else {
+            false
+        };
+        if !fast {
+            self.read_batch_into_private(batch, &mut result, true, deadline, open_reference)
+                .inspect_err(|error| {
+                    self.invalidate_native_batch_on_error(batch, error);
+                })?;
+        }
         self.check_native_read_authority(&authority)?;
         Ok(Some(result))
     }
@@ -2852,6 +2875,108 @@ impl DfsReadEngine {
         self.read_batch_into_private(batch, out, false, None, None)
     }
 
+    /// A single final-owned native range uses fixed-open routes. The generic
+    /// local/group/fanout/cache scheduler remains the fallback for other shapes.
+    fn read_fixed_open_remote(
+        &self,
+        batch: &ReadBatch,
+        out: &mut [u8],
+        reference: &str,
+    ) -> Result<bool> {
+        if self.external_backend.is_some()
+            || self.local.peer_read_crc_mode() != crate::config::DfsReadCrcMode::Off
+            || self.peer_cache.is_some()
+            || self.config.readahead_max_bytes != 0
+            || batch.ops.len() != 1
+            || batch.ops[0].output_offset != 0
+        {
+            return Ok(false);
+        }
+        let op = &batch.ops[0];
+        let version = batch
+            .file_version_id
+            .clone()
+            .ok_or_else(|| invalid("fixed open version absent"))?;
+        let key = (reference.to_owned(), op.chunk_id.clone());
+        let cached = self
+            .fixed_open_routes
+            .lock()
+            .map_err(|_| unavailable("fixed open route cache poisoned"))?
+            .entries
+            .get(&key)
+            .map(|(sources, _)| sources.clone());
+        let was_cached = cached.is_some();
+        if !was_cached {
+            match self.local_reader(&op.chunk_id) {
+                Ok(_) => return Ok(false),
+                Err(error) => self.handle_local_read_failure(&op.chunk_id, &error)?,
+            }
+        }
+        let mut resolved = cached;
+        let mut last_error = None;
+        // Only failure enters a fresh fixed-version source lookup; never read a
+        // current inode/head and never publish a partial failed attempt buffer.
+        for attempt in 0..2 {
+            if resolved.is_none() {
+                resolved = self
+                    .sources_for(batch)?
+                    .into_iter()
+                    .find(|set| set.chunk_id == op.chunk_id)
+                    .map(Arc::new);
+            }
+            let set = resolved
+                .take()
+                .ok_or_else(|| corrupt("fixed open object source absent"))?;
+            let Some(chunk) = set.chunk.as_ref().filter(|c| c.is_segment_crc32c()) else {
+                return Ok(false);
+            };
+            if set.sources.iter().any(|s| matches!(&s.location, CopyLocation::Node { node_id, .. } if node_id == &self.local_node_id) && s.state.is_readable()) {
+                return Ok(false);
+            }
+            for candidate in set.sources.iter().filter(|s| s.state.is_readable()
+                && matches!(s.role, CopyRole::DurableReplica | CopyRole::VerifiedCache)
+                && matches!(&s.location, CopyLocation::Node { node_id, .. } if node_id != &self.local_node_id)) {
+                let mut source = candidate.clone();
+                source.read_grant.token = format!("dfs-open-v1:{reference}");
+                let request = PeerReadBatch { file_version_id: version.clone(), layout_root_id: batch.layout_root_id.clone(),
+                    operations: vec![ResolvedReadOp { op: op.clone(), source }] };
+                match self.transfer.read_crc32c_range(&request, chunk, out) {
+                    Ok(()) => {
+                        if was_cached && attempt == 0 { return Ok(true); }
+                        let charge = SourceCache::retained_bytes(&(version.clone(), batch.layout_root_id.clone(), op.chunk_id.clone()), &set)
+                            .saturating_mul(2).saturating_add(reference.len() + 1024);
+                        let mut cache = self.fixed_open_routes.lock().map_err(|_| unavailable("fixed open route cache poisoned"))?;
+                        if charge <= MAX_SOURCE_CACHE_BYTES {
+                            if let Some((_, old)) = cache.entries.remove(&key) { cache.bytes = cache.bytes.saturating_sub(old); }
+                            while cache.entries.len() >= 512 || cache.bytes.saturating_add(charge) > MAX_SOURCE_CACHE_BYTES {
+                                let Some(old) = cache.entries.keys().next().cloned() else { break; };
+                                if let Some((_, bytes)) = cache.entries.remove(&old) { cache.bytes = cache.bytes.saturating_sub(bytes); }
+                            }
+                            cache.bytes = cache.bytes.saturating_add(charge);
+                            cache.entries.insert(key.clone(), (set.clone(), charge));
+                        }
+                        return Ok(true);
+                    }
+                    Err(error) => { last_error = Some(error); }
+                }
+            }
+            self.invalidate_native_batch_authority(batch);
+            {
+                let mut cache = self
+                    .fixed_open_routes
+                    .lock()
+                    .map_err(|_| unavailable("fixed open route cache poisoned"))?;
+                if let Some((_, bytes)) = cache.entries.remove(&key) {
+                    cache.bytes = cache.bytes.saturating_sub(bytes);
+                }
+            }
+            if attempt == 0 {
+                self.capture_native_read_authority()?;
+            }
+        }
+        Err(last_error.unwrap_or_else(|| corrupt("fixed open has no readable peer copy")))
+    }
+
     fn read_batch_into_private(
         &self,
         batch: &ReadBatch,
@@ -2860,6 +2985,8 @@ impl DfsReadEngine {
         deadline: Option<Instant>,
         open_reference: Option<&str>,
     ) -> Result<()> {
+        self.local
+            .record_read_check(super::read_work::ReadCheck::BatchGroup);
         let mut groups: Vec<(ChunkId, Vec<usize>)> = Vec::new();
         let mut positions: HashMap<ChunkId, usize> = HashMap::new();
         for (index, op) in batch.ops.iter().enumerate() {
@@ -2994,6 +3121,8 @@ impl DfsReadEngine {
     }
 
     fn local_reader(&self, chunk_id: &ChunkId) -> Result<Arc<PinnedChunkReader>> {
+        self.local
+            .record_read_check(super::read_work::ReadCheck::LocalProbe);
         if let Some(reader) = self
             .readers
             .lock()
@@ -5122,6 +5251,121 @@ mod tests {
                 token: "test-token".into(),
             },
         }
+    }
+
+    #[test]
+    fn fast_open_source_failure_refreshes_same_version_then_reuses_route() {
+        use std::sync::atomic::AtomicUsize;
+        struct Sources {
+            calls: AtomicUsize,
+            chunk: ChunkObject,
+        }
+        impl ReadSourceProvider for Sources {
+            fn sources_for(&self, request: DfsChunkSourcesRequest) -> Result<DfsChunkSourcesReply> {
+                assert_eq!(request.file_version_id.0, "version");
+                assert_eq!(request.layout_root_id.0, "layout");
+                let n = self.calls.fetch_add(1, Ordering::SeqCst);
+                let peer = if n == 0 {
+                    "failed-peer"
+                } else {
+                    "healthy-peer"
+                };
+                Ok(DfsChunkSourcesReply {
+                    revision: n as u64 + 1,
+                    chunks: vec![ChunkSources {
+                        chunk_id: self.chunk.id.clone(),
+                        chunk: Some(self.chunk.clone()),
+                        sources: vec![source(peer, &self.chunk.id, peer)],
+                        allowed_ranges: vec![(0, 4096)],
+                    }],
+                })
+            }
+        }
+        struct Transfer {
+            calls: AtomicUsize,
+        }
+        impl ChunkTransfer for Transfer {
+            fn read_ranges(&self, request: &PeerReadBatch, out: &mut [u8]) -> Result<()> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(request.file_version_id.0, "version");
+                assert_eq!(
+                    request.operations[0].source.read_grant.token,
+                    "dfs-open-v1:read-open:fixed"
+                );
+                if request.operations[0].source.copy_id.0 == "failed-peer" {
+                    return Err(Error::coded(
+                        afs_error::NODE_TRANSFER_UNAVAILABLE,
+                        "injected failed replica",
+                    ));
+                }
+                out.fill(19);
+                Ok(())
+            }
+            fn read_crc32c_range(
+                &self,
+                request: &PeerReadBatch,
+                _: &ChunkObject,
+                out: &mut [u8],
+            ) -> Result<()> {
+                self.read_ranges(request, out)
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let local = Arc::new(
+            LocalChunkStore::open(temp.path(), "node-a")
+                .unwrap()
+                .with_peer_read_crc_mode(crate::config::DfsReadCrcMode::Off),
+        );
+        let staged = crate::node::chunk::StagedChunk::new_crc32c(
+            OperationId::new("fixed-route"),
+            vec![19; 4096],
+        )
+        .unwrap();
+        let provider = Arc::new(Sources {
+            calls: AtomicUsize::new(0),
+            chunk: staged.chunk.clone(),
+        });
+        let transfer = Arc::new(Transfer {
+            calls: AtomicUsize::new(0),
+        });
+        let engine = DfsReadEngine::new(
+            crate::dfs::NamespaceId::new("default"),
+            "node-a".into(),
+            local,
+            provider.clone(),
+            transfer.clone(),
+            DfsReadConfig::default(),
+        );
+        let batch = ReadBatch {
+            file_version_id: Some(FileVersionId::new("version")),
+            layout_root_id: LayoutRootId::new("layout"),
+            lookahead: Vec::new(),
+            ops: vec![ChunkReadOp {
+                chunk_id: staged.chunk.id,
+                chunk_offset: 0,
+                length: 4096,
+                output_offset: 0,
+            }],
+        };
+        for _ in 0..2 {
+            let bytes = engine
+                .read_batch_native_open_owned_before(&batch, 4096, None, Some("read-open:fixed"))
+                .unwrap()
+                .unwrap();
+            assert_eq!(&bytes[..], &[19; 4096]);
+        }
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            2,
+            "only the error refreshes sources"
+        );
+        assert_eq!(
+            transfer.calls.load(Ordering::SeqCst),
+            3,
+            "one failed attempt then two successful reads"
+        );
+        engine.close_open_read_context("read-open:fixed").unwrap();
+        assert!(engine.fixed_open_routes.lock().unwrap().entries.is_empty());
     }
 
     fn put_local_chunk(local: &LocalChunkStore, operation: &str, bytes: &[u8]) -> ChunkId {

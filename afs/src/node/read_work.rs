@@ -101,8 +101,44 @@ const NATIVE_WRITE_RESOURCES: &[&str] = &[
     "descriptor_limit_bytes",
 ];
 
+/// Fixed, prebound counters: no label lookup in the per-frame hot loop.
+#[derive(Clone, Copy)]
+pub(crate) enum ReadCheck {
+    RequestValidate,
+    ServeState,
+    CatalogOpen,
+    CatalogFence,
+    DescriptorEncode,
+    DescriptorDecode,
+    AuthorizeFull,
+    ContextReuse,
+    PeerRegister,
+    LocalProbe,
+    BatchGroup,
+    FullGrant,
+    CompactGrant,
+    ContextRecover,
+}
+const READ_CHECK_NAMES: [&str; 14] = [
+    "request_validate",
+    "serve_state",
+    "catalog_open",
+    "catalog_fence",
+    "descriptor_encode",
+    "descriptor_decode",
+    "authorize_full",
+    "context_reuse",
+    "peer_register",
+    "local_probe",
+    "batch_group",
+    "full_grant",
+    "compact_grant",
+    "context_recover",
+];
+
 #[derive(Clone, Debug)]
 pub struct ReadWorkMetrics {
+    checks: [afs_metrics::IntCounter; 14],
     #[cfg(feature = "dfs")]
     native_write_resources: afs_metrics::IntGaugeVec,
     catalog_commit_resources: afs_metrics::IntGaugeVec,
@@ -225,6 +261,10 @@ impl ReadWorkMetrics {
             for stage in ["total", "cache_maintenance", "meta_rpc", "open_meta", "close_meta", "close_peer"] { authorization_ns.with_label_values(&[stage]); authorization_calls.with_label_values(&[stage]); }
             afs_metrics::register_collector(registry, &authorization_ns)?;
             afs_metrics::register_collector(registry, &authorization_calls)?;
+            let checks = afs_metrics::IntCounterVec::new(afs_metrics::Opts::new("afs_dfs_read_checks_total", "Executed read control operations; fixed-stage counters, not elapsed time."), &["stage"])?;
+            let stages = [ReadCheck::RequestValidate, ReadCheck::ServeState, ReadCheck::CatalogOpen, ReadCheck::CatalogFence, ReadCheck::DescriptorEncode, ReadCheck::DescriptorDecode, ReadCheck::AuthorizeFull, ReadCheck::ContextReuse, ReadCheck::PeerRegister, ReadCheck::LocalProbe, ReadCheck::BatchGroup, ReadCheck::FullGrant, ReadCheck::CompactGrant, ReadCheck::ContextRecover];
+            let checks_bound = std::array::from_fn(|i| checks.with_label_values(&[READ_CHECK_NAMES[stages[i] as usize]]));
+            afs_metrics::register_collector(registry, &checks)?;
             let read_buffer_events = afs_metrics::IntCounterVec::new(afs_metrics::Opts::new("afs_dfs_read_buffer_events_total", "Read buffer allocation/reuse/return events; zero counts explicit initialization."), &["role", "event"])?;
             let read_buffer_bytes = afs_metrics::IntCounterVec::new(afs_metrics::Opts::new("afs_dfs_read_buffer_bytes_total", "Actual capacity allocated/reused/returned or explicit bytes zeroed."), &["role", "event"])?;
             let read_buffer_idle = afs_metrics::IntGaugeVec::new(afs_metrics::Opts::new("afs_dfs_read_buffer_idle_bytes", "Idle buffer capacity; bounded to 2MiB per role, additional to active operation budgets."), &["role"])?;
@@ -581,6 +621,7 @@ impl ReadWorkMetrics {
                 copies.with_label_values(&[stage]);
             }
             Ok(Self {
+                checks: checks_bound,
                 #[cfg(feature = "dfs")]
                 native_write_resources,
                 catalog_commit_resources,
@@ -1086,6 +1127,10 @@ impl ReadWorkMetrics {
             self.read_buffer_idle.with_label_values(&[role]).set(bytes);
         }
     }
+    pub(crate) fn check(&self, stage: ReadCheck) {
+        self.checks[stage as usize].inc();
+    }
+
     pub(crate) fn copy(&self, stage: &'static str, bytes: u64) {
         self.copies.with_label_values(&[stage]).inc_by(bytes);
     }

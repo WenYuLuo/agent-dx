@@ -1912,17 +1912,19 @@ impl Filesystem for AfsFuse {
                         });
                         return;
                     }
-                    let identity = if keep_cache && flags & libc::O_ACCMODE == libc::O_RDONLY {
-                        backend.page_cache_identity(handle)
-                    } else {
-                        None
-                    };
+                    let fixed_view = backend.fixed_read_view(handle);
+                    let identity =
+                        if !fixed_view && keep_cache && flags & libc::O_ACCMODE == libc::O_RDONLY {
+                            backend.page_cache_identity(handle)
+                        } else {
+                            None
+                        };
                     // Poisoned optimization state opts out; it never permits
                     // reuse based on an identity that could not be checked.
                     let keep = cache_ids
                         .lock()
                         .is_ok_and(|mut cache| cache.observe(ino, identity));
-                    let mut reply_flags = open_reply_flags(!cached_io);
+                    let mut reply_flags = open_reply_flags(!cached_io || fixed_view);
                     if keep {
                         reply_flags |= FopenFlags::FOPEN_KEEP_CACHE;
                     }
@@ -2967,7 +2969,8 @@ fn requested_init_flags() -> InitFlags {
     // Linux otherwise serializes LOOKUPs in one directory even when our FUSE
     // receive thread dispatches them to independent workers. Direct-IO mmap is
     // requested so mmap on direct_io handles remains capability-gated. Native
-    // DFS uses cached write-through and fresh-open version-bound page reuse.
+    // DFS normally uses cached write-through and version-bound page reuse;
+    // fixed-open read views select direct IO per handle to own their EOF.
     InitFlags::FUSE_PARALLEL_DIROPS | InitFlags::FUSE_DIRECT_IO_ALLOW_MMAP
 }
 

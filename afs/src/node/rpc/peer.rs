@@ -1199,6 +1199,7 @@ impl PeerConnectionPool {
 #[cfg(feature = "dfs")]
 pub struct GrpcChunkTransfer {
     open_read_peers: std::sync::Mutex<open_read::OpenReadPeers>,
+    fast_open_ready: std::sync::Mutex<std::collections::HashSet<(String, String, u64)>>,
     peers: Arc<PeerConnectionPool>,
     runtime: PeerRuntime,
     timeout: Duration,
@@ -1214,6 +1215,7 @@ impl GrpcChunkTransfer {
             timeout,
             next_read: std::sync::atomic::AtomicU64::new(1),
             open_read_peers: std::sync::Mutex::new(std::collections::HashMap::new()),
+            fast_open_ready: std::sync::Mutex::new(std::collections::HashSet::new()),
         })
     }
 }

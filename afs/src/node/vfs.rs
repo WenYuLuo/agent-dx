@@ -55,6 +55,12 @@ pub trait Backend: Send + Sync {
         None
     }
 
+    /// Fixed-version handles own EOF in the backend; the shared kernel inode's
+    /// current size/page cache must not truncate an older handle's read.
+    fn fixed_read_view(&self, _handle: types::FileHandle) -> bool {
+        false
+    }
+
     /// Permit concurrent reads only when the backend preserves per-operation
     /// version, authority and deadline checks. The frontend still orders reads
     /// against write/resize/sync/release barriers on the same handle.

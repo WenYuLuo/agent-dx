@@ -39,10 +39,23 @@ impl GrpcChunkTransfer {
                 "open read serving peer budget exhausted",
             ));
         }
-        entries.insert(node_id.clone(), (*node_epoch, endpoint.clone()));
+        if entries
+            .get(node_id)
+            .is_none_or(|(epoch, address)| epoch != node_epoch || address != endpoint)
+        {
+            if let Some(metrics) = &self.peers.read_work_metrics {
+                metrics.check(crate::node::read_work::ReadCheck::PeerRegister);
+            }
+            entries.insert(node_id.clone(), (*node_epoch, endpoint.clone()));
+        }
         Ok(())
     }
     pub(super) fn close_open_context_impl(&self, reference: &str) -> afs_error::Result<()> {
+        self.fast_open_ready
+            .lock()
+            .map_err(|_| dfs_protocol_error("fixed open readiness table poisoned"))?
+            .retain(|(key, _, _)| key != &format!("dfs-open-v1:{reference}"));
+
         let _scope = self
             .peers
             .read_work_metrics

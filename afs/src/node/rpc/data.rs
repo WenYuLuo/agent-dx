@@ -18,6 +18,8 @@
 
 #[cfg(feature = "dfs")]
 mod open_read;
+#[cfg(feature = "dfs")]
+pub use open_read::DfsOpenReadContext;
 
 use afs_transport::grpc::error_status::{coded_status, error_to_status};
 #[cfg(feature = "dfs")]
@@ -531,11 +533,27 @@ pub struct DfsChunksService {
 }
 
 /// Verifies grant authenticity, caller epoch, namespace/version/layout membership
-/// and the selected local copy/device epoch for every requested range. Structural
-/// validation alone never authorizes access. The implementation owns any cached
-/// authority snapshot and its expiry; it must not turn each range into a Meta RPC.
+/// and the selected local copy/device epoch. Traditional ranges keep their
+/// expiry checks; the optional fixed-open lane binds authority once and admits
+/// each range against that open view. Structural validation alone never grants
+/// access, and cache/source TTL is not the lifetime of a connected open.
 #[cfg(feature = "dfs")]
 pub trait DfsReadAuthorizer: Send + Sync + 'static {
+    /// Only implementations owning a fixed-open context may advertise the lane.
+    fn supports_fast_open(&self) -> bool {
+        false
+    }
+
+    /// Optional fixed-open context. None keeps legacy authorizers on the old lane.
+    fn authorize_fast_open(
+        &self,
+        _peer: &str,
+        _request: &DfsReadRangesRequest,
+        _connection: Option<SocketAddr>,
+    ) -> afs_error::Result<Option<Arc<DfsOpenReadContext>>> {
+        Ok(None)
+    }
+
     fn close_open_context(&self, _peer: &str, _context: &str) -> afs_error::Result<()> {
         Err(replica_denied("file read context close unsupported"))
     }
@@ -636,11 +654,27 @@ fn authorized_read_range(entry: &crate::dfs::DfsAuthorizedRead, offset: u64, len
 
 #[cfg(feature = "dfs")]
 impl DfsReadAuthorizer for CachedDfsReadAuthorizer {
+    fn supports_fast_open(&self) -> bool {
+        true
+    }
+
     fn close_open_context(&self, peer: &str, context: &str) -> afs_error::Result<()> {
         self.close_open_context(peer, context)
     }
+    fn authorize_fast_open(
+        &self,
+        peer: &str,
+        request: &DfsReadRangesRequest,
+        connection: Option<SocketAddr>,
+    ) -> afs_error::Result<Option<Arc<DfsOpenReadContext>>> {
+        self.fast_open_context(peer, request, connection)
+    }
     fn authorize(&self, peer: &str, request: &DfsReadRangesRequest) -> afs_error::Result<()> {
         let metrics = self.validator.authorization_metrics();
+        if let Some(metrics) = &metrics {
+            metrics.check(crate::node::read_work::ReadCheck::AuthorizeFull);
+            metrics.check(crate::node::read_work::ReadCheck::RequestValidate);
+        }
         let _authorization_scope = metrics.as_ref().map(|m| m.authorization_scope("total"));
         if request
             .operations
@@ -1278,7 +1312,27 @@ impl DfsChunks for DfsChunksService {
                 local.peer_read_crc_mode()
             });
         validate_crc_read_mode_metadata(request.metadata(), configured_mode)?;
+        let fast_open = configured_mode == crate::config::DfsReadCrcMode::Off
+            && self.authorizer.supports_fast_open()
+            && request
+                .metadata()
+                .get("x-afs-open-fast")
+                .is_some_and(|v| v == "1")
+            && request.get_ref().operations.len() == 1
+            && request.get_ref().operations[0]
+                .grant
+                .as_ref()
+                .is_some_and(|g| g.token.starts_with("dfs-open-v1:read-open:"));
+        let connection = request.remote_addr();
         let request = request.into_inner();
+        if fast_open {
+            return self
+                .read_fast_open(authenticated_peer, request, connection, admission_deadline)
+                .await;
+        }
+        if let Some(local) = &self.local_chunks {
+            local.record_read_check(crate::node::read_work::ReadCheck::RequestValidate);
+        }
         validate_dfs_read_request(&request)?;
         for operation in &request.operations {
             if operation
@@ -1321,6 +1375,9 @@ impl DfsChunks for DfsChunksService {
                     .map_err(|_| Status::unavailable("DFS peer read admission is closed"))?
             }
         };
+        if let Some(local) = &self.local_chunks {
+            local.record_read_check(crate::node::read_work::ReadCheck::RequestValidate);
+        }
         validate_dfs_read_request(&request)?;
         let authorizer = self.authorizer.clone();
         let local = self.local_chunks.clone();
@@ -1576,6 +1633,139 @@ fn stream_dfs_ranges(
 }
 
 #[cfg(feature = "dfs")]
+impl DfsChunksService {
+    async fn read_fast_open(
+        &self,
+        peer: String,
+        request: DfsReadRangesRequest,
+        connection: Option<SocketAddr>,
+        deadline: std::time::Instant,
+    ) -> Result<
+        Response<<Self as afs_protocol::node_data::dfs_chunks_server::DfsChunks>::ReadRangesStream>,
+        Status,
+    > {
+        let local = self
+            .local_chunks
+            .clone()
+            .ok_or_else(|| Status::unavailable("DFS local store absent"))?;
+        // Shutdown and capacity are checked once at admission. Admitted work may
+        // drain through close; bounded sender cancellation stops abandoned IO.
+        local.ensure_peer_serve_open().map_err(error_to_status)?;
+        let permit = match self.read_permits.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                let permit = tokio::time::timeout_at(
+                    tokio::time::Instant::from_std(deadline),
+                    self.read_permits.clone().acquire_owned(),
+                )
+                .await
+                .map_err(|_| {
+                    Status::resource_exhausted("DFS peer read admission deadline exceeded")
+                })?
+                .map_err(|_| Status::unavailable("DFS peer read admission is closed"))?;
+                local.ensure_peer_serve_open().map_err(error_to_status)?;
+                permit
+            }
+        };
+        let authorizer = self.authorizer.clone();
+        let metrics = self.payload_metrics.clone();
+        let (sender, receiver) = tokio::sync::mpsc::channel(4);
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let result = (|| -> Result<(), Status> {
+                let context = authorizer
+                    .authorize_fast_open(&peer, &request, connection)
+                    .map_err(error_to_status)?;
+                if let Some(context) = context {
+                    stream_fixed_open(
+                        &local,
+                        &context,
+                        &request,
+                        &sender,
+                        metrics.as_ref(),
+                        deadline,
+                    )
+                } else {
+                    authorizer
+                        .authorize(&peer, &request)
+                        .map_err(error_to_status)?;
+                    stream_dfs_ranges_until(&local, &request, &sender, metrics.as_ref(), deadline)
+                }
+            })();
+            if let Err(error) = result {
+                let _ = sender.blocking_send(Err(error));
+            }
+        });
+        let mut response = Response::new(Box::pin(tokio_stream::wrappers::ReceiverStream::new(
+            receiver,
+        ))
+            as <Self as afs_protocol::node_data::dfs_chunks_server::DfsChunks>::ReadRangesStream);
+        response.metadata_mut().insert(
+            "x-afs-open-fast",
+            tonic::metadata::MetadataValue::from_static("1"),
+        );
+        Ok(response)
+    }
+}
+
+#[cfg(feature = "dfs")]
+fn stream_fixed_open(
+    local: &LocalChunkStore,
+    context: &DfsOpenReadContext,
+    request: &DfsReadRangesRequest,
+    sender: &tokio::sync::mpsc::Sender<Result<DfsReadRangesFrame, Status>>,
+    metrics: Option<&DfsPayloadMetrics>,
+    deadline: std::time::Instant,
+) -> Result<(), Status> {
+    if sender.is_closed() {
+        return Ok(());
+    }
+    let op = &request.operations[0]; // authorize_fast_open admitted exactly one bounded range.
+    let payload = context
+        .payload(local, op, deadline)
+        .map_err(error_to_status)?;
+    let send = |body| {
+        sender
+            .blocking_send(Ok(DfsReadRangesFrame { body: Some(body) }))
+            .map_err(|_| Status::cancelled("fixed open consumer disconnected"))
+    };
+    send(dfs_read_ranges_frame::Body::Header(DfsReadRangesHeader {
+        read_id: request.read_id.clone(),
+        attempt_id: request.attempt_id.clone(),
+        operation_index: 0,
+        chunk_id: op.chunk_id.clone(),
+        chunk_offset: op.chunk_offset,
+        length: op.length,
+        source_copy_id: op.source_copy_id.clone(),
+        blake3_outboard: Default::default(),
+        crc32c_table: Default::default(),
+    }))?;
+    let body = payload.into_shared_bytes();
+    for start in (0..body.len()).step_by(DFS_REPLICA_FRAME_BYTES) {
+        let data = body.slice(start..(start + DFS_REPLICA_FRAME_BYTES).min(body.len()));
+        local.record_peer_read_event("data_frame");
+        local.record_peer_read_event("shared_frame");
+        if let Some(metrics) = metrics {
+            metrics.record("grpc", "send", "read", data.len() as u64);
+        }
+        send(dfs_read_ranges_frame::Body::Data(data))?;
+    }
+    send(dfs_read_ranges_frame::Body::Completion(
+        DfsReadRangesCompletion {
+            read_id: request.read_id.clone(),
+            attempt_id: request.attempt_id.clone(),
+            operation_index: 0,
+            source_copy_id: op.source_copy_id.clone(),
+            transferred_bytes: op.length,
+            range_checksum: Vec::new(),
+            range_checksum_algorithm: afs_protocol::node_data::DfsDigestAlgorithm::ReadUnchecked
+                as i32,
+            crc32c_table: Default::default(),
+        },
+    ))
+}
+
+#[cfg(feature = "dfs")]
 fn validate_crc_read_mode_metadata(
     metadata: &tonic::metadata::MetadataMap,
     configured: crate::config::DfsReadCrcMode,
@@ -1652,8 +1842,10 @@ fn stream_dfs_ranges_until(
                 drop(crc_scope);
                 Some(checksum)
             };
+            local.record_read_check(crate::node::read_work::ReadCheck::DescriptorEncode);
             let descriptor =
                 serde_json::to_vec(&table).map_err(|error| Status::internal(error.to_string()))?;
+            local.record_read_check(crate::node::read_work::ReadCheck::RequestValidate);
             validate_dfs_read_request(request)?;
             local.ensure_peer_serve_open().map_err(error_to_status)?;
             send(dfs_read_ranges_frame::Body::Header(DfsReadRangesHeader {
@@ -1669,6 +1861,7 @@ fn stream_dfs_ranges_until(
             }))?;
             let body = verified.into_shared_bytes();
             for start in (0..body.len()).step_by(DFS_REPLICA_FRAME_BYTES) {
+                local.record_read_check(crate::node::read_work::ReadCheck::RequestValidate);
                 validate_dfs_read_request(request)?;
                 local.ensure_peer_serve_open().map_err(error_to_status)?;
                 let data = body.slice(start..(start + DFS_REPLICA_FRAME_BYTES).min(body.len()));
@@ -1816,6 +2009,7 @@ fn stream_dfs_ranges_until(
         let verified = verified.into_shared_bytes();
         // A fill follower can wait behind I/O. Content sharing never renews the
         // caller's grant or bypasses a known Node stop; no new Meta RPC here.
+        local.record_read_check(crate::node::read_work::ReadCheck::RequestValidate);
         validate_dfs_read_request(request)?;
         local.ensure_peer_serve_open().map_err(error_to_status)?;
         send(dfs_read_ranges_frame::Body::Header(DfsReadRangesHeader {
