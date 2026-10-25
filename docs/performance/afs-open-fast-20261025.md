@@ -1,6 +1,6 @@
 # Native fixed-open remote read candidate
 
-Experimental local candidate under validation; not submitted or performance accepted.
+Draft PR95 candidate with the scoped Linux gates recorded in the [current delivery](afs-remote-read-20261024/read-path-update-20261025.md); not merged or performance accepted.
 
 The baseline is the frozen buffer-reuse candidate on PR95 eb23a362. Remote read
 CRC remains `off`; write CRC, mTLS, 64KiB frames, demanded range size, prefetch and
@@ -64,5 +64,6 @@ CPU clocks, per-request trace journal, or perf sampler to the formal cohort.
 Functional gates cover fixed-version open/close, EOF after a shorter new open,
 GC pin retention/release, compact context loss through real gRPC, same-version
 source failure recovery, range rejection, pinned-path replacement, and byte-lease
-cleanup. Formal measurements may start only after required Linux and actual
-FUSE/GC gates pass. The fixed nine slots have no replacements or extra samples.
+cleanup. The recorded comparison used nine fixed slots after its functional
+gates, with no replacements or extra samples. This PR update starts no new
+measurements and does not establish a stable performance gain.
