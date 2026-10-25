@@ -97,7 +97,7 @@ def run():
         def log_message(self, *args):
             pass
 
-        def do_POST(self):
+        def do_POST(self):  # noqa: N802 - BaseHTTPRequestHandler requires this method name.
             data = self.rfile.read(int(self.headers.get('Content-Length', '0')))
             if self.headers.get('Content-Encoding') == 'gzip':
                 data = gzip.decompress(data)
@@ -220,10 +220,14 @@ def check_trace_links(rows):
     executions = [s for s in rows if s['name'] == 'environment.execute']
     if not (executions):
         raise AssertionError('environment execution spans missing')
+    queued = 0
     for span in executions:
         parent = index.get((span['traceId'], span.get('parentSpanId')))
-        if not (parent and parent['name'] == 'environment.queue'):
-            raise AssertionError('queue parent missing or belongs to another trace')
+        if not (parent and parent['name'] in {'environment.queue', 'environment.authority_reconcile'}):
+            raise AssertionError('execution parent missing, invalid or belongs to another trace')
+        queued += parent['name'] == 'environment.queue'
+    if not queued:
+        raise AssertionError('queue execution spans missing')
     return len(executions)
 
 
@@ -297,7 +301,7 @@ def validate_traces(node):
     }
     (E / f'traces-{node}.json').write_text(json.dumps(result, indent=2))
     print(
-        f'[TRACE PASS] {node}: {len(rows)} spans; {count} queue/execution parent links; EXECD context received',
+        f'[TRACE PASS] {node}: {len(rows)} spans; {count} execution parent links; EXECD context received',
         flush=True,
     )
 
