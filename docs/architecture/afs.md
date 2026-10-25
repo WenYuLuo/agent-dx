@@ -613,6 +613,45 @@ Meta 纯传输断链时，已打开视图的未到期合法范围可读本地 ca
 迟到响应不能覆盖新的归属或缩短有效期，正常关闭且已提交的文件无需继续续租。
 Meta 不可用超过租约期限时仍会拒绝旧写入，不通过复活过期租约绕过隔离。
 
+## 本机 SDK usrbio 数据面
+
+`afs-client` 提供与同机 `afs-node` 直连的批量 IO 数据面。控制面仍是 UDS 上的 gRPC：
+open、register、iov 与环的生命周期和 sync 都走 RPC，只传身份与布局，从不传文件正文。
+数据面是共享内存：SDK 创建持久 iov（memfd，区块为 4 KiB 到 64 MiB 的 2 的幂）并把
+fd 经 fd broker 一次性交给 node；之后读写把正文放进 iov 区块，通过共享提交/完成环
+（64 字节槽位，Release/Acquire）提交 `(reg_id, offset, iov_offset, len)`，一次操作既没有
+RPC，也没有逐次操作的 fd 传递。提交与完成各有一个跨进程 eventfd 门铃：SDK 提交后敲
+提交门铃唤醒 node 的环 worker，node 每投递一批完成项敲一次完成门铃，SDK 侧用 AsyncFd
+阻塞等待，不做固定间隔轮询。诊断穿刺路径（每次操作一个 memfd 加一次性 fd broker）仍
+保留，与常驻数据面分开，受进程内并发上限约束。
+
+区块归属在协议里固定：结果明确（完成项带字节数或错误码）归还空闲池；已入队后结果
+未知（等待超时、完成项对不上号、future 被外层取消，含部分入队）永久 forfeit，避免
+node 仍在读写的内存被复用；零入队（SQ 满等待超时或等待中被取消）按 Drop 归还，调用
+方可安全重试。环的凑批策略由 `io_depth`
+决定：正数必须攒满这么多提交才处理且不受 `timeout_ms` 约束，负数凑不满时最多等
+`timeout_ms`，零有多少处理多少；必须攒满的目标大于环项数、或绝对值超过 worker 单
+周期执行批量上限（256，`afs_transport::ring::MAX_IO_DEPTH`）时创建即被拒绝，单发接口
+不得用在必须攒满的环上。单条 IO 失败以带原
+`userdata` 的完成项返回，环继续可用；只有控制面错误才让整条环进入不可用状态。
+
+大块批量写在立即消费模式（`io_depth=0`）下，至少8MiB的一波以4MiB为bank分组目标交替复制和
+提交，重叠应用准备后一bank与Node消费前一bank；iov预约数量、写顺序和完成前禁止复用
+的契约不变。小波与必须凑批模式仍整波提交。批量完成按`userdata`唯一匹配并校验返回
+字节数不超过请求；重复、缺失或超长结果视为协议异常并保留整波区块。EOF返回零字节，
+保持调用方未读取区间不变，并回收结果明确的区块。
+
+Node按注册句柄隔离地采样读回调驻留成本。成本的移动平均超过每向上取整MiB的250微秒、Backend声明
+`supports_parallel_reads`且iov区间不重叠时，同一环的连续读可由该Node所有环共用的
+懒创建执行池处理；线程上限为可用CPU数与4的较小值。便宜读保持环worker串行路径，
+不因只读请求就无条件并发；写请求两侧的读组必须join后才继续。每次Backend读仍执行
+原有版本、授权与截止时间检查；没有将共享iov作为未验证数据的私有暂存区。
+
+数据面不改变 DFS 元数据与副本路径：SDK 的路径解析与 FUSE 走同一后端路径，权限与
+目录项语义一致；环内读写只携带注册编号，注册把句柄与调用身份绑定。连接是同机
+owner-only UDS，SDK 身份取 node 实际 uid/gid，越权请求照常失败。环活动计数经
+`RingStats` 与 Prometheus 指标导出，仅用于观察，不参与正确性判断。
+
 ## OwnerFs workspace bind mount
 
 OwnerFs workspace bind mount 是当前实际试用场景的优先能力，默认 OFF。开启后，它把 Home 上 workspace 的底层真实目录 bind 到独立原生 `ownerfs_workspace_egress_root` 下的同名一级目录。egress root 必须在 OwnerFs FUSE 挂载和 Node 数据目录之外；FUSE 子树仍保留，不以 bind 覆盖。把 FUSE 目录自身 bind 到别处不满足此设计。

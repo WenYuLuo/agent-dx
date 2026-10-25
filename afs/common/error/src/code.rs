@@ -79,8 +79,8 @@ catalog! {
     META_DFS_CONFLICT = 0x03030001 => FailedPrecondition;
     META_DFS_GC_CHANGED = 0x03030005 => Aborted;
     META_DFS_NAMESPACE_RETRY = 0x03030004 => Aborted;
-    META_DFS_GC_BUSY = 0x03030002 => Unavailable;
-    META_DFS_REFERENCE_ADMISSION_EXPIRED = 0x03030003 => FailedPrecondition;
+    META_DFS_GC_BUSY = 0x03030006 => Unavailable;
+    META_DFS_REFERENCE_ADMISSION_EXPIRED = 0x03030007 => FailedPrecondition;
     META_DFS_LEASE_RETRY = 0x03030002 => Unavailable;
     META_DFS_REPAIR_SUPERSEDED = 0x03030003 => FailedPrecondition;
     META_STORE_UNIMPLEMENTED = 0x03020001 => Unimplemented;

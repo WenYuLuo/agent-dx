@@ -104,6 +104,23 @@ fn linux_raw_errno_code(_raw: Option<i32>) -> Option<ErrorCode> {
 mod tests {
     use super::*;
     #[test]
+    fn numbered_constants_have_unique_identities() {
+        let mut names = std::collections::HashSet::new();
+        let mut numbers = std::collections::HashMap::new();
+        for entry in ERROR_CATALOG {
+            assert!(names.insert(entry.name), "duplicate name: {}", entry.name);
+            assert_ne!(entry.code.raw() & 0xffff, 0, "zero reason: {}", entry.name);
+            let previous = numbers.insert(entry.code, entry.name);
+            assert!(
+                previous.is_none(),
+                "{} reuses {} from {previous:?}",
+                entry.name,
+                entry.code
+            );
+        }
+    }
+
+    #[test]
     fn catalog_matches_unique_nonzero_numbered_constants() {
         let doc: toml::Value = toml::from_str(include_str!("../../../error-codes.toml")).unwrap();
         let rows = doc["error"].as_array().unwrap();
