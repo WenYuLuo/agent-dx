@@ -346,6 +346,22 @@ subsystem = "Catalog"
 description = "Meta 请求参数不合法"
 
 [[error]]
+name = "META_REQUEST_EXPIRED"
+value = "0x03010002"
+kind = "FailedPrecondition"
+component = "Meta"
+subsystem = "Catalog"
+description = "Meta 请求期限已过，不能按当前请求继续执行"
+
+[[error]]
+name = "META_REQUEST_TIME_INVALID"
+value = "0x03010003"
+kind = "InvalidArgument"
+component = "Meta"
+subsystem = "Catalog"
+description = "Meta 请求时间参数不合法"
+
+[[error]]
 name = "META_DFS_CONFLICT"
 value = "0x03030001"
 kind = "FailedPrecondition"
@@ -368,6 +384,38 @@ kind = "FailedPrecondition"
 component = "Meta"
 subsystem = "DistributedFs"
 description = "复制修复任务已离开 Running 或精确 claim 已被替换，原 worker 可结束该 claim；普通 CAS 冲突不得按此处理"
+
+[[error]]
+name = "META_DFS_NAMESPACE_RETRY"
+value = "0x03030004"
+kind = "Aborted"
+component = "Meta"
+subsystem = "DistributedFs"
+description = "命名空间在有界重试期间持续变化，本次操作中止"
+
+[[error]]
+name = "META_DFS_GC_CHANGED"
+value = "0x03030005"
+kind = "Aborted"
+component = "Meta"
+subsystem = "DistributedFs"
+description = "写代次的 GC fence 已变化，旧回执不得继续提交或刷新"
+
+[[error]]
+name = "META_DFS_GC_BUSY"
+value = "0x03030006"
+kind = "Unavailable"
+component = "Meta"
+subsystem = "DistributedFs"
+description = "相关 chunk 正在删除，发布必须等待删除完成；不同于写租约续租竞争"
+
+[[error]]
+name = "META_DFS_REFERENCE_ADMISSION_EXPIRED"
+value = "0x03030007"
+kind = "FailedPrecondition"
+component = "Meta"
+subsystem = "DistributedFs"
+description = "引用准入期限过期或被非法刷新；不同于复制修复 claim 已被替换"
 
 [[error]]
 name = "META_STORE_UNIMPLEMENTED"

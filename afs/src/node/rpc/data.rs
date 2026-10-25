@@ -5147,14 +5147,31 @@ mod tests {
             corrupt[0] ^= 1;
             *bytes = corrupt.into();
         }
+        // A well-framed body that fails its immutable digest is corrupt data,
+        // distinct from an invalid frame sequence or declared length.
+        let corruption = client
+            .put_replica_stream(tokio_stream::iter(bad))
+            .await
+            .unwrap_err();
+        assert_eq!(corruption.code(), tonic::Code::DataLoss);
         assert_eq!(
-            client
-                .put_replica_stream(tokio_stream::iter(bad))
-                .await
-                .unwrap_err()
-                .code(),
-            tonic::Code::InvalidArgument
+            afs_transport::grpc::error_status::status_to_error(corruption).code(),
+            afs_error::NODE_TRANSFER_CORRUPT_DATA
         );
+        let mut truncated = frames();
+        truncated.pop();
+        let mut oversized = frames();
+        oversized[1].body = Some(Body::Data(vec![0; DFS_REPLICA_FRAME_BYTES + 1].into()));
+        for malformed in [truncated, oversized] {
+            assert_eq!(
+                client
+                    .put_replica_stream(tokio_stream::iter(malformed))
+                    .await
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::InvalidArgument
+            );
+        }
         let duplicate = vec![
             DfsPutReplicaFrame {
                 body: Some(Body::Header(header.clone())),
@@ -5177,6 +5194,7 @@ mod tests {
             recovered.len()
         );
         assert_eq!(recovered, staged.bytes());
+        assert!(local.quarantined_chunks().unwrap().is_empty());
         server.abort();
         drop(local);
         let reopened = LocalChunkStore::open(temp.path(), "receiver").unwrap();
