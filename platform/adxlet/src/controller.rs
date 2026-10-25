@@ -22,8 +22,25 @@ pub(super) type CheckpointReferences = BTreeSet<(String, String)>;
 pub(super) enum AuthorityComparison {
     Published,
     Unpublished,
+    Unstarted,
     StaleCatalog,
     RetiredByAuthority,
+}
+
+// A live claim can precede its create RPC. Startup recovery deliberately does
+// not use this exemption: an old process may have started an uncommitted runtime.
+pub(super) fn unstarted(record: &EnvironmentRecord) -> bool {
+    record.state == EnvironmentState::Pending
+        && record.revision == 0
+        && record.runtime.id == format!("{}-{}", record.spec.id, record.assignment.generation)
+        && record.runtime.ip.is_none()
+        && record.checkpoint.is_none()
+        && record.snapshot_source.is_none()
+        && record.execution_artifacts.is_empty()
+        && record.last_operation.is_none()
+        && record.failure.is_none()
+        && record.restart_attempts == 0
+        && !record.restart_pending
 }
 
 enum Command {

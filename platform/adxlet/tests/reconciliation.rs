@@ -664,7 +664,7 @@ async fn periodic_catalog_fetch_preserves_known_lifecycle_operations() {
     tokio::time::timeout(Duration::from_secs(1), server.inspect_entered.notified())
         .await
         .unwrap();
-    assert!(!node.accepting_allocations());
+    assert!(node.accepting_allocations());
     tokio::time::timeout(Duration::from_secs(1), node.monitor_environments())
         .await
         .unwrap()
@@ -703,24 +703,15 @@ async fn periodic_busy_environment_does_not_close_other_environment_admission() 
         async move { node.monitor_environments().await }
     });
     backend.observation_entered.notified().await;
-    let reports = authority.authority.reports.clone();
-    reports.lock().unwrap().clear();
+    let server = authority.authority.clone();
+    server.block_inspect.store(true, Ordering::SeqCst);
     let mut refresh = tokio::spawn({
         let node = node.clone();
         async move { authority.cycle(&node).await }
     });
     let admitted = tokio::time::timeout(Duration::from_millis(300), async {
-        loop {
-            if reports
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|r| r.accepting_allocations)
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
+        server.inspect_entered.notified().await;
+        assert!(node.accepting_allocations());
         let new = record("new", EnvironmentState::Pending);
         node.environment(new.spec, new.assignment)
             .unwrap()
@@ -736,6 +727,7 @@ async fn periodic_busy_environment_does_not_close_other_environment_admission() 
         .unwrap();
     })
     .await;
+    server.inspect_release.notify_one();
     backend.block_observation.store(false, Ordering::SeqCst);
     backend.observation_release.notify_one();
     monitor.await.unwrap().unwrap();

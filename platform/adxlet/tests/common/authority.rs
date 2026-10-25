@@ -54,15 +54,11 @@ impl pb::coordinator_service_server::CoordinatorService for Authority {
         &self,
         _: Request<pb::InspectNodeRequest>,
     ) -> Result<Response<pb::InspectNodeResponse>, Status> {
-        assert!(
-            !self
-                .reports
-                .lock()
-                .unwrap()
-                .last()
-                .unwrap()
-                .accepting_allocations
-        );
+        {
+            let reports = self.reports.lock().unwrap();
+            let latest = reports.last().unwrap();
+            assert!(!latest.reconciling || !latest.accepting_allocations);
+        }
         if self.unavailable.load(Ordering::SeqCst) {
             return Err(Status::unavailable("authority unavailable"));
         }

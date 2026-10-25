@@ -2,7 +2,7 @@
 use super::*;
 use crate::{
     controller::{AuthorityCheck, AuthorityResult},
-    EnvironmentHandle, LocalReservation,
+    EnvironmentHandle,
 };
 use std::sync::atomic::Ordering;
 
@@ -12,7 +12,6 @@ mod tests;
 
 pub(crate) struct ComparisonBasis {
     controllers: crate::EnvironmentDirectory,
-    holds: Vec<(String, LocalReservation)>,
 }
 
 pub(crate) enum ReconciliationOutcome {
@@ -74,22 +73,7 @@ impl Adxlet {
             .lock()
             .expect("shared state lock poisoned")
             .clone();
-        let holds = self
-            .local_holds
-            .lock()
-            .expect("shared state lock poisoned")
-            .iter()
-            .map(|(id, hold)| {
-                (
-                    id.clone(),
-                    LocalReservation {
-                        token: Some(hold.token.clone()),
-                        devices: hold.devices.clone(),
-                    },
-                )
-            })
-            .collect();
-        ComparisonBasis { controllers, holds }
+        ComparisonBasis { controllers }
     }
 
     pub(crate) async fn compare_retained(
@@ -152,13 +136,9 @@ impl Adxlet {
                 Err(error) => failure = Some(error),
             }
         }
-        for (id, reservation) in basis.holds {
-            if !catalog.records.contains_key(&id) {
-                self.release_local(&id, &reservation)?;
-            }
-        }
-        // Inspection still uses the Coordinator's closed-admission snapshot
-        // contract. Slow per-environment work starts only after admission reopens.
+        // Missing catalog entries cannot resolve an in-flight Claim RPC. Its
+        // explicit outcome/retry owns the local reservation, not this snapshot.
+        // Clear a prior transport fence only after validating fresh authority.
         self.authority_reconciling.store(false, Ordering::Release);
         for (id, (assignment, handle)) in work {
             let record = catalog.records.get(&id).cloned();
@@ -274,6 +254,11 @@ impl Adxlet {
                             .is_none_or(|result| result.record.revision > record.revision)))
         }) {
             return Err(Error::Conflict);
+        }
+        // Coordinator has assigned ownership, but its create RPC may still be
+        // in flight. A live catalog must not recover/retire that fresh claim.
+        if controller::unstarted(record) {
+            return Ok(None);
         }
         self.adopt_local(&record.spec, &record.assignment)?;
         if record.resources_held {

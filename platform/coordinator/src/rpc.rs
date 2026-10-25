@@ -1177,9 +1177,12 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
             let live = state.live.get(&r.node_id).ok_or_else(|| {
                 Status::failed_precondition("register node before reconciliation")
             })?;
-            if live.session != r.session_id || live.report.accepting_allocations {
+            if live.session != r.session_id
+                || live.expired
+                || live.last_seen.elapsed() >= self.0.heartbeat_timeout
+            {
                 return Err(Status::failed_precondition(
-                    "node must close allocation admission before inspection",
+                    "live node session required for inspection",
                 ));
             }
             let (cached_snapshots, holds) =

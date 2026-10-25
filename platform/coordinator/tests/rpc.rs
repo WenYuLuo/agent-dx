@@ -1113,15 +1113,15 @@ async fn heartbeat_expiry_reconciliation_and_old_session_fencing() {
     .await
     .unwrap();
     assert_eq!(session.snapshot().await.unwrap().routes().unwrap().len(), 1);
-    assert!(
-        node.inspect_node(pb::InspectNodeRequest {
+    let live_catalog = node
+        .inspect_node(pb::InspectNodeRequest {
             node_id: "node".into(),
             session_id: report.session_id.clone(),
         })
         .await
-        .is_err(),
-        "inspection requires closed allocation admission"
-    );
+        .unwrap()
+        .into_inner();
+    assert_eq!(live_catalog.records.len(), 1);
     report.heartbeat_sequence = 3;
     report.accepting_allocations = false;
     node.register_node(report.clone()).await.unwrap();

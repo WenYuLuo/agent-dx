@@ -14,6 +14,18 @@ pub(crate) enum AuthorityResult {
 }
 
 impl Controller {
+    fn matches_unstarted(&self, record: &EnvironmentRecord) -> bool {
+        // A local reservation may already hold resources; a centrally assigned
+        // controller acquires them when Create runs. Neither has started yet.
+        // CheckAuthority temporarily fences both before making this comparison.
+        !self.retired
+            && unstarted(&self.record)
+            && unstarted(record)
+            && self.record.spec == record.spec
+            && self.record.assignment == record.assignment
+            && self.record.runtime == record.runtime
+    }
+
     pub(super) fn authority_trace(
         &self,
         check: &AuthorityCheck,
@@ -22,8 +34,10 @@ impl Controller {
         // ownership, publication and cleanup logic below in the serial queue.
         if !self.authority_fenced
             && !self.retired
-            && self.durability == Some(Durability::Published)
-            && check.record.as_ref() == Some(&self.record)
+            && check.record.as_ref().is_some_and(|record| {
+                self.matches_unstarted(record)
+                    || (self.durability == Some(Durability::Published) && self.record == *record)
+            })
         {
             return None;
         }
@@ -33,6 +47,9 @@ impl Controller {
     }
 
     fn compare_authority(&self, record: &EnvironmentRecord) -> Result<AuthorityComparison> {
+        if self.matches_unstarted(record) {
+            return Ok(AuthorityComparison::Unstarted);
+        }
         if self.durability != Some(Durability::Published) {
             return Ok(AuthorityComparison::Unpublished);
         }
@@ -75,6 +92,9 @@ impl Controller {
             return Err(Error::Unavailable("environment publication pending".into()));
         }
         let comparison = self.compare_authority(&record)?;
+        if comparison == AuthorityComparison::Unstarted {
+            return Ok(AuthorityResult::Current);
+        }
         if comparison == AuthorityComparison::StaleCatalog {
             return Ok(AuthorityResult::Stale);
         }

@@ -99,6 +99,30 @@ async fn authority_cycles_are_silent_until_cleanup_failure_or_state_change() {
         "id":"trace-authority", "tenant_id":"tenant", "image":"image", "runtime_class":"runsc", "priority":0,
         "resources":{"cpu_millis":1,"memory_bytes":1024,"disk_bytes":0}
     })).unwrap();
+    let pending = EnvironmentRecord {
+        spec: spec.clone(),
+        assignment: adx_core::Assignment {
+            environment_id: spec.id.clone(),
+            node_id: "n".into(),
+            shard_id: 0,
+            generation: 1,
+            devices: vec![],
+        },
+        state: EnvironmentState::Pending,
+        revision: 0,
+        runtime: adx_core::Runtime {
+            id: format!("{}-1", spec.id),
+            ip: None,
+        },
+        resources_held: false,
+        checkpoint: None,
+        snapshot_source: None,
+        execution_artifacts: vec![],
+        last_operation: None,
+        failure: None,
+        restart_attempts: 0,
+        restart_pending: false,
+    };
     let handle = node
         .environment(
             spec,
@@ -111,6 +135,36 @@ async fn authority_cycles_are_silent_until_cleanup_failure_or_state_change() {
             },
         )
         .unwrap();
+    *authority.authority.records.lock().unwrap() = vec![pending.clone().try_into().unwrap()];
+    provider.force_flush().unwrap();
+    let before_pending = exporter.get_finished_spans().unwrap().len();
+    for _ in 0..3 {
+        authority.cycle(&node).await.unwrap();
+    }
+    provider.force_flush().unwrap();
+    assert_eq!(
+        exporter.get_finished_spans().unwrap().len(),
+        before_pending,
+        "an unstarted create must not produce routine reconciliation spans"
+    );
+    let mut conflict = pending.clone();
+    conflict.spec.image = "conflicting-image".into();
+    *authority.authority.records.lock().unwrap() = vec![conflict.try_into().unwrap()];
+    assert!(authority.cycle(&node).await.is_err());
+    provider.force_flush().unwrap();
+    let after_conflict = exporter.get_finished_spans().unwrap();
+    assert!(after_conflict[before_pending..]
+        .iter()
+        .any(|span| matches!(span.status, Status::Error { .. })));
+    *authority.authority.records.lock().unwrap() = vec![pending.try_into().unwrap()];
+    authority.cycle(&node).await.unwrap();
+    provider.force_flush().unwrap();
+    assert!(
+        exporter.get_finished_spans().unwrap()[after_conflict.len()..]
+            .iter()
+            .any(|span| span.name == "environment.authority_reconcile"),
+        "recovery of a fenced pending create must retain its trace"
+    );
     let running = handle.create().await.unwrap().record;
     *authority.authority.records.lock().unwrap() = vec![running.clone().try_into().unwrap()];
     provider.force_flush().unwrap();
