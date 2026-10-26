@@ -115,3 +115,39 @@ unknown 计数。API unknown 分类与成功样本排除由上表 native 采集�
 本地完整日志、原始 scrape、PromQL、影响范围和包身份保存在执行者工作树的
 `out/observability/`，端到端机器可读汇总为 `e2e/regression-summary.json`。
 这些输出不随仓库发布；本页提供可审阅的验证范围和结果摘要。
+
+
+## Reload retry after adxlet restart
+
+Implementation: `61f4823a5b8f0d35cc8c14dfcb2082007fc67ad0`.
+
+Reload now persists its operation ID, original expected revision, source runtime
+and checkpoint identity before stopping. The SDK's existing bounded retries keep
+that ID. A restarted adxlet can continue from the matching live or stopped source;
+a fresh API Server retrieves the original revision. Healthy reconciliation clears
+the old stop intent while retaining the retry identity. Completed operations replay
+without another restore; ownership, source and checkpoint mismatches remain fenced.
+
+Validation on this implementation:
+
+- 176 Rust component tests passed: adxlet journal/pause-resume/reconciliation 105,
+  real Redis storage 64, and API reload over real gRPC sockets 7.
+- 23 Python SDK tests passed: lifecycle 21, reload retry 2. Transient failures keep
+  the same request ID; terminal rejection is not retried. SDK success responses
+  use the actual response envelope.
+- The pre-fix adxlet restart retry and Redis stopped-source completion tests failed
+  with `Conflict`; both pass after the change. Tests also cover completed replay,
+  journal reopen, protocol round-trip, and rejection of changed identities.
+- `make rust-check JOBS=2 ADX_WITH_AFS=0`, Python precheck against `4e86ebc`,
+  documentation checks and `git diff --check` passed.
+- A fresh SDK wheel/sdist was built with this commit. The subsequent Linux builder
+  could not start: Docker Desktop returned containerd blob `input/output error`.
+  Image listing and inspection failed similarly. Package assembly, verification
+  and the planned local lifecycle/restart E2E did not run. This revision has no new
+  full-runtime E2E result, and component fault tests do not establish KVM checkpoint
+  recovery. Docker was not reset; unrelated containers were left running.
+
+Evidence: `out/observability/reload-retry/`; the blocked build is recorded in
+`out/observability/e2e-reload-retry/build.log`. Earlier E2E results and failures above
+refer to their recorded revisions. The separate continuous-recovery observation
+conflict found in the latest review remains open.
