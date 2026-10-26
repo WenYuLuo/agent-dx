@@ -20,7 +20,7 @@ Coordinator 在启动或异常写入恢复时从 Redis 加载状态。Environmen
 
 ADXlet 启动或节点会话重新接管时，在准入屏障内排空已接纳的生命周期操作，并执行一次运行时清单恢复，接管既有执行并清理无主资源。`report_interval_seconds` 控制心跳、容量上报和权威记录核对；日常核对保持创建准入开放，只比较归属、generation、revision 和已提交记录，使用实例串行队列收敛记录差异，不扫描运行时清单。`InspectNode` 要求证书匹配且会话未过期，不要求关闭分配入口。
 
-同一实例最多一个待完成核对任务。读取目录前记录本机 Controller 身份，期间新接纳的 Controller 不会因缺席旧目录被删除；旧代际不能覆盖新执行。节点会话失效、启动恢复和目录错误仍限制准入。状态提交失败保留待发布结果，由该实例自己的重试截止时间恢复。
+同一实例最多一个待完成核对任务。读取目录前记录本机 Controller 身份，期间新接纳的 Controller 不会因缺席旧目录被删除；旧代际不能覆盖新执行。节点会话失效和启动恢复仍限制准入；普通周期目录获取失败保持原有目录与准入，后续重试收敛，不能把失败当作空目录。状态提交失败保留待发布结果，由该实例自己的重试截止时间恢复。
 
 已认领但创建 RPC 尚未到达的初始 `Pending`（revision 为 0、无执行结果）在日常核对中保留，等待原创建流程；已注册但尚未开始的 Controller 同样不会被转成 Failed。目录中暂时没有某条记录，不能证明在途 Claim 已被拒绝，本机预留由明确的声明结果或原身份重试收敛。启动恢复不采用这一豁免：旧进程可能启动过尚未提交的执行，仍须核对并清理。
 
@@ -134,7 +134,7 @@ Rust 用例位于 adxlet 的 `journal.rs`、`resources.rs`、`pause_resume.rs` �
 - Coordinator 被暂停时，节点空闲删除写入 SQLite，Redis 保留旧状态，未冒充全局提交成功。
 - 此时重启 adxlet，等待 Coordinator 对账，保留已有运行实例。
 - Coordinator 恢复后，重放删除日志并恢复已有实例路由，SQLite 待同步记录归零。
-- 资源采集 socket 暂时不可访问，超过有效期关闭准入；采集恢复后重新开放，已有实例继续运行。
+- 资源采集 socket 暂时不可访问时保留最近有效容量和资源账本，样本过期不关闭准入；首次尚无有效容量时等待采集，已有实例继续运行。
 
 同一轮最终目录中实例全部 Deleted，资源已释放，sandboxd 清单与 checkpoint 目录为空，服务正常停止。
 证据位于 `out/ci/pause-resume/fc-r7/evidence/`，包括 `sdk/result.json`、`lifecycle/result.json`、`catalog-final.json`、`inventory-final.txt` 和 `result.json`；构建/部署完整日志位于 `out/ci/stage-2/{linux-2,package-2,fc-r7}.log`。回归日志为 `rust-5.log`（141 项测试，Clippy 通过）及 `clients-4.log`（Go 检查及 138 项 SDK 测试）。这些是本地证据，Kubernetes 验收尚未包含新增生命周期场景。

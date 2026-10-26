@@ -1484,6 +1484,63 @@ async fn cached_log_retention_waits_for_recovery_and_cleanup_confirmation() {
 }
 
 #[tokio::test]
+async fn periodic_catalog_retry_reports_current_admission_without_closing_on_transport_failure() {
+    use std::sync::atomic::Ordering;
+    for mode in ["ready", "unavailable", "fenced"] {
+        let backend = Arc::new(Backend::default());
+        *backend.actual.lock().unwrap() = vec![observed("kept")];
+        let node = Arc::new(manager(&backend));
+        let mut fixture = authority::Fixture::new().await;
+        fixture.authority.records.lock().unwrap().push(
+            record("kept", EnvironmentState::Running)
+                .try_into()
+                .unwrap(),
+        );
+        fixture.cycle(&node).await.unwrap();
+        let mut stale = record("kept", EnvironmentState::Pending);
+        stale.runtime.ip = None;
+        *fixture.authority.records.lock().unwrap() = vec![stale.try_into().unwrap()];
+        node.set_pressure(true);
+        let control = fixture.authority.clone();
+        control.block_inspect.store(true, Ordering::SeqCst);
+        let cycle = tokio::spawn({
+            let node = node.clone();
+            async move {
+                let result = fixture.cycle(&node).await;
+                (fixture, result)
+            }
+        });
+        control.inspect_entered.notified().await;
+        node.set_pressure(false);
+        if mode == "unavailable" {
+            control.reject_ready.store(true, Ordering::SeqCst);
+        }
+        if mode == "fenced" {
+            control.requires_handshake.store(true, Ordering::SeqCst);
+        }
+        control.inspect_release.notify_one();
+        let (fixture, result) = cycle.await.unwrap();
+        assert_eq!(result.unwrap_err().code(), tonic::Code::Aborted);
+        if mode == "fenced" {
+            assert!(!node.accepting_allocations());
+            assert!(fixture.registration.reconciling);
+        } else {
+            assert!(node.accepting_allocations());
+            assert!(!fixture.registration.reconciling);
+            assert!(
+                control
+                    .reports
+                    .lock()
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .accepting_allocations
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn missing_execution_after_intended_stop_does_not_become_interruption_on_reconnect() {
     let backend = Arc::new(Backend::default());
     let node = manager(&backend);

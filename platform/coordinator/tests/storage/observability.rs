@@ -138,7 +138,7 @@ async fn oom_recovery_keeps_evidence_and_counts_distinct_executions() {
 
 #[tokio::test]
 #[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
-async fn request_binding_is_atomic_across_local_and_central_candidates() {
+async fn request_identity_is_settled_by_success_across_optional_claims() {
     let rig = common::Redis::new().await;
     let session = rig.store().await.begin(1).await.unwrap();
     session
@@ -154,7 +154,7 @@ async fn request_binding_is_atomic_across_local_and_central_candidates() {
         )
         .await
         .unwrap();
-    let candidates = vec!["one", "two"]
+    let candidates = ["one", "two"]
         .into_iter()
         .map(|id| {
             (
@@ -169,40 +169,57 @@ async fn request_binding_is_atomic_across_local_and_central_candidates() {
         })
         .collect();
     let results = session.claim_batch(candidates).await.unwrap();
-    assert!(results[0].is_ok());
-    assert_eq!(results[1], Err(Error::Conflict));
-    assert_eq!(session.snapshot().await.unwrap().environments.len(), 1);
-    let assignment = Assignment {
-        environment_id: "three".into(),
-        node_id: "node".into(),
-        shard_id: 0,
-        generation: 2,
-        devices: vec![],
-    };
-    assert_eq!(
-        session
-            .reserve_with_request(spec("three"), assignment, "same-request")
-            .await
-            .unwrap_err(),
-        Error::Conflict
-    );
-    let owner = results[0].as_ref().unwrap().record().clone();
-    let mut deleted = running(owner.spec, owner.assignment);
-    deleted.state = EnvironmentState::Deleted;
-    deleted.resources_held = false;
-    session.commit(deleted).await.unwrap();
-    // Bindings live exactly as long as the env; delete permits a deliberate new create.
-    let assignment = Assignment {
-        environment_id: "three".into(),
-        node_id: "node".into(),
-        shard_id: 0,
-        generation: 2,
-        devices: vec![],
-    };
-    session
-        .reserve_with_request(spec("three"), assignment, "same-request")
+    assert!(results.iter().all(Result::is_ok));
+    assert!(session
+        .published_request("tenant", "same-request")
+        .await
+        .unwrap()
+        .is_none());
+    let first = results[0].as_ref().unwrap().record().clone();
+    let second = results[1].as_ref().unwrap().record().clone();
+    let winner = session
+        .publish_initial(
+            running(first.spec, first.assignment),
+            "same-request",
+            "boot",
+        )
         .await
         .unwrap();
+    assert_eq!(
+        session
+            .publish_initial(
+                running(second.spec, second.assignment),
+                "same-request",
+                "boot"
+            )
+            .await
+            .unwrap(),
+        winner
+    );
+    assert_eq!(
+        session.business_counters().await.unwrap().creations,
+        [1, 0, 0]
+    );
+    let mut deleted = winner;
+    deleted.state = EnvironmentState::Deleted;
+    deleted.resources_held = false;
+    deleted.runtime.ip = None;
+    deleted.revision += 1;
+    session.commit(deleted).await.unwrap();
+    // Successful request receipts survive deletion and prevent accidental resurrection.
+    assert_eq!(
+        session
+            .published_request("tenant", "same-request")
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        EnvironmentState::Deleted
+    );
+    assert_eq!(
+        session.business_counters().await.unwrap().creations,
+        [1, 0, 0]
+    );
 }
 
 #[tokio::test]
@@ -508,6 +525,7 @@ async fn unpublished_running_exit_does_not_block_terminal_commit() {
 async fn rejoined_same_process_counts_second_node_incident() {
     let rig = common::Redis::new().await;
     let session = rig.store().await.begin(1).await.unwrap();
+    let mut incidents = std::collections::BTreeSet::new();
     for sequence in [1, 10] {
         session
             .register_session(
@@ -542,6 +560,18 @@ async fn rejoined_same_process_counts_second_node_incident() {
             .invalidate_node("node", "same-process")
             .await
             .unwrap();
+        let incident = session
+            .get(&id)
+            .await
+            .unwrap()
+            .last_interruption
+            .unwrap()
+            .incident_id
+            .unwrap();
+        assert!(
+            incidents.insert(incident),
+            "distinct outages require distinct incident IDs"
+        );
         // A replay of the same loss is still idempotent.
         session
             .invalidate_node("node", "same-process")

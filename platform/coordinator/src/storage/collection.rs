@@ -14,7 +14,7 @@ impl Session {
         let field = format!("environment:{id}");
         for _ in 0..ATTEMPTS {
             let [header_value, value] = self.store.fields([HEADER.into(), field.clone()]).await?;
-            let mut header = self.header(&header_value)?;
+            let header = self.header(&header_value)?;
             let mut stored: StoredEnvironment = decode(value.as_deref().ok_or(Error::NotFound)?)?;
             stored.validate()?;
             let old = stored.clone();
@@ -22,13 +22,12 @@ impl Session {
             if stored == old {
                 return Ok(stored);
             }
-            header.advance()?;
             if self
                 .store
-                .cas(
+                .object_cas(
                     header_value.as_deref().ok_or(Error::Conflict)?,
                     &header,
-                    Some((&field, encode(&stored)?)),
+                    Some((&field, value.as_deref(), encode(&stored)?)),
                 )
                 .await?
             {

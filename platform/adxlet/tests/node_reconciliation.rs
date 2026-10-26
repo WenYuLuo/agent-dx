@@ -265,11 +265,50 @@ async fn periodic_authority_preserves_allocation_and_live_routes() {
         .store(true, Ordering::SeqCst);
     assert!(authority.cycle(&node).await.is_err());
     assert!(!authority.registration.reconciling);
-    assert!(!node.accepting_allocations());
+    assert!(node.accepting_allocations());
     authority
         .authority
         .unavailable
         .store(false, Ordering::SeqCst);
     authority.cycle(&node).await.unwrap();
     assert!(node.accepting_allocations());
+}
+
+#[tokio::test]
+async fn live_catalog_failure_preserves_creation_admission() {
+    let node = authority::manager(Arc::new(Runtime::default()));
+    let mut fixture = authority::Fixture::new().await;
+    fixture.cycle(&node).await.unwrap();
+    fixture.authority.unavailable.store(true, Ordering::SeqCst);
+    assert!(fixture.cycle(&node).await.is_err());
+    assert!(
+        node.accepting_allocations(),
+        "a failed periodic read is not node failure"
+    );
+    node.reserve_local(&creating_spec()).unwrap();
+    fixture.authority.unavailable.store(false, Ordering::SeqCst);
+    fixture.cycle(&node).await.unwrap();
+    assert!(node.accepting_allocations());
+}
+
+#[tokio::test]
+async fn expired_capacity_observation_keeps_last_capacity_for_creation() {
+    let node = authority::manager(Arc::new(Runtime::default()));
+    let mut fixture = authority::Fixture::new().await;
+    fixture.cycle(&node).await.unwrap();
+    node.update_capacity(
+        adx_core::Resources {
+            cpu_millis: 10,
+            memory_bytes: 10,
+            disk_bytes: 0,
+        },
+        Duration::from_millis(1),
+    )
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    assert!(
+        node.accepting_allocations(),
+        "sample age is diagnostic, not admission"
+    );
+    node.reserve_local(&creating_spec()).unwrap();
 }

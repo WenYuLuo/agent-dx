@@ -732,20 +732,41 @@ async fn delete_waits_for_active_operation_even_if_original_caller_disconnects()
 }
 
 #[tokio::test(start_paused = true)]
-async fn capacity_expires_and_maintenance_only_blocks_new_admission() {
+async fn expired_capacity_remains_usable_and_maintenance_blocks_new_admission() {
     let deps = Dependencies::new(false);
     let node = node(&deps);
     tokio::time::advance(Duration::from_secs(31)).await;
+    assert!(node.accepting_allocations());
+    assert!(node
+        .metrics()
+        .contains("adx_node_accepting_allocations 1\n"));
+    assert!(node
+        .metrics()
+        .contains("adx_node_resource_observation_fresh 0\n"));
     let environment = node.environment(spec("a"), assignment("a")).unwrap();
-    assert_eq!(environment.create().await.unwrap_err(), Error::NoCapacity);
-    node.update_capacity(resources(), Duration::from_secs(30))
-        .unwrap();
-    node.set_maintenance(true);
-    assert_eq!(environment.create().await.unwrap_err(), Error::NoCapacity);
-    node.set_maintenance(false);
     environment.create().await.unwrap();
     node.set_maintenance(true);
     environment.delete().await.unwrap();
+    assert_eq!(node.used(), Resources::default());
+    let next = node.environment(spec("b"), assignment("b")).unwrap();
+    assert_eq!(next.create().await.unwrap_err(), Error::NoCapacity);
+    node.set_maintenance(false);
+    next.create().await.unwrap();
+    node.set_maintenance(true);
+    next.delete().await.unwrap();
+    assert!(node
+        .metrics()
+        .contains("adx_node_accepting_allocations 0\n"));
+    node.set_maintenance(false);
+    node.set_pressure(true);
+    assert!(node
+        .metrics()
+        .contains("adx_node_accepting_allocations 0\n"));
+    node.set_pressure(false);
+    node.update_runtime_classes(vec![]).unwrap();
+    assert!(node
+        .metrics()
+        .contains("adx_node_accepting_allocations 0\n"));
 }
 
 #[tokio::test]
@@ -909,7 +930,7 @@ async fn local_device_admission_is_atomic_and_failed_cleanup_keeps_cards_reserve
 }
 
 #[tokio::test(start_paused = true)]
-async fn stale_device_inventory_closes_accelerator_admission() {
+async fn stale_device_inventory_preserves_capacity_and_existing_card_reservations() {
     use adx_core::scheduling::*;
     let deps = Dependencies::new(false);
     let node = node(&deps);
@@ -935,9 +956,23 @@ async fn stale_device_inventory_closes_accelerator_admission() {
         kind: DeviceKind::Gpu,
         model: "a".into(),
     }];
-    let handle = node.environment(a, assigned).unwrap();
+    let handle = node.environment(a.clone(), assigned.clone()).unwrap();
     tokio::time::advance(Duration::from_secs(2)).await;
-    assert!(matches!(handle.create().await, Err(Error::NoCapacity)));
+    handle.create().await.unwrap();
+    assert_eq!(node.used(), resources());
+    let mut expanded = resources();
+    expanded.cpu_millis *= 2;
+    expanded.memory_bytes *= 2;
+    expanded.disk_bytes *= 2;
+    node.update_capacity(expanded, Duration::from_secs(30))
+        .unwrap();
+    a.id = "b".into();
+    assigned.environment_id = "b".into();
+    let next = node.environment(a, assigned).unwrap();
+    assert_eq!(next.create().await.unwrap_err(), Error::NoCapacity);
+    handle.delete().await.unwrap();
+    next.create().await.unwrap();
+    next.delete().await.unwrap();
     assert_eq!(node.used(), Resources::default());
 }
 

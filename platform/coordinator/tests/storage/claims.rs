@@ -213,8 +213,10 @@ async fn concurrent_claims_allocate_exact_generations_above_lua_integer_precisio
         y.unwrap().record().assignment.generation,
     ];
     generations.sort();
-    assert_eq!(generations, [high + 1, high + 2]);
-    assert_eq!(s.snapshot().await.unwrap().generation, high + 2);
+    assert_eq!(generations[1], generations[0] + 1);
+    assert_eq!(generations[0] >> 32, s.epoch());
+    assert_eq!(s.get("seed").await.unwrap().assignment.generation, high);
+    assert_eq!(s.snapshot().await.unwrap().generation, high);
 }
 
 #[tokio::test]
@@ -240,10 +242,11 @@ async fn batched_local_claims_allocate_one_contiguous_generation_range() {
         .map(|outcome| outcome.unwrap().record().assignment.generation)
         .collect();
     generations.sort_unstable();
-    assert_eq!(generations.first(), Some(&(before.generation + 1)));
-    assert_eq!(generations.last(), Some(&(before.generation + 128)));
+    let base = s.epoch() << 32;
+    assert_eq!(generations.first(), Some(&(base + 1)));
+    assert_eq!(generations.last(), Some(&(base + 128)));
     let after = s.snapshot().await.unwrap();
-    assert_eq!(after.generation, before.generation + 128);
+    assert_eq!(after.generation, base + 128);
     assert_eq!(after.revision, before.revision + 128);
     assert_eq!(after.environments.len(), 128);
 }
@@ -321,4 +324,61 @@ async fn snapshot_claim_requires_existing_restore_reference() {
         s.claim(request, &a).await.unwrap(),
         ClaimOutcome::Owned(_)
     ));
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Redis; run storage suite"]
+async fn batch_claims_isolate_expired_and_missing_nodes() {
+    let rig = common::Redis::new().await;
+    let s = rig.store().await.begin(1).await.unwrap();
+    let good = claimant(&s, "good").await;
+    let expired = claimant(&s, "expired").await;
+    s.invalidate_node("expired", &expired.node_session_id)
+        .await
+        .unwrap();
+    let missing = LocalClaim {
+        request_id: String::new(),
+        node_id: "missing".into(),
+        node_session_id: "boot".into(),
+        devices: vec![],
+    };
+    for bad in [expired, missing] {
+        let id = format!("good-with-{}", bad.node_id);
+        let results = s
+            .claim_batch(vec![(spec(&bad.node_id), bad), (spec(&id), good.clone())])
+            .await
+            .unwrap();
+        assert!(results[0].is_err());
+        assert!(matches!(&results[1], Ok(ClaimOutcome::Owned(_))));
+        assert!(s.get(&id).await.is_ok());
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Redis; run storage suite"]
+async fn claim_rejects_corrupt_persisted_node() {
+    let rig = common::Redis::new().await;
+    let s = rig.store().await.begin(1).await.unwrap();
+    let candidate = claimant(&s, "node").await;
+    // A new Coordinator has no live overlay; exercise the Redis decode boundary.
+    let s = rig.store().await.begin(1).await.unwrap();
+    let client = redis::Client::open(rig.url.as_str()).unwrap();
+    let mut connection = client.get_multiplexed_async_connection().await.unwrap();
+    let key = "adx:{test}:control:v1";
+    let raw: String = redis::cmd("HGET")
+        .arg(key)
+        .arg("node:node")
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    let mut stored: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    stored["node"]["runtime_classes"] = serde_json::json!([""]);
+    let _: usize = redis::cmd("HSET")
+        .arg(key)
+        .arg("node:node")
+        .arg(stored.to_string())
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    assert!(s.claim(spec("corrupt-node"), &candidate).await.is_err());
 }

@@ -13,6 +13,8 @@ service CoordinatorService {
   rpc GetSchedulingQueue(GetSchedulingQueueRequest) returns (GetSchedulingQueueResponse);
   rpc SetNodeScheduling(SetNodeSchedulingRequest) returns (NodeSchedulingState);
   rpc PrepareCreate(LocalEnvironmentCreateRequest) returns (PreparedEnvironment);
+  // Local execution identity and resource reservation, held only in memory.
+  rpc ReserveLocalEnvironment(ClaimEnvironmentRequest) returns (ClaimEnvironmentResponse);
   rpc ClaimEnvironment(ClaimEnvironmentRequest) returns (ClaimEnvironmentResponse);
   rpc ForwardCreate(LocalEnvironmentCreateRequest) returns (EnvironmentResult);
   rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeResponse);
@@ -77,7 +79,6 @@ message RegisterNodeRequest {
 message RegisterNodeResponse { uint32 shard_id = 1; uint64 coordinator_epoch = 2; }
 
 message CreateEnvironmentRequest {
-  string request_id = 7;
   EnvironmentSpec spec = 1;
   CallerContext caller = 2;
   // Bounds only time waiting for a central scheduling assignment.
@@ -86,8 +87,10 @@ message CreateEnvironmentRequest {
   uint64 create_timeout_seconds = 4;
   // Fixed by the entrypoint; retries and every hop retain this deadline.
   uint64 create_deadline_unix_millis = 5;
-  // When retrying an observed Pending owner, never allocate another generation.
+  // Previously observed assignment for diagnostics; unconfirmed attempts may be reassigned.
   Assignment expected_assignment = 6;
+  // Stable public operation identity, preserved on every hop and retry.
+  string request_id = 7;
 }
 
 message GetEnvironmentRequest { string environment_id = 1; CallerContext caller = 2; }
@@ -166,9 +169,21 @@ message SetNodeSchedulingRequest {
   reserved 3;
 }
 message NodeSchedulingState { string node_id = 1; bool accepting_allocations = 2; }
-message LocalEnvironmentCreateRequest { CreateEnvironmentRequest create = 1; string node_session_id = 2; }
+message LocalEnvironmentCreateRequest {
+  CreateEnvironmentRequest create = 1;
+  string node_session_id = 2;
+  // Explicit opt-in; ordinary local-first creation reserves only in memory.
+  bool persist_claim = 3;
+}
 message PreparedEnvironment { EnvironmentSpec spec = 1; ReusableSnapshot snapshot = 2; }
-message ClaimEnvironmentRequest { EnvironmentSpec spec = 1; CallerContext caller = 2; string node_session_id = 3; repeated DeviceAllocation devices = 4; string request_id = 5; }
+message ClaimEnvironmentRequest {
+  EnvironmentSpec spec = 1;
+  CallerContext caller = 2;
+  string node_session_id = 3;
+  repeated DeviceAllocation devices = 4;
+  string request_id = 5;
+  uint64 create_deadline_unix_millis = 6;
+}
 message ClaimEnvironmentResponse {
   oneof outcome {
     StartAssignedEnvironmentRequest owned = 1;

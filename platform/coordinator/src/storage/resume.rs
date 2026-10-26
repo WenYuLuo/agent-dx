@@ -27,7 +27,7 @@ impl Session {
         let field = format!("environment:{id}");
         for _ in 0..ATTEMPTS {
             let [header_value, value] = self.store.fields([HEADER.into(), field.clone()]).await?;
-            let mut header = self.header(&header_value)?;
+            let header = self.header(&header_value)?;
             let mut stored: StoredEnvironment = decode(value.as_deref().ok_or(Error::NotFound)?)?;
             stored.validate()?;
             let record = stored.result.as_ref().ok_or(Error::Conflict)?;
@@ -62,13 +62,12 @@ impl Session {
                     retry_after_unix_seconds: 0,
                 });
             }
-            header.advance()?;
             if self
                 .store
-                .cas(
+                .object_cas(
                     header_value.as_deref().ok_or(Error::Conflict)?,
                     &header,
-                    Some((&field, encode(&stored)?)),
+                    Some((&field, value.as_deref(), encode(&stored)?)),
                 )
                 .await?
             {
@@ -88,7 +87,7 @@ impl Session {
         let field = format!("environment:{}", assignment.environment_id);
         for _ in 0..ATTEMPTS {
             let [header_value, value] = self.store.fields([HEADER.into(), field.clone()]).await?;
-            let mut header = self.header(&header_value)?;
+            let header = self.header(&header_value)?;
             let mut stored: StoredEnvironment = decode(value.as_deref().ok_or(Error::NotFound)?)?;
             if stored.assignment != *assignment
                 || stored
@@ -111,13 +110,12 @@ impl Session {
             if intent.retry_after_unix_seconds == 0 {
                 intent.retry_after_unix_seconds = now.saturating_add(30);
             }
-            header.advance()?;
             if self
                 .store
-                .cas(
+                .object_cas(
                     header_value.as_deref().ok_or(Error::Conflict)?,
                     &header,
-                    Some((&field, encode(&stored)?)),
+                    Some((&field, value.as_deref(), encode(&stored)?)),
                 )
                 .await?
             {

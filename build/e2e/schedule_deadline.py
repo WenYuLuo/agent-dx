@@ -8,7 +8,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 
 from adx_environment import Environment, EnvironmentError
-from node import catalog
+from node import catalog, live_catalog
 from runtime_inventory import require_runc_only_inventory, require_unassigned_create
 
 
@@ -31,7 +31,7 @@ def pending_ids(endpoint, token, ca):
 
 def run(connection, image, output, ca, admin_key, *, queue_reader=pending_ids, clock=time.monotonic, sleep=time.sleep):
     """Use the installed SDK while observing the admin queue and Redis catalog."""
-    require_runc_only_inventory(catalog())
+    require_runc_only_inventory(live_catalog())
     name = 'queue-deadline-' + uuid.uuid4().hex[:12]
     instance_id = 'default-' + name
     report = {

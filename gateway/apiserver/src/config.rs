@@ -39,6 +39,9 @@ pub struct Config {
     pub metrics_listen: Option<SocketAddr>,
     #[serde(default)]
     pub create_mode: CreateMode,
+    /// Persist a pre-execution Claim when local-first placement is enabled.
+    #[serde(default)]
+    pub persist_local_claim: bool,
     #[serde(default)]
     pub loopback_http: bool,
     #[serde(default)]

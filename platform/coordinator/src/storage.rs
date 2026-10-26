@@ -1,6 +1,7 @@
 //! Single-Coordinator Redis persistence. Lua only compares opaque bytes and performs
 //! atomic hash writes; JSON and u64 counters are validated in Rust, never Lua doubles.
 mod claims;
+mod publication;
 pub use claims::{ClaimOutcome, LocalClaim};
 mod artifacts;
 pub use artifacts::ArtifactDeletionGuard;
@@ -9,6 +10,7 @@ mod credentials;
 mod failure;
 mod inspection;
 mod observability;
+use observability::CounterUpdate;
 mod recovery;
 pub use observability::{
     BusinessCounters, CreationResult, CreationSummary, InterruptionSummary, RecoveryState,
@@ -23,7 +25,14 @@ use adx_core::{
 use redis::{aio::MultiplexedConnection, FromRedisValue};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 use tokio::{
     sync::{broadcast, Mutex},
     time::timeout,
@@ -34,35 +43,32 @@ const CAS: &str = r#"
 local old = redis.call('HGET', KEYS[1], 'header')
 if ARGV[1] == '' then
   if redis.call('HLEN', KEYS[1]) ~= 0 then return 0 end
+  redis.call('DEL',KEYS[3])
 elseif old ~= ARGV[1] then return 0 end
-if #ARGV >= 6 and ARGV[5] ~= '' then
- local binding = redis.call('HGET', KEYS[3], ARGV[5])
- if binding and binding ~= ARGV[6] then return 2 end
-end
-if #ARGV == 2 then
-  redis.call('HSET', KEYS[1], 'header', ARGV[2])
+if #ARGV == 3 then
+  redis.call('HSET', KEYS[1], 'header', ARGV[2], 'epoch', ARGV[#ARGV])
 else
   redis.call('HSET', KEYS[1], 'header', ARGV[2], ARGV[3], ARGV[4])
 end
-if #ARGV >= 6 and ARGV[5] ~= '' then redis.call('HSET', KEYS[3], ARGV[5], ARGV[6]) end
-for i = 7, #ARGV, 2 do redis.call('HSET', KEYS[2], ARGV[i], ARGV[i+1]) end
+for i = 5, #ARGV, 2 do redis.call('HSET', KEYS[2], ARGV[i], ARGV[i+1]) end
 return 1
 "#;
 const RETIRE_FIELDS: &str = r#"
 if redis.call('HGET', KEYS[1], 'header') ~= ARGV[1] then return 0 end
-for i = 3, #ARGV do
+for i = 4, #ARGV do
   redis.call('HDEL', KEYS[1], ARGV[i])
 end
-redis.call('HSET', KEYS[1], 'header', ARGV[2])
+redis.call('HSET', KEYS[1], 'header', ARGV[2], 'epoch', ARGV[3])
 return 1
 "#;
 const RETIRE_ENVIRONMENT: &str = r#"
-if redis.call('HGET', KEYS[1], 'header') ~= ARGV[1] then return 0 end
+if redis.call('HGET', KEYS[1], 'epoch') ~= ARGV[1] then return 0 end
 if redis.call('HGET', KEYS[1], ARGV[3]) ~= ARGV[4] then return 0 end
+local facts = cjson.decode(ARGV[7])
+if (redis.call('HGET',KEYS[3],facts[1]) or '') ~= facts[2] then return 0 end
 redis.call('SET', KEYS[2], ARGV[5], 'PX', ARGV[6])
-redis.call('HSET', KEYS[1], 'header', ARGV[2])
+redis.call('HSET',KEYS[3],facts[1],facts[3])
 redis.call('HDEL', KEYS[1], ARGV[3])
-if ARGV[7] ~= '' and redis.call('HGET', KEYS[3], ARGV[7]) == ARGV[8] then redis.call('HDEL', KEYS[3], ARGV[7]) end
 return 1
 "#;
 const ATTEMPTS: usize = 32;
@@ -137,6 +143,9 @@ pub struct ResumeIntent {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredEnvironment {
+    /// Initial ownership generation identifies this lifetime across recovery.
+    /// Deleting and recreating the same name starts a different lifetime.
+    pub creation_generation: u64,
     #[serde(default)]
     pub creation: Option<CreationSummary>,
     #[serde(default)]
@@ -232,7 +241,10 @@ impl StoredEnvironment {
     }
     fn validate(&self) -> Result<()> {
         self.spec.validate()?;
-        if self.spec.id != self.assignment.environment_id || self.assignment.generation == 0 {
+        if self.spec.id != self.assignment.environment_id
+            || self.creation_generation == 0
+            || self.creation_generation > self.assignment.generation
+        {
             return Err(Error::Conflict);
         }
         validate_device_assignment(&self.spec.scheduling.devices, &self.assignment.devices)?;
@@ -482,6 +494,9 @@ struct Connection {
     current: Mutex<Option<MultiplexedConnection>>,
     timeout: Duration,
     committed_changes: broadcast::Sender<ControlChange>,
+    publication_sequence: AtomicU64,
+    active_epoch: AtomicU64,
+    live_nodes: std::sync::RwLock<BTreeMap<String, StoredNode>>,
     artifact_locks: std::sync::Mutex<BTreeMap<String, std::sync::Weak<tokio::sync::RwLock<()>>>>,
 }
 
@@ -498,6 +513,12 @@ pub struct RedisStore {
 }
 impl RedisStore {
     fn notify_committed_change(&self, revision: u64, fields: Vec<String>) {
+        let _ = revision;
+        let revision = self
+            .connection
+            .publication_sequence
+            .fetch_add(1, Ordering::AcqRel)
+            + 1;
         let _ = self
             .connection
             .committed_changes
@@ -525,6 +546,9 @@ impl RedisStore {
                 timeout: duration,
                 committed_changes,
                 artifact_locks: Default::default(),
+                publication_sequence: AtomicU64::new(0),
+                active_epoch: AtomicU64::new(0),
+                live_nodes: Default::default(),
             }),
             key: format!("adx:{{{namespace}}}:control:v1"),
         };
@@ -588,6 +612,7 @@ impl RedisStore {
         header: &Header,
         field: Option<(&str, String)>,
     ) -> Result<bool> {
+        let header_only = field.is_none();
         let changed = field
             .as_ref()
             .map(|(name, _)| vec![(*name).to_owned()])
@@ -602,39 +627,24 @@ impl RedisStore {
             }
             _ => vec![],
         };
-        let binding = match &field {
-            Some((name, value)) if name.starts_with("environment:") => {
-                let record: StoredEnvironment = decode(value)?;
-                record
-                    .creation
-                    .as_ref()
-                    .filter(|c| !c.request_id.is_empty())
-                    .map(|c| {
-                        (
-                            request_key(&record.spec.tenant_id, &c.request_id),
-                            record.spec.id.clone(),
-                        )
-                    })
-            }
-            _ => None,
-        };
         let _access = self.lock_artifacts(&artifacts)?;
         let mut cmd = redis::cmd("EVAL");
         cmd.arg(CAS)
             .arg(3)
             .arg(&self.key)
             .arg(format!("{}:artifacts", self.key))
-            .arg(format!("{}:requests", self.key))
+            .arg(format!("{}:business", self.key))
             .arg(expected)
             .arg(encode(header)?);
         if let Some((name, value)) = field {
             cmd.arg(name).arg(value);
-            let (key, id) = binding.unwrap_or_default();
-            cmd.arg(key).arg(id);
             for artifact in artifacts {
                 cmd.arg(artifacts::artifact_key(&artifact))
                     .arg(encode(&artifact)?);
             }
+        }
+        if header_only {
+            cmd.arg(header.epoch.to_string());
         }
         let applied: u8 = self.query(cmd).await?;
         if applied == 2 {
@@ -644,6 +654,85 @@ impl RedisStore {
             self.notify_committed_change(header.revision, changed);
         }
         Ok(applied == 1)
+    }
+    /// Compare only the touched record under a stable process epoch.
+    async fn object_cas(
+        &self,
+        _header_bytes: &str,
+        header: &Header,
+        field: Option<(&str, Option<&str>, String)>,
+    ) -> Result<bool> {
+        self.object_cas_with_counters(header, field, None).await
+    }
+    async fn object_cas_with_counters(
+        &self,
+        header: &Header,
+        field: Option<(&str, Option<&str>, String)>,
+        counters: Option<&CounterUpdate>,
+    ) -> Result<bool> {
+        let (name, old, next) = field.ok_or(Error::Conflict)?;
+        let artifacts = if name.starts_with("environment:") {
+            decode::<StoredEnvironment>(&next)?
+                .result
+                .as_ref()
+                .map(artifacts::record_artifacts)
+                .unwrap_or_default()
+        } else {
+            vec![]
+        };
+        let _access = self.lock_artifacts(&artifacts)?;
+        let membership = if name.starts_with("environment:") {
+            let environment: StoredEnvironment = decode(&next)?;
+            format!("node-ownership:{}", environment.assignment.node_id)
+        } else {
+            String::new()
+        };
+        let node_session = if name.starts_with("node:") {
+            let node: StoredNode = decode(&next)?;
+            let previous = old.map(decode::<StoredNode>).transpose()?;
+            if previous
+                .as_ref()
+                .and_then(|n| n.session.as_ref())
+                .map(|s| &s.id)
+                != node.session.as_ref().map(|s| &s.id)
+            {
+                node.session
+                    .as_ref()
+                    .map(|s| s.id.as_str())
+                    .unwrap_or("")
+                    .to_owned()
+            } else {
+                String::new()
+            }
+        } else {
+            String::new()
+        };
+        let mut cmd = redis::cmd("EVAL");
+        cmd.arg(r#"
+            if redis.call('HGET',KEYS[1],'epoch') ~= ARGV[1] then return 0 end
+            local old = redis.call('HGET',KEYS[1],ARGV[2])
+            if ARGV[3] == '' then if old then return 0 end
+            elseif old ~= ARGV[3] then return 0 end
+            local facts = cjson.decode(ARGV[7])
+            if facts[1] ~= '' and (redis.call('HGET',KEYS[3],facts[1]) or '') ~= facts[2] then return 0 end
+            redis.call('HSET',KEYS[1],ARGV[2],ARGV[4])
+            if facts[1] ~= '' then redis.call('HSET',KEYS[3],facts[1],facts[3]) end
+            if ARGV[5] ~= '' then redis.call('HSET',KEYS[1],'node-session:' .. string.sub(ARGV[2],6),ARGV[5]) end
+            if ARGV[6] ~= '' then redis.call('HINCRBY',KEYS[1],ARGV[6],1) end
+            for i=8,#ARGV,2 do redis.call('HSET',KEYS[2],ARGV[i],ARGV[i+1]) end
+            return 1
+        "#).arg(3).arg(&self.key).arg(format!("{}:artifacts", self.key)).arg(format!("{}:business", self.key))
+            .arg(header.epoch.to_string()).arg(name).arg(old.unwrap_or("")).arg(next).arg(node_session).arg(membership)
+            .arg(counters.map(CounterUpdate::argument).transpose()?.unwrap_or_else(|| r#"["","",""]"#.into()));
+        for artifact in artifacts {
+            cmd.arg(artifacts::artifact_key(&artifact))
+                .arg(encode(&artifact)?);
+        }
+        let applied = self.query::<u8>(cmd).await? == 1;
+        if applied {
+            self.notify_committed_change(0, vec![name.to_owned()]);
+        }
+        Ok(applied)
     }
     fn deleted_receipt_key(&self, id: &str) -> String {
         format!("{}:deleted:{id}", self.key)
@@ -667,7 +756,8 @@ impl RedisStore {
             .arg(1)
             .arg(&self.key)
             .arg(expected)
-            .arg(encode(header)?);
+            .arg(encode(header)?)
+            .arg(header.epoch.to_string());
         for field in retired {
             cmd.arg(field);
         }
@@ -676,27 +766,26 @@ impl RedisStore {
     }
     async fn retire_environment(
         &self,
-        expected_header: &str,
+        _expected_header: &str,
         expected_environment: &str,
         header: &Header,
         field: &str,
         receipt: &DeletedReceipt,
-        request_binding: Option<String>,
+        counters: &CounterUpdate,
     ) -> Result<bool> {
         let mut cmd = redis::cmd("EVAL");
         cmd.arg(RETIRE_ENVIRONMENT)
             .arg(3)
             .arg(&self.key)
             .arg(self.deleted_receipt_key(&receipt.environment_id))
-            .arg(format!("{}:requests", self.key))
-            .arg(expected_header)
+            .arg(format!("{}:business", self.key))
+            .arg(header.epoch.to_string())
             .arg(encode(header)?)
             .arg(field)
             .arg(expected_environment)
             .arg(encode(receipt)?)
             .arg(DELETED_RECEIPT_TTL.as_millis() as u64)
-            .arg(request_binding.unwrap_or_default())
-            .arg(&receipt.environment_id);
+            .arg(counters.argument()?);
         let applied: u8 = self.query(cmd).await?;
         if applied == 2 {
             return Err(Error::Conflict);
@@ -760,11 +849,16 @@ impl RedisStore {
                         retired.push(field.clone());
                     }
                 }
-                snapshot(&normalized)
+                let saved = snapshot(&normalized)
                     .map_err(|_| Error::Unavailable("control snapshot incompatible".into()))?;
-                h.epoch = h.epoch.checked_add(1).ok_or(Error::Conflict)?;
+                h.epoch = h.epoch.checked_add(1).ok_or(Error::Conflict)?.max(
+                    (saved.generation >> 32)
+                        .checked_add(1)
+                        .ok_or(Error::Conflict)?,
+                );
                 h
             };
+            h.epoch.checked_mul(1_u64 << 32).ok_or(Error::Conflict)?;
             h.advance()?;
             let applied = if retired.is_empty() {
                 self.cas(old, &h, None).await?
@@ -772,10 +866,21 @@ impl RedisStore {
                 self.retire_fields(old, &h, &retired).await?
             };
             if applied {
+                self.connection
+                    .active_epoch
+                    .store(h.epoch, Ordering::Release);
+                self.connection
+                    .live_nodes
+                    .write()
+                    .expect("node overlay lock poisoned")
+                    .clear();
                 return Ok(Session {
                     store: self.clone(),
                     epoch: h.epoch,
                     inspection: Arc::new(Mutex::new(None)),
+                    generations: Arc::new(AtomicU64::new(
+                        h.epoch.checked_mul(1_u64 << 32).ok_or(Error::Conflict)?,
+                    )),
                 });
             }
         }
@@ -867,10 +972,22 @@ fn snapshot(raw: &BTreeMap<String, String>) -> Result<StoredSnapshot> {
             out.nodes.insert(id.into(), decode(value)?);
         } else if let Some(id) = key.strip_prefix("environment:") {
             out.environments.insert(id.into(), decode(value)?);
-        } else if key != HEADER {
+        } else if key != HEADER
+            && key != "epoch"
+            && key != "claim-fence"
+            && !key.starts_with("node-session:")
+            && !key.starts_with("node-ownership:")
+        {
             return Err(Error::Unavailable("unknown control metadata field".into()));
         }
     }
+    out.generation = out
+        .environments
+        .values()
+        .map(|e| e.assignment.generation)
+        .max()
+        .unwrap_or(0)
+        .max(h.generation);
     out.validate()?;
     Ok(out)
 }
@@ -879,6 +996,7 @@ pub struct Session {
     store: RedisStore,
     epoch: u64,
     inspection: Arc<Mutex<Option<inspection::InspectionInventory>>>,
+    generations: Arc<AtomicU64>,
 }
 impl Session {
     pub(crate) fn committed_changes(&self) -> broadcast::Receiver<ControlChange> {
@@ -887,7 +1005,12 @@ impl Session {
 
     pub async fn revision(&self) -> Result<u64> {
         let [header_value] = self.store.fields([HEADER.into()]).await?;
-        Ok(self.header(&header_value)?.revision)
+        self.header(&header_value)?;
+        Ok(self
+            .store
+            .connection
+            .publication_sequence
+            .load(Ordering::Acquire))
     }
     pub fn epoch(&self) -> u64 {
         self.epoch
@@ -988,16 +1111,27 @@ impl Session {
     }
 
     pub(crate) async fn get_node(&self, id: &str) -> Result<StoredNode> {
-        let [header_value, node_value] = self
+        if let Some(node) = self
+            .store
+            .connection
+            .live_nodes
+            .read()
+            .expect("node overlay lock poisoned")
+            .get(id)
+            .cloned()
+        {
+            node.node.validate()?;
+            return Ok(node);
+        }
+        let [header, node] = self
             .store
             .fields([HEADER.into(), format!("node:{id}")])
             .await?;
-        self.header(&header_value)?;
-        let record: StoredNode = decode(node_value.as_deref().ok_or(Error::NotFound)?)?;
-        record.node.validate()?;
-        Ok(record)
+        self.header(&header)?;
+        let node: StoredNode = decode(node.as_deref().ok_or(Error::NotFound)?)?;
+        node.node.validate()?;
+        Ok(node)
     }
-
     fn header(&self, value: &Option<String>) -> Result<Header> {
         let header: Header = decode(value.as_deref().ok_or(Error::Conflict)?)?;
         header.validate()?;
@@ -1007,9 +1141,74 @@ impl Session {
         Ok(header)
     }
     pub async fn snapshot(&self) -> Result<StoredSnapshot> {
-        let raw = self.store.raw().await?;
-        self.header(&raw.get(HEADER).cloned())?;
-        snapshot(&raw)
+        // Never label an older snapshot with a later event sequence: consumers
+        // would otherwise skip the event needed to repair that snapshot.
+        for _ in 0..ATTEMPTS {
+            let before = self
+                .store
+                .connection
+                .publication_sequence
+                .load(Ordering::Acquire);
+            let raw = self.store.raw().await?;
+            self.header(&raw.get(HEADER).cloned())?;
+            let mut saved = snapshot(&raw)?;
+            saved.revision = before;
+            saved.generation = saved
+                .generation
+                .max(self.generations.load(Ordering::Acquire));
+            for (id, node) in self
+                .store
+                .connection
+                .live_nodes
+                .read()
+                .expect("node overlay lock poisoned")
+                .iter()
+            {
+                saved.nodes.insert(id.clone(), node.clone());
+            }
+            if before
+                == self
+                    .store
+                    .connection
+                    .publication_sequence
+                    .load(Ordering::Acquire)
+            {
+                return Ok(saved);
+            }
+        }
+        Err(Error::Unavailable(
+            "publication snapshot changed; retry".into(),
+        ))
+    }
+    pub(crate) fn observe_node(&self, node: StoredNode) {
+        if self.store.connection.active_epoch.load(Ordering::Acquire) != self.epoch {
+            return;
+        }
+        let mut nodes = self
+            .store
+            .connection
+            .live_nodes
+            .write()
+            .expect("node overlay lock poisoned");
+        let changed = nodes.get(&node.node.id) != Some(&node);
+        let id = node.node.id.clone();
+        nodes.insert(id.clone(), node);
+        drop(nodes);
+        if changed {
+            self.store
+                .notify_committed_change(0, vec![format!("node:{id}")]);
+        }
+    }
+    pub(crate) fn next_generation(&self) -> Result<u64> {
+        let base = self.epoch.checked_mul(1_u64 << 32).ok_or(Error::Conflict)?;
+        self.generations
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                value
+                    .checked_add(1)
+                    .filter(|next| *next - base < (1_u64 << 32))
+            })
+            .map(|value| value + 1)
+            .map_err(|_| Error::Unavailable("execution identity space exhausted".into()))
     }
     /// Node identity keeps its assigned ShardScheduler. Only first registration scans
     /// ShardScheduler counts; capacity refreshes read/write a single node field.
@@ -1022,6 +1221,60 @@ impl Session {
         self.register_session(node, address, proxy_address, None)
             .await
     }
+    /// Re-enable successful publication after a live process completes recovery.
+    /// Ordinary heartbeats never enter this transition or touch Redis.
+    async fn restore_node_publication(&self, id: &str, session_id: &str) -> Result<()> {
+        let field = format!("node:{id}");
+        let token = format!("node-session:{id}");
+        for _ in 0..ATTEMPTS {
+            let [header, raw, active] = self
+                .store
+                .fields([HEADER.into(), field.clone(), token.clone()])
+                .await?;
+            self.header(&header)?;
+            let raw = raw.ok_or(Error::NotFound)?;
+            let mut registered: StoredNode = decode(&raw)?;
+            if registered
+                .session
+                .as_ref()
+                .is_none_or(|session| session.id != session_id)
+            {
+                return Err(Error::Conflict);
+            }
+            if active.as_deref() == Some(session_id) {
+                return Ok(());
+            }
+            if active.is_some() {
+                return Err(Error::Conflict);
+            }
+            registered.last_incident_id = None;
+            let mut command = redis::cmd("EVAL");
+            command
+                .arg(
+                    r#"
+                if redis.call('HGET',KEYS[1],'epoch') ~= ARGV[1] then return 0 end
+                if redis.call('HGET',KEYS[1],ARGV[2]) ~= ARGV[3] then return 0 end
+                if redis.call('HEXISTS',KEYS[1],ARGV[4]) ~= 0 then return 0 end
+                redis.call('HSET',KEYS[1],ARGV[2],ARGV[6],ARGV[4],ARGV[5]); return 1
+            "#,
+                )
+                .arg(1)
+                .arg(&self.store.key)
+                .arg(self.epoch.to_string())
+                .arg(&field)
+                .arg(raw)
+                .arg(&token)
+                .arg(session_id)
+                .arg(encode(&registered)?);
+            if self.store.query::<u8>(command).await? == 1 {
+                return Ok(());
+            }
+        }
+        Err(Error::Unavailable(
+            "node recovery registration changed; retry request".into(),
+        ))
+    }
+
     pub async fn register_session(
         &self,
         mut node: Node,
@@ -1033,22 +1286,85 @@ impl Session {
         if address.trim().is_empty() || proxy_address.trim().is_empty() {
             return Err(Error::Invalid("node addresses required".into()));
         }
+        let cached = self
+            .store
+            .connection
+            .live_nodes
+            .read()
+            .expect("node overlay lock poisoned")
+            .get(&node.id)
+            .cloned();
+        if let Some(previous) = cached {
+            if self.store.connection.active_epoch.load(Ordering::Acquire) == self.epoch
+                && previous.address == address
+                && previous.proxy_address == proxy_address
+                && previous.session.as_ref().map(|s| &s.id) == session.as_ref().map(|s| &s.id)
+            {
+                if let Some(current) = session.as_ref().filter(|current| {
+                    current.routable && previous.session.as_ref().is_some_and(|old| !old.routable)
+                }) {
+                    self.restore_node_publication(&node.id, &current.id).await?;
+                }
+                node.available &= !previous.scheduling_paused;
+                let record = StoredNode {
+                    last_incident_id: if session.as_ref().is_some_and(|s| s.routable) {
+                        None
+                    } else {
+                        previous.last_incident_id.clone()
+                    },
+                    node,
+                    address,
+                    proxy_address,
+                    session,
+                    shard_id: previous.shard_id,
+                    scheduling_paused: previous.scheduling_paused,
+                };
+                self.observe_node(record.clone());
+                return Ok(record);
+            }
+        }
         let field = format!("node:{}", node.id);
         for _ in 0..ATTEMPTS {
             let [header_value, node_value] =
                 self.store.fields([HEADER.into(), field.clone()]).await?;
-            let mut header = self.header(&header_value)?;
+            let header = self.header(&header_value)?;
             let previous = node_value
                 .as_deref()
                 .map(decode::<StoredNode>)
                 .transpose()?;
+            if let Some(previous) = &previous {
+                if previous.address == address
+                    && previous.proxy_address == proxy_address
+                    && previous.session.as_ref().map(|s| &s.id) == session.as_ref().map(|s| &s.id)
+                {
+                    if let Some(current) = session.as_ref().filter(|current| {
+                        current.routable
+                            && previous.session.as_ref().is_some_and(|old| !old.routable)
+                    }) {
+                        self.restore_node_publication(&node.id, &current.id).await?;
+                    }
+                    node.available &= !previous.scheduling_paused;
+                    let record = StoredNode {
+                        last_incident_id: if session.as_ref().is_some_and(|s| s.routable) {
+                            None
+                        } else {
+                            previous.last_incident_id.clone()
+                        },
+                        node,
+                        address,
+                        proxy_address,
+                        session,
+                        shard_id: previous.shard_id,
+                        scheduling_paused: previous.scheduling_paused,
+                    };
+                    self.observe_node(record.clone());
+                    return Ok(record);
+                }
+            }
             let (shard, scheduling_paused) = if let Some(previous) = &previous {
                 (previous.shard_id, previous.scheduling_paused)
             } else {
                 let current = self.snapshot().await?;
-                if current.revision != header.revision {
-                    continue;
-                }
                 let mut counts = vec![0usize; header.shards];
                 for node in current.nodes.values() {
                     counts[node.shard_id] += 1;
@@ -1057,7 +1373,6 @@ impl Session {
                     .map(|offset| (header.next_node_shard + offset) % header.shards)
                     .min_by_key(|shard| counts[*shard])
                     .expect("nonempty shards");
-                header.next_node_shard = (shard + 1) % header.shards;
                 (shard, false)
             };
             if scheduling_paused {
@@ -1082,20 +1397,21 @@ impl Session {
             };
             let encoded = encode(&record)?;
             if node_value.as_ref() == Some(&encoded) {
+                self.observe_node(record.clone());
                 return Ok(record);
             }
-            header.advance()?;
             if self
                 .store
-                .cas(
+                .object_cas(
                     header_value
                         .as_deref()
                         .expect("validated control header is present"),
                     &header,
-                    Some((&field, encoded)),
+                    Some((&field, node_value.as_deref(), encoded)),
                 )
                 .await?
             {
+                self.observe_node(record.clone());
                 return Ok(record);
             }
         }
@@ -1118,26 +1434,28 @@ impl Session {
         for _ in 0..ATTEMPTS {
             let [header_value, node_value] =
                 self.store.fields([HEADER.into(), field.clone()]).await?;
-            let mut header = self.header(&header_value)?;
-            let mut record: StoredNode = decode(node_value.as_deref().ok_or(Error::NotFound)?)?;
+            let header = self.header(&header_value)?;
+            node_value.as_deref().ok_or(Error::NotFound)?;
+            let mut record = self.get_node(id).await?;
             let available = available && !paused;
             if record.scheduling_paused == paused && record.node.available == available {
+                self.observe_node(record.clone());
                 return Ok(record);
             }
             record.scheduling_paused = paused;
             record.node.available = available;
-            header.advance()?;
             if self
                 .store
-                .cas(
+                .object_cas(
                     header_value
                         .as_deref()
                         .expect("validated control header is present"),
                     &header,
-                    Some((&field, encode(&record)?)),
+                    Some((&field, node_value.as_deref(), encode(&record)?)),
                 )
                 .await?
             {
+                self.observe_node(record.clone());
                 return Ok(record);
             }
         }
@@ -1173,6 +1491,7 @@ impl Session {
             }
         }
         let record = StoredEnvironment {
+            creation_generation: assignment.generation,
             creation: Some(CreationSummary::new(request_id)?),
             last_interruption: None,
             resume: None,
@@ -1184,6 +1503,10 @@ impl Session {
             result: None,
         };
         record.validate()?;
+        if record.assignment.generation >> 32 == self.epoch {
+            self.generations
+                .fetch_max(record.assignment.generation, Ordering::AcqRel);
+        }
         let field = format!("environment:{}", record.spec.id);
         for _ in 0..ATTEMPTS {
             let [header_value, environment_value, node_value] = self
@@ -1194,7 +1517,7 @@ impl Session {
                     format!("node:{}", record.assignment.node_id),
                 ])
                 .await?;
-            let mut header = self.header(&header_value)?;
+            let header = self.header(&header_value)?;
             if let Some(environment_value) = &environment_value {
                 let existing: StoredEnvironment = decode(environment_value)?;
                 return if existing.spec == record.spec && existing.assignment == record.assignment {
@@ -1204,21 +1527,18 @@ impl Session {
                 };
             }
             let node: StoredNode = decode(node_value.as_deref().ok_or(Error::NotFound)?)?;
-            if node.shard_id != record.assignment.shard_id
-                || record.assignment.generation <= header.generation
-            {
+            if node.shard_id != record.assignment.shard_id {
                 return Err(Error::Conflict);
             }
-            header.generation = record.assignment.generation;
-            header.advance()?;
+
             if self
                 .store
-                .cas(
+                .object_cas(
                     header_value
                         .as_deref()
                         .expect("validated control header is present"),
                     &header,
-                    Some((&field, encode(&record)?)),
+                    Some((&field, None, encode(&record)?)),
                 )
                 .await?
             {
@@ -1251,7 +1571,7 @@ impl Session {
                     format!("node:{}", replacement.node_id),
                 ])
                 .await?;
-            let mut header = self.header(&header_value)?;
+            let header = self.header(&header_value)?;
             let mut stored_environment: StoredEnvironment =
                 decode(environment_value.as_deref().ok_or(Error::NotFound)?)?;
             stored_environment.validate()?;
@@ -1264,7 +1584,6 @@ impl Session {
                     .result
                     .as_ref()
                     .is_some_and(|r| r.state != EnvironmentState::Failed || r.resources_held)
-                || replacement.generation <= header.generation
             {
                 return Err(Error::Conflict);
             }
@@ -1275,16 +1594,19 @@ impl Session {
             stored_environment.assignment = replacement.clone();
             stored_environment.result = None;
             stored_environment.validate()?;
-            header.generation = replacement.generation;
-            header.advance()?;
+
             if self
                 .store
-                .cas(
+                .object_cas(
                     header_value
                         .as_deref()
                         .expect("validated control header is present"),
                     &header,
-                    Some((&field, encode(&stored_environment)?)),
+                    Some((
+                        &field,
+                        environment_value.as_deref(),
+                        encode(&stored_environment)?,
+                    )),
                 )
                 .await?
             {
@@ -1327,7 +1649,8 @@ impl Session {
         for _ in 0..ATTEMPTS {
             let [header_value, environment_value] =
                 self.store.fields([HEADER.into(), field.clone()]).await?;
-            let mut header = self.header(&header_value)?;
+            let mut counters = CounterUpdate::load(&self.store, field.clone()).await?;
+            let header = self.header(&header_value)?;
             let Some(environment_value) = environment_value.as_deref() else {
                 if result.state == EnvironmentState::Deleted {
                     return match self.store.deleted_receipt(&result.spec.id).await? {
@@ -1345,6 +1668,7 @@ impl Session {
             if !(next_result(&stored_environment, &result)?
                 || result.state == EnvironmentState::Running && stored_environment.resume.is_some())
             {
+                self.store.notify_committed_change(0, vec![field.clone()]);
                 return Ok(CommittedEnvironment {
                     result,
                     stored: Some(stored_environment),
@@ -1362,12 +1686,11 @@ impl Session {
             // runtime, while every placement and resource field remains
             // fenced by `next_result` above.
             let previous_observation = stored_environment.last_interruption.clone();
-            stored_environment.observe_result(&result, &mut header.observability)?;
+            stored_environment.observe_result(&result, &mut counters.value)?;
             stored_environment.spec = result.spec.clone();
             stored_environment.result = Some(result.clone());
             stored_environment.track_failure(collection::now()?);
             stored_environment.validate()?;
-            header.advance()?;
             let expected_header = header_value
                 .as_deref()
                 .expect("validated control header is present");
@@ -1379,21 +1702,19 @@ impl Session {
                         &header,
                         &field,
                         &DeletedReceipt::from_result(&result)?,
-                        stored_environment
-                            .creation
-                            .as_ref()
-                            .filter(|c| !c.request_id.is_empty())
-                            .map(|c| {
-                                request_key(&stored_environment.spec.tenant_id, &c.request_id)
-                            }),
+                        &counters,
                     )
                     .await?
             } else {
                 self.store
-                    .cas(
-                        expected_header,
+                    .object_cas_with_counters(
                         &header,
-                        Some((&field, encode(&stored_environment)?)),
+                        Some((
+                            &field,
+                            Some(environment_value),
+                            encode(&stored_environment)?,
+                        )),
+                        Some(&counters),
                     )
                     .await?
             };
@@ -1408,12 +1729,4 @@ impl Session {
             "concurrent environment commit; retry request".into(),
         ))
     }
-}
-
-fn request_key(tenant: &str, request: &str) -> String {
-    let mut digest = Sha256::new();
-    digest.update((tenant.len() as u64).to_be_bytes());
-    digest.update(tenant.as_bytes());
-    digest.update(request.as_bytes());
-    format!("{:x}", digest.finalize())
 }

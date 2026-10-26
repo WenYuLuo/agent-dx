@@ -96,6 +96,12 @@ impl pb::coordinator_service_server::CoordinatorService for Authority {
     ) -> Result<Response<pb::PreparedEnvironment>, Status> {
         Err(Status::unimplemented("unused test RPC"))
     }
+    async fn reserve_local_environment(
+        &self,
+        _: Request<pb::ClaimEnvironmentRequest>,
+    ) -> Result<Response<pb::ClaimEnvironmentResponse>, Status> {
+        Err(Status::unimplemented("unused test RPC"))
+    }
     async fn claim_environment(
         &self,
         _: Request<pb::ClaimEnvironmentRequest>,

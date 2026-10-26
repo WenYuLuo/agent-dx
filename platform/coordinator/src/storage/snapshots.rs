@@ -29,7 +29,7 @@ impl Session {
         command
             .arg(
                 r#"
-            if redis.call('HGET', KEYS[1], 'header') ~= ARGV[1] then return 0 end
+            if redis.call('HGET', KEYS[1], 'epoch') ~= ARGV[1] then return 0 end
             local old = redis.call('HGET', KEYS[2], ARGV[2])
             if ARGV[3] == '' then
                 if old then return 0 end
@@ -40,7 +40,7 @@ impl Session {
             .arg(2)
             .arg(&self.store.key)
             .arg(self.snapshots_key())
-            .arg(header_value.as_deref().ok_or(Error::Conflict)?)
+            .arg(self.epoch.to_string())
             .arg(id)
             .arg(old.unwrap_or(""))
             .arg(encode(next)?);

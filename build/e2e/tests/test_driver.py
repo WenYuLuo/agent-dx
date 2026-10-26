@@ -2,6 +2,7 @@ import importlib.util
 import json
 import tempfile
 import unittest
+from unittest import mock
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -12,6 +13,52 @@ spec.loader.exec_module(driver)
 
 
 class AcceptanceGateTests(unittest.TestCase):
+    def test_create_identity_inventory_receives_node_and_prefix(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = driver.Run(Path(directory))
+            run.nodes = ['node1', 'node2']
+            run.execute = mock.Mock()
+
+            def helper(node, action, *args, **_kwargs):
+                if action == 'execution-inventory':
+                    self.assertEqual(args, (node, 'identities'))
+                    backends = ['runtime'] if node == 'node1' else []
+                    (run.output / f'activator-identities-{node}.json').write_text(json.dumps({'backends': backends}))
+
+            run.helper = helper
+            checks = []
+            run.scenarios(checks, ('create-identities',))
+            self.assertEqual(checks, ['create-identities'])
+
+    def test_all_nodes_exist_before_configuration_resolves_peer_addresses(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = driver.Run(Path(directory))
+            created = []
+
+            def docker(*args, **_kwargs):
+                if args[:2] == ('image', 'inspect'):
+                    return json.dumps([{'Id': 'image', 'Architecture': 'arm64'}])
+                if args[0] == 'info':
+                    return json.dumps({'Architecture': 'aarch64'})
+                if args[0] == 'run':
+                    created.append(args[args.index('--name') + 1])
+                return ''
+
+            def execute(_node, *args, **_kwargs):
+                if 'setup' in args:
+                    self.assertEqual(created, [run.id + '-node1', run.id + '-node2'])
+                return ''
+
+            run.docker = docker
+            run.execute = execute
+            run.helper = mock.Mock()
+            with mock.patch.object(driver, 'validate_identity'):
+                run.deploy(
+                    {'image_ids': {'node': 'image'}, 'architecture': 'arm64', 'package': {}},
+                    Path(directory),
+                    Path(directory),
+                )
+
     def test_coordinator_and_adxlet_restart_together_preserve_both_backends(self):
         self.assertEqual(driver.selected_checks('full', 'coordinator-adxlet-restart'), ('coordinator-adxlet-restart',))
         with tempfile.TemporaryDirectory() as directory:
@@ -509,7 +556,7 @@ class AcceptanceGateTests(unittest.TestCase):
                 ],
             )
 
-    def test_resource_stale_closes_admission_until_observer_recovers(self):
+    def test_resource_stale_keeps_admission_until_observer_recovers(self):
         self.assertEqual(driver.selected_checks('full', 'resource-stale'), ('resource-stale',))
         with tempfile.TemporaryDirectory() as directory:
             run = driver.Run(Path(directory))
@@ -536,7 +583,7 @@ class AcceptanceGateTests(unittest.TestCase):
                     ('execute', 'node1', 'resource-create'),
                     ('helper', 'node1', 'observer-freeze'),
                     ('helper', 'node1', 'resource-stale'),
-                    ('execute', 'node1', 'resource-rejected'),
+                    ('execute', 'node1', 'resource-accepted'),
                     ('helper', 'node1', 'observer-resume'),
                     ('helper', 'node1', 'resource-fresh'),
                     ('execute', 'node1', 'resource-verify'),
@@ -997,10 +1044,10 @@ class RegistryImportTests(unittest.TestCase):
     def test_archive_import_checks_manifest_and_compresses_layers(self):
         import gzip
         import hashlib
-        import http.server
         import io
         import tarfile
         import threading
+        from wsgiref.simple_server import WSGIRequestHandler, make_server
 
         spec_local = importlib.util.spec_from_file_location('registry_publish', ROOT / 'publish.py')
         module = importlib.util.module_from_spec(spec_local)
@@ -1008,32 +1055,30 @@ class RegistryImportTests(unittest.TestCase):
         blobs = {}
         published = []
 
-        class Handler(http.server.BaseHTTPRequestHandler):
+        class QuietHandler(WSGIRequestHandler):
             def log_message(self, *args):
                 pass
 
-            def do_GET(self):
-                self.send_response(200)
-                self.end_headers()
-
-            def do_POST(self):
-                self.send_response(202)
-                self.send_header('Location', '/upload?id=fixture')
-                self.end_headers()
-
-            def do_PUT(self):
-                data = self.rfile.read(int(self.headers['Content-Length']))
+        def registry(environ, start_response):
+            method = environ.get('REQUEST_METHOD')
+            if method == 'GET':
+                start_response('200 OK', [])
+            elif method == 'POST':
+                start_response('202 Accepted', [('Location', '/upload?id=fixture')])
+            elif method == 'PUT':
+                data = environ['wsgi.input'].read(int(environ.get('CONTENT_LENGTH') or 0))
                 digest = 'sha256:' + hashlib.sha256(data).hexdigest()
-                if self.path.startswith('/upload'):
-                    self.assertion = digest in self.path
+                if environ.get('PATH_INFO', '').startswith('/upload'):
+                    self.assertIn(digest, environ.get('QUERY_STRING', ''))
                     blobs[digest] = data
                 else:
                     published.append(json.loads(data))
-                self.send_response(201)
-                self.send_header('Docker-Content-Digest', digest)
-                self.end_headers()
+                start_response('201 Created', [('Docker-Content-Digest', digest)])
+            else:
+                start_response('405 Method Not Allowed', [])
+            return [b'']
 
-        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        server = make_server('127.0.0.1', 0, registry, handler_class=QuietHandler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         self.addCleanup(server.server_close)

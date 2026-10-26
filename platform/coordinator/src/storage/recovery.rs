@@ -55,7 +55,7 @@ impl Session {
                     format!("node:{}", replacement.node_id),
                 ])
                 .await?;
-            let mut header = self.header(&header_value)?;
+            let header = self.header(&header_value)?;
             let mut stored_environment: StoredEnvironment =
                 decode(environment_value.as_deref().ok_or(Error::NotFound)?)?;
             stored_environment.validate()?;
@@ -67,9 +67,7 @@ impl Session {
             {
                 return Ok(stored_environment);
             }
-            if &stored_environment.assignment != previous
-                || replacement.generation <= header.generation
-            {
+            if &stored_environment.assignment != previous {
                 return Err(Error::Conflict);
             }
             let mut checkpoint = stored_environment
@@ -77,7 +75,8 @@ impl Session {
                 .or_else(|| stored_environment.resume_point(now))
                 .ok_or(Error::Conflict)?
                 .clone();
-            let target: StoredNode = decode(node_value.as_deref().ok_or(Error::NotFound)?)?;
+            node_value.as_deref().ok_or(Error::NotFound)?;
+            let target = self.get_node(&replacement.node_id).await?;
             if !target.node.available
                 || target.shard_id != replacement.shard_id
                 || target.session.as_ref().is_some_and(|s| !s.routable)
@@ -137,16 +136,19 @@ impl Session {
                 last.recovery_state = RecoveryState::Recovering;
             }
             stored_environment.validate()?;
-            header.generation = replacement.generation;
-            header.advance()?;
+
             if self
                 .store
-                .cas(
+                .object_cas(
                     header_value
                         .as_deref()
                         .expect("validated control header is present"),
                     &header,
-                    Some((&field, encode(&stored_environment)?)),
+                    Some((
+                        &field,
+                        environment_value.as_deref(),
+                        encode(&stored_environment)?,
+                    )),
                 )
                 .await?
             {

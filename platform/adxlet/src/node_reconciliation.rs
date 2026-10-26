@@ -102,7 +102,7 @@ async fn inspect(
 /// Startup and session fencing drain accepted lifecycle work before recovery.
 /// Live comparisons enqueue at most one task per Environment, so a slow or failed
 /// controller cannot close other Environments' admission. An unavailable catalog
-/// is never empty and still closes new node allocation.
+/// is never interpreted as empty; ordinary read failures preserve admission.
 pub async fn reconcile_node(
     coordinator: &mut Coordinator,
     registration: &mut pb::RegisterNodeRequest,
@@ -110,7 +110,7 @@ pub async fn reconcile_node(
     journal: Option<&JournalSink>,
     timeout: Duration,
     report_interval: Duration,
-    capacity_valid_until: Instant,
+    _capacity_valid_until: Instant,
 ) -> Result<(), Status> {
     let was_live = *manager.lifecycle_ready.read().await;
     // Admission can close after a failed cleanup/report. That does not make
@@ -122,10 +122,8 @@ pub async fn reconcile_node(
     // session can compare a snapshot while accepting new allocations.
     let handshake = !periodic || registration.reconciling;
     registration.reconciling = handshake;
-    registration.accepting_allocations = periodic
-        && manager.accepting_allocations()
-        && !manager.is_draining()
-        && Instant::now() < capacity_valid_until;
+    registration.accepting_allocations =
+        periodic && manager.accepting_allocations() && !manager.is_draining();
     if timeout.is_zero() || report_interval.is_zero() {
         return Err(Status::invalid_argument(
             "positive node reconciliation intervals required",
@@ -218,16 +216,15 @@ pub async fn reconcile_node(
                     if periodic && !manager.authority_reconciling.load(Ordering::Acquire) {
                         registration.reconciling = false;
                         registration.accepting_allocations = manager.accepting_allocations()
-                            && !manager.is_draining() && Instant::now() < capacity_valid_until;
+                            && !manager.is_draining();
                     }
                     report(coordinator, registration, timeout, &mut handshake_required).await?;
                 },
             }
         }
         registration.reconciling = false;
-        registration.accepting_allocations = manager.locally_accepting_allocations()
-            && !manager.is_draining()
-            && Instant::now() < capacity_valid_until;
+        registration.accepting_allocations =
+            manager.locally_accepting_allocations() && !manager.is_draining();
         // Coordinator may dispatch while processing this report, before replying.
         // Authority is already validated, so accept those confirmed assignments.
         manager
@@ -236,14 +233,29 @@ pub async fn reconcile_node(
         report(coordinator, registration, timeout, &mut handshake_required).await
     }
     .await;
+    if result.is_err() && periodic && !handshake_required {
+        // A failed live comparison leaves the last validated authority in force.
+        // Never turn a transport failure into an empty catalog or node outage.
+        registration.reconciling = false;
+        registration.accepting_allocations =
+            manager.accepting_allocations() && !manager.is_draining();
+        if catalog_retry {
+            let _ = report(coordinator, registration, timeout, &mut handshake_required).await;
+            if handshake_required {
+                manager.authority_reconciling.store(true, Ordering::Release);
+                registration.reconciling = true;
+                registration.accepting_allocations = false;
+            }
+        }
+        return result;
+    }
     if result.is_err() {
         if catalog_retry {
             // Even a fast local failure must publish restored node admission;
             // otherwise Coordinator only sees the earlier closed report.
             registration.reconciling = false;
-            registration.accepting_allocations = manager.accepting_allocations()
-                && !manager.is_draining()
-                && Instant::now() < capacity_valid_until;
+            registration.accepting_allocations =
+                manager.accepting_allocations() && !manager.is_draining();
             if let Err(error) =
                 report(coordinator, registration, timeout, &mut handshake_required).await
             {

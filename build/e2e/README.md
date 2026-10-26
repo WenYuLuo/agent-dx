@@ -150,7 +150,7 @@ Local Docker reproduction requires access to the same bind-mounted paths as the 
   requires nodes with different sandboxd inventories.
 - `local-first`: restart API Server with `create_mode: "local_first"`, verify
   entry-node rotation, concurrent same-name creation converging to one Environment,
-  conflicting specifications rejected, real EXECD commands, and physical cleanup.
+  confirmed results reused with their original specifications, real EXECD commands, and physical cleanup.
   Require Coordinator local-claim logs, then restore the central deployment mode.
 - `node-failure`: pin one running backend to each node, then suspend node2
   Adxlet heartbeats while its runtime remains independently hosted. Require
@@ -263,6 +263,14 @@ Local Docker reproduction requires access to the same bind-mounted paths as the 
   extended heartbeat deadline; require journal replay, Redis Deleted state,
   an empty pending table and the retained Environment serving a new SDK command
   with its original backend. Select with `--profile full --case sqlite-fallback`.
+- `create-identities` (targeted concurrency/restart case): send twelve concurrent
+  creates through independent HTTPS connections with one Request ID and different names
+  and specifications. Require one confirmed Environment and one physical backend.
+  A new Request ID with the winning Environment name must reuse its original
+  specification. Restart Coordinator and API Server, then replay both
+  request identities with new candidate names; require the same execution and
+  a working SDK command before physical cleanup. Select with
+  `--profile standalone --case create-identities`.
 - `create-response-cut` (targeted lost-acknowledgment case): a TLS proxy reads
   the first successful create final event from the real Ingress, verifies the
   Redis assignment and physical sandboxd backend, then closes the downstream
@@ -341,11 +349,11 @@ Local Docker reproduction requires access to the same bind-mounted paths as the 
   physical backend inventories. Select with `--profile full --case schedule-deadline`.
 - `resource-stale` (targeted observation-expiry case): pause only node1's
   resource observer so its 10-second capacity sample expires while adxlet,
-  Coordinator and existing backends continue. Require node1 to close new
-  admission without losing its routable session; a node1-pinned SDK create
-  must time out without a new allocation. Resume observation, require node1
-  to reopen admission in the same session, create and execute a new instance,
-  then delete both. Select with `--profile full --case resource-stale`.
+  Coordinator and existing backends continue. Require node1 to retain admission
+  and its session after verified sample expiry. A node1-pinned SDK create must
+  execute with the previous capacity while preserving existing allocations.
+  Release it, resume observation, verify a fresh sample in the same session,
+  create another instance, and physically clean up all backends. Select with `--profile full --case resource-stale`.
 - `network-partition` (targeted two-worker fault): block node2's TCP traffic to
   Coordinator with a container-local firewall rule while keeping sandboxd and
   the Relay running. Require heartbeat invalidation, public Ingress route

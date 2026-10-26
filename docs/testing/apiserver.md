@@ -50,7 +50,7 @@ Coordinator、adxlet 和 API Server 均使用 `--config /path/to/config.json`，
 
 Coordinator 在绑定监听地址后开启一次 Redis Session，恢复调度目录，装配 CoordinatorService 与 AuthService。
 
-adxlet 装配 Sandboxd、ExecdReadiness、UdsRoutes 及带 SQLite 降级的 StateSink。资源源支持 `resource_source.kind=auto` 自动探测、`kind=sandboxd` external collector，以及兼容的 `capacity_file`；配置互斥，按有效期关闭新准入。实例 Stats 与节点容量分别采集，见 [节点生命周期](node-lifecycle.md)。
+adxlet 装配 Sandboxd、ExecdReadiness、UdsRoutes 及带 SQLite 降级的 StateSink。资源源支持 `resource_source.kind=auto` 自动探测、`kind=sandboxd` external collector，以及兼容的 `capacity_file`；配置互斥；采集失败或样本过期保留最近有效容量，首次无有效容量时限制准入。实例 Stats 与节点容量分别采集，见 [节点生命周期](node-lifecycle.md)。
 
 Node 启动后先关闭生命周期入口，以本次进程身份注册并获取 Coordinator 完整目录，与 sandboxd 实际实例对账，恢复资源占用和本机绑定后再开放准入。Coordinator 暂不可用时不清理或重建。详细契约见 [发现与重启对账](recovery-discovery.md)。
 
@@ -91,8 +91,8 @@ Go 测试／构建使用 Linux ARM64 Go 1.25.5 容器，交叉编译 macOS ARM64
 ## 创建入口模式
 
 API Server 的 `create_mode` 默认 `central`；配置为 `local_first` 后，订阅 Coordinator 的可用节点目录并轮转选择 adxlet。
-本地资源和硬约束满足时通过原子 claim 创建；否则保持同 Environment ID 进入 ShardScheduler。
-本地成功不经过 Pack/Spread、软偏好评分或中心队列。相同规格的同 ID 创建收敛，规格/租户变化返回冲突。
+本地资源和硬约束满足时通过 ReserveLocalEnvironment 登记内存预留，成功后才持久化结果；否则保持同 Environment ID 进入 ShardScheduler。独立配置 `persist_local_claim: true` 才启用提前持久化 Claim，默认 false。
+本地成功不经过 Pack/Spread、软偏好评分或中心队列。同租户内已成功的 Environment ID 或 Request ID 复用原结果与规格；跨租户访问被拒绝。
 入口超时使用同身份向 Coordinator 重试；不会把一次缺失查询当作重新生成 ID 的许可。
 目录有效期、mTLS、暂留资源和验收范围见 [创建契约](atomic-environment-claim.md)。
 

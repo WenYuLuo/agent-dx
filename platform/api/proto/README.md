@@ -127,8 +127,9 @@ and credentials do not transfer Environment lifecycle ownership to Coordinator.
 
 ## Creation and interruption observations
 
-CreateEnvironmentRequest and ClaimEnvironmentRequest carry request_id for the atomic
-tenant/request-to-Environment ownership binding. EnvironmentResult.newly_created is true
+CreateEnvironmentRequest and ClaimEnvironmentRequest carry request_id for tenant-scoped
+identity replay. The first successful publication atomically binds the success receipt;
+ordinary central and local reservations remain in memory. EnvironmentResult.newly_created is true
 only for the actual initial start operation; replay, reuse, resume and recovery return false.
 EnvironmentRecord.observation carries bounded initial-create stage, normal-operation intent
 and old-execution interruption evidence through journal/replay and final Running publication.

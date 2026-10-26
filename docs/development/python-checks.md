@@ -13,14 +13,15 @@ make python-check PYTHON_CHECK_BASE=github/master
 基线必须显式提供，无法解析时检查失败，避免漏掉之前提交里的文件。
 
 当前本地规则覆盖：120 字符行宽、语法和常见名称错误、函数/参数/局部变量命名、
-外层变量遮蔽、重复异常，以及直接用相对命令名启动子进程。
+外层变量遮蔽、循环闭包的延迟绑定、重复异常，以及直接用相对命令名启动子进程。
 规则配置在 `build/ci/ruff-codecheck.toml`，Pylint 规则与版本在 `build/ci/python-check.sh`。
 该入口是独立本地预检，现有 Buildkite 流水线尚未调用它。
 
 静态检查通过后，还要运行改动组件的回归测试。测试通过只能证明已覆盖的行为；
 CodeCheck 的平台规则另行检查。处理 Python 代码时尤其注意：
 
-- URL 使用 `urllib.parse` 构建和编码；动态字典查找显式处理键缺失。
+- URL 使用 `urllib.parse` 构建和编码，CIDR 使用 `ipaddress` 构造；动态字典查找显式处理键缺失。
+- 运行日志使用 `logging`；循环内定义的回调通过参数显式绑定循环变量，避免延迟绑定。
 - 外部命令先通过 `shutil.which` 查找、处理缺失，再解析为绝对路径。
 - 第三方回调命名等例外需核对平台支持情况；本地 `pylint: disable` 不代表平台认可。
   测试 HTTP 接收器优先使用标准库 WSGI 函数回调；平台仍会检查 `do_POST` 等方法名，

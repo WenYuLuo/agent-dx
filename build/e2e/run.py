@@ -9,7 +9,6 @@ import os
 import shlex
 import signal
 import subprocess
-import sys
 import tempfile
 import threading
 import time
@@ -34,6 +33,7 @@ STANDARD = (
     'stop',
 )
 OPTIONAL_CASES = (
+    'create-identities',
     'activator-standalone',
     'activator-embedded',
     'redis-restart',
@@ -280,7 +280,7 @@ class Run:
                 try:
                     os.killpg(process.pid, signal.SIGKILL)
                 except ProcessLookupError:
-                    logging.getLogger(__name__).debug("Best-effort operation failed", exc_info=True)
+                    logging.getLogger(__name__).debug('Best-effort operation failed', exc_info=True)
                 process.wait()
                 reader.join(timeout=5)
                 self.event(f'[FAIL {log.name}] interrupted or timed out after {time.monotonic() - start:.1f}s')
@@ -317,7 +317,7 @@ class Run:
             record['seconds'] = round(time.monotonic() - start, 3)
             self.case_results.append(record)
             (self.output / 'case-results.json').write_text(json.dumps(self.case_results, indent=2) + '\n')
-            self.event(f"[{'PASS' if record['status'] == 'passed' else 'FAIL'}] {name} ({record['seconds']:.3f}s)")
+            self.event(f'[{"PASS" if record["status"] == "passed" else "FAIL"}] {name} ({record["seconds"]:.3f}s)')
 
     def docker(self, *args, timeout=180):
         return self.command(['docker', *args], timeout)
@@ -338,7 +338,7 @@ class Run:
             try:
                 self.helper(node, 'collect', node, timeout=20)
             except Exception:
-                logging.getLogger(__name__).debug("Best-effort operation failed", exc_info=True)
+                logging.getLogger(__name__).debug('Best-effort operation failed', exc_info=True)
             try:
                 self.docker('rm', '-f', self.id + '-' + node, timeout=45)
                 remaining = self.docker(
@@ -407,6 +407,8 @@ class Run:
             if os.getenv('ADX_E2E_RUNTIME_CONTROL') == '1':
                 args += ['-e', 'ADX_E2E_RUNTIME_CONTROL=1']
             self.docker(*args, m['image_ids']['node'])
+        # Both DNS aliases are required when configuring authenticated peer access.
+        for node in self.nodes:
             self.execute(
                 node, 'env', *setup_environment(self.selected_case), 'python3', '/opt/adx/e2e/node.py', 'setup', node
             )
@@ -439,8 +441,17 @@ class Run:
                 continue
             mode = scenario.removeprefix('activator-')
             with self.case(scenario, checks) as record:
-                def phase(name):
-                    return self.execute('node1', '/opt/adx/client/bin/python', '-u', '/opt/adx/e2e/activator.py', mode, name, timeout=600)
+
+                def phase(name, activator_mode=mode):
+                    return self.execute(
+                        'node1',
+                        '/opt/adx/client/bin/python',
+                        '-u',
+                        '/opt/adx/e2e/activator.py',
+                        activator_mode,
+                        name,
+                        timeout=600,
+                    )
 
                 def inventory(name):
                     for node in self.nodes:
@@ -454,7 +465,9 @@ class Run:
                         self.helper(node, 'activator-restart', node, timeout=60)
                     else:
                         self.helper(node, 'gateway-restart', 'apiserver', timeout=120)
-                        (self.output / f'apiserver-restart-{node}.json').write_bytes((self.output / 'apiserver-restart.json').read_bytes())
+                        (self.output / f'apiserver-restart-{node}.json').write_bytes(
+                            (self.output / 'apiserver-restart.json').read_bytes()
+                        )
                 inventory('restarted')
                 phase('recover')
                 for node in self.nodes:
@@ -800,6 +813,35 @@ class Run:
                 record['subcases'] = sdk_subcases_from_output(output)
                 for node in self.nodes:
                     self.helper(node, 'empty', node)
+        if 'create-identities' in selected:
+            with self.case('create-identities', checks):
+                self.execute(
+                    'node1',
+                    '/opt/adx/client/bin/python',
+                    '-u',
+                    '/opt/adx/e2e/scenarios.py',
+                    'create-identities-seed',
+                    timeout=240,
+                )
+                for node in self.nodes:
+                    self.helper(node, 'execution-inventory', node, 'identities', timeout=30)
+                inventories = [
+                    json.loads((self.output / f'activator-identities-{node}.json').read_text()) for node in self.nodes
+                ]
+                if sum(len(item['backends']) for item in inventories) != 1:
+                    raise AssertionError('concurrent identity replay created duplicate physical backends')
+                self.helper('node1', 'coordinator-restart', 'node1', timeout=90)
+                self.helper('node1', 'gateway-restart', 'apiserver', timeout=90)
+                self.execute(
+                    'node1',
+                    '/opt/adx/client/bin/python',
+                    '-u',
+                    '/opt/adx/e2e/scenarios.py',
+                    'create-identities-replay',
+                    timeout=240,
+                )
+                for node in self.nodes:
+                    self.helper(node, 'empty', node)
         if 'resource-stale' in selected:
             with self.case('resource-stale', checks) as record:
                 self.execute(
@@ -818,7 +860,7 @@ class Run:
                         '/opt/adx/client/bin/python',
                         '-u',
                         '/opt/adx/e2e/scenarios.py',
-                        'resource-rejected',
+                        'resource-accepted',
                         timeout=70,
                     )
                 finally:
@@ -1185,7 +1227,7 @@ def write_junit(path, report, suite_name='platform-e2e'):
                 case = ET.SubElement(
                     suite,
                     'testcase',
-                    name=f"{name}/{subcase['id']}",
+                    name=f'{name}/{subcase["id"]}',
                     time=str(subcase.get('seconds', 0)),
                 )
                 if subcase['status'] != 'passed':

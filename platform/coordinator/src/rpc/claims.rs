@@ -10,18 +10,42 @@ impl State {
             return Ok(());
         }
         self.needs_recovery = true;
-        // The failed writer has returned. Advancing the header prevents its last
-        // in-flight CAS from materializing after the authoritative snapshot.
+        // The failed writer has returned. Fence only optional claims before
+        // loading their authoritative outcomes; lifecycle objects are independent.
         self.session.claim_barrier().await?;
-        let saved = self.session.snapshot().await?;
+        let mut saved = self.session.snapshot().await?;
         self.session.refresh_inspection_inventory().await?;
+        // An in-process catalog rebuild must retain local work already handed
+        // to an adxlet. Requeuing it would have no central task to start it.
+        // These reservations remain memory-only and keep their original expiry;
+        // a new Coordinator process recovers only the durable snapshot.
+        for (id, (assignment, _)) in &self.local_reservation_deadlines {
+            if !saved.environments.contains_key(id) {
+                if let Some(record) = self.environments.get(id).filter(|record| {
+                    record.assignment == *assignment
+                        && record.result.is_none()
+                        && !record.invalidated
+                        && record.recovery.is_none()
+                }) {
+                    saved.generation = saved.generation.max(assignment.generation);
+                    saved.environments.insert(id.clone(), record.clone());
+                }
+            }
+        }
         let pending: Vec<_> = self
             .specs
             .values()
-            .filter(|s| !saved.environments.contains_key(&s.id))
+            .filter(|s| {
+                !saved.environments.contains_key(&s.id)
+                    && self
+                        .environments
+                        .get(&s.id)
+                        .is_none_or(|e| e.result.is_none())
+            })
             .cloned()
             .collect();
         let mut scheduler = Coordinator::restore(&saved, self.placement)?;
+        scheduler.use_generation_source(self.session.clone());
         for node in saved.nodes.values() {
             let mut candidate = node.node.clone();
             candidate.available &= self.live.get(&candidate.id).is_some_and(|live| {
@@ -34,8 +58,10 @@ impl State {
             });
             scheduler.register(candidate)?;
         }
+        self.specs.clear();
         for spec in pending {
-            scheduler.submit(spec)?;
+            scheduler.submit(spec.clone())?;
+            self.specs.insert(spec.id.clone(), spec);
         }
         self.scheduler = scheduler;
         self.nodes = saved.nodes;
@@ -168,13 +194,99 @@ impl CoordinatorRpc {
         &self,
         node: String,
         request: pb::ClaimEnvironmentRequest,
+        persistent: bool,
     ) -> std::result::Result<pb::ClaimEnvironmentResponse, Status> {
+        let deadline = if persistent && request.create_deadline_unix_millis == 0 {
+            None
+        } else {
+            Some(adx_transport::deadline::Deadline::from_unix_millis(
+                request.create_deadline_unix_millis,
+            )?)
+        };
+        let request_id = request.request_id.clone();
         let spec: EnvironmentSpec = request
             .spec
             .ok_or_else(|| Status::invalid_argument("spec required"))?
             .try_into()
             .map_err(status)?;
         tenant(request.caller.as_ref(), &spec.tenant_id)?;
+        let _publication = self.create_guard(format!("publication:{}", spec.id)).await;
+        let (session, cached) = {
+            let mut state = self.0.state.lock().await;
+            state.recover_authoritative_state().await.map_err(status)?;
+            state.healthy().map_err(status)?;
+            (
+                state.session.clone(),
+                state.environments.get(&spec.id).cloned(),
+            )
+        };
+        let cached = if cached
+            .as_ref()
+            .is_some_and(|stored| stored.result.is_some())
+        {
+            let mut state = self.0.state.lock().await;
+            state.recover_authoritative_state().await.map_err(status)?;
+            state.healthy().map_err(status)?;
+            match state.session.get(&spec.id).await {
+                Ok(current) => {
+                    state.accept_stored_claim(current.clone()).map_err(status)?;
+                    Some(current)
+                }
+                Err(Error::NotFound) => {
+                    if state.environments.get(&spec.id).is_some_and(|old| {
+                        cached
+                            .as_ref()
+                            .is_some_and(|cached| old.assignment == cached.assignment)
+                    }) {
+                        state.scheduler.retire_claim(&spec.id).map_err(status)?;
+                        state.scheduler.forget_deleted(&spec.id).map_err(status)?;
+                        state.environments.remove(&spec.id);
+                        state.specs.remove(&spec.id);
+                        state.create_requests.remove(&spec.id);
+                    }
+                    None
+                }
+                Err(error) => return Err(status(error)),
+            }
+        } else {
+            cached
+        };
+        let published = match session
+            .published_request(&spec.tenant_id, &request_id)
+            .await
+            .map_err(status)?
+        {
+            Some(record) => Some(record),
+            None => match cached {
+                Some(stored) if stored.spec.tenant_id != spec.tenant_id => {
+                    return Err(Status::not_found("environment not found"));
+                }
+                Some(stored) => stored.result,
+                None => None,
+            },
+        };
+        if let Some(record) = published {
+            let record = if record.state == EnvironmentState::Running {
+                session
+                    .publish_existing(record, &request_id)
+                    .await
+                    .map_err(status)?
+            } else {
+                record
+            };
+            let state = self.0.state.lock().await;
+            let owner = state
+                .nodes
+                .get(&record.assignment.node_id)
+                .ok_or_else(|| Status::unavailable("confirmed owner is unavailable"))?;
+            return Ok(pb::ClaimEnvironmentResponse {
+                outcome: Some(Outcome::Existing(Box::new(pb::GetEnvironmentResponse {
+                    record: Some(record.try_into().map_err(status)?),
+                    node_address: owner.address.clone(),
+                    relay_address: owner.proxy_address.clone(),
+                }))),
+            });
+        }
         let candidate = LocalClaim {
             request_id: request.request_id,
             node_id: node.clone(),
@@ -222,6 +334,23 @@ impl CoordinatorRpc {
                 outcome: Some(Outcome::Fallback(true)),
             });
         }
+        if let Some(record) = &existing {
+            // A center-selected assignment is memory-only. A competing optional
+            // Claim must reuse it rather than install a second durable owner.
+            // Forwarding through the center also replays a durable pending Claim.
+            if record.result.is_none() && !record.invalidated && record.recovery.is_none() {
+                state
+                    .create_requests
+                    .entry(spec.id.clone())
+                    .or_default()
+                    .insert(request_id);
+                return Ok(pb::ClaimEnvironmentResponse {
+                    outcome: Some(Outcome::Existing(Box::new(
+                        state.environment_response(record).map_err(status)?,
+                    ))),
+                });
+            }
+        }
         let snapshot = if let Some(id) = &spec.snapshot_id {
             if existing.is_none() {
                 let normalized = cloning::normalize(&state.session, spec.clone().into())
@@ -248,6 +377,66 @@ impl CoordinatorRpc {
         } else {
             None
         };
+        if let Some(deadline) = deadline {
+            deadline.remaining()?;
+        }
+        state
+            .create_requests
+            .entry(spec.id.clone())
+            .or_default()
+            .insert(request_id);
+        if !persistent {
+            let deadline = deadline
+                .ok_or_else(|| Status::invalid_argument("local reservation deadline required"))?;
+            let generation = state.session.next_generation().map_err(status)?;
+            let shard_id = state
+                .nodes
+                .get(&node)
+                .ok_or_else(|| Status::unavailable("local node disappeared"))?
+                .shard_id;
+            let assignment = adx_core::Assignment {
+                environment_id: spec.id.clone(),
+                node_id: node.clone(),
+                shard_id,
+                generation,
+                devices: candidate.devices.clone(),
+            };
+            let record = StoredEnvironment {
+                creation_generation: generation,
+                creation: Some(
+                    crate::storage::CreationSummary::new(&candidate.request_id).map_err(status)?,
+                ),
+                last_interruption: None,
+                spec: spec.clone(),
+                assignment: assignment.clone(),
+                result: None,
+                resume: None,
+                recovery: None,
+                invalidated: false,
+                failed_since_unix_seconds: None,
+            };
+            state.accept_stored_claim(record).map_err(status)?;
+            state
+                .local_reservation_deadlines
+                .insert(spec.id.clone(), (assignment.clone(), deadline.instant()));
+            self.0.changed.notify_waiters();
+            adx_observability::info!(event="local_environment_reservation", environment_id=%spec.id,
+                node_id=%node, generation, "local execution reserved in memory");
+            return Ok(pb::ClaimEnvironmentResponse {
+                outcome: Some(Outcome::Owned(Box::new(
+                    pb::StartAssignedEnvironmentRequest {
+                        create_deadline_unix_millis: deadline.unix_millis(),
+                        spec: Some(spec.into()),
+                        assignment: Some(assignment.try_into().map_err(status)?),
+                        node_session_id: candidate.node_session_id,
+                        snapshot: snapshot
+                            .map(TryInto::try_into)
+                            .transpose()
+                            .map_err(status)?,
+                    },
+                ))),
+            });
+        }
         *state.claims_in_flight.entry(spec.id.clone()).or_default() += 1;
         drop(state);
         let outcome = self.0.claim(spec.clone(), candidate.clone()).await;
@@ -268,24 +457,18 @@ impl CoordinatorRpc {
                 self.0.changed.notify_waiters();
                 return Err(status(e));
             }
-            Err(Error::Conflict)
-                if state
-                    .session
-                    .request_binding(&spec.tenant_id, &candidate.request_id)
-                    .await
-                    .map_err(status)?
-                    .is_some_and(|id| id != spec.id) =>
-            {
-                return Err(Status::already_exists(
-                    "request ID is bound to a different Environment",
-                ));
-            }
             Err(e) => return Err(status(e)),
         };
         state.recover_authoritative_state().await.map_err(status)?;
         state.healthy().map_err(status)?;
         let record = outcome.record().clone();
         state.accept_stored_claim(record.clone()).map_err(status)?;
+        if let Some(deadline) = deadline.filter(|_| matches!(outcome, ClaimOutcome::Owned(_))) {
+            state
+                .local_reservation_deadlines
+                .entry(spec.id.clone())
+                .or_insert((record.assignment.clone(), deadline.instant()));
+        }
         state
             .live_claimant(&node, &candidate.node_session_id, self.0.heartbeat_timeout)
             .map_err(status)?;

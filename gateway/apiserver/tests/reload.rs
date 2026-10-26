@@ -63,6 +63,7 @@ service_impl!(pb::coordinator_service_server::CoordinatorService, {
     get_scheduling_queue(GetSchedulingQueueRequest) -> GetSchedulingQueueResponse,
     set_node_scheduling(SetNodeSchedulingRequest) -> NodeSchedulingState,
     prepare_create(LocalEnvironmentCreateRequest) -> PreparedEnvironment,
+    reserve_local_environment(ClaimEnvironmentRequest) -> ClaimEnvironmentResponse,
     claim_environment(ClaimEnvironmentRequest) -> ClaimEnvironmentResponse,
     forward_create(LocalEnvironmentCreateRequest) -> EnvironmentResult,
     register_node(RegisterNodeRequest) -> RegisterNodeResponse,

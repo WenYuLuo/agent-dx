@@ -334,11 +334,8 @@ impl Admission {
                 .runtime_classes
                 .as_ref()
                 .is_some_and(|classes| !classes.contains(&spec.runtime_class))
-            || self.valid_until.is_none_or(|until| Instant::now() >= until)
-            || (!spec.scheduling.devices.is_empty()
-                && self
-                    .devices_valid_until
-                    .is_none_or(|until| Instant::now() >= until))
+            || self.valid_until.is_none()
+            || (!spec.scheduling.devices.is_empty() && self.devices_valid_until.is_none())
         {
             return Err(Error::NoCapacity);
         }
@@ -598,9 +595,7 @@ impl Adxlet {
                 .runtime_classes
                 .as_ref()
                 .is_none_or(|classes| !classes.is_empty())
-            && admission
-                .valid_until
-                .is_some_and(|until| Instant::now() < until)
+            && admission.valid_until.is_some()
     }
 
     pub fn used(&self) -> Resources {

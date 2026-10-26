@@ -48,7 +48,7 @@ def claimed_ids(control, identities, remote=ssh):
                 EVENT_LOG_SCRIPT,
                 directory,
                 json.dumps(sorted(identities)),
-                'local_environment_claim',
+                'local_environment_reservation',
                 'coordinator*.log*',
                 timeout=30,
             )

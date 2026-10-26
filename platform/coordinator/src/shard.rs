@@ -202,6 +202,11 @@ impl ShardScheduler {
         self.assigned.insert(spec.id.clone(), assignment.clone());
         Ok(())
     }
+    pub(crate) fn reconsider_node(&mut self, id: &str) {
+        for nodes in self.excluded.values_mut() {
+            nodes.remove(id);
+        }
+    }
     pub fn forget_queued(&mut self, id: &str) {
         self.queue.remove(id);
         self.deferred.remove(id);

@@ -25,9 +25,9 @@
 
 ## 生命周期与提交
 
-创建：Coordinator 先持久化 Assignment，再由 adxlet 本机准入、启动 sandboxd、确认 Execd 就绪和本机绑定，最后提交 Running。Coordinator 向 API Server 首次全量、后续增量发布活跃实例目录；删除后撤销目录项并从 Redis 主目录移除，短期最小回执只用于相同删除结果重试。暂停等已有实例操作命中本地目录后直达节点；手动恢复和 Ingress 需求统一由 Coordinator 持久化唤醒意图。
+创建：Coordinator 在内存中选择 Assignment 和预留资源，再由 adxlet 本机准入、启动 sandboxd、确认 Execd 就绪和本机绑定，最后原子发布首次 Running 与 Request ID 回执。中心路径不预写 Pending，未确认创建可在 Coordinator 重启后重新调度，残留执行通过对账回收。Coordinator 向 API Server 首次全量、后续增量发布活跃实例目录；删除后撤销目录项并从 Redis 主目录移除，短期最小回执只用于相同删除结果重试。暂停等已有实例操作命中本地目录后直达节点；手动恢复和 Ingress 需求统一由 Coordinator 持久化唤醒意图。
 
-可配置 `create_mode: "local_first"`：API Server 订阅可用节点并轮转入口，adxlet 用同一 Admission 暂留标量资源和整卡，再由 Coordinator 验证硬约束、CAS 确认归属并同步内存账本后启动。本地不满足时由入口节点保留同 ID 回退 ShardScheduler；API Server 不在连接失败或结果未知时二次发起中心创建。`createTimeoutSeconds` 约束完整创建，`scheduleTimeoutSeconds` 仅从请求进入 Coordinator 中心队列后计时，本地准入不预切或消耗中心排队预算。Pack/Spread、软评分和队列公平性仅适用于中心路径；默认仍为 `central`。并发、暂留释放和结果未知契约见 [本地优先与原子归属](atomic-environment-claim.md)。
+可配置 `create_mode: "local_first"`：API Server 订阅可用节点并轮转入口，adxlet 用同一 Admission 暂留标量资源和整卡，再由 Coordinator 验证硬约束、分配 generation 并同步内存账本后启动，成功后才持久化结果；独立开关 `persist_local_claim: true` 才启用提前持久化 Claim。本地不满足时由入口节点保留同 ID 回退 ShardScheduler；API Server 不在连接失败或结果未知时二次发起中心创建。`createTimeoutSeconds` 约束完整创建，`scheduleTimeoutSeconds` 仅从请求进入 Coordinator 中心队列后计时，本地准入不预切或消耗中心排队预算。Pack/Spread、软评分和队列公平性仅适用于中心路径；默认仍为 `central`。并发、暂留释放和结果未知契约见 [本地优先与原子归属](atomic-environment-claim.md)。
 
 暂停：节点完成 checkpoint、确认旧执行删除、保存制品，再经 Coordinator 提交 Paused 和恢复点。对象存储成功要求上传完成。恢复：公开 resume 与流量 autoResume 共用 Coordinator EnsureRunning，先原节点准入，明确 NoCapacity 或归属失效后使用共享 checkpoint 调度兼容目标；RPC 不确定时保留当前归属。完成 Execd/绑定后提交 Running，Ingress 等待对应路由再转发。删除先退役本机绑定、确认后端删除，再释放资源和提交结果。
 
@@ -36,7 +36,7 @@
 选择其他兼容节点，排队期间可跨分片回退并保留原期限和身份。显式放置策略覆盖自动偏好，
 local-only 仍只允许来源节点。来源节点偏好不保证其本地缓存仍存在。
 
-adxlet 调用 sandboxd Start 时，RPC 失败、超时、应答丢失或成功载荷无效均判定创建 Failed，不以同一执行身份重复 Start。创建进入 Failed 即释放本机标量资源和 GPU/NPU 预留，并在清理之前提交 `resources_held=false`。资源释放不依赖后端查询、删除成功或清理超时。清理与本机尚在等待的 Start 客户端任务串行，失败则继续重试；提交不可用时按既有降级／重试契约补写集群账本。Failed 实例即使已释放资源仍会在生命周期巡检中检查并删除迟到的后端，不能转成 Running；节点重启时通过权威目录对账清理。这里的 Failed 是创建结果，不是物理后端从未启动的证明。公开 API 应答丢失仍按同一 Environment 身份查询或重试，不能另建实例；checkpoint 结果未知的保护独立保留。
+adxlet 调用 sandboxd Start 时，RPC 失败、超时、应答丢失或成功载荷无效均判定创建 Failed，不以同一执行身份重复 Start。创建进入 Failed 即释放本机标量资源和 GPU/NPU 预留，并在清理之前提交 `resources_held=false`。资源释放不依赖后端查询、删除成功或清理超时。清理与本机尚在等待的 Start 客户端任务串行，失败则继续重试；提交不可用时按既有降级／重试契约补写集群账本。Failed 实例即使已释放资源仍会在生命周期巡检中检查并删除迟到的后端，不能转成 Running；节点重启时通过权威目录对账清理。这里的 Failed 是创建结果，不是物理后端从未启动的证明。公开 API 应答丢失仍按同一 Request ID/Environment ID 查询或重试；未成功确认的尝试可以重新分配，已确认成功不能覆盖，残留执行按目录回收；checkpoint 结果未知的保护独立保留。
 
 `StateSink` 返回 Published 表示 Coordinator 已提交 Redis；Journaled 表示结果只进入 SQLite 降级日志。后者不发布集群路由，API Server 不返回集群生命周期成功。Coordinator 恢复后去重补写；adxlet 重启而 Coordinator 不可用时只观察，等待权威对账。详见 [节点生命周期](node-lifecycle.md)、[暂停恢复](environment-checkpoint.md) 和 [存储](snapshot-storage.md)。
 

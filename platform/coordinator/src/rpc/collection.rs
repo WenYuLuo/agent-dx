@@ -27,7 +27,8 @@ impl CoordinatorRpc {
         let mut completed = 0;
         let mut error = None;
         for id in work {
-            match self.collect_one_failed(&id, now, retention.as_secs()).await {
+            // Keep the node RPC and publication futures off the collector's stack.
+            match Box::pin(self.collect_one_failed(&id, now, retention.as_secs())).await {
                 Ok(true) => completed += 1,
                 Ok(false) | Err(Error::Conflict | Error::NotFound) => {}
                 Err(failure) => error = Some(failure),

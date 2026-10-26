@@ -50,6 +50,36 @@ def catalog():
     )
 
 
+def live_catalog():
+    """Combine durable identities with the API's current Coordinator node view.
+
+    Node heartbeats are memory-only. Redis is still read directly for every
+    Environment and the registered process identity; readiness comes from the
+    bounded-lifetime node directory, whose entries require a live routable session.
+    """
+    import ssl
+    import urllib.request
+
+    records = catalog()
+    request = urllib.request.Request(
+        'https://coordinator:8443/api/environment/v1/resources',
+        headers={'Authorization': 'Bearer ' + (S / 'api-key').read_text().strip()},
+    )
+    with urllib.request.urlopen(
+        request, context=ssl.create_default_context(cafile=str(S / 'tls/ca.pem')), timeout=5
+    ) as response:
+        live = {item['id']: item for item in json.load(response)['items']}
+    for node_id in ('node1', 'node2'):
+        key = 'node:' + node_id
+        if key not in records:
+            continue
+        registered = json.loads(records[key])
+        registered['node']['available'] = node_id in live and live[node_id]['status'] == 0
+        registered['session']['routable'] = node_id in live
+        records[key] = json.dumps(registered)
+    return records
+
+
 def assert_environment_absent(records, instance_id):
     key = 'environment:' + instance_id
     if not (key not in records):
@@ -61,7 +91,7 @@ def persisted_runtime_id(result):
 
 
 def nodes():
-    c = catalog()
+    c = live_catalog()
     return [json.loads(c['node:' + node]) for node in ('node1', 'node2')]
 
 
@@ -338,7 +368,7 @@ def main():
                     continue
                 raise RuntimeError('fixture service exited')
             time.sleep(1)
-    elif action == 'activator-inventory':
+    elif action in ('activator-inventory', 'execution-inventory'):
         prefix = sys.argv[3]
         ids = json.loads((E / 'live-instances.json').read_text())
         data = {
@@ -375,7 +405,7 @@ def main():
                 ):
                     (E / 'ready-nodes.json').write_text(json.dumps(current, indent=2))
                     break
-            except (KeyError, ValueError, subprocess.SubprocessError):
+            except (OSError, KeyError, ValueError, subprocess.SubprocessError):
                 pass
             if time.monotonic() > end:
                 raise TimeoutError('both nodes did not become ready')
@@ -590,19 +620,22 @@ def main():
             time.sleep(0.5)
     elif action in ('resource-stale', 'resource-fresh'):
         live = json.loads((E / 'resource-live.json').read_text())
-        expect_available = action == 'resource-fresh'
+        expect_available = True
         started = time.monotonic()
         deadline = started + 30
         last = None
         while True:
             try:
-                records = catalog()
+                records = live_catalog()
                 node1 = json.loads(records['node:node1'])
                 node2 = json.loads(records['node:node2'])
                 result = json.loads(records['environment:' + live['instance_id']])['result']
                 backends = labeled_backend(live['instance_id'])
-                network_partition_reconciled = (
-                    node1['node']['available'] == expect_available
+                sample = json.loads((P / 'capacity.json').read_text())
+                sample_expired = time.time() >= sample['valid_until_unix_seconds']
+                observation_matches = (
+                    sample_expired == (action == 'resource-stale')
+                    and node1['node']['available'] == expect_available
                     and node1['session']['routable']
                     and node1['session']['id'] == live['session_id']
                     and node2['node']['available']
@@ -610,8 +643,11 @@ def main():
                     and persisted_runtime_id(result) == live['runtime_id']
                     and backends == [live['backend']]
                 )
-                if network_partition_reconciled:
+                if observation_matches:
                     evidence = {
+                        'sample_expired': sample_expired,
+                        'sample_valid_until': sample['valid_until_unix_seconds'],
+                        'observed_at': time.time(),
                         'node1_available': expect_available,
                         'node2_available': True,
                         'session_id': live['session_id'],
@@ -719,7 +755,7 @@ def main():
         last = 'waiting for sandboxd Delete to send SIGTERM'
         while True:
             try:
-                records = catalog()
+                records = live_catalog()
                 runtimes = backend()
                 failed_id, available, routable = returning_node_status(records, runtimes)
                 record = json.loads(records['node:node2'])
@@ -768,7 +804,7 @@ def main():
         while True:
             try:
                 service = next(s for s in supervisor('status')['services'] if s['role'] == 'adxlet')
-                records = catalog()
+                records = live_catalog()
                 node_record = json.loads(records['node:node2'])
                 session = node_record['session']
                 failed = json.loads(records['environment:' + before['failed_id']])
@@ -853,7 +889,7 @@ def main():
         last = None
         while True:
             try:
-                records = catalog()
+                records = live_catalog()
                 current = backend()
                 failed_id, available, routable = returning_node_status(records, current)
                 old_backend = labeled_backend(failed_id)
@@ -948,7 +984,7 @@ def main():
         last_error = 'replacement process/session not ready'
         while True:
             try:
-                record = json.loads(catalog()['node:' + node])
+                record = json.loads(live_catalog()['node:' + node])
                 evidence = validated_adxlet_restart(before, supervisor('status'), record)
                 (E / f'adxlet-after-{node}.json').write_text(json.dumps(evidence, indent=2))
                 break
@@ -1062,7 +1098,7 @@ def main():
                 services = [s for s in supervisor('status')['services'] if s['role'] == 'coordinator']
                 current_pid = services[0]['pid']
                 if current_pid and current_pid != previous_pid:
-                    evidence = validated_coordinator_recovery(before, catalog(), ids)
+                    evidence = validated_coordinator_recovery(before, live_catalog(), ids)
                     (E / 'coordinator-restart.json').write_text(
                         json.dumps(
                             {

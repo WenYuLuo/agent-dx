@@ -64,12 +64,26 @@ impl Session {
     }
     /// The node has reconciled and stopped every execution outside its current assignments.
     pub async fn release_execution_holds(&self, node: &str, session: &str) -> Result<()> {
+        if self
+            .inspection
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|inventory| {
+                !inventory
+                    .holds
+                    .values()
+                    .any(|hold| hold.assignment.node_id == node)
+            })
+        {
+            return Ok(());
+        }
         let [header, raw_node] = self
             .store
             .fields([HEADER.into(), format!("node:{node}")])
             .await?;
         self.header(&header)?;
-        let stored: StoredNode = decode(raw_node.as_deref().ok_or(Error::NotFound)?)?;
+        let stored = self.get_node(node).await?;
         if stored
             .session
             .as_ref()
@@ -79,14 +93,14 @@ impl Session {
         }
         let mut cmd = redis::cmd("EVAL");
         cmd.arg(r#"
-            if redis.call('HGET',KEYS[1],'header') ~= ARGV[1] or redis.call('HGET',KEYS[1],ARGV[2]) ~= ARGV[3] then return 0 end
+            if redis.call('HGET',KEYS[1],'epoch') ~= ARGV[1] or redis.call('HGET',KEYS[1],ARGV[2]) ~= ARGV[3] then return 0 end
             local values = redis.call('HGETALL',KEYS[2])
             for i=1,#values,2 do
                 if cjson.decode(values[i+1]).assignment.node_id == ARGV[4] then redis.call('HDEL',KEYS[2],values[i]) end
             end
             return 1
         "#).arg(2).arg(&self.store.key).arg(format!("{}:input-holds",self.store.key))
-            .arg(header.as_deref().ok_or(Error::Conflict)?).arg(format!("node:{node}"))
+            .arg(self.epoch.to_string()).arg(format!("node:{node}"))
             .arg(raw_node.as_deref().ok_or(Error::Conflict)?).arg(node);
         let mut inventory = self.inspection.lock().await;
         let mut committed = inventory.take();
@@ -172,16 +186,7 @@ impl Session {
         let mut cmd = redis::cmd("EVAL");
         cmd.arg(
             r#"
-            if redis.call('HGET',KEYS[1],'header') ~= ARGV[1] then return 0 end
-            for k=2,3 do
-                local expected = cjson.decode(ARGV[k])
-                local count=0
-                for field,value in pairs(expected) do
-                    count=count+1
-                    if redis.call('HGET',KEYS[k],field) ~= value then return 0 end
-                end
-                if redis.call('HLEN',KEYS[k]) ~= count then return 0 end
-            end
+            if redis.call('HGET',KEYS[1],'epoch') ~= ARGV[1] then return 0 end
             return 1
         "#,
         )
@@ -189,7 +194,7 @@ impl Session {
         .arg(&self.store.key)
         .arg(self.snapshots_key())
         .arg(format!("{}:input-holds", self.store.key))
-        .arg(header)
+        .arg(self.epoch.to_string())
         .arg(encode(&snapshots)?)
         .arg(encode(&holds)?);
         if self.store.query::<u64>(cmd).await? != 1 {
@@ -201,9 +206,9 @@ impl Session {
         let [header] = self.store.fields([HEADER.into()]).await?;
         self.header(&header)?;
         let mut cmd = redis::cmd("EVAL");
-        cmd.arg("if redis.call('HGET',KEYS[1],'header') ~= ARGV[1] then return 0 end; redis.call('HDEL',KEYS[2],ARGV[2]); return 1")
+        cmd.arg("if redis.call('HGET',KEYS[1],'epoch') ~= ARGV[1] then return 0 end; redis.call('HDEL',KEYS[2],ARGV[2]); return 1")
             .arg(2).arg(&self.store.key).arg(format!("{}:artifacts",self.store.key))
-            .arg(header.as_deref().ok_or(Error::Conflict)?).arg(artifact_key(artifact));
+            .arg(self.epoch.to_string()).arg(artifact_key(artifact));
         if self.store.query::<u64>(cmd).await? != 1 {
             return Err(Error::Conflict);
         }

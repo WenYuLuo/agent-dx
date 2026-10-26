@@ -9,7 +9,6 @@ pub struct LocalReservation {
     pub devices: Vec<DeviceAllocation>,
 }
 pub(crate) struct LocalHold {
-    pub request_id: String,
     pub spec: EnvironmentSpec,
     pub token: String,
     pub devices: Vec<DeviceAllocation>,
@@ -72,7 +71,6 @@ impl Adxlet {
         holds.insert(
             spec.id.clone(),
             LocalHold {
-                request_id: String::new(),
                 spec: spec.clone(),
                 token: token.clone(),
                 devices: devices.clone(),
@@ -83,7 +81,8 @@ impl Adxlet {
             devices,
         })
     }
-    /// Only after a definitive losing/fallback response, never after a timeout.
+    /// Release an unstarted hold after definitive loss or its original deadline.
+    /// Adopted Controllers own separate reservations and are unaffected.
     pub fn release_local(&self, id: &str, reservation: &LocalReservation) -> Result<()> {
         let mut holds = self.local_holds.lock().expect("shared state lock poisoned");
         if let Some(hold) = holds.get(id) {

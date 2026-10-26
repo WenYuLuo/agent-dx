@@ -1,4 +1,4 @@
-//! Business facts are changed with the same fenced header CAS as lifecycle state.
+//! Business facts commit with their owning object; unrelated objects never compare a shared counter version.
 use super::*;
 use adx_core::observation::{
     now_millis, EvidenceSource, InterruptionEvidence, InterruptionReason, OperationIntent,
@@ -43,7 +43,7 @@ pub struct CreationSummary {
     pub started_at_unix_millis: u64,
 }
 impl CreationSummary {
-    pub(super) fn new(request_id: &str) -> Result<Self> {
+    pub(crate) fn new(request_id: &str) -> Result<Self> {
         if request_id.len() > 256 {
             return Err(Error::Invalid("request ID too long".into()));
         }
@@ -323,18 +323,62 @@ impl StoredEnvironment {
     }
 }
 impl Session {
-    pub async fn request_binding(&self, tenant: &str, request_id: &str) -> Result<Option<String>> {
-        if request_id.is_empty() {
-            return Ok(None);
-        }
-        let mut command = redis::cmd("HGET");
-        command
-            .arg(format!("{}:requests", self.store.key))
-            .arg(request_key(tenant, request_id));
-        self.store.query(command).await
-    }
     pub async fn business_counters(&self) -> Result<BusinessCounters> {
         let [header] = self.store.fields([HEADER.into()]).await?;
-        Ok(self.header(&header)?.observability)
+        let mut total = self.header(&header)?.observability;
+        let mut command = redis::cmd("HVALS");
+        command.arg(format!("{}:business", self.store.key));
+        for value in self.store.query::<Vec<String>>(command).await? {
+            total.add(&decode::<BusinessCounters>(&value)?)?;
+        }
+        Ok(total)
+    }
+}
+
+impl BusinessCounters {
+    fn add(&mut self, other: &Self) -> Result<()> {
+        for (a, b) in self.creations.iter_mut().zip(other.creations) {
+            *a = a.checked_add(b).ok_or(Error::Conflict)?;
+        }
+        for (row, other_row) in self.interruptions.iter_mut().zip(other.interruptions) {
+            for (a, b) in row.iter_mut().zip(other_row) {
+                *a = a.checked_add(b).ok_or(Error::Conflict)?;
+            }
+        }
+        self.worker_incidents = self
+            .worker_incidents
+            .checked_add(other.worker_incidents)
+            .ok_or(Error::Conflict)?;
+        for (a, b) in self.recoveries.iter_mut().zip(other.recoveries) {
+            *a = a.checked_add(b).ok_or(Error::Conflict)?;
+        }
+        Ok(())
+    }
+}
+
+/// Retained cumulative facts for one object, including after its deletion.
+/// Rust checks u64 arithmetic; Lua compares opaque bytes with the lifecycle write.
+pub(super) struct CounterUpdate {
+    pub field: String,
+    pub old: Option<String>,
+    pub value: BusinessCounters,
+}
+impl CounterUpdate {
+    pub async fn load(store: &RedisStore, field: String) -> Result<Self> {
+        let mut command = redis::cmd("HGET");
+        command.arg(format!("{}:business", store.key)).arg(&field);
+        let old = store.query(command).await?;
+        Self::new(field, old)
+    }
+    pub fn new(field: String, old: Option<String>) -> Result<Self> {
+        let value = old.as_deref().map(decode).transpose()?.unwrap_or_default();
+        Ok(Self { field, old, value })
+    }
+    pub fn argument(&self) -> Result<String> {
+        encode(&(
+            &self.field,
+            self.old.as_deref().unwrap_or(""),
+            encode(&self.value)?,
+        ))
     }
 }

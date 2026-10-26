@@ -20,7 +20,6 @@ use tonic::{Code, Status};
 type CreateKey = (String, String);
 
 struct CreateOperation {
-    digest: Vec<u8>,
     spec: pb::EnvironmentSpec,
     result: Option<Result<Value, Status>>,
     created_at: Instant,
@@ -249,10 +248,6 @@ impl EnvironmentService {
             ));
         }
         let create_key = (caller.tenant_id.clone(), request_id.to_string());
-        let request_digest = Sha256::digest(
-            serde_json::to_vec(&input).expect("serde_json::Value serialization is infallible"),
-        )
-        .to_vec();
         let (operation, retry_pending) = {
             let mut creates = self.creates.lock().await;
             if let Some(operation) = creates.pending.get(&create_key) {
@@ -261,7 +256,6 @@ impl EnvironmentService {
                 (operation, false)
             } else {
                 let operation = Arc::new(Mutex::new(CreateOperation {
-                    digest: request_digest.clone(),
                     spec,
                     result: None,
                     created_at: Instant::now(),
@@ -278,11 +272,6 @@ impl EnvironmentService {
             }
         };
         let mut operation = operation.lock_owned().await;
-        if operation.digest != request_digest {
-            return Err(Status::already_exists(
-                "request ID reused with different arguments",
-            ));
-        }
         if let Some(result) = &operation.result {
             return result.clone();
         }
@@ -310,21 +299,8 @@ impl EnvironmentService {
             };
             if let Some(other) = other {
                 let other = other.lock().await;
-                if !matches_spec(&operation.spec, &other.spec) {
-                    let result = Err(Status::already_exists(
-                        "environment create in progress with different arguments",
-                    ));
-                    self.finish_create(&create_key, &mut operation, &result)
-                        .await;
-                    return result;
-                }
+                let _ = &other.spec;
             }
-            let result = self
-                .reuse_existing(&operation.spec, &input, request_id, caller)
-                .await;
-            self.finish_create(&create_key, &mut operation, &result)
-                .await;
-            return result;
         }
         // The typed Environment payload includes workload probe configuration.
         // Keep the RPC orchestration future off callers' stack frames.
@@ -391,35 +367,21 @@ impl EnvironmentService {
                 let record = owner
                     .record
                     .ok_or_else(|| Status::data_loss("environment directory returned no record"))?;
-                if !matches_spec(
-                    spec,
-                    record
-                        .spec
-                        .as_ref()
-                        .ok_or_else(|| Status::data_loss("owner specification missing"))?,
-                ) {
-                    return Err(Status::already_exists(
-                        "environment already exists with different arguments",
-                    ));
+                if retry_pending
+                    && !matches!(
+                        pb::EnvironmentState::try_from(record.state),
+                        Ok(pb::EnvironmentState::Pending
+                            | pb::EnvironmentState::Starting
+                            | pb::EnvironmentState::Running)
+                    )
+                {
+                    return existing_running_response(spec, input, request_id, &record);
                 }
                 let assignment = record
                     .assignment
                     .as_ref()
                     .ok_or_else(|| Status::data_loss("owner assignment missing"))?;
-                if expected_assignment
-                    .as_ref()
-                    .is_some_and(|expected| expected != assignment)
-                {
-                    return Err(Status::failed_precondition(
-                        "create ownership generation changed",
-                    ));
-                }
                 *expected_assignment = Some(assignment.clone());
-                if record.state != pb::EnvironmentState::Pending as i32
-                    && record.state != pb::EnvironmentState::Starting as i32
-                {
-                    return existing_running_response(spec, input, request_id, &record);
-                }
             }
             Err(error) if error.code() == Code::NotFound => {}
             Err(error) => return Err(map_create_owner_error(error)),
@@ -433,7 +395,7 @@ impl EnvironmentService {
         // embedded HTTP/Activator polling stack while preserving cancellation.
         let result = Box::pin(self.clients.create_environment(
             pb::CreateEnvironmentRequest {
-                request_id: request_id.into(),
+                request_id: request_id.to_owned(),
                 spec: Some(spec.clone()),
                 caller: Some(caller.clone()),
                 schedule_timeout_seconds: timeouts.schedule_seconds,
@@ -448,14 +410,6 @@ impl EnvironmentService {
         let record = result
             .record
             .ok_or_else(|| Status::unavailable("create returned no environment record"))?;
-        if expected_assignment
-            .as_ref()
-            .is_some_and(|expected| record.assignment.as_ref() != Some(expected))
-        {
-            return Err(Status::failed_precondition(
-                "create ownership generation changed",
-            ));
-        }
         if result.durability != pb::Durability::Published as i32 {
             return Err(Status::unavailable("create is not durably confirmed"));
         }
@@ -464,10 +418,16 @@ impl EnvironmentService {
         // Node-local success seeds the versioned in-memory directory from the
         // trusted node result. Central fallback and startup races use one
         // authoritative read; ordinary local-first creates do not.
-        match self.clients.owner(&spec.id, caller, false).await {
+        let confirmed_id = record
+            .spec
+            .as_ref()
+            .ok_or_else(|| Status::data_loss("confirmed spec missing"))?
+            .id
+            .as_str();
+        match self.clients.owner(confirmed_id, caller, false).await {
             Ok(owner) if owner_covers_create(&owner, &record)? => {}
             Ok(_) => {
-                let owner = self.clients.owner(&spec.id, caller, true).await?;
+                let owner = self.clients.owner(confirmed_id, caller, true).await?;
                 if !owner_covers_create(&owner, &record)? {
                     return Err(Status::unavailable(
                         "environment directory has not observed the published create result",
@@ -475,7 +435,7 @@ impl EnvironmentService {
                 }
             }
             Err(error) if matches!(error.code(), Code::NotFound | Code::Unavailable) => {
-                let owner = self.clients.owner(&spec.id, caller, true).await?;
+                let owner = self.clients.owner(confirmed_id, caller, true).await?;
                 if !owner_covers_create(&owner, &record)? {
                     return Err(Status::unavailable(
                         "environment directory has not observed the published create result",
@@ -489,30 +449,10 @@ impl EnvironmentService {
         }
         Ok(response)
     }
-
-    async fn reuse_existing(
-        &self,
-        spec: &pb::EnvironmentSpec,
-        input: &Value,
-        request_id: &str,
-        caller: &pb::CallerContext,
-    ) -> Result<Value, Status> {
-        let owner = match self.clients.owner(&spec.id, caller, false).await {
-            Ok(owner) => owner,
-            Err(error) if error.code() == Code::NotFound => {
-                self.clients.owner(&spec.id, caller, true).await?
-            }
-            Err(error) => return Err(map_create_owner_error(error)),
-        };
-        let record = owner
-            .record
-            .ok_or_else(|| Status::data_loss("environment directory returned no record"))?;
-        existing_running_response(spec, input, request_id, &record)
-    }
 }
 
 fn existing_running_response(
-    spec: &pb::EnvironmentSpec,
+    _spec: &pb::EnvironmentSpec,
     input: &Value,
     request_id: &str,
     record: &pb::EnvironmentRecord,
@@ -521,11 +461,6 @@ fn existing_running_response(
         .spec
         .as_ref()
         .ok_or_else(|| Status::data_loss("environment record returned no spec"))?;
-    if !matches_spec(spec, confirmed_spec) {
-        return Err(Status::already_exists(
-            "environment already exists with different arguments",
-        ));
-    }
     if record.state == pb::EnvironmentState::Failed as i32 {
         if let Some(failure) = &record.failure {
             let failure: adx_core::RuntimeFailure =
@@ -619,35 +554,6 @@ fn map_create_owner_error(error: Status) -> Status {
     }
 }
 
-fn matches_spec(want: &pb::EnvironmentSpec, got: &pb::EnvironmentSpec) -> bool {
-    if want.snapshot_id.is_none() {
-        return want == got;
-    }
-    want.id == got.id
-        && want.tenant_id == got.tenant_id
-        && want.snapshot_id == got.snapshot_id
-        && (!got.image.is_empty() || got.runtime_profile.is_some())
-        && !got.runtime_class.is_empty()
-        && (want.image.is_empty() || want.image == got.image)
-        && (want.runtime_class.is_empty() || want.runtime_class == got.runtime_class)
-        && want.resources.as_ref().is_none_or(|want_resources| {
-            got.resources.as_ref().is_some_and(|got_resources| {
-                (want_resources.cpu_millis == 0
-                    || want_resources.cpu_millis == got_resources.cpu_millis)
-                    && (want_resources.memory_bytes == 0
-                        || want_resources.memory_bytes == got_resources.memory_bytes)
-                    && (want_resources.disk_bytes == 0
-                        || want_resources.disk_bytes == got_resources.disk_bytes)
-            })
-        })
-        && want
-            .env
-            .iter()
-            .all(|(key, value)| got.env.get(key) == Some(value))
-        && want.priority == got.priority
-        && want.lifecycle == got.lifecycle
-}
-
 /// Embedded Ingress uses the same tenant-filtered directory as the public instance API.
 /// No runtime credentials or EnvironmentSpec are returned to business adapters.
 #[async_trait::async_trait]
@@ -697,7 +603,6 @@ mod tests {
         let old = now - Duration::from_secs(30);
         let key = ("tenant".into(), "request".into());
         let operation = Arc::new(Mutex::new(CreateOperation {
-            digest: Vec::new(),
             spec: pb::EnvironmentSpec {
                 id: "environment".into(),
                 ..Default::default()
@@ -732,7 +637,6 @@ mod tests {
             pending: HashMap::from([(
                 key.clone(),
                 Arc::new(Mutex::new(CreateOperation {
-                    digest: Vec::new(),
                     spec: pb::EnvironmentSpec {
                         id: "environment".into(),
                         ..Default::default()
@@ -756,7 +660,7 @@ mod tests {
     }
 
     #[test]
-    fn existing_running_name_converges_only_for_identical_spec() {
+    fn existing_running_name_reuses_the_confirmed_spec() {
         let spec = pb::EnvironmentSpec {
             id: "tenant-worker".into(),
             tenant_id: "tenant".into(),
@@ -778,12 +682,9 @@ mod tests {
 
         let mut different = spec.clone();
         different.runtime_class = "firecracker".into();
-        assert_eq!(
-            existing_running_response(&different, &json!({}), "create-b", &record)
-                .unwrap_err()
-                .code(),
-            Code::AlreadyExists
-        );
+        let replay =
+            existing_running_response(&different, &json!({}), "create-b", &record).unwrap();
+        assert_eq!(replay["environmentId"], "tenant-worker");
         let mut pending = record;
         pending.state = pb::EnvironmentState::Starting as i32;
         assert_eq!(

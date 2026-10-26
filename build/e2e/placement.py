@@ -4,7 +4,7 @@ import json
 import uuid
 
 from adx_environment import Environment, EnvironmentError
-from node import catalog
+from node import catalog, live_catalog
 from runtime_inventory import require_runc_only_inventory, require_unassigned_create
 
 
@@ -52,12 +52,18 @@ def run(connection, image, output):
             raise AssertionError()
         environment.kill()
         report['cases'].append(
-            {'name': name, 'expected_node': expected, 'actual_node': actual, 'instance_id': environment.id, 'passed': True}
+            {
+                'name': name,
+                'expected_node': expected,
+                'actual_node': actual,
+                'instance_id': environment.id,
+                'passed': True,
+            }
         )
         print('[PLACEMENT PASS]', name, 'node=' + actual, flush=True)
 
     try:
-        inventories = require_runc_only_inventory(catalog())
+        inventories = require_runc_only_inventory(live_catalog())
         report['cases'].append({'name': 'sandboxd runtime inventory', 'runtime_classes': inventories, 'passed': True})
         print('[PLACEMENT PASS] sandboxd runtime inventory ' + json.dumps(inventories, sort_keys=True), flush=True)
         left = create(node_id='node1', labels={'peer': 'left'})

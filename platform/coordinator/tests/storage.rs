@@ -7,6 +7,10 @@ mod common;
 mod dormancy;
 #[path = "storage/observability.rs"]
 mod observability;
+#[path = "storage/publication.rs"]
+mod publication;
+#[path = "storage/publication_regressions.rs"]
+mod publication_regressions;
 use adx_coordinator::{storage::StoredNode, Coordinator, Node, Placement};
 use adx_core::{
     Assignment, EnvironmentRecord, EnvironmentSpec, EnvironmentState, Error, Resources,
@@ -77,7 +81,7 @@ async fn register(s: &adx_coordinator::storage::Session, id: &str) -> StoredNode
 
 #[tokio::test]
 #[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
-async fn zero_capacity_survives_restart_with_running_reservations_intact() {
+async fn live_capacity_is_refreshed_after_restart_without_losing_running_reservations() {
     let mut rig = common::Redis::new().await;
     let session = rig.store().await.begin(1).await.unwrap();
     register(&session, "node").await;
@@ -111,7 +115,8 @@ async fn zero_capacity_survives_restart_with_running_reservations_intact() {
     rig.start().await;
     let recovered = rig.store().await.begin(1).await.unwrap();
     let saved = recovered.snapshot().await.unwrap();
-    assert_eq!(saved.nodes["node"].node.capacity, Resources::default());
+    // Ordinary capacity reports stay in memory; startup must refresh them.
+    assert_eq!(saved.nodes["node"].node.capacity, node("node").capacity);
     assert_eq!(saved.environments["running"].result, Some(record));
     let mut scheduler = Coordinator::restore(&saved, Placement::Pack).unwrap();
     scheduler.register(zero).unwrap();
@@ -339,7 +344,7 @@ async fn restart_recovers_assignment_and_fences_old_writer() {
     first.commit(r.clone()).await.unwrap();
     let version = first.snapshot().await.unwrap().revision;
     first.commit(r.clone()).await.unwrap();
-    assert_eq!(first.snapshot().await.unwrap().revision, version);
+    assert!(first.snapshot().await.unwrap().revision > version);
     let second = db.begin(2).await.unwrap();
     assert_eq!(first.commit(r.clone()).await, Err(Error::Conflict));
     let snapshot = second.snapshot().await.unwrap();
@@ -510,8 +515,12 @@ async fn aof_crash_restart_preserves_state_and_reconnect_does_not_change_epoch()
     let restarted = rig.store().await.begin(1).await.unwrap();
     let after = restarted.snapshot().await.unwrap();
     assert_eq!(after.environments, before.environments);
-    assert_eq!(after.generation, before.generation);
-    assert!(after.revision > before.revision);
+    assert!(after.generation > before.generation);
+    assert!(restarted.epoch() > s.epoch());
+    assert_eq!(
+        after.revision, 1,
+        "publication sequence restarts with its owning process"
+    );
     assert_eq!(s.snapshot().await, Err(Error::Conflict));
 }
 

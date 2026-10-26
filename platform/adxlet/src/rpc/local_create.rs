@@ -1,46 +1,55 @@
 use super::*;
 use adx_transport::deadline::remaining;
 use pb::claim_environment_response::Outcome;
+#[derive(Clone)]
+pub(super) struct PendingLocalCreate {
+    request: pb::LocalEnvironmentCreateRequest,
+    deadline: tokio::time::Instant,
+    reservation: crate::local::LocalReservation,
+}
 impl NodeRpc {
-    /// Retry only idle, unconfirmed holds. HTTP callers may have disappeared;
-    /// ownership must still converge before these resources can be released.
+    /// Retry idle, unconfirmed holds with the original identity and deadline.
     pub async fn retry_local_claims(&self) {
-        let specs: Vec<_> = self
-            .manager
-            .local_holds
-            .lock()
-            .expect("shared state lock poisoned")
-            .values()
-            .map(|hold| (hold.spec.clone(), hold.request_id.clone()))
-            .collect();
-        for (spec, request_id) in specs {
+        let pending: Vec<_> = {
+            let holds = self
+                .manager
+                .local_holds
+                .lock()
+                .expect("local hold registry poisoned");
+            let mut retries = self
+                .local_retries
+                .lock()
+                .expect("local retry registry poisoned");
+            retries.retain(|id, retry| {
+                holds
+                    .get(id)
+                    .is_some_and(|hold| retry.reservation.token.as_ref() == Some(&hold.token))
+            });
+            retries
+                .iter()
+                .map(|(id, retry)| (id.clone(), retry.clone()))
+                .collect()
+        };
+        for (id, retry) in pending {
             let busy = self
                 .entry_locks
                 .lock()
-                .expect("shared state lock poisoned")
-                .get(&spec.id)
+                .expect("entry lock registry poisoned")
+                .get(&id)
                 .is_some_and(|lock| lock.strong_count() > 0);
             if busy {
                 continue;
             }
-            let request = pb::LocalEnvironmentCreateRequest {
-                create: Some(pb::CreateEnvironmentRequest {
-                    request_id,
-                    caller: Some(pb::CallerContext {
-                        tenant_id: spec.tenant_id.clone(),
-                        administrator: false,
-                    }),
-                    spec: Some(spec.into()),
-                    schedule_timeout_seconds: 30,
-                    create_timeout_seconds: 90,
-                    create_deadline_unix_millis: 0,
-                    expected_assignment: None,
-                }),
-                node_session_id: self.session_id.clone(),
-            };
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
-            if let Err(error) = self.create_local(request, deadline).await {
-                adx_observability::warn!(code=?error.code(), "local claim still requires retry or reconciliation");
+            if retry.deadline <= tokio::time::Instant::now() {
+                // This hold has not become a Controller. No execution was started
+                // by it; a later central assignment performs normal local admission.
+                if let Err(error) = self.manager.release_local(&id, &retry.reservation) {
+                    adx_observability::warn!(environment_id=%id, %error, "expired local hold release failed");
+                }
+                continue;
+            }
+            if let Err(error) = self.create_local(retry.request, retry.deadline).await {
+                adx_observability::warn!(code=?error.code(), "local reservation still requires retry or reconciliation");
             }
         }
     }
@@ -84,58 +93,48 @@ impl NodeRpc {
         if !*gate || self.manager.is_draining() {
             return Err(Status::unavailable("node is reconciling or draining"));
         }
-        let spec: adx_core::EnvironmentSpec = if raw.snapshot_id.is_some() {
-            let mut client = sink
-                .client
-                .read()
-                .expect("shared state lock poisoned")
-                .clone();
-            tokio::time::timeout(
-                remaining(deadline, sink.timeout).ok_or_else(|| {
-                    Status::deadline_exceeded(
-                        "create deadline exceeded during local admission preparation",
-                    )
-                })?,
-                client.prepare_create(adx_observability::trace::inject(request.clone())),
-            )
-            .await
-            .map_err(|_| Status::unavailable("prepare create timed out"))??
-            .into_inner()
-            .spec
-            .ok_or_else(|| Status::data_loss("prepared specification missing"))?
-            .try_into()
-            .map_err(status)?
-        } else {
-            raw.clone().try_into().map_err(status)?
-        };
+        if raw.snapshot_id.is_some() {
+            drop(gate);
+            return self.forward_local(sink, request, deadline).await;
+        }
+        let spec: adx_core::EnvironmentSpec = raw.clone().try_into().map_err(status)?;
         let reservation = match self.manager.reserve_local(&spec) {
             Ok(held) => held,
-            Err(Error::NoCapacity) => {
+            Err(Error::NoCapacity | Error::Conflict) => {
                 drop(gate);
                 return self.forward_local(sink, request, deadline).await;
             }
             Err(e) => return Err(status(e)),
         };
-        if let Some(hold) = self
-            .manager
-            .local_holds
-            .lock()
-            .map_err(|_| Status::internal("local holds unavailable"))?
-            .get_mut(&spec.id)
-        {
-            if hold.request_id.is_empty() {
-                hold.request_id = request
-                    .create
-                    .as_ref()
-                    .map(|c| c.request_id.clone())
-                    .unwrap_or_default();
-            }
+        if reservation.token.is_some() {
+            self.local_retries
+                .lock()
+                .expect("local retry registry poisoned")
+                .entry(spec.id.clone())
+                .and_modify(|retry| {
+                    if retry.reservation.token != reservation.token {
+                        *retry = PendingLocalCreate {
+                            request: request.clone(),
+                            deadline,
+                            reservation: reservation.clone(),
+                        };
+                    }
+                })
+                .or_insert_with(|| PendingLocalCreate {
+                    request: request.clone(),
+                    deadline,
+                    reservation: reservation.clone(),
+                });
         }
         let claim = pb::ClaimEnvironmentRequest {
+            create_deadline_unix_millis: request
+                .create
+                .as_ref()
+                .map_or(0, |create| create.create_deadline_unix_millis),
             request_id: request
                 .create
                 .as_ref()
-                .map(|c| c.request_id.clone())
+                .map(|r| r.request_id.clone())
                 .unwrap_or_default(),
             spec: Some(spec.clone().into()),
             caller,
@@ -158,7 +157,19 @@ impl NodeRpc {
                 remaining(deadline, sink.timeout).ok_or_else(|| {
                     Status::deadline_exceeded("create deadline exceeded during ownership claim")
                 })?,
-                client.claim_environment(adx_observability::trace::inject(claim.clone())),
+                async {
+                    if request.persist_claim {
+                        client
+                            .claim_environment(adx_observability::trace::inject(claim.clone()))
+                            .await
+                    } else {
+                        client
+                            .reserve_local_environment(adx_observability::trace::inject(
+                                claim.clone(),
+                            ))
+                            .await
+                    }
+                },
             )
             .await
             {
@@ -228,8 +239,11 @@ impl NodeRpc {
                     .ok_or_else(|| Status::data_loss("existing record missing"))?
                     .try_into()
                     .map_err(status)?;
-                if record.spec != spec {
-                    return Err(Status::already_exists("existing specification changed"));
+                if record.spec.tenant_id != spec.tenant_id {
+                    self.manager
+                        .release_local(&spec.id, &reservation)
+                        .map_err(status)?;
+                    return Err(Status::not_found("environment not found"));
                 }
                 if let Some(create) = request.create.as_mut() {
                     create.expected_assignment =

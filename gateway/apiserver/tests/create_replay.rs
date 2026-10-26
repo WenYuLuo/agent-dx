@@ -16,7 +16,9 @@ use tonic::{Request, Response, Status};
 #[derive(Default)]
 struct State {
     entry_node: Mutex<Option<pb::NodeEndpoint>>,
+    local_persistence: Mutex<Vec<bool>>,
     owners: Mutex<HashMap<String, pb::GetEnvironmentResponse>>,
+    receipts: Mutex<HashMap<(String, String), String>>,
     starts: AtomicUsize,
     create_calls: AtomicUsize,
     lookups: AtomicUsize,
@@ -60,14 +62,21 @@ service_impl!(pb::coordinator_service_server::CoordinatorService, {
         let deadline = request.get_ref().create_deadline_unix_millis;
         self.0.deadlines.lock().unwrap().push(request.get_ref().create_deadline_unix_millis);
         self.0.create_calls.fetch_add(1, Ordering::SeqCst);
-        let spec = request.into_inner().spec.unwrap();
+        let request = request.into_inner();
+        let mut spec = request.spec.unwrap();
+        let identity = (spec.tenant_id.clone(), request.request_id);
+        if !identity.1.is_empty() {
+            if let Some(id) = self.0.receipts.lock().unwrap().get(&identity) {
+                spec = self.0.owners.lock().unwrap()[id].record.as_ref().unwrap().spec.clone().unwrap();
+            }
+        }
         if self.0.scheduling_expired.load(Ordering::SeqCst) {
             return Err(adx_protocol::scheduling_deadline(adx_core::scheduling::SchedulingFailure {
                 rejections: [("insufficient_cpu".into(), 1)].into(),
                 ..Default::default()
             }));
         }
-        let record = {
+        let (record, newly_created) = {
             let mut owners = self.0.owners.lock().unwrap();
             if let Some(owner) = owners.get_mut(&spec.id) {
                 assert_eq!(owner.record.as_ref().unwrap().spec.as_ref(), Some(&spec));
@@ -78,7 +87,7 @@ service_impl!(pb::coordinator_service_server::CoordinatorService, {
                         record.revision = 1;
                     }
                 }
-                owner.record.clone().unwrap()
+                (owner.record.clone().unwrap(), false)
             } else {
                 self.0.starts.fetch_add(1, Ordering::SeqCst);
                 let record = pb::EnvironmentRecord {
@@ -91,13 +100,17 @@ assignment: Some(pb::Assignment { environment_id: spec.id.clone(), node_id: self
                     resources_held: true, ..Default::default()
                 };
                 owners.insert(spec.id, pb::GetEnvironmentResponse { record: Some(record.clone()), node_address: "127.0.0.1:9000".into(), relay_address: "127.0.0.1:9443".into() });
-                record
+                (record, true)
             }
         };
+        if record.state == pb::EnvironmentState::Running as i32 && !identity.1.is_empty() {
+            self.0.receipts.lock().unwrap().entry(identity).or_insert_with(|| record.spec.as_ref().unwrap().id.clone());
+        }
         if self.0.block_response.load(Ordering::SeqCst) {
             self.0.release.notified().await;
         }
-        let phase = self.0.timeout_phase.lock().unwrap().clone();
+        let phase = self.0.timeout_phase.lock().unwrap().clone()
+            .filter(|_| record.state != pb::EnvironmentState::Failed as i32);
         if let Some(phase) = phase {
             let deadline = adx_transport::deadline::Deadline::from_unix_millis(deadline).unwrap();
             tokio::time::sleep_until(deadline.instant()).await;
@@ -120,12 +133,13 @@ assignment: Some(pb::Assignment { environment_id: spec.id.clone(), node_id: self
         if error != tonic::Code::Ok {
             return Err(Status::new(error, "injected missing create response"));
         }
-        Ok(Response::new(pb::EnvironmentResult { newly_created: true, record: Some(record), durability: pb::Durability::Published as i32 }))
+        Ok(Response::new(pb::EnvironmentResult { newly_created, record: Some(record), durability: pb::Durability::Published as i32 }))
     }
 }, [
     get_scheduling_queue(GetSchedulingQueueRequest) -> GetSchedulingQueueResponse,
     set_node_scheduling(SetNodeSchedulingRequest) -> NodeSchedulingState,
     prepare_create(LocalEnvironmentCreateRequest) -> PreparedEnvironment,
+    reserve_local_environment(ClaimEnvironmentRequest) -> ClaimEnvironmentResponse,
     claim_environment(ClaimEnvironmentRequest) -> ClaimEnvironmentResponse,
     forward_create(LocalEnvironmentCreateRequest) -> EnvironmentResult,
     register_node(RegisterNodeRequest) -> RegisterNodeResponse,
@@ -176,6 +190,9 @@ impl Fixture {
         Self::with_mode(retention, false).await
     }
     async fn with_mode(retention: u64, local_first: bool) -> Self {
+        Self::with_claim_mode(retention, local_first, None).await
+    }
+    async fn with_claim_mode(retention: u64, local_first: bool, persist: Option<bool>) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap().to_string();
         let state = Arc::new(State::default());
@@ -202,12 +219,16 @@ impl Fixture {
                 .add_service(pb::environment_directory_service_server::EnvironmentDirectoryServiceServer::new(endpoint))
                 .serve_with_incoming(incoming).await.unwrap();
         });
-        let config: Config = serde_json::from_value(json!({
+        let mut config = json!({
             "listen":"127.0.0.1:0", "coordinator_address":address, "internal_security":"network", "ingress_mode":"standalone",
             "rpc_timeout_seconds":2, "cache_entries":1, "auth_cache_ttl_seconds":1,
             "create_mode":if local_first { "local_first" } else { "central" },
             "create_unknown_retention_seconds":retention
-        })).unwrap();
+        });
+        if let Some(persist) = persist {
+            config["persist_local_claim"] = json!(persist);
+        }
+        let config: Config = serde_json::from_value(config).unwrap();
         let clients = Clients::new(config).unwrap();
         let service = EnvironmentService::new(clients.clone());
         tokio::time::timeout(Duration::from_secs(3), async {
@@ -272,7 +293,10 @@ async fn snapshot_create_uses_coordinator_even_with_a_live_local_first_entry() {
             .clients
             .create_environment(request, Duration::from_secs(2)),
     );
-    assert_eq!(first.unwrap(), replay.unwrap());
+    let (first, replay) = (first.unwrap(), replay.unwrap());
+    assert_eq!(first.record, replay.record);
+    assert_eq!(first.durability, replay.durability);
+    assert_ne!(first.newly_created, replay.newly_created);
     assert_eq!(fixture.state.create_calls.load(Ordering::SeqCst), 2);
     assert_eq!(fixture.state.starts.load(Ordering::SeqCst), 1);
 }
@@ -339,6 +363,7 @@ async fn creation_metrics_wait_for_result_and_count_replay_as_a_response() {
     let metrics = fixture.service.metrics();
     assert!(metrics.contains("adx_environment_create_in_flight 1\n"));
     assert!(metrics.contains("adx_environment_create_responses_total{outcome=\"success\"} 0\n"));
+    fixture.state.block_response.store(false, Ordering::SeqCst);
     fixture.state.release.notify_one();
     pending.await.unwrap().unwrap();
     fixture.create("observed", "observed").await.unwrap();
@@ -471,7 +496,7 @@ async fn confirmed_timeout_survives_rpc_timers_and_replay() {
     assert_eq!(replay.message(), error.message());
     assert!(adx_protocol::deadline_failure(&replay).is_some());
     assert_eq!(fixture.state.starts.load(Ordering::SeqCst), 1);
-    assert_eq!(fixture.state.create_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.state.create_calls.load(Ordering::SeqCst), 2);
 }
 #[tokio::test]
 async fn completed_cache_capacity_never_rejects_new_creates() {
@@ -515,23 +540,19 @@ async fn unknown_results_do_not_block_new_names_and_retry_original_identity() {
     }
     fixture.state.response_error.store(0, Ordering::SeqCst);
     fixture.create("new", "new-request").await.unwrap();
-    // All unknown outcomes retain their arguments while unrelated completed
-    // responses are evicted from the capacity-one cache.
+    // A repeated request reuses its confirmed result even when arguments differ.
     for index in 0..unknown_codes.len() {
         assert_eq!(
             fixture
                 .create("other-name", &format!("request-{index}"))
                 .await
-                .unwrap_err()
-                .code(),
-            tonic::Code::AlreadyExists
+                .unwrap()["environmentId"],
+            format!("unknown-{index}")
         );
     }
     let starts = fixture.state.starts.load(Ordering::SeqCst);
-    let calls = fixture.state.create_calls.load(Ordering::SeqCst);
     fixture.create("unknown-0", "request-0").await.unwrap();
     assert_eq!(fixture.state.starts.load(Ordering::SeqCst), starts);
-    assert_eq!(fixture.state.create_calls.load(Ordering::SeqCst), calls);
 }
 #[tokio::test]
 async fn active_creates_are_not_evicted_and_same_request_is_serialized() {
@@ -574,7 +595,7 @@ async fn expired_unknown_request_is_collected_without_querying_or_changing_envir
     );
     assert_eq!(
         fixture.create("new", "request").await.unwrap_err().code(),
-        tonic::Code::AlreadyExists
+        tonic::Code::Unavailable
     );
     let lookups = fixture.state.lookups.load(Ordering::SeqCst);
     let calls = fixture.state.create_calls.load(Ordering::SeqCst);
@@ -591,10 +612,10 @@ async fn expired_unknown_request_is_collected_without_querying_or_changing_envir
         pb::EnvironmentState::Running as i32
     );
     fixture.state.response_error.store(0, Ordering::SeqCst);
-    // Beyond the retry window, the old Request ID no longer pins its arguments.
+    // Evicting the process cache does not discard the durable request receipt.
     assert_eq!(
         fixture.create("new", "request").await.unwrap()["environmentId"],
-        "new"
+        "old"
     );
     let starts = fixture.state.starts.load(Ordering::SeqCst);
     assert_eq!(
@@ -677,7 +698,7 @@ async fn failed_owner_retry_is_terminal_and_does_not_repeat_start() {
 }
 
 #[tokio::test]
-async fn pending_retry_rejects_a_changed_generation() {
+async fn pending_retry_accepts_a_reassigned_unconfirmed_generation() {
     let fixture = Fixture::new().await;
     fixture.state.pending_response.store(true, Ordering::SeqCst);
     fixture
@@ -701,15 +722,17 @@ async fn pending_retry_rejects_a_changed_generation() {
         .as_mut()
         .unwrap()
         .generation = 2;
+    fixture
+        .state
+        .pending_response
+        .store(false, Ordering::SeqCst);
+    fixture.state.response_error.store(0, Ordering::SeqCst);
     assert_eq!(
-        fixture
-            .create("pending-fenced", "request")
-            .await
-            .unwrap_err()
-            .code(),
-        tonic::Code::FailedPrecondition
+        fixture.create("pending-fenced", "request").await.unwrap()["environmentId"],
+        "pending-fenced"
     );
-    assert_eq!(fixture.state.create_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(fixture.state.create_calls.load(Ordering::SeqCst), 3);
+    assert_eq!(fixture.state.starts.load(Ordering::SeqCst), 1);
 }
 
 #[tonic::async_trait]
@@ -728,7 +751,9 @@ service_impl!(pb::node_service_server::NodeService, {
     async fn create_local_environment(&self, request: Request<pb::LocalEnvironmentCreateRequest>) -> Result<Response<pb::EnvironmentResult>, Status> {
         let trace = adx_observability::trace::Trace::rpc("test.node.create_local_environment", &request);
         trace.run_result(async {
-            let create = request.into_inner().create.unwrap();
+            let request = request.into_inner();
+            self.0.local_persistence.lock().unwrap().push(request.persist_claim);
+            let create = request.create.unwrap();
             pb::coordinator_service_server::CoordinatorService::create_environment(self, adx_observability::trace::inject(create)).await
         }).await
     }
@@ -1026,6 +1051,28 @@ async fn cancelled_create_ends_total_span_without_losing_its_parent() {
     assert!(metrics.contains("adx_environment_create_in_flight 0\n"));
     assert!(metrics.contains("adx_environment_create_responses_total{outcome=\"cancelled\"} 1\n"));
     fixture.state.release.notify_one();
+}
+
+#[tokio::test]
+async fn local_first_claim_persistence_is_an_independent_opt_in() {
+    for persist in [None, Some(true)] {
+        let fixture = Fixture::with_claim_mode(600, true, persist).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while fixture.clients.nodes().await.is_err() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        fixture
+            .create("local-persistence-option", "local-request")
+            .await
+            .unwrap();
+        assert_eq!(
+            *fixture.state.local_persistence.lock().unwrap(),
+            vec![persist.unwrap_or(false)]
+        );
+    }
 }
 
 #[path = "../../../build/observability/tests/prometheus.rs"]

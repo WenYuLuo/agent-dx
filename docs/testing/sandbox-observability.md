@@ -1,6 +1,6 @@
 # Sandbox 创建与运行异常指标合同
 
-本合同覆盖 API Server 创建调用、Coordinator 已取得所有权的新建结果、运行期中断和恢复。
+本合同覆盖 API Server 创建调用、Coordinator 已持久化的新建结果、运行期中断和恢复。
 公共 API 的 Sandbox 对应内部 Environment。指标通过现有私有 `metrics_listen` 导出，
 health-checker 负责阈值、最小样本、持续触发/恢复、缺数处理和通知。
 
@@ -16,11 +16,12 @@ REST、SSE、embedded 共享创建服务，SSE accepted 不提前计成功。
 必须同时查看 unknown、cancelled、拒绝、当前排队/启动数和等待年龄。
 这个比值表示已获得确定结果的调用，不表示去重逻辑请求的全链路成功率。
 
-Coordinator 另外记录取得所有权后的初次创建结果，首次权威 Running 为 success；
-无待执行重启的终态 Failed 为 failure，其中结构化 DeadlineExceeded 为 timeout。
-结果在 env 内只裁定一次，重复提交、已有 Running 复用、resume、restart、recovery 均不补计。
-分配前调度失败由 API 的调用失败及 scheduling 分类体现，不混入这个去重分母。
-仅在需要诊断启动阶段时使用其 success/(success+failure+timeout)。
+Coordinator 另外记录已持久化的初次创建结果，首次权威 Running 为 success；
+持久化生命周期中的终态 Failed 为 failure，其中结构化 DeadlineExceeded 为 timeout。
+结果只裁定一次，重复提交、已有 Running 复用、resume、restart、recovery 均不补计。
+默认中央和本地创建在成功前只保留内存预留，失败预留不会为统计而写入 Redis；
+这些失败、调度失败及确认超时通过 API 的调用结果和阶段分类观测。
+因此持久化创建计数不能作为默认创建路径的完整成功率分母；成功率使用上面的 API 调用口径。
 
 ### 成功新建调用耗时 P95
 
@@ -48,7 +49,7 @@ unknown、失败和取消不进入成功耗时样本；后续确认成功不补�
 | `adx_environment_create_success_call_duration_seconds` | histogram/秒 | 新增，成功实际新建调用；无业务 ID 标签 | API Server 成功返回前 |
 | `adx_environment_create_errors_total` | counter/调用 | 新增 outcome=failure、unknown、cancelled；stage、reason 有限分类 | API Server 调用结束 |
 | `adx_environment_create_rejections_total` | counter/请求 | 新增 reason 有限分类；不属于 create 调用结果分母 | API Server HTTP/embedded 入口 |
-| `adx_environment_owned_creation_results_total` | counter/env | 新增 outcome=success、failure、timeout；取得所有权后的初次结果 | Coordinator 与 env 结果同 Redis CAS |
+| `adx_environment_owned_creation_results_total` | counter/env | 新增 outcome=success、failure、timeout；已持久化的初次结果 | Coordinator 与 env 结果同 Redis CAS |
 | `adx_environment_creating` | gauge/env | 新增 state=queued、starting；中央队列或已分配未裁定 | Coordinator 当前目录 |
 | `adx_environment_create_oldest_wait_seconds` | gauge/秒 | 新增 state=queued、starting；任一起点未知时该状态年龄样本缺失 | Coordinator 当前目录 |
 | `adx_environment_create_wait_age_unknown` | gauge/env | 新增 state=queued、starting；起点缺失/无效的数量 | Coordinator 当前目录 |
@@ -93,7 +94,7 @@ Coordinator 控制 hash 的 `environment:<id>` 是现有 `StoredEnvironment`，�
 | 字段 | 内容/保留规则 |
 | --- | --- |
 | `creation.request_id` | 初次创建 request ID，最多 256 bytes；不放入 Prometheus 标签 |
-| `creation.started_at_unix_millis` | Coordinator reserve/claim 首次持久接纳时间，用于 starting 等待年龄 |
+| `creation.started_at_unix_millis` | Coordinator 首次预留接纳时间；默认随成功结果持久化，用于 starting 等待年龄 |
 | `creation.result` | unsettled、success、failure、timeout；只裁定一次 |
 | `creation.reason` / `settled_at_unix_millis` | 确认失败的有限摘要及裁定时间；API 阶段诊断另见调用指标 |
 | `last_interruption` | 最近一次中断及恢复摘要，恢复成功后保留，下次中断替换，env 删除后一起删除 |
@@ -104,20 +105,23 @@ worker_id、reason、evidence_source、exit_code、detail（UTF-8 最多 4096 by
 occurred_at_unix_millis、recovery_state、recovery_kind、recovery_worker_id、recovery_runtime_id、
 resolved_at_unix_millis。无法知道准确发生时间时 occurred_at 为 null，检测时间始终保留。
 event_id 按旧执行的 generation/runtime 固定，与 environment_id 一起关联；节点 incident_id
-按 worker/session/失联起始控制 revision 固定。原始 failure 可在恢复时清除，中断证据与最近摘要保留。
+按 worker/session/跨重启唯一序号固定。原始 failure 可在恢复时清除，中断证据与最近摘要保留。
 
-控制 header 新增 `observability` 累计数及统计覆盖起点；`StoredNode.last_incident_id`
-用于当前失联周期的事件回放去重，重新确认可路由后清除；仅重连但仍在 reconciliation 的心跳
-不结束该失联周期。结果、最近摘要与累计数在现有 fenced CAS/Lua 内一起提交。
-提交直接返回本次确认的完整 StoredEnvironment，同步 Coordinator 内存目录无需再次读取 Redis；
+控制 header 记录统计覆盖起点。累计数保存在同 namespace 的 `:business` hash，
+按 Environment 和节点分别保存；每个对象的结果、最近摘要及其累计数在同一个 epoch-fenced
+Lua 事务内做条件更新，不同对象不比较全局 header 或共享计数版本。删除 Environment 保留
+累计数，重启和结果回放不重复计数。指标刷新仅聚合业务计数 hash，不读取全部控制目录。
+`StoredNode.last_incident_id` 用于当前失联周期的事件回放去重，重新确认可路由后清除；
+仅重连但仍在 reconciliation 的心跳不结束该失联周期。
+生命周期提交返回确认的完整 StoredEnvironment，同步内存中的中断和恢复摘要；
 删除及删除回放只返回结果，不恢复已删除记录。
 日志在提交成功后输出 `environment_interrupted`、`environment_recovery_resolved`，用于关联排障；
 日志不作为完整历史影响账本。
 
-同 tenant/request ID 的 request→env 绑定位于同 namespace 的 `:requests` hash，键为 SHA-256，
-与首次 reserve/claim 原子写入。未命名请求由 API 根据 tenant/request ID 生成稳定名称，
-Coordinator 拒绝相同 request ID 绑定到不同候选 env。adxlet 在取得唯一所有权后才启动 runtime。
-绑定随 env 删除清理；env 删除后再次创建属于新的生命周期。
+同 tenant/request ID 的成功回执位于 `:create-receipts` hash，和初次成功结果原子发布。
+Environment ID 或 Request ID 任一命中成功身份，复用已有结果；默认预留不持久化请求绑定。
+未命名请求由 API 根据 tenant/request ID 生成稳定名称。可选持久化 Claim 保留候选归属，
+最终仍由成功发布确定有效结果。成功 Request ID 回执跨删除保留；删除后新建须使用新请求身份。
 
 ### 快速恢复与正常操作竞态
 

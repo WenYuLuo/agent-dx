@@ -145,6 +145,7 @@ impl Clients {
                     self.channel(&node.address).await?,
                 );
                 let mut request = trace::inject(pb::LocalEnvironmentCreateRequest {
+                    persist_claim: self.config.persist_local_claim,
                     create: Some(request),
                     node_session_id: node.session_id.clone(),
                 });

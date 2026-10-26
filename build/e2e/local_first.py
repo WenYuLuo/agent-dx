@@ -7,7 +7,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from adx_environment import Environment, EnvironmentError
+from adx_environment import Environment
 from node import catalog
 
 
@@ -49,33 +49,27 @@ def run(connection, image, output):
             result = instance.commands.run("printf 'local-first-ready'")
             if not (result.exit_code == 0 and result.stdout == 'local-first-ready'):
                 raise AssertionError()
-        try:
-            changed = Environment(
-                name=prefix + '-race',
-                image=image,
-                runtime='runc',
-                cpu=600,
-                memory=512,
-                idle_timeout=0,
-                connection=connection,
-                create_timeout=150,
-            )
-        except EnvironmentError as error:
-            if not (error.code == 'CONFLICT'):
-                raise AssertionError(error.code) from error
-            if not (error.retry == 'never'):
-                raise AssertionError(error.retry) from error
-            if not (error.outcome == 'not_started'):
-                raise AssertionError(error.outcome) from error
-        else:
-            instances.append(changed)
-            raise AssertionError('changed specification unexpectedly accepted')
+        before = record(copies[0])
+        changed = Environment(
+            name=prefix + '-race',
+            image=image,
+            runtime='runc',
+            cpu=600,
+            memory=512,
+            idle_timeout=0,
+            connection=connection,
+            create_timeout=150,
+        )
+        instances.append(changed)
+        after = record(changed)
+        if changed.id != copies[0].id or after != before:
+            raise AssertionError('same Environment ID did not reuse the confirmed result and original spec')
         records = [record(s) for s in (first, second, copies[0])]
         if not (len({r['spec']['id'] for r in records}) == 3):
             raise AssertionError()
         if not (all(r['result']['resources_held'] for r in records)):
             raise AssertionError()
-        # Require evidence of the actual local-claim path, not just placement
+        # Require evidence of the actual local reservation path, not just placement
         # that could also have resulted from the default center Spread policy.
         expected = {r['spec']['id'] for r in records}
         end = time.monotonic() + 10
@@ -87,24 +81,24 @@ def run(connection, image, output):
                 try:
                     data = gzip.decompress(path.read_bytes()) if path.suffix == '.gz' else path.read_bytes()
                     for line in data.decode(errors='replace').splitlines():
-                        if 'local_environment_claim' in line:
+                        if 'local_environment_reservation' in line:
                             claimed.update(identity for identity in expected if identity in line)
                 except (EOFError, OSError):
                     continue
             if claimed == expected:
                 break
             if time.monotonic() > end:
-                raise AssertionError(('missing local claim evidence', expected - claimed))
+                raise AssertionError(('missing local reservation evidence', expected - claimed))
             time.sleep(0.1)
         output.write_text(
             json.dumps(
                 {
                     'status': 'passed',
-                    'local_claims': sorted(claimed),
+                    'local_reservations': sorted(claimed),
                     'entry_owners': owners,
                     'unique_instances': 3,
                     'duplicate_converged': True,
-                    'conflict_rejected': True,
+                    'changed_spec_reused': True,
                     'commands_passed': 3,
                     'assignments': [r['assignment'] for r in records],
                 },
@@ -112,7 +106,10 @@ def run(connection, image, output):
             )
         )
         print(
-            ('PASS local-first: two-node rotation, same-ID convergence, conflict and three real EXECD commands'),
+            (
+                'PASS local-first: two-node rotation, same-ID convergence, '
+                'original-spec reuse and three real EXECD commands'
+            ),
             flush=True,
         )
     finally:
