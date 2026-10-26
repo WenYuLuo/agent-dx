@@ -324,3 +324,59 @@ async fn snapshot_claim_requires_existing_restore_reference() {
         ClaimOutcome::Owned(_)
     ));
 }
+
+#[tokio::test]
+#[ignore = "requires isolated Redis; run storage suite"]
+async fn batch_claims_isolate_expired_and_missing_nodes() {
+    let rig = common::Redis::new().await;
+    let s = rig.store().await.begin(1).await.unwrap();
+    let good = claimant(&s, "good").await;
+    let expired = claimant(&s, "expired").await;
+    s.invalidate_node("expired", &expired.node_session_id)
+        .await
+        .unwrap();
+    let missing = LocalClaim {
+        node_id: "missing".into(),
+        node_session_id: "boot".into(),
+        devices: vec![],
+    };
+    for bad in [expired, missing] {
+        let id = format!("good-with-{}", bad.node_id);
+        let results = s
+            .claim_batch(vec![(spec(&bad.node_id), bad), (spec(&id), good.clone())])
+            .await
+            .unwrap();
+        assert!(results[0].is_err());
+        assert!(matches!(&results[1], Ok(ClaimOutcome::Owned(_))));
+        assert!(s.get(&id).await.is_ok());
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Redis; run storage suite"]
+async fn claim_rejects_corrupt_persisted_node() {
+    let rig = common::Redis::new().await;
+    let s = rig.store().await.begin(1).await.unwrap();
+    let candidate = claimant(&s, "node").await;
+    // A new Coordinator has no live overlay; exercise the Redis decode boundary.
+    let s = rig.store().await.begin(1).await.unwrap();
+    let client = redis::Client::open(rig.url.as_str()).unwrap();
+    let mut connection = client.get_multiplexed_async_connection().await.unwrap();
+    let key = "adx:{test}:control:v1";
+    let raw: String = redis::cmd("HGET")
+        .arg(key)
+        .arg("node:node")
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    let mut stored: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    stored["node"]["runtime_classes"] = serde_json::json!([""]);
+    let _: usize = redis::cmd("HSET")
+        .arg(key)
+        .arg("node:node")
+        .arg(stored.to_string())
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    assert!(s.claim(spec("corrupt-node"), &candidate).await.is_err());
+}

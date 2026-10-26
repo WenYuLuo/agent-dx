@@ -24,11 +24,18 @@ impl Session {
         let Some(raw) = self.store.query::<Option<String>>(command).await? else {
             return Ok(None);
         };
-        let receipt: StoredEnvironment = decode(&raw)?;
+        self.resolve_receipt(decode(&raw)?).await.map(Some)
+    }
+
+    async fn resolve_receipt(&self, receipt: StoredEnvironment) -> Result<EnvironmentRecord> {
+        receipt.validate()?;
         let mut record = receipt.result.ok_or(Error::Conflict)?;
         match self.get(&record.spec.id).await {
-            Ok(current) if current.assignment == record.assignment => {
-                record = current.result.ok_or(Error::Conflict)?
+            Ok(current)
+                if current.creation_generation == receipt.creation_generation
+                    && current.spec.tenant_id == record.spec.tenant_id =>
+            {
+                record = current.result.ok_or(Error::Conflict)?;
             }
             Ok(_) | Err(Error::NotFound) => {
                 record.state = EnvironmentState::Deleted;
@@ -37,7 +44,7 @@ impl Session {
             }
             Err(error) => return Err(error),
         }
-        Ok(Some(record))
+        Ok(record)
     }
 
     /// Remove only an unfinished optional Claim belonging to a losing execution.
@@ -123,6 +130,7 @@ impl Session {
             .map(|request| Self::request_field(&record.spec.tenant_id, request))
             .collect::<Result<Vec<_>>>()?;
         let next = StoredEnvironment {
+            creation_generation: record.assignment.generation,
             resume: None,
             failed_since_unix_seconds: None,
             recovery: None,
@@ -136,11 +144,21 @@ impl Session {
         for _ in 0..ATTEMPTS {
             let [header, old] = self.store.fields([HEADER.into(), field.clone()]).await?;
             self.header(&header)?;
-            let published = old
+            let previous = old
                 .as_deref()
                 .map(decode::<StoredEnvironment>)
-                .transpose()?
-                .is_some_and(|e| e.result.is_some());
+                .transpose()?;
+            if let Some(previous) = &previous {
+                previous.validate()?;
+            }
+            let published = previous.as_ref().is_some_and(|e| e.result.is_some());
+            // Keep receipt replay ahead of this guard inside the atomic script:
+            // a successful Request ID still wins even when this name is pending elsewhere.
+            let pending_conflict = previous.as_ref().is_some_and(|e| {
+                e.result.is_none()
+                    && (e.assignment != record.assignment || e.spec != record.spec || e.invalidated)
+            });
+
             if require_existing && !published {
                 return Err(Error::NotFound);
             }
@@ -170,6 +188,7 @@ impl Session {
                     aliases(old, ARGV[2])
                     return {2,old}
                 end
+                if ARGV[6] == 'conflict' then return {-1,''} end
                 if ARGV[7] ~= '' and redis.call('HGET',KEYS[1],ARGV[8]) ~= ARGV[7] then return {-1,''} end
                 redis.call('HSET',KEYS[1],ARGV[2],ARGV[4])
                 redis.call('HINCRBY',KEYS[1],'node-ownership:' .. string.sub(ARGV[8],14),1)
@@ -182,7 +201,7 @@ impl Session {
                 .arg(format!("{}:artifacts", self.store.key))
                 .arg(self.epoch.to_string()).arg(&field).arg(old.as_deref().unwrap_or(""))
                 .arg(encode(&next)?).arg(encode(&request_fields)?)
-                .arg(if published { "published" } else { "initial" }).arg(node_session)
+                .arg(if published { "published" } else if pending_conflict { "conflict" } else { "initial" }).arg(node_session)
                 .arg(format!("node-session:{}", record.assignment.node_id));
             for artifact in &artifacts {
                 command
@@ -198,19 +217,7 @@ impl Session {
                         vec![format!("environment:{}", winner.spec.id)],
                     );
                     if code == 2 {
-                        let mut result = winner.result.ok_or(Error::Conflict)?;
-                        match self.get(&result.spec.id).await {
-                            Ok(current) if current.assignment == result.assignment => {
-                                result = current.result.ok_or(Error::Conflict)?;
-                            }
-                            Ok(_) | Err(Error::NotFound) => {
-                                result.state = EnvironmentState::Deleted;
-                                result.resources_held = false;
-                                result.runtime.ip = None;
-                            }
-                            Err(error) => return Err(error),
-                        }
-                        return Ok(result);
+                        return self.resolve_receipt(winner).await;
                     }
                     return winner.result.ok_or(Error::Conflict);
                 }

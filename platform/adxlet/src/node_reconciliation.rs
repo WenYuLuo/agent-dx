@@ -239,6 +239,14 @@ pub async fn reconcile_node(
         registration.reconciling = false;
         registration.accepting_allocations =
             manager.accepting_allocations() && !manager.is_draining();
+        if catalog_retry {
+            let _ = report(coordinator, registration, timeout, &mut handshake_required).await;
+            if handshake_required {
+                manager.authority_reconciling.store(true, Ordering::Release);
+                registration.reconciling = true;
+                registration.accepting_allocations = false;
+            }
+        }
         return result;
     }
     if result.is_err() {

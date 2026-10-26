@@ -390,3 +390,33 @@ async fn returning_node_rearms_publication_after_reconciliation() {
         );
     }
 }
+
+#[tokio::test]
+#[ignore = "requires isolated Redis; run storage suite"]
+async fn initial_publication_cannot_overwrite_another_pending_assignment() {
+    let rig = common::Redis::new().await;
+    let s = rig.store().await.begin(1).await.unwrap();
+    register(&s, "node").await;
+    let assignment = Assignment {
+        environment_id: "pending".into(),
+        node_id: "node".into(),
+        shard_id: 0,
+        generation: 2,
+        devices: vec![],
+    };
+    s.reserve(spec("pending"), assignment.clone())
+        .await
+        .unwrap();
+    for generation in [1, 3] {
+        let late = running(
+            spec("pending"),
+            Assignment {
+                generation,
+                ..assignment.clone()
+            },
+        );
+        assert!(s.publish_initial(late, "late", "").await.is_err());
+    }
+    assert_eq!(s.get("pending").await.unwrap().assignment, assignment);
+    assert!(s.get("pending").await.unwrap().result.is_none());
+}

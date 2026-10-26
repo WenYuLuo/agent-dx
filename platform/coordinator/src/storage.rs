@@ -129,6 +129,9 @@ pub struct ResumeIntent {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredEnvironment {
+    /// Initial ownership generation identifies this lifetime across recovery.
+    /// Deleting and recreating the same name starts a different lifetime.
+    pub creation_generation: u64,
     #[serde(default)]
     pub resume: Option<ResumeIntent>,
     /// Durable age of a terminal failure; retries and Coordinator restarts do not reset it.
@@ -211,7 +214,10 @@ impl StoredEnvironment {
     }
     fn validate(&self) -> Result<()> {
         self.spec.validate()?;
-        if self.spec.id != self.assignment.environment_id || self.assignment.generation == 0 {
+        if self.spec.id != self.assignment.environment_id
+            || self.creation_generation == 0
+            || self.creation_generation > self.assignment.generation
+        {
             return Err(Error::Conflict);
         }
         validate_device_assignment(&self.spec.scheduling.devices, &self.assignment.devices)?;
@@ -1064,6 +1070,7 @@ impl Session {
             .get(id)
             .cloned()
         {
+            node.node.validate()?;
             return Ok(node);
         }
         let [header, node] = self
@@ -1071,7 +1078,9 @@ impl Session {
             .fields([HEADER.into(), format!("node:{id}")])
             .await?;
         self.header(&header)?;
-        decode(node.as_deref().ok_or(Error::NotFound)?)
+        let node: StoredNode = decode(node.as_deref().ok_or(Error::NotFound)?)?;
+        node.node.validate()?;
+        Ok(node)
     }
     fn header(&self, value: &Option<String>) -> Result<Header> {
         let header: Header = decode(value.as_deref().ok_or(Error::Conflict)?)?;
@@ -1403,6 +1412,7 @@ impl Session {
             }
         }
         let record = StoredEnvironment {
+            creation_generation: assignment.generation,
             resume: None,
             failed_since_unix_seconds: None,
             recovery: None,

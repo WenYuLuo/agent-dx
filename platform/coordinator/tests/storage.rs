@@ -7,6 +7,8 @@ mod common;
 mod dormancy;
 #[path = "storage/publication.rs"]
 mod publication;
+#[path = "storage/publication_regressions.rs"]
+mod publication_regressions;
 use adx_coordinator::{storage::StoredNode, Coordinator, Node, Placement};
 use adx_core::{
     Assignment, EnvironmentRecord, EnvironmentSpec, EnvironmentState, Error, Resources,

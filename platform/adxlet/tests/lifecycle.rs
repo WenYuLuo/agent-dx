@@ -735,6 +735,13 @@ async fn expired_capacity_remains_usable_and_maintenance_blocks_new_admission() 
     let deps = Dependencies::new(false);
     let node = node(&deps);
     tokio::time::advance(Duration::from_secs(31)).await;
+    assert!(node.accepting_allocations());
+    assert!(node
+        .metrics()
+        .contains("adx_node_accepting_allocations 1\n"));
+    assert!(node
+        .metrics()
+        .contains("adx_node_resource_observation_fresh 0\n"));
     let environment = node.environment(spec("a"), assignment("a")).unwrap();
     environment.create().await.unwrap();
     node.set_maintenance(true);
@@ -746,6 +753,19 @@ async fn expired_capacity_remains_usable_and_maintenance_blocks_new_admission() 
     next.create().await.unwrap();
     node.set_maintenance(true);
     next.delete().await.unwrap();
+    assert!(node
+        .metrics()
+        .contains("adx_node_accepting_allocations 0\n"));
+    node.set_maintenance(false);
+    node.set_pressure(true);
+    assert!(node
+        .metrics()
+        .contains("adx_node_accepting_allocations 0\n"));
+    node.set_pressure(false);
+    node.update_runtime_classes(vec![]).unwrap();
+    assert!(node
+        .metrics()
+        .contains("adx_node_accepting_allocations 0\n"));
 }
 
 #[tokio::test]

@@ -159,6 +159,7 @@ impl Session {
             };
             let generation = self.next_generation()?;
             let record = StoredEnvironment {
+                creation_generation: generation,
                 resume: None,
                 failed_since_unix_seconds: None,
                 recovery: None,
@@ -255,7 +256,9 @@ impl Session {
             }
             let mut nodes = BTreeMap::new();
             for field in &node_fields {
-                let value = by_field.remove(field).flatten().ok_or(Error::NotFound)?;
+                let Some(value) = by_field.remove(field).flatten() else {
+                    continue;
+                };
                 let node: StoredNode = decode(&value)?;
                 let node = self.get_node(&node.node.id).await?;
                 nodes.insert(node.node.id.clone(), node);
@@ -275,6 +278,7 @@ impl Session {
 
             let mut results = Vec::with_capacity(claims.len());
             let mut writes = Vec::new();
+            let mut writing_nodes = BTreeMap::new();
             for (spec, candidate) in &claims {
                 let result = (|| {
                     let node = nodes.get(&candidate.node_id).ok_or(Error::NotFound)?;
@@ -317,6 +321,7 @@ impl Session {
                     let generation = self.next_generation()?;
 
                     let record = StoredEnvironment {
+                        creation_generation: generation,
                         resume: None,
                         failed_since_unix_seconds: None,
                         recovery: None,
@@ -333,6 +338,8 @@ impl Session {
                     };
                     record.validate()?;
                     environments.insert(spec.id.clone(), record.clone());
+                    writing_nodes
+                        .insert(candidate.node_id.clone(), candidate.node_session_id.clone());
                     writes.push((
                         format!("environment:{}", spec.id),
                         encode(&record)?,
@@ -361,10 +368,8 @@ impl Session {
             for (field, value, _) in &writes {
                 command.arg(field).arg(value);
             }
-            for node in nodes.values() {
-                command
-                    .arg(format!("node-session:{}", node.node.id))
-                    .arg(&node.session.as_ref().ok_or(Error::Conflict)?.id);
+            for (node, session) in &writing_nodes {
+                command.arg(format!("node-session:{node}")).arg(session);
             }
             if self.store.query::<u8>(command).await? == 1 {
                 for (field, _, revision) in writes {

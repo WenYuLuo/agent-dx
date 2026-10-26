@@ -167,6 +167,7 @@ impl State {
                     .await
             } else {
                 Ok(StoredEnvironment {
+                    creation_generation: assignment.generation,
                     resume: None,
                     failed_since_unix_seconds: None,
                     recovery: None,
@@ -573,15 +574,29 @@ impl CoordinatorRpc {
     }
 
     async fn discard_unconfirmed(&self, spec: &EnvironmentSpec) {
-        let session = self.0.state.lock().await.session.clone();
-        // An optional Claim, or an applied publication whose reply was lost,
-        // remains durable. Recovery/reconciliation owns its subsequent cleanup.
-        if let Ok(stored) = session.get(&spec.id).await {
-            let mut state = self.0.state.lock().await;
-            let _ = state.accept_stored_claim(stored);
+        let _publication = self.create_guard(format!("publication:{}", spec.id)).await;
+        self.discard_unconfirmed_locked(spec).await;
+    }
+
+    async fn discard_unconfirmed_locked(&self, spec: &EnvironmentSpec) {
+        let mut state = self.0.state.lock().await;
+        if state.recover_authoritative_state().await.is_err() {
             return;
         }
-        let mut state = self.0.state.lock().await;
+        let session = state.session.clone();
+        // Read and install under the state lock so node invalidation cannot
+        // advance the catalog between the durable read and memory update.
+        match session.get(&spec.id).await {
+            Ok(stored) => {
+                let _ = state.accept_stored_claim(stored);
+                return;
+            }
+            Err(Error::NotFound) => (),
+            Err(_) => {
+                state.needs_recovery = true;
+                return;
+            }
+        }
         if state.environments.get(&spec.id).is_some_and(|e| {
             e.result
                 .as_ref()
@@ -812,9 +827,8 @@ impl CoordinatorRpc {
                         n.last_seen.elapsed() >= self.0.heartbeat_timeout || !n.inspected
                     })
                 {
-                    state.scheduler.retry(&stored.assignment).map_err(status)?;
-                    state.environments.remove(&spec.id);
                     drop(state);
+                    self.retry_initial(&spec.id, &stored.assignment).await?;
                     tokio::time::timeout_at(create_deadline.instant(), changed)
                         .await
                         .map_err(|_| {
@@ -948,7 +962,19 @@ impl CoordinatorRpc {
         id: &str,
         assignment: &adx_core::Assignment,
     ) -> std::result::Result<(), Status> {
+        let _publication = self.create_guard(format!("publication:{id}")).await;
         let mut state = self.0.state.lock().await;
+        state.recover_authoritative_state().await.map_err(status)?;
+        state.healthy().map_err(status)?;
+        // A timed-out Redis write may have succeeded before its reply was lost.
+        match state.session.get(id).await {
+            Ok(stored) if stored.result.is_some() => {
+                state.accept_stored_claim(stored).map_err(status)?;
+                return Ok(());
+            }
+            Ok(_) | Err(Error::NotFound) => (),
+            Err(error) => return Err(status(error)),
+        }
         if state
             .environments
             .get(id)
@@ -1055,7 +1081,7 @@ impl CoordinatorRpc {
             .cloned()
             .unwrap_or_default();
         drop(state);
-        let accepted = if initial && record.state == EnvironmentState::Running {
+        let mut accepted = if initial && record.state == EnvironmentState::Running {
             let winner = session
                 .publish_initial_requests(
                     record.clone(),
@@ -1065,7 +1091,7 @@ impl CoordinatorRpc {
                 .await?;
             if winner.assignment != record.assignment || winner.runtime.id != record.runtime.id {
                 session.abandon_initial(&record.assignment).await?;
-                self.discard_unconfirmed(&record.spec).await;
+                self.discard_unconfirmed_locked(&record.spec).await;
                 return Err(Error::Conflict);
             }
             winner
@@ -1092,6 +1118,24 @@ impl CoordinatorRpc {
             session.commit(record).await?
         };
         let mut state = self.0.state.lock().await;
+        if initial
+            && (state.needs_recovery
+                || state
+                    .environments
+                    .get(&accepted.spec.id)
+                    .is_none_or(|stored| {
+                        stored.assignment != accepted.assignment
+                            || stored.invalidated
+                            || stored.result.is_some()
+                    }))
+        {
+            // Recovery may have rebuilt the catalog while Redis was publishing.
+            // Reinstall the authoritative result before acknowledging success.
+            state.recover_authoritative_state().await?;
+            let durable = state.session.get(&accepted.spec.id).await?;
+            accepted = durable.result.clone().ok_or(Error::Conflict)?;
+            state.accept_stored_claim(durable)?;
+        }
         if state
             .environments
             .get(&accepted.spec.id)
@@ -1776,7 +1820,32 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                         durability: pb::Durability::Published as i32,
                     }));
                 }
-                let spec = cloning::normalize(&session, raw).await.map_err(status)?;
+                let spec = match session.get(&raw.id).await {
+                    Ok(stored) if stored.spec.tenant_id != raw.tenant_id => {
+                        return Err(Status::not_found("environment not found"));
+                    }
+                    Ok(stored) if stored.result.is_some() => {
+                        let record = stored
+                            .result
+                            .ok_or_else(|| Status::internal("confirmed result missing"))?;
+                        let record = if record.state == EnvironmentState::Running {
+                            // Keep the replay transaction off the RPC future's stack.
+                            Box::pin(session.publish_existing(record, &request_id))
+                                .await
+                                .map_err(status)?
+                        } else {
+                            record
+                        };
+                        return Ok(Response::new(pb::EnvironmentResult {
+                            record: Some(record.try_into().map_err(status)?),
+                            durability: pb::Durability::Published as i32,
+                        }));
+                    }
+                    Ok(_) | Err(Error::NotFound) => {
+                        cloning::normalize(&session, raw).await.map_err(status)?
+                    }
+                    Err(error) => return Err(status(error)),
+                };
                 let service = self.clone();
                 tokio::spawn(
                     adx_observability::trace::Trace::child("coordinator.create").run(async move {
@@ -1934,6 +2003,7 @@ mod reconciliation_tests {
             devices: vec![],
         };
         let mut environment = StoredEnvironment {
+            creation_generation: assignment.generation,
             resume: None,
             failed_since_unix_seconds: None,
             recovery: None,
@@ -2111,3 +2181,6 @@ mod cancellation_tests {
         redis.crash();
     }
 }
+
+#[cfg(test)]
+mod publication_tests;

@@ -186,7 +186,9 @@ impl CoordinatorRpc {
         tenant(request.caller.as_ref(), &spec.tenant_id)?;
         let _publication = self.create_guard(format!("publication:{}", spec.id)).await;
         let (session, cached) = {
-            let state = self.0.state.lock().await;
+            let mut state = self.0.state.lock().await;
+            state.recover_authoritative_state().await.map_err(status)?;
+            state.healthy().map_err(status)?;
             (
                 state.session.clone(),
                 state.environments.get(&spec.id).cloned(),
@@ -196,14 +198,15 @@ impl CoordinatorRpc {
             .as_ref()
             .is_some_and(|stored| stored.result.is_some())
         {
-            match session.get(&spec.id).await {
+            let mut state = self.0.state.lock().await;
+            state.recover_authoritative_state().await.map_err(status)?;
+            state.healthy().map_err(status)?;
+            match state.session.get(&spec.id).await {
                 Ok(current) => {
-                    let mut state = self.0.state.lock().await;
                     state.accept_stored_claim(current.clone()).map_err(status)?;
                     Some(current)
                 }
                 Err(Error::NotFound) => {
-                    let mut state = self.0.state.lock().await;
                     if state.environments.get(&spec.id).is_some_and(|old| {
                         cached
                             .as_ref()
