@@ -15,6 +15,32 @@ spec.loader.exec_module(node)
 
 
 class SandboxdRestartTests(unittest.TestCase):
+    def test_live_catalog_uses_loopback_on_the_coordinator_host(self):
+        records = {
+            'node:node1': json.dumps(
+                {'node': {'available': False}, 'session': {'id': 'boot-1', 'routable': False}}
+            )
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            evidence = Path(directory)
+            (evidence / 'deployment-node1.json').write_text('{}')
+            with (
+                mock.patch.object(node, 'E', evidence),
+                mock.patch.object(node, 'catalog', return_value=records),
+                mock.patch.object(Path, 'read_text', return_value='fixture-token'),
+                mock.patch('ssl.create_default_context'),
+                mock.patch(
+                    'urllib.request.urlopen',
+                    return_value=io.BytesIO(b'{"items":[{"id":"node1","status":0}]}'),
+                ) as fetch,
+            ):
+                after = node.live_catalog()
+        self.assertEqual(
+            fetch.call_args.args[0].full_url,
+            'https://127.0.0.1:8443/api/environment/v1/resources',
+        )
+        self.assertTrue(json.loads(after['node:node1'])['node']['available'])
+
     def test_live_catalog_uses_shared_api_and_preserves_durable_identities(self):
         records = {
             'node:node2': json.dumps(
