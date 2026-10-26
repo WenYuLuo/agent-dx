@@ -7,6 +7,8 @@
 //! and asks Meta to publish a new FileVersion. Writable `flush` commits prior
 //! writes before reporting close success; `release` only drops the handle.
 
+mod read_pipeline;
+
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     ffi::{OsStr, OsString},
@@ -111,7 +113,21 @@ pub trait DfsMeta: Send + Sync {
         attributes: InodeAttributes,
     ) -> Result<(InodeRecord, WriteLease)>;
     fn get_inode(&self, inode_id: &InodeId) -> Result<InodeRecord>;
+    fn get_inode_async(
+        &self,
+        inode_id: InodeId,
+    ) -> crate::node::read_pipeline::ReadFuture<'_, InodeRecord> {
+        Box::pin(async move { self.get_inode(&inode_id) })
+    }
+
     fn get_file_version(&self, version_id: &FileVersionId) -> Result<(FileVersion, LayoutRoot)>;
+    fn get_file_version_async(
+        &self,
+        version_id: FileVersionId,
+    ) -> crate::node::read_pipeline::ReadFuture<'_, (FileVersion, LayoutRoot)> {
+        Box::pin(async move { self.get_file_version(&version_id) })
+    }
+
     fn open_write(&self, inode_id: &InodeId) -> Result<(InodeRecord, WriteLease)>;
     fn resolve_lock_authority(&self, inode_id: &InodeId) -> Result<(InodeRecord, WriteLease)> {
         self.open_write(inode_id)
@@ -227,6 +243,7 @@ pub struct DistributedFs {
     gc_references: Option<Arc<crate::node::gc::GcReferences>>,
     optimistic_gc_commit: bool,
     crc32c_writes: bool,
+    native_open_read_authority: bool,
     gc_gate: Mutex<()>,
     dir_handles: Mutex<HashMap<u64, DfsDirectoryHandle>>,
     inode_writes: ShardedMap<InodeId, SharedInodeWriteState>,
@@ -271,7 +288,8 @@ pub struct DistributedFs {
     closed_lock_sessions: Mutex<HashSet<String>>,
     closed_lock_session_admission_closed: AtomicBool,
     remote_operation_results: Mutex<HashMap<RemoteOperationKey, RemoteOperationResult>>,
-    readonly_version_cache: Mutex<ReadOnlyVersionCache>,
+    readonly_version_cache: Arc<Mutex<ReadOnlyVersionCache>>,
+    readonly_version_gates: Arc<crate::node::read_pipeline::ReadKeyGates>,
     readonly_empty_version: Arc<ReadOnlyVersion>,
     dirty_budget_bytes: u64,
     write_buffer_pool: Arc<WriteBufferPool>,
@@ -476,18 +494,47 @@ impl ReadOnlyVersion {
         self.index.ops(&self.layout, offset, length)
     }
 
+    fn native_read_batch(&self, offset: u64, length: usize, lookahead: usize) -> Result<ReadBatch> {
+        self.read_batch_with_source_window(offset, length, lookahead, true)
+    }
+
     fn read_batch(&self, offset: u64, length: usize, lookahead: usize) -> Result<ReadBatch> {
+        self.read_batch_with_source_window(offset, length, lookahead, false)
+    }
+
+    fn read_batch_with_source_window(
+        &self,
+        offset: u64,
+        length: usize,
+        lookahead: usize,
+        native: bool,
+    ) -> Result<ReadBatch> {
         let ops = self.ops(offset, length)?;
         let end = offset
             .checked_add(length as u64)
             .ok_or_else(|| invalid("read range overflow"))?;
-        let next = self
-            .index
-            .entries
-            .partition_point(|entry| self.layout.inline_extents[entry.original].file_offset < end);
+        let source_window = if native && ops.len() == 1 && lookahead > 0 {
+            // Use the existing advisory quota in a stable immutable-layout
+            // window. A later concurrent offset must not omit earlier peers
+            // and force an extra lookup. This never changes body operations.
+            let width = lookahead
+                .saturating_add(1)
+                .min(crate::node::dfs_read::MAX_DFS_READ_OPS);
+            let first = self
+                .index
+                .entries
+                .partition_point(|entry| entry.max_end <= offset);
+            let start = (first / width) * width;
+            start..start.saturating_add(width).min(self.index.entries.len())
+        } else {
+            let next = self.index.entries.partition_point(|entry| {
+                self.layout.inline_extents[entry.original].file_offset < end
+            });
+            next..self.index.entries.len()
+        };
         Ok(ReadBatch {
             lookahead: source_lookahead_ids(
-                self.index.entries[next..]
+                self.index.entries[source_window]
                     .iter()
                     .map(|entry| &self.layout.inline_extents[entry.original]),
                 &ops,
@@ -642,6 +689,7 @@ fn extent_read_op(extent: &Extent, offset: u64, end: u64) -> Result<Option<Chunk
 
 #[derive(Clone)]
 struct NativeReadView {
+    open_to_close: bool,
     generation: u64,
     authority: NativeReadAuthoritySnapshot,
     deadline: Instant,
@@ -661,6 +709,8 @@ struct DfsFileHandle {
 }
 
 struct DfsHandle {
+    open_read_inode: Option<Arc<InodeRecord>>,
+    open_read_authority: Option<NativeReadAuthoritySnapshot>,
     _gc_pin: Option<Arc<crate::node::gc::GcPin>>,
     inode_id: InodeId,
     flags: i32,
@@ -689,15 +739,66 @@ type NativeReadRefreshResult = Result<(Arc<InodeRecord>, NativeReadView)>;
 struct NativeReadRefresh {
     result: Mutex<Option<NativeReadRefreshResult>>,
     changed: Condvar,
+    asynchronous_change: tokio::sync::Notify,
     #[cfg(test)]
     joined_waiters: AtomicUsize,
 }
 
+struct NativeRefreshLeader {
+    opened: Arc<DfsHandle>,
+    flight: Arc<NativeReadRefresh>,
+    completed: bool,
+}
+impl Drop for NativeRefreshLeader {
+    fn drop(&mut self) {
+        if !self.completed {
+            if let Ok(mut current) = self.opened.state.lock()
+                && current
+                    .refresh
+                    .as_ref()
+                    .is_some_and(|value| Arc::ptr_eq(value, &self.flight))
+            {
+                current.refresh = None;
+            }
+            let _ = self
+                .flight
+                .finish(Err(unavailable("DFS native read refresh cancelled")));
+        }
+    }
+}
+
 impl NativeReadRefresh {
+    async fn wait_async(
+        &self,
+        fs: &DistributedFs,
+        operation: &NativeReadView,
+    ) -> NativeReadRefreshResult {
+        #[cfg(test)]
+        self.joined_waiters.fetch_add(1, Ordering::SeqCst);
+        loop {
+            let changed = self.asynchronous_change.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            fs.check_native_read_view(operation)?;
+            let result = self
+                .result
+                .lock()
+                .map_err(|_| unavailable("native read refresh poisoned"))?
+                .clone();
+            if let Some(result) = result {
+                return result;
+            }
+            tokio::time::timeout_at(tokio::time::Instant::from_std(operation.deadline), changed)
+                .await
+                .map_err(|_| unavailable("DFS native refresh wait expired"))?;
+        }
+    }
+
     fn new() -> Self {
         Self {
             result: Mutex::new(None),
             changed: Condvar::new(),
+            asynchronous_change: tokio::sync::Notify::new(),
             #[cfg(test)]
             joined_waiters: AtomicUsize::new(0),
         }
@@ -709,9 +810,11 @@ impl NativeReadRefresh {
             .lock()
             .map_err(|_| unavailable("DFS native refresh result is poisoned"))? = Some(result);
         self.changed.notify_all();
+        self.asynchronous_change.notify_waiters();
         Ok(())
     }
 
+    #[cfg(test)]
     fn wait(&self, fs: &DistributedFs, operation: &NativeReadView) -> NativeReadRefreshResult {
         #[cfg(test)]
         self.joined_waiters.fetch_add(1, Ordering::SeqCst);
@@ -737,6 +840,16 @@ impl NativeReadRefresh {
 impl From<DfsFileHandle> for DfsHandle {
     fn from(opened: DfsFileHandle) -> Self {
         Self {
+            open_read_authority: opened
+                .native_read_view
+                .as_ref()
+                .filter(|v| v.open_to_close)
+                .map(|v| v.authority),
+            open_read_inode: opened
+                .native_read_view
+                .as_ref()
+                .filter(|v| v.open_to_close)
+                .map(|_| Arc::new(opened.opened_inode.clone())),
             _gc_pin: opened.gc_pin,
             inode_id: opened.inode_id,
             flags: opened.flags,
@@ -2659,6 +2772,7 @@ impl DistributedFs {
             gc_references: None,
             optimistic_gc_commit: false,
             crc32c_writes: false,
+            native_open_read_authority: false,
             gc_gate: Mutex::new(()),
             dir_handles: Mutex::new(HashMap::new()),
             inode_writes: ShardedMap::default(),
@@ -2702,10 +2816,11 @@ impl DistributedFs {
             closed_lock_sessions: Mutex::new(HashSet::new()),
             closed_lock_session_admission_closed: AtomicBool::new(false),
             remote_operation_results: Mutex::new(HashMap::new()),
-            readonly_version_cache: Mutex::new(ReadOnlyVersionCache::new(
+            readonly_version_gates: Arc::new(Default::default()),
+            readonly_version_cache: Arc::new(Mutex::new(ReadOnlyVersionCache::new(
                 DEFAULT_VERSION_CACHE_ENTRIES,
                 DEFAULT_VERSION_CACHE_BYTES,
-            )),
+            ))),
             readonly_empty_version: Arc::new(ReadOnlyVersion::empty()),
             dirty_budget_bytes: DEFAULT_DIRTY_DATA_BUDGET_BYTES,
             write_buffer_pool: WriteBufferPool::new(128 * 1024 * 1024),
@@ -2727,6 +2842,13 @@ impl DistributedFs {
         self.gc_references = references;
         self
     }
+    pub(crate) fn with_native_open_read_authority(mut self, enabled: bool) -> Self {
+        if self.native_open_read_authority != enabled {
+            self.native_open_read_authority = enabled;
+        }
+        self
+    }
+
     pub(crate) fn with_crc32c_writes(mut self, enabled: bool) -> Self {
         self.crc32c_writes = enabled;
         self
@@ -3757,21 +3879,23 @@ impl DistributedFs {
         self
     }
 
-    pub(crate) fn with_version_cache_capacity(mut self, capacity: usize) -> Self {
-        let cache = self
+    pub(crate) fn with_version_cache_capacity(self, capacity: usize) -> Self {
+        let mut cache = self
             .readonly_version_cache
-            .get_mut()
+            .lock()
             .unwrap_or_else(|error| error.into_inner());
         *cache = ReadOnlyVersionCache::new(capacity, cache.byte_limit);
+        drop(cache);
         self
     }
 
-    pub(crate) fn with_version_cache_bytes(mut self, bytes: u64) -> Self {
-        let cache = self
+    pub(crate) fn with_version_cache_bytes(self, bytes: u64) -> Self {
+        let mut cache = self
             .readonly_version_cache
-            .get_mut()
+            .lock()
             .unwrap_or_else(|error| error.into_inner());
         *cache = ReadOnlyVersionCache::new(cache.capacity, usize::try_from(bytes).unwrap_or(0));
+        drop(cache);
         self
     }
 
@@ -3884,8 +4008,27 @@ impl DistributedFs {
         let id = self.next_handle.fetch_add(1, Ordering::Relaxed);
         let inode_id = handle.inode_id.clone();
         if let Some(references) = &self.gc_references {
-            handle.gc_pin =
-                Some(references.pin(&inode_id, handle.opened_inode.head_version.as_ref(), None)?);
+            handle.gc_pin = if handle
+                .native_read_view
+                .as_ref()
+                .is_some_and(|v| v.open_to_close)
+            {
+                if let Some(version) = handle.opened_inode.head_version.as_ref() {
+                    let cached = self.readonly_version_for_inode(&handle.opened_inode)?;
+                    Some(references.pin_open_read(
+                        &inode_id,
+                        crate::dfs::OpenReadIdentity {
+                            version_id: version.clone(),
+                            layout_root_id: cached.layout.id.clone(),
+                            closed: false,
+                        },
+                    )?)
+                } else {
+                    Some(references.pin(&inode_id, None, None)?)
+                }
+            } else {
+                Some(references.pin(&inode_id, handle.opened_inode.head_version.as_ref(), None)?)
+            };
         }
         self.handles.insert(id, handle, || {
             let dynamic = self.write_state(&inode_id)?.is_some()
@@ -4452,6 +4595,7 @@ impl DistributedFs {
                 expiry.min(started + NATIVE_READ_VIEW_TTL)
             });
         Ok(NativeReadView {
+            open_to_close: false,
             generation: 0,
             authority,
             deadline,
@@ -4523,7 +4667,21 @@ impl DistributedFs {
         }
     }
 
+    #[cfg(test)]
     fn native_inode_for_read(
+        &self,
+        handle: FileHandle,
+        snapshot: &DfsFileHandleSnapshot,
+    ) -> NativeReadRefreshResult {
+        let mut result = None;
+        self.read_engine.run_sync_boundary(Box::pin(async {
+            result = Some(self.native_inode_for_read_async(handle, snapshot).await?);
+            Ok(())
+        }))?;
+        result.ok_or_else(|| unavailable("read refresh produced no result"))
+    }
+
+    async fn native_inode_for_read_async(
         &self,
         handle: FileHandle,
         snapshot: &DfsFileHandleSnapshot,
@@ -4578,18 +4736,26 @@ impl DistributedFs {
             }
         };
         if !leader {
-            let result = flight.wait(self, &operation)?;
+            let result = flight.wait_async(self, &operation).await?;
             self.check_native_read_view(&result.1)?;
             return Ok(result);
         }
-        let result = (|| {
+        let mut retirement = NativeRefreshLeader {
+            opened: opened.clone(),
+            flight: flight.clone(),
+            completed: false,
+        };
+        let result = async {
             loop {
                 self.check_native_read_view(&operation)?;
                 let inode = Arc::new(
                     self.validate_inode(
-                        tracing::info_span!("node.dfs.read.head", inode_id = %snapshot.inode_id.0,
-                        branch = "inode", cached = false)
-                        .in_scope(|| self.meta.get_inode(&snapshot.inode_id))
+                        tokio::time::timeout_at(
+                            tokio::time::Instant::from_std(operation.deadline),
+                            self.meta.get_inode_async(snapshot.inode_id.clone()),
+                        )
+                        .await
+                        .map_err(|_| unavailable("DFS native inode refresh expired"))?
                         .inspect_err(|error| {
                             self.invalidate_native_handle_view_on_error(handle, error)
                         })?,
@@ -4623,7 +4789,8 @@ impl DistributedFs {
                 current.opened_page_identity = None;
                 return Ok((inode, view));
             }
-        })();
+        }
+        .await;
         // Complete every ordinary error path for all joined readers. Clearing
         // only our own flight prevents a late completion retiring another one.
         if let Ok(mut current) = opened.state.lock()
@@ -4635,6 +4802,7 @@ impl DistributedFs {
             current.refresh = None;
         }
         flight.finish(result.clone())?;
+        retirement.completed = true;
         result
     }
 
@@ -4644,133 +4812,24 @@ impl DistributedFs {
         snapshot: &DfsFileHandleSnapshot,
         offset: u64,
         size: usize,
-    ) -> Result<Vec<u8>> {
-        self.read_engine.validate_native_read_size(size)?;
-        if snapshot.native_denial_serial == u64::MAX {
-            return Err(unavailable("DFS native read denial serial exhausted"));
-        }
-        let operation = self.capture_native_read_view()?;
-        let mut fetch_hint = None;
-        let mut fetched_deadline = None;
-        let result = (|| {
-            if snapshot.handle.dynamic_read_route.load(Ordering::Acquire)
-                && let Some(remote) = self.remote_provider_visible_for_reads(&snapshot.inode_id)?
-            {
-                return self.remote_read_owned(&remote, offset, size);
-            }
-            if snapshot.handle.dynamic_read_route.load(Ordering::Acquire)
-                && self.write_state(&snapshot.inode_id)?.is_some()
-            {
-                let mut out = vec![0; size];
-                let count = self.read_visible_from_handle_inode(
+    ) -> Result<prost::bytes::Bytes> {
+        let mut result = None;
+        let deadline = Instant::now() + self.read_engine.read_pipeline_timeout();
+        self.read_engine.run_sync_boundary(Box::pin(async {
+            result = Some(
+                self.read_native_bytes_async(
                     handle,
-                    &snapshot.inode_id,
-                    Some(&snapshot.opened_inode),
+                    snapshot,
                     offset,
-                    &mut out,
-                )?;
-                out.truncate(count);
-                return Ok(out);
-            }
-            let (inode, view) = self.native_inode_for_read(handle, snapshot)?;
-            let out = self.read_committed_inode_owned_hint(
-                &inode,
-                offset,
-                size,
-                &mut fetch_hint,
-                Some(operation.deadline.min(view.deadline)),
-            )?;
-            fetched_deadline = Some(view.deadline);
-            #[cfg(test)]
-            {
-                let hook = self.native_read_after_committed.lock().unwrap().take();
-                if let Some(hook) = hook {
-                    hook();
-                }
-            }
-            self.check_native_read_view(&view)?;
-            // A successful parallel refresh does not revoke this operation's
-            // committed version. The final authority/denial fence below still
-            // protects output from known invalidation and handle retirement.
-            Ok(out)
-        })()
-        .inspect_err(|error| {
-            self.invalidate_native_handle_view_on_error(handle, error);
-        })?;
-        #[cfg(test)]
-        {
-            let hook = self.native_read_before_delivery.lock().unwrap().take();
-            if let Some(hook) = hook {
-                hook();
-            }
-        }
-        // Local, dirty, empty and owner-proxy paths also validate before a
-        // private result escapes. A known rejection has a separate serial:
-        // normal publication may change generation without cancelling itself.
-        self.check_native_read_view(&operation)?;
-        if snapshot.handle.closed.load(Ordering::Acquire) {
-            return Err(stale("DFS file handle is no longer open"));
-        }
-        let mut current = snapshot
-            .handle
-            .state
-            .lock()
-            .map_err(|_| unavailable("DFS handle state is poisoned"))?;
-        if current.native_denial_serial != snapshot.native_denial_serial {
-            return Err(unavailable(
-                "DFS native read authorization changed before delivery",
-            ));
-        }
-        let hint = fetch_hint.and_then(|batch: ReadBatch| {
-            let version = batch.file_version_id.as_ref()?;
-            let mut hash = blake3::Hasher::new();
-            hash.update(&(version.0.len() as u64).to_le_bytes());
-            hash.update(version.0.as_bytes());
-            hash.update(batch.layout_root_id.0.as_bytes());
-            let window = current.read_sequence.record(
-                *hash.finalize().as_bytes(),
-                offset,
-                result.len(),
-                self.read_engine.readahead_object_limit(),
+                    size,
+                    deadline,
+                    Arc::new(()),
+                )
+                .await?,
             );
-            Some((
-                batch,
-                window,
-                current.read_sequence.generation(),
-                current.native_read_generation,
-            ))
-        });
-        drop(current);
-        if let Some((batch, window, sequence, view_generation)) = hint {
-            let handle = Arc::downgrade(&snapshot.handle);
-            let denial_serial = snapshot.native_denial_serial;
-            let deadline = fetched_deadline.unwrap_or(operation.deadline);
-            // No handle table/mutable state lock is held while scheduling work.
-            self.read_engine.prefetch_cached(
-                &batch,
-                window,
-                Arc::new(move || {
-                    let handle = handle
-                        .upgrade()
-                        .ok_or_else(|| stale("DFS prefetch handle closed"))?;
-                    if handle.closed.load(Ordering::Acquire) || Instant::now() >= deadline {
-                        return Err(stale("DFS prefetch handle view retired"));
-                    }
-                    let state = handle
-                        .state
-                        .lock()
-                        .map_err(|_| unavailable("DFS prefetch handle state poisoned"))?;
-                    if state.native_denial_serial != denial_serial
-                        || state.native_read_generation != view_generation
-                        || state.read_sequence.generation() != sequence
-                    {
-                        return Err(unavailable("DFS prefetch handle scope changed"));
-                    }
-                    Ok(())
-                }),
-            );
-        }
-        Ok(result)
+            Ok(())
+        }))?;
+        result.ok_or_else(|| unavailable("synchronous read boundary produced no result"))
     }
 
     fn read_visible_from_handle_inode(
@@ -4892,9 +4951,11 @@ impl DistributedFs {
         offset: u64,
         size: usize,
     ) -> Result<Vec<u8>> {
-        self.read_committed_inode_owned_hint(inode, offset, size, &mut None, None)
+        self.read_committed_inode_owned_hint(inode, offset, size, &mut None, None, None)
+            .map(crate::node::read_buffer::ReadBuffer::into_vec)
     }
 
+    #[cfg(test)]
     fn read_committed_inode_owned_hint(
         &self,
         inode: &InodeRecord,
@@ -4902,19 +4963,22 @@ impl DistributedFs {
         size: usize,
         hint: &mut Option<ReadBatch>,
         deadline: Option<Instant>,
-    ) -> Result<Vec<u8>> {
+        open_reference: Option<&str>,
+    ) -> Result<crate::node::read_buffer::ReadBuffer> {
         let cached = self.readonly_version_for_inode(inode)?;
         let length = cached.layout.file_length;
         if offset >= length || size == 0 {
-            return Ok(Vec::new());
+            return Ok(Vec::new().into());
         }
         let count = usize::try_from((length - offset).min(size as u64))
             .map_err(|_| invalid("read length is too large"))?;
         let batch = cached.read_batch(offset, count, self.read_engine.source_lookahead_chunks())?;
-        if let Some(result) = self
-            .read_engine
-            .read_batch_native_owned_before(&batch, count, deadline)?
-        {
+        if let Some(result) = self.read_engine.read_batch_native_open_owned_before(
+            &batch,
+            count,
+            deadline,
+            open_reference,
+        )? {
             if self.read_engine.readahead_object_limit() != 0 {
                 *hint = Some(batch);
             }
@@ -4922,11 +4986,16 @@ impl DistributedFs {
         }
         let mut result = vec![0; count];
         self.read_engine
-            .read_batch_native_into_private_before(&batch, &mut result, deadline)?;
+            .read_batch_native_open_into_private_before(
+                &batch,
+                &mut result,
+                deadline,
+                open_reference,
+            )?;
         if self.read_engine.readahead_object_limit() != 0 {
             *hint = Some(batch);
         }
-        Ok(result)
+        Ok(result.into())
     }
 
     fn read_visible_resolved(
@@ -5151,8 +5220,15 @@ impl DistributedFs {
             if state.write_session.is_some() || state.opened_inode.kind != InodeKind::Regular {
                 return None;
             }
-            self.check_native_read_view(state.native_read_view.as_ref()?)
-                .ok()?;
+            // A stale optimization view must be refreshed in the async route,
+            // never select a worker-blocking network implementation.
+            if let Some(authority) = opened.open_read_authority.as_ref() {
+                self.read_engine.check_open_read_epoch(authority).ok()?;
+            }
+            if opened.open_read_inode.is_none() {
+                self.check_native_read_view(state.native_read_view.as_ref()?)
+                    .ok()?;
+            }
         }
         Some(opened)
     }
@@ -10033,31 +10109,6 @@ impl DistributedFs {
         Ok(count)
     }
 
-    fn remote_read_owned(
-        &self,
-        provider: &RemoteDfsProviderIo,
-        offset: u64,
-        length: usize,
-    ) -> Result<Vec<u8>> {
-        self.read_engine.validate_native_read_size(length)?;
-        if length == 0 {
-            return Ok(Vec::new());
-        }
-        let remote = &provider.remote;
-        let handle = remote.read_handle.as_ref().unwrap_or(&remote.handle);
-        let reply = remote
-            .owner
-            .read(afs_protocol::node_data::DfsOwnerReadRequest {
-                handle: Some(Self::data_owner_handle(handle)),
-                offset,
-                length: length as u64,
-            })?;
-        if reply.data.len() > length {
-            return Err(invalid("DFS owner read returned more bytes than requested"));
-        }
-        Ok(reply.data)
-    }
-
     fn remote_getattr(&self, provider: &RemoteDfsProviderIo) -> Result<FileAttributes> {
         let remote = &provider.remote;
         let reply = remote
@@ -11115,6 +11166,14 @@ impl CommitReason {
 }
 
 impl Backend for DistributedFs {
+    fn fixed_read_view(&self, handle: FileHandle) -> bool {
+        self.handles
+            .get(handle.0)
+            .ok()
+            .flatten()
+            .is_some_and(|opened| opened.open_read_inode.is_some())
+    }
+
     fn page_cache_identity(&self, handle: FileHandle) -> Option<PageCacheIdentity> {
         let opened = self.native_read_capability(handle)?;
         let state = opened.state.lock().ok()?;
@@ -11565,6 +11624,10 @@ impl Backend for DistributedFs {
     ) -> Result<FileAttributes> {
         if let Some(handle) = handle {
             let snapshot = self.handle_snapshot(handle)?;
+            if let Some(opened) = snapshot.handle.open_read_inode.as_ref() {
+                let (size, blocks) = self.inode_size_and_blocks(opened)?;
+                return Ok(attributes(opened, size, blocks));
+            }
             if let Some(remote) = self.remote_provider_visible_for_reads(&snapshot.inode_id)? {
                 return self.remote_getattr(&remote).inspect_err(|error| {
                     self.invalidate_native_inode_views_on_error(&snapshot.inode_id, error);
@@ -11888,10 +11951,12 @@ impl Backend for DistributedFs {
         options: OpenOptions,
     ) -> Result<FileHandle> {
         let inode_id = self.inode_id(inode)?;
-        let native_read_view = if !self.read_engine.has_external_backend()
+        let mut native_read_view = if !self.read_engine.has_external_backend()
             && flags & libc::O_ACCMODE == libc::O_RDONLY
         {
-            Some(self.capture_native_read_view()?)
+            let mut view = self.capture_native_read_view()?;
+            view.open_to_close = self.native_open_read_authority;
+            Some(view)
         } else {
             None
         };
@@ -11962,11 +12027,15 @@ impl Backend for DistributedFs {
             };
             (inode, None)
         };
-        let opened_page_identity = if native_read_view.is_some()
+        let committed_read_only = native_read_view.is_some()
             && opened_inode.kind == InodeKind::Regular
             && self.write_state(&inode_id)?.is_none()
-            && self.current_remote_provider(&inode_id)?.is_none()
-        {
+            && self.current_remote_provider(&inode_id)?.is_none();
+        if let Some(view) = native_read_view.as_mut() {
+            // Keep accepted dirty/proxy views on their existing read path.
+            view.open_to_close &= committed_read_only;
+        }
+        let opened_page_identity = if committed_read_only {
             // The first version/layout cache miss costs one Meta RPC, outside
             // all handle locks. Authority still starts before the inode RPC.
             Some(self.opened_page_identity(&opened_inode)?)
@@ -12018,6 +12087,39 @@ impl Backend for DistributedFs {
         )
     }
 
+    fn supports_async_reads(&self) -> bool {
+        self.read_engine.async_read_enabled()
+    }
+
+    fn read_reply_async(
+        self: Arc<Self>,
+        _ctx: RequestContext,
+        handle: FileHandle,
+        offset: u64,
+        size: usize,
+        deadline: Instant,
+        lifetime: crate::node::read_pipeline::ReadLifetime,
+    ) -> Result<Option<crate::node::read_pipeline::ReadReplyFuture>> {
+        self.prepare_native_async_read(handle, offset, size, deadline, lifetime)
+    }
+
+    fn read_reply(
+        &self,
+        ctx: &RequestContext,
+        handle: FileHandle,
+        offset: u64,
+        size: usize,
+    ) -> Result<prost::bytes::Bytes> {
+        if self.read_engine.has_external_backend() {
+            return self.read_owned(ctx, handle, offset, size).map(Into::into);
+        }
+        let snapshot = self.handle_snapshot(handle)?;
+        if snapshot.flags & libc::O_ACCMODE == libc::O_WRONLY {
+            return Err(bad_file_descriptor("DFS handle was not opened for reading"));
+        }
+        self.read_native_owned(handle, &snapshot, offset, size)
+    }
+
     fn read_owned(
         &self,
         ctx: &RequestContext,
@@ -12030,7 +12132,9 @@ impl Backend for DistributedFs {
             return Err(bad_file_descriptor("DFS handle was not opened for reading"));
         }
         if !self.read_engine.has_external_backend() {
-            return self.read_native_owned(handle, &snapshot, offset, size);
+            return self
+                .read_native_owned(handle, &snapshot, offset, size)
+                .map(|bytes| bytes.to_vec());
         }
         let fallback = || {
             let mut out = vec![0; size];
@@ -12761,6 +12865,19 @@ impl Backend for DistributedFs {
             .handles
             .remove(handle.0)?
             .ok_or_else(|| stale("DFS file handle is no longer open"))?;
+        if let Some(pin) = removed
+            ._gc_pin
+            .as_ref()
+            .filter(|p| p.open_read_reference().is_some())
+        {
+            let meta_result = pin.close_open_read();
+            let peer_result = self.read_engine.close_open_read_context(
+                pin.open_read_reference()
+                    .ok_or_else(|| stale("open read reference missing"))?,
+            );
+            meta_result?;
+            peer_result?;
+        }
         let session = removed
             .state
             .lock()
@@ -15928,6 +16045,8 @@ mod tests {
                     .expect("fixture must return the committed external chunk key");
             DfsExternalAuthorizedRead {
                 authorized: DfsAuthorizedRead {
+                    open_sources: Vec::new(),
+
                     validation,
                     allowed_ranges: vec![(0, chunk.length)],
                     expires_at_unix_ms: u64::MAX,
@@ -26130,6 +26249,100 @@ mod tests {
     }
 
     #[test]
+    fn open_authority_keeps_existing_dirty_reader_path() {
+        let (_temp, _meta, fs) = test_fs();
+        let fs = fs.with_native_open_read_authority(true);
+        let created = fs
+            .create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new("mixed.txt"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        fs.write(&context(), created.handle, 0, b"hello").unwrap();
+        let reader = fs
+            .open(&context(), created.entry.inode, libc::O_RDONLY)
+            .unwrap();
+        assert!(
+            fs.handle_snapshot(reader)
+                .unwrap()
+                .handle
+                .open_read_inode
+                .is_none()
+        );
+        assert_eq!(fs.read_owned(&context(), reader, 0, 16).unwrap(), b"hello");
+        fs.release(&context(), reader).unwrap();
+        fs.fsync(&context(), created.handle, SyncMode::DataOnly)
+            .unwrap();
+        fs.release(&context(), created.handle).unwrap();
+    }
+    #[test]
+    fn open_authority_local_stop_rejects_cached_bytes_and_eof() {
+        let (_temp, meta, fs, authority) = test_fs_with_native_authority();
+        let fs = fs.with_native_open_read_authority(true);
+        let inode_id = meta.inode.lock().unwrap().inode_id.clone();
+        publish_external_version_with_bytes(&meta, &fs, "open-stop", b"data");
+        let inode = fs.backend_inode(&inode_id).unwrap();
+        let reader = fs.open(&context(), inode, libc::O_RDONLY).unwrap();
+        assert_eq!(fs.read_owned(&context(), reader, 0, 16).unwrap(), b"data");
+        authority.stop();
+        let mut output = [7; 16];
+        assert!(fs.read(&context(), reader, 0, &mut output).is_err());
+        assert_eq!(output, [7; 16]);
+        assert!(fs.read_owned(&context(), reader, 99, 0).is_err());
+        fs.release(&context(), reader).unwrap();
+    }
+
+    #[test]
+    fn fast_open_fixed_eof_and_attributes_survive_new_shorter_open() {
+        let (_temp, meta, fs) = test_fs();
+        let fs = fs.with_native_open_read_authority(true);
+        let inode_id = meta.inode.lock().unwrap().inode_id.clone();
+        publish_external_version_with_bytes(&meta, &fs, "fixed-old", b"old-open-data");
+        let inode = fs.backend_inode(&inode_id).unwrap();
+        let old = fs.open(&context(), inode, libc::O_RDONLY).unwrap();
+        assert!(fs.fixed_read_view(old));
+        publish_external_version_with_bytes(&meta, &fs, "fixed-new", b"new");
+        let new = fs.open(&context(), inode, libc::O_RDONLY).unwrap();
+        assert_eq!(fs.getattr(&context(), inode, Some(old)).unwrap().size, 13);
+        assert_eq!(fs.getattr(&context(), inode, Some(new)).unwrap().size, 3);
+        assert_eq!(
+            fs.read_reply(&context(), old, 3, 32).unwrap().as_ref(),
+            b"-open-data"
+        );
+        assert!(fs.read_reply(&context(), new, 3, 32).unwrap().is_empty());
+        assert!(fs.read_reply(&context(), old, 13, 32).unwrap().is_empty());
+        fs.release(&context(), old).unwrap();
+        fs.release(&context(), new).unwrap();
+    }
+    #[test]
+    fn open_authority_readonly_keeps_opened_version_after_view_expiry() {
+        let (_temp, meta, fs) = test_fs();
+        let fs = fs.with_native_open_read_authority(true);
+        let inode_id = meta.inode.lock().unwrap().inode_id.clone();
+        publish_external_version_with_bytes(&meta, &fs, "open-authority-old", b"old-open-data");
+        let inode = fs.backend_inode(&inode_id).unwrap();
+        let reader = fs.open(&context(), inode, libc::O_RDONLY).unwrap();
+        publish_external_version_with_bytes(&meta, &fs, "open-authority-new", b"new-open-data");
+        expire_native_read_view(&fs, reader);
+        let old = fs.read_owned(&context(), reader, 0, 32).unwrap();
+        assert_eq!(
+            old, b"old-open-data",
+            "open-to-close must retain the opened version"
+        );
+        let next = fs.open(&context(), inode, libc::O_RDONLY).unwrap();
+        assert_eq!(
+            fs.read_owned(&context(), next, 0, 32).unwrap(),
+            b"new-open-data"
+        );
+        fs.release(&context(), reader).unwrap();
+        assert!(fs.read_owned(&context(), reader, 0, 1).is_err());
+        fs.release(&context(), next).unwrap();
+    }
+
+    #[test]
     fn p1_readonly_open_uses_one_fresh_get_inode() {
         let (_temp, meta, fs) = test_fs();
         let inode_id = meta.inode.lock().unwrap().inode_id.clone();
@@ -26442,6 +26655,51 @@ mod tests {
             output, [0xa5; 16],
             "denied read must leave output unchanged"
         );
+    }
+
+    #[test]
+    fn open_authority_release_racing_delivery_never_exposes_partial_output() {
+        let (_temp, meta, fs) = test_fs();
+        let fs = Arc::new(fs.with_native_open_read_authority(true));
+        let inode_id = meta.inode.lock().unwrap().inode_id.clone();
+        publish_external_version_with_bytes(&meta, &fs, "p1-close-race", b"data");
+        let reader = fs
+            .open(
+                &context(),
+                fs.backend_inode(&inode_id).unwrap(),
+                libc::O_RDONLY,
+            )
+            .unwrap();
+        let pause = Arc::new(NativeReadPause::default());
+        let _resume = ResumeNativeReadOnDrop(pause.clone());
+        let read_pause = pause.clone();
+        *fs.native_read_after_committed.lock().unwrap() =
+            Some(Box::new(move || read_pause.block()));
+        let read_fs = fs.clone();
+        let read = std::thread::spawn(move || {
+            let mut output = [0xa5; 16];
+            let result = read_fs.read(&context(), reader, 0, &mut output);
+            (result, output)
+        });
+        pause.wait_until_reached();
+        let release_fs = fs.clone();
+        let (entered, observed) = std::sync::mpsc::channel();
+        let release = std::thread::spawn(move || {
+            entered.send(()).unwrap();
+            release_fs.release(&context(), reader)
+        });
+        observed.recv_timeout(Duration::from_secs(5)).unwrap();
+        pause.resume();
+        let (result, output) = read.join().unwrap();
+        release.join().unwrap().unwrap();
+        if let Ok(count) = result {
+            assert_eq!(count, 4);
+            assert_eq!(&output[..4], b"data");
+            assert_eq!(&output[4..], &[0xa5; 12]);
+        } else {
+            assert_eq!(output, [0xa5; 16]);
+        }
+        assert!(fs.read_owned(&context(), reader, 0, 16).is_err());
     }
 
     #[test]
@@ -27571,6 +27829,66 @@ mod tests {
         let capped = cached.read_batch(0, 128 * 1024, 2).unwrap();
         assert_eq!(capped.ops, batch.ops);
         assert_eq!(capped.lookahead.len(), 2);
+    }
+
+    #[test]
+    fn read_equivalence_native_source_window_is_independent_of_first_concurrent_offset() {
+        const CHUNK: u64 = 4 * 1024 * 1024;
+        let id = FileVersionId::new("equivalent-query-version");
+        let root = LayoutRootId::new("equivalent-query-layout");
+        let layout = LayoutRoot {
+            id: root.clone(),
+            file_length: 256 * CHUNK,
+            inline_extents: (0..256)
+                .map(|index| Extent {
+                    file_offset: index * CHUNK,
+                    length: CHUNK,
+                    chunk_id: crate::dfs::ChunkId::new(format!("source-{index}")),
+                    chunk_offset: 0,
+                })
+                .collect(),
+        };
+        let version = FileVersion {
+            id: id.clone(),
+            inode_id: InodeId::new("query-file"),
+            parent_version: None,
+            length: layout.file_length,
+            layout_root: root,
+            created_at_unix_ms: 0,
+        };
+        let cached = ReadOnlyVersion::checked(&id, version, layout).unwrap();
+        for (offset, first, last) in [
+            (3 * CHUNK, 0, 64),
+            (68 * CHUNK, 65, 129),
+            (255 * CHUNK, 195, 255),
+        ] {
+            let batch = cached.native_read_batch(offset, 1024 * 1024, 64).unwrap();
+            let original = cached.read_batch(offset, 1024 * 1024, 64).unwrap();
+            assert_eq!(
+                batch.ops, original.ops,
+                "metadata grouping never widens payload reads"
+            );
+            let ids: std::collections::BTreeSet<_> = batch
+                .lookahead
+                .iter()
+                .chain(batch.ops.iter().map(|op| &op.chunk_id))
+                .map(|id| id.0.clone())
+                .collect();
+            let expected: std::collections::BTreeSet<_> =
+                (first..=last).map(|i| format!("source-{i}")).collect();
+            assert_eq!(
+                ids, expected,
+                "native metadata window must not depend on which concurrent offset arrives first"
+            );
+            assert!(batch.lookahead.len() <= 64);
+        }
+        assert!(
+            cached
+                .native_read_batch(3 * CHUNK, 1024 * 1024, 0)
+                .unwrap()
+                .lookahead
+                .is_empty()
+        );
     }
 
     #[test]
@@ -32584,4 +32902,5 @@ mod tests {
         )
         .unwrap();
     }
+    include!("dfs/unified_tests.inc.rs");
 }

@@ -55,6 +55,12 @@ pub trait Backend: Send + Sync {
         None
     }
 
+    /// Fixed-version handles own EOF in the backend; the shared kernel inode's
+    /// current size/page cache must not truncate an older handle's read.
+    fn fixed_read_view(&self, _handle: types::FileHandle) -> bool {
+        false
+    }
+
     /// Permit concurrent reads only when the backend preserves per-operation
     /// version, authority and deadline checks. The frontend still orders reads
     /// against write/resize/sync/release barriers on the same handle.
@@ -269,6 +275,37 @@ pub trait Backend: Send + Sync {
         let n = self.read(ctx, handle, offset, &mut out)?;
         out.truncate(n);
         Ok(out)
+    }
+
+    fn supports_async_reads(&self) -> bool {
+        false
+    }
+
+    /// Native remote read capability, chosen by backend transport, not a user
+    /// algorithm switch or a per-request layout. None is reserved for genuine
+    /// synchronous backends; a native future returns a body or an error.
+    fn read_reply_async(
+        self: std::sync::Arc<Self>,
+        _ctx: types::RequestContext,
+        _handle: types::FileHandle,
+        _offset: u64,
+        _size: usize,
+        _deadline: std::time::Instant,
+        _lifetime: crate::node::read_pipeline::ReadLifetime,
+    ) -> Result<Option<crate::node::read_pipeline::ReadReplyFuture>> {
+        Ok(None)
+    }
+
+    /// Keep private response ownership through the synchronous FUSE reply.
+    /// Legacy backends transfer their Vec allocation without copying.
+    fn read_reply(
+        &self,
+        ctx: &types::RequestContext,
+        handle: types::FileHandle,
+        offset: u64,
+        size: usize,
+    ) -> Result<prost::bytes::Bytes> {
+        self.read_owned(ctx, handle, offset, size).map(Into::into)
     }
 
     /// 返回底层确认的实际字节数；不能把部分成功或未知结果报成整笔成功。

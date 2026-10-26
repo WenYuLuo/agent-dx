@@ -228,3 +228,10 @@ cargo run -p afs-client --example usrbio_round_trip -- /run/afs/node.sock /mnt/a
 [架构](../docs/architecture/afs.md#本机-sdk-usrbio-数据面)。
 
 本轮 Linux 功能、门禁和五轮保护结果见[fd 接入验收记录](../docs/testing/2026-10-26-usrbio-posix-fd.md)。
+
+
+## 原生gRPC远端读调度
+
+原生gRPC读统一异步，等待Meta/网络时释放AFS工作线程；应用接口不变，不提供同步/异步选择开关。执行线程、已接纳任务、在途RPC、回复缓冲和A端读盘深度分别有界。固定版本/授权、同fh顺序和真实工作退役规则继续保留，本地磁盘及同步后端保留必要适配。
+
+[配置及最小编程范式](../docs/performance/afs-remote-read-20261024/read-concurrency.md)和[冻结候选/主线集成的验证边界](../docs/performance/afs-remote-read-20261024/unified-read-20261026.md)分别说明实现与证据。性能例外、缓存准备及既有兼容性遗留继续跟踪，不因代码合入自动准入。

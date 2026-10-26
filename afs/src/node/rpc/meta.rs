@@ -1143,6 +1143,10 @@ impl GrpcDfsMeta {
         afs_protocol::meta::meta_client::MetaClient::new(self.channel.clone())
     }
 
+    pub(crate) fn authorization_metrics(&self) -> Option<crate::node::read_work::ReadWorkMetrics> {
+        self.read_work.clone()
+    }
+
     pub fn validate_read_grants(
         &self,
         request: crate::dfs::ValidateDfsReadGrants,
@@ -1150,7 +1154,17 @@ impl GrpcDfsMeta {
         self.read_diagnostic(
             crate::node::read_work::ReadDiagnosticStage::MetaValidateReadGrants,
             || {
-                self.record_read_rpc("validate_read_grants");
+                self.record_read_rpc(
+                    if request
+                        .validations
+                        .first()
+                        .is_some_and(|v| v.grant.token.starts_with("dfs-open-v1:"))
+                    {
+                        "validate_open_read_context"
+                    } else {
+                        "validate_read_grants"
+                    },
+                );
                 let validations = request
                     .validations
                     .into_iter()
@@ -1207,6 +1221,7 @@ impl GrpcDfsMeta {
                                 .map(|range| (range.offset, range.length))
                                 .collect(),
                             expires_at_unix_ms: entry.expires_at_unix_ms,
+                            open_sources: entry.open_sources,
                         })
                     })
                     .collect()
@@ -1499,6 +1514,44 @@ impl crate::node::replication::ReplicationTaskAuthority for GrpcDfsMeta {
 
 #[cfg(feature = "dfs")]
 impl crate::node::dfs_read::ReadSourceProvider for GrpcDfsMeta {
+    fn sources_for_async(
+        &self,
+        request: crate::dfs::DfsChunkSourcesRequest,
+    ) -> crate::node::read_pipeline::ReadFuture<'_, crate::dfs::DfsChunkSourcesReply> {
+        Box::pin(async move {
+            self.record_read_rpc("get_chunk_sources");
+            let mut client = self.client();
+            let reply = tokio::time::timeout(
+                self.timeout,
+                client.get_chunk_sources(afs_tracing::request_with_current_context(
+                    afs_protocol::meta::GetDfsChunkSourcesRequest {
+                        caller_id: request.caller_id,
+                        namespace_id: request.namespace_id.0,
+                        file_version_id: request.file_version_id.0,
+                        layout_root_id: request.layout_root_id.0,
+                        chunk_ids: request.chunk_ids.into_iter().map(|id| id.0).collect(),
+                    },
+                )),
+            )
+            .await
+            .map_err(|_| {
+                afs_error::Error::coded(
+                    afs_error::CLIENT_DEADLINE_EXCEEDED,
+                    "async source lookup deadline exceeded",
+                )
+            })?
+            .map_err(afs_transport::grpc::error_status::status_to_error)?
+            .into_inner();
+            Ok(crate::dfs::DfsChunkSourcesReply {
+                revision: reply.revision,
+                chunks: reply
+                    .chunks
+                    .into_iter()
+                    .map(domain_dfs_chunk_sources)
+                    .collect::<afs_error::Result<Vec<_>>>()?,
+            })
+        })
+    }
     fn sources_for(
         &self,
         request: crate::dfs::DfsChunkSourcesRequest,
@@ -1953,6 +2006,66 @@ impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
                 required(reply.inode, "GetDfsInode.inode").and_then(domain_dfs_inode)
             },
         )
+    }
+
+    fn get_inode_async(
+        &self,
+        inode_id: crate::dfs::InodeId,
+    ) -> crate::node::read_pipeline::ReadFuture<'_, crate::dfs::InodeRecord> {
+        Box::pin(async move {
+            self.record_read_rpc("get_inode");
+            let mut client = self.client();
+            let reply = tokio::time::timeout(
+                self.timeout,
+                client.get_inode(afs_tracing::request_with_current_context(
+                    afs_protocol::meta::GetDfsInodeRequest {
+                        inode_id: inode_id.0,
+                    },
+                )),
+            )
+            .await
+            .map_err(|_| {
+                afs_error::Error::coded(
+                    afs_error::CLIENT_DEADLINE_EXCEEDED,
+                    "async inode lookup deadline exceeded",
+                )
+            })?
+            .map_err(afs_transport::grpc::error_status::status_to_error)?
+            .into_inner();
+            required(reply.inode, "GetDfsInode.inode").and_then(domain_dfs_inode)
+        })
+    }
+
+    fn get_file_version_async(
+        &self,
+        version_id: crate::dfs::FileVersionId,
+    ) -> crate::node::read_pipeline::ReadFuture<'_, (crate::dfs::FileVersion, crate::dfs::LayoutRoot)>
+    {
+        Box::pin(async move {
+            self.record_read_rpc("get_file_version");
+            let mut client = self.client();
+            let reply = tokio::time::timeout(
+                self.timeout,
+                client.get_file_version(afs_tracing::request_with_current_context(
+                    afs_protocol::meta::GetFileVersionRequest {
+                        version_id: version_id.0,
+                    },
+                )),
+            )
+            .await
+            .map_err(|_| {
+                afs_error::Error::coded(
+                    afs_error::CLIENT_DEADLINE_EXCEEDED,
+                    "async layout lookup deadline exceeded",
+                )
+            })?
+            .map_err(afs_transport::grpc::error_status::status_to_error)?
+            .into_inner();
+            Ok((
+                domain_dfs_version(required(reply.version, "GetFileVersion.version")?),
+                domain_dfs_layout(required(reply.layout, "GetFileVersion.layout")?),
+            ))
+        })
     }
 
     fn get_file_version(
@@ -3004,6 +3117,8 @@ fn domain_external_authorized_read(
     }
     Ok(crate::dfs::DfsExternalAuthorizedRead {
         authorized: crate::dfs::DfsAuthorizedRead {
+            open_sources: Vec::new(),
+
             validation: crate::dfs::DfsReadValidation {
                 grant: domain_dfs_read_grant(required(
                     validation.grant,
@@ -3872,6 +3987,8 @@ mod tests {
         let key = crate::dfs::external_object_key("filesystem", "g1", &chunk_id).unwrap();
         let valid = afs_protocol::meta::DfsExternalAuthorizedRead {
             authorized: Some(afs_protocol::meta::DfsAuthorizedRead {
+                open_sources: Vec::new(),
+
                 validation: Some(afs_protocol::meta::DfsReadValidation {
                     grant: Some(afs_protocol::meta::DfsReadGrant::default()),
                     chunk_id: chunk_id.0.clone(),
@@ -3948,6 +4065,8 @@ mod tests {
         let key = crate::dfs::external_object_key("filesystem", "g1", &chunk_id).unwrap();
         afs_protocol::meta::DfsExternalAuthorizedRead {
             authorized: Some(afs_protocol::meta::DfsAuthorizedRead {
+                open_sources: Vec::new(),
+
                 validation: Some(afs_protocol::meta::DfsReadValidation {
                     grant: Some(afs_protocol::meta::DfsReadGrant::default()),
                     chunk_id: chunk_id.0.clone(),
@@ -4608,6 +4727,17 @@ impl crate::node::gc::GcControl for GrpcDfsMeta {
     ) -> Result<()> {
         self.update_gc(id, Some(inode), version, publication, Vec::new(), false)
     }
+    fn retain_open_read(
+        &self,
+        id: &str,
+        inode: &crate::dfs::InodeId,
+        identity: &crate::dfs::OpenReadIdentity,
+    ) -> Result<()> {
+        self.update_open_read(id, Some(inode), Some(identity), false)
+    }
+    fn close_open_read(&self, id: &str) -> Result<()> {
+        self.update_open_read(id, None, None, true)
+    }
     fn retain_fenced(
         &self,
         id: &str,
@@ -4683,6 +4813,55 @@ impl crate::node::gc::GcControl for GrpcDfsMeta {
 }
 #[cfg(feature = "dfs")]
 impl GrpcDfsMeta {
+    fn update_open_read(
+        &self,
+        id: &str,
+        inode: Option<&crate::dfs::InodeId>,
+        identity: Option<&crate::dfs::OpenReadIdentity>,
+        close: bool,
+    ) -> Result<()> {
+        let _scope = self
+            .read_work
+            .as_ref()
+            .map(|m| m.authorization_scope(if close { "close_meta" } else { "open_meta" }));
+
+        self.record_read_rpc(if close {
+            "close_open_read_context"
+        } else {
+            "open_read_context"
+        });
+        let open_read = identity
+            .map(serde_json::to_vec)
+            .transpose()
+            .map_err(|_| {
+                afs_error::Error::coded(
+                    afs_error::CLIENT_ARGUMENT_INVALID,
+                    "open read identity encoding failed",
+                )
+            })?
+            .unwrap_or_default();
+        self.run(self.client().update_gc_reference(
+            afs_protocol::meta::UpdateDfsGcReferenceRequest {
+                node_id: self.node_id.clone(),
+                session_id: self.session_id.clone(),
+                reference_id: id.into(),
+                inode_id: inode.map(|v| v.0.clone()).unwrap_or_default(),
+                version_id: identity.map(|v| v.version_id.0.clone()).unwrap_or_default(),
+                publication: false,
+                chunks: Vec::new(),
+                release: false,
+                admission_deadline_unix_ms: if close {
+                    0
+                } else {
+                    crate::meta::store::now_unix_ms().saturating_add(30_000)
+                },
+                capture_gc_fence: false,
+                open_read,
+                close_open_read: close,
+            },
+        ))?;
+        Ok(())
+    }
     fn update_gc(
         &self,
         id: &str,
@@ -4712,6 +4891,9 @@ impl GrpcDfsMeta {
         let reply = self
             .run(
                 client.update_gc_reference(afs_protocol::meta::UpdateDfsGcReferenceRequest {
+                    open_read: Vec::new(),
+                    close_open_read: false,
+
                     capture_gc_fence,
                     node_id: self.node_id.clone(),
                     session_id: self.session_id.clone(),

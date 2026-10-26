@@ -49,6 +49,7 @@ message DataWriteReply {
 // DistributedFs replica commands. gRPC streaming and one-sided RDMA are two
 // byte movers below the same immutable Chunk/ReplicaAck state machine.
 service DfsChunks {
+  rpc CloseReadContext(DfsCloseReadContextRequest) returns (DfsCloseReadContextReply);
   rpc PutReplicaStream(stream DfsPutReplicaFrame) returns (DfsPutReplicaReply);
   rpc PutReplicaRdma(DfsPutReplicaRdmaRequest) returns (DfsPutReplicaReply);
   rpc ConfirmReplica(DfsConfirmReplicaRequest) returns (DfsReplicaAck);
@@ -83,6 +84,10 @@ enum DfsDigestAlgorithm {
   DFS_DIGEST_ALGORITHM_CRC32C_SEGMENTS_V1 = 2;
   // CRC32C of the exact returned range, after storage segment verification.
   DFS_DIGEST_ALGORITHM_CRC32C = 3;
+  // Read completion only: receiver verifies trusted complete CRC segments.
+  DFS_DIGEST_ALGORITHM_CRC32C_RECEIVER_ONLY = 4;
+  // Read completion only: explicitly configured unchecked body, never an ACK digest.
+  DFS_DIGEST_ALGORITHM_READ_UNCHECKED = 5;
 }
 
 message DfsStorageDevice {
@@ -805,3 +810,6 @@ message DfsOwnerSyncReply {
   uint64 durable_write_seq = 1;
   string file_version_id = 2;
 }
+
+message DfsCloseReadContextRequest { string context = 1; }
+message DfsCloseReadContextReply {}

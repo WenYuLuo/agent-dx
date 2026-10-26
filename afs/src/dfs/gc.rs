@@ -9,6 +9,8 @@ pub struct GcReference {
     pub publication: bool,
     pub chunks: Vec<ChunkObject>,
     pub retired_at_unix_ms: Option<u64>,
+    #[serde(default)]
+    pub open_read: Option<OpenReadIdentity>,
 }
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct GcState {
@@ -19,6 +21,8 @@ pub struct GcState {
 
 #[derive(Clone, Debug)]
 pub struct UpdateGcReference {
+    pub open_read: Option<OpenReadIdentity>,
+    pub close_open_read: bool,
     pub node_id: String,
     pub session_id: String,
     pub reference_id: String,
@@ -71,6 +75,54 @@ impl GcFence {
                 revision: StoreRevision(value),
             }),
             Self::WriteGeneration => None,
+        }
+    }
+}
+
+/// Immutable version held by one native read-only open. Closing authority does
+/// not release its GC reference while an in-flight handle user still owns it.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct OpenReadIdentity {
+    pub version_id: FileVersionId,
+    pub layout_root_id: LayoutRootId,
+    pub closed: bool,
+}
+
+#[cfg(test)]
+mod open_authority_tests {
+    use super::*;
+    #[test]
+    fn open_authority_reference_journal_codec_roundtrip() {
+        for identity in [
+            None,
+            Some(OpenReadIdentity {
+                version_id: FileVersionId::new("v"),
+                layout_root_id: LayoutRootId::new("l"),
+                closed: false,
+            }),
+            Some(OpenReadIdentity {
+                version_id: FileVersionId::new("v"),
+                layout_root_id: LayoutRootId::new("l"),
+                closed: true,
+            }),
+        ] {
+            let reference = GcReference {
+                node_id: "n".into(),
+                session_id: "s".into(),
+                reference_id: "read-open:r".into(),
+                inode_id: Some(InodeId::new("i")),
+                publication: false,
+                chunks: vec![],
+                retired_at_unix_ms: None,
+                open_read: identity,
+            };
+            let expected = (reference, true);
+            let bytes = postcard::to_allocvec(&expected).unwrap();
+            let restored: (GcReference, bool) = postcard::from_bytes(&bytes).unwrap();
+            assert_eq!(
+                restored, expected,
+                "optional context fields must not shift the following journal record"
+            );
         }
     }
 }

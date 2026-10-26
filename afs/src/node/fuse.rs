@@ -5,6 +5,8 @@
 //! 不能当作后端持久文件身份。OwnerFs 的独用 Home 根可短暂缓存；首次远端
 //! 访问先通过 FUSE notifier 失效本机缓存，再由 Home 执行该请求。
 
+#[cfg(feature = "dfs")]
+mod read_pipeline;
 mod state;
 use crate::node::api::usrbio::FdBridge;
 use afs_transport::usrbio_fd as fd_wire;
@@ -16,7 +18,7 @@ use std::{
     io,
     path::{Path, PathBuf},
     sync::{
-        Arc, Condvar, Mutex, RwLock,
+        Arc, Condvar, Mutex,
         atomic::{AtomicU64, Ordering},
     },
     thread,
@@ -33,6 +35,7 @@ use fuser::{
     ReplyLock, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, SessionACL, TimeOrNow,
     WriteFlags,
 };
+use tokio::sync::RwLock;
 
 #[cfg(feature = "ownerfs")]
 use crate::node::vfs::ownerfs::OwnerFs;
@@ -63,6 +66,8 @@ pub struct FuseMountOptions {
     pub fuse_threads: u16,
     pub fuse_clone_fd: bool,
     pub fuse_workers: u16,
+    pub fuse_max_tasks: Option<usize>,
+    pub dfs_read_pipeline: crate::node::read_pipeline::ReadPipelineLimits,
     pub dfs_fuse_keep_cache: bool,
     pub dfs_fuse_entry_ttl_ms: u32,
     pub dfs_fuse_attr_ttl_ms: u32,
@@ -75,6 +80,8 @@ impl Default for FuseMountOptions {
             fuse_threads: 4,
             fuse_clone_fd: true,
             fuse_workers: 32,
+            fuse_max_tasks: None,
+            dfs_read_pipeline: Default::default(),
             dfs_fuse_keep_cache: true,
             dfs_fuse_entry_ttl_ms: 0,
             dfs_fuse_attr_ttl_ms: 0,
@@ -89,6 +96,8 @@ impl From<&crate::config::Config> for FuseMountOptions {
             fuse_threads: config.fuse_threads,
             fuse_clone_fd: config.fuse_clone_fd,
             fuse_workers: config.fuse_workers,
+            fuse_max_tasks: Some(config.fuse_max_tasks),
+            dfs_read_pipeline: config.dfs_read_pipeline,
             dfs_fuse_keep_cache: config.dfs_fuse_keep_cache,
             dfs_fuse_entry_ttl_ms: config.dfs_fuse_entry_ttl_ms,
             dfs_fuse_attr_ttl_ms: config.dfs_fuse_attr_ttl_ms,
@@ -98,9 +107,18 @@ impl From<&crate::config::Config> for FuseMountOptions {
 }
 
 impl FuseMountOptions {
+    fn task_capacity(self) -> usize {
+        self.fuse_max_tasks
+            .unwrap_or(usize::from(self.fuse_workers) * 8)
+    }
+
     fn validate(self) -> Result<Self> {
+        self.dfs_read_pipeline.validate()?;
         if !(1..=64).contains(&self.fuse_threads)
             || !(1..=1024).contains(&self.fuse_workers)
+            || self
+                .fuse_max_tasks
+                .is_some_and(|n| !(1..=65_536).contains(&n))
             || self.dfs_fuse_entry_ttl_ms > 60_000
             || self.dfs_fuse_attr_ttl_ms > 60_000
             || self.fuse_max_readahead_bytes > 16 * 1024 * 1024
@@ -224,8 +242,8 @@ fn backend_read_data(
     handle: FileHandle,
     offset: u64,
     size: usize,
-) -> Result<Vec<u8>> {
-    backend.read_owned(ctx, handle, offset, size)
+) -> Result<prost::bytes::Bytes> {
+    backend.read_reply(ctx, handle, offset, size)
 }
 
 // Keep the diagnostic alive through the actual reply operation. Ending it at
@@ -594,12 +612,17 @@ fn mount_dfs_inner(
     fs.requests = metrics.map(|metrics| (metrics, "dfs"));
     #[cfg(any(feature = "dfs", test))]
     {
+        if let Some(metrics) = &read_work {
+            let _ = fs.dispatch.shared.activity.set(metrics.activities.clone());
+        }
         fs.read_work = read_work;
     }
     // Cached write-through sends each syscall write to the inode owner and
     // keeps this mount's pages coherent. KEEP_CACHE requires an exact fresh
     // committed identity; writeback remains disabled.
     fs.cached_io = true;
+    #[cfg(feature = "dfs")]
+    fs.enable_read_pipeline()?;
     let cleanup_error = fs.cleanup_error.clone();
     let session = fuser::spawn_mount(fs, &path, &configured_mount("afs-dfs", true, options))
         .map_err(Error::from)?;
@@ -814,7 +837,29 @@ enum FuseActive {
 
 enum FuseJob {
     Owned(Box<dyn FnOnce() + Send + 'static>),
+    // Nonblocking starter only: hand ownership to a future, never run IO or wait here.
+    Deferred(Box<dyn FnOnce(std::result::Result<FuseCompletion, i32>) + Send + 'static>),
     Borrowed(Arc<(Mutex<bool>, Condvar)>),
+}
+
+/// Owns the admitted task and its ordering turn after the worker is returned.
+/// Moving this into a future or completion event does not retire the request.
+struct FuseCompletion {
+    inner: Arc<FuseCompletionInner>,
+}
+struct FuseCompletionInner {
+    shared: Arc<FuseDispatchShared>,
+    turn: Option<FuseTurn>,
+}
+impl FuseCompletion {
+    fn hold(&self) -> crate::node::read_pipeline::ReadLifetime {
+        self.inner.clone()
+    }
+}
+impl Drop for FuseCompletionInner {
+    fn drop(&mut self) {
+        FuseDispatch::finish(&self.shared, self.turn.take());
+    }
 }
 
 // Unlike an owned worker callback, a borrowed callback runs on the receiver.
@@ -846,6 +891,7 @@ struct FuseDispatch {
 }
 
 struct FuseDispatchShared {
+    activity: std::sync::OnceLock<crate::node::read_activity::Activities>,
     queue: Mutex<FuseQueue>,
     ready: Condvar,
     capacity: Condvar,
@@ -884,8 +930,14 @@ struct FuseQueue {
 }
 
 impl FuseDispatch {
+    #[cfg(test)]
     fn new(workers: usize) -> Self {
+        Self::with_capacity(workers, workers * 8)
+    }
+
+    fn with_capacity(workers: usize, capacity: usize) -> Self {
         let shared = Arc::new(FuseDispatchShared {
+            activity: std::sync::OnceLock::new(),
             queue: Mutex::new(FuseQueue {
                 ready: VecDeque::new(),
                 waiting: HashMap::new(),
@@ -926,6 +978,10 @@ impl FuseDispatch {
                                 }
                                 Self::finish(&shared, key);
                             }
+                            FuseJob::Deferred(job) => {
+                                Self::start_deferred(&shared, key, job);
+                            }
+
                             FuseJob::Borrowed(turn) => {
                                 let (started, wake) = &*turn;
                                 *started.lock().expect("borrowed FUSE turn mutex poisoned") = true;
@@ -938,9 +994,24 @@ impl FuseDispatch {
                 })
                 .expect("FUSE worker thread must start");
         }
-        Self {
-            shared,
-            capacity: workers * 8,
+        Self { shared, capacity }
+    }
+
+    fn start_deferred(
+        shared: &Arc<FuseDispatchShared>,
+        turn: Option<FuseTurn>,
+        starter: impl FnOnce(std::result::Result<FuseCompletion, i32>),
+    ) {
+        let completion = FuseCompletion {
+            inner: Arc::new(FuseCompletionInner {
+                shared: shared.clone(),
+                turn,
+            }),
+        };
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| starter(Ok(completion))))
+            .is_err()
+        {
+            afs_logging::error!("FUSE deferred callback panicked");
         }
     }
 
@@ -957,6 +1028,12 @@ impl FuseDispatch {
             return;
         }
         queue.jobs += 1;
+        if let Some(metrics) = self.shared.activity.get() {
+            metrics.observe_count(
+                crate::node::read_activity::Activity::FuseTask,
+                queue.jobs as u64,
+            );
+        }
         queue.ready.push_back((None, FuseJob::Owned(Box::new(job))));
         self.shared.ready.notify_one();
     }
@@ -988,17 +1065,88 @@ impl FuseDispatch {
         self.submit_access(key, FuseAccess::Read, job);
     }
 
+    #[cfg(test)]
+    fn submit_read_deferred(&self, key: u64, job: impl FnOnce(FuseCompletion) + Send + 'static) {
+        self.submit_job(
+            key,
+            FuseAccess::Read,
+            FuseJob::Deferred(Box::new(move |result| {
+                if let Ok(completion) = result {
+                    job(completion);
+                }
+            })),
+        );
+    }
+
     fn submit_access(&self, key: u64, access: FuseAccess, job: impl FnOnce() + Send + 'static) {
-        let mut queue = self.shared.queue.lock().unwrap();
+        self.submit_job(key, access, FuseJob::Owned(Box::new(job)));
+    }
+
+    fn submit_read_deferred_until(
+        &self,
+        key: u64,
+        deadline: std::time::Instant,
+        job: impl FnOnce(std::result::Result<FuseCompletion, i32>) + Send + 'static,
+    ) {
+        if let Err((error, job)) = self.submit_job_until(
+            key,
+            FuseAccess::Read,
+            FuseJob::Deferred(Box::new(job)),
+            Some(deadline),
+        ) && let FuseJob::Deferred(job) = job
+        {
+            job(Err(error));
+        }
+    }
+
+    fn submit_job(&self, key: u64, access: FuseAccess, job: FuseJob) {
+        if let Err((_, job)) = self.submit_job_until(key, access, job, None) {
+            drop(job);
+        }
+    }
+
+    fn submit_job_until(
+        &self,
+        key: u64,
+        access: FuseAccess,
+        job: FuseJob,
+        deadline: Option<std::time::Instant>,
+    ) -> std::result::Result<(), (i32, FuseJob)> {
+        let mut queue = match self.shared.queue.lock() {
+            Ok(queue) => queue,
+            Err(_) => return Err((libc::EIO, job)),
+        };
         while queue.jobs >= self.capacity && !queue.closed {
-            queue = self.shared.capacity.wait(queue).unwrap();
+            queue = if let Some(deadline) = deadline {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err((libc::ETIMEDOUT, job));
+                }
+                match self.shared.capacity.wait_timeout(queue, remaining) {
+                    Ok((queue, _)) => queue,
+                    Err(_) => return Err((libc::EIO, job)),
+                }
+            } else {
+                match self.shared.capacity.wait(queue) {
+                    Ok(queue) => queue,
+                    Err(_) => return Err((libc::EIO, job)),
+                }
+            };
         }
         if queue.closed {
             drop(queue);
-            drop(job);
-            return;
+            return Err((libc::EIO, job));
+        }
+        if deadline.is_some_and(|value| std::time::Instant::now() >= value) {
+            return Err((libc::ETIMEDOUT, job));
         }
         queue.jobs += 1;
+        if let Some(metrics) = self.shared.activity.get() {
+            metrics.observe_count(
+                crate::node::read_activity::Activity::FuseTask,
+                queue.jobs as u64,
+            );
+        }
         // Readers can join only before an exclusive turn has queued. Counting
         // ready readers as active preserves the barrier before they execute.
         let join_reads = access == FuseAccess::Read
@@ -1019,18 +1167,27 @@ impl FuseDispatch {
                     *readers += 1;
                 }
             }
-            queue.ready.push_back((
-                Some(FuseTurn { key, access }),
-                FuseJob::Owned(Box::new(job)),
-            ));
+            let turn = Some(FuseTurn { key, access });
+            match job {
+                FuseJob::Deferred(starter) => {
+                    // Already eligible at admission: starting the owned future
+                    // needs no worker hop. Keep its counted task/order turn,
+                    // and release the queue lock before a starter can finish.
+                    drop(queue);
+                    Self::start_deferred(&self.shared, turn, starter);
+                    return Ok(());
+                }
+                job => queue.ready.push_back((turn, job)),
+            }
             self.shared.ready.notify_one();
         } else {
             queue
                 .waiting
                 .entry(key)
                 .or_default()
-                .push_back((access, FuseJob::Owned(Box::new(job))));
+                .push_back((access, job));
         }
+        Ok(())
     }
 
     fn finish(shared: &FuseDispatchShared, turn: Option<FuseTurn>) {
@@ -1039,6 +1196,12 @@ impl FuseDispatch {
             .lock()
             .expect("FUSE queue mutex poisoned at completion");
         queue.jobs -= 1;
+        if let Some(metrics) = shared.activity.get() {
+            metrics.observe_count(
+                crate::node::read_activity::Activity::FuseTask,
+                queue.jobs as u64,
+            );
+        }
         if let Some(FuseTurn { key, access }) = turn {
             let finished = match (access, queue.active.get_mut(&key)) {
                 (FuseAccess::Read, Some(FuseActive::Readers(readers))) => {
@@ -1111,6 +1274,12 @@ impl FuseDispatch {
             return;
         }
         queue.jobs += 1;
+        if let Some(metrics) = self.shared.activity.get() {
+            metrics.observe_count(
+                crate::node::read_activity::Activity::FuseTask,
+                queue.jobs as u64,
+            );
+        }
         if let std::collections::hash_map::Entry::Vacant(entry) = queue.active.entry(key) {
             entry.insert(FuseActive::Exclusive);
             drop(queue);
@@ -1167,20 +1336,22 @@ impl Drop for FuseDispatch {
 
 /// Short shard-table locks only protect gate identity and reference retirement.
 /// The per-inode lock, never the table lock, spans backend work and FUSE reply.
+type GateShard = Arc<Mutex<HashMap<u64, Arc<RwLock<()>>>>>;
+
 struct InodeCacheGates {
-    shards: [Mutex<HashMap<u64, Arc<RwLock<()>>>>; PAGE_CACHE_INODE_GATES],
+    shards: [GateShard; PAGE_CACHE_INODE_GATES],
 }
 
 impl Default for InodeCacheGates {
     fn default() -> Self {
         Self {
-            shards: std::array::from_fn(|_| Mutex::new(HashMap::new())),
+            shards: std::array::from_fn(|_| Arc::new(Mutex::new(HashMap::new()))),
         }
     }
 }
 
 impl InodeCacheGates {
-    fn acquire(&self, ino: u64) -> std::result::Result<InodeCacheGate<'_>, i32> {
+    fn acquire(&self, ino: u64) -> std::result::Result<InodeCacheGate, i32> {
         let shard = &self.shards[(ino % PAGE_CACHE_INODE_GATES as u64) as usize];
         let mut table = shard.lock().map_err(|_| libc::EIO)?;
         let gate = table
@@ -1188,7 +1359,7 @@ impl InodeCacheGates {
             .or_insert_with(|| Arc::new(RwLock::new(())))
             .clone();
         Ok(InodeCacheGate {
-            shard,
+            shard: shard.clone(),
             ino,
             gate: Some(gate),
         })
@@ -1197,31 +1368,41 @@ impl InodeCacheGates {
 
 /// Each lease owns one reference outside the table. It cannot be cloned:
 /// acquisition and final retirement must both serialize through the table lock.
-struct InodeCacheGate<'a> {
-    shard: &'a Mutex<HashMap<u64, Arc<RwLock<()>>>>,
+struct InodeCacheGate {
+    shard: GateShard,
     ino: u64,
     gate: Option<Arc<RwLock<()>>>,
 }
 
-impl InodeCacheGate<'_> {
-    fn read(&self) -> std::result::Result<std::sync::RwLockReadGuard<'_, ()>, i32> {
-        self.gate
-            .as_ref()
-            .ok_or(libc::EIO)?
-            .read()
-            .map_err(|_| libc::EIO)
+impl InodeCacheGate {
+    fn read(&self) -> std::result::Result<tokio::sync::RwLockReadGuard<'_, ()>, i32> {
+        let gate = self.gate.as_ref().ok_or(libc::EIO)?;
+        Ok(match gate.try_read() {
+            Ok(guard) => guard,
+            Err(_) => gate.blocking_read(),
+        })
     }
 
-    fn write(&self) -> std::result::Result<std::sync::RwLockWriteGuard<'_, ()>, i32> {
-        self.gate
-            .as_ref()
-            .ok_or(libc::EIO)?
-            .write()
-            .map_err(|_| libc::EIO)
+    fn write(&self) -> std::result::Result<tokio::sync::RwLockWriteGuard<'_, ()>, i32> {
+        let gate = self.gate.as_ref().ok_or(libc::EIO)?;
+        Ok(match gate.try_write() {
+            Ok(guard) => guard,
+            Err(_) => gate.blocking_write(),
+        })
+    }
+
+    async fn read_owned_until(
+        &self,
+        deadline: std::time::Instant,
+    ) -> std::result::Result<tokio::sync::OwnedRwLockReadGuard<()>, i32> {
+        let gate = self.gate.as_ref().ok_or(libc::EIO)?.clone();
+        tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), gate.read_owned())
+            .await
+            .map_err(|_| libc::ETIMEDOUT)
     }
 }
 
-impl Drop for InodeCacheGate<'_> {
+impl Drop for InodeCacheGate {
     fn drop(&mut self) {
         let Some(gate) = self.gate.take() else {
             return;
@@ -1263,6 +1444,10 @@ pub struct AfsFuse {
     state: Arc<Mutex<FuseState>>,
     file_handle_inodes: Arc<Mutex<HashMap<u64, u64>>>,
     dispatch: FuseDispatch,
+    #[cfg(feature = "dfs")]
+    read_runtime: Option<tokio::runtime::Handle>,
+    #[cfg(feature = "dfs")]
+    read_completions: Option<read_pipeline::ReadCompletions>,
     ingress_session_id: String,
     lock_session_cleaned: bool,
     callbacks_drained: bool,
@@ -1278,6 +1463,7 @@ impl AfsFuse {
             backend,
             FuseMountOptions {
                 fuse_workers: 8,
+                fuse_max_tasks: Some(64),
                 ..FuseMountOptions::default()
             },
         )
@@ -1298,7 +1484,14 @@ impl AfsFuse {
             inline_local_read_scratch: Mutex::new(Vec::new()),
             state,
             file_handle_inodes: Arc::new(Mutex::new(HashMap::new())),
-            dispatch: FuseDispatch::new(usize::from(mount_options.fuse_workers)),
+            dispatch: FuseDispatch::with_capacity(
+                usize::from(mount_options.fuse_workers),
+                mount_options.task_capacity(),
+            ),
+            #[cfg(feature = "dfs")]
+            read_runtime: None,
+            #[cfg(feature = "dfs")]
+            read_completions: None,
             ingress_session_id: next_ingress_session_id(),
             lock_session_cleaned: false,
             callbacks_drained: false,
@@ -1443,6 +1636,19 @@ impl Filesystem for AfsFuse {
         }
         for capability in negotiated_init_flags(config.capabilities()) {
             let _ = config.add_capabilities(capability);
+        }
+        #[cfg(feature = "dfs")]
+        if self.read_runtime.is_some() {
+            // Fixed-version reads use direct_io. Without ASYNC_DIO the kernel
+            // allows only one pending direct read per fh, regardless of workers.
+            config
+                .add_capabilities(InitFlags::FUSE_ASYNC_DIO)
+                .map_err(|missing| {
+                    io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        format!("async read pipeline needs kernel ASYNC_DIO: {missing:?}"),
+                    )
+                })?;
         }
         Ok(())
     }
@@ -2032,17 +2238,19 @@ impl Filesystem for AfsFuse {
                         });
                         return;
                     }
-                    let identity = if keep_cache && flags & libc::O_ACCMODE == libc::O_RDONLY {
-                        backend.page_cache_identity(handle)
-                    } else {
-                        None
-                    };
+                    let fixed_view = backend.fixed_read_view(handle);
+                    let identity =
+                        if !fixed_view && keep_cache && flags & libc::O_ACCMODE == libc::O_RDONLY {
+                            backend.page_cache_identity(handle)
+                        } else {
+                            None
+                        };
                     // Poisoned optimization state opts out; it never permits
                     // reuse based on an identity that could not be checked.
                     let keep = cache_ids
                         .lock()
                         .is_ok_and(|mut cache| cache.observe(ino, identity));
-                    let mut reply_flags = open_reply_flags(!cached_io);
+                    let mut reply_flags = open_reply_flags(!cached_io || fixed_view);
                     if keep {
                         reply_flags |= FopenFlags::FOPEN_KEEP_CACHE;
                     }
@@ -2074,6 +2282,11 @@ impl Filesystem for AfsFuse {
             bridge.note_fuse_data(false);
         }
 
+        #[cfg(feature = "dfs")]
+        let reply = match self.try_start_async_read(req, ino, fh, offset, size, reply) {
+            Some(reply) => reply,
+            None => return,
+        };
         #[cfg(any(feature = "dfs", test))]
         let diagnostic = self.read_work.as_ref().and_then(|metrics| {
             metrics.diagnostic(crate::node::read_work::ReadDiagnosticStage::FuseRead)
@@ -3106,7 +3319,8 @@ fn requested_init_flags() -> InitFlags {
     // Linux otherwise serializes LOOKUPs in one directory even when our FUSE
     // receive thread dispatches them to independent workers. Direct-IO mmap is
     // requested so mmap on direct_io handles remains capability-gated. Native
-    // DFS uses cached write-through and fresh-open version-bound page reuse.
+    // DFS normally uses cached write-through and version-bound page reuse;
+    // fixed-open read views select direct IO per handle to own their EOF.
     InitFlags::FUSE_PARALLEL_DIROPS | InitFlags::FUSE_DIRECT_IO_ALLOW_MMAP
 }
 
@@ -3604,6 +3818,131 @@ mod dispatch_tests {
     }
 
     #[test]
+    fn read_concurrency_ready_async_starter_does_not_wait_for_unrelated_worker() {
+        let dispatch = super::FuseDispatch::with_capacity(1, 3);
+        let (busy_tx, busy_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        dispatch.submit_keyed(101, move || {
+            busy_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        busy_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let (ticket_tx, ticket_rx) = std::sync::mpsc::channel();
+        dispatch.submit_read_deferred(102, move |ticket| ticket_tx.send(ticket).unwrap());
+        let early = ticket_rx.recv_timeout(Duration::from_millis(100));
+        let started_while_busy = early.is_ok();
+        release_tx.send(()).unwrap();
+        let ticket = early
+            .or_else(|_| ticket_rx.recv_timeout(Duration::from_secs(1)))
+            .unwrap();
+        drop(ticket);
+        dispatch.close_and_drain();
+        assert!(
+            started_while_busy,
+            "eligible async starter must not await an unrelated synchronous worker"
+        );
+        assert_eq!(dispatch.shared.queue.lock().unwrap().jobs, 0);
+    }
+
+    #[test]
+    fn read_concurrency_async_starter_preserves_prior_exclusive_turn() {
+        let dispatch = super::FuseDispatch::with_capacity(1, 3);
+        let (busy_tx, busy_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        dispatch.submit_keyed(103, move || {
+            busy_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        busy_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let (ticket_tx, ticket_rx) = std::sync::mpsc::channel();
+        dispatch.submit_read_deferred(103, move |ticket| ticket_tx.send(ticket).unwrap());
+        let early = ticket_rx.recv_timeout(Duration::from_millis(20));
+        let incorrectly_started = early.is_ok();
+        release_tx.send(()).unwrap();
+        let ticket = early
+            .or_else(|_| ticket_rx.recv_timeout(Duration::from_secs(1)))
+            .unwrap();
+        assert_eq!(dispatch.shared.queue.lock().unwrap().jobs, 1);
+        drop(ticket);
+        dispatch.close_and_drain();
+        assert!(
+            !incorrectly_started,
+            "async start must retain the same-fh exclusive barrier"
+        );
+    }
+
+    #[test]
+    fn read_concurrency_deferred_completion_releases_worker_but_keeps_fh_barrier() {
+        let dispatch = super::FuseDispatch::with_capacity(1, 3);
+        let (ticket_tx, ticket_rx) = std::sync::mpsc::channel();
+        dispatch.submit_read_deferred(71, move |ticket| ticket_tx.send(ticket).unwrap());
+        let ticket = ticket_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let (independent_tx, independent_rx) = std::sync::mpsc::channel();
+        dispatch.submit_keyed(72, move || independent_tx.send(()).unwrap());
+        independent_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let (exclusive_tx, exclusive_rx) = std::sync::mpsc::channel();
+        dispatch.submit_keyed(71, move || exclusive_tx.send(()).unwrap());
+        assert!(
+            exclusive_rx
+                .recv_timeout(Duration::from_millis(20))
+                .is_err()
+        );
+        assert_eq!(dispatch.shared.queue.lock().unwrap().jobs, 2);
+        drop(ticket);
+        exclusive_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        dispatch.close_and_drain();
+        assert_eq!(dispatch.shared.queue.lock().unwrap().jobs, 0);
+    }
+
+    #[test]
+    fn read_concurrency_child_work_keeps_task_turn_after_parent_drop() {
+        let dispatch = super::FuseDispatch::with_capacity(1, 3);
+        let (ticket_tx, ticket_rx) = std::sync::mpsc::channel();
+        dispatch.submit_read_deferred(75, move |ticket| ticket_tx.send(ticket).unwrap());
+        let ticket = ticket_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let child = ticket.hold();
+        drop(ticket);
+        let (exclusive_tx, exclusive_rx) = std::sync::mpsc::channel();
+        dispatch.submit_keyed(75, move || exclusive_tx.send(()).unwrap());
+        assert!(
+            exclusive_rx
+                .recv_timeout(Duration::from_millis(20))
+                .is_err()
+        );
+        assert_eq!(dispatch.shared.queue.lock().unwrap().jobs, 2);
+        drop(child);
+        exclusive_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        dispatch.close_and_drain();
+        assert_eq!(dispatch.shared.queue.lock().unwrap().jobs, 0);
+    }
+
+    #[test]
+    fn read_concurrency_explicit_capacity_can_be_lower_than_worker_count() {
+        let dispatch = Arc::new(super::FuseDispatch::with_capacity(4, 1));
+        let (ticket_tx, ticket_rx) = std::sync::mpsc::channel();
+        dispatch.submit_read_deferred(73, move |ticket| ticket_tx.send(ticket).unwrap());
+        let ticket = ticket_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (submitted_tx, submitted_rx) = std::sync::mpsc::channel();
+        let submitting = dispatch.clone();
+        let submitter = std::thread::spawn(move || {
+            submitting.submit_keyed(74, move || entered_tx.send(()).unwrap());
+            submitted_tx.send(()).unwrap();
+        });
+        assert!(
+            submitted_rx
+                .recv_timeout(Duration::from_millis(20))
+                .is_err()
+        );
+        assert!(entered_rx.try_recv().is_err());
+        drop(ticket);
+        submitted_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        submitter.join().unwrap();
+        dispatch.close_and_drain();
+    }
+
+    #[test]
     fn read_batch_overlaps_but_a_queued_exclusive_turn_fences_later_reads() {
         let dispatch = super::FuseDispatch::new(3);
         let (started_tx, started_rx) = std::sync::mpsc::channel();
@@ -3980,6 +4319,43 @@ mod dispatch_tests {
     }
 
     #[test]
+    fn buffer_reuse_backend_reply_holds_pool_owner_until_send_returns() {
+        struct PooledBackend {
+            pool: std::sync::Arc<crate::node::read_buffer::ReadBufferPool>,
+        }
+        impl super::Backend for PooledBackend {
+            fn root_inode(&self) -> super::BackendInode {
+                super::BackendInode { value: 1 }
+            }
+            fn read_reply(
+                &self,
+                _: &super::RequestContext,
+                _: super::FileHandle,
+                _: u64,
+                size: usize,
+            ) -> super::Result<prost::bytes::Bytes> {
+                let mut out = self.pool.take(size, None)?;
+                out.fill(23);
+                Ok(prost::bytes::Bytes::from_owner(out))
+            }
+        }
+        let backend = PooledBackend {
+            pool: crate::node::read_buffer::ReadBufferPool::new("reply"),
+        };
+        let reply =
+            super::backend_read_data(&backend, &test_context(), super::FileHandle(9), 0, 1024)
+                .unwrap();
+        let pointer = reply.as_ptr();
+        let held = reply.clone();
+        drop(reply);
+        let other = backend.pool.take(1024, None).unwrap();
+        assert_ne!(other.as_ptr(), pointer);
+        assert_eq!(&held[..], &[23; 1024]);
+        drop(held);
+        assert_eq!(backend.pool.take(1024, None).unwrap().as_ptr(), pointer);
+    }
+
+    #[test]
     fn backend_read_data_prefers_owned_response_without_buffered_read() {
         let backend = OwnedReadBackend {
             owned: b"private".to_vec(),
@@ -3989,7 +4365,7 @@ mod dispatch_tests {
         };
         let data = super::backend_read_data(&backend, &test_context(), super::FileHandle(9), 4, 32)
             .unwrap();
-        assert_eq!(data, b"private");
+        assert_eq!(data.as_ref(), b"private");
         assert_eq!(
             backend
                 .read_owned_calls
@@ -4034,7 +4410,7 @@ mod dispatch_tests {
         };
         let data = super::backend_read_data(&backend, &test_context(), super::FileHandle(9), 4, 32)
             .unwrap();
-        assert_eq!(data, b"fallback");
+        assert_eq!(data.as_ref(), b"fallback");
         assert_eq!(
             backend.read_calls.load(std::sync::atomic::Ordering::SeqCst),
             1

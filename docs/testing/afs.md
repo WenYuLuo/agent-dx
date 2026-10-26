@@ -1002,3 +1002,85 @@ sudo unshare --mount --net --propagation private sh -c '
 ```sh
 cargo test --release -p afs --lib pr93_fix_ -- --test-threads=1
 ```
+
+## Experimental native gRPC read CRC modes
+
+The isolated CRC read candidate adds `dfs_read_crc_mode = "both" | "receiver" | "off"` (CLI `--dfs-read-crc-mode`). Native DFS with `data_mode = "grpc"` defaults to `off`; native writes continue to generate CRC32C by default. Set `receiver` to opt in to B-side verification, or `both` for diagnostic checks at both ends. This setting affects native CRC-format peer reads over gRPC; it does not disable CRC generation, replica verification, fsync, local read verification, or recovery checks. Other backends and transports retain their existing `both` setting; explicit `off` or `receiver` overrides require native DFS and `data_mode = "grpc"`. The default data mode is already `grpc`; this change does not select a different transport.
+
+- `both`: A verifies stored segments; B verifies complete trusted segments. Exact boundary fragments retain the existing range checksum.
+- `receiver`: aligned complete segments are verified at B; fragments retain A covering-segment verification plus the exact-range check at B. This mode does not claim B can independently verify an incomplete stored segment.
+- `off`: peer-read body CRC is deliberately skipped at A and B. Corrupt stored bytes may be delivered successfully. Descriptor binding, authenticated identity, authorization, bounds, frame order, lengths, completion, resource limits and close behavior remain checked.
+
+A/B must agree via the explicit `x-afs-read-crc-mode` request metadata. New read-only completion algorithm tags prevent silent downgrade; old receivers reject unsupported modes. These tags are never accepted as stored object digests or replica durable-ACK digests. A configured mode mismatch fails before data delivery. Mixed-version rollout and non-CRC object support for the new modes are not admitted by this experiment.
+
+To enable optional B verification, set `dfs_read_crc_mode = "receiver"` on both A and B. A only needs to serve the matching policy for aligned complete segments; those segments are checked at B. A standalone B-only configuration change is not negotiated by the current implementation. Requests without the policy metadata retain the legacy `both` interpretation and therefore fail against an `off` server rather than silently changing their verification contract.
+
+Moving detection from A to B also moves the point where a corrupted copy becomes visible. This experiment retains existing candidate fallback, but its R1 corruption test proves detection/EIO or explicit unchecked delivery, not multi-replica quarantine, repair or self-healing. Previously recorded open-handle EOF and GC qualification boundaries remain separate.
+
+
+## Experimental native readonly open authority
+
+The isolated read candidate supports `dfs_native_open_read_authority = true` only with explicit native `data_mode = "grpc"`. The switch defaults to false. Eligible regular O_RDONLY handles with no dirty/proxy view pin their opened version/layout and reuse file-scoped authorization. The ordinary lane retains its lease checks. The off-only native fast lane binds a full Meta-authorized context to a trackable mTLS connection; source-page TTL does not expire that connected open. It retains fixed range/length/resource bounds without repeating per-frame authorization. Close prevents new admission; in-flight owners keep the existing durable GC pin until their last release.
+
+Fixed native handles use FOPEN_DIRECT_IO: actual Linux read/pread EOF remains tied to the opened version across truncate and a new open. This does not guarantee a per-fd fstat or mmap snapshot: fstat may report the shared inode's newer length. The new persisted GC context schema has only been checked with fresh isolated stores and same-version Meta/A/B. Migration, mixed versions and integration with prefetch/cache are not admitted.
+
+The [remote read candidate ledger](../performance/afs-remote-read-20261024/README.md) records the exact cohorts, Linux validation, retained failures and future work. Benchmark settings explicitly enable this switch, set `dfs_fuse_keep_cache=false` and `dfs_readahead_max_bytes=0`; merely using a new binary does not activate all candidate optimizations.
+
+The fixed-open retirement regressions also cover durable quarantine invalidating
+cached descriptors, repairing the same object before reopening it, a missing
+cold-open file returning an error without recursive cache locking, explicit
+close releasing the cache while admitted IO drains, real mTLS disconnect cleanup
+without a later read, and background retry after a lost close acknowledgment.
+The fast lane requires transport-provided connection identity; a missing identity
+keeps the ordinary lane. These are Linux component/RPC cases, not a claim of
+mixed-version, long-running or full multi-replica recovery acceptance.
+
+## Experimental native read buffer reuse
+
+The buffer candidate reads complete CRC segments directly into the final A-side
+send allocation and verifies them there when required. Unchecked peer ranges can
+also read directly; checked partial segments retain covering-segment verification
+and cropping. Catalog, file identity, authorization, descriptor and completion
+checks are retained. This also combines the previous small positioned reads;
+performance changes must not be attributed entirely to removing memcpy.
+
+A `Bytes` frame retains its payload and live budget lease until the last frame
+reference disappears. B assembles frames directly in its final contiguous reply
+allocation. `Backend::read_reply` retains that allocation through the synchronous
+FUSE reply, then returns it for reuse. Legacy `read_owned` Vec callers transfer
+ownership without copying, which deliberately removes that allocation from the
+pool. External, sparse and multi-operation fallbacks retain their existing paths.
+
+Each LocalChunkStore/reader engine has at most two idle allocations of at most
+1MiB actual capacity each; task readers share their parent pool. This is an
+additional idle limit of 2MiB per role, not part of A's existing 16MiB live-payload
+budget. Reused actual capacity remains charged to the live lease. B retains its
+existing per-operation inflight-size check; this change adds no global active-B
+budget. Larger allocations are not retained. Initialized storage is reused only
+for a complete private single-range result that must be overwritten before
+successful publication. Reused memory is not a data cache.
+
+`afs_dfs_read_buffer_events_total` and `afs_dfs_read_buffer_bytes_total` distinguish
+allocation, reuse, return-to-idle and explicit zeroing for `serve` and `reply`.
+`afs_dfs_read_buffer_idle_bytes` reports retained idle capacity. These counters
+cover final body buffers, not all protobuf/descriptor heap allocations. B's
+frame-assembly copy, transport and kernel/FUSE copies still exist; this is not an
+end-to-end zero-copy interface. No concurrency, prefetch, TLS or libfuse setting
+is changed by buffer reuse.
+
+```sh
+cargo test --release -p afs --lib buffer_reuse_ -- --test-threads=1
+```
+
+The targeted tests cover direct off-mode ranges including fragments/short tails,
+last-frame ownership and live leases, FUSE reply ownership, idle capacity, and
+zero-copy Vec ownership transfer. Existing CRC and native-read authority/error
+checks remain required. Performance needs a separate fixed, interleaved complete
+FUSE comparison; old CRC/open-authority timings are not a current baseline.
+
+
+## 原生异步远端读集成验证
+
+原生gRPC读现统一使用异步业务核心；重点核对固定版本/授权、CRC模式、同fh顺序、缓存/预取已有行为、取消后子工作真实退役、任务/RPC/缓冲/磁盘限额及超时恢复。同步SDK和真正同步后端只保留必要适配。
+
+[统一交付](../performance/afs-remote-read-20261024/unified-read-20261026.md)区分冻结候选Linux/FUSE/24次性能证据与最新主线集成门禁。多读者原单对+5.18%及缓存准备根因继续保留；完整性能未全部准入，云环境后续复测，不以机制计数替代完整耗时。

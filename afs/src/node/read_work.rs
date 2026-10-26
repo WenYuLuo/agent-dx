@@ -101,13 +101,58 @@ const NATIVE_WRITE_RESOURCES: &[&str] = &[
     "descriptor_limit_bytes",
 ];
 
+/// Fixed, prebound counters: no label lookup in the per-frame hot loop.
+#[derive(Clone, Copy)]
+pub(crate) enum ReadCheck {
+    RequestValidate,
+    ServeState,
+    CatalogOpen,
+    CatalogFence,
+    DescriptorEncode,
+    DescriptorDecode,
+    AuthorizeFull,
+    ContextReuse,
+    PeerRegister,
+    LocalProbe,
+    BatchGroup,
+    FullGrant,
+    CompactGrant,
+    ContextRecover,
+}
+const READ_CHECK_NAMES: [&str; 14] = [
+    "request_validate",
+    "serve_state",
+    "catalog_open",
+    "catalog_fence",
+    "descriptor_encode",
+    "descriptor_decode",
+    "authorize_full",
+    "context_reuse",
+    "peer_register",
+    "local_probe",
+    "batch_group",
+    "full_grant",
+    "compact_grant",
+    "context_recover",
+];
+
 #[derive(Clone, Debug)]
 pub struct ReadWorkMetrics {
+    pub(crate) activities: super::read_activity::Activities,
+    checks: [afs_metrics::IntCounter; 14],
     #[cfg(feature = "dfs")]
     native_write_resources: afs_metrics::IntGaugeVec,
     catalog_commit_resources: afs_metrics::IntGaugeVec,
     scan_bytes: afs_metrics::IntCounter,
     hashes: afs_metrics::IntCounterVec,
+    read_buffer_events: afs_metrics::IntCounterVec,
+    read_buffer_bytes: afs_metrics::IntCounterVec,
+    read_buffer_idle: afs_metrics::IntGaugeVec,
+    read_buffer_capacity: afs_metrics::IntGaugeVec,
+    crc_read_bytes: afs_metrics::IntCounterVec,
+    crc_read_calls: afs_metrics::IntCounterVec,
+    authorization_ns: afs_metrics::IntCounterVec,
+    authorization_calls: afs_metrics::IntCounterVec,
     outboard_total_bytes: afs_metrics::IntGauge,
     outboard_resident_bytes: afs_metrics::IntGauge,
     outboard_total_limit: afs_metrics::IntGauge,
@@ -213,6 +258,42 @@ impl ReadWorkMetrics {
                 "afs_dfs_read_scan_bytes_total",
                 "Logical file bytes read and hashed by complete immutable Chunk verification.",
             )?;
+            let authorization_ns = afs_metrics::IntCounterVec::new(afs_metrics::Opts::new("afs_dfs_read_authorization_nanoseconds_total", "Complete authorization scope wall time; scopes can nest and overlap."), &["stage"])?;
+            let authorization_calls = afs_metrics::IntCounterVec::new(afs_metrics::Opts::new("afs_dfs_read_authorization_calls_total", "Authorization scope calls, including cache hits and failures."), &["stage"])?;
+            for stage in ["total", "cache_maintenance", "meta_rpc", "open_meta", "close_meta", "close_peer"] { authorization_ns.with_label_values(&[stage]); authorization_calls.with_label_values(&[stage]); }
+            afs_metrics::register_collector(registry, &authorization_ns)?;
+            afs_metrics::register_collector(registry, &authorization_calls)?;
+            let checks = afs_metrics::IntCounterVec::new(afs_metrics::Opts::new("afs_dfs_read_checks_total", "Executed read control operations; fixed-stage counters, not elapsed time."), &["stage"])?;
+            let stages = [ReadCheck::RequestValidate, ReadCheck::ServeState, ReadCheck::CatalogOpen, ReadCheck::CatalogFence, ReadCheck::DescriptorEncode, ReadCheck::DescriptorDecode, ReadCheck::AuthorizeFull, ReadCheck::ContextReuse, ReadCheck::PeerRegister, ReadCheck::LocalProbe, ReadCheck::BatchGroup, ReadCheck::FullGrant, ReadCheck::CompactGrant, ReadCheck::ContextRecover];
+            let checks_bound = std::array::from_fn(|i| checks.with_label_values(&[READ_CHECK_NAMES[stages[i] as usize]]));
+            afs_metrics::register_collector(registry, &checks)?;
+            let read_buffer_events = afs_metrics::IntCounterVec::new(afs_metrics::Opts::new("afs_dfs_read_buffer_events_total", "Read buffer allocation/reuse/return events; zero counts explicit initialization."), &["role", "event"])?;
+            let read_buffer_bytes = afs_metrics::IntCounterVec::new(afs_metrics::Opts::new("afs_dfs_read_buffer_bytes_total", "Actual capacity allocated/reused/returned or explicit bytes zeroed."), &["role", "event"])?;
+            let read_buffer_idle = afs_metrics::IntGaugeVec::new(afs_metrics::Opts::new("afs_dfs_read_buffer_idle_bytes", "Idle initialized buffer capacity; native async idle plus active storage shares a fixed byte budget."), &["role"])?;
+            for role in ["serve", "reply"] {
+                read_buffer_idle.with_label_values(&[role]);
+                for event in ["allocate", "reuse", "return", "zero"] {
+                    read_buffer_events.with_label_values(&[role,event]);
+                    read_buffer_bytes.with_label_values(&[role,event]);
+                }
+            }
+            afs_metrics::register_collector(registry, &read_buffer_events)?;
+            afs_metrics::register_collector(registry, &read_buffer_bytes)?;
+            afs_metrics::register_collector(registry, &read_buffer_idle)?;
+            let read_buffer_capacity=afs_metrics::IntGaugeVec::new(afs_metrics::Opts::new("afs_dfs_read_buffer_capacity_bytes","Pool-owned storage by role/state; active plus idle equals total; legacy detached Vec storage excluded."), &["role","state"])?;
+            afs_metrics::register_collector(registry,&read_buffer_capacity)?;
+            let crc_read_bytes = afs_metrics::IntCounterVec::new(
+                afs_metrics::Opts::new("afs_dfs_crc32c_read_bytes_total", "Actual CRC32C read input bytes, including failed work; descriptor hashes are separate."), &["stage"],
+            )?;
+            let crc_read_calls = afs_metrics::IntCounterVec::new(
+                afs_metrics::Opts::new("afs_dfs_crc32c_read_calls_total", "Actual CRC32C read checksum invocations, including failed work."), &["stage"],
+            )?;
+            for stage in ["storage_segments", "range_send", "range_receive", "trusted_segments_receive"] {
+                crc_read_bytes.with_label_values(&[stage]);
+                crc_read_calls.with_label_values(&[stage]);
+            }
+            afs_metrics::register_collector(registry, &crc_read_bytes)?;
+            afs_metrics::register_collector(registry, &crc_read_calls)?;
             let hashes = afs_metrics::IntCounterVec::new(
                 afs_metrics::Opts::new(
                     "afs_dfs_read_hash_bytes_total",
@@ -224,7 +305,7 @@ impl ReadWorkMetrics {
                 "root_local_scan", "stream_range_hash", "peer_range_in_receive",
                 "root_in_receive", "root_fallback", "segment_index_bytes",
                 "cache_segment_hash", "cache_full_hash", "outboard_body_hash",
-                "outboard_parent_hash",
+                "outboard_parent_hash", "crc_descriptor_hash",
             ] { hashes.with_label_values(&[stage]); }
             #[cfg(any(feature = "dfs", test))]
             let disk_cache_metadata_bytes = afs_metrics::IntGauge::new(
@@ -534,6 +615,7 @@ impl ReadWorkMetrics {
                 "scan_to_range",
                 "pinned_range_to_output",
                 "range_to_frame",
+                "crc_storage_to_range",
                 "frame_to_attempt",
                 "attempt_to_staging",
                 "staging_to_output",
@@ -543,11 +625,21 @@ impl ReadWorkMetrics {
                 copies.with_label_values(&[stage]);
             }
             Ok(Self {
+                activities: super::read_activity::Activities::register(registry)?,
+                checks: checks_bound,
                 #[cfg(feature = "dfs")]
                 native_write_resources,
                 catalog_commit_resources,
                 scan_bytes,
                 hashes,
+                read_buffer_events,
+                read_buffer_bytes,
+                read_buffer_idle,
+                read_buffer_capacity,
+                crc_read_bytes,
+                crc_read_calls,
+                authorization_ns,
+                authorization_calls,
                 outboard_total_bytes,
                 outboard_resident_bytes,
                 outboard_total_limit,
@@ -683,6 +775,21 @@ impl ReadWorkMetrics {
         self.diagnostics.as_ref().map(|journal| journal.snapshot())
     }
 
+    pub(crate) fn authorization_scope(&self, stage: &'static str) -> ReadAuthorizationScope {
+        ReadAuthorizationScope {
+            metrics: self.clone(),
+            stage,
+            started: std::time::Instant::now(),
+        }
+    }
+
+    pub(crate) fn crc_read(&self, stage: &'static str, bytes: u64) {
+        self.crc_read_bytes
+            .with_label_values(&[stage])
+            .inc_by(bytes);
+        self.crc_read_calls.with_label_values(&[stage]).inc();
+    }
+
     pub(crate) fn hash(&self, stage: &'static str, bytes: u64) {
         if matches!(
             stage,
@@ -696,6 +803,7 @@ impl ReadWorkMetrics {
                 | "cache_full_hash"
                 | "outboard_body_hash"
                 | "outboard_parent_hash"
+                | "crc_descriptor_hash"
         ) {
             self.hashes.with_label_values(&[stage]).inc_by(bytes);
         }
@@ -1012,6 +1120,45 @@ impl ReadWorkMetrics {
         }
     }
 
+    pub(crate) fn read_buffer(&self, role: &'static str, event: &'static str, bytes: u64) {
+        self.read_buffer_events
+            .with_label_values(&[role, event])
+            .inc();
+        self.read_buffer_bytes
+            .with_label_values(&[role, event])
+            .inc_by(bytes);
+    }
+    pub(crate) fn read_buffer_capacity(
+        &self,
+        role: &'static str,
+        total: u64,
+        idle: u64,
+        limit: u64,
+        peak: u64,
+    ) {
+        for (name, value) in [
+            ("total", total),
+            ("active", total.saturating_sub(idle)),
+            ("idle", idle),
+            ("limit", limit),
+            ("peak", peak),
+        ] {
+            if let Ok(value) = i64::try_from(value) {
+                self.read_buffer_capacity
+                    .with_label_values(&[role, name])
+                    .set(value);
+            }
+        }
+    }
+    pub(crate) fn read_buffer_idle(&self, role: &'static str, bytes: u64) {
+        if let Ok(bytes) = i64::try_from(bytes) {
+            self.read_buffer_idle.with_label_values(&[role]).set(bytes);
+        }
+    }
+    pub(crate) fn check(&self, stage: ReadCheck) {
+        self.checks[stage as usize].inc();
+    }
+
     pub(crate) fn copy(&self, stage: &'static str, bytes: u64) {
         self.copies.with_label_values(&[stage]).inc_by(bytes);
     }
@@ -1110,6 +1257,10 @@ impl ReadWorkMetrics {
                 | "get_file_version"
                 | "get_chunk_sources"
                 | "validate_read_grants"
+                | "validate_open_read_context"
+                | "open_read_context"
+                | "close_open_read_context"
+                | "peer_close_open_read_context"
                 | "peer_read_ranges"
         ) {
             self.read_rpc_calls.with_label_values(&[method]).inc();
@@ -1372,7 +1523,11 @@ impl ReadDiagnosticConsumerWork {
 // One fixed entry per phase, not one event per frame or syscall. First/last
 // endpoints describe the aggregate envelope, not a contiguous critical path.
 #[cfg(any(feature = "dfs", test))]
-const READ_COARSE_PHASES: [&str; 24] = [
+const READ_COARSE_PHASES: [&str; 28] = [
+    "crc_storage",
+    "crc_range_send",
+    "crc_range_receive",
+    "crc_trusted_receive",
     "peer_slot_wait",
     "peer_read_verify",
     "peer_first_frame_enqueue",
@@ -2114,6 +2269,25 @@ impl Drop for ReadDiagnosticSpan {
     }
 }
 
+/// Cumulative counters independent of the bounded per-request journal.
+pub(crate) struct ReadAuthorizationScope {
+    metrics: ReadWorkMetrics,
+    stage: &'static str,
+    started: std::time::Instant,
+}
+impl Drop for ReadAuthorizationScope {
+    fn drop(&mut self) {
+        self.metrics
+            .authorization_ns
+            .with_label_values(&[self.stage])
+            .inc_by(self.started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+        self.metrics
+            .authorization_calls
+            .with_label_values(&[self.stage])
+            .inc();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::ReadWorkMetrics;
@@ -2601,6 +2775,7 @@ mod tests {
         metrics.hash("segment_index_bytes", 4096);
         metrics.hash("outboard_body_hash", 8192);
         metrics.hash("outboard_parent_hash", 64);
+        metrics.hash("crc_descriptor_hash", 128);
         metrics.hash("request-id-must-not-be-a-label", 1);
         metrics.peer_cache_metadata(256, 512);
         assert_eq!(
@@ -2634,7 +2809,13 @@ mod tests {
             .into_iter()
             .find(|family| family.name() == "afs_dfs_read_hash_bytes_total")
             .unwrap();
-        assert_eq!(hashes.get_metric().len(), 10);
+        assert_eq!(
+            same.hashes
+                .with_label_values(&["crc_descriptor_hash"])
+                .get(),
+            128
+        );
+        assert_eq!(hashes.get_metric().len(), 11);
     }
 
     #[test]

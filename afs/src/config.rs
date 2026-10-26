@@ -259,6 +259,9 @@ pub struct Cli {
     /// Bounded callback executor worker count (1..=1024).
     #[arg(long)]
     pub fuse_workers: Option<u16>,
+    /// Maximum accepted FUSE tasks, including queued and asynchronous work.
+    #[arg(long)]
+    pub fuse_max_tasks: Option<usize>,
     /// Keep DFS kernel pages only across opens of the exact committed version.
     #[arg(long)]
     pub dfs_fuse_keep_cache: Option<bool>,
@@ -338,6 +341,12 @@ pub struct Cli {
     /// Bounded coarse read timing for explicit diagnosis only; disabled by default.
     #[arg(long)]
     pub dfs_read_diagnostics_enabled: Option<bool>,
+    #[arg(long)]
+    pub dfs_native_open_read_authority: Option<bool>,
+    /// Native gRPC read CRC policy (default off); receiver opts in to B checks.
+    /// All serving peers must use the same mode.
+    #[arg(long)]
+    pub dfs_read_crc_mode: Option<DfsReadCrcMode>,
     /// Write native objects with segmented CRC32C; native DFS Nodes default to true.
     #[arg(long)]
     pub dfs_crc32c_writes: Option<bool>,
@@ -442,6 +451,8 @@ struct FileConfig {
     fuse_threads: Option<u16>,
     fuse_clone_fd: Option<bool>,
     fuse_workers: Option<u16>,
+    fuse_max_tasks: Option<usize>,
+    dfs_read_pipeline: Option<crate::node::read_pipeline::ReadPipelineLimits>,
     dfs_fuse_keep_cache: Option<bool>,
     dfs_fuse_entry_ttl_ms: Option<u32>,
     dfs_fuse_attr_ttl_ms: Option<u32>,
@@ -474,6 +485,8 @@ struct FileConfig {
     dfs_source_lookahead_chunks: Option<usize>,
     dfs_source_cache_bytes: Option<usize>,
     dfs_read_diagnostics_enabled: Option<bool>,
+    dfs_native_open_read_authority: Option<bool>,
+    dfs_read_crc_mode: Option<DfsReadCrcMode>,
     dfs_crc32c_writes: Option<bool>,
     dfs_optimistic_gc_commit: Option<bool>,
     timeout_ms: Option<u64>,
@@ -482,6 +495,25 @@ struct FileConfig {
     trace_endpoint: Option<String>,
     trace_sample_ratio: Option<f64>,
 }
+/// Remote native CRC-format reads only; write integrity is independent.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum DfsReadCrcMode {
+    Both,
+    Receiver,
+    #[default]
+    Off,
+}
+impl DfsReadCrcMode {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Both => "both",
+            Self::Receiver => "receiver",
+            Self::Off => "off",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 /// 解析和校验后的进程配置。模块接收这个值，不各自重复读取配置文件或环境变量。
 pub struct Config {
@@ -527,6 +559,8 @@ pub struct Config {
     pub fuse_threads: u16,
     pub fuse_clone_fd: bool,
     pub fuse_workers: u16,
+    pub fuse_max_tasks: usize,
+    pub dfs_read_pipeline: crate::node::read_pipeline::ReadPipelineLimits,
     pub dfs_fuse_keep_cache: bool,
     pub dfs_fuse_entry_ttl_ms: u32,
     pub dfs_fuse_attr_ttl_ms: u32,
@@ -560,6 +594,8 @@ pub struct Config {
     pub dfs_source_lookahead_chunks: usize,
     pub dfs_source_cache_bytes: usize,
     pub dfs_read_diagnostics_enabled: bool,
+    pub dfs_native_open_read_authority: bool,
+    pub dfs_read_crc_mode: DfsReadCrcMode,
     pub dfs_crc32c_writes: bool,
     pub dfs_optimistic_gc_commit: bool,
     pub timeout_ms: u64,
@@ -624,6 +660,18 @@ impl Config {
         if data_mode == "rdma" && !cfg!(feature = "rdma") {
             return Err(invalid("rdma feature is not compiled in"));
         }
+        // This policy is implemented only for native CRC-format gRPC reads.
+        // Keep unrelated backends and transports on their existing path.
+        let default_read_crc_mode =
+            if dfs && file.dfs_external_backend.is_none() && data_mode == "grpc" {
+                DfsReadCrcMode::default()
+            } else {
+                DfsReadCrcMode::Both
+            };
+        let dfs_read_crc_mode = cli
+            .dfs_read_crc_mode
+            .or(file.dfs_read_crc_mode)
+            .unwrap_or(default_read_crc_mode);
         let dfs_desired_copies = cli
             .dfs_desired_copies
             .or(file.dfs_desired_copies)
@@ -695,6 +743,12 @@ impl Config {
         }
         let fuse_threads = cli.fuse_threads.or(file.fuse_threads).unwrap_or(4);
         let fuse_workers = cli.fuse_workers.or(file.fuse_workers).unwrap_or(32);
+        let fuse_max_tasks = cli
+            .fuse_max_tasks
+            .or(file.fuse_max_tasks)
+            .unwrap_or(usize::from(fuse_workers) * 8);
+        let dfs_read_pipeline = file.dfs_read_pipeline.unwrap_or_default();
+        let dfs_read_pipeline = dfs_read_pipeline.validate()?;
         let dfs_fuse_entry_ttl_ms = cli
             .dfs_fuse_entry_ttl_ms
             .or(file.dfs_fuse_entry_ttl_ms)
@@ -709,12 +763,13 @@ impl Config {
             .unwrap_or(1024 * 1024);
         if !(1..=64).contains(&fuse_threads)
             || !(1..=1024).contains(&fuse_workers)
+            || !(1..=65_536).contains(&fuse_max_tasks)
             || dfs_fuse_entry_ttl_ms > 60_000
             || dfs_fuse_attr_ttl_ms > 60_000
             || fuse_max_readahead_bytes > 16 * 1024 * 1024
         {
             return Err(invalid(
-                "FUSE threads must be 1..=64, workers 1..=1024, DFS TTLs <= 60000 ms and read-ahead <= 16 MiB",
+                "FUSE threads must be 1..=64, workers 1..=1024, accepted tasks 1..=65536, DFS TTLs <= 60000 ms and read-ahead <= 16 MiB",
             ));
         }
         let dfs_version_cache_entries = cli
@@ -952,6 +1007,8 @@ impl Config {
             fuse_threads,
             fuse_clone_fd: cli.fuse_clone_fd.or(file.fuse_clone_fd).unwrap_or(true),
             fuse_workers,
+            fuse_max_tasks,
+            dfs_read_pipeline,
             dfs_fuse_keep_cache: cli
                 .dfs_fuse_keep_cache
                 .or(file.dfs_fuse_keep_cache)
@@ -988,6 +1045,11 @@ impl Config {
             dfs_source_cache_max_ms,
             dfs_source_lookahead_chunks,
             dfs_source_cache_bytes,
+            dfs_read_crc_mode,
+            dfs_native_open_read_authority: cli
+                .dfs_native_open_read_authority
+                .or(file.dfs_native_open_read_authority)
+                .unwrap_or(false),
             dfs_read_diagnostics_enabled: cli
                 .dfs_read_diagnostics_enabled
                 .or(file.dfs_read_diagnostics_enabled)
@@ -1207,6 +1269,13 @@ impl Config {
             }
         }
         cfg.validate_crc32c_writes()?;
+        if cfg.dfs_read_crc_mode != DfsReadCrcMode::Both
+            && (!cfg.dfs || cfg.dfs_external_backend.is_some() || cfg.data_mode != "grpc")
+        {
+            return Err(invalid(
+                "dfs_read_crc_mode overrides require native DFS grpc",
+            ));
+        }
         cfg.meta_log_limits()?;
         cfg.meta_maintenance_policy()?;
         cfg.meta_history_limits()?;
@@ -1549,5 +1618,181 @@ mod crc32c_config_tests {
         cfg.dfs_optimistic_gc_commit = true;
         cfg.dfs = false;
         assert!(cfg.validate_crc32c_writes().is_err());
+    }
+}
+
+#[cfg(test)]
+mod crc_read_modes_contract_tests {
+    use super::*;
+    #[test]
+    fn crc_read_modes_explicit_config_survives_resolution() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            file.path(),
+            r#"fs = "dfs"
+data_mode = "grpc"
+dfs_read_crc_mode = "receiver"
+"#,
+        )
+        .unwrap();
+        let cli = Cli::parse_from(["afs-node", "--config", file.path().to_str().unwrap()]);
+        let cfg = Config::resolve(Role::Node, cli).unwrap();
+        assert_eq!(
+            serde_json::to_value(cfg).unwrap()["dfs_read_crc_mode"],
+            serde_json::json!("receiver"),
+            "configured CRC read mode must survive resolution"
+        );
+    }
+}
+
+#[cfg(test)]
+mod crc_read_modes_validation_tests {
+    use super::*;
+    #[test]
+    fn crc_read_modes_cli_defaults_and_scope_preserve_write_crc() {
+        for mode in ["both", "receiver", "off"] {
+            let cfg = Config::resolve(
+                Role::Node,
+                Cli::parse_from([
+                    "afs-node",
+                    "--fs",
+                    "dfs",
+                    "--data-mode",
+                    "grpc",
+                    "--dfs-read-crc-mode",
+                    mode,
+                ]),
+            )
+            .unwrap();
+            assert_eq!(cfg.dfs_read_crc_mode.as_str(), mode);
+            assert!(cfg.dfs_crc32c_writes && cfg.dfs_optimistic_gc_commit);
+        }
+        let cfg =
+            Config::resolve(Role::Node, Cli::parse_from(["afs-node", "--fs", "dfs"])).unwrap();
+        assert_eq!(cfg.dfs_read_crc_mode, DfsReadCrcMode::Off);
+        assert!(Cli::try_parse_from(["afs-node", "--dfs-read-crc-mode", "maybe"]).is_err());
+        assert!(
+            Config::resolve(
+                Role::Node,
+                Cli::parse_from([
+                    "afs-node",
+                    "--fs",
+                    "dfs",
+                    "--data-mode",
+                    "rdma",
+                    "--dfs-read-crc-mode",
+                    "off"
+                ])
+            )
+            .is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+mod crc_read_default_off_tests {
+    use super::*;
+
+    #[test]
+    fn crc_read_default_off_keeps_native_write_checks_and_optional_receiver() {
+        let cfg =
+            Config::resolve(Role::Node, Cli::parse_from(["afs-node", "--fs", "dfs"])).unwrap();
+        assert_eq!(cfg.dfs_read_crc_mode, DfsReadCrcMode::Off);
+        assert_eq!(DfsReadCrcMode::default(), DfsReadCrcMode::Off);
+        assert!(cfg.dfs_crc32c_writes && cfg.dfs_optimistic_gc_commit);
+        assert_eq!(
+            serde_json::to_value(&cfg).unwrap()["dfs_read_crc_mode"],
+            "off"
+        );
+        for mode in ["receiver", "both", "off"] {
+            let cfg = Config::resolve(
+                Role::Node,
+                Cli::parse_from(["afs-node", "--fs", "dfs", "--dfs-read-crc-mode", mode]),
+            )
+            .unwrap();
+            assert_eq!(cfg.dfs_read_crc_mode.as_str(), mode);
+            assert!(cfg.dfs_crc32c_writes);
+        }
+    }
+
+    #[test]
+    fn crc_read_default_off_does_not_activate_native_policy_on_other_backends() {
+        for role in [Role::Node, Role::Meta] {
+            let cfg = Config::resolve(role, Cli::parse_from(["afs", "--fs", "ownerfs"])).unwrap();
+            assert_eq!(cfg.dfs_read_crc_mode, DfsReadCrcMode::Both);
+            assert!(!cfg.dfs_crc32c_writes);
+        }
+        let cfg = Config::resolve(
+            Role::Node,
+            Cli::parse_from(["afs-node", "--fs", "dfs", "--data-mode", "auto"]),
+        )
+        .unwrap();
+        assert_eq!(cfg.dfs_read_crc_mode, DfsReadCrcMode::Both);
+        assert!(cfg.dfs_crc32c_writes);
+    }
+
+    #[test]
+    fn crc_read_default_off_respects_toml_and_cli_precedence() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            file.path(),
+            "fs = \"dfs\"\ndata_mode = \"grpc\"\ndfs_read_crc_mode = \"receiver\"\n",
+        )
+        .unwrap();
+        let path = file.path().to_str().unwrap();
+        let from_file =
+            Config::resolve(Role::Node, Cli::parse_from(["afs-node", "--config", path])).unwrap();
+        assert_eq!(from_file.dfs_read_crc_mode, DfsReadCrcMode::Receiver);
+        assert!(from_file.dfs_crc32c_writes);
+        let cli = Config::resolve(
+            Role::Node,
+            Cli::parse_from(["afs-node", "--config", path, "--dfs-read-crc-mode", "off"]),
+        )
+        .unwrap();
+        assert_eq!(cli.dfs_read_crc_mode, DfsReadCrcMode::Off);
+        assert!(cli.dfs_crc32c_writes);
+    }
+}
+
+#[cfg(test)]
+mod read_concurrency_config_tests {
+    use super::*;
+
+    #[test]
+    fn read_concurrency_admission_is_independent_of_workers() {
+        let cli = Cli::try_parse_from([
+            "afs-node",
+            "--fs",
+            "dfs",
+            "--fuse-workers",
+            "32",
+            "--fuse-max-tasks",
+            "2",
+        ]);
+        assert!(
+            cli.is_ok(),
+            "independent task capacity must be configurable"
+        );
+        let cfg = Config::resolve(Role::Node, cli.unwrap()).unwrap();
+        let value = serde_json::to_value(cfg).unwrap();
+        assert_eq!(value["fuse_workers"], 32);
+        assert_eq!(value["fuse_max_tasks"], 2);
+    }
+
+    #[test]
+    fn read_concurrency_default_capacity_preserves_worker_multiplier() {
+        let cfg = Config::resolve(
+            Role::Node,
+            Cli::parse_from(["afs-node", "--fs", "dfs", "--fuse-workers", "3"]),
+        )
+        .unwrap();
+        assert_eq!(serde_json::to_value(cfg).unwrap()["fuse_max_tasks"], 24);
+    }
+
+    #[test]
+    fn read_concurrency_admission_rejects_zero() {
+        let cli =
+            Cli::try_parse_from(["afs-node", "--fs", "dfs", "--fuse-max-tasks", "0"]).unwrap();
+        assert!(Config::resolve(Role::Node, cli).is_err());
     }
 }

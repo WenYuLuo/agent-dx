@@ -27,6 +27,9 @@ pub mod gc;
 mod native_workspace;
 #[cfg(feature = "dfs")]
 pub mod peer_cache;
+mod read_activity;
+mod read_buffer;
+pub mod read_pipeline;
 pub mod read_work;
 #[cfg(feature = "dfs")]
 pub mod replication;
@@ -1236,6 +1239,7 @@ async fn run_node(
                 )?
                 .with_peer_serve_wait(std::time::Duration::from_millis(cfg.dfs_peer_serve_wait_ms))?
                 .with_read_work_metrics(dfs_read_work_metrics.clone())
+                .with_peer_read_crc_mode(cfg.dfs_read_crc_mode)
                 .with_sidecar_install_queue(cfg.dfs_sidecar_install_queue)?
                 .with_catalog_commit_queue(cfg.dfs_catalog_commit_queue)?,
         ))
@@ -1350,7 +1354,9 @@ async fn run_node(
         64,
     )?;
     #[cfg(feature = "dfs")]
-    let peer_connections = peer_connections.with_read_work_metrics(dfs_read_work_metrics.clone());
+    let peer_connections = peer_connections
+        .with_read_work_metrics(dfs_read_work_metrics.clone())
+        .with_read_crc_mode(cfg.dfs_read_crc_mode);
     #[cfg(any(feature = "ownerfs", feature = "dfs"))]
     let peer_connections = Arc::new(peer_connections);
 
@@ -1673,6 +1679,7 @@ async fn run_node(
         let gc_references = external_store
             .is_none()
             .then(|| gc::GcReferences::new(meta.clone()));
+        let read_engine = read_engine.with_read_pipeline(cfg.dfs_read_pipeline)?;
         let read_engine = Arc::new(match external_store {
             Some(store) => read_engine.with_external_backend(store, meta.clone()),
             None => read_engine,
@@ -1693,6 +1700,9 @@ async fn run_node(
         .with_gc_references(gc_references)
         .with_optimistic_gc_commit(cfg.dfs_optimistic_gc_commit)
         .with_crc32c_writes(cfg.dfs_crc32c_writes)
+        .with_native_open_read_authority(
+            cfg.dfs_native_open_read_authority && cfg.data_mode == "grpc",
+        )
         .with_remote_owner_factory(remote_factory)
         .with_version_cache_capacity(cfg.dfs_version_cache_entries)
         .with_version_cache_bytes(cfg.dfs_version_cache_bytes)
@@ -2212,6 +2222,7 @@ async fn run_node(
         Some(dfs_replica_plane.clone()),
         timeout,
         rpc::data::DfsChunkTransportResources {
+            read_pipeline: cfg.dfs_read_pipeline,
             rdma_sessions: sessions.clone(),
             payload_metrics: Some(rpc::data::DfsPayloadMetrics::register(
                 &state.observability.registry,

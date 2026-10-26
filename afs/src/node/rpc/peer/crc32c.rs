@@ -67,9 +67,55 @@ impl GrpcChunkTransfer {
         chunk: &ChunkObject,
         out: &mut [u8],
     ) -> afs_error::Result<()> {
-        batch.validate(out.len())?;
+        self.read_crc32c_attempt(batch, chunk, out, true)
+    }
+    fn read_crc32c_attempt(
+        &self,
+        batch: &PeerReadBatch,
+        chunk: &ChunkObject,
+        out: &mut [u8],
+        allow_compact: bool,
+    ) -> afs_error::Result<()> {
+        self.runtime.block_on(self.read_crc32c_attempt_async(
+            batch,
+            chunk,
+            out,
+            allow_compact,
+            None,
+        ))
+    }
+
+    pub(super) async fn read_crc32c_attempt_async(
+        &self,
+        batch: &PeerReadBatch,
+        chunk: &ChunkObject,
+        out: &mut [u8],
+        allow_compact: bool,
+        deadline: Option<std::time::Instant>,
+    ) -> afs_error::Result<()> {
+        let fast_requested = self.peers.read_crc_mode == crate::config::DfsReadCrcMode::Off
+            && batch.operations.len() == 1
+            && batch.operations[0]
+                .source
+                .read_grant
+                .token
+                .starts_with("dfs-open-v1:read-open:");
+        if fast_requested {
+            let op = &batch.operations[0].op;
+            if op.output_offset != 0
+                || op.length != out.len() as u64
+                || op.length == 0
+                || op.length > crate::node::dfs_read::MAX_DFS_READ_BYTES
+                || batch.file_version_id.0.is_empty()
+                || batch.layout_root_id.0.is_empty()
+            {
+                return Err(dfs_protocol_error("fixed open output range differs"));
+            }
+        } else {
+            batch.validate(out.len())?;
+        }
         if !chunk.is_segment_crc32c()
-            || !chunk.valid_immutable_identity()
+            || (!fast_requested && !chunk.valid_immutable_identity())
             || batch.operations.len() != 1
         {
             return Err(dfs_protocol_error(
@@ -77,6 +123,7 @@ impl GrpcChunkTransfer {
             ));
         }
         let item = &batch.operations[0];
+        self.remember_open_read(&item.source)?;
         if item.op.chunk_id != chunk.id
             || item.source.chunk_id != chunk.id
             || item
@@ -95,10 +142,29 @@ impl GrpcChunkTransfer {
         else {
             return Err(dfs_protocol_error("CRC source is not a Node replica"));
         };
+        let context_key = (
+            item.source.read_grant.token.clone(),
+            node_id.clone(),
+            *node_epoch,
+        );
+        let compact = allow_compact
+            && fast_requested
+            && self
+                .fast_open_ready
+                .lock()
+                .map_err(|_| dfs_protocol_error("fixed open readiness table poisoned"))?
+                .contains(&context_key);
+        if let Some(metrics) = &self.peers.read_work_metrics {
+            metrics.check(if compact {
+                crate::node::read_work::ReadCheck::CompactGrant
+            } else {
+                crate::node::read_work::ReadCheck::FullGrant
+            });
+        }
         let sequence = self
             .next_read
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let request = DfsReadRangesRequest {
+        let mut request = DfsReadRangesRequest {
             read_id: format!("crc-{}-{sequence}", item.source.read_grant.caller_node_id),
             attempt_id: format!("{node_id}-{node_epoch}-{sequence}"),
             file_version_id: batch.file_version_id.0.clone(),
@@ -114,8 +180,18 @@ impl GrpcChunkTransfer {
                 grant: Some(wire_dfs_read_grant(&item.source.read_grant)),
             }],
         };
-        self.runtime.block_on(async {
-            tokio::time::timeout(self.timeout, async {
+        if compact {
+            request.operations[0].grant = Some(afs_protocol::node_data::DfsReadGrant {
+                token: item.source.read_grant.token.clone(),
+                ..Default::default()
+            });
+        }
+        let timeout = deadline
+            .map(|d| crate::node::read_pipeline::remaining_read_budget(d, self.timeout))
+            .transpose()?
+            .unwrap_or(self.timeout);
+        let result = async {
+            tokio::time::timeout(timeout, async {
                 let channel = self
                     .peers
                     .channel(
@@ -130,16 +206,65 @@ impl GrpcChunkTransfer {
                 let mut client = DfsChunksClient::new(channel)
                     .max_encoding_message_size(self.peers.config.max_encoding_message_bytes)
                     .max_decoding_message_size(self.peers.config.max_decoding_message_bytes);
-                let mut stream = client
-                    .read_ranges(request.clone())
+                let mut wire_request = tonic::Request::new(request.clone());
+                wire_request.metadata_mut().insert(
+                    "x-afs-read-crc-mode",
+                    tonic::metadata::MetadataValue::from_static(self.peers.read_crc_mode.as_str()),
+                );
+                if fast_requested {
+                    wire_request.metadata_mut().insert(
+                        "x-afs-open-fast",
+                        tonic::metadata::MetadataValue::from_static("1"),
+                    );
+                }
+                if let Some(deadline) = deadline {
+                    wire_request.set_timeout(crate::node::read_pipeline::remaining_read_budget(
+                        deadline,
+                        self.timeout,
+                    )?);
+                }
+                if let Some(metrics) = &self.peers.read_work_metrics {
+                    metrics.read_rpc("peer_read_ranges");
+                }
+                let _activity = self.peers.read_work_metrics.as_ref().map(|m| {
+                    m.activities
+                        .enter(crate::node::read_activity::Activity::RangeRpc, 0)
+                });
+                let response = client
+                    .read_ranges(wire_request)
                     .await
-                    .map_err(peer_status_error)?
-                    .into_inner();
+                    .map_err(peer_status_error)?;
+                self.note_native_batch_capability(batch, response.metadata());
+                let fast_accepted = fast_requested
+                    && response
+                        .metadata()
+                        .get("x-afs-open-fast")
+                        .is_some_and(|v| v == "1");
+                let mut stream = response.into_inner();
+                if compact && !fast_accepted {
+                    return Err(afs_error::Error::coded(
+                        afs_error::NODE_TRANSFER_UNAVAILABLE,
+                        "fixed open setup required",
+                    ));
+                }
                 let mut decoder = CrcRangeDecoder::new(&request, chunk, out)?;
+                decoder.metrics = self.peers.read_work_metrics.clone();
+                decoder.mode = self.peers.read_crc_mode;
+                decoder.fast_open = fast_accepted;
                 while let Some(frame) = stream.message().await.map_err(peer_status_error)? {
                     decoder.accept(frame)?;
                 }
-                decoder.finish()
+                decoder.finish()?;
+                if fast_accepted {
+                    let mut ready = self
+                        .fast_open_ready
+                        .lock()
+                        .map_err(|_| dfs_protocol_error("fixed open readiness table poisoned"))?;
+                    if ready.len() < 128 * 32 {
+                        ready.insert(context_key.clone());
+                    }
+                }
+                Ok(())
             })
             .await
             .map_err(|_| {
@@ -148,25 +273,46 @@ impl GrpcChunkTransfer {
                     "CRC range deadline exceeded",
                 )
             })?
-        })
+        }
+        .await;
+        if compact
+            && result
+                .as_ref()
+                .is_err_and(|e| e.code() == afs_error::NODE_TRANSFER_UNAVAILABLE)
+        {
+            if let Some(metrics) = &self.peers.read_work_metrics {
+                metrics.check(crate::node::read_work::ReadCheck::ContextRecover);
+            }
+            self.fast_open_ready
+                .lock()
+                .map_err(|_| dfs_protocol_error("fixed open readiness table poisoned"))?
+                .remove(&context_key);
+            return Box::pin(self.read_crc32c_attempt_async(batch, chunk, out, false, deadline))
+                .await;
+        }
+        result
     }
 }
 
-fn peer_status_error(status: tonic::Status) -> afs_error::Error {
+pub(super) fn peer_status_error(status: tonic::Status) -> afs_error::Error {
     afs_transport::grpc::error_status::status_to_error(status)
 }
 
-struct CrcRangeDecoder<'a> {
+pub(super) struct CrcRangeDecoder<'a> {
     request: &'a DfsReadRangesRequest,
     chunk: &'a ChunkObject,
     out: &'a mut [u8],
     table: Option<CrcTable>,
+    header_seen: bool,
+    fast_open: bool,
+    mode: crate::config::DfsReadCrcMode,
     cursor: usize,
     complete: bool,
+    metrics: Option<ReadWorkMetrics>,
 }
 
 impl<'a> CrcRangeDecoder<'a> {
-    fn new(
+    pub(super) fn new(
         request: &'a DfsReadRangesRequest,
         chunk: &'a ChunkObject,
         out: &'a mut [u8],
@@ -179,11 +325,28 @@ impl<'a> CrcRangeDecoder<'a> {
             chunk,
             out,
             table: None,
+            header_seen: false,
+            fast_open: false,
+            mode: crate::config::DfsReadCrcMode::Both,
             cursor: 0,
             complete: false,
+            metrics: None,
         })
     }
-    fn accept(
+    pub(super) fn new_fast(
+        request: &'a DfsReadRangesRequest,
+        chunk: &'a ChunkObject,
+        out: &'a mut [u8],
+        metrics: Option<ReadWorkMetrics>,
+    ) -> afs_error::Result<Self> {
+        let mut decoder = Self::new(request, chunk, out)?;
+        decoder.metrics = metrics;
+        decoder.mode = crate::config::DfsReadCrcMode::Off;
+        decoder.fast_open = true;
+        Ok(decoder)
+    }
+
+    pub(super) fn accept(
         &mut self,
         frame: afs_protocol::node_data::DfsReadRangesFrame,
     ) -> afs_error::Result<()> {
@@ -193,7 +356,7 @@ impl<'a> CrcRangeDecoder<'a> {
         }
         match frame.body {
             Some(dfs_read_ranges_frame::Body::Header(header)) => {
-                if self.table.is_some()
+                if self.header_seen
                     || header.read_id != self.request.read_id
                     || header.attempt_id != self.request.attempt_id
                     || header.operation_index != 0
@@ -202,15 +365,25 @@ impl<'a> CrcRangeDecoder<'a> {
                     || header.length != op.length
                     || header.source_copy_id != op.source_copy_id
                     || !header.blake3_outboard.is_empty()
-                    || header.crc32c_table.is_empty()
+                    || (!self.fast_open && header.crc32c_table.is_empty())
                     || header.crc32c_table.len() > 4096
                 {
                     return Err(dfs_protocol_error(
                         "CRC header identity/descriptor mismatch",
                     ));
                 }
+                self.header_seen = true;
+                if self.fast_open && self.mode == crate::config::DfsReadCrcMode::Off {
+                    return Ok(());
+                }
+                if let Some(metrics) = &self.metrics {
+                    metrics.check(crate::node::read_work::ReadCheck::DescriptorDecode);
+                }
                 let table: CrcTable = serde_json::from_slice(&header.crc32c_table)
                     .map_err(|_| dfs_corrupt_error("invalid CRC descriptor"))?;
+                if let Some(metrics) = &self.metrics {
+                    metrics.hash("crc_descriptor_hash", table.descriptor_input_bytes());
+                }
                 if !table.valid_shape(self.chunk.length)
                     || table.descriptor_digest() != self.chunk.content_digest
                 {
@@ -221,7 +394,7 @@ impl<'a> CrcRangeDecoder<'a> {
                 self.table = Some(table);
             }
             Some(dfs_read_ranges_frame::Body::Data(data)) => {
-                if self.table.is_none()
+                if !self.header_seen
                     || data.is_empty()
                     || data.len() > super::super::data::DFS_REPLICA_FRAME_BYTES
                 {
@@ -239,18 +412,46 @@ impl<'a> CrcRangeDecoder<'a> {
                     .get_mut(start + self.cursor..start + next)
                     .ok_or_else(|| dfs_protocol_error("CRC output exceeds destination"))?;
                 target.copy_from_slice(&data);
+                if let Some(metrics) = &self.metrics {
+                    metrics.copy("frame_to_attempt", data.len() as u64);
+                }
                 self.cursor = next;
             }
             Some(dfs_read_ranges_frame::Body::Completion(done)) => {
-                if self.table.is_none()
+                let complete_segments = op.chunk_offset.is_multiple_of(SEGMENT as u64)
+                    && (op.length.is_multiple_of(SEGMENT as u64)
+                        || op.chunk_offset.checked_add(op.length) == Some(self.chunk.length));
+                let segment_only = done.range_checksum_algorithm
+                    == afs_protocol::node_data::DfsDigestAlgorithm::Crc32cSegmentsV1 as i32;
+                let legacy_range = done.range_checksum_algorithm
+                    == afs_protocol::node_data::DfsDigestAlgorithm::Crc32c as i32;
+                let receiver_only = done.range_checksum_algorithm
+                    == afs_protocol::node_data::DfsDigestAlgorithm::Crc32cReceiverOnly as i32;
+                let unchecked = done.range_checksum_algorithm
+                    == afs_protocol::node_data::DfsDigestAlgorithm::ReadUnchecked as i32;
+                let policy_matches = match self.mode {
+                    crate::config::DfsReadCrcMode::Both => {
+                        legacy_range || (segment_only && complete_segments)
+                    }
+                    crate::config::DfsReadCrcMode::Receiver => {
+                        if complete_segments {
+                            receiver_only
+                        } else {
+                            legacy_range
+                        }
+                    }
+                    crate::config::DfsReadCrcMode::Off => unchecked,
+                };
+                if !self.header_seen
                     || done.read_id != self.request.read_id
                     || done.attempt_id != self.request.attempt_id
                     || done.operation_index != 0
                     || done.source_copy_id != op.source_copy_id
                     || done.transferred_bytes != op.length
                     || self.cursor as u64 != op.length
-                    || done.range_checksum_algorithm
-                        != afs_protocol::node_data::DfsDigestAlgorithm::Crc32c as i32
+                    || !policy_matches
+                    || ((segment_only || receiver_only || unchecked)
+                        && !done.range_checksum.is_empty())
                 {
                     return Err(dfs_protocol_error(
                         "CRC completion identity/length mismatch",
@@ -262,23 +463,38 @@ impl<'a> CrcRangeDecoder<'a> {
                     .out
                     .get(start..start + self.cursor)
                     .ok_or_else(|| dfs_protocol_error("CRC output exceeds destination"))?;
-                if done.range_checksum.as_slice() != checksum(body).to_le_bytes() {
-                    return Err(dfs_corrupt_error("CRC transport checksum mismatch"));
+                if legacy_range {
+                    let crc_scope = self.metrics.as_ref().and_then(|metrics| {
+                        metrics.coarse_diagnostic("crc_range_receive", body.len() as u64)
+                    });
+                    if let Some(metrics) = &self.metrics {
+                        metrics.crc_read("range_receive", body.len() as u64);
+                    }
+                    let actual_crc = checksum(body);
+                    drop(crc_scope);
+                    if done.range_checksum.as_slice() != actual_crc.to_le_bytes() {
+                        return Err(dfs_corrupt_error("CRC transport checksum mismatch"));
+                    }
                 }
                 // Complete segments can additionally bind directly to Meta's
                 // table. Boundary fragments rely on the authenticated server's
                 // storage verification, without expanding the read grant.
-                if op.chunk_offset.is_multiple_of(SEGMENT as u64)
-                    && (op.length.is_multiple_of(SEGMENT as u64)
-                        || op.chunk_offset + op.length == self.chunk.length)
-                {
+                if complete_segments && self.mode != crate::config::DfsReadCrcMode::Off {
                     let table = self
                         .table
                         .as_ref()
                         .ok_or_else(|| dfs_protocol_error("CRC table missing"))?;
                     let index = (op.chunk_offset / SEGMENT as u64) as usize;
                     for (relative, bytes) in body.chunks(SEGMENT).enumerate() {
-                        if table.checksums.get(index + relative) != Some(&checksum(bytes)) {
+                        let crc_scope = self.metrics.as_ref().and_then(|metrics| {
+                            metrics.coarse_diagnostic("crc_trusted_receive", bytes.len() as u64)
+                        });
+                        if let Some(metrics) = &self.metrics {
+                            metrics.crc_read("trusted_segments_receive", bytes.len() as u64);
+                        }
+                        let actual_crc = checksum(bytes);
+                        drop(crc_scope);
+                        if table.checksums.get(index + relative) != Some(&actual_crc) {
                             return Err(dfs_corrupt_error(
                                 "CRC range differs from trusted segment",
                             ));
@@ -291,7 +507,7 @@ impl<'a> CrcRangeDecoder<'a> {
         }
         Ok(())
     }
-    fn finish(self) -> afs_error::Result<()> {
+    pub(super) fn finish(self) -> afs_error::Result<()> {
         if !self.complete {
             return Err(dfs_protocol_error("CRC stream omitted completion"));
         }
@@ -301,6 +517,182 @@ impl<'a> CrcRangeDecoder<'a> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fast_open_descriptorless_off_is_negotiated_and_lengths_still_checked() {
+        let mode = crate::config::DfsReadCrcMode::Off;
+        let (chunk, request, mut frames, expected) = mode_frames(0, 65536, mode, false);
+        if let Some(dfs_read_ranges_frame::Body::Header(header)) = frames[0].body.as_mut() {
+            header.crc32c_table.clear();
+        }
+        let mut out = vec![0; expected.len()];
+        let mut legacy = CrcRangeDecoder::new(&request, &chunk, &mut out).unwrap();
+        legacy.mode = mode;
+        assert!(
+            legacy.accept(frames[0].clone()).is_err(),
+            "old lane does not silently accept a new envelope"
+        );
+        let mut decoder = CrcRangeDecoder::new(&request, &chunk, &mut out).unwrap();
+        decoder.mode = mode;
+        decoder.fast_open = true;
+        for frame in frames.clone() {
+            decoder.accept(frame).unwrap();
+        }
+        decoder.finish().unwrap();
+        assert_eq!(out, expected);
+        if let Some(dfs_read_ranges_frame::Body::Completion(done)) =
+            frames.last_mut().unwrap().body.as_mut()
+        {
+            done.transferred_bytes += 1;
+        }
+        let mut decoder = CrcRangeDecoder::new(&request, &chunk, &mut out).unwrap();
+        decoder.mode = mode;
+        decoder.fast_open = true;
+        let last = frames.pop().unwrap();
+        for frame in frames {
+            decoder.accept(frame).unwrap();
+        }
+        assert!(
+            decoder.accept(last).is_err(),
+            "length mismatches remain errors with CRC off"
+        );
+    }
+    fn mode_frames(
+        offset: usize,
+        len: usize,
+        mode: crate::config::DfsReadCrcMode,
+        damaged: bool,
+    ) -> (
+        ChunkObject,
+        DfsReadRangesRequest,
+        Vec<DfsReadRangesFrame>,
+        Vec<u8>,
+    ) {
+        let (chunk, request, mut frames, expected) = fixture(offset, len);
+        let Some(dfs_read_ranges_frame::Body::Completion(done)) =
+            frames.last_mut().unwrap().body.as_mut()
+        else {
+            panic!("completion absent")
+        };
+        done.range_checksum.clear();
+        done.range_checksum_algorithm = match mode {
+            crate::config::DfsReadCrcMode::Both => {
+                afs_protocol::node_data::DfsDigestAlgorithm::Crc32cSegmentsV1
+            }
+            crate::config::DfsReadCrcMode::Receiver => {
+                afs_protocol::node_data::DfsDigestAlgorithm::Crc32cReceiverOnly
+            }
+            crate::config::DfsReadCrcMode::Off => {
+                afs_protocol::node_data::DfsDigestAlgorithm::ReadUnchecked
+            }
+        } as i32;
+        if damaged {
+            for frame in &mut frames {
+                if let Some(dfs_read_ranges_frame::Body::Data(data)) = &mut frame.body {
+                    let mut changed = data.to_vec();
+                    changed[0] ^= 1;
+                    *data = changed.into();
+                    break;
+                }
+            }
+        }
+        (chunk, request, frames, expected)
+    }
+    #[test]
+    fn crc_read_modes_receiver_detects_corruption_off_explicitly_does_not() {
+        for (mode, offset, len, damaged, succeeds) in [
+            (
+                crate::config::DfsReadCrcMode::Receiver,
+                0,
+                SEGMENT,
+                false,
+                true,
+            ),
+            (
+                crate::config::DfsReadCrcMode::Receiver,
+                0,
+                SEGMENT,
+                true,
+                false,
+            ),
+            (
+                crate::config::DfsReadCrcMode::Receiver,
+                2 * SEGMENT,
+                13,
+                false,
+                true,
+            ),
+            (crate::config::DfsReadCrcMode::Off, 0, SEGMENT, true, true),
+            (crate::config::DfsReadCrcMode::Off, 1, 7, true, true),
+        ] {
+            let (chunk, request, frames, expected) = mode_frames(offset, len, mode, damaged);
+            let mut out = vec![0; len];
+            let mut decoder = CrcRangeDecoder::new(&request, &chunk, &mut out).unwrap();
+            decoder.mode = mode;
+            let result = frames
+                .into_iter()
+                .try_for_each(|f| decoder.accept(f))
+                .and_then(|()| decoder.finish());
+            assert_eq!(result.is_ok(), succeeds, "mode={mode:?}");
+            if succeeds {
+                assert_eq!(out == expected, !damaged);
+            }
+        }
+    }
+    #[test]
+    fn crc_read_modes_policy_tags_cannot_silently_downgrade() {
+        use crate::config::DfsReadCrcMode::*;
+        for caller in [Both, Receiver, Off] {
+            for sender in [Both, Receiver, Off] {
+                let (chunk, request, frames, _) = mode_frames(0, SEGMENT, sender, false);
+                let mut out = vec![0; SEGMENT];
+                let mut decoder = CrcRangeDecoder::new(&request, &chunk, &mut out).unwrap();
+                decoder.mode = caller;
+                let result = frames
+                    .into_iter()
+                    .try_for_each(|f| decoder.accept(f))
+                    .and_then(|()| decoder.finish());
+                assert_eq!(result.is_ok(), caller == sender);
+            }
+        }
+    }
+    #[test]
+    fn crc_read_modes_off_still_requires_descriptor_identity_length_and_completion() {
+        for defect in 0..4 {
+            let (chunk, request, mut frames, _) =
+                mode_frames(0, SEGMENT, crate::config::DfsReadCrcMode::Off, false);
+            match defect {
+                0 => {
+                    frames.pop();
+                }
+                1 => {
+                    if let Some(dfs_read_ranges_frame::Body::Header(h)) = frames[0].body.as_mut() {
+                        h.crc32c_table = b"{}".to_vec();
+                    }
+                }
+                2 => {
+                    if let Some(dfs_read_ranges_frame::Body::Completion(c)) =
+                        frames.last_mut().unwrap().body.as_mut()
+                    {
+                        c.transferred_bytes -= 1;
+                    }
+                }
+                _ => {
+                    if let Some(dfs_read_ranges_frame::Body::Header(h)) = frames[0].body.as_mut() {
+                        h.chunk_id = "other".into();
+                    }
+                }
+            }
+            let mut out = vec![0; SEGMENT];
+            let mut decoder = CrcRangeDecoder::new(&request, &chunk, &mut out).unwrap();
+            decoder.mode = crate::config::DfsReadCrcMode::Off;
+            let result = frames
+                .into_iter()
+                .try_for_each(|f| decoder.accept(f))
+                .and_then(|()| decoder.finish());
+            assert!(result.is_err());
+        }
+    }
+
     use super::*;
     use afs_protocol::node_data::{
         DfsReadRangesCompletion, DfsReadRangesFrame, DfsReadRangesHeader,
@@ -400,6 +792,69 @@ mod tests {
             )),
         });
         (staged.chunk, request, frames, expected)
+    }
+
+    #[test]
+    fn crc32c_segment_only_completion_keeps_trusted_segments() {
+        for (offset, length) in [(0, SEGMENT), (SEGMENT, SEGMENT), (2 * SEGMENT, 13)] {
+            let (chunk, request, mut frames, expected) = fixture(offset, length);
+            for frame in &mut frames {
+                if let Some(dfs_read_ranges_frame::Body::Completion(done)) = &mut frame.body {
+                    done.range_checksum_algorithm =
+                        afs_protocol::node_data::DfsDigestAlgorithm::Crc32cSegmentsV1 as i32;
+                    done.range_checksum.clear();
+                }
+            }
+            let mut out = vec![0; length];
+            let mut decoder = CrcRangeDecoder::new(&request, &chunk, &mut out).unwrap();
+            let result = frames
+                .into_iter()
+                .try_for_each(|frame| decoder.accept(frame))
+                .and_then(|()| decoder.finish());
+            assert!(
+                result.is_ok(),
+                "segment-only completion must verify original segments without a range checksum: {result:?}"
+            );
+            assert_eq!(out, expected);
+        }
+    }
+
+    #[test]
+    fn crc32c_segment_only_rejects_fragments_damage_and_ambiguous_checksum() {
+        for damage in 0..4 {
+            let (offset, length) = if damage == 0 { (13, 79) } else { (0, SEGMENT) };
+            let (chunk, request, mut frames, _) = fixture(offset, length);
+            for frame in &mut frames {
+                if let Some(dfs_read_ranges_frame::Body::Completion(done)) = &mut frame.body {
+                    done.range_checksum_algorithm =
+                        afs_protocol::node_data::DfsDigestAlgorithm::Crc32cSegmentsV1 as i32;
+                    done.range_checksum.clear();
+                    if damage == 2 {
+                        done.range_checksum = vec![0; 4];
+                    }
+                }
+                if damage == 1
+                    && let Some(dfs_read_ranges_frame::Body::Data(data)) = &mut frame.body
+                {
+                    let mut body = data.to_vec();
+                    body[0] ^= 1;
+                    *data = body.into();
+                }
+            }
+            if damage == 3 {
+                frames.pop();
+            }
+            let mut out = vec![0; length];
+            let mut decoder = CrcRangeDecoder::new(&request, &chunk, &mut out).unwrap();
+            assert!(
+                frames
+                    .into_iter()
+                    .try_for_each(|frame| decoder.accept(frame))
+                    .and_then(|()| decoder.finish())
+                    .is_err(),
+                "segment-only damage {damage} accepted"
+            );
+        }
     }
 
     #[test]
