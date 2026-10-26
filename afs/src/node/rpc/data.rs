@@ -19,6 +19,8 @@
 #[cfg(feature = "dfs")]
 mod open_read;
 #[cfg(feature = "dfs")]
+mod read_pipeline;
+#[cfg(feature = "dfs")]
 pub use open_read::{DfsOpenReadConnection, DfsOpenReadContext};
 
 use afs_transport::grpc::error_status::{coded_status, error_to_status};
@@ -510,6 +512,7 @@ impl DfsPayloadMetrics {
 
 #[cfg(feature = "dfs")]
 pub struct DfsChunkTransportResources {
+    pub read_pipeline: crate::node::read_pipeline::ReadPipelineLimits,
     pub rdma_sessions: super::control::RdmaSessionRegistry,
     pub payload_metrics: Option<DfsPayloadMetrics>,
 }
@@ -527,6 +530,9 @@ pub struct DfsChunksService {
     replica_data_plane: Option<Arc<dyn crate::node::replication::ReplicaDataPlane>>,
     replica_permits: Arc<tokio::sync::Semaphore>,
     read_permits: Arc<tokio::sync::Semaphore>,
+    read_limits: crate::node::read_pipeline::ReadPipelineLimits,
+    disk_slots: Arc<tokio::sync::Semaphore>,
+    open_setup_gates: Arc<crate::node::read_pipeline::ReadKeyGates>,
     replica_timeout: std::time::Duration,
     rdma_sessions: super::control::RdmaSessionRegistry,
     payload_metrics: Option<DfsPayloadMetrics>,
@@ -542,6 +548,16 @@ pub trait DfsReadAuthorizer: Send + Sync + 'static {
     /// Only implementations owning a fixed-open context may advertise the lane.
     fn supports_fast_open(&self) -> bool {
         false
+    }
+
+    /// Local-only authority lookup. A miss must not perform disk or network IO.
+    fn cached_fast_open_context(
+        &self,
+        _peer: &str,
+        _request: &DfsReadRangesRequest,
+        _connection: Option<&DfsOpenReadConnection>,
+    ) -> afs_error::Result<Option<Arc<DfsOpenReadContext>>> {
+        Ok(None)
     }
 
     /// Optional fixed-open context. None keeps legacy authorizers on the old lane.
@@ -664,6 +680,14 @@ impl DfsReadAuthorizer for CachedDfsReadAuthorizer {
 
     fn close_open_context(&self, peer: &str, context: &str) -> afs_error::Result<()> {
         self.close_open_context(peer, context)
+    }
+    fn cached_fast_open_context(
+        &self,
+        peer: &str,
+        request: &DfsReadRangesRequest,
+        connection: Option<&DfsOpenReadConnection>,
+    ) -> afs_error::Result<Option<Arc<DfsOpenReadContext>>> {
+        self.cached_open_context(peer, request, connection)
     }
     fn authorize_fast_open(
         &self,
@@ -859,6 +883,7 @@ pub fn make_dfs_chunks_server_with_replication(
         replica_data_plane,
         replica_timeout,
         DfsChunkTransportResources {
+            read_pipeline: Default::default(),
             rdma_sessions: super::control::RdmaSessionRegistry::new(None),
             payload_metrics: None,
         },
@@ -883,6 +908,11 @@ pub fn make_dfs_chunks_server_with_transport(
         replica_data_plane,
         replica_permits: Arc::new(tokio::sync::Semaphore::new(8)),
         read_permits: Arc::new(tokio::sync::Semaphore::new(8)),
+        read_limits: resources.read_pipeline,
+        open_setup_gates: Arc::new(Default::default()),
+        disk_slots: Arc::new(tokio::sync::Semaphore::new(
+            resources.read_pipeline.max_disk_reads,
+        )),
         replica_timeout,
         rdma_sessions: resources.rdma_sessions,
         payload_metrics: resources.payload_metrics,
@@ -1324,15 +1354,30 @@ impl DfsChunks for DfsChunksService {
                 .metadata()
                 .get("x-afs-open-fast")
                 .is_some_and(|v| v == "1")
-            && request.get_ref().operations.len() == 1
+            && (request.get_ref().operations.len() == 1
+                || (!request.get_ref().operations.is_empty()))
             && request.get_ref().operations[0]
                 .grant
                 .as_ref()
                 .is_some_and(|g| g.token.starts_with("dfs-open-v1:read-open:"));
+        let processing_deadline = if fast_open {
+            Some(read_pipeline::processing_deadline(
+                request.metadata(),
+                std::time::Duration::from_millis(self.read_limits.task_timeout_ms),
+            )?)
+        } else {
+            None
+        };
         let request = request.into_inner();
         if fast_open {
             return self
-                .read_fast_open(authenticated_peer, request, connection, admission_deadline)
+                .read_fast_open(
+                    authenticated_peer,
+                    request,
+                    connection,
+                    admission_deadline,
+                    processing_deadline,
+                )
                 .await;
         }
         if let Some(local) = &self.local_chunks {
@@ -1645,10 +1690,16 @@ impl DfsChunksService {
         request: DfsReadRangesRequest,
         connection: Option<DfsOpenReadConnection>,
         deadline: std::time::Instant,
+        processing_deadline: Option<std::time::Instant>,
     ) -> Result<
         Response<<Self as afs_protocol::node_data::dfs_chunks_server::DfsChunks>::ReadRangesStream>,
         Status,
     > {
+        if request.operations.len() > self.read_limits.max_batch_ops {
+            return Err(Status::resource_exhausted(
+                "fixed-open batch exceeds service limit",
+            ));
+        }
         let local = self
             .local_chunks
             .clone()
@@ -1672,102 +1723,11 @@ impl DfsChunksService {
                 permit
             }
         };
-        let authorizer = self.authorizer.clone();
-        let metrics = self.payload_metrics.clone();
-        let (sender, receiver) = tokio::sync::mpsc::channel(4);
-        tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            let result = (|| -> Result<(), Status> {
-                let context = authorizer
-                    .authorize_fast_open(&peer, &request, connection)
-                    .map_err(error_to_status)?;
-                if let Some(context) = context {
-                    stream_fixed_open(
-                        &local,
-                        &context,
-                        &request,
-                        &sender,
-                        metrics.as_ref(),
-                        deadline,
-                    )
-                } else {
-                    authorizer
-                        .authorize(&peer, &request)
-                        .map_err(error_to_status)?;
-                    stream_dfs_ranges_until(&local, &request, &sender, metrics.as_ref(), deadline)
-                }
-            })();
-            if let Err(error) = result {
-                let _ = sender.blocking_send(Err(error));
-            }
-        });
-        let mut response = Response::new(Box::pin(tokio_stream::wrappers::ReceiverStream::new(
-            receiver,
-        ))
-            as <Self as afs_protocol::node_data::dfs_chunks_server::DfsChunks>::ReadRangesStream);
-        response.metadata_mut().insert(
-            "x-afs-open-fast",
-            tonic::metadata::MetadataValue::from_static("1"),
-        );
-        Ok(response)
+        let processing_deadline = processing_deadline
+            .ok_or_else(|| Status::internal("native read processing deadline absent"))?;
+        self.read_fast_open_async(peer, request, connection, processing_deadline, permit)
+            .await
     }
-}
-
-#[cfg(feature = "dfs")]
-fn stream_fixed_open(
-    local: &LocalChunkStore,
-    context: &DfsOpenReadContext,
-    request: &DfsReadRangesRequest,
-    sender: &tokio::sync::mpsc::Sender<Result<DfsReadRangesFrame, Status>>,
-    metrics: Option<&DfsPayloadMetrics>,
-    deadline: std::time::Instant,
-) -> Result<(), Status> {
-    if sender.is_closed() {
-        return Ok(());
-    }
-    let op = &request.operations[0]; // authorize_fast_open admitted exactly one bounded range.
-    let payload = context
-        .payload(local, op, deadline)
-        .map_err(error_to_status)?;
-    let send = |body| {
-        sender
-            .blocking_send(Ok(DfsReadRangesFrame { body: Some(body) }))
-            .map_err(|_| Status::cancelled("fixed open consumer disconnected"))
-    };
-    send(dfs_read_ranges_frame::Body::Header(DfsReadRangesHeader {
-        read_id: request.read_id.clone(),
-        attempt_id: request.attempt_id.clone(),
-        operation_index: 0,
-        chunk_id: op.chunk_id.clone(),
-        chunk_offset: op.chunk_offset,
-        length: op.length,
-        source_copy_id: op.source_copy_id.clone(),
-        blake3_outboard: Default::default(),
-        crc32c_table: Default::default(),
-    }))?;
-    let body = payload.into_shared_bytes();
-    for start in (0..body.len()).step_by(DFS_REPLICA_FRAME_BYTES) {
-        let data = body.slice(start..(start + DFS_REPLICA_FRAME_BYTES).min(body.len()));
-        local.record_peer_read_event("data_frame");
-        local.record_peer_read_event("shared_frame");
-        if let Some(metrics) = metrics {
-            metrics.record("grpc", "send", "read", data.len() as u64);
-        }
-        send(dfs_read_ranges_frame::Body::Data(data))?;
-    }
-    send(dfs_read_ranges_frame::Body::Completion(
-        DfsReadRangesCompletion {
-            read_id: request.read_id.clone(),
-            attempt_id: request.attempt_id.clone(),
-            operation_index: 0,
-            source_copy_id: op.source_copy_id.clone(),
-            transferred_bytes: op.length,
-            range_checksum: Vec::new(),
-            range_checksum_algorithm: afs_protocol::node_data::DfsDigestAlgorithm::ReadUnchecked
-                as i32,
-            crc32c_table: Default::default(),
-        },
-    ))
 }
 
 #[cfg(feature = "dfs")]
@@ -5937,6 +5897,7 @@ mod tests {
             None,
             std::time::Duration::from_secs(2),
             DfsChunkTransportResources {
+                read_pipeline: Default::default(),
                 rdma_sessions: super::super::control::RdmaSessionRegistry::new(None),
                 payload_metrics: Some(metrics),
             },
@@ -6916,6 +6877,7 @@ mod tests {
             None,
             std::time::Duration::from_secs(10),
             DfsChunkTransportResources {
+                read_pipeline: Default::default(),
                 rdma_sessions: rdma_registry.clone(),
                 payload_metrics: Some(metrics.clone()),
             },
@@ -7244,6 +7206,7 @@ mod tests {
             None,
             std::time::Duration::from_secs(10),
             DfsChunkTransportResources {
+                read_pipeline: Default::default(),
                 rdma_sessions: super::super::control::RdmaSessionRegistry::new(
                     server_rdma.then(|| device.clone()),
                 ),
@@ -7786,6 +7749,9 @@ mod tests {
             replica_data_plane: None,
             replica_permits: Arc::new(tokio::sync::Semaphore::new(8)),
             read_permits: Arc::new(tokio::sync::Semaphore::new(8)),
+            read_limits: Default::default(),
+            open_setup_gates: Arc::new(Default::default()),
+            disk_slots: Arc::new(tokio::sync::Semaphore::new(1)),
             replica_timeout: std::time::Duration::from_secs(30),
             rdma_sessions: crate::node::rpc::control::RdmaSessionRegistry::new(None),
             payload_metrics: None,
@@ -8427,6 +8393,9 @@ mod tests {
             replica_data_plane: None,
             replica_permits: Arc::new(tokio::sync::Semaphore::new(8)),
             read_permits: Arc::new(tokio::sync::Semaphore::new(8)),
+            read_limits: Default::default(),
+            open_setup_gates: Arc::new(Default::default()),
+            disk_slots: Arc::new(tokio::sync::Semaphore::new(1)),
             replica_timeout: std::time::Duration::from_secs(30),
             rdma_sessions: crate::node::rpc::control::RdmaSessionRegistry::new(None),
             payload_metrics: None,
@@ -8445,6 +8414,9 @@ mod tests {
             replica_data_plane: None,
             replica_permits: Arc::new(tokio::sync::Semaphore::new(8)),
             read_permits: Arc::new(tokio::sync::Semaphore::new(8)),
+            read_limits: Default::default(),
+            open_setup_gates: Arc::new(Default::default()),
+            disk_slots: Arc::new(tokio::sync::Semaphore::new(1)),
             replica_timeout: std::time::Duration::from_secs(30),
             rdma_sessions: crate::node::rpc::control::RdmaSessionRegistry::new(None),
             payload_metrics: None,

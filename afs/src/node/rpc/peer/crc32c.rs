@@ -76,6 +76,23 @@ impl GrpcChunkTransfer {
         out: &mut [u8],
         allow_compact: bool,
     ) -> afs_error::Result<()> {
+        self.runtime.block_on(self.read_crc32c_attempt_async(
+            batch,
+            chunk,
+            out,
+            allow_compact,
+            None,
+        ))
+    }
+
+    pub(super) async fn read_crc32c_attempt_async(
+        &self,
+        batch: &PeerReadBatch,
+        chunk: &ChunkObject,
+        out: &mut [u8],
+        allow_compact: bool,
+        deadline: Option<std::time::Instant>,
+    ) -> afs_error::Result<()> {
         let fast_requested = self.peers.read_crc_mode == crate::config::DfsReadCrcMode::Off
             && batch.operations.len() == 1
             && batch.operations[0]
@@ -169,8 +186,12 @@ impl GrpcChunkTransfer {
                 ..Default::default()
             });
         }
-        let result = self.runtime.block_on(async {
-            tokio::time::timeout(self.timeout, async {
+        let timeout = deadline
+            .map(|d| crate::node::read_pipeline::remaining_read_budget(d, self.timeout))
+            .transpose()?
+            .unwrap_or(self.timeout);
+        let result = async {
+            tokio::time::timeout(timeout, async {
                 let channel = self
                     .peers
                     .channel(
@@ -185,9 +206,6 @@ impl GrpcChunkTransfer {
                 let mut client = DfsChunksClient::new(channel)
                     .max_encoding_message_size(self.peers.config.max_encoding_message_bytes)
                     .max_decoding_message_size(self.peers.config.max_decoding_message_bytes);
-                if let Some(metrics) = &self.peers.read_work_metrics {
-                    metrics.read_rpc("peer_read_ranges");
-                }
                 let mut wire_request = tonic::Request::new(request.clone());
                 wire_request.metadata_mut().insert(
                     "x-afs-read-crc-mode",
@@ -199,10 +217,24 @@ impl GrpcChunkTransfer {
                         tonic::metadata::MetadataValue::from_static("1"),
                     );
                 }
+                if let Some(deadline) = deadline {
+                    wire_request.set_timeout(crate::node::read_pipeline::remaining_read_budget(
+                        deadline,
+                        self.timeout,
+                    )?);
+                }
+                if let Some(metrics) = &self.peers.read_work_metrics {
+                    metrics.read_rpc("peer_read_ranges");
+                }
+                let _activity = self.peers.read_work_metrics.as_ref().map(|m| {
+                    m.activities
+                        .enter(crate::node::read_activity::Activity::RangeRpc, 0)
+                });
                 let response = client
                     .read_ranges(wire_request)
                     .await
                     .map_err(peer_status_error)?;
+                self.note_native_batch_capability(batch, response.metadata());
                 let fast_accepted = fast_requested
                     && response
                         .metadata()
@@ -241,7 +273,8 @@ impl GrpcChunkTransfer {
                     "CRC range deadline exceeded",
                 )
             })?
-        });
+        }
+        .await;
         if compact
             && result
                 .as_ref()
@@ -254,17 +287,18 @@ impl GrpcChunkTransfer {
                 .lock()
                 .map_err(|_| dfs_protocol_error("fixed open readiness table poisoned"))?
                 .remove(&context_key);
-            return self.read_crc32c_attempt(batch, chunk, out, false);
+            return Box::pin(self.read_crc32c_attempt_async(batch, chunk, out, false, deadline))
+                .await;
         }
         result
     }
 }
 
-fn peer_status_error(status: tonic::Status) -> afs_error::Error {
+pub(super) fn peer_status_error(status: tonic::Status) -> afs_error::Error {
     afs_transport::grpc::error_status::status_to_error(status)
 }
 
-struct CrcRangeDecoder<'a> {
+pub(super) struct CrcRangeDecoder<'a> {
     request: &'a DfsReadRangesRequest,
     chunk: &'a ChunkObject,
     out: &'a mut [u8],
@@ -278,7 +312,7 @@ struct CrcRangeDecoder<'a> {
 }
 
 impl<'a> CrcRangeDecoder<'a> {
-    fn new(
+    pub(super) fn new(
         request: &'a DfsReadRangesRequest,
         chunk: &'a ChunkObject,
         out: &'a mut [u8],
@@ -299,7 +333,20 @@ impl<'a> CrcRangeDecoder<'a> {
             metrics: None,
         })
     }
-    fn accept(
+    pub(super) fn new_fast(
+        request: &'a DfsReadRangesRequest,
+        chunk: &'a ChunkObject,
+        out: &'a mut [u8],
+        metrics: Option<ReadWorkMetrics>,
+    ) -> afs_error::Result<Self> {
+        let mut decoder = Self::new(request, chunk, out)?;
+        decoder.metrics = metrics;
+        decoder.mode = crate::config::DfsReadCrcMode::Off;
+        decoder.fast_open = true;
+        Ok(decoder)
+    }
+
+    pub(super) fn accept(
         &mut self,
         frame: afs_protocol::node_data::DfsReadRangesFrame,
     ) -> afs_error::Result<()> {
@@ -460,7 +507,7 @@ impl<'a> CrcRangeDecoder<'a> {
         }
         Ok(())
     }
-    fn finish(self) -> afs_error::Result<()> {
+    pub(super) fn finish(self) -> afs_error::Result<()> {
         if !self.complete {
             return Err(dfs_protocol_error("CRC stream omitted completion"));
         }

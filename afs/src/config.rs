@@ -259,6 +259,9 @@ pub struct Cli {
     /// Bounded callback executor worker count (1..=1024).
     #[arg(long)]
     pub fuse_workers: Option<u16>,
+    /// Maximum accepted FUSE tasks, including queued and asynchronous work.
+    #[arg(long)]
+    pub fuse_max_tasks: Option<usize>,
     /// Keep DFS kernel pages only across opens of the exact committed version.
     #[arg(long)]
     pub dfs_fuse_keep_cache: Option<bool>,
@@ -448,6 +451,8 @@ struct FileConfig {
     fuse_threads: Option<u16>,
     fuse_clone_fd: Option<bool>,
     fuse_workers: Option<u16>,
+    fuse_max_tasks: Option<usize>,
+    dfs_read_pipeline: Option<crate::node::read_pipeline::ReadPipelineLimits>,
     dfs_fuse_keep_cache: Option<bool>,
     dfs_fuse_entry_ttl_ms: Option<u32>,
     dfs_fuse_attr_ttl_ms: Option<u32>,
@@ -554,6 +559,8 @@ pub struct Config {
     pub fuse_threads: u16,
     pub fuse_clone_fd: bool,
     pub fuse_workers: u16,
+    pub fuse_max_tasks: usize,
+    pub dfs_read_pipeline: crate::node::read_pipeline::ReadPipelineLimits,
     pub dfs_fuse_keep_cache: bool,
     pub dfs_fuse_entry_ttl_ms: u32,
     pub dfs_fuse_attr_ttl_ms: u32,
@@ -736,6 +743,12 @@ impl Config {
         }
         let fuse_threads = cli.fuse_threads.or(file.fuse_threads).unwrap_or(4);
         let fuse_workers = cli.fuse_workers.or(file.fuse_workers).unwrap_or(32);
+        let fuse_max_tasks = cli
+            .fuse_max_tasks
+            .or(file.fuse_max_tasks)
+            .unwrap_or(usize::from(fuse_workers) * 8);
+        let dfs_read_pipeline = file.dfs_read_pipeline.unwrap_or_default();
+        let dfs_read_pipeline = dfs_read_pipeline.validate()?;
         let dfs_fuse_entry_ttl_ms = cli
             .dfs_fuse_entry_ttl_ms
             .or(file.dfs_fuse_entry_ttl_ms)
@@ -750,12 +763,13 @@ impl Config {
             .unwrap_or(1024 * 1024);
         if !(1..=64).contains(&fuse_threads)
             || !(1..=1024).contains(&fuse_workers)
+            || !(1..=65_536).contains(&fuse_max_tasks)
             || dfs_fuse_entry_ttl_ms > 60_000
             || dfs_fuse_attr_ttl_ms > 60_000
             || fuse_max_readahead_bytes > 16 * 1024 * 1024
         {
             return Err(invalid(
-                "FUSE threads must be 1..=64, workers 1..=1024, DFS TTLs <= 60000 ms and read-ahead <= 16 MiB",
+                "FUSE threads must be 1..=64, workers 1..=1024, accepted tasks 1..=65536, DFS TTLs <= 60000 ms and read-ahead <= 16 MiB",
             ));
         }
         let dfs_version_cache_entries = cli
@@ -993,6 +1007,8 @@ impl Config {
             fuse_threads,
             fuse_clone_fd: cli.fuse_clone_fd.or(file.fuse_clone_fd).unwrap_or(true),
             fuse_workers,
+            fuse_max_tasks,
+            dfs_read_pipeline,
             dfs_fuse_keep_cache: cli
                 .dfs_fuse_keep_cache
                 .or(file.dfs_fuse_keep_cache)
@@ -1735,5 +1751,48 @@ mod crc_read_default_off_tests {
         .unwrap();
         assert_eq!(cli.dfs_read_crc_mode, DfsReadCrcMode::Off);
         assert!(cli.dfs_crc32c_writes);
+    }
+}
+
+#[cfg(test)]
+mod read_concurrency_config_tests {
+    use super::*;
+
+    #[test]
+    fn read_concurrency_admission_is_independent_of_workers() {
+        let cli = Cli::try_parse_from([
+            "afs-node",
+            "--fs",
+            "dfs",
+            "--fuse-workers",
+            "32",
+            "--fuse-max-tasks",
+            "2",
+        ]);
+        assert!(
+            cli.is_ok(),
+            "independent task capacity must be configurable"
+        );
+        let cfg = Config::resolve(Role::Node, cli.unwrap()).unwrap();
+        let value = serde_json::to_value(cfg).unwrap();
+        assert_eq!(value["fuse_workers"], 32);
+        assert_eq!(value["fuse_max_tasks"], 2);
+    }
+
+    #[test]
+    fn read_concurrency_default_capacity_preserves_worker_multiplier() {
+        let cfg = Config::resolve(
+            Role::Node,
+            Cli::parse_from(["afs-node", "--fs", "dfs", "--fuse-workers", "3"]),
+        )
+        .unwrap();
+        assert_eq!(serde_json::to_value(cfg).unwrap()["fuse_max_tasks"], 24);
+    }
+
+    #[test]
+    fn read_concurrency_admission_rejects_zero() {
+        let cli =
+            Cli::try_parse_from(["afs-node", "--fs", "dfs", "--fuse-max-tasks", "0"]).unwrap();
+        assert!(Config::resolve(Role::Node, cli).is_err());
     }
 }

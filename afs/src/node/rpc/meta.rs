@@ -1514,6 +1514,44 @@ impl crate::node::replication::ReplicationTaskAuthority for GrpcDfsMeta {
 
 #[cfg(feature = "dfs")]
 impl crate::node::dfs_read::ReadSourceProvider for GrpcDfsMeta {
+    fn sources_for_async(
+        &self,
+        request: crate::dfs::DfsChunkSourcesRequest,
+    ) -> crate::node::read_pipeline::ReadFuture<'_, crate::dfs::DfsChunkSourcesReply> {
+        Box::pin(async move {
+            self.record_read_rpc("get_chunk_sources");
+            let mut client = self.client();
+            let reply = tokio::time::timeout(
+                self.timeout,
+                client.get_chunk_sources(afs_tracing::request_with_current_context(
+                    afs_protocol::meta::GetDfsChunkSourcesRequest {
+                        caller_id: request.caller_id,
+                        namespace_id: request.namespace_id.0,
+                        file_version_id: request.file_version_id.0,
+                        layout_root_id: request.layout_root_id.0,
+                        chunk_ids: request.chunk_ids.into_iter().map(|id| id.0).collect(),
+                    },
+                )),
+            )
+            .await
+            .map_err(|_| {
+                afs_error::Error::coded(
+                    afs_error::CLIENT_DEADLINE_EXCEEDED,
+                    "async source lookup deadline exceeded",
+                )
+            })?
+            .map_err(afs_transport::grpc::error_status::status_to_error)?
+            .into_inner();
+            Ok(crate::dfs::DfsChunkSourcesReply {
+                revision: reply.revision,
+                chunks: reply
+                    .chunks
+                    .into_iter()
+                    .map(domain_dfs_chunk_sources)
+                    .collect::<afs_error::Result<Vec<_>>>()?,
+            })
+        })
+    }
     fn sources_for(
         &self,
         request: crate::dfs::DfsChunkSourcesRequest,
@@ -1968,6 +2006,66 @@ impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
                 required(reply.inode, "GetDfsInode.inode").and_then(domain_dfs_inode)
             },
         )
+    }
+
+    fn get_inode_async(
+        &self,
+        inode_id: crate::dfs::InodeId,
+    ) -> crate::node::read_pipeline::ReadFuture<'_, crate::dfs::InodeRecord> {
+        Box::pin(async move {
+            self.record_read_rpc("get_inode");
+            let mut client = self.client();
+            let reply = tokio::time::timeout(
+                self.timeout,
+                client.get_inode(afs_tracing::request_with_current_context(
+                    afs_protocol::meta::GetDfsInodeRequest {
+                        inode_id: inode_id.0,
+                    },
+                )),
+            )
+            .await
+            .map_err(|_| {
+                afs_error::Error::coded(
+                    afs_error::CLIENT_DEADLINE_EXCEEDED,
+                    "async inode lookup deadline exceeded",
+                )
+            })?
+            .map_err(afs_transport::grpc::error_status::status_to_error)?
+            .into_inner();
+            required(reply.inode, "GetDfsInode.inode").and_then(domain_dfs_inode)
+        })
+    }
+
+    fn get_file_version_async(
+        &self,
+        version_id: crate::dfs::FileVersionId,
+    ) -> crate::node::read_pipeline::ReadFuture<'_, (crate::dfs::FileVersion, crate::dfs::LayoutRoot)>
+    {
+        Box::pin(async move {
+            self.record_read_rpc("get_file_version");
+            let mut client = self.client();
+            let reply = tokio::time::timeout(
+                self.timeout,
+                client.get_file_version(afs_tracing::request_with_current_context(
+                    afs_protocol::meta::GetFileVersionRequest {
+                        version_id: version_id.0,
+                    },
+                )),
+            )
+            .await
+            .map_err(|_| {
+                afs_error::Error::coded(
+                    afs_error::CLIENT_DEADLINE_EXCEEDED,
+                    "async layout lookup deadline exceeded",
+                )
+            })?
+            .map_err(afs_transport::grpc::error_status::status_to_error)?
+            .into_inner();
+            Ok((
+                domain_dfs_version(required(reply.version, "GetFileVersion.version")?),
+                domain_dfs_layout(required(reply.layout, "GetFileVersion.layout")?),
+            ))
+        })
     }
 
     fn get_file_version(

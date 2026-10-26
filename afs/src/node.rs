@@ -27,7 +27,9 @@ pub mod gc;
 mod native_workspace;
 #[cfg(feature = "dfs")]
 pub mod peer_cache;
+mod read_activity;
 mod read_buffer;
+pub mod read_pipeline;
 pub mod read_work;
 #[cfg(feature = "dfs")]
 pub mod replication;
@@ -1673,6 +1675,7 @@ async fn run_node(
         let gc_references = external_store
             .is_none()
             .then(|| gc::GcReferences::new(meta.clone()));
+        let read_engine = read_engine.with_read_pipeline(cfg.dfs_read_pipeline)?;
         let read_engine = Arc::new(match external_store {
             Some(store) => read_engine.with_external_backend(store, meta.clone()),
             None => read_engine,
@@ -2198,6 +2201,7 @@ async fn run_node(
         Some(dfs_replica_plane.clone()),
         timeout,
         rpc::data::DfsChunkTransportResources {
+            read_pipeline: cfg.dfs_read_pipeline,
             rdma_sessions: sessions.clone(),
             payload_metrics: Some(rpc::data::DfsPayloadMetrics::register(
                 &state.observability.registry,

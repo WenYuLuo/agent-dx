@@ -628,6 +628,7 @@ pub struct DiskPeerCache {
     started: Instant,
     state: Mutex<CacheState>,
     changed: Condvar,
+    asynchronous_change: tokio::sync::Notify,
     max_flights: usize,
     read_work: Option<super::read_work::ReadWorkMetrics>,
     proof_budget: Arc<OutboardBudget>,
@@ -760,6 +761,7 @@ pub(crate) enum FillOutcome {
 struct FillFlight {
     result: Mutex<Option<FillOutcome>>,
     changed: Condvar,
+    asynchronous_change: tokio::sync::Notify,
     _metadata: OutboardLease,
 }
 
@@ -969,6 +971,7 @@ impl DiskPeerCache {
             started: Instant::now(),
             state: Mutex::new(CacheState::new(proof_budget.clone())),
             changed: Condvar::new(),
+            asynchronous_change: tokio::sync::Notify::new(),
             max_flights: 8,
             proof_budget,
             read_work: None,
@@ -1092,8 +1095,10 @@ impl DiskPeerCache {
         if let Ok(mut state) = self.state.lock() {
             state.closed = true;
             self.changed.notify_all();
+            self.asynchronous_change.notify_waiters();
             for flight in state.flights.values() {
                 flight.changed.notify_all();
+                flight.asynchronous_change.notify_waiters();
             }
         }
     }
@@ -1521,6 +1526,7 @@ impl DiskPeerCache {
                 state.deleting_slots = state.deleting_slots.saturating_sub(1);
             }
             self.changed.notify_all();
+            self.asynchronous_change.notify_waiters();
             self.report_resources();
             result?;
         }
@@ -1789,6 +1795,7 @@ impl DiskPeerCache {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn fill_flight<'a>(
         &'a self,
         chunk: &ChunkObject,
@@ -1814,6 +1821,7 @@ impl DiskPeerCache {
                 let flight = Arc::new(FillFlight {
                     result: Mutex::new(None),
                     changed: Condvar::new(),
+                    asynchronous_change: tokio::sync::Notify::new(),
                     _metadata: metadata,
                 });
                 state.flights.insert(key.clone(), flight.clone());
@@ -1859,6 +1867,90 @@ impl DiskPeerCache {
         self.release_flight(&key, flight);
         outcome.map(FillRole::Finished)
     }
+    pub(crate) async fn fill_flight_async<'a>(
+        &'a self,
+        chunk: &ChunkObject,
+        check: impl Fn() -> Result<()> + Send + Sync,
+    ) -> Result<FillRole<'a>> {
+        let key = self.key(chunk)?;
+        let (flight, leader) = loop {
+            let changed = self.asynchronous_change.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            check()?;
+            let selected = {
+                let mut state = self.lock_state()?;
+                if state.closed {
+                    return Err(unavailable("Peer cache is stopped"));
+                }
+                if let Some(flight) = state.flights.get(&key) {
+                    Some((flight.clone(), false))
+                } else if state.flight_live < self.max_flights {
+                    let charge = std::mem::size_of::<FillFlight>() + 512 + key.capacity() + 256;
+                    let Some(metadata) = self.proof_budget.try_reserve(charge) else {
+                        return Ok(FillRole::Finished(FillOutcome::Uncached));
+                    };
+                    let flight = Arc::new(FillFlight {
+                        result: Mutex::new(None),
+                        changed: Condvar::new(),
+                        asynchronous_change: tokio::sync::Notify::new(),
+                        _metadata: metadata,
+                    });
+                    state.flights.insert(key.clone(), flight.clone());
+                    state.flight_live += 1;
+                    state.flight_metadata_bytes += charge;
+                    Some((flight, true))
+                } else {
+                    None
+                }
+            };
+            if let Some(selected) = selected {
+                break selected;
+            }
+            let _ = tokio::time::timeout(Duration::from_millis(25), changed).await;
+        };
+        if leader {
+            self.report_resources();
+            return Ok(FillRole::Leader(FillLeader {
+                cache: self,
+                key,
+                flight: Some(flight),
+                completed: false,
+            }));
+        }
+        let follower = AsyncFillFollower {
+            cache: self,
+            key,
+            flight: Some(flight),
+        };
+        let flight = follower
+            .flight
+            .as_ref()
+            .ok_or_else(|| unavailable("Peer follower flight missing"))?;
+        let outcome = async {
+            loop {
+                let changed = flight.asynchronous_change.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                check()?;
+                if self.lock_state()?.closed {
+                    return Err(unavailable("Peer cache is stopped"));
+                }
+                let ready = flight
+                    .result
+                    .lock()
+                    .map_err(|_| unavailable("Peer flight lock poisoned"))?
+                    .clone();
+                if let Some(outcome) = ready {
+                    return Ok(outcome);
+                }
+                let _ = tokio::time::timeout(Duration::from_millis(25), changed).await;
+            }
+        }
+        .await;
+        drop(follower);
+        outcome.map(FillRole::Finished)
+    }
 
     pub(crate) fn try_fill_flight(
         self: &Arc<Self>,
@@ -1882,6 +1974,7 @@ impl DiskPeerCache {
         let flight = Arc::new(FillFlight {
             result: Mutex::new(None),
             changed: Condvar::new(),
+            asynchronous_change: tokio::sync::Notify::new(),
             _metadata: metadata,
         });
         state.flights.insert(key.clone(), flight.clone());
@@ -1925,7 +2018,21 @@ impl DiskPeerCache {
                 .saturating_sub(std::mem::size_of::<FillFlight>() + 512 + key.len() + 256);
         }
         self.changed.notify_all();
+        self.asynchronous_change.notify_waiters();
         self.report_resources();
+    }
+}
+
+struct AsyncFillFollower<'a> {
+    cache: &'a DiskPeerCache,
+    key: String,
+    flight: Option<Arc<FillFlight>>,
+}
+impl Drop for AsyncFillFollower<'_> {
+    fn drop(&mut self) {
+        if let Some(flight) = self.flight.take() {
+            self.cache.release_flight(&self.key, flight);
+        }
     }
 }
 
@@ -1954,6 +2061,7 @@ fn finish_flight(flight: &Option<Arc<FillFlight>>, completed: &mut bool, outcome
         *result = Some(outcome);
         *completed = true;
         flight.changed.notify_all();
+        flight.asynchronous_change.notify_waiters();
     }
 }
 
@@ -2002,6 +2110,7 @@ impl Drop for FillWaiter<'_> {
             state.foreground_waiters = state.foreground_waiters.saturating_sub(1);
         }
         self.0.changed.notify_all();
+        self.0.asynchronous_change.notify_waiters();
     }
 }
 
@@ -2015,6 +2124,7 @@ impl Drop for FillPermit<'_> {
             }
         }
         self.cache.changed.notify_all();
+        self.cache.asynchronous_change.notify_waiters();
         self.cache.report_resources();
     }
 }
@@ -2110,6 +2220,59 @@ impl PeerCacheOperation<'_> {
                     .wait_timeout(state, Duration::from_millis(25))
                     .map_err(|_| unavailable("Peer fill admission lock poisoned"))?,
             );
+        }
+    }
+
+    pub(crate) async fn acquire_fill_async(
+        &mut self,
+        streaming: bool,
+        check: impl Fn() -> Result<()> + Send + Sync,
+    ) -> Result<()> {
+        if let Some(fill) = &self.fill {
+            if fill.streaming == streaming || !fill.streaming {
+                return Ok(());
+            }
+            return Err(invalid(
+                "legacy fill requires releasing the stream allowance",
+            ));
+        }
+        let _waiting = FillWaiter::new(self.cache)?;
+        loop {
+            let changed = self.cache.asynchronous_change.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            check()?;
+            let admitted = {
+                let mut state = self.cache.lock_state()?;
+                if state.closed {
+                    return Err(unavailable("Peer cache is stopped"));
+                }
+                if !state.fill_active
+                    && if streaming {
+                        state.stream_active < 2
+                    } else {
+                        state.stream_active == 0
+                    }
+                {
+                    if streaming {
+                        state.stream_active += 1
+                    } else {
+                        state.fill_active = true
+                    }
+                    self.fill = Some(FillPermit {
+                        cache: self.cache,
+                        streaming,
+                    });
+                    true
+                } else {
+                    false
+                }
+            };
+            if admitted {
+                self.cache.report_resources();
+                return Ok(());
+            }
+            let _ = tokio::time::timeout(Duration::from_millis(25), changed).await;
         }
     }
 
@@ -3010,6 +3173,7 @@ impl Drop for PeerCacheOperation<'_> {
             }
         }
         self.cache.changed.notify_all();
+        self.cache.asynchronous_change.notify_waiters();
         self.cache.report_resources();
         if let Some(metrics) = &self.cache.read_work {
             report_work(
@@ -5228,5 +5392,39 @@ mod tests {
         assert!(encoded.contains(&format!(
             "afs_dfs_peer_disk_cache_metadata_peak_bytes {current}"
         )));
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn unified_cancelled_fill_follower_releases_last_flight_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = Arc::new(
+            DiskPeerCache::open(PeerCacheOptions {
+                directory: temp.path().join("cache"),
+                capacity_bytes: 1024 * 1024,
+                namespace_id: crate::dfs::NamespaceId::new("default"),
+            })
+            .unwrap(),
+        );
+        let chunk = StagedChunk::new(
+            crate::dfs::OperationId::new("cancel-follower"),
+            vec![7; 4096],
+        )
+        .chunk;
+        let leader = match cache.fill_flight_async(&chunk, || Ok(())).await.unwrap() {
+            FillRole::Leader(leader) => leader,
+            _ => panic!("expected leader"),
+        };
+        let other = cache.clone();
+        let object = chunk.clone();
+        let waiting = tokio::spawn(async move {
+            let _ = other.fill_flight_async(&object, || Ok(())).await;
+        });
+        while Arc::strong_count(leader.flight.as_ref().unwrap()) < 3 {
+            tokio::task::yield_now().await;
+        }
+        waiting.abort();
+        drop(leader);
+        assert!(waiting.await.unwrap_err().is_cancelled());
+        assert_eq!(cache.lock_state().unwrap().flight_live, 0);
+        assert!(cache.lock_state().unwrap().flights.is_empty());
     }
 }

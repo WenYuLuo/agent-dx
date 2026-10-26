@@ -15,6 +15,8 @@
 
 #[cfg(feature = "dfs")]
 mod crc32c;
+#[cfg(feature = "dfs")]
+mod read_pipeline;
 
 #[cfg(feature = "dfs")]
 mod open_read;
@@ -1198,6 +1200,7 @@ impl PeerConnectionPool {
 
 #[cfg(feature = "dfs")]
 pub struct GrpcChunkTransfer {
+    read_pipeline: std::sync::OnceLock<Arc<read_pipeline::PeerReadPipeline>>,
     open_read_peers: Arc<std::sync::Mutex<open_read::OpenReadPeers>>,
     fast_open_ready: std::sync::Mutex<std::collections::HashSet<(String, String, u64)>>,
     peers: Arc<PeerConnectionPool>,
@@ -1224,6 +1227,7 @@ impl GrpcChunkTransfer {
         let open_read_peers = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
         open_read::start_close_retirement(&runtime, &open_read_peers, peers.clone(), timeout);
         Ok(Self {
+            read_pipeline: std::sync::OnceLock::new(),
             peers,
             runtime,
             timeout,
@@ -1243,6 +1247,19 @@ impl GrpcChunkTransfer {
         out: &'a mut [u8],
         proof_budget: Option<Arc<OutboardBudget>>,
     ) -> afs_error::Result<Option<VerifiedPeerChunk<'a>>> {
+        self.runtime
+            .block_on(self.read_ranges_impl_async(batch, chunk, out, proof_budget))
+    }
+
+    async fn read_ranges_impl_async<'a>(
+        &self,
+        batch: &crate::node::dfs_read::PeerReadBatch,
+        chunk: Option<&'a ChunkObject>,
+        out: &'a mut [u8],
+        proof_budget: Option<Arc<OutboardBudget>>,
+    ) -> afs_error::Result<Option<VerifiedPeerChunk<'a>>> {
+        let _read_owner = self.admit_borrowed_read().await?;
+
         match chunk {
             Some(chunk) => crate::node::dfs_read::validate_verified_peer_object_request(
                 batch,
@@ -1288,9 +1305,13 @@ impl GrpcChunkTransfer {
                 })
                 .collect(),
         };
-        self.runtime.block_on(async {
+        let timeout = crate::node::read_pipeline::current_read_scope()
+            .map(|s| crate::node::read_pipeline::remaining_read_budget(s.deadline, self.timeout))
+            .transpose()?
+            .unwrap_or(self.timeout);
+        async {
             // One deadline covers connection, response headers and every frame.
-            tokio::time::timeout(self.timeout, async {
+            tokio::time::timeout(timeout, async {
                 let channel = self
                     .peers
                     .channel(
@@ -1305,7 +1326,7 @@ impl GrpcChunkTransfer {
                     .max_encoding_message_size(self.peers.config.max_encoding_message_bytes)
                     .max_decoding_message_size(self.peers.config.max_decoding_message_bytes);
                 let mut rpc_request = request_with_current_context(request.clone());
-                rpc_request.set_timeout(self.timeout);
+                rpc_request.set_timeout(timeout);
                 if let Some(metrics) = &self.peers.read_work_metrics {
                     metrics.read_rpc("peer_read_ranges");
                 }
@@ -1330,7 +1351,8 @@ impl GrpcChunkTransfer {
                     "DFS peer read total deadline exceeded",
                 )
             })?
-        })
+        }
+        .await
     }
 }
 
@@ -2055,6 +2077,13 @@ impl GrpcChunkTransfer {
             && self.peers.config.initial_stream_window_size <= 2 * 1024 * 1024
     }
 
+    fn stream_sink_fits(&self, length: usize) -> bool {
+        self.stream_sink_supported()
+            && length
+                .checked_add(4 * 1024 * 1024)
+                .is_some_and(|bytes| bytes <= crate::node::dfs_read::MAX_DFS_READ_BYTES as usize)
+    }
+
     fn read_object_to_sink<'output>(
         &self,
         batch: &crate::node::dfs_read::PeerReadBatch,
@@ -2064,14 +2093,35 @@ impl GrpcChunkTransfer {
         sink: &mut PeerStreamSink<'_>,
         prefetch: Option<&crate::node::dfs_read::PrefetchControl>,
     ) -> afs_error::Result<Option<CompletedPeerDiskRead<'output>>> {
-        if !self.stream_sink_supported()
-            || out
-                .len()
-                .checked_add(4 * 1024 * 1024)
-                .is_none_or(|bytes| bytes > crate::node::dfs_read::MAX_DFS_READ_BYTES as usize)
-        {
+        // Capability rejection predates the sync API boundary: do not enter a
+        // runtime or reserve transport work for a genuinely unsupported sink.
+        if !self.stream_sink_fits(out.len()) {
             return Ok(None);
         }
+
+        self.runtime.block_on(self.read_object_to_sink_async(
+            batch,
+            chunk,
+            requested_offset,
+            out,
+            sink,
+            prefetch,
+        ))
+    }
+
+    async fn read_object_to_sink_async<'output>(
+        &self,
+        batch: &crate::node::dfs_read::PeerReadBatch,
+        chunk: &ChunkObject,
+        requested_offset: u64,
+        out: &'output mut [u8],
+        sink: &mut PeerStreamSink<'_>,
+        prefetch: Option<&crate::node::dfs_read::PrefetchControl>,
+    ) -> afs_error::Result<Option<CompletedPeerDiskRead<'output>>> {
+        if !self.stream_sink_fits(out.len()) {
+            return Ok(None);
+        }
+        let read_owner = self.admit_borrowed_read().await?;
         crate::node::dfs_read::validate_verified_peer_object_request(
             batch,
             chunk,
@@ -2169,7 +2219,10 @@ impl GrpcChunkTransfer {
             PeerRuntime::Owned(runtime) => runtime.handle().clone(),
         };
         let peers = self.peers.clone();
-        let timeout = self.timeout;
+        let timeout = crate::node::read_pipeline::current_read_scope()
+            .map(|s| crate::node::read_pipeline::remaining_read_budget(s.deadline, self.timeout))
+            .transpose()?
+            .unwrap_or(self.timeout);
         let deadline = std::time::Instant::now() + timeout;
         let output_binding = sink.bind_output(requested_offset, out)?;
         // Capture tracing metadata on the caller before crossing the task boundary.
@@ -2180,7 +2233,7 @@ impl GrpcChunkTransfer {
         if let Some(control) = prefetch {
             control.check()?;
         }
-        let active = self.runtime.block_on(async {
+        let active = async {
             let admit = async {
                 tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
                     if prefetch.is_some() {
@@ -2197,7 +2250,7 @@ impl GrpcChunkTransfer {
                     _ = control.cancelled() => Err(afs_error::Error::coded(afs_error::IO_UNAVAILABLE, "Peer prefetch cancelled before admission")),
                 }
             } else { admit.await }
-        })?;
+        }.await?;
         let Some(active) = active else {
             return Ok(None);
         };
@@ -2226,6 +2279,7 @@ impl GrpcChunkTransfer {
         let producer_binding = output_binding.clone();
         let producer_control = prefetch.cloned();
         let producer = handle.spawn(async move {
+            let _read_owner = read_owner;
             let receive = async {
                 tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
                     if let Some(control) = &producer_control { control.check()?; }
@@ -2423,87 +2477,97 @@ impl GrpcChunkTransfer {
             }
             result
         });
-        let consumer_work = consumer_diagnostic.clone().map(ReadDiagnosticConsumer::new);
-        let observation = PeerConsumerObservation {
-            metrics: self.peers.read_work_metrics.as_ref(),
-            diagnostic: consumer_work.as_ref(),
-        };
-        let received: afs_error::Result<ReadFrameDecoder<'_>> = (|| {
-            let mut decoder = ReadFrameDecoder::for_producer_object(&request, chunk)?;
-            decoder.stream_binding = Some(output_binding);
-            while let Some(message) = receiver.blocking_recv() {
-                if let Some(control) = prefetch {
-                    control.check()?;
-                }
-                match message? {
-                    OwnedPeerStreamMessage::Control(control) => {
-                        let OwnedPeerStreamControl {
-                            frame,
-                            outboard_builder,
-                            _permit,
-                        } = *control;
-                        if matches!(&frame.body, Some(dfs_read_ranges_frame::Body::Header(_))) {
-                            decoder.install_producer_outboard(outboard_builder)?;
-                        } else if outboard_builder.is_some() {
-                            return Err(dfs_protocol_error(
-                                "outboard metadata must accompany its header",
-                            ));
-                        }
-                        let consume_start = consumer_diagnostic
-                            .as_ref()
-                            .map(|diagnostic| diagnostic.now());
-                        let result = consume_peer_frame_into_sink(
-                            &mut decoder,
-                            frame,
-                            requested_offset,
-                            out,
-                            sink,
-                            deadline,
-                            observation,
-                        );
-                        if let (Some(diagnostic), Some(start)) =
-                            (&consumer_diagnostic, consume_start)
-                        {
-                            diagnostic.consumer(start);
-                        }
-                        result?;
+        let received: afs_error::Result<(ReadFrameDecoder<'_>, Option<ReadDiagnosticConsumer>)> =
+            async {
+                let consumer_work = consumer_diagnostic.clone().map(ReadDiagnosticConsumer::new);
+                let mut decoder = ReadFrameDecoder::for_producer_object(&request, chunk)?;
+                decoder.stream_binding = Some(output_binding);
+                while let Some(message) = receiver.recv().await {
+                    let observation = PeerConsumerObservation {
+                        metrics: self.peers.read_work_metrics.as_ref(),
+                        diagnostic: consumer_work.as_ref(),
+                    };
+                    if let Some(control) = prefetch {
+                        control.check()?;
                     }
-                    OwnedPeerStreamMessage::Block(block) => {
-                        let consume_start = consumer_diagnostic
-                            .as_ref()
-                            .map(|diagnostic| diagnostic.now());
-                        let result = consume_peer_input_into_sink(
-                            &mut decoder,
-                            PeerSinkInput::Block {
-                                offset: block.offset,
-                                bytes: &block.bytes,
-                            },
-                            requested_offset,
-                            out,
-                            sink,
-                            deadline,
-                            observation,
-                        );
-                        if let (Some(diagnostic), Some(start)) =
-                            (&consumer_diagnostic, consume_start)
-                        {
-                            diagnostic.consumer(start);
+                    match message? {
+                        OwnedPeerStreamMessage::Control(control) => {
+                            let OwnedPeerStreamControl {
+                                frame,
+                                outboard_builder,
+                                _permit,
+                            } = *control;
+                            if matches!(&frame.body, Some(dfs_read_ranges_frame::Body::Header(_))) {
+                                decoder.install_producer_outboard(outboard_builder)?;
+                            } else if outboard_builder.is_some() {
+                                return Err(dfs_protocol_error(
+                                    "outboard metadata must accompany its header",
+                                ));
+                            }
+                            let consume_start = consumer_diagnostic
+                                .as_ref()
+                                .map(|diagnostic| diagnostic.now());
+                            let result = crate::node::read_pipeline::local_io(|| {
+                                consume_peer_frame_into_sink(
+                                    &mut decoder,
+                                    frame,
+                                    requested_offset,
+                                    out,
+                                    sink,
+                                    deadline,
+                                    observation,
+                                )
+                            });
+                            if let (Some(diagnostic), Some(start)) =
+                                (&consumer_diagnostic, consume_start)
+                            {
+                                diagnostic.consumer(start);
+                            }
+                            result?;
                         }
-                        result?;
-                        // RAII returns the shared block on success and every error.
-                        drop(block);
+                        OwnedPeerStreamMessage::Block(block) => {
+                            let consume_start = consumer_diagnostic
+                                .as_ref()
+                                .map(|diagnostic| diagnostic.now());
+                            let result = crate::node::read_pipeline::local_io(|| {
+                                consume_peer_input_into_sink(
+                                    &mut decoder,
+                                    PeerSinkInput::Block {
+                                        offset: block.offset,
+                                        bytes: &block.bytes,
+                                    },
+                                    requested_offset,
+                                    out,
+                                    sink,
+                                    deadline,
+                                    observation,
+                                )
+                            });
+                            if let (Some(diagnostic), Some(start)) =
+                                (&consumer_diagnostic, consume_start)
+                            {
+                                diagnostic.consumer(start);
+                            }
+                            result?;
+                            // RAII returns the shared block on success and every error.
+                            drop(block);
+                        }
                     }
                 }
+                Ok((decoder, consumer_work))
             }
-            Ok(decoder)
-        })();
+            .await;
         drop(receiver);
         if received.is_err() {
             producer.abort();
         }
         // Join/drain before output proof, sink cleanup or ownership retirement.
-        let joined = self.runtime.block_on(producer);
-        let decoder = received?;
+        let joined = producer.await;
+        let (decoder, consumer_work) = received?;
+        let observation = PeerConsumerObservation {
+            metrics: self.peers.read_work_metrics.as_ref(),
+            diagnostic: consumer_work.as_ref(),
+        };
         let root = joined.map_err(|error| {
             afs_error::Error::coded(
                 afs_error::CLIENT_WORKER_FAILED,
@@ -2515,14 +2579,16 @@ impl GrpcChunkTransfer {
         let finish_start = consumer_diagnostic
             .as_ref()
             .map(|diagnostic| diagnostic.now());
-        let proof = decoder.finish_stream_from_producer(
-            chunk,
-            root,
-            sink,
-            requested_offset,
-            out,
-            observation,
-        );
+        let proof = crate::node::read_pipeline::local_io(|| {
+            decoder.finish_stream_from_producer(
+                chunk,
+                root,
+                sink,
+                requested_offset,
+                out,
+                observation,
+            )
+        });
         if let (Some(diagnostic), Some(start)) = (&consumer_diagnostic, finish_start) {
             diagnostic.consumer(start);
         }
@@ -2550,6 +2616,93 @@ impl GrpcChunkTransfer {
 
 #[cfg(feature = "dfs")]
 impl crate::node::dfs_read::ChunkTransfer for GrpcChunkTransfer {
+    fn block_on_read(
+        &self,
+        future: crate::node::read_pipeline::ReadFuture<'_, ()>,
+    ) -> afs_error::Result<()> {
+        self.runtime.block_on(future)
+    }
+    fn read_ranges_async<'a>(
+        &'a self,
+        batch: &'a crate::node::dfs_read::PeerReadBatch,
+        out: &'a mut [u8],
+    ) -> crate::node::read_pipeline::ReadFuture<'a, ()> {
+        Box::pin(async move {
+            self.read_ranges_impl_async(batch, None, out, None)
+                .await
+                .map(|_| ())
+        })
+    }
+    fn read_crc32c_range_async<'a>(
+        &'a self,
+        batch: &'a crate::node::dfs_read::PeerReadBatch,
+        chunk: &'a ChunkObject,
+        out: &'a mut [u8],
+    ) -> crate::node::read_pipeline::ReadFuture<'a, ()> {
+        Box::pin(async move {
+            let _read_owner = self.admit_borrowed_read().await?;
+            let deadline = crate::node::read_pipeline::current_read_scope().map(|s| s.deadline);
+            self.read_crc32c_attempt_async(batch, chunk, out, true, deadline)
+                .await
+        })
+    }
+
+    fn read_verified_object_async<'a>(
+        &'a self,
+        batch: &'a crate::node::dfs_read::PeerReadBatch,
+        chunk: &'a ChunkObject,
+        out: &'a mut [u8],
+        proof_budget: Arc<OutboardBudget>,
+    ) -> crate::node::read_pipeline::ReadFuture<'a, VerifiedPeerChunk<'a>> {
+        Box::pin(async move {
+            self.read_ranges_impl_async(batch, Some(chunk), out, Some(proof_budget))
+                .await?
+                .ok_or_else(|| dfs_protocol_error("verified Peer stream omitted its object proof"))
+        })
+    }
+    fn read_verified_object_to_sink_async<'a, 'output: 'a>(
+        &'a self,
+        batch: &'a crate::node::dfs_read::PeerReadBatch,
+        chunk: &'a ChunkObject,
+        requested_offset: u64,
+        out: &'output mut [u8],
+        sink: &'a mut PeerStreamSink<'_>,
+        prefetch: Option<&'a crate::node::dfs_read::PrefetchControl>,
+    ) -> crate::node::read_pipeline::ReadFuture<'a, Option<CompletedPeerDiskRead<'output>>> {
+        Box::pin(self.read_object_to_sink_async(
+            batch,
+            chunk,
+            requested_offset,
+            out,
+            sink,
+            prefetch,
+        ))
+    }
+
+    fn supports_async_native_read(&self) -> bool {
+        true
+    }
+
+    fn admit_native_read_async(
+        &self,
+    ) -> crate::node::read_pipeline::ReadFuture<'_, crate::node::read_pipeline::ReadLifetime> {
+        Box::pin(self.admit_borrowed_read())
+    }
+    fn configure_read_pipeline(
+        &self,
+        limits: crate::node::read_pipeline::ReadPipelineLimits,
+    ) -> afs_error::Result<()> {
+        self.configure_native_read_pipeline(limits)
+    }
+
+    fn read_owned_native_async(
+        self: Arc<Self>,
+        read: crate::node::read_pipeline::OwnedNativeRead,
+    ) -> crate::node::read_pipeline::ReadFuture<'static, crate::node::read_pipeline::OwnedNativeRead>
+    {
+        Box::pin(async move { self.read_owned_native_pipeline(read).await })
+    }
+
     fn close_open_read_context(&self, reference: &str) -> afs_error::Result<()> {
         self.close_open_context_impl(reference)
     }
@@ -3366,6 +3519,13 @@ enum RdmaReadResult {
 }
 #[cfg(feature = "dfs")]
 impl crate::node::dfs_read::ChunkTransfer for RdmaChunkTransfer {
+    fn block_on_read(
+        &self,
+        future: crate::node::read_pipeline::ReadFuture<'_, ()>,
+    ) -> afs_error::Result<()> {
+        self.runtime.block_on(future)
+    }
+
     fn verification_metrics(&self) -> Option<&ReadWorkMetrics> {
         self.pool.peers.read_work_metrics.as_ref()
     }
@@ -3741,6 +3901,15 @@ pub trait RemoteDfsOwner: Send + Sync {
         _timeout: Duration,
     ) -> afs_error::Result<afs_protocol::node_control::DfsOwnerReleaseLockSessionReply> {
         self.release_lock_session(request)
+    }
+    fn read_async(
+        &self,
+        request: afs_protocol::node_data::DfsOwnerReadRequest,
+    ) -> crate::node::read_pipeline::ReadFuture<'_, afs_protocol::node_data::DfsOwnerReadReply>
+    {
+        Box::pin(
+            async move { crate::node::read_pipeline::sync_read_backend(|| self.read(request)) },
+        )
     }
     fn read(
         &self,
@@ -4203,11 +4372,50 @@ impl RemoteDfsOwner for GrpcDfsOwnerClient {
             },
         )
     }
-    dfs_owner_rpc!(
-        read,
-        afs_protocol::node_data::DfsOwnerReadRequest,
-        afs_protocol::node_data::DfsOwnerReadReply
-    );
+    fn read(
+        &self,
+        request: afs_protocol::node_data::DfsOwnerReadRequest,
+    ) -> afs_error::Result<afs_protocol::node_data::DfsOwnerReadReply> {
+        self.runtime.block_on(self.read_async(request))
+    }
+    fn read_async(
+        &self,
+        request: afs_protocol::node_data::DfsOwnerReadRequest,
+    ) -> crate::node::read_pipeline::ReadFuture<'_, afs_protocol::node_data::DfsOwnerReadReply>
+    {
+        Box::pin(async move {
+            if request
+                .handle
+                .as_ref()
+                .is_none_or(|h| h.owner_node_id != self.node_id)
+            {
+                return Err(dfs_protocol_error("DFS owner request targets another Node"));
+            }
+            let timeout = crate::node::read_pipeline::current_read_scope()
+                .map(|s| {
+                    crate::node::read_pipeline::remaining_read_budget(s.deadline, self.timeout)
+                })
+                .transpose()?
+                .unwrap_or(self.timeout);
+            tokio::time::timeout(timeout, async {
+                let mut client = self.data_client().await?;
+                let mut request = request_with_current_context(request);
+                request.set_timeout(timeout);
+                client
+                    .read(request)
+                    .await
+                    .map(tonic::Response::into_inner)
+                    .map_err(afs_transport::grpc::error_status::status_to_error)
+            })
+            .await
+            .map_err(|_| {
+                afs_error::Error::coded(
+                    afs_error::CLIENT_DEADLINE_EXCEEDED,
+                    "DFS owner read expired",
+                )
+            })?
+        })
+    }
     dfs_owner_rpc!(
         write,
         afs_protocol::node_data::DfsOwnerWriteRequest,
@@ -6805,22 +7013,23 @@ mod tests {
     use tonic::{Request, Response, Status, transport::Server};
 
     #[cfg(feature = "dfs")]
-    type FetchFixtureObjects = std::collections::BTreeMap<String, (ChunkObject, Vec<u8>)>;
+    pub(super) type FetchFixtureObjects =
+        std::collections::BTreeMap<String, (ChunkObject, Vec<u8>)>;
 
     #[cfg(feature = "dfs")]
     #[derive(Clone)]
-    struct DiskStreamFixture {
-        chunk: ChunkObject,
-        body: Arc<Vec<u8>>,
-        mode: u8,
-        calls: Arc<std::sync::atomic::AtomicUsize>,
-        fetch_objects: Option<Arc<FetchFixtureObjects>>,
-        fetch_gate: Option<(String, Arc<FetchRpcGate>)>,
+    pub(super) struct DiskStreamFixture {
+        pub(super) chunk: ChunkObject,
+        pub(super) body: Arc<Vec<u8>>,
+        pub(super) mode: u8,
+        pub(super) calls: Arc<std::sync::atomic::AtomicUsize>,
+        pub(super) fetch_objects: Option<Arc<FetchFixtureObjects>>,
+        pub(super) fetch_gate: Option<(String, Arc<FetchRpcGate>)>,
     }
 
     #[cfg(feature = "dfs")]
     #[derive(Default)]
-    struct FetchRpcGate {
+    pub(super) struct FetchRpcGate {
         entered: std::sync::atomic::AtomicUsize,
         release: std::sync::atomic::AtomicBool,
         changed: tokio::sync::Notify,
@@ -6945,6 +7154,9 @@ mod tests {
             request: Request<DfsReadRangesRequest>,
         ) -> Result<Response<Self::ReadRangesStream>, Status> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.mode == 21 {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
             let request = request.into_inner();
             if let Some(objects) = &self.fetch_objects {
                 if let Some((target, gate)) = &self.fetch_gate
@@ -6968,10 +7180,44 @@ mod tests {
                         changed.await;
                     }
                 }
-                let frames = fetch_fixture_frames(&request, objects)?;
-                return Ok(Response::new(Box::pin(tokio_stream::iter(
-                    frames.into_iter().map(Ok),
-                ))));
+                if self.mode == 18 && request.operations.len() > 1 {
+                    return Err(Status::unimplemented("fixture old peer rejects group"));
+                }
+                let mut frames = fetch_fixture_frames(&request, objects)?;
+                if self.mode >= 17 {
+                    for frame in &mut frames {
+                        match &mut frame.body {
+                            Some(dfs_read_ranges_frame::Body::Header(header)) => {
+                                header.blake3_outboard = Default::default();
+                                if self.mode == 20 && request.operations.len() > 1 {
+                                    header.operation_index = 77;
+                                }
+                            }
+                            Some(dfs_read_ranges_frame::Body::Completion(done)) => {
+                                done.range_checksum = Vec::new();
+                                done.range_checksum_algorithm =
+                                    afs_protocol::node_data::DfsDigestAlgorithm::ReadUnchecked
+                                        as i32;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                let mut frames: Vec<_> = frames.into_iter().map(Ok).collect();
+                if self.mode == 19 && request.operations.len() > 1 {
+                    frames.push(Err(Status::unavailable("fixture late group error")));
+                }
+                let mut response =
+                    Response::new(Box::pin(tokio_stream::iter(frames)) as Self::ReadRangesStream);
+                if self.mode >= 17 {
+                    response
+                        .metadata_mut()
+                        .insert("x-afs-open-fast", "1".parse().unwrap());
+                    response
+                        .metadata_mut()
+                        .insert("x-afs-read-batch-v1", "4".parse().unwrap());
+                }
+                return Ok(response);
             }
 
             let mut body = self.body.as_ref().clone();
@@ -7034,7 +7280,7 @@ mod tests {
     }
 
     #[cfg(feature = "dfs")]
-    fn disk_stream_batch(
+    pub(super) fn disk_stream_batch(
         chunk: &ChunkObject,
         endpoint: String,
     ) -> crate::node::dfs_read::PeerReadBatch {
@@ -7275,6 +7521,142 @@ mod tests {
                 }]
             },
         }
+    }
+
+    #[cfg(feature = "dfs")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unified_actual_rpc_cross_object_cache_fill_hit_has_no_sync_fallback() {
+        let mut case = fetch_rpc_case(0, true).await;
+        case.engine = Arc::new(
+            Arc::try_unwrap(case.engine)
+                .ok()
+                .unwrap()
+                .with_read_pipeline(crate::node::read_pipeline::ReadPipelineLimits::default())
+                .unwrap(),
+        );
+        let batch = fetch_case_batch(&case, true);
+        let engine = case.engine.clone();
+        let first = batch.clone();
+        let reading = tokio::spawn(async move {
+            engine
+                .read_native_unified_async(
+                    first,
+                    16,
+                    None,
+                    std::time::Instant::now() + Duration::from_secs(3),
+                    1,
+                    Arc::new(()),
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while case.gate.entered.load(std::sync::atomic::Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap();
+        case.gate
+            .release
+            .store(true, std::sync::atomic::Ordering::Release);
+        case.gate.changed.notify_waiters();
+        let output = reading.await.unwrap().unwrap();
+        assert_eq!(&output[..8], &[17; 8]);
+        assert_eq!(&output[8..], &[29; 8]);
+        drop(output);
+        let output = case
+            .engine
+            .read_native_unified_async(
+                batch,
+                16,
+                None,
+                std::time::Instant::now() + Duration::from_secs(3),
+                1,
+                Arc::new(()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(&output[..8], &[17; 8]);
+        assert_eq!(&output[8..], &[29; 8]);
+        drop(output);
+        assert_eq!(case.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        case.engine
+            .object_fetcher()
+            .unwrap()
+            .shutdown()
+            .await
+            .unwrap();
+        case.server.abort();
+        let _ = case.server.await;
+    }
+
+    #[cfg(feature = "dfs")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unified_actual_rpc_cancelled_parent_keeps_descendant_lifetime_until_retirement() {
+        struct Owner(Arc<std::sync::atomic::AtomicUsize>);
+        impl Drop for Owner {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let mut case = fetch_rpc_case(0, true).await;
+        case.engine = Arc::new(
+            Arc::try_unwrap(case.engine)
+                .ok()
+                .unwrap()
+                .with_read_pipeline(crate::node::read_pipeline::ReadPipelineLimits::default())
+                .unwrap(),
+        );
+        let batch = fetch_case_batch(&case, true);
+        let engine = case.engine.clone();
+        let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let lifetime = Arc::new(Owner(dropped.clone()));
+        let reading = tokio::spawn(async move {
+            engine
+                .read_native_unified_async(
+                    batch,
+                    16,
+                    None,
+                    std::time::Instant::now() + Duration::from_secs(3),
+                    1,
+                    lifetime,
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while case.gate.entered.load(std::sync::atomic::Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap();
+        reading.abort();
+        assert!(reading.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            dropped.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "actual children still own the original dispatch lifetime"
+        );
+        case.gate
+            .release
+            .store(true, std::sync::atomic::Ordering::Release);
+        case.gate.changed.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while dropped.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(dropped.load(std::sync::atomic::Ordering::SeqCst), 1);
+        case.engine
+            .object_fetcher()
+            .unwrap()
+            .shutdown()
+            .await
+            .unwrap();
+        case.server.abort();
+        let _ = case.server.await;
     }
 
     #[cfg(feature = "dfs")]

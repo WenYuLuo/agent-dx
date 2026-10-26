@@ -1,72 +1,194 @@
-//! Private initialized buffers, recycled only after the last transport/reply owner.
+//! Initialized storage is recycled only after its final owner. Native async
+//! pools charge both idle and borrowed capacity to the same fixed byte limit.
 use super::read_work::ReadWorkMetrics;
 use afs_error::{Error, Result};
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 const MAX_BUFFER: usize = 1024 * 1024;
 const SLOTS: usize = 2;
 
+#[derive(Debug, Default)]
+struct PoolState {
+    free: Vec<Vec<u8>>,
+    allocated: usize,
+    peak: usize,
+    limit: Option<usize>,
+}
 #[derive(Debug)]
 pub(crate) struct ReadBufferPool {
-    free: Mutex<[Option<Vec<u8>>; SLOTS]>,
+    state: Mutex<PoolState>,
+    changed: tokio::sync::Notify,
     role: &'static str,
+    metrics: std::sync::OnceLock<ReadWorkMetrics>,
 }
-
 impl ReadBufferPool {
     pub(crate) fn new(role: &'static str) -> Arc<Self> {
         Arc::new(Self {
-            free: Mutex::new(std::array::from_fn(|_| None)),
+            state: Mutex::new(PoolState::default()),
+            changed: tokio::sync::Notify::new(),
             role,
+            metrics: std::sync::OnceLock::new(),
         })
+    }
+    pub(crate) fn configure_byte_limit(&self, limit: usize) -> Result<()> {
+        if limit == 0 {
+            return Err(capacity("zero buffer pool limit"));
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| capacity("buffer pool poisoned"))?;
+        if state.limit == Some(limit) {
+            return Ok(());
+        }
+        while state.allocated > limit {
+            let Some(bytes) = state.free.pop() else {
+                return Err(capacity("active buffers exceed configured limit"));
+            };
+            state.allocated = state.allocated.saturating_sub(bytes.capacity());
+        }
+        state.limit = Some(limit);
+        drop(state);
+        self.changed.notify_waiters();
+        Ok(())
+    }
+    fn observe(&self, state: &PoolState, metrics: Option<&ReadWorkMetrics>) {
+        if let Some(m) = metrics.or_else(|| self.metrics.get()) {
+            let idle = state.free.iter().map(Vec::capacity).sum::<usize>();
+            m.read_buffer_idle(self.role, idle as u64);
+            m.read_buffer_capacity(
+                self.role,
+                state.allocated as u64,
+                idle as u64,
+                state.limit.unwrap_or(0) as u64,
+                state.peak as u64,
+            );
+        }
+    }
+    fn try_take(
+        self: &Arc<Self>,
+        size: usize,
+        metrics: Option<ReadWorkMetrics>,
+    ) -> Result<Option<ReadBuffer>> {
+        if let Some(m) = &metrics {
+            self.metrics.get_or_init(|| m.clone());
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| capacity("read buffer pool poisoned"))?;
+        let charge = size.max(MAX_BUFFER);
+        let slot = state
+            .free
+            .iter()
+            .enumerate()
+            // Preserve legacy most-recent reuse when capacities are equal.
+            .rev()
+            .filter(|(_, v)| v.len() >= size && v.capacity() <= charge)
+            .min_by_key(|(_, v)| v.capacity())
+            .map(|(i, _)| i);
+        let bytes = if let Some(index) = slot {
+            let bytes = state.free.swap_remove(index);
+            if let Some(m) = &metrics {
+                m.read_buffer(self.role, "reuse", bytes.capacity() as u64);
+            }
+            bytes
+        } else {
+            if let Some(limit) = state.limit {
+                if size > limit {
+                    return Err(capacity("read buffer exceeds pool byte limit"));
+                }
+                while state.allocated.checked_add(size).is_none_or(|n| n > limit) {
+                    let Some(idle) = state.free.pop() else {
+                        self.observe(&state, metrics.as_ref());
+                        return Ok(None);
+                    };
+                    state.allocated = state.allocated.saturating_sub(idle.capacity());
+                }
+            }
+            let mut bytes = Vec::new();
+            bytes
+                .try_reserve_exact(size)
+                .map_err(|_| capacity("read buffer allocation failed"))?;
+            let next = state
+                .allocated
+                .checked_add(bytes.capacity())
+                .ok_or_else(|| capacity("buffer accounting overflow"))?;
+            if state.limit.is_some_and(|limit| next > limit) {
+                return Err(capacity("allocator capacity exceeds pool limit"));
+            }
+            bytes.resize(size, 0);
+            state.allocated = next;
+            state.peak = state.peak.max(next);
+            if let Some(m) = &metrics {
+                m.read_buffer(self.role, "allocate", bytes.capacity() as u64);
+                m.read_buffer(self.role, "zero", size as u64);
+            }
+            bytes
+        };
+        self.observe(&state, metrics.as_ref());
+        drop(state);
+        Ok(Some(ReadBuffer {
+            bytes,
+            length: size,
+            pool: Some(self.clone()),
+            metrics,
+        }))
     }
     pub(crate) fn take(
         self: &Arc<Self>,
         size: usize,
         metrics: Option<ReadWorkMetrics>,
     ) -> Result<ReadBuffer> {
-        let mut bytes = Vec::new();
-        if size != 0 && size <= MAX_BUFFER {
-            let mut free = self
-                .free
-                .lock()
-                .map_err(|_| Error::coded(afs_error::IO_CAPACITY, "read buffer pool poisoned"))?;
-            if let Some(slot) = free
-                .iter_mut()
-                .find(|v| v.as_ref().is_some_and(|b| b.len() >= size))
-            {
-                bytes = slot.take().unwrap_or_default();
-                if let Some(m) = &metrics {
-                    m.read_buffer(self.role, "reuse", bytes.capacity() as u64);
-                }
-            }
-            self.observe_idle(&free, metrics.as_ref());
-        }
-        if bytes.len() < size {
-            bytes.try_reserve_exact(size - bytes.len()).map_err(|_| {
-                Error::coded(afs_error::IO_CAPACITY, "read buffer allocation failed")
-            })?;
-            bytes.resize(size, 0);
-            if let Some(m) = &metrics {
-                m.read_buffer(self.role, "allocate", bytes.capacity() as u64);
-                m.read_buffer(self.role, "zero", size as u64);
-            }
-        }
-        Ok(ReadBuffer {
-            bytes,
-            length: size,
-            pool: Some(self.clone()),
-            metrics,
-        })
+        self.try_take(size, metrics)?
+            .ok_or_else(|| capacity("read buffer pool busy"))
     }
-    fn observe_idle(&self, free: &[Option<Vec<u8>>; SLOTS], metrics: Option<&ReadWorkMetrics>) {
-        if let Some(m) = metrics {
-            m.read_buffer_idle(
-                self.role,
-                free.iter().flatten().map(Vec::capacity).sum::<usize>() as u64,
-            );
+    pub(crate) async fn take_until(
+        self: &Arc<Self>,
+        size: usize,
+        metrics: Option<ReadWorkMetrics>,
+        deadline: Instant,
+    ) -> Result<ReadBuffer> {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if let Some(buffer) = self.try_take(size, metrics.clone())? {
+                return Ok(buffer);
+            }
+            tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), changed)
+                .await
+                .map_err(|_| capacity("read buffer deadline exceeded"))?;
         }
     }
+    fn detach(&self, bytes: usize, metrics: Option<&ReadWorkMetrics>) {
+        if let Ok(mut state) = self.state.lock() {
+            state.allocated = state.allocated.saturating_sub(bytes);
+            self.observe(&state, metrics);
+        }
+        self.changed.notify_waiters();
+    }
+}
+impl Drop for ReadBufferPool {
+    fn drop(&mut self) {
+        if let Some(m) = self.metrics.get() {
+            m.read_buffer_idle(self.role, 0);
+            if let Ok(state) = self.state.get_mut() {
+                m.read_buffer_capacity(
+                    self.role,
+                    0,
+                    0,
+                    state.limit.unwrap_or(0) as u64,
+                    state.peak as u64,
+                );
+            }
+        }
+    }
+}
+fn capacity(message: &'static str) -> Error {
+    Error::coded(afs_error::IO_CAPACITY, message)
 }
 
 #[derive(Debug)]
@@ -81,6 +203,9 @@ impl ReadBuffer {
         self.bytes.capacity()
     }
     pub(crate) fn into_vec(mut self) -> Vec<u8> {
+        if let Some(pool) = self.pool.take() {
+            pool.detach(self.bytes.capacity(), self.metrics.as_ref());
+        }
         self.bytes.truncate(self.length);
         std::mem::take(&mut self.bytes)
     }
@@ -116,22 +241,25 @@ impl Drop for ReadBuffer {
         let Some(pool) = &self.pool else {
             return;
         };
-        if self.bytes.capacity() == 0 || self.bytes.capacity() > MAX_BUFFER {
-            return;
-        }
-        if let Ok(mut free) = pool.free.lock() {
-            if let Some(slot) = free.iter_mut().find(|v| v.is_none()) {
-                *slot = Some(std::mem::take(&mut self.bytes));
+        let bytes = std::mem::take(&mut self.bytes);
+        let n = bytes.capacity();
+        if let Ok(mut state) = pool.state.lock() {
+            let retain = n > 0
+                && match state.limit {
+                    Some(limit) => n <= limit,
+                    None => n <= MAX_BUFFER && state.free.len() < SLOTS,
+                };
+            if retain {
+                state.free.push(bytes);
                 if let Some(m) = &self.metrics {
-                    m.read_buffer(
-                        pool.role,
-                        "return",
-                        slot.as_ref().map_or(0, Vec::capacity) as u64,
-                    );
+                    m.read_buffer(pool.role, "return", n as u64);
                 }
+            } else {
+                state.allocated = state.allocated.saturating_sub(n);
             }
-            pool.observe_idle(&free, self.metrics.as_ref());
+            pool.observe(&state, self.metrics.as_ref());
         }
+        pool.changed.notify_waiters();
     }
 }
 
@@ -147,7 +275,7 @@ mod tests {
         let bytes = prost::bytes::Bytes::from_owner(b);
         let frame = bytes.slice(16..32);
         drop(bytes);
-        assert!(pool.free.lock().unwrap().iter().all(Option::is_none));
+        assert!(pool.state.lock().unwrap().free.is_empty());
         let other = pool.take(1024, None).unwrap();
         assert_ne!(other.as_ptr(), ptr);
         assert_eq!(&frame[..], &[17; 16]);
@@ -165,22 +293,22 @@ mod tests {
             .collect();
         drop(held);
         assert_eq!(
-            pool.free
+            pool.state
                 .lock()
                 .unwrap()
+                .free
                 .iter()
-                .flatten()
                 .map(Vec::capacity)
                 .sum::<usize>(),
             2 * MAX_BUFFER
         );
         drop(pool.take(MAX_BUFFER + 1, None).unwrap());
         assert_eq!(
-            pool.free
+            pool.state
                 .lock()
                 .unwrap()
+                .free
                 .iter()
-                .flatten()
                 .map(Vec::capacity)
                 .sum::<usize>(),
             2 * MAX_BUFFER
@@ -193,6 +321,45 @@ mod tests {
         };
         assert_eq!(pool.take(MAX_BUFFER, None).unwrap().as_ptr(), ptr);
     }
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_equivalence_pool_budget_reuses_idle_and_waits_for_last_owner() {
+        let pool = ReadBufferPool::new("reply");
+        pool.configure_byte_limit(2 * MAX_BUFFER).unwrap();
+        let first = prost::bytes::Bytes::from_owner(pool.take(MAX_BUFFER, None).unwrap());
+        let last = first.clone();
+        drop(first);
+        let second = pool.take(MAX_BUFFER, None).unwrap();
+        assert!(pool.try_take(MAX_BUFFER, None).unwrap().is_none());
+        let waiting = pool.clone();
+        let task = tokio::spawn(async move {
+            waiting
+                .take_until(
+                    MAX_BUFFER,
+                    None,
+                    Instant::now() + std::time::Duration::from_secs(1),
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished());
+        drop(last);
+        let borrowed = task.await.unwrap().unwrap();
+        drop(borrowed);
+        drop(second);
+        let state = pool.state.lock().unwrap();
+        assert_eq!(state.allocated, 2 * MAX_BUFFER);
+        assert_eq!(
+            state.free.iter().map(Vec::capacity).sum::<usize>(),
+            2 * MAX_BUFFER
+        );
+        drop(state);
+        // Incompatible idle sizes can be reclaimed; idle credits cannot deadlock allocation.
+        let large = pool.take(2 * MAX_BUFFER, None).unwrap();
+        assert_eq!(large.capacity(), 2 * MAX_BUFFER);
+        drop(large);
+        assert!(pool.take(3 * MAX_BUFFER, None).is_err());
+    }
+
     #[test]
     fn buffer_reuse_vec_compatibility_transfers_without_copy_or_pool_alias() {
         let pool = ReadBufferPool::new("reply");
@@ -200,6 +367,6 @@ mod tests {
         let ptr = b.as_ptr();
         let v = b.into_vec();
         assert_eq!(v.as_ptr(), ptr);
-        assert!(pool.free.lock().unwrap().iter().all(Option::is_none));
+        assert!(pool.state.lock().unwrap().free.is_empty());
     }
 }

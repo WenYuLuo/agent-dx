@@ -27,6 +27,8 @@ mod native_live;
 #[cfg(test)]
 mod native_live_tests;
 pub mod outboard;
+#[cfg(any(feature = "dfs", test))]
+mod read_pipeline;
 use catalog_commit::CatalogCommitter;
 #[cfg(feature = "dfs")]
 pub(crate) use native_live::NativeWriteBudgetSnapshot;
@@ -39,6 +41,8 @@ use outboard::{
     ChunkOutboard, DEFAULT_OUTBOARD_BUDGET_BYTES, MAX_ENCODED_OUTBOARD_BYTES, OutboardBuilder,
     OutboardLease, OutboardReadContext, OutboardReadWork, SharedOutboard, SidecarOutboard,
 };
+#[cfg(any(feature = "dfs", test))]
+pub(crate) use read_pipeline::FixedReadReservation;
 
 use afs_error::{Error, Result};
 use afs_tracing::tracing;
@@ -1982,6 +1986,7 @@ struct PeerReadBudget {
     // Never acquire the serve table or destroy charged owners while holding it.
     admission: Mutex<()>,
     changed: Condvar,
+    async_changed: tokio::sync::Notify,
     stopped: std::sync::atomic::AtomicBool,
     wait: Duration,
     #[cfg(test)]
@@ -1999,6 +2004,7 @@ impl Default for PeerReadBudget {
             control_peak: AtomicU64::new(0),
             admission: Mutex::new(()),
             changed: Condvar::new(),
+            async_changed: tokio::sync::Notify::new(),
             stopped: std::sync::atomic::AtomicBool::new(false),
             wait: Duration::from_millis(20),
             #[cfg(test)]
@@ -2049,6 +2055,7 @@ impl Drop for PeerControlLease {
             metrics.peer_serve_control(-(self.bytes as i64), 0);
         }
         self.budget.changed.notify_all();
+        self.budget.async_changed.notify_waiters();
     }
 }
 
@@ -2232,6 +2239,7 @@ impl Drop for PeerReadReservation {
             metrics.peer_payload_released(self.bytes);
         }
         self.budget.changed.notify_all();
+        self.budget.async_changed.notify_waiters();
     }
 }
 
@@ -3615,6 +3623,7 @@ impl LocalChunkStore {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             self.peer_read_budget.stopped.store(true, Ordering::Release);
             self.peer_read_budget.changed.notify_all();
+            self.peer_read_budget.async_changed.notify_waiters();
         }
         let residents = if let Ok(mut state) = self.peer_read_cache.lock() {
             state.closed = true;
@@ -3692,6 +3701,7 @@ impl LocalChunkStore {
         self.read_work.as_ref()
     }
 
+    #[cfg(feature = "dfs")]
     pub(crate) fn with_read_work_metrics(
         mut self,
         metrics: super::read_work::ReadWorkMetrics,
@@ -5147,6 +5157,7 @@ impl LocalChunkStore {
     /// CRC-off immutable range: identity is established when the reader is pinned.
     /// No repeated path open/stat/hash; IO errors retire this reader at its owner.
     #[cfg(any(feature = "dfs", test))]
+    #[cfg(test)]
     pub(crate) fn read_fixed_peer_range(
         &self,
         reader: &PinnedChunkReader,
@@ -5168,7 +5179,16 @@ impl LocalChunkStore {
         reservation.retain_capacity(bytes.capacity().saturating_add(scratch))?;
         let mut done = 0;
         while done < length {
-            let got = read_positioned(&reader.file, offset + done as u64, &mut bytes[done..])?;
+            let activity = self.read_work.as_ref().map(|m| {
+                m.activities
+                    .enter(crate::node::read_activity::Activity::SourceIo, 0)
+            });
+            let result = read_positioned(&reader.file, offset + done as u64, &mut bytes[done..]);
+            if let (Some(activity), Ok(got)) = (&activity, &result) {
+                activity.completed_bytes(*got as u64);
+            }
+            drop(activity);
+            let got = result?;
             if got == 0 {
                 return Err(corrupt(&reader.chunk.id, "fixed open object ended early"));
             }
@@ -5196,6 +5216,7 @@ impl LocalChunkStore {
         chunk_id: &ChunkId,
         quarantine_open_error: bool,
     ) -> Result<PinnedChunkReader> {
+        #[cfg(feature = "dfs")]
         self.record_read_check(super::read_work::ReadCheck::CatalogOpen);
         let record = self
             .catalog

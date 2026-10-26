@@ -178,6 +178,7 @@ impl GrpcChunkTransfer {
         Ok(())
     }
     pub(super) fn close_open_context_impl(&self, reference: &str) -> afs_error::Result<()> {
+        self.forget_native_batch_context(reference);
         self.fast_open_ready
             .lock()
             .map_err(|_| dfs_protocol_error("fixed open readiness table poisoned"))?

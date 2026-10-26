@@ -277,6 +277,25 @@ pub trait Backend: Send + Sync {
         Ok(out)
     }
 
+    fn supports_async_reads(&self) -> bool {
+        false
+    }
+
+    /// Native remote read capability, chosen by backend transport, not a user
+    /// algorithm switch or a per-request layout. None is reserved for genuine
+    /// synchronous backends; a native future returns a body or an error.
+    fn read_reply_async(
+        self: std::sync::Arc<Self>,
+        _ctx: types::RequestContext,
+        _handle: types::FileHandle,
+        _offset: u64,
+        _size: usize,
+        _deadline: std::time::Instant,
+        _lifetime: crate::node::read_pipeline::ReadLifetime,
+    ) -> Result<Option<crate::node::read_pipeline::ReadReplyFuture>> {
+        Ok(None)
+    }
+
     /// Keep private response ownership through the synchronous FUSE reply.
     /// Legacy backends transfer their Vec allocation without copying.
     fn read_reply(

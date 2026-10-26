@@ -13,6 +13,9 @@ impl DfsOpenReadConnection {
             Self(Arc::downgrade(&owner))
         })
     }
+    pub(super) fn identity(&self) -> usize {
+        self.0.as_ptr() as *const () as usize
+    }
     fn same_connection(&self, other: &Self) -> bool {
         std::sync::Weak::ptr_eq(&self.0, &other.0)
     }
@@ -73,36 +76,53 @@ impl DfsOpenReadContext {
         if !self.active.load(Ordering::Acquire)
             || request.file_version_id != self.version
             || request.layout_root_id != self.layout
-            || request.operations.len() != 1
+            || request.operations.is_empty()
+            || request.operations.len() > super::MAX_DFS_READ_OPS
             || request.read_id.is_empty()
+            || request.read_id.len() > 512
             || request.attempt_id.is_empty()
+            || request.attempt_id.len() > 512
         {
             return Err(replica_denied(
                 "fixed open context identity differs or is closed",
             ));
         }
-        let op = &request.operations[0];
-        if op.operation_index != 0
-            || op.length == 0
-            || op.length > super::MAX_DFS_READ_BYTES
-            || op.destination_offset != 0
-        {
-            return Err(replica_denied("fixed open range shape differs"));
+        let first_token = request.operations[0].grant.as_ref().map(|g| &g.token);
+        if first_token.is_none() {
+            return Err(replica_denied("fixed open context token missing"));
         }
-        match self.sources.get(&op.chunk_id) {
-            Some(source) if covers(source, op) => Ok(true),
-            Some(_) => Err(replica_denied(
-                "fixed open range exceeds its admitted object",
-            )),
-            None => Ok(false), // A missing source page is a cold-context path.
+        let mut destination = 0_u64;
+        let mut all_present = true;
+        for (index, op) in request.operations.iter().enumerate() {
+            if op.operation_index as usize != index
+                || op.length == 0
+                || op.destination_offset != destination
+                || op.grant.as_ref().map(|g| &g.token) != first_token
+            {
+                return Err(replica_denied("fixed open range shape differs"));
+            }
+            destination = destination
+                .checked_add(op.length)
+                .filter(|n| *n <= super::MAX_DFS_READ_BYTES)
+                .ok_or_else(|| replica_denied("fixed open range budget exceeded"))?;
+            match self.sources.get(&op.chunk_id) {
+                Some(source) if covers(source, op) => (),
+                Some(_) => {
+                    return Err(replica_denied(
+                        "fixed open range exceeds its admitted object",
+                    ));
+                }
+                None => all_present = false,
+            }
         }
+        Ok(all_present)
     }
-    pub(super) fn payload(
+
+    fn fixed_reader(
         &self,
         local: &LocalChunkStore,
         op: &afs_protocol::node_data::DfsChunkReadOp,
-        deadline: std::time::Instant,
-    ) -> afs_error::Result<crate::node::chunk::PeerReadPayload> {
+    ) -> afs_error::Result<Arc<crate::node::chunk::PinnedChunkReader>> {
         let id = crate::dfs::ChunkId::new(op.chunk_id.clone());
         let reader = {
             let mut readers = self
@@ -139,6 +159,24 @@ impl DfsOpenReadContext {
                 reader
             }
         };
+        Ok(reader)
+    }
+
+    fn forget_failed_reader(&self, id: &crate::dfs::ChunkId) {
+        if let Ok(mut readers) = self.readers.lock() {
+            readers.remove(id);
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn payload(
+        &self,
+        local: &LocalChunkStore,
+        op: &afs_protocol::node_data::DfsChunkReadOp,
+        deadline: std::time::Instant,
+    ) -> afs_error::Result<crate::node::chunk::PeerReadPayload> {
+        let id = crate::dfs::ChunkId::new(op.chunk_id.clone());
+        let reader = self.fixed_reader(local, op)?;
         local
             .read_fixed_peer_range(
                 &reader,
@@ -147,11 +185,61 @@ impl DfsOpenReadContext {
                     .map_err(|_| replica_denied("fixed open length exceeds address space"))?,
                 deadline,
             )
-            .inspect_err(|_| {
-                if let Ok(mut readers) = self.readers.lock() {
-                    readers.remove(&id);
-                }
-            })
+            .inspect_err(|_| self.forget_failed_reader(&id))
+    }
+
+    #[cfg(test)]
+    pub(super) async fn payload_async(
+        self: Arc<Self>,
+        local: Arc<LocalChunkStore>,
+        op: afs_protocol::node_data::DfsChunkReadOp,
+        deadline: std::time::Instant,
+        disk_slots: Arc<tokio::sync::Semaphore>,
+    ) -> afs_error::Result<crate::node::chunk::PeerReadPayload> {
+        let length = usize::try_from(op.length)
+            .map_err(|_| replica_denied("fixed open length exceeds address space"))?;
+        let reservation = local.reserve_fixed_read_until(length, deadline).await?;
+        self.payload_reserved_async(local, op, deadline, disk_slots, reservation, Arc::new(()))
+            .await
+    }
+
+    pub(super) async fn payload_reserved_async(
+        self: Arc<Self>,
+        local: Arc<LocalChunkStore>,
+        op: afs_protocol::node_data::DfsChunkReadOp,
+        deadline: std::time::Instant,
+        disk_slots: Arc<tokio::sync::Semaphore>,
+        reservation: crate::node::chunk::FixedReadReservation,
+        lifetime: crate::node::read_pipeline::ReadLifetime,
+    ) -> afs_error::Result<crate::node::chunk::PeerReadPayload> {
+        let length = usize::try_from(op.length)
+            .map_err(|_| replica_denied("fixed open length exceeds address space"))?;
+        let disk_wait = local.read_work_metrics().map(|m| {
+            m.activities
+                .enter(crate::node::read_activity::Activity::DiskWait, 0)
+        });
+        let disk = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            disk_slots.acquire_owned(),
+        )
+        .await
+        .map_err(|_| {
+            afs_error::Error::coded(
+                afs_error::CLIENT_DEADLINE_EXCEEDED,
+                "disk admission deadline exceeded",
+            )
+        })?
+        .map_err(|_| afs_error::Error::coded(afs_error::IO_UNAVAILABLE, "disk admission closed"))?;
+        drop(disk_wait);
+        crate::node::read_pipeline::blocking_read(disk, move || {
+            let _lifetime = lifetime;
+            let id = crate::dfs::ChunkId::new(op.chunk_id.clone());
+            let reader = self.fixed_reader(&local, &op)?;
+            local
+                .read_fixed_peer_range_reserved(&reader, op.chunk_offset, length, reservation)
+                .inspect_err(|_| self.forget_failed_reader(&id))
+        })
+        .await
     }
 }
 
@@ -219,6 +307,44 @@ fn covers(
         })
 }
 impl CachedDfsReadAuthorizer {
+    pub(super) fn cached_open_context(
+        &self,
+        peer: &str,
+        request: &DfsReadRangesRequest,
+        connection: Option<&DfsOpenReadConnection>,
+    ) -> afs_error::Result<Option<Arc<DfsOpenReadContext>>> {
+        let metrics = self.validator.authorization_metrics();
+        let _scope = metrics
+            .as_ref()
+            .map(|m| m.authorization_scope("context_lookup"));
+        let Some(connection) = connection else {
+            return Ok(None);
+        };
+        let Some(grant) = request.operations.first().and_then(|op| op.grant.as_ref()) else {
+            return Err(replica_denied("fixed open context is absent"));
+        };
+        if !grant.token.starts_with("dfs-open-v1:read-open:") || grant.token.len() > 524 {
+            return Ok(None);
+        }
+        let context = self
+            .open_cache
+            .lock()
+            .map_err(|_| replica_denied("open read cache poisoned"))?
+            .entries
+            .get(&(peer.to_owned(), grant.token.clone()))
+            .and_then(|entry| entry.fast.clone());
+        if let Some(context) = context
+            && context.connection.same_connection(connection)
+            && context.admits(request)?
+        {
+            if let Some(metrics) = &metrics {
+                metrics.check(crate::node::read_work::ReadCheck::ContextReuse);
+            }
+            return Ok(Some(context));
+        }
+        Ok(None)
+    }
+
     pub(super) fn fast_open_context(
         &self,
         peer: &str,
@@ -612,6 +738,232 @@ mod tests {
             }],
         }
     }
+    struct PipelineTlsFixture {
+        client:
+            afs_protocol::node_data::dfs_chunks_client::DfsChunksClient<tonic::transport::Channel>,
+        server: tokio::task::JoinHandle<()>,
+    }
+    async fn pipeline_tls_fixture(
+        local: Arc<LocalChunkStore>,
+        validator: Arc<dyn DfsReadGrantValidator>,
+        limits: crate::node::read_pipeline::ReadPipelineLimits,
+    ) -> PipelineTlsFixture {
+        use super::test_tls::*;
+        use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity, ServerTlsConfig};
+        struct Peer;
+        impl PeerAuthenticator for Peer {
+            fn authenticate(
+                &self,
+                _: &tonic::metadata::MetadataMap,
+                _: Option<SocketAddr>,
+                cert: Option<&[u8]>,
+            ) -> afs_error::Result<String> {
+                assert!(
+                    cert.is_some(),
+                    "test must use an authenticated TLS connection"
+                );
+                Ok("reader".into())
+            }
+        }
+        let authorizer = Arc::new(CachedDfsReadAuthorizer::new(
+            validator,
+            "receiver".into(),
+            1,
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!(
+            "https://localhost:{}",
+            listener.local_addr().unwrap().port()
+        );
+        let service = make_dfs_chunks_server_with_transport(
+            Some(local),
+            Arc::new(Peer),
+            authorizer.clone(),
+            Arc::new(DenyDfsReplicaAuthorizer),
+            None,
+            std::time::Duration::from_secs(3),
+            DfsChunkTransportResources {
+                read_pipeline: limits,
+                rdma_sessions: super::super::super::control::RdmaSessionRegistry::new(None),
+                payload_metrics: None,
+            },
+        );
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .tls_config(
+                    ServerTlsConfig::new()
+                        .client_ca_root(Certificate::from_pem(CA_PEM))
+                        .identity(Identity::from_pem(SERVER_CERT_PEM, SERVER_KEY_PEM)),
+                )
+                .unwrap()
+                .add_service(service)
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        let channel = Endpoint::from_shared(endpoint)
+            .unwrap()
+            .initial_stream_window_size(65_535)
+            .initial_connection_window_size(65_535)
+            .tls_config(
+                ClientTlsConfig::new()
+                    .ca_certificate(Certificate::from_pem(CA_PEM))
+                    .identity(Identity::from_pem(CLIENT_CERT_PEM, CLIENT_KEY_PEM))
+                    .domain_name("localhost"),
+            )
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let client = afs_protocol::node_data::dfs_chunks_client::DfsChunksClient::new(channel);
+        PipelineTlsFixture { client, server }
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn read_concurrency_real_mtls_service_routes_group_to_fast_lane() {
+        let temp = tempfile::tempdir().unwrap();
+        let local = Arc::new(
+            LocalChunkStore::open(temp.path(), "node-a")
+                .unwrap()
+                .with_peer_read_crc_mode(crate::config::DfsReadCrcMode::Off),
+        );
+        let validator = Arc::new(PageValidator {
+            calls: AtomicUsize::new(0),
+            gate: None,
+        });
+        let PipelineTlsFixture { mut client, server } = pipeline_tls_fixture(
+            local,
+            validator,
+            crate::node::read_pipeline::ReadPipelineLimits {
+                ..Default::default()
+            },
+        )
+        .await;
+        let mut warm = tonic::Request::new(request());
+        warm.metadata_mut()
+            .insert("x-afs-open-fast", "1".parse().unwrap());
+        warm.metadata_mut()
+            .insert("x-afs-read-crc-mode", "off".parse().unwrap());
+        let mut body = client.read_ranges(warm).await.unwrap().into_inner();
+        let _ = body.message().await;
+        drop(body);
+        let mut group = request();
+        let token = group.operations[0].grant.as_ref().unwrap().token.clone();
+        group.operations[0].grant = Some(afs_protocol::node_data::DfsReadGrant {
+            token,
+            ..Default::default()
+        });
+        let mut second = group.operations[0].clone();
+        second.operation_index = 1;
+        second.chunk_offset = 1024;
+        second.destination_offset = 1024;
+        group.operations.push(second);
+        let mut group = tonic::Request::new(group);
+        group
+            .metadata_mut()
+            .insert("x-afs-open-fast", "1".parse().unwrap());
+        group
+            .metadata_mut()
+            .insert("x-afs-read-crc-mode", "off".parse().unwrap());
+        let response = client.read_ranges(group).await;
+        server.abort();
+        assert!(
+            response.is_ok(),
+            "enabled authenticated grouped request must reach fixed-open admission: {:?}",
+            response.as_ref().err()
+        );
+        let response = response.unwrap();
+        assert_eq!(response.metadata().get("x-afs-open-fast").unwrap(), "1");
+        assert!(response.metadata().get("x-afs-read-batch-v1").is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn read_concurrency_stream_lifetime_is_not_the_resource_admission_timeout() {
+        use crate::node::chunk::{ChunkStore, StagedChunk};
+        struct SourceValidator(crate::dfs::OpenReadSource);
+        impl DfsReadGrantValidator for SourceValidator {
+            fn validate(
+                &self,
+                request: crate::dfs::ValidateDfsReadGrants,
+            ) -> afs_error::Result<Vec<crate::dfs::DfsAuthorizedRead>> {
+                let validation = request.validations[0].clone();
+                Ok(vec![crate::dfs::DfsAuthorizedRead {
+                    expires_at_unix_ms: crate::meta::store::now_unix_ms() + 10000,
+                    validation,
+                    allowed_ranges: self.0.ranges.clone(),
+                    open_sources: serde_json::to_vec(std::slice::from_ref(&self.0)).unwrap(),
+                }])
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let local = Arc::new(
+            LocalChunkStore::open(temp.path(), "node-a")
+                .unwrap()
+                .with_peer_read_crc_mode(crate::config::DfsReadCrcMode::Off),
+        );
+        let expected = vec![37; 4 * 1024 * 1024];
+        let staged = StagedChunk::new_crc32c(
+            crate::dfs::OperationId::new("stream-lifetime"),
+            expected.clone(),
+        )
+        .unwrap();
+        local.put(staged.clone()).unwrap();
+        let validator = Arc::new(SourceValidator(crate::dfs::OpenReadSource {
+            chunk_id: staged.chunk.id.clone(),
+            copy_ids: vec![crate::dfs::CopyId::new("copy")],
+            ranges: vec![(0, expected.len() as u64)],
+        }));
+        let PipelineTlsFixture { mut client, server } = pipeline_tls_fixture(
+            local,
+            validator,
+            crate::node::read_pipeline::ReadPipelineLimits {
+                task_timeout_ms: 5000,
+                ..Default::default()
+            },
+        )
+        .await;
+        let mut r = request();
+        r.operations[0].chunk_id = staged.chunk.id.0.clone();
+        r.operations[0].length = expected.len() as u64;
+        let mut r = tonic::Request::new(r);
+        r.set_timeout(std::time::Duration::from_secs(5));
+        r.metadata_mut()
+            .insert("x-afs-open-fast", "1".parse().unwrap());
+        r.metadata_mut()
+            .insert("x-afs-read-crc-mode", "off".parse().unwrap());
+        // This checks a 20ms admission bound, not a 1s throughput guarantee.
+        let started = std::time::Instant::now();
+        let mut stream = client.read_ranges(r).await.unwrap().into_inner();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let mut received = Vec::new();
+        let mut error = None;
+        loop {
+            match stream.message().await {
+                Ok(Some(frame)) => {
+                    if let Some(afs_protocol::node_data::dfs_read_ranges_frame::Body::Data(bytes)) =
+                        frame.body
+                    {
+                        received.extend_from_slice(&bytes);
+                    }
+                }
+                Ok(None) => break,
+                Err(failure) => {
+                    error = Some(failure);
+                    break;
+                }
+            }
+        }
+        server.abort();
+        eprintln!(
+            "slow consumer: elapsed={:?}, received={}, error={error:?}",
+            started.elapsed(),
+            received.len()
+        );
+        assert!(
+            error.is_none(),
+            "stream must outlive 20ms resource admission window within request deadline: {error:?}"
+        );
+        assert_eq!(received, expected);
+    }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn retirement_mtls_disconnect_retires_context() {
         use super::test_tls::*;
@@ -797,6 +1149,196 @@ mod tests {
             "disconnected setup cannot publish a reusable context"
         );
         assert!(authorizer.open_cache.lock().unwrap().entries.is_empty());
+    }
+
+    #[test]
+    fn read_concurrency_cached_authority_lookup_has_no_meta_and_keeps_identity_checks() {
+        let validator = Arc::new(PageValidator {
+            calls: AtomicUsize::new(0),
+            gate: None,
+        });
+        let authorizer = CachedDfsReadAuthorizer::new(validator.clone(), "receiver".into(), 1);
+        let (_owner, connection) = connection();
+        let mut r = request();
+        assert!(
+            authorizer
+                .cached_fast_open_context("reader", &r, connection.as_ref())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(validator.calls.load(Ordering::SeqCst), 0);
+        authorizer
+            .authorize_fast_open("reader", &r, connection.clone())
+            .unwrap()
+            .unwrap();
+        for _ in 0..8 {
+            assert!(
+                authorizer
+                    .cached_fast_open_context("reader", &r, connection.as_ref())
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        assert_eq!(validator.calls.load(Ordering::SeqCst), 1);
+        r.file_version_id = "other-version".into();
+        assert!(
+            authorizer
+                .cached_fast_open_context("reader", &r, connection.as_ref())
+                .is_err()
+        );
+        r = request();
+        let (_other_owner, other) = self::connection();
+        assert!(
+            authorizer
+                .cached_fast_open_context("reader", &r, other.as_ref())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(validator.calls.load(Ordering::SeqCst), 1);
+        authorizer
+            .close_open_context("reader", "dfs-open-v1:read-open:test")
+            .unwrap();
+        assert!(
+            authorizer
+                .cached_fast_open_context("reader", &r, connection.as_ref())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    fn async_fixed_fixture() -> (
+        tempfile::TempDir,
+        Arc<LocalChunkStore>,
+        Arc<DfsOpenReadContext>,
+        DfsReadRangesRequest,
+        Vec<u8>,
+    ) {
+        use crate::node::chunk::{ChunkStore, StagedChunk};
+        let temp = tempfile::tempdir().unwrap();
+        let local = Arc::new(
+            LocalChunkStore::open(temp.path(), "node-a")
+                .unwrap()
+                .with_peer_read_crc_mode(crate::config::DfsReadCrcMode::Off),
+        );
+        let data: Vec<u8> = (0..1024 * 1024).map(|i| (i % 251) as u8).collect();
+        let staged = StagedChunk::new_crc32c(
+            crate::dfs::OperationId::new("async-fixed-read"),
+            data.clone(),
+        )
+        .unwrap();
+        local.put(staged.clone()).unwrap();
+        let (_owner, connection) = connection();
+        let context = Arc::new(DfsOpenReadContext {
+            version: "v".into(),
+            layout: "l".into(),
+            sources: HashMap::from([(
+                staged.chunk.id.0.clone(),
+                crate::dfs::OpenReadSource {
+                    chunk_id: staged.chunk.id.clone(),
+                    copy_ids: vec![crate::dfs::CopyId::new("copy")],
+                    ranges: vec![(0, data.len() as u64)],
+                },
+            )]),
+            active: Arc::new(AtomicBool::new(true)),
+            connection: connection.unwrap(),
+            readers: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            readers_registered: AtomicBool::new(false),
+        });
+        let mut r = request();
+        r.operations[0].chunk_id = staged.chunk.id.0.clone();
+        r.operations[0].length = data.len() as u64;
+        (temp, local, context, r, data)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_concurrency_async_payload_preserves_bytes_and_last_reference_budget() {
+        use std::time::{Duration, Instant};
+        let (_temp, local, context, r, data) = async_fixed_fixture();
+        let payload = context
+            .payload_async(
+                local.clone(),
+                r.operations[0].clone(),
+                Instant::now() + Duration::from_secs(3),
+                Arc::new(tokio::sync::Semaphore::new(2)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(payload.as_slice(), data);
+        let shared = payload.into_shared_bytes();
+        let last = shared.slice(0..1024);
+        drop(shared);
+        let full = crate::node::chunk::PEER_READ_PAYLOAD_LIMIT - crate::node::chunk_crc32c::SEGMENT;
+        let blocked = tokio::time::timeout(
+            Duration::from_millis(20),
+            local.reserve_fixed_read_until(full, Instant::now() + Duration::from_secs(3)),
+        )
+        .await;
+        assert!(
+            !matches!(blocked, Ok(Ok(_))),
+            "live final frame must retain its body charge"
+        );
+        drop(last);
+        let reservation = tokio::time::timeout(
+            Duration::from_secs(1),
+            local.reserve_fixed_read_until(full, Instant::now() + Duration::from_secs(3)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        drop(reservation);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_concurrency_group_send_backpressure_releases_disk_and_drains_children() {
+        use std::time::{Duration, Instant};
+        let (_temp, local, context, mut request, data) = async_fixed_fixture();
+        request.operations[0].length = (data.len() / 2) as u64;
+        let mut second = request.operations[0].clone();
+        second.operation_index = 1;
+        second.chunk_offset = second.length;
+        second.destination_offset = second.length;
+        request.operations.push(second);
+        assert!(context.admits(&request).unwrap());
+        let mut invalid = request.clone();
+        invalid.operations[1].destination_offset = 0;
+        assert!(context.admits(&invalid).is_err());
+        let disk = Arc::new(tokio::sync::Semaphore::new(2));
+        let service = Arc::new(tokio::sync::Semaphore::new(1));
+        let lease = Arc::new(service.clone().acquire_owned().await.unwrap());
+        let (sender, receiver) = tokio::sync::mpsc::channel(2);
+        let observe = sender.clone();
+        let producer = super::super::read_pipeline::AsyncReadProducer {
+            local: local.clone(),
+            context,
+            request,
+            sender,
+            metrics: None,
+            deadline: Instant::now() + Duration::from_secs(3),
+            disk: disk.clone(),
+            window: 2,
+            service: lease,
+        };
+        let task = tokio::spawn(async move { producer.produce().await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while observe.capacity() != 0 || disk.available_permits() != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!task.is_finished());
+        assert_eq!(service.available_permits(), 0);
+        drop(receiver);
+        assert!(task.await.unwrap().is_err());
+        assert_eq!(disk.available_permits(), 2);
+        assert_eq!(service.available_permits(), 1);
+        let full = crate::node::chunk::PEER_READ_PAYLOAD_LIMIT - crate::node::chunk_crc32c::SEGMENT;
+        drop(
+            local
+                .reserve_fixed_read_until(full, Instant::now() + Duration::from_secs(1))
+                .await
+                .unwrap(),
+        );
     }
 
     #[test]

@@ -138,6 +138,7 @@ const READ_CHECK_NAMES: [&str; 14] = [
 
 #[derive(Clone, Debug)]
 pub struct ReadWorkMetrics {
+    pub(crate) activities: super::read_activity::Activities,
     checks: [afs_metrics::IntCounter; 14],
     #[cfg(feature = "dfs")]
     native_write_resources: afs_metrics::IntGaugeVec,
@@ -147,6 +148,7 @@ pub struct ReadWorkMetrics {
     read_buffer_events: afs_metrics::IntCounterVec,
     read_buffer_bytes: afs_metrics::IntCounterVec,
     read_buffer_idle: afs_metrics::IntGaugeVec,
+    read_buffer_capacity: afs_metrics::IntGaugeVec,
     crc_read_bytes: afs_metrics::IntCounterVec,
     crc_read_calls: afs_metrics::IntCounterVec,
     authorization_ns: afs_metrics::IntCounterVec,
@@ -267,7 +269,7 @@ impl ReadWorkMetrics {
             afs_metrics::register_collector(registry, &checks)?;
             let read_buffer_events = afs_metrics::IntCounterVec::new(afs_metrics::Opts::new("afs_dfs_read_buffer_events_total", "Read buffer allocation/reuse/return events; zero counts explicit initialization."), &["role", "event"])?;
             let read_buffer_bytes = afs_metrics::IntCounterVec::new(afs_metrics::Opts::new("afs_dfs_read_buffer_bytes_total", "Actual capacity allocated/reused/returned or explicit bytes zeroed."), &["role", "event"])?;
-            let read_buffer_idle = afs_metrics::IntGaugeVec::new(afs_metrics::Opts::new("afs_dfs_read_buffer_idle_bytes", "Idle buffer capacity; bounded to 2MiB per role, additional to active operation budgets."), &["role"])?;
+            let read_buffer_idle = afs_metrics::IntGaugeVec::new(afs_metrics::Opts::new("afs_dfs_read_buffer_idle_bytes", "Idle initialized buffer capacity; native async idle plus active storage shares a fixed byte budget."), &["role"])?;
             for role in ["serve", "reply"] {
                 read_buffer_idle.with_label_values(&[role]);
                 for event in ["allocate", "reuse", "return", "zero"] {
@@ -278,6 +280,8 @@ impl ReadWorkMetrics {
             afs_metrics::register_collector(registry, &read_buffer_events)?;
             afs_metrics::register_collector(registry, &read_buffer_bytes)?;
             afs_metrics::register_collector(registry, &read_buffer_idle)?;
+            let read_buffer_capacity=afs_metrics::IntGaugeVec::new(afs_metrics::Opts::new("afs_dfs_read_buffer_capacity_bytes","Pool-owned storage by role/state; active plus idle equals total; legacy detached Vec storage excluded."), &["role","state"])?;
+            afs_metrics::register_collector(registry,&read_buffer_capacity)?;
             let crc_read_bytes = afs_metrics::IntCounterVec::new(
                 afs_metrics::Opts::new("afs_dfs_crc32c_read_bytes_total", "Actual CRC32C read input bytes, including failed work; descriptor hashes are separate."), &["stage"],
             )?;
@@ -621,6 +625,7 @@ impl ReadWorkMetrics {
                 copies.with_label_values(&[stage]);
             }
             Ok(Self {
+                activities: super::read_activity::Activities::register(registry)?,
                 checks: checks_bound,
                 #[cfg(feature = "dfs")]
                 native_write_resources,
@@ -630,6 +635,7 @@ impl ReadWorkMetrics {
                 read_buffer_events,
                 read_buffer_bytes,
                 read_buffer_idle,
+                read_buffer_capacity,
                 crc_read_bytes,
                 crc_read_calls,
                 authorization_ns,
@@ -1121,6 +1127,28 @@ impl ReadWorkMetrics {
         self.read_buffer_bytes
             .with_label_values(&[role, event])
             .inc_by(bytes);
+    }
+    pub(crate) fn read_buffer_capacity(
+        &self,
+        role: &'static str,
+        total: u64,
+        idle: u64,
+        limit: u64,
+        peak: u64,
+    ) {
+        for (name, value) in [
+            ("total", total),
+            ("active", total.saturating_sub(idle)),
+            ("idle", idle),
+            ("limit", limit),
+            ("peak", peak),
+        ] {
+            if let Ok(value) = i64::try_from(value) {
+                self.read_buffer_capacity
+                    .with_label_values(&[role, name])
+                    .set(value);
+            }
+        }
     }
     pub(crate) fn read_buffer_idle(&self, role: &'static str, bytes: u64) {
         if let Ok(bytes) = i64::try_from(bytes) {
