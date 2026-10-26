@@ -85,8 +85,10 @@ message CreateEnvironmentRequest {
   uint64 create_timeout_seconds = 4;
   // Fixed by the entrypoint; retries and every hop retain this deadline.
   uint64 create_deadline_unix_millis = 5;
-  // When retrying an observed Pending owner, never allocate another generation.
+  // Previously observed assignment for diagnostics; unconfirmed attempts may be reassigned.
   Assignment expected_assignment = 6;
+  // Stable public operation identity, preserved on every hop and retry.
+  string request_id = 7;
 }
 
 message GetEnvironmentRequest { string environment_id = 1; CallerContext caller = 2; }
@@ -167,7 +169,13 @@ message SetNodeSchedulingRequest {
 message NodeSchedulingState { string node_id = 1; bool accepting_allocations = 2; }
 message LocalEnvironmentCreateRequest { CreateEnvironmentRequest create = 1; string node_session_id = 2; }
 message PreparedEnvironment { EnvironmentSpec spec = 1; ReusableSnapshot snapshot = 2; }
-message ClaimEnvironmentRequest { EnvironmentSpec spec = 1; CallerContext caller = 2; string node_session_id = 3; repeated DeviceAllocation devices = 4; }
+message ClaimEnvironmentRequest {
+  EnvironmentSpec spec = 1;
+  CallerContext caller = 2;
+  string node_session_id = 3;
+  repeated DeviceAllocation devices = 4;
+  string request_id = 5;
+}
 message ClaimEnvironmentResponse {
   oneof outcome {
     StartAssignedEnvironmentRequest owned = 1;

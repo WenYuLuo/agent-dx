@@ -4,9 +4,9 @@ import json
 import time
 import uuid
 
-from adx_environment import Environment, EnvironmentError
+from adx_environment import Environment
 from functional_lifecycle import _wait_deleted
-from node import backend, catalog, labeled_backend, persisted_runtime_id
+from node import backend, labeled_backend, live_catalog as catalog, persisted_runtime_id
 
 
 def create(connection, image, output):
@@ -51,7 +51,7 @@ def create(connection, image, output):
         environment.close()
 
 
-def rejected(connection, image, evidence):
+def accepted(connection, image, evidence):
     live = json.loads((evidence / 'resource-live.json').read_text())
     before = catalog()
     held = {
@@ -60,49 +60,50 @@ def rejected(connection, image, evidence):
         if key.startswith('environment:') and (json.loads(value).get('result') or {}).get('resources_held')
     }
     backends = backend()
-    name = 'stale-rejected-' + uuid.uuid4().hex
     started = time.monotonic()
+    created = Environment(
+        name='stale-accepted-' + uuid.uuid4().hex,
+        image=image,
+        runtime='runc',
+        node_id='node1',
+        cpu=250,
+        memory=256,
+        idle_timeout=0,
+        create_timeout=40,
+        schedule_timeout=10,
+        connection=connection,
+    )
     try:
-        unexpected = Environment(
-            name=name,
-            image=image,
-            runtime='runc',
-            node_id='node1',
-            cpu=250,
-            memory=256,
-            idle_timeout=0,
-            schedule_timeout=3,
-            create_timeout=40,
-            connection=connection,
-        )
-    except EnvironmentError as error:
-        if 'central scheduling queue deadline exceeded' not in str(error):
-            raise AssertionError(str(error)) from error
-    else:
+        command = created.commands.run('printf stale-capacity-usable')
+        if command.exit_code != 0 or command.stdout != 'stale-capacity-usable':
+            raise AssertionError('new runtime was not executable while the observer was stopped')
+        after = catalog()
+        held_after = {
+            key
+            for key, value in after.items()
+            if key.startswith('environment:') and (json.loads(value).get('result') or {}).get('resources_held')
+        }
+        if held_after != held | {'environment:' + created.id}:
+            raise AssertionError('existing allocations changed during stale-capacity creation')
+        if labeled_backend(live['instance_id']) != [live['backend']] or len(backend()) != len(backends) + 1:
+            raise AssertionError('existing backend changed or duplicate runtime was created')
+        result = {
+            'instance_id': created.id,
+            'node_id': 'node1',
+            'held_before': len(held),
+            'held_during': len(held_after),
+            'backend': live['backend'],
+            'seconds': round(time.monotonic() - started, 3),
+        }
+    finally:
         try:
-            raise AssertionError('stale node accepted a new instance')
+            Environment.delete(created.id, connection=connection)
+            _wait_deleted(created.id, connection, timeout=60)
+            if backend() != backends:
+                raise AssertionError('stale-capacity test allocation was not physically released')
         finally:
-            unexpected.kill()
-            unexpected.close()
-    after = catalog()
-    held_after = {
-        key
-        for key, value in after.items()
-        if key.startswith('environment:') and (json.loads(value).get('result') or {}).get('resources_held')
-    }
-    if not (held_after == held and 'environment:' + live['instance_id'] in held_after):
-        raise AssertionError()
-    if not (backend() == backends and labeled_backend(live['instance_id']) == [live['backend']]):
-        raise AssertionError()
-    result = {
-        'name': name,
-        'node_id': 'node1',
-        'held_before': len(held),
-        'held_after': len(held_after),
-        'backend': live['backend'],
-        'seconds': round(time.monotonic() - started, 3),
-    }
-    (evidence / 'resource-rejected.json').write_text(json.dumps(result, indent=2) + '\n')
+            created.close()
+    (evidence / 'resource-accepted.json').write_text(json.dumps(result, indent=2) + '\n')
     return result
 
 
@@ -110,7 +111,7 @@ def verify(connection, image, evidence, output):
     live = json.loads((evidence / 'resource-live.json').read_text())
     stale = json.loads((evidence / 'resource-stale.json').read_text())
     fresh = json.loads((evidence / 'resource-fresh.json').read_text())
-    rejected_result = json.loads((evidence / 'resource-rejected.json').read_text())
+    accepted_result = json.loads((evidence / 'resource-accepted.json').read_text())
     created = None
     deleted = set()
     report = {'status': 'failed', 'cases': [], 'cleanup_errors': []}
@@ -154,7 +155,7 @@ def verify(connection, image, evidence, output):
             {
                 'id': 'reliability.resource-stale-admission',
                 'status': 'passed',
-                'seconds': stale['seconds'] + rejected_result['seconds'],
+                'seconds': stale['seconds'] + accepted_result['seconds'],
             },
             {'id': 'reliability.resource-observation-recovery', 'status': 'passed', 'seconds': fresh['seconds']},
         ]

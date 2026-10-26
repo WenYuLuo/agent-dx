@@ -10,18 +10,25 @@ impl State {
             return Ok(());
         }
         self.needs_recovery = true;
-        // The failed writer has returned. Advancing the header prevents its last
-        // in-flight CAS from materializing after the authoritative snapshot.
+        // The failed writer has returned. Fence only optional claims before
+        // loading their authoritative outcomes; lifecycle objects are independent.
         self.session.claim_barrier().await?;
         let saved = self.session.snapshot().await?;
         self.session.refresh_inspection_inventory().await?;
         let pending: Vec<_> = self
             .specs
             .values()
-            .filter(|s| !saved.environments.contains_key(&s.id))
+            .filter(|s| {
+                !saved.environments.contains_key(&s.id)
+                    && self
+                        .environments
+                        .get(&s.id)
+                        .is_none_or(|e| e.result.is_none())
+            })
             .cloned()
             .collect();
         let mut scheduler = Coordinator::restore(&saved, self.placement)?;
+        scheduler.use_generation_source(self.session.clone());
         for node in saved.nodes.values() {
             let mut candidate = node.node.clone();
             candidate.available &= self.live.get(&candidate.id).is_some_and(|live| {
@@ -34,8 +41,10 @@ impl State {
             });
             scheduler.register(candidate)?;
         }
+        self.specs.clear();
         for spec in pending {
-            scheduler.submit(spec)?;
+            scheduler.submit(spec.clone())?;
+            self.specs.insert(spec.id.clone(), spec);
         }
         self.scheduler = scheduler;
         self.nodes = saved.nodes;
@@ -168,12 +177,87 @@ impl CoordinatorRpc {
         node: String,
         request: pb::ClaimEnvironmentRequest,
     ) -> std::result::Result<pb::ClaimEnvironmentResponse, Status> {
+        let request_id = request.request_id.clone();
         let spec: EnvironmentSpec = request
             .spec
             .ok_or_else(|| Status::invalid_argument("spec required"))?
             .try_into()
             .map_err(status)?;
         tenant(request.caller.as_ref(), &spec.tenant_id)?;
+        let _publication = self.create_guard(format!("publication:{}", spec.id)).await;
+        let (session, cached) = {
+            let state = self.0.state.lock().await;
+            (
+                state.session.clone(),
+                state.environments.get(&spec.id).cloned(),
+            )
+        };
+        let cached = if cached
+            .as_ref()
+            .is_some_and(|stored| stored.result.is_some())
+        {
+            match session.get(&spec.id).await {
+                Ok(current) => {
+                    let mut state = self.0.state.lock().await;
+                    state.accept_stored_claim(current.clone()).map_err(status)?;
+                    Some(current)
+                }
+                Err(Error::NotFound) => {
+                    let mut state = self.0.state.lock().await;
+                    if state.environments.get(&spec.id).is_some_and(|old| {
+                        cached
+                            .as_ref()
+                            .is_some_and(|cached| old.assignment == cached.assignment)
+                    }) {
+                        state.scheduler.retire_claim(&spec.id).map_err(status)?;
+                        state.scheduler.forget_deleted(&spec.id).map_err(status)?;
+                        state.environments.remove(&spec.id);
+                        state.specs.remove(&spec.id);
+                        state.create_requests.remove(&spec.id);
+                    }
+                    None
+                }
+                Err(error) => return Err(status(error)),
+            }
+        } else {
+            cached
+        };
+        let published = match session
+            .published_request(&spec.tenant_id, &request_id)
+            .await
+            .map_err(status)?
+        {
+            Some(record) => Some(record),
+            None => match cached {
+                Some(stored) if stored.spec.tenant_id != spec.tenant_id => {
+                    return Err(Status::not_found("environment not found"));
+                }
+                Some(stored) => stored.result,
+                None => None,
+            },
+        };
+        if let Some(record) = published {
+            let record = if record.state == EnvironmentState::Running {
+                session
+                    .publish_existing(record, &request_id)
+                    .await
+                    .map_err(status)?
+            } else {
+                record
+            };
+            let state = self.0.state.lock().await;
+            let owner = state
+                .nodes
+                .get(&record.assignment.node_id)
+                .ok_or_else(|| Status::unavailable("confirmed owner is unavailable"))?;
+            return Ok(pb::ClaimEnvironmentResponse {
+                outcome: Some(Outcome::Existing(Box::new(pb::GetEnvironmentResponse {
+                    record: Some(record.try_into().map_err(status)?),
+                    node_address: owner.address.clone(),
+                    relay_address: owner.proxy_address.clone(),
+                }))),
+            });
+        }
         let candidate = LocalClaim {
             node_id: node.clone(),
             node_session_id: request.node_session_id,
@@ -220,6 +304,23 @@ impl CoordinatorRpc {
                 outcome: Some(Outcome::Fallback(true)),
             });
         }
+        if let Some(record) = &existing {
+            // A center-selected assignment is memory-only. A competing optional
+            // Claim must reuse it rather than install a second durable owner.
+            // Forwarding through the center also replays a durable pending Claim.
+            if record.result.is_none() && !record.invalidated && record.recovery.is_none() {
+                state
+                    .create_requests
+                    .entry(spec.id.clone())
+                    .or_default()
+                    .insert(request_id);
+                return Ok(pb::ClaimEnvironmentResponse {
+                    outcome: Some(Outcome::Existing(Box::new(
+                        state.environment_response(record).map_err(status)?,
+                    ))),
+                });
+            }
+        }
         let snapshot = if let Some(id) = &spec.snapshot_id {
             if existing.is_none() {
                 let normalized = cloning::normalize(&state.session, spec.clone().into())
@@ -246,6 +347,11 @@ impl CoordinatorRpc {
         } else {
             None
         };
+        state
+            .create_requests
+            .entry(spec.id.clone())
+            .or_default()
+            .insert(request_id);
         *state.claims_in_flight.entry(spec.id.clone()).or_default() += 1;
         drop(state);
         let outcome = self.0.claim(spec.clone(), candidate.clone()).await;

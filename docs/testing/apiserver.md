@@ -50,7 +50,7 @@ Coordinator、adxlet 和 API Server 均使用 `--config /path/to/config.json`，
 
 Coordinator 在绑定监听地址后开启一次 Redis Session，恢复调度目录，装配 CoordinatorService 与 AuthService。
 
-adxlet 装配 Sandboxd、ExecdReadiness、UdsRoutes 及带 SQLite 降级的 StateSink。资源源支持 `resource_source.kind=auto` 自动探测、`kind=sandboxd` external collector，以及兼容的 `capacity_file`；配置互斥，按有效期关闭新准入。实例 Stats 与节点容量分别采集，见 [节点生命周期](node-lifecycle.md)。
+adxlet 装配 Sandboxd、ExecdReadiness、UdsRoutes 及带 SQLite 降级的 StateSink。资源源支持 `resource_source.kind=auto` 自动探测、`kind=sandboxd` external collector，以及兼容的 `capacity_file`；配置互斥；采集失败或样本过期保留最近有效容量，首次无有效容量时限制准入。实例 Stats 与节点容量分别采集，见 [节点生命周期](node-lifecycle.md)。
 
 Node 启动后先关闭生命周期入口，以本次进程身份注册并获取 Coordinator 完整目录，与 sandboxd 实际实例对账，恢复资源占用和本机绑定后再开放准入。Coordinator 暂不可用时不清理或重建。详细契约见 [发现与重启对账](recovery-discovery.md)。
 

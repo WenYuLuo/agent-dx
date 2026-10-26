@@ -202,7 +202,7 @@ impl RuntimeDriver for SlowBackend {
 
 #[tokio::test]
 #[ignore = "requires isolated Redis server"]
-async fn create_retries_delivery_and_lost_response_on_the_same_assignment() {
+async fn create_retries_ready_delivery_and_lost_response_within_original_deadline() {
     let redis = common::Redis::new().await;
     let session = redis.store().await.begin(1).await.unwrap();
     let rpc = CoordinatorRpc::new(
@@ -251,7 +251,7 @@ async fn create_retries_delivery_and_lost_response_on_the_same_assignment() {
         .update_capacity(spec("test").resources, Duration::from_secs(60))
         .unwrap();
     let node = NodeRpc::new(manager, Peers::network(), "boot-1".into());
-    // The registered owner is initially unreachable: persist ownership before delivery.
+    // The first candidate is unreachable; its unfinished assignment stays in memory.
     let nl = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let na = nl.local_addr().unwrap();
     drop(nl);
@@ -282,7 +282,7 @@ async fn create_retries_delivery_and_lost_response_on_the_same_assignment() {
     register.heartbeat_sequence = 2;
     register.reconciling = false;
     register.accepting_allocations = true;
-    worker.register_node(register).await.unwrap();
+    worker.register_node(register.clone()).await.unwrap();
     let mut api = pb::coordinator_service_client::CoordinatorServiceClient::new(
         connect(ma, Principal::ApiServer).await,
     );
@@ -299,17 +299,17 @@ async fn create_retries_delivery_and_lost_response_on_the_same_assignment() {
         adx_transport::deadline::Deadline::after(Duration::from_secs(10))
             .unwrap()
             .unix_millis();
+    let pending_reply = tokio::spawn({
+        let mut api = api.clone();
+        let request = request.clone();
+        async move { api.create_environment(request).await }
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(
-        api.create_environment(request.clone())
-            .await
-            .unwrap_err()
-            .code(),
-        tonic::Code::Unavailable
+        session.get("retry-cold").await,
+        Err(adx_core::Error::NotFound)
     );
-    let allocation = session.get("retry-cold").await.unwrap();
-    assert!(allocation.result.is_none());
     assert_eq!(backend.1.load(Ordering::SeqCst), 0);
-    request.expected_assignment = Some(allocation.assignment.clone().try_into().unwrap());
     let nl = TcpListener::bind(na).await.unwrap();
     servers.0.push(tokio::spawn(async move {
         Server::builder()
@@ -318,12 +318,10 @@ async fn create_retries_delivery_and_lost_response_on_the_same_assignment() {
             .await
             .unwrap();
     }));
-    // Lose the reply after delivery. The serialized controller retains its in-flight start.
-    let pending_reply = tokio::spawn({
-        let mut api = api.clone();
-        let request = request.clone();
-        async move { api.create_environment(request).await }
-    });
+    register.heartbeat_sequence = 3;
+    worker.register_node(register).await.unwrap();
+    // Fresh readiness permits retry. Losing the caller's reply does not cancel
+    // the Coordinator-owned create task or extend its deadline.
     tokio::time::timeout(Duration::from_secs(2), async {
         while backend.1.load(Ordering::SeqCst) == 0 {
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -340,18 +338,24 @@ async fn create_retries_delivery_and_lost_response_on_the_same_assignment() {
         .into_inner();
     let record = result.record.unwrap();
     assert_eq!(record.state, pb::EnvironmentState::Running as i32);
-    assert_eq!(record.assignment, request.expected_assignment);
+    let confirmed = record.assignment.clone().unwrap();
     assert_eq!(backend.1.load(Ordering::SeqCst), 1);
     assert_eq!(backend.0.started.load(Ordering::SeqCst), 1);
     assert_eq!(
         session.get("retry-cold").await.unwrap().assignment,
-        allocation.assignment
+        confirmed.clone().try_into().unwrap()
     );
-    // A stale owner generation cannot replay or create another execution.
-    request.expected_assignment.as_mut().unwrap().generation += 1;
+    // A diagnostic assignment cannot override an already confirmed result.
+    let mut observed = confirmed;
+    observed.generation += 1;
+    request.expected_assignment = Some(observed);
     assert_eq!(
-        api.create_environment(request).await.unwrap_err().code(),
-        tonic::Code::FailedPrecondition
+        api.create_environment(request)
+            .await
+            .unwrap()
+            .into_inner()
+            .record,
+        Some(record.clone())
     );
     let mut expired = create("expired");
     expired.create_deadline_unix_millis = 1;
@@ -391,22 +395,9 @@ async fn create_retries_delivery_and_lost_response_on_the_same_assignment() {
         "{error:?}"
     );
     assert!(adx_protocol::deadline_failure(&error).is_some());
-    let failed = session.get("timeout-cold").await.unwrap();
-    let failed_record = failed.result.unwrap();
-    assert_eq!(failed_record.state, adx_core::EnvironmentState::Failed);
-    assert!(!failed_record.resources_held);
-    assert_eq!(failed_record.failure.unwrap().message, error.message());
-    // A fresh request reaches the authoritative Coordinator even when an API
-    // directory has not yet consumed its Failed delta. No execution is replayed.
-    let replay = api
-        .create_environment(create("timeout-cold"))
-        .await
-        .unwrap_err();
-    assert_eq!(replay.message(), error.message());
-    assert!(adx_protocol::deadline_failure(&replay).is_some());
     assert_eq!(
-        session.get("timeout-cold").await.unwrap().assignment,
-        failed.assignment
+        session.get("timeout-cold").await,
+        Err(adx_core::Error::NotFound)
     );
     assert_eq!(backend.1.load(Ordering::SeqCst), 2);
     assert_eq!(backend.0.started.load(Ordering::SeqCst), 1);

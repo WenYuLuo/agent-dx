@@ -60,6 +60,7 @@ pub struct Coordinator {
     next_shard: usize,
     next_node_shard: usize,
     generation: u64,
+    generation_source: Option<Arc<dyn Fn() -> Result<u64> + Send + Sync>>,
     config: SchedulerConfig,
     snapshot: Arc<Snapshot>,
     journal: MutationJournal,
@@ -74,6 +75,9 @@ pub struct PendingRequest {
 }
 
 impl Coordinator {
+    pub(crate) fn use_generation_source(&mut self, session: storage::Session) {
+        self.generation_source = Some(Arc::new(move || session.next_generation()));
+    }
     pub fn metrics(&self) -> String {
         self.metrics_excluding(&BTreeSet::new()).finish()
     }
@@ -165,6 +169,7 @@ impl Coordinator {
             next_shard: 0,
             next_node_shard: 0,
             generation: 0,
+            generation_source: None,
             journal: MutationJournal::new(config.mutation_history),
             config,
             snapshot: Arc::new(Snapshot::default()),
@@ -194,6 +199,19 @@ impl Coordinator {
         self.journal.record(&node.id);
         self.wake_pending(None);
         Ok(shard)
+    }
+
+    pub(crate) fn register_at(&mut self, node: Node, shard: usize) -> Result<usize> {
+        if shard >= self.shards.len()
+            || self
+                .node_shards
+                .get(&node.id)
+                .is_some_and(|old| *old != shard)
+        {
+            return Err(Error::Conflict);
+        }
+        self.node_shards.insert(node.id.clone(), shard);
+        self.register(node)
     }
 
     /// Global chooses the shard; queued Snapshots can move when a different
@@ -496,9 +514,16 @@ impl Coordinator {
                 outcome.yielded = true;
                 break;
             }
-            let Some(generation) = self.generation.checked_add(1) else {
-                outcome.error = Some(Error::Conflict);
-                break;
+            let allocated = match &self.generation_source {
+                Some(source) => source(),
+                None => self.generation.checked_add(1).ok_or(Error::Conflict),
+            };
+            let generation = match allocated {
+                Ok(value) => value,
+                Err(error) => {
+                    outcome.error = Some(error);
+                    break;
+                }
             };
             outcome.attempted += 1;
             match self.shards[shard].attempt(
@@ -541,6 +566,13 @@ impl Coordinator {
         Ok(outcome)
     }
 
+    /// Reconsider a candidate only after a fresh ready report.
+    pub(crate) fn reconsider_node(&mut self, node: &str) {
+        for shard in &mut self.shards {
+            shard.reconsider_node(node);
+        }
+        self.wake_pending(None);
+    }
     /// Only after the owning node rejects before execution or confirms cleanup.
     /// Retains request identity, rolls back the old reservation and excludes
     /// rejected nodes for this request. A live Environment must not use this path.

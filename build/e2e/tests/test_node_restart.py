@@ -1,4 +1,5 @@
 import importlib.util
+import io
 import json
 import signal
 import sys
@@ -14,10 +15,72 @@ spec.loader.exec_module(node)
 
 
 class SandboxdRestartTests(unittest.TestCase):
+    def test_live_catalog_uses_shared_api_and_preserves_durable_identities(self):
+        records = {
+            'node:node2': json.dumps(
+                {
+                    'node': {'available': False},
+                    'session': {'id': 'boot-2', 'routable': False},
+                }
+            ),
+            'environment:env': 'durable execution',
+        }
+        with (
+            mock.patch.object(node, 'catalog', return_value=records),
+            mock.patch.object(Path, 'read_text', return_value='fixture-token'),
+            mock.patch('ssl.create_default_context'),
+            mock.patch(
+                'urllib.request.urlopen',
+                return_value=io.BytesIO(b'{"items":[{"id":"node2","status":0}]}'),
+            ) as fetch,
+        ):
+            after = node.live_catalog()
+        self.assertEqual(
+            fetch.call_args.args[0].full_url,
+            'https://coordinator:8443/api/environment/v1/resources',
+        )
+        registered = json.loads(after['node:node2'])
+        self.assertTrue(registered['node']['available'])
+        self.assertEqual(registered['session'], {'id': 'boot-2', 'routable': True})
+        self.assertEqual(after['environment:env'], 'durable execution')
+
+    def test_ready_retries_temporary_directory_unavailable(self):
+        from urllib.error import HTTPError
+
+        ready = [
+            {
+                'node': {'id': 'node1', 'available': True},
+                'session': {'id': 'boot', 'routable': True},
+            }
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                mock.patch.object(node, 'E', Path(directory)),
+                mock.patch.object(sys, 'argv', ['node.py', 'ready']),
+                mock.patch.object(
+                    node,
+                    'nodes',
+                    side_effect=[
+                        HTTPError('fixture', 503, 'not ready', {}, None),
+                        ready,
+                    ],
+                ),
+                mock.patch.object(node.time, 'sleep') as sleep,
+            ):
+                node.main()
+                sleep.assert_called_once()
+                self.assertEqual(
+                    json.loads((Path(directory) / 'ready-nodes.json').read_text()),
+                    ready,
+                )
+
     def test_adxlet_restart_evidence_requires_new_pid_and_session(self):
         before = {'node_id': 'node2', 'pid': 123, 'session_id': 'old'}
         after = {'services': [{'role': 'adxlet', 'pid': 456}]}
-        record = {'node': {'available': True}, 'session': {'id': 'new', 'routable': True}}
+        record = {
+            'node': {'available': True},
+            'session': {'id': 'new', 'routable': True},
+        }
         evidence = node.validated_adxlet_restart(before, after, record)
         self.assertEqual(evidence['pid_before'], 123)
         self.assertEqual(evidence['pid_after'], 456)
@@ -27,11 +90,21 @@ class SandboxdRestartTests(unittest.TestCase):
             node.validated_adxlet_restart(before, {'services': [{'role': 'adxlet', 'pid': 123}]}, record)
         with self.assertRaises(AssertionError):
             node.validated_adxlet_restart(
-                before, after, {'node': {'available': True}, 'session': {'id': 'old', 'routable': True}}
+                before,
+                after,
+                {
+                    'node': {'available': True},
+                    'session': {'id': 'old', 'routable': True},
+                },
             )
         with self.assertRaises(AssertionError):
             node.validated_adxlet_restart(
-                before, after, {'node': {'available': False}, 'session': {'id': 'new', 'routable': False}}
+                before,
+                after,
+                {
+                    'node': {'available': False},
+                    'session': {'id': 'new', 'routable': False},
+                },
             )
 
     def test_persisted_runtime_identity_uses_environment_record_runtime(self):
@@ -56,7 +129,10 @@ class SandboxdRestartTests(unittest.TestCase):
         status = f'State:\tT (stopped)\nSigPnd:\t{pending:016x}\nShdPnd:\t0000000000000000\n'
         records = {
             'node:node2': json.dumps(
-                {'node': {'available': False}, 'session': {'id': 'old-session', 'routable': False}}
+                {
+                    'node': {'available': False},
+                    'session': {'id': 'old-session', 'routable': False},
+                }
             ),
             'environment:env-1': json.dumps(
                 {
@@ -82,7 +158,7 @@ class SandboxdRestartTests(unittest.TestCase):
             with (
                 mock.patch.object(node, 'P', root),
                 mock.patch.object(node, 'E', root),
-                mock.patch.object(node, 'catalog', return_value=records),
+                mock.patch.object(node, 'live_catalog', return_value=records),
                 mock.patch.object(node, 'backend', return_value=['runtime-1']),
                 mock.patch.object(
                     node,
@@ -105,7 +181,12 @@ class SandboxdRestartTests(unittest.TestCase):
 
     def test_reconciliation_recovery_rejects_admission_before_cleanup(self):
         records = {
-            'node:node2': json.dumps({'node': {'available': True}, 'session': {'id': 'new-session', 'routable': True}}),
+            'node:node2': json.dumps(
+                {
+                    'node': {'available': True},
+                    'session': {'id': 'new-session', 'routable': True},
+                }
+            ),
             'environment:env-1': json.dumps(
                 {
                     'invalidated': True,
@@ -127,7 +208,7 @@ class SandboxdRestartTests(unittest.TestCase):
             with (
                 mock.patch.object(node, 'P', root),
                 mock.patch.object(node, 'E', root),
-                mock.patch.object(node, 'catalog', return_value=records),
+                mock.patch.object(node, 'live_catalog', return_value=records),
                 mock.patch.object(node, 'backend', return_value=['stale-backend']),
                 mock.patch.object(
                     node,
@@ -178,7 +259,10 @@ class SandboxdRestartTests(unittest.TestCase):
         before = snapshot(4)
         self.assertEqual(
             node.validated_gateway_recovery(before, snapshot(4), ['env-1']),
-            {'coordinator_epoch': 4, 'ownership': {'env-1': {'node_id': 'node1', 'generation': 7}}},
+            {
+                'coordinator_epoch': 4,
+                'ownership': {'env-1': {'node_id': 'node1', 'generation': 7}},
+            },
         )
         with self.assertRaises(AssertionError):
             node.validated_gateway_recovery(before, snapshot(5), ['env-1'])
@@ -202,7 +286,11 @@ class SandboxdRestartTests(unittest.TestCase):
         before = snapshot(4)
         self.assertEqual(
             node.validated_coordinator_recovery(before, snapshot(5), ['env-1']),
-            {'epoch_before': 4, 'epoch_after': 5, 'ownership': {'env-1': {'node_id': 'node1', 'generation': 7}}},
+            {
+                'epoch_before': 4,
+                'epoch_after': 5,
+                'ownership': {'env-1': {'node_id': 'node1', 'generation': 7}},
+            },
         )
         with self.assertRaises(AssertionError):
             node.validated_coordinator_recovery(before, snapshot(4), ['env-1'])
@@ -217,7 +305,10 @@ class SandboxdRestartTests(unittest.TestCase):
             'assignment': {'node_id': 'node2', 'generation': 7},
         }
         records = {'environment:env-1': json.dumps(record)}
-        self.assertEqual(node.persisted_ownership(records, ['env-1']), {'env-1': {'node_id': 'node2', 'generation': 7}})
+        self.assertEqual(
+            node.persisted_ownership(records, ['env-1']),
+            {'env-1': {'node_id': 'node2', 'generation': 7}},
+        )
         record['result']['resources_held'] = False
         with self.assertRaises(AssertionError):
             node.persisted_ownership({'environment:env-1': json.dumps(record)}, ['env-1'])
@@ -238,9 +329,19 @@ class SandboxdRestartTests(unittest.TestCase):
                 mock.patch.object(node, 'E', root),
                 mock.patch.object(node, 'backend', side_effect=lambda: next(observed)),
                 mock.patch.object(node, 'command', return_value='Healthz status: SERVING'),
-                mock.patch.object(node, 'nodes', return_value=[
-                    {'node': {'id': 'node1', 'available': True, 'runtime_classes': ['runsc']}}
-                ]),
+                mock.patch.object(
+                    node,
+                    'nodes',
+                    return_value=[
+                        {
+                            'node': {
+                                'id': 'node1',
+                                'available': True,
+                                'runtime_classes': ['runsc'],
+                            }
+                        }
+                    ],
+                ),
                 mock.patch.object(node.os, 'kill', side_effect=terminate),
                 mock.patch.object(node.time, 'sleep'),
                 mock.patch.object(sys, 'argv', ['node.py', 'restart-sandboxd', 'node1']),

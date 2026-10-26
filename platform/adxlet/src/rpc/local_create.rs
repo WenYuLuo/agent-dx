@@ -25,6 +25,7 @@ impl NodeRpc {
             }
             let request = pb::LocalEnvironmentCreateRequest {
                 create: Some(pb::CreateEnvironmentRequest {
+                    request_id: String::new(),
                     caller: Some(pb::CallerContext {
                         tenant_id: spec.tenant_id.clone(),
                         administrator: false,
@@ -109,13 +110,18 @@ impl NodeRpc {
         };
         let reservation = match self.manager.reserve_local(&spec) {
             Ok(held) => held,
-            Err(Error::NoCapacity) => {
+            Err(Error::NoCapacity | Error::Conflict) => {
                 drop(gate);
                 return self.forward_local(sink, request, deadline).await;
             }
             Err(e) => return Err(status(e)),
         };
         let claim = pb::ClaimEnvironmentRequest {
+            request_id: request
+                .create
+                .as_ref()
+                .map(|r| r.request_id.clone())
+                .unwrap_or_default(),
             spec: Some(spec.clone().into()),
             caller,
             node_session_id: self.session_id.clone(),
@@ -207,8 +213,11 @@ impl NodeRpc {
                     .ok_or_else(|| Status::data_loss("existing record missing"))?
                     .try_into()
                     .map_err(status)?;
-                if record.spec != spec {
-                    return Err(Status::already_exists("existing specification changed"));
+                if record.spec.tenant_id != spec.tenant_id {
+                    self.manager
+                        .release_local(&spec.id, &reservation)
+                        .map_err(status)?;
+                    return Err(Status::not_found("environment not found"));
                 }
                 if let Some(create) = request.create.as_mut() {
                     create.expected_assignment =

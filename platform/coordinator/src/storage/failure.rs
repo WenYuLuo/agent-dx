@@ -6,8 +6,13 @@ impl Session {
         for _ in 0..ATTEMPTS {
             let snapshots = self.retained_snapshots().await?;
             let raw = self.store.raw().await?;
-            let mut header = self.header(&raw.get(HEADER).cloned())?;
+            let header = self.header(&raw.get(HEADER).cloned())?;
             let mut saved = snapshot(&raw)?;
+            saved.revision = self
+                .store
+                .connection
+                .publication_sequence
+                .load(Ordering::Acquire);
             let node = saved.nodes.get_mut(id).ok_or(Error::NotFound)?;
             if node.session.as_ref().is_none_or(|s| s.id != session_id) {
                 return Err(Error::Conflict);
@@ -100,29 +105,41 @@ impl Session {
             if writes
                 .iter()
                 .all(|(field, value)| raw.get(field) == Some(value))
+                && !raw.contains_key(&format!("node-session:{id}"))
             {
                 return Ok(saved);
             }
-            header.advance()?;
             saved.revision = header.revision;
             saved.validate()?;
             // Validate/encode all data before the script. No fallible decoding or
             // floating point version comparisons occur between its writes.
+            let mut expected: BTreeMap<_, _> = writes
+                .iter()
+                .map(|(field, _)| (field.clone(), raw.get(field).cloned().unwrap_or_default()))
+                .collect();
+            // Fence new assignments to this node that were absent from the scan.
+            let membership = format!("node-ownership:{id}");
+            expected.insert(
+                membership.clone(),
+                raw.get(&membership).cloned().unwrap_or_default(),
+            );
             let mut command = redis::cmd("EVAL");
             command
                 .arg(
                     r#"
-                if redis.call('HGET', KEYS[1], 'header') ~= ARGV[1] then return 0 end
+                if redis.call('HGET', KEYS[1], 'epoch') ~= ARGV[1] then return 0 end
+                local expected = cjson.decode(ARGV[2])
+                for field,value in pairs(expected) do if (redis.call('HGET',KEYS[1],field) or '') ~= value then return 0 end end
                 local count=tonumber(ARGV[3]); for i=4,3+count*2,2 do redis.call('HSET',KEYS[1],ARGV[i],ARGV[i+1]) end
-                for i=4+count*2,#ARGV,2 do redis.call('HSET',KEYS[2],ARGV[i],ARGV[i+1]) end
-                redis.call('HSET', KEYS[1], 'header', ARGV[2]); return 1
+                for i=4+count*2,#ARGV-1,2 do redis.call('HSET',KEYS[2],ARGV[i],ARGV[i+1]) end
+                redis.call('HDEL',KEYS[1],ARGV[#ARGV]); return 1
             "#,
                 )
                 .arg(2)
                 .arg(&self.store.key)
                 .arg(format!("{}:input-holds",self.store.key))
-                .arg(raw.get(HEADER).ok_or(Error::Conflict)?)
-                .arg(encode(&header)?)
+                .arg(self.epoch.to_string())
+                .arg(encode(&expected)?)
                 .arg(writes.len());
             let changed = writes.iter().map(|(field, _)| field.clone()).collect();
             for (field, value) in writes {
@@ -137,6 +154,12 @@ impl Session {
             for (field, value) in holds {
                 command.arg(field).arg(value);
             }
+            let protected = cached_holds
+                .values()
+                .flat_map(|hold| hold.artifacts.clone())
+                .collect::<Vec<_>>();
+            let _access = self.store.lock_artifacts(&protected)?;
+            command.arg(format!("node-session:{id}"));
             let mut inventory = self.inspection.lock().await;
             let mut committed = inventory.take();
             let applied = match self.store.query::<u8>(command).await {
@@ -151,7 +174,13 @@ impl Session {
                     inventory.holds.extend(cached_holds);
                 }
                 *inventory = committed;
+                self.observe_node(saved.nodes[id].clone());
                 self.store.notify_committed_change(header.revision, changed);
+                saved.revision = self
+                    .store
+                    .connection
+                    .publication_sequence
+                    .load(Ordering::Acquire);
                 return Ok(saved);
             }
             *inventory = committed;

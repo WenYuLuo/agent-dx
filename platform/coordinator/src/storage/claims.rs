@@ -9,15 +9,21 @@ use adx_core::{
 use std::collections::{BTreeMap, BTreeSet};
 
 const CLAIM_BATCH: &str = r#"
-if redis.call('HGET', KEYS[1], 'header') ~= ARGV[1] then return 0 end
+if redis.call('HGET', KEYS[1], 'epoch') ~= ARGV[1] then return 0 end
 local cursor = 4
 for _ = 1, tonumber(ARGV[3]) do
   if redis.call('HGET', KEYS[2], ARGV[cursor]) ~= ARGV[cursor + 1] then return 0 end
   cursor = cursor + 2
 end
 local writes = tonumber(ARGV[2])
-redis.call('HSET', KEYS[1], 'header', ARGV[cursor])
+if (redis.call('HGET',KEYS[1],'claim-fence') or '0') ~= ARGV[cursor] then return 0 end
 cursor = cursor + 1
+local check = cursor
+for _=1,writes do if redis.call('HEXISTS',KEYS[1],ARGV[check]) == 1 then return 0 end; check=check+2 end
+for i=check,#ARGV,2 do
+  if redis.call('HGET',KEYS[1],ARGV[i]) ~= ARGV[i+1] then return 0 end
+end
+for i=check,#ARGV,2 do redis.call('HINCRBY',KEYS[1],'node-ownership:' .. string.sub(ARGV[i],14),1) end
 for _ = 1, writes do
   redis.call('HSET', KEYS[1], ARGV[cursor], ARGV[cursor + 1])
   cursor = cursor + 2
@@ -52,26 +58,24 @@ impl ClaimOutcome {
 }
 
 impl Session {
-    /// Fence CAS commands from completed-but-unacknowledged operations. Call only
-    /// after their producer has returned; a plain NotFound read is not a barrier.
+    /// Fence uncertain optional Claim commands before rebuilding their catalog.
+    /// Ordinary lifecycle mutations never compare or advance this token.
     pub async fn claim_barrier(&self) -> Result<()> {
-        for _ in 0..ATTEMPTS {
-            let [header_value] = self.store.fields([HEADER.into()]).await?;
-            let mut header = self.header(&header_value)?;
-            header.advance()?;
-            if self
-                .store
-                .cas(
-                    header_value.as_deref().ok_or(Error::Conflict)?,
-                    &header,
-                    None,
-                )
-                .await?
-            {
-                return Ok(());
-            }
+        let mut command = redis::cmd("EVAL");
+        command
+            .arg(
+                r#"
+            if redis.call('HGET',KEYS[1],'epoch') ~= ARGV[1] then return 0 end
+            redis.call('HINCRBY',KEYS[1],'claim-fence',1); return 1
+        "#,
+            )
+            .arg(1)
+            .arg(&self.store.key)
+            .arg(self.epoch.to_string());
+        match self.store.query::<u8>(command).await? {
+            1 => Ok(()),
+            _ => Err(Error::Conflict),
         }
-        Err(Error::Unavailable("claim barrier contended".into()))
     }
 
     /// Register one globally unique owner for a normalized EnvironmentSpec.
@@ -95,16 +99,18 @@ impl Session {
         validate_device_assignment(&spec.scheduling.devices, &candidate.devices)?;
         let field = format!("environment:{}", spec.id);
         for _ in 0..ATTEMPTS {
-            let [header_value, environment_value, node_value] = self
+            let [header_value, environment_value, node_value, claim_fence] = self
                 .store
                 .fields([
                     HEADER.into(),
                     field.clone(),
                     format!("node:{}", candidate.node_id),
+                    "claim-fence".into(),
                 ])
                 .await?;
-            let mut header = self.header(&header_value)?;
-            let node: StoredNode = decode(node_value.as_deref().ok_or(Error::NotFound)?)?;
+            let header = self.header(&header_value)?;
+            let node = self.get_node(&candidate.node_id).await?;
+            let _ = node_value;
             if node.node.id != candidate.node_id
                 || node.shard_id >= header.shards
                 || node
@@ -151,7 +157,7 @@ impl Session {
             } else {
                 None
             };
-            let generation = header.generation.checked_add(1).ok_or(Error::Conflict)?;
+            let generation = self.next_generation()?;
             let record = StoredEnvironment {
                 resume: None,
                 failed_since_unix_seconds: None,
@@ -168,19 +174,25 @@ impl Session {
                 },
             };
             record.validate()?;
-            header.generation = generation;
-            header.advance()?;
+
             let mut command = redis::cmd("EVAL");
             command.arg(r#"
-                if redis.call('HGET', KEYS[1], 'header') ~= ARGV[1] then return 0 end
+                if redis.call('HGET', KEYS[1], 'epoch') ~= ARGV[1] then return 0 end
                 if ARGV[5] ~= '' and redis.call('HGET', KEYS[2], ARGV[5]) ~= ARGV[6] then return 0 end
-                redis.call('HSET', KEYS[1], 'header', ARGV[2], ARGV[3], ARGV[4]); return 1
+                if (redis.call('HGET',KEYS[1],'claim-fence') or '0') ~= ARGV[7] then return 0 end
+                if redis.call('HGET',KEYS[1],ARGV[8]) ~= ARGV[9] then return 0 end
+                if redis.call('HEXISTS',KEYS[1],ARGV[3]) == 1 then return 0 end
+                redis.call('HSET', KEYS[1], ARGV[3], ARGV[4])
+                redis.call('HINCRBY',KEYS[1],'node-ownership:' .. string.sub(ARGV[8],14),1); return 1
             "#)
                 .arg(2).arg(&self.store.key).arg(self.snapshots_key())
-                .arg(header_value.as_deref().ok_or(Error::Conflict)?)
+                .arg(self.epoch.to_string())
                 .arg(encode(&header)?).arg(&field).arg(encode(&record)?)
                 .arg(spec.snapshot_id.as_deref().unwrap_or(""))
-                .arg(snapshot.as_deref().unwrap_or(""));
+                .arg(snapshot.as_deref().unwrap_or(""))
+                .arg(claim_fence.as_deref().unwrap_or("0"))
+                .arg(format!("node-session:{}", candidate.node_id))
+                .arg(&candidate.node_session_id);
             if self.store.query::<u8>(command).await? == 1 {
                 self.store
                     .notify_committed_change(header.revision, vec![field]);
@@ -192,7 +204,7 @@ impl Session {
         ))
     }
 
-    /// Commit independent local ownership requests with one header CAS. The
+    /// Commit independent optional local ownership requests in one epoch-fenced batch. The
     /// returned vector preserves request order; a conflict in one entry does not
     /// discard other valid claims in the same batch.
     pub async fn claim_batch(
@@ -220,14 +232,19 @@ impl Session {
             .map(|(_, candidate)| format!("node:{}", candidate.node_id))
             .collect();
         for _ in 0..ATTEMPTS {
-            let fields: Vec<_> = std::iter::once(HEADER.to_owned())
+            let fields: Vec<_> = [HEADER.to_owned(), "claim-fence".to_owned()]
+                .into_iter()
                 .chain(environment_fields.iter().cloned())
                 .chain(node_fields.iter().cloned())
                 .collect();
             let values = self.store.fields_vec(&fields).await?;
             let mut by_field: BTreeMap<_, _> = fields.into_iter().zip(values).collect();
             let header_value = by_field.remove(HEADER).flatten().ok_or(Error::Conflict)?;
-            let mut header = self.header(&Some(header_value.clone()))?;
+            let header = self.header(&Some(header_value.clone()))?;
+            let claim_fence = by_field
+                .remove("claim-fence")
+                .flatten()
+                .unwrap_or_else(|| "0".into());
             let mut environments = BTreeMap::new();
             for field in &environment_fields {
                 if let Some(value) = by_field.remove(field).flatten() {
@@ -240,6 +257,7 @@ impl Session {
             for field in &node_fields {
                 let value = by_field.remove(field).flatten().ok_or(Error::NotFound)?;
                 let node: StoredNode = decode(&value)?;
+                let node = self.get_node(&node.node.id).await?;
                 nodes.insert(node.node.id.clone(), node);
             }
             let snapshot_ids: BTreeSet<_> = claims
@@ -296,9 +314,8 @@ impl Session {
                             return Err(Error::Conflict);
                         }
                     }
-                    let generation = header.generation.checked_add(1).ok_or(Error::Conflict)?;
-                    header.generation = generation;
-                    header.advance()?;
+                    let generation = self.next_generation()?;
+
                     let record = StoredEnvironment {
                         resume: None,
                         failed_since_unix_seconds: None,
@@ -334,15 +351,20 @@ impl Session {
                 .arg(2)
                 .arg(&self.store.key)
                 .arg(self.snapshots_key())
-                .arg(&header_value)
+                .arg(self.epoch.to_string())
                 .arg(writes.len())
                 .arg(snapshot_ids.len());
             for id in &snapshot_ids {
                 command.arg(id).arg(&snapshots[id].0);
             }
-            command.arg(encode(&header)?);
+            command.arg(&claim_fence);
             for (field, value, _) in &writes {
                 command.arg(field).arg(value);
+            }
+            for node in nodes.values() {
+                command
+                    .arg(format!("node-session:{}", node.node.id))
+                    .arg(&node.session.as_ref().ok_or(Error::Conflict)?.id);
             }
             if self.store.query::<u8>(command).await? == 1 {
                 for (field, _, revision) in writes {

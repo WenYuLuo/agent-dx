@@ -53,6 +53,7 @@ struct State {
     // Local ownership CAS batches run outside the state lock. Cancellation must
     // wait until their result has been synchronized or authoritatively fenced.
     claims_in_flight: BTreeMap<String, usize>,
+    create_requests: BTreeMap<String, BTreeSet<String>>,
 }
 
 fn requires_node_reconciliation(environment: &StoredEnvironment) -> bool {
@@ -165,7 +166,15 @@ impl State {
                     .reserve_recovery(&old.assignment, assignment.clone(), recovery::now()?)
                     .await
             } else {
-                self.session.reserve(spec, assignment.clone()).await
+                Ok(StoredEnvironment {
+                    resume: None,
+                    failed_since_unix_seconds: None,
+                    recovery: None,
+                    invalidated: false,
+                    spec,
+                    assignment: assignment.clone(),
+                    result: None,
+                })
             };
             match saved {
                 Ok(record) => {
@@ -218,6 +227,7 @@ struct Inner {
     resume_admission: Arc<tokio::sync::Semaphore>,
     resume_locks: std::sync::Mutex<BTreeMap<String, std::sync::Weak<Mutex<()>>>>,
     state: Mutex<State>,
+    create_locks: std::sync::Mutex<BTreeMap<String, std::sync::Weak<Mutex<()>>>>,
     claim_sender: mpsc::Sender<PendingClaim>,
     changed: Notify,
     peers: Peers,
@@ -379,7 +389,8 @@ impl CoordinatorRpc {
                 )
                 .await?;
         }
-        let scheduler = Coordinator::restore(&saved, placement)?;
+        let mut scheduler = Coordinator::restore(&saved, placement)?;
+        scheduler.use_generation_source(session.clone());
         let specs = saved
             .environments
             .iter()
@@ -393,6 +404,7 @@ impl CoordinatorRpc {
         tokio::spawn(run_claim_batches(session.clone(), claim_requests));
         Ok(Self(Arc::new(Inner {
             created: Default::default(),
+            create_locks: Default::default(),
             reclaimers: Default::default(),
             resume_admission: Arc::new(tokio::sync::Semaphore::new(1024)),
             resume_locks: std::sync::Mutex::new(BTreeMap::new()),
@@ -422,6 +434,7 @@ impl CoordinatorRpc {
                 retired_sessions: BTreeSet::new(),
                 scheduling_deadlines: BTreeMap::new(),
                 claims_in_flight: BTreeMap::new(),
+                create_requests: BTreeMap::new(),
             }),
             claim_sender,
             changed: Notify::new(),
@@ -494,13 +507,213 @@ impl CoordinatorRpc {
         (actual.node_id == r.node_id && actual.session_id == r.session_id).then_some(predecessor)
     }
 
+    async fn create_guard(&self, key: String) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            let mut locks = self
+                .0
+                .create_locks
+                .lock()
+                .expect("create lock registry poisoned");
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            match locks.get(&key).and_then(std::sync::Weak::upgrade) {
+                Some(lock) => lock,
+                None => {
+                    let lock = Arc::new(Mutex::new(()));
+                    locks.insert(key, Arc::downgrade(&lock));
+                    lock
+                }
+            }
+        };
+        lock.lock_owned().await
+    }
     async fn create(
         &self,
         spec: EnvironmentSpec,
         schedule_timeout: Duration,
         create_deadline: adx_transport::deadline::Deadline,
-        expected_assignment: Option<adx_core::Assignment>,
+        _expected_assignment: Option<adx_core::Assignment>,
+        request_id: String,
     ) -> std::result::Result<pb::EnvironmentResult, Status> {
+        // Lock identities before selecting an execution. No scheduler lock is
+        // held while another operation, storage, or a remote node is awaited.
+        let request_key = serde_json::to_string(&("request", &spec.tenant_id, &request_id))
+            .map_err(|_| Status::invalid_argument("invalid request identity"))?;
+        let _request = if request_id.is_empty() {
+            None
+        } else {
+            Some(
+                tokio::time::timeout_at(create_deadline.instant(), self.create_guard(request_key))
+                    .await
+                    .map_err(|_| {
+                        Status::deadline_exceeded("create deadline waiting for request")
+                    })?,
+            )
+        };
+        let _environment = tokio::time::timeout_at(
+            create_deadline.instant(),
+            self.create_guard(format!("environment:{}", spec.id)),
+        )
+        .await
+        .map_err(|_| Status::deadline_exceeded("create deadline waiting for environment"))?;
+        let outcome = match tokio::time::timeout_at(
+            create_deadline.instant() + adx_transport::deadline::CREATE_RESPONSE_GRACE,
+            self.create_attempt(spec.clone(), schedule_timeout, create_deadline, request_id),
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(_) => Err(Status::deadline_exceeded(
+                "create operation deadline exceeded",
+            )),
+        };
+        if outcome.is_err() {
+            self.discard_unconfirmed(&spec).await;
+        }
+        outcome
+    }
+
+    async fn discard_unconfirmed(&self, spec: &EnvironmentSpec) {
+        let session = self.0.state.lock().await.session.clone();
+        // An optional Claim, or an applied publication whose reply was lost,
+        // remains durable. Recovery/reconciliation owns its subsequent cleanup.
+        if let Ok(stored) = session.get(&spec.id).await {
+            let mut state = self.0.state.lock().await;
+            let _ = state.accept_stored_claim(stored);
+            return;
+        }
+        let mut state = self.0.state.lock().await;
+        if state.environments.get(&spec.id).is_some_and(|e| {
+            e.result
+                .as_ref()
+                .is_some_and(|r| r.state == EnvironmentState::Running)
+        }) {
+            return;
+        }
+        if state.scheduler.retire_claim(&spec.id).is_err() {
+            state.needs_recovery = true;
+            return;
+        }
+        if state.scheduler.forget_deleted(&spec.id).is_err() {
+            state.needs_recovery = true;
+            return;
+        }
+        state.environments.remove(&spec.id);
+        state.specs.remove(&spec.id);
+        state.scheduling_deadlines.remove(&spec.id);
+        state.create_requests.remove(&spec.id);
+        drop(state);
+        if let Some(snapshot_id) = &spec.snapshot_id {
+            let _ = session
+                .release_snapshot(
+                    snapshot_id,
+                    adx_core::snapshots::Reference::Restore {
+                        environment_id: spec.id.clone(),
+                    },
+                )
+                .await;
+        }
+        self.0.changed.notify_waiters();
+    }
+
+    async fn create_attempt(
+        &self,
+        spec: EnvironmentSpec,
+        schedule_timeout: Duration,
+        create_deadline: adx_transport::deadline::Deadline,
+        request_id: String,
+    ) -> std::result::Result<pb::EnvironmentResult, Status> {
+        let inspection = self.create_guard(format!("publication:{}", spec.id)).await;
+        let session = { self.0.state.lock().await.session.clone() };
+        if let Some(record) = session
+            .published_request(&spec.tenant_id, &request_id)
+            .await
+            .map_err(status)?
+        {
+            return Ok(pb::EnvironmentResult {
+                record: Some(record.try_into().map_err(status)?),
+                durability: pb::Durability::Published as i32,
+            });
+        }
+        match session.get(&spec.id).await {
+            Ok(stored) if stored.spec.tenant_id != spec.tenant_id => {
+                return Err(Status::not_found("environment not found"))
+            }
+            Ok(stored) if stored.result.is_some() => {
+                let record = stored
+                    .result
+                    .ok_or_else(|| Status::internal("confirmed environment result missing"))?;
+                let record = if record.state == EnvironmentState::Running {
+                    session
+                        .publish_existing(record, &request_id)
+                        .await
+                        .map_err(status)?
+                } else {
+                    record
+                };
+                return Ok(pb::EnvironmentResult {
+                    record: Some(record.try_into().map_err(status)?),
+                    durability: pb::Durability::Published as i32,
+                });
+            }
+            Err(Error::NotFound) => {
+                let mut state = self.0.state.lock().await;
+                if state
+                    .environments
+                    .get(&spec.id)
+                    .is_some_and(|e| e.result.is_some())
+                {
+                    state.scheduler.retire_claim(&spec.id).map_err(status)?;
+                    state.scheduler.forget_deleted(&spec.id).map_err(status)?;
+                    state.environments.remove(&spec.id);
+                    state.specs.remove(&spec.id);
+                    state.create_requests.remove(&spec.id);
+                }
+            }
+            Ok(_) => (),
+            Err(error) => return Err(status(error)),
+        }
+        {
+            let state = self.0.state.lock().await;
+            if state.specs.get(&spec.id).is_some_and(|old| old != &spec) {
+                return Err(Status::already_exists(
+                    "environment ID has a different pending specification",
+                ));
+            }
+        }
+        // Snapshot reference IO is serialized by this Environment's lock rather
+        // than the scheduler mutex. The reference keeps the prepared descriptor
+        // stable until the create operation completes or is cancelled.
+        let prepared_snapshot = if let Some(id) = &spec.snapshot_id {
+            session
+                .acquire_snapshot(
+                    id,
+                    &spec.tenant_id,
+                    adx_core::snapshots::Reference::Restore {
+                        environment_id: spec.id.clone(),
+                    },
+                )
+                .await
+                .map_err(status)?;
+            Some(
+                session
+                    .get_snapshot(id)
+                    .await
+                    .map_err(status)?
+                    .try_into()
+                    .map_err(status)?,
+            )
+        } else {
+            None
+        };
+        self.0
+            .state
+            .lock()
+            .await
+            .create_requests
+            .entry(spec.id.clone())
+            .or_default()
+            .insert(request_id);
+        drop(inspection);
         let mut schedule_deadline = None;
         loop {
             create_deadline.remaining().map_err(|_| {
@@ -512,15 +725,14 @@ impl CoordinatorRpc {
             let mut state = self.0.state.lock().await;
             state.recover_authoritative_state().await.map_err(status)?;
             state.healthy().map_err(status)?;
-            if expected_assignment.as_ref().is_some_and(|expected| {
-                state
-                    .environments
-                    .get(&spec.id)
-                    .is_none_or(|stored| &stored.assignment != expected)
-            }) {
-                return Err(Status::failed_precondition(
-                    "create ownership generation changed",
-                ));
+            if state.claims_in_flight.contains_key(&spec.id) {
+                drop(state);
+                tokio::time::timeout_at(create_deadline.instant(), changed)
+                    .await
+                    .map_err(|_| {
+                        Status::deadline_exceeded("create deadline waiting for optional claim")
+                    })?;
+                continue;
             }
             if schedule_deadline.is_some_and(|deadline| {
                 tokio::time::Instant::now() >= deadline && !state.specs.contains_key(&spec.id)
@@ -545,34 +757,7 @@ impl CoordinatorRpc {
                         })
                 });
             } else {
-                if let Some(id) = &spec.snapshot_id {
-                    state
-                        .session
-                        .acquire_snapshot(
-                            id,
-                            &spec.tenant_id,
-                            adx_core::snapshots::Reference::Restore {
-                                environment_id: spec.id.clone(),
-                            },
-                        )
-                        .await
-                        .map_err(status)?;
-                }
-                if let Err(error) = state.scheduler.submit(spec.clone()) {
-                    if let Some(id) = &spec.snapshot_id {
-                        state
-                            .session
-                            .release_snapshot(
-                                id,
-                                adx_core::snapshots::Reference::Restore {
-                                    environment_id: spec.id.clone(),
-                                },
-                            )
-                            .await
-                            .map_err(status)?;
-                    }
-                    return Err(status(error));
-                }
+                state.scheduler.submit(spec.clone()).map_err(status)?;
                 state.specs.insert(spec.id.clone(), spec.clone());
                 let deadline =
                     (tokio::time::Instant::now() + schedule_timeout).min(create_deadline.instant());
@@ -586,8 +771,12 @@ impl CoordinatorRpc {
             let progress = drive.map_err(status)?;
             if state.environments.contains_key(&spec.id) {
                 state.scheduling_deadlines.remove(&spec.id);
-                // Recheck storage session before using a cached assignment.
-                let stored = state.session.get(&spec.id).await.map_err(status)?;
+                // Only successful publication is durable; this assignment is held in memory.
+                let stored = state
+                    .environments
+                    .get(&spec.id)
+                    .ok_or_else(|| Status::not_found("environment reservation disappeared"))?
+                    .clone();
                 if stored.invalidated || stored.recovery.as_ref().is_some_and(|r| r.pending) {
                     return Err(Status::failed_precondition(
                         "existing environment requires recovery/query",
@@ -623,23 +812,19 @@ impl CoordinatorRpc {
                         n.last_seen.elapsed() >= self.0.heartbeat_timeout || !n.inspected
                     })
                 {
-                    return Err(Status::unavailable("owner node requires reconciliation"));
+                    state.scheduler.retry(&stored.assignment).map_err(status)?;
+                    state.environments.remove(&spec.id);
+                    drop(state);
+                    tokio::time::timeout_at(create_deadline.instant(), changed)
+                        .await
+                        .map_err(|_| {
+                            Status::deadline_exceeded(
+                                "create deadline exceeded waiting for a ready node",
+                            )
+                        })?;
+                    continue;
                 }
-                let snapshot = match &spec.snapshot_id {
-                    Some(id) => {
-                        let snapshot = state.session.get_snapshot(id).await.map_err(status)?;
-                        if !snapshot
-                            .references
-                            .contains(&adx_core::snapshots::Reference::Restore {
-                                environment_id: spec.id.clone(),
-                            })
-                        {
-                            return Err(Status::failed_precondition("snapshot reference missing"));
-                        }
-                        Some(snapshot.try_into().map_err(status)?)
-                    }
-                    None => None,
-                };
+                let snapshot = prepared_snapshot.clone();
                 drop(state);
                 let endpoint = self
                     .0
@@ -650,13 +835,14 @@ impl CoordinatorRpc {
                     .timeout(adx_transport::deadline::create_response_timeout(
                         create_deadline.remaining()?,
                     ));
-                let channel = endpoint.connect().await.map_err(|_| {
-                    if create_deadline.remaining().is_err() {
-                        Status::deadline_exceeded("create deadline exceeded during node connection")
-                    } else {
-                        Status::unavailable("node connection unavailable")
+                let channel = match endpoint.connect().await {
+                    Ok(channel) => channel,
+                    Err(_) => {
+                        self.retry_initial(&spec.id, &stored.assignment).await?;
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        continue;
                     }
-                })?;
+                };
                 let request = pb::StartAssignedEnvironmentRequest {
                     create_deadline_unix_millis: create_deadline.unix_millis(),
                     snapshot,
@@ -693,6 +879,25 @@ impl CoordinatorRpc {
                         tokio::time::sleep(Duration::from_millis(50)).await;
                         continue;
                     }
+                    Err(error)
+                        if adx_protocol::deadline_failure(&error).is_none()
+                            && error
+                                .metadata()
+                                .get("adx-backend-failure")
+                                .is_none_or(|value| value != "true")
+                            && matches!(
+                                error.code(),
+                                tonic::Code::Unavailable
+                                    | tonic::Code::FailedPrecondition
+                                    | tonic::Code::Cancelled
+                                    | tonic::Code::Unknown
+                                    | tonic::Code::DeadlineExceeded
+                            ) =>
+                    {
+                        self.retry_initial(&spec.id, &stored.assignment).await?;
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        continue;
+                    }
                     Err(error) => return Err(error),
                 };
                 let record: EnvironmentRecord = result
@@ -710,15 +915,8 @@ impl CoordinatorRpc {
                     ));
                 }
                 if result.durability == pb::Durability::Published as i32 {
-                    let state = self.0.state.lock().await;
-                    if state
-                        .session
-                        .get(&spec.id)
-                        .await
-                        .map_err(status)?
-                        .result
-                        .as_ref()
-                        != Some(&record)
+                    let session = self.0.state.lock().await.session.clone();
+                    if session.get(&spec.id).await.map_err(status)?.result.as_ref() != Some(&record)
                     {
                         return Err(Status::unavailable("node result has not been committed"));
                     }
@@ -745,6 +943,23 @@ impl CoordinatorRpc {
         }
     }
 
+    async fn retry_initial(
+        &self,
+        id: &str,
+        assignment: &adx_core::Assignment,
+    ) -> std::result::Result<(), Status> {
+        let mut state = self.0.state.lock().await;
+        if state
+            .environments
+            .get(id)
+            .is_some_and(|e| e.assignment == *assignment && e.result.is_none())
+        {
+            state.scheduler.retry(assignment).map_err(status)?;
+            state.environments.remove(id);
+            self.0.changed.notify_waiters();
+        }
+        Ok(())
+    }
     async fn expire_pending(
         &self,
         spec: &EnvironmentSpec,
@@ -790,6 +1005,9 @@ impl CoordinatorRpc {
         record: EnvironmentRecord,
         session_id: String,
     ) -> Result<EnvironmentRecord> {
+        let _publication = self
+            .create_guard(format!("publication:{}", record.spec.id))
+            .await;
         let mut state = self.0.state.lock().await;
         state.recover_authoritative_state().await?;
         state.healthy()?;
@@ -818,15 +1036,78 @@ impl CoordinatorRpc {
                 .is_some_and(|stored| {
                     stored.result.is_none() && stored.recovery.is_none() && !stored.invalidated
                 });
-        let accepted = state.session.commit(record).await?;
+        let initial = state
+            .environments
+            .get(&record.spec.id)
+            .is_some_and(|e| e.result.is_none() && e.recovery.is_none());
+        if initial
+            && state
+                .environments
+                .get(&record.spec.id)
+                .is_none_or(|e| e.assignment != record.assignment)
+        {
+            return Err(Error::Conflict);
+        }
+        let session = state.session.clone();
+        let request_ids = state
+            .create_requests
+            .get(&record.spec.id)
+            .cloned()
+            .unwrap_or_default();
+        drop(state);
+        let accepted = if initial && record.state == EnvironmentState::Running {
+            let winner = session
+                .publish_initial_requests(
+                    record.clone(),
+                    &request_ids.into_iter().collect::<Vec<_>>(),
+                    &session_id,
+                )
+                .await?;
+            if winner.assignment != record.assignment || winner.runtime.id != record.runtime.id {
+                session.abandon_initial(&record.assignment).await?;
+                self.discard_unconfirmed(&record.spec).await;
+                return Err(Error::Conflict);
+            }
+            winner
+        } else if initial {
+            // Retire an optional pending Claim as well as the memory reservation;
+            // unsuccessful initial attempts have no durable creation result.
+            session.abandon_initial(&record.assignment).await?;
+            let mut state = self.0.state.lock().await;
+            if state
+                .environments
+                .get(&record.spec.id)
+                .is_some_and(|e| e.assignment == record.assignment)
+            {
+                state.scheduler.retire_claim(&record.spec.id)?;
+                state.scheduler.forget_deleted(&record.spec.id)?;
+                state.environments.remove(&record.spec.id);
+                state.specs.remove(&record.spec.id);
+                state.create_requests.remove(&record.spec.id);
+                state.scheduling_deadlines.remove(&record.spec.id);
+            }
+            self.0.changed.notify_waiters();
+            return Ok(record);
+        } else {
+            session.commit(record).await?
+        };
+        let mut state = self.0.state.lock().await;
+        if state
+            .environments
+            .get(&accepted.spec.id)
+            .is_some_and(|e| e.assignment != accepted.assignment)
+        {
+            return Err(Error::Conflict);
+        }
         if first_create {
             self.0
                 .created
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-        if accepted.state == EnvironmentState::Failed
-            || (accepted.state != EnvironmentState::Deleted
-                && !state.environments.contains_key(&accepted.spec.id))
+        if !initial
+            && (accepted.state == EnvironmentState::Failed
+                || (accepted.state != EnvironmentState::Deleted
+                    && !state.environments.contains_key(&accepted.spec.id)))
         {
             let durable = state.session.get(&accepted.spec.id).await?;
             state.remember_environment(durable);
@@ -903,6 +1184,9 @@ impl CoordinatorRpc {
             state.failed_environments.remove(&accepted.spec.id);
             state.specs.remove(&accepted.spec.id);
             state.scheduling_deadlines.remove(&accepted.spec.id);
+        }
+        if initial || accepted.state == EnvironmentState::Deleted {
+            state.create_requests.remove(&accepted.spec.id);
         }
         self.0.changed.notify_waiters();
         Ok(accepted)
@@ -1066,7 +1350,10 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
             )
             .await
             .map_err(status)?;
-        let shard = match state.scheduler.register(saved.node.clone()) {
+        let shard = match state
+            .scheduler
+            .register_at(saved.node.clone(), saved.shard_id)
+        {
             Ok(shard) => shard,
             Err(error) => {
                 state.needs_recovery = true;
@@ -1134,6 +1421,7 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
             .as_ref()
             .ok_or_else(|| Status::invalid_argument("create required"))?;
         let deadline = create_deadline(create)?;
+        let request_id = create.request_id.clone();
         let expected_assignment = create
             .expected_assignment
             .clone()
@@ -1149,7 +1437,13 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
         let service = self.clone();
         tokio::spawn(trace.run(async move {
             service
-                .create(spec, schedule_timeout, deadline, expected_assignment)
+                .create(
+                    spec,
+                    schedule_timeout,
+                    deadline,
+                    expected_assignment,
+                    request_id,
+                )
                 .await
                 .map(Response::new)
         }))
@@ -1387,11 +1681,14 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
             };
             let shard = state
                 .scheduler
-                .register(saved.node.clone())
+                .register_at(saved.node.clone(), saved.shard_id)
                 .map_err(status)?;
             if shard != saved.shard_id {
                 state.needs_recovery = true;
                 return Err(Status::internal("node shard mismatch; recovery required"));
+            }
+            if !r.reconciling && inspected && saved.node.available {
+                state.scheduler.reconsider_node(&r.node_id);
             }
             state.nodes.insert(saved.node.id.clone(), saved);
             state.recovering.remove(&r.node_id);
@@ -1452,6 +1749,7 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                         Status::invalid_argument("schedule timeout must not exceed 24 hours")
                     })?;
                 let deadline = create_deadline(&r)?;
+                let request_id = r.request_id.clone();
                 let expected_assignment = r
                     .expected_assignment
                     .clone()
@@ -1462,19 +1760,34 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                     .spec
                     .ok_or_else(|| Status::invalid_argument("spec required"))?;
                 tenant(r.caller.as_ref(), &raw.tenant_id)?;
-                let spec = {
+                let session = {
                     let mut state = self.0.state.lock().await;
                     state.recover_authoritative_state().await.map_err(status)?;
                     state.healthy().map_err(status)?;
-                    cloning::normalize(&state.session, raw)
-                        .await
-                        .map_err(status)?
+                    state.session.clone()
                 };
+                if let Some(record) = session
+                    .published_request(&raw.tenant_id, &request_id)
+                    .await
+                    .map_err(status)?
+                {
+                    return Ok(Response::new(pb::EnvironmentResult {
+                        record: Some(record.try_into().map_err(status)?),
+                        durability: pb::Durability::Published as i32,
+                    }));
+                }
+                let spec = cloning::normalize(&session, raw).await.map_err(status)?;
                 let service = self.clone();
                 tokio::spawn(
                     adx_observability::trace::Trace::child("coordinator.create").run(async move {
                         service
-                            .create(spec, schedule_timeout, deadline, expected_assignment)
+                            .create(
+                                spec,
+                                schedule_timeout,
+                                deadline,
+                                expected_assignment,
+                                request_id,
+                            )
                             .await
                             .map(Response::new)
                     }),
@@ -1493,8 +1806,18 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
             .run_result(async {
                 let principal = self.0.peers.authenticate(&request)?;
                 let r = request.into_inner();
+                let (session, cached) = {
+                    let state = self.0.state.lock().await;
+                    (
+                        state.session.clone(),
+                        state.environments.get(&r.environment_id).cloned(),
+                    )
+                };
+                let stored = match cached {
+                    Some(stored) if stored.result.is_none() => stored,
+                    _ => session.get(&r.environment_id).await.map_err(status)?,
+                };
                 let state = self.0.state.lock().await;
-                let stored = state.session.get(&r.environment_id).await.map_err(status)?;
                 match principal {
                     Principal::ApiServer => tenant(r.caller.as_ref(), &stored.spec.tenant_id)?,
                     // Trusted Ingress reads policy metadata before applying the
@@ -1725,6 +2048,7 @@ mod cancellation_tests {
                     .claim_local(
                         "node".into(),
                         pb::ClaimEnvironmentRequest {
+                            request_id: String::new(),
                             spec: Some(spec.into()),
                             node_session_id: "boot".into(),
                             devices: vec![],

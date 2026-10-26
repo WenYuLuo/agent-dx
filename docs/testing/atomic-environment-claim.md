@@ -1,104 +1,58 @@
-# 节点本地优先创建与原子归属确认
+# 创建确认、对象持久化与可选本地 Claim
 
-核对日期：2026-09-28。创建链路已接入 API Server、adxlet 和 Coordinator。
+默认 `create_mode: "central"`。所有组件使用同一版本的 Environment RPC；公开 Request ID 随创建、转发和可选 Claim 传递。
 
-## 开启方式与调度语义
+## 中心创建
 
-API Server 配置 `create_mode: "local_first"` 开启；默认 `"central"` 保持中心创建路径。
-统一部署配置中放在 `role: "apiserver"` 对应的 `config` 下；组件更新后重启生效。
-所有控制面组件需要使用同一版本的 Environment RPC。
+Coordinator 在内存中排队、选择节点和预留资源。adxlet 完成本机准入、sandboxd 启动、Execd 就绪和路由绑定后，Coordinator 才用一次 Redis 原子事务发布初次 Running 结果和请求回执。中心路径不预写 Pending 或 Assignment。快照恢复引用、后续生命周期和节点故障处理有各自的持久化步骤，不计入普通无快照创建的一次成功发布。
 
-| 路径 | 放置与排队 |
+同一进程按租户/Request ID、Environment ID 串行协调创建，等待锁也受原始创建期限约束。Redis 和节点 RPC 不占用普通创建的调度锁；快照与异常恢复仍需要单独协调。未确认请求到期后释放内存预留。已经确认的结果保留；写入应答丢失后通过原身份查询和重放复用。
+
+对尚未成功确认的创建，连接失败、节点恢复中或旧 session 拒绝允许重新选点。候选节点必须完成恢复对账、心跳有效并开放准入；换一个 session 字符串不构成就绪。每次尝试保留原绝对 deadline。运行中的已确认实例继续遵循生命周期和恢复协议。
+
+Coordinator 重启可以丢失未确认调度；新的尝试使用新的 generation。旧节点上的未确认执行由后续权威对账回收。允许暂时存在多个未确认执行，最终只有已确认结果进入有效目录。
+
+## 两种成功身份
+
+在同一租户内，已有成功结果命中 Environment ID **或** Request ID，就复用已有结果及其规格，不允许迟到候选覆盖。不同 Request ID 命中同一 Environment 时，为新 Request ID 登记相同结果的回执。不同 API Server 和重启后的查询使用 Redis 回执收敛；API Server 的 600 秒响应缓存只是加速层。
+
+Environment 与 Request ID 回执在同一次事务中写入。节点 process session 和 Coordinator epoch 同时校验；同对象的读改写比较该对象原始字节。删除移除主目录，已完成 Request ID 仍绑定旧执行：重放查询返回其当前终态，不复活已删除实例，也不把旧请求指向同名新执行。请求回执随命名空间保留，当前没有自动过期策略；需要回收时应先定义公共重试保留期。
+
+## 存储边界
+
+| 数据 | 更新时机与一致性 |
 |---|---|
-| `central` | Global 轮转进入 ShardScheduler，按租户轮转、租户内优先级/FIFO 排队；Filter/Score 执行 Pack/Spread 和放置规则 |
-| `local_first` 本地成功 | API Server 轮转一个可用入口；节点暂留资源，Coordinator 对该节点检查全部硬约束并原子确认归属；不做跨节点 Score、不进入中心队列 |
-| 本地不足或硬约束不满足 | 释放可确认属于本次申请的暂留，使用原 Environment ID/规格进入 ShardScheduler；中心排队和评分在这里生效 |
-| 从 Snapshot 创建 | 两种模式均直接进入 Coordinator；共享制品默认弱亲和来源节点，跨分片比较可用候选，local-only 保留来源节点硬约束 |
+| 节点注册、地址和进程 session | 首次注册、新进程或地址变更时持久化；超时失效后，同进程完成恢复对账时重新启用成功发布标记 |
+| 心跳序号、容量、设备能力、ready 状态 | 内存更新；普通心跳不写 Redis；重启后重新上报和对账 |
+| Coordinator 地址发现 | 定期续约带 epoch 和 TTL 的发现键，独立于节点心跳 |
+| 管理员暂停调度 | 设置改变时持久化，心跳不能清除 |
+| 初次中心排队、选点和 Pending | 仅内存 |
+| 初次成功及 Request ID 回执 | 原子条件发布；按任一成功身份复用 |
+| 已确认实例的生命周期、恢复、快照、引用、凭据 | 各自对象的条件更新；保持既有持久化语义 |
+| 节点超时失效 | 校验目标节点、受影响实例和该节点归属集合的版本后批量退役；并发新发布不会漏掉 |
+| 发布序号 | 本进程内存；用于目录增量和缺口检测，不参与 Redis 对象写入条件 |
 
-因此本地优先不提供集群级 Pack/Spread、软偏好最优选择或全局队列公平性承诺。
-已进入中心队列的同 ID 请求继续使用原队列，不通过本地重试插队。
+全局 header 负责 schema、分片数和 Coordinator 启动 epoch。普通对象写入不推进或比较整个控制表版本。Environment、Snapshot 等比较自己的旧值；故障批量更新只比较受影响对象。节点归属集合的计数只用于防止“扫描后新增执行”逃过节点失效，不会让不同节点互相竞争。generation 使用 epoch 划分的 `u64` 范围，由进程内分配器递增，重启后不复用旧执行身份。
 
-## 创建链路
+目录发布器首次发送完整快照，后续按内存序号发送增量。序号缺口或订阅积压时重建全量视图；新 epoch 重新建立订阅基线。快照读取验证读取期间的发布序号，避免把旧快照标成新版本而漏掉事件。
 
-```text
-API Server：WatchNodes 全量目录 → 轮转入口
-  → adxlet：CreateLocalEnvironment，检查租户、节点会话与生命周期准入门
-  → 共用 Mutex<Admission>：一次性暂留标量资源及 GPU/NPU 卡
-  → Coordinator：ClaimEnvironment
-      mTLS 节点身份 + CallerContext 租户 + 实时心跳/会话 + 硬约束
-      并发申请经有界微批合并，由 Redis CAS 写入唯一归属与 generation
-      各条结果再串行导入内存资源/设备账本、调度快照与 generation
-  → adxlet：暂留 token 转交 Assignment，复用该 Environment 串行控制器
-  → sandboxd → Execd 就绪 → 本机路由绑定 → Coordinator 提交 Running → 返回成功
-```
+## 可选本地优先
 
-带 `snapshotId` 的公开创建由 Coordinator 解析模板并选分片、节点，
-不经过任意入口节点的本地优先路径；显式放置策略覆盖共享 Snapshot 的默认来源偏好。
-Coordinator 持有恢复引用；CAS 同时比较快照原始记录，防止引用检查和归属登记之间的竞态。
+`create_mode: "local_first"` 启用入口节点暂留资源和 `ClaimEnvironment`。Coordinator 检查心跳、会话、硬约束，在最多 256 条、最长 1 ms 的微批中登记可选持久化 Claim，再导入调度账本。本地不足时用原身份和剩余期限回退中心路径。Pack/Spread、软评分和队列公平性属于中心路径；Snapshot 创建始终进入中心路径。
 
-Coordinator 的 `ForwardCreate` 仅接受受信节点调用；原有中心 `CreateEnvironment` 仍接受 API Server。
-adxlet 的未调度入口仅接受受信 API Server，已分配执行入口仅接受 Coordinator。
-租户由已认证的调用上下文传递，节点执行及已存在实例的复用均检查归属。
+Claim 的同一环境原子占位与 Snapshot 引用比较独立于其他对象更新。写入未知后，仅推进 Claim 自己的恢复屏障，再重载权威状态；普通生命周期写入不比较该屏障。迟到失败候选只能撤销自己尚无成功结果的 Claim，不能删除成功或替代执行。
 
-## 唯一归属与资源规则
+## 对账和资源观测
 
-`Session::claim`、`Session::claim_batch` 与中心 `reserve` 共用 Redis 控制 header 和
-Environment 字段；generation 在 Rust 中按 `u64` 计算。Coordinator 释放内存调度锁后把同时到达的
-本地申请放入最多 256 条、最长等待 1 ms 的微批；同一批只执行一次 header CAS，每条申请仍独立返回
-`Owned`、`Existing` 或错误。CAS 成功后重新取得调度锁并逐条同步账本，其他调度路径不会遗漏本地占用。
+容量采集失败保留最后一次有效容量和现有资源扣减，不因此关闭准入。尚无首次有效容量、明确 draining、管理员禁用和启动恢复仍可限制准入。
 
-| 结果 | 含义和动作 |
-|---|---|
-| `Owned(record)` | 当前节点拥有尚未提交结果的首次创建，包括重复申请；使用同一 Assignment/控制器启动，不重复预留或启动后端 |
-| `Existing(record)` | 其他节点拥有，或已有结果、失效、恢复流程；不作为启动许可，释放本次暂留并复用已有结果/交给中心查询处理 |
-| 规格/租户冲突 | Coordinator RPC 返回 `AlreadyExists`，不会覆盖旧记录；节点只释放匹配当前 token 的暂留 |
-| 会话/设备选择冲突 | 拒绝启动；不能把此错误当作未知写入从未成功的证明，等待同身份重试或权威对账 |
-| `Unavailable`/超时 | 结果未知，保留 Environment ID、规格、设备选择和暂留；不得换 ID 重建 |
+普通周期对账采用最终一致：获取失败保持原有目录和准入，不把失败解释为空目录。正常比较通过每个 Environment 的串行任务清理失去归属的执行；抓取目录期间新接纳的工作受比较基线保护。启动/进程替换则必须恢复控制器、账本并清理孤儿后才开放准入。
 
-同节点入口按 Environment ID 串行化；不同调用共用同一暂留 token。标量资源和卡全部成功才更新 Admission。
-暂留转为 `instance_id-generation` 执行记录后，迟到的 token 释放不能影响执行占用。
-新增加的暂留表只保存规格、token 和设备选择；资源计量仍只在现有 Admission 内。
+## 验证入口
 
-本地暂留尚未登记时，中心可能已把另一个请求分配给该节点。已确认的 Assignment 保持不变，
-中心重试本机准入，等待暂留收敛；本地申请发现中心账本已不足则释放 token 并回退。
-不会为同一已确认实例改 ID 或重复扣除本机资源。
+- `python3 build/ci/run.py storage --jobs 2`：真实 Redis/AOF、对象并发、成功身份复用、崩溃重启、旧 epoch 与节点失效竞争。
+- `python3 build/ci/run.py control-rpc --jobs 2`：真实 Redis/mTLS、中心与可选本地路径、心跳、重启、会话和资源账本。
+- `cargo test -p adxlet --test node_reconciliation`：容量观测失效、周期获取失败、启动孤儿清理和清理重试。
+- `cargo test -p adx-apiserver`：公开请求缓存、重放、剩余期限与错误契约。
 
-## 结果未知与恢复
-
-1. adxlet 先使用同一 claim 重试；调用结束仍未知的暂留，由后台任务按现有报告间隔继续处理。
-2. Coordinator 对写入超时标记协调状态需要恢复，停止使用可能漏项的内存账本。
-3. 在前一个写入生产者已经返回后，CAS 推进控制 header，再读取权威快照。先前迟到的 CAS
-   要么发生在这个屏障前，要么因旧 header 不匹配失败；一次 `NotFound` 查询本身不提供该保证。
-4. 重建全部分配和 generation，并恢复本进程尚未持久化的等待请求。中心 reserve 遇到竞争时也重建整个预计算轮次。
-   删除提交会原子移除 Redis 主目录记录；Coordinator 同步释放内存旧分配。同名后续 claim 使用更高 generation，旧写入不能修改新归属。
-5. 心跳/周期节点检查、后续创建和提交可触发该恢复，不依赖原 HTTP 请求再次到达。
-6. adxlet 重启或重新对账时，以 Coordinator 完整目录重建 Admission，再清除旧暂留元数据；主端不可用时不开启生命周期操作。
-
-后台任务跳过仍在处理中的入口；权威恢复和暂留重试使用现有生命周期门及每实例串行控制器。
-未确认暂留未解决时，节点停机清理不能报告成功。存储 claim 不转移仍然活跃的既有归属；已确认删除后的同名创建属于新的 generation。
-
-## API 节点目录与失败处理
-
-`WatchNodes` 为 API Server 提供带 Coordinator epoch、节点进程会话和有效期的全量可用目录。
-只包含已完成对账、心跳未超时且允许分配的节点；每秒刷新，目录有独立的短有效期。
-断流/异常后清空并重订阅；目录过期或为空时使用中心创建。节点会话始终在实际入口再次校验。
-
-入口 adxlet 只有在本地资源或硬约束明确不满足时，才使用剩余整体预算向 Coordinator 的中心调度提交**同一 ID 和规格**。API Server 不会在入口连接失败、超时或会话前置条件失效后自行发起第二条中心创建；这些错误可能对应已接受的本地操作，调用方必须使用同一请求和 Environment ID 重试或查询。
-Coordinator 将中心请求与仍在途的 claim 串行协调。API 不把结果未知缓存成最终失败；保留的创建操作可继续使用原规格重试。`scheduleTimeoutSeconds` 仅约束中心队列等待 Assignment，本地入口使用完整的 `createTimeoutSeconds`，不做固定比例切分。
-adxlet 到 Coordinator 的连接仅以 `rpc_timeout_seconds` 限制建连，不再统一截断所有 RPC 的响应等待。`ForwardCreate` 使用原创建期限的剩余时间，额外 3 秒仅供下游返回超时诊断，不延长创建或排队期限；claim、心跳、对账和状态提交继续使用各自的短 RPC 超时。启动和发现 Coordinator 地址变化后的重连使用相同规则。
-这里保证同 Environment ID 的收敛，不提供跨 API Server 的匿名 HTTP 请求 ID 全局持久化服务。
-
-## 验证分层
-
-- `coordinator/tests/storage/claims.rs`：10 项存储用例，真实 Redis/AOF；跨节点和中心 reserve 竞争、会话、设备、快照引用、超过 `2^53` 的 generation，以及 128 条申请的一次批量 CAS。
-- `coordinator/tests/scheduling.rs`、`adxlet/tests/lifecycle.rs`：账本导入、中心队列去重、generation、共享暂留、迟到释放和标量/整卡原子性。
-- `coordinator/tests/rpc/local_first.rs`：真实 Redis/mTLS，双节点/同节点/中心并发、并发申请合并为有界 Redis 提交、心跳与调用身份、延迟写入后的屏障重建、无人重试时的后台收敛、两侧资源账本。
-- `build/ci/local_first_http.py`：实际 Rust API HTTPS → Node/Coordinator RPC，目录轮转、4 个并发请求、不同 HTTP 请求 ID 复用同 Environment、规格/租户冲突、删除后资源归零。
-- `build/e2e/local_first.py`：独立 `local-first` 基础验收组；切换 API 配置后通过安装的 SDK 创建、实际 Execd 命令和删除，检查本地 claim 日志；随后恢复中心模式。Docker/K8s 共用该组。
-
-真实 Redis 的 `CLIENT PAUSE ... WRITE` 验证延迟写入/未知结果；RPC 截止时间用例验证调用被取消后仍只执行一次。
-迟到终态用例在实际后端清理后通过 Session 注入未被协调器观察的提交，不能把它当作真实网络丢包。存储层原“丢失应答”测试只是丢弃返回值。
-RPC/HTTPS fixture 中的 RuntimeDriver 是测试实现；真实 sandboxd/runc/Execd 新制品本地双节点8组验收见 [本地端到端报告](2026-09-17-local-first-e2e.md)。提交 `363e44f` 的 [Buildkite #30](2026-09-18-runtime-environment-k8s.md) 已使用正式发布包、OCI 镜像和 Kubernetes 部署完成同一八组验收。
-日志位于当前工作树 `out/ci/local-first/`。最终计数见同目录各套件 `result.json` 和测试日志。
-
-本轮最终通过计数、二进制身份与未运行范围见 [接线验证记录](2026-09-17-local-first-create.md)。
+这些组件/RPC 夹具使用 RuntimeDriver 测试实现，不能替代真实 sandboxd、Execd、多 VM 或 Kubernetes 验收。

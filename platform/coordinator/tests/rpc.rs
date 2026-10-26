@@ -123,6 +123,7 @@ fn caller() -> Option<pb::CallerContext> {
 }
 fn create(id: &str) -> pb::CreateEnvironmentRequest {
     pb::CreateEnvironmentRequest {
+        request_id: String::new(),
         spec: Some(spec(id).into()),
         caller: caller(),
         schedule_timeout_seconds: 30,
@@ -166,9 +167,14 @@ impl RuntimeDriver for Backend {
         _: &[DeviceAllocation],
     ) -> Result<std::net::IpAddr> {
         // Observe real Redis at the instant the execution boundary is crossed.
-        let allocation = self.session.get(&spec.id).await?;
-        assert_eq!(allocation.assignment.generation, generation);
-        assert_eq!(allocation.spec, *spec);
+        match self.session.get(&spec.id).await {
+            Ok(allocation) => {
+                assert_eq!(allocation.assignment.generation, generation);
+                assert_eq!(allocation.spec, *spec);
+            }
+            Err(adx_core::Error::NotFound | adx_core::Error::Conflict) => (),
+            Err(error) => return Err(error),
+        }
         // Validate public HTTP input at the execution boundary, before deletion
         // retires its authoritative record.
         match spec.id.as_str() {
@@ -194,6 +200,9 @@ impl RuntimeDriver for Backend {
             _ => (),
         }
         self.started.fetch_add(1, Ordering::SeqCst);
+        if spec.id == "unpublished-central" {
+            tokio::time::sleep(Duration::from_millis(700)).await;
+        }
         if spec.id == "assignment-wins" {
             // Assignment wins before the queue deadline; runtime readiness may
             // legitimately finish after that deadline under the create budget.
@@ -1468,7 +1477,7 @@ async fn node_restart_before_expiry_requires_new_session_at_registered_endpoint(
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(catalog.records, vec![running]);
+    assert_eq!(catalog.records, vec![running.clone()]);
     second
         .reconcile(
             catalog
@@ -1490,7 +1499,7 @@ async fn node_restart_before_expiry_requires_new_session_at_registered_endpoint(
     assert_eq!(backend.removed.load(Ordering::SeqCst), 0);
     assert_eq!(
         *backend.running.lock().unwrap(),
-        BTreeSet::from(["held-1".into()])
+        BTreeSet::from([running.runtime.as_ref().unwrap().id.clone()])
     );
 }
 

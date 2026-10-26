@@ -456,7 +456,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let assignment = {
+        {
             let mut state = rpc.0.state.lock().await;
             for node in &nodes {
                 state.scheduler.register(node.clone()).unwrap();
@@ -474,8 +474,7 @@ mod tests {
             let assignment = state.environments[&spec.id].assignment.clone();
             assert_eq!(assignment.node_id, "other-node");
             assert!(!state.drive().await.unwrap());
-            assignment
-        };
+        }
         drop(rpc);
         redis.crash();
         redis.start().await;
@@ -486,17 +485,15 @@ mod tests {
                 .unwrap(),
             spec
         );
-        assert_eq!(
-            recovered.get(&spec.id).await.unwrap().assignment,
-            assignment
-        );
+        assert_eq!(recovered.get(&spec.id).await, Err(Error::NotFound));
         let saved = recovered.snapshot().await.unwrap();
         let mut scheduler = Coordinator::restore(&saved, Placement::Pack).unwrap();
-        assert_eq!(scheduler.submit(spec).unwrap(), assignment.shard_id);
-        assert!(scheduler.pending_requests().is_empty());
+        let shard = scheduler.submit(spec).unwrap();
+        assert!(scheduler.schedule(shard).unwrap().is_none());
+        let (capacity, available) = scheduler.node_resources("other-node").unwrap();
         assert_eq!(
-            scheduler.node_resources("other-node").unwrap().1.cpu_millis,
-            0
+            available, capacity,
+            "an unconfirmed attempt has no restored reservation"
         );
     }
 

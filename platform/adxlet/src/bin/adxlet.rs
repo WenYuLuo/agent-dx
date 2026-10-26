@@ -390,9 +390,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut last = registration.clone();
         let mut valid_until = tokio::time::Instant::now() + valid;
         // Resource/backend observation is not on the heartbeat critical path.
-        // Bound each attempt to one reporting period so a busy or restarting
-        // sandboxd closes admission after `valid_until` without causing Coordinator
-        // to expire the node session and fence otherwise healthy environments.
+        // Bound each sample to one reporting period and keep the last successful
+        // capacity during outages. Heartbeats continue independently.
         let sample_timeout = timeout.min(Duration::from_secs(config.report_interval_seconds));
         let mut interval =
             tokio::time::interval(Duration::from_secs(config.report_interval_seconds));

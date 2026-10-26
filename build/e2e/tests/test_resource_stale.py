@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class ResourceStaleScenarioTests(unittest.TestCase):
-    def test_rejects_stale_allocation_then_reopens_without_replacing_live_backend(self):
+    def test_accepts_stale_capacity_without_replacing_live_backend(self):
         records = {
             'node:node1': {'node': {'available': True}, 'session': {'id': 'session-one', 'routable': True}},
             'node:node2': {'node': {'available': True}, 'session': {'id': 'session-two', 'routable': True}},
@@ -26,8 +26,6 @@ class ResourceStaleScenarioTests(unittest.TestCase):
 
         class Environment:
             def __init__(self, **options):
-                if options.get('name', '').startswith('stale-rejected-'):
-                    raise EnvironmentError('central scheduling queue deadline exceeded')
                 self.id = 'instance-' + str(len(backends) + len(deleted) + 1)
                 self.commands = types.SimpleNamespace(run=self.run)
                 backends[self.id] = 'backend-' + self.id
@@ -60,7 +58,7 @@ class ResourceStaleScenarioTests(unittest.TestCase):
             'adx_environment': types.SimpleNamespace(Environment=Environment, EnvironmentError=EnvironmentError),
             'functional_lifecycle': types.SimpleNamespace(_wait_deleted=lambda *_a, **_kw: None),
             'node': types.SimpleNamespace(
-                catalog=lambda: {key: json.dumps(value) for key, value in records.items()},
+                live_catalog=lambda: {key: json.dumps(value) for key, value in records.items()},
                 backend=lambda: sorted(backends.values()),
                 labeled_backend=lambda instance_id: [backends[instance_id]] if instance_id in backends else [],
                 persisted_runtime_id=lambda result: result['runtime']['id'],
@@ -77,9 +75,8 @@ class ResourceStaleScenarioTests(unittest.TestCase):
             live = json.loads((evidence / 'resource-live.json').read_text())
             self.assertEqual(live['session_id'], 'session-one')
             self.assertEqual(backends[live['instance_id']], live['backend'])
-            records['node:node1']['node']['available'] = False
-            rejected = scenario.rejected(object(), 'test-image', evidence)
-            self.assertEqual(rejected['held_before'], rejected['held_after'])
+            accepted = scenario.accepted(object(), 'test-image', evidence)
+            self.assertEqual(accepted['held_before'] + 1, accepted['held_during'])
             self.assertEqual(len(backends), 1)
             records['node:node1']['node']['available'] = True
             (evidence / 'resource-stale.json').write_text(json.dumps({'seconds': 12.0}))
@@ -93,7 +90,7 @@ class ResourceStaleScenarioTests(unittest.TestCase):
                     'reliability.resource-observation-recovery',
                 ],
             )
-            self.assertEqual(sorted(deleted), ['instance-1', 'instance-2'])
+            self.assertEqual(sorted(deleted), ['instance-1', 'instance-2', 'instance-3'])
             self.assertEqual(backends, {})
 
 

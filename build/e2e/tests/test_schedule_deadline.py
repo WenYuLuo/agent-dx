@@ -56,7 +56,7 @@ class ScheduleDeadlineTests(unittest.TestCase):
         scenario = importlib.util.module_from_spec(spec)
         modules = {
             'adx_environment': types.SimpleNamespace(Environment=Environment, EnvironmentError=EnvironmentError),
-            'node': types.SimpleNamespace(catalog=lambda: nodes),
+            'node': types.SimpleNamespace(catalog=lambda: nodes, live_catalog=lambda: nodes),
             'runtime_inventory': runtime_inventory,
         }
         with patch.dict(sys.modules, modules):

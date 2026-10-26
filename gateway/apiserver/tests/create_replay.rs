@@ -17,6 +17,7 @@ use tonic::{Request, Response, Status};
 struct State {
     entry_node: Mutex<Option<pb::NodeEndpoint>>,
     owners: Mutex<HashMap<String, pb::GetEnvironmentResponse>>,
+    receipts: Mutex<HashMap<(String, String), String>>,
     starts: AtomicUsize,
     create_calls: AtomicUsize,
     lookups: AtomicUsize,
@@ -60,7 +61,14 @@ service_impl!(pb::coordinator_service_server::CoordinatorService, {
         let deadline = request.get_ref().create_deadline_unix_millis;
         self.0.deadlines.lock().unwrap().push(request.get_ref().create_deadline_unix_millis);
         self.0.create_calls.fetch_add(1, Ordering::SeqCst);
-        let spec = request.into_inner().spec.unwrap();
+        let request = request.into_inner();
+        let mut spec = request.spec.unwrap();
+        let identity = (spec.tenant_id.clone(), request.request_id);
+        if !identity.1.is_empty() {
+            if let Some(id) = self.0.receipts.lock().unwrap().get(&identity) {
+                spec = self.0.owners.lock().unwrap()[id].record.as_ref().unwrap().spec.clone().unwrap();
+            }
+        }
         if self.0.scheduling_expired.load(Ordering::SeqCst) {
             return Err(adx_protocol::scheduling_deadline(adx_core::scheduling::SchedulingFailure {
                 rejections: [("insufficient_cpu".into(), 1)].into(),
@@ -93,10 +101,14 @@ assignment: Some(pb::Assignment { environment_id: spec.id.clone(), node_id: self
                 record
             }
         };
+        if record.state == pb::EnvironmentState::Running as i32 && !identity.1.is_empty() {
+            self.0.receipts.lock().unwrap().entry(identity).or_insert_with(|| record.spec.as_ref().unwrap().id.clone());
+        }
         if self.0.block_response.load(Ordering::SeqCst) {
             self.0.release.notified().await;
         }
-        let phase = self.0.timeout_phase.lock().unwrap().clone();
+        let phase = self.0.timeout_phase.lock().unwrap().clone()
+            .filter(|_| record.state != pb::EnvironmentState::Failed as i32);
         if let Some(phase) = phase {
             let deadline = adx_transport::deadline::Deadline::from_unix_millis(deadline).unwrap();
             tokio::time::sleep_until(deadline.instant()).await;
@@ -258,6 +270,7 @@ async fn snapshot_create_uses_coordinator_even_with_a_live_local_first_entry() {
     let mut spec = spec("snapshot-clone");
     spec.snapshot_id = Some("snapshot".into());
     let request = pb::CreateEnvironmentRequest {
+        request_id: String::new(),
         spec: Some(spec),
         caller: Some(caller()),
         ..Default::default()
@@ -456,7 +469,7 @@ async fn confirmed_timeout_survives_rpc_timers_and_replay() {
     assert_eq!(replay.message(), error.message());
     assert!(adx_protocol::deadline_failure(&replay).is_some());
     assert_eq!(fixture.state.starts.load(Ordering::SeqCst), 1);
-    assert_eq!(fixture.state.create_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.state.create_calls.load(Ordering::SeqCst), 2);
 }
 #[tokio::test]
 async fn completed_cache_capacity_never_rejects_new_creates() {
@@ -500,23 +513,19 @@ async fn unknown_results_do_not_block_new_names_and_retry_original_identity() {
     }
     fixture.state.response_error.store(0, Ordering::SeqCst);
     fixture.create("new", "new-request").await.unwrap();
-    // All unknown outcomes retain their arguments while unrelated completed
-    // responses are evicted from the capacity-one cache.
+    // A repeated request reuses its confirmed result even when arguments differ.
     for index in 0..unknown_codes.len() {
         assert_eq!(
             fixture
                 .create("other-name", &format!("request-{index}"))
                 .await
-                .unwrap_err()
-                .code(),
-            tonic::Code::AlreadyExists
+                .unwrap()["environmentId"],
+            format!("unknown-{index}")
         );
     }
     let starts = fixture.state.starts.load(Ordering::SeqCst);
-    let calls = fixture.state.create_calls.load(Ordering::SeqCst);
     fixture.create("unknown-0", "request-0").await.unwrap();
     assert_eq!(fixture.state.starts.load(Ordering::SeqCst), starts);
-    assert_eq!(fixture.state.create_calls.load(Ordering::SeqCst), calls);
 }
 #[tokio::test]
 async fn active_creates_are_not_evicted_and_same_request_is_serialized() {
@@ -559,7 +568,7 @@ async fn expired_unknown_request_is_collected_without_querying_or_changing_envir
     );
     assert_eq!(
         fixture.create("new", "request").await.unwrap_err().code(),
-        tonic::Code::AlreadyExists
+        tonic::Code::Unavailable
     );
     let lookups = fixture.state.lookups.load(Ordering::SeqCst);
     let calls = fixture.state.create_calls.load(Ordering::SeqCst);
@@ -576,10 +585,10 @@ async fn expired_unknown_request_is_collected_without_querying_or_changing_envir
         pb::EnvironmentState::Running as i32
     );
     fixture.state.response_error.store(0, Ordering::SeqCst);
-    // Beyond the retry window, the old Request ID no longer pins its arguments.
+    // Evicting the process cache does not discard the durable request receipt.
     assert_eq!(
         fixture.create("new", "request").await.unwrap()["environmentId"],
-        "new"
+        "old"
     );
     let starts = fixture.state.starts.load(Ordering::SeqCst);
     assert_eq!(
@@ -662,7 +671,7 @@ async fn failed_owner_retry_is_terminal_and_does_not_repeat_start() {
 }
 
 #[tokio::test]
-async fn pending_retry_rejects_a_changed_generation() {
+async fn pending_retry_accepts_a_reassigned_unconfirmed_generation() {
     let fixture = Fixture::new().await;
     fixture.state.pending_response.store(true, Ordering::SeqCst);
     fixture
@@ -686,15 +695,17 @@ async fn pending_retry_rejects_a_changed_generation() {
         .as_mut()
         .unwrap()
         .generation = 2;
+    fixture
+        .state
+        .pending_response
+        .store(false, Ordering::SeqCst);
+    fixture.state.response_error.store(0, Ordering::SeqCst);
     assert_eq!(
-        fixture
-            .create("pending-fenced", "request")
-            .await
-            .unwrap_err()
-            .code(),
-        tonic::Code::FailedPrecondition
+        fixture.create("pending-fenced", "request").await.unwrap()["environmentId"],
+        "pending-fenced"
     );
-    assert_eq!(fixture.state.create_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(fixture.state.create_calls.load(Ordering::SeqCst), 3);
+    assert_eq!(fixture.state.starts.load(Ordering::SeqCst), 1);
 }
 
 #[tonic::async_trait]

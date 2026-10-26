@@ -228,15 +228,19 @@ elif sys.argv[1] == 'schedule-deadline':
 
     report = run(connection, image, E / 'schedule-deadline-result.json', S / 'tls/ca.pem', S / 'admin-key')
     print(json.dumps(report), flush=True)
+elif sys.argv[1] in ('create-identities-seed', 'create-identities-replay'):
+    from create_identities import run
+
+    run(connection, image, E, S, sys.argv[1].rsplit('-', 1)[1])
 elif sys.argv[1] == 'resource-create':
     from resource_stale import create
 
     create(connection, image, E / 'resource-live.json')
     print('Created retained instance before resource observation expiry', flush=True)
-elif sys.argv[1] == 'resource-rejected':
-    from resource_stale import rejected
+elif sys.argv[1] == 'resource-accepted':
+    from resource_stale import accepted
 
-    print(json.dumps(rejected(connection, image, E)), flush=True)
+    print(json.dumps(accepted(connection, image, E)), flush=True)
 elif sys.argv[1] == 'resource-verify':
     from resource_stale import verify
 

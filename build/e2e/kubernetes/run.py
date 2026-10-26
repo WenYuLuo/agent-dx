@@ -363,6 +363,10 @@ class KubernetesRun(common.Run):
         print('Kubernetes placement: ' + json.dumps(placement), flush=True)
         ingress_pod = next(p for p in pods if p['metadata']['name'] == 'node1')
         ingress_ip = str(ipaddress.ip_address(ingress_pod['status']['podIP']))
+        api_clients = ['127.0.0.1/32'] + [
+            str(ipaddress.ip_network(pod['status']['podIP']))
+            for pod in pods if pod['metadata']['name'] in self.nodes
+        ]
         self.sync_harness(harness_commit or source_commit(), m['package']['commit'])
         self.event('[DEPLOY] Checking OCI runtime and bridge netfilter prerequisites')
         for node in self.nodes:
@@ -373,6 +377,7 @@ class KubernetesRun(common.Run):
                 node,
                 'env',
                 'ADX_E2E_INGRESS_IP=' + ingress_ip,
+                'ADX_E2E_API_CLIENT_CIDRS=' + ','.join(api_clients),
                 *common.setup_environment(self.selected_case),
                 'python3',
                 '/opt/adx/e2e/node.py',

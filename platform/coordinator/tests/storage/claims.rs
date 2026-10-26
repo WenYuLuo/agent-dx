@@ -212,8 +212,10 @@ async fn concurrent_claims_allocate_exact_generations_above_lua_integer_precisio
         y.unwrap().record().assignment.generation,
     ];
     generations.sort();
-    assert_eq!(generations, [high + 1, high + 2]);
-    assert_eq!(s.snapshot().await.unwrap().generation, high + 2);
+    assert_eq!(generations[1], generations[0] + 1);
+    assert_eq!(generations[0] >> 32, s.epoch());
+    assert_eq!(s.get("seed").await.unwrap().assignment.generation, high);
+    assert_eq!(s.snapshot().await.unwrap().generation, high);
 }
 
 #[tokio::test]
@@ -239,10 +241,11 @@ async fn batched_local_claims_allocate_one_contiguous_generation_range() {
         .map(|outcome| outcome.unwrap().record().assignment.generation)
         .collect();
     generations.sort_unstable();
-    assert_eq!(generations.first(), Some(&(before.generation + 1)));
-    assert_eq!(generations.last(), Some(&(before.generation + 128)));
+    let base = s.epoch() << 32;
+    assert_eq!(generations.first(), Some(&(base + 1)));
+    assert_eq!(generations.last(), Some(&(base + 128)));
     let after = s.snapshot().await.unwrap();
-    assert_eq!(after.generation, before.generation + 128);
+    assert_eq!(after.generation, base + 128);
     assert_eq!(after.revision, before.revision + 128);
     assert_eq!(after.environments.len(), 128);
 }

@@ -394,6 +394,7 @@ impl Rig {
         );
         let created = client
             .create_environment(pb::CreateEnvironmentRequest {
+                request_id: String::new(),
                 spec: Some(spec().into()),
                 caller: caller(),
                 schedule_timeout_seconds: 3,
@@ -628,6 +629,7 @@ async fn coordinator_autoscaling_http_queries_authoritative_node_ownership_witho
                     channel(&rpc_address, Principal::ApiServer).await,
                 )
                 .create_environment(pb::CreateEnvironmentRequest {
+                    request_id: String::new(),
                     spec: Some(queued.into()),
                     caller: caller(),
                     schedule_timeout_seconds: 1,
