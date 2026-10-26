@@ -1,11 +1,36 @@
 # Sandbox 可观测本地验证记录
 
 验证日期：2026-10-26。实现分支：`feat/sandbox-observability-20261026`。
-组件和端到端运行基于 `f7aaee0fc50a2c6a5d8dcf525a59fbac6babf00d` 加本分支实现；
-本记录描述本地验证，不表示测试或生产集群已部署。
+以下按验证轮次列出实现版本及结果；本记录描述本地验证，
+不表示测试或生产集群已部署。
 指标口径见 [Sandbox 指标合同](sandbox-observability.md)。
 
-## PR #125 复核修复验证
+## PR #125 第二轮复核修复验证
+
+实现提交：`5ca837d7868a1f62a44e5cfba1cea69c5bf24f09`，2026-10-26 验证。
+本轮修复替代执行首次 Running 未发布时的终态提交、正常停止后的迟到退出归因、
+以及默认名称生成前的参数类型校验。三个问题均先通过失败断言复现。
+
+- 真实 Redis 存储：63 passed，新增替代执行终态、重放、恢复及错误 worker/generation/runtime 证据拒绝测试。
+- adxlet：140 passed（journal 6、lifecycle 39、pause_resume 55、reconciliation 40），
+  包括正常停止迟到 exit 137 不计中断及独立 OOM 仍计中断。
+- API create_replay：18 passed、1 ignored；ignored 项需原生 Prometheus，
+  本轮实际采集通过下述 Docker E2E 验证。
+- `make rust-check JOBS=2 ADX_WITH_AFS=0`、文档和 diff 检查通过；macOS 检查未包含 Linux AFS。
+- 从干净实现提交构建 Linux ARM64 安装包，manifest commit 与上述提交一致、dirty=false，
+  package verify 通过；SDK、二进制使用同一提交。
+- 本地双节点 Docker/runc、真实 sandboxd/Redis/SDK/Prometheus：18 组完整执行，
+  首轮 **16 passed、2 failed**；15 个通过场景完成实际指标采集，stop 场景验证停止清理。
+- auth 首轮重复撤销密钥返回 HTTP 409；同一 bundle、未修改源码或断言的独立复测通过，
+  实际采集也通过。保留首轮失败，尚未确认该间歇性失败的根因。
+- sandboxd-restart 仍失败：强杀后原 runtime 丢失，after=[]；后端记录 exit 137、oom=false。
+  固定 backend 提交 `efc201531d7e2e9d69505da151eb66084b61eebf` 未修改，完整 E2E 尚未全绿。
+- 首轮与复测 cleanup_errors 均为空，所属容器和网络均已清理。
+
+组件证据：`out/observability/review-fixes-round2/`。安装包、18 组首轮汇总、独立鉴权复测及
+原始指标：`out/observability/e2e-round2/`。没有部署测试或生产集群。
+
+## PR #125 第一轮复核修复验证
 
 基于 `c8f5091` 加本次复核修复，2026-10-26 在独立 worktree 验证：
 
