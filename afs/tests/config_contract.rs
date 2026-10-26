@@ -1960,3 +1960,17 @@ fn p2_r1_replaced_source_cache_name_is_rejected_explicitly() {
     assert_eq!(error.code(), afs_error::CONFIG_INVALID);
     assert!(error.to_string().contains("dfs_read_source_cache_ttl_ms"));
 }
+
+#[test]
+fn unified_native_read_has_no_user_sync_async_switch() {
+    assert!(Cli::try_parse_from(["afs-node", "--dfs-read-async", "true"]).is_err());
+    let config = Config::resolve(Role::Node, Cli::default()).unwrap();
+    let json = serde_json::to_value(&config).unwrap();
+    assert!(json["dfs_read_pipeline"].get("enabled").is_none());
+    assert!(
+        serde_json::from_value::<afs::node::read_pipeline::ReadPipelineLimits>(
+            serde_json::json!({"enabled":false})
+        )
+        .is_err()
+    );
+}

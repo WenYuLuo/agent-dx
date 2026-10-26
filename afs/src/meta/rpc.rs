@@ -935,6 +935,15 @@ impl DfsMetaService for DfsMetaRpc {
                     .map(domain_chunk_object)
                     .collect::<Result<Vec<_>, _>>()?,
                 release: request.release,
+                open_read: if request.open_read.is_empty() {
+                    None
+                } else {
+                    Some(
+                        serde_json::from_slice(&request.open_read)
+                            .map_err(|_| invalid("invalid open read identity"))?,
+                    )
+                },
+                close_open_read: request.close_open_read,
                 admission_deadline_unix_ms: request.admission_deadline_unix_ms,
             })
             .await
@@ -1796,6 +1805,7 @@ impl DfsMetaService for DfsMetaRpc {
                                 })
                                 .collect(),
                             expires_at_unix_ms: entry.expires_at_unix_ms,
+                            open_sources: entry.open_sources,
                         }
                     })
                     .collect(),
@@ -2780,6 +2790,8 @@ fn wire_authorized_read(
 ) -> afs_protocol::meta::DfsAuthorizedRead {
     let validation = entry.validation;
     afs_protocol::meta::DfsAuthorizedRead {
+        open_sources: Vec::new(),
+
         validation: Some(afs_protocol::meta::DfsReadValidation {
             grant: Some(wire_read_grant(validation.grant)),
             chunk_id: validation.chunk_id.0,

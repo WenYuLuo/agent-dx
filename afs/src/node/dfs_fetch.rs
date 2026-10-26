@@ -241,7 +241,7 @@ impl ObjectFetcher {
 
     /// Call before cloning the bounded job context. Foreground caller keeps
     /// its original deadline/authority check; no new deadline starts here.
-    pub(super) fn reserve_foreground(
+    pub(super) async fn reserve_foreground_async(
         self: &Arc<Self>,
         charge: usize,
         deadline: Option<Instant>,
@@ -249,46 +249,48 @@ impl ObjectFetcher {
     ) -> Result<Option<FetchTaskPermit>> {
         let _waiting = ForegroundWaiter::new(self.clone())?;
         loop {
+            let changed = self.asynchronous_change.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
             check()?;
-            let mut state = self
-                .state
-                .lock()
-                .map_err(|_| invalid("DFS fetch lock poisoned"))?;
-            if state.closed {
-                return Err(stopped());
-            }
-            let wait = match deadline {
-                Some(deadline) => deadline
-                    .checked_duration_since(Instant::now())
-                    .filter(|remaining| !remaining.is_zero())
-                    .ok_or_else(|| {
-                        Error::coded(
-                            afs_error::CLIENT_DEADLINE_EXCEEDED,
-                            "DFS fetch admission context expired",
-                        )
-                    })?
-                    .min(Duration::from_millis(25)),
-                None => Duration::from_millis(25),
-            };
-            if state.active < self.limit {
-                let Some(metadata) = self.budget.try_reserve(charge) else {
-                    return Ok(None);
+            let wait = {
+                let mut state = self
+                    .state
+                    .lock()
+                    .map_err(|_| invalid("DFS fetch lock poisoned"))?;
+                if state.closed {
+                    return Err(stopped());
+                }
+                let wait = match deadline {
+                    Some(deadline) => deadline
+                        .checked_duration_since(Instant::now())
+                        .filter(|remaining| !remaining.is_zero())
+                        .ok_or_else(|| {
+                            Error::coded(
+                                afs_error::CLIENT_DEADLINE_EXCEEDED,
+                                "DFS fetch admission context expired",
+                            )
+                        })?
+                        .min(Duration::from_millis(25)),
+                    None => Duration::from_millis(25),
                 };
-                state.active += 1;
-                state.metadata += charge;
-                state.metadata_peak = state.metadata_peak.max(state.metadata);
-                self.report(&state);
-                return Ok(Some(FetchTaskPermit {
-                    owner: self.clone(),
-                    charge,
-                    metadata: Some(metadata),
-                }));
-            }
-            drop(
-                self.changed
-                    .wait_timeout(state, wait)
-                    .map_err(|_| invalid("DFS fetch wait lock poisoned"))?,
-            );
+                if state.active < self.limit {
+                    let Some(metadata) = self.budget.try_reserve(charge) else {
+                        return Ok(None);
+                    };
+                    state.active += 1;
+                    state.metadata += charge;
+                    state.metadata_peak = state.metadata_peak.max(state.metadata);
+                    self.report(&state);
+                    return Ok(Some(FetchTaskPermit {
+                        owner: self.clone(),
+                        charge,
+                        metadata: Some(metadata),
+                    }));
+                }
+                wait
+            };
+            let _ = tokio::time::timeout(wait, changed).await;
         }
     }
 
@@ -329,13 +331,22 @@ impl ObjectFetcher {
 
     /// The result is only existing per-request scratch, never captured source
     /// metadata. Callers must join every returned handle before returning.
-    pub(super) fn spawn_foreground<T: Send + 'static>(
+    pub(super) fn spawn_foreground_async<T: Send + 'static>(
         &self,
         permit: FetchTaskPermit,
-        work: impl FnOnce() -> Result<T> + Send + 'static,
+        work: impl Future<Output = Result<T>> + Send + 'static,
     ) -> tokio::task::JoinHandle<Result<T>> {
-        self.runtime.spawn_blocking(move || {
-            let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)) {
+        let permit = Arc::new(permit);
+        let parent = crate::node::read_pipeline::current_read_scope();
+        let scope = crate::node::read_pipeline::ReadScope {
+            deadline: parent
+                .as_ref()
+                .map_or_else(|| Instant::now() + Duration::from_secs(30), |s| s.deadline),
+            lifetime: Arc::new((parent.map(|s| s.lifetime), permit.clone())),
+        };
+        self.runtime.spawn(async move {
+            let work = crate::node::read_pipeline::in_read_scope(scope, work);
+            let result = match catch_async(work).await {
                 Ok(result) => result.map_err(|error| {
                     let mut end = error.message().len().min(512);
                     while !error.message().is_char_boundary(end) {
@@ -353,19 +364,23 @@ impl ObjectFetcher {
         })
     }
 
-    pub(super) fn spawn_background(
+    pub(super) fn spawn_background_async(
         &self,
         permit: FetchTaskPermit,
-        work: impl FnOnce() -> Result<()> + Send + 'static,
+        deadline: Instant,
+        work: impl Future<Output = Result<()>> + Send + 'static,
     ) -> Result<()> {
         let mut state = self.state.try_lock().map_err(|_| stopped())?;
         if state.closed || state.background.len() >= self.limit {
             return Err(stopped());
         }
-        state.background.push(self.runtime.spawn_blocking(move || {
-            // A completed optional task retains no remote Error or panic payload
-            // after its context lease is refunded. Join results are fixed unit.
-            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)) {
+        let permit = Arc::new(permit);
+        let scope = crate::node::read_pipeline::ReadScope {
+            deadline,
+            lifetime: permit.clone(),
+        };
+        state.background.push(self.runtime.spawn(async move {
+            match catch_async(crate::node::read_pipeline::in_read_scope(scope, work)).await {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
                     permit.owner.event("failed");
@@ -379,14 +394,6 @@ impl ObjectFetcher {
             drop(permit);
         }));
         Ok(())
-    }
-
-    pub(super) fn block_on<T>(&self, future: impl Future<Output = T>) -> T {
-        if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::task::block_in_place(|| self.runtime.block_on(future))
-        } else {
-            self.runtime.block_on(future)
-        }
     }
 
     fn join_finished_background(&self) -> Result<bool> {
@@ -409,10 +416,16 @@ impl ObjectFetcher {
             }
             finished
         };
-        for task in finished {
+        for mut task in finished {
             // Optional prefetch failure is observed, never a foreground error.
-            if self.block_on(task).is_err() {
-                self.event("failed");
+            // is_finished selected completed tasks only. Poll once to observe
+            // their result; no runtime nesting, thread parking or network wait.
+            use std::task::{Context, Poll, Waker};
+            let mut context = Context::from_waker(Waker::noop());
+            match std::pin::Pin::new(&mut task).poll(&mut context) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(_)) => self.event("failed"),
+                Poll::Pending => return Err(stopped()),
             }
         }
         Ok(true)
@@ -437,7 +450,18 @@ impl ObjectFetcher {
             std::mem::take(&mut state.background)
         };
         for task in tasks {
-            self.block_on(task).map_err(|_| stopped())?;
+            // Test fixture teardown may be called inside the compatibility
+            // current-thread runtime, while this fetcher owns a separate live
+            // multithread runtime. Never invoke block_in_place there.
+            let result = if tokio::runtime::Handle::try_current()
+                .is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+            {
+                tokio::task::block_in_place(|| self.runtime.block_on(task))
+            } else {
+                std::thread::scope(|scope| scope.spawn(|| self.runtime.block_on(task)).join())
+                    .map_err(|_| stopped())?
+            };
+            result.map_err(|_| stopped())?;
         }
         Ok(())
     }
@@ -517,6 +541,20 @@ fn invalid(message: &str) -> Error {
 }
 fn stopped() -> Error {
     Error::coded(afs_error::IO_UNAVAILABLE, "DFS fetcher stopped")
+}
+
+async fn catch_async<T>(
+    work: impl Future<Output = T>,
+) -> std::result::Result<T, Box<dyn std::any::Any + Send>> {
+    let mut work = Box::pin(work);
+    std::future::poll_fn(move |cx| {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work.as_mut().poll(cx))) {
+            Ok(std::task::Poll::Ready(value)) => std::task::Poll::Ready(Ok(value)),
+            Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
+            Err(payload) => std::task::Poll::Ready(Err(payload)),
+        }
+    })
+    .await
 }
 
 #[cfg(test)]

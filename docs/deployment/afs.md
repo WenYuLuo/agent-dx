@@ -285,7 +285,8 @@ cache ON 必须按[验收说明](../testing/afs.md#dfs-外部-s3-闭环)登记�
 | --- | --- | --- |
 | `fuse_threads` | `4` | `1..=64`，OwnerFs／DFS接收线程 |
 | `fuse_clone_fd` | `true` | 仅多接收线程时生效 |
-| `fuse_workers` | `32` | `1..=1024`，有界callback executor，队列容量为worker数×8 |
+| `fuse_workers` | `32` | `1..=1024`，dispatch执行线程数 |
+| `fuse_max_tasks` | 省略时`fuse_workers×8` | `1..=65536`，执行、排队、异步等待及待回复任务的已接纳总数，完成后才退账 |
 | `dfs_fuse_keep_cache` | `true` | 仅原生DFS只读、已核对提交身份的open允许保留页面 |
 | `dfs_fuse_entry_ttl_ms` | `0` | `0..=60000`，路径entry TTL |
 | `dfs_fuse_attr_ttl_ms` | `0` | `0..=60000`，属性TTL；CREATE的单TTL回复取两者较小值 |
@@ -300,6 +301,8 @@ cache ON 必须按[验收说明](../testing/afs.md#dfs-外部-s3-闭环)登记�
 | `dfs_source_lookahead_chunks` | `64` | `0..=128`，仅后续源元数据；与mandatory合并请求至多128项；0仅关闭前瞻 |
 | `dfs_source_cache_bytes` | `4194304`（4MiB） | `0..=4194304`，最多1024条源元数据的保留估算上限；0不保留且不前瞻 |
 | `dfs_readahead_max_bytes` | `0` | `0..=33554432`；0不创建后台fetch任务；product可显式设8388608。这是对象调度距离，未新增正文、proof、连接或磁盘额度 |
+
+原生gRPC远端读统一异步，没有同步/异步算法开关。`[dfs_read_pipeline]`分别限制RPC、回复缓冲、A磁盘深度、聚合范围数、待发送队列和超时；默认值、合法范围及示例见[远端读资源配置](../performance/afs-remote-read-20261024/read-concurrency.md#configuration)。历史实验的`--dfs-read-async`及`enabled`键应删除，应用不新增必填参数。
 
 TTL均保持0才属于严格路径新鲜度配置；正值是显式宽松模式，rename替换等路径
 可能在TTL内继续解析为旧inode，不能宣传严格close-to-open。OwnerFs原Home缓存、TTL、

@@ -594,7 +594,13 @@ impl Heap for super::MetaKey {
         }
     }
 }
+fields_heap!(crate::dfs::OpenReadIdentity {
+    version_id,
+    layout_root_id,
+    closed
+});
 fields_heap!(crate::dfs::GcReference {
+    open_read,
     node_id,
     session_id,
     reference_id,

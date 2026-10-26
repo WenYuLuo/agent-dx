@@ -47,6 +47,9 @@ async fn generation_fixture() -> Fixture {
 
 fn generation_admission(f: &Fixture, release: bool) -> crate::dfs::UpdateGcReference {
     crate::dfs::UpdateGcReference {
+        open_read: None,
+        close_open_read: false,
+
         node_id: "writer".into(),
         session_id: "writer-session".into(),
         reference_id: format!("write:{}", f.commit.operation_id.0),

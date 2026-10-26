@@ -51,6 +51,10 @@ impl CrcTable {
         })
     }
 
+    pub(crate) fn descriptor_input_bytes(&self) -> u64 {
+        (b"AFS-CRC32C-SEGMENTS-v1".len() + 4 + 8 + 4 + self.checksums.len() * 4) as u64
+    }
+
     pub(crate) fn descriptor_digest(&self) -> ContentDigest {
         let mut h = blake3::Hasher::new();
         h.update(b"AFS-CRC32C-SEGMENTS-v1");

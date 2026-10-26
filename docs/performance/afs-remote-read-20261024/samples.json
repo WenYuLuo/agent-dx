@@ -1,0 +1,1129 @@
+{
+  "scope": "Frozen existing samples only; no new performance runs for this tracking PR",
+  "cohorts": [
+    {
+      "id": "afs-crc-read-dedup-20261024",
+      "original_ledger_sha256": "70caccfaaff0da2df622905f0c1d287137a8b066f09db7cefc3c1bbf37fa7b16",
+      "clock": "primary_full includes app close and producer completion; verification excluded",
+      "rows": [
+        {
+          "sample": "compare-r1-product",
+          "stage": "comparison",
+          "group": "product",
+          "round": 1,
+          "application_bytes": 1073741824,
+          "app_read_calls": 1024,
+          "full_ms": 2291.847647,
+          "open_ms": 3.145561,
+          "read_ms": 2288.367616,
+          "eof_and_close_ms": 0.33447,
+          "rpc": 1024.0,
+          "frames": 16384.0,
+          "fuse_data_requests": 1024.0,
+          "a_grant_validation_rpcs": 256.0,
+          "a_explicit_copy_bytes": 1073741824.0,
+          "b_explicit_copy_bytes": 1073741824.0,
+          "a_crc_bytes": {
+            "afs_dfs_crc32c_read_bytes_total{stage=\"range_send\"}": 1073741824.0,
+            "afs_dfs_crc32c_read_bytes_total{stage=\"storage_segments\"}": 1073741824.0
+          },
+          "b_crc_bytes": {
+            "afs_dfs_crc32c_read_bytes_total{stage=\"range_receive\"}": 1073741824.0,
+            "afs_dfs_crc32c_read_bytes_total{stage=\"trusted_segments_receive\"}": 1073741824.0
+          },
+          "checks_passed": true
+        },
+        {
+          "sample": "compare-r1-candidate01",
+          "stage": "comparison",
+          "group": "candidate01",
+          "round": 1,
+          "application_bytes": 1073741824,
+          "app_read_calls": 1024,
+          "full_ms": 2120.338105,
+          "open_ms": 4.819449,
+          "read_ms": 2115.179728,
+          "eof_and_close_ms": 0.338928,
+          "rpc": 1024.0,
+          "frames": 16384.0,
+          "fuse_data_requests": 1024.0,
+          "a_grant_validation_rpcs": 256.0,
+          "a_explicit_copy_bytes": 1073741824.0,
+          "b_explicit_copy_bytes": 1073741824.0,
+          "a_crc_bytes": {
+            "afs_dfs_crc32c_read_bytes_total{stage=\"storage_segments\"}": 1073741824.0
+          },
+          "b_crc_bytes": {
+            "afs_dfs_crc32c_read_bytes_total{stage=\"trusted_segments_receive\"}": 1073741824.0
+          },
+          "checks_passed": true
+        },
+        {
+          "sample": "compare-r2-candidate01",
+          "stage": "comparison",
+          "group": "candidate01",
+          "round": 2,
+          "application_bytes": 1073741824,
+          "app_read_calls": 1024,
+          "full_ms": 2144.387206,
+          "open_ms": 2.735422,
+          "read_ms": 2141.324106,
+          "eof_and_close_ms": 0.327678,
+          "rpc": 1024.0,
+          "frames": 16384.0,
+          "fuse_data_requests": 1024.0,
+          "a_grant_validation_rpcs": 256.0,
+          "a_explicit_copy_bytes": 1073741824.0,
+          "b_explicit_copy_bytes": 1073741824.0,
+          "a_crc_bytes": {
+            "afs_dfs_crc32c_read_bytes_total{stage=\"storage_segments\"}": 1073741824.0
+          },
+          "b_crc_bytes": {
+            "afs_dfs_crc32c_read_bytes_total{stage=\"trusted_segments_receive\"}": 1073741824.0
+          },
+          "checks_passed": true
+        },
+        {
+          "sample": "compare-r2-product",
+          "stage": "comparison",
+          "group": "product",
+          "round": 2,
+          "application_bytes": 1073741824,
+          "app_read_calls": 1024,
+          "full_ms": 2270.118727,
+          "open_ms": 2.508873,
+          "read_ms": 2267.260926,
+          "eof_and_close_ms": 0.348928,
+          "rpc": 1024.0,
+          "frames": 16384.0,
+          "fuse_data_requests": 1024.0,
+          "a_grant_validation_rpcs": 256.0,
+          "a_explicit_copy_bytes": 1073741824.0,
+          "b_explicit_copy_bytes": 1073741824.0,
+          "a_crc_bytes": {
+            "afs_dfs_crc32c_read_bytes_total{stage=\"range_send\"}": 1073741824.0,
+            "afs_dfs_crc32c_read_bytes_total{stage=\"storage_segments\"}": 1073741824.0
+          },
+          "b_crc_bytes": {
+            "afs_dfs_crc32c_read_bytes_total{stage=\"range_receive\"}": 1073741824.0,
+            "afs_dfs_crc32c_read_bytes_total{stage=\"trusted_segments_receive\"}": 1073741824.0
+          },
+          "checks_passed": true
+        },
+        {
+          "sample": "compare-r3-product",
+          "stage": "comparison",
+          "group": "product",
+          "round": 3,
+          "application_bytes": 1073741824,
+          "app_read_calls": 1024,
+          "full_ms": 2305.989879,
+          "open_ms": 2.575041,
+          "read_ms": 2303.071452,
+          "eof_and_close_ms": 0.343386,
+          "rpc": 1024.0,
+          "frames": 16384.0,
+          "fuse_data_requests": 1024.0,
+          "a_grant_validation_rpcs": 256.0,
+          "a_explicit_copy_bytes": 1073741824.0,
+          "b_explicit_copy_bytes": 1073741824.0,
+          "a_crc_bytes": {
+            "afs_dfs_crc32c_read_bytes_total{stage=\"range_send\"}": 1073741824.0,
+            "afs_dfs_crc32c_read_bytes_total{stage=\"storage_segments\"}": 1073741824.0
+          },
+          "b_crc_bytes": {
+            "afs_dfs_crc32c_read_bytes_total{stage=\"range_receive\"}": 1073741824.0,
+            "afs_dfs_crc32c_read_bytes_total{stage=\"trusted_segments_receive\"}": 1073741824.0
+          },
+          "checks_passed": true
+        },
+        {
+          "sample": "compare-r3-candidate01",
+          "stage": "comparison",
+          "group": "candidate01",
+          "round": 3,
+          "application_bytes": 1073741824,
+          "app_read_calls": 1024,
+          "full_ms": 2067.675018,
+          "open_ms": 2.405452,
+          "read_ms": 2064.907012,
+          "eof_and_close_ms": 0.362554,
+          "rpc": 1024.0,
+          "frames": 16384.0,
+          "fuse_data_requests": 1024.0,
+          "a_grant_validation_rpcs": 256.0,
+          "a_explicit_copy_bytes": 1073741824.0,
+          "b_explicit_copy_bytes": 1073741824.0,
+          "a_crc_bytes": {
+            "afs_dfs_crc32c_read_bytes_total{stage=\"storage_segments\"}": 1073741824.0
+          },
+          "b_crc_bytes": {
+            "afs_dfs_crc32c_read_bytes_total{stage=\"trusted_segments_receive\"}": 1073741824.0
+          },
+          "checks_passed": true
+        },
+        {
+          "sample": "reference-r1-crc",
+          "stage": "reference-step01",
+          "group": "reference-crc",
+          "round": 1,
+          "application_bytes": 1073741824,
+          "app_read_calls": 1024,
+          "full_ms": 2323.40988,
+          "open_ms": 4.863193,
+          "read_ms": 2318.208674,
+          "eof_and_close_ms": 0.338013,
+          "rpc": 1024.0,
+          "frames": 16384.0,
+          "fuse_data_requests": 1024.0,
+          "a_grant_validation_rpcs": 256.0,
+          "a_explicit_copy_bytes": 1073741824.0,
+          "b_explicit_copy_bytes": 1073741824.0,
+          "a_crc_bytes": {
+            "afs_dfs_crc32c_read_bytes_total{stage=\"range_send\"}": 1073741824.0,
+            "afs_dfs_crc32c_read_bytes_total{stage=\"storage_segments\"}": 1073741824.0
+          },
+          "b_crc_bytes": {
+            "afs_dfs_crc32c_read_bytes_total{stage=\"range_receive\"}": 1073741824.0,
+            "afs_dfs_crc32c_read_bytes_total{stage=\"trusted_segments_receive\"}": 1073741824.0
+          },
+          "checks_passed": true
+        },
+        {
+          "sample": "reference-r1-raw",
+          "stage": "reference-step02",
+          "group": "reference-raw",
+          "round": 1,
+          "application_bytes": 1073741824,
+          "app_read_calls": 1024,
+          "full_ms": 2088.263983,
+          "open_ms": 0.150673,
+          "read_ms": 2088.018599,
+          "eof_and_close_ms": 0.094711,
+          "rpc": 1024,
+          "frames": 16384,
+          "fuse_data_requests": 1024,
+          "b_explicit_copy_bytes": 1073741824,
+          "checks_passed": true
+        },
+        {
+          "sample": "reference-r2-raw",
+          "stage": "reference-step03",
+          "group": "reference-raw",
+          "round": 2,
+          "application_bytes": 1073741824,
+          "app_read_calls": 1024,
+          "full_ms": 1972.404114,
+          "open_ms": 0.13938,
+          "read_ms": 1972.156854,
+          "eof_and_close_ms": 0.10788,
+          "rpc": 1024,
+          "frames": 16384,
+          "fuse_data_requests": 1024,
+          "b_explicit_copy_bytes": 1073741824,
+          "checks_passed": true
+        },
+        {
+          "sample": "reference-r2-crc",
+          "stage": "reference-step04",
+          "group": "reference-crc",
+          "round": 2,
+          "application_bytes": 1073741824,
+          "app_read_calls": 1024,
+          "full_ms": 2363.61858,
+          "open_ms": 2.625763,
+          "read_ms": 2360.64743,
+          "eof_and_close_ms": 0.345387,
+          "rpc": 1024.0,
+          "frames": 16384.0,
+          "fuse_data_requests": 1024.0,
+          "a_grant_validation_rpcs": 256.0,
+          "a_explicit_copy_bytes": 1073741824.0,
+          "b_explicit_copy_bytes": 1073741824.0,
+          "a_crc_bytes": {
+            "afs_dfs_crc32c_read_bytes_total{stage=\"range_send\"}": 1073741824.0,
+            "afs_dfs_crc32c_read_bytes_total{stage=\"storage_segments\"}": 1073741824.0
+          },
+          "b_crc_bytes": {
+            "afs_dfs_crc32c_read_bytes_total{stage=\"range_receive\"}": 1073741824.0,
+            "afs_dfs_crc32c_read_bytes_total{stage=\"trusted_segments_receive\"}": 1073741824.0
+          },
+          "checks_passed": true
+        },
+        {
+          "sample": "reference-r3-crc",
+          "stage": "reference-step05",
+          "group": "reference-crc",
+          "round": 3,
+          "application_bytes": 1073741824,
+          "app_read_calls": 1024,
+          "full_ms": 2287.436246,
+          "open_ms": 2.516423,
+          "read_ms": 2284.589478,
+          "eof_and_close_ms": 0.330345,
+          "rpc": 1024.0,
+          "frames": 16384.0,
+          "fuse_data_requests": 1024.0,
+          "a_grant_validation_rpcs": 256.0,
+          "a_explicit_copy_bytes": 1073741824.0,
+          "b_explicit_copy_bytes": 1073741824.0,
+          "a_crc_bytes": {
+            "afs_dfs_crc32c_read_bytes_total{stage=\"range_send\"}": 1073741824.0,
+            "afs_dfs_crc32c_read_bytes_total{stage=\"storage_segments\"}": 1073741824.0
+          },
+          "b_crc_bytes": {
+            "afs_dfs_crc32c_read_bytes_total{stage=\"range_receive\"}": 1073741824.0,
+            "afs_dfs_crc32c_read_bytes_total{stage=\"trusted_segments_receive\"}": 1073741824.0
+          },
+          "checks_passed": true
+        },
+        {
+          "sample": "reference-r3-raw",
+          "stage": "reference-step06",
+          "group": "reference-raw",
+          "round": 3,
+          "application_bytes": 1073741824,
+          "app_read_calls": 1024,
+          "full_ms": 2006.435937,
+          "open_ms": 0.163631,
+          "read_ms": 2006.163344,
+          "eof_and_close_ms": 0.108962,
+          "rpc": 1024,
+          "frames": 16384,
+          "fuse_data_requests": 1024,
+          "b_explicit_copy_bytes": 1073741824,
+          "checks_passed": true
+        }
+      ],
+      "incomplete": [],
+      "environment_rejected_count": 0,
+      "interpretation": "historical single-cohort comparison only"
+    },
+    {
+      "id": "afs-open-read-authority-20261024",
+      "original_ledger_sha256": "ee9609146a72707bb88abf75b215394bf55562206ed1fd030fd2a912b574fa90",
+      "clock": "full AFS primary is application open through close syscall return; oracle excluded; FUSE RELEASE may complete asynchronously and context-close scopes are separate",
+      "rows": [
+        {
+          "sample": "compare-r1-product",
+          "stage": "comparison",
+          "group": "product",
+          "round": 1,
+          "application_bytes": 1073741824,
+          "app_read_calls": 1024,
+          "full_ms": 2123.138355,
+          "open_ms": 5.384501,
+          "read_ms": 2117.416867,
+          "eof_and_close_ms": 0.336987,
+          "rpc": 1024.0,
+          "frames": 16384.0,
+          "fuse_data_requests": 1024.0,
+          "a_grant_validation_rpcs": 256.0,
+          "a_file_context_validation_rpcs": 0,
+          "a_explicit_copy_bytes": 1073741824.0,
+          "b_explicit_copy_bytes": 1073741824.0,
+          "a_crc_bytes": {
+            "afs_dfs_crc32c_read_bytes_total{stage=\"storage_segments\"}": 1073741824.0
+          },
+          "b_crc_bytes": {
+            "afs_dfs_crc32c_read_bytes_total{stage=\"trusted_segments_receive\"}": 1073741824.0
+          },
+          "a_authorization_ns": {
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"cache_maintenance\"}": 4636053.0,
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"meta_rpc\"}": 58501254.0,
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"total\"}": 67418628.0
+          },
+          "b_authorization_ns": {},
+          "checks_passed": true
+        },
+        {
+          "sample": "compare-r1-candidate01",
+          "stage": "comparison",
+          "group": "candidate01",
+          "round": 1,
+          "application_bytes": 1073741824,
+          "app_read_calls": 1024,
+          "full_ms": 2010.455409,
+          "open_ms": 2.582816,
+          "read_ms": 2007.484023,
+          "eof_and_close_ms": 0.38857,
+          "rpc": 1024.0,
+          "frames": 16384.0,
+          "fuse_data_requests": 1024.0,
+          "a_grant_validation_rpcs": 0,
+          "a_file_context_validation_rpcs": 1.0,
+          "a_explicit_copy_bytes": 1073741824.0,
+          "b_explicit_copy_bytes": 1073741824.0,
+          "a_crc_bytes": {
+            "afs_dfs_crc32c_read_bytes_total{stage=\"storage_segments\"}": 1073741824.0
+          },
+          "b_crc_bytes": {
+            "afs_dfs_crc32c_read_bytes_total{stage=\"trusted_segments_receive\"}": 1073741824.0
+          },
+          "a_authorization_ns": {
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"meta_rpc\"}": 668395.0,
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"total\"}": 2349438.0
+          },
+          "b_authorization_ns": {
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"close_meta\"}": 5069121.0,
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"close_peer\"}": 526122.0,
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"open_meta\"}": 825436.0
+          },
+          "checks_passed": true
+        },
+        {
+          "sample": "compare-r2-candidate01",
+          "stage": "comparison",
+          "group": "candidate01",
+          "round": 2,
+          "application_bytes": 1073741824,
+          "app_read_calls": 1024,
+          "full_ms": 2042.549632,
+          "open_ms": 4.774472,
+          "read_ms": 2037.390136,
+          "eof_and_close_ms": 0.385024,
+          "rpc": 1024.0,
+          "frames": 16384.0,
+          "fuse_data_requests": 1024.0,
+          "a_grant_validation_rpcs": 0,
+          "a_file_context_validation_rpcs": 1.0,
+          "a_explicit_copy_bytes": 1073741824.0,
+          "b_explicit_copy_bytes": 1073741824.0,
+          "a_crc_bytes": {
+            "afs_dfs_crc32c_read_bytes_total{stage=\"storage_segments\"}": 1073741824.0
+          },
+          "b_crc_bytes": {
+            "afs_dfs_crc32c_read_bytes_total{stage=\"trusted_segments_receive\"}": 1073741824.0
+          },
+          "a_authorization_ns": {
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"meta_rpc\"}": 593433.0,
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"total\"}": 2323603.0
+          },
+          "b_authorization_ns": {
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"close_meta\"}": 3539808.0,
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"close_peer\"}": 268517.0,
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"open_meta\"}": 3173411.0
+          },
+          "checks_passed": true
+        },
+        {
+          "sample": "compare-r2-product",
+          "stage": "comparison",
+          "group": "product",
+          "round": 2,
+          "application_bytes": 1073741824,
+          "app_read_calls": 1024,
+          "full_ms": 2121.562941,
+          "open_ms": 5.605604,
+          "read_ms": 2115.631194,
+          "eof_and_close_ms": 0.326143,
+          "rpc": 1024.0,
+          "frames": 16384.0,
+          "fuse_data_requests": 1024.0,
+          "a_grant_validation_rpcs": 256.0,
+          "a_file_context_validation_rpcs": 0,
+          "a_explicit_copy_bytes": 1073741824.0,
+          "b_explicit_copy_bytes": 1073741824.0,
+          "a_crc_bytes": {
+            "afs_dfs_crc32c_read_bytes_total{stage=\"storage_segments\"}": 1073741824.0
+          },
+          "b_crc_bytes": {
+            "afs_dfs_crc32c_read_bytes_total{stage=\"trusted_segments_receive\"}": 1073741824.0
+          },
+          "a_authorization_ns": {
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"cache_maintenance\"}": 4841998.0,
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"meta_rpc\"}": 57987815.0,
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"total\"}": 67188210.0
+          },
+          "b_authorization_ns": {},
+          "checks_passed": true
+        },
+        {
+          "sample": "compare-r3-product",
+          "stage": "comparison",
+          "group": "product",
+          "round": 3,
+          "application_bytes": 1073741824,
+          "app_read_calls": 1024,
+          "full_ms": 2094.238415,
+          "open_ms": 5.234171,
+          "read_ms": 2088.661311,
+          "eof_and_close_ms": 0.342933,
+          "rpc": 1024.0,
+          "frames": 16384.0,
+          "fuse_data_requests": 1024.0,
+          "a_grant_validation_rpcs": 256.0,
+          "a_file_context_validation_rpcs": 0,
+          "a_explicit_copy_bytes": 1073741824.0,
+          "b_explicit_copy_bytes": 1073741824.0,
+          "a_crc_bytes": {
+            "afs_dfs_crc32c_read_bytes_total{stage=\"storage_segments\"}": 1073741824.0
+          },
+          "b_crc_bytes": {
+            "afs_dfs_crc32c_read_bytes_total{stage=\"trusted_segments_receive\"}": 1073741824.0
+          },
+          "a_authorization_ns": {
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"cache_maintenance\"}": 4770237.0,
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"meta_rpc\"}": 60235925.0,
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"total\"}": 69502198.0
+          },
+          "b_authorization_ns": {},
+          "checks_passed": true
+        },
+        {
+          "sample": "compare-r3-candidate01",
+          "stage": "comparison",
+          "group": "candidate01",
+          "round": 3,
+          "application_bytes": 1073741824,
+          "app_read_calls": 1024,
+          "full_ms": 2023.811313,
+          "open_ms": 2.610944,
+          "read_ms": 2020.836395,
+          "eof_and_close_ms": 0.363974,
+          "rpc": 1024.0,
+          "frames": 16384.0,
+          "fuse_data_requests": 1024.0,
+          "a_grant_validation_rpcs": 0,
+          "a_file_context_validation_rpcs": 1.0,
+          "a_explicit_copy_bytes": 1073741824.0,
+          "b_explicit_copy_bytes": 1073741824.0,
+          "a_crc_bytes": {
+            "afs_dfs_crc32c_read_bytes_total{stage=\"storage_segments\"}": 1073741824.0
+          },
+          "b_crc_bytes": {
+            "afs_dfs_crc32c_read_bytes_total{stage=\"trusted_segments_receive\"}": 1073741824.0
+          },
+          "a_authorization_ns": {
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"meta_rpc\"}": 605179.0,
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"total\"}": 2327363.0
+          },
+          "b_authorization_ns": {
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"close_meta\"}": 3443812.0,
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"close_peer\"}": 237802.0,
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"open_meta\"}": 980417.0
+          },
+          "checks_passed": true
+        }
+      ],
+      "incomplete": [],
+      "environment_rejected_count": 0,
+      "interpretation": "historical single-cohort comparison only"
+    },
+    {
+      "id": "afs-read-crc-modes-20261024",
+      "original_ledger_sha256": "17eaee5220e861f712a7b3cd99153628fe843e5de3303435be70f39f167e9e5d",
+      "clock": "full AFS primary is application open through close syscall return; oracle excluded; FUSE RELEASE may complete asynchronously and context-close scopes are separate",
+      "rows": [
+        {
+          "sample": "compare-r1-product-envretry1",
+          "stage": "comparison",
+          "group": "product",
+          "round": 1,
+          "application_bytes": 1073741824,
+          "app_read_calls": 1024,
+          "full_ms": 4511.459889,
+          "open_ms": 3.118912,
+          "read_ms": 4507.809178,
+          "eof_and_close_ms": 0.531799,
+          "rpc": 1024.0,
+          "frames": 16384.0,
+          "fuse_data_requests": 1024.0,
+          "a_grant_validation_rpcs": 0,
+          "a_file_context_validation_rpcs": 1.0,
+          "a_explicit_copy_bytes": 1073741824.0,
+          "b_explicit_copy_bytes": 1073741824.0,
+          "a_crc_bytes": {
+            "afs_dfs_crc32c_read_bytes_total{stage=\"storage_segments\"}": 1073741824.0
+          },
+          "b_crc_bytes": {
+            "afs_dfs_crc32c_read_bytes_total{stage=\"trusted_segments_receive\"}": 1073741824.0
+          },
+          "a_authorization_ns": {
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"meta_rpc\"}": 757633.0,
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"total\"}": 4225879.0
+          },
+          "b_authorization_ns": {
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"close_meta\"}": 4405988.0,
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"close_peer\"}": 404663.0,
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"open_meta\"}": 982299.0
+          },
+          "checks_passed": true
+        },
+        {
+          "sample": "compare-r1-receiver",
+          "stage": "comparison",
+          "group": "receiver",
+          "round": 1,
+          "application_bytes": 1073741824,
+          "app_read_calls": 1024,
+          "full_ms": 3341.656124,
+          "open_ms": 3.813541,
+          "read_ms": 3337.415212,
+          "eof_and_close_ms": 0.427371,
+          "rpc": 1024.0,
+          "frames": 16384.0,
+          "fuse_data_requests": 1024.0,
+          "a_grant_validation_rpcs": 0,
+          "a_file_context_validation_rpcs": 1.0,
+          "a_explicit_copy_bytes": 1073741824.0,
+          "b_explicit_copy_bytes": 1073741824.0,
+          "a_crc_bytes": {},
+          "b_crc_bytes": {
+            "afs_dfs_crc32c_read_bytes_total{stage=\"trusted_segments_receive\"}": 1073741824.0
+          },
+          "a_authorization_ns": {
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"meta_rpc\"}": 742095.0,
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"total\"}": 3314037.0
+          },
+          "b_authorization_ns": {
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"close_meta\"}": 2907213.0,
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"close_peer\"}": 282525.0,
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"open_meta\"}": 1324074.0
+          },
+          "checks_passed": true
+        },
+        {
+          "sample": "compare-r1-off",
+          "stage": "comparison",
+          "group": "off",
+          "round": 1,
+          "application_bytes": 1073741824,
+          "app_read_calls": 1024,
+          "full_ms": 2234.342046,
+          "open_ms": 5.615272,
+          "read_ms": 2228.399584,
+          "eof_and_close_ms": 0.32719,
+          "rpc": 1024.0,
+          "frames": 16384.0,
+          "fuse_data_requests": 1024.0,
+          "a_grant_validation_rpcs": 0,
+          "a_file_context_validation_rpcs": 1.0,
+          "a_explicit_copy_bytes": 1073741824.0,
+          "b_explicit_copy_bytes": 1073741824.0,
+          "a_crc_bytes": {},
+          "b_crc_bytes": {},
+          "a_authorization_ns": {
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"meta_rpc\"}": 759755.0,
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"total\"}": 2928371.0
+          },
+          "b_authorization_ns": {
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"close_meta\"}": 5512241.0,
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"close_peer\"}": 249112.0,
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"open_meta\"}": 3328399.0
+          },
+          "checks_passed": true
+        },
+        {
+          "sample": "compare-r2-off",
+          "stage": "comparison",
+          "group": "off",
+          "round": 2,
+          "application_bytes": 1073741824,
+          "app_read_calls": 1024,
+          "full_ms": 2124.341262,
+          "open_ms": 2.774273,
+          "read_ms": 2121.200127,
+          "eof_and_close_ms": 0.366862,
+          "rpc": 1024.0,
+          "frames": 16384.0,
+          "fuse_data_requests": 1024.0,
+          "a_grant_validation_rpcs": 0,
+          "a_file_context_validation_rpcs": 1.0,
+          "a_explicit_copy_bytes": 1073741824.0,
+          "b_explicit_copy_bytes": 1073741824.0,
+          "a_crc_bytes": {},
+          "b_crc_bytes": {},
+          "a_authorization_ns": {
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"meta_rpc\"}": 616171.0,
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"total\"}": 2650067.0
+          },
+          "b_authorization_ns": {
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"close_meta\"}": 5041610.0,
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"close_peer\"}": 254699.0,
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"open_meta\"}": 926091.0
+          },
+          "checks_passed": true
+        },
+        {
+          "sample": "compare-r2-product",
+          "stage": "comparison",
+          "group": "product",
+          "round": 2,
+          "application_bytes": 1073741824,
+          "app_read_calls": 1024,
+          "full_ms": 2508.813476,
+          "open_ms": 3.038186,
+          "read_ms": 2505.38209,
+          "eof_and_close_ms": 0.3932,
+          "rpc": 1024.0,
+          "frames": 16384.0,
+          "fuse_data_requests": 1024.0,
+          "a_grant_validation_rpcs": 0,
+          "a_file_context_validation_rpcs": 1.0,
+          "a_explicit_copy_bytes": 1073741824.0,
+          "b_explicit_copy_bytes": 1073741824.0,
+          "a_crc_bytes": {
+            "afs_dfs_crc32c_read_bytes_total{stage=\"storage_segments\"}": 1073741824.0
+          },
+          "b_crc_bytes": {
+            "afs_dfs_crc32c_read_bytes_total{stage=\"trusted_segments_receive\"}": 1073741824.0
+          },
+          "a_authorization_ns": {
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"meta_rpc\"}": 623796.0,
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"total\"}": 2812813.0
+          },
+          "b_authorization_ns": {
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"close_meta\"}": 6857987.0,
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"close_peer\"}": 359452.0,
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"open_meta\"}": 860815.0
+          },
+          "checks_passed": true
+        },
+        {
+          "sample": "compare-r2-receiver",
+          "stage": "comparison",
+          "group": "receiver",
+          "round": 2,
+          "application_bytes": 1073741824,
+          "app_read_calls": 1024,
+          "full_ms": 2902.8749,
+          "open_ms": 6.137328,
+          "read_ms": 2896.332269,
+          "eof_and_close_ms": 0.405303,
+          "rpc": 1024.0,
+          "frames": 16384.0,
+          "fuse_data_requests": 1024.0,
+          "a_grant_validation_rpcs": 0,
+          "a_file_context_validation_rpcs": 1.0,
+          "a_explicit_copy_bytes": 1073741824.0,
+          "b_explicit_copy_bytes": 1073741824.0,
+          "a_crc_bytes": {},
+          "b_crc_bytes": {
+            "afs_dfs_crc32c_read_bytes_total{stage=\"trusted_segments_receive\"}": 1073741824.0
+          },
+          "a_authorization_ns": {
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"meta_rpc\"}": 746757.0,
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"total\"}": 3068611.0
+          },
+          "b_authorization_ns": {
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"close_meta\"}": 5704320.0,
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"close_peer\"}": 375677.0,
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"open_meta\"}": 3491092.0
+          },
+          "checks_passed": true
+        },
+        {
+          "sample": "compare-r3-receiver",
+          "stage": "comparison",
+          "group": "receiver",
+          "round": 3,
+          "application_bytes": 1073741824,
+          "app_read_calls": 1024,
+          "full_ms": 2527.63433,
+          "open_ms": 4.340866,
+          "read_ms": 2522.608974,
+          "eof_and_close_ms": 0.68449,
+          "rpc": 1024.0,
+          "frames": 16384.0,
+          "fuse_data_requests": 1024.0,
+          "a_grant_validation_rpcs": 0,
+          "a_file_context_validation_rpcs": 1.0,
+          "a_explicit_copy_bytes": 1073741824.0,
+          "b_explicit_copy_bytes": 1073741824.0,
+          "a_crc_bytes": {},
+          "b_crc_bytes": {
+            "afs_dfs_crc32c_read_bytes_total{stage=\"trusted_segments_receive\"}": 1073741824.0
+          },
+          "a_authorization_ns": {
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"meta_rpc\"}": 682258.0,
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"total\"}": 2759111.0
+          },
+          "b_authorization_ns": {
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"close_meta\"}": 5293246.0,
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"close_peer\"}": 301222.0,
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"open_meta\"}": 1093883.0
+          },
+          "checks_passed": true
+        },
+        {
+          "sample": "compare-r3-off",
+          "stage": "comparison",
+          "group": "off",
+          "round": 3,
+          "application_bytes": 1073741824,
+          "app_read_calls": 1024,
+          "full_ms": 2273.338893,
+          "open_ms": 3.975232,
+          "read_ms": 2269.006849,
+          "eof_and_close_ms": 0.356812,
+          "rpc": 1024.0,
+          "frames": 16384.0,
+          "fuse_data_requests": 1024.0,
+          "a_grant_validation_rpcs": 0,
+          "a_file_context_validation_rpcs": 1.0,
+          "a_explicit_copy_bytes": 1073741824.0,
+          "b_explicit_copy_bytes": 1073741824.0,
+          "a_crc_bytes": {},
+          "b_crc_bytes": {},
+          "a_authorization_ns": {
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"meta_rpc\"}": 782760.0,
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"total\"}": 2519817.0
+          },
+          "b_authorization_ns": {
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"close_meta\"}": 3430159.0,
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"close_peer\"}": 775670.0,
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"open_meta\"}": 1530839.0
+          },
+          "checks_passed": true
+        },
+        {
+          "sample": "compare-r3-product",
+          "stage": "comparison",
+          "group": "product",
+          "round": 3,
+          "application_bytes": 1073741824,
+          "app_read_calls": 1024,
+          "full_ms": 3419.643226,
+          "open_ms": 4.337719,
+          "read_ms": 3414.551879,
+          "eof_and_close_ms": 0.753628,
+          "rpc": 1024.0,
+          "frames": 16384.0,
+          "fuse_data_requests": 1024.0,
+          "a_grant_validation_rpcs": 0,
+          "a_file_context_validation_rpcs": 1.0,
+          "a_explicit_copy_bytes": 1073741824.0,
+          "b_explicit_copy_bytes": 1073741824.0,
+          "a_crc_bytes": {
+            "afs_dfs_crc32c_read_bytes_total{stage=\"storage_segments\"}": 1073741824.0
+          },
+          "b_crc_bytes": {
+            "afs_dfs_crc32c_read_bytes_total{stage=\"trusted_segments_receive\"}": 1073741824.0
+          },
+          "a_authorization_ns": {
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"meta_rpc\"}": 1362435.0,
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"total\"}": 4505212.0
+          },
+          "b_authorization_ns": {
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"close_meta\"}": 6004945.0,
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"close_peer\"}": 376231.0,
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"open_meta\"}": 1218157.0
+          },
+          "checks_passed": true
+        }
+      ],
+      "incomplete": [],
+      "environment_rejected_count": 1,
+      "interpretation": "mechanism evidence; complete-wall benefit NOT admitted due unstable/unreproduced baseline"
+    },
+    {
+      "id": "afs-read-crc-retest-20261024",
+      "original_ledger_sha256": "70d429c26ec1b0bae743f8e729c568de1f4195bf6cc4bb5901b10b15e9966296",
+      "clock": "full AFS primary is application open through close syscall return; oracle excluded; FUSE RELEASE may complete asynchronously and context-close scopes are separate",
+      "rows": [
+        {
+          "sample": "retest-v3-compare-r1-product",
+          "stage": "comparison03",
+          "group": "product",
+          "round": 1,
+          "application_bytes": 1073741824,
+          "app_read_calls": 1024,
+          "full_ms": 3366.274159,
+          "open_ms": 3.444698,
+          "read_ms": 3362.356832,
+          "eof_and_close_ms": 0.472629,
+          "rpc": 1024.0,
+          "frames": 16384.0,
+          "fuse_data_requests": 1024.0,
+          "a_grant_validation_rpcs": 0,
+          "a_file_context_validation_rpcs": 1.0,
+          "a_explicit_copy_bytes": 1073741824.0,
+          "b_explicit_copy_bytes": 1073741824.0,
+          "a_crc_bytes": {
+            "afs_dfs_crc32c_read_bytes_total{stage=\"storage_segments\"}": 1073741824.0
+          },
+          "b_crc_bytes": {
+            "afs_dfs_crc32c_read_bytes_total{stage=\"trusted_segments_receive\"}": 1073741824.0
+          },
+          "a_authorization_ns": {
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"meta_rpc\"}": 720244.0,
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"total\"}": 3202925.0
+          },
+          "b_authorization_ns": {
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"close_meta\"}": 5873051.0,
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"close_peer\"}": 438504.0,
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"open_meta\"}": 1044801.0
+          },
+          "checks_passed": true
+        },
+        {
+          "sample": "retest-v3-compare-r1-receiver",
+          "stage": "comparison03",
+          "group": "receiver",
+          "round": 1,
+          "application_bytes": 1073741824,
+          "app_read_calls": 1024,
+          "full_ms": 2413.344051,
+          "open_ms": 2.989024,
+          "read_ms": 2410.002065,
+          "eof_and_close_ms": 0.352962,
+          "rpc": 1024.0,
+          "frames": 16384.0,
+          "fuse_data_requests": 1024.0,
+          "a_grant_validation_rpcs": 0,
+          "a_file_context_validation_rpcs": 1.0,
+          "a_explicit_copy_bytes": 1073741824.0,
+          "b_explicit_copy_bytes": 1073741824.0,
+          "a_crc_bytes": {},
+          "b_crc_bytes": {
+            "afs_dfs_crc32c_read_bytes_total{stage=\"trusted_segments_receive\"}": 1073741824.0
+          },
+          "a_authorization_ns": {
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"meta_rpc\"}": 614452.0,
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"total\"}": 2495894.0
+          },
+          "b_authorization_ns": {
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"close_meta\"}": 5273293.0,
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"close_peer\"}": 265211.0,
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"open_meta\"}": 855924.0
+          },
+          "checks_passed": true
+        },
+        {
+          "sample": "retest-v3-compare-r1-off",
+          "stage": "comparison03",
+          "group": "off",
+          "round": 1,
+          "application_bytes": 1073741824,
+          "app_read_calls": 1024,
+          "full_ms": 2007.386111,
+          "open_ms": 3.377318,
+          "read_ms": 2003.636832,
+          "eof_and_close_ms": 0.371961,
+          "rpc": 1024.0,
+          "frames": 16384.0,
+          "fuse_data_requests": 1024.0,
+          "a_grant_validation_rpcs": 0,
+          "a_file_context_validation_rpcs": 1.0,
+          "a_explicit_copy_bytes": 1073741824.0,
+          "b_explicit_copy_bytes": 1073741824.0,
+          "a_crc_bytes": {},
+          "b_crc_bytes": {},
+          "a_authorization_ns": {
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"meta_rpc\"}": 634534.0,
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"total\"}": 2404278.0
+          },
+          "b_authorization_ns": {
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"close_meta\"}": 2032557.0,
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"close_peer\"}": 225210.0,
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"open_meta\"}": 1228552.0
+          },
+          "checks_passed": true
+        },
+        {
+          "sample": "retest-v3-compare-r2-off",
+          "stage": "comparison03",
+          "group": "off",
+          "round": 2,
+          "application_bytes": 1073741824,
+          "app_read_calls": 1024,
+          "full_ms": 2267.69302,
+          "open_ms": 2.862105,
+          "read_ms": 2264.446287,
+          "eof_and_close_ms": 0.384628,
+          "rpc": 1024.0,
+          "frames": 16384.0,
+          "fuse_data_requests": 1024.0,
+          "a_grant_validation_rpcs": 0,
+          "a_file_context_validation_rpcs": 1.0,
+          "a_explicit_copy_bytes": 1073741824.0,
+          "b_explicit_copy_bytes": 1073741824.0,
+          "a_crc_bytes": {},
+          "b_crc_bytes": {},
+          "a_authorization_ns": {
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"meta_rpc\"}": 624117.0,
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"total\"}": 2752955.0
+          },
+          "b_authorization_ns": {
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"close_meta\"}": 5424957.0,
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"close_peer\"}": 269460.0,
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"open_meta\"}": 998924.0
+          },
+          "checks_passed": true
+        },
+        {
+          "sample": "retest-v3-compare-r2-product",
+          "stage": "comparison03",
+          "group": "product",
+          "round": 2,
+          "application_bytes": 1073741824,
+          "app_read_calls": 1024,
+          "full_ms": 3198.574738,
+          "open_ms": 7.189593,
+          "read_ms": 3190.944349,
+          "eof_and_close_ms": 0.440796,
+          "rpc": 1024.0,
+          "frames": 16384.0,
+          "fuse_data_requests": 1024.0,
+          "a_grant_validation_rpcs": 0,
+          "a_file_context_validation_rpcs": 1.0,
+          "a_explicit_copy_bytes": 1073741824.0,
+          "b_explicit_copy_bytes": 1073741824.0,
+          "a_crc_bytes": {
+            "afs_dfs_crc32c_read_bytes_total{stage=\"storage_segments\"}": 1073741824.0
+          },
+          "b_crc_bytes": {
+            "afs_dfs_crc32c_read_bytes_total{stage=\"trusted_segments_receive\"}": 1073741824.0
+          },
+          "a_authorization_ns": {
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"meta_rpc\"}": 2163598.0,
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"total\"}": 4739332.0
+          },
+          "b_authorization_ns": {
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"close_meta\"}": 3573067.0,
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"close_peer\"}": 340836.0,
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"open_meta\"}": 2541935.0
+          },
+          "checks_passed": true
+        },
+        {
+          "sample": "retest-v3-compare-r2-receiver",
+          "stage": "comparison03",
+          "group": "receiver",
+          "round": 2,
+          "application_bytes": 1073741824,
+          "app_read_calls": 1024,
+          "full_ms": 2148.675466,
+          "open_ms": 3.950194,
+          "read_ms": 2144.362894,
+          "eof_and_close_ms": 0.362378,
+          "rpc": 1024.0,
+          "frames": 16384.0,
+          "fuse_data_requests": 1024.0,
+          "a_grant_validation_rpcs": 0,
+          "a_file_context_validation_rpcs": 1.0,
+          "a_explicit_copy_bytes": 1073741824.0,
+          "b_explicit_copy_bytes": 1073741824.0,
+          "a_crc_bytes": {},
+          "b_crc_bytes": {
+            "afs_dfs_crc32c_read_bytes_total{stage=\"trusted_segments_receive\"}": 1073741824.0
+          },
+          "a_authorization_ns": {
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"meta_rpc\"}": 728824.0,
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"total\"}": 2577183.0
+          },
+          "b_authorization_ns": {
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"close_meta\"}": 3172397.0,
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"close_peer\"}": 277127.0,
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"open_meta\"}": 1458677.0
+          },
+          "checks_passed": true
+        },
+        {
+          "sample": "retest-v3-compare-r3-receiver",
+          "stage": "comparison03",
+          "group": "receiver",
+          "round": 3,
+          "application_bytes": 1073741824,
+          "app_read_calls": 1024,
+          "full_ms": 2163.067323,
+          "open_ms": 2.914228,
+          "read_ms": 2159.749633,
+          "eof_and_close_ms": 0.403462,
+          "rpc": 1024.0,
+          "frames": 16384.0,
+          "fuse_data_requests": 1024.0,
+          "a_grant_validation_rpcs": 0,
+          "a_file_context_validation_rpcs": 1.0,
+          "a_explicit_copy_bytes": 1073741824.0,
+          "b_explicit_copy_bytes": 1073741824.0,
+          "a_crc_bytes": {},
+          "b_crc_bytes": {
+            "afs_dfs_crc32c_read_bytes_total{stage=\"trusted_segments_receive\"}": 1073741824.0
+          },
+          "a_authorization_ns": {
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"meta_rpc\"}": 720866.0,
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"total\"}": 2478697.0
+          },
+          "b_authorization_ns": {
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"close_meta\"}": 5705997.0,
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"close_peer\"}": 263502.0,
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"open_meta\"}": 941381.0
+          },
+          "checks_passed": true
+        },
+        {
+          "sample": "retest-v3-compare-r3-off",
+          "stage": "comparison03",
+          "group": "off",
+          "round": 3,
+          "application_bytes": 1073741824,
+          "app_read_calls": 1024,
+          "full_ms": 2205.51352,
+          "open_ms": 5.325536,
+          "read_ms": 2199.825398,
+          "eof_and_close_ms": 0.362586,
+          "rpc": 1024.0,
+          "frames": 16384.0,
+          "fuse_data_requests": 1024.0,
+          "a_grant_validation_rpcs": 0,
+          "a_file_context_validation_rpcs": 1.0,
+          "a_explicit_copy_bytes": 1073741824.0,
+          "b_explicit_copy_bytes": 1073741824.0,
+          "a_crc_bytes": {},
+          "b_crc_bytes": {},
+          "a_authorization_ns": {
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"meta_rpc\"}": 627867.0,
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"total\"}": 2648103.0
+          },
+          "b_authorization_ns": {
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"close_meta\"}": 3762234.0,
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"close_peer\"}": 246418.0,
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"open_meta\"}": 3231188.0
+          },
+          "checks_passed": true
+        },
+        {
+          "sample": "retest-v3-compare-r3-product",
+          "stage": "comparison03",
+          "group": "product",
+          "round": 3,
+          "application_bytes": 1073741824,
+          "app_read_calls": 1024,
+          "full_ms": 4148.571895,
+          "open_ms": 3.247146,
+          "read_ms": 4144.292199,
+          "eof_and_close_ms": 1.03255,
+          "rpc": 1024.0,
+          "frames": 16384.0,
+          "fuse_data_requests": 1024.0,
+          "a_grant_validation_rpcs": 0,
+          "a_file_context_validation_rpcs": 1.0,
+          "a_explicit_copy_bytes": 1073741824.0,
+          "b_explicit_copy_bytes": 1073741824.0,
+          "a_crc_bytes": {
+            "afs_dfs_crc32c_read_bytes_total{stage=\"storage_segments\"}": 1073741824.0
+          },
+          "b_crc_bytes": {
+            "afs_dfs_crc32c_read_bytes_total{stage=\"trusted_segments_receive\"}": 1073741824.0
+          },
+          "a_authorization_ns": {
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"meta_rpc\"}": 713710.0,
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"total\"}": 3895502.0
+          },
+          "b_authorization_ns": {
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"close_meta\"}": 5674247.0,
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"close_peer\"}": 1228258.0,
+            "afs_dfs_read_authorization_nanoseconds_total{stage=\"open_meta\"}": 1009007.0
+          },
+          "checks_passed": true
+        }
+      ],
+      "incomplete": [],
+      "environment_rejected_count": 0,
+      "interpretation": "mechanism evidence; complete-wall benefit NOT admitted due unstable/unreproduced baseline"
+    }
+  ],
+  "default_off_latest_binary_samples": 0
+}

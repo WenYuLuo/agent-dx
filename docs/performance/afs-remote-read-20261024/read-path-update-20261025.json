@@ -1,0 +1,513 @@
+{
+  "date": "2026-10-25",
+  "delivery": "Draft PR95 follow-up; not merged",
+  "phases": [
+    {
+      "phase": 1,
+      "subject": "perf(afs): reuse bounded read buffers through fuse replies",
+      "sha": "dc3295aed52e4044bd06d115bb8ffb0f3d0321b5",
+      "paths": [
+        "afs/src/node.rs",
+        "afs/src/node/chunk.rs",
+        "afs/src/node/dfs_read.rs",
+        "afs/src/node/fuse.rs",
+        "afs/src/node/read_buffer.rs",
+        "afs/src/node/read_work.rs",
+        "afs/src/node/vfs.rs",
+        "afs/src/node/vfs/dfs.rs",
+        "docs/testing/afs.md"
+      ]
+    },
+    {
+      "phase": 2,
+      "subject": "perf(afs): streamline fixed-open native remote reads",
+      "sha": "4eb4cacaa30286f789419f3c6a7dd08a183d4354",
+      "paths": [
+        "afs/src/node/chunk.rs",
+        "afs/src/node/chunk/gc.rs",
+        "afs/src/node/dfs_read.rs",
+        "afs/src/node/fuse.rs",
+        "afs/src/node/read_work.rs",
+        "afs/src/node/rpc/data.rs",
+        "afs/src/node/rpc/data/open_read.rs",
+        "afs/src/node/rpc/peer.rs",
+        "afs/src/node/rpc/peer/crc32c.rs",
+        "afs/src/node/rpc/peer/open_read.rs",
+        "afs/src/node/vfs.rs",
+        "afs/src/node/vfs/dfs.rs",
+        "docs/performance/afs-open-fast-20261025.md"
+      ]
+    },
+    {
+      "phase": 3,
+      "subject": "fix(afs): retire quarantined readers and disconnected contexts",
+      "sha": "1db9b2d82bc47a8dfe33980128516144681ad7eb",
+      "paths": [
+        "afs/src/node/chunk.rs",
+        "afs/src/node/rpc/data.rs",
+        "afs/src/node/rpc/data/open_read.rs",
+        "afs/src/node/rpc/data/open_read/test_tls.rs",
+        "afs/src/node/rpc/peer.rs",
+        "afs/src/node/rpc/peer/open_read.rs",
+        "docs/performance/afs-open-fast-20261025.md",
+        "docs/testing/afs.md"
+      ]
+    }
+  ],
+  "latest_business_candidate": {
+    "source": "/Users/lzc/workspace/code/agentruntime/adx/experiments/afs-read-retirement-fixes-20261025/source",
+    "binary": {
+      "afs-node": {
+        "sha256": "a50874f008771c3eb1dd836daf3f161b63f4250f85fef6b9806978334ffdb4d2",
+        "bytes": 34427728
+      },
+      "afs-meta": {
+        "sha256": "c3b031b599356929cd916e52442399fbcb0dc48da5e61c5adeb5f145e77413fe",
+        "bytes": 15922504
+      },
+      "source_label": "green02",
+      "image": "sha256:85699f1615b06b46ed214a8a7d689d5b13d5a052d19d498bc1c380ce5c759719"
+    },
+    "files_matched_before_documentation_refresh": 1335,
+    "new_performance_samples": 0
+  },
+  "buffer_performance": {
+    "groups": [
+      {
+        "group": "baseline",
+        "mode": "buffered-product",
+        "n": 3,
+        "full_ms": [
+          1963.319351,
+          1877.427301,
+          1895.286713
+        ],
+        "median_full_ms": 1895.286713,
+        "median_first_ms": 9.11338,
+        "median_open_to_first_ms": 11.826494,
+        "median_mib_s": 540.2876477612915,
+        "median_a_cpu_s": 0.9099999999999999,
+        "median_b_cpu_s": 1.43,
+        "median_meta_cpu_s": 0.01,
+        "rpc": [
+          1024.0
+        ],
+        "b_copy_bytes": [
+          1073741824.0
+        ],
+        "samples": [
+          "p2-01-product",
+          "p2-04-product",
+          "p2-05-product"
+        ]
+      },
+      {
+        "group": "buffers",
+        "mode": "buffered-product",
+        "n": 3,
+        "full_ms": [
+          2003.213054,
+          1829.194087,
+          1791.251816
+        ],
+        "median_full_ms": 1829.194087,
+        "median_first_ms": 9.658424,
+        "median_open_to_first_ms": 14.718073,
+        "median_mib_s": 559.8093757669138,
+        "median_a_cpu_s": 0.86,
+        "median_b_cpu_s": 1.42,
+        "median_meta_cpu_s": 0.01,
+        "rpc": [
+          1024.0
+        ],
+        "b_copy_bytes": [
+          1073741824.0
+        ],
+        "samples": [
+          "p2-02-candidate01",
+          "p2-03-candidate01",
+          "p2-06-candidate01"
+        ]
+      }
+    ],
+    "pairs": [
+      {
+        "round": 1,
+        "baseline_ms": 1963.319351,
+        "buffers_ms": 2003.213054,
+        "saved_ms": -39.89370299999996,
+        "reduction_percent": -2.031951805480878
+      },
+      {
+        "round": 2,
+        "baseline_ms": 1877.427301,
+        "buffers_ms": 1829.194087,
+        "saved_ms": 48.23321399999986,
+        "reduction_percent": 2.5691122087288676
+      },
+      {
+        "round": 3,
+        "baseline_ms": 1895.286713,
+        "buffers_ms": 1791.251816,
+        "saved_ms": 104.034897,
+        "reduction_percent": 5.489137674337719
+      }
+    ],
+    "gates": {
+      "six_complete": true,
+      "all_counters_passed": true,
+      "baseline_stable": true,
+      "all_pairs_faster": false,
+      "paired_median_at_least_3percent": false
+    },
+    "accepted_performance_benefit": false,
+    "limits": [
+      "baseline missing pool counters: its1024 allocations and1GiB zeroing per side are source-derived from matching1024 requests, not measured allocator events",
+      "application O_DIRECT, A buffered file reads after fixture write, no source cache eviction; not a cold-disk or backend O_DIRECT result",
+      "copy ledger counts explicit application code copies; excludes protobuf/TLS/socket/kernel/FUSE copies",
+      "A direct buffer read naturally combines32KiB read calls; cannot attribute whole speedup solely to memcpy",
+      "pool counters cover final body allocations, not all heap allocations; candidate-only observation cost not isolated",
+      "CRC/open/GC known functional boundaries inherited, not admitted by this optimization"
+    ]
+  },
+  "fixed_open_performance": {
+    "groups": {
+      "B": {
+        "n": 3,
+        "median_full_ms": 1886.908569,
+        "range_full_ms": [
+          1868.70273,
+          2143.501564
+        ],
+        "A_CPU_ms_median": 850,
+        "B_CPU_ms_median": 1550
+      },
+      "S": {
+        "n": 3,
+        "median_full_ms": 1906.653553,
+        "range_full_ms": [
+          1892.336551,
+          1999.551204
+        ],
+        "A_CPU_ms_median": 850,
+        "B_CPU_ms_median": 1540
+      },
+      "R": {
+        "n": 3,
+        "median_full_ms": 1807.433021,
+        "range_full_ms": [
+          1797.49534,
+          1836.641111
+        ],
+        "A_CPU_ms_median": 760,
+        "B_CPU_ms_median": 1500
+      }
+    },
+    "accepted_performance_gain": false,
+    "promoted_to_baseline": false,
+    "limits": [
+      "No replacement/supplementary performance reads; incomplete or rejected rows retained.",
+      "CPU is original wider before-driver/after-driver proc window,100Hz; not additive wall or exact app-only CPU.",
+      "Counters identify executed control entries, not every predicate or syscall; nested scopes cannot be summed as independent checks.",
+      "R is unchanged demanded raw reference; B/S share added prebound counters, no CPU/perf observer. No new observer qualification was run.",
+      "S FOPEN_DIRECT_IO is required fixed-view EOF wiring; application O_DIRECT, mount/readahead/workers/TLS/frame size stay fixed.",
+      "Actual Linux fstat can show newer shared-inode length; read/pread EOF is fixed. No per-fd fstat/mmap snapshot guarantee.",
+      "A catalog_open counts reader creation, not all open syscalls. CRC-off metadata hash counter is not exhaustive of first-object descriptor validation.",
+      "A fixture targets warm ordinary buffered reads, but round3 A process read_bytes B=25280512 and S=55078912; other seven rows=0. Full-hot comparability is not established for all nine, nor is the round3 delta uniquely attributable to business logic. No rows excluded or rerun.",
+      "Do not subtract historical absolute times or claim all business overhead is gone."
+    ]
+  },
+  "latest_validation": {
+    "passed": true,
+    "status": "本轮功能修复门禁通过，待用户评审；未扩大为完整产品准入",
+    "source_label": "green02",
+    "source_files": 1335,
+    "new_tests": 8,
+    "focused_tests": 12,
+    "related_groups_passed": 661,
+    "related_groups_ignored": 4,
+    "counts_overlap": true,
+    "regressions": [
+      {
+        "scope": "异常收尾专项（含分组中的用例）",
+        "result": "12 通过 / 0 忽略",
+        "log": "green02-focused-command.log"
+      },
+      {
+        "scope": "open 到 close 授权、断连与恢复",
+        "result": "11 通过 / 0 忽略",
+        "log": "green02-open-read-command.log"
+      },
+      {
+        "scope": "对象与 GC",
+        "result": "184 通过 / 4 忽略",
+        "log": "green02-chunk-command.log"
+      },
+      {
+        "scope": "读引擎与同版本恢复",
+        "result": "126 通过 / 0 忽略",
+        "log": "green02-dfs-read-command.log"
+      },
+      {
+        "scope": "VFS、EOF 与句柄",
+        "result": "287 通过 / 0 忽略",
+        "log": "green02-dfs-vfs-command.log"
+      },
+      {
+        "scope": "B 端传输与关闭重试",
+        "result": "53 通过 / 0 忽略",
+        "log": "green02-peer-command.log"
+      },
+      {
+        "scope": "Linux fmt",
+        "result": "通过",
+        "log": "green02-fmt-check-command.log"
+      },
+      {
+        "scope": "严格 workspace/all-targets/all-features Clippy",
+        "result": "通过",
+        "log": "green02-clippy-command.log"
+      },
+      {
+        "scope": "afs-node / afs-meta release",
+        "result": "通过",
+        "log": "green02-release-command.log"
+      }
+    ],
+    "red": [
+      {
+        "label": "red-quarantine",
+        "expected_assertion": "quarantine must retire cached fixed readers",
+        "log": "red-quarantine-red.log"
+      },
+      {
+        "label": "red-close",
+        "expected_assertion": "failed close must remain pending until acknowledgment",
+        "log": "red-close-red.log"
+      },
+      {
+        "label": "red-disconnect",
+        "expected_assertion": "disconnected context must retire without a later read",
+        "log": "red-disconnect-red.log"
+      },
+      {
+        "label": "red-cold-missing",
+        "expected_assertion": "missing cold file must fail without reader-cache lock recursion",
+        "log": "red-cold-missing-red.log"
+      }
+    ],
+    "CRC_mode": "off unchanged",
+    "write_CRC": true,
+    "performance_samples": 0,
+    "no_commit_push": true,
+    "new_actual_multivm_FUSE": false,
+    "new_validation": "Linux component and real loopback mTLS gRPC",
+    "parent_actual_FUSE_GC_evidence": "../afs-read-open-fast-20261025/functional-gate.json",
+    "remaining_boundaries": [
+      "CRC off silent corruption",
+      "mixed-version and full multi-replica recovery not admitted",
+      "fstat/mmap snapshot not guaranteed",
+      "unacknowledged closes consume bounded retry budget",
+      "fast lane requires trackable mTLS connection identity; otherwise ordinary path"
+    ],
+    "normal_read_no_repeated_checks_restored": true,
+    "lock_review": "locking-review.json"
+  },
+  "parent_actual_FUSE_GC": {
+    "passed": true,
+    "scope": "native read/pread fixed version and EOF, GC retention/release, tested context/range/recovery contracts; not complete POSIX snapshot semantics",
+    "actual_FUSE_cases": {
+      "a": 16,
+      "b": 16
+    },
+    "old_read_EOF_fixed": true,
+    "new_open_new_version_and_EOF": true,
+    "after_unlink_70s_old_bytes_and_files_retained": true,
+    "last_close_plus_70s_old_files_reclaimed": true,
+    "per_fd_fstat_snapshot": false,
+    "fstat_failure_retained": "semantic01-boundary.json; failed run preserved in functional-failure01-a/b",
+    "new_contract_tests": 9,
+    "engine_tests": 126,
+    "chunk_tests": 183,
+    "chunk_ignored": 4,
+    "VFS_tests": 287,
+    "strict_Clippy": true,
+    "CRC_mode": "off",
+    "write_CRC": true,
+    "formal_samples_started": 0,
+    "functional_full_reads": 3,
+    "failed_functional_runs": [
+      "semantic01"
+    ],
+    "performance_replacements": 0
+  },
+  "observer_sources_excluded": [
+    "afs-read-causal-diagnostics-20261024",
+    "afs-read-observer-split-20261024",
+    "afs-read-gap-probe-20261025"
+  ],
+  "source_inputs_validation_reused": true,
+  "new_performance_experiments": 0,
+  "no_merge": true,
+  "raw_evidence_receipts": [
+    {
+      "local_evidence": "adx/evidence/afs-read-buffer-reuse-20261024/ledger.json",
+      "sha256": "b12ba80fe43ba09033d8218f47db4786b93632fbab9ed39c85e25373186d7a0f",
+      "bytes": 139813
+    },
+    {
+      "local_evidence": "adx/evidence/afs-read-buffer-reuse-20261024/summary.json",
+      "sha256": "3b9d92d007d4a0b5441bd9be4bfe042d96c667a5ec68a26ef46ef6b57f7a64a7",
+      "bytes": 2842
+    },
+    {
+      "local_evidence": "adx/evidence/afs-read-buffer-reuse-20261024/candidate01-identity.json",
+      "sha256": "1c16896288aebdc2c9ba775e929562728178980cf9579ec926a8adbe13fd48d9",
+      "bytes": 367
+    },
+    {
+      "local_evidence": "adx/evidence/afs-read-buffer-reuse-20261024/source-identity.json",
+      "sha256": "15ed4302f58004551c3213128bc6ff8441a69a3afd07e3169d4b0c54019d5878",
+      "bytes": 381
+    },
+    {
+      "local_evidence": "adx/evidence/afs-read-open-fast-20261025/ledger.json",
+      "sha256": "d1f82e753884b4b9e1b8bc473349a46ba1cf775e1cbc363143534250e68ce783",
+      "bytes": 55314
+    },
+    {
+      "local_evidence": "adx/evidence/afs-read-open-fast-20261025/summary.json",
+      "sha256": "c9ebe6e4595057a41743102906e4a7f847f133eda5ac0b3f542727b8f6db6385",
+      "bytes": 158445
+    },
+    {
+      "local_evidence": "adx/evidence/afs-read-open-fast-20261025/functional-gate.json",
+      "sha256": "46567b62076c333a600bd44e6c812dacffbaab79db645602951286b2f143c86c",
+      "bytes": 877
+    },
+    {
+      "local_evidence": "adx/evidence/afs-read-open-fast-20261025/F1-identity.json",
+      "sha256": "0ee2f528883844a2139d8fb3a8977e93b705d8d57278209352d41a661a414599",
+      "bytes": 367
+    },
+    {
+      "local_evidence": "adx/evidence/afs-read-retirement-fixes-20261025/functional-gate.json",
+      "sha256": "6367a056121e4f1514940f2e1fa03ffdd3a10d74a030094ca6c9154a25711d7d",
+      "bytes": 2964
+    },
+    {
+      "local_evidence": "adx/evidence/afs-read-retirement-fixes-20261025/candidate01-identity.json",
+      "sha256": "cabb54a3d0d7b7613b793df19a84773c44b7cd6f8a42485c6f6a970cffc78a7a",
+      "bytes": 367
+    },
+    {
+      "local_evidence": "adx/evidence/afs-read-retirement-fixes-20261025/final-source-sha256.json",
+      "sha256": "f274216f6d7938a4262f4d293a533271499c93a31c9de369a45ed87a3e73f93c",
+      "bytes": 148375
+    },
+    {
+      "local_evidence": "adx/evidence/afs-read-retirement-fixes-20261025/locking-review.json",
+      "sha256": "f95493226247956bd55e3fab009fe0c342db0c168f8be53998fd6991520d5acc",
+      "bytes": 908
+    },
+    {
+      "local_evidence": "adx/evidence/afs-read-retirement-fixes-20261025/closeout.json",
+      "sha256": "894f606a4b5005be1a852e75e221524f7e80366f5c25a1cf4bfca5416ea67cc4",
+      "bytes": 1288
+    },
+    {
+      "local_evidence": "adx/evidence/afs-read-retirement-fixes-20261025/integration-check.json",
+      "sha256": "73e24987785e58d578654d3b4982fbaa1a2b25784f6353440187c1501638697f",
+      "bytes": 2165
+    },
+    {
+      "local_evidence": "adx/evidence/afs-read-retirement-fixes-20261025/green02-focused-command.log",
+      "sha256": "bfe0db6820c1ae82e7ca50014dc99654160dc6a57445a677836366a78247e54e",
+      "bytes": 1539
+    },
+    {
+      "local_evidence": "adx/evidence/afs-read-retirement-fixes-20261025/green02-open-read-command.log",
+      "sha256": "6f9aad44deee6d77cac983f7487a74e137d534e294f2a5aef59c7f126387544d",
+      "bytes": 1415
+    },
+    {
+      "local_evidence": "adx/evidence/afs-read-retirement-fixes-20261025/green02-chunk-command.log",
+      "sha256": "e880277db033216a947ce87d03dbb8ea187b5a9ce6afd21c812668b93212d49e",
+      "bytes": 21008
+    },
+    {
+      "local_evidence": "adx/evidence/afs-read-retirement-fixes-20261025/green02-dfs-read-command.log",
+      "sha256": "2ad2235d40daf34422a160808228695f3200d5e31d8c2928a5dcd35581c7cb2d",
+      "bytes": 13215
+    },
+    {
+      "local_evidence": "adx/evidence/afs-read-retirement-fixes-20261025/green02-dfs-vfs-command.log",
+      "sha256": "63aee15ab4dc032546ee3c0b654cb7b8531268bc81971eb62843e995b2842753",
+      "bytes": 28775
+    },
+    {
+      "local_evidence": "adx/evidence/afs-read-retirement-fixes-20261025/green02-peer-command.log",
+      "sha256": "0d6c8d88c1c82c585d0f9fe805fb5292d82b19e112f3dad4a6c2041d3909d54b",
+      "bytes": 5508
+    },
+    {
+      "local_evidence": "adx/evidence/afs-read-retirement-fixes-20261025/green02-fmt-check-command.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    {
+      "local_evidence": "adx/evidence/afs-read-retirement-fixes-20261025/green02-clippy-command.log",
+      "sha256": "f3bf23d1b6251894864e55ea02ea40d91c0f02ef6f3140c1b448dae75b39df77",
+      "bytes": 109
+    },
+    {
+      "local_evidence": "adx/evidence/afs-read-retirement-fixes-20261025/green02-release-command.log",
+      "sha256": "735396cc3dd16c4a232df9027cd581cd7489ccd502df93650eefc872d44a2499",
+      "bytes": 99
+    },
+    {
+      "local_evidence": "adx/evidence/afs-read-retirement-fixes-20261025/red-quarantine-red.log",
+      "sha256": "d76783d88d87ef210b12c0c80e7111c1bfee57a127083fc0c596ab24e7ba9e53",
+      "bytes": 1240
+    },
+    {
+      "local_evidence": "adx/evidence/afs-read-retirement-fixes-20261025/red-close-red.log",
+      "sha256": "7698ff164cab8cacdcde9ca3d88793b8080d713b11e7f912c69d670efd6fc659",
+      "bytes": 785
+    },
+    {
+      "local_evidence": "adx/evidence/afs-read-retirement-fixes-20261025/red-disconnect-red.log",
+      "sha256": "10c2744602247cd810f02dfde313a77288562496a8e6b9491faf7e2825d82ee2",
+      "bytes": 785
+    },
+    {
+      "local_evidence": "adx/evidence/afs-read-retirement-fixes-20261025/red-cold-missing-red.log",
+      "sha256": "ebb77d1f07ae4aba03471be8d5e9a889cd82c78623b9ce4f79ac7cd6b33885c2",
+      "bytes": 985
+    }
+  ],
+  "PR_integration_validation_reuse": {
+    "all_frozen_non_document_inputs_equal": true,
+    "exact_frozen_files_still_equal": 1331,
+    "documentation_only_refresh": [
+      "docs/development/afs-plan.md",
+      "docs/performance/afs-open-fast-20261025.md",
+      "docs/performance/afs-remote-read-20261024/README.md",
+      "docs/testing/afs.md"
+    ],
+    "validated_candidate_source": "/Users/lzc/workspace/code/agentruntime/adx/experiments/afs-read-retirement-fixes-20261025/source",
+    "frozen_source_manifest_sha256": "f274216f6d7938a4262f4d293a533271499c93a31c9de369a45ed87a3e73f93c",
+    "Linux_gates_reused": "afs-read-retirement-fixes-20261025/functional-gate.json",
+    "new_Rust_or_runtime_changes_after_validation": 0,
+    "new_performance_experiments": 0,
+    "new_multiVM_runs": 0,
+    "remote_CI_for_new_PR_head_not_claimed": true
+  },
+  "documentation_gate": {
+    "documents": 160,
+    "local_links": 797,
+    "json_examples": 52,
+    "svg_files": 5,
+    "errors": []
+  }
+}
