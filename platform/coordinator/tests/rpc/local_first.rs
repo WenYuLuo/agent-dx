@@ -1,4 +1,111 @@
 use super::*;
+
+#[tokio::test]
+#[ignore = "requires isolated Redis and generated mTLS certificates; run control-rpc suite"]
+async fn live_inspection_accepts_open_admission_but_requires_a_current_session() {
+    let mut rig = Rig::new().await;
+    let inspection = pb::InspectNodeRequest {
+        node_id: "a".into(),
+        session_id: "boot-a".into(),
+    };
+    // Rig's registration handshake has completed and allocation is open.
+    rig.claimants[0]
+        .inspect_node(inspection.clone())
+        .await
+        .unwrap();
+    let mut stale = inspection.clone();
+    stale.session_id = "old-boot".into();
+    assert_eq!(
+        rig.claimants[0]
+            .inspect_node(stale)
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
+    assert_eq!(
+        rig.claimants[1]
+            .inspect_node(inspection.clone())
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+    // Inspection cannot revive an expired session before the expiry worker runs.
+    tokio::time::sleep(Duration::from_millis(10050)).await;
+    assert_eq!(
+        rig.claimants[0]
+            .inspect_node(inspection)
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Redis and generated mTLS certificates; run control-rpc suite"]
+async fn live_catalog_keeps_a_durable_claim_pending_until_the_create_rpc() {
+    let mut rig = Rig::new().await;
+    rig.managers[0].reconcile(vec![]).await.unwrap();
+    let spec = spec("claim-before-create");
+    rig.claimants[0]
+        .claim_environment(pb::ClaimEnvironmentRequest {
+            spec: Some(spec.clone().into()),
+            caller: caller(),
+            node_session_id: "boot-a".into(),
+            devices: vec![],
+        })
+        .await
+        .unwrap();
+    assert!(rig.session.get(&spec.id).await.unwrap().result.is_none());
+    let snapshot = rig.session.snapshot().await.unwrap();
+    let node = &snapshot.nodes["a"];
+    let mut registration = pb::RegisterNodeRequest {
+        node_id: "a".into(),
+        session_id: "boot-a".into(),
+        node_address: node.address.clone(),
+        proxy_address: node.proxy_address.clone(),
+        capacity: Some(node.node.capacity.into()),
+        heartbeat_sequence: 3,
+        reconciling: false,
+        accepting_allocations: true,
+        runtime_classes: vec!["r".into(), "runc".into(), "runsc".into()],
+        labels: Default::default(),
+        devices: vec![],
+    };
+    let mut authority = pb::coordinator_service_client::CoordinatorServiceClient::new(
+        adx_transport::rpc::authenticated_channel(channel(rig.address, "node").await),
+    );
+    adxlet::node_reconciliation::reconcile_node(
+        &mut authority,
+        &mut registration,
+        &rig.managers[0],
+        None,
+        Duration::from_secs(2),
+        Duration::from_millis(10),
+        tokio::time::Instant::now() + Duration::from_secs(60),
+    )
+    .await
+    .unwrap();
+    let reserved = rig.session.get(&spec.id).await.unwrap();
+    assert!(
+        reserved.result.is_none(),
+        "live comparison turned a durable unstarted claim into a terminal result"
+    );
+    assert_eq!(rig.backends[0].started.load(Ordering::SeqCst), 0);
+    let created = rig.nodes[0]
+        .create_local_environment(Rig::request("claim-before-create", 0))
+        .await
+        .unwrap()
+        .into_inner()
+        .record
+        .unwrap();
+    assert_eq!(created.state, pb::EnvironmentState::Running as i32);
+    assert_eq!(rig.backends[0].started.load(Ordering::SeqCst), 1);
+    rig.delete(&created).await;
+}
+
 fn local_peers() -> Peers {
     Peers::new(
         [
@@ -732,6 +839,18 @@ async fn concurrent_local_entries_converge_and_fallback_preserves_both_ledgers()
         .unwrap()
         .into_inner();
     assert_eq!(replay.record.as_ref(), Some(&record));
+    assert!(rig
+        .rpc
+        .metrics()
+        .await
+        .unwrap()
+        .contains("adx_environment_created_total 1\n"));
+    assert!(rig
+        .rpc
+        .environment_metrics()
+        .await
+        .unwrap()
+        .contains("adx_environment_info{environment_id=\"same\",node_id="));
     let mut changed = Rig::request("same", 1);
     changed
         .create
@@ -770,6 +889,7 @@ async fn concurrent_local_entries_converge_and_fallback_preserves_both_ledgers()
         200
     );
     let metrics = rig.rpc.metrics().await.unwrap();
+    assert!(metrics.contains("adx_environment_created_total 2\n"));
     assert!(metrics
         .contains("adx_coordinator_node_reserved_cpu_millis{shard_id=\"0\",node_id=\"a\"} 100"));
     assert!(metrics

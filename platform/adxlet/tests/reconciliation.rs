@@ -22,6 +22,7 @@ struct Backend {
     observation_release: tokio::sync::Notify,
     fail_inventory: std::sync::atomic::AtomicBool,
     allow_start: std::sync::atomic::AtomicBool,
+    fail_start: std::sync::atomic::AtomicBool,
     fail_remove: std::sync::atomic::AtomicBool,
     block_remove: std::sync::atomic::AtomicBool,
     remove_entered: tokio::sync::Notify,
@@ -123,6 +124,9 @@ impl RuntimeDriver for Backend {
             self.allow_start.load(std::sync::atomic::Ordering::SeqCst),
             "reconciliation must not recreate an image without restart policy"
         );
+        if self.fail_start.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(adx_core::Error::Unavailable("start failed".into()));
+        }
         self.events.lock().unwrap().push(format!("start:{id}"));
         self.actual.lock().unwrap().push(RuntimeObservation {
             environment_id: spec.id.clone(),
@@ -326,8 +330,7 @@ async fn periodic_matching_execution_has_no_recovery_side_effects() {
 }
 
 #[tokio::test]
-async fn periodic_orphan_retry_and_late_create_preserve_healthy_execution() {
-    use std::sync::atomic::Ordering;
+async fn periodic_orphans_require_recovery_instead_of_runtime_scanning() {
     let backend = Arc::new(Backend::default());
     *backend.actual.lock().unwrap() = vec![observed("kept")];
     let node = manager(&backend);
@@ -339,21 +342,24 @@ async fn periodic_orphan_retry_and_late_create_preserve_healthy_execution() {
     );
     authority.cycle(&node).await.unwrap();
     reset_recovery_effects(&backend);
-    backend.actual.lock().unwrap().push(observed("orphan"));
-    backend.fail_remove.store(true, Ordering::SeqCst);
-    assert!(authority.cycle(&node).await.is_err());
-    backend.fail_remove.store(false, Ordering::SeqCst);
-    authority.cycle(&node).await.unwrap();
-    authority.cycle(&node).await.unwrap();
-    backend.actual.lock().unwrap().push(observed("late"));
+    backend
+        .actual
+        .lock()
+        .unwrap()
+        .extend([observed("orphan"), observed("late")]);
+    for _ in 0..3 {
+        authority.cycle(&node).await.unwrap();
+    }
+    assert_eq!(backend.actual.lock().unwrap().len(), 3);
+    assert_no_recovery_effects(&backend);
+    authority.registration.reconciling = true;
     authority.cycle(&node).await.unwrap();
     assert_eq!(*backend.actual.lock().unwrap(), vec![observed("kept")]);
-    assert_no_recovery_effects(&backend);
     assert!(node.accepting_allocations());
 }
 
 #[tokio::test]
-async fn periodic_missing_execution_still_publishes_loss_and_releases_resources() {
+async fn periodic_comparison_does_not_infer_lifecycle_from_backend_state() {
     let backend = Arc::new(Backend::default());
     *backend.actual.lock().unwrap() = vec![observed("lost")];
     let node = manager(&backend);
@@ -367,21 +373,16 @@ async fn periodic_missing_execution_still_publishes_loss_and_releases_resources(
     backend.actual.lock().unwrap().clear();
     reset_recovery_effects(&backend);
     authority.cycle(&node).await.unwrap();
-    assert_eq!(node.used(), Resources::default());
-    assert!(backend
-        .events
-        .lock()
-        .unwrap()
-        .contains(&"commit:Failed".into()));
-    assert!(!backend
-        .events
-        .lock()
-        .unwrap()
-        .iter()
-        .any(|e| e.starts_with("bind:")));
+    assert_eq!(
+        node.used(),
+        record("lost", EnvironmentState::Running).spec.resources
+    );
+    assert_no_recovery_effects(&backend);
+    assert!(backend.events.lock().unwrap().is_empty());
 }
+
 #[tokio::test]
-async fn periodic_retry_after_ready_report_failure_does_not_repeat_recovery() {
+async fn failed_initial_handshake_retries_recovery_before_reopening() {
     use std::sync::atomic::Ordering;
     let backend = Arc::new(Backend::default());
     *backend.actual.lock().unwrap() = vec![observed("kept")];
@@ -403,6 +404,9 @@ async fn periodic_retry_after_ready_report_failure_does_not_repeat_recovery() {
         .authority
         .reject_ready
         .store(false, Ordering::SeqCst);
+    authority.cycle(&node).await.unwrap();
+    assert!(backend.binding_syncs.load(Ordering::SeqCst) > 0);
+    reset_recovery_effects(&backend);
     authority.cycle(&node).await.unwrap();
     assert_no_recovery_effects(&backend);
     assert!(node.accepting_allocations());
@@ -439,7 +443,11 @@ async fn periodic_stale_catalog_cannot_reactivate_a_published_deletion() {
     backend.actual.lock().unwrap().push(observed("kept"));
     authority.cycle(&node).await.unwrap();
     authority.cycle(&node).await.unwrap();
+    assert_eq!(backend.actual.lock().unwrap().len(), 1);
+    authority.registration.reconciling = true;
+    authority.cycle(&node).await.unwrap();
     assert!(backend.actual.lock().unwrap().is_empty());
+    reset_recovery_effects(&backend);
     assert_no_recovery_effects(&backend);
     assert!(node.accepting_allocations());
 }
@@ -607,7 +615,7 @@ async fn periodic_network_update_must_publish_before_dismissing_stale_authority(
 }
 
 #[tokio::test]
-async fn periodic_coordinator_restart_renews_handshake_without_recovering_healthy_controller() {
+async fn coordinator_restart_recovers_once_then_resumes_data_only_comparison() {
     use std::sync::atomic::Ordering;
     let backend = Arc::new(Backend::default());
     *backend.actual.lock().unwrap() = vec![observed("kept")];
@@ -625,6 +633,9 @@ async fn periodic_coordinator_restart_renews_handshake_without_recovering_health
         .requires_handshake
         .store(true, Ordering::SeqCst);
     assert!(authority.cycle(&node).await.is_err());
+    authority.cycle(&node).await.unwrap();
+    assert!(backend.binding_syncs.load(Ordering::SeqCst) > 0);
+    reset_recovery_effects(&backend);
     authority.cycle(&node).await.unwrap();
     assert_no_recovery_effects(&backend);
     assert!(node.accepting_allocations());
@@ -653,7 +664,7 @@ async fn periodic_catalog_fetch_preserves_known_lifecycle_operations() {
     tokio::time::timeout(Duration::from_secs(1), server.inspect_entered.notified())
         .await
         .unwrap();
-    assert!(!node.accepting_allocations());
+    assert!(node.accepting_allocations());
     tokio::time::timeout(Duration::from_secs(1), node.monitor_environments())
         .await
         .unwrap()
@@ -692,24 +703,15 @@ async fn periodic_busy_environment_does_not_close_other_environment_admission() 
         async move { node.monitor_environments().await }
     });
     backend.observation_entered.notified().await;
-    let reports = authority.authority.reports.clone();
-    reports.lock().unwrap().clear();
+    let server = authority.authority.clone();
+    server.block_inspect.store(true, Ordering::SeqCst);
     let mut refresh = tokio::spawn({
         let node = node.clone();
         async move { authority.cycle(&node).await }
     });
     let admitted = tokio::time::timeout(Duration::from_millis(300), async {
-        loop {
-            if reports
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|r| r.accepting_allocations)
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
+        server.inspect_entered.notified().await;
+        assert!(node.accepting_allocations());
         let new = record("new", EnvironmentState::Pending);
         node.environment(new.spec, new.assignment)
             .unwrap()
@@ -725,6 +727,7 @@ async fn periodic_busy_environment_does_not_close_other_environment_admission() 
         .unwrap();
     })
     .await;
+    server.inspect_release.notify_one();
     backend.block_observation.store(false, Ordering::SeqCst);
     backend.observation_release.notify_one();
     monitor.await.unwrap().unwrap();
@@ -1417,7 +1420,7 @@ async fn periodic_authority_outage_keeps_known_lifecycle_but_blocks_new_allocati
 }
 
 #[tokio::test]
-async fn public_authority_cycles_preserve_valid_execution_while_collecting_orphans() {
+async fn recovery_preserves_valid_execution_while_collecting_orphans() {
     let backend = Arc::new(Backend::default());
     *backend.actual.lock().unwrap() = vec![observed("kept")];
     let node = manager(&backend);
@@ -1432,6 +1435,7 @@ async fn public_authority_cycles_preserve_valid_execution_while_collecting_orpha
         .push(kept.clone().try_into().unwrap());
     authority.cycle(&node).await.unwrap();
     backend.actual.lock().unwrap().push(observed("orphan"));
+    authority.registration.reconciling = true;
     authority.cycle(&node).await.unwrap();
     {
         let actual = backend.actual.lock().unwrap();
@@ -1454,4 +1458,26 @@ async fn public_authority_cycles_preserve_valid_execution_while_collecting_orpha
             .state,
         EnvironmentState::Running
     );
+}
+
+#[tokio::test]
+async fn cached_log_retention_waits_for_recovery_and_cleanup_confirmation() {
+    use std::sync::atomic::Ordering;
+    let backend = Arc::new(Backend::default());
+    let node = authority::manager(backend.clone());
+    assert!(node.retained_runtime_ids().is_none());
+    let mut authority = authority::Fixture::new().await;
+    authority.cycle(&node).await.unwrap();
+    assert!(node.retained_runtime_ids().unwrap().is_empty());
+    backend.allow_start.store(true, Ordering::SeqCst);
+    backend.fail_start.store(true, Ordering::SeqCst);
+    backend.fail_remove.store(true, Ordering::SeqCst);
+    let wanted = record("failed", EnvironmentState::Pending);
+    let handle = node.environment(wanted.spec, wanted.assignment).unwrap();
+    assert!(handle.create().await.is_err());
+    assert_eq!(node.used(), Resources::default());
+    assert!(node.retained_runtime_ids().unwrap().contains("failed-7"));
+    backend.fail_remove.store(false, Ordering::SeqCst);
+    handle.tick().await.unwrap();
+    assert!(node.retained_runtime_ids().unwrap().is_empty());
 }

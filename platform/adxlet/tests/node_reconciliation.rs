@@ -3,6 +3,63 @@ mod authority;
 use adx_core::{EnvironmentSpec, Error, Result};
 use adxlet::{RuntimeDriver, RuntimeObservation};
 use async_trait::async_trait;
+fn creating_spec() -> EnvironmentSpec {
+    serde_json::from_value(serde_json::json!({
+        "id":"creating", "tenant_id":"t", "image":"image", "runtime_class":"runc", "priority":0,
+        "resources":{"cpu_millis":1,"memory_bytes":1,"disk_bytes":0}
+    }))
+    .unwrap()
+}
+
+#[tokio::test]
+async fn live_catalog_fetch_does_not_reject_or_wait_for_new_creation() {
+    let node = authority::manager(Arc::new(Runtime::default()));
+    let mut authority = authority::Fixture::new().await;
+    authority.cycle(&node).await.unwrap();
+    authority
+        .authority
+        .block_inspect
+        .store(true, Ordering::SeqCst);
+    let control = authority.authority.clone();
+    let other = node.clone();
+    let cycle = tokio::spawn(async move { authority.cycle(&other).await });
+    control.inspect_entered.notified().await;
+    assert!(
+        node.accepting_allocations(),
+        "a normal catalog fetch cannot close creation"
+    );
+    let spec = creating_spec();
+    node.reserve_local(&spec).unwrap();
+    node.environment(
+        spec.clone(),
+        adx_core::Assignment {
+            environment_id: spec.id,
+            node_id: "n".into(),
+            shard_id: 0,
+            generation: 1,
+            devices: vec![],
+        },
+    )
+    .unwrap();
+    control.inspect_release.notify_one();
+    cycle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn live_catalog_absence_does_not_cancel_an_in_flight_claim_reservation() {
+    let node = authority::manager(Arc::new(Runtime::default()));
+    let mut authority = authority::Fixture::new().await;
+    authority.cycle(&node).await.unwrap();
+    let spec = creating_spec();
+    let before = node.reserve_local(&spec).unwrap();
+    // Claim may still be in flight while this snapshot is read.
+    authority.cycle(&node).await.unwrap();
+    let after = node.reserve_local(&spec).unwrap();
+    assert_eq!(
+        before.token, after.token,
+        "a catalog cannot prove an in-flight claim was rejected"
+    );
+}
 use std::{
     net::IpAddr,
     sync::{
@@ -78,7 +135,7 @@ async fn periodic_cycle_removes_orphan_without_any_local_controller() {
 }
 
 #[tokio::test]
-async fn later_cycle_collects_create_materialized_after_an_empty_scan() {
+async fn ordinary_cycles_compare_records_without_scanning_runtime_state() {
     let runtime = Arc::new(Runtime::default());
     let node = authority::manager(runtime.clone());
     node.reconcile(vec![]).await.unwrap();
@@ -86,8 +143,8 @@ async fn later_cycle_collects_create_materialized_after_an_empty_scan() {
     authority.cycle(&node).await.unwrap();
     runtime.actual.lock().unwrap().push(orphan("late"));
     authority.cycle(&node).await.unwrap();
-    assert!(runtime.actual.lock().unwrap().is_empty());
-    assert_eq!(runtime.scans.load(Ordering::SeqCst), 3);
+    assert_eq!(runtime.actual.lock().unwrap().len(), 1);
+    assert_eq!(runtime.scans.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
@@ -186,7 +243,7 @@ async fn stalled_authority_report_is_bounded_and_keeps_admission_closed() {
 }
 
 #[tokio::test]
-async fn periodic_authority_closes_allocation_without_withdrawing_live_routes() {
+async fn periodic_authority_preserves_allocation_and_live_routes() {
     let runtime = Arc::new(Runtime::default());
     let node = authority::manager(runtime);
     let mut authority = authority::Fixture::new().await;
@@ -195,7 +252,7 @@ async fn periodic_authority_closes_allocation_without_withdrawing_live_routes() 
     authority.cycle(&node).await.unwrap();
     {
         let reports = authority.authority.reports.lock().unwrap();
-        assert!(!reports[before].accepting_allocations);
+        assert!(reports[before].accepting_allocations);
         assert!(
             !reports[before].reconciling,
             "periodic catalog refresh must preserve routability"

@@ -58,6 +58,33 @@ class TraceCollectionTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             telemetry.check_trace_links(rows)
 
+    def test_recovery_execution_can_follow_its_authority_reconcile_span(self):
+        rows = [
+            {'traceId': 'create', 'spanId': 'q', 'name': 'environment.queue'},
+            {'traceId': 'create', 'spanId': 'e', 'parentSpanId': 'q', 'name': 'environment.execute'},
+            {'traceId': 'recovery', 'spanId': 'r', 'name': 'environment.authority_reconcile'},
+            {'traceId': 'recovery', 'spanId': 'e', 'parentSpanId': 'r', 'name': 'environment.execute'},
+        ]
+        self.assertEqual(telemetry.check_trace_links(rows), 2)
+
+    def test_recovery_trace_cannot_substitute_for_a_queue_execution(self):
+        rows = [
+            {'traceId': 'recovery', 'spanId': 'r', 'name': 'environment.authority_reconcile'},
+            {'traceId': 'recovery', 'spanId': 'e', 'parentSpanId': 'r', 'name': 'environment.execute'},
+        ]
+        with self.assertRaises(AssertionError):
+            telemetry.check_trace_links(rows)
+
+    def test_recovery_parent_from_another_trace_is_rejected(self):
+        rows = [
+            {'traceId': 'create', 'spanId': 'q', 'name': 'environment.queue'},
+            {'traceId': 'create', 'spanId': 'e', 'parentSpanId': 'q', 'name': 'environment.execute'},
+            {'traceId': 'other', 'spanId': 'r', 'name': 'environment.authority_reconcile'},
+            {'traceId': 'recovery', 'spanId': 'e', 'parentSpanId': 'r', 'name': 'environment.execute'},
+        ]
+        with self.assertRaises(AssertionError):
+            telemetry.check_trace_links(rows)
+
 
 class HttpTraceContractTests(unittest.TestCase):
     def test_execd_named_http_span_with_parent_proves_context(self):
@@ -85,7 +112,10 @@ class HttpTraceContractTests(unittest.TestCase):
 
     def test_create_trace_requires_two_linked_http_spans_and_all_stages(self):
         rows = [
-            {'traceId': 't', 'spanId': '1', 'name': 'POST /api/environment/v1/environments', 'service': 'adx-apiserver'},
+            {
+                'traceId': 't', 'spanId': '1',
+                'name': 'POST /api/environment/v1/environments', 'service': 'adx-apiserver',
+            },
             {
                 'traceId': 't',
                 'spanId': '2',

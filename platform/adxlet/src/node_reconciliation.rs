@@ -98,12 +98,11 @@ async fn inspect(
         .into_inner())
 }
 
-/// Obtain a complete current catalog with admission closed, reconcile every
-/// configured runtime, and publish readiness before the next reporting interval.
-/// Startup and session fencing drain the node. Live comparisons enqueue at most
-/// one task per Environment and reopen admission after catalog validation, so a
-/// slow or failed controller cannot close other Environments' admission. An
-/// unavailable catalog is never empty and still closes new node allocation.
+/// Compare a complete current catalog without closing healthy live admission.
+/// Startup and session fencing drain accepted lifecycle work before recovery.
+/// Live comparisons enqueue at most one task per Environment, so a slow or failed
+/// controller cannot close other Environments' admission. An unavailable catalog
+/// is never empty and still closes new node allocation.
 pub async fn reconcile_node(
     coordinator: &mut Coordinator,
     registration: &mut pb::RegisterNodeRequest,
@@ -117,13 +116,16 @@ pub async fn reconcile_node(
     // Admission can close after a failed cleanup/report. That does not make
     // already recovered controllers need startup recovery again.
     let periodic = manager.authority_initialized.load(Ordering::Acquire)
-        && registration.heartbeat_sequence > 0;
-    manager.authority_reconciling.store(true, Ordering::Release);
+        && registration.heartbeat_sequence > 0
+        && !registration.reconciling;
     // Startup withdraws routability until recovery completes. A validated live
-    // session only closes new allocation while refreshing its authority catalog.
+    // session can compare a snapshot while accepting new allocations.
     let handshake = !periodic || registration.reconciling;
     registration.reconciling = handshake;
-    registration.accepting_allocations = false;
+    registration.accepting_allocations = periodic
+        && manager.accepting_allocations()
+        && !manager.is_draining()
+        && Instant::now() < capacity_valid_until;
     if timeout.is_zero() || report_interval.is_zero() {
         return Err(Status::invalid_argument(
             "positive node reconciliation intervals required",
@@ -133,6 +135,7 @@ pub async fn reconcile_node(
     let mut catalog_retry = false;
     let mut handshake_required = false;
     if !periodic {
+        manager.authority_reconciling.store(true, Ordering::Release);
         pause_lifecycle_reporting(
             manager,
             coordinator,
