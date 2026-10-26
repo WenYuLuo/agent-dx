@@ -2,8 +2,10 @@
 
 import base64
 import json
+import logging
 import ssl
 import time
+import urllib.parse
 import urllib.request
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -14,7 +16,7 @@ from node import catalog
 
 def create(endpoint, token, ca, request_id, name, image, cpu=250):
     request = urllib.request.Request(
-        'https://' + endpoint + '/api/environment/v1/environments',
+        urllib.parse.urlunsplit(('https', endpoint, '/api/environment/v1/environments', '', '')),
         data=json.dumps(
             {
                 'name': name,
@@ -42,6 +44,7 @@ def create(endpoint, token, ca, request_id, name, image, cpu=250):
 
 
 def run(connection, image, evidence, secrets, phase):
+    logging.basicConfig(level=logging.INFO, format='%(message)s')
     saved = evidence / 'create-identities.json'
     ca = secrets / 'tls/ca.pem'
     endpoint = 'coordinator:8443'
@@ -131,4 +134,4 @@ def run(connection, image, evidence, secrets, phase):
             saved.write_text(json.dumps(original, indent=2) + '\n')
         finally:
             Environment.delete(identity, connection=connection)
-    print('PASS create identities ' + phase, flush=True)
+    logging.info('PASS create identities %s', phase)

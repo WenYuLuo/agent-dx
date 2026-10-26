@@ -442,13 +442,13 @@ class Run:
             mode = scenario.removeprefix('activator-')
             with self.case(scenario, checks) as record:
 
-                def phase(name):
+                def phase(name, activator_mode=mode):
                     return self.execute(
                         'node1',
                         '/opt/adx/client/bin/python',
                         '-u',
                         '/opt/adx/e2e/activator.py',
-                        mode,
+                        activator_mode,
                         name,
                         timeout=600,
                     )

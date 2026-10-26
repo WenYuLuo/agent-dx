@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import ipaddress
 import json
 import os
 import pathlib
@@ -365,7 +366,10 @@ if node == 'node1' or activator_mode:
         'ADX_DATA_PLANE_INGRESS_ALLOWED_CLIENT_CIDRS': os.getenv('ADX_E2E_API_CLIENT_CIDRS') or (
             '127.0.0.1/32,172.16.0.0/12'
             if activator_mode
-            else ','.join(['127.0.0.1/32'] + [socket.gethostbyname(peer) + '/32' for peer in ('coordinator', 'node2')])
+            else ','.join(
+                ['127.0.0.1/32']
+                + [str(ipaddress.IPv4Network((socket.gethostbyname(peer), 32))) for peer in ('coordinator', 'node2')]
+            )
         ),
         'ADX_DATA_PLANE_INGRESS_NODE_TLS_CA': str(T / 'ca.pem'),
         'ADX_DATA_PLANE_INGRESS_NODE_TLS_SERVER_NAME': 'localhost',

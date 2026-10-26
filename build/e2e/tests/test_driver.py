@@ -1044,10 +1044,10 @@ class RegistryImportTests(unittest.TestCase):
     def test_archive_import_checks_manifest_and_compresses_layers(self):
         import gzip
         import hashlib
-        import http.server
         import io
         import tarfile
         import threading
+        from wsgiref.simple_server import WSGIRequestHandler, make_server
 
         spec_local = importlib.util.spec_from_file_location('registry_publish', ROOT / 'publish.py')
         module = importlib.util.module_from_spec(spec_local)
@@ -1055,32 +1055,30 @@ class RegistryImportTests(unittest.TestCase):
         blobs = {}
         published = []
 
-        class Handler(http.server.BaseHTTPRequestHandler):
+        class QuietHandler(WSGIRequestHandler):
             def log_message(self, *args):
                 pass
 
-            def do_GET(self):  # noqa: N802 - BaseHTTPRequestHandler callback
-                self.send_response(200)
-                self.end_headers()
-
-            def do_POST(self):  # noqa: N802 - BaseHTTPRequestHandler callback
-                self.send_response(202)
-                self.send_header('Location', '/upload?id=fixture')
-                self.end_headers()
-
-            def do_PUT(self):  # noqa: N802 - BaseHTTPRequestHandler callback
-                data = self.rfile.read(int(self.headers['Content-Length']))
+        def registry(environ, start_response):
+            method = environ.get('REQUEST_METHOD')
+            if method == 'GET':
+                start_response('200 OK', [])
+            elif method == 'POST':
+                start_response('202 Accepted', [('Location', '/upload?id=fixture')])
+            elif method == 'PUT':
+                data = environ['wsgi.input'].read(int(environ.get('CONTENT_LENGTH') or 0))
                 digest = 'sha256:' + hashlib.sha256(data).hexdigest()
-                if self.path.startswith('/upload'):
-                    self.assertion = digest in self.path
+                if environ.get('PATH_INFO', '').startswith('/upload'):
+                    self.assertIn(digest, environ.get('QUERY_STRING', ''))
                     blobs[digest] = data
                 else:
                     published.append(json.loads(data))
-                self.send_response(201)
-                self.send_header('Docker-Content-Digest', digest)
-                self.end_headers()
+                start_response('201 Created', [('Docker-Content-Digest', digest)])
+            else:
+                start_response('405 Method Not Allowed', [])
+            return [b'']
 
-        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        server = make_server('127.0.0.1', 0, registry, handler_class=QuietHandler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         self.addCleanup(server.server_close)
