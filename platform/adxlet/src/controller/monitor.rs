@@ -34,7 +34,7 @@ impl Controller {
                 }
                 Ok(status) if !status.running => {
                     self.record.failure = status.failure;
-                    return self.unexpected_exit().await;
+                    return self.runtime_stopped().await;
                 }
                 Ok(_) => (),
             }
@@ -205,6 +205,17 @@ impl Controller {
         self.unexpected_exit().await?;
         Ok(true)
     }
+    // An absent execution after an intended stop is not independent fault evidence.
+    // Preserve the intent through cleanup reconciliation; explicit OOM/exit/probe
+    // evidence still takes the unexpected-exit path.
+    pub(super) async fn runtime_stopped(&mut self) -> Result<()> {
+        if self.intended_execution_absence() {
+            self.unexpected_exit_inner().await
+        } else {
+            self.unexpected_exit().await
+        }
+    }
+
     pub(super) async fn unexpected_exit(&mut self) -> Result<()> {
         let source = if self
             .record

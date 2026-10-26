@@ -888,24 +888,15 @@ impl CoordinatorRpc {
                 .is_some_and(|stored| {
                     stored.result.is_none() && stored.recovery.is_none() && !stored.invalidated
                 });
-        let accepted = state.session.commit(record).await?;
-        if accepted.state != EnvironmentState::Deleted {
-            let stored = state.session.get(&accepted.spec.id).await?;
+        let committed = state.session.commit_with_state(record).await?;
+        let accepted = committed.result;
+        if let Some(stored) = committed.stored {
             state.remember_environment(stored);
         }
         if first_create {
             self.0
                 .created
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-        if accepted.state == EnvironmentState::Failed
-            || (accepted.state != EnvironmentState::Deleted
-                && !state.environments.contains_key(&accepted.spec.id))
-        {
-            let durable = state.session.get(&accepted.spec.id).await?;
-            state.remember_environment(durable);
-        } else {
-            state.failed_environments.remove(&accepted.spec.id);
         }
         if let Some(stored) = state.environments.get_mut(&accepted.spec.id) {
             stored.spec = accepted.spec.clone();

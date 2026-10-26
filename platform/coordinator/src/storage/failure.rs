@@ -12,8 +12,11 @@ impl Session {
             if node.session.as_ref().is_none_or(|s| s.id != session_id) {
                 return Err(Error::Conflict);
             }
-            let incident_id = format!("node:{id}:{session_id}");
-            if node.last_incident_id.as_deref() != Some(&incident_id) {
+            let incident_id = node
+                .last_incident_id
+                .clone()
+                .unwrap_or_else(|| format!("node:{id}:{session_id}:{}", header.revision));
+            if node.last_incident_id.is_none() {
                 header.observability.worker_incidents = header
                     .observability
                     .worker_incidents

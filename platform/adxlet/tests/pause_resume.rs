@@ -37,6 +37,8 @@ struct Backend {
     fail_prepare: Mutex<bool>,
     fail_abort: Mutex<bool>,
     fail_remove: Mutex<bool>,
+    remove_then_timeout: Mutex<bool>,
+    observed_failure: Mutex<Option<adx_core::RuntimeFailure>>,
     checkpoint_leaves_running: Mutex<bool>,
     workload_request: Mutex<Option<String>>,
     workload_deadline_unix_millis: Mutex<Option<u64>>,
@@ -98,12 +100,21 @@ impl RuntimeDriver for Backend {
     async fn is_running(&self, id: &str) -> Result<bool> {
         Ok(self.running.lock().unwrap().contains(id))
     }
+    async fn observe(&self, id: &str) -> Result<adxlet::RuntimeStatus> {
+        Ok(adxlet::RuntimeStatus {
+            running: self.running.lock().unwrap().contains(id),
+            failure: self.observed_failure.lock().unwrap().clone(),
+        })
+    }
     async fn remove(&self, id: &str) -> Result<()> {
         self.event("remove");
         if *self.fail_remove.lock().unwrap() {
             return Err(Error::Unavailable("delete outcome unknown".into()));
         }
         self.running.lock().unwrap().remove(id);
+        if *self.remove_then_timeout.lock().unwrap() {
+            return Err(Error::Unavailable("remove succeeded but reply lost".into()));
+        }
         Ok(())
     }
     async fn checkpoint_supported(&self, _: &str) -> Result<()> {
@@ -2552,4 +2563,80 @@ async fn workload_ack_failure_does_not_repeat_capture() {
 #[tokio::test]
 async fn workload_replayed_notification_cannot_extend_original_deadline() {
     workload_retry_case(WorkloadRetryFailure::ExpiredBudget).await;
+}
+
+#[tokio::test]
+async fn reload_uncertain_cleanup_retains_intent() {
+    let (_temp, backend, node, spec, assignment) = fixture();
+    let handle = node.environment(spec, assignment).unwrap();
+    let created = handle.create().await.unwrap();
+    let paused = handle.pause(pause(created.record.revision)).await.unwrap();
+    let running = handle.resume(resume(paused.record.revision)).await.unwrap();
+    *backend.remove_then_timeout.lock().unwrap() = true;
+    assert!(handle
+        .reload("review-reload".into(), running.record.revision)
+        .await
+        .is_err());
+    assert!(!backend
+        .running
+        .lock()
+        .unwrap()
+        .contains(&running.record.runtime.id));
+    {
+        let committed = backend.committed_records.lock().unwrap();
+        let published = &committed[&running.record.spec.id];
+        assert_eq!(published.state, EnvironmentState::Running);
+        assert!(
+            published
+                .observation
+                .as_ref()
+                .and_then(|o| o.intent)
+                .is_some(),
+            "uncertain normal stop was published as Running without normal-operation intent"
+        );
+    }
+    *backend.remove_then_timeout.lock().unwrap() = false;
+    handle.tick().await.unwrap();
+    let committed = backend.committed_records.lock().unwrap();
+    let published = &committed[&running.record.spec.id];
+    assert_eq!(published.state, EnvironmentState::Failed);
+    assert!(published
+        .observation
+        .as_ref()
+        .unwrap()
+        .interruption
+        .is_none());
+}
+
+#[tokio::test]
+async fn reload_uncertain_cleanup_does_not_hide_independent_oom() {
+    let (_temp, backend, node, spec, assignment) = fixture();
+    let handle = node.environment(spec, assignment).unwrap();
+    let created = handle.create().await.unwrap();
+    let paused = handle.pause(pause(created.record.revision)).await.unwrap();
+    let running = handle.resume(resume(paused.record.revision)).await.unwrap();
+    *backend.fail_remove.lock().unwrap() = true;
+    assert!(handle
+        .reload("reload-oom".into(), running.record.revision)
+        .await
+        .is_err());
+    backend.running.lock().unwrap().clear();
+    *backend.observed_failure.lock().unwrap() = Some(adx_core::RuntimeFailure {
+        reason: adx_core::RuntimeFailureReason::OomKilled,
+        exit_code: Some(137),
+        message: "backend confirmed OOM".into(),
+        probe_failure: None,
+    });
+    *backend.fail_remove.lock().unwrap() = false;
+    handle.tick().await.unwrap();
+    let committed = backend.committed_records.lock().unwrap();
+    let observation = committed[&running.record.spec.id]
+        .observation
+        .as_ref()
+        .unwrap();
+    assert!(observation.intent.is_none());
+    assert_eq!(
+        observation.interruption.as_ref().unwrap().reason,
+        adx_core::observation::InterruptionReason::Oom
+    );
 }

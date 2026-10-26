@@ -106,6 +106,7 @@ pub struct NodeSession {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredNode {
+    /// Incident for the current unavailable period; cleared when routable again.
     #[serde(default)]
     pub last_incident_id: Option<String>,
     pub node: Node,
@@ -152,6 +153,14 @@ pub struct StoredEnvironment {
     pub spec: EnvironmentSpec,
     pub assignment: Assignment,
     pub result: Option<EnvironmentRecord>,
+}
+
+/// The accepted result and the complete environment confirmed by the same CAS/read.
+/// Deleted environments have no retained record, including receipt replays.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommittedEnvironment {
+    pub result: EnvironmentRecord,
+    pub stored: Option<StoredEnvironment>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1055,9 +1064,15 @@ impl Session {
                 node.available = false;
             }
             let record = StoredNode {
-                last_incident_id: previous
-                    .as_ref()
-                    .and_then(|node| node.last_incident_id.clone()),
+                // Reconciliation heartbeats keep the active outage. A confirmed
+                // routable registration closes it, even within the same process.
+                last_incident_id: if session.as_ref().is_some_and(|s| s.routable) {
+                    None
+                } else {
+                    previous
+                        .as_ref()
+                        .and_then(|node| node.last_incident_id.clone())
+                },
                 node: node.clone(),
                 shard_id: shard,
                 address: address.clone(),
@@ -1283,6 +1298,15 @@ impl Session {
     /// One result write: state and the route publication cursor change atomically.
     /// Identical replay is idempotent; older versions never roll state backward.
     pub async fn commit(&self, result: EnvironmentRecord) -> Result<EnvironmentRecord> {
+        Ok(self.commit_with_state(result).await?.result)
+    }
+
+    /// Commit a result and return its authoritative summaries without a follow-up read.
+    /// Replay returns the stored record; deletion returns only the accepted result.
+    pub async fn commit_with_state(
+        &self,
+        result: EnvironmentRecord,
+    ) -> Result<CommittedEnvironment> {
         if let Some(source) = &result.snapshot_source {
             let snapshot = self
                 .get_snapshot(result.spec.snapshot_id.as_deref().ok_or(Error::Conflict)?)
@@ -1307,7 +1331,10 @@ impl Session {
             let Some(environment_value) = environment_value.as_deref() else {
                 if result.state == EnvironmentState::Deleted {
                     return match self.store.deleted_receipt(&result.spec.id).await? {
-                        Some(receipt) if receipt.matches(&result)? => Ok(result),
+                        Some(receipt) if receipt.matches(&result)? => Ok(CommittedEnvironment {
+                            result,
+                            stored: None,
+                        }),
                         Some(_) => Err(Error::Conflict),
                         None => Err(Error::NotFound),
                     };
@@ -1318,7 +1345,10 @@ impl Session {
             if !(next_result(&stored_environment, &result)?
                 || result.state == EnvironmentState::Running && stored_environment.resume.is_some())
             {
-                return Ok(result);
+                return Ok(CommittedEnvironment {
+                    result,
+                    stored: Some(stored_environment),
+                });
             }
             if result.state != EnvironmentState::Paused {
                 stored_environment.resume = None;
@@ -1369,7 +1399,9 @@ impl Session {
             };
             if applied {
                 stored_environment.log_observation_change(previous_observation.as_ref());
-                return Ok(result);
+                let stored =
+                    (result.state != EnvironmentState::Deleted).then_some(stored_environment);
+                return Ok(CommittedEnvironment { result, stored });
             }
         }
         Err(Error::Unavailable(

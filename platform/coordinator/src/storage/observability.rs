@@ -143,18 +143,32 @@ impl StoredEnvironment {
                 .last_interruption
                 .as_ref()
                 .is_none_or(|last| last.evidence.event_id != evidence.event_id)
+                && self
+                    .result
+                    .as_ref()
+                    .and_then(|r| r.observation.as_ref())
+                    .and_then(|o| o.interruption.as_ref())
+                    != Some(evidence)
             {
-                // Only the prior authoritative Running execution can introduce a loss.
-                // The evidence may accompany a later successful recovery result.
-                let previous = self.result.as_ref().ok_or(Error::Conflict)?;
-                if previous.state != EnvironmentState::Running
-                    || previous.runtime.id != evidence.runtime_id
-                    || previous.assignment.generation != evidence.assignment_generation
-                    || previous.assignment.node_id != evidence.worker_id
+                if self.assignment.generation != evidence.assignment_generation
+                    || self.assignment.node_id != evidence.worker_id
                 {
                     return Err(Error::Conflict);
                 }
-                self.record_interruption(evidence.clone(), None, counters)?;
+                // An execution may exit before its first Running publication reaches
+                // either Coordinator or the journal. Settle that lifecycle result,
+                // retaining evidence without counting a pre-availability interruption.
+                // Repeated evidence is recognized from the previous record above.
+                if let Some(previous) = self
+                    .result
+                    .as_ref()
+                    .filter(|r| r.state == EnvironmentState::Running)
+                {
+                    if previous.runtime.id != evidence.runtime_id {
+                        return Err(Error::Conflict);
+                    }
+                    self.record_interruption(evidence.clone(), None, counters)?;
+                }
             }
         }
         self.observe_recovery(next, counters, now)

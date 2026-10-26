@@ -449,3 +449,194 @@ async fn old_records_do_not_backfill_results_and_redis_reset_changes_coverage_st
     assert!(reset.started_at_unix_millis > started);
     assert_eq!(reset.creations, [0, 0, 0]);
 }
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn unpublished_running_exit_does_not_block_terminal_commit() {
+    use adx_core::observation::{ExecutionObservation, InterruptionReason};
+    let rig = common::Redis::new().await;
+    let session = rig.store().await.begin(1).await.unwrap();
+    register(&session, "node").await;
+    let assignment = Assignment {
+        environment_id: "unpublished".into(),
+        node_id: "node".into(),
+        shard_id: 0,
+        generation: 1,
+        devices: vec![],
+    };
+    session
+        .reserve(spec("unpublished"), assignment.clone())
+        .await
+        .unwrap();
+    // The first Running publication was cancelled before journal persistence.
+    let mut record = running(spec("unpublished"), assignment);
+    let evidence = interruption(&record, InterruptionReason::RuntimeExit);
+    record.state = EnvironmentState::Failed;
+    record.revision += 1;
+    record.resources_held = false;
+    record.runtime.ip = None;
+    record.observation = Some(ExecutionObservation {
+        interruption: Some(evidence),
+        ..Default::default()
+    });
+    let result = session.commit(record.clone()).await;
+    assert!(
+        result.is_ok(),
+        "a real terminal result must settle the reservation, got {result:?}"
+    );
+    assert_eq!(
+        session.business_counters().await.unwrap().creations,
+        [0, 1, 0]
+    );
+    session.commit(record.clone()).await.unwrap();
+    record.revision += 1;
+    session.commit(record).await.unwrap();
+    assert_eq!(
+        session.business_counters().await.unwrap().interruptions,
+        [[0; 7]; 4]
+    );
+    assert!(session
+        .get("unpublished")
+        .await
+        .unwrap()
+        .last_interruption
+        .is_none());
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn rejoined_same_process_counts_second_node_incident() {
+    let rig = common::Redis::new().await;
+    let session = rig.store().await.begin(1).await.unwrap();
+    for sequence in [1, 10] {
+        session
+            .register_session(
+                node("node"),
+                "node:9000".into(),
+                "node:9001".into(),
+                Some(adx_coordinator::storage::NodeSession {
+                    id: "same-process".into(),
+                    sequence,
+                    routable: true,
+                }),
+            )
+            .await
+            .unwrap();
+        let id = format!("round-{sequence}");
+        let assignment = Assignment {
+            environment_id: id.clone(),
+            node_id: "node".into(),
+            shard_id: 0,
+            generation: sequence,
+            devices: vec![],
+        };
+        session
+            .reserve(spec(&id), assignment.clone())
+            .await
+            .unwrap();
+        session
+            .commit(running(spec(&id), assignment))
+            .await
+            .unwrap();
+        session
+            .invalidate_node("node", "same-process")
+            .await
+            .unwrap();
+        // A replay of the same loss is still idempotent.
+        session
+            .invalidate_node("node", "same-process")
+            .await
+            .unwrap();
+        session
+            .register_session(
+                node("node"),
+                "node:9000".into(),
+                "node:9001".into(),
+                Some(adx_coordinator::storage::NodeSession {
+                    id: "same-process".into(),
+                    sequence: sequence + 1,
+                    routable: false,
+                }),
+            )
+            .await
+            .unwrap();
+        session
+            .invalidate_node("node", "same-process")
+            .await
+            .unwrap();
+    }
+    let counters = session.business_counters().await.unwrap();
+    assert_eq!(counters.interruptions[2][4], 2);
+    assert_eq!(
+        counters.worker_incidents, 2,
+        "a new loss after reconciliation is a second incident"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn committed_state_includes_atomic_summaries_and_delete_replay() {
+    use adx_core::observation::{ExecutionObservation, InterruptionReason};
+    let rig = common::Redis::new().await;
+    let session = rig.store().await.begin(1).await.unwrap();
+    register(&session, "node").await;
+    let assignment = Assignment {
+        environment_id: "commit-state".into(),
+        node_id: "node".into(),
+        shard_id: 0,
+        generation: 1,
+        devices: vec![],
+    };
+    session
+        .reserve(spec("commit-state"), assignment.clone())
+        .await
+        .unwrap();
+    let mut record = running(spec("commit-state"), assignment);
+    let created = session.commit_with_state(record.clone()).await.unwrap();
+    let stored = created.stored.unwrap();
+    assert_eq!(
+        stored.creation.as_ref().unwrap().result,
+        adx_coordinator::storage::CreationResult::Success
+    );
+    assert_eq!(stored, session.get("commit-state").await.unwrap());
+    assert_eq!(
+        session
+            .commit_with_state(record.clone())
+            .await
+            .unwrap()
+            .stored,
+        Some(stored)
+    );
+    let evidence = interruption(&record, InterruptionReason::Oom);
+    record.state = EnvironmentState::Failed;
+    record.resources_held = false;
+    record.runtime.ip = None;
+    record.revision += 1;
+    record.observation = Some(ExecutionObservation {
+        interruption: Some(evidence.clone()),
+        ..Default::default()
+    });
+    let failed = session.commit_with_state(record.clone()).await.unwrap();
+    let stored = failed.stored.unwrap();
+    assert_eq!(
+        stored.last_interruption.as_ref().unwrap().evidence,
+        evidence
+    );
+    assert!(stored.failed_since_unix_seconds.is_some());
+    assert_eq!(stored, session.get("commit-state").await.unwrap());
+    assert_eq!(
+        session
+            .commit_with_state(record.clone())
+            .await
+            .unwrap()
+            .stored,
+        Some(stored)
+    );
+    record.state = EnvironmentState::Deleted;
+    record.revision += 1;
+    for _ in 0..2 {
+        let deleted = session.commit_with_state(record.clone()).await.unwrap();
+        assert_eq!(deleted.result, record);
+        assert!(deleted.stored.is_none());
+    }
+}

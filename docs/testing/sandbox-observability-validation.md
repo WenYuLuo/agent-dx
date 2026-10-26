@@ -5,6 +5,25 @@
 本记录描述本地验证，不表示测试或生产集群已部署。
 指标口径见 [Sandbox 指标合同](sandbox-observability.md)。
 
+## PR #125 复核修复验证
+
+基于 `c8f5091` 加本次复核修复，2026-10-26 在独立 worktree 验证：
+
+- 真实 Redis 存储：62 passed，覆盖未发布 Running 后终态归并、同进程重连后第二次事故、
+  reconciliation 期间回放去重，以及 CAS 返回完整摘要和删除回放。
+- adxlet：139 passed（journal 6、lifecycle 39、pause_resume 54、reconciliation 40），
+  覆盖 reload 清理结果不确定时保留意图、后续确认缺失、重连归并和独立 OOM 不被屏蔽。
+- mTLS RPC：串行 33 passed，另有 ignored lib 2、background_traces 1 passed。
+  默认并行首轮有 Redis 写暂停故障注入超时、Coordinator 启动等待超时各 1 项；
+  配置相同证书串行复测全部通过，保留首轮失败日志。
+- `make rust-check JOBS=2 ADX_WITH_AFS=0`、文档检查和 diff 检查通过。
+- native Prometheus：Coordinator/API Server 各 1 项实际采集及查询通过。
+
+三项原始行为缺陷先通过失败断言复现，再加入正式回归测试。共享 Cargo 缓存曾命中其他
+worktree 的旧类型产物；最终验证使用独立缓存，未清理共享缓存。日志与采集证据位于
+`out/observability/review-fixes/`。本次未重跑完整 Docker E2E，未部署测试或生产集群；
+下文端到端结果及外部 sandboxd 已知失败仍来自初版验证。
+
 ## 组件与采集
 
 | 检查 | 结果 |

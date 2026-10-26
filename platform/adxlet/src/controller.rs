@@ -982,7 +982,7 @@ impl Controller {
             if let Some(status) = observation {
                 self.record.failure = status.failure;
             }
-            if lost_running {
+            if lost_running && !self.intended_execution_absence() {
                 self.mark_interruption(adx_core::observation::EvidenceSource::Reconcile)?;
             }
             self.cleanup().await?;

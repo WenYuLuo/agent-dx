@@ -53,7 +53,7 @@ unknown、失败和取消不进入成功耗时样本；后续确认成功不补�
 | `adx_environment_create_oldest_wait_seconds` | gauge/秒 | 新增 state=queued、starting；任一起点未知时该状态年龄样本缺失 | Coordinator 当前目录 |
 | `adx_environment_create_wait_age_unknown` | gauge/env | 新增 state=queued、starting；起点缺失/无效的数量 | Coordinator 当前目录 |
 | `adx_environment_interruptions_total` | counter/执行中断 | 新增 reason、runtime_class；同一次执行不重复计数 | Coordinator 接收证据/判定节点失联 |
-| `adx_worker_incidents_total` | counter/节点事故 | 新增 reason=node_unreachable；同 worker session 只计一次 | Coordinator 节点所有权失效 |
+| `adx_worker_incidents_total` | counter/节点事故 | 新增 reason=node_unreachable；同一次失联周期只计一次，恢复可路由后再次失联另计 | Coordinator 节点所有权失效 |
 | `adx_environment_recovery_results_total` | counter/恢复裁定 | 新增 result=recovered、unrecoverable、closed_by_user | Coordinator 与 env 结果同 Redis CAS |
 | `adx_environment_unrecovered` | gauge/env | 新增 state=waiting、recovering、unrecoverable；当前保留摘要 | Coordinator 当前目录 |
 | `adx_environment_operation_unknown` | gauge/env | 新增；操作意图已发布、节点随后失联的当前对象 | Coordinator 当前目录 |
@@ -104,10 +104,13 @@ worker_id、reason、evidence_source、exit_code、detail（UTF-8 最多 4096 by
 occurred_at_unix_millis、recovery_state、recovery_kind、recovery_worker_id、recovery_runtime_id、
 resolved_at_unix_millis。无法知道准确发生时间时 occurred_at 为 null，检测时间始终保留。
 event_id 按旧执行的 generation/runtime 固定，与 environment_id 一起关联；节点 incident_id
-按 worker/session 固定。原始 failure 可在恢复时清除，中断证据与最近摘要保留。
+按 worker/session/失联起始控制 revision 固定。原始 failure 可在恢复时清除，中断证据与最近摘要保留。
 
 控制 header 新增 `observability` 累计数及统计覆盖起点；`StoredNode.last_incident_id`
-用于节点事件回放去重。结果、最近摘要与累计数在现有 fenced CAS/Lua 内一起提交。
+用于当前失联周期的事件回放去重，重新确认可路由后清除；仅重连但仍在 reconciliation 的心跳
+不结束该失联周期。结果、最近摘要与累计数在现有 fenced CAS/Lua 内一起提交。
+提交直接返回本次确认的完整 StoredEnvironment，同步 Coordinator 内存目录无需再次读取 Redis；
+删除及删除回放只返回结果，不恢复已删除记录。
 日志在提交成功后输出 `environment_interrupted`、`environment_recovery_resolved`，用于关联排障；
 日志不作为完整历史影响账本。
 
@@ -122,9 +125,13 @@ adxlet 在清理旧 runtime 或启动替代执行前，将旧执行身份和异�
 该字段经现有 EnvironmentRecord 协议和持久化提交链路传递；快速恢复可直接发布新的 Running，
 Coordinator 仍根据旧执行证据计一次中断、一次恢复。发布失败时保留证据，按原有 journal/提交
 重试链路重放；重复 Running/Failed 提交不会重复计量。
+若首次 Running 发布在写入 journal 前被取消，随后退出仍能提交终态并裁定创建结果。
+首次权威 Running 前的退出证据保留在 result.observation，不计运行期中断；证据重放不会补计。
 
 reload/delete/pause 在停止执行前，先向 Coordinator 发布当前执行的 `observation.intent`。
-不能确认意图发布时不能继续主动停止；中止且仍为 Running 时清除意图并再次发布。
+不能确认意图发布时不能继续主动停止；只有尚未进入清理的中止才清除意图并再次发布。
+清理已开始而结果不确定时保留意图；后续仅确认执行缺失属于正常停止的结果归并，
+不据此产生运行中断。独立 OOM、退出或探针失败证据仍按异常处理。
 节点失联时，已有正常操作意图的对象进入 operation_unknown 视图，不据此判为非预期中断或健康。
 独立 backend/probe/reconcile 确认的真实异常仍携带事件证据，并清除正常意图。
 

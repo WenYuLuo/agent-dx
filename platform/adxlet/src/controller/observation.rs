@@ -5,6 +5,18 @@ use adx_core::observation::{
 };
 
 impl Controller {
+    pub(super) fn intended_execution_absence(&self) -> bool {
+        self.record
+            .observation
+            .as_ref()
+            .is_some_and(|o| o.intent.is_some())
+            && self
+                .record
+                .failure
+                .as_ref()
+                .is_none_or(|failure| failure.reason == adx_core::RuntimeFailureReason::Missing)
+    }
+
     pub(super) fn mark_interruption(&mut self, source: EvidenceSource) -> Result<()> {
         if self.record.state != EnvironmentState::Running {
             return Ok(());
@@ -68,6 +80,9 @@ impl Controller {
     }
     pub(super) async fn clear_operation_intent(&mut self) -> Result<()> {
         if self.record.state == EnvironmentState::Running
+            && !self
+                .cleanup_pending
+                .load(std::sync::atomic::Ordering::Acquire)
             && self
                 .record
                 .observation
