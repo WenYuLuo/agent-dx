@@ -970,6 +970,7 @@ impl CoordinatorRpc {
         match state.session.get(id).await {
             Ok(stored) if stored.result.is_some() => {
                 state.accept_stored_claim(stored).map_err(status)?;
+                self.0.changed.notify_waiters();
                 return Ok(());
             }
             Ok(_) | Err(Error::NotFound) => (),

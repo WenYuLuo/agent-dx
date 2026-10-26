@@ -177,4 +177,23 @@ async fn publication_race(action: &str) {
             .contains_key(&spec.id),
         "published execution must retain its scheduling reservation"
     );
+    drop(state);
+    if action == "retry" {
+        // A publication whose reply was lost is first discovered by retry.
+        rpc.0
+            .state
+            .lock()
+            .await
+            .environments
+            .get_mut(&spec.id)
+            .unwrap()
+            .result = None;
+        let changed = rpc.0.changed.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        rpc.retry_initial(&spec.id, &assignment).await.unwrap();
+        tokio::time::timeout(Duration::from_millis(100), changed)
+            .await
+            .expect("observed success must wake a create waiting for node readiness");
+    }
 }
