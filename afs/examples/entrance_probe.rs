@@ -1,7 +1,7 @@
 //! Diagnostic only. Same Backend behind unmodified AFS FUSE and USRBIO frontends.
 use afs::node::{
     api::local::{LocalApiOptions, serve_local_api_with_options},
-    fuse::{FuseMountOptions, mount_dfs_with_options},
+    fuse::{FuseMountOptions, mount_dfs_with_fd_bridge},
     storage::Storage,
     vfs::{Backend, types::*},
 };
@@ -262,13 +262,14 @@ async fn main() -> Result<(), Any> {
             },
         )
         .await?;
-        let mount = mount_dfs_with_options(
+        let mount = mount_dfs_with_fd_bridge(
             b.clone(),
             &root.join("mnt"),
             FuseMountOptions {
                 dfs_fuse_keep_cache: false,
                 ..Default::default()
             },
+            server.fd_bridge().ok_or("missing fd bridge")?,
         )?;
         println!("{}", json!({"ready":true,"pid":std::process::id()}));
         while !root.join("stop").exists() {
@@ -382,58 +383,122 @@ async fn main() -> Result<(), Any> {
             "{}",
             json!({"setup_s":setup_s,"io_s":io_s,"sync_s":sync_s,"total_s":setup_s+io_s,"cpu_s":cpu()-c0,"rings":workers})
         );
-    } else if mode == "sdk" {
+    } else if mode == "sdk" || mode == "sdk_fd" {
         let client =
             DfsLocalClient::connect(DfsLocalClientConfig::new(root.join("node.sock"))).await?;
-        let file = client
-            .open(
-                "/data.bin",
-                if write {
-                    DfsAccess::ReadWrite
-                } else {
-                    DfsAccess::ReadOnly
-                },
+        use std::os::fd::AsFd;
+        let posix = if mode == "sdk_fd" {
+            Some(
+                OpenOptions::new()
+                    .read(true)
+                    .write(write)
+                    .open(root.join("mnt/data.bin"))?,
             )
-            .await?;
+        } else {
+            None
+        };
+        let file = if posix.is_none() {
+            Some(
+                client
+                    .open(
+                        "/data.bin",
+                        if write {
+                            DfsAccess::ReadWrite
+                        } else {
+                            DfsAccess::ReadOnly
+                        },
+                    )
+                    .await?,
+            )
+        } else {
+            None
+        };
         let mut iov = client.create_iov(block, q as u32).await?;
         let mut ring = client.create_ring(&iov, 128, 0, 30000).await?;
-        let reg = client.register_file(&file).await?;
+        let mut imported = if let Some(posix) = &posix {
+            Some(client.register_fd(posix.as_fd()).await?)
+        } else {
+            None
+        };
+        let reg = if let Some(imported) = &imported {
+            imported.registration().clone()
+        } else {
+            client
+                .register_file(file.as_ref().ok_or("missing path handle")?)
+                .await?
+        };
         let setup_s = setup.elapsed().as_secs_f64();
-        t = Instant::now();
-        for base in (0..n).step_by(block * q) {
-            let end = (base + block * q).min(n);
-            if write {
-                let items: Vec<_> = input[base..end]
-                    .chunks(block)
-                    .enumerate()
-                    .map(|(j, s)| ((base + j * block) as u64, s))
-                    .collect();
-                let sizes = ring.write_batch(&mut iov, &reg, &items).await?;
-                assert!(sizes.iter().all(|s| *s == block));
-            } else {
-                let mut items: Vec<_> = output[base..end]
-                    .chunks_mut(block)
-                    .enumerate()
-                    .map(|(j, s)| ((base + j * block) as u64, s))
-                    .collect();
-                let sizes = ring.read_batch(&mut iov, &reg, &mut items).await?;
-                assert!(sizes.iter().all(|s| *s == block));
+        let passes: usize = a
+            .get(8)
+            .map(|value| value.parse())
+            .transpose()?
+            .unwrap_or(1);
+        assert!((1..=3).contains(&passes));
+        let mut pass_io_s = Vec::new();
+        for _ in 0..passes {
+            let pass_start = Instant::now();
+            for base in (0..n).step_by(block * q) {
+                let end = (base + block * q).min(n);
+                if write {
+                    let items: Vec<_> = input[base..end]
+                        .chunks(block)
+                        .enumerate()
+                        .map(|(j, s)| ((base + j * block) as u64, s))
+                        .collect();
+                    let sizes = ring.write_batch(&mut iov, &reg, &items).await?;
+                    assert!(sizes.iter().all(|s| *s == block));
+                } else {
+                    let mut items: Vec<_> = output[base..end]
+                        .chunks_mut(block)
+                        .enumerate()
+                        .map(|(j, s)| ((base + j * block) as u64, s))
+                        .collect();
+                    let sizes = ring.read_batch(&mut iov, &reg, &mut items).await?;
+                    assert!(sizes.iter().all(|s| *s == block));
+                }
+            }
+            pass_io_s.push(pass_start.elapsed().as_secs_f64());
+            if !write && !null {
+                assert_eq!(&*output, input, "FULL BYTE MISMATCH");
             }
         }
-        io_s = t.elapsed().as_secs_f64();
+        let first_io_s = pass_io_s[0];
+        let steady_io_s = if passes > 1 {
+            pass_io_s[1..].iter().sum::<f64>() / (passes - 1) as f64
+        } else {
+            first_io_s
+        };
+        io_s = steady_io_s;
+        let all_io_s = pass_io_s.iter().sum::<f64>();
         let s = Instant::now();
         if write {
-            client.sync(&file.handle, DfsSyncMode::Full).await?;
+            if let Some(imported) = &imported {
+                imported.sync_all().await?;
+            } else {
+                client
+                    .sync(
+                        &file.as_ref().ok_or("missing handle")?.handle,
+                        DfsSyncMode::Full,
+                    )
+                    .await?;
+            }
         }
         sync_s = s.elapsed().as_secs_f64();
-        println!(
-            "{}",
-            json!({"setup_s":setup_s,"io_s":io_s,"sync_s":sync_s,"total_s":setup_s+io_s+sync_s,"cpu_s":cpu()-c0,"free_blocks":iov.free_blocks()})
-        );
-        client.unregister_file(reg).await?;
-        client.close(file.handle).await?;
+        let cleanup_start = Instant::now();
+        if let Some(imported) = &mut imported {
+            client.unregister_fd(imported).await?;
+        } else {
+            client.unregister_file(reg).await?;
+            client.close(file.ok_or("missing handle")?.handle).await?;
+        }
         ring.destroy().await?;
         iov.destroy().await?;
+        drop(posix);
+        let cleanup_s = cleanup_start.elapsed().as_secs_f64();
+        println!(
+            "{}",
+            json!({"setup_s":setup_s,"io_s":io_s,"sync_s":sync_s,"cleanup_s":cleanup_s,"total_s":setup.elapsed().as_secs_f64(),"io_total_s":all_io_s,"first_io_s":first_io_s,"steady_io_s":steady_io_s,"pass_io_s":pass_io_s,"passes":passes,"cpu_s":cpu()-c0})
+        );
     } else if mode == "native" {
         let client = native::DfsLocalClient::connect(native::DfsLocalClientConfig::new(
             root.join("node.sock"),
@@ -543,7 +608,7 @@ async fn main() -> Result<(), Any> {
             json!({"setup_s":setup_s,"io_s":io_s,"sync_s":sync_s,"total_s":setup_s+io_s+sync_s,"cpu_s":cpu()-c0})
         );
     }
-    if !write && !null {
+    if !write && !null && mode != "sdk" && mode != "sdk_fd" {
         assert_eq!(&*output, input, "FULL BYTE MISMATCH");
     }
     println!(

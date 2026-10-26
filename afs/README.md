@@ -209,3 +209,22 @@ ADX 进程不强制替换。S3 原窗口和预算独立保持，不新增正文 
 具体一致性、未知提交、一次复制范围、ENOMEM/OOM和验证边界见
 [架构](../docs/architecture/afs.md#dfs-原生写正文所有权)、[配置](../docs/deployment/afs.md#原生写-buffer-与-node-allocator)
 与[测试](../docs/testing/afs.md#原生写-buffer-验证)。减少复制不自动等于性能达标。
+
+## POSIX fd 接入本机 USRBIO
+
+主示例是 [usrbio_round_trip](client/examples/usrbio_round_trip.rs)：普通 POSIX create/open
+取得 fd，SDK `register_fd(file.as_fd())` 导入原打开对象，数据走持久 IOV/SQ/CQ；
+读写完成后对原对象 fsync、`unregister_fd`，再用 POSIX 读回/关闭。路径参数是完整挂载路径。
+
+```sh
+cargo run -p afs-client --example usrbio_round_trip -- /run/afs/node.sock /mnt/afs/data.bin
+```
+
+同机 owner-only、DFS 普通文件、顺序交接是首版边界；SDK 数据阶段不能同时使用 POSIX
+数据 IO/mmap 或修改 fd 状态标志，注销失败不能当作已经交回缓存。原 fd 关闭后可用注册对象的 `sync_all`
+同步保留副本。O_APPEND/O_PATH、其他文件系统或错误 Node fd 明确失败。
+[usrbio_path_round_trip](client/examples/usrbio_path_round_trip.rs) 保留 SDK `open(path)`
+便利方式，它会单独打开路径；不等同于导入原 fd。更多生命周期与缓存边界见
+[架构](../docs/architecture/afs.md#本机-sdk-usrbio-数据面)。
+
+本轮 Linux 功能、门禁和五轮保护结果见[fd 接入验收记录](../docs/testing/2026-10-26-usrbio-posix-fd.md)。

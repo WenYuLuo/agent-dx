@@ -1639,6 +1639,7 @@ impl DfsLocalClient {
             timeout_ms,
             doorbell: Some(doorbell_grant),
             completion: Some(completion_grant),
+            fd_session_key: Vec::new(),
         });
         let mut client = self.inner.clone();
         let response =

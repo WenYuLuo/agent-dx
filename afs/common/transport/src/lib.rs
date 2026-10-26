@@ -22,6 +22,8 @@ pub mod rdma;
 pub mod ring;
 #[cfg(feature = "shm")]
 pub mod shm;
+#[cfg(all(feature = "shm", target_os = "linux"))]
+pub mod usrbio_fd;
 
 #[cfg(feature = "grpc")]
 pub use error::GrpcError;
