@@ -9,6 +9,7 @@ pub struct LocalReservation {
     pub devices: Vec<DeviceAllocation>,
 }
 pub(crate) struct LocalHold {
+    pub request_id: String,
     pub spec: EnvironmentSpec,
     pub token: String,
     pub devices: Vec<DeviceAllocation>,
@@ -31,7 +32,6 @@ impl Adxlet {
             .environments
             .lock()
             .expect("shared state lock poisoned");
-        self.ensure_not_cleaning(&spec.id)?;
         if let Some((old, assignment, _)) = environments.get(&spec.id) {
             if old != spec {
                 return Err(Error::Conflict);
@@ -72,6 +72,7 @@ impl Adxlet {
         holds.insert(
             spec.id.clone(),
             LocalHold {
+                request_id: String::new(),
                 spec: spec.clone(),
                 token: token.clone(),
                 devices: devices.clone(),

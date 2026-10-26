@@ -54,6 +54,18 @@ impl Api {
         self: Arc<Self>,
         request: Request<Incoming>,
     ) -> Result<Response<Body>, Infallible> {
+        if request.method() == hyper::Method::POST
+            && percent_encoding::percent_decode_str(request.uri().path())
+                .decode_utf8()
+                .is_ok_and(|path| {
+                    matches!(
+                        path.trim_end_matches('/'),
+                        "/api/environment/v1/environments" | "/api/environment/create"
+                    )
+                })
+        {
+            self.environment_service.creation_metrics.http_request();
+        }
         let trace = trace::Trace::http(
             request.method().as_str(),
             trace::http_route(request.uri().path()),
@@ -111,6 +123,19 @@ impl Api {
         Ok(response)
     }
     async fn handle(self: Arc<Self>, request: Request<Incoming>) -> Response<Body> {
+        let create_route = request.method() == hyper::Method::POST
+            && percent_encoding::percent_decode_str(request.uri().path())
+                .decode_utf8()
+                .is_ok_and(|path| {
+                    matches!(
+                        path.trim_end_matches('/'),
+                        "/api/environment/v1/environments" | "/api/environment/create"
+                    )
+                });
+        let mut rejection = self
+            .environment_service
+            .creation_metrics
+            .rejection_guard(create_route);
         let request_id = RequestContext::from_headers(request.headers()).request_id;
         let api_key = header(&request, "authorization")
             .and_then(|s| s.strip_prefix("Bearer "))
@@ -121,6 +146,7 @@ impl Api {
         let caller = match Box::pin(self.clients.authenticate(api_key)).await {
             Ok(caller) => caller,
             Err(error) => {
+                rejection.status(&error);
                 let status = if matches!(error.code(), Code::Unavailable | Code::DeadlineExceeded) {
                     Status::unavailable("authentication service unavailable")
                 } else {
@@ -330,15 +356,17 @@ impl Api {
                     object.remove("runtime");
                 }
             }
-            let spec = match self
-                .environment_service
-                .prepare_create(input.clone(), &caller)
-            {
+            let spec = match self.environment_service.prepare_create_with_request(
+                input.clone(),
+                &caller,
+                &request_id,
+            ) {
                 Ok(spec) => spec,
                 Err(error) => return error_response(error, &request_id, None, None, false),
             };
+            rejection.accepted();
             if stream && path.ends_with("environments") {
-                return self.create_stream(spec, input, request_id, caller);
+                return self.clone().create_stream(spec, input, request_id, caller);
             }
             let environment_id = spec.id.clone();
             let result =
@@ -473,9 +501,7 @@ impl Api {
                     .boxed_unsync(),
             )
             .expect("static event-stream response is valid");
-        let trace = trace::Trace::child("apiserver.create_stream");
-        let started = Instant::now();
-        tokio::spawn(trace.run(async move {
+        tokio::spawn(trace::with_current_context(async move {
             let accepted = json!({"status":"creating", "requestId":request_id});
             if sender.send(Ok(sse("accepted", accepted))).await.is_err() {
                 return;
@@ -495,15 +521,6 @@ impl Api {
                     }
                 }
             };
-            adx_observability::info!(
-                event = "environment_create_stream_completed",
-                request_id,
-                environment_id = %instance_id,
-                duration_ms = started.elapsed().as_secs_f64() * 1_000.0,
-                succeeded = result.is_ok(),
-                status_code = result.as_ref().err().map_or("OK", |error| error.code().description()),
-                "Environment create stream completed"
-            );
             let final_event = match result {
                 Ok(value) => value,
                 Err(error) => create_error_event(&error, &request_id, &instance_id),
@@ -1236,6 +1253,7 @@ mod error_contract_tests {
     fn instance_view_exposes_record_tenant_without_execution_secrets() {
         let view = instance_view(pb::GetEnvironmentResponse {
             record: Some(pb::EnvironmentRecord {
+                observation: None,
                 execution_artifacts: vec![],
                 snapshot_source: None,
                 spec: Some(pb::EnvironmentSpec {

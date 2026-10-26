@@ -8,6 +8,7 @@ pub use checkpoint::{
     valid_runtime_id, CheckpointArtifact, CompletedOperation, LifecycleKind, RestorePoint,
 };
 pub mod execution;
+pub mod observation;
 pub mod probes;
 pub mod runtime;
 pub mod scheduling;
@@ -313,6 +314,8 @@ pub enum RuntimeFailureReason {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnvironmentRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation: Option<observation::ExecutionObservation>,
     #[serde(default)]
     pub failure: Option<RuntimeFailure>,
     #[serde(default)]

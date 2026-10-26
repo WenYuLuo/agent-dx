@@ -22,11 +22,13 @@ for _ = 1, writes do
   redis.call('HSET', KEYS[1], ARGV[cursor], ARGV[cursor + 1])
   cursor = cursor + 2
 end
+for i = cursor, #ARGV, 2 do redis.call('HSET', KEYS[3], ARGV[i], ARGV[i+1]) end
 return 1
 "#;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalClaim {
+    pub request_id: String,
     pub node_id: String,
     pub node_session_id: String,
     /// Cards already tentatively held by the node's shared Admission ledger.
@@ -86,110 +88,8 @@ impl Session {
         spec: EnvironmentSpec,
         candidate: &LocalClaim,
     ) -> Result<ClaimOutcome> {
-        spec.validate()?;
-        if candidate.node_id.trim().is_empty() || candidate.node_session_id.trim().is_empty() {
-            return Err(Error::Invalid(
-                "claim requires node and process session".into(),
-            ));
-        }
-        validate_device_assignment(&spec.scheduling.devices, &candidate.devices)?;
-        let field = format!("environment:{}", spec.id);
-        for _ in 0..ATTEMPTS {
-            let [header_value, environment_value, node_value] = self
-                .store
-                .fields([
-                    HEADER.into(),
-                    field.clone(),
-                    format!("node:{}", candidate.node_id),
-                ])
-                .await?;
-            let mut header = self.header(&header_value)?;
-            let node: StoredNode = decode(node_value.as_deref().ok_or(Error::NotFound)?)?;
-            if node.node.id != candidate.node_id
-                || node.shard_id >= header.shards
-                || node
-                    .session
-                    .as_ref()
-                    .is_none_or(|s| s.id != candidate.node_session_id)
-            {
-                return Err(Error::Conflict);
-            }
-            if let Some(environment_value) = &environment_value {
-                let existing: StoredEnvironment = decode(environment_value)?;
-                existing.validate()?;
-                if existing.spec != spec {
-                    return Err(Error::Conflict);
-                }
-                if existing.assignment.node_id != candidate.node_id
-                    || existing.result.is_some()
-                    || existing.invalidated
-                    || existing.recovery.is_some()
-                {
-                    return Ok(ClaimOutcome::Existing(existing));
-                }
-                if existing.assignment.devices != candidate.devices {
-                    return Err(Error::Conflict);
-                }
-                claim_admission(&node)?;
-                return Ok(ClaimOutcome::Owned(existing));
-            }
-            claim_admission(&node)?;
-            // Snapshot references are kept in a separate hash and do not bump
-            // the control header. Compare their exact bytes in the same CAS.
-            let snapshot = if let Some(id) = &spec.snapshot_id {
-                let raw = self.snapshot_raw(id).await?.ok_or(Error::NotFound)?;
-                let snapshot: Snapshot = decode(&raw)?;
-                snapshot.validate()?;
-                if snapshot.template.tenant_id != spec.tenant_id
-                    || !snapshot.references.contains(&Reference::Restore {
-                        environment_id: spec.id.clone(),
-                    })
-                {
-                    return Err(Error::Conflict);
-                }
-                Some(raw)
-            } else {
-                None
-            };
-            let generation = header.generation.checked_add(1).ok_or(Error::Conflict)?;
-            let record = StoredEnvironment {
-                resume: None,
-                failed_since_unix_seconds: None,
-                recovery: None,
-                invalidated: false,
-                spec: spec.clone(),
-                result: None,
-                assignment: Assignment {
-                    environment_id: spec.id.clone(),
-                    node_id: candidate.node_id.clone(),
-                    shard_id: node.shard_id,
-                    generation,
-                    devices: candidate.devices.clone(),
-                },
-            };
-            record.validate()?;
-            header.generation = generation;
-            header.advance()?;
-            let mut command = redis::cmd("EVAL");
-            command.arg(r#"
-                if redis.call('HGET', KEYS[1], 'header') ~= ARGV[1] then return 0 end
-                if ARGV[5] ~= '' and redis.call('HGET', KEYS[2], ARGV[5]) ~= ARGV[6] then return 0 end
-                redis.call('HSET', KEYS[1], 'header', ARGV[2], ARGV[3], ARGV[4]); return 1
-            "#)
-                .arg(2).arg(&self.store.key).arg(self.snapshots_key())
-                .arg(header_value.as_deref().ok_or(Error::Conflict)?)
-                .arg(encode(&header)?).arg(&field).arg(encode(&record)?)
-                .arg(spec.snapshot_id.as_deref().unwrap_or(""))
-                .arg(snapshot.as_deref().unwrap_or(""));
-            if self.store.query::<u8>(command).await? == 1 {
-                self.store
-                    .notify_committed_change(header.revision, vec![field]);
-                return Ok(ClaimOutcome::Owned(record));
-            }
-        }
-        Err(Error::Unavailable(
-            "concurrent ownership registration; retry same Environment ID".into(),
-        ))
+        let mut results = self.claim_batch(vec![(spec, candidate.clone())]).await?;
+        results.pop().ok_or(Error::Conflict)?
     }
 
     /// Commit independent local ownership requests with one header CAS. The
@@ -204,6 +104,9 @@ impl Session {
         }
         for (spec, candidate) in &claims {
             spec.validate()?;
+            if candidate.request_id.len() > 256 {
+                return Err(Error::Invalid("request ID too long".into()));
+            }
             if candidate.node_id.trim().is_empty() || candidate.node_session_id.trim().is_empty() {
                 return Err(Error::Invalid(
                     "claim requires node and process session".into(),
@@ -255,10 +158,39 @@ impl Session {
                 snapshots.insert(id.clone(), (raw, snapshot));
             }
 
+            let request_fields: Vec<_> = claims
+                .iter()
+                .filter(|(_, c)| !c.request_id.is_empty())
+                .map(|(s, c)| request_key(&s.tenant_id, &c.request_id))
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            let mut requests: BTreeMap<String, String> = BTreeMap::new();
+            if !request_fields.is_empty() {
+                let mut cmd = redis::cmd("HMGET");
+                cmd.arg(format!("{}:requests", self.store.key))
+                    .arg(&request_fields);
+                let values: Vec<Option<String>> = self.store.query(cmd).await?;
+                for (key, value) in request_fields.iter().cloned().zip(values) {
+                    if let Some(value) = value {
+                        requests.insert(key, value);
+                    }
+                }
+            }
+            let mut request_writes = BTreeMap::new();
             let mut results = Vec::with_capacity(claims.len());
             let mut writes = Vec::new();
             for (spec, candidate) in &claims {
                 let result = (|| {
+                    let binding = (!candidate.request_id.is_empty())
+                        .then(|| request_key(&spec.tenant_id, &candidate.request_id));
+                    if binding
+                        .as_ref()
+                        .and_then(|key| requests.get(key))
+                        .is_some_and(|id| id != &spec.id)
+                    {
+                        return Err(Error::Conflict);
+                    }
                     let node = nodes.get(&candidate.node_id).ok_or(Error::NotFound)?;
                     if node.node.id != candidate.node_id
                         || node.shard_id >= header.shards
@@ -269,7 +201,6 @@ impl Session {
                     {
                         return Err(Error::Conflict);
                     }
-                    claim_admission(node)?;
                     if let Some(existing) = environments.get(&spec.id) {
                         if existing.spec != *spec {
                             return Err(Error::Conflict);
@@ -284,8 +215,10 @@ impl Session {
                         if existing.assignment.devices != candidate.devices {
                             return Err(Error::Conflict);
                         }
+                        claim_admission(node)?;
                         return Ok(ClaimOutcome::Owned(existing.clone()));
                     }
+                    claim_admission(node)?;
                     if let Some(id) = &spec.snapshot_id {
                         let (_, snapshot) = snapshots.get(id).ok_or(Error::NotFound)?;
                         if snapshot.template.tenant_id != spec.tenant_id
@@ -300,6 +233,8 @@ impl Session {
                     header.generation = generation;
                     header.advance()?;
                     let record = StoredEnvironment {
+                        creation: Some(CreationSummary::new(&candidate.request_id)?),
+                        last_interruption: None,
                         resume: None,
                         failed_since_unix_seconds: None,
                         recovery: None,
@@ -315,6 +250,10 @@ impl Session {
                         },
                     };
                     record.validate()?;
+                    if let Some(key) = binding {
+                        requests.insert(key.clone(), spec.id.clone());
+                        request_writes.insert(key, spec.id.clone());
+                    }
                     environments.insert(spec.id.clone(), record.clone());
                     writes.push((
                         format!("environment:{}", spec.id),
@@ -331,9 +270,10 @@ impl Session {
             let mut command = redis::cmd("EVAL");
             command
                 .arg(CLAIM_BATCH)
-                .arg(2)
+                .arg(3)
                 .arg(&self.store.key)
                 .arg(self.snapshots_key())
+                .arg(format!("{}:requests", self.store.key))
                 .arg(&header_value)
                 .arg(writes.len())
                 .arg(snapshot_ids.len());
@@ -343,6 +283,9 @@ impl Session {
             command.arg(encode(&header)?);
             for (field, value, _) in &writes {
                 command.arg(field).arg(value);
+            }
+            for (key, value) in request_writes {
+                command.arg(key).arg(value);
             }
             if self.store.query::<u8>(command).await? == 1 {
                 for (field, _, revision) in writes {

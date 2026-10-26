@@ -115,7 +115,8 @@ fn create_with_options(child: &Path, options: &CreateOptions) -> Result<()> {
         .map_err(unavailable)
 }
 
-#[cfg(test)]
+// These tests exercise the Linux /proc/self/fd descriptor traversal.
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
     use std::fs;

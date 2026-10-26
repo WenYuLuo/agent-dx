@@ -67,7 +67,12 @@ impl<'a> ErrorDetail<'a> {
                 RetryDirective::Never,
                 OperationOutcome::Terminal,
             )
-        } else if probe_failure.is_some() {
+        } else if probe_failure.is_some()
+            || status
+                .metadata()
+                .get("adx-create-terminal")
+                .is_some_and(|value| value == "true")
+        {
             (
                 ErrorCode::Unavailable,
                 RetryDirective::Never,

@@ -59,6 +59,7 @@ async fn network_create_preserves_tenant_session_and_api_key_checks() {
         .with_session("boot-1".into()),
     );
     let backend = Arc::new(Backend {
+        pause_writes_after_remove: Mutex::new(None),
         session: session.clone(),
         started: AtomicUsize::new(0),
         removed: AtomicUsize::new(0),
@@ -233,6 +234,7 @@ async fn create_retries_delivery_and_lost_response_on_the_same_assignment() {
     );
     let backend = Arc::new(SlowBackend(
         Backend {
+            pause_writes_after_remove: Mutex::new(None),
             session: session.clone(),
             started: AtomicUsize::new(0),
             removed: AtomicUsize::new(0),

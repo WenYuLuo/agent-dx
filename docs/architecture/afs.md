@@ -86,6 +86,10 @@ Meta的watch RPC在取数前取得独立响应额度；流式队列有固定槽�
 大场景资源及完整真实产品验收仍未完成，不能宣称持续增长部署已交付。
 配置与当前限制见[部署说明](../deployment/afs.md#meta-操作日志与数据目录)。
 
+Meta WAL 预算枚举与退休回收允许并发：只对 CURRENT 已持久退休、已封存的同名段在枚举后
+被删除的 `NotFound` 跳过计费。仍存在的退休文件继续占用容量，活跃/未知文件丢失、非普通
+文件及其他 IO 错误仍拒绝；不改变 WAL 容量、退休资格、持久顺序或锁外删除策略。
+
 OwnerFs 面向小规模 Agent workspace。Home 节点把 workspace 保存为普通本地目录；远端节点通过受控 peer 回到 Home 访问文件。远端传输会话本身不授予文件访问权限，每次打开、读写、flush、sync 和 close 都必须校验授权、句柄、权限、root grant、session、Home session 和 fence。
 
 DFS 把已提交数据表示为不可变 chunk。普通写入先进入 inode 的 dirty 状态；sync、同步写标志、close-time flush 或后台策略触发提交，形成新的 `FileVersion`。复制发生在文件布局之下，Meta 只在收到可验证持久 receipt 后提交新版本和副本目录。验证缓存不能自动算作持久副本。
@@ -612,6 +616,60 @@ Meta 纯传输断链时，已打开视图的未到期合法范围可读本地 ca
 续租只更新同一归属的有效期，不改动已经冻结、需要按原身份重放的提交请求。
 迟到响应不能覆盖新的归属或缩短有效期，正常关闭且已提交的文件无需继续续租。
 Meta 不可用超过租约期限时仍会拒绝旧写入，不通过复活过期租约绕过隔离。
+
+## 本机 SDK usrbio 数据面
+
+`afs-client` 提供与同机 `afs-node` 直连的批量 IO 数据面。控制面仍是 UDS 上的 gRPC：
+路径便利接口的 open/register/sync、iov 与环生命周期走 RPC，只传身份与布局，从不传正文。
+已有 POSIX fd 的入口走固定版本的 FUSE ioctl：先由 UDS 的实际 peer UID 建立 owner-only
+会话，PROBE 核对 Node，REGISTER 将原 FUSE fh 的 Backend handle/打开上下文/访问位
+绑定到该会话的环；不按路径重开。SDK 保留 CLOEXEC dup，原 fd 关闭或整数复用不改变目标。
+数据面是共享内存：SDK 创建持久 iov（memfd，区块为 4 KiB 到 64 MiB 的 2 的幂）并把
+fd 经 fd broker 一次性交给 node；之后读写把正文放进 iov 区块，通过共享提交/完成环
+（64 字节槽位，Release/Acquire）提交 `(reg_id, offset, iov_offset, len)`，一次操作既没有
+RPC，也没有逐次操作的 fd 传递。提交与完成各有一个跨进程 eventfd 门铃：SDK 提交后敲
+提交门铃唤醒 node 的环 worker，node 每投递一批完成项敲一次完成门铃，SDK 侧用 AsyncFd
+阻塞等待，不做固定间隔轮询。诊断穿刺路径（每次操作一个 memfd 加一次性 fd broker）仍
+保留，与常驻数据面分开，受进程内并发上限约束。
+
+区块归属在协议里固定：结果明确（完成项带字节数或错误码）归还空闲池；已入队后结果
+未知（等待超时、完成项对不上号、future 被外层取消，含部分入队）永久 forfeit，避免
+node 仍在读写的内存被复用；零入队（SQ 满等待超时或等待中被取消）按 Drop 归还，调用
+方可安全重试。环的凑批策略由 `io_depth`
+决定：正数必须攒满这么多提交才处理且不受 `timeout_ms` 约束，负数凑不满时最多等
+`timeout_ms`，零有多少处理多少；必须攒满的目标大于环项数、或绝对值超过 worker 单
+周期执行批量上限（256，`afs_transport::ring::MAX_IO_DEPTH`）时创建即被拒绝，单发接口
+不得用在必须攒满的环上。单条 IO 失败以带原
+`userdata` 的完成项返回，环继续可用；只有控制面错误才让整条环进入不可用状态。
+
+大块批量写在立即消费模式（`io_depth=0`）下，至少8MiB的一波以4MiB为bank分组目标交替复制和
+提交，重叠应用准备后一bank与Node消费前一bank；iov预约数量、写顺序和完成前禁止复用
+的契约不变。小波与必须凑批模式仍整波提交。批量完成按`userdata`唯一匹配并校验返回
+字节数不超过请求；重复、缺失或超长结果视为协议异常并保留整波区块。EOF返回零字节，
+保持调用方未读取区间不变，并回收结果明确的区块。
+
+Node按注册句柄隔离地采样读回调驻留成本。成本的移动平均超过每向上取整MiB的250微秒、Backend声明
+`supports_parallel_reads`且iov区间不重叠时，同一环的连续读可由该Node所有环共用的
+懒创建执行池处理；线程上限为可用CPU数与4的较小值。便宜读保持环worker串行路径，
+不因只读请求就无条件并发；写请求两侧的读组必须join后才继续。每次Backend读仍执行
+原有版本、授权与截止时间检查；没有将共享iov作为未验证数据的私有暂存区。
+
+数据面不改变 DFS 元数据与副本路径：SDK 的路径解析与 FUSE 走同一后端路径，权限与
+目录项语义一致；环内读写只携带注册编号，注册把句柄与调用身份绑定。连接是同机
+owner-only UDS，SDK 身份取 node 实际 uid/gid，越权请求照常失败。环活动计数经
+`RingStats` 与 Prometheus 指标导出，仅用于观察，不参与正确性判断。
+
+已有 fd 采用顺序交接：注册前对可写 fd 执行 POSIX fsync；SDK 数据阶段不与 POSIX 数据 IO/mmap
+重叠，也不修改 fd 状态标志；注册检查实际 dup 的 F_GETFL，拒绝 open 后新增 O_APPEND。
+drain 后对原 fd（或 `DfsRegisteredFd::sync_all` 的保留副本）fsync，显式注销后才交回 POSIX。
+注销先拒绝新执行并等待已经取得执行权的请求，ioctl 回复后再向内核发送数据/属性失效通知，
+避免回调内缓存锁循环；轮询确认完成后才放掉 dup。通知失败保持可重试状态，不能假成功。
+同 inode 的 fd 导入允许多只读或单可写阶段；拒绝 O_APPEND/O_PATH、非本挂载、非本会话的请求。
+旧 reg_id 不复用；取消的操作序号保留墓碑以阻止迟到注册。应用最终 close/进程退出由 FUSE
+release 撤销注册并等待活跃执行，后端打开对象由原 FUSE 路径最终释放一次。
+SDK 活跃导入及待清理任务合计最多 64 个；取消/丢失回复由工作线程和守卫继续负责注销，
+Drop 仅安排有界后台清理，失败持有 fd/配额重试，显式 unregister 才是确认交回的接口。
+这不承诺跨 Node 已打开缓存 fd 的即时一致性或任意 POSIX/SDK 并发混写。
 
 ## OwnerFs workspace bind mount
 

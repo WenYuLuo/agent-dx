@@ -15,6 +15,9 @@ use std::{
 
 #[derive(Default)]
 struct Backend {
+    sampled_runtimes: Mutex<BTreeSet<String>>,
+    checkpoint_commit_failures: Mutex<usize>,
+    workload_ack_failures: Mutex<usize>,
     prepare_ids: Mutex<Vec<String>>,
     prepare_gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
     prepare_entered: tokio::sync::Notify,
@@ -34,6 +37,8 @@ struct Backend {
     fail_prepare: Mutex<bool>,
     fail_abort: Mutex<bool>,
     fail_remove: Mutex<bool>,
+    remove_then_timeout: Mutex<bool>,
+    observed_failure: Mutex<Option<adx_core::RuntimeFailure>>,
     checkpoint_leaves_running: Mutex<bool>,
     workload_request: Mutex<Option<String>>,
     workload_deadline_unix_millis: Mutex<Option<u64>>,
@@ -49,6 +54,14 @@ impl Backend {
 }
 #[async_trait]
 impl RuntimeDriver for Backend {
+    async fn stats(&self, id: &str) -> Result<adxlet::metrics::RuntimeUsage> {
+        self.sampled_runtimes.lock().unwrap().insert(id.into());
+        Ok(adxlet::metrics::RuntimeUsage {
+            cpu_usage_ns: 1_000_000,
+            memory_usage_bytes: 100,
+            memory_limit_bytes: 1024,
+        })
+    }
     fn retains_checkpoint_files(&self, runtime_class: &str) -> bool {
         *self.background_restore.lock().unwrap() || runtime_class != "runsc"
     }
@@ -87,12 +100,21 @@ impl RuntimeDriver for Backend {
     async fn is_running(&self, id: &str) -> Result<bool> {
         Ok(self.running.lock().unwrap().contains(id))
     }
+    async fn observe(&self, id: &str) -> Result<adxlet::RuntimeStatus> {
+        Ok(adxlet::RuntimeStatus {
+            running: self.running.lock().unwrap().contains(id),
+            failure: self.observed_failure.lock().unwrap().clone(),
+        })
+    }
     async fn remove(&self, id: &str) -> Result<()> {
         self.event("remove");
         if *self.fail_remove.lock().unwrap() {
             return Err(Error::Unavailable("delete outcome unknown".into()));
         }
         self.running.lock().unwrap().remove(id);
+        if *self.remove_then_timeout.lock().unwrap() {
+            return Err(Error::Unavailable("remove succeeded but reply lost".into()));
+        }
         Ok(())
     }
     async fn checkpoint_supported(&self, _: &str) -> Result<()> {
@@ -206,6 +228,14 @@ impl CheckpointCooperation for Backend {
         _: &str,
         error: Option<String>,
     ) -> Result<()> {
+        if error.is_none() {
+            let mut failures = self.workload_ack_failures.lock().unwrap();
+            if *failures > 0 {
+                *failures -= 1;
+                self.event("checkpoint-ack-retry");
+                return Err(Error::Unavailable("transient ACK failure".into()));
+            }
+        }
         self.event(if error.is_none() {
             "checkpoint-ack"
         } else {
@@ -267,6 +297,14 @@ impl Routes for Backend {
 impl StateSink for Backend {
     async fn commit(&self, r: &EnvironmentRecord) -> Result<Durability> {
         self.event(&format!("commit:{:?}", r.state));
+        if r.checkpoint.is_some() {
+            let mut failures = self.checkpoint_commit_failures.lock().unwrap();
+            if *failures > 0 {
+                *failures -= 1;
+                self.event("checkpoint-result-retry");
+                return Err(Error::Unavailable("transient result commit failure".into()));
+            }
+        }
         if *self.unavailable_commit.lock().unwrap()
             && self
                 .unavailable_state
@@ -429,9 +467,16 @@ async fn pause_resume_preserves_environment_changes_execution_and_fences_delayed
     let (_temp, backend, node, spec, assignment) = fixture();
     let h = node.environment(spec.clone(), assignment).unwrap();
     let created = h.create().await.unwrap();
+    h.tick().await.unwrap();
+    assert!(node
+        .environment_metrics()
+        .contains("adx_environment_memory_usage_bytes"));
     backend.events.lock().unwrap().clear();
     let paused = h.pause(pause(created.record.revision)).await.unwrap();
     assert_eq!(paused.record.state, EnvironmentState::Paused);
+    assert!(!node
+        .environment_metrics()
+        .contains("adx_environment_memory_usage_bytes"));
     assert!(!paused.record.resources_held);
     assert_eq!(node.used(), Resources::default());
     assert!(
@@ -849,6 +894,22 @@ async fn failover_restores_latest_checkpoint_without_cold_start() {
     let recovered = handle.sync().await.unwrap().record;
     assert_eq!(recovered.state, EnvironmentState::Running);
     assert_ne!(recovered.runtime.id, running.record.runtime.id);
+    let evidence = recovered
+        .observation
+        .as_ref()
+        .unwrap()
+        .interruption
+        .as_ref()
+        .unwrap();
+    assert_eq!(evidence.runtime_id, running.record.runtime.id);
+    assert_eq!(
+        evidence.assignment_generation,
+        running.record.assignment.generation
+    );
+    assert_eq!(
+        backend.committed_records.lock().unwrap()[&recovered.spec.id].observation,
+        recovered.observation
+    );
     assert_eq!(recovered.restart_attempts, running.record.restart_attempts);
     let events = backend.events.lock().unwrap();
     assert_eq!(
@@ -898,6 +959,17 @@ async fn reload_replaces_runtime_from_checkpoint_and_replays_result() {
         .iter()
         .filter(|event| *event == "restore")
         .count();
+    *backend.unavailable_commit.lock().unwrap() = true;
+    assert!(handle
+        .reload("reload-a".into(), running.record.revision)
+        .await
+        .is_err());
+    assert!(backend
+        .running
+        .lock()
+        .unwrap()
+        .contains(&running.record.runtime.id));
+    *backend.unavailable_commit.lock().unwrap() = false;
     let reloaded = handle
         .reload("reload-a".into(), running.record.revision)
         .await
@@ -1339,6 +1411,7 @@ async fn recovery_with_unusable_checkpoint_settles_failed_without_image_start() 
     let (_temp, backend, node, spec, mut assignment) = fixture();
     assignment.generation = 2;
     let record = EnvironmentRecord {
+        observation: None,
         execution_artifacts: vec![],
         snapshot_source: None,
         failure: None,
@@ -1420,6 +1493,7 @@ async fn recovery_retries_publication_without_repeating_backend_restore() {
             .unwrap();
         assignment.generation = 2;
         let seed = EnvironmentRecord {
+            observation: None,
             execution_artifacts: vec![],
             snapshot_source: None,
             failure: None,
@@ -2210,5 +2284,399 @@ async fn runsc_capture_preserves_background_restore_input_without_pinning_new_ca
     assert!(
         !input_path.exists(),
         "stopped execution releases the cache input"
+    );
+}
+
+#[derive(Clone, Copy)]
+enum WorkloadRetryFailure {
+    InputCommit,
+    ResultCommit,
+    Acknowledgement,
+    ExpiredBudget,
+}
+
+async fn workload_retry_case(failure: WorkloadRetryFailure) {
+    use adx_core::runtime::{RuntimePhase, RuntimeStatus};
+    use adx_protocol::{runtime as pb, runtime_stream::execution_token};
+    use adxlet::{control_stream::RuntimeControlHub, runtime_control::RuntimeControlClient};
+    use tokio::sync::mpsc;
+    let (_temp, backend, node, mut spec, assignment) = fixture();
+    spec.execution.failover = true;
+    spec.runtime_class = "runsc".into();
+    let secret = b"0123456789abcdef0123456789abcdef";
+    let hub = RuntimeControlHub::new(secret.to_vec(), Duration::from_secs(1)).unwrap();
+    let control = RuntimeControlClient::new(50090, Duration::from_secs(1))
+        .unwrap()
+        .with_stream(hub.clone());
+    let node = node.with_runtime_control(control).unwrap();
+    hub.expect(&adx_core::runtime::RuntimeIdentity {
+        environment_id: spec.id.clone(),
+        runtime_id: "environment-1".into(),
+        ownership_generation: 1,
+    })
+    .unwrap();
+    let handle = node.environment(spec, assignment).unwrap();
+    let created = handle.create().await.unwrap();
+    let identity = RuntimeControlClient::identity(&created.record);
+    hub.expect(&identity).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = format!("http://{}", listener.local_addr().unwrap());
+    let service = pb::runtime_control_service_server::RuntimeControlServiceServer::new(hub.clone());
+    let server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(service)
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+    let mut client =
+        pb::runtime_control_service_client::RuntimeControlServiceClient::connect(address)
+            .await
+            .unwrap();
+    let (send, receive) = mpsc::channel(16);
+    let mut status = RuntimeStatus {
+        identity: identity.clone(),
+        revision: 1,
+        phase: RuntimePhase::Running,
+        failure: None,
+        checkpoint: None,
+        requested_checkpoint: None,
+        requested_checkpoint_deadline_unix_millis: None,
+        active_requests: 1,
+        active_commands: 0,
+        activity_revision: 1,
+    };
+    *backend.workload_request.lock().unwrap() = Some("retry-workload".into());
+    match failure {
+        WorkloadRetryFailure::InputCommit | WorkloadRetryFailure::ExpiredBudget => {
+            *backend.unavailable_commit.lock().unwrap() = true
+        }
+        WorkloadRetryFailure::ResultCommit => {
+            *backend.checkpoint_commit_failures.lock().unwrap() = 1
+        }
+        WorkloadRetryFailure::Acknowledgement => *backend.workload_ack_failures.lock().unwrap() = 1,
+    }
+    status.requested_checkpoint = Some("retry-workload".into());
+    if matches!(failure, WorkloadRetryFailure::ExpiredBudget) {
+        let now: u64 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+            .try_into()
+            .unwrap();
+        status.requested_checkpoint_deadline_unix_millis = Some(now + 500);
+        *backend.workload_deadline_unix_millis.lock().unwrap() = Some(now + 500);
+    }
+    send.send(pb::RuntimeEvent {
+        event: Some(pb::runtime_event::Event::Hello(pb::RuntimeHello {
+            token: execution_token(secret, &identity).unwrap(),
+            status_json: serde_json::to_vec(&status).unwrap(),
+        })),
+    })
+    .await
+    .unwrap();
+    let _commands = client
+        .open_control(tokio_stream::wrappers::ReceiverStream::new(receive))
+        .await
+        .unwrap()
+        .into_inner();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let attempts = backend
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| e.as_str() == "commit:Running")
+                .count();
+            let failed = match failure {
+                WorkloadRetryFailure::InputCommit | WorkloadRetryFailure::ExpiredBudget => {
+                    attempts >= 2
+                }
+                WorkloadRetryFailure::ResultCommit => backend
+                    .events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|event| event == "checkpoint-result-retry"),
+                WorkloadRetryFailure::Acknowledgement => backend
+                    .events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|event| event == "checkpoint-ack-retry"),
+            };
+            if failed {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    if matches!(failure, WorkloadRetryFailure::ExpiredBudget) {
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        let now: u64 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+            .try_into()
+            .unwrap();
+        status.requested_checkpoint_deadline_unix_millis = Some(now + 60_000);
+        *backend.workload_deadline_unix_millis.lock().unwrap() = Some(now + 60_000);
+        send.send(pb::RuntimeEvent {
+            event: Some(pb::runtime_event::Event::StatusJson(
+                serde_json::to_vec(&status).unwrap(),
+            )),
+        })
+        .await
+        .unwrap();
+    }
+    *backend.unavailable_commit.lock().unwrap() = false;
+    tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            let complete = backend.events.lock().unwrap().iter().any(|event| {
+                event
+                    == if matches!(failure, WorkloadRetryFailure::ExpiredBudget) {
+                        "checkpoint-error"
+                    } else {
+                        "checkpoint-ack"
+                    }
+            });
+            if complete {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("pending checkpoint must complete without another status notification");
+    let events_before = backend.events.lock().unwrap().clone();
+    let completed = events_before.iter().any(|e| e == "checkpoint-ack");
+    server.abort();
+    drop(send);
+    if matches!(failure, WorkloadRetryFailure::ExpiredBudget) {
+        assert!(!completed);
+        assert!(!events_before
+            .iter()
+            .any(|event| event == "checkpoint-running"));
+        return;
+    }
+    assert!(completed,"transient commit failure must retry pending workload checkpoint without a new status event: {events_before:?}");
+    assert_eq!(
+        events_before
+            .iter()
+            .filter(|event| event.as_str() == "checkpoint-running")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn busy_controllers_do_not_starve_other_runtime_samples() {
+    let (_temp, backend, node, mut spec, assignment) = fixture();
+    let node = Arc::new(node);
+    spec.resources = Resources {
+        cpu_millis: 1,
+        memory_bytes: 1,
+        disk_bytes: 0,
+    };
+    let gate = Arc::new(tokio::sync::Notify::new());
+    *backend.prepare_gate.lock().unwrap() = Some(gate.clone());
+    let mut operations = Vec::new();
+    for index in 0..33 {
+        let mut spec = spec.clone();
+        spec.id = format!("environment-{index:02}");
+        let mut assignment = assignment.clone();
+        assignment.environment_id = spec.id.clone();
+        let handle = node.environment(spec, assignment).unwrap();
+        let created = handle.create().await.unwrap();
+        if index < 32 {
+            operations.push(tokio::spawn(async move {
+                handle
+                    .snapshot(adxlet::checkpoint::SnapshotRequest {
+                        operation_id: format!("review-{index}"),
+                        expected_revision: created.record.revision,
+                        names: vec![],
+                        timeout_seconds: 60,
+                    })
+                    .await
+            }));
+        }
+    }
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let count = backend
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| e.as_str() == "prepare")
+                .count();
+            if count == 32 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let manager = node.clone();
+    let sampling = tokio::spawn(async move { manager.sample_metrics().await });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let sampled_healthy = backend
+        .sampled_runtimes
+        .lock()
+        .unwrap()
+        .contains("environment-32-1");
+    let sample_count = backend.sampled_runtimes.lock().unwrap().len();
+    assert!(sample_count >= 32);
+    gate.notify_waiters();
+    for operation in operations {
+        let _ = tokio::time::timeout(Duration::from_secs(5), operation)
+            .await
+            .unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(5), sampling)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(
+        sampled_healthy,
+        "healthy runtime must be sampled even while other controllers execute checkpoints"
+    );
+}
+
+#[tokio::test]
+async fn workload_commit_failure_retries_without_another_notification() {
+    workload_retry_case(WorkloadRetryFailure::InputCommit).await;
+}
+#[tokio::test]
+async fn workload_result_commit_failure_does_not_repeat_capture() {
+    workload_retry_case(WorkloadRetryFailure::ResultCommit).await;
+}
+#[tokio::test]
+async fn workload_ack_failure_does_not_repeat_capture() {
+    workload_retry_case(WorkloadRetryFailure::Acknowledgement).await;
+}
+#[tokio::test]
+async fn workload_replayed_notification_cannot_extend_original_deadline() {
+    workload_retry_case(WorkloadRetryFailure::ExpiredBudget).await;
+}
+
+#[tokio::test]
+async fn reload_uncertain_cleanup_retains_intent() {
+    let (_temp, backend, node, spec, assignment) = fixture();
+    let handle = node.environment(spec, assignment).unwrap();
+    let created = handle.create().await.unwrap();
+    let paused = handle.pause(pause(created.record.revision)).await.unwrap();
+    let running = handle.resume(resume(paused.record.revision)).await.unwrap();
+    *backend.remove_then_timeout.lock().unwrap() = true;
+    assert!(handle
+        .reload("review-reload".into(), running.record.revision)
+        .await
+        .is_err());
+    assert!(!backend
+        .running
+        .lock()
+        .unwrap()
+        .contains(&running.record.runtime.id));
+    {
+        let committed = backend.committed_records.lock().unwrap();
+        let published = &committed[&running.record.spec.id];
+        assert_eq!(published.state, EnvironmentState::Running);
+        assert!(
+            published
+                .observation
+                .as_ref()
+                .and_then(|o| o.intent)
+                .is_some(),
+            "uncertain normal stop was published as Running without normal-operation intent"
+        );
+    }
+    *backend.remove_then_timeout.lock().unwrap() = false;
+    handle.tick().await.unwrap();
+    let committed = backend.committed_records.lock().unwrap();
+    let published = &committed[&running.record.spec.id];
+    assert_eq!(published.state, EnvironmentState::Failed);
+    assert!(published
+        .observation
+        .as_ref()
+        .unwrap()
+        .interruption
+        .is_none());
+}
+
+#[tokio::test]
+async fn reload_uncertain_cleanup_does_not_hide_independent_oom() {
+    let (_temp, backend, node, spec, assignment) = fixture();
+    let handle = node.environment(spec, assignment).unwrap();
+    let created = handle.create().await.unwrap();
+    let paused = handle.pause(pause(created.record.revision)).await.unwrap();
+    let running = handle.resume(resume(paused.record.revision)).await.unwrap();
+    *backend.fail_remove.lock().unwrap() = true;
+    assert!(handle
+        .reload("reload-oom".into(), running.record.revision)
+        .await
+        .is_err());
+    backend.running.lock().unwrap().clear();
+    *backend.observed_failure.lock().unwrap() = Some(adx_core::RuntimeFailure {
+        reason: adx_core::RuntimeFailureReason::OomKilled,
+        exit_code: Some(137),
+        message: "backend confirmed OOM".into(),
+        probe_failure: None,
+    });
+    *backend.fail_remove.lock().unwrap() = false;
+    handle.tick().await.unwrap();
+    let committed = backend.committed_records.lock().unwrap();
+    let observation = committed[&running.record.spec.id]
+        .observation
+        .as_ref()
+        .unwrap();
+    assert!(observation.intent.is_none());
+    assert_eq!(
+        observation.interruption.as_ref().unwrap().reason,
+        adx_core::observation::InterruptionReason::Oom
+    );
+}
+
+#[tokio::test]
+async fn intended_removal_with_late_exit_is_not_runtime_interruption() {
+    let (_temp, backend, node, spec, assignment) = fixture();
+    let handle = node.environment(spec, assignment).unwrap();
+    let created = handle.create().await.unwrap();
+    let paused = handle.pause(pause(created.record.revision)).await.unwrap();
+    let running = handle.resume(resume(paused.record.revision)).await.unwrap();
+    *backend.remove_then_timeout.lock().unwrap() = true;
+    assert!(handle
+        .reload("normal-stop".into(), running.record.revision)
+        .await
+        .is_err());
+    assert!(!backend
+        .running
+        .lock()
+        .unwrap()
+        .contains(&running.record.runtime.id));
+    *backend.remove_then_timeout.lock().unwrap() = false;
+    *backend.observed_failure.lock().unwrap() = Some(adx_core::RuntimeFailure {
+        reason: adx_core::RuntimeFailureReason::Exited,
+        exit_code: Some(137),
+        message: "runtime stopped by requested removal".into(),
+        probe_failure: None,
+    });
+    handle.tick().await.unwrap();
+    let records = backend.committed_records.lock().unwrap();
+    let settled = &records[&running.record.spec.id];
+    assert_eq!(settled.state, EnvironmentState::Failed);
+    let observation = settled.observation.as_ref().unwrap();
+    assert!(
+        observation.interruption.is_none(),
+        "normal removal created interruption: {:?}",
+        observation.interruption
+    );
+    assert_eq!(
+        observation.intent,
+        Some(adx_core::observation::OperationIntent::User)
     );
 }

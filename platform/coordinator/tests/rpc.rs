@@ -123,6 +123,7 @@ fn caller() -> Option<pb::CallerContext> {
 }
 fn create(id: &str) -> pb::CreateEnvironmentRequest {
     pb::CreateEnvironmentRequest {
+        request_id: String::new(),
         spec: Some(spec(id).into()),
         caller: caller(),
         schedule_timeout_seconds: 30,
@@ -136,6 +137,7 @@ struct Backend {
     started: AtomicUsize,
     removed: AtomicUsize,
     running: Mutex<BTreeSet<String>>,
+    pause_writes_after_remove: Mutex<Option<(String, u64)>>,
 }
 #[async_trait::async_trait]
 impl RuntimeDriver for Backend {
@@ -258,6 +260,21 @@ impl RuntimeDriver for Backend {
     async fn remove(&self, id: &str) -> Result<()> {
         self.removed.fetch_add(1, Ordering::SeqCst);
         self.running.lock().unwrap().remove(id);
+        let pause = self.pause_writes_after_remove.lock().unwrap().take();
+        if let Some((url, millis)) = pause {
+            let mut connection = redis::Client::open(url)
+                .unwrap()
+                .get_multiplexed_async_connection()
+                .await
+                .unwrap();
+            redis::cmd("CLIENT")
+                .arg("PAUSE")
+                .arg(millis)
+                .arg("WRITE")
+                .query_async::<()>(&mut connection)
+                .await
+                .unwrap();
+        }
         Ok(())
     }
 }
@@ -343,6 +360,7 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
             .unwrap();
     }));
     let backend = Arc::new(Backend {
+        pause_writes_after_remove: Mutex::new(None),
         session: session.clone(),
         started: AtomicUsize::new(0),
         removed: AtomicUsize::new(0),
@@ -443,11 +461,29 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
         duplicate.create_environment(create("first"))
     );
     let first = a.unwrap().into_inner();
-    assert_eq!(first, b.unwrap().into_inner());
+    let second = b.unwrap().into_inner();
+    assert_eq!(
+        u8::from(first.newly_created) + u8::from(second.newly_created),
+        1
+    );
+    assert_eq!(first.record, second.record);
+    assert_eq!(first.durability, second.durability);
     assert_eq!(first.durability, pb::Durability::Published as i32);
     assert_eq!(backend.started.load(Ordering::SeqCst), 1);
     let first_record = first.record.unwrap();
     let metrics = scrape_metrics(metrics_address).await;
+    assert!(metrics.contains("adx_environment_created_total 1\n"));
+    // Re-publishing the same durable Running result must not create a second event.
+    node_coordinator
+        .commit_environment(pb::CommitEnvironmentRequest {
+            node_session_id: "boot-1".into(),
+            record: Some(first_record.clone()),
+        })
+        .await
+        .unwrap();
+    assert!(scrape_metrics(metrics_address)
+        .await
+        .contains("adx_environment_created_total 1\n"));
     assert!(metrics.contains(
         "adx_coordinator_environments{shard_id=\"0\",node_id=\"node\",state=\"Running\"} 1\n"
     ));
@@ -714,7 +750,11 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
         .delete_environment(delete.clone())
         .await
         .is_err());
-    assert_eq!(backend.removed.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        backend.removed.load(Ordering::SeqCst),
+        1,
+        "an unconfirmed intent cannot stop the runtime"
+    );
     redis.start().await;
     node_frontend.delete_environment(delete).await.unwrap();
     assert_eq!(
@@ -1077,6 +1117,7 @@ async fn heartbeat_expiry_reconciliation_and_old_session_fencing() {
         .await
         .unwrap();
     let running = EnvironmentRecord {
+        observation: None,
         execution_artifacts: vec![],
         snapshot_source: None,
         failure: None,
@@ -1094,17 +1135,22 @@ async fn heartbeat_expiry_reconciliation_and_old_session_fencing() {
         checkpoint: None,
         last_operation: None,
     };
-    session.commit(running.clone()).await.unwrap();
+    node.commit_environment(pb::CommitEnvironmentRequest {
+        record: Some(running.clone().try_into().unwrap()),
+        node_session_id: report.session_id.clone(),
+    })
+    .await
+    .unwrap();
     assert_eq!(session.snapshot().await.unwrap().routes().unwrap().len(), 1);
-    assert!(
-        node.inspect_node(pb::InspectNodeRequest {
+    let live_catalog = node
+        .inspect_node(pb::InspectNodeRequest {
             node_id: "node".into(),
             session_id: report.session_id.clone(),
         })
         .await
-        .is_err(),
-        "inspection requires closed allocation admission"
-    );
+        .unwrap()
+        .into_inner();
+    assert_eq!(live_catalog.records.len(), 1);
     report.heartbeat_sequence = 3;
     report.accepting_allocations = false;
     node.register_node(report.clone()).await.unwrap();
@@ -1168,6 +1214,7 @@ async fn heartbeat_expiry_reconciliation_and_old_session_fencing() {
     assert!(!snapshot.records[0].resources_held);
     assert!(!snapshot.records[0].restart_pending);
     let backend = Arc::new(Backend {
+        pause_writes_after_remove: Mutex::new(None),
         session: session.clone(),
         started: AtomicUsize::new(0),
         removed: AtomicUsize::new(0),
@@ -1275,6 +1322,7 @@ async fn node_restart_before_expiry_requires_new_session_at_registered_endpoint(
             .unwrap();
     })]);
     let backend = Arc::new(Backend {
+        pause_writes_after_remove: Mutex::new(None),
         session: session.clone(),
         started: AtomicUsize::new(0),
         removed: AtomicUsize::new(0),
@@ -1520,6 +1568,7 @@ async fn coordinator_restart_bounds_re_registration_grace() {
             .await
             .unwrap();
         let running = EnvironmentRecord {
+            observation: None,
             execution_artifacts: vec![],
             snapshot_source: None,
             failure: None,
@@ -1758,6 +1807,7 @@ async fn published_routes_drive_real_gateway_streams_and_reconnect_to_new_coordi
         .await
         .unwrap();
     let mut record = EnvironmentRecord {
+        observation: None,
         execution_artifacts: vec![],
         snapshot_source: None,
         failure: None,
@@ -2282,6 +2332,7 @@ async fn snapshot_gc_waits_for_node_ack_and_recovers_from_lost_ack() {
             .unwrap();
     })]);
     let backend = Arc::new(Backend {
+        pause_writes_after_remove: Mutex::new(None),
         session: session.clone(),
         started: AtomicUsize::new(0),
         removed: AtomicUsize::new(0),
@@ -2749,6 +2800,7 @@ async fn shared_checkpoint_moves_to_new_node_and_old_node_cleans_without_deletin
         .unwrap(),
     );
     let backend = Arc::new(RecoveryBackend(Backend {
+        pause_writes_after_remove: Mutex::new(None),
         session: session.clone(),
         started: AtomicUsize::new(0),
         removed: AtomicUsize::new(0),
@@ -2843,6 +2895,7 @@ async fn shared_checkpoint_moves_to_new_node_and_old_node_cleans_without_deletin
         .await
         .unwrap();
     let old = EnvironmentRecord {
+        observation: None,
         execution_artifacts: vec![],
         snapshot_source: None,
         failure: None,
@@ -2953,6 +3006,7 @@ async fn shared_checkpoint_moves_to_new_node_and_old_node_cleans_without_deletin
         .unwrap(),
     );
     let old_backend = Arc::new(Backend {
+        pause_writes_after_remove: Mutex::new(None),
         session: session.clone(),
         started: AtomicUsize::new(0),
         removed: AtomicUsize::new(0),
@@ -2989,3 +3043,66 @@ mod local_first;
 
 #[path = "rpc/network.rs"]
 mod network;
+
+#[tokio::test]
+#[ignore = "requires isolated Redis and mTLS certificates; run control-rpc suite"]
+async fn inspect_node_uses_committed_cache_when_redis_is_unavailable() {
+    let mut redis = common::Redis::new().await;
+    let store = redis.store().await;
+    let session = store.begin(1).await.unwrap();
+    let rpc = CoordinatorRpc::with_heartbeat_timeout(
+        session.clone(),
+        Placement::Pack,
+        peers(),
+        client_tls("coordinator"),
+        Duration::from_secs(2),
+        Duration::from_millis(250),
+    )
+    .await
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let service = rpc.clone();
+    let _servers = Servers(vec![tokio::spawn(async move {
+        Server::builder()
+            .tls_config(server_tls("coordinator"))
+            .unwrap()
+            .add_service(pb::coordinator_service_server::CoordinatorServiceServer::new(service))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    })]);
+    let mut node = pb::coordinator_service_client::CoordinatorServiceClient::new(
+        channel(address, "node").await,
+    );
+
+    node.register_node(pb::RegisterNodeRequest {
+        node_id: "node".into(),
+        node_address: "127.0.0.1:9001".into(),
+        proxy_address: "127.0.0.1:9002".into(),
+        capacity: Some(spec("cache").resources.into()),
+        session_id: "cache-session".into(),
+        heartbeat_sequence: 1,
+        accepting_allocations: false,
+        reconciling: true,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let request = pb::InspectNodeRequest {
+        node_id: "node".into(),
+        session_id: "cache-session".into(),
+    };
+    let before = node
+        .inspect_node(request.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    redis.crash();
+    let after = node.inspect_node(request).await.unwrap().into_inner();
+    assert_eq!(after, before);
+    // Empty background sweeps use the same committed inventory; neither a
+    // recovery check nor dormant expiration needs a fresh durable catalog.
+    assert_eq!(rpc.resume_pending().await.unwrap(), 0);
+    assert_eq!(rpc.expire_dormant().await.unwrap(), 0);
+}

@@ -5,6 +5,8 @@ mod claims;
 mod common;
 #[path = "storage/dormancy.rs"]
 mod dormancy;
+#[path = "storage/observability.rs"]
+mod observability;
 use adx_coordinator::{storage::StoredNode, Coordinator, Node, Placement};
 use adx_core::{
     Assignment, EnvironmentRecord, EnvironmentSpec, EnvironmentState, Error, Resources,
@@ -48,6 +50,7 @@ fn node(id: &str) -> Node {
 }
 fn running(spec: EnvironmentSpec, assignment: Assignment) -> EnvironmentRecord {
     EnvironmentRecord {
+        observation: None,
         execution_artifacts: vec![],
         snapshot_source: None,
         failure: None,
@@ -1402,3 +1405,15 @@ async fn recovery_never_uses_missing_local_or_expired_checkpoint() {
 
 #[path = "storage/admin_keys.rs"]
 mod admin_keys;
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn inspection_inventory_remains_available_without_redis() {
+    let mut rig = common::Redis::new().await;
+    let session = rig.store().await.begin(1).await.unwrap();
+    session.refresh_inspection_inventory().await.unwrap();
+    rig.crash();
+    let (snapshots, holds) = session.inspection_inventory().await.unwrap();
+    assert!(snapshots.is_empty());
+    assert!(holds.is_empty());
+}

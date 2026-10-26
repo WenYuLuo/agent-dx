@@ -6,6 +6,7 @@ mod claims;
 mod cloning;
 mod collection;
 mod metrics;
+mod observation;
 mod recovery;
 mod resume;
 mod snapshots;
@@ -38,6 +39,7 @@ struct State {
     session: Session,
     scheduler: Coordinator,
     specs: BTreeMap<String, EnvironmentSpec>,
+    create_request_ids: BTreeMap<String, String>,
     environments: BTreeMap<String, StoredEnvironment>,
     failed_environments: BTreeSet<String>,
     nodes: BTreeMap<String, StoredNode>,
@@ -165,7 +167,15 @@ impl State {
                     .reserve_recovery(&old.assignment, assignment.clone(), recovery::now()?)
                     .await
             } else {
-                self.session.reserve(spec, assignment.clone()).await
+                self.session
+                    .reserve_with_request(
+                        spec,
+                        assignment.clone(),
+                        self.create_request_ids
+                            .get(&assignment.environment_id)
+                            .map_or("", String::as_str),
+                    )
+                    .await
             };
             match saved {
                 Ok(record) => {
@@ -213,6 +223,9 @@ impl State {
     }
 }
 struct Inner {
+    business: Arc<std::sync::RwLock<Option<observation::BusinessSnapshot>>>,
+    business_fenced: Arc<std::sync::atomic::AtomicBool>,
+    created: std::sync::atomic::AtomicU64,
     reclaimers: std::sync::RwLock<adx_checkpoint_storage::reclaim::Reclaimers>,
     resume_admission: Arc<tokio::sync::Semaphore>,
     resume_locks: std::sync::Mutex<BTreeMap<String, std::sync::Weak<Mutex<()>>>>,
@@ -347,6 +360,7 @@ impl CoordinatorRpc {
             return Err(Error::Invalid("RPC timeout must be positive".into()));
         }
         let mut saved = session.snapshot().await?;
+        session.refresh_inspection_inventory().await?;
         // The pending queues are intentionally memory-only. Release their old
         // source pins after a new Coordinator epoch has fenced all previous writers.
         for snapshot in session.retained_snapshots().await? {
@@ -389,7 +403,17 @@ impl CoordinatorRpc {
         let recovering = saved.nodes.keys().map(|id| (id.clone(), now)).collect();
         let (claim_sender, claim_requests) = mpsc::channel(CLAIM_BATCH_CAPACITY);
         tokio::spawn(run_claim_batches(session.clone(), claim_requests));
-        Ok(Self(Arc::new(Inner {
+        let monitoring = session.clone();
+        let counters = monitoring.business_counters().await?;
+        let service = Self(Arc::new(Inner {
+            business: Arc::new(std::sync::RwLock::new(Some(
+                observation::BusinessSnapshot {
+                    counters,
+                    refreshed: std::time::Instant::now(),
+                },
+            ))),
+            business_fenced: Default::default(),
+            created: Default::default(),
             reclaimers: Default::default(),
             resume_admission: Arc::new(tokio::sync::Semaphore::new(1024)),
             resume_locks: std::sync::Mutex::new(BTreeMap::new()),
@@ -397,6 +421,7 @@ impl CoordinatorRpc {
                 session,
                 scheduler,
                 specs,
+                create_request_ids: BTreeMap::new(),
                 failed_environments: saved
                     .environments
                     .iter()
@@ -426,7 +451,32 @@ impl CoordinatorRpc {
             node_tls: node_tls.into(),
             timeout,
             heartbeat_timeout,
-        })))
+        }));
+        let weak = Arc::downgrade(&service.0.business);
+        let fenced = service.0.business_fenced.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let Some(cache) = weak.upgrade() else {
+                    break;
+                };
+                match monitoring.business_counters().await {
+                    Ok(counters) => {
+                        if let Ok(mut cache) = cache.write() {
+                            *cache = Some(observation::BusinessSnapshot {
+                                counters,
+                                refreshed: std::time::Instant::now(),
+                            });
+                        }
+                    }
+                    Err(Error::Conflict) => {
+                        fenced.store(true, std::sync::atomic::Ordering::Release);
+                    }
+                    Err(_) => (),
+                }
+            }
+        });
+        Ok(service)
     }
     pub fn with_reclaimers(self, reclaimers: adx_checkpoint_storage::reclaim::Reclaimers) -> Self {
         *self
@@ -497,7 +547,11 @@ impl CoordinatorRpc {
         schedule_timeout: Duration,
         create_deadline: adx_transport::deadline::Deadline,
         expected_assignment: Option<adx_core::Assignment>,
+        request_id: String,
     ) -> std::result::Result<pb::EnvironmentResult, Status> {
+        if request_id.len() > 256 {
+            return Err(Status::invalid_argument("request ID too long"));
+        }
         let mut schedule_deadline = None;
         loop {
             create_deadline.remaining().map_err(|_| {
@@ -509,6 +563,23 @@ impl CoordinatorRpc {
             let mut state = self.0.state.lock().await;
             state.recover_authoritative_state().await.map_err(status)?;
             state.healthy().map_err(status)?;
+            if !request_id.is_empty()
+                && !state.environments.contains_key(&spec.id)
+                && state
+                    .session
+                    .request_binding(&spec.tenant_id, &request_id)
+                    .await
+                    .map_err(status)?
+                    .is_some_and(|id| id != spec.id)
+            {
+                return Err(Status::already_exists(
+                    "request ID is bound to a different Environment",
+                ));
+            }
+            state
+                .create_request_ids
+                .entry(spec.id.clone())
+                .or_insert_with(|| request_id.clone());
             if expected_assignment.as_ref().is_some_and(|expected| {
                 state
                     .environments
@@ -606,6 +677,7 @@ impl CoordinatorRpc {
                         ));
                     }
                     return Ok(pb::EnvironmentResult {
+                        newly_created: false,
                         record: Some(result.try_into().map_err(status)?),
                         durability: pb::Durability::Published as i32,
                     });
@@ -766,6 +838,7 @@ impl CoordinatorRpc {
             return Ok(None);
         }
         state.specs.remove(&spec.id);
+        state.create_request_ids.remove(&spec.id);
         state.scheduling_deadlines.remove(&spec.id);
         if let Some(snapshot_id) = &spec.snapshot_id {
             state
@@ -807,12 +880,23 @@ impl CoordinatorRpc {
         {
             return Err(Error::Conflict);
         }
-        let accepted = state.session.commit(record).await?;
-        if accepted.state == EnvironmentState::Failed {
-            let durable = state.session.get(&accepted.spec.id).await?;
-            state.remember_environment(durable);
-        } else {
-            state.failed_environments.remove(&accepted.spec.id);
+        let first_create = record.state == EnvironmentState::Running
+            && record.restart_attempts == 0
+            && state
+                .environments
+                .get(&record.spec.id)
+                .is_some_and(|stored| {
+                    stored.result.is_none() && stored.recovery.is_none() && !stored.invalidated
+                });
+        let committed = state.session.commit_with_state(record).await?;
+        let accepted = committed.result;
+        if let Some(stored) = committed.stored {
+            state.remember_environment(stored);
+        }
+        if first_create {
+            self.0
+                .created
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         if let Some(stored) = state.environments.get_mut(&accepted.spec.id) {
             stored.spec = accepted.spec.clone();
@@ -883,6 +967,7 @@ impl CoordinatorRpc {
             state.environments.remove(&accepted.spec.id);
             state.failed_environments.remove(&accepted.spec.id);
             state.specs.remove(&accepted.spec.id);
+            state.create_request_ids.remove(&accepted.spec.id);
             state.scheduling_deadlines.remove(&accepted.spec.id);
         }
         self.0.changed.notify_waiters();
@@ -1121,6 +1206,7 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
             .map(TryInto::try_into)
             .transpose()
             .map_err(status)?;
+        let request_id = create.request_id.clone();
         let prepared = self.prepare_local(&node, request).await?;
         let spec = prepared
             .spec
@@ -1130,7 +1216,13 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
         let service = self.clone();
         tokio::spawn(trace.run(async move {
             service
-                .create(spec, schedule_timeout, deadline, expected_assignment)
+                .create(
+                    spec,
+                    schedule_timeout,
+                    deadline,
+                    expected_assignment,
+                    request_id,
+                )
                 .await
                 .map(Response::new)
         }))
@@ -1142,110 +1234,124 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
         &self,
         request: Request<pb::InspectNodeRequest>,
     ) -> std::result::Result<Response<pb::InspectNodeResponse>, Status> {
-        let trace = adx_observability::trace::Trace::rpc("coordinator.inspect_node", &request);
-        trace
-            .run_result(async {
-                let principal = self.0.peers.authenticate(&request)?;
-                let r = request.into_inner();
-                if principal != Principal::Node(r.node_id.clone()) {
-                    return Err(Status::permission_denied("node identity mismatch"));
+        let trace = request
+            .metadata()
+            .contains_key("traceparent")
+            .then(|| adx_observability::trace::Trace::rpc("coordinator.inspect_node", &request));
+        let observation = async {
+            let principal = self.0.peers.authenticate(&request)?;
+            let r = request.into_inner();
+            if principal != Principal::Node(r.node_id.clone()) {
+                return Err(Status::permission_denied("node identity mismatch"));
+            }
+            let mut state = self.0.state.lock().await;
+            state.recover_authoritative_state().await.map_err(status)?;
+            state.healthy().map_err(status)?;
+            let live = state.live.get(&r.node_id).ok_or_else(|| {
+                Status::failed_precondition("register node before reconciliation")
+            })?;
+            if live.session != r.session_id
+                || live.expired
+                || live.last_seen.elapsed() >= self.0.heartbeat_timeout
+            {
+                return Err(Status::failed_precondition(
+                    "live node session required for inspection",
+                ));
+            }
+            let (cached_snapshots, holds) =
+                state.session.inspection_inventory().await.map_err(status)?;
+            let mut retained = BTreeMap::new();
+            let mut retain = |artifact: &adx_core::CheckpointArtifact| {
+                if artifact.storage == "local" {
+                    return;
                 }
-                let mut state = self.0.state.lock().await;
-                state.recover_authoritative_state().await.map_err(status)?;
-                state.healthy().map_err(status)?;
-                let live = state.live.get(&r.node_id).ok_or_else(|| {
-                    Status::failed_precondition("register node before reconciliation")
-                })?;
-                if live.session != r.session_id || live.report.accepting_allocations {
-                    return Err(Status::failed_precondition(
-                        "node must close allocation admission before inspection",
-                    ));
+                let key = (artifact.storage.clone(), artifact.location.clone());
+                let entry = retained.entry(key).or_insert_with(|| artifact.clone());
+                if artifact.size_bytes > entry.size_bytes {
+                    *entry = artifact.clone();
                 }
-                let snapshot = state.session.snapshot().await.map_err(status)?;
-                let holds = state.session.execution_holds().await.map_err(status)?;
-                let mut retained = BTreeMap::new();
-                let mut retain = |artifact: &adx_core::CheckpointArtifact| {
-                    if artifact.storage == "local" {
-                        return;
+            };
+            for environment in state.environments.values() {
+                if let Some(record) = &environment.result {
+                    for point in record
+                        .checkpoint
+                        .iter()
+                        .chain(record.snapshot_source.iter())
+                    {
+                        retain(&point.artifact);
                     }
-                    let key = (artifact.storage.clone(), artifact.location.clone());
-                    let entry = retained.entry(key).or_insert_with(|| artifact.clone());
-                    if artifact.size_bytes > entry.size_bytes {
-                        *entry = artifact.clone();
-                    }
-                };
-                for environment in snapshot.environments.values() {
-                    if let Some(record) = &environment.result {
-                        for point in record
-                            .checkpoint
-                            .iter()
-                            .chain(record.snapshot_source.iter())
-                        {
-                            retain(&point.artifact);
-                        }
-                        for artifact in &record.execution_artifacts {
-                            retain(artifact);
-                        }
+                    for artifact in &record.execution_artifacts {
+                        retain(artifact);
                     }
                 }
-                for hold in holds {
-                    for artifact in hold.artifacts {
-                        retain(&artifact);
-                    }
+            }
+            for hold in holds {
+                for artifact in hold.artifacts {
+                    retain(&artifact);
                 }
-                let retained_artifacts = retained.into_values().map(Into::into).collect();
-                let records = snapshot
-                    .environments
-                    .into_values()
-                    .filter(|i| {
-                        i.assignment.node_id == r.node_id && requires_node_reconciliation(i)
-                    })
-                    .map(|i| {
-                        i.result
-                            .unwrap_or_else(|| EnvironmentRecord {
-                                execution_artifacts: vec![],
-                                snapshot_source: None,
-                                failure: None,
-                                restart_attempts: 0,
-                                restart_pending: false,
-                                runtime: adx_core::Runtime {
-                                    id: format!("{}-{}", i.spec.id, i.assignment.generation),
-                                    ip: None,
-                                },
-                                spec: i.spec,
-                                assignment: i.assignment,
-                                state: EnvironmentState::Pending,
-                                revision: 0,
-                                resources_held: true,
-                                checkpoint: None,
-                                last_operation: None,
-                            })
-                            .try_into()
-                    })
-                    .collect::<Result<Vec<_>>>()
-                    .map_err(status)?;
-                let snapshots = state
-                    .session
-                    .node_snapshots(&r.node_id)
-                    .await
-                    .map_err(status)?
-                    .into_iter()
-                    .map(TryInto::try_into)
-                    .collect::<Result<Vec<_>>>()
-                    .map_err(status)?;
-                state
-                    .live
-                    .get_mut(&r.node_id)
-                    .ok_or_else(|| Status::unavailable("node heartbeat state disappeared"))?
-                    .inspected = true;
-                Ok(Response::new(pb::InspectNodeResponse {
-                    records,
-                    snapshots,
-                    retained_artifacts,
-                    coordinator_epoch: state.session.epoch(),
-                }))
-            })
-            .await
+            }
+            let retained_artifacts = retained.into_values().map(Into::into).collect();
+            let records = state
+                .environments
+                .values()
+                .filter(|i| i.assignment.node_id == r.node_id && requires_node_reconciliation(i))
+                .cloned()
+                .map(|i| {
+                    i.result
+                        .unwrap_or_else(|| EnvironmentRecord {
+                            observation: None,
+                            execution_artifacts: vec![],
+                            snapshot_source: None,
+                            failure: None,
+                            restart_attempts: 0,
+                            restart_pending: false,
+                            runtime: adx_core::Runtime {
+                                id: format!("{}-{}", i.spec.id, i.assignment.generation),
+                                ip: None,
+                            },
+                            spec: i.spec,
+                            assignment: i.assignment,
+                            state: EnvironmentState::Pending,
+                            revision: 0,
+                            resources_held: true,
+                            checkpoint: None,
+                            last_operation: None,
+                        })
+                        .try_into()
+                })
+                .collect::<Result<Vec<_>>>()
+                .map_err(status)?;
+            let snapshots = cached_snapshots
+                .into_iter()
+                .filter(|snapshot| {
+                    snapshot.source_node_id == r.node_id
+                        && snapshot.state != adx_core::snapshots::SnapshotState::Deleted
+                })
+                .map(TryInto::try_into)
+                .collect::<Result<Vec<_>>>()
+                .map_err(status)?;
+            state
+                .live
+                .get_mut(&r.node_id)
+                .ok_or_else(|| Status::unavailable("node heartbeat state disappeared"))?
+                .inspected = true;
+            Ok(Response::new(pb::InspectNodeResponse {
+                records,
+                snapshots,
+                retained_artifacts,
+                coordinator_epoch: state.session.epoch(),
+            }))
+        };
+        if let Some(trace) = trace {
+            trace.run_result(observation).await
+        } else {
+            let result = observation.await;
+            if result.is_err() {
+                let trace = adx_observability::trace::Trace::child("coordinator.inspect_node");
+                trace.scope(adx_observability::trace::error);
+            }
+            result
+        }
     }
 
     async fn register_node(
@@ -1426,6 +1532,7 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                     .map(TryInto::try_into)
                     .transpose()
                     .map_err(status)?;
+                let request_id = r.request_id.clone();
                 let raw = r
                     .spec
                     .ok_or_else(|| Status::invalid_argument("spec required"))?;
@@ -1442,7 +1549,13 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                 tokio::spawn(
                     adx_observability::trace::Trace::child("coordinator.create").run(async move {
                         service
-                            .create(spec, schedule_timeout, deadline, expected_assignment)
+                            .create(
+                                spec,
+                                schedule_timeout,
+                                deadline,
+                                expected_assignment,
+                                request_id,
+                            )
                             .await
                             .map(Response::new)
                     }),
@@ -1579,6 +1692,8 @@ mod reconciliation_tests {
             devices: vec![],
         };
         let mut environment = StoredEnvironment {
+            creation: None,
+            last_interruption: None,
             resume: None,
             failed_since_unix_seconds: None,
             recovery: None,
@@ -1586,6 +1701,7 @@ mod reconciliation_tests {
             spec: spec.clone(),
             assignment: assignment.clone(),
             result: Some(EnvironmentRecord {
+                observation: None,
                 execution_artifacts: vec![],
                 snapshot_source: None,
                 failure: None,
@@ -1693,6 +1809,7 @@ mod cancellation_tests {
                     .claim_local(
                         "node".into(),
                         pb::ClaimEnvironmentRequest {
+                            request_id: String::new(),
                             spec: Some(spec.into()),
                             node_session_id: "boot".into(),
                             devices: vec![],

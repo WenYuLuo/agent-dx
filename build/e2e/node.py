@@ -341,7 +341,11 @@ def main():
     elif action == 'activator-inventory':
         prefix = sys.argv[3]
         ids = json.loads((E / 'live-instances.json').read_text())
-        data = {'node': node, 'backends': backend(), 'labeled': [runtime for identity in ids for runtime in labeled_backend(identity)]}
+        data = {
+            'node': node,
+            'backends': backend(),
+            'labeled': [runtime for identity in ids for runtime in labeled_backend(identity)],
+        }
         (E / f'activator-{prefix}-{node}.json').write_text(json.dumps(data))
     elif action in ('activator-start', 'activator-restart'):
         from activator_fixture import start
@@ -1178,6 +1182,8 @@ def main():
         os.kill(previous_pid, signal.SIGKILL)
         deadline = time.monotonic() + 65
         last_after = None
+        serving = False
+        admission_ready = False
         while True:
             try:
                 current_pid = int((P / 'sandboxd.pid').read_text())
@@ -1185,6 +1191,20 @@ def main():
                     after = backend()
                     last_after = after
                     if after == before:
+                        # Recovered runtimes can serve existing traffic before
+                        # sandboxd housekeeping publishes backend readiness.
+                        # New creates require both that readiness and its node report.
+                        serving = (
+                            command(['sbox', '-a', P / 'sandboxd/sandboxd.sock', 'check'], timeout=5).strip()
+                            == 'Healthz status: SERVING'
+                        )
+                        admission_ready = serving and any(
+                            record['node']['id'] == node
+                            and record['node']['available']
+                            and record['node']['runtime_classes']
+                            for record in nodes()
+                        )
+                    if after == before and admission_ready:
                         (E / f'sandboxd-restart-{node}.json').write_text(
                             json.dumps(
                                 {
@@ -1192,15 +1212,20 @@ def main():
                                     'pid': current_pid,
                                     'backend_ids_before': before,
                                     'backend_ids_after': after,
+                                    'backend_serving': serving,
+                                    'node_admission_ready': admission_ready,
                                 },
                                 indent=2,
                             )
                         )
                         break
-            except (OSError, subprocess.SubprocessError):
+            except (OSError, subprocess.SubprocessError, ValueError, KeyError):
                 pass
             if time.monotonic() > deadline:
-                raise TimeoutError(f'sandboxd backend IDs did not converge: before={before!r}, after={last_after!r}')
+                raise TimeoutError(
+                    f'sandboxd restart did not become ready: before={before!r}, after={last_after!r}, '
+                    f'serving={serving}, admission_ready={admission_ready}'
+                )
             time.sleep(0.2)
     elif action == 'unchanged':
         after = backend()

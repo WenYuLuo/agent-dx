@@ -8,9 +8,11 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 
 mod authority;
+mod events;
 mod lifecycle;
 pub(super) use authority::{AuthorityCheck, AuthorityResult};
 mod monitor;
+mod observation;
 mod snapshots;
 mod workload_checkpoint;
 use super::checkpoint::{PauseRequest, ResumeRequest};
@@ -21,8 +23,25 @@ pub(super) type CheckpointReferences = BTreeSet<(String, String)>;
 pub(super) enum AuthorityComparison {
     Published,
     Unpublished,
+    Unstarted,
     StaleCatalog,
     RetiredByAuthority,
+}
+
+// A live claim can precede its create RPC. Startup recovery deliberately does
+// not use this exemption: an old process may have started an uncommitted runtime.
+pub(super) fn unstarted(record: &EnvironmentRecord) -> bool {
+    record.state == EnvironmentState::Pending
+        && record.revision == 0
+        && record.runtime.id == format!("{}-{}", record.spec.id, record.assignment.generation)
+        && record.runtime.ip.is_none()
+        && record.checkpoint.is_none()
+        && record.snapshot_source.is_none()
+        && record.execution_artifacts.is_empty()
+        && record.last_operation.is_none()
+        && record.failure.is_none()
+        && record.restart_attempts == 0
+        && !record.restart_pending
 }
 
 enum Command {
@@ -72,14 +91,19 @@ type Reply = oneshot::Sender<Result<OperationResult>>;
 struct Envelope {
     command: Command,
     reply: Reply,
-    trace: adx_observability::trace::Trace,
+    trace: Option<adx_observability::trace::Trace>,
 }
 impl Envelope {
     fn new(command: Command, reply: Reply) -> Self {
+        let trace = (!matches!(
+            command,
+            Command::Tick(_) | Command::Expire(_, _) | Command::CheckAuthority(_, _)
+        ))
+        .then(|| adx_observability::trace::Trace::child("environment.queue"));
         Self {
             command,
             reply,
-            trace: adx_observability::trace::Trace::child("environment.queue"),
+            trace,
         }
     }
 }
@@ -88,9 +112,42 @@ impl Envelope {
 pub struct EnvironmentHandle {
     tx: mpsc::Sender<Envelope>,
     demand: Arc<std::sync::atomic::AtomicU64>,
+    current: tokio::sync::watch::Receiver<(EnvironmentRecord, Option<Durability>)>,
+    cleanup_pending: Arc<std::sync::atomic::AtomicBool>,
+    metrics_registration: crate::metrics::Registration,
 }
 
 impl EnvironmentHandle {
+    pub(crate) fn record_usage(
+        &self,
+        metrics: &crate::metrics::Metrics,
+        record: &EnvironmentRecord,
+        usage: crate::metrics::RuntimeUsage,
+    ) {
+        metrics.record(
+            &self.metrics_registration,
+            &record.runtime.id,
+            record.assignment.generation,
+            usage,
+        );
+    }
+    pub(crate) fn view(&self) -> (EnvironmentRecord, Option<Durability>) {
+        self.current.borrow().clone()
+    }
+    pub(crate) fn retained_runtime_id(&self) -> Option<String> {
+        let view = self.current.borrow();
+        let record = &view.0;
+        (record.resources_held
+            || self
+                .cleanup_pending
+                .load(std::sync::atomic::Ordering::Acquire)
+            || matches!(
+                record.state,
+                EnvironmentState::Starting | EnvironmentState::Resuming | EnvironmentState::Pausing
+            ))
+        .then(|| record.runtime.id.clone())
+    }
+
     pub async fn snapshot(
         &self,
         request: super::checkpoint::SnapshotRequest,
@@ -276,6 +333,7 @@ pub(crate) fn spawn(
     let runtime_id = format!("{}-{}", spec.id, assignment.generation);
     spawn_restored(
         EnvironmentRecord {
+            observation: None,
             execution_artifacts: vec![],
             snapshot_source: None,
             failure: None,
@@ -341,9 +399,13 @@ fn spawn_controller(
     authority_fenced: bool,
 ) -> EnvironmentHandle {
     let (tx, mut rx) = mpsc::channel::<Envelope>(32);
+    let (observed, current) = tokio::sync::watch::channel((record.clone(), durability));
     let demand = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let cleanup_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let metrics_registration = services.metrics.register(&record.spec.id);
     let mut controller = Controller {
         capture_preparation: None,
+        intent_retry: None,
         recovery_files: None,
         execution_files: vec![],
         held: record.resources_held,
@@ -356,29 +418,144 @@ fn spawn_controller(
         idle: None,
         restart_after: None,
         health_failures: 0,
+        events: events::LifecycleEvents::default(),
+        observed,
+        metrics_registration: metrics_registration.clone(),
+        cleanup_pending: cleanup_pending.clone(),
         demand: demand.clone(),
         observed_demand: 0,
         auto_pause_guard: None,
         create_deadline: None,
     };
+    controller.publish_view();
     tokio::spawn(async move {
-        while let Some(Envelope {
-            command,
-            reply,
-            trace,
-        }) = rx.recv().await
-        {
-            trace.attribute("environment.id", controller.record.spec.id.clone());
-            trace
-                .run(async {
-                    adx_observability::trace::Trace::child("environment.execute")
-                        .run(controller.dispatch(command, reply))
-                        .await;
-                })
-                .await;
+        let mut observers = events::Observers::default();
+        loop {
+            controller.publish_view();
+            observers.refresh(&mut controller);
+            let deadline = controller.lifecycle_deadline();
+            let record = controller.record.clone();
+            let routes = controller.services.routes.clone();
+            let proxy_stamp = controller.proxy_stamp();
+            let running = record.state == EnvironmentState::Running
+                && !controller.authority_fenced
+                && !controller.retired;
+            enum Wake {
+                Command(Option<Envelope>),
+                Control(Option<adx_core::runtime::RuntimeStatus>),
+                Exit(Result<adx_core::RuntimeFailure>),
+                Proxy(Result<(String, u64, u64)>),
+                Deadline,
+            }
+            let wake = tokio::select! {
+                command = rx.recv() => Wake::Command(command),
+                status = async {
+                    let Some(changes) = observers.control.as_mut() else { return std::future::pending().await; };
+                    if !observers.initial && changes.changed().await.is_err() { return None; }
+                    changes.borrow_and_update().clone()
+                } => Wake::Control(status),
+                result = async {
+                    match observers.exit.as_mut() { Some(wait) => wait.await, None => std::future::pending().await }
+                } => Wake::Exit(result),
+                proxy = async {
+                    if !running || record.spec.lifecycle.idle_timeout_seconds == 0 { return std::future::pending().await; }
+                    routes.activity_changed(&record, proxy_stamp).await
+                } => Wake::Proxy(proxy),
+                _ = async { match deadline { Some(deadline) => tokio::time::sleep_until(deadline).await, None => std::future::pending().await } } => Wake::Deadline,
+            };
+            let envelope = match wake {
+                Wake::Command(command) => {
+                    let Some(command) = command else {
+                        break;
+                    };
+                    command
+                }
+                Wake::Control(status) => {
+                    observers.initial = false;
+                    if observers
+                        .control
+                        .as_ref()
+                        .is_some_and(|changes| changes.has_changed().is_err())
+                    {
+                        observers.control = None;
+                    }
+                    let result = controller.control_observed(status).await;
+                    controller.trace_observation_error("runtime.control", &result);
+                    if let Err(error) = result {
+                        controller.retry_lifecycle();
+                        adx_observability::warn!(%error, "runtime control event incomplete");
+                    }
+                    continue;
+                }
+                Wake::Exit(result) => {
+                    observers.exit = None;
+                    let result = controller.backend_exited(result).await;
+                    controller.trace_observation_error("runtime.exit", &result);
+                    if let Err(error) = result {
+                        controller.retry_lifecycle();
+                        adx_observability::warn!(%error, "runtime exit observation incomplete");
+                    }
+                    continue;
+                }
+                Wake::Proxy(status) => {
+                    controller.proxy_observed(status);
+                    continue;
+                }
+                Wake::Deadline => {
+                    let result = controller.lifecycle_due().await;
+                    controller.trace_observation_error("lifecycle.deadline", &result);
+                    if let Err(error) = result {
+                        controller.retry_lifecycle();
+                        adx_observability::warn!(%error, "lifecycle deadline incomplete");
+                    }
+                    observers.arm_exit(&controller);
+                    continue;
+                }
+            };
+            let Envelope {
+                command,
+                reply,
+                trace,
+            } = envelope;
+            let trace = match &command {
+                Command::CheckAuthority(check, _) => controller.authority_trace(check),
+                _ => trace,
+            };
+            if let Some(trace) = trace {
+                trace.attribute("environment.id", controller.record.spec.id.clone());
+                let reconciliation = matches!(&command, Command::CheckAuthority(_, _));
+                let work = trace.scope(|| {
+                    adx_observability::trace::with_current_context(async {
+                        adx_observability::trace::Trace::child("environment.execute")
+                            .run(controller.dispatch(command, reply))
+                            .await;
+                    })
+                });
+                if reconciliation {
+                    trace.run(work).await;
+                } else {
+                    // Queue time ends at dispatch. The captured context keeps
+                    // execution linked even after the queue span has ended.
+                    drop(trace);
+                    work.await;
+                }
+            } else {
+                // Observation is passive. State-changing work below creates its
+                // own lifecycle spans only when that work actually occurs.
+                controller.dispatch(command, reply).await;
+            }
+            if controller.record.state == EnvironmentState::Failed {
+                controller.retry_lifecycle();
+            }
         }
     });
-    EnvironmentHandle { tx, demand }
+    EnvironmentHandle {
+        tx,
+        demand,
+        current,
+        cleanup_pending,
+        metrics_registration,
+    }
 }
 
 impl Controller {
@@ -387,7 +564,11 @@ impl Controller {
             Command::CheckAuthority(check, ack) => {
                 self.authority_fenced = true;
                 let result = self.check_authority(*check).await;
+                if result.is_err() {
+                    adx_observability::trace::error();
+                }
                 self.authority_fenced = result.is_err();
+                self.publish_view();
                 let _ = ack.send(result);
                 return;
             }
@@ -396,6 +577,7 @@ impl Controller {
                 if result.is_ok() {
                     self.authority_fenced = false;
                 }
+                self.publish_view();
                 let _ = ack.send(result);
                 return;
             }
@@ -434,6 +616,7 @@ impl Controller {
                 } else {
                     self.tick().await
                 };
+                self.trace_observation_error("tick", &result);
                 let _ = ack.send(result);
                 return;
             }
@@ -443,6 +626,7 @@ impl Controller {
                 } else {
                     self.expire_checkpoint(now).await
                 };
+                self.trace_observation_error("checkpoint_expiry", &result);
                 let _ = ack.send(result);
                 return;
             }
@@ -477,6 +661,11 @@ impl Controller {
             Command::Reconcile => "reconcile",
             _ => unreachable!(),
         };
+        if matches!(&command, Command::Delete) {
+            self.operation_intent(adx_core::observation::OperationIntent::User);
+        } else if matches!(&command, Command::CollectFailed(_)) {
+            self.operation_intent(adx_core::observation::OperationIntent::Policy);
+        }
         let result = match command {
             Command::Snapshot(_, _)
             | Command::AlignAuthority(_, _)
@@ -563,6 +752,8 @@ impl Controller {
 }
 
 struct Controller {
+    // One validated reload may retry after its intent-only state revisions.
+    intent_retry: Option<adx_core::CompletedOperation>,
     capture_preparation: Option<(adx_core::CompletedOperation, std::path::PathBuf)>,
     create_deadline: Option<tokio::time::Instant>,
     auto_pause_guard: Option<((String, u64, u64), u64)>,
@@ -580,9 +771,33 @@ struct Controller {
     idle: Option<((String, u64, u64), tokio::time::Instant)>,
     restart_after: Option<tokio::time::Instant>,
     health_failures: u32,
+    events: events::LifecycleEvents,
+    observed: tokio::sync::watch::Sender<(EnvironmentRecord, Option<Durability>)>,
+    metrics_registration: crate::metrics::Registration,
+    cleanup_pending: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for Controller {
+    fn drop(&mut self) {
+        self.services.metrics.unregister(&self.metrics_registration);
+    }
 }
 
 impl Controller {
+    fn publish_view(&self) {
+        let eligible = self.record.state == EnvironmentState::Running
+            && !self.retired
+            && !self.authority_fenced
+            && !self
+                .cleanup_pending
+                .load(std::sync::atomic::Ordering::Acquire);
+        self.services
+            .metrics
+            .observe(&self.metrics_registration, eligible.then_some(&self.record));
+        self.observed
+            .send_replace((self.record.clone(), self.durability));
+    }
+
     pub(super) fn hold_artifact(
         &mut self,
         artifact: adx_core::CheckpointArtifact,
@@ -596,6 +811,17 @@ impl Controller {
         }
         if let Some(previous) = self.recovery_files.replace(access) {
             self.execution_files.push(previous);
+        }
+    }
+
+    fn trace_observation_error<T>(&self, observation: &'static str, result: &Result<T>) {
+        if result.is_err() {
+            // Emit only a failure event after a passive check fails. Successful
+            // checks never allocate a span; lifecycle work has its own spans.
+            let trace = adx_observability::trace::Trace::child("environment.observation_failed");
+            trace.attribute("environment.id", self.record.spec.id.clone());
+            trace.attribute("environment.observation", observation.into());
+            trace.scope(adx_observability::trace::error);
         }
     }
     async fn discard_execution(&mut self, references: Option<&CheckpointReferences>) -> Result<()> {
@@ -718,6 +944,12 @@ impl Controller {
             }
             tokio::time::timeout(self.services.operation_timeout, async {
                 self.services.readiness.wait_ready(&self.record).await?;
+                if let Some(control) = &self.services.runtime_control {
+                    if control.uses_stream() {
+                        // A previous node process may have lost the idle barrier reply.
+                        control.reopen_idle(&self.record).await?;
+                    }
+                }
                 self.services.routes.activate(&self.record).await
             })
             .await
@@ -737,6 +969,7 @@ impl Controller {
                     self.record.revision.checked_add(1).ok_or(Error::Conflict)?;
             }
             if cp.expired(super::checkpoint::now()?) {
+                self.operation_intent(adx_core::observation::OperationIntent::Policy);
                 return self.delete().await;
             }
             match services.store.validate_artifact(&cp.artifact).await {
@@ -748,6 +981,9 @@ impl Controller {
             let lost_running = self.record.state == EnvironmentState::Running;
             if let Some(status) = observation {
                 self.record.failure = status.failure;
+            }
+            if lost_running && !self.intended_execution_absence() {
+                self.mark_interruption(adx_core::observation::EvidenceSource::Reconcile)?;
             }
             self.cleanup().await?;
             if !matches!(
@@ -775,6 +1011,12 @@ impl Controller {
         let next = self.record.state.apply(event)?;
         self.record.revision = self.record.revision.checked_add(1).ok_or(Error::Conflict)?;
         self.record.state = next;
+        self.intent_retry = None;
+        if matches!(next, EnvironmentState::Running | EnvironmentState::Paused) {
+            if let Some(observation) = self.record.observation.as_mut() {
+                observation.intent = None;
+            }
+        }
         if matches!(event, Event::Start | Event::Resume | Event::Ready) {
             self.record.failure = None;
         }
@@ -782,6 +1024,7 @@ impl Controller {
         self.idle = None;
         self.health_failures = 0;
         self.durability = None;
+        self.publish_view();
         Ok(())
     }
 
@@ -804,8 +1047,10 @@ impl Controller {
         .await
         .map_err(|_| Error::Unavailable("state commit timed out".into()))??;
         self.durability = Some(durability);
+        self.publish_view();
         self.clean_obsolete_checkpoints().await?;
         Ok(OperationResult {
+            newly_created: false,
             record: self.record.clone(),
             durability,
         })
@@ -815,6 +1060,7 @@ impl Controller {
         if self.durability == Some(Durability::Published) {
             self.clean_obsolete_checkpoints().await?;
             Ok(OperationResult {
+                newly_created: false,
                 record: self.record.clone(),
                 durability: Durability::Published,
             })
@@ -862,7 +1108,9 @@ impl Controller {
                 "snapshot source required before starting".into(),
             ));
         }
-        self.start_attempt(false, false, None).await
+        let mut result = self.start_attempt(false, false, None).await?;
+        result.newly_created = true;
+        Ok(result)
     }
 
     async fn start_attempt(
@@ -916,6 +1164,7 @@ impl Controller {
         };
         let mut awaiting_readiness = false;
         let mut stage = "backend preparation/runtime start";
+        self.create_stage(adx_core::observation::CreateStage::RuntimePrepare);
         let operation_started = Instant::now();
         let attempt = timeout(initialization_timeout, async {
             if self
@@ -933,6 +1182,7 @@ impl Controller {
                     .await?;
             }
             self.services.readiness.expect_runtime(&self.record)?;
+            self.create_stage(adx_core::observation::CreateStage::RuntimeStart);
             let runtime_start_started = Instant::now();
             self.record.runtime.ip = Some(
                 adx_observability::trace::Trace::child("environment.runtime.start")
@@ -1001,6 +1251,7 @@ impl Controller {
             );
             let runtime_start_ms = runtime_start_started.elapsed().as_secs_f64() * 1_000.0;
             awaiting_readiness = true;
+            self.create_stage(adx_core::observation::CreateStage::Readiness);
             stage = "Execd readiness";
             let runtime_ready_started = Instant::now();
             adx_observability::trace::Trace::child("environment.runtime.ready")
@@ -1009,6 +1260,7 @@ impl Controller {
             let runtime_ready_ms = runtime_ready_started.elapsed().as_secs_f64() * 1_000.0;
             awaiting_readiness = false;
             stage = "route activation";
+            self.create_stage(adx_core::observation::CreateStage::RouteActivation);
             let route_started = Instant::now();
             adx_observability::trace::Trace::child("environment.route.activate")
                 .run_result(self.services.routes.activate(&self.record))
@@ -1061,6 +1313,8 @@ impl Controller {
                         probe_failure: None,
                     });
                 }
+                self.cleanup_pending
+                    .store(true, std::sync::atomic::Ordering::Release);
                 self.transition(Event::Fail)?;
                 self.release_capacity()?;
                 self.record.restart_pending = restart
@@ -1113,6 +1367,7 @@ impl Controller {
         }
         self.record.restart_pending = false;
         self.restart_after = None;
+        self.create_stage(adx_core::observation::CreateStage::StatePublish);
         let commit_started = Instant::now();
         let result = if let Some(deadline) = self.create_deadline {
             tokio::time::timeout_at(deadline, self.sync())
@@ -1152,6 +1407,9 @@ impl Controller {
     }
 
     async fn cleanup(&mut self) -> Result<()> {
+        self.services.metrics.remove(&self.metrics_registration);
+        self.cleanup_pending
+            .store(true, std::sync::atomic::Ordering::Release);
         timeout(self.services.operation_timeout, async {
             self.services.routes.retire(&self.record).await?;
             if let Some(control) = &self.services.runtime_control {
@@ -1161,15 +1419,36 @@ impl Controller {
         })
         .await
         .map_err(|_| Error::Unavailable("environment cleanup timed out".into()))??;
+        self.cleanup_pending
+            .store(false, std::sync::atomic::Ordering::Release);
         self.capture_preparation = None;
         self.recovery_files = None;
         self.execution_files.clear();
         self.record.execution_artifacts.clear();
-        self.services.metrics.remove(&self.record.spec.id);
+        self.services.metrics.remove(&self.metrics_registration);
         self.release_capacity()
     }
 
     async fn delete(&mut self) -> Result<OperationResult> {
+        let services = self.services.clone();
+        let intent = self
+            .record
+            .observation
+            .as_ref()
+            .and_then(|o| o.intent)
+            .unwrap_or(adx_core::observation::OperationIntent::Policy);
+        let mut attempt = services.metrics.operation_attempt("delete", intent);
+        let result = self.delete_inner().await;
+        let cleared = self.clear_operation_intent().await;
+        let result = match (result, cleared) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(error), _) | (_, Err(error)) => Err(error),
+        };
+        attempt.finish(&result);
+        result
+    }
+    async fn delete_inner(&mut self) -> Result<OperationResult> {
+        self.publish_operation_intent().await?;
         self.record.restart_pending = false;
         self.restart_after = None;
         if self.record.state == EnvironmentState::Deleted {

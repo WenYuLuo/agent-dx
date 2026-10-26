@@ -14,15 +14,49 @@ pub async fn serve(listener: TcpListener, coordinator: CoordinatorRpc) -> std::i
                 move |request: hyper::Request<hyper::body::Incoming>| {
                     let coordinator = coordinator.clone();
                     async move {
+                        if request.method() == hyper::Method::GET
+                            && request.uri().path() == "/observability/environments"
+                        {
+                            let result = coordinator
+                                .interruption_details(request.uri().query().unwrap_or(""))
+                                .await;
+                            let (status, body) = match result {
+                                Ok(body) => (200, body.to_string()),
+                                Err(adx_core::Error::Invalid(message)) => {
+                                    (400, serde_json::json!({"error":message}).to_string())
+                                }
+                                Err(_) => (
+                                    503,
+                                    serde_json::json!({"error":"observation snapshot unavailable"})
+                                        .to_string(),
+                                ),
+                            };
+                            let mut response = hyper::Response::new(Full::new(Bytes::from(body)));
+                            *response.status_mut() = hyper::StatusCode::from_u16(status)
+                                .unwrap_or(hyper::StatusCode::INTERNAL_SERVER_ERROR);
+                            response.headers_mut().insert(
+                                hyper::header::CONTENT_TYPE,
+                                hyper::header::HeaderValue::from_static("application/json"),
+                            );
+                            return Ok::<_, std::convert::Infallible>(response);
+                        }
                         let (status, body) = if request.method() != hyper::Method::GET
-                            || request.uri().path() != "/metrics"
+                            || !matches!(request.uri().path(), "/metrics" | "/metrics/environments")
                         {
                             (404, String::new())
                         } else {
-                            match coordinator.metrics().await {
+                            let detail = request.uri().path() == "/metrics/environments";
+                            let result = if detail {
+                                coordinator.environment_metrics().await
+                            } else {
+                                coordinator.metrics().await
+                            };
+                            match result {
                                 Ok(mut text) => {
-                                    text.push_str(&adx_observability::trace::metrics());
-                                    text.push_str(&adx_observability::process::metrics());
+                                    if !detail {
+                                        text.push_str(&adx_observability::trace::metrics());
+                                        text.push_str(&adx_observability::process::metrics());
+                                    }
                                     (200, text)
                                 }
                                 Err(_) => (503, "metrics temporarily unavailable\n".into()),

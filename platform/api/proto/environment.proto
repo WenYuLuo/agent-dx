@@ -77,6 +77,7 @@ message RegisterNodeRequest {
 message RegisterNodeResponse { uint32 shard_id = 1; uint64 coordinator_epoch = 2; }
 
 message CreateEnvironmentRequest {
+  string request_id = 7;
   EnvironmentSpec spec = 1;
   CallerContext caller = 2;
   // Bounds only time waiting for a central scheduling assignment.
@@ -167,7 +168,7 @@ message SetNodeSchedulingRequest {
 message NodeSchedulingState { string node_id = 1; bool accepting_allocations = 2; }
 message LocalEnvironmentCreateRequest { CreateEnvironmentRequest create = 1; string node_session_id = 2; }
 message PreparedEnvironment { EnvironmentSpec spec = 1; ReusableSnapshot snapshot = 2; }
-message ClaimEnvironmentRequest { EnvironmentSpec spec = 1; CallerContext caller = 2; string node_session_id = 3; repeated DeviceAllocation devices = 4; }
+message ClaimEnvironmentRequest { EnvironmentSpec spec = 1; CallerContext caller = 2; string node_session_id = 3; repeated DeviceAllocation devices = 4; string request_id = 5; }
 message ClaimEnvironmentResponse {
   oneof outcome {
     StartAssignedEnvironmentRequest owned = 1;

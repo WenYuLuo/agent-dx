@@ -24,7 +24,7 @@ data-plane-gateway = { path = "..", features = ["agent-api"] }
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time", "process"] }
 tonic = { version = "0.12", features = ["tls"] }
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
@@ -40,6 +40,8 @@ tokio-stream = "0.1"
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "stream"] }
 
 [dev-dependencies]
+opentelemetry = { version = "0.31", features = ["trace"] }
+opentelemetry_sdk = { version = "0.31", features = ["trace", "testing"] }
 adx-agent-api = { path = "../../agent/api" }
 adx-agent-store = { path = "../../agent/crates/store", features = ["test-memory"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

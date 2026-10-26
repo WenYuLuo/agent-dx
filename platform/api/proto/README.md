@@ -124,3 +124,14 @@ conflicting cursor or regressed execution version causes a fresh subscription.
 Coordinator publishes only committed, Running Environments on routable nodes. API key
 verification is shared by trusted API Server and Ingress callers. Route publication
 and credentials do not transfer Environment lifecycle ownership to Coordinator.
+
+## Creation and interruption observations
+
+CreateEnvironmentRequest and ClaimEnvironmentRequest carry request_id for the atomic
+tenant/request-to-Environment ownership binding. EnvironmentResult.newly_created is true
+only for the actual initial start operation; replay, reuse, resume and recovery return false.
+EnvironmentRecord.observation carries bounded initial-create stage, normal-operation intent
+and old-execution interruption evidence through journal/replay and final Running publication.
+Coordinator retains its latest interruption/recovery summary in the Redis env record.
+All participating components must use matching generated contracts. See the
+[metric and persistence contract](../../../docs/testing/sandbox-observability.md).

@@ -1,4 +1,112 @@
 use super::*;
+
+#[tokio::test]
+#[ignore = "requires isolated Redis and generated mTLS certificates; run control-rpc suite"]
+async fn live_inspection_accepts_open_admission_but_requires_a_current_session() {
+    let mut rig = Rig::new().await;
+    let inspection = pb::InspectNodeRequest {
+        node_id: "a".into(),
+        session_id: "boot-a".into(),
+    };
+    // Rig's registration handshake has completed and allocation is open.
+    rig.claimants[0]
+        .inspect_node(inspection.clone())
+        .await
+        .unwrap();
+    let mut stale = inspection.clone();
+    stale.session_id = "old-boot".into();
+    assert_eq!(
+        rig.claimants[0]
+            .inspect_node(stale)
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
+    assert_eq!(
+        rig.claimants[1]
+            .inspect_node(inspection.clone())
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+    // Inspection cannot revive an expired session before the expiry worker runs.
+    tokio::time::sleep(Duration::from_millis(10050)).await;
+    assert_eq!(
+        rig.claimants[0]
+            .inspect_node(inspection)
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Redis and generated mTLS certificates; run control-rpc suite"]
+async fn live_catalog_keeps_a_durable_claim_pending_until_the_create_rpc() {
+    let mut rig = Rig::new().await;
+    rig.managers[0].reconcile(vec![]).await.unwrap();
+    let spec = spec("claim-before-create");
+    rig.claimants[0]
+        .claim_environment(pb::ClaimEnvironmentRequest {
+            request_id: String::new(),
+            spec: Some(spec.clone().into()),
+            caller: caller(),
+            node_session_id: "boot-a".into(),
+            devices: vec![],
+        })
+        .await
+        .unwrap();
+    assert!(rig.session.get(&spec.id).await.unwrap().result.is_none());
+    let snapshot = rig.session.snapshot().await.unwrap();
+    let node = &snapshot.nodes["a"];
+    let mut registration = pb::RegisterNodeRequest {
+        node_id: "a".into(),
+        session_id: "boot-a".into(),
+        node_address: node.address.clone(),
+        proxy_address: node.proxy_address.clone(),
+        capacity: Some(node.node.capacity.into()),
+        heartbeat_sequence: 3,
+        reconciling: false,
+        accepting_allocations: true,
+        runtime_classes: vec!["r".into(), "runc".into(), "runsc".into()],
+        labels: Default::default(),
+        devices: vec![],
+    };
+    let mut authority = pb::coordinator_service_client::CoordinatorServiceClient::new(
+        adx_transport::rpc::authenticated_channel(channel(rig.address, "node").await),
+    );
+    adxlet::node_reconciliation::reconcile_node(
+        &mut authority,
+        &mut registration,
+        &rig.managers[0],
+        None,
+        Duration::from_secs(2),
+        Duration::from_millis(10),
+        tokio::time::Instant::now() + Duration::from_secs(60),
+    )
+    .await
+    .unwrap();
+    let reserved = rig.session.get(&spec.id).await.unwrap();
+    assert!(
+        reserved.result.is_none(),
+        "live comparison turned a durable unstarted claim into a terminal result"
+    );
+    assert_eq!(rig.backends[0].started.load(Ordering::SeqCst), 0);
+    let created = rig.nodes[0]
+        .create_local_environment(Rig::request("claim-before-create", 0))
+        .await
+        .unwrap()
+        .into_inner()
+        .record
+        .unwrap();
+    assert_eq!(created.state, pb::EnvironmentState::Running as i32);
+    assert_eq!(rig.backends[0].started.load(Ordering::SeqCst), 1);
+    rig.delete(&created).await;
+}
+
 fn local_peers() -> Peers {
     Peers::new(
         [
@@ -95,6 +203,7 @@ impl Rig {
                     .with_session(format!("boot-{id}")),
             );
             let backend = Arc::new(Backend {
+                pause_writes_after_remove: Mutex::new(None),
                 session: session.clone(),
                 started: AtomicUsize::new(0),
                 removed: AtomicUsize::new(0),
@@ -486,13 +595,16 @@ async fn environment_directory_streams_full_then_incremental_ownership() {
             let frame = directory.message().await.unwrap().unwrap();
             assert_eq!(frame.base_revision, revision);
             revision = frame.revision;
-            assert!(frame.upserts.iter().all(|entry| {
-                entry
+            for entry in &frame.upserts {
+                if let Some(record) = entry
                     .record
                     .as_ref()
-                    .and_then(|record| record.spec.as_ref())
-                    .is_none_or(|spec| spec.id != "directory-case")
-            }));
+                    .filter(|r| r.spec.as_ref().is_some_and(|s| s.id == "directory-case"))
+                {
+                    assert_eq!(record.state, pb::EnvironmentState::Running as i32);
+                    assert_eq!(record.observation.as_ref().unwrap().intent, "user");
+                }
+            }
             if frame.deleted.iter().any(|id| id == "directory-case") {
                 break;
             }
@@ -619,13 +731,21 @@ async fn environment_directory_increment_does_not_rescan_control_history() {
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             let frame = directory.message().await.unwrap().unwrap();
-            assert!(frame.upserts.iter().all(|entry| {
-                entry
-                    .record
+            for record in frame
+                .upserts
+                .iter()
+                .filter_map(|entry| entry.record.as_ref())
+            {
+                if record
+                    .spec
                     .as_ref()
-                    .and_then(|record| record.spec.as_ref())
-                    .is_none_or(|spec| spec.id != "incremental-publication")
-            }));
+                    .is_some_and(|spec| spec.id == "incremental-publication")
+                {
+                    // The confirmed normal-operation intent is visible before deletion.
+                    assert_eq!(record.state, pb::EnvironmentState::Running as i32);
+                    assert_eq!(record.observation.as_ref().unwrap().intent, "user");
+                }
+            }
             if frame
                 .deleted
                 .iter()
@@ -709,7 +829,10 @@ async fn concurrent_local_entries_converge_and_fallback_preserves_both_ledgers()
         b.create_local_environment(Rig::request("same", 1))
     );
     let one = one.unwrap().into_inner();
-    assert_eq!(one, two.unwrap().into_inner());
+    let two = two.unwrap().into_inner();
+    assert_eq!(u8::from(one.newly_created) + u8::from(two.newly_created), 1);
+    assert_eq!(one.record, two.record);
+    assert_eq!(one.durability, two.durability);
     let record = one.record.unwrap();
     assert_eq!(
         rig.backends
@@ -732,6 +855,18 @@ async fn concurrent_local_entries_converge_and_fallback_preserves_both_ledgers()
         .unwrap()
         .into_inner();
     assert_eq!(replay.record.as_ref(), Some(&record));
+    assert!(rig
+        .rpc
+        .metrics()
+        .await
+        .unwrap()
+        .contains("adx_environment_created_total 1\n"));
+    assert!(rig
+        .rpc
+        .environment_metrics()
+        .await
+        .unwrap()
+        .contains("adx_environment_info{environment_id=\"same\",node_id="));
     let mut changed = Rig::request("same", 1);
     changed
         .create
@@ -770,6 +905,7 @@ async fn concurrent_local_entries_converge_and_fallback_preserves_both_ledgers()
         200
     );
     let metrics = rig.rpc.metrics().await.unwrap();
+    assert!(metrics.contains("adx_environment_created_total 2\n"));
     assert!(metrics
         .contains("adx_coordinator_node_reserved_cpu_millis{shard_id=\"0\",node_id=\"a\"} 100"));
     assert!(metrics
@@ -812,7 +948,13 @@ async fn concurrent_local_entries_converge_and_fallback_preserves_both_ledgers()
         a.create_local_environment(Rig::request("mixed", 0))
     );
     let central = central.unwrap().into_inner();
-    assert_eq!(central, local.unwrap().into_inner());
+    let local = local.unwrap().into_inner();
+    assert_eq!(central.record, local.record);
+    assert_eq!(central.durability, local.durability);
+    assert_eq!(
+        usize::from(central.newly_created) + usize::from(local.newly_created),
+        1
+    );
     assert_eq!(
         rig.managers
             .iter()
@@ -858,6 +1000,7 @@ async fn new_local_claim_avoids_redundant_preclaim_storage_read() {
 
     rig.claimants[0]
         .claim_environment(pb::ClaimEnvironmentRequest {
+            request_id: String::new(),
             spec: Some(spec("one-storage-read").into()),
             caller: caller(),
             node_session_id: "boot-a".into(),
@@ -884,6 +1027,7 @@ async fn concurrent_local_claims_share_bounded_redis_commits() {
         claims.spawn(async move {
             claimant
                 .claim_environment(pb::ClaimEnvironmentRequest {
+                    request_id: String::new(),
                     spec: Some(spec(&format!("batched-{index}")).into()),
                     caller: caller(),
                     node_session_id: "boot-a".into(),
@@ -914,6 +1058,7 @@ async fn concurrent_local_claims_share_bounded_redis_commits() {
 async fn claim_rpc_auth_session_directory_and_real_delayed_redis_write() {
     let mut rig = Rig::new().await;
     let claim = pb::ClaimEnvironmentRequest {
+        request_id: String::new(),
         spec: Some(spec("delayed").into()),
         caller: caller(),
         node_session_id: "boot-a".into(),
@@ -1314,19 +1459,15 @@ async fn existing_terminal_claim_reconciles_a_late_commit_into_scheduler_account
     terminal.state = adx_core::EnvironmentState::Deleted;
     terminal.resources_held = false;
     terminal.runtime.ip = None;
-    terminal.revision += 2;
-    let mut control = redis::Client::open(rig._redis.url.as_str())
-        .unwrap()
-        .get_multiplexed_async_connection()
-        .await
-        .unwrap();
-    redis::cmd("CLIENT")
-        .arg("PAUSE")
-        .arg(500)
-        .arg("WRITE")
-        .query_async::<()>(&mut control)
-        .await
-        .unwrap();
+    terminal.revision += 3;
+    terminal
+        .observation
+        .get_or_insert_with(Default::default)
+        .intent = Some(adx_core::observation::OperationIntent::User);
+    // Pause only the final result write, after the intent was acknowledged and
+    // the old runtime was removed.
+    *rig.backends[0].pause_writes_after_remove.lock().unwrap() =
+        Some((rig._redis.url.clone(), 500));
     assert!(rig.nodes[0]
         .delete_environment(pb::DeleteEnvironmentRequest {
             failed_revision: None,

@@ -97,6 +97,7 @@ impl Session {
                 .ok_or(Error::Conflict)?
                 .clone();
             stored_environment.result = Some(EnvironmentRecord {
+                observation: None,
                 execution_artifacts: vec![],
                 snapshot_source: source.snapshot_source.clone(),
                 failure: None,
@@ -128,6 +129,13 @@ impl Session {
                 source: previous.clone(),
                 pending: true,
             });
+            if let Some(last) = stored_environment
+                .last_interruption
+                .as_mut()
+                .filter(|last| last.resolved_at_unix_millis.is_none())
+            {
+                last.recovery_state = RecoveryState::Recovering;
+            }
             stored_environment.validate()?;
             header.generation = replacement.generation;
             header.advance()?;

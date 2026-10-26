@@ -8,6 +8,8 @@
 #[cfg(feature = "dfs")]
 mod read_pipeline;
 mod state;
+use crate::node::api::usrbio::FdBridge;
+use afs_transport::usrbio_fd as fd_wire;
 
 use std::{
     borrow::Cow,
@@ -28,9 +30,10 @@ use afs_tracing::tracing;
 use fuser::{
     AccessFlags, BackgroundSession, Config, CopyFileRangeFlags, Errno, FileAttr,
     FileHandle as FuseFileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo, InitFlags,
-    KernelConfig, LockOwner, MountOption, OpenFlags, RenameFlags as FuseRenameFlags, ReplyAttr,
-    ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyLock, ReplyOpen,
-    ReplyStatfs, ReplyWrite, ReplyXattr, Request, SessionACL, TimeOrNow, WriteFlags,
+    IoctlFlags, KernelConfig, LockOwner, MountOption, OpenFlags, RenameFlags as FuseRenameFlags,
+    ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyIoctl,
+    ReplyLock, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, SessionACL, TimeOrNow,
+    WriteFlags,
 };
 use tokio::sync::RwLock;
 
@@ -495,6 +498,7 @@ pub fn mount_dfs_with_options(
         #[cfg(any(feature = "dfs", test))]
         None,
         options,
+        None,
     )
 }
 
@@ -519,6 +523,7 @@ pub fn mount_dfs_with_metrics_and_options(
         #[cfg(any(feature = "dfs", test))]
         None,
         options,
+        None,
     )
 }
 
@@ -548,7 +553,44 @@ pub fn mount_dfs_with_read_diagnostics_and_options(
     read_work: crate::node::read_work::ReadWorkMetrics,
     options: FuseMountOptions,
 ) -> Result<MountedFuse> {
-    mount_dfs_inner(backend, path, Some(metrics), Some(read_work), options)
+    mount_dfs_inner(backend, path, Some(metrics), Some(read_work), options, None)
+}
+
+/// Mount the same Backend served by a local SDK, with existing-fd controls.
+pub fn mount_dfs_with_fd_bridge(
+    backend: Arc<dyn Backend>,
+    path: &Path,
+    options: FuseMountOptions,
+    bridge: Arc<FdBridge>,
+) -> Result<MountedFuse> {
+    mount_dfs_inner(
+        backend,
+        path,
+        None,
+        #[cfg(any(feature = "dfs", test))]
+        None,
+        options,
+        Some(bridge),
+    )
+}
+
+#[cfg(feature = "dfs")]
+pub fn mount_dfs_with_diagnostics_and_fd_bridge(
+    backend: Arc<dyn Backend>,
+    path: &Path,
+    metrics: FuseRequestMetrics,
+    read_work: crate::node::read_work::ReadWorkMetrics,
+    options: FuseMountOptions,
+    bridge: Arc<FdBridge>,
+) -> Result<MountedFuse> {
+    mount_dfs_inner(
+        backend,
+        path,
+        Some(metrics),
+        Some(read_work),
+        options,
+        Some(bridge),
+    )
 }
 
 fn mount_dfs_inner(
@@ -557,11 +599,16 @@ fn mount_dfs_inner(
     metrics: Option<FuseRequestMetrics>,
     #[cfg(any(feature = "dfs", test))] read_work: Option<crate::node::read_work::ReadWorkMetrics>,
     options: FuseMountOptions,
+    bridge: Option<Arc<FdBridge>>,
 ) -> Result<MountedFuse> {
     let options = options.validate()?;
     let path = canonical_mount_path(path)?;
     reject_existing_mount(&path)?;
+    if let Some(bridge) = &bridge {
+        bridge.bind(&backend)?;
+    }
     let mut fs = AfsFuse::with_mount_options(backend, options);
+    fs.fd_bridge = bridge.clone();
     fs.requests = metrics.map(|metrics| (metrics, "dfs"));
     #[cfg(any(feature = "dfs", test))]
     {
@@ -579,6 +626,9 @@ fn mount_dfs_inner(
     let cleanup_error = fs.cleanup_error.clone();
     let session = fuser::spawn_mount(fs, &path, &configured_mount("afs-dfs", true, options))
         .map_err(Error::from)?;
+    if let Some(bridge) = bridge {
+        bridge.set_notifier(session.notifier());
+    }
     MountedFuse::new(session, &path, cleanup_error)
 }
 
@@ -1381,6 +1431,7 @@ impl Drop for InodeCacheGate {
 }
 
 pub struct AfsFuse {
+    fd_bridge: Option<Arc<FdBridge>>,
     #[cfg(any(feature = "dfs", test))]
     read_work: Option<crate::node::read_work::ReadWorkMetrics>,
     requests: Option<(FuseRequestMetrics, &'static str)>,
@@ -1421,6 +1472,7 @@ impl AfsFuse {
     fn with_mount_options(backend: Arc<dyn Backend>, mount_options: FuseMountOptions) -> Self {
         let state = Arc::new(Mutex::new(FuseState::new(backend.root_inode())));
         Self {
+            fd_bridge: None,
             #[cfg(any(feature = "dfs", test))]
             read_work: None,
             requests: None,
@@ -1557,6 +1609,9 @@ impl AfsFuse {
         // lock state is still released for recoverable historical sessions.
         self.cleanup_lock_session();
         self.dispatch.close_and_drain();
+        if let Some(bridge) = &self.fd_bridge {
+            bridge.unmount();
+        }
         // Final idempotent sweep observes every accepted callback's terminal
         // outcome before a joined mount can report successful cleanup.
         self.release_lock_session();
@@ -1601,6 +1656,56 @@ impl Filesystem for AfsFuse {
     fn destroy(&mut self) {
         self.record_request("destroy");
         self.finish_callbacks();
+    }
+
+    fn ioctl(
+        &self,
+        req: &Request,
+        ino: INodeNo,
+        fh: FuseFileHandle,
+        flags: IoctlFlags,
+        cmd: u32,
+        in_data: &[u8],
+        out_size: u32,
+        reply: ReplyIoctl,
+    ) {
+        self.record_request("ioctl");
+        if !flags.is_empty()
+            || !matches!(
+                cmd,
+                fd_wire::PROBE | fd_wire::REGISTER | fd_wire::UNREGISTER
+            )
+        {
+            reply.error(fuse_errno(libc::ENOTTY));
+            return;
+        }
+        if out_size as usize != fd_wire::RECORD_BYTES {
+            reply.error(fuse_errno(libc::EINVAL));
+            return;
+        }
+        let Ok(value) = fd_wire::Control::decode(in_data) else {
+            reply.error(fuse_errno(libc::EINVAL));
+            return;
+        };
+        let Some(bridge) = self.fd_bridge.clone() else {
+            reply.error(fuse_errno(libc::EOPNOTSUPP));
+            return;
+        };
+        if let Err(error) = bridge.check_control(ino.0, fh.0) {
+            reply.error(fuse_errno(error));
+            return;
+        }
+        let uid = req.uid();
+        self.dispatch
+            .submit_keyed(fh.0, move || match bridge.control(fh.0, uid, cmd, value) {
+                Ok((value, work)) => {
+                    reply.ioctl(0, &value.encode());
+                    if let Some(work) = work {
+                        bridge.after_reply(work);
+                    }
+                }
+                Err(error) => reply.error(fuse_errno(error)),
+            });
     }
 
     fn lookup(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
@@ -2036,6 +2141,17 @@ impl Filesystem for AfsFuse {
                 Ok(handle) => {
                     let fh = self.state.lock().unwrap().insert_file_handle(handle);
                     self.file_handle_inodes.lock().unwrap().insert(fh, ino);
+                    if let Some(bridge) = &self.fd_bridge {
+                        bridge.opened(
+                            fh,
+                            ino,
+                            inode,
+                            handle,
+                            Self::context(req, 0),
+                            flags,
+                            self.cached_io,
+                        );
+                    }
                     self.with_cache_policy(inode, |_, private| {
                         reply.opened(FuseFileHandle(fh), open_reply_flags(!private));
                     });
@@ -2052,6 +2168,7 @@ impl Filesystem for AfsFuse {
                 .is_some_and(|ownerfs| ownerfs.is_local_inode(inode));
         #[cfg(not(feature = "ownerfs"))]
         let inline_local_read = false;
+        let fd_bridge = self.fd_bridge.clone();
         let backend = self.backend.clone();
         let state = self.state.clone();
         let file_handle_inodes = self.file_handle_inodes.clone();
@@ -2111,6 +2228,9 @@ impl Filesystem for AfsFuse {
                         .unwrap()
                         .insert_file_handle_with_policy(handle, inline_local_read);
                     file_handle_inodes.lock().unwrap().insert(fh, ino);
+                    if let Some(bridge) = &fd_bridge {
+                        bridge.opened(fh, ino, inode, handle, context.clone(), flags, cached_io);
+                    }
                     #[cfg(feature = "ownerfs")]
                     if let Some(ownerfs) = &ownerfs {
                         ownerfs.with_fuse_cache_policy(inode, |_, private| {
@@ -2157,6 +2277,11 @@ impl Filesystem for AfsFuse {
         _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
+        #[cfg(test)]
+        if let Some(bridge) = &self.fd_bridge {
+            bridge.note_fuse_data(false);
+        }
+
         #[cfg(feature = "dfs")]
         let reply = match self.try_start_async_read(req, ino, fh, offset, size, reply) {
             Some(reply) => reply,
@@ -2325,6 +2450,11 @@ impl Filesystem for AfsFuse {
         _lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
+        #[cfg(test)]
+        if let Some(bridge) = &self.fd_bridge {
+            bridge.note_fuse_data(true);
+        }
+
         self.record_io_request("write", data.len());
         let ino = ino.0;
         let fh = fh.0;
@@ -2589,6 +2719,7 @@ impl Filesystem for AfsFuse {
             .unwrap()
             .file_handle(fh)
             .is_some_and(|file| file.inline_local_read);
+        let fd_bridge = self.fd_bridge.clone();
         let backend = self.backend.clone();
         let state = self.state.clone();
         let file_handle_inodes = self.file_handle_inodes.clone();
@@ -2596,6 +2727,9 @@ impl Filesystem for AfsFuse {
         let flock_owner = lock_owner.map(|owner| self.file_lock_owner(owner));
         let run = move || {
             let file = state.lock().unwrap().remove_file_handle(fh);
+            if let Some(bridge) = &fd_bridge {
+                bridge.release_fuse(fh);
+            }
             file_handle_inodes.lock().unwrap().remove(&fh);
             let result = file.ok_or(libc::ESTALE).and_then(|file| {
                 AfsFuse::validate_handle_inode_in(&state, ino)?;
@@ -2790,17 +2924,11 @@ impl Filesystem for AfsFuse {
         let options = OpenOptions {
             kill_suidgid: false,
         };
+        let context = Self::context(req, umask);
         let result = self.backend_inode(parent.0).and_then(|parent_inode| {
             Ok(self.backend.as_ref()).and_then(|backend| {
                 backend
-                    .create_with_options(
-                        &Self::context(req, umask),
-                        parent_inode,
-                        name,
-                        mode,
-                        flags,
-                        options,
-                    )
+                    .create_with_options(&context, parent_inode, name, mode, flags, options)
                     .map_err(errno)
             })
         });
@@ -2814,6 +2942,17 @@ impl Filesystem for AfsFuse {
                     .unwrap()
                     .insert_file_handle(created.handle);
                 self.file_handle_inodes.lock().unwrap().insert(fh, ino);
+                if let Some(bridge) = &self.fd_bridge {
+                    bridge.opened(
+                        fh,
+                        ino,
+                        created.entry.inode,
+                        created.handle,
+                        context.clone(),
+                        flags,
+                        self.cached_io,
+                    );
+                }
                 if let Ok(mut cache) = self.page_cache_ids.lock() {
                     cache.remove(ino);
                 }

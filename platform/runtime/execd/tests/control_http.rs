@@ -50,6 +50,7 @@ impl Drop for Runtime {
 }
 fn record(generation: u64) -> EnvironmentRecord {
     EnvironmentRecord {
+        observation: None,
         execution_artifacts: vec![],
         snapshot_source: None,
         failure: None,

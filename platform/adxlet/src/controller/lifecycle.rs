@@ -26,7 +26,9 @@ impl Controller {
                 return Ok(());
             }
             self.auto_pause_guard = Some((stamp, demand));
-            self.pause(request).await.map(|_| ())
+            let trace = adx_observability::trace::Trace::child("environment.auto_pause");
+            trace.attribute("environment.id", self.record.spec.id.clone());
+            trace.run_result(self.pause(request)).await.map(|_| ())
         }
         .await;
         self.auto_pause_guard = None;
@@ -36,6 +38,24 @@ impl Controller {
         result
     }
     pub(super) async fn reload(
+        &mut self,
+        operation_id: String,
+        expected_revision: u64,
+    ) -> Result<OperationResult> {
+        let services = self.services.clone();
+        let mut attempt = services
+            .metrics
+            .operation_attempt("reload", adx_core::observation::OperationIntent::User);
+        let result = self.reload_inner(operation_id, expected_revision).await;
+        let cleared = self.clear_operation_intent().await;
+        let result = match (result, cleared) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(error), _) | (_, Err(error)) => Err(error),
+        };
+        attempt.finish(&result);
+        result
+    }
+    async fn reload_inner(
         &mut self,
         operation_id: String,
         expected_revision: u64,
@@ -61,6 +81,13 @@ impl Controller {
             .store
             .validate_artifact(&checkpoint.artifact)
             .await?;
+        self.intent_retry = Some(CompletedOperation {
+            id: operation_id.clone(),
+            expected_revision,
+            kind: LifecycleKind::Reload,
+        });
+        self.operation_intent(adx_core::observation::OperationIntent::User);
+        self.publish_operation_intent().await?;
         self.cleanup().await?;
         self.transition(Event::Fail)?;
         self.start_attempt(
@@ -110,7 +137,23 @@ impl Controller {
         let Some(cp) = self.record.checkpoint.clone().filter(|cp| cp.expired(now)) else {
             return Ok(None);
         };
+        if !matches!(
+            self.record.state,
+            EnvironmentState::Paused | EnvironmentState::Running | EnvironmentState::Failed
+        ) {
+            return Ok(None);
+        }
+        let trace = adx_observability::trace::Trace::child("environment.checkpoint_expired");
+        trace.attribute("environment.id", self.record.spec.id.clone());
+        trace.run_result(self.expire_checkpoint_inner(cp)).await
+    }
+
+    async fn expire_checkpoint_inner(
+        &mut self,
+        cp: RestorePoint,
+    ) -> Result<Option<OperationResult>> {
         if self.record.state == EnvironmentState::Paused {
+            self.operation_intent(adx_core::observation::OperationIntent::Policy);
             return self.delete().await.map(Some);
         }
         if self.record.state != EnvironmentState::Running
@@ -151,6 +194,13 @@ impl Controller {
         {
             return Ok(true);
         }
+        if self
+            .intent_retry
+            .as_ref()
+            .is_some_and(|op| op.id == id && op.expected_revision == revision && op.kind == kind)
+        {
+            return Ok(false);
+        }
         if self.record.revision != revision {
             return Err(Error::Conflict);
         }
@@ -181,6 +231,7 @@ impl Controller {
         Ok(path)
     }
     pub(super) fn completed(&mut self, id: String, expected_revision: u64, kind: LifecycleKind) {
+        self.intent_retry = None;
         self.record.last_operation = Some(CompletedOperation {
             id,
             expected_revision,
@@ -188,6 +239,23 @@ impl Controller {
         });
     }
     pub(super) async fn pause(&mut self, request: PauseRequest) -> Result<OperationResult> {
+        let intent = if self.auto_pause_guard.is_some() {
+            adx_core::observation::OperationIntent::Idle
+        } else {
+            adx_core::observation::OperationIntent::User
+        };
+        let services = self.services.clone();
+        let mut attempt = services.metrics.operation_attempt("pause", intent);
+        let result = self.pause_inner(request).await;
+        let cleared = self.clear_operation_intent().await;
+        let result = match (result, cleared) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(error), _) | (_, Err(error)) => Err(error),
+        };
+        attempt.finish(&result);
+        result
+    }
+    async fn pause_inner(&mut self, request: PauseRequest) -> Result<OperationResult> {
         if self.replay_operation(
             &request.operation_id,
             request.expected_revision,
@@ -308,6 +376,11 @@ impl Controller {
                 self.record.execution_artifacts.push(reference);
             }
         }
+        self.operation_intent(if self.auto_pause_guard.is_some() {
+            adx_core::observation::OperationIntent::Idle
+        } else {
+            adx_core::observation::OperationIntent::User
+        });
         self.record.revision = self.record.revision.checked_add(1).ok_or(Error::Conflict)?;
         match self.sync().await {
             Ok(result) if result.durability == Durability::Published => {}
@@ -378,6 +451,8 @@ impl Controller {
         if let Some(control) = &self.services.runtime_control {
             control.retire(&self.record);
         }
+        // The stop barrier has completed; pre-pause usage is no longer current.
+        self.services.metrics.remove(&self.metrics_registration);
         self.recovery_files = None;
         self.execution_files.clear();
         self.record.execution_artifacts.clear();
