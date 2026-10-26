@@ -143,11 +143,31 @@ Validation on this implementation:
 - A fresh SDK wheel/sdist was built with this commit. The subsequent Linux builder
   could not start: Docker Desktop returned containerd blob `input/output error`.
   Image listing and inspection failed similarly. Package assembly, verification
-  and the planned local lifecycle/restart E2E did not run. This revision has no new
-  full-runtime E2E result, and component fault tests do not establish KVM checkpoint
-  recovery. Docker was not reset; unrelated containers were left running.
+  and the planned local lifecycle/restart E2E did not run. That attempt produced no full-runtime E2E result. Component fault tests do not
+  establish KVM checkpoint recovery. Docker was not reset; unrelated containers were left running.
 
 Evidence: `out/observability/reload-retry/`; the blocked build is recorded in
 `out/observability/e2e-reload-retry/build.log`. Earlier E2E results and failures above
 refer to their recorded revisions. The separate continuous-recovery observation
 conflict found in the latest review remains open.
+
+
+### Resumed local E2E after Docker restart
+
+The resumed run built and verified a coherent package from
+`beedf0313a58181a247247ab664408afbaca2f61` with `dirty=false` (the implementation is
+`61f4823`; the following commit only records validation). Build, package verification,
+image preparation and both targeted local Docker/runc scenarios passed:
+
+- `lifecycle`: six subcases passed, covering detached reattach/delete, named owner
+  reuse, attached close, context-manager deletion and two idle-reclamation paths.
+- `restart`: adxlet process restart passed.
+- Both scenarios passed actual Prometheus collection. Both cleanup reports were
+  empty; a final check found no containers or networks for these two run IDs.
+
+Evidence is under `out/observability/e2e-reload-retry-resumed/`, including
+`summary.json`, per-case `result.json`, raw metrics, queries and package identity.
+This is targeted lifecycle/restart regression, not a rerun of the complete
+18-group suite or an end-to-end checkpoint/reload fault-injection test. The
+previous full-suite failures and the separate continuous-recovery review finding
+remain open. No test or production cluster was deployed.
