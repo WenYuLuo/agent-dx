@@ -3,7 +3,6 @@
 
 import collections
 import gzip
-import http.server
 import json
 import signal
 import subprocess
@@ -13,6 +12,8 @@ import time
 import urllib.request
 import uuid
 from pathlib import Path
+from socketserver import ThreadingMixIn
+from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 
 P = Path('/tmp/adx-e2e')
 E = Path('/evidence')
@@ -84,6 +85,46 @@ def setup(node):
     tmp.replace(P / 'collector.json')
 
 
+def make_backend_server(address, secrets):
+    """Create the threaded OTLP receiver without starting its serving loop."""
+    lock = threading.Lock()
+
+    class Server(ThreadingMixIn, WSGIServer):
+        daemon_threads = True
+
+    class Handler(WSGIRequestHandler):
+        def log_message(self, *args):
+            pass
+
+    def receive(environ, start_response):
+        def respond(status):
+            start_response(status, [('Content-Type', 'application/json')])
+            return [b'{}']
+
+        if environ.get('REQUEST_METHOD') != 'POST':
+            return respond('405 Method Not Allowed')
+        path = environ.get('PATH_INFO', '')
+        if path not in ('/v1/logs', '/v1/traces'):
+            return respond('404 Not Found')
+        data = environ['wsgi.input'].read(int(environ.get('CONTENT_LENGTH') or '0'))
+        if environ.get('HTTP_CONTENT_ENCODING') == 'gzip':
+            data = gzip.decompress(data)
+        if (P / 'sink-paused').exists():
+            (D / 'collector-backend-unavailable').write_text('observed')
+            return respond('503 Service Unavailable')
+        if any(secret and secret.encode() in data for secret in secrets):
+            (D / 'collector-secret-leak').write_text('credential found before collection storage')
+            return respond('400 Bad Request')
+        batch = json.loads(data)
+        destination = BATCHES if path == '/v1/logs' else D / 'collected-traces.jsonl'
+        with lock, destination.open('a') as output:
+            output.write(json.dumps(batch) + '\n')
+            output.flush()
+        return respond('200 OK')
+
+    return make_server(*address, receive, server_class=Server, handler_class=Handler)
+
+
 def run():
     # The deployment driver owns the startup deadline; a sidecar may start
     # before the peer Pod finishes pulling its image and config is generated.
@@ -91,38 +132,7 @@ def run():
         time.sleep(0.2)
     node_context(json.loads((P / 'collector.json').read_text())['receivers']['filelog/adx']['resource']['adx.node.id'])
     secrets = [p.read_text().strip() for p in S.glob('*key') if p.is_file()]
-    lock = threading.Lock()
-
-    class Handler(http.server.BaseHTTPRequestHandler):
-        def log_message(self, *args):
-            pass
-
-        def do_POST(self):  # noqa: N802 - BaseHTTPRequestHandler requires this method name.
-            data = self.rfile.read(int(self.headers.get('Content-Length', '0')))
-            if self.headers.get('Content-Encoding') == 'gzip':
-                data = gzip.decompress(data)
-            if self.path not in ('/v1/logs', '/v1/traces'):
-                self.send_error(404)
-                return
-            if (P / 'sink-paused').exists():
-                (D / 'collector-backend-unavailable').write_text('observed')
-                self.send_error(503)
-                return
-            if any(secret and secret.encode() in data for secret in secrets):
-                (D / 'collector-secret-leak').write_text('credential found before collection storage')
-                self.send_error(400)
-                return
-            batch = json.loads(data)
-            destination = BATCHES if self.path == '/v1/logs' else D / 'collected-traces.jsonl'
-            with lock, destination.open('a') as f:
-                f.write(json.dumps(batch) + '\n')
-                f.flush()
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json')
-            self.end_headers()
-            self.wfile.write(b'{}')
-
-    server = http.server.ThreadingHTTPServer(('127.0.0.1', 14318), Handler)
+    server = make_backend_server(('127.0.0.1', 14318), secrets)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     stopped = threading.Event()
