@@ -982,12 +982,19 @@ fn afs_deployment_example_uses_current_shared_schema() {
 }
 
 #[test]
-fn colocated_profiles_use_distinct_control_listener_ports() {
+fn colocated_profiles_preserve_autoscaling_and_isolate_creation_metrics() {
     let root = tempfile::tempdir().unwrap();
     for profile in ["standalone", "standalone-external-redis"] {
         let path = root.path().join(format!("{profile}.yaml"));
         std::fs::write(&path, format!("schema_version: 1\nprofile: {profile}\n")).unwrap();
         let deployment = Deployment::load(&path).unwrap();
+        for (role, field, expected) in [
+            (Role::Coordinator, "autoscaling_listen", "127.0.0.1:19092"),
+            (Role::ApiServer, "metrics_listen", "127.0.0.1:19093"),
+        ] {
+            let service = deployment.services.iter().find(|s| s.role == role).unwrap();
+            assert_eq!(service.config[field], expected, "{profile}.{field}");
+        }
         let mut listeners = std::collections::BTreeMap::new();
         for service in deployment.services {
             for (name, value) in service.config.as_object().unwrap() {
@@ -1005,4 +1012,20 @@ fn colocated_profiles_use_distinct_control_listener_ports() {
             }
         }
     }
+}
+
+#[test]
+fn example_creation_metrics_scrape_matches_the_private_api_listener() {
+    let config: serde_json::Value =
+        serde_json::from_str(include_str!("../../../build/observability/prometheus.json")).unwrap();
+    let job = config["scrape_configs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|job| job["job_name"] == "adx-apiserver")
+        .unwrap();
+    assert_eq!(
+        job["static_configs"][0]["targets"],
+        json!(["127.0.0.1:19093"])
+    );
 }
