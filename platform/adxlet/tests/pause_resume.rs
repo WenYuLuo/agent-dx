@@ -2640,3 +2640,43 @@ async fn reload_uncertain_cleanup_does_not_hide_independent_oom() {
         adx_core::observation::InterruptionReason::Oom
     );
 }
+
+#[tokio::test]
+async fn intended_removal_with_late_exit_is_not_runtime_interruption() {
+    let (_temp, backend, node, spec, assignment) = fixture();
+    let handle = node.environment(spec, assignment).unwrap();
+    let created = handle.create().await.unwrap();
+    let paused = handle.pause(pause(created.record.revision)).await.unwrap();
+    let running = handle.resume(resume(paused.record.revision)).await.unwrap();
+    *backend.remove_then_timeout.lock().unwrap() = true;
+    assert!(handle
+        .reload("normal-stop".into(), running.record.revision)
+        .await
+        .is_err());
+    assert!(!backend
+        .running
+        .lock()
+        .unwrap()
+        .contains(&running.record.runtime.id));
+    *backend.remove_then_timeout.lock().unwrap() = false;
+    *backend.observed_failure.lock().unwrap() = Some(adx_core::RuntimeFailure {
+        reason: adx_core::RuntimeFailureReason::Exited,
+        exit_code: Some(137),
+        message: "runtime stopped by requested removal".into(),
+        probe_failure: None,
+    });
+    handle.tick().await.unwrap();
+    let records = backend.committed_records.lock().unwrap();
+    let settled = &records[&running.record.spec.id];
+    assert_eq!(settled.state, EnvironmentState::Failed);
+    let observation = settled.observation.as_ref().unwrap();
+    assert!(
+        observation.interruption.is_none(),
+        "normal removal created interruption: {:?}",
+        observation.interruption
+    );
+    assert_eq!(
+        observation.intent,
+        Some(adx_core::observation::OperationIntent::User)
+    );
+}

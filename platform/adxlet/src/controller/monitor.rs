@@ -205,8 +205,8 @@ impl Controller {
         self.unexpected_exit().await?;
         Ok(true)
     }
-    // An absent execution after an intended stop is not independent fault evidence.
-    // Preserve the intent through cleanup reconciliation; explicit OOM/exit/probe
+    // Absence or a generic exit after an intended stop is not independent fault
+    // evidence. Preserve intent through reconciliation; explicit OOM/probe
     // evidence still takes the unexpected-exit path.
     pub(super) async fn runtime_stopped(&mut self) -> Result<()> {
         if self.intended_execution_absence() {

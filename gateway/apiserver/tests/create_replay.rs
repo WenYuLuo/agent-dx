@@ -1123,3 +1123,32 @@ async fn unnamed_requests_keep_identity_across_api_replicas_and_tenants() {
         .prepare_create_with_request(input, &caller(), "")
         .is_err());
 }
+
+#[tokio::test]
+async fn invalid_name_types_are_rejected_before_default_identity() {
+    let fixture = Fixture::new().await;
+    for name in [json!(42), json!(true), json!(null), json!([]), json!({})] {
+        let input = json!({"image":"image", "name":name});
+        let result = fixture
+            .service
+            .prepare_create_with_request(input, &caller(), "request");
+        assert_eq!(result.unwrap_err().code(), tonic::Code::InvalidArgument);
+    }
+    let absent = fixture
+        .service
+        .prepare_create_with_request(json!({"image":"image"}), &caller(), "request")
+        .unwrap();
+    let empty = fixture
+        .service
+        .prepare_create_with_request(json!({"image":"image", "name":""}), &caller(), "request")
+        .unwrap();
+    assert_eq!(absent.id, empty.id);
+    let input = json!({"image":"image", "name":"explicit"});
+    assert_eq!(
+        fixture
+            .service
+            .prepare_create_with_request(input.clone(), &caller(), "request")
+            .unwrap(),
+        fixture.service.prepare_create(input, &caller()).unwrap()
+    );
+}

@@ -164,10 +164,15 @@ impl StoredEnvironment {
                     .as_ref()
                     .filter(|r| r.state == EnvironmentState::Running)
                 {
-                    if previous.runtime.id != evidence.runtime_id {
+                    if previous.runtime.id == evidence.runtime_id {
+                        self.record_interruption(evidence.clone(), None, counters)?;
+                    } else if next.runtime.id != evidence.runtime_id {
                         return Err(Error::Conflict);
                     }
-                    self.record_interruption(evidence.clone(), None, counters)?;
+                    // A replacement may fail before publishing Running while the
+                    // previous execution is still authoritative. Its own evidence
+                    // must not block the already-fenced lifecycle result, nor count
+                    // as an interruption of the previously published execution.
                 }
             }
         }

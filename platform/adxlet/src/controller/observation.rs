@@ -10,11 +10,15 @@ impl Controller {
             .observation
             .as_ref()
             .is_some_and(|o| o.intent.is_some())
-            && self
-                .record
-                .failure
-                .as_ref()
-                .is_none_or(|failure| failure.reason == adx_core::RuntimeFailureReason::Missing)
+            && self.record.failure.as_ref().is_none_or(|failure| {
+                // A generic exit can be the delayed result of our own stop.
+                // Only independent fault evidence overrides the persisted intent.
+                matches!(
+                    failure.reason,
+                    adx_core::RuntimeFailureReason::Missing
+                        | adx_core::RuntimeFailureReason::Exited
+                )
+            })
     }
 
     pub(super) fn mark_interruption(&mut self, source: EvidenceSource) -> Result<()> {

@@ -640,3 +640,88 @@ async fn committed_state_includes_atomic_summaries_and_delete_replay() {
         assert!(deleted.stored.is_none());
     }
 }
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn unpublished_reload_replacement_can_settle_failed() {
+    use adx_core::observation::{ExecutionObservation, InterruptionReason, OperationIntent};
+    let rig = common::Redis::new().await;
+    let session = rig.store().await.begin(1).await.unwrap();
+    register(&session, "node").await;
+    let assignment = Assignment {
+        environment_id: "reload-gap".into(),
+        node_id: "node".into(),
+        shard_id: 0,
+        generation: 1,
+        devices: vec![],
+    };
+    let mut spec = spec("reload-gap");
+    spec.lifecycle.restart = Some(adx_core::lifecycle::RestartPolicy {
+        max_attempts: 1,
+        initial_backoff_seconds: 1,
+        max_backoff_seconds: 1,
+    });
+    session
+        .reserve(spec.clone(), assignment.clone())
+        .await
+        .unwrap();
+    let mut record = running(spec, assignment);
+    session.commit(record.clone()).await.unwrap();
+    record.revision += 1;
+    record.observation = Some(ExecutionObservation {
+        intent: Some(OperationIntent::User),
+        ..Default::default()
+    });
+    session.commit(record.clone()).await.unwrap();
+    // Reload has replaced A with B locally, but B's first Running publication timed out.
+    record.runtime.id.push_str("-r4");
+    record.revision += 4;
+    let evidence = interruption(&record, InterruptionReason::RuntimeExit);
+    record.state = EnvironmentState::Failed;
+    record.restart_pending = true;
+    record.runtime.ip = None;
+    record.resources_held = false;
+    record.observation = Some(ExecutionObservation {
+        interruption: Some(evidence),
+        ..Default::default()
+    });
+    // Evidence for an unrelated execution or owner must still be rejected.
+    for field in ["runtime", "worker", "generation"] {
+        let mut unrelated = record.clone();
+        let evidence = unrelated
+            .observation
+            .as_mut()
+            .unwrap()
+            .interruption
+            .as_mut()
+            .unwrap();
+        match field {
+            "runtime" => evidence.runtime_id = "reload-gap-1-r99".into(),
+            "worker" => evidence.worker_id = "other-node".into(),
+            _ => evidence.assignment_generation += 1,
+        }
+        assert_eq!(session.commit(unrelated).await, Err(Error::Conflict));
+    }
+    for _ in 0..2 {
+        session
+            .commit(record.clone())
+            .await
+            .expect("valid replacement terminal result");
+    }
+    let saved = session.get("reload-gap").await.unwrap();
+    assert_eq!(saved.result, Some(record.clone()));
+    assert!(saved.last_interruption.is_none());
+    let counters = session.business_counters().await.unwrap();
+    assert_eq!(counters.interruptions, [[0; 7]; 4]);
+    assert_eq!(counters.creations, [1, 0, 0]);
+    // Persisted pre-availability evidence does not become an event on recovery.
+    record.runtime.id = "reload-gap-1-r8".into();
+    record.revision += 4;
+    record.state = EnvironmentState::Running;
+    record.restart_pending = false;
+    record.restart_attempts = 1;
+    record.resources_held = true;
+    record.runtime.ip = Some("10.0.0.2".parse().unwrap());
+    session.commit(record).await.unwrap();
+    assert_eq!(session.business_counters().await.unwrap(), counters);
+}

@@ -167,8 +167,7 @@ impl EnvironmentService {
         }
         if input
             .get("name")
-            .and_then(Value::as_str)
-            .is_none_or(str::is_empty)
+            .is_none_or(|name| name.as_str().is_some_and(str::is_empty))
         {
             if let Some(object) = input.as_object_mut() {
                 let identity = serde_json::to_vec(&(caller.tenant_id.as_str(), request_id))
