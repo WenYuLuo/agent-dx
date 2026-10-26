@@ -4,7 +4,7 @@ info:
   version: 0.1.0
   description: Optional direct Coordinator HTTP listener configured by autoscaling_listen.
 servers:
-  - url: http://127.0.0.1:19092
+  - url: http://127.0.0.1:19093
 security: []
 paths:
   /global-scheduler/scheduling_queue:

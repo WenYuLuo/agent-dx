@@ -4,7 +4,7 @@ Coordinator provides the external autoscaling controller with an optional HTTP
 management listener. Configure `autoscaling_listen` in the Coordinator service:
 
 ```json
-{"autoscaling_listen": "127.0.0.1:19092"}
+{"autoscaling_listen": "127.0.0.1:19093"}
 ```
 
 Omitting the field disables this listener. The listener uses plain HTTP and
@@ -25,11 +25,11 @@ RPC retains its configured transport security.
 
 ```bash
 curl --fail --silent --show-error \
-  'http://127.0.0.1:19092/global-scheduler/scheduling_queue'
+  'http://127.0.0.1:19093/global-scheduler/scheduling_queue'
 curl --fail --silent --show-error --request POST \
-  'http://127.0.0.1:19092/global-scheduler/node/localschedulingstatus?node_id=node-a'
+  'http://127.0.0.1:19093/global-scheduler/node/localschedulingstatus?node_id=node-a'
 curl --fail --silent --show-error \
-  'http://127.0.0.1:19092/instance-manager/query-tenant-instances?node_id=node-a&page=1&page_size=100'
+  'http://127.0.0.1:19093/instance-manager/query-tenant-instances?node_id=node-a&page=1&page_size=100'
 ```
 
 All responses use ordinary JSON. Query values must be URL encoded. Unknown

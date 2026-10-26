@@ -980,3 +980,29 @@ fn afs_deployment_example_uses_current_shared_schema() {
         vec![Role::AfsMeta, Role::AfsNode]
     );
 }
+
+#[test]
+fn colocated_profiles_use_distinct_control_listener_ports() {
+    let root = tempfile::tempdir().unwrap();
+    for profile in ["standalone", "standalone-external-redis"] {
+        let path = root.path().join(format!("{profile}.yaml"));
+        std::fs::write(&path, format!("schema_version: 1\nprofile: {profile}\n")).unwrap();
+        let deployment = Deployment::load(&path).unwrap();
+        let mut listeners = std::collections::BTreeMap::new();
+        for service in deployment.services {
+            for (name, value) in service.config.as_object().unwrap() {
+                if name == "listen" || name.ends_with("_listen") {
+                    let address: std::net::SocketAddr = value.as_str().unwrap().parse().unwrap();
+                    assert!(
+                        listeners
+                            .insert(address.port(), format!("{}.{name}", service.id))
+                            .is_none(),
+                        "{profile} has conflicting listener port {} at {}.{name}",
+                        address.port(),
+                        service.id,
+                    );
+                }
+            }
+        }
+    }
+}
