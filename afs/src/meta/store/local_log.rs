@@ -451,6 +451,17 @@ fn wal_name(base: LogTip) -> Result<String> {
     ))
 }
 fn wal_budget(dir: &Path, limits: LogLimits, extra_bytes: u64, extra_files: usize) -> Result<u64> {
+    wal_budget_with_metadata(dir, limits, extra_bytes, extra_files, |path| {
+        fs::symlink_metadata(path)
+    })
+}
+fn wal_budget_with_metadata(
+    dir: &Path,
+    limits: LogLimits,
+    extra_bytes: u64,
+    extra_files: usize,
+    mut metadata: impl FnMut(&Path) -> std::io::Result<fs::Metadata>,
+) -> Result<u64> {
     let mut bytes = extra_bytes;
     let mut files = extra_files;
     for entry in fs::read_dir(dir)? {
@@ -458,7 +469,15 @@ fn wal_budget(dir: &Path, limits: LogLimits, extra_bytes: u64, extra_files: usiz
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if name.starts_with("wal-") && name.ends_with(".log") {
-            let metadata = fs::symlink_metadata(entry.path())?;
+            let metadata = match metadata(&entry.path()) {
+                Ok(metadata) => metadata,
+                // Checkpoint cleanup removes retired segments without holding
+                // the writer lock. A directory entry can disappear between
+                // read_dir and stat; it consumes no capacity after deletion.
+                // Live segments are validated separately by check_files/replay.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
             if !metadata.is_file() {
                 return Err(invalid_log("WAL entry is not a regular file"));
             }
@@ -2440,6 +2459,37 @@ mod tests {
         drop(log);
         fs::rename(&path, dir.path().join("preserved-required-segment")).unwrap();
         assert!(LocalLog::open(dir.path(), limits).is_err());
+    }
+
+    #[test]
+    fn wal_budget_allows_retired_segment_cleanup_during_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let retired = dir.path().join("wal-00000000000000000001.log");
+        let active = dir.path().join("wal-00000000000000000002.log");
+        fs::write(&retired, [0; 32]).unwrap();
+        fs::write(&active, [0; 64]).unwrap();
+        let bytes = wal_budget_with_metadata(dir.path(), LogLimits::default(), 8, 0, |path| {
+            if path == retired {
+                fs::remove_file(path).unwrap();
+            }
+            fs::symlink_metadata(path)
+        })
+        .unwrap();
+        assert_eq!(bytes, 72);
+        assert!(active.is_file());
+    }
+
+    #[test]
+    fn wal_budget_propagates_metadata_errors_other_than_disappearance() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("wal-00000000000000000001.log"), [0; 32]).unwrap();
+        let result = wal_budget_with_metadata(dir.path(), LogLimits::default(), 0, 0, |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "denied",
+            ))
+        });
+        assert!(result.is_err());
     }
 
     #[tokio::test]

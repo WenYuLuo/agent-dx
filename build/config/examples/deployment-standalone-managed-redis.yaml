@@ -88,7 +88,7 @@ services:
     role: apiserver
     config:
       listen: 127.0.0.1:8888
-      metrics_listen: 127.0.0.1:19092
+      metrics_listen: 127.0.0.1:19093
       ca: /opt/adx/config/tls/ca.pem
       certificate: /opt/adx/config/tls/apiserver.pem
       private_key: /opt/adx/config/tls/apiserver.key

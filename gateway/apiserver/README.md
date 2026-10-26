@@ -64,4 +64,4 @@ Local bind mounts accept `host_path`/`hostPath` when exactly one source is prese
 
 ## Creation metrics
 
-Set the optional private `metrics_listen` address (example `127.0.0.1:19092`) to expose creation request counters, final application-call outcomes, in-flight calls and duration histograms at `GET /metrics`. SSE acceptance is separate from background completion. First committed creation success is counted by Coordinator. See [observability capacity](../../docs/testing/observability-capacity.md) for dashboard queries and collection.
+Set the optional private `metrics_listen` address (example `127.0.0.1:19093`) to expose creation request counters, final application-call outcomes, in-flight calls and duration histograms at `GET /metrics`. SSE acceptance is separate from background completion. First committed creation success is counted by Coordinator. See [observability capacity](../../docs/testing/observability-capacity.md) for dashboard queries and collection.

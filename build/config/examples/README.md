@@ -103,4 +103,4 @@ Configure matching `checkpoint_reclaimers` on Coordinator for every shared stora
 
 `node-jiuwenbox.json` 是 Jiuwenbox／Conch 的 adxlet 配置示例；替换 EROFS SHA256、Conch socket、镜像绑定和证书路径后使用。Linux 前置条件、配置语义及未完成的运行时验收见 [Jiuwenbox P0](../../../docs/testing/jiuwenbox-runtime.md)。
 
-API Server examples enable private `metrics_listen` at `127.0.0.1:19092` for creation telemetry. Coordinator/adxlet expose optional per-Environment inventory/resource samples at `/metrics/environments`; use the separate short-retention collector described in [observability capacity](../../../docs/testing/observability-capacity.md).
+API Server examples enable private `metrics_listen` at `127.0.0.1:19093` for creation telemetry. Coordinator/adxlet expose optional per-Environment inventory/resource samples at `/metrics/environments`; use the separate short-retention collector described in [observability capacity](../../../docs/testing/observability-capacity.md).
