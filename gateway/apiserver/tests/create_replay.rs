@@ -16,6 +16,7 @@ use tonic::{Request, Response, Status};
 #[derive(Default)]
 struct State {
     entry_node: Mutex<Option<pb::NodeEndpoint>>,
+    local_persistence: Mutex<Vec<bool>>,
     owners: Mutex<HashMap<String, pb::GetEnvironmentResponse>>,
     receipts: Mutex<HashMap<(String, String), String>>,
     starts: AtomicUsize,
@@ -137,6 +138,7 @@ assignment: Some(pb::Assignment { environment_id: spec.id.clone(), node_id: self
     get_scheduling_queue(GetSchedulingQueueRequest) -> GetSchedulingQueueResponse,
     set_node_scheduling(SetNodeSchedulingRequest) -> NodeSchedulingState,
     prepare_create(LocalEnvironmentCreateRequest) -> PreparedEnvironment,
+    reserve_local_environment(ClaimEnvironmentRequest) -> ClaimEnvironmentResponse,
     claim_environment(ClaimEnvironmentRequest) -> ClaimEnvironmentResponse,
     forward_create(LocalEnvironmentCreateRequest) -> EnvironmentResult,
     register_node(RegisterNodeRequest) -> RegisterNodeResponse,
@@ -187,6 +189,9 @@ impl Fixture {
         Self::with_mode(retention, false).await
     }
     async fn with_mode(retention: u64, local_first: bool) -> Self {
+        Self::with_claim_mode(retention, local_first, None).await
+    }
+    async fn with_claim_mode(retention: u64, local_first: bool, persist: Option<bool>) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap().to_string();
         let state = Arc::new(State::default());
@@ -213,12 +218,16 @@ impl Fixture {
                 .add_service(pb::environment_directory_service_server::EnvironmentDirectoryServiceServer::new(endpoint))
                 .serve_with_incoming(incoming).await.unwrap();
         });
-        let config: Config = serde_json::from_value(json!({
+        let mut config = json!({
             "listen":"127.0.0.1:0", "coordinator_address":address, "internal_security":"network", "ingress_mode":"standalone",
             "rpc_timeout_seconds":2, "cache_entries":1, "auth_cache_ttl_seconds":1,
             "create_mode":if local_first { "local_first" } else { "central" },
             "create_unknown_retention_seconds":retention
-        })).unwrap();
+        });
+        if let Some(persist) = persist {
+            config["persist_local_claim"] = json!(persist);
+        }
+        let config: Config = serde_json::from_value(config).unwrap();
         let clients = Clients::new(config).unwrap();
         let service = EnvironmentService::new(clients.clone());
         tokio::time::timeout(Duration::from_secs(3), async {
@@ -724,7 +733,9 @@ service_impl!(pb::node_service_server::NodeService, {
     async fn create_local_environment(&self, request: Request<pb::LocalEnvironmentCreateRequest>) -> Result<Response<pb::EnvironmentResult>, Status> {
         let trace = adx_observability::trace::Trace::rpc("test.node.create_local_environment", &request);
         trace.run_result(async {
-            let create = request.into_inner().create.unwrap();
+            let request = request.into_inner();
+            self.0.local_persistence.lock().unwrap().push(request.persist_claim);
+            let create = request.create.unwrap();
             pb::coordinator_service_server::CoordinatorService::create_environment(self, adx_observability::trace::inject(create)).await
         }).await
     }
@@ -1022,4 +1033,26 @@ async fn cancelled_create_ends_total_span_without_losing_its_parent() {
     assert!(metrics.contains("adx_environment_create_in_flight 0\n"));
     assert!(metrics.contains("adx_environment_create_responses_total{outcome=\"cancelled\"} 1\n"));
     fixture.state.release.notify_one();
+}
+
+#[tokio::test]
+async fn local_first_claim_persistence_is_an_independent_opt_in() {
+    for persist in [None, Some(true)] {
+        let fixture = Fixture::with_claim_mode(600, true, persist).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while fixture.clients.nodes().await.is_err() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        fixture
+            .create("local-persistence-option", "local-request")
+            .await
+            .unwrap();
+        assert_eq!(
+            *fixture.state.local_persistence.lock().unwrap(),
+            vec![persist.unwrap_or(false)]
+        );
+    }
 }

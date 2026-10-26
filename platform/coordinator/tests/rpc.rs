@@ -2526,6 +2526,7 @@ async fn snapshot_gc_waits_for_node_ack_and_recovers_from_lost_ack() {
     );
     let created = frontend
         .create_local_environment(pb::LocalEnvironmentCreateRequest {
+            persist_claim: true,
             create: Some(request.clone()),
             node_session_id: "gc-boot".into(),
         })
@@ -2557,6 +2558,7 @@ async fn snapshot_gc_waits_for_node_ack_and_recovers_from_lost_ack() {
     assert_eq!(
         frontend
             .create_local_environment(pb::LocalEnvironmentCreateRequest {
+                persist_claim: true,
                 create: Some(request.clone()),
                 node_session_id: "gc-boot".into()
             })

@@ -1,6 +1,6 @@
 # 创建确认、对象持久化与可选本地 Claim
 
-默认 `create_mode: "central"`。所有组件使用同一版本的 Environment RPC；公开 Request ID 随创建、转发和可选 Claim 传递。
+默认 `create_mode: "central"`、`persist_local_claim: false`。所有组件使用同一版本的 Environment RPC；公开 Request ID 随创建、转发和可选 Claim 传递。
 
 ## 中心创建
 
@@ -38,7 +38,11 @@ Environment 与 Request ID 回执在同一次事务中写入。节点 process se
 
 ## 可选本地优先
 
-`create_mode: "local_first"` 启用入口节点暂留资源和 `ClaimEnvironment`。Coordinator 检查心跳、会话、硬约束，在最多 256 条、最长 1 ms 的微批中登记可选持久化 Claim，再导入调度账本。本地不足时用原身份和剩余期限回退中心路径。Pack/Spread、软评分和队列公平性属于中心路径；Snapshot 创建始终进入中心路径。
+`create_mode: "local_first"` 启用入口节点暂留资源。默认通过一次 `ReserveLocalEnvironment` RPC 检查心跳、会话和硬约束，分配 generation，并同步 Coordinator 内存账本；此步骤不写 Redis、不进入中央选点队列。执行成功后与中心创建共用同一次原子成功发布。进程内重建目录保留本地预留及其原 deadline；Coordinator 进程重启只恢复已持久化状态。未完成的内存预留到原始创建 deadline 后由维护任务清理，迟到执行通过发布校验和对账回收。
+
+`persist_local_claim: true` 是独立的显式开关：仅在本地优先模式下改用 `ClaimEnvironment`，在最多 256 条、最长 1 ms 的微批中提前持久化归属。重新选点前按旧 assignment 和记录原始值撤销未完成 Claim；发现成功结果则接纳，不能覆盖或删除成功结果。后台重试保留原 Request ID、绝对 deadline 和持久化选择。
+
+本地不足时用原身份和剩余期限回退中心路径。Pack/Spread、软评分和队列公平性属于中心路径；Snapshot 创建始终进入中心路径。
 
 批量 Claim 中失效或缺失节点只影响对应项，事务仅校验实际参与写入的节点 session。Claim 的同一环境原子占位与 Snapshot 引用比较独立于其他对象更新。写入未知后，仅推进 Claim 自己的恢复屏障，再重载权威状态；普通生命周期写入不比较该屏障。迟到失败候选只能撤销自己尚无成功结果的 Claim，不能删除成功或替代执行。
 
@@ -58,3 +62,5 @@ Environment 与 Request ID 回执在同一次事务中写入。节点 process se
 - `cargo test -p adx-apiserver`：公开请求缓存、重放、剩余期限与错误契约。
 
 这些组件/RPC 夹具使用 RuntimeDriver 测试实现，不能替代真实 sandboxd、Execd、多 VM 或 Kubernetes 验收。
+
+API 创建与 ForwardCreate 共用身份优先流程：租户校验后先查成功 Request ID／Environment ID，未命中才规范化规格、读取快照和调度。直达本地 RPC 的快照请求转入该流程，因此失效的新快照输入不会阻止已有成功身份重放。

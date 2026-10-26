@@ -54,6 +54,7 @@ struct State {
     // wait until their result has been synchronized or authoritatively fenced.
     claims_in_flight: BTreeMap<String, usize>,
     create_requests: BTreeMap<String, BTreeSet<String>>,
+    local_reservation_deadlines: BTreeMap<String, (adx_core::Assignment, tokio::time::Instant)>,
 }
 
 fn requires_node_reconciliation(environment: &StoredEnvironment) -> bool {
@@ -436,6 +437,7 @@ impl CoordinatorRpc {
                 scheduling_deadlines: BTreeMap::new(),
                 claims_in_flight: BTreeMap::new(),
                 create_requests: BTreeMap::new(),
+                local_reservation_deadlines: BTreeMap::new(),
             }),
             claim_sender,
             changed: Notify::new(),
@@ -469,7 +471,57 @@ impl CoordinatorRpc {
             self.0.changed.notify_waiters();
             result?;
         }
+        drop(state);
+        self.expire_local_reservations().await?;
         Ok(ids.len())
+    }
+
+    async fn expire_local_reservations(&self) -> Result<()> {
+        let expired: Vec<_> = self
+            .0
+            .state
+            .lock()
+            .await
+            .local_reservation_deadlines
+            .iter()
+            .filter(|(_, (_, deadline))| *deadline <= tokio::time::Instant::now())
+            .map(|(id, (assignment, _))| (id.clone(), assignment.clone()))
+            .collect();
+        for (id, assignment) in expired {
+            let _publication = self.create_guard(format!("publication:{id}")).await;
+            let mut state = self.0.state.lock().await;
+            if state
+                .local_reservation_deadlines
+                .get(&id)
+                .is_none_or(|(current, deadline)| {
+                    current != &assignment || *deadline > tokio::time::Instant::now()
+                })
+            {
+                continue;
+            }
+            let spec = match state.environments.get(&id) {
+                Some(record) if record.assignment == assignment && record.result.is_none() => {
+                    Some(record.spec.clone())
+                }
+                None => state.specs.get(&id).cloned(),
+                _ => None,
+            };
+            if spec.is_none() {
+                state.local_reservation_deadlines.remove(&id);
+                continue;
+            }
+            // A persistent opt-in may still have an unfinished Claim. This CAS
+            // cannot erase a result or a replacement assignment.
+            if let Err(error) = state.session.abandon_initial(&assignment).await {
+                state.needs_recovery = true;
+                return Err(error);
+            }
+            drop(state);
+            if let Some(spec) = spec {
+                self.discard_unconfirmed_locked(&spec).await;
+            }
+        }
+        Ok(())
     }
 
     /// A restarted process can retain unexpired assignments only if it is the
@@ -527,6 +579,85 @@ impl CoordinatorRpc {
         };
         lock.lock_owned().await
     }
+    async fn create_from_request(
+        &self,
+        r: pb::CreateEnvironmentRequest,
+    ) -> std::result::Result<Response<pb::EnvironmentResult>, Status> {
+        let schedule_timeout = scheduling_timeout(r.schedule_timeout_seconds)
+            .ok_or_else(|| Status::invalid_argument("schedule timeout must not exceed 24 hours"))?;
+        let deadline = create_deadline(&r)?;
+        let request_id = r.request_id.clone();
+        let expected_assignment = r
+            .expected_assignment
+            .clone()
+            .map(TryInto::try_into)
+            .transpose()
+            .map_err(status)?;
+        let raw = r
+            .spec
+            .ok_or_else(|| Status::invalid_argument("spec required"))?;
+        tenant(r.caller.as_ref(), &raw.tenant_id)?;
+        let session = {
+            let mut state = self.0.state.lock().await;
+            state.recover_authoritative_state().await.map_err(status)?;
+            state.healthy().map_err(status)?;
+            state.session.clone()
+        };
+        if let Some(record) = session
+            .published_request(&raw.tenant_id, &request_id)
+            .await
+            .map_err(status)?
+        {
+            return Ok(Response::new(pb::EnvironmentResult {
+                record: Some(record.try_into().map_err(status)?),
+                durability: pb::Durability::Published as i32,
+            }));
+        }
+        let spec = match session.get(&raw.id).await {
+            Ok(stored) if stored.spec.tenant_id != raw.tenant_id => {
+                return Err(Status::not_found("environment not found"));
+            }
+            Ok(stored) if stored.result.is_some() => {
+                let record = stored
+                    .result
+                    .ok_or_else(|| Status::internal("confirmed result missing"))?;
+                let record = if record.state == EnvironmentState::Running {
+                    // Keep the replay transaction off the RPC future's stack.
+                    Box::pin(session.publish_existing(record, &request_id))
+                        .await
+                        .map_err(status)?
+                } else {
+                    record
+                };
+                return Ok(Response::new(pb::EnvironmentResult {
+                    record: Some(record.try_into().map_err(status)?),
+                    durability: pb::Durability::Published as i32,
+                }));
+            }
+            Ok(_) | Err(Error::NotFound) => {
+                cloning::normalize(&session, raw).await.map_err(status)?
+            }
+            Err(error) => return Err(status(error)),
+        };
+        let service = self.clone();
+        tokio::spawn(
+            adx_observability::trace::Trace::child("coordinator.create").run(async move {
+                service
+                    .create(
+                        spec,
+                        schedule_timeout,
+                        deadline,
+                        expected_assignment,
+                        request_id,
+                    )
+                    .await
+                    .map(Response::new)
+            }),
+        )
+        .await
+        .map_err(|_| Status::internal("creation task failed"))?
+    }
+
     async fn create(
         &self,
         spec: EnvironmentSpec,
@@ -616,6 +747,7 @@ impl CoordinatorRpc {
         state.specs.remove(&spec.id);
         state.scheduling_deadlines.remove(&spec.id);
         state.create_requests.remove(&spec.id);
+        state.local_reservation_deadlines.remove(&spec.id);
         drop(state);
         if let Some(snapshot_id) = &spec.snapshot_id {
             let _ = session
@@ -973,7 +1105,35 @@ impl CoordinatorRpc {
                 self.0.changed.notify_waiters();
                 return Ok(());
             }
-            Ok(_) | Err(Error::NotFound) => (),
+            Ok(stored) => {
+                if stored.assignment != *assignment
+                    || stored.invalidated
+                    || stored.recovery.is_some()
+                {
+                    state.accept_stored_claim(stored).map_err(status)?;
+                    self.0.changed.notify_waiters();
+                    return Ok(());
+                }
+                // Only the optional path has a durable pending owner. Retire its
+                // exact opaque record before selecting a replacement execution.
+                if let Err(error) = state.session.abandon_initial(assignment).await {
+                    state.needs_recovery = true;
+                    return Err(status(error));
+                }
+                match state.session.get(id).await {
+                    Ok(current) => {
+                        state.accept_stored_claim(current).map_err(status)?;
+                        self.0.changed.notify_waiters();
+                        return Ok(());
+                    }
+                    Err(Error::NotFound) => (),
+                    Err(error) => {
+                        state.needs_recovery = true;
+                        return Err(status(error));
+                    }
+                }
+            }
+            Err(Error::NotFound) => (),
             Err(error) => return Err(status(error)),
         }
         if state
@@ -983,6 +1143,7 @@ impl CoordinatorRpc {
         {
             state.scheduler.retry(assignment).map_err(status)?;
             state.environments.remove(id);
+            state.local_reservation_deadlines.remove(id);
             self.0.changed.notify_waiters();
         }
         Ok(())
@@ -1111,6 +1272,7 @@ impl CoordinatorRpc {
                 state.environments.remove(&record.spec.id);
                 state.specs.remove(&record.spec.id);
                 state.create_requests.remove(&record.spec.id);
+                state.local_reservation_deadlines.remove(&record.spec.id);
                 state.scheduling_deadlines.remove(&record.spec.id);
             }
             self.0.changed.notify_waiters();
@@ -1231,6 +1393,7 @@ impl CoordinatorRpc {
             state.scheduling_deadlines.remove(&accepted.spec.id);
         }
         if initial || accepted.state == EnvironmentState::Deleted {
+            state.local_reservation_deadlines.remove(&accepted.spec.id);
             state.create_requests.remove(&accepted.spec.id);
         }
         self.0.changed.notify_waiters();
@@ -1429,6 +1592,26 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
             .await
             .map(Response::new)
     }
+    async fn reserve_local_environment(
+        &self,
+        request: Request<pb::ClaimEnvironmentRequest>,
+    ) -> std::result::Result<Response<pb::ClaimEnvironmentResponse>, Status> {
+        let trace =
+            adx_observability::trace::Trace::rpc("coordinator.reserve_local_environment", &request);
+        let Principal::Node(node) = self.0.peers.authenticate(&request)? else {
+            return Err(Status::permission_denied("Adxlet required"));
+        };
+        let service = self.clone();
+        let request = request.into_inner();
+        tokio::spawn(trace.run(async move {
+            service
+                .claim_local(node, request, false)
+                .await
+                .map(Response::new)
+        }))
+        .await
+        .map_err(|_| Status::internal("local reservation task failed"))?
+    }
     async fn claim_environment(
         &self,
         request: Request<pb::ClaimEnvironmentRequest>,
@@ -1439,9 +1622,12 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
         };
         let service = self.clone();
         let request = request.into_inner();
-        tokio::spawn(
-            trace.run(async move { service.claim_local(node, request).await.map(Response::new) }),
-        )
+        tokio::spawn(trace.run(async move {
+            service
+                .claim_local(node, request, true)
+                .await
+                .map(Response::new)
+        }))
         .await
         .map_err(|_| Status::internal("claim task failed"))?
     }
@@ -1454,46 +1640,20 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
             return Err(Status::permission_denied("Adxlet required"));
         };
         let request = request.into_inner();
-        let schedule_timeout = scheduling_timeout(
-            request
-                .create
-                .as_ref()
-                .map_or(0, |create| create.schedule_timeout_seconds),
-        )
-        .ok_or_else(|| Status::invalid_argument("schedule timeout must not exceed 24 hours"))?;
+        {
+            let mut state = self.0.state.lock().await;
+            state.recover_authoritative_state().await.map_err(status)?;
+            state
+                .live_claimant(&node, &request.node_session_id, self.0.heartbeat_timeout)
+                .map_err(status)?;
+        }
         let create = request
             .create
-            .as_ref()
             .ok_or_else(|| Status::invalid_argument("create required"))?;
-        let deadline = create_deadline(create)?;
-        let request_id = create.request_id.clone();
-        let expected_assignment = create
-            .expected_assignment
-            .clone()
-            .map(TryInto::try_into)
-            .transpose()
-            .map_err(status)?;
-        let prepared = self.prepare_local(&node, request).await?;
-        let spec = prepared
-            .spec
-            .ok_or_else(|| Status::internal("missing prepared spec"))?
-            .try_into()
-            .map_err(status)?;
         let service = self.clone();
-        tokio::spawn(trace.run(async move {
-            service
-                .create(
-                    spec,
-                    schedule_timeout,
-                    deadline,
-                    expected_assignment,
-                    request_id,
-                )
-                .await
-                .map(Response::new)
-        }))
-        .await
-        .map_err(|_| Status::internal("forwarded creation task failed"))?
+        tokio::spawn(trace.run(async move { service.create_from_request(create).await }))
+            .await
+            .map_err(|_| Status::internal("forwarded creation task failed"))?
     }
 
     async fn inspect_node(
@@ -1788,82 +1948,7 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                 if self.0.peers.authenticate(&request)? != Principal::ApiServer {
                     return Err(Status::permission_denied("Frontend caller required"));
                 }
-                let r = request.into_inner();
-                let schedule_timeout =
-                    scheduling_timeout(r.schedule_timeout_seconds).ok_or_else(|| {
-                        Status::invalid_argument("schedule timeout must not exceed 24 hours")
-                    })?;
-                let deadline = create_deadline(&r)?;
-                let request_id = r.request_id.clone();
-                let expected_assignment = r
-                    .expected_assignment
-                    .clone()
-                    .map(TryInto::try_into)
-                    .transpose()
-                    .map_err(status)?;
-                let raw = r
-                    .spec
-                    .ok_or_else(|| Status::invalid_argument("spec required"))?;
-                tenant(r.caller.as_ref(), &raw.tenant_id)?;
-                let session = {
-                    let mut state = self.0.state.lock().await;
-                    state.recover_authoritative_state().await.map_err(status)?;
-                    state.healthy().map_err(status)?;
-                    state.session.clone()
-                };
-                if let Some(record) = session
-                    .published_request(&raw.tenant_id, &request_id)
-                    .await
-                    .map_err(status)?
-                {
-                    return Ok(Response::new(pb::EnvironmentResult {
-                        record: Some(record.try_into().map_err(status)?),
-                        durability: pb::Durability::Published as i32,
-                    }));
-                }
-                let spec = match session.get(&raw.id).await {
-                    Ok(stored) if stored.spec.tenant_id != raw.tenant_id => {
-                        return Err(Status::not_found("environment not found"));
-                    }
-                    Ok(stored) if stored.result.is_some() => {
-                        let record = stored
-                            .result
-                            .ok_or_else(|| Status::internal("confirmed result missing"))?;
-                        let record = if record.state == EnvironmentState::Running {
-                            // Keep the replay transaction off the RPC future's stack.
-                            Box::pin(session.publish_existing(record, &request_id))
-                                .await
-                                .map_err(status)?
-                        } else {
-                            record
-                        };
-                        return Ok(Response::new(pb::EnvironmentResult {
-                            record: Some(record.try_into().map_err(status)?),
-                            durability: pb::Durability::Published as i32,
-                        }));
-                    }
-                    Ok(_) | Err(Error::NotFound) => {
-                        cloning::normalize(&session, raw).await.map_err(status)?
-                    }
-                    Err(error) => return Err(status(error)),
-                };
-                let service = self.clone();
-                tokio::spawn(
-                    adx_observability::trace::Trace::child("coordinator.create").run(async move {
-                        service
-                            .create(
-                                spec,
-                                schedule_timeout,
-                                deadline,
-                                expected_assignment,
-                                request_id,
-                            )
-                            .await
-                            .map(Response::new)
-                    }),
-                )
-                .await
-                .map_err(|_| Status::internal("creation task failed"))?
+                self.create_from_request(request.into_inner()).await
             })
             .await
     }
@@ -2119,6 +2204,7 @@ mod cancellation_tests {
                     .claim_local(
                         "node".into(),
                         pb::ClaimEnvironmentRequest {
+                            create_deadline_unix_millis: 0,
                             request_id: String::new(),
                             spec: Some(spec.into()),
                             node_session_id: "boot".into(),
@@ -2128,6 +2214,7 @@ mod cancellation_tests {
                                 administrator: false,
                             }),
                         },
+                        true,
                     )
                     .await
             }

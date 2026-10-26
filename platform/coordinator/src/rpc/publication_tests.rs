@@ -15,6 +15,11 @@ async fn cleanup_cannot_remove_a_success_being_published() {
 async fn publication_restores_a_rebuilt_catalog() {
     publication_race("rebuild").await;
 }
+#[tokio::test]
+#[ignore = "requires isolated Redis; run control-rpc suite"]
+async fn catalog_rebuild_preserves_memory_local_reservation_until_publication() {
+    publication_race("local-rebuild").await;
+}
 async fn publication_race(action: &str) {
     let redis = cancellation_test_redis::Redis::new().await;
     let store = crate::storage::RedisStore::connect(&redis.url, "test", Duration::from_secs(5))
@@ -96,6 +101,39 @@ async fn publication_race(action: &str) {
         snapshot_source: None,
         execution_artifacts: vec![],
     };
+    if action == "local-rebuild" {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        {
+            let mut state = rpc.0.state.lock().await;
+            state
+                .local_reservation_deadlines
+                .insert(spec.id.clone(), (assignment.clone(), deadline));
+            state.needs_recovery = true;
+            state.recover_authoritative_state().await.unwrap();
+            assert_eq!(state.environments[&spec.id].assignment, assignment);
+            assert_eq!(state.scheduler.pending(0).unwrap(), 0);
+            assert_eq!(state.local_reservation_deadlines[&spec.id].1, deadline);
+            assert!(state
+                .scheduler
+                .snapshot()
+                .environments()
+                .contains_key(&spec.id));
+        }
+        assert_eq!(session.get(&spec.id).await.unwrap_err(), Error::NotFound);
+        assert_eq!(
+            rpc.commit(record.clone(), "boot".into()).await.unwrap(),
+            record
+        );
+        assert!(rpc
+            .0
+            .state
+            .lock()
+            .await
+            .local_reservation_deadlines
+            .is_empty());
+        assert_eq!(session.get(&spec.id).await.unwrap().result, Some(record));
+        return;
+    }
     let client = redis::Client::open(redis.url.as_str()).unwrap();
     let mut control = client.get_multiplexed_async_connection().await.unwrap();
     let _: String = redis::cmd("CLIENT")

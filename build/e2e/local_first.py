@@ -69,7 +69,7 @@ def run(connection, image, output):
             raise AssertionError()
         if not (all(r['result']['resources_held'] for r in records)):
             raise AssertionError()
-        # Require evidence of the actual local-claim path, not just placement
+        # Require evidence of the actual local reservation path, not just placement
         # that could also have resulted from the default center Spread policy.
         expected = {r['spec']['id'] for r in records}
         end = time.monotonic() + 10
@@ -81,20 +81,20 @@ def run(connection, image, output):
                 try:
                     data = gzip.decompress(path.read_bytes()) if path.suffix == '.gz' else path.read_bytes()
                     for line in data.decode(errors='replace').splitlines():
-                        if 'local_environment_claim' in line:
+                        if 'local_environment_reservation' in line:
                             claimed.update(identity for identity in expected if identity in line)
                 except (EOFError, OSError):
                     continue
             if claimed == expected:
                 break
             if time.monotonic() > end:
-                raise AssertionError(('missing local claim evidence', expected - claimed))
+                raise AssertionError(('missing local reservation evidence', expected - claimed))
             time.sleep(0.1)
         output.write_text(
             json.dumps(
                 {
                     'status': 'passed',
-                    'local_claims': sorted(claimed),
+                    'local_reservations': sorted(claimed),
                     'entry_owners': owners,
                     'unique_instances': 3,
                     'duplicate_converged': True,

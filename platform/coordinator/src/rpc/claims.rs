@@ -13,8 +13,25 @@ impl State {
         // The failed writer has returned. Fence only optional claims before
         // loading their authoritative outcomes; lifecycle objects are independent.
         self.session.claim_barrier().await?;
-        let saved = self.session.snapshot().await?;
+        let mut saved = self.session.snapshot().await?;
         self.session.refresh_inspection_inventory().await?;
+        // An in-process catalog rebuild must retain local work already handed
+        // to an adxlet. Requeuing it would have no central task to start it.
+        // These reservations remain memory-only and keep their original expiry;
+        // a new Coordinator process recovers only the durable snapshot.
+        for (id, (assignment, _)) in &self.local_reservation_deadlines {
+            if !saved.environments.contains_key(id) {
+                if let Some(record) = self.environments.get(id).filter(|record| {
+                    record.assignment == *assignment
+                        && record.result.is_none()
+                        && !record.invalidated
+                        && record.recovery.is_none()
+                }) {
+                    saved.generation = saved.generation.max(assignment.generation);
+                    saved.environments.insert(id.clone(), record.clone());
+                }
+            }
+        }
         let pending: Vec<_> = self
             .specs
             .values()
@@ -176,7 +193,15 @@ impl CoordinatorRpc {
         &self,
         node: String,
         request: pb::ClaimEnvironmentRequest,
+        persistent: bool,
     ) -> std::result::Result<pb::ClaimEnvironmentResponse, Status> {
+        let deadline = if persistent && request.create_deadline_unix_millis == 0 {
+            None
+        } else {
+            Some(adx_transport::deadline::Deadline::from_unix_millis(
+                request.create_deadline_unix_millis,
+            )?)
+        };
         let request_id = request.request_id.clone();
         let spec: EnvironmentSpec = request
             .spec
@@ -350,11 +375,62 @@ impl CoordinatorRpc {
         } else {
             None
         };
+        if let Some(deadline) = deadline {
+            deadline.remaining()?;
+        }
         state
             .create_requests
             .entry(spec.id.clone())
             .or_default()
             .insert(request_id);
+        if !persistent {
+            let deadline = deadline
+                .ok_or_else(|| Status::invalid_argument("local reservation deadline required"))?;
+            let generation = state.session.next_generation().map_err(status)?;
+            let shard_id = state
+                .nodes
+                .get(&node)
+                .ok_or_else(|| Status::unavailable("local node disappeared"))?
+                .shard_id;
+            let assignment = adx_core::Assignment {
+                environment_id: spec.id.clone(),
+                node_id: node.clone(),
+                shard_id,
+                generation,
+                devices: candidate.devices.clone(),
+            };
+            let record = StoredEnvironment {
+                creation_generation: generation,
+                spec: spec.clone(),
+                assignment: assignment.clone(),
+                result: None,
+                resume: None,
+                recovery: None,
+                invalidated: false,
+                failed_since_unix_seconds: None,
+            };
+            state.accept_stored_claim(record).map_err(status)?;
+            state
+                .local_reservation_deadlines
+                .insert(spec.id.clone(), (assignment.clone(), deadline.instant()));
+            self.0.changed.notify_waiters();
+            adx_observability::info!(event="local_environment_reservation", environment_id=%spec.id,
+                node_id=%node, generation, "local execution reserved in memory");
+            return Ok(pb::ClaimEnvironmentResponse {
+                outcome: Some(Outcome::Owned(Box::new(
+                    pb::StartAssignedEnvironmentRequest {
+                        create_deadline_unix_millis: deadline.unix_millis(),
+                        spec: Some(spec.into()),
+                        assignment: Some(assignment.try_into().map_err(status)?),
+                        node_session_id: candidate.node_session_id,
+                        snapshot: snapshot
+                            .map(TryInto::try_into)
+                            .transpose()
+                            .map_err(status)?,
+                    },
+                ))),
+            });
+        }
         *state.claims_in_flight.entry(spec.id.clone()).or_default() += 1;
         drop(state);
         let outcome = self.0.claim(spec.clone(), candidate.clone()).await;
@@ -381,6 +457,12 @@ impl CoordinatorRpc {
         state.healthy().map_err(status)?;
         let record = outcome.record().clone();
         state.accept_stored_claim(record.clone()).map_err(status)?;
+        if let Some(deadline) = deadline.filter(|_| matches!(outcome, ClaimOutcome::Owned(_))) {
+            state
+                .local_reservation_deadlines
+                .entry(spec.id.clone())
+                .or_insert((record.assignment.clone(), deadline.instant()));
+        }
         state
             .live_claimant(&node, &candidate.node_session_id, self.0.heartbeat_timeout)
             .map_err(status)?;

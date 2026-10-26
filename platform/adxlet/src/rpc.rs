@@ -19,6 +19,8 @@ pub struct NodeRpc {
     peers: Peers,
     session_id: String,
     coordinator: Option<CoordinatorStateSink>,
+    local_retries:
+        Arc<std::sync::Mutex<std::collections::BTreeMap<String, local_create::PendingLocalCreate>>>,
     entry_locks: Arc<
         std::sync::Mutex<
             std::collections::BTreeMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>,
@@ -61,6 +63,7 @@ impl NodeRpc {
             session_id,
             coordinator: None,
             entry_locks: Arc::default(),
+            local_retries: Arc::default(),
         }
     }
 }

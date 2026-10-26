@@ -13,6 +13,8 @@ service CoordinatorService {
   rpc GetSchedulingQueue(GetSchedulingQueueRequest) returns (GetSchedulingQueueResponse);
   rpc SetNodeScheduling(SetNodeSchedulingRequest) returns (NodeSchedulingState);
   rpc PrepareCreate(LocalEnvironmentCreateRequest) returns (PreparedEnvironment);
+  // Local execution identity and resource reservation, held only in memory.
+  rpc ReserveLocalEnvironment(ClaimEnvironmentRequest) returns (ClaimEnvironmentResponse);
   rpc ClaimEnvironment(ClaimEnvironmentRequest) returns (ClaimEnvironmentResponse);
   rpc ForwardCreate(LocalEnvironmentCreateRequest) returns (EnvironmentResult);
   rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeResponse);
@@ -167,7 +169,12 @@ message SetNodeSchedulingRequest {
   reserved 3;
 }
 message NodeSchedulingState { string node_id = 1; bool accepting_allocations = 2; }
-message LocalEnvironmentCreateRequest { CreateEnvironmentRequest create = 1; string node_session_id = 2; }
+message LocalEnvironmentCreateRequest {
+  CreateEnvironmentRequest create = 1;
+  string node_session_id = 2;
+  // Explicit opt-in; ordinary local-first creation reserves only in memory.
+  bool persist_claim = 3;
+}
 message PreparedEnvironment { EnvironmentSpec spec = 1; ReusableSnapshot snapshot = 2; }
 message ClaimEnvironmentRequest {
   EnvironmentSpec spec = 1;
@@ -175,6 +182,7 @@ message ClaimEnvironmentRequest {
   string node_session_id = 3;
   repeated DeviceAllocation devices = 4;
   string request_id = 5;
+  uint64 create_deadline_unix_millis = 6;
 }
 message ClaimEnvironmentResponse {
   oneof outcome {

@@ -27,7 +27,7 @@
 
 创建：Coordinator 在内存中选择 Assignment 和预留资源，再由 adxlet 本机准入、启动 sandboxd、确认 Execd 就绪和本机绑定，最后原子发布首次 Running 与 Request ID 回执。中心路径不预写 Pending，未确认创建可在 Coordinator 重启后重新调度，残留执行通过对账回收。Coordinator 向 API Server 首次全量、后续增量发布活跃实例目录；删除后撤销目录项并从 Redis 主目录移除，短期最小回执只用于相同删除结果重试。暂停等已有实例操作命中本地目录后直达节点；手动恢复和 Ingress 需求统一由 Coordinator 持久化唤醒意图。
 
-可配置 `create_mode: "local_first"`：API Server 订阅可用节点并轮转入口，adxlet 用同一 Admission 暂留标量资源和整卡，再由 Coordinator 验证硬约束、CAS 确认归属并同步内存账本后启动。本地不满足时由入口节点保留同 ID 回退 ShardScheduler；API Server 不在连接失败或结果未知时二次发起中心创建。`createTimeoutSeconds` 约束完整创建，`scheduleTimeoutSeconds` 仅从请求进入 Coordinator 中心队列后计时，本地准入不预切或消耗中心排队预算。Pack/Spread、软评分和队列公平性仅适用于中心路径；默认仍为 `central`。并发、暂留释放和结果未知契约见 [本地优先与原子归属](atomic-environment-claim.md)。
+可配置 `create_mode: "local_first"`：API Server 订阅可用节点并轮转入口，adxlet 用同一 Admission 暂留标量资源和整卡，再由 Coordinator 验证硬约束、分配 generation 并同步内存账本后启动，成功后才持久化结果；独立开关 `persist_local_claim: true` 才启用提前持久化 Claim。本地不满足时由入口节点保留同 ID 回退 ShardScheduler；API Server 不在连接失败或结果未知时二次发起中心创建。`createTimeoutSeconds` 约束完整创建，`scheduleTimeoutSeconds` 仅从请求进入 Coordinator 中心队列后计时，本地准入不预切或消耗中心排队预算。Pack/Spread、软评分和队列公平性仅适用于中心路径；默认仍为 `central`。并发、暂留释放和结果未知契约见 [本地优先与原子归属](atomic-environment-claim.md)。
 
 暂停：节点完成 checkpoint、确认旧执行删除、保存制品，再经 Coordinator 提交 Paused 和恢复点。对象存储成功要求上传完成。恢复：公开 resume 与流量 autoResume 共用 Coordinator EnsureRunning，先原节点准入，明确 NoCapacity 或归属失效后使用共享 checkpoint 调度兼容目标；RPC 不确定时保留当前归属。完成 Execd/绑定后提交 Running，Ingress 等待对应路由再转发。删除先退役本机绑定、确认后端删除，再释放资源和提交结果。
 

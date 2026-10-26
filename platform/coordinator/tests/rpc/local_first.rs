@@ -51,6 +51,7 @@ async fn live_catalog_keeps_a_durable_claim_pending_until_the_create_rpc() {
     let spec = spec("claim-before-create");
     rig.claimants[0]
         .claim_environment(pb::ClaimEnvironmentRequest {
+            create_deadline_unix_millis: 0,
             request_id: String::new(),
             spec: Some(spec.clone().into()),
             caller: caller(),
@@ -294,6 +295,7 @@ impl Rig {
     }
     fn request(id: &str, index: usize) -> pb::LocalEnvironmentCreateRequest {
         pb::LocalEnvironmentCreateRequest {
+            persist_claim: true,
             create: Some(create(id)),
             node_session_id: format!("boot-{}", if index == 0 { "a" } else { "b" }),
         }
@@ -990,6 +992,7 @@ async fn new_local_claim_avoids_redundant_preclaim_storage_read() {
 
     rig.claimants[0]
         .claim_environment(pb::ClaimEnvironmentRequest {
+            create_deadline_unix_millis: 0,
             request_id: String::new(),
             spec: Some(spec("one-storage-read").into()),
             caller: caller(),
@@ -1017,6 +1020,7 @@ async fn concurrent_local_claims_share_bounded_redis_commits() {
         claims.spawn(async move {
             claimant
                 .claim_environment(pb::ClaimEnvironmentRequest {
+                    create_deadline_unix_millis: 0,
                     request_id: String::new(),
                     spec: Some(spec(&format!("batched-{index}")).into()),
                     caller: caller(),
@@ -1048,6 +1052,7 @@ async fn concurrent_local_claims_share_bounded_redis_commits() {
 async fn claim_rpc_auth_session_directory_and_real_delayed_redis_write() {
     let mut rig = Rig::new().await;
     let claim = pb::ClaimEnvironmentRequest {
+        create_deadline_unix_millis: 0,
         request_id: String::new(),
         spec: Some(spec("delayed").into()),
         caller: caller(),
@@ -1826,4 +1831,296 @@ async fn central_recreation_retires_a_deleted_result_missing_from_its_cache() {
         recreated.assignment.as_ref().unwrap().generation
     );
     rig.delete(&recreated).await;
+}
+
+#[tokio::test]
+#[ignore = "review reproduction with isolated Redis and mTLS"]
+async fn optional_claim_can_retry_on_ready_node() {
+    let mut rig = Rig::new().await;
+    let id = "review-pending-retry";
+    rig.claimants[0]
+        .claim_environment(pb::ClaimEnvironmentRequest {
+            create_deadline_unix_millis: 0,
+            request_id: "review-pending-request".into(),
+            spec: Some(spec(id).into()),
+            caller: caller(),
+            node_session_id: "boot-a".into(),
+            devices: vec![],
+        })
+        .await
+        .unwrap();
+    rig.managers[0].pause_lifecycle().await;
+    let mut request = create(id);
+    request.request_id = "review-pending-request".into();
+    request.create_timeout_seconds = 3;
+    request.schedule_timeout_seconds = 2;
+    let result = rig.coordinator.create_environment(request).await;
+    let stored = rig.session.get(id).await;
+    eprintln!(
+        "review optional retry result={result:?}; stored={stored:?}; backend_b_starts={}",
+        rig.backends[1].started.load(Ordering::SeqCst)
+    );
+    assert!(
+        result.is_ok(),
+        "unstarted claim on unavailable A must allow ready B to finish: {result:?}"
+    );
+    let record = result.unwrap().into_inner().record.unwrap();
+    assert_eq!(record.assignment.as_ref().unwrap().node_id, "b");
+    rig.delete(&record).await;
+}
+
+#[tokio::test]
+#[ignore = "review reproduction with isolated Redis and mTLS"]
+async fn local_replay_precedes_snapshot_normalization() {
+    let mut rig = Rig::new().await;
+    let id = "review-local-snapshot";
+    let mut original = Rig::request(id, 0);
+    original.persist_claim = false;
+    original.create.as_mut().unwrap().request_id = "review-local-request".into();
+    let first = rig.nodes[0]
+        .create_local_environment(original)
+        .await
+        .unwrap()
+        .into_inner()
+        .record
+        .unwrap();
+    for persist_claim in [false, true] {
+        for (environment_id, request_id) in [
+            (id, "another-local-request"),
+            ("another-local-environment", "review-local-request"),
+        ] {
+            let mut replay = Rig::request(environment_id, 0);
+            replay.persist_claim = persist_claim;
+            let create = replay.create.as_mut().unwrap();
+            create.request_id = request_id.into();
+            create.spec.as_mut().unwrap().snapshot_id = Some("missing-review-snapshot".into());
+            let got = rig.nodes[0].create_local_environment(replay).await;
+            assert!(
+                got.is_ok(),
+                "either successful identity must replay before reading new snapshot: {got:?}"
+            );
+            assert_eq!(got.unwrap().into_inner().record, Some(first.clone()));
+        }
+    }
+    assert_eq!(rig.backends[0].started.load(Ordering::SeqCst), 1);
+    rig.delete(&first).await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Redis and mTLS; run control-rpc suite"]
+async fn default_local_create_persists_only_success() {
+    let mut rig = Rig::new().await;
+    let mut node = rig.nodes[0].clone();
+    let before = redis_command_calls(&rig._redis, "eval").await;
+    let task = tokio::spawn(async move {
+        let mut request = Rig::request("unpublished-central", 0);
+        request.persist_claim = false;
+        request.create.as_mut().unwrap().request_id = "local-memory-request".into();
+        node.create_local_environment(request).await
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while rig.backends[0].started.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        rig.session.get("unpublished-central").await.unwrap_err(),
+        adx_core::Error::NotFound
+    );
+    let record = task.await.unwrap().unwrap().into_inner().record.unwrap();
+    assert_eq!(redis_command_calls(&rig._redis, "eval").await - before, 1);
+    assert_eq!(record.assignment.as_ref().unwrap().node_id, "a");
+    assert_eq!(
+        rig.session
+            .published_request("tenant", "local-memory-request")
+            .await
+            .unwrap()
+            .unwrap()
+            .spec
+            .id,
+        "unpublished-central"
+    );
+    rig.delete(&record).await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Redis and mTLS; run control-rpc suite"]
+async fn memory_local_reservation_expires_and_late_result_is_fenced() {
+    let mut rig = Rig::new().await;
+    let id = "memory-local-expiry";
+    let deadline = adx_transport::deadline::Deadline::after(Duration::from_millis(150)).unwrap();
+    let owned = rig.claimants[0]
+        .reserve_local_environment(pb::ClaimEnvironmentRequest {
+            spec: Some(spec(id).into()),
+            caller: caller(),
+            node_session_id: "boot-a".into(),
+            devices: vec![],
+            request_id: "expired-local-request".into(),
+            create_deadline_unix_millis: deadline.unix_millis(),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .outcome
+        .unwrap();
+    let pb::claim_environment_response::Outcome::Owned(owned) = owned else {
+        panic!("local reservation required")
+    };
+    assert_eq!(
+        rig.session.get(id).await.unwrap_err(),
+        adx_core::Error::NotFound
+    );
+    tokio::time::sleep_until(deadline.instant() + Duration::from_millis(30)).await;
+    rig.rpc.expire_nodes().await.unwrap();
+    let catalog = rig.claimants[0]
+        .inspect_node(pb::InspectNodeRequest {
+            node_id: "a".into(),
+            session_id: "boot-a".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!catalog
+        .records
+        .iter()
+        .any(|r| r.spec.as_ref().is_some_and(|s| s.id == id)));
+    let mut request = Rig::request(id, 0);
+    request.persist_claim = false;
+    request.create.as_mut().unwrap().request_id = "replacement-local-request".into();
+    let created = rig.nodes[0]
+        .create_local_environment(request)
+        .await
+        .unwrap()
+        .into_inner()
+        .record
+        .unwrap();
+    assert_ne!(created.assignment, owned.assignment);
+    let mut late = created.clone();
+    late.assignment = owned.assignment;
+    late.runtime.as_mut().unwrap().id =
+        format!("{id}-{}", late.assignment.as_ref().unwrap().generation);
+    assert_eq!(
+        rig.claimants[0]
+            .commit_environment(pb::CommitEnvironmentRequest {
+                record: Some(late),
+                node_session_id: "boot-a".into()
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
+    assert_eq!(
+        rig.session
+            .get(id)
+            .await
+            .unwrap()
+            .result
+            .unwrap()
+            .assignment
+            .generation,
+        created.assignment.as_ref().unwrap().generation
+    );
+    rig.delete(&created).await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Redis and mTLS; run control-rpc suite"]
+async fn memory_local_reservation_is_lost_on_coordinator_restart() {
+    let mut rig = Rig::new().await;
+    let owned = rig.claimants[0]
+        .reserve_local_environment(pb::ClaimEnvironmentRequest {
+            spec: Some(spec("local-before-restart").into()),
+            caller: caller(),
+            node_session_id: "boot-a".into(),
+            devices: vec![],
+            request_id: "local-restart-request".into(),
+            create_deadline_unix_millis: adx_transport::deadline::Deadline::after(
+                Duration::from_secs(30),
+            )
+            .unwrap()
+            .unix_millis(),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .outcome
+        .unwrap();
+    assert!(matches!(
+        owned,
+        pb::claim_environment_response::Outcome::Owned(_)
+    ));
+    let next = rig._redis.store().await.begin(1).await.unwrap();
+    let restarted = CoordinatorRpc::new(
+        next.clone(),
+        Placement::Pack,
+        local_peers(),
+        client_tls("coordinator"),
+        Duration::from_secs(2),
+    )
+    .await
+    .unwrap();
+    assert!(next.snapshot().await.unwrap().environments.is_empty());
+    assert!(next
+        .published_request("tenant", "local-restart-request")
+        .await
+        .unwrap()
+        .is_none());
+    assert!(restarted
+        .metrics()
+        .await
+        .unwrap()
+        .contains("adx_environment_created_total 0"));
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Redis and mTLS; run control-rpc suite"]
+async fn memory_local_concurrent_entries_reuse_one_success() {
+    let mut rig = Rig::new().await;
+    let mut tasks = Vec::new();
+    for index in 0..8 {
+        let mut node = rig.nodes[index % 2].clone();
+        tasks.push(tokio::spawn(async move {
+            let mut request = Rig::request("memory-local-concurrent", index % 2);
+            request.persist_claim = false;
+            request.create.as_mut().unwrap().request_id = format!("local-concurrent-{index}");
+            node.create_local_environment(request)
+                .await
+                .unwrap()
+                .into_inner()
+                .record
+                .unwrap()
+        }));
+    }
+    let mut records = Vec::new();
+    for task in tasks {
+        records.push(task.await.unwrap());
+    }
+    assert!(records.iter().all(|record| record == &records[0]));
+    assert_eq!(
+        rig.backends
+            .iter()
+            .map(|b| b.started.load(Ordering::SeqCst))
+            .sum::<usize>(),
+        1
+    );
+    for index in 0..8 {
+        assert_eq!(
+            rig.session
+                .published_request("tenant", &format!("local-concurrent-{index}"))
+                .await
+                .unwrap()
+                .unwrap()
+                .spec
+                .id,
+            "memory-local-concurrent"
+        );
+    }
+    rig.delete(&records[0]).await;
+    assert!(rig
+        .managers
+        .iter()
+        .all(|m| m.used() == Resources::default()));
 }

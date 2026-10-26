@@ -91,8 +91,8 @@ Go 测试／构建使用 Linux ARM64 Go 1.25.5 容器，交叉编译 macOS ARM64
 ## 创建入口模式
 
 API Server 的 `create_mode` 默认 `central`；配置为 `local_first` 后，订阅 Coordinator 的可用节点目录并轮转选择 adxlet。
-本地资源和硬约束满足时通过原子 claim 创建；否则保持同 Environment ID 进入 ShardScheduler。
-本地成功不经过 Pack/Spread、软偏好评分或中心队列。相同规格的同 ID 创建收敛，规格/租户变化返回冲突。
+本地资源和硬约束满足时通过 ReserveLocalEnvironment 登记内存预留，成功后才持久化结果；否则保持同 Environment ID 进入 ShardScheduler。独立配置 `persist_local_claim: true` 才启用提前持久化 Claim，默认 false。
+本地成功不经过 Pack/Spread、软偏好评分或中心队列。同租户内已成功的 Environment ID 或 Request ID 复用原结果与规格；跨租户访问被拒绝。
 入口超时使用同身份向 Coordinator 重试；不会把一次缺失查询当作重新生成 ID 的许可。
 目录有效期、mTLS、暂留资源和验收范围见 [创建契约](atomic-environment-claim.md)。
 
