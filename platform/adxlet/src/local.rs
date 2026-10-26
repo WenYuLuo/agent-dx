@@ -9,6 +9,7 @@ pub struct LocalReservation {
     pub devices: Vec<DeviceAllocation>,
 }
 pub(crate) struct LocalHold {
+    pub request_id: String,
     pub spec: EnvironmentSpec,
     pub token: String,
     pub devices: Vec<DeviceAllocation>,
@@ -71,6 +72,7 @@ impl Adxlet {
         holds.insert(
             spec.id.clone(),
             LocalHold {
+                request_id: String::new(),
                 spec: spec.clone(),
                 token: token.clone(),
                 devices: devices.clone(),

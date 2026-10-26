@@ -34,7 +34,7 @@ impl Controller {
                 }
                 Ok(status) if !status.running => {
                     self.record.failure = status.failure;
-                    return self.unexpected_exit().await;
+                    return self.runtime_stopped().await;
                 }
                 Ok(_) => (),
             }
@@ -100,6 +100,9 @@ impl Controller {
                             {
                                 match self.record.spec.lifecycle.idle_action {
                                     adx_core::lifecycle::IdleAction::Delete => {
+                                        self.operation_intent(
+                                            adx_core::observation::OperationIntent::Idle,
+                                        );
                                         self.delete().await?;
                                     }
                                     adx_core::lifecycle::IdleAction::Pause => {
@@ -178,6 +181,7 @@ impl Controller {
             && !self.record.resources_held
             && self.durability == Some(crate::Durability::Published))
         .then(|| crate::OperationResult {
+            newly_created: false,
             record: self.record.clone(),
             durability: crate::Durability::Published,
         })
@@ -201,7 +205,31 @@ impl Controller {
         self.unexpected_exit().await?;
         Ok(true)
     }
+    // Absence or a generic exit after an intended stop is not independent fault
+    // evidence. Preserve intent through reconciliation; explicit OOM/probe
+    // evidence still takes the unexpected-exit path.
+    pub(super) async fn runtime_stopped(&mut self) -> Result<()> {
+        if self.intended_execution_absence() {
+            self.unexpected_exit_inner().await
+        } else {
+            self.unexpected_exit().await
+        }
+    }
+
     pub(super) async fn unexpected_exit(&mut self) -> Result<()> {
+        let source = if self
+            .record
+            .failure
+            .as_ref()
+            .is_some_and(|f| f.reason == adx_core::RuntimeFailureReason::ProbeFailed)
+        {
+            adx_core::observation::EvidenceSource::Probe
+        } else if self.record.failure.is_some() {
+            adx_core::observation::EvidenceSource::BackendExit
+        } else {
+            adx_core::observation::EvidenceSource::Control
+        };
+        self.mark_interruption(source)?;
         let trace = adx_observability::trace::Trace::child("environment.unexpected_exit");
         trace.attribute("environment.id", self.record.spec.id.clone());
         trace.run_result(self.unexpected_exit_inner()).await

@@ -74,11 +74,13 @@ def run(connection, image, output, ca, admin_key, *, queue_reader=pending_ids, c
                 try:
                     unexpected = future.result(timeout=90)
                 except EnvironmentError as error:
+                    # Coordinator confirmed queue cancellation before ownership.
+                    # This is a settled scheduling failure, not a transport timeout.
                     deadline_contract_invalid = (
                         'central scheduling queue deadline exceeded' not in str(error)
                         or error.code != 'DEADLINE_EXCEEDED'
-                        or error.retry != 'same_operation'
-                        or error.outcome != 'unknown'
+                        or error.retry != 'never'
+                        or error.outcome != 'not_started'
                         or error.environment_id != instance_id
                     )
                     if deadline_contract_invalid:

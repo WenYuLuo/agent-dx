@@ -12,6 +12,18 @@ impl Session {
             if node.session.as_ref().is_none_or(|s| s.id != session_id) {
                 return Err(Error::Conflict);
             }
+            let incident_id = node
+                .last_incident_id
+                .clone()
+                .unwrap_or_else(|| format!("node:{id}:{session_id}:{}", header.revision));
+            if node.last_incident_id.is_none() {
+                header.observability.worker_incidents = header
+                    .observability
+                    .worker_incidents
+                    .checked_add(1)
+                    .ok_or(Error::Conflict)?;
+                node.last_incident_id = Some(incident_id.clone());
+            }
             node.node.available = false;
             node.session.as_mut().ok_or(Error::Conflict)?.routable = false;
             let mut holds = Vec::new();
@@ -26,10 +38,12 @@ impl Session {
                 {
                     continue;
                 }
+                environment.observe_node_loss(&incident_id, &mut header.observability)?;
                 let mut result = environment
                     .result
                     .clone()
                     .unwrap_or_else(|| EnvironmentRecord {
+                        observation: None,
                         execution_artifacts: vec![],
                         snapshot_source: None,
                         failure: None,
@@ -88,8 +102,12 @@ impl Session {
                 result.runtime.ip = None;
                 result.restart_pending = false;
                 result.last_operation = None;
-                environment.result = Some(result);
+                if let Some(observation) = result.observation.as_mut() {
+                    observation.interruption = None;
+                }
                 environment.invalidated = true;
+                environment.observe_result(&result, &mut header.observability)?;
+                environment.result = Some(result);
                 environment.track_failure(super::collection::now()?);
                 environment.validate()?;
                 writes.push((
@@ -152,6 +170,16 @@ impl Session {
                 }
                 *inventory = committed;
                 self.store.notify_committed_change(header.revision, changed);
+                for (id, env) in &saved.environments {
+                    let previous = raw
+                        .get(&format!("environment:{id}"))
+                        .and_then(|value| decode::<StoredEnvironment>(value).ok());
+                    env.log_observation_change(
+                        previous
+                            .as_ref()
+                            .and_then(|env| env.last_interruption.as_ref()),
+                    );
+                }
                 return Ok(saved);
             }
             *inventory = committed;

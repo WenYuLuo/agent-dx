@@ -123,6 +123,19 @@ impl Api {
         Ok(response)
     }
     async fn handle(self: Arc<Self>, request: Request<Incoming>) -> Response<Body> {
+        let create_route = request.method() == hyper::Method::POST
+            && percent_encoding::percent_decode_str(request.uri().path())
+                .decode_utf8()
+                .is_ok_and(|path| {
+                    matches!(
+                        path.trim_end_matches('/'),
+                        "/api/environment/v1/environments" | "/api/environment/create"
+                    )
+                });
+        let mut rejection = self
+            .environment_service
+            .creation_metrics
+            .rejection_guard(create_route);
         let request_id = RequestContext::from_headers(request.headers()).request_id;
         let api_key = header(&request, "authorization")
             .and_then(|s| s.strip_prefix("Bearer "))
@@ -133,6 +146,7 @@ impl Api {
         let caller = match Box::pin(self.clients.authenticate(api_key)).await {
             Ok(caller) => caller,
             Err(error) => {
+                rejection.status(&error);
                 let status = if matches!(error.code(), Code::Unavailable | Code::DeadlineExceeded) {
                     Status::unavailable("authentication service unavailable")
                 } else {
@@ -342,15 +356,17 @@ impl Api {
                     object.remove("runtime");
                 }
             }
-            let spec = match self
-                .environment_service
-                .prepare_create(input.clone(), &caller)
-            {
+            let spec = match self.environment_service.prepare_create_with_request(
+                input.clone(),
+                &caller,
+                &request_id,
+            ) {
                 Ok(spec) => spec,
                 Err(error) => return error_response(error, &request_id, None, None, false),
             };
+            rejection.accepted();
             if stream && path.ends_with("environments") {
-                return self.create_stream(spec, input, request_id, caller);
+                return self.clone().create_stream(spec, input, request_id, caller);
             }
             let environment_id = spec.id.clone();
             let result =
@@ -1237,6 +1253,7 @@ mod error_contract_tests {
     fn instance_view_exposes_record_tenant_without_execution_secrets() {
         let view = instance_view(pb::GetEnvironmentResponse {
             record: Some(pb::EnvironmentRecord {
+                observation: None,
                 execution_artifacts: vec![],
                 snapshot_source: None,
                 spec: Some(pb::EnvironmentSpec {

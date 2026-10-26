@@ -67,6 +67,7 @@ fn saved() -> StoredSnapshot {
         nodes: [(
             "n".into(),
             StoredNode {
+                last_incident_id: None,
                 node,
                 shard_id: 0,
                 address: "127.0.0.1:9000".into(),
@@ -79,6 +80,8 @@ fn saved() -> StoredSnapshot {
         environments: [(
             "i".into(),
             StoredEnvironment {
+                creation: None,
+                last_interruption: None,
                 resume: None,
                 failed_since_unix_seconds: None,
                 recovery: None,

@@ -22,6 +22,7 @@ impl StateSink for Coordinator {
 }
 fn record(revision: u64) -> EnvironmentRecord {
     EnvironmentRecord {
+        observation: None,
         execution_artifacts: vec![],
         snapshot_source: None,
         failure: None,
@@ -179,4 +180,50 @@ async fn authoritative_failure_discards_newer_local_running_result() {
     journal.recover(&[failed]).await.unwrap();
     journal.flush().await.unwrap();
     assert!(coordinator.records.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn direct_recovery_evidence_survives_journal_restart_and_replay() {
+    use adx_core::observation::{
+        EvidenceSource, ExecutionObservation, InterruptionEvidence, InterruptionReason,
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("journal.sqlite");
+    let coordinator = Arc::new(Coordinator::default());
+    let old = record(2);
+    let sink = JournalSink::new(path.clone(), coordinator.clone());
+    sink.commit(&old).await.unwrap();
+    *coordinator.failure.lock().unwrap() = Some(Error::Unavailable("response lost".into()));
+    let mut recovered = record(5);
+    recovered.runtime.id = "i-1-recovered".into();
+    recovered.observation = Some(ExecutionObservation {
+        interruption: Some(InterruptionEvidence {
+            event_id: "execution:1:i-1".into(),
+            detected_at_unix_millis: 1,
+            assignment_generation: 1,
+            runtime_id: old.runtime.id.clone(),
+            worker_id: "n".into(),
+            reason: InterruptionReason::Oom,
+            evidence_source: EvidenceSource::BackendExit,
+            exit_code: Some(137),
+            detail: "backend confirmed OOM".into(),
+        }),
+        ..Default::default()
+    });
+    assert_eq!(
+        sink.commit(&recovered).await.unwrap(),
+        Durability::Journaled
+    );
+    drop(sink);
+    *coordinator.failure.lock().unwrap() = None;
+    let sink = JournalSink::new(path, coordinator.clone());
+    sink.recover(&[old]).await.unwrap();
+    assert_eq!(sink.pending().await.unwrap(), 0);
+    assert_eq!(coordinator.records.lock().unwrap().last(), Some(&recovered));
+    assert!(coordinator
+        .records
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|r| r.state == EnvironmentState::Running));
 }

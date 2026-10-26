@@ -209,6 +209,7 @@ impl StateSink for Backend {
 }
 fn record(id: &str, state: EnvironmentState) -> EnvironmentRecord {
     EnvironmentRecord {
+        observation: None,
         execution_artifacts: vec![],
         snapshot_source: None,
         failure: None,
@@ -1480,4 +1481,30 @@ async fn cached_log_retention_waits_for_recovery_and_cleanup_confirmation() {
     backend.fail_remove.store(false, Ordering::SeqCst);
     handle.tick().await.unwrap();
     assert!(node.retained_runtime_ids().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn missing_execution_after_intended_stop_does_not_become_interruption_on_reconnect() {
+    let backend = Arc::new(Backend::default());
+    let node = manager(&backend);
+    let mut original = record("stopped", EnvironmentState::Running);
+    original.observation = Some(adx_core::observation::ExecutionObservation {
+        intent: Some(adx_core::observation::OperationIntent::User),
+        ..Default::default()
+    });
+    node.reconcile(vec![original.clone()]).await.unwrap();
+    let failed = node
+        .environment(original.spec, original.assignment)
+        .unwrap()
+        .sync()
+        .await
+        .unwrap()
+        .record;
+    assert_eq!(failed.state, EnvironmentState::Failed);
+    let observation = failed.observation.unwrap();
+    assert!(observation.interruption.is_none());
+    assert_eq!(
+        observation.intent,
+        Some(adx_core::observation::OperationIntent::User)
+    );
 }

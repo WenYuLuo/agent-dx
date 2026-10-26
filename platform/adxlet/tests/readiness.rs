@@ -42,6 +42,7 @@ impl RuntimeDriver for Runtime {
 }
 fn record() -> EnvironmentRecord {
     EnvironmentRecord {
+        observation: None,
         execution_artifacts: vec![],
         snapshot_source: None,
         failure: None,

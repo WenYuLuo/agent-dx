@@ -6,6 +6,7 @@ mod claims;
 mod cloning;
 mod collection;
 mod metrics;
+mod observation;
 mod recovery;
 mod resume;
 mod snapshots;
@@ -38,6 +39,7 @@ struct State {
     session: Session,
     scheduler: Coordinator,
     specs: BTreeMap<String, EnvironmentSpec>,
+    create_request_ids: BTreeMap<String, String>,
     environments: BTreeMap<String, StoredEnvironment>,
     failed_environments: BTreeSet<String>,
     nodes: BTreeMap<String, StoredNode>,
@@ -165,7 +167,15 @@ impl State {
                     .reserve_recovery(&old.assignment, assignment.clone(), recovery::now()?)
                     .await
             } else {
-                self.session.reserve(spec, assignment.clone()).await
+                self.session
+                    .reserve_with_request(
+                        spec,
+                        assignment.clone(),
+                        self.create_request_ids
+                            .get(&assignment.environment_id)
+                            .map_or("", String::as_str),
+                    )
+                    .await
             };
             match saved {
                 Ok(record) => {
@@ -213,6 +223,8 @@ impl State {
     }
 }
 struct Inner {
+    business: Arc<std::sync::RwLock<Option<observation::BusinessSnapshot>>>,
+    business_fenced: Arc<std::sync::atomic::AtomicBool>,
     created: std::sync::atomic::AtomicU64,
     reclaimers: std::sync::RwLock<adx_checkpoint_storage::reclaim::Reclaimers>,
     resume_admission: Arc<tokio::sync::Semaphore>,
@@ -391,7 +403,16 @@ impl CoordinatorRpc {
         let recovering = saved.nodes.keys().map(|id| (id.clone(), now)).collect();
         let (claim_sender, claim_requests) = mpsc::channel(CLAIM_BATCH_CAPACITY);
         tokio::spawn(run_claim_batches(session.clone(), claim_requests));
-        Ok(Self(Arc::new(Inner {
+        let monitoring = session.clone();
+        let counters = monitoring.business_counters().await?;
+        let service = Self(Arc::new(Inner {
+            business: Arc::new(std::sync::RwLock::new(Some(
+                observation::BusinessSnapshot {
+                    counters,
+                    refreshed: std::time::Instant::now(),
+                },
+            ))),
+            business_fenced: Default::default(),
             created: Default::default(),
             reclaimers: Default::default(),
             resume_admission: Arc::new(tokio::sync::Semaphore::new(1024)),
@@ -400,6 +421,7 @@ impl CoordinatorRpc {
                 session,
                 scheduler,
                 specs,
+                create_request_ids: BTreeMap::new(),
                 failed_environments: saved
                     .environments
                     .iter()
@@ -429,7 +451,32 @@ impl CoordinatorRpc {
             node_tls: node_tls.into(),
             timeout,
             heartbeat_timeout,
-        })))
+        }));
+        let weak = Arc::downgrade(&service.0.business);
+        let fenced = service.0.business_fenced.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let Some(cache) = weak.upgrade() else {
+                    break;
+                };
+                match monitoring.business_counters().await {
+                    Ok(counters) => {
+                        if let Ok(mut cache) = cache.write() {
+                            *cache = Some(observation::BusinessSnapshot {
+                                counters,
+                                refreshed: std::time::Instant::now(),
+                            });
+                        }
+                    }
+                    Err(Error::Conflict) => {
+                        fenced.store(true, std::sync::atomic::Ordering::Release);
+                    }
+                    Err(_) => (),
+                }
+            }
+        });
+        Ok(service)
     }
     pub fn with_reclaimers(self, reclaimers: adx_checkpoint_storage::reclaim::Reclaimers) -> Self {
         *self
@@ -500,7 +547,11 @@ impl CoordinatorRpc {
         schedule_timeout: Duration,
         create_deadline: adx_transport::deadline::Deadline,
         expected_assignment: Option<adx_core::Assignment>,
+        request_id: String,
     ) -> std::result::Result<pb::EnvironmentResult, Status> {
+        if request_id.len() > 256 {
+            return Err(Status::invalid_argument("request ID too long"));
+        }
         let mut schedule_deadline = None;
         loop {
             create_deadline.remaining().map_err(|_| {
@@ -512,6 +563,23 @@ impl CoordinatorRpc {
             let mut state = self.0.state.lock().await;
             state.recover_authoritative_state().await.map_err(status)?;
             state.healthy().map_err(status)?;
+            if !request_id.is_empty()
+                && !state.environments.contains_key(&spec.id)
+                && state
+                    .session
+                    .request_binding(&spec.tenant_id, &request_id)
+                    .await
+                    .map_err(status)?
+                    .is_some_and(|id| id != spec.id)
+            {
+                return Err(Status::already_exists(
+                    "request ID is bound to a different Environment",
+                ));
+            }
+            state
+                .create_request_ids
+                .entry(spec.id.clone())
+                .or_insert_with(|| request_id.clone());
             if expected_assignment.as_ref().is_some_and(|expected| {
                 state
                     .environments
@@ -609,6 +677,7 @@ impl CoordinatorRpc {
                         ));
                     }
                     return Ok(pb::EnvironmentResult {
+                        newly_created: false,
                         record: Some(result.try_into().map_err(status)?),
                         durability: pb::Durability::Published as i32,
                     });
@@ -769,6 +838,7 @@ impl CoordinatorRpc {
             return Ok(None);
         }
         state.specs.remove(&spec.id);
+        state.create_request_ids.remove(&spec.id);
         state.scheduling_deadlines.remove(&spec.id);
         if let Some(snapshot_id) = &spec.snapshot_id {
             state
@@ -818,20 +888,15 @@ impl CoordinatorRpc {
                 .is_some_and(|stored| {
                     stored.result.is_none() && stored.recovery.is_none() && !stored.invalidated
                 });
-        let accepted = state.session.commit(record).await?;
+        let committed = state.session.commit_with_state(record).await?;
+        let accepted = committed.result;
+        if let Some(stored) = committed.stored {
+            state.remember_environment(stored);
+        }
         if first_create {
             self.0
                 .created
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-        if accepted.state == EnvironmentState::Failed
-            || (accepted.state != EnvironmentState::Deleted
-                && !state.environments.contains_key(&accepted.spec.id))
-        {
-            let durable = state.session.get(&accepted.spec.id).await?;
-            state.remember_environment(durable);
-        } else {
-            state.failed_environments.remove(&accepted.spec.id);
         }
         if let Some(stored) = state.environments.get_mut(&accepted.spec.id) {
             stored.spec = accepted.spec.clone();
@@ -902,6 +967,7 @@ impl CoordinatorRpc {
             state.environments.remove(&accepted.spec.id);
             state.failed_environments.remove(&accepted.spec.id);
             state.specs.remove(&accepted.spec.id);
+            state.create_request_ids.remove(&accepted.spec.id);
             state.scheduling_deadlines.remove(&accepted.spec.id);
         }
         self.0.changed.notify_waiters();
@@ -1140,6 +1206,7 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
             .map(TryInto::try_into)
             .transpose()
             .map_err(status)?;
+        let request_id = create.request_id.clone();
         let prepared = self.prepare_local(&node, request).await?;
         let spec = prepared
             .spec
@@ -1149,7 +1216,13 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
         let service = self.clone();
         tokio::spawn(trace.run(async move {
             service
-                .create(spec, schedule_timeout, deadline, expected_assignment)
+                .create(
+                    spec,
+                    schedule_timeout,
+                    deadline,
+                    expected_assignment,
+                    request_id,
+                )
                 .await
                 .map(Response::new)
         }))
@@ -1226,6 +1299,7 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                 .map(|i| {
                     i.result
                         .unwrap_or_else(|| EnvironmentRecord {
+                            observation: None,
                             execution_artifacts: vec![],
                             snapshot_source: None,
                             failure: None,
@@ -1458,6 +1532,7 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                     .map(TryInto::try_into)
                     .transpose()
                     .map_err(status)?;
+                let request_id = r.request_id.clone();
                 let raw = r
                     .spec
                     .ok_or_else(|| Status::invalid_argument("spec required"))?;
@@ -1474,7 +1549,13 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                 tokio::spawn(
                     adx_observability::trace::Trace::child("coordinator.create").run(async move {
                         service
-                            .create(spec, schedule_timeout, deadline, expected_assignment)
+                            .create(
+                                spec,
+                                schedule_timeout,
+                                deadline,
+                                expected_assignment,
+                                request_id,
+                            )
                             .await
                             .map(Response::new)
                     }),
@@ -1611,6 +1692,8 @@ mod reconciliation_tests {
             devices: vec![],
         };
         let mut environment = StoredEnvironment {
+            creation: None,
+            last_interruption: None,
             resume: None,
             failed_since_unix_seconds: None,
             recovery: None,
@@ -1618,6 +1701,7 @@ mod reconciliation_tests {
             spec: spec.clone(),
             assignment: assignment.clone(),
             result: Some(EnvironmentRecord {
+                observation: None,
                 execution_artifacts: vec![],
                 snapshot_source: None,
                 failure: None,
@@ -1725,6 +1809,7 @@ mod cancellation_tests {
                     .claim_local(
                         "node".into(),
                         pb::ClaimEnvironmentRequest {
+                            request_id: String::new(),
                             spec: Some(spec.into()),
                             node_session_id: "boot".into(),
                             devices: vec![],

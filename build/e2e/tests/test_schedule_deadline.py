@@ -23,8 +23,8 @@ class ScheduleDeadlineTests(unittest.TestCase):
             def __init__(self, instance_id):
                 super().__init__('central scheduling queue deadline exceeded')
                 self.code = 'DEADLINE_EXCEEDED'
-                self.retry = 'same_operation'
-                self.outcome = 'unknown'
+                self.retry = 'never'
+                self.outcome = 'not_started'
                 self.environment_id = instance_id
 
         class Environment:
@@ -74,6 +74,8 @@ class ScheduleDeadlineTests(unittest.TestCase):
             persisted = json.loads(output.read_text())
         self.assertEqual(result, persisted)
         self.assertEqual(result['status'], 'passed')
+        self.assertEqual(result['error_contract']['retry'], 'never')
+        self.assertEqual(result['error_contract']['outcome'], 'not_started')
         self.assertEqual(result['cases'][0]['id'], 'reliability.central-queue-deadline')
         self.assertTrue(result['queue_observed'] and result['queue_drained'])
         self.assertEqual(state['created'], 1)

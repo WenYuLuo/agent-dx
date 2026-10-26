@@ -297,7 +297,7 @@ impl Controller {
                 .map_err(|_| Error::Unavailable("exit confirmation timed out".into()))??;
                 if !status.running {
                     self.record.failure = status.failure;
-                    return self.unexpected_exit().await;
+                    return self.runtime_stopped().await;
                 }
                 if self.services.health_failure_threshold.is_some() {
                     return self.unexpected_exit().await;
@@ -329,6 +329,9 @@ impl Controller {
                                 let barrier = control.quiesce_idle(&self.record, stamp.2).await;
                                 match barrier {
                                     Ok(()) => {
+                                        self.operation_intent(
+                                            adx_core::observation::OperationIntent::Idle,
+                                        );
                                         self.delete().await?;
                                     }
                                     Err(error) => {
@@ -393,7 +396,7 @@ impl Controller {
         match result {
             Ok(failure) => {
                 self.record.failure = Some(failure);
-                self.unexpected_exit().await
+                self.runtime_stopped().await
             }
             Err(error) => Err(error),
         }

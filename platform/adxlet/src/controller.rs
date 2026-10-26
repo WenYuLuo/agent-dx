@@ -12,6 +12,7 @@ mod events;
 mod lifecycle;
 pub(super) use authority::{AuthorityCheck, AuthorityResult};
 mod monitor;
+mod observation;
 mod snapshots;
 mod workload_checkpoint;
 use super::checkpoint::{PauseRequest, ResumeRequest};
@@ -332,6 +333,7 @@ pub(crate) fn spawn(
     let runtime_id = format!("{}-{}", spec.id, assignment.generation);
     spawn_restored(
         EnvironmentRecord {
+            observation: None,
             execution_artifacts: vec![],
             snapshot_source: None,
             failure: None,
@@ -403,6 +405,7 @@ fn spawn_controller(
     let metrics_registration = services.metrics.register(&record.spec.id);
     let mut controller = Controller {
         capture_preparation: None,
+        intent_retry: None,
         recovery_files: None,
         execution_files: vec![],
         held: record.resources_held,
@@ -658,6 +661,11 @@ impl Controller {
             Command::Reconcile => "reconcile",
             _ => unreachable!(),
         };
+        if matches!(&command, Command::Delete) {
+            self.operation_intent(adx_core::observation::OperationIntent::User);
+        } else if matches!(&command, Command::CollectFailed(_)) {
+            self.operation_intent(adx_core::observation::OperationIntent::Policy);
+        }
         let result = match command {
             Command::Snapshot(_, _)
             | Command::AlignAuthority(_, _)
@@ -744,6 +752,8 @@ impl Controller {
 }
 
 struct Controller {
+    // One validated reload may retry after its intent-only state revisions.
+    intent_retry: Option<adx_core::CompletedOperation>,
     capture_preparation: Option<(adx_core::CompletedOperation, std::path::PathBuf)>,
     create_deadline: Option<tokio::time::Instant>,
     auto_pause_guard: Option<((String, u64, u64), u64)>,
@@ -959,6 +969,7 @@ impl Controller {
                     self.record.revision.checked_add(1).ok_or(Error::Conflict)?;
             }
             if cp.expired(super::checkpoint::now()?) {
+                self.operation_intent(adx_core::observation::OperationIntent::Policy);
                 return self.delete().await;
             }
             match services.store.validate_artifact(&cp.artifact).await {
@@ -970,6 +981,9 @@ impl Controller {
             let lost_running = self.record.state == EnvironmentState::Running;
             if let Some(status) = observation {
                 self.record.failure = status.failure;
+            }
+            if lost_running && !self.intended_execution_absence() {
+                self.mark_interruption(adx_core::observation::EvidenceSource::Reconcile)?;
             }
             self.cleanup().await?;
             if !matches!(
@@ -997,6 +1011,12 @@ impl Controller {
         let next = self.record.state.apply(event)?;
         self.record.revision = self.record.revision.checked_add(1).ok_or(Error::Conflict)?;
         self.record.state = next;
+        self.intent_retry = None;
+        if matches!(next, EnvironmentState::Running | EnvironmentState::Paused) {
+            if let Some(observation) = self.record.observation.as_mut() {
+                observation.intent = None;
+            }
+        }
         if matches!(event, Event::Start | Event::Resume | Event::Ready) {
             self.record.failure = None;
         }
@@ -1030,6 +1050,7 @@ impl Controller {
         self.publish_view();
         self.clean_obsolete_checkpoints().await?;
         Ok(OperationResult {
+            newly_created: false,
             record: self.record.clone(),
             durability,
         })
@@ -1039,6 +1060,7 @@ impl Controller {
         if self.durability == Some(Durability::Published) {
             self.clean_obsolete_checkpoints().await?;
             Ok(OperationResult {
+                newly_created: false,
                 record: self.record.clone(),
                 durability: Durability::Published,
             })
@@ -1086,7 +1108,9 @@ impl Controller {
                 "snapshot source required before starting".into(),
             ));
         }
-        self.start_attempt(false, false, None).await
+        let mut result = self.start_attempt(false, false, None).await?;
+        result.newly_created = true;
+        Ok(result)
     }
 
     async fn start_attempt(
@@ -1140,6 +1164,7 @@ impl Controller {
         };
         let mut awaiting_readiness = false;
         let mut stage = "backend preparation/runtime start";
+        self.create_stage(adx_core::observation::CreateStage::RuntimePrepare);
         let operation_started = Instant::now();
         let attempt = timeout(initialization_timeout, async {
             if self
@@ -1157,6 +1182,7 @@ impl Controller {
                     .await?;
             }
             self.services.readiness.expect_runtime(&self.record)?;
+            self.create_stage(adx_core::observation::CreateStage::RuntimeStart);
             let runtime_start_started = Instant::now();
             self.record.runtime.ip = Some(
                 adx_observability::trace::Trace::child("environment.runtime.start")
@@ -1225,6 +1251,7 @@ impl Controller {
             );
             let runtime_start_ms = runtime_start_started.elapsed().as_secs_f64() * 1_000.0;
             awaiting_readiness = true;
+            self.create_stage(adx_core::observation::CreateStage::Readiness);
             stage = "Execd readiness";
             let runtime_ready_started = Instant::now();
             adx_observability::trace::Trace::child("environment.runtime.ready")
@@ -1233,6 +1260,7 @@ impl Controller {
             let runtime_ready_ms = runtime_ready_started.elapsed().as_secs_f64() * 1_000.0;
             awaiting_readiness = false;
             stage = "route activation";
+            self.create_stage(adx_core::observation::CreateStage::RouteActivation);
             let route_started = Instant::now();
             adx_observability::trace::Trace::child("environment.route.activate")
                 .run_result(self.services.routes.activate(&self.record))
@@ -1339,6 +1367,7 @@ impl Controller {
         }
         self.record.restart_pending = false;
         self.restart_after = None;
+        self.create_stage(adx_core::observation::CreateStage::StatePublish);
         let commit_started = Instant::now();
         let result = if let Some(deadline) = self.create_deadline {
             tokio::time::timeout_at(deadline, self.sync())
@@ -1401,6 +1430,25 @@ impl Controller {
     }
 
     async fn delete(&mut self) -> Result<OperationResult> {
+        let services = self.services.clone();
+        let intent = self
+            .record
+            .observation
+            .as_ref()
+            .and_then(|o| o.intent)
+            .unwrap_or(adx_core::observation::OperationIntent::Policy);
+        let mut attempt = services.metrics.operation_attempt("delete", intent);
+        let result = self.delete_inner().await;
+        let cleared = self.clear_operation_intent().await;
+        let result = match (result, cleared) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(error), _) | (_, Err(error)) => Err(error),
+        };
+        attempt.finish(&result);
+        result
+    }
+    async fn delete_inner(&mut self) -> Result<OperationResult> {
+        self.publish_operation_intent().await?;
         self.record.restart_pending = false;
         self.restart_after = None;
         if self.record.state == EnvironmentState::Deleted {

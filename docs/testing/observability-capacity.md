@@ -1,5 +1,8 @@
 # Environment 可观测数据与容量
 
+新增创建调用归因、成功新建调用 P95、Redis 权威结果和中断/恢复合同见
+[Sandbox 可观测指标合同](sandbox-observability.md)。该合同区分调用结果与取得所有权后的去重新建结果。
+
 ## 创建吞吐
 
 API Server 的私有 `metrics_listen` 暴露 `GET /metrics`，示例地址是
@@ -8,7 +11,7 @@ API Server 的私有 `metrics_listen` 暴露 `GET /metrics`，示例地址是
 | 指标 | 口径 |
 | --- | --- |
 | `adx_environment_create_requests_total{source="http|embedded"}` | 创建入口请求数。HTTP 在身份认证和参数校验之前计数，覆盖同步、SSE、兼容创建接口及其重试；embedded 在应用服务入口计数。转发层不重复计数。 |
-| `adx_environment_create_responses_total{outcome="success|failure|unknown|cancelled"}` | 已进入创建应用服务的调用结果，包含重放响应。结构化调度取消和确认的业务失败为 failure；无法确认执行结果的传输错误为 unknown；调用 future 被丢弃为 cancelled。unknown/cancelled 不代表创建失败。参数校验前的拒绝只有请求计数。 |
+| `adx_environment_create_responses_total{outcome="success|failure|unknown|cancelled"}` | 已进入创建应用服务的调用结果，包含重放响应。结构化调度取消和确认的业务失败为 failure；无法确认执行结果的传输错误为 unknown；调用 future 被丢弃为 cancelled。unknown/cancelled 不代表创建失败。参数校验前的拒绝另有 rejections 计数，不计入调用结果。 |
 | `adx_environment_create_in_flight` | 正在等待创建结果的应用服务调用，包含等待重放结果的调用。SSE 响应头返回不会提前减去后台创建。 |
 | `adx_environment_create_duration_seconds` | 应用服务调用开始至最终结果或取消的耗时 Histogram，覆盖排队、就绪及提交确认，包含重放调用；与 `environment.create` Span 同口径，JSON、SSE、embedded 共用。排除进入服务前的认证、参数转换及 SDK 传输/重试；固定 12 个有限桶。 |
 | `adx_environment_created_total` | Coordinator 首次接受新 Environment 的持久化 Running 结果。已有结果的重复提交、resume、restart 和 recovery 不计入。 |
