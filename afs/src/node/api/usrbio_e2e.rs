@@ -4,8 +4,8 @@
 //! 独立 crate 的集成测试看不到它，而生产路径正是用它装配 `DistributedFs`。
 //!
 //! 已有的 usrbio 用例全部跑在内存假后端上，证明的是"环与 iov 的语义"；本文件证明
-//! "同一套语义接在真实 `DistributedFs` 上仍然成立"。刻意不引入 FUSE：FUSE 只是同一个
-//! `Backend` 的另一个客户端，与本层验证无关。
+//! "同一套语义接在真实 `DistributedFs` 上仍然成立"；显式 ignored 的 POSIX fd 用例还验证
+//! 默认缓存 FUSE 的数据交接与重启持久性。
 #![cfg(test)]
 
 use std::{ffi::OsStr, sync::Arc, time::Duration};
@@ -70,10 +70,12 @@ fn context() -> types::RequestContext {
 }
 
 /// 进程内装配真实 DFS：本地日志 meta store → tonic meta 服务 → GrpcDfsMeta → DistributedFs。
-async fn real_dfs(temp: &tempfile::TempDir) -> (Arc<DistributedFs>, tokio::task::JoinHandle<()>) {
+async fn real_dfs(temp: &std::path::Path) -> (Arc<DistributedFs>, tokio::task::JoinHandle<()>) {
+    // A restarted Node must not renew the previous process's expired session.
+    let session_id = format!("usrbio-e2e-{}", std::process::id());
     let store = Arc::new(
         Store::open_log(Arc::new(
-            LocalLog::open(temp.path().join("meta"), LogLimits::default()).expect("open meta log"),
+            LocalLog::open(temp.join("meta"), LogLimits::default()).expect("open meta log"),
         ))
         .await
         .expect("open log-backed meta store"),
@@ -117,16 +119,15 @@ async fn real_dfs(temp: &tempfile::TempDir) -> (Arc<DistributedFs>, tokio::task:
         GrpcDfsMeta::new(
             &endpoint,
             "node-a".to_owned(),
-            "session-a".to_owned(),
+            session_id.clone(),
             namespace.clone(),
             Duration::from_secs(10),
             TlsConfig::Disabled,
         )
         .expect("grpc dfs meta"),
     );
-    let chunks = Arc::new(
-        LocalChunkStore::open(temp.path().join("chunks"), "node-a").expect("local chunk store"),
-    );
+    let chunks =
+        Arc::new(LocalChunkStore::open(temp.join("chunks"), "node-a").expect("local chunk store"));
 
     // 生产节点在挂载前必须先向 Meta 注册会话；不注册的话所有涉及 placement 的调用都会被
     // 拒绝（"DFS placement requires a live caller Node session"）。
@@ -142,7 +143,7 @@ async fn real_dfs(temp: &tempfile::TempDir) -> (Arc<DistributedFs>, tokio::task:
             }),
             labels: std::collections::HashMap::new(),
             capabilities: vec!["dfs".to_owned()],
-            session_id: "session-a".to_owned(),
+            session_id: session_id.clone(),
             storage_devices: vec![afs_protocol::meta::DfsStorageDevice {
                 device_id: device.device_id,
                 device_epoch: device.device_epoch,
@@ -197,7 +198,7 @@ async fn real_dfs(temp: &tempfile::TempDir) -> (Arc<DistributedFs>, tokio::task:
     let dfs = Arc::new(DistributedFs::new(
         namespace,
         "node-a",
-        "session-a",
+        session_id,
         meta_client,
         chunk_store,
         read_engine,
@@ -220,7 +221,7 @@ async fn real_dfs(temp: &tempfile::TempDir) -> (Arc<DistributedFs>, tokio::task:
 #[tokio::test]
 async fn usrbio_round_trips_on_a_real_dfs_backend() {
     let temp = tempfile::tempdir().expect("tempdir");
-    let (dfs, server) = real_dfs(&temp).await;
+    let (dfs, server) = real_dfs(temp.path()).await;
 
     // 通过同一个 Backend 建文件：SDK 与 FUSE 看到的是同一份后端状态。
     let creator = dfs.clone();
@@ -344,7 +345,7 @@ async fn usrbio_perf_single_vs_batch() {
     const REGION: u64 = 4 * 1024 * 1024;
 
     let temp = tempfile::tempdir().expect("tempdir");
-    let (dfs, server) = real_dfs(&temp).await;
+    let (dfs, server) = real_dfs(temp.path()).await;
 
     let creator = dfs.clone();
     on_plain_thread(move || {
@@ -608,7 +609,7 @@ async fn usrbio_multi_client_rings_keep_regions_isolated() {
     const CHUNK: usize = 4096; // iov 块大小下限是 4096
 
     let temp = tempfile::tempdir().expect("tempdir");
-    let (dfs, server) = real_dfs(&temp).await;
+    let (dfs, server) = real_dfs(temp.path()).await;
     let creator = dfs.clone();
     on_plain_thread(move || {
         let created = creator.create(
@@ -706,7 +707,7 @@ async fn usrbio_multi_client_rings_keep_regions_isolated() {
 #[tokio::test]
 async fn usrbio_writes_are_visible_through_the_backend_read_path() {
     let temp = tempfile::tempdir().expect("tempdir");
-    let (dfs, server) = real_dfs(&temp).await;
+    let (dfs, server) = real_dfs(temp.path()).await;
     let creator = dfs.clone();
     on_plain_thread(move || {
         let created = creator.create(
@@ -803,7 +804,7 @@ async fn usrbio_perf_real_disk_one_gib() {
     const WAVE: usize = 8;
 
     let temp = tempfile::tempdir().expect("tempdir");
-    let (dfs, server) = real_dfs(&temp).await;
+    let (dfs, server) = real_dfs(temp.path()).await;
     let creator = dfs.clone();
     on_plain_thread(move || {
         let created = creator.create(
@@ -928,7 +929,7 @@ async fn usrbio_perf_real_disk_scaling() {
     const REGION: u64 = 64 * 1024 * 1024;
 
     let temp = tempfile::tempdir().expect("tempdir");
-    let (dfs, server) = real_dfs(&temp).await;
+    let (dfs, server) = real_dfs(temp.path()).await;
     let creator = dfs.clone();
     on_plain_thread(move || {
         let created = creator.create(
@@ -1129,7 +1130,7 @@ async fn usrbio_perf_backend_floor() {
     const SLOTS: u64 = 64;
 
     let temp = tempfile::tempdir().expect("tempdir");
-    let (dfs, server) = real_dfs(&temp).await;
+    let (dfs, server) = real_dfs(temp.path()).await;
     let creator = dfs.clone();
     on_plain_thread(move || {
         let created = creator.create(
@@ -1215,7 +1216,7 @@ async fn usrbio_perf_read_path() {
     const WAVE: usize = 8;
 
     let temp = tempfile::tempdir().expect("tempdir");
-    let (dfs, server) = real_dfs(&temp).await;
+    let (dfs, server) = real_dfs(temp.path()).await;
     let creator = dfs.clone();
     on_plain_thread(move || {
         let created = creator.create(
@@ -1317,4 +1318,450 @@ async fn usrbio_perf_read_path() {
     iov.destroy().await.expect("destroy iov");
     api.shutdown().await.expect("shutdown");
     server.abort();
+}
+
+/// Real OS processes: write/close/exit, then restart Meta/Node and read durable bytes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Linux /dev/fuse and an owned writable test root"]
+async fn usrbio_posix_fd_real_fuse_handoff() {
+    let root = std::env::var("CADX_FD_TEST_ROOT").expect("owned test root");
+    let temp = tempfile::tempdir_in(root).unwrap();
+    let executable = std::env::current_exe().unwrap();
+    for phase in [
+        "usrbio_posix_fd_write_child",
+        "usrbio_posix_fd_restart_child",
+    ] {
+        let executable = executable.clone();
+        let path = temp.path().to_path_buf();
+        let status = tokio::task::spawn_blocking(move || {
+            std::process::Command::new(executable)
+                .args([
+                    "--exact",
+                    &format!("node::api::usrbio_e2e::{phase}"),
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("CADX_FD_CASE_ROOT", path)
+                .status()
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        if !status.success() {
+            let mount = temp.path().join("mount");
+            let _ = tokio::task::spawn_blocking(move || {
+                std::process::Command::new("fusermount3")
+                    .args(["-u", "--"])
+                    .arg(mount)
+                    .status()
+            })
+            .await;
+        }
+        assert!(status.success(), "phase {phase} failed: {status}");
+    }
+}
+
+/// Real cached FUSE → original fd import → ring → fsync → cached POSIX handoff.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Linux /dev/fuse and an owned writable test root"]
+async fn usrbio_posix_fd_write_child() {
+    use std::{
+        fs::OpenOptions,
+        os::{
+            fd::AsFd,
+            unix::fs::{FileExt, OpenOptionsExt},
+        },
+    };
+    const BLOCK: usize = 4 << 20;
+    const TOTAL: usize = 1 << 30;
+    let temp = std::path::PathBuf::from(
+        std::env::var("CADX_FD_CASE_ROOT").expect("parent-owned case root"),
+    );
+    let (backend, meta_task) = real_dfs(temp.as_path()).await;
+    let mount_path = temp.as_path().join("mount");
+    std::fs::create_dir_all(&mount_path).unwrap();
+    let api = serve_local_api_with_options(
+        Storage::new(temp.as_path().join("diag")).unwrap(),
+        temp.as_path().join("node.sock"),
+        LocalApiOptions {
+            metrics_registry: None,
+            dfs_backend: Some(backend.clone()),
+            dfs_namespace: Some("default".into()),
+        },
+    )
+    .await
+    .unwrap();
+    let bridge = api.fd_bridge().unwrap();
+    let counters = bridge.clone();
+    let fs_backend: Arc<dyn Backend> = backend.clone();
+    let mounted = on_plain_thread(move || {
+        crate::node::fuse::mount_dfs_with_fd_bridge(
+            fs_backend,
+            &mount_path,
+            crate::node::fuse::FuseMountOptions::default(),
+            bridge,
+        )
+    })
+    .await
+    .unwrap();
+    let path = temp.as_path().join("mount/checkpoint.tmp");
+    let original = path.clone();
+    let file = tokio::task::spawn_blocking(move || {
+        let f = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        f.write_all_at(&vec![0x37; BLOCK], 0).unwrap();
+        let mut old = vec![0; BLOCK];
+        f.read_exact_at(&mut old, 0).unwrap();
+        assert!(old.iter().all(|b| *b == 0x37));
+        f
+    })
+    .await
+    .unwrap();
+    let client =
+        DfsLocalClient::connect(DfsLocalClientConfig::new(temp.as_path().join("node.sock")))
+            .await
+            .unwrap();
+    let mut iov = client.create_iov(BLOCK, 8).await.unwrap();
+    let mut ring = client.create_ring(&iov, 64, 0, 30_000).await.unwrap();
+    let mut imported = client.register_fd(file.as_fd()).await.unwrap();
+    let before_sdk = counters.fuse_data_counts();
+    assert!(
+        client.register_fd(file.as_fd()).await.is_err(),
+        "second writable import must conflict"
+    );
+    let mut old = vec![0; BLOCK];
+    assert_eq!(
+        ring.read_into(&mut iov, imported.registration(), 0, &mut old)
+            .await
+            .unwrap(),
+        BLOCK
+    );
+    assert!(
+        old.iter().all(|b| *b == 0x37),
+        "POSIX writes handed into SDK"
+    );
+    assert_eq!(
+        counters.fuse_data_counts(),
+        before_sdk,
+        "SDK read phase bypasses FUSE data callbacks"
+    );
+    // Renaming and recreating the path must not change the imported open identity.
+    let renamed = temp.as_path().join("mount/checkpoint.final");
+    let renamed2 = renamed.clone();
+    tokio::task::spawn_blocking(move || {
+        std::fs::rename(&original, &renamed2).unwrap();
+        std::fs::write(&original, b"replacement").unwrap();
+    })
+    .await
+    .unwrap();
+    let before_sdk = counters.fuse_data_counts(); // replacement POSIX write is outside SDK data phase
+    let mut payloads = vec![vec![0u8; BLOCK]; 8];
+    let mut expected = blake3::Hasher::new();
+    for wave in 0..TOTAL / BLOCK / 8 {
+        for (lane, payload) in payloads.iter_mut().enumerate() {
+            let mut seed = 0x918345eabd122351u64 ^ ((wave * 8 + lane + 1) as u64 * 7919);
+            for chunk in payload.chunks_exact_mut(8) {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                chunk.copy_from_slice(&seed.to_le_bytes());
+            }
+        }
+        let writes: Vec<_> = payloads
+            .iter()
+            .enumerate()
+            .map(|(j, p)| (((wave * 8 + j) * BLOCK) as u64, p.as_slice()))
+            .collect();
+        let counts = ring
+            .write_batch(&mut iov, imported.registration(), &writes)
+            .await
+            .unwrap();
+        assert!(counts.iter().all(|n| *n == BLOCK));
+        for p in &payloads {
+            expected.update(p);
+        }
+    }
+    assert_eq!(
+        counters.fuse_data_counts(),
+        before_sdk,
+        "SDK data stage must not invoke FUSE read/write"
+    );
+    let original_file = file.try_clone().unwrap();
+    tokio::task::spawn_blocking(move || original_file.sync_all())
+        .await
+        .unwrap()
+        .unwrap();
+    client.unregister_fd(&mut imported).await.unwrap();
+    client.unregister_fd(&mut imported).await.unwrap();
+    let original_file = file.try_clone().unwrap();
+    let expected_hash = expected.finalize();
+    let verify = tokio::task::spawn_blocking(move || {
+        assert_eq!(
+            original_file.metadata().unwrap().len(),
+            TOTAL as u64,
+            "cached attrs invalidated"
+        );
+        let mut actual = blake3::Hasher::new();
+        let mut data = vec![0; BLOCK];
+        for offset in (0..TOTAL).step_by(BLOCK) {
+            original_file
+                .read_exact_at(&mut data, offset as u64)
+                .unwrap();
+            actual.update(&data);
+        }
+        assert_eq!(
+            actual.finalize(),
+            expected_hash,
+            "cached POSIX data invalidated"
+        );
+        assert_eq!(original_file.read_at(&mut data, TOTAL as u64).unwrap(), 0);
+    });
+    verify.await.unwrap();
+    // Same fd after handback can be registered again, using a fresh operation id.
+    let mut next = client.register_fd(file.as_fd()).await.unwrap();
+    client.unregister_fd(&mut next).await.unwrap();
+    let ro_path = renamed.clone();
+    let ro = tokio::task::spawn_blocking(move || std::fs::File::open(ro_path))
+        .await
+        .unwrap()
+        .unwrap();
+    let mut read_only = client.register_fd(ro.as_fd()).await.unwrap();
+    assert!(
+        ring.write_from(&mut iov, read_only.registration(), 0, b"forbidden")
+            .await
+            .is_err()
+    );
+    client.unregister_fd(&mut read_only).await.unwrap();
+    drop(ro);
+    let append_path = temp.as_path().join("mount/append.tmp");
+    let append = tokio::task::spawn_blocking(move || {
+        OpenOptions::new()
+            .create_new(true)
+            .append(true)
+            .open(append_path)
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(client.register_fd(append.as_fd()).await.is_err());
+    drop(append);
+    // Status flags can change after open; the SDK must inspect its retained fd,
+    // while access authority remains bound to the Node's original open context.
+    let toggle_path = temp.join("mount/toggle.tmp");
+    let toggled = tokio::task::spawn_blocking(move || {
+        OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(toggle_path)
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: toggled owns a live fd; F_GETFL takes no pointer argument.
+        let flags = unsafe { libc::fcntl(toggled.as_raw_fd(), libc::F_GETFL) };
+        assert!(flags >= 0);
+        // SAFETY: this test exclusively owns the file status, and changes no
+        // descriptor ownership or access mode.
+        let result =
+            unsafe { libc::fcntl(toggled.as_raw_fd(), libc::F_SETFL, flags | libc::O_APPEND) };
+        assert_eq!(result, 0);
+        assert_eq!(
+            client
+                .register_fd(toggled.as_fd())
+                .await
+                .unwrap_err()
+                .code(),
+            afs_error::IO_NOT_SUPPORTED
+        );
+        // SAFETY: restore the same owned descriptor's original status flags.
+        let result = unsafe { libc::fcntl(toggled.as_raw_fd(), libc::F_SETFL, flags) };
+        assert_eq!(result, 0);
+    }
+    let mut toggle_reg = client.register_fd(toggled.as_fd()).await.unwrap();
+    client.unregister_fd(&mut toggle_reg).await.unwrap();
+    drop(toggled);
+    let opath_path = renamed.clone();
+    let opath = tokio::task::spawn_blocking(move || {
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH)
+            .open(opath_path)
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(client.register_fd(opath.as_fd()).await.is_err());
+    drop(opath);
+    let local = tempfile::tempfile().unwrap();
+    assert!(
+        client.register_fd(local.as_fd()).await.is_err(),
+        "ordinary local file rejected"
+    );
+    // Lost result/drop cleanup must release the phase while original POSIX fd stays open.
+    drop(client.register_fd(file.as_fd()).await.unwrap());
+    let until = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match client.register_fd(file.as_fd()).await {
+            Ok(mut reg) => {
+                client.unregister_fd(&mut reg).await.unwrap();
+                break;
+            }
+            Err(_) if std::time::Instant::now() < until => {
+                tokio::time::sleep(Duration::from_millis(5)).await
+            }
+            Err(error) => panic!("drop cleanup failed: {error}"),
+        }
+    }
+    // A child exits without Drop: kernel final release must reclaim its import.
+    let executable = std::env::current_exe().unwrap();
+    let socket = temp.as_path().join("node.sock");
+    let child_path = temp.as_path().join("mount/child.tmp");
+    tokio::task::spawn_blocking(move || {
+        let result = std::process::Command::new(executable)
+            .args([
+                "--exact",
+                "node::api::usrbio_e2e::usrbio_posix_fd_exit_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("CADX_FD_CHILD_SOCKET", socket)
+            .env("CADX_FD_CHILD_PATH", child_path)
+            .status()
+            .unwrap();
+        assert!(result.success());
+    })
+    .await
+    .unwrap();
+    let child_path = temp.as_path().join("mount/child.tmp");
+    tokio::task::spawn_blocking(move || {
+        let until = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match OpenOptions::new().read(true).write(true).open(&child_path) {
+                Ok(f) => {
+                    drop(f);
+                    break;
+                }
+                Err(_) if std::time::Instant::now() < until => {
+                    std::thread::sleep(Duration::from_millis(5))
+                }
+                Err(error) => panic!("process exit did not release original writer: {error}"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let mut retained = client.register_fd(file.as_fd()).await.unwrap();
+    // Replace the application's *same integer* with an unrelated local file.
+    // The SDK's retained CLOEXEC duplicate must continue to refer to the DFS file.
+    let local = tempfile::tempfile().unwrap();
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: both owned files are live; no borrowed IO is in flight. dup2
+        // atomically replaces file's descriptor, which remains owned by File.
+        let replaced = unsafe { libc::dup2(local.as_raw_fd(), file.as_raw_fd()) };
+        assert_eq!(replaced, file.as_raw_fd());
+    }
+    retained.sync_all().await.unwrap();
+    let mut retained_data = vec![0; BLOCK];
+    assert_eq!(
+        ring.read_into(&mut iov, retained.registration(), 0, &mut retained_data)
+            .await
+            .unwrap(),
+        BLOCK
+    );
+    let mut seed = 0x918345eabd122351u64 ^ 7919;
+    for chunk in retained_data.chunks_exact(8) {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        assert_eq!(chunk, seed.to_le_bytes());
+    }
+    client.unregister_fd(&mut retained).await.unwrap();
+    ring.destroy().await.unwrap();
+    iov.destroy().await.unwrap();
+    drop(file);
+    on_plain_thread(move || mounted.join()).await.unwrap();
+    api.shutdown().await.unwrap();
+    drop(client);
+    drop(backend);
+    meta_task.abort();
+    let _ = meta_task.await;
+    std::fs::write(
+        temp.join("expected-blake3"),
+        expected_hash.to_hex().as_bytes(),
+    )
+    .unwrap();
+    println!(
+        "FD_WRITE_OK bytes={TOTAL} blake3={expected_hash} cached=true fd_reuse=true process_exit=true"
+    );
+}
+
+/// Separate OS process: no previous Arc/channel/task can keep the Meta log alive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "only launched by the isolated POSIX fd E2E parent"]
+async fn usrbio_posix_fd_restart_child() {
+    use std::os::unix::fs::FileExt;
+    const BLOCK: usize = 4 << 20;
+    const TOTAL: usize = 1 << 30;
+    let temp = std::path::PathBuf::from(std::env::var("CADX_FD_CASE_ROOT").expect("case root"));
+    let expected_hash =
+        blake3::Hash::from_hex(std::fs::read_to_string(temp.join("expected-blake3")).unwrap())
+            .unwrap();
+    let renamed = temp.join("mount/checkpoint.final");
+    let (backend, meta_task) = real_dfs(temp.as_path()).await;
+    let mount_path = temp.as_path().join("mount");
+    let fs_backend: Arc<dyn Backend> = backend.clone();
+    let mounted = on_plain_thread(move || crate::node::fuse::mount_dfs(fs_backend, &mount_path))
+        .await
+        .unwrap();
+    tokio::task::spawn_blocking(move || {
+        let f = std::fs::File::open(renamed).unwrap();
+        assert_eq!(f.metadata().unwrap().len(), TOTAL as u64);
+        let mut actual = blake3::Hasher::new();
+        let mut data = vec![0; BLOCK];
+        for offset in (0..TOTAL).step_by(BLOCK) {
+            f.read_exact_at(&mut data, offset as u64).unwrap();
+            actual.update(&data);
+        }
+        assert_eq!(
+            actual.finalize(),
+            expected_hash,
+            "fresh Node/Meta restart preserved 1GiB"
+        );
+    })
+    .await
+    .unwrap();
+    on_plain_thread(move || mounted.join()).await.unwrap();
+    drop(backend);
+    meta_task.abort();
+    let _ = meta_task.await;
+    println!("FD_E2E_OK bytes={TOTAL} blake3={expected_hash} cached=true restart=true");
+}
+
+/// Invoked only by the parent E2E test to verify OS process-exit cleanup.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "only launched by the isolated POSIX fd E2E parent"]
+async fn usrbio_posix_fd_exit_child() {
+    use std::os::fd::AsFd;
+    let socket = std::env::var("CADX_FD_CHILD_SOCKET").expect("child socket");
+    let path = std::env::var("CADX_FD_CHILD_PATH").expect("child path");
+    let client = DfsLocalClient::connect(DfsLocalClientConfig::new(socket))
+        .await
+        .unwrap();
+    let file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap();
+    let registered = client.register_fd(file.as_fd()).await.unwrap();
+    assert_ne!(registered.registration().reg_id, 0);
+    std::process::exit(0);
 }

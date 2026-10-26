@@ -27,6 +27,9 @@
 // 是本模块唯一的 unsafe 边界，每一处都带 SAFETY 说明，其余逻辑保持 safe。
 #![allow(unsafe_code)]
 
+mod fd;
+pub use fd::DfsRegisteredFd;
+
 use std::{
     fmt,
     os::fd::OwnedFd,
@@ -98,6 +101,7 @@ pub struct DfsLocalClient {
     request_timeout: Duration,
     /// 打开文件时使用的 namespace；默认 [`DEFAULT_NAMESPACE`]，可用 `with_namespace` 覆盖。
     namespace_id: String,
+    fd_identity: Arc<fd::ClientIdentity>,
 }
 
 /// Node 签发的 DFS 本机打开句柄。value 对调用方不透明，并且不能自行构造空句柄。
@@ -221,6 +225,8 @@ pub enum LocalClientError {
     /// 门铃（eventfd）创建或接管失败。
     Doorbell(EventFdError),
     Closed,
+    /// Original Linux errno from POSIX fd handoff controls.
+    FdControl(std::io::Error),
 }
 
 impl fmt::Display for LocalClientError {
@@ -240,6 +246,7 @@ impl fmt::Display for LocalClientError {
             Self::RingTimeout => formatter.write_str("shared ring wait timed out"),
             Self::Doorbell(error) => write!(formatter, "shared ring doorbell error: {error}"),
             Self::Closed => formatter.write_str("local SDK client is closed"),
+            Self::FdControl(error) => write!(formatter, "POSIX fd handoff: {error}"),
         }
     }
 }
@@ -256,6 +263,12 @@ impl LocalClientError {
     /// - `RingTimeout` → `CLIENT_DEADLINE_EXCEEDED`，其结果不确定，不能当作「操作未发生」。
     pub fn error(&self) -> afs_error::Error {
         use afs_error::*;
+        if let Self::FdControl(error) = self {
+            return Error::from(match error.raw_os_error() {
+                Some(raw) => std::io::Error::from_raw_os_error(raw),
+                None => std::io::Error::new(error.kind(), error.to_string()),
+            });
+        }
         if let Self::Status(error) = self {
             return error.clone();
         }
@@ -291,7 +304,7 @@ impl LocalClientError {
             }
             Self::Ring(_) => CLIENT_PROTOCOL_VIOLATION,
             Self::Doorbell(_) => CLIENT_SHM_UNAVAILABLE,
-            Self::Status(_) => unreachable!(),
+            Self::Status(_) | Self::FdControl(_) => unreachable!(),
         };
         Error::coded(code, self.to_string())
     }
@@ -1517,6 +1530,7 @@ impl DfsLocalClient {
                 .max_decoding_message_size(grpc.max_decoding_message_bytes),
             request_timeout: grpc.request_timeout,
             namespace_id: DEFAULT_NAMESPACE.to_owned(),
+            fd_identity: Arc::new(fd::ClientIdentity::new()?),
         })
     }
 
@@ -1676,6 +1690,7 @@ impl DfsLocalClient {
     ) -> Result<DfsRing, LocalClientError> {
         let layout = RingLayout::new(entries)?;
         layout.validate_io_depth(io_depth)?;
+        self.fd_session().await?;
         let total_bytes = layout.total_bytes();
         let region = SharedRegion::create_with_limit("afs-local-ring", total_bytes, total_bytes)?;
         let mapped = MappedRegion::map(region.duplicate_fd_owned()?, total_bytes)?;
@@ -1721,6 +1736,7 @@ impl DfsLocalClient {
             timeout_ms,
             doorbell: Some(doorbell_grant),
             completion: Some(completion_grant),
+            fd_session_key: self.fd_identity.key.to_vec(),
         });
         let mut client = self.inner.clone();
         let response =
@@ -2947,6 +2963,7 @@ mod tests {
             )),
             request_timeout: Duration::from_secs(1),
             namespace_id: DEFAULT_NAMESPACE.to_owned(),
+            fd_identity: Arc::new(fd::ClientIdentity::new().unwrap()),
         };
 
         // 大于 entries：原有规则，走 SDK 入口必须本地拒绝。

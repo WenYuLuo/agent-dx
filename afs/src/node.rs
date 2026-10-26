@@ -1775,12 +1775,18 @@ async fn run_node(
     #[cfg(feature = "dfs")]
     let mounted_dfs = match (&cfg.dfs_mount, &dfs_instance) {
         (Some(path), Some(dfs)) => {
-            match fuse::mount_dfs_with_read_diagnostics_and_options(
+            match fuse::mount_dfs_with_diagnostics_and_fd_bridge(
                 dfs.clone(),
                 path,
                 fuse_request_metrics.clone(),
                 dfs_read_work_metrics.clone(),
                 fuse::FuseMountOptions::from(&cfg),
+                local.fd_bridge().ok_or_else(|| {
+                    afs_error::Error::coded(
+                        afs_error::NODE_VFS_UNAVAILABLE,
+                        "DFS fd bridge missing",
+                    )
+                })?,
             ) {
                 Ok(session) => Some(session),
                 Err(error) => {

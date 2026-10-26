@@ -16,13 +16,16 @@
 //! # 使用顺序
 //!
 //! ```text
-//! connect → open → create_iov → create_ring → register_file
-//!         → write_from / write_batch / read_into / read_batch → sync
-//!         → unregister_file → close → ring.destroy → iov.destroy
+//! POSIX create/open → connect → create_iov → create_ring → register_fd
+//!         → write_from / write_batch / read_into / read_batch → registered.sync_all
+//!         → unregister_fd → POSIX read/stat/close → ring.destroy → iov.destroy
 //! ```
 //!
-//! 元数据（创建、删除、重命名）不在这里：那部分仍然走 FUSE/POSIX。SDK 只对**已存在**的
-//! 路径做 `open`，然后接管它之后的所有数据读写。
+//! 元数据（创建、删除、重命名）仍走 FUSE/POSIX。主入口 `register_fd` 导入原打开对象，
+//! 保留访问位和私有 CLOEXEC dup，无路径重开。SDK 阶段不与 POSIX 数据 IO/mmap 重叠；
+//! drain → fsync → unregister 完成缓存失效后才交回 POSIX。原 fd 提前关闭可用
+//! `DfsRegisteredFd::sync_all` 同步保留的打开对象。`open(path)` + `register_file`
+//! 是单独的路径便利接口，示例见 `usrbio_path_round_trip`。
 //!
 //! # iov 区块的生命周期（重要）
 //!
@@ -64,7 +67,7 @@ pub mod connection;
 
 pub use connection::{
     DfsAccess, DfsFileHandle, DfsIov, DfsLocalClient, DfsLocalClientConfig, DfsOpenFile,
-    DfsRegistration, DfsRing, DfsSyncMode, DfsSyncResult, DiagnosticLocalClient,
+    DfsRegisteredFd, DfsRegistration, DfsRing, DfsSyncMode, DfsSyncResult, DiagnosticLocalClient,
     DiagnosticLocalClientConfig, LocalClient, LocalClientConfig, LocalClientError,
     max_parallel_shm_operations,
 };

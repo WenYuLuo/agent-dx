@@ -11,6 +11,10 @@
 //!   但环 worker 也不能在完成项落盘前再读同一区块）；
 //! - 后端句柄在仍被注册时不能被关闭，否则环里的请求会指向已释放的句柄。
 
+mod fd;
+pub use fd::FdBridge;
+pub(crate) use fd::FdSession;
+
 use std::{
     collections::HashMap,
     ffi::OsStr,
@@ -178,6 +182,7 @@ struct RegisteredFile {
     /// 注册时使用的句柄值，用于拒绝「注册未注销就 close」。
     opened: Vec<u8>,
     read_cost: Arc<ReadCost>,
+    imported: Option<Arc<fd::ImportedFile>>,
 }
 
 /// 一条 iov 及其映射。
@@ -214,6 +219,14 @@ struct HubState {
 }
 
 impl HubState {
+    fn allocate_registration(&mut self) -> Result<u32, Error> {
+        let id = self.next_registration;
+        if id == 0 || self.registrations.contains_key(&id) {
+            return Err(invalid("registration identity space exhausted"));
+        }
+        self.next_registration = id.checked_add(1).unwrap_or(0);
+        Ok(id)
+    }
     fn new() -> Self {
         let epoch = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -260,6 +273,15 @@ pub(crate) struct BackendThread {
 }
 
 impl BackendThread {
+    fn enqueue(&self, work: BackendJob) -> Result<(), Error> {
+        self.jobs
+            .as_ref()
+            .ok_or_else(|| invalid("backend thread unavailable"))?
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .send(work)
+            .map_err(|_| invalid("backend thread is gone"))
+    }
     fn spawn() -> Self {
         let (jobs, receiver) = std::sync::mpsc::channel::<BackendJob>();
         match std::thread::Builder::new()
@@ -320,6 +342,7 @@ impl BackendThread {
 pub(crate) struct UsrbioHub {
     backend: Arc<dyn Backend>,
     reads: Arc<ReadExecutor>,
+    fd_bridge: Arc<FdBridge>,
     /// 控制面调用后端的唯一通道；环 worker 有自己的 std 线程，不经过这里。
     executor: Arc<BackendThread>,
     metrics: Option<RingMetrics>,
@@ -345,15 +368,28 @@ pub(crate) struct RingFds {
 impl UsrbioHub {
     /// 绑定一个 DFS 后端与它服务的命名空间。
     pub(crate) fn new(backend: Arc<dyn Backend>, namespace: Option<String>) -> Self {
+        let state = Arc::new(Mutex::new(HubState::new()));
+        let executor = Arc::new(BackendThread::spawn());
+        let fd_bridge = Arc::new(FdBridge::new(
+            backend.clone(),
+            Arc::downgrade(&state),
+            executor.clone(),
+            process_identity().uid,
+        ));
         Self {
             backend,
-            executor: Arc::new(BackendThread::spawn()),
+            executor,
+            fd_bridge,
             reads: Arc::new(ReadExecutor::default()),
             metrics: None,
             namespace,
             identity: process_identity(),
-            state: Arc::new(Mutex::new(HubState::new())),
+            state,
         }
+    }
+
+    pub(crate) fn fd_bridge(&self) -> Arc<FdBridge> {
+        self.fd_bridge.clone()
     }
 
     /// 控制面后端执行器。RPC 处理器必须经它调用后端，不能在 runtime 线程上直接调。
@@ -375,6 +411,19 @@ impl UsrbioHub {
         self
     }
 
+    pub(crate) fn check_namespace(&self, namespace: &str) -> Result<(), Error> {
+        if self
+            .namespace
+            .as_deref()
+            .is_some_and(|expected| expected != namespace)
+        {
+            return Err(invalid(format!(
+                "namespace {namespace} is not served by this node"
+            )));
+        }
+        Ok(())
+    }
+
     /// 打开一个路径，返回不透明句柄值、文件长度。
     ///
     /// 路径从后端根 inode 逐段 `lookup` 解析，与 FUSE 走同一条后端路径，因此权限和目录项
@@ -385,15 +434,7 @@ impl UsrbioHub {
         path: &str,
         access: OpenAccess,
     ) -> Result<(Vec<u8>, u64), Error> {
-        if self
-            .namespace
-            .as_deref()
-            .is_some_and(|expected| expected != namespace)
-        {
-            return Err(invalid(format!(
-                "namespace {namespace} is not served by this node"
-            )));
-        }
+        self.check_namespace(namespace)?;
         let ctx = self.identity.clone();
         let inode = self.resolve_path(&ctx, path)?;
         let flags = match access {
@@ -503,8 +544,7 @@ impl UsrbioHub {
         let Some(opened) = state.opened.get(handle).cloned() else {
             return Err(invalid("unknown DFS file handle"));
         };
-        let registration = state.next_registration;
-        state.next_registration = state.next_registration.wrapping_add(1).max(1);
+        let registration = state.allocate_registration()?;
         state.registrations.insert(
             registration,
             RegisteredFile {
@@ -512,6 +552,7 @@ impl UsrbioHub {
                 ctx: opened.ctx,
                 opened: handle.to_vec(),
                 read_cost: Arc::new(ReadCost::default()),
+                imported: None,
             },
         );
         Ok(registration)
@@ -523,6 +564,15 @@ impl UsrbioHub {
     /// 的提交仍会用它已取到的句柄执行。`DfsRing::wait_for` 返回之后才注销是唯一安全的顺序。
     pub(crate) fn unregister_file(&self, registration: u32) -> Result<(), Error> {
         let mut state = self.lock();
+        if state
+            .registrations
+            .get(&registration)
+            .is_some_and(|r| r.imported.is_some())
+        {
+            return Err(invalid(
+                "POSIX registrations require the fd handoff control",
+            ));
+        }
         state
             .registrations
             .remove(&registration)
@@ -531,6 +581,7 @@ impl UsrbioHub {
     }
 
     /// 绑定一条共享环并启动它的 worker。
+    #[cfg(test)]
     pub(crate) fn create_ring(
         &self,
         fds: RingFds,
@@ -539,6 +590,18 @@ impl UsrbioHub {
         io_depth: i32,
         timeout_ms: u32,
     ) -> Result<u64, Error> {
+        self.create_ring_owned(fds, layout, iov_id, (io_depth, timeout_ms), None)
+    }
+
+    pub(crate) fn create_ring_owned(
+        &self,
+        fds: RingFds,
+        layout: RingLayout,
+        iov_id: u64,
+        policy: (i32, u32),
+        session: Option<Arc<FdSession>>,
+    ) -> Result<u64, Error> {
+        let (io_depth, timeout_ms) = policy;
         // 凑批策略在创建时校验：「必须攒满」的目标大于环项数时永远凑不满一批，环只能
         // 永久停摆；绝对值超过单周期执行批量（ring::MAX_IO_DEPTH）的目标同样拒绝，
         // 攒满后的剩余提交到不了下一轮门槛。两种情况都直接拒绝，不静默截断。
@@ -576,6 +639,7 @@ impl UsrbioHub {
         let worker = RingWorker {
             backend: self.backend.clone(),
             reads: self.reads.clone(),
+            session,
             iov,
             _region: region,
             state: self.state_handle(),
@@ -718,6 +782,7 @@ fn invalid(message: impl Into<String>) -> Error {
 
 /// 环的消费循环。
 struct RingWorker {
+    session: Option<Arc<FdSession>>,
     backend: Arc<dyn Backend>,
     reads: Arc<ReadExecutor>,
     iov: Arc<IovEntry>,
@@ -891,7 +956,18 @@ impl RingWorker {
                 .filter(|r| r.read_cost.is_slow())
                 .cloned()
         });
-        registered.is_some_and(|r| self.backend.supports_parallel_reads(r.handle))
+        registered.is_some_and(|r| {
+            let _lease = match r
+                .imported
+                .as_ref()
+                .map(|i| i.begin(OP_READ, self.session.as_ref()))
+                .transpose()
+            {
+                Ok(lease) => lease,
+                Err(_) => return false,
+            };
+            self.backend.supports_parallel_reads(r.handle)
+        })
     }
 
     fn execute(&self, submission: &Submission) -> Completion {
@@ -912,6 +988,18 @@ impl RingWorker {
         let Some(registered) = registered else {
             completion.status = afs_error::NODE_VFS_INVALID.raw();
             return completion;
+        };
+        let _fd_use = match registered
+            .imported
+            .as_ref()
+            .map(|i| i.begin(submission.op, self.session.as_ref()))
+            .transpose()
+        {
+            Ok(lease) => lease,
+            Err(error) => {
+                completion.status = error.code().raw();
+                return completion;
+            }
         };
         let length = u64::from(submission.len);
         match submission.op {
@@ -2525,6 +2613,222 @@ pub(crate) mod tests {
         fixture.hub.close(&handle).expect("close");
         fixture.hub.destroy_ring(fixture.ring_id).expect("destroy");
         fixture.hub.destroy_ring(second_id).expect("destroy");
+    }
+
+    fn posix_fd_fixture(
+        flags: i32,
+    ) -> (UsrbioHub, Arc<FdBridge>, afs_transport::usrbio_fd::Control) {
+        let backend = Arc::new(MemoryBackend::new(4096));
+        let ctx = process_identity();
+        let handle = backend
+            .open_with_options(
+                &ctx,
+                types::BackendInode { value: FILE_INODE },
+                flags,
+                types::OpenOptions::default(),
+            )
+            .unwrap();
+        let hub = UsrbioHub::new(backend, None);
+        let bridge = hub.fd_bridge();
+        bridge.opened(
+            7,
+            2,
+            types::BackendInode { value: FILE_INODE },
+            handle,
+            ctx.clone(),
+            flags,
+            false,
+        );
+        let key = [17; 16];
+        let node = bridge.begin_session(&key, ctx.uid).unwrap();
+        let mut operation = [3; 16];
+        operation[..8].copy_from_slice(&1u64.to_le_bytes());
+        let control = afs_transport::usrbio_fd::Control {
+            flags: 0,
+            node,
+            session: key,
+            operation,
+            registration: 0,
+        };
+        (hub, bridge, control)
+    }
+
+    #[test]
+    fn posix_fd_import_preserves_access_and_ring_session() {
+        use afs_transport::usrbio_fd as wire;
+        let (hub, bridge, request) = posix_fd_fixture(libc::O_RDONLY);
+        let (registered, _) = bridge
+            .control(7, hub.identity.uid, wire::REGISTER, request)
+            .unwrap();
+        let import = hub.lock().registrations[&registered.registration]
+            .imported
+            .clone()
+            .unwrap();
+        let own = bridge.session(&request.session, hub.identity.uid).unwrap();
+        assert!(import.begin(OP_READ, Some(&own)).is_ok());
+        assert_eq!(
+            import.begin(OP_WRITE, Some(&own)).err().unwrap().code(),
+            afs_error::IO_PERMISSION_DENIED
+        );
+        let other = [18; 16];
+        bridge.begin_session(&other, hub.identity.uid).unwrap();
+        let other = bridge.session(&other, hub.identity.uid).unwrap();
+        assert!(import.begin(OP_READ, Some(&other)).is_err());
+        assert!(
+            hub.unregister_file(registered.registration).is_err(),
+            "generic unregister cannot bypass cached handoff"
+        );
+    }
+
+    #[test]
+    fn posix_fd_registration_is_idempotent_and_cancellation_retires_identity() {
+        use afs_transport::usrbio_fd as wire;
+        let (hub, bridge, mut request) = posix_fd_fixture(libc::O_RDWR);
+        let (first, _) = bridge
+            .control(7, hub.identity.uid, wire::REGISTER, request)
+            .unwrap();
+        let (retry, _) = bridge
+            .control(7, hub.identity.uid, wire::REGISTER, request)
+            .unwrap();
+        assert_eq!(first.registration, retry.registration);
+        assert_eq!(hub.lock().registrations.len(), 1);
+        let (_, work) = bridge
+            .control(7, hub.identity.uid, wire::UNREGISTER, first)
+            .unwrap();
+        work.unwrap()();
+        assert!(hub.lock().registrations.is_empty());
+        assert!(matches!(
+            bridge.control(7, hub.identity.uid, wire::REGISTER, request),
+            Err(libc::ESTALE)
+        ));
+        request.operation[..8].copy_from_slice(&2u64.to_le_bytes());
+        assert_eq!(
+            bridge
+                .control(7, hub.identity.uid, wire::UNREGISTER, request)
+                .unwrap()
+                .0
+                .flags,
+            0
+        );
+        assert!(matches!(
+            bridge.control(7, hub.identity.uid, wire::REGISTER, request),
+            Err(libc::ESTALE)
+        ));
+        request.operation[..8].copy_from_slice(&3u64.to_le_bytes());
+        let (next, _) = bridge
+            .control(7, hub.identity.uid, wire::REGISTER, request)
+            .unwrap();
+        assert!(next.registration > first.registration);
+    }
+
+    #[test]
+    fn posix_fd_final_close_fences_inflight_use_before_releasing() {
+        use afs_transport::usrbio_fd as wire;
+        let (hub, bridge, request) = posix_fd_fixture(libc::O_RDWR);
+        let (registered, _) = bridge
+            .control(7, hub.identity.uid, wire::REGISTER, request)
+            .unwrap();
+        let import = hub.lock().registrations[&registered.registration]
+            .imported
+            .clone()
+            .unwrap();
+        let own = bridge.session(&request.session, hub.identity.uid).unwrap();
+        let using = import.begin(OP_WRITE, Some(&own)).unwrap();
+        let (done, finished) = std::sync::mpsc::channel();
+        let close = std::thread::spawn(move || {
+            bridge.release_fuse(7);
+            done.send(()).unwrap();
+        });
+        assert!(
+            finished.recv_timeout(Duration::from_millis(20)).is_err(),
+            "close waits for actual completion"
+        );
+        drop(using);
+        finished.recv_timeout(Duration::from_secs(2)).unwrap();
+        close.join().unwrap();
+        assert!(import.begin(OP_READ, Some(&own)).is_err());
+        assert!(hub.lock().registrations.is_empty());
+    }
+
+    #[test]
+    fn posix_fd_wrong_node_and_write_only_access_are_rejected() {
+        use afs_transport::usrbio_fd as wire;
+        let (hub, bridge, mut request) = posix_fd_fixture(libc::O_WRONLY);
+        let mut wrong = request;
+        wrong.node = [29; 16];
+        assert!(matches!(
+            bridge.control(7, hub.identity.uid, wire::REGISTER, wrong),
+            Err(libc::EXDEV)
+        ));
+        assert!(
+            bridge
+                .begin_session(&[22; 16], hub.identity.uid.wrapping_add(1))
+                .is_err()
+        );
+        assert!(bridge.check_control(3, 7).is_err());
+        request = bridge
+            .control(7, hub.identity.uid, wire::REGISTER, request)
+            .unwrap()
+            .0;
+        let import = hub.lock().registrations[&request.registration]
+            .imported
+            .clone()
+            .unwrap();
+        let own = bridge.session(&request.session, hub.identity.uid).unwrap();
+        assert!(import.begin(OP_READ, Some(&own)).is_err());
+        assert!(import.begin(OP_WRITE, Some(&own)).is_ok());
+        let (_, work) = bridge
+            .control(7, hub.identity.uid, wire::UNREGISTER, request)
+            .unwrap();
+        assert!(
+            import.begin(OP_WRITE, Some(&own)).is_err(),
+            "closing rejects new execution immediately"
+        );
+        // Queue rejection/lost work must produce a retryable error, not permanent PENDING.
+        drop(work);
+        assert!(matches!(
+            bridge.control(7, hub.identity.uid, wire::UNREGISTER, request),
+            Err(libc::EIO)
+        ));
+        let (_, work) = bridge
+            .control(7, hub.identity.uid, wire::UNREGISTER, request)
+            .unwrap();
+        work.unwrap()();
+        assert!(hub.lock().registrations.is_empty());
+    }
+
+    #[test]
+    fn posix_fd_registration_numbers_never_wrap_to_an_old_submission() {
+        let (hub, _, _) = posix_fd_fixture(libc::O_RDONLY);
+        let mut state = hub.lock();
+        state.next_registration = u32::MAX;
+        assert_eq!(state.allocate_registration().unwrap(), u32::MAX);
+        assert!(state.allocate_registration().is_err());
+    }
+
+    #[test]
+    fn posix_fd_cancelled_sessions_respect_the_per_open_budget() {
+        use afs_transport::usrbio_fd as wire;
+        let (hub, bridge, mut request) = posix_fd_fixture(libc::O_RDONLY);
+        for index in 1..=257u64 {
+            let mut key = [23; 16];
+            key[..8].copy_from_slice(&index.to_le_bytes());
+            bridge.begin_session(&key, hub.identity.uid).unwrap();
+            request.session = key;
+            assert_eq!(
+                bridge
+                    .control(7, hub.identity.uid, wire::UNREGISTER, request)
+                    .unwrap()
+                    .0
+                    .flags,
+                0
+            );
+        }
+        assert!(matches!(
+            bridge.control(7, hub.identity.uid, wire::REGISTER, request),
+            Err(libc::EMFILE)
+        ));
+        assert!(hub.lock().registrations.is_empty());
     }
 
     struct ParallelProbe {

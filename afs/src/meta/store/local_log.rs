@@ -450,33 +450,61 @@ fn wal_name(base: LogTip) -> Result<String> {
             .ok_or_else(|| invalid_log("segment sequence exhausted"))?
     ))
 }
-fn wal_budget(dir: &Path, limits: LogLimits, extra_bytes: u64, extra_files: usize) -> Result<u64> {
-    wal_budget_with_metadata(dir, limits, extra_bytes, extra_files, |path| {
-        fs::symlink_metadata(path)
-    })
-}
-fn wal_budget_with_metadata(
+fn wal_budget(
     dir: &Path,
     limits: LogLimits,
     extra_bytes: u64,
     extra_files: usize,
+    retired: &[SegmentRef],
+) -> Result<u64> {
+    wal_budget_entries(
+        fs::read_dir(dir)?,
+        limits,
+        extra_bytes,
+        extra_files,
+        retired,
+        |path| fs::symlink_metadata(path),
+    )
+}
+// Keep enumeration and accounting in the same implementation. The iterator seam
+// lets regressions delete an enumerated file before stat, without timing hooks.
+fn wal_budget_entries(
+    entries: impl IntoIterator<Item = std::io::Result<fs::DirEntry>>,
+    limits: LogLimits,
+    extra_bytes: u64,
+    extra_files: usize,
+    retired: &[SegmentRef],
     mut metadata: impl FnMut(&Path) -> std::io::Result<fs::Metadata>,
 ) -> Result<u64> {
     let mut bytes = extra_bytes;
     let mut files = extra_files;
-    for entry in fs::read_dir(dir)? {
+    for entry in entries {
         let entry = entry?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if name.starts_with("wal-") && name.ends_with(".log") {
             let metadata = match metadata(&entry.path()) {
                 Ok(metadata) => metadata,
-                // Checkpoint cleanup removes retired segments without holding
-                // the writer lock. A directory entry can disappear between
-                // read_dir and stat; it consumes no capacity after deletion.
-                // Live segments are validated separately by check_files/replay.
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error.into()),
+                Err(error) => {
+                    let mut deleted_retired = false;
+                    if error.kind() == std::io::ErrorKind::NotFound {
+                        for segment in retired {
+                            if segment.sealed.is_some() && wal_name(segment.base)? == name.as_ref()
+                            {
+                                deleted_retired = true;
+                                break;
+                            }
+                        }
+                    }
+                    // Retirement is selected durably before cleanup unlinks in
+                    // parallel with this scan. Only that exact sealed set may
+                    // disappear; missing live/unknown files and other IO errors
+                    // still fail closed. Present retired bytes remain charged.
+                    if deleted_retired {
+                        continue;
+                    }
+                    return Err(error.into());
+                }
             };
             if !metadata.is_file() {
                 return Err(invalid_log("WAL entry is not a regular file"));
@@ -881,11 +909,11 @@ fn replay(
     limits: LogLimits,
     checkpoint_limits: CheckpointLimits,
 ) -> Result<Replay> {
-    wal_budget(dir, limits, 0, 0)?;
     let manifest = read_current(dir, identity)?.ok_or_else(|| {
         invalid_log("CURRENT missing from initialized Meta log; originals retained")
     })?;
     manifest.validate()?;
+    wal_budget(dir, limits, 0, 0, &manifest.retired_segments)?;
     let prepared_segment = unselected_prepared_segment(dir, &manifest)?;
     let references: Vec<_> = manifest
         .current
@@ -1471,7 +1499,7 @@ impl LocalLog {
             manifest.retired_images = retired_images;
             write_current(&dir, &manifest, checkpoint_limits)?;
         }
-        let wal_bytes = wal_budget(&dir, limits, 0, 0)?;
+        let wal_bytes = wal_budget(&dir, limits, 0, 0, &manifest.retired_segments)?;
         Ok(Self {
             inner: Arc::new(Inner {
                 owner_pid: std::process::id(),
@@ -1563,6 +1591,7 @@ impl LocalLog {
             inner.limits,
             if exists { 0 } else { LOG_HEADER_BYTES },
             usize::from(!exists),
+            &state.manifest.retired_segments,
         )?;
         let mut file = if exists {
             let mut file = open_file(&target, false)?;
@@ -1651,7 +1680,13 @@ impl LocalLog {
             }
             state.manifest = current;
         }
-        state.wal_bytes = wal_budget(&inner.dir, inner.limits, 0, 0)?;
+        state.wal_bytes = wal_budget(
+            &inner.dir,
+            inner.limits,
+            0,
+            0,
+            &state.manifest.retired_segments,
+        )?;
         Ok(())
     }
 }
@@ -1750,7 +1785,13 @@ impl MetaLog for LocalLog {
                     .ok_or_else(|| full("WAL admission byte overflow"))?;
                 // This path performs only reads: capacity failure proves append
                 // was not attempted. Never apply this classification to write IO.
-                match wal_budget(&inner.dir, inner.limits, charge, files) {
+                match wal_budget(
+                    &inner.dir,
+                    inner.limits,
+                    charge,
+                    files,
+                    &state.manifest.retired_segments,
+                ) {
                     Ok(_) => Ok(true),
                     Err(error) if error.code() == afs_error::IO_CAPACITY => Ok(false),
                     Err(error) => Err(error),
@@ -2070,6 +2111,112 @@ impl MetaLog for LocalLog {
 mod tests {
     use super::*;
     use crate::meta::store::journal::{encode_frame, test_records};
+
+    fn budget_retired_segment() -> SegmentRef {
+        SegmentRef {
+            base: LogTip::EMPTY,
+            base_revision: StoreRevision::ZERO,
+            sealed: Some((
+                Tail {
+                    generation: 1,
+                    tip: LogTip {
+                        sequence: 1,
+                        record_hash: [1; 32],
+                    },
+                    end: LOG_HEADER_BYTES + 16,
+                },
+                StoreRevision(1),
+            )),
+        }
+    }
+    #[test]
+    fn wal_budget_retired_deletion_after_enumeration_is_safe() {
+        let dir = tempfile::tempdir().unwrap();
+        let retired = budget_retired_segment();
+        let retired_name = wal_name(retired.base).unwrap();
+        fs::write(dir.path().join(&retired_name), [1u8; 16]).unwrap();
+        fs::write(dir.path().join("wal-live.log"), [2u8; 64]).unwrap();
+        let entries = fs::read_dir(dir.path()).unwrap().map(|entry| {
+            let entry = entry.unwrap();
+            if entry.file_name() == retired_name.as_str() {
+                fs::remove_file(entry.path()).unwrap();
+            }
+            Ok(entry)
+        });
+        assert_eq!(
+            wal_budget_entries(entries, LogLimits::default(), 11, 0, &[retired], |path| {
+                fs::symlink_metadata(path)
+            })
+            .unwrap(),
+            75
+        );
+    }
+    #[test]
+    fn wal_budget_missing_live_and_unknown_entries_still_fail() {
+        for name in ["wal-00000000000000000002.log", "wal-unrecognized.log"] {
+            let dir = tempfile::tempdir().unwrap();
+            fs::write(dir.path().join(name), [1u8; 16]).unwrap();
+            let entries = fs::read_dir(dir.path()).unwrap().map(|entry| {
+                let entry = entry.unwrap();
+                fs::remove_file(entry.path()).unwrap();
+                Ok(entry)
+            });
+            let error = wal_budget_entries(
+                entries,
+                LogLimits::default(),
+                0,
+                0,
+                &[budget_retired_segment()],
+                |path| fs::symlink_metadata(path),
+            )
+            .unwrap_err();
+            assert_eq!(error.code(), afs_error::IO_NOT_FOUND);
+        }
+    }
+    #[test]
+    fn wal_budget_retired_files_still_consume_capacity_until_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let retired = budget_retired_segment();
+        fs::write(dir.path().join(wal_name(retired.base).unwrap()), [1u8; 16]).unwrap();
+        let limits = LogLimits {
+            segments_max: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            wal_budget_entries(
+                fs::read_dir(dir.path()).unwrap(),
+                limits,
+                0,
+                0,
+                &[retired],
+                |path| fs::symlink_metadata(path)
+            )
+            .unwrap(),
+            16
+        );
+        assert_eq!(
+            wal_budget_entries(
+                fs::read_dir(dir.path()).unwrap(),
+                limits,
+                0,
+                1,
+                &[retired],
+                |path| fs::symlink_metadata(path)
+            )
+            .unwrap_err()
+            .code(),
+            afs_error::IO_CAPACITY
+        );
+        let errors = vec![Err(std::io::Error::from_raw_os_error(libc::EACCES))];
+        assert_eq!(
+            wal_budget_entries(errors, limits, 0, 0, &[retired], |path| {
+                fs::symlink_metadata(path)
+            })
+            .unwrap_err()
+            .code(),
+            afs_error::IO_PERMISSION_DENIED
+        );
+    }
 
     #[test]
     fn p3_lock_owner_release_is_not_delayed_by_inherited_descriptor() {
@@ -2468,12 +2615,19 @@ mod tests {
         let active = dir.path().join("wal-00000000000000000002.log");
         fs::write(&retired, [0; 32]).unwrap();
         fs::write(&active, [0; 64]).unwrap();
-        let bytes = wal_budget_with_metadata(dir.path(), LogLimits::default(), 8, 0, |path| {
-            if path == retired {
-                fs::remove_file(path).unwrap();
-            }
-            fs::symlink_metadata(path)
-        })
+        let bytes = wal_budget_entries(
+            fs::read_dir(dir.path()).unwrap(),
+            LogLimits::default(),
+            8,
+            0,
+            &[budget_retired_segment()],
+            |path| {
+                if path == retired {
+                    fs::remove_file(path).unwrap();
+                }
+                fs::symlink_metadata(path)
+            },
+        )
         .unwrap();
         assert_eq!(bytes, 72);
         assert!(active.is_file());
@@ -2483,12 +2637,19 @@ mod tests {
     fn wal_budget_propagates_metadata_errors_other_than_disappearance() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("wal-00000000000000000001.log"), [0; 32]).unwrap();
-        let result = wal_budget_with_metadata(dir.path(), LogLimits::default(), 0, 0, |_| {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "denied",
-            ))
-        });
+        let result = wal_budget_entries(
+            fs::read_dir(dir.path()).unwrap(),
+            LogLimits::default(),
+            0,
+            0,
+            &[],
+            |_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "denied",
+                ))
+            },
+        );
         assert!(result.is_err());
     }
 

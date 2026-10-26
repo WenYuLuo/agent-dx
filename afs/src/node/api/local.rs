@@ -48,9 +48,10 @@ use tokio::{net::UnixListener, sync::oneshot, task::JoinHandle};
 use tokio_stream::wrappers::UnixListenerStream;
 use tonic::{Request, Response, Status, transport::Server};
 
-use crate::node::api::usrbio::{OpenAccess, UsrbioHub};
+use crate::node::api::usrbio::{FdBridge, OpenAccess, UsrbioHub};
 use crate::node::storage::{Storage, StorageError};
 use crate::node::vfs::{Backend, types};
+use afs_protocol::local_api::{DfsFdSessionReply, DfsFdSessionRequest};
 
 const STALE_SOCKET_CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 
@@ -124,6 +125,7 @@ pub async fn serve_local_api_with_options(
         };
         Arc::new(hub)
     });
+    let fd_bridge = dfs_hub.as_ref().map(|hub| hub.fd_bridge());
     let dfs_service = DfsLocalDataServer::new(DfsLocalDataService {
         metrics,
         hub: dfs_hub,
@@ -141,6 +143,7 @@ pub async fn serve_local_api_with_options(
             .map_err(|error| io::Error::other(error.to_string()))
     });
     Ok(LocalApiServer {
+        fd_bridge,
         shutdown_tx: Some(shutdown_tx),
         task: Some(task),
         socket_path,
@@ -154,6 +157,7 @@ pub async fn serve_local_api_with_options(
 /// `shutdown()` 是正常路径；`Drop` 是兜底路径，只发关闭信号并清理自有 socket，
 /// 不承诺等待所有运行中请求完成。root/node supervisor 可用 `abort_handle()` 观察或中止。
 pub struct LocalApiServer {
+    fd_bridge: Option<Arc<FdBridge>>,
     shutdown_tx: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<io::Result<()>>>,
     socket_path: PathBuf,
@@ -162,6 +166,10 @@ pub struct LocalApiServer {
 }
 
 impl LocalApiServer {
+    /// Existing-file control bridge for this server's own DFS FUSE mount.
+    pub fn fd_bridge(&self) -> Option<Arc<FdBridge>> {
+        self.fd_bridge.clone()
+    }
     /// 供 node supervisor 轮询服务 task 是否已经自然退出。
     pub fn is_finished(&self) -> bool {
         self.task.as_ref().is_none_or(JoinHandle::is_finished)
@@ -333,6 +341,24 @@ impl LocalData for DiagnosticLocalDataService {
 
 #[tonic::async_trait]
 impl DfsLocalData for DfsLocalDataService {
+    async fn fd_session(
+        &self,
+        request: Request<DfsFdSessionRequest>,
+    ) -> Result<Response<DfsFdSessionReply>, Status> {
+        let uid = local_peer_uid(&request)?;
+        let request = request.into_inner();
+        let hub = self.hub()?;
+        hub.check_namespace(&request.namespace_id)
+            .map_err(error_to_status)?;
+        let node = hub
+            .fd_bridge()
+            .begin_session(&request.key, uid)
+            .map_err(error_to_status)?;
+        Ok(Response::new(DfsFdSessionReply {
+            node_id: node.to_vec(),
+        }))
+    }
+
     async fn open(
         &self,
         request: Request<DfsOpenRequest>,
@@ -499,9 +525,18 @@ impl DfsLocalData for DfsLocalDataService {
         &self,
         request: Request<DfsRingCreateRequest>,
     ) -> Result<Response<DfsRingCreateReply>, Status> {
+        let owner = if request.get_ref().fd_session_key.is_empty() {
+            None
+        } else {
+            Some(local_peer_uid(&request)?)
+        };
         let request = request.into_inner();
         let outcome = async {
             let hub = self.hub()?;
+            let session = owner
+                .map(|uid| hub.fd_bridge().session(&request.fd_session_key, uid))
+                .transpose()
+                .map_err(error_to_status)?;
             let grant = request
                 .region
                 .ok_or_else(|| shm_invalid_status("missing ring SHM grant"))?;
@@ -539,7 +574,7 @@ impl DfsLocalData for DfsLocalDataService {
                 ));
             }
             let ring_id = hub
-                .create_ring(
+                .create_ring_owned(
                     super::usrbio::RingFds {
                         region: fd,
                         doorbell: doorbell_fd,
@@ -547,8 +582,8 @@ impl DfsLocalData for DfsLocalDataService {
                     },
                     layout,
                     request.iov_id,
-                    request.io_depth,
-                    request.timeout_ms,
+                    (request.io_depth, request.timeout_ms),
+                    session,
                 )
                 .map_err(error_to_status)?;
             Ok(DfsRingCreateReply {
@@ -632,6 +667,20 @@ fn handle_value(handle: Option<DfsFileHandle>) -> Result<Vec<u8>, Status> {
         Some(handle) if !handle.value.is_empty() => Ok(handle.value),
         _ => Err(invalid_status("missing DFS file handle")),
     }
+}
+
+fn local_peer_uid<T>(request: &Request<T>) -> Result<u32, Status> {
+    request
+        .extensions()
+        .get::<tonic::transport::server::UdsConnectInfo>()
+        .and_then(|info| info.peer_cred.as_ref())
+        .map(|cred| cred.uid())
+        .ok_or_else(|| {
+            coded_status(
+                afs_error::IO_PERMISSION_DENIED,
+                "fd operations require authenticated UDS credentials",
+            )
+        })
 }
 
 fn invalid_status(message: impl Into<String>) -> Status {

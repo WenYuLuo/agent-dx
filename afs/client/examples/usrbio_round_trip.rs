@@ -1,18 +1,12 @@
-//! usrbio 风格读写的完整示例：持久 iov + 共享环 + 批量提交 + 落盘。
-//!
-//! 运行前需要一个在跑的 node（本机 UDS）以及一个已存在的文件——**创建文件仍然走 FUSE/POSIX**，
-//! 这个 SDK 只接管文件打开之后的数据读写。
-//!
-//! ```text
-//! cargo run --example usrbio_round_trip -- /var/run/afs/node.sock /data.bin
-//! ```
-//!
-//! 演示的顺序就是生产用法：
-//! `connect → open → create_iov → create_ring → register_file → 读写 → sync → 收尾`。
+//! POSIX create/open → register_fd → shared rings → fsync → unregister → POSIX readback.
+//! Run against the mounted DFS path, not a path relative to its namespace:
+//! cargo run -p afs-client --example usrbio_round_trip -- /run/afs/node.sock /mnt/afs/data.bin
+//! During the SDK phase do not overlap POSIX data IO or mmap. Metadata operations
+//! remain POSIX; the SDK reuses the original open identity without reopening it.
 
-use std::time::Instant;
+use std::{os::fd::AsFd, time::Instant};
 
-use afs_client::{DfsAccess, DfsLocalClient, DfsLocalClientConfig, DfsSyncMode, LocalClientError};
+use afs_client::{DfsLocalClient, DfsLocalClientConfig};
 
 /// iov 块大小：必须 ≥ 4096，且一次 IO 不能跨块边界（由 SDK 内部保证）。
 const BLOCK_SIZE: usize = 64 * 1024;
@@ -24,7 +18,7 @@ const ENTRIES: u32 = 64;
 const WAVE: usize = 16;
 
 #[tokio::main]
-async fn main() -> Result<(), LocalClientError> {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let socket = args.next().unwrap_or_else(|| {
         eprintln!("用法: usrbio_round_trip <node.sock> <已存在的文件路径>");
@@ -36,10 +30,18 @@ async fn main() -> Result<(), LocalClientError> {
     });
 
     let client = DfsLocalClient::connect(DfsLocalClientConfig::new(&socket)).await?;
-    let file = client.open(&path, DfsAccess::ReadWrite).await?;
+    let file = tokio::task::spawn_blocking(move || {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)
+    })
+    .await??;
     let mut iov = client.create_iov(BLOCK_SIZE, BLOCKS).await?;
     let mut ring = client.create_ring(&iov, ENTRIES, 0, 5_000).await?;
-    let registration = client.register_file(&file).await?;
+    let mut imported = client.register_fd(file.as_fd()).await?;
 
     // 准备一批互不重叠的数据：每条一个块，长度正好一块。
     let payloads: Vec<Vec<u8>> = (0..WAVE)
@@ -53,7 +55,9 @@ async fn main() -> Result<(), LocalClientError> {
 
     // ---- 写 ----
     let started = Instant::now();
-    let written = ring.write_batch(&mut iov, &registration, &items).await?;
+    let written = ring
+        .write_batch(&mut iov, imported.registration(), &items)
+        .await?;
     let write_elapsed = started.elapsed();
 
     let total: usize = written.iter().sum();
@@ -65,8 +69,8 @@ async fn main() -> Result<(), LocalClientError> {
     );
 
     // ---- 落盘 ----
-    // Data 只要保证数据可见；Full 还要求元数据落盘。按需要选，别无条件用 Full。
-    client.sync(&file.handle, DfsSyncMode::Full).await?;
+    // 对原来的 POSIX 打开对象 fsync；SDK 持有的 dup 支持原 fd 提前关闭。
+    imported.sync_all().await?;
 
     // ---- 读回校验 ----
     let mut reads: Vec<Vec<u8>> = (0..WAVE).map(|_| vec![0_u8; BLOCK_SIZE]).collect();
@@ -77,7 +81,7 @@ async fn main() -> Result<(), LocalClientError> {
             .enumerate()
             .map(|(index, buffer)| (index as u64 * BLOCK_SIZE as u64, buffer.as_mut_slice()))
             .collect();
-        ring.read_batch(&mut iov, &registration, &mut targets)
+        ring.read_batch(&mut iov, imported.registration(), &mut targets)
             .await?;
     }
     let read_elapsed = started.elapsed();
@@ -99,8 +103,20 @@ async fn main() -> Result<(), LocalClientError> {
 
     // ---- 收尾 ----
     // 顺序有意义：先撤注册，再关句柄，最后销毁环与 iov（环绑定了 iov id）。
-    client.unregister_file(registration).await?;
-    client.close(file.handle).await?;
+    client.unregister_fd(&mut imported).await?;
+    // 注销成功后才把数据访问交回 POSIX，并核对原 fd 看到的内容。
+    tokio::task::spawn_blocking(move || {
+        use std::os::unix::fs::FileExt;
+        let mut data = vec![0; BLOCK_SIZE];
+        for index in 0..WAVE {
+            file.read_exact_at(&mut data, (index * BLOCK_SIZE) as u64)?;
+            if data.iter().any(|b| *b != index as u8 + 1) {
+                return Err(std::io::Error::other("POSIX readback mismatch"));
+            }
+        }
+        Ok::<_, std::io::Error>(())
+    })
+    .await??;
     ring.destroy().await?;
     iov.destroy().await?;
     Ok(())

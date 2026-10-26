@@ -22,6 +22,8 @@ service LocalData {
 // 内存取字节调用 DFS 后端，完成后把结果写进共享完成队列。因此数据面既没有 RPC，
 // 也没有逐次操作的 FD 传递。
 service DfsLocalData {
+  // Bind a local authenticated SDK session for existing-fd imports and its rings.
+  rpc FdSession(DfsFdSessionRequest) returns (DfsFdSessionReply);
   rpc Open(DfsOpenRequest) returns (DfsOpenReply);
   rpc Sync(DfsSyncRequest) returns (DfsSyncReply);
   rpc Close(DfsCloseRequest) returns (DfsCloseReply);
@@ -35,6 +37,9 @@ service DfsLocalData {
   rpc RingCreate(DfsRingCreateRequest) returns (DfsRingCreateReply);
   rpc RingDestroy(DfsRingDestroyRequest) returns (DfsRingDestroyReply);
 }
+
+message DfsFdSessionRequest { bytes key = 1; string namespace_id = 2; }
+message DfsFdSessionReply { bytes node_id = 1; }
 
 enum DfsOpenAccess {
   DFS_OPEN_ACCESS_UNSPECIFIED = 0;
@@ -141,6 +146,7 @@ message DfsRingCreateRequest {
   // SDK 创建的 eventfd，方向与门铃相反：Node 每投递一批完成项写一次，SDK 阻塞等它。
   // 没有它 SDK 只能轮询完成队列——而 tokio 的定时器粒度是毫秒级，单条 IO 会被抬高一个数量级。
   LocalShmGrant completion = 7;
+  bytes fd_session_key = 8;
 }
 
 message DfsRingCreateReply {
