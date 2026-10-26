@@ -61,8 +61,15 @@ def live_catalog():
     import urllib.request
 
     records = catalog()
+    # A Service hairpin may rewrite the source address outside the fixture's
+    # allowed Pod CIDRs. The Coordinator host has the same TLS API on loopback.
+    deployment = P / 'deployment.yaml'
+    local_api = deployment.is_file() and any(
+        service['role'] == 'apiserver' for service in json.loads(deployment.read_text())['services']
+    )
+    host = '127.0.0.1' if local_api else 'coordinator'
     request = urllib.request.Request(
-        'https://coordinator:8443/api/environment/v1/resources',
+        f'https://{host}:8443/api/environment/v1/resources',
         headers={'Authorization': 'Bearer ' + (S / 'api-key').read_text().strip()},
     )
     with urllib.request.urlopen(
