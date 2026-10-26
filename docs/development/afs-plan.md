@@ -71,7 +71,7 @@ local-file Meta正常重启和正常退出。Linux工程检查、功能、工作
 固定块减少内部交接不代表复制量下降或性能目标完成，原始比较数据不进入产品仓。
 
 当前buffer管理已限定实现原生DFS本地写正文的独占builder、消费冻结、有效范围共享与有空闲基线的复用池；
-Linux Node使用官方jemalloc。同handle FIFO与同inode互斥串行保持，不承诺跨handle全inode到达顺序FIFO。
+Linux Node使用官方jemalloc。同handle顺序屏障与同inode读写互斥保持；合格只读请求可共享读锁并行，不承诺跨handle全inode到达顺序FIFO。原生gRPC统一异步、资源限额和验证边界见[统一读交付](../performance/afs-remote-read-20261024/unified-read-20261026.md)。
 真实FUSE顺序写／小覆盖、最后引用退账及GNU Linux ARM峰值回落已有有限运行证据，历史版本与当前回归分别登记。
 读／解码缓冲未扩展为全局统一池，正文内容缓存和授权不变，S3预算独立保持。
 

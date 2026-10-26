@@ -1077,3 +1077,10 @@ last-frame ownership and live leases, FUSE reply ownership, idle capacity, and
 zero-copy Vec ownership transfer. Existing CRC and native-read authority/error
 checks remain required. Performance needs a separate fixed, interleaved complete
 FUSE comparison; old CRC/open-authority timings are not a current baseline.
+
+
+## 原生异步远端读集成验证
+
+原生gRPC读现统一使用异步业务核心；重点核对固定版本/授权、CRC模式、同fh顺序、缓存/预取已有行为、取消后子工作真实退役、任务/RPC/缓冲/磁盘限额及超时恢复。同步SDK和真正同步后端只保留必要适配。
+
+[统一交付](../performance/afs-remote-read-20261024/unified-read-20261026.md)区分冻结候选Linux/FUSE/24次性能证据与最新主线集成门禁。多读者原单对+5.18%及缓存准备根因继续保留；完整性能未全部准入，云环境后续复测，不以机制计数替代完整耗时。

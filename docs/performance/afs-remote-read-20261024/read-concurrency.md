@@ -1,6 +1,6 @@
 # Native remote read concurrency candidate
 
-Status: this isolated 2026-10-26 candidate removes the native synchronous/asynchronous algorithm switch. Native gRPC reads use one asynchronous core; validation of this final consolidation is recorded separately in `afs-read-unified-async-20261026`. It has not been submitted or deployed.
+Status: this branch uses one native asynchronous read core and removes the native synchronous/asynchronous selector. The [consolidation delivery](unified-read-20261026.md) separates frozen stage17 evidence from current-mainline integration validation.
 
 The semantic baseline is PR95 `b7894c4f13ca1bf161c336eca9b92f938f579c31`. Read CRC remains off and write CRC remains enabled. This change does not enable prefetch, disable TLS, change the FUSE library, or add a zero-copy interface.
 
