@@ -13,7 +13,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from urllib.error import HTTPError
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urljoin
 from urllib.request import HTTPSHandler, ProxyHandler, Request, build_opener
 
 from autoscaling_contract import CASES
@@ -257,7 +257,10 @@ def wake_case(environment, traffic, index):
     if traffic:
         future = executor.submit(
             lambda: https.open(
-                Request(environment.get_port_url(8088) + "/marker", headers=environment.get_port_auth_headers()),
+                Request(
+                    urljoin(f"{environment.get_port_url(8088)}/", "marker"),
+                    headers=environment.get_port_auth_headers(),
+                ),
                 timeout=180,
             )
             .read()
@@ -330,7 +333,10 @@ def main():
         result["guest_pid"] = command(sleeper, "cat /tmp/autoscale-http.pid; kill -0 $(cat /tmp/autoscale-http.pid)")
         wait(
             lambda: https.open(
-                Request(sleeper.get_port_url(8088) + "/marker", headers=sleeper.get_port_auth_headers()), timeout=5
+                Request(
+                    urljoin(f"{sleeper.get_port_url(8088)}/", "marker"), headers=sleeper.get_port_auth_headers()
+                ),
+                timeout=5,
             )
             .read()
             .decode()
