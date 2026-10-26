@@ -115,6 +115,7 @@ fn record_roundtrip_preserves_identity_state_and_ownership() {
     execution: Default::default(),
     };
     let r = EnvironmentRecord {
+        observation: None,
         execution_artifacts: vec![adx_core::CheckpointArtifact {
             storage: "afs".into(),
             location: "pending-capture".into(),

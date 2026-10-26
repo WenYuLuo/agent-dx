@@ -64,11 +64,45 @@ impl NodeRpc {
         }
     }
 }
+fn creation_error(handle: &crate::EnvironmentHandle, error: Error) -> Status {
+    let (record, durability) = handle.view();
+    let stage = record
+        .observation
+        .as_ref()
+        .and_then(|o| o.create_stage)
+        .unwrap_or(adx_core::observation::CreateStage::Unknown);
+    let reason = match &error {
+        Error::NoCapacity => "capacity",
+        Error::Conflict => "conflict",
+        Error::DeadlineExceeded(_) => "timeout",
+        Error::ProbeFailed(_) => "probe_failed",
+        Error::BackendFailure { .. } => "runtime_error",
+        Error::Unavailable(_) => "dependency",
+        Error::ResponseTimeout(_) => "transport",
+        _ => "unknown",
+    };
+    let mut status = adx_protocol::create_status(status(error), stage);
+    status.metadata_mut().insert(
+        "adx-create-reason",
+        tonic::metadata::MetadataValue::from_static(reason),
+    );
+    if durability == Some(Durability::Published)
+        && record.state == adx_core::EnvironmentState::Failed
+        && !record.restart_pending
+    {
+        status.metadata_mut().insert(
+            "adx-create-terminal",
+            tonic::metadata::MetadataValue::from_static("true"),
+        );
+    }
+    status
+}
 fn response(result: crate::OperationResult) -> Result<Response<pb::EnvironmentResult>> {
     adx_observability::info!(event="environment_operation_completed", traceparent=?adx_observability::trace::traceparent(), environment_id=%result.record.spec.id,
         generation=result.record.assignment.generation, revision=result.record.revision,
         state=?result.record.state, "environment operation completed");
     Ok(Response::new(pb::EnvironmentResult {
+        newly_created: result.newly_created,
         record: Some(result.record.try_into()?),
         durability: match result.durability {
             Durability::Published => pb::Durability::Published,
@@ -332,7 +366,7 @@ impl pb::node_service_server::NodeService for NodeRpc {
                         None => handle.create().await,
                     },
                 };
-                response(result.map_err(status)?).map_err(status)
+                response(result.map_err(|error| creation_error(&handle, error))?).map_err(status)
             })
             .await
     }

@@ -593,6 +593,7 @@ mod tests {
 
     fn record(port: u16) -> (EnvironmentRecord, RuntimeControlClient) {
         let record = EnvironmentRecord {
+            observation: None,
             execution_artifacts: vec![],
             snapshot_source: None,
             failure: None,

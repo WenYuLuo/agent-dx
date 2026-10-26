@@ -5,6 +5,8 @@ mod claims;
 mod common;
 #[path = "storage/dormancy.rs"]
 mod dormancy;
+#[path = "storage/observability.rs"]
+mod observability;
 use adx_coordinator::{storage::StoredNode, Coordinator, Node, Placement};
 use adx_core::{
     Assignment, EnvironmentRecord, EnvironmentSpec, EnvironmentState, Error, Resources,
@@ -48,6 +50,7 @@ fn node(id: &str) -> Node {
 }
 fn running(spec: EnvironmentSpec, assignment: Assignment) -> EnvironmentRecord {
     EnvironmentRecord {
+        observation: None,
         execution_artifacts: vec![],
         snapshot_source: None,
         failure: None,

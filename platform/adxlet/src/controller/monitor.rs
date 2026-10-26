@@ -100,6 +100,9 @@ impl Controller {
                             {
                                 match self.record.spec.lifecycle.idle_action {
                                     adx_core::lifecycle::IdleAction::Delete => {
+                                        self.operation_intent(
+                                            adx_core::observation::OperationIntent::Idle,
+                                        );
                                         self.delete().await?;
                                     }
                                     adx_core::lifecycle::IdleAction::Pause => {
@@ -178,6 +181,7 @@ impl Controller {
             && !self.record.resources_held
             && self.durability == Some(crate::Durability::Published))
         .then(|| crate::OperationResult {
+            newly_created: false,
             record: self.record.clone(),
             durability: crate::Durability::Published,
         })
@@ -202,6 +206,19 @@ impl Controller {
         Ok(true)
     }
     pub(super) async fn unexpected_exit(&mut self) -> Result<()> {
+        let source = if self
+            .record
+            .failure
+            .as_ref()
+            .is_some_and(|f| f.reason == adx_core::RuntimeFailureReason::ProbeFailed)
+        {
+            adx_core::observation::EvidenceSource::Probe
+        } else if self.record.failure.is_some() {
+            adx_core::observation::EvidenceSource::BackendExit
+        } else {
+            adx_core::observation::EvidenceSource::Control
+        };
+        self.mark_interruption(source)?;
         let trace = adx_observability::trace::Trace::child("environment.unexpected_exit");
         trace.attribute("environment.id", self.record.spec.id.clone());
         trace.run_result(self.unexpected_exit_inner()).await

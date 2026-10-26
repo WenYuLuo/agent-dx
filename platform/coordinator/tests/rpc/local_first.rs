@@ -51,6 +51,7 @@ async fn live_catalog_keeps_a_durable_claim_pending_until_the_create_rpc() {
     let spec = spec("claim-before-create");
     rig.claimants[0]
         .claim_environment(pb::ClaimEnvironmentRequest {
+            request_id: String::new(),
             spec: Some(spec.clone().into()),
             caller: caller(),
             node_session_id: "boot-a".into(),
@@ -202,6 +203,7 @@ impl Rig {
                     .with_session(format!("boot-{id}")),
             );
             let backend = Arc::new(Backend {
+                pause_writes_after_remove: Mutex::new(None),
                 session: session.clone(),
                 started: AtomicUsize::new(0),
                 removed: AtomicUsize::new(0),
@@ -593,13 +595,16 @@ async fn environment_directory_streams_full_then_incremental_ownership() {
             let frame = directory.message().await.unwrap().unwrap();
             assert_eq!(frame.base_revision, revision);
             revision = frame.revision;
-            assert!(frame.upserts.iter().all(|entry| {
-                entry
+            for entry in &frame.upserts {
+                if let Some(record) = entry
                     .record
                     .as_ref()
-                    .and_then(|record| record.spec.as_ref())
-                    .is_none_or(|spec| spec.id != "directory-case")
-            }));
+                    .filter(|r| r.spec.as_ref().is_some_and(|s| s.id == "directory-case"))
+                {
+                    assert_eq!(record.state, pb::EnvironmentState::Running as i32);
+                    assert_eq!(record.observation.as_ref().unwrap().intent, "user");
+                }
+            }
             if frame.deleted.iter().any(|id| id == "directory-case") {
                 break;
             }
@@ -726,13 +731,21 @@ async fn environment_directory_increment_does_not_rescan_control_history() {
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             let frame = directory.message().await.unwrap().unwrap();
-            assert!(frame.upserts.iter().all(|entry| {
-                entry
-                    .record
+            for record in frame
+                .upserts
+                .iter()
+                .filter_map(|entry| entry.record.as_ref())
+            {
+                if record
+                    .spec
                     .as_ref()
-                    .and_then(|record| record.spec.as_ref())
-                    .is_none_or(|spec| spec.id != "incremental-publication")
-            }));
+                    .is_some_and(|spec| spec.id == "incremental-publication")
+                {
+                    // The confirmed normal-operation intent is visible before deletion.
+                    assert_eq!(record.state, pb::EnvironmentState::Running as i32);
+                    assert_eq!(record.observation.as_ref().unwrap().intent, "user");
+                }
+            }
             if frame
                 .deleted
                 .iter()
@@ -816,7 +829,10 @@ async fn concurrent_local_entries_converge_and_fallback_preserves_both_ledgers()
         b.create_local_environment(Rig::request("same", 1))
     );
     let one = one.unwrap().into_inner();
-    assert_eq!(one, two.unwrap().into_inner());
+    let two = two.unwrap().into_inner();
+    assert_eq!(u8::from(one.newly_created) + u8::from(two.newly_created), 1);
+    assert_eq!(one.record, two.record);
+    assert_eq!(one.durability, two.durability);
     let record = one.record.unwrap();
     assert_eq!(
         rig.backends
@@ -932,7 +948,13 @@ async fn concurrent_local_entries_converge_and_fallback_preserves_both_ledgers()
         a.create_local_environment(Rig::request("mixed", 0))
     );
     let central = central.unwrap().into_inner();
-    assert_eq!(central, local.unwrap().into_inner());
+    let local = local.unwrap().into_inner();
+    assert_eq!(central.record, local.record);
+    assert_eq!(central.durability, local.durability);
+    assert_eq!(
+        usize::from(central.newly_created) + usize::from(local.newly_created),
+        1
+    );
     assert_eq!(
         rig.managers
             .iter()
@@ -978,6 +1000,7 @@ async fn new_local_claim_avoids_redundant_preclaim_storage_read() {
 
     rig.claimants[0]
         .claim_environment(pb::ClaimEnvironmentRequest {
+            request_id: String::new(),
             spec: Some(spec("one-storage-read").into()),
             caller: caller(),
             node_session_id: "boot-a".into(),
@@ -1004,6 +1027,7 @@ async fn concurrent_local_claims_share_bounded_redis_commits() {
         claims.spawn(async move {
             claimant
                 .claim_environment(pb::ClaimEnvironmentRequest {
+                    request_id: String::new(),
                     spec: Some(spec(&format!("batched-{index}")).into()),
                     caller: caller(),
                     node_session_id: "boot-a".into(),
@@ -1034,6 +1058,7 @@ async fn concurrent_local_claims_share_bounded_redis_commits() {
 async fn claim_rpc_auth_session_directory_and_real_delayed_redis_write() {
     let mut rig = Rig::new().await;
     let claim = pb::ClaimEnvironmentRequest {
+        request_id: String::new(),
         spec: Some(spec("delayed").into()),
         caller: caller(),
         node_session_id: "boot-a".into(),
@@ -1434,19 +1459,15 @@ async fn existing_terminal_claim_reconciles_a_late_commit_into_scheduler_account
     terminal.state = adx_core::EnvironmentState::Deleted;
     terminal.resources_held = false;
     terminal.runtime.ip = None;
-    terminal.revision += 2;
-    let mut control = redis::Client::open(rig._redis.url.as_str())
-        .unwrap()
-        .get_multiplexed_async_connection()
-        .await
-        .unwrap();
-    redis::cmd("CLIENT")
-        .arg("PAUSE")
-        .arg(500)
-        .arg("WRITE")
-        .query_async::<()>(&mut control)
-        .await
-        .unwrap();
+    terminal.revision += 3;
+    terminal
+        .observation
+        .get_or_insert_with(Default::default)
+        .intent = Some(adx_core::observation::OperationIntent::User);
+    // Pause only the final result write, after the intent was acknowledged and
+    // the old runtime was removed.
+    *rig.backends[0].pause_writes_after_remove.lock().unwrap() =
+        Some((rig._redis.url.clone(), 500));
     assert!(rig.nodes[0]
         .delete_environment(pb::DeleteEnvironmentRequest {
             failed_revision: None,

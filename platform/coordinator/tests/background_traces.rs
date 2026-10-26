@@ -121,6 +121,7 @@ async fn routine_reports_and_inspection_are_silent_but_failures_and_requests_kee
     }))
     .unwrap();
     let mut request = Request::new(pb::CreateEnvironmentRequest {
+        request_id: String::new(),
         spec: Some(spec.into()),
         caller: Some(pb::CallerContext {
             tenant_id: "tenant".into(),

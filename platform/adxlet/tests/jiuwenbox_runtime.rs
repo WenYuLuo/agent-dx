@@ -1196,6 +1196,7 @@ async fn driver_has_no_ownership_database_and_retains_shared_mount_after_delete(
 
 fn running_record(class: &str) -> EnvironmentRecord {
     EnvironmentRecord {
+        observation: None,
         spec: spec(class),
         assignment: Assignment {
             environment_id: "tenant-agent".into(),

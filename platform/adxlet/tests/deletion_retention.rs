@@ -57,7 +57,17 @@ impl Routes for Dependencies {
 
 #[async_trait]
 impl StateSink for Dependencies {
-    async fn commit(&self, _: &EnvironmentRecord) -> Result<Durability> {
+    async fn commit(&self, record: &EnvironmentRecord) -> Result<Durability> {
+        // The operation intent is acknowledged before cleanup; this fixture can
+        // separately withhold publication of the final Deleted result.
+        if record.state == adx_core::EnvironmentState::Running
+            && record
+                .observation
+                .as_ref()
+                .is_some_and(|o| o.intent.is_some())
+        {
+            return Ok(Durability::Published);
+        }
         Ok(*self.0.lock().expect("test state lock is healthy"))
     }
 }

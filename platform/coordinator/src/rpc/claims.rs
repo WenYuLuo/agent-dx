@@ -100,6 +100,7 @@ impl State {
             .get(&stored.assignment.node_id)
             .ok_or(Error::NotFound)?;
         let record = stored.result.clone().unwrap_or_else(|| EnvironmentRecord {
+            observation: None,
             execution_artifacts: vec![],
             snapshot_source: None,
             failure: None,
@@ -175,6 +176,7 @@ impl CoordinatorRpc {
             .map_err(status)?;
         tenant(request.caller.as_ref(), &spec.tenant_id)?;
         let candidate = LocalClaim {
+            request_id: request.request_id,
             node_id: node.clone(),
             node_session_id: request.node_session_id,
             devices: request
@@ -265,6 +267,18 @@ impl CoordinatorRpc {
                 state.needs_recovery = true;
                 self.0.changed.notify_waiters();
                 return Err(status(e));
+            }
+            Err(Error::Conflict)
+                if state
+                    .session
+                    .request_binding(&spec.tenant_id, &candidate.request_id)
+                    .await
+                    .map_err(status)?
+                    .is_some_and(|id| id != spec.id) =>
+            {
+                return Err(Status::already_exists(
+                    "request ID is bound to a different Environment",
+                ));
             }
             Err(e) => return Err(status(e)),
         };

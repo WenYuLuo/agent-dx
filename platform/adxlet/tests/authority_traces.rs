@@ -100,6 +100,7 @@ async fn authority_cycles_are_silent_until_cleanup_failure_or_state_change() {
         "resources":{"cpu_millis":1,"memory_bytes":1024,"disk_bytes":0}
     })).unwrap();
     let pending = EnvironmentRecord {
+        observation: None,
         spec: spec.clone(),
         assignment: adx_core::Assignment {
             environment_id: spec.id.clone(),

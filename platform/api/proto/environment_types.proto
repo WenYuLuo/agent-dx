@@ -162,6 +162,7 @@ enum EnvironmentState {
 }
 
 message EnvironmentRecord {
+  ExecutionObservation observation = 15;
   EnvironmentSpec spec = 1;
   Assignment assignment = 2;
   EnvironmentState state = 3;
@@ -196,8 +197,26 @@ enum Durability {
 }
 
 message EnvironmentResult {
+  bool newly_created = 3;
   EnvironmentRecord record = 1;
   Durability durability = 2;
+}
+
+message ExecutionObservation {
+  InterruptionEvidence interruption = 1;
+  string intent = 2;
+  string create_stage = 3;
+}
+message InterruptionEvidence {
+  string event_id = 1;
+  uint64 detected_at_unix_millis = 2;
+  uint64 assignment_generation = 3;
+  string runtime_id = 4;
+  string worker_id = 5;
+  string reason = 6;
+  string evidence_source = 7;
+  optional int32 exit_code = 8;
+  string detail = 9;
 }
 
 message CallerContext { string tenant_id = 1; bool administrator = 2; }

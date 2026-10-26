@@ -209,6 +209,7 @@ impl StateSink for Backend {
 }
 fn record(id: &str, state: EnvironmentState) -> EnvironmentRecord {
     EnvironmentRecord {
+        observation: None,
         execution_artifacts: vec![],
         snapshot_source: None,
         failure: None,

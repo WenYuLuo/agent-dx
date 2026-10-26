@@ -82,6 +82,7 @@ service_impl!(pb::coordinator_service_server::CoordinatorService, {
             } else {
                 self.0.starts.fetch_add(1, Ordering::SeqCst);
                 let record = pb::EnvironmentRecord {
+                    observation: None,
                     execution_artifacts: vec![],
             snapshot_source: None,
                     failure: None,
@@ -119,7 +120,7 @@ assignment: Some(pb::Assignment { environment_id: spec.id.clone(), node_id: self
         if error != tonic::Code::Ok {
             return Err(Status::new(error, "injected missing create response"));
         }
-        Ok(Response::new(pb::EnvironmentResult { record: Some(record), durability: pb::Durability::Published as i32 }))
+        Ok(Response::new(pb::EnvironmentResult { newly_created: true, record: Some(record), durability: pb::Durability::Published as i32 }))
     }
 }, [
     get_scheduling_queue(GetSchedulingQueueRequest) -> GetSchedulingQueueResponse,
@@ -258,6 +259,7 @@ async fn snapshot_create_uses_coordinator_even_with_a_live_local_first_entry() {
     let mut spec = spec("snapshot-clone");
     spec.snapshot_id = Some("snapshot".into());
     let request = pb::CreateEnvironmentRequest {
+        request_id: String::new(),
         spec: Some(spec),
         caller: Some(caller()),
         ..Default::default()
@@ -343,6 +345,15 @@ async fn creation_metrics_wait_for_result_and_count_replay_as_a_response() {
     let metrics = fixture.service.metrics();
     assert!(metrics.contains("adx_environment_create_in_flight 0\n"));
     assert!(metrics.contains("adx_environment_create_responses_total{outcome=\"success\"} 2\n"));
+    assert!(
+        metrics.contains("adx_environment_create_success_call_duration_seconds_count 1\n"),
+        "{metrics}"
+    );
+    fixture.create("observed", "different-call").await.unwrap();
+    assert!(fixture
+        .service
+        .metrics()
+        .contains("adx_environment_create_success_call_duration_seconds_count 1\n"));
     assert!(!metrics.contains("environment_id="));
     assert_eq!(fixture.state.starts.load(Ordering::SeqCst), 1);
 }
@@ -397,6 +408,10 @@ async fn private_metrics_include_rejected_http_arrivals_without_reporting_succes
         .await
         .unwrap();
     assert!(text.contains("adx_environment_create_requests_total{source=\"http\"} 3\n"));
+    assert!(
+        text.contains("adx_environment_create_rejections_total{reason=\"unauthenticated\"} 3\n"),
+        "{text}"
+    );
     assert!(text.contains("adx_environment_create_responses_total{outcome=\"success\"} 0\n"));
     assert!(text.contains("adx_environment_create_in_flight 0\n"));
     assert_eq!(
@@ -1011,4 +1026,100 @@ async fn cancelled_create_ends_total_span_without_losing_its_parent() {
     assert!(metrics.contains("adx_environment_create_in_flight 0\n"));
     assert!(metrics.contains("adx_environment_create_responses_total{outcome=\"cancelled\"} 1\n"));
     fixture.state.release.notify_one();
+}
+
+#[path = "../../../build/observability/tests/prometheus.rs"]
+mod prometheus;
+
+#[tokio::test]
+#[ignore = "requires native Prometheus and evidence directory"]
+async fn prometheus_collects_new_creation_latency_without_replay_samples() {
+    let fixture = Fixture::new().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let metrics = tokio::spawn(adx_apiserver::metrics::serve(
+        listener,
+        fixture.service.clone(),
+    ));
+    let mut collector = prometheus::Collector::start("apiserver", address).await;
+    collector
+        .wait_value(
+            "adx_environment_create_success_call_duration_seconds_count",
+            0.0,
+        )
+        .await;
+    fixture.create("collected", "first").await.unwrap();
+    fixture.create("collected", "first").await.unwrap();
+    fixture.create("collected", "reuse").await.unwrap();
+    fixture
+        .state
+        .response_error
+        .store(tonic::Code::Unavailable as usize, Ordering::SeqCst);
+    assert!(fixture
+        .create("response-lost", "response-lost")
+        .await
+        .is_err());
+    fixture.state.response_error.store(0, Ordering::SeqCst);
+    fixture
+        .create("response-lost", "response-lost")
+        .await
+        .unwrap();
+    fixture
+        .state
+        .scheduling_expired
+        .store(true, Ordering::SeqCst);
+    assert!(fixture
+        .create("schedule-failed", "schedule-failed")
+        .await
+        .is_err());
+    collector
+        .wait_value(
+            "adx_environment_create_responses_total{outcome=\"unknown\"}",
+            1.0,
+        )
+        .await;
+    collector.wait_value("adx_environment_create_errors_total{outcome=\"failure\",stage=\"scheduling\",reason=\"timeout\"}",1.0).await;
+    collector
+        .wait_value(
+            "adx_environment_create_success_call_duration_seconds_count",
+            1.0,
+        )
+        .await;
+    collector
+        .wait_value(
+            "adx_environment_create_responses_total{outcome=\"success\"}",
+            4.0,
+        )
+        .await;
+    let p95 = "histogram_quantile(0.95,sum by(le)(rate(adx_environment_create_success_call_duration_seconds_bucket[1m])))";
+    let value = collector.query(p95).await.unwrap();
+    assert!(value.is_finite() && value > 0.0, "{value}");
+    collector.capture().await;
+    metrics.abort();
+}
+
+#[tokio::test]
+async fn unnamed_requests_keep_identity_across_api_replicas_and_tenants() {
+    let fixture = Fixture::new().await;
+    let replica = EnvironmentService::new(fixture.clients.clone());
+    let input = json!({"image":"image"});
+    let a = fixture
+        .service
+        .prepare_create_with_request(input.clone(), &caller(), "same")
+        .unwrap();
+    let b = replica
+        .prepare_create_with_request(input.clone(), &caller(), "same")
+        .unwrap();
+    assert_eq!(a.id, b.id);
+    let other_tenant = pb::CallerContext {
+        tenant_id: "other".into(),
+        administrator: false,
+    };
+    let c = replica
+        .prepare_create_with_request(input.clone(), &other_tenant, "same")
+        .unwrap();
+    assert_ne!(a.id, c.id);
+    assert!(replica
+        .prepare_create_with_request(input, &caller(), "")
+        .is_err());
 }

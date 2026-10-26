@@ -11,9 +11,9 @@ impl NodeRpc {
             .lock()
             .expect("shared state lock poisoned")
             .values()
-            .map(|hold| hold.spec.clone())
+            .map(|hold| (hold.spec.clone(), hold.request_id.clone()))
             .collect();
-        for spec in specs {
+        for (spec, request_id) in specs {
             let busy = self
                 .entry_locks
                 .lock()
@@ -25,6 +25,7 @@ impl NodeRpc {
             }
             let request = pb::LocalEnvironmentCreateRequest {
                 create: Some(pb::CreateEnvironmentRequest {
+                    request_id,
                     caller: Some(pb::CallerContext {
                         tenant_id: spec.tenant_id.clone(),
                         administrator: false,
@@ -115,7 +116,27 @@ impl NodeRpc {
             }
             Err(e) => return Err(status(e)),
         };
+        if let Some(hold) = self
+            .manager
+            .local_holds
+            .lock()
+            .map_err(|_| Status::internal("local holds unavailable"))?
+            .get_mut(&spec.id)
+        {
+            if hold.request_id.is_empty() {
+                hold.request_id = request
+                    .create
+                    .as_ref()
+                    .map(|c| c.request_id.clone())
+                    .unwrap_or_default();
+            }
+        }
         let claim = pb::ClaimEnvironmentRequest {
+            request_id: request
+                .create
+                .as_ref()
+                .map(|c| c.request_id.clone())
+                .unwrap_or_default(),
             spec: Some(spec.clone().into()),
             caller,
             node_session_id: self.session_id.clone(),
@@ -199,7 +220,7 @@ impl NodeRpc {
                     }
                     None => handle.create_with_deadline(deadline).await,
                 };
-                response(result.map_err(status)?).map_err(status)
+                response(result.map_err(|error| creation_error(&handle, error))?).map_err(status)
             }
             Outcome::Existing(existing) => {
                 let record: EnvironmentRecord = existing
@@ -219,6 +240,7 @@ impl NodeRpc {
                     .map_err(status)?;
                 if record.state == adx_core::EnvironmentState::Running {
                     response(crate::OperationResult {
+                        newly_created: false,
                         record,
                         durability: Durability::Published,
                     })

@@ -590,6 +590,7 @@ mod tests {
     fn owned(id: &str, tenant: &str) -> pb::GetEnvironmentResponse {
         pb::GetEnvironmentResponse {
             record: Some(pb::EnvironmentRecord {
+                observation: None,
                 execution_artifacts: vec![],
                 snapshot_source: None,
                 failure: None,
@@ -637,6 +638,7 @@ mod tests {
             ..Default::default()
         };
         let result = pb::EnvironmentResult {
+            newly_created: false,
             record: owned("capsule", "tenant").record,
             durability: pb::Durability::Published as i32,
         };
@@ -657,6 +659,7 @@ mod tests {
             ..Default::default()
         };
         let result = pb::EnvironmentResult {
+            newly_created: false,
             record: owned("capsule", "tenant").record,
             durability: pb::Durability::Published as i32,
         };
@@ -673,6 +676,7 @@ mod tests {
             ..Default::default()
         };
         let result = pb::EnvironmentResult {
+            newly_created: false,
             record: owned("capsule", "tenant").record,
             durability: pb::Durability::Journaled as i32,
         };

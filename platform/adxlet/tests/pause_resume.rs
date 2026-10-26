@@ -883,6 +883,22 @@ async fn failover_restores_latest_checkpoint_without_cold_start() {
     let recovered = handle.sync().await.unwrap().record;
     assert_eq!(recovered.state, EnvironmentState::Running);
     assert_ne!(recovered.runtime.id, running.record.runtime.id);
+    let evidence = recovered
+        .observation
+        .as_ref()
+        .unwrap()
+        .interruption
+        .as_ref()
+        .unwrap();
+    assert_eq!(evidence.runtime_id, running.record.runtime.id);
+    assert_eq!(
+        evidence.assignment_generation,
+        running.record.assignment.generation
+    );
+    assert_eq!(
+        backend.committed_records.lock().unwrap()[&recovered.spec.id].observation,
+        recovered.observation
+    );
     assert_eq!(recovered.restart_attempts, running.record.restart_attempts);
     let events = backend.events.lock().unwrap();
     assert_eq!(
@@ -932,6 +948,17 @@ async fn reload_replaces_runtime_from_checkpoint_and_replays_result() {
         .iter()
         .filter(|event| *event == "restore")
         .count();
+    *backend.unavailable_commit.lock().unwrap() = true;
+    assert!(handle
+        .reload("reload-a".into(), running.record.revision)
+        .await
+        .is_err());
+    assert!(backend
+        .running
+        .lock()
+        .unwrap()
+        .contains(&running.record.runtime.id));
+    *backend.unavailable_commit.lock().unwrap() = false;
     let reloaded = handle
         .reload("reload-a".into(), running.record.revision)
         .await
@@ -1373,6 +1400,7 @@ async fn recovery_with_unusable_checkpoint_settles_failed_without_image_start() 
     let (_temp, backend, node, spec, mut assignment) = fixture();
     assignment.generation = 2;
     let record = EnvironmentRecord {
+        observation: None,
         execution_artifacts: vec![],
         snapshot_source: None,
         failure: None,
@@ -1454,6 +1482,7 @@ async fn recovery_retries_publication_without_repeating_backend_restore() {
             .unwrap();
         assignment.generation = 2;
         let seed = EnvironmentRecord {
+            observation: None,
             execution_artifacts: vec![],
             snapshot_source: None,
             failure: None,

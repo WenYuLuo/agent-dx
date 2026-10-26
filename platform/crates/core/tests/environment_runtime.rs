@@ -7,6 +7,7 @@ fn environment_identity_survives_runtime_replacement() {
     }
 
     let mut record = EnvironmentRecord {
+        observation: None,
         execution_artifacts: vec![],
         snapshot_source: None,
         failure: None,

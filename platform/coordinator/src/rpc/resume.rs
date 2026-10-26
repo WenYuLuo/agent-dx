@@ -49,6 +49,7 @@ impl CoordinatorRpc {
         state.needs_recovery = false;
         self.0.changed.notify_waiters();
         Ok(pb::EnvironmentResult {
+            newly_created: false,
             record: Some(deleted.try_into().map_err(status)?),
             durability: pb::Durability::Published as i32,
         })

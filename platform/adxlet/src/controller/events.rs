@@ -329,6 +329,9 @@ impl Controller {
                                 let barrier = control.quiesce_idle(&self.record, stamp.2).await;
                                 match barrier {
                                     Ok(()) => {
+                                        self.operation_intent(
+                                            adx_core::observation::OperationIntent::Idle,
+                                        );
                                         self.delete().await?;
                                     }
                                     Err(error) => {
