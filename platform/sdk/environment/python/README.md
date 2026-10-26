@@ -350,6 +350,13 @@ recovery point. It returns `True` only after the replacement reaches Running and
 the authoritative result is committed. Automatic restart policy is a separate cold
 restart mechanism. Shared-checkpoint node-failure recovery is coordinated by
 Coordinator and is not selected by either public call.
+Within one `reload()` call, transient retries keep the same operation ID. ADX
+persists the source execution, checkpoint and original revision before stopping,
+so a retry can continue an interrupted reload after adxlet restart while that
+source and ownership still match. Confirmed completion is replayed without
+repeating the restore. The three-attempt SDK limit still applies; exhaustion
+returns `False` through `Environment.reload()` and does not confirm rollback.
+
 
 ## Timeouts, attempts, and errors
 

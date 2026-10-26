@@ -63,7 +63,15 @@ impl Controller {
         if self.replay_operation(&operation_id, expected_revision, LifecycleKind::Reload)? {
             return self.replay_or_sync().await;
         }
-        if self.record.state != EnvironmentState::Running {
+        let continuing = self
+            .record
+            .observation
+            .as_ref()
+            .and_then(|o| o.reload_retry.as_ref())
+            .is_some_and(|retry| retry.matches(&self.record, &operation_id, expected_revision));
+        if self.record.state != EnvironmentState::Running
+            && !(continuing && self.record.state == EnvironmentState::Failed)
+        {
             return Err(Error::Conflict);
         }
         let checkpoint = self
@@ -81,6 +89,16 @@ impl Controller {
             .store
             .validate_artifact(&checkpoint.artifact)
             .await?;
+        let checkpoint_id = checkpoint.id.clone();
+        self.record
+            .observation
+            .get_or_insert_with(Default::default)
+            .reload_retry = Some(adx_core::observation::ReloadRetry {
+            id: operation_id.clone(),
+            expected_revision,
+            runtime_id: self.record.runtime.id.clone(),
+            checkpoint_id,
+        });
         self.intent_retry = Some(CompletedOperation {
             id: operation_id.clone(),
             expected_revision,
@@ -89,7 +107,9 @@ impl Controller {
         self.operation_intent(adx_core::observation::OperationIntent::User);
         self.publish_operation_intent().await?;
         self.cleanup().await?;
-        self.transition(Event::Fail)?;
+        if self.record.state != EnvironmentState::Failed {
+            self.transition(Event::Fail)?;
+        }
         self.start_attempt(
             true,
             true,
@@ -194,6 +214,16 @@ impl Controller {
         {
             return Ok(true);
         }
+        if kind == LifecycleKind::Reload
+            && self
+                .record
+                .observation
+                .as_ref()
+                .and_then(|o| o.reload_retry.as_ref())
+                .is_some_and(|retry| retry.matches(&self.record, id, revision))
+        {
+            return Ok(false);
+        }
         if self
             .intent_retry
             .as_ref()
@@ -232,6 +262,9 @@ impl Controller {
     }
     pub(super) fn completed(&mut self, id: String, expected_revision: u64, kind: LifecycleKind) {
         self.intent_retry = None;
+        if let Some(observation) = self.record.observation.as_mut() {
+            observation.reload_retry = None;
+        }
         self.record.last_operation = Some(CompletedOperation {
             id,
             expected_revision,

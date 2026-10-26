@@ -954,6 +954,9 @@ impl Controller {
             })
             .await
             .map_err(|_| Error::Unavailable("recovery readiness timed out".into()))??;
+            // The prior process no longer drives its stop. Keep the reload retry
+            // identity, but do not suppress future faults of this live execution.
+            self.clear_operation_intent().await?;
         } else if self.record.state == EnvironmentState::Paused {
             let cp = self
                 .record

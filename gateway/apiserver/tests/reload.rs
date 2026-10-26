@@ -16,6 +16,7 @@ struct State {
     owner: pb::GetEnvironmentResponse,
     lookups: usize,
     reloads: usize,
+    reload_versions: Vec<u64>,
     resumes: usize,
     executions: usize,
     lookup_unavailable: bool,
@@ -77,6 +78,7 @@ service_impl!(pb::node_service_server::NodeService, {
         let request = request.into_inner();
         let mut state = self.0.lock().unwrap();
         state.reloads += 1;
+        state.reload_versions.push(request.expected_revision);
         if state.reload_unavailable {
             return Err(Status::unavailable("reload recovery point is unavailable"));
         }
@@ -89,7 +91,9 @@ service_impl!(pb::node_service_server::NodeService, {
                 && op.expected_revision == request.expected_revision
         });
         if !replay {
-            if request.expected_revision != record.revision {
+            let continuing = record.observation.as_ref().and_then(|o| o.reload_retry.as_ref())
+                .is_some_and(|retry| retry.id == request.operation_id && retry.expected_revision == request.expected_revision);
+            if request.expected_revision != record.revision && !continuing {
                 return Err(Status::failed_precondition("identity or version conflict"));
             }
             record.revision += 1;
@@ -176,6 +180,7 @@ impl Fixture {
             owner: owner.clone(),
             lookups: 0,
             reloads: 0,
+            reload_versions: vec![],
             resumes: 0,
             executions: 0,
             lookup_unavailable: false,
@@ -370,4 +375,41 @@ async fn coordinator_resume_failure_does_not_fall_back_to_direct_node_resume() {
         tonic::Code::Unavailable
     );
     assert_eq!(fixture.state.lock().unwrap().resumes, 1);
+}
+
+#[tokio::test]
+async fn fresh_api_uses_durable_reload_identity_after_node_restart() {
+    let fixture = Fixture::new().await;
+    {
+        let mut state = fixture.state.lock().unwrap();
+        let record = state.owner.record.as_mut().unwrap();
+        record.revision = 5;
+        record.observation = Some(pb::ExecutionObservation {
+            reload_retry: Some(pb::ReloadRetry {
+                id: "reload-test".into(),
+                expected_revision: 3,
+                runtime_id: "environment-1".into(),
+                checkpoint_id: "cp".into(),
+            }),
+            ..Default::default()
+        });
+    }
+    fixture.execute(Kind::Reload).await.unwrap();
+    // Another API process must replay the completed operation, not reload again.
+    Operations::new(fixture.clients.clone())
+        .execute(
+            Kind::Reload,
+            "environment",
+            "reload-test",
+            json!({}),
+            &pb::CallerContext {
+                tenant_id: "tenant".into(),
+                administrator: false,
+            },
+        )
+        .await
+        .unwrap();
+    let state = fixture.state.lock().unwrap();
+    assert_eq!(state.reload_versions, vec![3, 3]);
+    assert_eq!(state.executions, 1);
 }

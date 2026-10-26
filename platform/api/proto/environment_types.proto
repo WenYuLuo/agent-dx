@@ -202,7 +202,14 @@ message EnvironmentResult {
   Durability durability = 2;
 }
 
+message ReloadRetry {
+  string id = 1;
+  uint64 expected_revision = 2;
+  string runtime_id = 3;
+  string checkpoint_id = 4;
+}
 message ExecutionObservation {
+  ReloadRetry reload_retry = 4;
   InterruptionEvidence interruption = 1;
   string intent = 2;
   string create_stage = 3;

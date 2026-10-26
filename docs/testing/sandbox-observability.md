@@ -97,7 +97,8 @@ Coordinator 控制 hash 的 `environment:<id>` 是现有 `StoredEnvironment`，�
 | `creation.result` | unsettled、success、failure、timeout；只裁定一次 |
 | `creation.reason` / `settled_at_unix_millis` | 确认失败的有限摘要及裁定时间；API 阶段诊断另见调用指标 |
 | `last_interruption` | 最近一次中断及恢复摘要，恢复成功后保留，下次中断替换，env 删除后一起删除 |
-| `result.observation` | adxlet 随状态 journal/RPC 携带的中断证据、正常操作意图、创建阶段 |
+| `result.observation` | adxlet 随状态 journal/RPC 携带的中断证据、正常操作意图、创建阶段及 reload 重试身份 |
+| `result.observation.reload_retry` | 待完成 reload 的 id、expected_revision、runtime_id、checkpoint_id；随 env 状态持久化，不放入指标标签 |
 
 `last_interruption` 包括 event_id、detected_at_unix_millis、assignment_generation、runtime_id、
 worker_id、reason、evidence_source、exit_code、detail（UTF-8 最多 4096 bytes）、incident_id、
@@ -137,6 +138,12 @@ reload/delete/pause 在停止执行前，先向 Coordinator 发布当前执行�
 探针失败等独立故障证据仍按异常处理。没有正常停止意图的退出继续计为运行中断。
 节点失联时，已有正常操作意图的对象进入 operation_unknown 视图，不据此判为非预期中断或健康。
 独立 backend/probe/reconcile 确认的真实异常仍携带事件证据，并清除正常意图。
+重连确认旧执行健康并重新开放服务后，清除旧停止意图，但保留 reload 重试身份。
+SDK 在同一次 reload 调用内以相同操作 ID 重试；API 可从权威记录恢复原 expected_revision。
+同一所有权、源执行及 checkpoint 仍匹配时，即使重连已确认源执行停止并提交 Failed，
+也可继续原 reload。成功后清除重试身份，通过 last_operation 重放结果，不重复替换 runtime。
+所有权变化、源执行或 checkpoint 已被其他操作替换时，原操作不绕过版本及身份校验。
+
 
 恢复状态区分 waiting、recovering、recovered、unrecoverable、closed_by_user。
 首次新执行 Running 确认为 recovered；显式用户删除为 closed_by_user；已终止且无可执行重启预算、

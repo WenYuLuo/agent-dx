@@ -1,7 +1,7 @@
 use crate::{control as pb, Error, Result};
 use adx_core::observation::{
     CreateStage, EvidenceSource, ExecutionObservation, InterruptionEvidence, InterruptionReason,
-    OperationIntent,
+    OperationIntent, ReloadRetry,
 };
 
 impl TryFrom<pb::InterruptionEvidence> for InterruptionEvidence {
@@ -37,10 +37,35 @@ impl From<InterruptionEvidence> for pb::InterruptionEvidence {
         }
     }
 }
+impl TryFrom<pb::ReloadRetry> for ReloadRetry {
+    type Error = Error;
+    fn try_from(v: pb::ReloadRetry) -> Result<Self> {
+        let value = Self {
+            id: v.id,
+            expected_revision: v.expected_revision,
+            runtime_id: v.runtime_id,
+            checkpoint_id: v.checkpoint_id,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+}
+impl From<ReloadRetry> for pb::ReloadRetry {
+    fn from(v: ReloadRetry) -> Self {
+        Self {
+            id: v.id,
+            expected_revision: v.expected_revision,
+            runtime_id: v.runtime_id,
+            checkpoint_id: v.checkpoint_id,
+        }
+    }
+}
+
 impl TryFrom<pb::ExecutionObservation> for ExecutionObservation {
     type Error = Error;
     fn try_from(v: pb::ExecutionObservation) -> Result<Self> {
         Ok(Self {
+            reload_retry: v.reload_retry.map(TryInto::try_into).transpose()?,
             interruption: v.interruption.map(TryInto::try_into).transpose()?,
             intent: if v.intent.is_empty() {
                 None
@@ -58,6 +83,7 @@ impl TryFrom<pb::ExecutionObservation> for ExecutionObservation {
 impl From<ExecutionObservation> for pb::ExecutionObservation {
     fn from(v: ExecutionObservation) -> Self {
         Self {
+            reload_retry: v.reload_retry.map(Into::into),
             interruption: v.interruption.map(Into::into),
             intent: v.intent.map_or("", OperationIntent::as_str).into(),
             create_stage: v.create_stage.map_or("", CreateStage::as_str).into(),

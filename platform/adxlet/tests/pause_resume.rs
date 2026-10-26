@@ -2680,3 +2680,119 @@ async fn intended_removal_with_late_exit_is_not_runtime_interruption() {
         Some(adx_core::observation::OperationIntent::User)
     );
 }
+
+#[tokio::test]
+async fn reload_retry_survives_restart_before_stop() {
+    let (temp, backend, node, spec, assignment) = fixture();
+    let handle = node.environment(spec.clone(), assignment.clone()).unwrap();
+    let created = handle.create().await.unwrap();
+    let paused = handle.pause(pause(created.record.revision)).await.unwrap();
+    let running = handle.resume(resume(paused.record.revision)).await.unwrap();
+    *backend.fail_remove.lock().unwrap() = true;
+    assert!(handle
+        .reload("reload-restart".into(), running.record.revision)
+        .await
+        .is_err());
+    let persisted = backend.committed_records.lock().unwrap()[&spec.id].clone();
+    assert!(persisted.revision > running.record.revision);
+    assert!(backend
+        .running
+        .lock()
+        .unwrap()
+        .contains(&running.record.runtime.id));
+    *backend.fail_remove.lock().unwrap() = false;
+    let restarted = Adxlet::new(
+        "node".into(),
+        backend.clone(),
+        backend.clone(),
+        backend.clone(),
+        backend.clone(),
+    )
+    .with_checkpointing(
+        Arc::new(LocalCheckpointStore::new(temp.path().into()).unwrap()),
+        backend.clone(),
+    )
+    .unwrap();
+    restarted
+        .update_capacity(spec.resources, Duration::from_secs(300))
+        .unwrap();
+    restarted.reconcile(vec![persisted]).await.unwrap();
+    let retry = restarted.environment(spec, assignment).unwrap();
+    let restored = retry
+        .reload("reload-restart".into(), running.record.revision)
+        .await
+        .expect("same SDK operation must continue after adxlet restart");
+    assert_ne!(restored.record.runtime.id, running.record.runtime.id);
+    assert_eq!(
+        restored
+            .record
+            .last_operation
+            .as_ref()
+            .unwrap()
+            .expected_revision,
+        running.record.revision
+    );
+    let replay = retry
+        .reload("reload-restart".into(), running.record.revision)
+        .await
+        .unwrap();
+    assert_eq!(restored.record, replay.record);
+}
+
+#[tokio::test]
+async fn reload_retry_survives_restart_after_stop() {
+    let (temp, backend, node, spec, assignment) = fixture();
+    let handle = node.environment(spec.clone(), assignment.clone()).unwrap();
+    let created = handle.create().await.unwrap();
+    let paused = handle.pause(pause(created.record.revision)).await.unwrap();
+    let running = handle.resume(resume(paused.record.revision)).await.unwrap();
+    *backend.remove_then_timeout.lock().unwrap() = true;
+    assert!(handle
+        .reload("reload-restart".into(), running.record.revision)
+        .await
+        .is_err());
+    let persisted = backend.committed_records.lock().unwrap()[&spec.id].clone();
+    assert!(persisted.revision > running.record.revision);
+    assert!(!backend
+        .running
+        .lock()
+        .unwrap()
+        .contains(&running.record.runtime.id));
+    *backend.remove_then_timeout.lock().unwrap() = false;
+    let restarted = Adxlet::new(
+        "node".into(),
+        backend.clone(),
+        backend.clone(),
+        backend.clone(),
+        backend.clone(),
+    )
+    .with_checkpointing(
+        Arc::new(LocalCheckpointStore::new(temp.path().into()).unwrap()),
+        backend.clone(),
+    )
+    .unwrap();
+    restarted
+        .update_capacity(spec.resources, Duration::from_secs(300))
+        .unwrap();
+    restarted.reconcile(vec![persisted]).await.unwrap();
+    let retry = restarted.environment(spec, assignment).unwrap();
+    let restored = retry
+        .reload("reload-restart".into(), running.record.revision)
+        .await
+        .expect("same SDK operation must continue after adxlet restart");
+    assert_ne!(restored.record.runtime.id, running.record.runtime.id);
+    assert_eq!(
+        restored
+            .record
+            .last_operation
+            .as_ref()
+            .unwrap()
+            .expected_revision,
+        running.record.revision
+    );
+    let replay = retry
+        .reload("reload-restart".into(), running.record.revision)
+        .await
+        .unwrap();
+    assert_eq!(restored.record, replay.record);
+}

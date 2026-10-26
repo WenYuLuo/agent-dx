@@ -135,3 +135,13 @@ and old-execution interruption evidence through journal/replay and final Running
 Coordinator retains its latest interruption/recovery summary in the Redis env record.
 All participating components must use matching generated contracts. See the
 [metric and persistence contract](../../../docs/testing/sandbox-observability.md).
+
+`ExecutionObservation.reload_retry` retains a reload operation ID, its original
+expected revision, source runtime ID, and checkpoint ID before stopping the source.
+The existing Environment result commit and journal persist this identity. After
+adxlet restart, a same-operation retry can continue from the matching Running or
+Failed source. Successful completion clears the retry identity and records
+`last_operation` for replay. A fresh API Server recovers the original expected
+revision from this identity. Ownership, source execution and checkpoint fences
+still apply. Healthy reconciliation clears the old stop intent independently of
+this retry identity, so later independent exits remain observable.

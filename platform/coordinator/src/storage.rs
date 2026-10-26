@@ -329,6 +329,14 @@ fn decode<T: for<'a> Deserialize<'a>>(v: &str) -> Result<T> {
     serde_json::from_str(v).map_err(|_| Error::Unavailable("corrupt control record".into()))
 }
 fn validate_result(r: &EnvironmentRecord) -> Result<()> {
+    if let Some(retry) = r.observation.as_ref().and_then(|o| o.reload_retry.as_ref()) {
+        retry.validate()?;
+        if retry.expected_revision >= r.revision
+            || !adx_core::valid_runtime_id(&r.spec.id, r.assignment.generation, &retry.runtime_id)
+        {
+            return Err(Error::Conflict);
+        }
+    }
     if r.restart_attempts
         > r.spec
             .lifecycle
@@ -465,11 +473,37 @@ fn next_result(old: &StoredEnvironment, r: &EnvironmentRecord) -> Result<bool> {
                                     .is_some_and(|recovery| recovery.pending)));
                     op.kind == adx_core::LifecycleKind::Resume && expected
                 }));
+        // A reload interrupted after stopping its source can resume with the
+        // persisted operation identity; it is not a cold-policy restart.
+        let reload_replacement = previous.state == EnvironmentState::Failed
+            && previous.runtime.id != r.runtime.id
+            && previous.checkpoint == r.checkpoint
+            && previous.snapshot_source == r.snapshot_source
+            && previous
+                .observation
+                .as_ref()
+                .and_then(|o| o.reload_retry.as_ref())
+                .is_some_and(|retry| {
+                    retry.matches(previous, &retry.id, retry.expected_revision)
+                        && (r.state == EnvironmentState::Running
+                            && r.last_operation.as_ref().is_some_and(|op| {
+                                op.kind == adx_core::LifecycleKind::Reload
+                                    && op.id == retry.id
+                                    && op.expected_revision == retry.expected_revision
+                            })
+                            || r.state == EnvironmentState::Failed
+                                && r.observation.as_ref().and_then(|o| o.reload_retry.as_ref())
+                                    == Some(retry))
+                });
         if r.restart_attempts < previous.restart_attempts
             || (r.restart_attempts != previous.restart_attempts && !restarting)
             || r.revision <= previous.revision
             || previous.state == EnvironmentState::Deleted
-            || (!previous.resources_held && r.resources_held && !restarting && !resume_completed)
+            || (!previous.resources_held
+                && r.resources_held
+                && !restarting
+                && !resume_completed
+                && !reload_replacement)
         {
             return Err(Error::Conflict);
         }

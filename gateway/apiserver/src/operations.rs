@@ -208,7 +208,18 @@ impl Operations {
                     .last_operation
                     .as_ref()
                     .filter(|operation| operation.id == request_id && operation.kind == kind.code())
-                    .map_or(record.revision, |operation| operation.expected_revision);
+                    .map(|operation| operation.expected_revision)
+                    .or_else(|| {
+                        (kind == Kind::Reload).then_some(())?;
+                        record
+                            .observation
+                            .as_ref()?
+                            .reload_retry
+                            .as_ref()
+                            .filter(|retry| retry.id == request_id)
+                            .map(|retry| retry.expected_revision)
+                    })
+                    .unwrap_or(record.revision);
                 let operation = Arc::new(Mutex::new(Operation {
                     assignment: record.assignment.clone().ok_or_else(|| {
                         Status::unavailable("environment record returned no assignment")

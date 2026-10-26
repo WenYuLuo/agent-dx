@@ -1508,3 +1508,38 @@ async fn missing_execution_after_intended_stop_does_not_become_interruption_on_r
         Some(adx_core::observation::OperationIntent::User)
     );
 }
+
+#[tokio::test]
+async fn reconnected_live_execution_does_not_keep_stale_stop_intent() {
+    let backend = Arc::new(Backend::default());
+    *backend.actual.lock().unwrap() = vec![observed("kept")];
+    let node = manager(&backend);
+    let mut original = record("kept", EnvironmentState::Running);
+    original.observation = Some(adx_core::observation::ExecutionObservation {
+        intent: Some(adx_core::observation::OperationIntent::User),
+        ..Default::default()
+    });
+    // Previous process published a reload intent, then died before stopping.
+    node.reconcile(vec![original.clone()]).await.unwrap();
+    let handle = node
+        .environment(original.spec, original.assignment)
+        .unwrap();
+    assert_eq!(
+        handle.sync().await.unwrap().record.state,
+        EnvironmentState::Running
+    );
+    assert!(backend
+        .events
+        .lock()
+        .unwrap()
+        .contains(&"bind:kept-7".into()));
+    // The recovered execution later independently disappears.
+    backend.actual.lock().unwrap().clear();
+    handle.tick().await.unwrap();
+    let failed = handle.sync().await.unwrap().record;
+    assert_eq!(failed.state, EnvironmentState::Failed);
+    assert!(
+        failed.observation.unwrap().interruption.is_some(),
+        "a new loss after healthy reconciliation must retain interruption evidence"
+    );
+}

@@ -227,3 +227,32 @@ async fn direct_recovery_evidence_survives_journal_restart_and_replay() {
         .iter()
         .all(|r| r.state == EnvironmentState::Running));
 }
+
+#[tokio::test]
+async fn interrupted_reload_identity_survives_journal_reopen() {
+    use adx_core::observation::{ExecutionObservation, OperationIntent, ReloadRetry};
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("journal.sqlite");
+    let coordinator = Arc::new(Coordinator::default());
+    let old = record(2);
+    let mut pending = record(3);
+    pending.observation = Some(ExecutionObservation {
+        intent: Some(OperationIntent::User),
+        reload_retry: Some(ReloadRetry {
+            id: "reload-op".into(),
+            expected_revision: 2,
+            runtime_id: "i-1".into(),
+            checkpoint_id: "cp".into(),
+        }),
+        ..Default::default()
+    });
+    *coordinator.failure.lock().unwrap() = Some(Error::Unavailable("response lost".into()));
+    let sink = JournalSink::new(path.clone(), coordinator.clone());
+    assert_eq!(sink.commit(&pending).await.unwrap(), Durability::Journaled);
+    drop(sink);
+    *coordinator.failure.lock().unwrap() = None;
+    let reopened = JournalSink::new(path, coordinator.clone());
+    reopened.recover(&[old]).await.unwrap();
+    assert_eq!(reopened.pending().await.unwrap(), 0);
+    assert_eq!(coordinator.records.lock().unwrap().last(), Some(&pending));
+}

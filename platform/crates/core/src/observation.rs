@@ -62,8 +62,44 @@ impl InterruptionEvidence {
     }
 }
 
+/// Retry identity retained before a reload stops its source execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReloadRetry {
+    pub id: String,
+    pub expected_revision: u64,
+    pub runtime_id: String,
+    pub checkpoint_id: String,
+}
+impl ReloadRetry {
+    pub fn validate(&self) -> Result<()> {
+        if self.id.is_empty()
+            || self.id.len() > 256
+            || self.expected_revision == 0
+            || self.runtime_id.is_empty()
+            || self.runtime_id.len() > 1024
+            || self.checkpoint_id.is_empty()
+            || self.checkpoint_id.len() > 256
+        {
+            return Err(Error::Invalid("invalid reload retry identity".into()));
+        }
+        Ok(())
+    }
+
+    pub fn matches(&self, record: &crate::EnvironmentRecord, id: &str, revision: u64) -> bool {
+        self.id == id
+            && self.expected_revision == revision
+            && self.runtime_id == record.runtime.id
+            && record
+                .checkpoint
+                .as_ref()
+                .is_some_and(|cp| cp.id == self.checkpoint_id)
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionObservation {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reload_retry: Option<ReloadRetry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interruption: Option<InterruptionEvidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

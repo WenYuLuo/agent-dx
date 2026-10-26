@@ -725,3 +725,95 @@ async fn unpublished_reload_replacement_can_settle_failed() {
     session.commit(record).await.unwrap();
     assert_eq!(session.business_counters().await.unwrap(), counters);
 }
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn reload_retry_from_stopped_source_is_durable_and_fenced() {
+    use adx_core::observation::{ExecutionObservation, OperationIntent, ReloadRetry};
+    let rig = common::Redis::new().await;
+    let store = rig.store().await;
+    let session = store.begin(1).await.unwrap();
+    register(&session, "node").await;
+    let wanted = spec("reload-retry");
+    let assignment = Assignment {
+        environment_id: wanted.id.clone(),
+        node_id: "node".into(),
+        shard_id: 0,
+        generation: 1,
+        devices: vec![],
+    };
+    session
+        .reserve(wanted.clone(), assignment.clone())
+        .await
+        .unwrap();
+    let mut record = running(wanted, assignment);
+    record.checkpoint = Some(adx_core::RestorePoint {
+        origin: None,
+        id: "cp".into(),
+        source_runtime_id: record.runtime.id.clone(),
+        expires_at_unix_seconds: None,
+        artifact: adx_core::CheckpointArtifact {
+            storage: "local".into(),
+            location: "cp".into(),
+            size_bytes: 1,
+        },
+    });
+    session.commit(record.clone()).await.unwrap();
+    let expected = record.revision;
+    record.revision += 1;
+    record.observation = Some(ExecutionObservation {
+        intent: Some(OperationIntent::User),
+        reload_retry: Some(ReloadRetry {
+            id: "reload-op".into(),
+            expected_revision: expected,
+            runtime_id: record.runtime.id.clone(),
+            checkpoint_id: "cp".into(),
+        }),
+        ..Default::default()
+    });
+    session.commit(record.clone()).await.unwrap();
+    let restarted = store.begin(1).await.unwrap();
+    let saved = restarted
+        .get(&record.spec.id)
+        .await
+        .unwrap()
+        .result
+        .unwrap();
+    let wire: adx_protocol::control::EnvironmentRecord = saved.clone().try_into().unwrap();
+    let round_trip: EnvironmentRecord = wire.try_into().unwrap();
+    assert_eq!(saved, round_trip);
+    record.state = EnvironmentState::Failed;
+    record.resources_held = false;
+    record.runtime.ip = None;
+    record.revision += 1;
+    restarted.commit(record.clone()).await.unwrap();
+    record.runtime.id.push_str("-r5");
+    record.state = EnvironmentState::Running;
+    record.resources_held = true;
+    record.runtime.ip = Some("10.0.0.2".parse().unwrap());
+    record.revision += 3;
+    record.observation = Some(ExecutionObservation::default());
+    record.last_operation = Some(adx_core::CompletedOperation {
+        id: "reload-op".into(),
+        expected_revision: expected,
+        kind: adx_core::LifecycleKind::Reload,
+    });
+    for field in ["id", "revision", "checkpoint", "assignment"] {
+        let mut invalid = record.clone();
+        match field {
+            "id" => invalid.last_operation.as_mut().unwrap().id = "other".into(),
+            "revision" => invalid.last_operation.as_mut().unwrap().expected_revision += 1,
+            "checkpoint" => invalid.checkpoint.as_mut().unwrap().id = "other".into(),
+            _ => invalid.assignment.generation += 1,
+        }
+        assert_eq!(restarted.commit(invalid).await, Err(Error::Conflict));
+    }
+    restarted
+        .commit(record.clone())
+        .await
+        .expect("same reload can finish from a stopped source");
+    restarted.commit(record).await.unwrap();
+    let counts = restarted.business_counters().await.unwrap();
+    assert_eq!(counts.creations, [1, 0, 0]);
+    assert_eq!(counts.interruptions, [[0; 7]; 4]);
+}
