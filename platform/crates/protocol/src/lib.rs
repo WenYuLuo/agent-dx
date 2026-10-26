@@ -10,7 +10,9 @@ pub mod control {
 pub use adx_core::valid_runtime_id;
 use adx_core::{Error, Result};
 mod execution;
+mod observation;
 mod probes;
+pub use observation::create_status;
 mod scheduling;
 
 impl From<adx_core::Resources> for control::Resources {
@@ -233,6 +235,7 @@ impl TryFrom<control::EnvironmentRecord> for adx_core::EnvironmentRecord {
                 .collect::<Result<Vec<_>>>()?,
             last_operation: v.last_operation.map(TryInto::try_into).transpose()?,
             failure: v.failure.map(TryInto::try_into).transpose()?,
+            observation: v.observation.map(TryInto::try_into).transpose()?,
         })
     }
 }
@@ -258,6 +261,7 @@ impl TryFrom<adx_core::EnvironmentRecord> for control::EnvironmentRecord {
             restart_attempts: v.restart_attempts,
             restart_pending: v.restart_pending,
             failure: v.failure.map(|failure| Box::new(failure.into())),
+            observation: v.observation.map(Into::into),
             runtime: Some(control::Runtime {
                 id: v.runtime.id,
                 ip: v.runtime.ip.map(|ip| ip.to_string()).unwrap_or_default(),

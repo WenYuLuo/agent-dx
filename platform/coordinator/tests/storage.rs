@@ -5,6 +5,8 @@ mod claims;
 mod common;
 #[path = "storage/dormancy.rs"]
 mod dormancy;
+#[path = "storage/observability.rs"]
+mod observability;
 #[path = "storage/publication.rs"]
 mod publication;
 #[path = "storage/publication_regressions.rs"]
@@ -52,6 +54,7 @@ fn node(id: &str) -> Node {
 }
 fn running(spec: EnvironmentSpec, assignment: Assignment) -> EnvironmentRecord {
     EnvironmentRecord {
+        observation: None,
         execution_artifacts: vec![],
         snapshot_source: None,
         failure: None,

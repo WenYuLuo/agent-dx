@@ -37,6 +37,8 @@ struct Backend {
     fail_prepare: Mutex<bool>,
     fail_abort: Mutex<bool>,
     fail_remove: Mutex<bool>,
+    remove_then_timeout: Mutex<bool>,
+    observed_failure: Mutex<Option<adx_core::RuntimeFailure>>,
     checkpoint_leaves_running: Mutex<bool>,
     workload_request: Mutex<Option<String>>,
     workload_deadline_unix_millis: Mutex<Option<u64>>,
@@ -98,12 +100,21 @@ impl RuntimeDriver for Backend {
     async fn is_running(&self, id: &str) -> Result<bool> {
         Ok(self.running.lock().unwrap().contains(id))
     }
+    async fn observe(&self, id: &str) -> Result<adxlet::RuntimeStatus> {
+        Ok(adxlet::RuntimeStatus {
+            running: self.running.lock().unwrap().contains(id),
+            failure: self.observed_failure.lock().unwrap().clone(),
+        })
+    }
     async fn remove(&self, id: &str) -> Result<()> {
         self.event("remove");
         if *self.fail_remove.lock().unwrap() {
             return Err(Error::Unavailable("delete outcome unknown".into()));
         }
         self.running.lock().unwrap().remove(id);
+        if *self.remove_then_timeout.lock().unwrap() {
+            return Err(Error::Unavailable("remove succeeded but reply lost".into()));
+        }
         Ok(())
     }
     async fn checkpoint_supported(&self, _: &str) -> Result<()> {
@@ -883,6 +894,22 @@ async fn failover_restores_latest_checkpoint_without_cold_start() {
     let recovered = handle.sync().await.unwrap().record;
     assert_eq!(recovered.state, EnvironmentState::Running);
     assert_ne!(recovered.runtime.id, running.record.runtime.id);
+    let evidence = recovered
+        .observation
+        .as_ref()
+        .unwrap()
+        .interruption
+        .as_ref()
+        .unwrap();
+    assert_eq!(evidence.runtime_id, running.record.runtime.id);
+    assert_eq!(
+        evidence.assignment_generation,
+        running.record.assignment.generation
+    );
+    assert_eq!(
+        backend.committed_records.lock().unwrap()[&recovered.spec.id].observation,
+        recovered.observation
+    );
     assert_eq!(recovered.restart_attempts, running.record.restart_attempts);
     let events = backend.events.lock().unwrap();
     assert_eq!(
@@ -932,6 +959,17 @@ async fn reload_replaces_runtime_from_checkpoint_and_replays_result() {
         .iter()
         .filter(|event| *event == "restore")
         .count();
+    *backend.unavailable_commit.lock().unwrap() = true;
+    assert!(handle
+        .reload("reload-a".into(), running.record.revision)
+        .await
+        .is_err());
+    assert!(backend
+        .running
+        .lock()
+        .unwrap()
+        .contains(&running.record.runtime.id));
+    *backend.unavailable_commit.lock().unwrap() = false;
     let reloaded = handle
         .reload("reload-a".into(), running.record.revision)
         .await
@@ -1373,6 +1411,7 @@ async fn recovery_with_unusable_checkpoint_settles_failed_without_image_start() 
     let (_temp, backend, node, spec, mut assignment) = fixture();
     assignment.generation = 2;
     let record = EnvironmentRecord {
+        observation: None,
         execution_artifacts: vec![],
         snapshot_source: None,
         failure: None,
@@ -1454,6 +1493,7 @@ async fn recovery_retries_publication_without_repeating_backend_restore() {
             .unwrap();
         assignment.generation = 2;
         let seed = EnvironmentRecord {
+            observation: None,
             execution_artifacts: vec![],
             snapshot_source: None,
             failure: None,
@@ -2523,4 +2563,120 @@ async fn workload_ack_failure_does_not_repeat_capture() {
 #[tokio::test]
 async fn workload_replayed_notification_cannot_extend_original_deadline() {
     workload_retry_case(WorkloadRetryFailure::ExpiredBudget).await;
+}
+
+#[tokio::test]
+async fn reload_uncertain_cleanup_retains_intent() {
+    let (_temp, backend, node, spec, assignment) = fixture();
+    let handle = node.environment(spec, assignment).unwrap();
+    let created = handle.create().await.unwrap();
+    let paused = handle.pause(pause(created.record.revision)).await.unwrap();
+    let running = handle.resume(resume(paused.record.revision)).await.unwrap();
+    *backend.remove_then_timeout.lock().unwrap() = true;
+    assert!(handle
+        .reload("review-reload".into(), running.record.revision)
+        .await
+        .is_err());
+    assert!(!backend
+        .running
+        .lock()
+        .unwrap()
+        .contains(&running.record.runtime.id));
+    {
+        let committed = backend.committed_records.lock().unwrap();
+        let published = &committed[&running.record.spec.id];
+        assert_eq!(published.state, EnvironmentState::Running);
+        assert!(
+            published
+                .observation
+                .as_ref()
+                .and_then(|o| o.intent)
+                .is_some(),
+            "uncertain normal stop was published as Running without normal-operation intent"
+        );
+    }
+    *backend.remove_then_timeout.lock().unwrap() = false;
+    handle.tick().await.unwrap();
+    let committed = backend.committed_records.lock().unwrap();
+    let published = &committed[&running.record.spec.id];
+    assert_eq!(published.state, EnvironmentState::Failed);
+    assert!(published
+        .observation
+        .as_ref()
+        .unwrap()
+        .interruption
+        .is_none());
+}
+
+#[tokio::test]
+async fn reload_uncertain_cleanup_does_not_hide_independent_oom() {
+    let (_temp, backend, node, spec, assignment) = fixture();
+    let handle = node.environment(spec, assignment).unwrap();
+    let created = handle.create().await.unwrap();
+    let paused = handle.pause(pause(created.record.revision)).await.unwrap();
+    let running = handle.resume(resume(paused.record.revision)).await.unwrap();
+    *backend.fail_remove.lock().unwrap() = true;
+    assert!(handle
+        .reload("reload-oom".into(), running.record.revision)
+        .await
+        .is_err());
+    backend.running.lock().unwrap().clear();
+    *backend.observed_failure.lock().unwrap() = Some(adx_core::RuntimeFailure {
+        reason: adx_core::RuntimeFailureReason::OomKilled,
+        exit_code: Some(137),
+        message: "backend confirmed OOM".into(),
+        probe_failure: None,
+    });
+    *backend.fail_remove.lock().unwrap() = false;
+    handle.tick().await.unwrap();
+    let committed = backend.committed_records.lock().unwrap();
+    let observation = committed[&running.record.spec.id]
+        .observation
+        .as_ref()
+        .unwrap();
+    assert!(observation.intent.is_none());
+    assert_eq!(
+        observation.interruption.as_ref().unwrap().reason,
+        adx_core::observation::InterruptionReason::Oom
+    );
+}
+
+#[tokio::test]
+async fn intended_removal_with_late_exit_is_not_runtime_interruption() {
+    let (_temp, backend, node, spec, assignment) = fixture();
+    let handle = node.environment(spec, assignment).unwrap();
+    let created = handle.create().await.unwrap();
+    let paused = handle.pause(pause(created.record.revision)).await.unwrap();
+    let running = handle.resume(resume(paused.record.revision)).await.unwrap();
+    *backend.remove_then_timeout.lock().unwrap() = true;
+    assert!(handle
+        .reload("normal-stop".into(), running.record.revision)
+        .await
+        .is_err());
+    assert!(!backend
+        .running
+        .lock()
+        .unwrap()
+        .contains(&running.record.runtime.id));
+    *backend.remove_then_timeout.lock().unwrap() = false;
+    *backend.observed_failure.lock().unwrap() = Some(adx_core::RuntimeFailure {
+        reason: adx_core::RuntimeFailureReason::Exited,
+        exit_code: Some(137),
+        message: "runtime stopped by requested removal".into(),
+        probe_failure: None,
+    });
+    handle.tick().await.unwrap();
+    let records = backend.committed_records.lock().unwrap();
+    let settled = &records[&running.record.spec.id];
+    assert_eq!(settled.state, EnvironmentState::Failed);
+    let observation = settled.observation.as_ref().unwrap();
+    assert!(
+        observation.interruption.is_none(),
+        "normal removal created interruption: {:?}",
+        observation.interruption
+    );
+    assert_eq!(
+        observation.intent,
+        Some(adx_core::observation::OperationIntent::User)
+    );
 }

@@ -101,6 +101,7 @@ service_impl!(pb::node_service_server::NodeService, {
             });
         }
         let result = pb::EnvironmentResult {
+            newly_created: false,
             record: Some(record.clone()),
             durability: pb::Durability::Published as i32,
         };
@@ -114,6 +115,7 @@ service_impl!(pb::node_service_server::NodeService, {
         record.state = pb::EnvironmentState::Deleted as i32;
         record.resources_held = false;
         Ok(Response::new(pb::EnvironmentResult {
+            newly_created: false,
             record: Some(record),
             durability: pb::Durability::Published as i32,
         }))
@@ -148,6 +150,7 @@ impl Fixture {
         let address = listener.local_addr().unwrap().to_string();
         let owner = pb::GetEnvironmentResponse {
             record: Some(pb::EnvironmentRecord {
+                observation: None,
                 execution_artifacts: vec![],
                 snapshot_source: None,
                 failure: None,

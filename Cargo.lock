@@ -471,6 +471,7 @@ dependencies = [
  "afs-tracing",
  "afs-transport",
  "hyper-util",
+ "libc",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",

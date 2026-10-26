@@ -134,6 +134,7 @@ impl CoordinatorRpc {
             "# TYPE adx_environment_created_total counter\nadx_environment_created_total {}\n",
             self.0.created.load(std::sync::atomic::Ordering::Relaxed)
         ));
+        output.push_str(&self.business_metrics(&state)?);
         Ok(output)
     }
 }

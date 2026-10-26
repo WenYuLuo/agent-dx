@@ -8,6 +8,7 @@ use crate::{
 use adx_protocol::control as pb;
 use adx_transport::deadline::Deadline;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     sync::Arc,
@@ -151,6 +152,34 @@ impl EnvironmentService {
     }
 
     /// Shared admission for HTTP and in-process callers; accepts no Agent-specific types.
+    /// Preserve the public request identity before optimistic local admission.
+    pub fn prepare_create_with_request(
+        &self,
+        mut input: Value,
+        caller: &pb::CallerContext,
+        request_id: &str,
+    ) -> Result<pb::EnvironmentSpec, Status> {
+        if request_id.is_empty() || request_id.len() > 256 {
+            return Err(Status::invalid_argument(
+                "request ID must contain 1 to 256 bytes",
+            ));
+        }
+        if input
+            .get("name")
+            .is_none_or(|name| name.as_str().is_some_and(str::is_empty))
+        {
+            if let Some(object) = input.as_object_mut() {
+                let identity = serde_json::to_vec(&(caller.tenant_id.as_str(), request_id))
+                    .map_err(|_| Status::internal("request identity encoding failed"))?;
+                object.insert(
+                    "name".into(),
+                    Value::String(format!("environment-{:x}", Sha256::digest(identity))),
+                );
+            }
+        }
+        self.prepare_create(input, caller)
+    }
+
     pub async fn create_request(
         &self,
         input: Value,
@@ -158,7 +187,9 @@ impl EnvironmentService {
         caller: &pb::CallerContext,
     ) -> Result<Value, Status> {
         self.creation_metrics.embedded_request();
-        let spec = self.prepare_create(input.clone(), caller)?;
+        let spec = self
+            .prepare_create_with_request(input.clone(), caller, request_id)
+            .inspect_err(|error| self.creation_metrics.rejection(error))?;
         Box::pin(self.create(spec, input, request_id, caller)).await
     }
 
@@ -176,7 +207,10 @@ impl EnvironmentService {
             .run_result(async {
                 let environment_id = spec.id.clone();
                 let mut attempt = self.creation_metrics.attempt();
-                let result = self.create_inner(spec, input, request_id, caller).await;
+                let started = Instant::now();
+                let result = self
+                    .create_inner(spec, input, request_id, caller, started)
+                    .await;
                 attempt.finish(&result);
                 adx_observability::trace::attribute(
                     "environment.create.outcome",
@@ -206,9 +240,12 @@ impl EnvironmentService {
         input: Value,
         request_id: &str,
         caller: &pb::CallerContext,
+        started: Instant,
     ) -> Result<Value, Status> {
-        if request_id.len() > 256 {
-            return Err(Status::invalid_argument("request ID too long"));
+        if request_id.is_empty() || request_id.len() > 256 {
+            return Err(Status::invalid_argument(
+                "request ID must contain 1 to 256 bytes",
+            ));
         }
         let create_key = (caller.tenant_id.clone(), request_id.to_string());
         let (operation, retry_pending) = {
@@ -275,6 +312,7 @@ impl EnvironmentService {
                 request_id,
                 caller,
                 retry_pending,
+                started,
             )),
         )
         .await
@@ -297,18 +335,7 @@ impl EnvironmentService {
     ) {
         // Unknown outcomes retain their identity for a finite retry window.
         // Repeated inconclusive retries do not renew that window.
-        if result.as_ref().is_err_and(|error| {
-            adx_protocol::deadline_failure(error).is_none()
-                && adx_protocol::scheduling_failure(error).is_none()
-                && matches!(
-                    error.code(),
-                    Code::Cancelled
-                        | Code::Unknown
-                        | Code::Unavailable
-                        | Code::DeadlineExceeded
-                        | Code::Internal
-                )
-        }) {
+        if result.as_ref().is_err_and(crate::metrics::unknown) {
             operation.unknown_since.get_or_insert_with(Instant::now);
             return;
         }
@@ -328,6 +355,7 @@ impl EnvironmentService {
         request_id: &str,
         caller: &pb::CallerContext,
         retry_pending: bool,
+        started: Instant,
     ) -> Result<Value, Status> {
         let spec = &operation.spec;
         let deadline = operation.deadline;
@@ -415,6 +443,9 @@ impl EnvironmentService {
                 }
             }
             Err(error) => return Err(error),
+        }
+        if result.newly_created && !retry_pending {
+            self.creation_metrics.successful_create(started.elapsed());
         }
         Ok(response)
     }
@@ -637,6 +668,7 @@ mod tests {
             ..Default::default()
         };
         let record = pb::EnvironmentRecord {
+            observation: None,
             execution_artifacts: vec![],
             snapshot_source: None,
             failure: None,
@@ -678,6 +710,7 @@ mod tests {
         spec.env
             .insert("EXECD_TUNNEL_HTTP_PORT".into(), "12345".into());
         let record = pb::EnvironmentRecord {
+            observation: None,
             execution_artifacts: vec![],
             snapshot_source: None,
             failure: None,
@@ -698,6 +731,7 @@ mod tests {
     #[test]
     fn create_owner_cache_must_cover_the_published_running_revision() {
         let record = pb::EnvironmentRecord {
+            observation: None,
             execution_artifacts: vec![],
             snapshot_source: None,
             failure: None,
@@ -718,6 +752,7 @@ mod tests {
         };
         let owner = |state, generation, revision, node_id: &str| pb::GetEnvironmentResponse {
             record: Some(pb::EnvironmentRecord {
+                observation: None,
                 execution_artifacts: vec![],
                 snapshot_source: None,
                 failure: None,

@@ -171,3 +171,12 @@ OOM 分为命令级与 Environment 级，不由 HTTP 502/503 或 exit_code=137 �
 - SDK direct invoke 重试耗尽后，在原 deadline 剩余时间内进行一次最长 2 秒的认证目录查询。仅当目录已经提交 `status=failed` 且 `failure.reason=OomKilled` 时返回 `EnvironmentError(code=ENVIRONMENT_OOM, retry=never, outcome=terminal)`，`failure` 属性保留详情。这是 SDK 对已确认 Environment 终态的分类，不是新的管理面 gRPC 状态，也不改变数据网关的通用 502/503 响应。
 - 原因尚未提交、API 暂不可用、普通退出或缺少 OOM 证据时保留 `OUTCOME_UNKNOWN` 等原分类；失败查询不会刷新 deadline。早于状态提交的首个调用仍可能收到 OUTCOME_UNKNOWN，之后用 `get_info()` 确認原因。不会在普通成功调用中增加目录查询。
 - 普通退出记录 `failure.reason=Exited`；后端已消失且没有可读取退出记录时为 `Missing`，不猜测 OOM。SDK 未知结果查询的权限与普通实例查询相同，不能跨租户读取原因。
+
+### Confirmed creation failures
+
+An internal create status may include bounded adx-create-stage/adx-create-reason
+provenance. adx-create-terminal=true is emitted only when the producer has confirmed
+a Published terminal Failed result. It maps to retry=never/outcome=terminal; plain
+transport Unavailable or DeadlineExceeded retains outcome=unknown. API diagnostics
+export bounded labels rather than raw error messages. See the
+[Sandbox metric contract](../../../docs/testing/sandbox-observability.md).

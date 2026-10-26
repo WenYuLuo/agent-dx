@@ -26,3 +26,13 @@ build-identity failure and remedy are included in the evidence report.
 
 Examples and helper scripts are test artifacts; default AFS release packaging
 builds product bins only. Do not deploy patched ablation copies.
+
+For POSIX-fd admission, `entrance_probe` also accepts `sdk_fd` alongside `sdk`.
+Both use the same in-memory Backend, data, rings, block size and depth. The server
+mount exposes the product fd bridge. The fd mode uses a POSIX open plus
+`register_fd`, the path mode uses SDK open/register. JSON separates setup, hot IO,
+sync, cleanup and the full lifecycle; compare paired read/write rounds at Q1/Q8.
+An optional final argument (1..3, default 1) repeats IO within the same session;
+3 reports first pass and the mean of passes 2/3 separately. Full lifecycle uses
+one wall clock and includes all passes and in-client read validation.
+This is a frontend nonregression check, not a claim about durable DFS throughput.

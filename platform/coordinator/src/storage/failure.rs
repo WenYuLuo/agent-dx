@@ -7,6 +7,7 @@ impl Session {
             let snapshots = self.retained_snapshots().await?;
             let raw = self.store.raw().await?;
             let header = self.header(&raw.get(HEADER).cloned())?;
+            let mut counters = CounterUpdate::load(&self.store, format!("node:{id}")).await?;
             let mut saved = snapshot(&raw)?;
             saved.revision = self
                 .store
@@ -16,6 +17,18 @@ impl Session {
             let node = saved.nodes.get_mut(id).ok_or(Error::NotFound)?;
             if node.session.as_ref().is_none_or(|s| s.id != session_id) {
                 return Err(Error::Conflict);
+            }
+            let incident_id = match &node.last_incident_id {
+                Some(incident) => incident.clone(),
+                None => format!("node:{id}:{session_id}:{}", self.next_generation()?),
+            };
+            if node.last_incident_id.is_none() {
+                counters.value.worker_incidents = counters
+                    .value
+                    .worker_incidents
+                    .checked_add(1)
+                    .ok_or(Error::Conflict)?;
+                node.last_incident_id = Some(incident_id.clone());
             }
             node.node.available = false;
             node.session.as_mut().ok_or(Error::Conflict)?.routable = false;
@@ -31,10 +44,12 @@ impl Session {
                 {
                     continue;
                 }
+                environment.observe_node_loss(&incident_id, &mut counters.value)?;
                 let mut result = environment
                     .result
                     .clone()
                     .unwrap_or_else(|| EnvironmentRecord {
+                        observation: None,
                         execution_artifacts: vec![],
                         snapshot_source: None,
                         failure: None,
@@ -93,8 +108,12 @@ impl Session {
                 result.runtime.ip = None;
                 result.restart_pending = false;
                 result.last_operation = None;
-                environment.result = Some(result);
+                if let Some(observation) = result.observation.as_mut() {
+                    observation.interruption = None;
+                }
                 environment.invalidated = true;
+                environment.observe_result(&result, &mut counters.value)?;
+                environment.result = Some(result);
                 environment.track_failure(super::collection::now()?);
                 environment.validate()?;
                 writes.push((
@@ -130,16 +149,21 @@ impl Session {
                 if redis.call('HGET', KEYS[1], 'epoch') ~= ARGV[1] then return 0 end
                 local expected = cjson.decode(ARGV[2])
                 for field,value in pairs(expected) do if (redis.call('HGET',KEYS[1],field) or '') ~= value then return 0 end end
-                local count=tonumber(ARGV[3]); for i=4,3+count*2,2 do redis.call('HSET',KEYS[1],ARGV[i],ARGV[i+1]) end
-                for i=4+count*2,#ARGV-1,2 do redis.call('HSET',KEYS[2],ARGV[i],ARGV[i+1]) end
+                local facts=cjson.decode(ARGV[3])
+                if (redis.call('HGET',KEYS[3],facts[1]) or '') ~= facts[2] then return 0 end
+                redis.call('HSET',KEYS[3],facts[1],facts[3])
+                local count=tonumber(ARGV[4]); for i=5,4+count*2,2 do redis.call('HSET',KEYS[1],ARGV[i],ARGV[i+1]) end
+                for i=5+count*2,#ARGV-1,2 do redis.call('HSET',KEYS[2],ARGV[i],ARGV[i+1]) end
                 redis.call('HDEL',KEYS[1],ARGV[#ARGV]); return 1
             "#,
                 )
-                .arg(2)
+                .arg(3)
                 .arg(&self.store.key)
                 .arg(format!("{}:input-holds",self.store.key))
+                .arg(format!("{}:business",self.store.key))
                 .arg(self.epoch.to_string())
                 .arg(encode(&expected)?)
+                .arg(counters.argument()?)
                 .arg(writes.len());
             let changed = writes.iter().map(|(field, _)| field.clone()).collect();
             for (field, value) in writes {
@@ -181,6 +205,16 @@ impl Session {
                     .connection
                     .publication_sequence
                     .load(Ordering::Acquire);
+                for (id, env) in &saved.environments {
+                    let previous = raw
+                        .get(&format!("environment:{id}"))
+                        .and_then(|value| decode::<StoredEnvironment>(value).ok());
+                    env.log_observation_change(
+                        previous
+                            .as_ref()
+                            .and_then(|env| env.last_interruption.as_ref()),
+                    );
+                }
                 return Ok(saved);
             }
             *inventory = committed;

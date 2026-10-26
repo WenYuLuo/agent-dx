@@ -226,6 +226,7 @@ mod tests {
     fn entry(id: &str, generation: u64, revision: u64) -> pb::PublishedEnvironment {
         pb::PublishedEnvironment {
             record: Some(pb::EnvironmentRecord {
+                observation: None,
                 execution_artifacts: vec![],
                 snapshot_source: None,
                 failure: None,

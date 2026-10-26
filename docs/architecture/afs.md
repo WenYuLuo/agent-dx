@@ -86,6 +86,10 @@ Meta的watch RPC在取数前取得独立响应额度；流式队列有固定槽�
 大场景资源及完整真实产品验收仍未完成，不能宣称持续增长部署已交付。
 配置与当前限制见[部署说明](../deployment/afs.md#meta-操作日志与数据目录)。
 
+Meta WAL 预算枚举与退休回收允许并发：只对 CURRENT 已持久退休、已封存的同名段在枚举后
+被删除的 `NotFound` 跳过计费。仍存在的退休文件继续占用容量，活跃/未知文件丢失、非普通
+文件及其他 IO 错误仍拒绝；不改变 WAL 容量、退休资格、持久顺序或锁外删除策略。
+
 OwnerFs 面向小规模 Agent workspace。Home 节点把 workspace 保存为普通本地目录；远端节点通过受控 peer 回到 Home 访问文件。远端传输会话本身不授予文件访问权限，每次打开、读写、flush、sync 和 close 都必须校验授权、句柄、权限、root grant、session、Home session 和 fence。
 
 DFS 把已提交数据表示为不可变 chunk。普通写入先进入 inode 的 dirty 状态；sync、同步写标志、close-time flush 或后台策略触发提交，形成新的 `FileVersion`。复制发生在文件布局之下，Meta 只在收到可验证持久 receipt 后提交新版本和副本目录。验证缓存不能自动算作持久副本。
@@ -616,7 +620,10 @@ Meta 不可用超过租约期限时仍会拒绝旧写入，不通过复活过期
 ## 本机 SDK usrbio 数据面
 
 `afs-client` 提供与同机 `afs-node` 直连的批量 IO 数据面。控制面仍是 UDS 上的 gRPC：
-open、register、iov 与环的生命周期和 sync 都走 RPC，只传身份与布局，从不传文件正文。
+路径便利接口的 open/register/sync、iov 与环生命周期走 RPC，只传身份与布局，从不传正文。
+已有 POSIX fd 的入口走固定版本的 FUSE ioctl：先由 UDS 的实际 peer UID 建立 owner-only
+会话，PROBE 核对 Node，REGISTER 将原 FUSE fh 的 Backend handle/打开上下文/访问位
+绑定到该会话的环；不按路径重开。SDK 保留 CLOEXEC dup，原 fd 关闭或整数复用不改变目标。
 数据面是共享内存：SDK 创建持久 iov（memfd，区块为 4 KiB 到 64 MiB 的 2 的幂）并把
 fd 经 fd broker 一次性交给 node；之后读写把正文放进 iov 区块，通过共享提交/完成环
 （64 字节槽位，Release/Acquire）提交 `(reg_id, offset, iov_offset, len)`，一次操作既没有
@@ -651,6 +658,18 @@ Node按注册句柄隔离地采样读回调驻留成本。成本的移动平均�
 目录项语义一致；环内读写只携带注册编号，注册把句柄与调用身份绑定。连接是同机
 owner-only UDS，SDK 身份取 node 实际 uid/gid，越权请求照常失败。环活动计数经
 `RingStats` 与 Prometheus 指标导出，仅用于观察，不参与正确性判断。
+
+已有 fd 采用顺序交接：注册前对可写 fd 执行 POSIX fsync；SDK 数据阶段不与 POSIX 数据 IO/mmap
+重叠，也不修改 fd 状态标志；注册检查实际 dup 的 F_GETFL，拒绝 open 后新增 O_APPEND。
+drain 后对原 fd（或 `DfsRegisteredFd::sync_all` 的保留副本）fsync，显式注销后才交回 POSIX。
+注销先拒绝新执行并等待已经取得执行权的请求，ioctl 回复后再向内核发送数据/属性失效通知，
+避免回调内缓存锁循环；轮询确认完成后才放掉 dup。通知失败保持可重试状态，不能假成功。
+同 inode 的 fd 导入允许多只读或单可写阶段；拒绝 O_APPEND/O_PATH、非本挂载、非本会话的请求。
+旧 reg_id 不复用；取消的操作序号保留墓碑以阻止迟到注册。应用最终 close/进程退出由 FUSE
+release 撤销注册并等待活跃执行，后端打开对象由原 FUSE 路径最终释放一次。
+SDK 活跃导入及待清理任务合计最多 64 个；取消/丢失回复由工作线程和守卫继续负责注销，
+Drop 仅安排有界后台清理，失败持有 fd/配额重试，显式 unregister 才是确认交回的接口。
+这不承诺跨 Node 已打开缓存 fd 的即时一致性或任意 POSIX/SDK 并发混写。
 
 ## OwnerFs workspace bind mount
 

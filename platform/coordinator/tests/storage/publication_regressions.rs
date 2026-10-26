@@ -48,6 +48,7 @@ async fn registered(session: &Session, id: &str) {
 }
 fn running() -> EnvironmentRecord {
     EnvironmentRecord {
+        observation: None,
         spec: spec(),
         assignment: Assignment {
             environment_id: "review-env".into(),

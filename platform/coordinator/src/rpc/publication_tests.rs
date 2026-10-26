@@ -84,6 +84,7 @@ async fn publication_race(action: &str) {
         state.environments[&spec.id].assignment.clone()
     };
     let record = EnvironmentRecord {
+        observation: None,
         spec: spec.clone(),
         assignment: assignment.clone(),
         state: EnvironmentState::Running,

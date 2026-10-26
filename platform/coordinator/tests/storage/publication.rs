@@ -47,6 +47,10 @@ async fn initial_success_is_atomic_by_environment_or_request_and_survives_restar
     };
     let (one, two) = tokio::join!(one, two);
     assert_eq!(one, two);
+    assert_eq!(
+        session.business_counters().await.unwrap().creations,
+        [1, 0, 0]
+    );
     assert_eq!(session.snapshot().await.unwrap().environments.len(), 1);
     let mut duplicate = one.clone();
     duplicate.assignment.generation += 10;
@@ -61,6 +65,10 @@ async fn initial_success_is_atomic_by_environment_or_request_and_survives_restar
     rig.crash();
     rig.start().await;
     let recovered = rig.store().await.begin(1).await.unwrap();
+    assert_eq!(
+        recovered.business_counters().await.unwrap().creations,
+        [1, 0, 0]
+    );
     assert_eq!(
         recovered
             .published_request("tenant", "request")
@@ -125,6 +133,23 @@ async fn independent_environment_commits_do_not_retry_a_global_version() {
         let barrier = barrier.clone();
         tasks.push(tokio::spawn(async move {
             record.revision += 1;
+            record.state = EnvironmentState::Failed;
+            record.runtime.ip = None;
+            record.resources_held = false;
+            record.observation = Some(adx_core::observation::ExecutionObservation {
+                interruption: Some(adx_core::observation::InterruptionEvidence {
+                    event_id: format!("exit:{}", record.spec.id),
+                    detected_at_unix_millis: adx_core::observation::now_millis().unwrap(),
+                    assignment_generation: record.assignment.generation,
+                    runtime_id: record.runtime.id.clone(),
+                    worker_id: record.assignment.node_id.clone(),
+                    reason: adx_core::observation::InterruptionReason::Oom,
+                    evidence_source: adx_core::observation::EvidenceSource::BackendExit,
+                    exit_code: Some(137),
+                    detail: "confirmed exit".into(),
+                }),
+                ..Default::default()
+            });
             barrier.wait().await;
             session.commit(record).await.unwrap();
         }));
@@ -141,6 +166,20 @@ async fn independent_environment_commits_do_not_retry_a_global_version() {
         calls(&after) - calls(&before),
         16,
         "unrelated records must each commit in one CAS attempt"
+    );
+    let counters = session.business_counters().await.unwrap();
+    assert_eq!(counters.creations, [16, 0, 0]);
+    assert_eq!(counters.interruptions[2][0], 16);
+    assert_eq!(
+        rig.store()
+            .await
+            .begin(1)
+            .await
+            .unwrap()
+            .business_counters()
+            .await
+            .unwrap(),
+        counters
     );
 }
 

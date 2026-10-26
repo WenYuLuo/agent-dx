@@ -45,6 +45,8 @@ pub enum Durability {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OperationResult {
+    /// True only for the controller command that performed the initial start.
+    pub newly_created: bool,
     pub record: EnvironmentRecord,
     pub durability: Durability,
 }
@@ -835,6 +837,7 @@ impl Adxlet {
                     && durability == Some(Durability::Published)
                 {
                     self.release_published_controller(&OperationResult {
+                        newly_created: false,
                         record,
                         durability: Durability::Published,
                     });

@@ -231,7 +231,7 @@ impl NodeRpc {
                     }
                     None => handle.create_with_deadline(deadline).await,
                 };
-                response(result.map_err(status)?).map_err(status)
+                response(result.map_err(|error| creation_error(&handle, error))?).map_err(status)
             }
             Outcome::Existing(existing) => {
                 let record: EnvironmentRecord = existing
@@ -254,6 +254,7 @@ impl NodeRpc {
                     .map_err(status)?;
                 if record.state == adx_core::EnvironmentState::Running {
                     response(crate::OperationResult {
+                        newly_created: false,
                         record,
                         durability: Durability::Published,
                     })

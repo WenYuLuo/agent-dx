@@ -99,7 +99,18 @@ impl Session {
         requests: &[String],
         node_session: &str,
     ) -> Result<EnvironmentRecord> {
-        self.publish_success(record, requests, node_session, false)
+        self.publish_initial_observed(record, requests, node_session, None)
+            .await
+    }
+
+    pub(crate) async fn publish_initial_observed(
+        &self,
+        record: EnvironmentRecord,
+        requests: &[String],
+        node_session: &str,
+        creation: Option<CreationSummary>,
+    ) -> Result<EnvironmentRecord> {
+        self.publish_success(record, requests, node_session, false, creation)
             .await
     }
 
@@ -108,7 +119,7 @@ impl Session {
         record: EnvironmentRecord,
         request: &str,
     ) -> Result<EnvironmentRecord> {
-        self.publish_success(record, &[request.to_owned()], "", true)
+        self.publish_success(record, &[request.to_owned()], "", true, None)
             .await
     }
 
@@ -118,6 +129,7 @@ impl Session {
         requests: &[String],
         node_session: &str,
         require_existing: bool,
+        creation: Option<CreationSummary>,
     ) -> Result<EnvironmentRecord> {
         validate_result(&record)?;
         if record.state != EnvironmentState::Running {
@@ -131,18 +143,24 @@ impl Session {
             .collect::<Result<Vec<_>>>()?;
         let next = StoredEnvironment {
             creation_generation: record.assignment.generation,
+            creation: Some(match creation {
+                Some(creation) => creation,
+                None => CreationSummary::new(requests.first().map_or("", String::as_str))?,
+            }),
+            last_interruption: None,
             resume: None,
             failed_since_unix_seconds: None,
             recovery: None,
             invalidated: false,
             spec: record.spec.clone(),
             assignment: record.assignment.clone(),
-            result: Some(record.clone()),
+            result: None,
         };
         let artifacts = artifacts::record_artifacts(&record);
         let _access = self.store.lock_artifacts(&artifacts)?;
         for _ in 0..ATTEMPTS {
             let [header, old] = self.store.fields([HEADER.into(), field.clone()]).await?;
+            let mut counters = CounterUpdate::load(&self.store, field.clone()).await?;
             self.header(&header)?;
             let previous = old
                 .as_deref()
@@ -162,6 +180,12 @@ impl Session {
             if require_existing && !published {
                 return Err(Error::NotFound);
             }
+            let mut next = next.clone();
+            if let Some(previous) = &previous {
+                next.creation = previous.creation.clone();
+            }
+            next.observe_result(&record, &mut counters.value)?;
+            next.result = Some(record.clone());
             let mut command = redis::cmd("EVAL");
             command.arg(r#"
                 if redis.call('HGET',KEYS[1],'epoch') ~= ARGV[1] then return {-1,''} end
@@ -190,19 +214,24 @@ impl Session {
                 end
                 if ARGV[6] == 'conflict' then return {-1,''} end
                 if ARGV[7] ~= '' and redis.call('HGET',KEYS[1],ARGV[8]) ~= ARGV[7] then return {-1,''} end
+                local facts = cjson.decode(ARGV[9])
+                if (redis.call('HGET',KEYS[5],facts[1]) or '') ~= facts[2] then return {0,''} end
+                redis.call('HSET',KEYS[5],facts[1],facts[3])
                 redis.call('HSET',KEYS[1],ARGV[2],ARGV[4])
                 redis.call('HINCRBY',KEYS[1],'node-ownership:' .. string.sub(ARGV[8],14),1)
                 aliases(ARGV[4], ARGV[2])
-                for i=9,#ARGV,2 do redis.call('HSET',KEYS[4],ARGV[i],ARGV[i+1]) end
+                for i=10,#ARGV,2 do redis.call('HSET',KEYS[4],ARGV[i],ARGV[i+1]) end
                 return {1,ARGV[4]}
-            "#).arg(4).arg(&self.store.key)
+            "#).arg(5).arg(&self.store.key)
                 .arg(format!("{}:create-requests", self.store.key))
                 .arg(format!("{}:create-receipts", self.store.key))
                 .arg(format!("{}:artifacts", self.store.key))
+                .arg(format!("{}:business", self.store.key))
                 .arg(self.epoch.to_string()).arg(&field).arg(old.as_deref().unwrap_or(""))
                 .arg(encode(&next)?).arg(encode(&request_fields)?)
                 .arg(if published { "published" } else if pending_conflict { "conflict" } else { "initial" }).arg(node_session)
-                .arg(format!("node-session:{}", record.assignment.node_id));
+                .arg(format!("node-session:{}", record.assignment.node_id))
+                .arg(counters.argument()?);
             for artifact in &artifacts {
                 command
                     .arg(artifacts::artifact_key(artifact))

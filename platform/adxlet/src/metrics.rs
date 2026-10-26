@@ -37,6 +37,7 @@ struct Registered {
 }
 #[derive(Default)]
 struct Samples {
+    operations: BTreeMap<(&'static str, &'static str, &'static str), u64>,
     registrations: BTreeMap<String, Registered>,
     samples: BTreeMap<String, Sample>,
     // Lifetime CPU totals survive removal of an Environment and runtime resets.
@@ -44,7 +45,44 @@ struct Samples {
 }
 #[derive(Default)]
 pub(crate) struct Metrics(Mutex<Samples>);
+pub(crate) struct OperationAttempt<'a> {
+    metrics: &'a Metrics,
+    operation: &'static str,
+    intent: &'static str,
+    outcome: &'static str,
+}
+impl OperationAttempt<'_> {
+    pub fn finish<T>(&mut self, result: &adx_core::Result<T>) {
+        self.outcome = match result {
+            Ok(_) => "success",
+            Err(adx_core::Error::Unavailable(_) | adx_core::Error::ResponseTimeout(_)) => "unknown",
+            Err(_) => "failure",
+        };
+    }
+}
+impl Drop for OperationAttempt<'_> {
+    fn drop(&mut self) {
+        *self
+            .metrics
+            .lock()
+            .operations
+            .entry((self.operation, self.intent, self.outcome))
+            .or_default() += 1;
+    }
+}
 impl Metrics {
+    pub fn operation_attempt(
+        &self,
+        operation: &'static str,
+        intent: adx_core::observation::OperationIntent,
+    ) -> OperationAttempt<'_> {
+        OperationAttempt {
+            metrics: self,
+            operation,
+            intent: intent.as_str(),
+            outcome: "cancelled",
+        }
+    }
     fn lock(&self) -> std::sync::MutexGuard<'_, Samples> {
         // This cache contains only rebuildable telemetry.
         self.0
@@ -167,7 +205,7 @@ impl Metrics {
         };
         // Copy eligible samples before formatting; exporters never hold the
         // registry lock while building a potentially large text response.
-        let (samples, cpu_ns) = {
+        let (samples, cpu_ns, operations) = {
             let samples = self.lock();
             let current: BTreeMap<_, _> = samples
                 .samples
@@ -184,7 +222,7 @@ impl Metrics {
                 })
                 .map(|(id, sample)| (id.clone(), sample.clone()))
                 .collect();
-            (current, samples.cpu_ns.clone())
+            (current, samples.cpu_ns.clone(), samples.operations.clone())
         };
         let mut output = String::new();
         if detail {
@@ -245,6 +283,12 @@ impl Metrics {
                         "adx_node_environment_{name}{{runtime_class=\"{class}\"}} {value}\n"
                     ));
                 }
+            }
+        }
+        if !detail {
+            output.push_str("# TYPE adx_environment_lifecycle_operations_total counter\n");
+            for ((operation, intent, outcome), count) in operations {
+                output.push_str(&format!("adx_environment_lifecycle_operations_total{{operation=\"{operation}\",intent=\"{intent}\",outcome=\"{outcome}\"}} {count}\n"));
             }
         }
         output
@@ -363,6 +407,7 @@ mod tests {
 
     fn running(environment: &str, runtime: &str, class: &str) -> EnvironmentRecord {
         EnvironmentRecord {
+            observation: None,
             spec: serde_json::from_value(serde_json::json!({
                 "id":environment,"tenant_id":"tenant","image":"image","runtime_class":class,
                 "priority":0,"resources":{"cpu_millis":1,"memory_bytes":1,"disk_bytes":0}

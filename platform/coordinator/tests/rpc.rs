@@ -137,6 +137,7 @@ struct Backend {
     started: AtomicUsize,
     removed: AtomicUsize,
     running: Mutex<BTreeSet<String>>,
+    pause_writes_after_remove: Mutex<Option<(String, u64)>>,
 }
 #[async_trait::async_trait]
 impl RuntimeDriver for Backend {
@@ -267,6 +268,21 @@ impl RuntimeDriver for Backend {
     async fn remove(&self, id: &str) -> Result<()> {
         self.removed.fetch_add(1, Ordering::SeqCst);
         self.running.lock().unwrap().remove(id);
+        let pause = self.pause_writes_after_remove.lock().unwrap().take();
+        if let Some((url, millis)) = pause {
+            let mut connection = redis::Client::open(url)
+                .unwrap()
+                .get_multiplexed_async_connection()
+                .await
+                .unwrap();
+            redis::cmd("CLIENT")
+                .arg("PAUSE")
+                .arg(millis)
+                .arg("WRITE")
+                .query_async::<()>(&mut connection)
+                .await
+                .unwrap();
+        }
         Ok(())
     }
 }
@@ -352,6 +368,7 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
             .unwrap();
     }));
     let backend = Arc::new(Backend {
+        pause_writes_after_remove: Mutex::new(None),
         session: session.clone(),
         started: AtomicUsize::new(0),
         removed: AtomicUsize::new(0),
@@ -452,7 +469,13 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
         duplicate.create_environment(create("first"))
     );
     let first = a.unwrap().into_inner();
-    assert_eq!(first, b.unwrap().into_inner());
+    let second = b.unwrap().into_inner();
+    assert_eq!(
+        u8::from(first.newly_created) + u8::from(second.newly_created),
+        1
+    );
+    assert_eq!(first.record, second.record);
+    assert_eq!(first.durability, second.durability);
     assert_eq!(first.durability, pb::Durability::Published as i32);
     assert_eq!(backend.started.load(Ordering::SeqCst), 1);
     let first_record = first.record.unwrap();
@@ -735,7 +758,11 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
         .delete_environment(delete.clone())
         .await
         .is_err());
-    assert_eq!(backend.removed.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        backend.removed.load(Ordering::SeqCst),
+        1,
+        "an unconfirmed intent cannot stop the runtime"
+    );
     redis.start().await;
     node_frontend.delete_environment(delete).await.unwrap();
     assert_eq!(
@@ -1098,6 +1125,7 @@ async fn heartbeat_expiry_reconciliation_and_old_session_fencing() {
         .await
         .unwrap();
     let running = EnvironmentRecord {
+        observation: None,
         execution_artifacts: vec![],
         snapshot_source: None,
         failure: None,
@@ -1194,6 +1222,7 @@ async fn heartbeat_expiry_reconciliation_and_old_session_fencing() {
     assert!(!snapshot.records[0].resources_held);
     assert!(!snapshot.records[0].restart_pending);
     let backend = Arc::new(Backend {
+        pause_writes_after_remove: Mutex::new(None),
         session: session.clone(),
         started: AtomicUsize::new(0),
         removed: AtomicUsize::new(0),
@@ -1301,6 +1330,7 @@ async fn node_restart_before_expiry_requires_new_session_at_registered_endpoint(
             .unwrap();
     })]);
     let backend = Arc::new(Backend {
+        pause_writes_after_remove: Mutex::new(None),
         session: session.clone(),
         started: AtomicUsize::new(0),
         removed: AtomicUsize::new(0),
@@ -1546,6 +1576,7 @@ async fn coordinator_restart_bounds_re_registration_grace() {
             .await
             .unwrap();
         let running = EnvironmentRecord {
+            observation: None,
             execution_artifacts: vec![],
             snapshot_source: None,
             failure: None,
@@ -1784,6 +1815,7 @@ async fn published_routes_drive_real_gateway_streams_and_reconnect_to_new_coordi
         .await
         .unwrap();
     let mut record = EnvironmentRecord {
+        observation: None,
         execution_artifacts: vec![],
         snapshot_source: None,
         failure: None,
@@ -2308,6 +2340,7 @@ async fn snapshot_gc_waits_for_node_ack_and_recovers_from_lost_ack() {
             .unwrap();
     })]);
     let backend = Arc::new(Backend {
+        pause_writes_after_remove: Mutex::new(None),
         session: session.clone(),
         started: AtomicUsize::new(0),
         removed: AtomicUsize::new(0),
@@ -2777,6 +2810,7 @@ async fn shared_checkpoint_moves_to_new_node_and_old_node_cleans_without_deletin
         .unwrap(),
     );
     let backend = Arc::new(RecoveryBackend(Backend {
+        pause_writes_after_remove: Mutex::new(None),
         session: session.clone(),
         started: AtomicUsize::new(0),
         removed: AtomicUsize::new(0),
@@ -2871,6 +2905,7 @@ async fn shared_checkpoint_moves_to_new_node_and_old_node_cleans_without_deletin
         .await
         .unwrap();
     let old = EnvironmentRecord {
+        observation: None,
         execution_artifacts: vec![],
         snapshot_source: None,
         failure: None,
@@ -2981,6 +3016,7 @@ async fn shared_checkpoint_moves_to_new_node_and_old_node_cleans_without_deletin
         .unwrap(),
     );
     let old_backend = Arc::new(Backend {
+        pause_writes_after_remove: Mutex::new(None),
         session: session.clone(),
         started: AtomicUsize::new(0),
         removed: AtomicUsize::new(0),

@@ -9,7 +9,12 @@ mod collection;
 mod credentials;
 mod failure;
 mod inspection;
+mod observability;
+use observability::CounterUpdate;
 mod recovery;
+pub use observability::{
+    BusinessCounters, CreationResult, CreationSummary, InterruptionSummary, RecoveryState,
+};
 mod resume;
 mod snapshots;
 use crate::Node;
@@ -38,6 +43,7 @@ const CAS: &str = r#"
 local old = redis.call('HGET', KEYS[1], 'header')
 if ARGV[1] == '' then
   if redis.call('HLEN', KEYS[1]) ~= 0 then return 0 end
+  redis.call('DEL',KEYS[3])
 elseif old ~= ARGV[1] then return 0 end
 if #ARGV == 3 then
   redis.call('HSET', KEYS[1], 'header', ARGV[2], 'epoch', ARGV[#ARGV])
@@ -58,7 +64,10 @@ return 1
 const RETIRE_ENVIRONMENT: &str = r#"
 if redis.call('HGET', KEYS[1], 'epoch') ~= ARGV[1] then return 0 end
 if redis.call('HGET', KEYS[1], ARGV[3]) ~= ARGV[4] then return 0 end
+local facts = cjson.decode(ARGV[7])
+if (redis.call('HGET',KEYS[3],facts[1]) or '') ~= facts[2] then return 0 end
 redis.call('SET', KEYS[2], ARGV[5], 'PX', ARGV[6])
+redis.call('HSET',KEYS[3],facts[1],facts[3])
 redis.call('HDEL', KEYS[1], ARGV[3])
 return 1
 "#;
@@ -68,6 +77,8 @@ const DELETED_RECEIPT_TTL: Duration = Duration::from_secs(600);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Header {
+    #[serde(default)]
+    observability: BusinessCounters,
     schema: u32,
     shards: usize,
     epoch: u64,
@@ -101,6 +112,9 @@ pub struct NodeSession {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredNode {
+    /// Incident for the current unavailable period; cleared when routable again.
+    #[serde(default)]
+    pub last_incident_id: Option<String>,
     pub node: Node,
     pub shard_id: usize,
     pub address: String,
@@ -133,6 +147,10 @@ pub struct StoredEnvironment {
     /// Deleting and recreating the same name starts a different lifetime.
     pub creation_generation: u64,
     #[serde(default)]
+    pub creation: Option<CreationSummary>,
+    #[serde(default)]
+    pub last_interruption: Option<InterruptionSummary>,
+    #[serde(default)]
     pub resume: Option<ResumeIntent>,
     /// Durable age of a terminal failure; retries and Coordinator restarts do not reset it.
     #[serde(default)]
@@ -144,6 +162,14 @@ pub struct StoredEnvironment {
     pub spec: EnvironmentSpec,
     pub assignment: Assignment,
     pub result: Option<EnvironmentRecord>,
+}
+
+/// The accepted result and the complete environment confirmed by the same CAS/read.
+/// Deleted environments have no retained record, including receipt replays.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommittedEnvironment {
+    pub result: EnvironmentRecord,
+    pub stored: Option<StoredEnvironment>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -194,6 +220,7 @@ impl StoredEnvironment {
     }
     pub(crate) fn effective_record(&self) -> EnvironmentRecord {
         self.result.clone().unwrap_or_else(|| EnvironmentRecord {
+            observation: None,
             execution_artifacts: vec![],
             snapshot_source: None,
             failure: None,
@@ -603,9 +630,10 @@ impl RedisStore {
         let _access = self.lock_artifacts(&artifacts)?;
         let mut cmd = redis::cmd("EVAL");
         cmd.arg(CAS)
-            .arg(2)
+            .arg(3)
             .arg(&self.key)
             .arg(format!("{}:artifacts", self.key))
+            .arg(format!("{}:business", self.key))
             .arg(expected)
             .arg(encode(header)?);
         if let Some((name, value)) = field {
@@ -619,6 +647,9 @@ impl RedisStore {
             cmd.arg(header.epoch.to_string());
         }
         let applied: u8 = self.query(cmd).await?;
+        if applied == 2 {
+            return Err(Error::Conflict);
+        }
         if applied == 1 {
             self.notify_committed_change(header.revision, changed);
         }
@@ -630,6 +661,14 @@ impl RedisStore {
         _header_bytes: &str,
         header: &Header,
         field: Option<(&str, Option<&str>, String)>,
+    ) -> Result<bool> {
+        self.object_cas_with_counters(header, field, None).await
+    }
+    async fn object_cas_with_counters(
+        &self,
+        header: &Header,
+        field: Option<(&str, Option<&str>, String)>,
+        counters: Option<&CounterUpdate>,
     ) -> Result<bool> {
         let (name, old, next) = field.ok_or(Error::Conflict)?;
         let artifacts = if name.starts_with("environment:") {
@@ -674,13 +713,17 @@ impl RedisStore {
             local old = redis.call('HGET',KEYS[1],ARGV[2])
             if ARGV[3] == '' then if old then return 0 end
             elseif old ~= ARGV[3] then return 0 end
+            local facts = cjson.decode(ARGV[7])
+            if facts[1] ~= '' and (redis.call('HGET',KEYS[3],facts[1]) or '') ~= facts[2] then return 0 end
             redis.call('HSET',KEYS[1],ARGV[2],ARGV[4])
+            if facts[1] ~= '' then redis.call('HSET',KEYS[3],facts[1],facts[3]) end
             if ARGV[5] ~= '' then redis.call('HSET',KEYS[1],'node-session:' .. string.sub(ARGV[2],6),ARGV[5]) end
             if ARGV[6] ~= '' then redis.call('HINCRBY',KEYS[1],ARGV[6],1) end
-            for i=7,#ARGV,2 do redis.call('HSET',KEYS[2],ARGV[i],ARGV[i+1]) end
+            for i=8,#ARGV,2 do redis.call('HSET',KEYS[2],ARGV[i],ARGV[i+1]) end
             return 1
-        "#).arg(2).arg(&self.key).arg(format!("{}:artifacts", self.key))
-            .arg(header.epoch.to_string()).arg(name).arg(old.unwrap_or("")).arg(next).arg(node_session).arg(membership);
+        "#).arg(3).arg(&self.key).arg(format!("{}:artifacts", self.key)).arg(format!("{}:business", self.key))
+            .arg(header.epoch.to_string()).arg(name).arg(old.unwrap_or("")).arg(next).arg(node_session).arg(membership)
+            .arg(counters.map(CounterUpdate::argument).transpose()?.unwrap_or_else(|| r#"["","",""]"#.into()));
         for artifact in artifacts {
             cmd.arg(artifacts::artifact_key(&artifact))
                 .arg(encode(&artifact)?);
@@ -728,18 +771,21 @@ impl RedisStore {
         header: &Header,
         field: &str,
         receipt: &DeletedReceipt,
+        counters: &CounterUpdate,
     ) -> Result<bool> {
         let mut cmd = redis::cmd("EVAL");
         cmd.arg(RETIRE_ENVIRONMENT)
-            .arg(2)
+            .arg(3)
             .arg(&self.key)
             .arg(self.deleted_receipt_key(&receipt.environment_id))
+            .arg(format!("{}:business", self.key))
             .arg(header.epoch.to_string())
             .arg(encode(header)?)
             .arg(field)
             .arg(expected_environment)
             .arg(encode(receipt)?)
-            .arg(DELETED_RECEIPT_TTL.as_millis() as u64);
+            .arg(DELETED_RECEIPT_TTL.as_millis() as u64)
+            .arg(counters.argument()?);
         let applied: u8 = self.query(cmd).await?;
         if applied == 2 {
             return Err(Error::Conflict);
@@ -761,6 +807,10 @@ impl RedisStore {
             let mut retired = Vec::new();
             let mut h = if raw.is_empty() {
                 Header {
+                    observability: BusinessCounters {
+                        started_at_unix_millis: adx_core::observation::now_millis()?,
+                        ..Default::default()
+                    },
                     schema: 1,
                     shards,
                     epoch: 1,
@@ -1183,7 +1233,7 @@ impl Session {
                 .await?;
             self.header(&header)?;
             let raw = raw.ok_or(Error::NotFound)?;
-            let registered: StoredNode = decode(&raw)?;
+            let mut registered: StoredNode = decode(&raw)?;
             if registered
                 .session
                 .as_ref()
@@ -1197,6 +1247,7 @@ impl Session {
             if active.is_some() {
                 return Err(Error::Conflict);
             }
+            registered.last_incident_id = None;
             let mut command = redis::cmd("EVAL");
             command
                 .arg(
@@ -1204,7 +1255,7 @@ impl Session {
                 if redis.call('HGET',KEYS[1],'epoch') ~= ARGV[1] then return 0 end
                 if redis.call('HGET',KEYS[1],ARGV[2]) ~= ARGV[3] then return 0 end
                 if redis.call('HEXISTS',KEYS[1],ARGV[4]) ~= 0 then return 0 end
-                redis.call('HSET',KEYS[1],ARGV[4],ARGV[5]); return 1
+                redis.call('HSET',KEYS[1],ARGV[2],ARGV[6],ARGV[4],ARGV[5]); return 1
             "#,
                 )
                 .arg(1)
@@ -1213,7 +1264,8 @@ impl Session {
                 .arg(&field)
                 .arg(raw)
                 .arg(&token)
-                .arg(session_id);
+                .arg(session_id)
+                .arg(encode(&registered)?);
             if self.store.query::<u8>(command).await? == 1 {
                 return Ok(());
             }
@@ -1255,6 +1307,11 @@ impl Session {
                 }
                 node.available &= !previous.scheduling_paused;
                 let record = StoredNode {
+                    last_incident_id: if session.as_ref().is_some_and(|s| s.routable) {
+                        None
+                    } else {
+                        previous.last_incident_id.clone()
+                    },
                     node,
                     address,
                     proxy_address,
@@ -1288,6 +1345,11 @@ impl Session {
                     }
                     node.available &= !previous.scheduling_paused;
                     let record = StoredNode {
+                        last_incident_id: if session.as_ref().is_some_and(|s| s.routable) {
+                            None
+                        } else {
+                            previous.last_incident_id.clone()
+                        },
                         node,
                         address,
                         proxy_address,
@@ -1317,6 +1379,15 @@ impl Session {
                 node.available = false;
             }
             let record = StoredNode {
+                // Reconciliation heartbeats keep the active outage. A confirmed
+                // routable registration closes it, even within the same process.
+                last_incident_id: if session.as_ref().is_some_and(|s| s.routable) {
+                    None
+                } else {
+                    previous
+                        .as_ref()
+                        .and_then(|node| node.last_incident_id.clone())
+                },
                 node: node.clone(),
                 shard_id: shard,
                 address: address.clone(),
@@ -1399,6 +1470,14 @@ impl Session {
         spec: EnvironmentSpec,
         assignment: Assignment,
     ) -> Result<StoredEnvironment> {
+        self.reserve_with_request(spec, assignment, "").await
+    }
+    pub async fn reserve_with_request(
+        &self,
+        spec: EnvironmentSpec,
+        assignment: Assignment,
+        request_id: &str,
+    ) -> Result<StoredEnvironment> {
         if let Some(id) = &spec.snapshot_id {
             let snapshot = self.get_snapshot(id).await?;
             if snapshot.template.tenant_id != spec.tenant_id
@@ -1413,6 +1492,8 @@ impl Session {
         }
         let record = StoredEnvironment {
             creation_generation: assignment.generation,
+            creation: Some(CreationSummary::new(request_id)?),
+            last_interruption: None,
             resume: None,
             failed_since_unix_seconds: None,
             recovery: None,
@@ -1539,6 +1620,15 @@ impl Session {
     /// One result write: state and the route publication cursor change atomically.
     /// Identical replay is idempotent; older versions never roll state backward.
     pub async fn commit(&self, result: EnvironmentRecord) -> Result<EnvironmentRecord> {
+        Ok(self.commit_with_state(result).await?.result)
+    }
+
+    /// Commit a result and return its authoritative summaries without a follow-up read.
+    /// Replay returns the stored record; deletion returns only the accepted result.
+    pub async fn commit_with_state(
+        &self,
+        result: EnvironmentRecord,
+    ) -> Result<CommittedEnvironment> {
         if let Some(source) = &result.snapshot_source {
             let snapshot = self
                 .get_snapshot(result.spec.snapshot_id.as_deref().ok_or(Error::Conflict)?)
@@ -1559,11 +1649,15 @@ impl Session {
         for _ in 0..ATTEMPTS {
             let [header_value, environment_value] =
                 self.store.fields([HEADER.into(), field.clone()]).await?;
+            let mut counters = CounterUpdate::load(&self.store, field.clone()).await?;
             let header = self.header(&header_value)?;
             let Some(environment_value) = environment_value.as_deref() else {
                 if result.state == EnvironmentState::Deleted {
                     return match self.store.deleted_receipt(&result.spec.id).await? {
-                        Some(receipt) if receipt.matches(&result)? => Ok(result),
+                        Some(receipt) if receipt.matches(&result)? => Ok(CommittedEnvironment {
+                            result,
+                            stored: None,
+                        }),
                         Some(_) => Err(Error::Conflict),
                         None => Err(Error::NotFound),
                     };
@@ -1575,7 +1669,10 @@ impl Session {
                 || result.state == EnvironmentState::Running && stored_environment.resume.is_some())
             {
                 self.store.notify_committed_change(0, vec![field.clone()]);
-                return Ok(result);
+                return Ok(CommittedEnvironment {
+                    result,
+                    stored: Some(stored_environment),
+                });
             }
             if result.state != EnvironmentState::Paused {
                 stored_environment.resume = None;
@@ -1588,6 +1685,8 @@ impl Session {
             // commits compare against the version already enforced by the
             // runtime, while every placement and resource field remains
             // fenced by `next_result` above.
+            let previous_observation = stored_environment.last_interruption.clone();
+            stored_environment.observe_result(&result, &mut counters.value)?;
             stored_environment.spec = result.spec.clone();
             stored_environment.result = Some(result.clone());
             stored_environment.track_failure(collection::now()?);
@@ -1603,23 +1702,27 @@ impl Session {
                         &header,
                         &field,
                         &DeletedReceipt::from_result(&result)?,
+                        &counters,
                     )
                     .await?
             } else {
                 self.store
-                    .object_cas(
-                        expected_header,
+                    .object_cas_with_counters(
                         &header,
                         Some((
                             &field,
                             Some(environment_value),
                             encode(&stored_environment)?,
                         )),
+                        Some(&counters),
                     )
                     .await?
             };
             if applied {
-                return Ok(result);
+                stored_environment.log_observation_change(previous_observation.as_ref());
+                let stored =
+                    (result.state != EnvironmentState::Deleted).then_some(stored_environment);
+                return Ok(CommittedEnvironment { result, stored });
             }
         }
         Err(Error::Unavailable(

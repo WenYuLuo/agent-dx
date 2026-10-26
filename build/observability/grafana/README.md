@@ -7,6 +7,7 @@
 
 | JSON | 内容与口径 |
 | --- | --- |
+| [adx-sandbox-lifecycle.json](dashboards/adx-sandbox-lifecycle.json) | 创建调用成功率、成功实际新建调用 P95、unknown、排队/启动与年龄、中断/恢复及采集覆盖；按 cluster/adx_env 隔离。影响明细通过私有 Coordinator JSON 查询。 |
 | [adx-schedule.json](dashboards/adx-schedule.json) | CPU/内存/磁盘调度容量、已分配及分配率，Running/Paused 分布，创建当前/峰值 QPS、耗时与结果、节点汇总资源、队列、节点健康和采集健康。 |
 | [adx-data-plane.json](dashboards/adx-data-plane.json) | Ingress 请求速率、状态分类、4xx/5xx 比例、响应头耗时 P50/P95/P99、超过 100 ms 比例、活跃请求及连接池；Relay 活跃流、连接成功/失败、拒绝与路由错误；Ingress 逻辑流及物理连接。 |
 | [adx-process-resources.json](dashboards/adx-process-resources.json) | 进程 CPU 核数、RSS、文件描述符、线程，以及按 Pod/组件/PID 的运行时长和虚拟内存明细。 |
@@ -74,3 +75,6 @@ ADX Schedule 的标题、列名、图例、状态值和筛选说明统一使用�
 暂停准入后仍能显示已有分配比例；容量列的调度容量为 0。原始容量为 0 或
 缺少观测时显示 `Unknown`。条形固定以 100% 为满格，超过 100% 的数值仍显示；
 低于 70% 为绿色，70%–90% 为黄色，达到 90% 为红色。分配率不是实际使用率。
+
+Sandbox Lifecycle 的正式口径和私有影响范围查询见 [指标合同](../../../docs/testing/sandbox-observability.md)。
+使用 [sandbox-prometheus.json](../sandbox-prometheus.json) 注入 cluster/adx_env；该看板 UID 为 `adx-sandbox-lifecycle`，不包含告警规则。

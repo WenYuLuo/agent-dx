@@ -33,6 +33,7 @@ return 1
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalClaim {
+    pub request_id: String,
     pub node_id: String,
     pub node_session_id: String,
     /// Cards already tentatively held by the node's shared Admission ledger.
@@ -160,6 +161,8 @@ impl Session {
             let generation = self.next_generation()?;
             let record = StoredEnvironment {
                 creation_generation: generation,
+                creation: Some(CreationSummary::new(&candidate.request_id)?),
+                last_interruption: None,
                 resume: None,
                 failed_since_unix_seconds: None,
                 recovery: None,
@@ -217,6 +220,9 @@ impl Session {
         }
         for (spec, candidate) in &claims {
             spec.validate()?;
+            if candidate.request_id.len() > 256 {
+                return Err(Error::Invalid("request ID too long".into()));
+            }
             if candidate.node_id.trim().is_empty() || candidate.node_session_id.trim().is_empty() {
                 return Err(Error::Invalid(
                     "claim requires node and process session".into(),
@@ -291,7 +297,6 @@ impl Session {
                     {
                         return Err(Error::Conflict);
                     }
-                    claim_admission(node)?;
                     if let Some(existing) = environments.get(&spec.id) {
                         if existing.spec != *spec {
                             return Err(Error::Conflict);
@@ -306,8 +311,10 @@ impl Session {
                         if existing.assignment.devices != candidate.devices {
                             return Err(Error::Conflict);
                         }
+                        claim_admission(node)?;
                         return Ok(ClaimOutcome::Owned(existing.clone()));
                     }
+                    claim_admission(node)?;
                     if let Some(id) = &spec.snapshot_id {
                         let (_, snapshot) = snapshots.get(id).ok_or(Error::NotFound)?;
                         if snapshot.template.tenant_id != spec.tenant_id
@@ -322,6 +329,8 @@ impl Session {
 
                     let record = StoredEnvironment {
                         creation_generation: generation,
+                        creation: Some(CreationSummary::new(&candidate.request_id)?),
+                        last_interruption: None,
                         resume: None,
                         failed_since_unix_seconds: None,
                         recovery: None,

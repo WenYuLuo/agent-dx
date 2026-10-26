@@ -15,6 +15,7 @@ async fn claimant(s: &adx_coordinator::storage::Session, id: &str) -> LocalClaim
     .await
     .unwrap();
     LocalClaim {
+        request_id: String::new(),
         node_id: id.into(),
         node_session_id: format!("boot-{id}"),
         devices: vec![],
@@ -336,6 +337,7 @@ async fn batch_claims_isolate_expired_and_missing_nodes() {
         .await
         .unwrap();
     let missing = LocalClaim {
+        request_id: String::new(),
         node_id: "missing".into(),
         node_session_id: "boot".into(),
         devices: vec![],

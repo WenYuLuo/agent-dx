@@ -126,6 +126,7 @@ impl State {
             .get(&stored.assignment.node_id)
             .ok_or(Error::NotFound)?;
         let record = stored.result.clone().unwrap_or_else(|| EnvironmentRecord {
+            observation: None,
             execution_artifacts: vec![],
             snapshot_source: None,
             failure: None,
@@ -287,6 +288,7 @@ impl CoordinatorRpc {
             });
         }
         let candidate = LocalClaim {
+            request_id: request.request_id,
             node_id: node.clone(),
             node_session_id: request.node_session_id,
             devices: request
@@ -401,6 +403,10 @@ impl CoordinatorRpc {
             };
             let record = StoredEnvironment {
                 creation_generation: generation,
+                creation: Some(
+                    crate::storage::CreationSummary::new(&candidate.request_id).map_err(status)?,
+                ),
+                last_interruption: None,
                 spec: spec.clone(),
                 assignment: assignment.clone(),
                 result: None,

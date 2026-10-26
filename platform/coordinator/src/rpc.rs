@@ -6,6 +6,7 @@ mod claims;
 mod cloning;
 mod collection;
 mod metrics;
+mod observation;
 mod recovery;
 mod resume;
 mod snapshots;
@@ -169,6 +170,13 @@ impl State {
             } else {
                 Ok(StoredEnvironment {
                     creation_generation: assignment.generation,
+                    creation: Some(crate::storage::CreationSummary::new(
+                        self.create_requests
+                            .get(&spec.id)
+                            .and_then(|ids| ids.first())
+                            .map_or("", String::as_str),
+                    )?),
+                    last_interruption: None,
                     resume: None,
                     failed_since_unix_seconds: None,
                     recovery: None,
@@ -224,6 +232,8 @@ impl State {
     }
 }
 struct Inner {
+    business: Arc<std::sync::RwLock<Option<observation::BusinessSnapshot>>>,
+    business_fenced: Arc<std::sync::atomic::AtomicBool>,
     created: std::sync::atomic::AtomicU64,
     reclaimers: std::sync::RwLock<adx_checkpoint_storage::reclaim::Reclaimers>,
     resume_admission: Arc<tokio::sync::Semaphore>,
@@ -404,7 +414,16 @@ impl CoordinatorRpc {
         let recovering = saved.nodes.keys().map(|id| (id.clone(), now)).collect();
         let (claim_sender, claim_requests) = mpsc::channel(CLAIM_BATCH_CAPACITY);
         tokio::spawn(run_claim_batches(session.clone(), claim_requests));
-        Ok(Self(Arc::new(Inner {
+        let monitoring = session.clone();
+        let counters = monitoring.business_counters().await?;
+        let service = Self(Arc::new(Inner {
+            business: Arc::new(std::sync::RwLock::new(Some(
+                observation::BusinessSnapshot {
+                    counters,
+                    refreshed: std::time::Instant::now(),
+                },
+            ))),
+            business_fenced: Default::default(),
             created: Default::default(),
             create_locks: Default::default(),
             reclaimers: Default::default(),
@@ -445,7 +464,32 @@ impl CoordinatorRpc {
             node_tls: node_tls.into(),
             timeout,
             heartbeat_timeout,
-        })))
+        }));
+        let weak = Arc::downgrade(&service.0.business);
+        let fenced = service.0.business_fenced.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let Some(cache) = weak.upgrade() else {
+                    break;
+                };
+                match monitoring.business_counters().await {
+                    Ok(counters) => {
+                        if let Ok(mut cache) = cache.write() {
+                            *cache = Some(observation::BusinessSnapshot {
+                                counters,
+                                refreshed: std::time::Instant::now(),
+                            });
+                        }
+                    }
+                    Err(Error::Conflict) => {
+                        fenced.store(true, std::sync::atomic::Ordering::Release);
+                    }
+                    Err(_) => (),
+                }
+            }
+        });
+        Ok(service)
     }
     pub fn with_reclaimers(self, reclaimers: adx_checkpoint_storage::reclaim::Reclaimers) -> Self {
         *self
@@ -586,6 +630,9 @@ impl CoordinatorRpc {
         let schedule_timeout = scheduling_timeout(r.schedule_timeout_seconds)
             .ok_or_else(|| Status::invalid_argument("schedule timeout must not exceed 24 hours"))?;
         let deadline = create_deadline(&r)?;
+        if r.request_id.len() > 256 {
+            return Err(Status::invalid_argument("request ID too long"));
+        }
         let request_id = r.request_id.clone();
         let expected_assignment = r
             .expected_assignment
@@ -609,6 +656,7 @@ impl CoordinatorRpc {
             .map_err(status)?
         {
             return Ok(Response::new(pb::EnvironmentResult {
+                newly_created: false,
                 record: Some(record.try_into().map_err(status)?),
                 durability: pb::Durability::Published as i32,
             }));
@@ -630,6 +678,7 @@ impl CoordinatorRpc {
                     record
                 };
                 return Ok(Response::new(pb::EnvironmentResult {
+                    newly_created: false,
                     record: Some(record.try_into().map_err(status)?),
                     durability: pb::Durability::Published as i32,
                 }));
@@ -777,6 +826,7 @@ impl CoordinatorRpc {
             .map_err(status)?
         {
             return Ok(pb::EnvironmentResult {
+                newly_created: false,
                 record: Some(record.try_into().map_err(status)?),
                 durability: pb::Durability::Published as i32,
             });
@@ -798,6 +848,7 @@ impl CoordinatorRpc {
                     record
                 };
                 return Ok(pb::EnvironmentResult {
+                    newly_created: false,
                     record: Some(record.try_into().map_err(status)?),
                     durability: pb::Durability::Published as i32,
                 });
@@ -945,6 +996,7 @@ impl CoordinatorRpc {
                         ));
                     }
                     return Ok(pb::EnvironmentResult {
+                        newly_created: false,
                         record: Some(result.try_into().map_err(status)?),
                         durability: pb::Durability::Published as i32,
                     });
@@ -1237,18 +1289,24 @@ impl CoordinatorRpc {
             return Err(Error::Conflict);
         }
         let session = state.session.clone();
+        let creation = state
+            .environments
+            .get(&record.spec.id)
+            .and_then(|stored| stored.creation.clone());
         let request_ids = state
             .create_requests
             .get(&record.spec.id)
             .cloned()
             .unwrap_or_default();
         drop(state);
+        let mut authoritative = None;
         let mut accepted = if initial && record.state == EnvironmentState::Running {
             let winner = session
-                .publish_initial_requests(
+                .publish_initial_observed(
                     record.clone(),
                     &request_ids.into_iter().collect::<Vec<_>>(),
                     &session_id,
+                    creation,
                 )
                 .await?;
             if winner.assignment != record.assignment || winner.runtime.id != record.runtime.id {
@@ -1278,12 +1336,27 @@ impl CoordinatorRpc {
             self.0.changed.notify_waiters();
             return Ok(record);
         } else {
-            session.commit(record).await?
+            let committed = session.commit_with_state(record).await?;
+            authoritative = committed.stored;
+            committed.result
         };
+        if initial {
+            authoritative = Some(session.get(&accepted.spec.id).await?);
+        }
         let mut state = self.0.state.lock().await;
-        if initial
-            && (state.needs_recovery
-                || state
+        if state.needs_recovery
+            || state
+                .environments
+                .get(&accepted.spec.id)
+                .is_some_and(|stored| {
+                    stored.invalidated
+                        || stored
+                            .result
+                            .as_ref()
+                            .is_some_and(|result| result.revision > accepted.revision)
+                })
+            || (initial
+                && state
                     .environments
                     .get(&accepted.spec.id)
                     .is_none_or(|stored| {
@@ -1295,9 +1368,14 @@ impl CoordinatorRpc {
             // Recovery may have rebuilt the catalog while Redis was publishing.
             // Reinstall the authoritative result before acknowledging success.
             state.recover_authoritative_state().await?;
-            let durable = state.session.get(&accepted.spec.id).await?;
-            accepted = durable.result.clone().ok_or(Error::Conflict)?;
-            state.accept_stored_claim(durable)?;
+            // A successful deletion has already retired the durable record. Its
+            // receipt was validated by commit_with_state; finish cache cleanup.
+            if accepted.state != EnvironmentState::Deleted {
+                let durable = state.session.get(&accepted.spec.id).await?;
+                accepted = durable.result.clone().ok_or(Error::Conflict)?;
+                authoritative = Some(durable.clone());
+                state.accept_stored_claim(durable)?;
+            }
         }
         if state
             .environments
@@ -1311,15 +1389,10 @@ impl CoordinatorRpc {
                 .created
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-        if !initial
-            && (accepted.state == EnvironmentState::Failed
-                || (accepted.state != EnvironmentState::Deleted
-                    && !state.environments.contains_key(&accepted.spec.id)))
+        if let Some(stored) =
+            authoritative.filter(|stored| stored.assignment == accepted.assignment)
         {
-            let durable = state.session.get(&accepted.spec.id).await?;
-            state.remember_environment(durable);
-        } else {
-            state.failed_environments.remove(&accepted.spec.id);
+            state.remember_environment(stored);
         }
         if let Some(stored) = state.environments.get_mut(&accepted.spec.id) {
             stored.spec = accepted.spec.clone();
@@ -1725,6 +1798,7 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                 .map(|i| {
                     i.result
                         .unwrap_or_else(|| EnvironmentRecord {
+                            observation: None,
                             execution_artifacts: vec![],
                             snapshot_source: None,
                             failure: None,
@@ -2090,6 +2164,8 @@ mod reconciliation_tests {
         };
         let mut environment = StoredEnvironment {
             creation_generation: assignment.generation,
+            creation: None,
+            last_interruption: None,
             resume: None,
             failed_since_unix_seconds: None,
             recovery: None,
@@ -2097,6 +2173,7 @@ mod reconciliation_tests {
             spec: spec.clone(),
             assignment: assignment.clone(),
             result: Some(EnvironmentRecord {
+                observation: None,
                 execution_artifacts: vec![],
                 snapshot_source: None,
                 failure: None,

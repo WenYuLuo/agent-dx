@@ -217,10 +217,10 @@ async fn create_publishes_only_after_runtime_readiness_and_route_binding() {
     assert_eq!(node.used(), Resources::default());
     assert_eq!(
         &deps.events.lock().unwrap()[4..],
-        ["retire", "remove", "commit:Deleted"]
+        ["commit:Running", "retire", "remove", "commit:Deleted"]
     );
     environment.delete().await.unwrap();
-    assert_eq!(deps.events.lock().unwrap().len(), 7);
+    assert_eq!(deps.events.lock().unwrap().len(), 8);
     assert_eq!(environment.create().await.unwrap_err(), Error::Conflict);
 }
 
@@ -723,6 +723,7 @@ async fn delete_waits_for_active_operation_even_if_original_caller_disconnects()
             "ready",
             "activate",
             "commit:Running",
+            "commit:Running", // publish delete intent before cleanup
             "retire",
             "remove",
             "commit:Deleted"
@@ -1067,9 +1068,8 @@ async fn accepted_environment_operations_keep_request_context_after_caller_cance
     );
     deps.start_release.add_permits(1);
     delete.await.unwrap().unwrap();
-    for (event, parent) in deps.traces.lock().unwrap().iter() {
-        let expected = if ["start", "ready", "activate", "commit:Running"].contains(&event.as_str())
-        {
+    for (index, (event, parent)) in deps.traces.lock().unwrap().iter().enumerate() {
+        let expected = if index < 4 {
             "11111111111111111111111111111111"
         } else {
             "22222222222222222222222222222222"
@@ -1104,7 +1104,10 @@ async fn local_reservations_share_one_hold_and_transfer_to_one_controller() {
     // A delayed losing/retry path must never release a transferred runtime hold.
     manager.release_local("a", &a).unwrap();
     let (x, y) = tokio::join!(x.create(), y.create());
-    assert_eq!(x.unwrap(), y.unwrap());
+    let (x, y) = (x.unwrap(), y.unwrap());
+    assert_eq!(u8::from(x.newly_created) + u8::from(y.newly_created), 1);
+    assert_eq!(x.record, y.record);
+    assert_eq!(x.durability, y.durability);
     assert_eq!(manager.used(), resources());
     assert_eq!(
         deps.events
@@ -1424,4 +1427,40 @@ async fn tunnel_rejects_stateless_update_before_changing_backend_or_record() {
     ));
     assert!(deps.events.lock().unwrap().is_empty());
     assert_eq!(environment.sync().await.unwrap().record, created.record);
+}
+
+#[tokio::test]
+async fn delete_publishes_execution_intent_before_cleanup_and_aborts_if_unconfirmed() {
+    let deps = Dependencies::new(false);
+    let node = node(&deps);
+    let environment = node
+        .environment(spec("intent"), assignment("intent"))
+        .unwrap();
+    let running = environment.create().await.unwrap().record;
+    *deps.fail_at.lock().unwrap() = Some("commit:Running".into());
+    assert!(environment.delete().await.is_err());
+    assert!(!deps.events.lock().unwrap().iter().any(|e| e == "remove"));
+    assert!(!deps.events.lock().unwrap().iter().any(|e| e == "retire"));
+    *deps.fail_at.lock().unwrap() = None;
+    *deps.durability.lock().unwrap() = Durability::Journaled;
+    assert!(environment.delete().await.is_err());
+    assert!(!deps.events.lock().unwrap().iter().any(|e| e == "remove"));
+    *deps.durability.lock().unwrap() = Durability::Published;
+    let confirmed = environment.sync().await.unwrap().record;
+    assert_eq!(confirmed.state, EnvironmentState::Running);
+    assert_eq!(confirmed.runtime.id, running.runtime.id);
+    assert_eq!(confirmed.observation.as_ref().and_then(|o| o.intent), None);
+    environment.delete().await.unwrap();
+    let records = deps.records.lock().unwrap();
+    let intent = records
+        .iter()
+        .find(|r| r.observation.as_ref().and_then(|o| o.intent).is_some())
+        .unwrap();
+    assert_eq!(intent.state, EnvironmentState::Running);
+    assert_eq!(intent.runtime.id, running.runtime.id);
+    assert_eq!(intent.assignment, running.assignment);
+    assert_eq!(
+        intent.observation.as_ref().unwrap().intent,
+        Some(adx_core::observation::OperationIntent::User)
+    );
 }

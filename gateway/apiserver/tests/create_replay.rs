@@ -76,7 +76,7 @@ service_impl!(pb::coordinator_service_server::CoordinatorService, {
                 ..Default::default()
             }));
         }
-        let record = {
+        let (record, newly_created) = {
             let mut owners = self.0.owners.lock().unwrap();
             if let Some(owner) = owners.get_mut(&spec.id) {
                 assert_eq!(owner.record.as_ref().unwrap().spec.as_ref(), Some(&spec));
@@ -87,10 +87,11 @@ service_impl!(pb::coordinator_service_server::CoordinatorService, {
                         record.revision = 1;
                     }
                 }
-                owner.record.clone().unwrap()
+                (owner.record.clone().unwrap(), false)
             } else {
                 self.0.starts.fetch_add(1, Ordering::SeqCst);
                 let record = pb::EnvironmentRecord {
+                    observation: None,
                     execution_artifacts: vec![],
             snapshot_source: None,
                     failure: None,
@@ -99,7 +100,7 @@ assignment: Some(pb::Assignment { environment_id: spec.id.clone(), node_id: self
                     resources_held: true, ..Default::default()
                 };
                 owners.insert(spec.id, pb::GetEnvironmentResponse { record: Some(record.clone()), node_address: "127.0.0.1:9000".into(), relay_address: "127.0.0.1:9443".into() });
-                record
+                (record, true)
             }
         };
         if record.state == pb::EnvironmentState::Running as i32 && !identity.1.is_empty() {
@@ -132,7 +133,7 @@ assignment: Some(pb::Assignment { environment_id: spec.id.clone(), node_id: self
         if error != tonic::Code::Ok {
             return Err(Status::new(error, "injected missing create response"));
         }
-        Ok(Response::new(pb::EnvironmentResult { record: Some(record), durability: pb::Durability::Published as i32 }))
+        Ok(Response::new(pb::EnvironmentResult { newly_created, record: Some(record), durability: pb::Durability::Published as i32 }))
     }
 }, [
     get_scheduling_queue(GetSchedulingQueueRequest) -> GetSchedulingQueueResponse,
@@ -292,7 +293,10 @@ async fn snapshot_create_uses_coordinator_even_with_a_live_local_first_entry() {
             .clients
             .create_environment(request, Duration::from_secs(2)),
     );
-    assert_eq!(first.unwrap(), replay.unwrap());
+    let (first, replay) = (first.unwrap(), replay.unwrap());
+    assert_eq!(first.record, replay.record);
+    assert_eq!(first.durability, replay.durability);
+    assert_ne!(first.newly_created, replay.newly_created);
     assert_eq!(fixture.state.create_calls.load(Ordering::SeqCst), 2);
     assert_eq!(fixture.state.starts.load(Ordering::SeqCst), 1);
 }
@@ -359,12 +363,22 @@ async fn creation_metrics_wait_for_result_and_count_replay_as_a_response() {
     let metrics = fixture.service.metrics();
     assert!(metrics.contains("adx_environment_create_in_flight 1\n"));
     assert!(metrics.contains("adx_environment_create_responses_total{outcome=\"success\"} 0\n"));
+    fixture.state.block_response.store(false, Ordering::SeqCst);
     fixture.state.release.notify_one();
     pending.await.unwrap().unwrap();
     fixture.create("observed", "observed").await.unwrap();
     let metrics = fixture.service.metrics();
     assert!(metrics.contains("adx_environment_create_in_flight 0\n"));
     assert!(metrics.contains("adx_environment_create_responses_total{outcome=\"success\"} 2\n"));
+    assert!(
+        metrics.contains("adx_environment_create_success_call_duration_seconds_count 1\n"),
+        "{metrics}"
+    );
+    fixture.create("observed", "different-call").await.unwrap();
+    assert!(fixture
+        .service
+        .metrics()
+        .contains("adx_environment_create_success_call_duration_seconds_count 1\n"));
     assert!(!metrics.contains("environment_id="));
     assert_eq!(fixture.state.starts.load(Ordering::SeqCst), 1);
 }
@@ -419,6 +433,10 @@ async fn private_metrics_include_rejected_http_arrivals_without_reporting_succes
         .await
         .unwrap();
     assert!(text.contains("adx_environment_create_requests_total{source=\"http\"} 3\n"));
+    assert!(
+        text.contains("adx_environment_create_rejections_total{reason=\"unauthenticated\"} 3\n"),
+        "{text}"
+    );
     assert!(text.contains("adx_environment_create_responses_total{outcome=\"success\"} 0\n"));
     assert!(text.contains("adx_environment_create_in_flight 0\n"));
     assert_eq!(
@@ -1055,4 +1073,129 @@ async fn local_first_claim_persistence_is_an_independent_opt_in() {
             vec![persist.unwrap_or(false)]
         );
     }
+}
+
+#[path = "../../../build/observability/tests/prometheus.rs"]
+mod prometheus;
+
+#[tokio::test]
+#[ignore = "requires native Prometheus and evidence directory"]
+async fn prometheus_collects_new_creation_latency_without_replay_samples() {
+    let fixture = Fixture::new().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let metrics = tokio::spawn(adx_apiserver::metrics::serve(
+        listener,
+        fixture.service.clone(),
+    ));
+    let mut collector = prometheus::Collector::start("apiserver", address).await;
+    collector
+        .wait_value(
+            "adx_environment_create_success_call_duration_seconds_count",
+            0.0,
+        )
+        .await;
+    fixture.create("collected", "first").await.unwrap();
+    fixture.create("collected", "first").await.unwrap();
+    fixture.create("collected", "reuse").await.unwrap();
+    fixture
+        .state
+        .response_error
+        .store(tonic::Code::Unavailable as usize, Ordering::SeqCst);
+    assert!(fixture
+        .create("response-lost", "response-lost")
+        .await
+        .is_err());
+    fixture.state.response_error.store(0, Ordering::SeqCst);
+    fixture
+        .create("response-lost", "response-lost")
+        .await
+        .unwrap();
+    fixture
+        .state
+        .scheduling_expired
+        .store(true, Ordering::SeqCst);
+    assert!(fixture
+        .create("schedule-failed", "schedule-failed")
+        .await
+        .is_err());
+    collector
+        .wait_value(
+            "adx_environment_create_responses_total{outcome=\"unknown\"}",
+            1.0,
+        )
+        .await;
+    collector.wait_value("adx_environment_create_errors_total{outcome=\"failure\",stage=\"scheduling\",reason=\"timeout\"}",1.0).await;
+    collector
+        .wait_value(
+            "adx_environment_create_success_call_duration_seconds_count",
+            1.0,
+        )
+        .await;
+    collector
+        .wait_value(
+            "adx_environment_create_responses_total{outcome=\"success\"}",
+            4.0,
+        )
+        .await;
+    let p95 = "histogram_quantile(0.95,sum by(le)(rate(adx_environment_create_success_call_duration_seconds_bucket[1m])))";
+    let value = collector.query(p95).await.unwrap();
+    assert!(value.is_finite() && value > 0.0, "{value}");
+    collector.capture().await;
+    metrics.abort();
+}
+
+#[tokio::test]
+async fn unnamed_requests_keep_identity_across_api_replicas_and_tenants() {
+    let fixture = Fixture::new().await;
+    let replica = EnvironmentService::new(fixture.clients.clone());
+    let input = json!({"image":"image"});
+    let a = fixture
+        .service
+        .prepare_create_with_request(input.clone(), &caller(), "same")
+        .unwrap();
+    let b = replica
+        .prepare_create_with_request(input.clone(), &caller(), "same")
+        .unwrap();
+    assert_eq!(a.id, b.id);
+    let other_tenant = pb::CallerContext {
+        tenant_id: "other".into(),
+        administrator: false,
+    };
+    let c = replica
+        .prepare_create_with_request(input.clone(), &other_tenant, "same")
+        .unwrap();
+    assert_ne!(a.id, c.id);
+    assert!(replica
+        .prepare_create_with_request(input, &caller(), "")
+        .is_err());
+}
+
+#[tokio::test]
+async fn invalid_name_types_are_rejected_before_default_identity() {
+    let fixture = Fixture::new().await;
+    for name in [json!(42), json!(true), json!(null), json!([]), json!({})] {
+        let input = json!({"image":"image", "name":name});
+        let result = fixture
+            .service
+            .prepare_create_with_request(input, &caller(), "request");
+        assert_eq!(result.unwrap_err().code(), tonic::Code::InvalidArgument);
+    }
+    let absent = fixture
+        .service
+        .prepare_create_with_request(json!({"image":"image"}), &caller(), "request")
+        .unwrap();
+    let empty = fixture
+        .service
+        .prepare_create_with_request(json!({"image":"image", "name":""}), &caller(), "request")
+        .unwrap();
+    assert_eq!(absent.id, empty.id);
+    let input = json!({"image":"image", "name":"explicit"});
+    assert_eq!(
+        fixture
+            .service
+            .prepare_create_with_request(input.clone(), &caller(), "request")
+            .unwrap(),
+        fixture.service.prepare_create(input, &caller()).unwrap()
+    );
 }
