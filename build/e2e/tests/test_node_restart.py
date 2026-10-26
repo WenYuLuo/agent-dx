@@ -237,6 +237,10 @@ class SandboxdRestartTests(unittest.TestCase):
                 mock.patch.object(node, 'P', root),
                 mock.patch.object(node, 'E', root),
                 mock.patch.object(node, 'backend', side_effect=lambda: next(observed)),
+                mock.patch.object(node, 'command', return_value='Healthz status: SERVING'),
+                mock.patch.object(node, 'nodes', return_value=[
+                    {'node': {'id': 'node1', 'available': True, 'runtime_classes': ['runsc']}}
+                ]),
                 mock.patch.object(node.os, 'kill', side_effect=terminate),
                 mock.patch.object(node.time, 'sleep'),
                 mock.patch.object(sys, 'argv', ['node.py', 'restart-sandboxd', 'node1']),
