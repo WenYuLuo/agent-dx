@@ -8,7 +8,7 @@ type Key = (String, String);
 pub struct DfsOpenReadConnection(std::sync::Weak<dyn std::any::Any + Send + Sync>);
 impl DfsOpenReadConnection {
     pub(super) fn from_request<T>(request: &tonic::Request<T>) -> Option<Self> {
-        request.peer_certs().map(|certificates| {
+        afs_transport::grpc::peer_certificates(request).map(|certificates| {
             let owner: Arc<dyn std::any::Any + Send + Sync> = certificates;
             Self(Arc::downgrade(&owner))
         })
@@ -748,8 +748,17 @@ mod tests {
         validator: Arc<dyn DfsReadGrantValidator>,
         limits: crate::node::read_pipeline::ReadPipelineLimits,
     ) -> PipelineTlsFixture {
+        pipeline_tls_modes(local, validator, limits, true, true).await
+    }
+    async fn pipeline_tls_modes(
+        local: Arc<LocalChunkStore>,
+        validator: Arc<dyn DfsReadGrantValidator>,
+        limits: crate::node::read_pipeline::ReadPipelineLimits,
+        server_encrypted: bool,
+        client_encrypted: bool,
+    ) -> PipelineTlsFixture {
         use super::test_tls::*;
-        use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity, ServerTlsConfig};
+        use tonic::transport::Endpoint;
         struct Peer;
         impl PeerAuthenticator for Peer {
             fn authenticate(
@@ -788,36 +797,139 @@ mod tests {
                 payload_metrics: None,
             },
         );
+        let credentials = tempfile::tempdir().unwrap();
+        let make_policy = |encrypted, cert: &str, key: &str, label| {
+            let ca = credentials.path().join("ca.pem");
+            std::fs::write(&ca, CA_PEM).unwrap();
+            let c = credentials.path().join(format!("{label}.pem"));
+            std::fs::write(&c, cert).unwrap();
+            let k = credentials.path().join(format!("{label}.key"));
+            std::fs::write(&k, key).unwrap();
+            afs_transport::SecurityManager::new(afs_transport::TlsConfig::MutualTls {
+                encryption_enabled: encrypted,
+                ca_certificate: ca,
+                identity_certificate: c,
+                identity_private_key: k,
+                server_name: "localhost".into(),
+            })
+            .unwrap()
+        };
+        let server_security =
+            make_policy(server_encrypted, SERVER_CERT_PEM, SERVER_KEY_PEM, "server");
+        let client_security =
+            make_policy(client_encrypted, CLIENT_CERT_PEM, CLIENT_KEY_PEM, "client");
+        let incoming = server_security
+            .incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+            .unwrap();
         let server = tokio::spawn(async move {
             tonic::transport::Server::builder()
-                .tls_config(
-                    ServerTlsConfig::new()
-                        .client_ca_root(Certificate::from_pem(CA_PEM))
-                        .identity(Identity::from_pem(SERVER_CERT_PEM, SERVER_KEY_PEM)),
-                )
-                .unwrap()
                 .add_service(service)
-                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                .serve_with_incoming(incoming)
                 .await
                 .unwrap();
         });
-        let channel = Endpoint::from_shared(endpoint)
-            .unwrap()
-            .initial_stream_window_size(65_535)
-            .initial_connection_window_size(65_535)
-            .tls_config(
-                ClientTlsConfig::new()
-                    .ca_certificate(Certificate::from_pem(CA_PEM))
-                    .identity(Identity::from_pem(CLIENT_CERT_PEM, CLIENT_KEY_PEM))
-                    .domain_name("localhost"),
+        let channel = client_security
+            .connect_lazy(
+                Endpoint::from_shared(client_security.endpoint_uri(&endpoint))
+                    .unwrap()
+                    .initial_stream_window_size(65_535)
+                    .initial_connection_window_size(65_535),
             )
-            .unwrap()
-            .connect()
-            .await
             .unwrap();
         let client = afs_protocol::node_data::dfs_chunks_client::DfsChunksClient::new(channel);
         PipelineTlsFixture { client, server }
     }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unified_tls_modes_keep_open_authorization_fast_lane() {
+        for (bulk, client_bulk) in [(true, true), (false, false)] {
+            let temp = tempfile::tempdir().unwrap();
+            let local = Arc::new(
+                LocalChunkStore::open(temp.path(), "node-a")
+                    .unwrap()
+                    .with_peer_read_crc_mode(crate::config::DfsReadCrcMode::Off),
+            );
+            let validator = Arc::new(PageValidator {
+                calls: AtomicUsize::new(0),
+                gate: None,
+            });
+            let PipelineTlsFixture { mut client, server } = pipeline_tls_modes(
+                local,
+                validator.clone(),
+                crate::node::read_pipeline::ReadPipelineLimits {
+                    ..Default::default()
+                },
+                bulk,
+                client_bulk,
+            )
+            .await;
+            let mut warm = tonic::Request::new(request());
+            warm.metadata_mut()
+                .insert("x-afs-open-fast", "1".parse().unwrap());
+            warm.metadata_mut()
+                .insert("x-afs-read-crc-mode", "off".parse().unwrap());
+            let mut body = client.read_ranges(warm).await.unwrap().into_inner();
+            let _ = body.message().await;
+            drop(body);
+            let mut group = request();
+            let token = group.operations[0].grant.as_ref().unwrap().token.clone();
+            group.operations[0].grant = Some(afs_protocol::node_data::DfsReadGrant {
+                token,
+                ..Default::default()
+            });
+            let mut second = group.operations[0].clone();
+            second.operation_index = 1;
+            second.chunk_offset = 1024;
+            second.destination_offset = 1024;
+            group.operations.push(second);
+            let mut group = tonic::Request::new(group);
+            group
+                .metadata_mut()
+                .insert("x-afs-open-fast", "1".parse().unwrap());
+            group
+                .metadata_mut()
+                .insert("x-afs-read-crc-mode", "off".parse().unwrap());
+            let response = client.read_ranges(group).await;
+            server.abort();
+            assert!(
+                response.is_ok(),
+                "enabled authenticated grouped request must reach fixed-open admission: {:?}",
+                response.as_ref().err()
+            );
+            let response = response.unwrap();
+            assert_eq!(response.metadata().get("x-afs-open-fast").unwrap(), "1");
+            assert!(response.metadata().get("x-afs-read-batch-v1").is_some());
+            assert_eq!(
+                validator.calls.load(Ordering::SeqCst),
+                1,
+                "same one open authorization in both modes"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unified_tls_mode_mismatch_fails_before_authorization() {
+        let temp = tempfile::tempdir().unwrap();
+        let local = Arc::new(
+            LocalChunkStore::open(temp.path(), "node-a")
+                .unwrap()
+                .with_peer_read_crc_mode(crate::config::DfsReadCrcMode::Off),
+        );
+        let validator = Arc::new(PageValidator {
+            calls: AtomicUsize::new(0),
+            gate: None,
+        });
+        let PipelineTlsFixture { mut client, server } =
+            pipeline_tls_modes(local, validator.clone(), Default::default(), true, false).await;
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            client.read_ranges(request()),
+        )
+        .await;
+        server.abort();
+        assert!(response.is_err() || response.unwrap().is_err());
+        assert_eq!(validator.calls.load(Ordering::SeqCst), 0);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn read_concurrency_real_mtls_service_routes_group_to_fast_lane() {
         let temp = tempfile::tempdir().unwrap();
@@ -1612,6 +1724,7 @@ mod tests {
             PeerConnectionPool::new(
                 afs_transport::GrpcConfig::default(),
                 afs_transport::TlsConfig::MutualTls {
+                    encryption_enabled: true,
                     ca_certificate: ca,
                     identity_certificate: cert,
                     identity_private_key: key,

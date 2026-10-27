@@ -218,6 +218,9 @@ pub struct Cli {
     /// 对外发布的本 Node gRPC URI；监听 0.0.0.0 时必须显式指定。
     #[arg(long)]
     pub advertise_endpoint: Option<String>,
+    /// Encrypt AFS internal traffic after mutual certificate authentication (default false).
+    #[arg(long)]
+    pub tls_encryption_enabled: Option<bool>,
     #[arg(long)]
     pub tls_ca_certificate: Option<PathBuf>,
     #[arg(long)]
@@ -430,6 +433,7 @@ struct FileConfig {
     allow_volatile_meta: Option<bool>,
     peer_endpoint: Option<String>,
     advertise_endpoint: Option<String>,
+    tls_encryption_enabled: Option<bool>,
     tls_ca_certificate: Option<PathBuf>,
     tls_identity_certificate: Option<PathBuf>,
     tls_identity_private_key: Option<PathBuf>,
@@ -538,6 +542,7 @@ pub struct Config {
     pub allow_volatile_meta: bool,
     pub peer_endpoint: Option<String>,
     pub advertise_endpoint: Option<String>,
+    pub tls_encryption_enabled: bool,
     pub tls_ca_certificate: Option<PathBuf>,
     pub tls_identity_certificate: Option<PathBuf>,
     pub tls_identity_private_key: Option<PathBuf>,
@@ -967,6 +972,10 @@ impl Config {
                 .unwrap_or(false),
             peer_endpoint: cli.peer_endpoint.or(file.peer_endpoint),
             advertise_endpoint: cli.advertise_endpoint.or(file.advertise_endpoint),
+            tls_encryption_enabled: cli
+                .tls_encryption_enabled
+                .or(file.tls_encryption_enabled)
+                .unwrap_or(false),
             tls_ca_certificate: cli.tls_ca_certificate.or(file.tls_ca_certificate),
             tls_identity_certificate: cli
                 .tls_identity_certificate
@@ -1260,6 +1269,11 @@ impl Config {
         .into_iter()
         .filter(|value| *value)
         .count();
+        if cfg.tls_encryption_enabled && tls_count == 0 {
+            return Err(invalid(
+                "tls_encryption_enabled requires all four tls_* identity fields",
+            ));
+        }
         if tls_count != 0 && tls_count != 4 {
             return Err(invalid("all four tls_* fields are required together"));
         }
@@ -1356,6 +1370,7 @@ impl Config {
         ) {
             (Some(ca), Some(cert), Some(key), Some(server_name)) => {
                 afs_transport::grpc::TlsConfig::MutualTls {
+                    encryption_enabled: self.tls_encryption_enabled,
                     ca_certificate: ca.clone(),
                     identity_certificate: cert.clone(),
                     identity_private_key: key.clone(),

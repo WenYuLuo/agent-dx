@@ -2045,11 +2045,11 @@ pub fn authenticate_peer<T>(
     authenticator: &dyn PeerAuthenticator,
     request: &Request<T>,
 ) -> Result<String, Status> {
-    let certificates = request.peer_certs();
+    let certificates = afs_transport::grpc::peer_certificates(request);
     authenticator
         .authenticate(
             request.metadata(),
-            request.remote_addr(),
+            afs_transport::grpc::peer_remote_addr(request),
             certificates
                 .as_ref()
                 .and_then(|certs| certs.first().map(|cert| cert.as_ref())),
@@ -3526,9 +3526,8 @@ impl OwnerFilesService {
         };
         let started = std::time::Instant::now();
         let metadata = request.metadata().clone();
-        let remote_addr = request.remote_addr();
-        let peer_cert_der = request
-            .peer_certs()
+        let remote_addr = afs_transport::grpc::peer_remote_addr(&request);
+        let peer_cert_der = afs_transport::grpc::peer_certificates(&request)
             .and_then(|certs| certs.iter().next().map(|cert| cert.as_ref().to_vec()));
         let request = request.into_inner();
         let work = move || {

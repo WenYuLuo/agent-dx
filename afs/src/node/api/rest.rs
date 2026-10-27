@@ -99,15 +99,14 @@ async fn diagnose(node: Arc<Node>) -> afs_error::Result<Value> {
         request_timeout: timeout,
         ..Default::default()
     };
+    let security = afs_transport::grpc::SecurityManager::new(tls.clone())
+        .map_err(|e| Error::coded(CLIENT_ARGUMENT_INVALID, e.to_string()))?;
     let endpoint = grpc_config.configure_client(
-        tonic::transport::Endpoint::from_shared(peer_endpoint.clone())
+        tonic::transport::Endpoint::from_shared(security.endpoint_uri(peer_endpoint))
             .map_err(|e| Error::coded(CLIENT_ARGUMENT_INVALID, e.to_string()))?,
     );
-    let channel = afs_transport::grpc::SecurityManager::new(tls.clone())
-        .map_err(|e| Error::coded(CLIENT_ARGUMENT_INVALID, e.to_string()))?
-        .configure_client(endpoint)
-        .map_err(|e| Error::coded(CLIENT_ARGUMENT_INVALID, e.to_string()))?
-        .connect()
+    let channel = security
+        .connect(endpoint)
         .await
         .map_err(|e| Error::coded(CLIENT_CONNECTION_UNAVAILABLE, e.to_string()))?;
     let mut control = NodeControlClient::new(afs_tracing::traced_channel(channel));

@@ -78,7 +78,7 @@ fn authenticated_node_id<T>(
     if !meta.enforce_peer_identity {
         return Ok(None);
     }
-    let certs = request.peer_certs().ok_or_else(|| {
+    let certs = afs_transport::grpc::peer_certificates(request).ok_or_else(|| {
         permission_denied("mTLS peer certificate is required for Meta authority RPC")
     })?;
     let leaf = certs.first().ok_or_else(|| {

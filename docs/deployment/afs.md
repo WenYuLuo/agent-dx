@@ -150,6 +150,19 @@ sudo adxctl validate
 证书绑定表不能替代 TLS 配置；启用 OwnerFs 或 DFS 权威的 Meta 缺少 mTLS 时，
 必须在监听端口和打开持久后端前拒绝启动。
 
+组件间持续传输加密统一由顶层 `tls_encryption_enabled` 控制，Node／Meta默认均为
+false；可在TOML或CLI（`--tls-encryption-enabled true|false`）覆盖。false仍需要
+原CA、证书、私钥、服务端名称及受信节点映射：连接先完成双向证书认证，再按AFS1
+协议切换明文；true持续使用标准TLS。读、写、副本、Meta、控制和内部诊断使用同一
+公共策略；UDS、RDMA及原REST入口不因该开关新增TLS。
+
+关闭加密后，后续正文、请求头和Meta／控制消息不受链路保密及密码学防篡改保护。
+初始证书认证和CRC不能替代持续保护。受控且无主动攻击者的网络可使用默认模式，
+其他网络应统一开启加密。模式不兼容明确失败，不自动降级，修改配置后重启生效。
+
+与旧节点或grpcurl等标准TLS客户端互通时，新节点显式开启加密；旧版仍沿用原TLS
+配置，不向旧版下发它不认识的新字段。全部升级后再统一切换为false并重启。
+
 示例 Node 配置使用 mTLS `https://` endpoint、`/opt/adx/data/afs/node-a` 和
 `/opt/adx/run/afs/node-a.sock`。前台运行 `sudo adxctl run` 后，在另一终端用
 `sudo adxctl status` 检查 Meta 与 Node 都返回 `status=ready`，并用

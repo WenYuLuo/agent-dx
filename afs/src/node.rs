@@ -2158,13 +2158,10 @@ async fn run_node(
     let stop = services.stop.subscribe();
     let grpc_config = afs_transport::grpc::GrpcConfig::default();
     let grpc_security = afs_transport::grpc::SecurityManager::new(cfg.tls_config())?;
-    let grpc_server = grpc_security.configure_server(configure_node_tcp_server(
-        &grpc_config,
-        cfg.ownerfs,
-        cfg.dfs,
-    ))?;
+    let grpc_server = configure_node_tcp_server(&grpc_config, cfg.ownerfs, cfg.dfs);
     let incoming =
         grpc_config.configure_tcp_incoming(tonic::transport::server::TcpIncoming::from(grpc));
+    let incoming = grpc_security.incoming(incoming)?;
     // 业务 Handler 在 Node，公共 transport 只提供 builder 配置和低层搬运机制。
     #[cfg(any(feature = "ownerfs", feature = "dfs"))]
     let dfs_trusted = cfg

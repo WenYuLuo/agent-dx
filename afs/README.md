@@ -7,7 +7,8 @@ OwnerFs 与 DistributedFs（DFS）两种文件访问模式。`afs-meta` 管理�
 保持独立，只复用 ADX 的构建、发布与进程管理入口。
 
 AFS 默认不进入普通 ADX 构建和发布包；通过 `ADX_WITH_AFS=1` 显式启用。
-当前部署必须使用 mTLS，并把每张受信节点证书精确绑定到一个 Node ID。
+当前部署必须保留双向证书身份认证，并把每张受信节点证书精确绑定到一个 Node ID。
+组件间持续传输加密由统一的 `tls_encryption_enabled` 控制，默认 false；证书配置仍必需。
 DFS Peer 客户端允许接收 128 KiB HTTP/2 DATA 帧；业务消息、流控窗口、正文预算、
 并发和校验合同保持不变，对端仍可发送更小的帧。
 
@@ -235,3 +236,15 @@ cargo run -p afs-client --example usrbio_round_trip -- /run/afs/node.sock /mnt/a
 原生gRPC读统一异步，等待Meta/网络时释放AFS工作线程；应用接口不变，不提供同步/异步选择开关。执行线程、已接纳任务、在途RPC、回复缓冲和A端读盘深度分别有界。固定版本/授权、同fh顺序和真实工作退役规则继续保留，本地磁盘及同步后端保留必要适配。
 
 [配置及最小编程范式](../docs/performance/afs-remote-read-20261024/read-concurrency.md)和[冻结候选/主线集成的验证边界](../docs/performance/afs-remote-read-20261024/unified-read-20261026.md)分别说明实现与证据。性能例外、缓存准备及既有兼容性遗留继续跟踪，不因代码合入自动准入。
+
+
+### Internal transport authentication and encryption
+
+Node and Meta share `tls_encryption_enabled = false` by default. With the existing
+CA/certificate/private-key/server-name configuration, mutual certificate identity
+is always verified; the switch controls ongoing TCP/gRPC encryption across read,
+write, replica, Meta and control relations. Set it to `true` consistently to keep
+full TLS, including when using standard TLS-only diagnostic clients. False uses
+an AFS-specific authenticated-handshake/plaintext protocol and gives no subsequent
+cryptographic confidentiality or integrity. See
+[transport contract](../docs/testing/afs.md#unified-internal-transport-encryption).

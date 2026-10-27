@@ -1012,9 +1012,10 @@ impl PeerConnectionPool {
             entry.touched = std::time::Instant::now();
             return Ok(entry.channel.clone());
         }
-        let endpoint = Endpoint::from_shared(endpoint.to_owned()).map_err(|error| {
-            afs_error::Error::coded(afs_error::CLIENT_ARGUMENT_INVALID, error.to_string())
-        })?;
+        let endpoint =
+            Endpoint::from_shared(self.security.endpoint_uri(endpoint)).map_err(|error| {
+                afs_error::Error::coded(afs_error::CLIENT_ARGUMENT_INVALID, error.to_string())
+            })?;
         let endpoint = if request_timeout {
             self.config.configure_client(endpoint)
         } else {
@@ -1030,10 +1031,9 @@ impl PeerConnectionPool {
         } else {
             DFS_PEER_RECEIVE_FRAME_BYTES
         });
-        let endpoint = self.security.configure_client(endpoint).map_err(|error| {
+        let channel = self.security.connect_lazy(endpoint).map_err(|error| {
             afs_error::Error::coded(afs_error::CLIENT_ARGUMENT_INVALID, error.to_string())
         })?;
-        let channel = endpoint.connect_lazy();
         if request_timeout {
             self.publish_channel(state, key.clone(), channel.clone());
         } else {
@@ -6704,14 +6704,14 @@ async fn connect_channel(
     timeout: Duration,
     tls: afs_transport::TlsConfig,
 ) -> PeerResult<Channel> {
-    let endpoint = Endpoint::from_shared(endpoint.to_string())?
+    let security = afs_transport::SecurityManager::new(tls)
+        .map_err(|error| PeerError::coded(afs_error::CLIENT_ARGUMENT_INVALID, error.to_string()))?;
+    let endpoint = Endpoint::from_shared(security.endpoint_uri(endpoint))?
         .connect_timeout(timeout)
         .timeout(timeout);
-    let endpoint = afs_transport::SecurityManager::new(tls)
-        .map_err(|error| PeerError::coded(afs_error::CLIENT_ARGUMENT_INVALID, error.to_string()))?
-        .configure_client(endpoint)
-        .map_err(|error| PeerError::coded(afs_error::CLIENT_ARGUMENT_INVALID, error.to_string()))?;
-    Ok(endpoint.connect().await?)
+    security.connect(endpoint).await.map_err(|error| {
+        PeerError::coded(afs_error::CLIENT_CONNECTION_UNAVAILABLE, error.to_string())
+    })
 }
 
 fn validate_length(length: usize) -> PeerResult<()> {
@@ -8454,6 +8454,7 @@ mod tests {
             rdma_device: None,
             timeout: Duration::from_millis(10),
             tls: afs_transport::TlsConfig::MutualTls {
+                encryption_enabled: true,
                 ca_certificate: "missing-ca.pem".into(),
                 identity_certificate: "missing-client.pem".into(),
                 identity_private_key: "missing-client-key.pem".into(),

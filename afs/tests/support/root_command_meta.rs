@@ -142,8 +142,9 @@ async fn main() -> Result<(), BoxError> {
     let grpc_config = afs_transport::grpc::GrpcConfig::default();
     let incoming =
         grpc_config.configure_tcp_incoming(tonic::transport::server::TcpIncoming::from(grpc));
-    let server = afs_transport::grpc::SecurityManager::new(cfg.tls_config())?
-        .configure_server(grpc_config.configure_server(tonic::transport::Server::builder()))?;
+    let incoming =
+        afs_transport::grpc::SecurityManager::new(cfg.tls_config())?.incoming(incoming)?;
+    let server = grpc_config.configure_server(tonic::transport::Server::builder());
     services.spawn({
         let state = state.clone();
         async move {

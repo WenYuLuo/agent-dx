@@ -86,15 +86,14 @@ pub async fn ping(
         request_timeout: timeout,
         ..Default::default()
     };
+    let security = SecurityManager::new(tls)
+        .map_err(|e| Error::coded(CLIENT_ARGUMENT_INVALID, e.to_string()))?;
     let endpoint = config.configure_client(
-        Endpoint::from_shared(endpoint.to_owned())
+        Endpoint::from_shared(security.endpoint_uri(endpoint))
             .map_err(|e| Error::coded(CLIENT_ARGUMENT_INVALID, e.to_string()))?,
     );
-    let channel = SecurityManager::new(tls)
-        .map_err(|e| Error::coded(CLIENT_ARGUMENT_INVALID, e.to_string()))?
-        .configure_client(endpoint)
-        .map_err(|e| Error::coded(CLIENT_ARGUMENT_INVALID, e.to_string()))?
-        .connect()
+    let channel = security
+        .connect(endpoint)
         .await
         .map_err(|e| Error::coded(CLIENT_CONNECTION_UNAVAILABLE, e.to_string()))?;
     let mut client = MetaClient::new(afs_tracing::traced_channel(channel))
@@ -120,6 +119,7 @@ mod ping_tls_tests {
             "node-a",
             Duration::from_millis(10),
             TlsConfig::MutualTls {
+                encryption_enabled: true,
                 ca_certificate: "missing-ca.pem".into(),
                 identity_certificate: "missing-client.pem".into(),
                 identity_private_key: "missing-client-key.pem".into(),
@@ -251,6 +251,7 @@ mod registration_connect_tests {
             node_descriptor(&endpoint),
             Duration::from_secs(2),
             TlsConfig::MutualTls {
+                encryption_enabled: true,
                 ca_certificate: tls.ca.clone(),
                 identity_certificate: tls.client_cert.clone(),
                 identity_private_key: tls.client_key.clone(),
@@ -518,20 +519,20 @@ impl GrpcRootMeta {
         timeout: Duration,
         tls: TlsConfig,
     ) -> Result<Self> {
+        let security = SecurityManager::new(tls)
+            .map_err(|e| Error::coded(CLIENT_ARGUMENT_INVALID, e.to_string()))?;
         let endpoint = GrpcConfig {
             connect_timeout: timeout,
             request_timeout: timeout,
             ..Default::default()
         }
         .configure_client(
-            Endpoint::from_shared(endpoint.to_owned())
+            Endpoint::from_shared(security.endpoint_uri(endpoint))
                 .map_err(|e| Error::coded(CLIENT_ARGUMENT_INVALID, e.to_string()))?,
         );
-        let endpoint = SecurityManager::new(tls)
-            .map_err(|e| Error::coded(CLIENT_ARGUMENT_INVALID, e.to_string()))?
-            .configure_client(endpoint)
+        let channel = security
+            .connect_lazy(endpoint)
             .map_err(|e| Error::coded(CLIENT_ARGUMENT_INVALID, e.to_string()))?;
-        let channel = endpoint.connect_lazy();
         Ok(Self {
             channel,
             runtime: tokio::runtime::Handle::current(),
@@ -950,17 +951,19 @@ pub async fn register_node_with_readiness(
         request_timeout: timeout,
         ..Default::default()
     };
+    let security = SecurityManager::new(tls)
+        .map_err(|e| Error::coded(CLIENT_ARGUMENT_INVALID, e.to_string()))?;
     let endpoint = config.configure_client(
-        Endpoint::from_shared(endpoint.to_owned())
+        Endpoint::from_shared(security.endpoint_uri(endpoint))
             .map_err(|e| Error::coded(CLIENT_ARGUMENT_INVALID, e.to_string()))?,
     );
-    let channel = SecurityManager::new(tls)
-        .map_err(|e| Error::coded(CLIENT_ARGUMENT_INVALID, e.to_string()))?
-        .configure_client(endpoint)
-        .map_err(|e| Error::coded(CLIENT_ARGUMENT_INVALID, e.to_string()))?
-        .connect()
+    let channel = security
+        .connect(endpoint)
         .await
-        .map_err(map_registration_connect_error)?;
+        .map_err(|error| match error {
+            afs_transport::GrpcError::Transport(source) => map_registration_connect_error(source),
+            other => Error::coded(CLIENT_ARGUMENT_INVALID, other.to_string()),
+        })?;
     let mut client = MetaClient::new(afs_tracing::traced_channel(channel));
     let reply = client
         .register_node(RegisterNodeRequest {
@@ -1002,21 +1005,22 @@ impl GrpcDfsMeta {
         timeout: Duration,
         tls: TlsConfig,
     ) -> afs_error::Result<Self> {
+        let security = SecurityManager::new(tls)
+            .map_err(|e| Error::coded(CLIENT_ARGUMENT_INVALID, e.to_string()))?;
         let endpoint = GrpcConfig {
             connect_timeout: timeout,
             request_timeout: timeout,
             ..Default::default()
         }
         .configure_client(
-            Endpoint::from_shared(endpoint.to_owned())
+            Endpoint::from_shared(security.endpoint_uri(endpoint))
                 .map_err(|error| Error::coded(CLIENT_ARGUMENT_INVALID, error.to_string()))?,
         );
-        let endpoint = SecurityManager::new(tls)
-            .map_err(|error| Error::coded(CLIENT_ARGUMENT_INVALID, error.to_string()))?
-            .configure_client(endpoint)
-            .map_err(|error| Error::coded(CLIENT_ARGUMENT_INVALID, error.to_string()))?;
+        let channel = security
+            .connect_lazy(endpoint)
+            .map_err(|e| Error::coded(CLIENT_ARGUMENT_INVALID, e.to_string()))?;
         Ok(Self {
-            channel: afs_tracing::traced_channel(endpoint.connect_lazy()),
+            channel: afs_tracing::traced_channel(channel),
             runtime: tokio::runtime::Handle::current(),
             node_id,
             session_id,
