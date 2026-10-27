@@ -2,6 +2,8 @@
 """Build portable E2E images from a verified release; deployment never compiles."""
 
 import argparse
+import configparser
+from contextlib import contextmanager
 import hashlib
 import importlib.util
 import json
@@ -31,6 +33,34 @@ spec = importlib.util.spec_from_file_location('release_package', ROOT / 'build/r
 package = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(package)
 BACKEND_BINARIES = ('sandboxd', 'sbox', 'runc', 'runc-shim', 'sandbox-logger', 'redis-cli')
+
+
+
+@contextmanager
+def _pip_build_secret(environment):
+    """Pass the caller's pip settings to BuildKit without persisting them."""
+    settings = {}
+    for name, option in (
+        ('PIP_INDEX_URL', 'index-url'),
+        ('PIP_EXTRA_INDEX_URL', 'extra-index-url'),
+        ('PIP_DEFAULT_TIMEOUT', 'timeout'),
+    ):
+        value = environment.get(name)
+        if value:
+            if '\n' in value or '\r' in value:
+                raise ValueError('pip build settings must be single-line values')
+            settings[option] = value
+    if not settings:
+        yield []
+        return
+    config = configparser.ConfigParser(interpolation=None)
+    config['global'] = settings
+    # NamedTemporaryFile is mode 0600 and lives outside the Docker context.
+    # BuildKit exposes it only to the RUN step and removes its mount afterward.
+    with tempfile.NamedTemporaryFile(mode='w', prefix='adx-e2e-pip-', suffix='.conf') as secret:
+        config.write(secret)
+        secret.flush()
+        yield ['--secret', 'id=adx-pip-config,src=' + secret.name]
 
 
 def sha(path):
@@ -123,7 +153,7 @@ def main():
         tags['activator'] = f'adx-e2e-activator:{uid}'
     if a.workload_probes:
         tags['probes'] = f'adx-e2e-probes:{uid}'
-    with tempfile.TemporaryDirectory(prefix='adx-e2e-image-') as d:
+    with tempfile.TemporaryDirectory(prefix='adx-e2e-image-') as d, _pip_build_secret(os.environ) as pip_secret:
         context = Path(d)
         shutil.copytree(a.package, context / 'package')
         (context / 'sdk').mkdir()
@@ -159,8 +189,11 @@ def main():
                 '{BASE}\nCOPY --from=collector /otelcol-contrib /usr/local/bin'
                 '/otelcol-contrib\nCOPY observability /opt/adx/observability\nC'
                 'OPY package /opt/adx/package\nCOPY sdk /opt/adx/sdk\nCOPY back'
-                'end /usr/local/bin\nCOPY e2e /opt/adx/e2e\nRUN python3 -m venv'
-                ' /opt/adx/client && /opt/adx/client/bin/pip install /opt/adx'
+                'end /usr/local/bin\nCOPY e2e /opt/adx/e2e\n'
+                'RUN --mount=type=secret,id=adx-pip-config python3 -m venv'
+                ' /opt/adx/client && if [ -f /run/secrets/adx-pip-config ]; then'
+                ' export PIP_CONFIG_FILE=/run/secrets/adx-pip-config; fi'
+                ' && /opt/adx/client/bin/pip install /opt/adx'
                 '/sdk/*.whl\nWORKDIR /opt/adx\nCMD ["sleep", "infinity"]\n'
             )
         )
@@ -205,6 +238,7 @@ def main():
                     'build',
                     '--progress=plain',
                     '--provenance=false',
+                    *(pip_secret if role == 'node' else []),
                     '--build-arg',
                     'BASE=' + base,
                     '--build-arg',
@@ -242,7 +276,11 @@ def main():
             timeout=300,
         )
         if a.activator:
-            subprocess.run([_executable('docker'), 'save', '-o', str(a.output / 'activator.tar'), tags['activator']], check=True, timeout=300)
+            subprocess.run(
+                [_executable('docker'), 'save', '-o', str(a.output / 'activator.tar'), tags['activator']],
+                check=True,
+                timeout=300,
+            )
         if a.workload_probes:
             subprocess.run(
                 [_executable('docker'), 'save', '-o', str(a.output / 'workload-probes.tar'), tags['probes']],

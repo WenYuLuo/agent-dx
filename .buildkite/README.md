@@ -672,3 +672,9 @@ rebuild instruction. Package and install-smoke virtualenvs remain isolated.
 The Docker runner mounts the same persistent pip directory that it passes as
 `PIP_CACHE_DIR`; `PIP_INDEX_URL`, `PIP_EXTRA_INDEX_URL` and `PIP_DEFAULT_TIMEOUT`
 are forwarded when configured, for runs using an image without a wheelhouse.
+
+E2E node-image SDK installation honors `PIP_INDEX_URL`, `PIP_EXTRA_INDEX_URL`
+and `PIP_DEFAULT_TIMEOUT`, like the SDK package job. The image builder forwards
+these settings through a temporary BuildKit secret, outside its build context;
+index credentials are not stored in Docker build arguments or image layers.
+When no overrides are set, the runtime base image keeps its pip configuration.
