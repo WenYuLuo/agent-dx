@@ -72,8 +72,10 @@ if redis.call('HGET', KEYS[1], ARGV[3]) ~= ARGV[4] then return 0 end
 if ARGV[8] ~= '' and redis.call('HGET',KEYS[1],'header') ~= ARGV[8] then return 0 end
 local facts = cjson.decode(ARGV[7])
 if (redis.call('HGET',KEYS[3],facts[1]) or '') ~= facts[2] then return 0 end
+if (redis.call('HGET',KEYS[3],facts[4]) or '') ~= facts[5] then return 0 end
 redis.call('SET', KEYS[2], ARGV[5], 'PX', ARGV[6])
-redis.call('HSET',KEYS[3],facts[1],facts[3])
+redis.call('HSET',KEYS[3],facts[4],facts[6])
+redis.call('HDEL',KEYS[3],facts[1])
 redis.call('HDEL', KEYS[1], ARGV[3])
 if ARGV[8] ~= '' then
   redis.call('HSET',KEYS[1],'header',ARGV[9])
@@ -946,14 +948,20 @@ impl RedisStore {
                     .write()
                     .expect("node overlay lock poisoned")
                     .clear();
-                return Ok(Session {
+                let session = Session {
                     store: self.clone(),
                     epoch: h.epoch,
                     inspection: Arc::new(Mutex::new(None)),
                     generations: Arc::new(AtomicU64::new(
                         h.epoch.checked_mul(1_u64 << 32).ok_or(Error::Conflict)?,
                     )),
-                });
+                };
+                let mut active = raw;
+                for field in retired {
+                    active.remove(&field);
+                }
+                session.compact_retired_counters(&active).await?;
+                return Ok(session);
             }
         }
         Err(Error::Unavailable(
@@ -1881,6 +1889,7 @@ impl Session {
                 .as_deref()
                 .expect("validated control header is present");
             let applied = if result.state == EnvironmentState::Deleted {
+                counters.prepare_retirement(&self.store).await?;
                 self.store
                     .retire_environment(
                         expected_header,

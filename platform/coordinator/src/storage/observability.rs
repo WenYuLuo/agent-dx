@@ -1,4 +1,4 @@
-//! Business facts commit with their owning object; unrelated objects never compare a shared counter version.
+//! Live facts commit with their owning object; retirement folds into fixed CAS buckets.
 use super::*;
 use adx_core::observation::{
     now_millis, EvidenceSource, InterruptionEvidence, InterruptionReason, OperationIntent,
@@ -323,6 +323,59 @@ impl StoredEnvironment {
     }
 }
 impl Session {
+    /// Fold historical orphan fields once at startup, fenced by the new epoch.
+    /// Runtime retirement performs the same fold in its lifecycle transaction.
+    pub(super) async fn compact_retired_counters(
+        &self,
+        active: &BTreeMap<String, String>,
+    ) -> Result<()> {
+        let mut command = redis::cmd("HKEYS");
+        command.arg(format!("{}:business", self.store.key));
+        for field in self.store.query::<Vec<String>>(command).await? {
+            if active.contains_key(&field)
+                || !(field.starts_with("environment:") || field.starts_with("node:"))
+            {
+                continue;
+            }
+            for attempt in 0..ATTEMPTS {
+                let mut counters = CounterUpdate::load(&self.store, field.clone()).await?;
+                if counters.old.is_none() {
+                    break;
+                }
+                counters.prepare_retirement(&self.store).await?;
+                let mut command = redis::cmd("EVAL");
+                command
+                    .arg(
+                        r#"
+                    if redis.call('HGET',KEYS[1],'epoch') ~= ARGV[1] then return 3 end
+                    local facts = cjson.decode(ARGV[2])
+                    if redis.call('HEXISTS',KEYS[1],facts[1]) == 1 then return 2 end
+                    if (redis.call('HGET',KEYS[2],facts[1]) or '') ~= facts[2] then return 0 end
+                    if (redis.call('HGET',KEYS[2],facts[4]) or '') ~= facts[5] then return 0 end
+                    redis.call('HSET',KEYS[2],facts[4],facts[6])
+                    redis.call('HDEL',KEYS[2],facts[1]); return 1
+                    "#,
+                    )
+                    .arg(2)
+                    .arg(&self.store.key)
+                    .arg(format!("{}:business", self.store.key))
+                    .arg(self.epoch.to_string())
+                    .arg(counters.argument()?);
+                match self.store.query::<u8>(command).await? {
+                    1 | 2 => break,
+                    3 => return Err(Error::Conflict),
+                    _ if attempt + 1 == ATTEMPTS => {
+                        return Err(Error::Unavailable(
+                            "concurrent business history compaction; retry startup".into(),
+                        ));
+                    }
+                    _ => (),
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub async fn business_counters(&self) -> Result<BusinessCounters> {
         let [header] = self.store.fields([HEADER.into()]).await?;
         let mut total = self.header(&header)?.observability;
@@ -356,12 +409,18 @@ impl BusinessCounters {
     }
 }
 
-/// Retained cumulative facts for one object, including after its deletion.
+/// Live object facts are folded into 64 stable buckets on retirement.
 /// Rust checks u64 arithmetic; Lua compares opaque bytes with the lifecycle write.
 pub(super) struct CounterUpdate {
     pub field: String,
     pub old: Option<String>,
     pub value: BusinessCounters,
+    retired: Option<RetiredCounters>,
+}
+struct RetiredCounters {
+    field: String,
+    old: Option<String>,
+    value: BusinessCounters,
 }
 impl CounterUpdate {
     pub async fn load(store: &RedisStore, field: String) -> Result<Self> {
@@ -372,13 +431,44 @@ impl CounterUpdate {
     }
     pub fn new(field: String, old: Option<String>) -> Result<Self> {
         let value = old.as_deref().map(decode).transpose()?.unwrap_or_default();
-        Ok(Self { field, old, value })
+        Ok(Self {
+            field,
+            old,
+            value,
+            retired: None,
+        })
+    }
+    pub async fn prepare_retirement(&mut self, store: &RedisStore) -> Result<()> {
+        // Independent retirement buckets avoid a global control-header CAS.
+        let field = format!(
+            "retired:{:02x}",
+            Sha256::digest(self.field.as_bytes())[0] % 64
+        );
+        let mut total = Self::load(store, field.clone()).await?;
+        total.value.add(&self.value)?;
+        self.retired = Some(RetiredCounters {
+            field,
+            old: total.old,
+            value: total.value,
+        });
+        Ok(())
     }
     pub fn argument(&self) -> Result<String> {
+        let (retired_field, retired_old, retired_value) = match &self.retired {
+            Some(retired) => (
+                retired.field.as_str(),
+                retired.old.as_deref().unwrap_or(""),
+                encode(&retired.value)?,
+            ),
+            None => ("", "", String::new()),
+        };
         encode(&(
             &self.field,
             self.old.as_deref().unwrap_or(""),
             encode(&self.value)?,
+            retired_field,
+            retired_old,
+            retired_value,
         ))
     }
 }

@@ -145,6 +145,7 @@ impl Session {
                 membership.clone(),
                 raw.get(&membership).cloned().unwrap_or_default(),
             );
+            counters.prepare_retirement(&self.store).await?;
             let mut command = redis::cmd("EVAL");
             command
                 .arg(
@@ -156,7 +157,9 @@ impl Session {
                 for field,value in pairs(expected) do if (redis.call('HGET',KEYS[1],field) or '') ~= value then return 0 end end
                 local facts=cjson.decode(ARGV[3])
                 if (redis.call('HGET',KEYS[3],facts[1]) or '') ~= facts[2] then return 0 end
-                redis.call('HSET',KEYS[3],facts[1],facts[3])
+                if (redis.call('HGET',KEYS[3],facts[4]) or '') ~= facts[5] then return 0 end
+                redis.call('HSET',KEYS[3],facts[4],facts[6])
+                redis.call('HDEL',KEYS[3],facts[1])
                 local count=tonumber(ARGV[4]); for i=8,7+count*2,2 do redis.call('HSET',KEYS[1],ARGV[i],ARGV[i+1]) end
                 for i=8+count*2,7+(count+tail)*2,2 do redis.call('HSET',KEYS[2],ARGV[i],ARGV[i+1]) end
                 local cursor=8+(count+tail)*2

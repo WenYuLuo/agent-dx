@@ -3,6 +3,8 @@ mod artifact_lifecycle;
 #[path = "storage/claims.rs"]
 mod claims;
 mod common;
+#[path = "storage/counter_compaction.rs"]
+mod counter_compaction;
 #[path = "storage/dormancy.rs"]
 mod dormancy;
 #[path = "storage/observability.rs"]

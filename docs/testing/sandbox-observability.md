@@ -107,10 +107,15 @@ resolved_at_unix_millis。无法知道准确发生时间时 occurred_at 为 null
 event_id 按旧执行的 generation/runtime 固定，与 environment_id 一起关联；节点 incident_id
 按 worker/session/跨重启唯一序号固定。原始 failure 可在恢复时清除，中断证据与最近摘要保留。
 
-控制 header 记录统计覆盖起点。累计数保存在同 namespace 的 `:business` hash，
-按 Environment 和节点分别保存；每个对象的结果、最近摘要及其累计数在同一个 epoch-fenced
-Lua 事务内做条件更新，不同对象不比较全局 header 或共享计数版本。删除 Environment 保留
-累计数，重启和结果回放不重复计数。指标刷新仅聚合业务计数 hash，不读取全部控制目录。
+控制 header 记录统计覆盖起点。累计数保存在同 namespace 的 `:business` hash。
+活动 Environment 的结果、最近摘要及其对象计数在同一个 epoch-fenced Lua 事务内更新，
+普通对象提交只比较该对象版本。Environment 退役和节点失联提交将相关计数原子归并到
+按对象身份散列的 64 个固定 `retired:<bucket>` 字段，并删除已归并的对象计数字段；
+归并只额外比较目标桶的旧值，不改变全局控制 header。所有 u64 加法在 Rust 中检查，
+Lua 仅比较和写入序列化字节。删除回放、同名重建及 Redis/Coordinator 重启均保持累计口径。
+Coordinator 启动时在新 epoch 下归并已有孤立计数字段；崩溃后的重试不会重复归并。
+指标刷新读取当前对象计数和至多 64 个退役累计桶，读取规模随当前对象数量变化，
+不随历史退役对象总数持续增长，也不扫描全部控制目录。
 `StoredNode.last_incident_id` 用于当前失联周期的事件回放去重，重新确认可路由后清除；
 仅重连但仍在 reconciliation 的心跳不结束该失联周期。
 生命周期提交返回确认的完整 StoredEnvironment，同步内存中的中断和恢复摘要；
