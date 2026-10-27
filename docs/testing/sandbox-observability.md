@@ -64,6 +64,12 @@ unknown、失败和取消不进入成功耗时样本；后续确认成功不补�
 | `adx_observability_started_timestamp_seconds` | gauge/Unix 秒 | 新增；此 Redis 统计集的初始建立时间，未知时不导出 | Coordinator |
 
 所有直方图共享边界：0.01、0.05、0.1、0.5、1、2、5、10、30、60、300、3600、+Inf 秒。
+API errors/rejections and adxlet lifecycle-operation producers export bounded
+zero-valued label tuples from startup, allowing `increase()` to observe their
+first event after a prior scrape. Lifecycle baselines include reload/user,
+pause/user-or-idle, and delete/user-or-idle-or-policy; raw error details never
+become labels. Events before the first scrape remain outside this guarantee.
+
 API/adxlet counter 为进程内计数，重启归零；取消计数不等于用户主动取消，也不等于平台失败。
 Coordinator 业务累计数与权威状态原子写入 Redis，重连、普通重启及回放不归零。
 源数据建立前的历史不补计。人工清库或重建 namespace 后计数重新开始；普通 Coordinator epoch

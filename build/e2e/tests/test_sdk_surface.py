@@ -62,8 +62,8 @@ class PublicSdkSurfaceTests(unittest.TestCase):
         self.assertEqual(
             surface.counts(),
             {
-                'public_operations': 71,
-                'standalone': 60,
+                'public_operations': 72,
+                'standalone': 61,
                 'firecracker': 11,
                 'unsupported': 0,
             },

@@ -721,6 +721,7 @@ class Environment:
             body["ports"] = pf_ports
 
         self._sid = ""
+        self._newly_created = False
         try:
             if readiness_probe is not None or healthcheck_probe is not None:
                 self._client.require_workload_probes()
@@ -729,6 +730,7 @@ class Environment:
             if not isinstance(environment_id, str) or not environment_id:
                 raise RuntimeError(f"create response missing environment id: {create_info}")
             self._sid = environment_id
+            self._newly_created = create_info.get("newlyCreated") is True
 
             # ── reverse tunnel: connect after environment is running ──────────
             if upstream is not None:
@@ -796,7 +798,7 @@ class Environment:
                     )
                 self._tunnel_client = None
             try:
-                if self._sid:
+                if self._sid and self._newly_created:
                     self._client.delete(self._sid)
             except Exception as cleanup_error:
                 logger.warning(
@@ -839,6 +841,7 @@ class Environment:
                 raise RuntimeError(f"environment {environment_id} is not running: {info.get('status', 'unknown')}")
             environment = cls.__new__(cls)
             environment._sid = environment_id
+            environment._newly_created = False
             environment._client = client
             environment._connection = connection
             environment._detached = True
@@ -877,6 +880,16 @@ class Environment:
     @property
     def pty(self):
         return self._pty
+
+    @property
+    def newly_created(self) -> bool:
+        """Whether this logical create owns a confirmed new remote instance.
+
+        Reuse, attachment and responses without an explicit ownership bit are
+        false. Only a true value permits automatic initialization rollback.
+        Explicit ``delete`` and ``kill`` keep their documented semantics.
+        """
+        return self._newly_created
 
     @property
     def id(self) -> str:

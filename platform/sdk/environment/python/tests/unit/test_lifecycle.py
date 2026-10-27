@@ -386,7 +386,7 @@ class LifecycleTests(unittest.TestCase):
 
             @staticmethod
             def create_info(_body):
-                return {"environmentId": "environment-1", "status": "running"}
+                return {"environmentId": "environment-1", "status": "running", "newlyCreated": True}
 
             @staticmethod
             def delete(environment_id):

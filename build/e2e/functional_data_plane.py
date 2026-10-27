@@ -37,7 +37,7 @@ SERVER_COMMAND = (
 
 
 class _TunnelUpstream(http.server.BaseHTTPRequestHandler):
-    def do_GET(self):
+    def do_GET(self):  # noqa: N802 - BaseHTTPRequestHandler dispatch name.
         body = f'{TUNNEL_BODY}:{self.path}'.encode()
         self.send_response(200)
         self.send_header('Content-Length', str(len(body)))
@@ -180,6 +180,8 @@ def run(connection, image, output, ca_path, *, runtime='runc', node_ids=('node1'
             connection=connection,
             create_timeout=150,
         )
+        if not environment.newly_created:
+            raise AssertionError('new Environment must confirm creation ownership')
         if not (environment.environment_id == environment.id):
             raise AssertionError()
         info = environment.get_info()
@@ -187,6 +189,8 @@ def run(connection, image, output, ca_path, *, runtime='runc', node_ids=('node1'
             raise AssertionError()
         attached = Environment.from_id(environment.id, connection=connection)
         try:
+            if attached.newly_created:
+                raise AssertionError('attachment must not acquire creation ownership')
             result = attached.commands.run(
                 "printf '%s:%s' \"$PWD\" \"$E2E_FUNCTIONAL_ENV\"", cwd='/tmp', envs={'E2E_FUNCTIONAL_ENV': 'functional'}
             )
@@ -458,7 +462,9 @@ def run(connection, image, output, ca_path, *, runtime='runc', node_ids=('node1'
             create_timeout=150,
         )
         tls_command = SERVER_COMMAND.replace(str(PORT), str(TLS_PORT))
-        security_server = security_environment.commands.run(tls_command, background=True, command_id='functional-http-tls')
+        security_server = security_environment.commands.run(
+            tls_command, background=True, command_id='functional-http-tls'
+        )
         if not (_fetch_forwarded(security_environment, ca_path, port=TLS_PORT, authenticated=False) == EXPECTED_BODY):
             raise AssertionError()
         checks['per_instance_data_plane_security'] = True

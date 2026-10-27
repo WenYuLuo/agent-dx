@@ -345,6 +345,54 @@ async fn cancelled_schedule_is_cached_without_resubmission_or_runtime_start() {
 }
 
 #[tokio::test]
+async fn create_response_preserves_authoritative_creation_ownership() {
+    let fixture = Fixture::new().await;
+    let first = fixture.create("owned", "owner-request").await.unwrap();
+    assert_eq!(first["newlyCreated"], true);
+    let retry = fixture.create("owned", "owner-request").await.unwrap();
+    assert_eq!(retry["newlyCreated"], true);
+    let reuse = fixture.create("owned", "another-request").await.unwrap();
+    assert_eq!(reuse["newlyCreated"], false);
+    assert_eq!(first["environmentId"], reuse["environmentId"]);
+    assert_eq!(fixture.state.starts.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn concurrent_names_and_api_restart_do_not_transfer_creation_ownership() {
+    for local_first in [false, true] {
+        let fixture = Fixture::with_mode(600, local_first).await;
+        if local_first {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while fixture.clients.nodes().await.is_err() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        let (a, b) = tokio::join!(
+            fixture.create("shared-owner", "request-a"),
+            fixture.create("shared-owner", "request-b"),
+        );
+        let (a, b) = (a.unwrap(), b.unwrap());
+        assert_ne!(a["newlyCreated"], b["newlyCreated"]);
+        assert_eq!(a["environmentId"], b["environmentId"]);
+        let replica = EnvironmentService::new(fixture.clients.clone());
+        let recovered = replica
+            .create(
+                spec("shared-owner"),
+                json!({"name":"shared-owner"}),
+                "request-a",
+                &caller(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(recovered["newlyCreated"], false);
+        assert_eq!(fixture.state.starts.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
 async fn creation_metrics_wait_for_result_and_count_replay_as_a_response() {
     let fixture = Fixture::new().await;
     fixture.state.block_response.store(true, Ordering::SeqCst);

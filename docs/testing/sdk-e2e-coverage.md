@@ -4,14 +4,14 @@
 操作入口类、错误类型、数据／策略类型，以及 `resources()` 和
 `SDK_CAPABILITIES`。`Commands` 与 `Filesystem` 不单独顶层导出，但由 `Environment` 属性返回，
 也是用户接口。`EnvironmentFailure` 是 `EnvironmentInfo.failure` 使用的结构化失败数据，
-不新增独立操作；包含原生文件搜索后的公开操作为 71 个。
+不新增独立操作；包含原生文件搜索后的公开操作为 72 个。
 
 操作数的统计口径是上述操作入口及其返回对象的每个公开方法／属性，加顶层
 `resources()`；数据对象的本地校验和序列化不算独立 E2E 操作。构造参数和错误类型另外
 统计。一个业务用例可以同时覆盖多个操作，但 JUnit 必须展示稳定的子用例 ID，不能只显示
 `data-plane` 这一组名称。
 
-`build/e2e/sdk_surface.py` 保存 71 个操作的处置结果，并把全部 71 个已支持操作逐项关联到稳定的
+`build/e2e/sdk_surface.py` 保存 72 个操作的处置结果，并把全部 72 个已支持操作逐项关联到稳定的
 E2E case ID；静态测试会在 SDK 新增、删除或漏登记公开成员时失败。该映射只说明用例归属，
 仍以对应 Standalone／Firecracker 实跑结果作为通过证据。
 
@@ -19,20 +19,20 @@ E2E case ID；静态测试会在 SDK 新增、删除或漏登记公开成员时�
 
 | 公开对象 | 操作数 | E2E 覆盖 | 运行层级 | 说明 |
 |---|---:|---:|---|---|
-| `Environment` | 30 | 30 | Standalone + KVM FC | 普通生命周期、访问操作和 reverse tunnel 由 Standalone 验证；checkpoint、S3 rootfs/mount、入口继承、reload、运行期网络策略和 failover 由 FC 验证 |
+| `Environment` | 31 | 31 | Standalone + KVM FC | 普通生命周期、访问操作和 reverse tunnel 由 Standalone 验证；checkpoint、S3 rootfs/mount、入口继承、reload、运行期网络策略和 failover 由 FC 验证 |
 | `CommandHandle` | 8 | 8 | Standalone | ID、归属、poll、同步／异步 wait、kill、stdin、EOF |
 | `Commands` | 6 | 6 | Standalone | run/get/list/kill/send_stdin/close_stdin |
 | `Filesystem` | 11 | 11 | Standalone | 文本／二进制、CRUD、原生文件搜索、深度目录、双向目录复制 |
 | `Pty` / `PtySession` | 9 | 9 | Standalone | 创建、会话 ID、输入、EOF、resize、wait、终态和关闭 |
 | `Shells` / `Shell` | 6 | 6 | Standalone | 创建／集合关闭、会话 ID、状态保持、退出码、同步／异步关闭 |
 | `resources()` | 1 | 1 | Standalone | 两节点状态、CPU／内存／磁盘 capacity 与 allocatable、标签 |
-| **合计** | **71** | **71** |  | 每个公开操作均有关联的真实 E2E case ID |
+| **合计** | **72** | **72** |  | 每个公开操作均有关联的真实 E2E case ID |
 
 `volume.catalog-crud-and-replay` 在配置的租户 storage domain 中验证 Volume 定义的
 ensure/get/list/delete、同 ID 重放和分页。该用例验证 API Server 与 Coordinator
 目录持久化，不声明挂载、初始化或独占准入的运行时覆盖。
 
-普通 runc Standalone 负责其中 60 个操作；KVM Firecracker profile 负责其余 11 个操作，包括
+普通 runc Standalone 负责其中 61 个操作；KVM Firecracker profile 负责其余 11 个操作，包括
 checkpoint/snapshot、入口继承、reload 和运行期网络策略。这里的“覆盖”要求
 Environment 执行请求真实经过 API Server、Gateway、adxlet、sandboxd 和 Execd；Volume 目录请求经过 API Server 与 Coordinator；SDK 单测不计入此表。
 
