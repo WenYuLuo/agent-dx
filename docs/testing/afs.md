@@ -157,7 +157,7 @@ SeaweedFS、PostgreSQL、JuiceFS 的部署、凭据和环境编排留在产品�
 
 正常重启恢复不等于物理崩溃恢复、HA 或复杂可靠性。cache OFF 与 ON 分别绑定候选，
 历史 debug／release 或不同后端的功能通过不自动继承。当前支持与剩余缺口见
-[演进计划](../development/afs-plan.md#支持范围)。
+[AFS roadmap](../development/afs-roadmap.md)。
 
 ### 缓存、授权与资源生命周期
 
