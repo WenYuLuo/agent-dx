@@ -2,7 +2,6 @@
 """Installed SDK functional acceptance for the complete data-plane surface."""
 
 import asyncio
-import http.server
 import json
 import logging
 import ssl
@@ -13,6 +12,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
+from socketserver import ThreadingMixIn
+from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 
 PORT = 18081
 TLS_PORT = 18082
@@ -36,20 +37,36 @@ SERVER_COMMAND = (
 )
 
 
-class _TunnelUpstream(http.server.BaseHTTPRequestHandler):
-    def do_GET(self):
-        body = f'{TUNNEL_BODY}:{self.path}'.encode()
-        self.send_response(200)
-        self.send_header('Content-Length', str(len(body)))
-        self.send_header('Content-Type', 'text/plain')
-        self.end_headers()
-        self.wfile.write(body)
+class TunnelUpstreamServer(ThreadingMixIn, WSGIServer):
+    daemon_threads = True
+
+
+class TunnelUpstreamHandler(WSGIRequestHandler):
+    def get_environ(self):
+        environ = super().get_environ()
+        # PATH_INFO is decoded by WSGI; retain the exact request target for the
+        # tunnel fidelity assertion, including escapes and query parameters.
+        environ['RAW_URI'] = self.path
+        return environ
 
     def log_message(self, _format, *_args):
         pass
 
 
-def _tunnel_fetch_command(url):
+def tunnel_upstream_application(environ, start_response):
+    body = f"{TUNNEL_BODY}:{environ.get('RAW_URI', '/')}".encode()
+    start_response('200 OK', [('Content-Length', str(len(body))), ('Content-Type', 'text/plain')])
+    return [body]
+
+
+def make_tunnel_upstream():
+    return make_server(
+        '127.0.0.1', 0, tunnel_upstream_application,
+        server_class=TunnelUpstreamServer, handler_class=TunnelUpstreamHandler,
+    )
+
+
+def tunnel_fetch_command(url):
     target = urllib.parse.urlsplit(url.rstrip('/') + '/functional')
     if target.scheme != 'http' or target.hostname != '127.0.0.1' or not target.port:
         raise ValueError(f'invalid environment-side tunnel URL: {url}')
@@ -180,6 +197,8 @@ def run(connection, image, output, ca_path, *, runtime='runc', node_ids=('node1'
             connection=connection,
             create_timeout=150,
         )
+        if not environment.newly_created:
+            raise AssertionError('new Environment must confirm creation ownership')
         if not (environment.environment_id == environment.id):
             raise AssertionError()
         info = environment.get_info()
@@ -187,6 +206,8 @@ def run(connection, image, output, ca_path, *, runtime='runc', node_ids=('node1'
             raise AssertionError()
         attached = Environment.from_id(environment.id, connection=connection)
         try:
+            if attached.newly_created:
+                raise AssertionError('attachment must not acquire creation ownership')
             result = attached.commands.run(
                 "printf '%s:%s' \"$PWD\" \"$E2E_FUNCTIONAL_ENV\"", cwd='/tmp', envs={'E2E_FUNCTIONAL_ENV': 'functional'}
             )
@@ -458,14 +479,16 @@ def run(connection, image, output, ca_path, *, runtime='runc', node_ids=('node1'
             create_timeout=150,
         )
         tls_command = SERVER_COMMAND.replace(str(PORT), str(TLS_PORT))
-        security_server = security_environment.commands.run(tls_command, background=True, command_id='functional-http-tls')
+        security_server = security_environment.commands.run(
+            tls_command, background=True, command_id='functional-http-tls'
+        )
         if not (_fetch_forwarded(security_environment, ca_path, port=TLS_PORT, authenticated=False) == EXPECTED_BODY):
             raise AssertionError()
         checks['per_instance_data_plane_security'] = True
         passed('port-forward.per-instance-tls-route', started)
 
         started = begin('reverse-tunnel.sdk-upstream-roundtrip')
-        tunnel_upstream = http.server.ThreadingHTTPServer(('127.0.0.1', 0), _TunnelUpstream)
+        tunnel_upstream = make_tunnel_upstream()
         tunnel_thread = threading.Thread(
             target=tunnel_upstream.serve_forever,
             name='adx-e2e-reverse-tunnel-upstream',
@@ -486,7 +509,7 @@ def run(connection, image, output, ca_path, *, runtime='runc', node_ids=('node1'
             tunnel_connect_timeout=30,
         )
         tunnel_url = tunnel_environment.get_tunnel_url()
-        command = _tunnel_fetch_command(tunnel_url)
+        command = tunnel_fetch_command(tunnel_url)
         tunnel_result = None
         for attempt in range(3):
             tunnel_result = tunnel_environment.commands.run(command)

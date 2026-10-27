@@ -413,7 +413,10 @@ impl EnvironmentService {
         if result.durability != pb::Durability::Published as i32 {
             return Err(Status::unavailable("create is not durably confirmed"));
         }
-        let response = existing_running_response(spec, input, request_id, &record)?;
+        let mut response = existing_running_response(spec, input, request_id, &record)?;
+        // This bit comes from the node's creation result, never requestId echo
+        // or a pre-create existence query. Cached retries retain the same bit.
+        response["newlyCreated"] = Value::Bool(result.newly_created);
 
         // Node-local success seeds the versioned in-memory directory from the
         // trusted node result. Central fallback and startup races use one
@@ -492,6 +495,7 @@ fn existing_running_response(
         "environmentId": confirmed_spec.id,
         "status": "running",
         "requestId": request_id,
+        "newlyCreated": false,
     });
     if input.pointer("/tunnel/enabled").and_then(Value::as_bool) == Some(true) {
         let port = confirmed_spec

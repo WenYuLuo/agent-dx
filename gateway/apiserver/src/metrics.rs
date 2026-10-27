@@ -8,6 +8,28 @@ use std::sync::{
 use std::time::Instant;
 use tonic::{Code, Status};
 
+// These are the bounded outputs of classify/rejection_reason, never raw errors.
+const CREATE_REASONS: &[&str] = &[
+    "capacity",
+    "constraint",
+    "dependency",
+    "timeout",
+    "probe_failed",
+    "runtime_error",
+    "conflict",
+    "transport",
+    "caller_cancelled",
+    "unknown",
+];
+const REJECTION_REASONS: &[&str] = &[
+    "invalid_argument",
+    "unauthenticated",
+    "permission_denied",
+    "conflict",
+    "dependency_unavailable",
+    "unknown",
+];
+
 const BOUNDS: [f64; 12] = [
     0.01, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 300.0, 3600.0,
 ];
@@ -221,17 +243,44 @@ impl CreationMetrics {
             histogram.count, histogram.count, histogram.seconds
         ));
         output.push_str("# TYPE adx_environment_create_errors_total counter\n");
-        for ((outcome, stage, reason), count) in &completed.errors {
-            output.push_str(&format!("adx_environment_create_errors_total{{outcome=\"{outcome}\",stage=\"{stage}\",reason=\"{reason}\"}} {count}\n"));
+        // Pre-export the classifier's finite domain so the first event has a
+        // prior zero scrape. Cancellation before finish has one fixed tuple.
+        for outcome in ["failure", "unknown"] {
+            for stage in adx_core::observation::CreateStage::ALL {
+                for reason in CREATE_REASONS {
+                    render_error(&mut output, &completed, outcome, stage.as_str(), reason);
+                }
+            }
         }
+        render_error(&mut output, &completed, "cancelled", "unknown", "unknown");
         output.push_str("# TYPE adx_environment_create_rejections_total counter\n");
-        for (reason, count) in &completed.rejections {
+        for reason in REJECTION_REASONS {
+            let count = completed
+                .rejections
+                .get(reason)
+                .copied()
+                .unwrap_or_default();
             output.push_str(&format!(
                 "adx_environment_create_rejections_total{{reason=\"{reason}\"}} {count}\n"
             ));
         }
         output
     }
+}
+
+fn render_error(
+    output: &mut String,
+    completed: &Completed,
+    outcome: &'static str,
+    stage: &'static str,
+    reason: &'static str,
+) {
+    let count = completed
+        .errors
+        .get(&(outcome, stage, reason))
+        .copied()
+        .unwrap_or_default();
+    output.push_str(&format!("adx_environment_create_errors_total{{outcome=\"{outcome}\",stage=\"{stage}\",reason=\"{reason}\"}} {count}\n"));
 }
 
 fn classify(error: &Status) -> (&'static str, &'static str) {
@@ -326,6 +375,36 @@ pub async fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn diagnostics_have_zero_baselines_before_the_first_event() {
+        let metrics = CreationMetrics::default();
+        let error_series = "adx_environment_create_errors_total{outcome=\"unknown\",stage=\"unknown\",reason=\"transport\"}";
+        let rejection_series =
+            "adx_environment_create_rejections_total{reason=\"unauthenticated\"}";
+        let before = metrics.render();
+        assert!(before.contains(&format!("{error_series} 0\n")), "{before}");
+        assert!(
+            before.contains(&format!("{rejection_series} 0\n")),
+            "{before}"
+        );
+        {
+            let mut attempt = metrics.attempt();
+            attempt.finish::<()>(&Err(Status::unavailable("lost response")));
+        }
+        metrics.rejection(&Status::unauthenticated("missing credential"));
+        let after = metrics.render();
+        assert!(after.contains(&format!("{error_series} 1\n")));
+        assert!(after.contains(&format!("{rejection_series} 1\n")));
+        assert_eq!(before.lines().count(), after.lines().count());
+        if let Some(directory) = std::env::var_os("ADX_TEST_METRIC_SAMPLES") {
+            let directory = std::path::PathBuf::from(directory);
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(directory.join("apiserver-before.prom"), &before).unwrap();
+            std::fs::write(directory.join("apiserver-after.prom"), &after).unwrap();
+        }
+        assert!(!before.contains("outcome=\"success\",stage="));
+    }
+
     #[test]
     fn bounded_provenance_preserves_unknown_transport_and_confirmed_terminal() {
         let mut error = Status::unavailable("raw backend detail not a label");

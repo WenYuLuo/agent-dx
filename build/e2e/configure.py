@@ -257,6 +257,14 @@ if node == 'node1':
         'tls': tls(
             'coordinator', {'apiserver': 'apiserver', 'ingress': 'ingress', 'node:node1': 'node', 'node:node2': 'node2'}
         ),
+        # Catalog-only SDK CRUD exercises configured authorization without mounts.
+        'storage_domains': {
+            'e2e-volumes': {
+                'backend_id': 'e2e-volume-api',
+                'node_roots': {name: str(P / 'managed-volumes') for name in ('node1', 'node2')},
+                'tenant_paths': {'e2e': 'workspaces/e2e'},
+            },
+        },
         'bootstrap_credentials': [
             {'key_file': str(admin), 'tenant_id': 'admin', 'administrator': True, 'expires_at_unix_seconds': 0},
             {'key_file': str(key), 'tenant_id': 'e2e', 'administrator': False, 'expires_at_unix_seconds': 0},

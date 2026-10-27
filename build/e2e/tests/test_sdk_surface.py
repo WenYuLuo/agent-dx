@@ -48,8 +48,12 @@ class PublicSdkSurfaceTests(unittest.TestCase):
                 exports = ast.literal_eval(node.value)
                 break
         self.assertIsNotNone(exports, '__all__ assignment is missing')
-        self.assertEqual(len(exports), 49)
-        self.assertTrue({'Environment', 'CommandHandle', 'PtySession', 'PausePolicy', 'EnvironmentFailure', 'resources'}.issubset(exports))
+        self.assertEqual(len(exports), 52)
+        self.assertTrue(
+            {
+                'Environment', 'CommandHandle', 'PtySession', 'PausePolicy', 'EnvironmentFailure', 'resources'
+            }.issubset(exports)
+        )
         self.assertTrue({'ReadinessProbe', 'HealthcheckProbe'}.issubset(exports))
         self.assertIn('resources', exports)
         self.assertEqual(surface.SURFACE['<module>'], {'resources': 'standalone'})
@@ -58,8 +62,8 @@ class PublicSdkSurfaceTests(unittest.TestCase):
         self.assertEqual(
             surface.counts(),
             {
-                'public_operations': 67,
-                'standalone': 56,
+                'public_operations': 72,
+                'standalone': 61,
                 'firecracker': 11,
                 'unsupported': 0,
             },

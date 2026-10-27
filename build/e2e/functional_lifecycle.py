@@ -9,7 +9,7 @@ import time
 import uuid
 from pathlib import Path
 
-from adx_environment import Environment, EnvironmentNotFound
+from adx_environment import DirectoryVolumeSource, Environment, EnvironmentNotFound, VolumeSpec
 
 
 def _wait_deleted(instance_id, connection, timeout=90):
@@ -32,6 +32,44 @@ def _wait_deleted(instance_id, connection, timeout=90):
     raise TimeoutError(f"instance {instance_id} was not reclaimed: {last_error}")
 
 
+def volume_catalog(connection):
+    """Round-trip managed definitions; no filesystem mount is implied."""
+    volume_id = 'e2e-volume-' + uuid.uuid4().hex
+    spec = VolumeSpec(
+        id=volume_id,
+        source=DirectoryVolumeSource(storage_domain='e2e-volumes', path='workspaces/e2e/' + volume_id),
+    )
+    created = False
+    try:
+        volume = Environment.ensure_volume(spec, connection=connection)
+        created = True
+        replay = Environment.ensure_volume(spec, connection=connection)
+        fetched = Environment.get_volume(volume_id, connection=connection)
+        if not (volume.uid == replay.uid == fetched.uid and fetched.spec == spec):
+            raise AssertionError('volume ensure/get did not retain identity and definition')
+
+        def listed():
+            token = None
+            for _ in range(1000):
+                page, token = Environment.list_volumes(page_size=1, page_token=token, connection=connection)
+                if any(item.uid == volume.uid for item in page):
+                    return True
+                if not token:
+                    return False
+            raise AssertionError('volume catalog pagination did not converge')
+
+        if not listed():
+            raise AssertionError('new volume missing from paginated catalog')
+        Environment.delete_volume(volume_id, connection=connection)
+        created = False
+        if listed():
+            raise AssertionError('deleted volume remains in catalog')
+        return volume.uid
+    finally:
+        if created:
+            Environment.delete_volume(volume_id, connection=connection)
+
+
 def run(connection, image, output):
     checks = {}
     cases = []
@@ -47,6 +85,10 @@ def run(connection, image, output):
         print(f'[SDK CASE PASS] {case_id} ({seconds:.3f}s)', flush=True)
 
     try:
+        started = begin('volume.catalog-crud-and-replay')
+        checks['managed_volume_uid'] = volume_catalog(connection)
+        passed('volume.catalog-crud-and-replay', started)
+
         started = begin('lifecycle.detached-close-reattach-delete')
         detached = Environment(
             image=image,

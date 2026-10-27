@@ -64,6 +64,12 @@ unknown、失败和取消不进入成功耗时样本；后续确认成功不补�
 | `adx_observability_started_timestamp_seconds` | gauge/Unix 秒 | 新增；此 Redis 统计集的初始建立时间，未知时不导出 | Coordinator |
 
 所有直方图共享边界：0.01、0.05、0.1、0.5、1、2、5、10、30、60、300、3600、+Inf 秒。
+API errors/rejections and adxlet lifecycle-operation producers export bounded
+zero-valued label tuples from startup, allowing `increase()` to observe their
+first event after a prior scrape. Lifecycle baselines include reload/user,
+pause/user-or-idle, and delete/user-or-idle-or-policy; raw error details never
+become labels. Events before the first scrape remain outside this guarantee.
+
 API/adxlet counter 为进程内计数，重启归零；取消计数不等于用户主动取消，也不等于平台失败。
 Coordinator 业务累计数与权威状态原子写入 Redis，重连、普通重启及回放不归零。
 源数据建立前的历史不补计。人工清库或重建 namespace 后计数重新开始；普通 Coordinator epoch
@@ -107,10 +113,20 @@ resolved_at_unix_millis。无法知道准确发生时间时 occurred_at 为 null
 event_id 按旧执行的 generation/runtime 固定，与 environment_id 一起关联；节点 incident_id
 按 worker/session/跨重启唯一序号固定。原始 failure 可在恢复时清除，中断证据与最近摘要保留。
 
-控制 header 记录统计覆盖起点。累计数保存在同 namespace 的 `:business` hash，
-按 Environment 和节点分别保存；每个对象的结果、最近摘要及其累计数在同一个 epoch-fenced
-Lua 事务内做条件更新，不同对象不比较全局 header 或共享计数版本。删除 Environment 保留
-累计数，重启和结果回放不重复计数。指标刷新仅聚合业务计数 hash，不读取全部控制目录。
+控制 header 记录统计覆盖起点。累计数保存在同 namespace 的 `:business` hash。
+活动 Environment 的结果、最近摘要及其对象计数在同一个 epoch-fenced Lua 事务内更新，
+普通对象提交只比较该对象版本。Environment 退役和节点失联提交将相关计数原子归并到
+按对象身份散列的 64 个固定 `retired:<bucket>` 字段，并删除已归并的对象计数字段；
+归并只额外比较目标桶的旧值，不改变全局控制 header。所有 u64 加法在 Rust 中检查，
+Lua 仅比较和写入序列化字节。删除回放、同名重建及 Redis/Coordinator 重启均保持累计口径。
+Coordinator 启动时在新 epoch 下归并已有孤立计数字段；崩溃后的重试不会重复归并。
+无法解码的字段或暂未收敛的桶保留原值并告警，不阻塞控制状态恢复；有效字段继续归并。
+损坏计数修复前，统计刷新报告失败并保留旧快照，不将不完整累计数发布为有效统计。
+只有确认新 epoch 已隔离本次会话时才中止启动归并。
+RPC 服务首次读取业务统计失败时以未初始化快照继续启动，后台刷新循环在数据修复后恢复统计；
+控制状态读取和 epoch 隔离错误仍中止启动。
+历史计数有效且归并完成后，指标刷新读取当前对象计数和至多 64 个退役累计桶，读取规模随当前对象数量变化，
+不随历史退役对象总数持续增长，也不扫描全部控制目录。
 `StoredNode.last_incident_id` 用于当前失联周期的事件回放去重，重新确认可路由后清除；
 仅重连但仍在 reconciliation 的心跳不结束该失联周期。
 生命周期提交返回确认的完整 StoredEnvironment，同步内存中的中断和恢复摘要；
@@ -244,3 +260,7 @@ promtool check metrics < "$ADX_TEST_EVIDENCE/apiserver/scrape.txt"
 验收同时包含原子 request 绑定、重复提交、跨 Coordinator 重启、直接恢复 Running 携带旧证据、
 OOM 后恢复、节点影响范围、正常操作先发布意图、存量缺字段及统计起点保留。
 测试/生产集群部署不属于本次本地验证授权。
+
+Redis 操作预算同时包含重连与命令响应；驱动内部的默认连接／响应超时不再提前截断该预算。
+定向存储用例用 `CLIENT PAUSE` 验证超过 500ms 的响应在较长预算内成功、较短预算仍及时失败，
+并确认超时后替换连接可以继续访问状态。

@@ -26,3 +26,11 @@ for package in "${packages[@]}"; do args+=(-p "$package"); done
 if [[ $component == gateway ]]; then args+=(--features adx-agent-store/test-memory); fi
 echo "--- :test_tube: $component unit and component tests"
 cargo test --locked -j "${JOBS:-4}" "${args[@]}"
+
+# These tests need the pinned Redis binary in the CI image and opt in explicitly.
+if [[ $component == platform ]]; then
+  export ADX_TEST_REDIS_SERVER="${ADX_TEST_REDIS_SERVER:-${ADX_REDIS_SERVER:-redis-server}}"
+  export ADX_TEST_EVIDENCE="$PWD/out/buildkite/logs/redis-counter-compaction"
+  cargo test --locked --package=adx-coordinator --test storage -j "${JOBS:-4}" \
+    counter_compaction -- --ignored
+fi

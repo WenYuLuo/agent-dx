@@ -205,7 +205,7 @@ impl Metrics {
         };
         // Copy eligible samples before formatting; exporters never hold the
         // registry lock while building a potentially large text response.
-        let (samples, cpu_ns, operations) = {
+        let (samples, cpu_ns, mut operations) = {
             let samples = self.lock();
             let current: BTreeMap<_, _> = samples
                 .samples
@@ -286,6 +286,19 @@ impl Metrics {
             }
         }
         if !detail {
+            // Only supported operation/intent pairs have startup baselines.
+            // Reload is user-only; pause can be user/idle; deletion also has policy.
+            for (operation, intents) in [
+                ("reload", &["user"][..]),
+                ("pause", &["user", "idle"][..]),
+                ("delete", &["user", "idle", "policy"][..]),
+            ] {
+                for intent in intents {
+                    for outcome in ["success", "failure", "unknown", "cancelled"] {
+                        operations.entry((operation, intent, outcome)).or_default();
+                    }
+                }
+            }
             output.push_str("# TYPE adx_environment_lifecycle_operations_total counter\n");
             for ((operation, intent, outcome), count) in operations {
                 output.push_str(&format!("adx_environment_lifecycle_operations_total{{operation=\"{operation}\",intent=\"{intent}\",outcome=\"{outcome}\"}} {count}\n"));
@@ -396,6 +409,30 @@ pub async fn serve(manager: Arc<Adxlet>, bind: std::net::SocketAddr) -> std::io:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lifecycle_counters_have_zero_baselines_before_the_first_event() {
+        let metrics = Metrics::default();
+        let series = "adx_environment_lifecycle_operations_total{operation=\"pause\",intent=\"idle\",outcome=\"success\"}";
+        let before = metrics.render(false);
+        assert!(before.contains(&format!("{series} 0\n")), "{before}");
+        {
+            let mut attempt =
+                metrics.operation_attempt("pause", adx_core::observation::OperationIntent::Idle);
+            attempt.finish(&Ok(()));
+        }
+        let after = metrics.render(false);
+        assert!(after.contains(&format!("{series} 1\n")));
+        assert_eq!(before.lines().count(), after.lines().count());
+        if let Some(directory) = std::env::var_os("ADX_TEST_METRIC_SAMPLES") {
+            let directory = std::path::PathBuf::from(directory);
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(directory.join("adxlet-before.prom"), &before).unwrap();
+            std::fs::write(directory.join("adxlet-after.prom"), &after).unwrap();
+        }
+        assert!(!before.contains("operation=\"reload\",intent=\"idle\""));
+        assert!(!metrics.render(true).contains("lifecycle_operations_total"));
+    }
 
     fn usage(cpu: u64, memory: u64) -> RuntimeUsage {
         RuntimeUsage {

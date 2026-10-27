@@ -21,6 +21,13 @@ remains visible even when cleanup also fails.
 
 ## Server compatibility
 
+The successful create result includes authoritative `newlyCreated` ownership.
+`environment.newly_created` is true for a confirmed new instance, and false for
+reuse, `from_id()` or an absent ownership bit. Constructor failure only deletes
+a confirmed new instance; failed reuse closes local clients. Explicit deletion
+and `kill()` retain their documented lifecycle semantics. The [HTTP create
+contract](../../../api/http/environment-create.md) defines retry behavior.
+
 The new Environment backend supports basic lifecycle, on-demand pause/resume, reusable snapshots, grouped placement, idle deletion/pause and restart policy. It requires an image containing the release EXECD at the configured command path; generic `python:3.12-slim` below is only an illustrative image name.
 
 The Environment backend supports S3 rootfs, S3/image/Local mounts, entrypoint inheritance,

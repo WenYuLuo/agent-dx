@@ -722,7 +722,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "adx_observability_started_timestamp_seconds{cluster=~\"$cluster\",adx_env=~\"$adx_env\"}",
+          "expr": "adx_observability_started_timestamp_seconds{cluster=~\"$cluster\",adx_env=~\"$adx_env\"} * 1000",
           "instant": true,
           "legendFormat": "{{cluster}} / {{adx_env}} {{outcome}} {{state}} {{stage}} {{reason}} {{result}}"
         }
