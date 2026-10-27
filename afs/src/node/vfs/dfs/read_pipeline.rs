@@ -312,6 +312,87 @@ impl DistributedFs {
             return Ok(prost::bytes::Bytes::new());
         }
         let count = (version.layout.file_length - offset).min(size as u64) as usize;
+        if reference.is_some()
+            && crate::node::native_prefetch::eligible(snapshot.flags)
+            && let Some((budget, window)) = self.read_engine.native_prefetch_policy()
+        {
+            let controller = snapshot.handle.native_prefetch.get_or_init(|| {
+                crate::node::native_prefetch::Controller::new(budget.clone(), window)
+            });
+            let fetch = controller.fetch(|| {
+                let engine = self.read_engine.clone();
+                let version = version.clone();
+                let reference = reference.clone();
+                Arc::new(move |a, n, read_deadline, life| {
+                    let engine = engine.clone();
+                    let version = version.clone();
+                    let reference = reference.clone();
+                    Box::pin(async move {
+                        let batch =
+                            version.native_read_batch(a, n, engine.source_lookahead_chunks())?;
+                        engine
+                            .read_native_unified_async(
+                                batch,
+                                n,
+                                reference,
+                                read_deadline,
+                                handle.0,
+                                life,
+                            )
+                            .await
+                    })
+                })
+            });
+            // Large internal reads discard speculative parts and use a single
+            // owned reply; only small cross-boundary reads need assembly.
+            let crossing = count <= crate::node::native_prefetch::UNIT
+                && offset % crate::node::native_prefetch::UNIT as u64 + count as u64
+                    > crate::node::native_prefetch::UNIT as u64;
+            // Serialize rare shape-change assembly before acquiring any parts.
+            // Pausing prevents another completion from growing the window here.
+            let assembly = if crossing {
+                Some(
+                    tokio::time::timeout_at(
+                        tokio::time::Instant::from_std(deadline),
+                        budget.assembly.clone().lock_owned(),
+                    )
+                    .await
+                    .map_err(|_| unavailable("native prefetch assembly expired"))?,
+                )
+            } else {
+                None
+            };
+            let pause = if crossing {
+                Some(controller.pause(offset, count)?)
+            } else {
+                None
+            };
+            let prepared = if crossing && controller.overlaps(offset, count)? {
+                Some(
+                    self.read_engine
+                        .allocate_native_prefetch_reply(count, deadline)
+                        .await?,
+                )
+            } else {
+                None
+            };
+            let parts = controller
+                .read(
+                    offset,
+                    count,
+                    version.layout.file_length,
+                    deadline,
+                    fetch,
+                    lifetime.clone(),
+                )
+                .await?;
+            let reply = self
+                .read_engine
+                .compose_native_prefetch_reply(parts, count, prepared)?;
+            drop(pause);
+            drop(assembly);
+            return Ok(reply);
+        }
         let batch =
             version.native_read_batch(offset, count, self.read_engine.source_lookahead_chunks())?;
         let hint = if prefetch && self.read_engine.readahead_object_limit() != 0 {

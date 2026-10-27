@@ -23,6 +23,8 @@ pub mod external_chunk;
 pub mod fuse;
 #[cfg(feature = "dfs")]
 pub mod gc;
+#[cfg(feature = "dfs")]
+mod native_prefetch;
 #[cfg(feature = "ownerfs")]
 mod native_workspace;
 #[cfg(feature = "dfs")]

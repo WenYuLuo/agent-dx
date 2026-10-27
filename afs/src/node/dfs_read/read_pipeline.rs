@@ -32,6 +32,79 @@ impl DfsReadEngine {
         self.transfer.block_on_read(future)
     }
 
+    pub(crate) fn native_prefetch_policy(
+        &self,
+    ) -> Option<(Arc<super::super::native_prefetch::Budget>, u64)> {
+        if self.config.readahead_max_bytes == 0
+            || !self.async_read_enabled()
+            || self.peer_cache.is_some()
+            || self.local.peer_read_crc_mode() != crate::config::DfsReadCrcMode::Off
+        {
+            return None;
+        }
+        // Retained speculative replies share the existing reply admission.
+        // Leave at least half for ordinary requests; do not enlarge any limit.
+        let cap = (self.read_pipeline_limits.max_reply_bytes / 2).min(64 * 1024 * 1024);
+        let budget = self
+            .native_prefetch_budget
+            .get_or_init(|| {
+                super::super::native_prefetch::Budget::new(
+                    cap,
+                    self.local.read_work_metrics().cloned(),
+                )
+            })
+            .clone();
+        Some((
+            budget,
+            self.config.readahead_max_bytes.min(16 * 1024 * 1024),
+        ))
+    }
+
+    pub(crate) async fn allocate_native_prefetch_reply(
+        &self,
+        length: usize,
+        deadline: Instant,
+    ) -> Result<crate::node::read_pipeline::NativeReadReply> {
+        crate::node::read_pipeline::NativeReadAllocation {
+            length,
+            pool: self.reply_buffer_pool.clone(),
+            admission: self.reply_admission.clone(),
+            local: self.local.clone(),
+        }
+        .allocate(deadline)
+        .await
+    }
+    pub(crate) fn compose_native_prefetch_reply(
+        &self,
+        parts: crate::node::native_prefetch::Reply,
+        length: usize,
+        prepared: Option<crate::node::read_pipeline::NativeReadReply>,
+    ) -> Result<prost::bytes::Bytes> {
+        if parts.len() == 1 {
+            return parts
+                .into_parts()
+                .next()
+                .ok_or_else(|| invalid("empty native prefetch reply"));
+        }
+        let mut reply = prepared.ok_or_else(|| invalid("native prefetch assembly not admitted"))?;
+        let mut offset = 0usize;
+        for bytes in parts.into_parts() {
+            let end = offset
+                .checked_add(bytes.len())
+                .filter(|&end| end <= length)
+                .ok_or_else(|| invalid("native prefetch reply overrun"))?;
+            reply.buffer[offset..end].copy_from_slice(&bytes);
+            if let Some(m) = self.local.read_work_metrics() {
+                m.copy("prefetch_parts_to_reply", bytes.len() as u64);
+            }
+            offset = end;
+        }
+        if offset != length {
+            return Err(invalid("native prefetch reply incomplete"));
+        }
+        Ok(reply.into_bytes())
+    }
+
     pub(crate) fn async_read_enabled(&self) -> bool {
         self.external_backend.is_none() && self.transfer.supports_async_native_read()
     }
@@ -180,7 +253,6 @@ impl DfsReadEngine {
             self.validate_private_native_ranges(&batch)?;
             if self.local.peer_read_crc_mode() == crate::config::DfsReadCrcMode::Off
                 && self.peer_cache.is_none()
-                && self.config.readahead_max_bytes == 0
                 && let Some(reference) = reference.as_ref()
                 && let Some(bytes) = self
                     .read_fixed_open_async(

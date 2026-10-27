@@ -760,7 +760,7 @@ impl Config {
         let fuse_max_readahead_bytes = cli
             .fuse_max_readahead_bytes
             .or(file.fuse_max_readahead_bytes)
-            .unwrap_or(1024 * 1024);
+            .unwrap_or(16 * 1024 * 1024);
         if !(1..=64).contains(&fuse_threads)
             || !(1..=1024).contains(&fuse_workers)
             || !(1..=65_536).contains(&fuse_max_tasks)
@@ -1499,6 +1499,45 @@ fn decode_base64(input: &str) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod certificate_tests {
     use super::*;
+
+    #[test]
+    fn read_config_delivery_defaults_and_overrides() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("node.toml");
+        std::fs::write(&config, "id = 'b'\nfs = 'dfs'\n").unwrap();
+        let cfg = Cli::try_parse_from(["afs-node", "--config", config.to_str().unwrap()]).unwrap();
+        let cfg = Config::resolve(Role::Node, cfg).unwrap();
+        assert_eq!(cfg.dfs_read_pipeline.max_reply_bytes, 256 * 1024 * 1024);
+        assert_eq!(cfg.fuse_max_readahead_bytes, 16 * 1024 * 1024);
+        assert_eq!(cfg.dfs_readahead_max_bytes, 0);
+        assert!(!cfg.dfs_native_open_read_authority);
+        assert!(cfg.dfs_crc32c_writes);
+        assert_eq!(cfg.dfs_read_crc_mode, DfsReadCrcMode::Off);
+        let cli = Cli::try_parse_from([
+            "afs-node",
+            "--config",
+            config.to_str().unwrap(),
+            "--fuse-max-readahead-bytes",
+            "0",
+        ])
+        .unwrap();
+        assert_eq!(
+            Config::resolve(Role::Node, cli)
+                .unwrap()
+                .fuse_max_readahead_bytes,
+            0
+        );
+        for bytes in [8, 256, 512] {
+            std::fs::write(&config, format!("id = 'b'\nfs = 'dfs'\nfuse_max_readahead_bytes = 0\n[dfs_read_pipeline]\nmax_reply_bytes = {}\n", bytes * 1024 * 1024)).unwrap();
+            let cfg = Config::resolve(
+                Role::Node,
+                Cli::try_parse_from(["afs-node", "--config", config.to_str().unwrap()]).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(cfg.dfs_read_pipeline.max_reply_bytes, bytes * 1024 * 1024);
+            assert_eq!(cfg.fuse_max_readahead_bytes, 0);
+        }
+    }
 
     #[test]
     fn trusted_certificates_normalize_pem_and_preserve_der() {

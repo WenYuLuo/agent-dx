@@ -709,6 +709,7 @@ struct DfsFileHandle {
 }
 
 struct DfsHandle {
+    native_prefetch: std::sync::OnceLock<Arc<crate::node::native_prefetch::Controller>>,
     open_read_inode: Option<Arc<InodeRecord>>,
     open_read_authority: Option<NativeReadAuthoritySnapshot>,
     _gc_pin: Option<Arc<crate::node::gc::GcPin>>,
@@ -840,6 +841,7 @@ impl NativeReadRefresh {
 impl From<DfsFileHandle> for DfsHandle {
     fn from(opened: DfsFileHandle) -> Self {
         Self {
+            native_prefetch: std::sync::OnceLock::new(),
             open_read_authority: opened
                 .native_read_view
                 .as_ref()
@@ -1066,6 +1068,9 @@ impl DfsHandleTable {
             .remove(&id);
         if let Some(handle) = &removed {
             handle.closed.store(true, Ordering::Release);
+            if let Some(prefetch) = handle.native_prefetch.get() {
+                prefetch.retire();
+            }
         }
         if let Some(handles) = index.get_mut(&handle.inode_id) {
             handles.remove(&id);

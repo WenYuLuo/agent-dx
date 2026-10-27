@@ -1,0 +1,30 @@
+{
+  "base": "6056842b14a1b15eb5ad7c4fe4a59f71e0b8451c",
+  "old_PR95_state": "merged",
+  "AFS_runtime_source_equal_frozen_measured_candidate": true,
+  "Linux": {
+    "library_passed": 1671,
+    "library_ignored": 39,
+    "bin_tests_passed": 3,
+    "fmt": true,
+    "strict_workspace_all_targets_all_features_clippy": true,
+    "release": true,
+    "ownerfs_only_compiled": true,
+    "ownerfs_only_warnings": 34
+  },
+  "release_SHA_equal_frozen_measured_binaries": true,
+  "runtime_SHA256": {
+    "afs-node": "2b91b432c004e0f1dec707bb966da475631a8eae12b952cece76a44d24187215",
+    "afs-meta": "de9ba852b540b274b7402d8962cbf03545196e765c5317d95c923d19e430e74e"
+  },
+  "defaults": {
+    "reply_bytes": 268435456,
+    "kernel_readahead_bytes": 16777216,
+    "B_prefetch_bytes": 0,
+    "read_CRC": "off",
+    "write_CRC": true
+  },
+  "performance_new_runs_after_mainline_integration": 0,
+  "documentation_updated_after_code_gate": true,
+  "not_remote_CI_or_merge": true
+}
