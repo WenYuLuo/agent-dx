@@ -14,6 +14,16 @@ pub struct RelayStats {
 }
 
 impl RelayStats {
+    pub(crate) fn track(
+        &self,
+        meter: &Arc<crate::common::traffic::TrafficMeter>,
+    ) -> crate::common::traffic::Registration {
+        meter.register(crate::common::traffic::ByteCounters {
+            up: self.bytes_up.clone(),
+            down: self.bytes_down.clone(),
+        })
+    }
+
     pub fn snapshot(&self) -> (u64, u64) {
         (
             self.bytes_up.load(Ordering::Relaxed),

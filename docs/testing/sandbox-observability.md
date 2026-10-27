@@ -264,3 +264,20 @@ OOM 后恢复、节点影响范围、正常操作先发布意图、存量缺字�
 Redis 操作预算同时包含重连与命令响应；驱动内部的默认连接／响应超时不再提前截断该预算。
 定向存储用例用 `CLIENT PAUSE` 验证超过 500ms 的响应在较长预算内成功、较短预算仍及时失败，
 并确认超时后替换连接可以继续访问状态。
+
+## 数据面流量
+
+Ingress 的 `data_plane_ingress_frontend_bytes_total{direction="received|sent"}`
+是公网连接在 TLS 解密后的接收/发送累计字节，包含 HTTP 头、帧和升级后的流。
+Relay 的 `data_plane_relay_transfer_bytes_total{direction="to_runtime|from_runtime"}`
+是到运行时/从运行时返回的负载累计字节，包含仍在传输的连接。两者位于不同跳，
+不可相加为业务总流量；都不包含 TLS 记录、IP 或链路层开销。
+
+所有方向启动时导出 0，进程重启清零。区间流量先对各生产者应用
+`increase(counter[window])`，再跨实例汇总，以处理重启清零；采样外推可能产生小数，
+首轮抓取之前的流量无法恢复。HTTP 响应类别 `1xx` 单列 101 WebSocket 升级；
+SSE 的 HTTP 200 不代表 Environment 最终创建成功。
+
+Ingress 仅在现有 I/O 返回时执行每连接 relaxed 原子计数，不复制负载、不发送额外 RPC。
+Relay 复用现有每流计数，转发热路径不新增原子操作。连接注册/关闭与抓取汇总使用
+登记表锁；数据块转发不获取该锁。抓取成本与活动连接数成正比。

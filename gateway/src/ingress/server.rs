@@ -181,6 +181,8 @@ struct CommandWatchMetrics {
 
 #[derive(Default)]
 struct IngressRequestMetrics {
+    traffic: Arc<crate::common::traffic::TrafficMeter>,
+    responses_1xx: AtomicU64,
     in_flight: AtomicU64,
     total: AtomicU64,
     responses_2xx: AtomicU64,
@@ -199,6 +201,7 @@ impl IngressRequestMetrics {
         self.duration_us_total
             .fetch_add(duration_us, Ordering::Relaxed);
         match status.as_u16() / 100 {
+            1 => &self.responses_1xx,
             2 => &self.responses_2xx,
             3 => &self.responses_3xx,
             4 => &self.responses_4xx,
@@ -234,6 +237,13 @@ data_plane_ingress_http_responses_total{{class=\"other\"}} {}\n",
             self.responses_5xx.load(Ordering::Relaxed),
             self.responses_other.load(Ordering::Relaxed),
         );
+        let (received, sent) = self.traffic.snapshot();
+        let _ = writeln!(
+            output,
+            "data_plane_ingress_http_responses_total{{class=\"1xx\"}} {}",
+            self.responses_1xx.load(Ordering::Relaxed)
+        );
+        let _ = writeln!(output, "# TYPE data_plane_ingress_frontend_bytes_total counter\ndata_plane_ingress_frontend_bytes_total{{direction=\"received\"}} {received}\ndata_plane_ingress_frontend_bytes_total{{direction=\"sent\"}} {sent}");
         let mut cumulative = 0;
         for ((label, _), bucket) in REQUEST_DURATION_BUCKETS_US
             .iter()
@@ -838,6 +848,7 @@ impl Ingress {
     ) where
         T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
+        let stream = crate::common::traffic::MeteredIo::new(stream, &self.request_metrics.traffic);
         let gateway = self;
         let service =
             service_fn(move |request| gateway.clone().handle_http(request, ingress_security, peer));
@@ -2100,11 +2111,15 @@ impl CommandWatchHub {
             let metrics = Arc::clone(&self.metrics);
             let ping_interval = self.config.ping_interval;
             tokio::spawn(async move {
-                run_downstream_watch(websocket, controls, events, ping_interval).await;
-                all_entries.lock().await.remove(&key);
-                metrics.environments.fetch_sub(1, Ordering::Relaxed);
-                metrics.downstream_streams.fetch_sub(1, Ordering::Relaxed);
-                metrics.reconnects.fetch_add(1, Ordering::Relaxed);
+                // Retire the shared entry before waiting for a close reply so
+                // a new subscriber never joins a socket already shutting down.
+                let retire = async {
+                    all_entries.lock().await.remove(&key);
+                    metrics.environments.fetch_sub(1, Ordering::Relaxed);
+                    metrics.downstream_streams.fetch_sub(1, Ordering::Relaxed);
+                    metrics.reconnects.fetch_add(1, Ordering::Relaxed);
+                };
+                run_downstream_watch(websocket, controls, events, ping_interval, retire).await;
             });
             entry
         };
@@ -2126,16 +2141,18 @@ async fn run_downstream_watch<S>(
     mut controls: mpsc::Receiver<HubControl>,
     events: broadcast::Sender<WatchState>,
     ping_interval: std::time::Duration,
+    retire: impl std::future::Future<Output = ()>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let mut graceful = false;
     let mut refs = HashMap::<String, usize>::new();
     let mut ping = tokio::time::interval(ping_interval);
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             control = controls.recv() => {
-                let Some(control) = control else { break; };
+                let Some(control) = control else { graceful = true; break; };
                 let (op, command_id) = match control {
                     HubControl::Add(command_id) => {
                         let count = refs.entry(command_id.clone()).or_default();
@@ -2156,7 +2173,7 @@ async fn run_downstream_watch<S>(
                 };
                 let message = serde_json::json!({"op": op, "commandIds": [command_id]});
                 if websocket.send(tokio_tungstenite::tungstenite::Message::Text(message.to_string())).await.is_err() { break; }
-                if refs.is_empty() && op == "unsubscribe" { break; }
+                if refs.is_empty() && op == "unsubscribe" { graceful = true; break; }
             }
             incoming = websocket.next() => {
                 let Some(Ok(incoming)) = incoming else { break; };
@@ -2178,7 +2195,11 @@ async fn run_downstream_watch<S>(
                         let reply = websocket.send(tokio_tungstenite::tungstenite::Message::Pong(payload)).await;
                         if reply.is_err() { break; }
                     }
-                    tokio_tungstenite::tungstenite::Message::Close(_) => break,
+                    tokio_tungstenite::tungstenite::Message::Close(_) => {
+                        // Tungstenite queues the peer's close acknowledgement.
+                        let _ = websocket.flush().await;
+                        break;
+                    }
                     _ => {}
                 }
             }
@@ -2186,6 +2207,21 @@ async fn run_downstream_watch<S>(
                 if websocket.send(tokio_tungstenite::tungstenite::Message::Ping(Vec::new())).await.is_err() { break; }
             }
         }
+    }
+    retire.await;
+    if graceful {
+        // A normal unsubscribe must not look like an abruptly reset runtime
+        // connection. Bound the handshake so a lost peer cannot retain a task.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            websocket.close(None).await?;
+            while let Some(message) = websocket.next().await {
+                if matches!(message?, tokio_tungstenite::tungstenite::Message::Close(_)) {
+                    break;
+                }
+            }
+            Ok::<_, tokio_tungstenite::tungstenite::Error>(())
+        })
+        .await;
     }
 }
 
@@ -3279,3 +3315,61 @@ mod agent_api_tests;
 
 #[cfg(test)]
 mod processing_tests;
+
+#[cfg(test)]
+mod watch_close_contract_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn last_command_subscription_closes_downstream_websocket_cleanly() {
+        use tokio_tungstenite::{
+            tungstenite::{protocol::Role, Message},
+            WebSocketStream,
+        };
+        let (client, peer) = tokio::io::duplex(4096);
+        let client = WebSocketStream::from_raw_socket(client, Role::Client, None).await;
+        let mut peer = WebSocketStream::from_raw_socket(peer, Role::Server, None).await;
+        let (send, receive) = mpsc::channel(4);
+        let (events, _) = broadcast::channel(4);
+        let task = tokio::spawn(run_downstream_watch(
+            client,
+            receive,
+            events,
+            std::time::Duration::from_secs(60),
+            async {},
+        ));
+        send.send(HubControl::Add("command-a".into()))
+            .await
+            .unwrap();
+        loop {
+            match peer.next().await.unwrap().unwrap() {
+                Message::Text(_) => break,
+                Message::Ping(payload) => peer.send(Message::Pong(payload)).await.unwrap(),
+                _ => (),
+            }
+        }
+        send.send(HubControl::Remove("command-a".into()))
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match peer
+                    .next()
+                    .await
+                    .expect("close frame")
+                    .expect("clean close handshake")
+                {
+                    Message::Close(_) => {
+                        peer.flush().await.unwrap();
+                        break;
+                    }
+                    Message::Ping(payload) => peer.send(Message::Pong(payload)).await.unwrap(),
+                    _ => (),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        task.await.unwrap();
+    }
+}
