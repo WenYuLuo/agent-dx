@@ -1,5 +1,13 @@
 use super::*;
-use adx_coordinator::storage::BusinessCounters;
+use adx_coordinator::storage::{BusinessCounters, RedisStore};
+
+// These are state/convergence tests, with synchronous AOF enabled. Allow fsync
+// on a shared CI filesystem without turning its latency into a storage failure.
+async fn counter_store(rig: &common::Redis) -> RedisStore {
+    RedisStore::connect(&rig.url, "test", std::time::Duration::from_secs(5))
+        .await
+        .unwrap()
+}
 
 async fn business_fields(rig: &common::Redis) -> Vec<String> {
     let client = redis::Client::open(rig.url.as_str()).unwrap();
@@ -41,7 +49,7 @@ fn deletion(mut record: EnvironmentRecord) -> EnvironmentRecord {
 #[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
 async fn retired_counter_storage_is_bounded_by_live_objects_and_fixed_buckets() {
     let rig = common::Redis::new().await;
-    let session = rig.store().await.begin(1).await.unwrap();
+    let session = counter_store(&rig).await.begin(1).await.unwrap();
     register(&session, "node").await;
     for index in 0..512 {
         let record = create(&session, &format!("churn-{index}"), index + 1).await;
@@ -65,7 +73,7 @@ async fn retired_counter_storage_is_bounded_by_live_objects_and_fixed_buckets() 
 #[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
 async fn concurrent_retirement_and_delete_replay_preserve_counts_across_redis_restart() {
     let mut rig = common::Redis::new().await;
-    let session = rig.store().await.begin(1).await.unwrap();
+    let session = counter_store(&rig).await.begin(1).await.unwrap();
     register(&session, "node").await;
     let mut records = Vec::new();
     for index in 0..96 {
@@ -87,7 +95,7 @@ async fn concurrent_retirement_and_delete_replay_preserve_counts_across_redis_re
     assert!(business_fields(&rig).await.len() <= 64);
     rig.crash();
     rig.start().await;
-    let restarted = rig.store().await.begin(1).await.unwrap();
+    let restarted = counter_store(&rig).await.begin(1).await.unwrap();
     assert_eq!(restarted.business_counters().await.unwrap(), expected);
     assert!(restarted.snapshot().await.unwrap().environments.is_empty());
     assert!(business_fields(&rig).await.len() <= 64);
@@ -97,7 +105,7 @@ async fn concurrent_retirement_and_delete_replay_preserve_counts_across_redis_re
 #[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
 async fn recreated_name_counts_each_generation_once_and_fences_old_deletion() {
     let rig = common::Redis::new().await;
-    let session = rig.store().await.begin(1).await.unwrap();
+    let session = counter_store(&rig).await.begin(1).await.unwrap();
     register(&session, "node").await;
     let mut previous: Option<EnvironmentRecord> = None;
     for generation in 1..=32 {
@@ -124,7 +132,7 @@ async fn recreated_name_counts_each_generation_once_and_fences_old_deletion() {
 #[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
 async fn startup_compacts_orphaned_history_without_losing_live_or_node_facts() {
     let rig = common::Redis::new().await;
-    let store = rig.store().await;
+    let store = counter_store(&rig).await;
     let session = store.begin(1).await.unwrap();
     register(&session, "node").await;
     create(&session, "live", 1).await;
@@ -186,7 +194,7 @@ async fn startup_compacts_orphaned_history_without_losing_live_or_node_facts() {
 #[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
 async fn node_incident_replay_uses_bounded_retired_buckets() {
     let rig = common::Redis::new().await;
-    let store = rig.store().await;
+    let store = counter_store(&rig).await;
     let session = store.begin(1).await.unwrap();
     for index in 0..96 {
         let id = format!("node-{index}");
@@ -232,7 +240,7 @@ async fn node_incident_replay_uses_bounded_retired_buckets() {
 #[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
 async fn retirement_keeps_u64_precision_and_overflow_leaves_lifecycle_unchanged() {
     let rig = common::Redis::new().await;
-    let session = rig.store().await.begin(1).await.unwrap();
+    let session = counter_store(&rig).await.begin(1).await.unwrap();
     register(&session, "node").await;
     let first = create(&session, "large-count", 1).await;
     session.commit(deletion(first)).await.unwrap();
@@ -283,7 +291,7 @@ async fn retirement_keeps_u64_precision_and_overflow_leaves_lifecycle_unchanged(
 #[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
 async fn corrupt_history_does_not_block_startup_or_discard_repairable_facts() {
     let rig = common::Redis::new().await;
-    let store = rig.store().await;
+    let store = counter_store(&rig).await;
     let session = store.begin(1).await.unwrap();
     register(&session, "node").await;
     create(&session, "live", 1).await;
