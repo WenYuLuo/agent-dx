@@ -338,3 +338,45 @@ async fn corrupt_history_does_not_block_startup_or_discard_repairable_facts() {
         .iter()
         .any(|field| field == "environment:corrupt"));
 }
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn configured_operation_budget_outlives_driver_default_and_remains_bounded() {
+    let rig = common::Redis::new().await;
+    let client = redis::Client::open(rig.url.as_str()).unwrap();
+    let mut control = client.get_multiplexed_async_connection().await.unwrap();
+    let long = RedisStore::connect(&rig.url, "test", std::time::Duration::from_secs(3))
+        .await
+        .unwrap();
+    let session = long.begin(1).await.unwrap();
+    register(&session, "node").await;
+    let short = RedisStore::connect(&rig.url, "test", std::time::Duration::from_millis(100))
+        .await
+        .unwrap();
+    redis::cmd("CLIENT")
+        .arg("PAUSE")
+        .arg(800)
+        .arg("ALL")
+        .query_async::<()>(&mut control)
+        .await
+        .unwrap();
+    let started = std::time::Instant::now();
+    assert!(
+        session.snapshot().await.is_ok(),
+        "configured budget was truncated by the driver's default"
+    );
+    assert!(started.elapsed() >= std::time::Duration::from_millis(600));
+    redis::cmd("CLIENT")
+        .arg("PAUSE")
+        .arg(1500)
+        .arg("ALL")
+        .query_async::<()>(&mut control)
+        .await
+        .unwrap();
+    let started = std::time::Instant::now();
+    assert!(matches!(short.begin(1).await, Err(Error::Unavailable(_))));
+    assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    // The timed-out connection is replaced; a later operation can recover.
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    assert!(short.begin(1).await.is_ok());
+}

@@ -252,3 +252,7 @@ promtool check metrics < "$ADX_TEST_EVIDENCE/apiserver/scrape.txt"
 验收同时包含原子 request 绑定、重复提交、跨 Coordinator 重启、直接恢复 Running 携带旧证据、
 OOM 后恢复、节点影响范围、正常操作先发布意图、存量缺字段及统计起点保留。
 测试/生产集群部署不属于本次本地验证授权。
+
+Redis 操作预算同时包含重连与命令响应；驱动内部的默认连接／响应超时不再提前截断该预算。
+定向存储用例用 `CLIENT PAUSE` 验证超过 500ms 的响应在较长预算内成功、较短预算仍及时失败，
+并确认超时后替换连接可以继续访问状态。

@@ -614,10 +614,15 @@ impl RedisStore {
         let operation = async {
             let mut guard = self.connection.current.lock().await;
             if guard.is_none() {
+                // The outer budget covers connection setup and the response.
+                // Disable driver defaults that could truncate that same budget.
+                let config = redis::AsyncConnectionConfig::new()
+                    .set_connection_timeout(None)
+                    .set_response_timeout(None);
                 *guard = Some(
                     self.connection
                         .client
-                        .get_multiplexed_async_connection()
+                        .get_multiplexed_async_connection_with_config(&config)
                         .await?,
                 );
             }
