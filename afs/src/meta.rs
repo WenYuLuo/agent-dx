@@ -235,8 +235,8 @@ pub async fn run(cfg: Config, obs: Observability) -> Result<(), BoxError> {
     let dfs_service =
         afs_protocol::meta::dfs_meta_server::DfsMetaServer::new(rpc::DfsMetaRpc(state.clone()));
     let security = afs_transport::grpc::SecurityManager::new(cfg.tls_config())?;
-    let server = security
-        .configure_server(grpc_config.configure_server(tonic::transport::Server::builder()))?;
+    let incoming = security.incoming(incoming)?;
+    let server = grpc_config.configure_server(tonic::transport::Server::builder());
     services.spawn(async move {
         server
             .layer(afs_tracing::GrpcServerTraceLayer::default())

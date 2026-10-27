@@ -1151,3 +1151,49 @@ reads retain overlap sharing and bounded assembly. Controlled capacity tests mus
 show forward progress and complete credit release; increasing capacity alone is
 not a fix for mutually dependent ownership. This is not a general latency/QoS or
 all-saturation admission.
+
+
+## Unified internal transport encryption
+
+`tls_encryption_enabled` is a top-level Node and Meta boolean, default `false`,
+with the usual defaults < TOML < explicit CLI precedence. It applies uniformly
+to AFS internal TCP/gRPC: registration and heartbeat, filesystem Meta authority,
+node read/write, replica transfer and NodeControl. It does not introduce TLS to
+UDS, RDMA, REST or external object-store HTTPS.
+
+With all four existing `tls_*` identity fields configured, both values require
+real mutual certificate authentication and preserve `trusted_node_certs`
+DER-to-node binding. `false` performs that handshake and an authenticated AFS1
+mode agreement, then switches HTTP/2 to plaintext after an ACK/GO barrier.
+`true` retains standard TLS for the full connection. Missing/invalid certificates
+never fall back to unauthenticated traffic. Legacy no-identity local/diagnostic
+fixtures remain a separate `TlsConfig::Disabled` mode; existing authority startup
+checks still reject it where node identity is required. Setting encryption=true
+without identity is a configuration error.
+
+Production TCP listeners and clients share `afs-transport::SecurityManager`;
+handlers obtain identity only through the common connection extractor. Read
+open-to-close authorization and socket-bound retirement remain unchanged. The
+accepted socket and in-flight requests own the certificate Arc; cached open
+contexts retain only a Weak reference. Reconnection re-establishes identity and
+existing file authority instead of inheriting an old connection.
+
+All peers must use compatible mode settings. There is no automatic plaintext
+fallback. Restart processes to change mode. During rolling upgrades or when using
+standard TLS-only tools such as grpcurl, explicitly set encryption=true on all
+participants. Old clients/servers do not understand authenticated-only AFS1.
+
+Encryption=false permits observation and active modification of subsequent
+request headers, control/Meta messages and file bodies. The initial certificate
+handshake does not cryptographically protect later plaintext bytes. Read CRC off
+remains off; write CRC and optional receiver CRC do not replace cryptographic
+integrity. This mode assumes a controlled network without active attackers;
+enable encryption when that assumption does not hold.
+
+`afs.transport.authenticated` records actual `encryption_enabled`, remote socket
+and peer leaf DER hash once per accepted connection; rejection is logged as
+`afs.transport.rejected`. Handshakes are bounded (32 concurrently, 5s each).
+Component tests cover two modes, real certificate identity, body transfer,
+mode mismatch, open authorization reuse and progress past a slow handshake.
+Runtime qualification and performance remain separate evidence: the earlier
+peer-only 60/84 experiment is not a performance result for this unified code.

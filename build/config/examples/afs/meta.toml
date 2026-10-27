@@ -1,3 +1,6 @@
+# Shared AFS internal TCP/gRPC policy: always authenticate configured mTLS identity; encrypt application traffic only when true.
+tls_encryption_enabled = false
+
 id = "meta"
 fs = "all"
 grpc_listen = "127.0.0.1:7400"

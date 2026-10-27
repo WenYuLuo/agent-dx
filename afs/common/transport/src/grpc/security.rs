@@ -1,7 +1,7 @@
 //! AFS 所有 gRPC 链路共用的明文与双向 TLS 策略。
 //!
-//! `SecurityManager` 仍然只修改 Tonic builder，不负责连接生命周期。这样业务代码
-//! 只选择安全策略，不需要重复读取证书和拼装 `ClientTlsConfig/ServerTlsConfig`。
+//! `SecurityManager` shares authenticated socket setup and optional sustained encryption.
+//! Callers still own routing, connection pools, retries and business lifecycles.
 
 // 花括号 import 表示从同一个模块一次导入多个名字。
 use std::{fs, path::PathBuf};
@@ -21,6 +21,8 @@ pub enum TlsConfig {
     Disabled,
     /// 双向 TLS：双方都要出示证书，并由同一个 CA 信任链校验。
     MutualTls {
+        /// Continue encrypting application bytes after mutual certificate authentication.
+        encryption_enabled: bool,
         /// 用于校验对端证书的 CA PEM 文件。
         ca_certificate: PathBuf,
         /// 本端证书 PEM；Client/Server 都使用同一数据结构。
@@ -57,6 +59,18 @@ impl SecurityManager {
 
     /// 把客户端安全策略应用到 Endpoint。
     pub fn configure_client(&self, endpoint: Endpoint) -> Result<Endpoint, GrpcError> {
+        if matches!(
+            self.config,
+            TlsConfig::MutualTls {
+                encryption_enabled: false,
+                ..
+            }
+        ) {
+            return Err(GrpcError::InvalidTlsConfiguration(
+                "authentication-only mode requires SecurityManager::connect/connect_lazy".into(),
+            ));
+        }
+
         // `let PATTERN = value else { ... }` 表示：如果不是 MutualTls，就走 else。
         // 这里 Disabled 直接返回原 Endpoint，不做多余包装。
         let TlsConfig::MutualTls {
@@ -64,6 +78,7 @@ impl SecurityManager {
             identity_certificate,
             identity_private_key,
             server_name,
+            ..
         } = &self.config
         else {
             return Ok(endpoint);
@@ -84,6 +99,18 @@ impl SecurityManager {
 
     /// 把服务端安全策略应用到 Server builder。
     pub fn configure_server(&self, server: Server) -> Result<Server, GrpcError> {
+        if matches!(
+            self.config,
+            TlsConfig::MutualTls {
+                encryption_enabled: false,
+                ..
+            }
+        ) {
+            return Err(GrpcError::InvalidTlsConfiguration(
+                "authentication-only mode requires SecurityManager::incoming".into(),
+            ));
+        }
+
         let TlsConfig::MutualTls {
             ca_certificate,
             identity_certificate,
@@ -103,6 +130,100 @@ impl SecurityManager {
             ));
         Ok(server.tls_config(tls)?)
     }
+    /// URI used only inside Tonic; advertised endpoints and verified server name stay unchanged.
+    pub fn endpoint_uri(&self, uri: &str) -> String {
+        if matches!(
+            self.config,
+            TlsConfig::MutualTls {
+                encryption_enabled: false,
+                ..
+            }
+        ) {
+            uri.replacen("https://", "http://", 1)
+        } else {
+            uri.to_owned()
+        }
+    }
+    fn authenticated(
+        &self,
+    ) -> Result<Option<std::sync::Arc<super::authenticated::AuthenticatedTransport>>, GrpcError>
+    {
+        match &self.config {
+            TlsConfig::Disabled => Ok(None),
+            _ => super::authenticated::AuthenticatedTransport::new(&self.config)
+                .map(std::sync::Arc::new)
+                .map(Some)
+                .map_err(|e| GrpcError::InvalidTlsConfiguration(e.to_string())),
+        }
+    }
+    /// One common client path for all AFS relations; there is no plaintext fallback.
+    pub fn connect_lazy(&self, endpoint: Endpoint) -> Result<tonic::transport::Channel, GrpcError> {
+        if matches!(
+            self.config,
+            TlsConfig::MutualTls {
+                encryption_enabled: false,
+                ..
+            }
+        ) {
+            Ok(self
+                .authenticated()?
+                .ok_or_else(|| GrpcError::InvalidTlsConfiguration("mTLS identity absent".into()))?
+                .connect_lazy(endpoint))
+        } else {
+            Ok(self.configure_client(endpoint)?.connect_lazy())
+        }
+    }
+    pub async fn connect(
+        &self,
+        endpoint: Endpoint,
+    ) -> Result<tonic::transport::Channel, GrpcError> {
+        if matches!(
+            self.config,
+            TlsConfig::MutualTls {
+                encryption_enabled: false,
+                ..
+            }
+        ) {
+            Ok(self
+                .authenticated()?
+                .ok_or_else(|| GrpcError::InvalidTlsConfiguration("mTLS identity absent".into()))?
+                .connect(endpoint)
+                .await?)
+        } else {
+            Ok(self.configure_client(endpoint)?.connect().await?)
+        }
+    }
+    /// Bounded concurrent handshakes: one slow client cannot block every accept.
+    /// Invalid handshakes are logged and rejected before any business handler.
+    pub fn incoming<S>(
+        &self,
+        incoming: S,
+    ) -> Result<
+        impl futures_util::Stream<Item = std::io::Result<super::AuthenticatedIo>> + Send + 'static,
+        GrpcError,
+    >
+    where
+        S: futures_util::Stream<Item = std::io::Result<tokio::net::TcpStream>> + Send + 'static,
+    {
+        use futures_util::StreamExt;
+        let authentication = self.authenticated()?;
+        Ok(incoming.map(move |socket| {
+            let authentication = authentication.clone();
+            async move {
+                // Preserve listener errors; only a per-client handshake rejection
+                // may be skipped. Otherwise FD/socket failure could hot-loop.
+                let socket = match socket { Ok(socket) => socket, Err(error) => return Some(Err(error)) };
+                let accepted = match authentication {
+                    Some(policy) => policy.accept(socket).await,
+                    None => super::AuthenticatedIo::plain(socket),
+                };
+                match accepted {
+                    Ok(socket) => Some(Ok(socket)),
+                    Err(error) => { afs_logging::warn!("afs.transport.rejected"; "error"=>error.to_string()); None }
+                }
+            }
+        }).buffer_unordered(32).filter_map(futures_util::future::ready))
+    }
 }
 
 fn read_file(path: &PathBuf) -> Result<Vec<u8>, GrpcError> {
@@ -118,10 +239,27 @@ mod tests {
     // `#[cfg(test)]` 使整个模块只在 `cargo test` 时编译，不进入正式二进制。
     use super::*;
 
+    #[tokio::test]
+    async fn unified_transport_preserves_listener_errors() {
+        use futures_util::StreamExt;
+        let security = SecurityManager::new(TlsConfig::Disabled).unwrap();
+        let incoming = security
+            .incoming(futures_util::stream::iter([
+                Err::<tokio::net::TcpStream, _>(std::io::Error::other("listener failed")),
+            ]))
+            .unwrap();
+        tokio::pin!(incoming);
+        let item = incoming
+            .next()
+            .await
+            .expect("listener error must not be swallowed");
+        assert_eq!(item.err().unwrap().to_string(), "listener failed");
+    }
     #[test]
     fn mutual_tls_requires_server_name() {
         // 本测试不需要真实证书，因为 `new` 应在读文件之前拒绝空 server_name。
         let error = SecurityManager::new(TlsConfig::MutualTls {
+            encryption_enabled: true,
             ca_certificate: "ca.pem".into(),
             identity_certificate: "client.pem".into(),
             identity_private_key: "client.key".into(),

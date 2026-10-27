@@ -543,17 +543,26 @@ name = "afs-transport"
 version = "0.1.0"
 dependencies = [
  "afs-error",
+ "afs-logging",
  "afs-protocol",
+ "blake3",
  "cc",
+ "futures-util",
+ "hyper-util",
  "libc",
  "nix 0.29.0",
  "prost 0.14.4",
  "prost-types 0.14.4",
+ "rustls",
+ "rustls-pemfile",
+ "tempfile",
  "thiserror 2.0.20",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "tonic 0.14.6",
  "tonic-types",
+ "tower 0.5.3",
 ]
 
 [[package]]

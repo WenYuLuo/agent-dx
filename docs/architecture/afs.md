@@ -98,13 +98,23 @@ DFS 的 `copy_file_range` 通过元数据 COW 为目标创建独立 FileVersion�
 
 文件提交和完整元数据同步遇到事务 CAS 未命中时，会重新验证 head 和写租约身份；同身份续期或并发 inode 属性变化不再永久污染 writer。换主和 head 变化仍拒绝。单次处理的持续竞争返回可重试错误，保留原 operation，避免把暂时竞争带到退出 drain。
 
-所有启用 OwnerFs 或 DFS 权威能力的 Meta 都要求 mTLS 和
+所有启用 OwnerFs 或 DFS 权威能力的 Meta 都要求双向证书身份认证和
 `trusted_node_certs`。CA 只证明证书链可信；Meta 还把握手得到的叶证书 DER 精确
 映射到一个 Node ID，并校验 RPC 中声明的 caller／holder／owner 身份。DFS-only
 部署与 OwnerFs 部署执行同一身份绑定，不能用另一张同 CA 证书冒充目标 Node。
-Node 的 Meta、peer control 和 data 诊断请求复用生产 TLS 配置，诊断不建立明文旁路。
+Node 的 Meta、peer control 和 data 诊断请求复用同一生产认证及加密配置，诊断不绕过证书认证。
 这里的 Node ID 绑定发生在服务端对调用方的校验中；客户端仍按 CA 和
 `tls_server_name` 验证服务端，不承诺按目标 Node ID 对服务端证书逐一 pinning。
+
+组件间 TCP/gRPC 统一使用 `tls_encryption_enabled`（默认 false）。配置完整证书时，
+false 保留真实 mTLS 身份握手，在受认证的 AFS1 模式协商和 ACK/GO 屏障后传输明文；
+true 在握手后继续使用标准 TLS。Node、Meta、读写、副本、控制和诊断复用公共
+`afs-transport` 接线；模式不兼容不自动降级，切换配置需要重启。
+未配置身份的旧本地诊断模式不能通过现有权威能力启动检查。
+
+关闭持续加密也关闭后续消息的密码学完整性保护；正文、请求头、Meta及控制消息
+可被观察或主动修改。初始证书身份不等于明文流的持续防篡改，CRC不能替代该保护。
+默认模式适用于受控且无主动攻击者的网络；需要抵抗链路攻击时统一开启加密。
 
 ### OwnerFs Root 授权的代际与回收
 

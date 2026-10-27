@@ -1949,6 +1949,7 @@ async fn mtls_ownerfiles_grpc_roundtrip_uses_real_ownerfs_backend() {
     let peers = afs::node::rpc::peer::PeerConnectionPool::new(
         afs_transport::GrpcConfig::default(),
         afs_transport::TlsConfig::MutualTls {
+            encryption_enabled: true,
             ca_certificate: ca,
             identity_certificate: cert,
             identity_private_key: key,

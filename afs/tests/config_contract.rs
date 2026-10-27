@@ -453,7 +453,13 @@ fn shipped_examples_resolve_with_mutual_tls_and_node_identity_binding() {
             .starts_with("https://")
     );
     for tls in [meta.tls_config(), node.tls_config()] {
-        assert!(matches!(tls, afs_transport::TlsConfig::MutualTls { .. }));
+        assert!(matches!(
+            tls,
+            afs_transport::TlsConfig::MutualTls {
+                encryption_enabled: false,
+                ..
+            }
+        ));
     }
 }
 
@@ -1279,7 +1285,7 @@ fn fuse_execution_and_dfs_cache_defaults_are_explicit() {
         ("dfs_fuse_keep_cache", serde_json::json!(true)),
         ("dfs_fuse_entry_ttl_ms", serde_json::json!(0)),
         ("dfs_fuse_attr_ttl_ms", serde_json::json!(0)),
-        ("fuse_max_readahead_bytes", serde_json::json!(1048576)),
+        ("fuse_max_readahead_bytes", serde_json::json!(16777216)),
     ] {
         assert_eq!(value.get(key), Some(&expected), "missing/wrong {key}");
     }
@@ -1970,6 +1976,66 @@ fn unified_native_read_has_no_user_sync_async_switch() {
     assert!(
         serde_json::from_value::<afs::node::read_pipeline::ReadPipelineLimits>(
             serde_json::json!({"enabled":false})
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn tls_encryption_defaults_off_without_disabling_identity() {
+    let cfg = Config::resolve(
+        Role::Node,
+        Cli::parse_from(["afs-node", "--id", "tls-default"]),
+    )
+    .unwrap();
+    let value = serde_json::to_value(&cfg).unwrap();
+    assert_eq!(
+        value["tls_encryption_enabled"],
+        serde_json::Value::Bool(false)
+    );
+}
+
+#[test]
+fn tls_encryption_cli_file_precedence_and_identity_are_independent() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tls.toml");
+    for role in [Role::Node, Role::Meta] {
+        std::fs::write(&path, "tls_encryption_enabled=true\ntls_ca_certificate='ca'\ntls_identity_certificate='cert'\ntls_identity_private_key='key'\ntls_server_name='localhost'\n").unwrap();
+        let cfg = Config::resolve(
+            role,
+            Cli::parse_from(["afs", "--config", path.to_str().unwrap()]),
+        )
+        .unwrap();
+        assert!(matches!(
+            cfg.tls_config(),
+            afs_transport::TlsConfig::MutualTls {
+                encryption_enabled: true,
+                ..
+            }
+        ));
+        let cfg = Config::resolve(
+            role,
+            Cli::parse_from([
+                "afs",
+                "--config",
+                path.to_str().unwrap(),
+                "--tls-encryption-enabled",
+                "false",
+            ]),
+        )
+        .unwrap();
+        assert!(matches!(
+            cfg.tls_config(),
+            afs_transport::TlsConfig::MutualTls {
+                encryption_enabled: false,
+                ..
+            }
+        ));
+    }
+    assert!(
+        Config::resolve(
+            Role::Node,
+            Cli::parse_from(["afs", "--tls-encryption-enabled", "true"])
         )
         .is_err()
     );

@@ -6,8 +6,10 @@
 //! 调用方直接使用 Tonic 建连、选择 TCP/UDS、监听并注册生成的 service。
 //! 不增加统一连接管理器、重试框架或 actor 调度层。
 
+mod authenticated;
 mod config;
 mod security;
+pub use authenticated::{AuthenticatedIo, peer_certificates, peer_remote_addr};
 
 pub use config::GrpcConfig;
 pub use security::{SecurityManager, TlsConfig};
