@@ -66,6 +66,7 @@ service_impl!(pb::coordinator_service_server::CoordinatorService, {
     reserve_local_environment(ClaimEnvironmentRequest) -> ClaimEnvironmentResponse,
     claim_environment(ClaimEnvironmentRequest) -> ClaimEnvironmentResponse,
     forward_create(LocalEnvironmentCreateRequest) -> EnvironmentResult,
+    unregister_node(UnregisterNodeRequest) -> UnregisterNodeResponse,
     register_node(RegisterNodeRequest) -> RegisterNodeResponse,
     inspect_node(InspectNodeRequest) -> InspectNodeResponse,
     create_environment(CreateEnvironmentRequest) -> EnvironmentResult,

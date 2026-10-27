@@ -99,6 +99,18 @@ impl ShardScheduler {
             stats: SchedulingStats::default(),
         }
     }
+    pub(crate) fn forget_node(&mut self, id: &str) -> Result<()> {
+        if self.assigned.values().any(|a| a.node_id == id) {
+            return Err(Error::Conflict);
+        }
+        self.nodes.remove(id);
+        self.cache.clear();
+        self.cache_order.clear();
+        for nodes in self.excluded.values_mut() {
+            nodes.remove(id);
+        }
+        Ok(())
+    }
     pub fn metrics(
         &self,
         out: &mut adx_observability::metrics::Text,

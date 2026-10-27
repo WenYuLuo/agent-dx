@@ -292,6 +292,7 @@ impl StoredEnvironment {
     pub(super) fn observe_node_loss(
         &mut self,
         incident: &str,
+        planned: bool,
         counters: &mut BusinessCounters,
     ) -> Result<()> {
         let previous = self.result.clone();
@@ -309,10 +310,19 @@ impl StoredEnvironment {
                         assignment_generation: record.assignment.generation,
                         runtime_id: record.runtime.id.clone(),
                         worker_id: record.assignment.node_id.clone(),
-                        reason: InterruptionReason::NodeUnreachable,
+                        reason: if planned {
+                            InterruptionReason::Unknown
+                        } else {
+                            InterruptionReason::NodeUnreachable
+                        },
                         evidence_source: EvidenceSource::Coordinator,
                         exit_code: None,
-                        detail: "Coordinator retired unreachable node ownership".into(),
+                        detail: if planned {
+                            "Node explicitly unregistered"
+                        } else {
+                            "Coordinator retired unreachable node ownership"
+                        }
+                        .into(),
                     },
                     Some(incident.into()),
                     counters,

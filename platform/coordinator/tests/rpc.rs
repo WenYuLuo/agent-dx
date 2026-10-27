@@ -1,4 +1,6 @@
 mod common;
+#[path = "rpc/node_retirement.rs"]
+mod node_retirement;
 #[path = "rpc/volumes.rs"]
 mod volumes;
 use adx_coordinator::{routes::RoutePublisher, rpc::CoordinatorRpc, storage::Session, Placement};

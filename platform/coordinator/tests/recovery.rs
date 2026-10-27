@@ -67,6 +67,7 @@ fn saved() -> StoredSnapshot {
         nodes: [(
             "n".into(),
             StoredNode {
+                retirement: None,
                 last_incident_id: None,
                 node,
                 shard_id: 0,

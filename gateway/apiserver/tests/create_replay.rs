@@ -142,6 +142,7 @@ assignment: Some(pb::Assignment { environment_id: spec.id.clone(), node_id: self
     reserve_local_environment(ClaimEnvironmentRequest) -> ClaimEnvironmentResponse,
     claim_environment(ClaimEnvironmentRequest) -> ClaimEnvironmentResponse,
     forward_create(LocalEnvironmentCreateRequest) -> EnvironmentResult,
+    unregister_node(UnregisterNodeRequest) -> UnregisterNodeResponse,
     register_node(RegisterNodeRequest) -> RegisterNodeResponse,
     inspect_node(InspectNodeRequest) -> InspectNodeResponse,
     commit_environment(CommitEnvironmentRequest) -> CommitEnvironmentResponse,
