@@ -1,6 +1,6 @@
 {
   "repository": "https://github.com/WenYuLuo/sandboxd.git",
-  "revision": "b1ada0263b44820e1298ebf269f435b4e1d31793",
+  "revision": "f800327459a104c04a0689940062fc9bb9e2bb9e",
   "files": [
     {
       "source": "api/runtime/v1/sandbox-api.proto",

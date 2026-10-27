@@ -22,6 +22,8 @@ struct Server {
     network_updates: Arc<Mutex<Vec<SetNetworkPolicyRequest>>>,
     unready: Arc<std::sync::atomic::AtomicUsize>,
     running: Arc<Mutex<bool>>,
+    pending: Arc<Mutex<bool>>,
+    advertise_pending: bool,
     xpu: Arc<Mutex<Vec<XpuAllocation>>>,
     entered: Arc<Semaphore>,
     release: Arc<Semaphore>,
@@ -49,6 +51,8 @@ impl Default for Server {
             network_updates: Arc::default(),
             unready: Arc::default(),
             running: Arc::default(),
+            pending: Arc::default(),
+            advertise_pending: false,
             xpu: Arc::default(),
             entered: Arc::new(Semaphore::new(0)),
             release: Arc::new(Semaphore::new(1)),
@@ -77,6 +81,9 @@ impl sandbox_service_server::SandboxService for Server {
         request: Request<StartRequest>,
     ) -> Result<Response<StartResponse>, Status> {
         let request = request.into_inner();
+        if self.advertise_pending {
+            *self.pending.lock().unwrap() = true;
+        }
         assert!(request.sandbox_id.is_empty());
         self.starts.lock().unwrap().push(request.clone());
         *self.labels.lock().unwrap() = request.labels.clone();
@@ -156,6 +163,7 @@ impl sandbox_service_server::SandboxService for Server {
             .push(format!("delete:{}", request.id));
         if !self.retain_after_delete {
             *self.running.lock().unwrap() = false;
+            *self.pending.lock().unwrap() = false;
         }
         Ok(Response::new(DeleteResponse::default()))
     }
@@ -166,7 +174,9 @@ impl sandbox_service_server::SandboxService for Server {
         let request = request.into_inner();
         let id = request.id;
         self.requests.lock().unwrap().push(format!("list:{id}"));
-        if (!*self.running.lock().unwrap() && self.exit_message.is_none())
+        if (!*self.running.lock().unwrap()
+            && !*self.pending.lock().unwrap()
+            && self.exit_message.is_none())
             || (!id.is_empty() && id != "generated-backend-id")
         {
             if !id.is_empty() {
@@ -188,6 +198,8 @@ impl sandbox_service_server::SandboxService for Server {
                 labels,
                 state: if *self.running.lock().unwrap() {
                     SandboxState::Running as i32
+                } else if *self.pending.lock().unwrap() {
+                    SandboxState::Unknown as i32
                 } else {
                     SandboxState::Exited as i32
                 },
@@ -2080,4 +2092,29 @@ async fn periodic_authority_retires_failed_controller_after_start_fence() {
         .unwrap()
         .iter()
         .all(|r| r.state != EnvironmentState::Running));
+}
+
+#[tokio::test]
+async fn restart_inventory_reclaims_pending_start_without_previous_client_state() {
+    let server = Server {
+        transport_error: true,
+        advertise_pending: true,
+        ..Default::default()
+    };
+    let (old, harness) = connect(server.clone()).await;
+    assert!(old.start(&spec(), "i-1", 1, &[]).await.is_err());
+    drop(old);
+    let restored = Sandboxd::connect(
+        harness._directory.path().join("rpc.sock"),
+        Config::default(),
+    )
+    .await
+    .unwrap();
+    let pending = restored.inventory().await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].runtime_id, "i-1");
+    assert!(!pending[0].running);
+    restored.remove(&pending[0].runtime_id).await.unwrap();
+    assert!(restored.inventory().await.unwrap().is_empty());
+    assert_eq!(server.starts.lock().unwrap().len(), 1);
 }
