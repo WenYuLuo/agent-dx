@@ -161,7 +161,11 @@ async fn startup_compacts_orphaned_history_without_losing_live_or_node_facts() {
     assert_eq!(restarted.business_counters().await.unwrap(), expected);
     assert_eq!(expected.creations, [97, 192, 288]);
     assert_eq!(expected.worker_incidents, 96);
-    assert!(restarted.get("live").await.is_ok());
+    assert_eq!(
+        restarted.get("live").await.unwrap().result.unwrap().state,
+        EnvironmentState::Running,
+        "startup compaction must retain the live lifecycle record"
+    );
     let fields = business_fields(&rig).await;
     assert!(fields.len() <= 65);
     assert_eq!(
@@ -273,4 +277,56 @@ async fn retirement_keeps_u64_precision_and_overflow_leaves_lifecycle_unchanged(
         .unwrap();
     let retained: BusinessCounters = serde_json::from_str(&raw).unwrap();
     assert_eq!(retained.creations, [u64::MAX, 0, 0]);
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn corrupt_history_does_not_block_startup_or_discard_repairable_facts() {
+    let rig = common::Redis::new().await;
+    let store = rig.store().await;
+    let session = store.begin(1).await.unwrap();
+    register(&session, "node").await;
+    create(&session, "live", 1).await;
+    let client = redis::Client::open(rig.url.as_str()).unwrap();
+    let mut connection = client.get_multiplexed_async_connection().await.unwrap();
+    let historical = BusinessCounters {
+        creations: [2, 0, 0],
+        ..Default::default()
+    };
+    redis::cmd("HSET")
+        .arg("adx:{test}:control:v1:business")
+        .arg("environment:corrupt")
+        .arg("invalid historical record")
+        .arg("environment:healthy")
+        .arg(serde_json::to_string(&historical).unwrap())
+        .query_async::<()>(&mut connection)
+        .await
+        .unwrap();
+    let recovered = store.begin(1).await.unwrap();
+    assert_eq!(
+        recovered.get("live").await.unwrap().result.unwrap().state,
+        EnvironmentState::Running
+    );
+    assert!(recovered.business_counters().await.is_err());
+    let fields = business_fields(&rig).await;
+    assert!(fields.iter().any(|field| field == "environment:corrupt"));
+    assert!(!fields.iter().any(|field| field == "environment:healthy"));
+    // A bad observability field must not prevent new lifecycle commits.
+    create(&recovered, "after-recovery", 2).await;
+    redis::cmd("HSET")
+        .arg("adx:{test}:control:v1:business")
+        .arg("environment:corrupt")
+        .arg(serde_json::to_string(&historical).unwrap())
+        .query_async::<()>(&mut connection)
+        .await
+        .unwrap();
+    let repaired = store.begin(1).await.unwrap();
+    assert_eq!(
+        repaired.business_counters().await.unwrap().creations,
+        [6, 0, 0]
+    );
+    assert!(!business_fields(&rig)
+        .await
+        .iter()
+        .any(|field| field == "environment:corrupt"));
 }

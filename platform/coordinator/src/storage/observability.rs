@@ -331,22 +331,43 @@ impl Session {
     ) -> Result<()> {
         let mut command = redis::cmd("HKEYS");
         command.arg(format!("{}:business", self.store.key));
-        for field in self.store.query::<Vec<String>>(command).await? {
+        let fields = match self.store.query::<Vec<String>>(command).await {
+            Ok(fields) => fields,
+            Err(error) => {
+                adx_observability::warn!(%error, "business history scan deferred");
+                return Ok(());
+            }
+        };
+        for field in fields {
             if active.contains_key(&field)
                 || !(field.starts_with("environment:") || field.starts_with("node:"))
             {
                 continue;
             }
-            for attempt in 0..ATTEMPTS {
-                let mut counters = CounterUpdate::load(&self.store, field.clone()).await?;
-                if counters.old.is_none() {
-                    break;
+            match self.compact_retired_counter(&field).await {
+                Ok(true) => (),
+                Ok(false) => return Err(Error::Conflict),
+                Err(error) => {
+                    adx_observability::warn!(%error, %field, "business history field compaction deferred")
                 }
-                counters.prepare_retirement(&self.store).await?;
-                let mut command = redis::cmd("EVAL");
-                command
-                    .arg(
-                        r#"
+            }
+        }
+        Ok(())
+    }
+
+    /// False means a newer control epoch fenced this session. Observability
+    /// failures stay recoverable without discarding the original history field.
+    async fn compact_retired_counter(&self, field: &str) -> Result<bool> {
+        for attempt in 0..ATTEMPTS {
+            let mut counters = CounterUpdate::load(&self.store, field.to_owned()).await?;
+            if counters.old.is_none() {
+                return Ok(true);
+            }
+            counters.prepare_retirement(&self.store).await?;
+            let mut command = redis::cmd("EVAL");
+            command
+                .arg(
+                    r#"
                     if redis.call('HGET',KEYS[1],'epoch') ~= ARGV[1] then return 3 end
                     local facts = cjson.decode(ARGV[2])
                     if redis.call('HEXISTS',KEYS[1],facts[1]) == 1 then return 2 end
@@ -355,25 +376,24 @@ impl Session {
                     redis.call('HSET',KEYS[2],facts[4],facts[6])
                     redis.call('HDEL',KEYS[2],facts[1]); return 1
                     "#,
-                    )
-                    .arg(2)
-                    .arg(&self.store.key)
-                    .arg(format!("{}:business", self.store.key))
-                    .arg(self.epoch.to_string())
-                    .arg(counters.argument()?);
-                match self.store.query::<u8>(command).await? {
-                    1 | 2 => break,
-                    3 => return Err(Error::Conflict),
-                    _ if attempt + 1 == ATTEMPTS => {
-                        return Err(Error::Unavailable(
-                            "concurrent business history compaction; retry startup".into(),
-                        ));
-                    }
-                    _ => (),
+                )
+                .arg(2)
+                .arg(&self.store.key)
+                .arg(format!("{}:business", self.store.key))
+                .arg(self.epoch.to_string())
+                .arg(counters.argument()?);
+            match self.store.query::<u8>(command).await? {
+                1 | 2 => return Ok(true),
+                3 => return Ok(false),
+                _ if attempt + 1 == ATTEMPTS => {
+                    return Err(Error::Unavailable(
+                        "concurrent business history compaction; retry later".into(),
+                    ));
                 }
+                _ => (),
             }
         }
-        Ok(())
+        Ok(true)
     }
 
     pub async fn business_counters(&self) -> Result<BusinessCounters> {
