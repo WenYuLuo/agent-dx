@@ -732,7 +732,7 @@ revision 截断；快照 GC 的读视图和相关键 CAS 保留 canonical 的期
 等待取消、bind/native 与远端 FUSE 锁域协同。bind 本机 ext4 锁和单挂载
 内核回退不能宣传为分布式锁。
 
-支持范围、验证边界和性能目标见 [Agent FS（AFS） 演进计划](../development/afs-plan.md)。
+支持范围、验证边界和性能目标见 [AFS roadmap](../development/afs-roadmap.md) 和 [DFS plan](../development/dfs-plan.md)。
 
 写流水线的 normal 128MiB 租约分别归属原 partial dirty 分配、pending Vec 容量
 及 sealed Arc；封块后 dirty 与 HTTP/retry 共享 sealed 租约，旧 partial read pin
