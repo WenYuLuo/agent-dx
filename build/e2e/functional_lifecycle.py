@@ -47,22 +47,23 @@ def _volume_catalog(connection):
         fetched = Environment.get_volume(volume_id, connection=connection)
         if not (volume.uid == replay.uid == fetched.uid and fetched.spec == spec):
             raise AssertionError('volume ensure/get did not retain identity and definition')
-        token = None
-        for _ in range(1000):
-            page, token = Environment.list_volumes(page_size=1, page_token=token, connection=connection)
-            if any(item.uid == volume.uid for item in page):
-                break
-            if not token:
-                raise AssertionError('new volume missing from paginated catalog')
-        else:
+        def listed():
+            token = None
+            for _ in range(1000):
+                page, token = Environment.list_volumes(page_size=1, page_token=token, connection=connection)
+                if any(item.uid == volume.uid for item in page):
+                    return True
+                if not token:
+                    return False
             raise AssertionError('volume catalog pagination did not converge')
+
+        if not listed():
+            raise AssertionError('new volume missing from paginated catalog')
         Environment.delete_volume(volume_id, connection=connection)
         created = False
-        try:
-            Environment.get_volume(volume_id, connection=connection)
-        except EnvironmentNotFound:
-            return volume.uid
-        raise AssertionError('deleted volume remains queryable')
+        if listed():
+            raise AssertionError('deleted volume remains in catalog')
+        return volume.uid
     finally:
         if created:
             Environment.delete_volume(volume_id, connection=connection)
