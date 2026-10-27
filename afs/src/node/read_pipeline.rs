@@ -276,7 +276,7 @@ impl Default for ReadPipelineLimits {
     fn default() -> Self {
         Self {
             max_rpcs: 4,
-            max_reply_bytes: 8 * 1024 * 1024,
+            max_reply_bytes: 256 * 1024 * 1024,
             max_disk_reads: 2,
             max_batch_ops: 4,
             max_pending: 256,

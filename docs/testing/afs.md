@@ -1022,7 +1022,9 @@ Moving detection from A to B also moves the point where a corrupted copy becomes
 
 The isolated read candidate supports `dfs_native_open_read_authority = true` only with explicit native `data_mode = "grpc"`. The switch defaults to false. Eligible regular O_RDONLY handles with no dirty/proxy view pin their opened version/layout and reuse file-scoped authorization. The ordinary lane retains its lease checks. The off-only native fast lane binds a full Meta-authorized context to a trackable mTLS connection; source-page TTL does not expire that connected open. It retains fixed range/length/resource bounds without repeating per-frame authorization. Close prevents new admission; in-flight owners keep the existing durable GC pin until their last release.
 
-Fixed native handles use FOPEN_DIRECT_IO: actual Linux read/pread EOF remains tied to the opened version across truncate and a new open. This does not guarantee a per-fd fstat or mmap snapshot: fstat may report the shared inode's newer length. The new persisted GC context schema has only been checked with fresh isolated stores and same-version Meta/A/B. Migration, mixed versions and integration with prefetch/cache are not admitted.
+Native readonly handles with a known immutable version/length identity may use the kernel page cache and readahead. The FUSE open fence drains earlier read replies before making a fresh cache decision. Live cached handles for one inode share one identity; a new open for an incompatible version/length uses direct IO until those cached handles retire, so an older fixed view cannot refill the new view's shared pages. Explicit O_DIRECT, unknown native readonly identities and admission exhaustion also use direct IO. The live-handle metadata table is bounded and never evicts an active identity. `dfs_fuse_keep_cache` controls reuse across opens, not whether a newly opened eligible handle may cache pages. This provides close-to-open behavior rather than a per-fd historical length, fstat or mmap snapshot guarantee. Historical direct-only EOF measurements remain historical evidence. The new persisted GC context schema has only been checked with fresh isolated stores and same-version Meta/A/B. Migration, mixed versions and user-space prefetch/cache integration are not admitted.
+
+Kernel readahead is independently requested with `fuse_max_readahead_bytes` (0..16MiB); fuser clamps it to the kernel's proposed ceiling, so the requested number is not an assertion of the effective window. Record the `dfs.fuse_cache_init` configuration and Linux BDI `read_ahead_kb`. `dfs.fuse_cache_open` records actual cached/direct admission and keep-cache choices. Native object prefetch remains controlled separately by `dfs_readahead_max_bytes`, and remains zero in the kernel-readahead comparison. Actual Linux validation must cover overwritten/truncated/extended versions on a fresh open, overlapping old/new handles and exactly-once release before any performance claim.
 
 The [remote read candidate ledger](../performance/afs-remote-read-20261024/README.md) records the exact cohorts, Linux validation, retained failures and future work. Benchmark settings explicitly enable this switch, set `dfs_fuse_keep_cache=false` and `dfs_readahead_max_bytes=0`; merely using a new binary does not activate all candidate optimizations.
 
@@ -1084,3 +1086,68 @@ FUSE comparison; old CRC/open-authority timings are not a current baseline.
 原生gRPC读现统一使用异步业务核心；重点核对固定版本/授权、CRC模式、同fh顺序、缓存/预取已有行为、取消后子工作真实退役、任务/RPC/缓冲/磁盘限额及超时恢复。同步SDK和真正同步后端只保留必要适配。
 
 [统一交付](../performance/afs-remote-read-20261024/unified-read-20261026.md)区分冻结候选Linux/FUSE/24次性能证据与最新主线集成门禁。多读者原单对+5.18%及缓存准备根因继续保留；完整性能未全部准入，云环境后续复测，不以机制计数替代完整耗时。
+
+
+## Native fixed-open direct read-ahead candidate
+
+For native DFS gRPC fixed-open reads with read CRC `off` and no disk peer cache,
+`dfs_readahead_max_bytes = 16777216` enables bounded B-side look-ahead only for
+explicit read-only direct handles. Zero retains the original path. Other
+transport, write, local and recovery checksum policies are unchanged. This
+candidate is experimental and has not been admitted for default enablement.
+
+The per-fh speculative bound is 16 MiB, the node ceiling 64 MiB, and the effective
+node bound is additionally at most half of `dfs_read_pipeline.max_reply_bytes`.
+Thus the 16 MiB reply budget used by the fixed experiment permits at most 8 MiB
+of speculative retained/in-flight charges. Existing RPC, task and buffer limits
+are not enlarged. A speculative failure receives a normal demand read attempt.
+The negotiated FUSE request limits remain unchanged; large internal API reads
+under retained-buffer pressure are outside this fixed FUSE cohort's admission.
+
+The `afs_dfs_read_buffer_*` metrics with role `b_prefetch` report scheduled/ready,
+ready hits, in-flight joins, retries, unused-ready bytes, cancellation and exact
+reserved/peak capacity. Unused-ready bytes exclude the union of successfully
+served ranges, rather than treating one partial hit as full consumption. These
+are not wire-byte or application-consumption metrics. Explicit assembly copies
+use stage `prefetch_parts_to_reply`. Timing and compatibility admission require
+independent evidence; unchanged functional policies are not new admission.
+
+### Scoped direct read-ahead revision (experimental)
+
+The native CRC-off, fixed-open path enables speculative B read-ahead only for
+explicit read-only `O_DIRECT` handles. Cached and unknown modes use the original
+native asynchronous read path; kernel read-ahead and keep-cache are unchanged.
+Ordinary reads run in the caller future and never retain bodies in the look-ahead
+index. After 32 MiB of completed, aligned 1 MiB sequential requests, the window
+starts at 4 MiB and grows to 8/16 MiB subject to the unchanged half-reply node
+quota (8 MiB with a 16 MiB reply budget). Refill uses a low watermark and polls
+up to four existing native futures per background task. A jump, request-shape
+change or same-handle concurrency resets confidence and stops new speculation.
+Already overlapping flights are reused; rare multi-part assembly is serialized
+and its destination is admitted before obtaining parts. Cancellation and final
+reply slices retain real transport/buffer ownership until completion.
+
+Regression coverage includes dense local holes, caller-task ordinary reads,
+ordinary cancellation, 32 MiB activation, explicit mode gating, partial overlap,
+EOF slices, speculative failure retry, and last-reference/transport retirement.
+These component tests do not establish performance admission, independent-host
+behavior, or all legacy compatibility and integrity boundaries.
+
+
+## Read configuration delivery and large internal reads
+
+Reply capacity defaults to 256MiB, kernel read-ahead requests 16MiB, and B-side
+look-ahead remains opt-in. Linux DFS mounts update only their own BDI setting
+after mount creation and log readback or a nonfatal `applied=false` fallback.
+Functional admission records actual INIT/BDI values, configuration overrides,
+CRC policy, exact data/EOF and real resource retirement independently of timing.
+The historical 16MiB reply/8MiB speculation cohort is unchanged.
+
+Internal reads larger than the 1MiB speculation unit discard speculative index
+ownership and request one final owned result instead of holding source parts
+while waiting for a second complete assembly allocation. Cancellation preserves
+real in-flight child and externally claimed reply ownership. Small cross-unit
+reads retain overlap sharing and bounded assembly. Controlled capacity tests must
+show forward progress and complete credit release; increasing capacity alone is
+not a fix for mutually dependent ownership. This is not a general latency/QoS or
+all-saturation admission.

@@ -55,8 +55,8 @@ pub trait Backend: Send + Sync {
         None
     }
 
-    /// Fixed-version handles own EOF in the backend; the shared kernel inode's
-    /// current size/page cache must not truncate an older handle's read.
+    /// The handle reads an immutable open view. A cached frontend must isolate
+    /// incompatible active views; explicit direct IO also bypasses shared EOF.
     fn fixed_read_view(&self, _handle: types::FileHandle) -> bool {
         false
     }

@@ -1120,6 +1120,23 @@ impl ReadWorkMetrics {
         }
     }
 
+    pub(crate) fn read_buffer_counters(
+        &self,
+        role: &'static str,
+        event: &'static str,
+    ) -> (afs_metrics::IntCounter, afs_metrics::IntCounter) {
+        (
+            self.read_buffer_events.with_label_values(&[role, event]),
+            self.read_buffer_bytes.with_label_values(&[role, event]),
+        )
+    }
+    pub(crate) fn read_buffer_gauge(
+        &self,
+        role: &'static str,
+        state: &'static str,
+    ) -> afs_metrics::IntGauge {
+        self.read_buffer_capacity.with_label_values(&[role, state])
+    }
     pub(crate) fn read_buffer(&self, role: &'static str, event: &'static str, bytes: u64) {
         self.read_buffer_events
             .with_label_values(&[role, event])

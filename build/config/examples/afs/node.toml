@@ -20,7 +20,7 @@ uds_path = "/opt/adx/run/afs/node-a.sock"
 # dfs_fuse_attr_ttl_ms = 0
 # Requested DFS kernel read-ahead limit; record the negotiated value in tests.
 # This does not enable next-object prefetch or change OwnerFs cache policy.
-# fuse_max_readahead_bytes = 1048576
+# fuse_max_readahead_bytes = 16777216
 # Resident immutable metadata entries, not a byte or authorization budget.
 # dfs_version_cache_entries = 4096
 # Cache-retained metadata estimate; active reader Arcs and Node RSS are separate.
@@ -110,3 +110,8 @@ node-a = "/opt/adx/config/afs/tls/node-a.pem"
 # capacity_bytes = 268435456
 # pending_bytes = 37748736
 # cache_large_write = false
+
+# B-side owned reply memory, allocated on demand (8MiB..1GiB).
+# Distinct from kernel/B look-ahead windows; B look-ahead remains opt-in.
+# [dfs_read_pipeline]
+# max_reply_bytes = 268435456

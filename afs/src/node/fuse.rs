@@ -85,7 +85,7 @@ impl Default for FuseMountOptions {
             dfs_fuse_keep_cache: true,
             dfs_fuse_entry_ttl_ms: 0,
             dfs_fuse_attr_ttl_ms: 0,
-            fuse_max_readahead_bytes: 1024 * 1024,
+            fuse_max_readahead_bytes: 16 * 1024 * 1024,
         }
     }
 }
@@ -191,6 +191,99 @@ impl PageCacheIdentities {
         self.entries.insert(ino, (identity, self.clock));
         keep
     }
+}
+
+/// One kernel inode has one data cache. Concurrent fixed-open views that
+/// disagree must use direct IO instead of filling that cache with old bytes.
+/// This is an admission table for live handles, not another payload cache.
+#[derive(Default)]
+struct ActiveCachedViews {
+    inodes: HashMap<u64, (PageCacheIdentity, std::collections::HashSet<u64>)>,
+    handles: usize,
+    version_bytes: usize,
+}
+
+impl ActiveCachedViews {
+    fn admit(&mut self, ino: u64, fh: u64, identity: &PageCacheIdentity) -> bool {
+        if self.handles >= PAGE_CACHE_IDENTITIES {
+            return false;
+        }
+        if let Some((previous, handles)) = self.inodes.get_mut(&ino) {
+            if previous != identity {
+                return false;
+            }
+            self.handles += usize::from(handles.insert(fh));
+            return true;
+        }
+        let bytes = identity.version_id.as_ref().map_or(0, String::len);
+        if (identity.version_id.is_none() && identity.length != 0)
+            || bytes > PAGE_CACHE_VERSION_BYTES.saturating_sub(self.version_bytes)
+        {
+            return false;
+        }
+        self.inodes.insert(ino, (identity.clone(), [fh].into()));
+        self.handles += 1;
+        self.version_bytes += bytes;
+        true
+    }
+
+    fn release(&mut self, ino: u64, fh: u64) {
+        if let Some((_, handles)) = self.inodes.get_mut(&ino) {
+            self.handles -= usize::from(handles.remove(&fh));
+            if handles.is_empty()
+                && let Some((identity, _)) = self.inodes.remove(&ino)
+            {
+                self.version_bytes -= identity.version_id.as_ref().map_or(0, String::len);
+            }
+        }
+    }
+}
+
+// Called only after creating this DFS mount. Never tune a source disk or
+// global BDI. INIT negotiation and Linux's effective BDI limit are independent.
+#[cfg(target_os = "linux")]
+fn configure_mount_readahead(path: &Path, requested: u32) {
+    use std::os::unix::fs::MetadataExt;
+    let outcome = (|| -> io::Result<(PathBuf, u64, u64)> {
+        let dev = std::fs::metadata(path)?.dev();
+        let setting = PathBuf::from(format!(
+            "/sys/class/bdi/{}:{}/read_ahead_kb",
+            libc::major(dev),
+            libc::minor(dev)
+        ));
+        let (before, effective) = update_bdi_readahead(&setting, requested)?;
+        Ok((setting, before, effective))
+    })();
+    match outcome {
+        Ok((setting, before, effective)) => {
+            afs_logging::info!("dfs.fuse_readahead"; "mount" => path.display().to_string(), "setting" => setting.display().to_string(), "requested_bytes" => requested, "initial_kib" => before, "effective_kib" => effective, "applied" => true);
+        }
+        Err(error) => {
+            // Correct reads remain available with the kernel's existing limit.
+            // Operators must not interpret a requested value as applied.
+            afs_logging::warn!("dfs.fuse_readahead"; "mount" => path.display().to_string(), "requested_bytes" => requested, "applied" => false, "error" => error.to_string());
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn update_bdi_readahead(setting: &Path, requested: u32) -> io::Result<(u64, u64)> {
+    let read = || -> io::Result<u64> {
+        std::fs::read_to_string(setting)?
+            .trim()
+            .parse()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    };
+    let before = read()?;
+    let target = u64::from(requested) / 1024;
+    std::fs::write(setting, format!("{target}\n"))?;
+    let effective = read()?;
+    if effective != target {
+        return Err(io::Error::other(format!(
+            "BDI read-ahead requested {target}KiB but effective {effective}KiB"
+        )));
+    }
+    Ok((before, effective))
 }
 
 fn configure_readahead(
@@ -626,6 +719,8 @@ fn mount_dfs_inner(
     let cleanup_error = fs.cleanup_error.clone();
     let session = fuser::spawn_mount(fs, &path, &configured_mount("afs-dfs", true, options))
         .map_err(Error::from)?;
+    #[cfg(target_os = "linux")]
+    configure_mount_readahead(&path, options.fuse_max_readahead_bytes);
     if let Some(bridge) = bridge {
         bridge.set_notifier(session.notifier());
     }
@@ -801,6 +896,29 @@ fn parse_octal(bytes: &[u8]) -> Option<u8> {
 mod mount_path_tests {
     use super::canonical_mount_path;
     use std::os::unix::fs::symlink;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn read_config_mount_bdi_updates_only_selected_setting_and_supports_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let setting = dir.path().join("read_ahead_kb");
+        let other = dir.path().join("other_bdi");
+        std::fs::write(&setting, "128\n").unwrap();
+        std::fs::write(&other, "256\n").unwrap();
+        assert_eq!(
+            super::update_bdi_readahead(&setting, 16 * 1024 * 1024).unwrap(),
+            (128, 16384)
+        );
+        assert_eq!(
+            super::update_bdi_readahead(&setting, 0).unwrap(),
+            (16384, 0)
+        );
+        assert_eq!(std::fs::read_to_string(other).unwrap(), "256\n");
+        assert!(super::update_bdi_readahead(&dir.path().join("absent"), 16777216).is_err());
+        assert!(!dir.path().join("absent").exists());
+        std::fs::write(&setting, "not a number").unwrap();
+        assert!(super::update_bdi_readahead(&setting, 16777216).is_err());
+    }
 
     #[test]
     fn mount_owner_resolves_ancestor_symlinks_once() {
@@ -1439,6 +1557,7 @@ pub struct AfsFuse {
     cached_io: bool,
     mount_options: FuseMountOptions,
     page_cache_ids: Arc<Mutex<PageCacheIdentities>>,
+    active_cached_views: Arc<Mutex<ActiveCachedViews>>,
     inode_cache_gates: Arc<InodeCacheGates>,
     inline_local_read_scratch: Mutex<Vec<u8>>,
     state: Arc<Mutex<FuseState>>,
@@ -1480,6 +1599,7 @@ impl AfsFuse {
             cached_io: false,
             mount_options,
             page_cache_ids: Arc::new(Mutex::new(PageCacheIdentities::default())),
+            active_cached_views: Arc::new(Mutex::new(ActiveCachedViews::default())),
             inode_cache_gates: Arc::new(InodeCacheGates::default()),
             inline_local_read_scratch: Mutex::new(Vec::new()),
             state,
@@ -1649,6 +1769,9 @@ impl Filesystem for AfsFuse {
                         format!("async read pipeline needs kernel ASYNC_DIO: {missing:?}"),
                     )
                 })?;
+        }
+        if self.cached_io {
+            afs_logging::info!("dfs.fuse_cache_init"; "requested_readahead_bytes" => self.mount_options.fuse_max_readahead_bytes, "kernel_config" => format!("{config:?}"));
         }
         Ok(())
     }
@@ -2177,6 +2300,7 @@ impl Filesystem for AfsFuse {
         let keep_cache = cached_io && self.mount_options.dfs_fuse_keep_cache;
         let cache_ids = self.page_cache_ids.clone();
         let cache_gates = self.inode_cache_gates.clone();
+        let active_cached_views = self.active_cached_views.clone();
         let enqueue_at = std::time::Instant::now();
         let open_span = tracing::info_span!(
             "node.fuse.open",
@@ -2238,22 +2362,39 @@ impl Filesystem for AfsFuse {
                         });
                         return;
                     }
-                    let fixed_view = backend.fixed_read_view(handle);
-                    let identity =
-                        if !fixed_view && keep_cache && flags & libc::O_ACCMODE == libc::O_RDONLY {
-                            backend.page_cache_identity(handle)
-                        } else {
-                            None
-                        };
+                    let versioned_read = backend.fixed_read_view(handle)
+                        || (backend.supports_async_reads()
+                            && flags & libc::O_ACCMODE == libc::O_RDONLY);
+                    let identity = if cached_io
+                        && flags & (libc::O_ACCMODE | libc::O_DIRECT) == libc::O_RDONLY
+                    {
+                        backend.page_cache_identity(handle)
+                    } else {
+                        None
+                    };
+                    let cache_admitted = identity.as_ref().is_some_and(|identity| {
+                        active_cached_views
+                            .lock()
+                            .is_ok_and(|mut views| views.admit(ino, fh, identity))
+                    });
                     // Poisoned optimization state opts out; it never permits
                     // reuse based on an identity that could not be checked.
-                    let keep = cache_ids
-                        .lock()
-                        .is_ok_and(|mut cache| cache.observe(ino, identity));
-                    let mut reply_flags = open_reply_flags(!cached_io || fixed_view);
+                    let keep = cache_ids.lock().is_ok_and(|mut cache| {
+                        cache.observe(
+                            ino,
+                            if keep_cache && cache_admitted {
+                                identity
+                            } else {
+                                None
+                            },
+                        )
+                    });
+                    let mut reply_flags =
+                        native_open_reply_flags(cached_io, versioned_read, flags, cache_admitted);
                     if keep {
                         reply_flags |= FopenFlags::FOPEN_KEEP_CACHE;
                     }
+                    afs_logging::info!("dfs.fuse_cache_open"; "ino" => ino, "fh" => fh, "versioned_read" => versioned_read, "cached" => !reply_flags.contains(DIRECT_IO), "keep_cache" => keep);
                     reply.opened(FuseFileHandle(fh), reply_flags);
                 }
                 Err(error) => reply.error(fuse_errno(error)),
@@ -2725,8 +2866,12 @@ impl Filesystem for AfsFuse {
         let file_handle_inodes = self.file_handle_inodes.clone();
         let context = Self::context(req, 0);
         let flock_owner = lock_owner.map(|owner| self.file_lock_owner(owner));
+        let active_cached_views = self.active_cached_views.clone();
         let run = move || {
             let file = state.lock().unwrap().remove_file_handle(fh);
+            if let Ok(mut views) = active_cached_views.lock() {
+                views.release(ino, fh);
+            }
             if let Some(bridge) = &fd_bridge {
                 bridge.release_fuse(fh);
             }
@@ -3320,7 +3465,8 @@ fn requested_init_flags() -> InitFlags {
     // receive thread dispatches them to independent workers. Direct-IO mmap is
     // requested so mmap on direct_io handles remains capability-gated. Native
     // DFS normally uses cached write-through and version-bound page reuse;
-    // fixed-open read views select direct IO per handle to own their EOF.
+    // explicit direct IO and overlapping incompatible fixed-open views bypass
+    // the shared inode cache. Cached handles follow close-to-open semantics.
     InitFlags::FUSE_PARALLEL_DIROPS | InitFlags::FUSE_DIRECT_IO_ALLOW_MMAP
 }
 
@@ -3351,6 +3497,15 @@ fn open_reply_flags(direct_io: bool) -> FopenFlags {
     } else {
         FopenFlags::empty()
     }
+}
+
+fn native_open_reply_flags(
+    cached_io: bool,
+    fixed_view: bool,
+    flags: i32,
+    cache_admitted: bool,
+) -> FopenFlags {
+    open_reply_flags(!cached_io || (fixed_view && !cache_admitted) || flags & libc::O_DIRECT != 0)
 }
 
 fn unsupported_lock_errno(start: u64, end: u64, typ: i32) -> i32 {
@@ -3530,6 +3685,68 @@ fn status_groups(status: &str, uid: u32, gid: u32) -> Option<Vec<u32>> {
 
 #[cfg(test)]
 mod dispatch_tests {
+    #[test]
+    fn cached_open_incompatible_versions_bypass_shared_pages_until_retired() {
+        let old = super::PageCacheIdentity {
+            version_id: Some("v1".into()),
+            length: 8,
+        };
+        let new = super::PageCacheIdentity {
+            version_id: Some("v2".into()),
+            length: 4,
+        };
+        let mut views = super::ActiveCachedViews::default();
+        assert!(views.admit(2, 10, &old));
+        assert!(views.admit(2, 11, &old));
+        assert!(!views.admit(2, 12, &new));
+        views.release(2, 10);
+        assert!(!views.admit(2, 12, &new));
+        views.release(2, 11);
+        assert!(views.admit(2, 12, &new));
+        views.release(2, 12);
+        assert!(views.inodes.is_empty());
+        assert_eq!(views.handles, 0);
+        assert_eq!(views.version_bytes, 0);
+    }
+
+    #[test]
+    fn cached_open_live_view_metadata_is_bounded_and_never_evicted() {
+        let identity = super::PageCacheIdentity {
+            version_id: Some("v".into()),
+            length: 1,
+        };
+        let mut views = super::ActiveCachedViews {
+            version_bytes: super::PAGE_CACHE_VERSION_BYTES,
+            ..Default::default()
+        };
+        assert!(!views.admit(2, 10, &identity));
+        views.version_bytes = 0;
+        views.handles = super::PAGE_CACHE_IDENTITIES;
+        assert!(!views.admit(2, 10, &identity));
+        assert!(views.inodes.is_empty());
+    }
+    #[test]
+    fn cached_open_fixed_view_may_use_kernel_readahead() {
+        assert!(
+            !super::native_open_reply_flags(true, true, libc::O_RDONLY, true)
+                .contains(super::DIRECT_IO)
+        );
+    }
+
+    #[test]
+    fn cached_open_direct_and_unidentified_views_stay_direct() {
+        for (cached, flags, admitted) in [
+            (false, libc::O_RDONLY, true),
+            (true, libc::O_RDONLY | libc::O_DIRECT, true),
+            (true, libc::O_RDONLY, false),
+        ] {
+            assert!(
+                super::native_open_reply_flags(cached, true, flags, admitted)
+                    .contains(super::DIRECT_IO)
+            );
+        }
+    }
+
     #[test]
     fn page_cache_reuse_requires_exact_version_and_length() {
         let identity = |version: Option<&str>, length| super::PageCacheIdentity {

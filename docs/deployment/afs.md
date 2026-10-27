@@ -290,7 +290,7 @@ cache ON 必须按[验收说明](../testing/afs.md#dfs-外部-s3-闭环)登记�
 | `dfs_fuse_keep_cache` | `true` | 仅原生DFS只读、已核对提交身份的open允许保留页面 |
 | `dfs_fuse_entry_ttl_ms` | `0` | `0..=60000`，路径entry TTL |
 | `dfs_fuse_attr_ttl_ms` | `0` | `0..=60000`，属性TTL；CREATE的单TTL回复取两者较小值 |
-| `fuse_max_readahead_bytes` | `1048576` | `0..=16777216`，仅DFS的内核read-ahead请求上限，实际值受协商限制 |
+| `fuse_max_readahead_bytes` | `16777216` | `0..=16777216`，仅DFS的内核read-ahead请求上限，实际值受协商限制 |
 | `dfs_version_cache_entries` | `4096` | `1..=65536`，不可变版本／布局的resident元数据条目数 |
 | `dfs_version_cache_bytes` | `33554432`（32MiB） | 标量范围`1..=1073741824`；具备DFS能力的Node还校验与entries相关的最低结构预算 |
 | `dfs_outboard_work_wait_ms` | `2` | `0..=50`，共享 proof 工作额度不足时的最长准入等待；0 表示不等待，仍保留完整校验和原全扫回退 |
@@ -301,6 +301,19 @@ cache ON 必须按[验收说明](../testing/afs.md#dfs-外部-s3-闭环)登记�
 | `dfs_source_lookahead_chunks` | `64` | `0..=128`，仅后续源元数据；与mandatory合并请求至多128项；0仅关闭前瞻 |
 | `dfs_source_cache_bytes` | `4194304`（4MiB） | `0..=4194304`，最多1024条源元数据的保留估算上限；0不保留且不前瞻 |
 | `dfs_readahead_max_bytes` | `0` | `0..=33554432`；0不创建后台fetch任务；product可显式设8388608。这是对象调度距离，未新增正文、proof、连接或磁盘额度 |
+
+Linux DFS挂载完成后仅设置自身FUSE设备的BDI `read_ahead_kb`，默认16384KiB；显式0禁用。
+INIT协商值与BDI有效值分别记录在`dfs.fuse_cache_init`和`dfs.fuse_readahead`。
+后者成功记录`applied=true`及读回值；权限不足或sysfs不可用记录`applied=false`和原因，
+继续使用内核原有限制，不承诺16MiB已经生效。不得修改源磁盘或全局BDI。
+`keep_cache=true`允许同版本重开复用，不保证页实际驻留。
+
+回复缓冲默认总额度为256MiB，按需分配，用户可在`[dfs_read_pipeline]`中调整
+`max_reply_bytes`（8MiB..1GiB），例如512MiB为536870912；这不是进程RSS总上限。
+内核预读、单流B预取窗口及回复总额度分别控制。B预取默认关闭，
+显式开启仍受CRC off、原生gRPC、固定只读O_DIRECT等条件限制。
+256MiB回复额度下，节点投机额度按现有公式最多64MiB，单句柄最多16MiB；
+该资源组合不能沿用历史16MiB回复/8MiB投机额度的性能成绩。
 
 原生gRPC远端读统一异步，没有同步/异步算法开关。`[dfs_read_pipeline]`分别限制RPC、回复缓冲、A磁盘深度、聚合范围数、待发送队列和超时；默认值、合法范围及示例见[远端读资源配置](../performance/afs-remote-read-20261024/read-concurrency.md#configuration)。历史实验的`--dfs-read-async`及`enabled`键应删除，应用不新增必填参数。
 

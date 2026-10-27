@@ -88,7 +88,7 @@ SHM 的 memfd、sealing 与原子 CLOEXEC FD 传递实现及对应运行测试�
 
 ## 文档入口
 
-- 演进计划、支持范围和后续验收：[docs/development/afs-plan.md](../docs/development/afs-plan.md)
+- 演进计划、支持范围和后续验收：[docs/development/afs-roadmap.md](../docs/development/afs-roadmap.md)
 - 架构边界：[docs/architecture/afs.md](../docs/architecture/afs.md)
 - 部署与配置：[docs/deployment/afs.md](../docs/deployment/afs.md)
 - 测试与验收：[docs/testing/afs.md](../docs/testing/afs.md)
