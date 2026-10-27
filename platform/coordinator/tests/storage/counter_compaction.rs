@@ -319,6 +319,16 @@ async fn corrupt_history_does_not_block_startup_or_discard_repairable_facts() {
     let fields = business_fields(&rig).await;
     assert!(fields.iter().any(|field| field == "environment:corrupt"));
     assert!(!fields.iter().any(|field| field == "environment:healthy"));
+    let rpc = adx_coordinator::rpc::CoordinatorRpc::new(
+        recovered.clone(),
+        Placement::Pack,
+        adx_protocol::auth::Peers::network(),
+        adx_transport::rpc::RpcClient::network(adx_protocol::auth::Principal::Coordinator),
+        std::time::Duration::from_secs(2),
+    )
+    .await
+    .expect("observation corruption must not block RPC service startup");
+    assert!(matches!(rpc.metrics().await, Err(Error::Unavailable(_))));
     // A bad observability field must not prevent new lifecycle commits.
     create(&recovered, "after-recovery", 2).await;
     redis::cmd("HSET")
@@ -328,6 +338,16 @@ async fn corrupt_history_does_not_block_startup_or_discard_repairable_facts() {
         .query_async::<()>(&mut connection)
         .await
         .unwrap();
+    let mut refreshed = None;
+    for _ in 0..40 {
+        if let Ok(metrics) = rpc.metrics().await {
+            refreshed = Some(metrics);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let metrics = refreshed.expect("statistics did not refresh after history repair");
+    assert!(metrics.contains("adx_environment_owned_creation_results_total{outcome=\"success\"} 6"));
     let repaired = store.begin(1).await.unwrap();
     assert_eq!(
         repaired.business_counters().await.unwrap().creations,
@@ -379,4 +399,22 @@ async fn configured_operation_budget_outlives_driver_default_and_remains_bounded
     // The timed-out connection is replaced; a later operation can recover.
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     assert!(short.begin(1).await.is_ok());
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn rpc_startup_keeps_epoch_fencing_fatal() {
+    let rig = common::Redis::new().await;
+    let store = counter_store(&rig).await;
+    let stale = store.begin(1).await.unwrap();
+    store.begin(1).await.unwrap();
+    let result = adx_coordinator::rpc::CoordinatorRpc::new(
+        stale,
+        Placement::Pack,
+        adx_protocol::auth::Peers::network(),
+        adx_transport::rpc::RpcClient::network(adx_protocol::auth::Principal::Coordinator),
+        std::time::Duration::from_secs(2),
+    )
+    .await;
+    assert!(matches!(result, Err(Error::Conflict)));
 }

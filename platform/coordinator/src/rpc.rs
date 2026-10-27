@@ -454,14 +454,19 @@ impl CoordinatorRpc {
         tokio::spawn(run_claim_batches(session.clone(), claim_requests));
         let volume_changes = session.committed_changes();
         let monitoring = session.clone();
-        let counters = monitoring.business_counters().await?;
+        let business = match monitoring.business_counters().await {
+            Ok(counters) => Some(observation::BusinessSnapshot {
+                counters,
+                refreshed: std::time::Instant::now(),
+            }),
+            Err(Error::Conflict) => return Err(Error::Conflict),
+            Err(error) => {
+                adx_observability::warn!(%error, "initial business metrics unavailable; refresh will retry");
+                None
+            }
+        };
         let service = Self(Arc::new(Inner {
-            business: Arc::new(std::sync::RwLock::new(Some(
-                observation::BusinessSnapshot {
-                    counters,
-                    refreshed: std::time::Instant::now(),
-                },
-            ))),
+            business: Arc::new(std::sync::RwLock::new(business)),
             business_fenced: Default::default(),
             created: Default::default(),
             create_locks: Default::default(),
