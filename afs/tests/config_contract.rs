@@ -1279,7 +1279,7 @@ fn fuse_execution_and_dfs_cache_defaults_are_explicit() {
         ("dfs_fuse_keep_cache", serde_json::json!(true)),
         ("dfs_fuse_entry_ttl_ms", serde_json::json!(0)),
         ("dfs_fuse_attr_ttl_ms", serde_json::json!(0)),
-        ("fuse_max_readahead_bytes", serde_json::json!(1048576)),
+        ("fuse_max_readahead_bytes", serde_json::json!(16777216)),
     ] {
         assert_eq!(value.get(key), Some(&expected), "missing/wrong {key}");
     }
