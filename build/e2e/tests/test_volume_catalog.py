@@ -35,7 +35,7 @@ class VolumeCatalogTests(unittest.TestCase):
     def test_paginated_catalog_loses_the_deleted_uid(self):
         scenario, environment, volume = self.fixture()
         environment.list_volumes.side_effect = [([], 'next'), ([volume], ''), ([], '')]
-        self.assertEqual(scenario._volume_catalog(object()), 'uid')
+        self.assertEqual(scenario.volume_catalog(object()), 'uid')
         self.assertEqual(environment.ensure_volume.call_count, 2)
         environment.get_volume.assert_called_once()
         environment.delete_volume.assert_called_once()
@@ -45,14 +45,14 @@ class VolumeCatalogTests(unittest.TestCase):
         scenario, environment, _volume = self.fixture()
         environment.list_volumes.return_value = ([], '')
         with self.assertRaisesRegex(AssertionError, 'new volume missing'):
-            scenario._volume_catalog(object())
+            scenario.volume_catalog(object())
         environment.delete_volume.assert_called_once()
 
     def test_delete_must_remove_the_catalog_entry(self):
         scenario, environment, volume = self.fixture()
         environment.list_volumes.return_value = ([volume], '')
         with self.assertRaisesRegex(AssertionError, 'deleted volume remains'):
-            scenario._volume_catalog(object())
+            scenario.volume_catalog(object())
         environment.delete_volume.assert_called_once()
 
 

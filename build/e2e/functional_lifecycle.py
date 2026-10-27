@@ -32,7 +32,7 @@ def _wait_deleted(instance_id, connection, timeout=90):
     raise TimeoutError(f"instance {instance_id} was not reclaimed: {last_error}")
 
 
-def _volume_catalog(connection):
+def volume_catalog(connection):
     """Round-trip managed definitions; no filesystem mount is implied."""
     volume_id = 'e2e-volume-' + uuid.uuid4().hex
     spec = VolumeSpec(
@@ -47,6 +47,7 @@ def _volume_catalog(connection):
         fetched = Environment.get_volume(volume_id, connection=connection)
         if not (volume.uid == replay.uid == fetched.uid and fetched.spec == spec):
             raise AssertionError('volume ensure/get did not retain identity and definition')
+
         def listed():
             token = None
             for _ in range(1000):
@@ -85,7 +86,7 @@ def run(connection, image, output):
 
     try:
         started = begin('volume.catalog-crud-and-replay')
-        checks['managed_volume_uid'] = _volume_catalog(connection)
+        checks['managed_volume_uid'] = volume_catalog(connection)
         passed('volume.catalog-crud-and-replay', started)
 
         started = begin('lifecycle.detached-close-reattach-delete')
