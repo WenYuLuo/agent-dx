@@ -299,7 +299,7 @@ paths:
       tags: [Environments]
       operationId: listEnvironments
       summary: List caller-visible Environments, or inspect one by ID
-      description: Returns the synchronized in-memory directory. Without instance_id, returns a bounded page of caller-visible instances; administrators can see every tenant. Every view includes tenant_id from the owning record. With instance_id, returns the matching view in an array. Tombstones are omitted.
+      description: Returns the synchronized in-memory directory. Without instance_id, returns a bounded page of caller-visible instances; administrators can see every tenant. Every view includes tenant_id and observed runtime placement from the owning record. With instance_id, returns the matching view in an array. Tombstones are omitted.
       parameters:
         - name: instance_id
           in: query
@@ -355,6 +355,37 @@ paths:
               schema:
                 $ref: "#/components/schemas/Envelope"
         "4XX":
+          $ref: "#/components/responses/Error"
+        default:
+          $ref: "#/components/responses/Error"
+  /api/environment/v1/environments/{environmentId}/inspect:
+    get:
+      tags: [Environments]
+      operationId: inspectEnvironment
+      summary: Administrator-only authoritative Environment inspection
+      description: >-
+        Reads published metadata, using a read-only Coordinator lookup when the
+        API directory has no matching entry or is not synchronized.
+        Returns the durable Environment record and current node/relay addresses.
+        Requires an administrator API Key; tenant keys receive 403 even for
+        their own Environment. The record includes requested configuration,
+        which can contain credentials. Protect and redact diagnostic output.
+        This read does not acquire a lifecycle operation lock.
+      parameters:
+        - $ref: "#/components/parameters/EnvironmentId"
+      responses:
+        "200":
+          description: Record and node_address/relay_address in the standard envelope.
+          headers:
+            Cache-Control:
+              schema: {type: string, const: no-store}
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Envelope"
+        "403":
+          $ref: "#/components/responses/Error"
+        "404":
           $ref: "#/components/responses/Error"
         default:
           $ref: "#/components/responses/Error"
@@ -1194,6 +1225,11 @@ components:
         required_cpu: {type: integer, format: int64, description: CPU millicores}
         required_mem: {type: integer, format: int64, description: Memory MiB}
         image: {type: string}
+        runtime_id: {type: string, description: Current physical execution identity}
+        sandbox_ip: {type: string, description: Observed runtime IP; empty before startup}
+        node_id: {type: string, description: Assigned node identity}
+        generation: {type: integer, format: int64, description: Current assignment generation}
+        node_ip: {type: [string, "null"], description: IP parsed from the assigned node RPC address}
         failure:
           oneOf:
             - type: "null"

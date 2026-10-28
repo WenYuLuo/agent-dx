@@ -788,13 +788,131 @@ async fn pending_retry_accepts_a_reassigned_unconfirmed_generation() {
 impl pb::auth_service_server::AuthService for Service {
     async fn verify_api_key(
         &self,
-        _: Request<pb::VerifyApiKeyRequest>,
+        request: Request<pb::VerifyApiKeyRequest>,
     ) -> Result<Response<pb::VerifyApiKeyResponse>, Status> {
+        let mut identity = caller();
+        identity.administrator =
+            request.get_ref().api_key == "admin-inspection-key-0000000000000000";
         Ok(Response::new(pb::VerifyApiKeyResponse {
-            caller: Some(caller()),
+            caller: Some(identity),
             expires_at_unix_seconds: 0,
         }))
     }
+}
+
+#[tokio::test]
+async fn admin_inspection_reads_an_environment_created_through_another_api() {
+    use base64::Engine;
+
+    adx_transport::install_crypto_provider();
+    let fixture = Fixture::new().await;
+    let id = "other-api+agent";
+    let environment_spec = adx_apiserver::contract::create_spec(
+        json!({
+            "namespace":"other", "name":"api+agent", "cpu":1000, "memory":1024,
+            "rootfs":{"type":"image","imageurl":"app:1","runtime":"runc"}
+        }),
+        &caller(),
+    )
+    .unwrap();
+    assert_eq!(environment_spec.id, id);
+    let owner = pb::GetEnvironmentResponse {
+        record: Some(pb::EnvironmentRecord {
+            spec: Some(environment_spec),
+            assignment: Some(pb::Assignment {
+                environment_id: id.into(),
+                node_id: "worker".into(),
+                generation: 7,
+                ..Default::default()
+            }),
+            runtime: Some(pb::Runtime {
+                id: "other-api+agent-7".into(),
+                ip: "100.64.1.2".into(),
+            }),
+            state: pb::EnvironmentState::Running as i32,
+            revision: 9,
+            resources_held: true,
+            ..Default::default()
+        }),
+        node_address: "127.0.0.1:9000".into(),
+        relay_address: "127.0.0.1:9443".into(),
+    };
+    // The authoritative service knows this object; this API's synchronized
+    // directory has deliberately received no delta for it.
+    fixture
+        .state
+        .owners
+        .lock()
+        .unwrap()
+        .insert(id.into(), owner);
+    assert_eq!(
+        fixture
+            .clients
+            .owner(id, &caller(), false)
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::NotFound
+    );
+    let api = adx_apiserver::http::Api::new(fixture.clients.clone()).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let http = tokio::spawn(async move {
+        loop {
+            let (socket, _) = listener.accept().await.unwrap();
+            let api = api.clone();
+            tokio::spawn(async move {
+                hyper::server::conn::http1::Builder::new()
+                    .serve_connection(
+                        hyper_util::rt::TokioIo::new(socket),
+                        hyper::service::service_fn(move |request| api.clone().serve(request)),
+                    )
+                    .await
+                    .unwrap();
+            });
+        }
+    });
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let uri = format!("http://{address}/api/environment/v1/environments/other-api%2Bagent/inspect");
+    let denied = client
+        .get(&uri)
+        .bearer_auth("ordinary-key-00000000000000000000")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), reqwest::StatusCode::FORBIDDEN);
+    assert_eq!(fixture.state.lookups.load(Ordering::SeqCst), 0);
+    let response = client
+        .get(&uri)
+        .bearer_auth("admin-inspection-key-0000000000000000")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    let envelope: Value = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
+    let value: Value = serde_json::from_slice(
+        &base64::engine::general_purpose::STANDARD
+            .decode(envelope["data"].as_str().unwrap())
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(value["record"]["assignment"]["generation"], 7);
+    assert_eq!(value["record"]["runtime"]["id"], "other-api+agent-7");
+    assert_eq!(fixture.state.lookups.load(Ordering::SeqCst), 1);
+    let missing = client
+        .get(format!(
+            "http://{address}/api/environment/v1/environments/absent/inspect"
+        ))
+        .bearer_auth("admin-inspection-key-0000000000000000")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), reqwest::StatusCode::NOT_FOUND);
+    assert_eq!(fixture.state.lookups.load(Ordering::SeqCst), 2);
+    assert_eq!(fixture.state.starts.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.state.create_calls.load(Ordering::SeqCst), 0);
+    http.abort();
 }
 service_impl!(pb::node_service_server::NodeService, {
     async fn create_local_environment(&self, request: Request<pb::LocalEnvironmentCreateRequest>) -> Result<Response<pb::EnvironmentResult>, Status> {

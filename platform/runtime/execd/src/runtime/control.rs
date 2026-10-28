@@ -32,6 +32,7 @@ struct State {
     status: RuntimeStatus,
     probe_epoch: u64,
     probe_phase: RuntimePhase,
+    healthcheck_progress: Option<(RuntimeIdentity, u64, u32)>,
     prepare: Option<PrepareCheckpoint>,
     reader_running: bool,
     workload_reply: Option<watch::Sender<Option<std::result::Result<(), String>>>>,
@@ -71,6 +72,7 @@ impl Controller {
                 },
                 probe_epoch: 1,
                 probe_phase: RuntimePhase::Running,
+                healthcheck_progress: None,
                 prepare: None,
                 reader_running: false,
                 workload_reply: None,
@@ -277,6 +279,41 @@ impl Controller {
             .lock()
             .map_err(|_| Error::Unavailable("runtime state lock poisoned".into()))?;
         Ok((state.status.clone(), state.probe_epoch))
+    }
+    pub fn record_healthcheck(
+        &self,
+        identity: &RuntimeIdentity,
+        epoch: u64,
+        failures: u32,
+    ) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| Error::Unavailable("runtime state lock poisoned".into()))?;
+        if state.status.identity != *identity
+            || state.probe_epoch != epoch
+            || state.status.phase != RuntimePhase::Running
+        {
+            return Err(Error::Conflict);
+        }
+        state.healthcheck_progress = Some((identity.clone(), epoch, failures));
+        Ok(())
+    }
+    pub fn healthcheck_progress(&self) -> Result<(RuntimeIdentity, Option<u32>)> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| Error::Unavailable("runtime state lock poisoned".into()))?;
+        let failures = state
+            .healthcheck_progress
+            .as_ref()
+            .filter(|(identity, epoch, _)| {
+                *identity == state.status.identity
+                    && *epoch == state.probe_epoch
+                    && state.status.phase == RuntimePhase::Running
+            })
+            .map(|(_, _, failures)| *failures);
+        Ok((state.status.identity.clone(), failures))
     }
     pub fn subscribe(&self) -> watch::Receiver<u64> {
         self.changed.subscribe()
@@ -527,5 +564,67 @@ impl Controller {
         state.status.checkpoint.as_mut().unwrap().phase = CheckpointPhase::Aborted;
         self.publish(&mut state);
         Ok(state.status.clone())
+    }
+}
+
+#[cfg(test)]
+mod probe_progress_tests {
+    use super::*;
+    struct Hooks;
+    impl CheckpointHooks for Hooks {
+        fn open(&self) -> io::Result<Handoff> {
+            unreachable!()
+        }
+        fn restore(&self, _: &RuntimeIdentity) -> io::Result<RuntimeIdentity> {
+            unreachable!()
+        }
+    }
+    #[test]
+    fn progress_is_fenced_by_execution_identity_epoch_and_running_phase() {
+        let identity = RuntimeIdentity {
+            environment_id: "probe".into(),
+            runtime_id: "probe-1".into(),
+            ownership_generation: 1,
+        };
+        let controller = Controller::new(identity.clone(), Arc::new(Hooks)).unwrap();
+        let (_, epoch) = controller.probe_status().unwrap();
+        controller.record_healthcheck(&identity, epoch, 2).unwrap();
+        assert_eq!(controller.healthcheck_progress().unwrap().1, Some(2));
+        assert!(matches!(
+            controller.record_healthcheck(&identity, epoch + 1, 0),
+            Err(Error::Conflict)
+        ));
+        let replacement = RuntimeIdentity {
+            runtime_id: "probe-2".into(),
+            ownership_generation: 2,
+            ..identity.clone()
+        };
+        {
+            let mut state = controller.state.lock().unwrap();
+            state.status.identity = replacement.clone();
+            controller.publish(&mut state);
+        }
+        assert_eq!(
+            controller.healthcheck_progress().unwrap(),
+            (replacement.clone(), None)
+        );
+        assert!(matches!(
+            controller.record_healthcheck(&identity, epoch, 0),
+            Err(Error::Conflict)
+        ));
+        controller
+            .record_healthcheck(&replacement, epoch, 0)
+            .unwrap();
+        assert_eq!(controller.healthcheck_progress().unwrap().1, Some(0));
+        {
+            let mut state = controller.state.lock().unwrap();
+            state.status.phase = RuntimePhase::Initializing;
+            controller.publish(&mut state);
+        }
+        assert_eq!(controller.healthcheck_progress().unwrap().1, None);
+        assert!(matches!(
+            controller.record_healthcheck(&replacement, epoch, 0),
+            Err(Error::Conflict)
+        ));
     }
 }

@@ -27,6 +27,10 @@ an explicit image or S3 source atomically replaces the source. Adxlet still
 requires the deployment-owned source, bootstrap and environment to match the
 local node when no source replacement was requested.
 
+Supervisor and Conch image bindings accept explicit workload `process`
+commands, working directory and user overrides through Execd. Fields omitted
+from `process` retain the corresponding image defaults.
+
 All ordinary responses use the API Server response envelope:
 
 ```json
@@ -57,6 +61,19 @@ instead of inferring retry safety from HTTP status or message text. See the
 | Resume | `POST /api/environment/v1/environments/{environmentID}/resume` | none | `{"environmentId":"...","state":"running","routeAddress":"host:port","functionProxyId":"...","nodeId":"...","portMappings":{}}` |
 | Reload latest recovery point | `POST /api/environment/v1/environments/{environmentID}/reload` | none | `{"success":true}` after a new backend execution reaches Running and is published |
 | Replace network policy | `PUT /api/environment/v1/environments/{environmentID}/network` | complete network policy, or `{}` to clear it | `{"success":true}` after sandboxd accepts the replacement and the operation is published |
+| Administrator inspection | `GET /api/environment/v1/environments/{environmentID}/inspect` | none | `{"record":<EnvironmentRecord>,"node_address":"host:port","relay_address":"host:port"}` |
+
+Administrator inspection reads published Environment metadata through the
+existing owner lookup. A missing or unsynchronized API directory triggers a
+read-only Coordinator lookup, so creation through another API is visible before
+its directory update arrives. It does not acquire a lifecycle operation lock or
+invoke the workload. It preserves
+the execution ID, assignment generation, runtime address, restart evidence,
+resources and requested configuration. It requires an administrator API key;
+ordinary tenant keys receive 403, including for their own environments. The
+record can contain environment variables and storage credentials, so diagnostic
+consumers must protect and redact its output. The ordinary `/api/instances`
+summary continues to omit execution secrets. Deleted or absent records return 404.
 
 `snapshotId` on the normal create route creates a new environment from a reusable
 snapshot. The snapshot is reusable; creating from it does not consume it.
@@ -121,6 +138,23 @@ control-stream delivery. The committed instance view exposes `failure.reason=Pro
 `failure.probe_failure` with `kind`, `message`, `consecutive_failures`, and optional `exit_code` /
 `http_status`. Pause/resume/restore cancel checks, recheck readiness and reset
 healthcheck counts. Probes do not count as user activity.
+
+### Current healthcheck progress
+
+`POST /direct/{environment-id}/invoke` with
+`{"action":"runtime.probes","args":{}}` reads Execd's actual healthcheck
+progress. The result contains `environment_id`, `runtime_id`,
+`ownership_generation`, and `healthcheck_consecutive_failures`. The count is
+`null` until a healthcheck completes in the current running probe epoch, and
+also when healthchecks are disabled or the runtime is not Running. A failed
+check increments it; a successful check resets it to zero. Observations from
+an earlier runtime identity or probe epoch are not returned.
+
+A positive count below `failureThreshold` is an unhealthy observation while
+the Environment lifecycle remains Running. Reaching the threshold still
+follows the existing Failed/restart policy. Reading progress does not run a
+probe, reset its count, or change lifecycle state; the invoke request follows
+normal data-plane activity accounting.
 
 ## Create from a reusable snapshot
 
@@ -404,3 +438,7 @@ existing directories are never automatically repaired, removed or renamed. No
 fallback to more permissive access is applied. The shared filesystem must permit
 ownership and permission changes, with no renameat2 requirement. A node release
 supporting these options is required before templates use them; this behavior has local component coverage, not a runsc/SFS end-to-end claim.
+
+Instance summaries include runtime_id, sandbox_ip, node_id, generation and node_ip from the current assignment and runtime. These fields describe observed placement; they do not include execution environment variables or credentials.
+
+Administrator inspection responses use `Cache-Control: no-store` because the execution record can contain environment credentials.

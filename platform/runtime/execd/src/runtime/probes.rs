@@ -298,9 +298,13 @@ async fn healthcheck(
             return Ok(());
         };
         match result {
-            Ok(()) => failures = 0,
+            Ok(()) => {
+                failures = 0;
+                controller.record_healthcheck(identity, epoch, failures)?;
+            }
             Err(mut result) => {
                 failures = failures.saturating_add(1);
+                controller.record_healthcheck(identity, epoch, failures)?;
                 if failures >= probe.failure_threshold {
                     result.consecutive_failures = failures;
                     return controller.probe_failed(identity, epoch, result);

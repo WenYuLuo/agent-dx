@@ -164,7 +164,7 @@ impl Api {
                     None,
                     None,
                     false,
-                )
+                );
             }
         };
         let method = request.method().as_str().to_string();
@@ -179,6 +179,50 @@ impl Api {
             v.split(',')
                 .any(|v| v.trim().starts_with("text/event-stream"))
         });
+        if method == "GET" {
+            if let Some(id) = path
+                .strip_prefix("/api/environment/v1/environments/")
+                .and_then(|rest| rest.strip_suffix("/inspect"))
+            {
+                if !caller.administrator {
+                    return error_response(
+                        Status::permission_denied("administrator required"),
+                        &request_id,
+                        None,
+                        Some(id),
+                        false,
+                    );
+                }
+                if id.is_empty() || id.contains('/') {
+                    return error_response(
+                        Status::invalid_argument("invalid environment ID"),
+                        &request_id,
+                        None,
+                        Some(id),
+                        false,
+                    );
+                }
+                let owner = match Box::pin(self.clients.owner(id, &caller, false)).await {
+                    Err(error) if matches!(error.code(), Code::NotFound | Code::Unavailable) => {
+                        // Another API may have created the Environment before
+                        // this API's directory has received its publication.
+                        // A local miss is not authoritative absence.
+                        Box::pin(self.clients.owner(id, &caller, true)).await
+                    }
+                    result => result,
+                };
+                let result = match owner {
+                    Ok(owner) => admin_environment_view(owner, &caller),
+                    Err(error) => Err(error),
+                };
+                let mut reply = response(result, &request_id, None, Some(id), false);
+                reply.headers_mut().insert(
+                    hyper::header::CACHE_CONTROL,
+                    hyper::header::HeaderValue::from_static("no-store"),
+                );
+                return reply;
+            }
+        }
         let lifecycle_id = header(&request, "x-adx-request-id")
             .unwrap_or("")
             .trim()
@@ -997,6 +1041,28 @@ fn status_code(error: &Status) -> u16 {
         _ => 500,
     }
 }
+fn admin_environment_view(
+    owner: pb::GetEnvironmentResponse,
+    caller: &pb::CallerContext,
+) -> Result<Value, Status> {
+    if !caller.administrator {
+        return Err(Status::permission_denied("administrator required"));
+    }
+    let record = owner
+        .record
+        .ok_or_else(|| Status::data_loss("environment directory returned no record"))?;
+    if record.state == pb::EnvironmentState::Deleted as i32 {
+        return Err(Status::not_found("environment not found"));
+    }
+    let record = adx_core::EnvironmentRecord::try_from(record)
+        .map_err(|_| Status::data_loss("invalid environment inspection record"))?;
+    Ok(json!({
+        "record": record,
+        "node_address": owner.node_address,
+        "relay_address": owner.relay_address,
+    }))
+}
+
 pub(crate) fn instance_view(owner: pb::GetEnvironmentResponse) -> Result<Value, Status> {
     let record = owner
         .record
@@ -1008,6 +1074,13 @@ pub(crate) fn instance_view(owner: pb::GetEnvironmentResponse) -> Result<Value, 
         .spec
         .ok_or_else(|| Status::data_loss("environment record returned no spec"))?;
     let resource = spec.resources.unwrap_or_default();
+    let runtime = record.runtime.unwrap_or_default();
+    let assignment = record.assignment.unwrap_or_default();
+    let node_ip = owner
+        .node_address
+        .parse::<std::net::SocketAddr>()
+        .ok()
+        .map(|address| address.ip().to_string());
     let failure = record
         .failure
         .map(adx_core::RuntimeFailure::try_from)
@@ -1021,6 +1094,11 @@ pub(crate) fn instance_view(owner: pb::GetEnvironmentResponse) -> Result<Value, 
         "required_cpu": resource.cpu_millis,
         "required_mem": resource.memory_bytes / 1048576,
         "image": spec.image,
+        "runtime_id": runtime.id,
+        "sandbox_ip": runtime.ip,
+        "node_id": assignment.node_id,
+        "generation": assignment.generation,
+        "node_ip": node_ip,
     }))
 }
 fn state(value: i32) -> &'static str {
@@ -1271,6 +1349,68 @@ fn scheduling_queue_view(queue: pb::GetSchedulingQueueResponse) -> Value {
 mod error_contract_tests {
     use super::*;
 
+    #[test]
+    fn admin_environment_inspection_requires_admin_and_preserves_execution_evidence() {
+        let caller = pb::CallerContext {
+            tenant_id: "acceptance".into(),
+            administrator: true,
+        };
+        let spec = crate::contract::create_spec(
+            json!({
+                "namespace":"audit", "name":"agent", "cpu":1000, "memory":1024,
+                "rootfs":{"type":"image","imageurl":"agentos-supervisor:v1","runtime":"supervisor"},
+                "env":{"TEST_MARKER":"retained"},
+                "restartPolicy":{"maxAttempts":3,"initialBackoffSeconds":1,"maxBackoffSeconds":5}
+            }),
+            &caller,
+        )
+        .unwrap();
+        let owner = pb::GetEnvironmentResponse {
+            record: Some(pb::EnvironmentRecord {
+                assignment: Some(pb::Assignment {
+                    environment_id: spec.id.clone(),
+                    node_id: "worker-a".into(),
+                    generation: 7,
+                    ..Default::default()
+                }),
+                spec: Some(spec),
+                state: pb::EnvironmentState::Running as i32,
+                runtime: Some(pb::Runtime {
+                    id: "backend-execution-7".into(),
+                    ip: "100.64.1.2".into(),
+                }),
+                revision: 19,
+                restart_attempts: 2,
+                resources_held: true,
+                ..Default::default()
+            }),
+            node_address: "172.30.58.2:27001".into(),
+            relay_address: "172.30.58.2:28444".into(),
+        };
+        let denied = admin_environment_view(
+            owner.clone(),
+            &pb::CallerContext {
+                tenant_id: "acceptance".into(),
+                administrator: false,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(denied.code(), Code::PermissionDenied);
+        let detail = admin_environment_view(owner.clone(), &caller).unwrap();
+        assert_eq!(detail["record"]["assignment"]["generation"], 7);
+        assert_eq!(detail["record"]["runtime"]["id"], "backend-execution-7");
+        assert_eq!(detail["record"]["runtime"]["ip"], "100.64.1.2");
+        assert_eq!(detail["record"]["restart_attempts"], 2);
+        assert_eq!(detail["record"]["spec"]["env"]["TEST_MARKER"], "retained");
+        assert_eq!(detail["node_address"], "172.30.58.2:27001");
+        let mut deleted = owner;
+        deleted.record.as_mut().unwrap().state = pb::EnvironmentState::Deleted as i32;
+        assert_eq!(
+            admin_environment_view(deleted, &caller).unwrap_err().code(),
+            Code::NotFound
+        );
+    }
+
     async fn error_body(response: Response<Body>) -> Value {
         serde_json::from_slice(
             &response
@@ -1296,14 +1436,29 @@ mod error_contract_tests {
                     env: HashMap::from([("EXECD_HTTP_TOKEN".into(), "private".into())]),
                     ..Default::default()
                 }),
+                runtime: Some(pb::Runtime {
+                    id: "runtime-7".into(),
+                    ip: "100.96.1.7".into(),
+                }),
+                assignment: Some(pb::Assignment {
+                    node_id: "node-1".into(),
+                    generation: 7,
+                    ..Default::default()
+                }),
                 state: pb::EnvironmentState::Running as i32,
                 ..Default::default()
             }),
+            node_address: "172.30.58.2:27001".into(),
             ..Default::default()
         })
         .unwrap();
         assert_eq!(view["tenant_id"], "tenant-a");
         assert_eq!(view["id"], "environment-1");
+        assert_eq!(view["runtime_id"], "runtime-7");
+        assert_eq!(view["sandbox_ip"], "100.96.1.7");
+        assert_eq!(view["node_ip"], "172.30.58.2");
+        assert_eq!(view["node_id"], "node-1");
+        assert_eq!(view["generation"], 7);
         assert!(view.get("env").is_none());
         assert!(!view.to_string().contains("private"));
     }
