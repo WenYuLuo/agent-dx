@@ -135,7 +135,7 @@ async fn periodic_cycle_removes_orphan_without_any_local_controller() {
 }
 
 #[tokio::test]
-async fn ordinary_cycles_compare_records_without_scanning_runtime_state() {
+async fn ordinary_cycles_scan_and_reclaim_late_runtime_state() {
     let runtime = Arc::new(Runtime::default());
     let node = authority::manager(runtime.clone());
     node.reconcile(vec![]).await.unwrap();
@@ -143,8 +143,8 @@ async fn ordinary_cycles_compare_records_without_scanning_runtime_state() {
     authority.cycle(&node).await.unwrap();
     runtime.actual.lock().unwrap().push(orphan("late"));
     authority.cycle(&node).await.unwrap();
-    assert_eq!(runtime.actual.lock().unwrap().len(), 1);
-    assert_eq!(runtime.scans.load(Ordering::SeqCst), 2);
+    assert!(runtime.actual.lock().unwrap().is_empty());
+    assert_eq!(runtime.scans.load(Ordering::SeqCst), 3);
 }
 
 #[tokio::test]

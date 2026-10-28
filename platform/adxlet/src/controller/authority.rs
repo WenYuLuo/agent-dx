@@ -14,6 +14,25 @@ pub(crate) enum AuthorityResult {
 }
 
 impl Controller {
+    pub(super) async fn reap_orphan(&mut self, runtime: crate::RuntimeObservation) -> Result<()> {
+        // Execute after accepted lifecycle work. The published view may still
+        // describe the previous runtime while Resume is starting its successor.
+        if runtime.environment_id != self.record.spec.id
+            || runtime.generation > self.record.assignment.generation
+            || protects_execution(&self.record, &runtime.runtime_id)
+        {
+            return Ok(());
+        }
+        tokio::time::timeout(self.services.operation_timeout, async {
+            if runtime.generation != self.record.assignment.generation {
+                self.services.routes.retire_orphan(&runtime).await?;
+            }
+            self.services.runtime.remove(&runtime.runtime_id).await
+        })
+        .await
+        .map_err(|_| Error::Unavailable("orphan cleanup timed out".into()))?
+    }
+
     fn matches_unstarted(&self, record: &EnvironmentRecord) -> bool {
         // A local reservation may already hold resources; a centrally assigned
         // controller acquires them when Create runs. Neither has started yet.

@@ -163,7 +163,11 @@ pub async fn reconcile_node(
     }
     let result = async {
         report(coordinator, registration, timeout, &mut handshake_required).await?;
-        let basis = periodic.then(|| manager.comparison_basis());
+        let basis = if periodic {
+            Some(manager.comparison_basis(report_interval).await)
+        } else {
+            None
+        };
         let mut catalog = inspect(coordinator, registration, timeout).await?;
         catalog_received = true;
         if let Some(journal) = journal.filter(|_| !periodic) {

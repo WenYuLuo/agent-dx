@@ -1,16 +1,16 @@
 # sandboxd protocol
 
-- Repository: https://github.com/WenYuLuo/sandboxd
-- Selected change: https://github.com/inclusionAI/sandboxd/pull/82
-- Pinned head: `f800327459a104c04a0689940062fc9bb9e2bb9e`
+- Repository: https://github.com/inclusionAI/sandboxd
+- Pinned head: `b5dab2958183faa8bcf04955eef7b0ae1c9b10ef`
 - ADX builds this revision without downstream source patches. Rootfs defaults,
   bootstrap mounts and managed-file paths are adapted by the control plane to
   the published sandboxd protocol.
 - Source path: `api/runtime/v1/sandbox-api.proto`
 - License: Apache-2.0; source and license copied verbatim.
 
-The pinned protocol supplies `StartRequest.start_key` and keyed Delete settlement acknowledgements for unknown Start cleanup, in addition to `StartResponse.sandbox_ip` as field 4 and includes
-the Checkpoint RPC. Adxlet generates its sandboxd client from this file.
+The pinned protocol supplies `StartResponse.sandbox_ip` as field 4 and the
+Checkpoint RPC. Unknown Start outcomes converge through periodic inventory
+and physical-ID Delete, including instances that appear after an empty scan. Adxlet generates its sandboxd client from this file.
 Build and E2E inputs must use this same revision, rather than an independently
 maintained control-plane copy of the backend API.
 
@@ -32,3 +32,12 @@ AMD64 and verified against its per-file manifest, protocol hashes, runc checksum
 and Redis CLI version. Updating this dependency requires a matching source pin
 and verified replacement archive pin. ARM package jobs currently exclude this
 x86-only external runtime bundle.
+
+For native cleanup qualification, point `ADX_SANDBOXD_TEST_SOCKET` at a dedicated,
+empty backend and set `ADX_SANDBOXD_TEST_IMAGE` to a reachable image. Optional
+`ADX_SANDBOXD_TEST_RUNTIME` selects runsc instead of runc;
+`ADX_SANDBOXD_TEST_ROOTFS` selects a backend-local rootfs. Run
+`cargo test -p adxlet --test sandboxd_main_reconciliation -- --ignored --nocapture`.
+The fixture injects lost responses and late delivery through a gRPC proxy,
+reconstructs the node/driver to lose caller state, verifies periodic reclamation
+and preservation of an unrelated sandbox, then checks an empty backend.

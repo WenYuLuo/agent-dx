@@ -1,11 +1,11 @@
 {
   "schema_version": 1,
-  "sandboxd_revision": "f800327459a104c04a0689940062fc9bb9e2bb9e",
+  "sandboxd_revision": "b5dab2958183faa8bcf04955eef7b0ae1c9b10ef",
   "artifacts": {
     "x86_64-unknown-linux-gnu": {
-      "url": "https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/adx/daily/20261027125028-f800327459a1/linux/amd64/backend-f800327459a1-linux-amd64.tar.gz",
-      "bytes": 57013905,
-      "sha256": "973660cfdcfa96d243b6ed49e3c557bacb44f1ffbe4783f0c6ccc4356aa03df1"
+      "url": "https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/adx/daily/20261028120439-b5dab2958183/linux/amd64/backend-b5dab2958183-linux-amd64.tar.gz",
+      "bytes": 56998750,
+      "sha256": "ba6789255ecfd12a1db24a2ad27189f0f850ae9b9889e8cbfb0303ff3e849300"
     }
   }
 }

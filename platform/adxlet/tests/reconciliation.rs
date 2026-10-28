@@ -81,8 +81,12 @@ impl RuntimeDriver for Backend {
             b"checkpoint data"
         );
         if spec.id == "busy" && self.block_restore.load(std::sync::atomic::Ordering::SeqCst) {
+            // Backend inventory can expose the successor before Restore replies
+            // and before the controller publishes its new runtime view.
+            let result = self.start(spec, id, generation, devices).await;
             self.restore_entered.notify_one();
             self.restore_release.notified().await;
+            return result;
         }
         self.start(spec, id, generation, devices).await
     }
@@ -331,7 +335,7 @@ async fn periodic_matching_execution_has_no_recovery_side_effects() {
 }
 
 #[tokio::test]
-async fn periodic_orphans_require_recovery_instead_of_runtime_scanning() {
+async fn periodic_orphans_are_collected_without_recovering_valid_executions() {
     let backend = Arc::new(Backend::default());
     *backend.actual.lock().unwrap() = vec![observed("kept")];
     let node = manager(&backend);
@@ -351,10 +355,7 @@ async fn periodic_orphans_require_recovery_instead_of_runtime_scanning() {
     for _ in 0..3 {
         authority.cycle(&node).await.unwrap();
     }
-    assert_eq!(backend.actual.lock().unwrap().len(), 3);
     assert_no_recovery_effects(&backend);
-    authority.registration.reconciling = true;
-    authority.cycle(&node).await.unwrap();
     assert_eq!(*backend.actual.lock().unwrap(), vec![observed("kept")]);
     assert!(node.accepting_allocations());
 }
@@ -444,12 +445,11 @@ async fn periodic_stale_catalog_cannot_reactivate_a_published_deletion() {
     backend.actual.lock().unwrap().push(observed("kept"));
     authority.cycle(&node).await.unwrap();
     authority.cycle(&node).await.unwrap();
-    assert_eq!(backend.actual.lock().unwrap().len(), 1);
-    authority.registration.reconciling = true;
-    authority.cycle(&node).await.unwrap();
+    // A published deletion does not authorize a late execution with the same
+    // identity. Live inventory must collect it without another handshake.
     assert!(backend.actual.lock().unwrap().is_empty());
-    reset_recovery_effects(&backend);
     assert_no_recovery_effects(&backend);
+    assert_eq!(node.used(), Resources::default());
     assert!(node.accepting_allocations());
 }
 

@@ -701,11 +701,8 @@ async fn recovery_reclaims_failed_execution_without_a_retained_controller() {
             .count(),
         deletes
     );
-    // An external execution has no lifecycle controller; recovery owns cleanup.
+    // Periodic inventory can reclaim an identified execution without a controller.
     fixture.backend.reject_delete.store(false, Ordering::SeqCst);
-    authority.cycle(&node).await.unwrap();
-    assert_eq!(driver.inventory().await.unwrap().len(), 1);
-    authority.registration.reconciling = true;
     authority.cycle(&node).await.unwrap();
     assert!(node.accepting_allocations());
     assert!(driver.inventory().await.unwrap().is_empty());
@@ -1395,8 +1392,10 @@ async fn recovery_reaps_late_supervisor_and_conch_without_local_records() {
             fixture.host.supervisors.lock().unwrap().push(id);
             fixture.host.process_alive.store(true, Ordering::SeqCst);
         }
-        // Ordinary data reconciliation does not scan backend execution state.
-        authority.cycle(&node).await.unwrap();
+        // Unidentified native executions still require quiescent recovery.
+        // A live inventory failure preserves admission and the backend.
+        assert!(authority.cycle(&node).await.is_err());
+        assert!(node.accepting_allocations());
         assert!(!fixture.backend.refs.lock().unwrap().is_empty(), "{class}");
         // A new recovery handshake performs complete orphan cleanup.
         authority.registration.reconciling = true;
