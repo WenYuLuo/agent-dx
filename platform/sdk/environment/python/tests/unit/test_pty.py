@@ -148,18 +148,20 @@ class PtyEarlyCloseTests(unittest.IsolatedAsyncioTestCase):
                 on_done=lambda: None,
             )
             with patch.object(ws_client, "connect", after_peer_close):
-                await asyncio.wait_for(transport._run(), 5)
-            return transport
+                try:
+                    await asyncio.to_thread(transport.start, 5)
+                    return await asyncio.to_thread(transport.wait, 5)
+                finally:
+                    await asyncio.to_thread(transport.close)
 
     async def test_buffered_terminal_survives_initial_resize_after_close(self):
-        transport = await self.exercise_peer_closed_before_resize(True)
-        self.assertEqual(transport.wait(0), 7)
+        exit_code = await self.exercise_peer_closed_before_resize(True)
+        self.assertEqual(exit_code, 7)
 
     async def test_close_without_terminal_does_not_fabricate_success(self):
         from adx_environment._pty_transport import _PtyTransportError
-        transport = await self.exercise_peer_closed_before_resize(False)
         with self.assertRaises(_PtyTransportError):
-            transport.wait(0)
+            await self.exercise_peer_closed_before_resize(False)
 
 
 if __name__ == "__main__":
