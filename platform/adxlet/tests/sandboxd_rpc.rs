@@ -36,12 +36,10 @@ struct Server {
     settled_error: Option<tonic::Code>,
     settled_error_after_start: bool,
     retain_after_delete: bool,
-    fence_starts: bool,
-    fence_entered: Arc<Semaphore>,
-    fence_release: Arc<Semaphore>,
-    fence_ack: bool,
     exit_message: Option<String>,
     start_timeout: Option<String>,
+    list_unavailable: Arc<std::sync::atomic::AtomicBool>,
+    wait_pending: bool,
 }
 impl Default for Server {
     fn default() -> Self {
@@ -65,12 +63,10 @@ impl Default for Server {
             settled_error: None,
             settled_error_after_start: false,
             retain_after_delete: false,
-            fence_starts: false,
-            fence_entered: Arc::new(Semaphore::new(0)),
-            fence_release: Arc::new(Semaphore::new(1)),
-            fence_ack: true,
             exit_message: None,
             start_timeout: None,
+            list_unavailable: Arc::default(),
+            wait_pending: false,
         }
     }
 }
@@ -136,27 +132,6 @@ impl sandbox_service_server::SandboxService for Server {
         request: Request<DeleteRequest>,
     ) -> Result<Response<DeleteResponse>, Status> {
         let request = request.into_inner();
-        if !request.start_key.is_empty() {
-            if !self.fence_starts {
-                return Err(Status::unimplemented("start fencing unavailable"));
-            }
-            self.requests
-                .lock()
-                .unwrap()
-                .push(format!("fence:{}", request.start_key));
-            self.fence_entered.add_permits(1);
-            self.fence_release.acquire().await.unwrap().forget();
-            if !self.retain_after_delete {
-                *self.running.lock().unwrap() = false;
-            }
-            let mut response = Response::new(DeleteResponse::default());
-            if self.fence_ack {
-                response
-                    .metadata_mut()
-                    .insert("sandboxd-start-fenced", "true".parse().unwrap());
-            }
-            return Ok(response);
-        }
         self.requests
             .lock()
             .unwrap()
@@ -171,6 +146,12 @@ impl sandbox_service_server::SandboxService for Server {
         &self,
         request: Request<ListSandboxesRequest>,
     ) -> Result<Response<ListSandboxesResponse>, Status> {
+        if self
+            .list_unavailable
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(Status::unavailable("inventory unavailable"));
+        }
         let request = request.into_inner();
         let id = request.id;
         self.requests.lock().unwrap().push(format!("list:{id}"));
@@ -239,6 +220,9 @@ impl sandbox_service_server::SandboxService for Server {
         Ok(Response::new(CheckpointResponse {}))
     }
     async fn wait(&self, request: Request<WaitRequest>) -> Result<Response<WaitResponse>, Status> {
+        if self.wait_pending {
+            return std::future::pending().await;
+        }
         self.requests
             .lock()
             .unwrap()
@@ -713,9 +697,12 @@ async fn ambiguous_start_keeps_cleanup_pending_without_repeating_start() {
     let (adapter, _server) = connect(server.clone()).await;
     assert!(adapter.start(&spec(), "i-1", 1, &[]).await.is_err());
     assert!(adapter.start(&spec(), "i-1", 1, &[]).await.is_err());
-    assert!(adapter.remove("i-1").await.is_err());
+    adapter.remove("i-1").await.unwrap();
     assert!(adapter.start(&spec(), "i-1", 1, &[]).await.is_err());
-    assert_eq!(*server.requests.lock().unwrap(), vec!["start:", "list:"]);
+    assert_eq!(
+        *server.requests.lock().unwrap(),
+        vec!["start:", "list:", "list:"]
+    );
 }
 
 #[tokio::test]
@@ -726,7 +713,7 @@ async fn late_backend_of_failed_start_is_deleted_not_adopted() {
     };
     let (adapter, _server) = connect(server.clone()).await;
     assert!(adapter.start(&spec(), "i-1", 1, &[]).await.is_err());
-    assert!(adapter.remove("i-1").await.is_err());
+    adapter.remove("i-1").await.unwrap();
     *server.running.lock().unwrap() = true;
     // Targeted cleanup retries discover and remove the late execution.
     adapter.remove("i-1").await.unwrap();
@@ -756,6 +743,9 @@ impl Readiness for LifecycleHooks {
 
 #[async_trait::async_trait]
 impl Routes for LifecycleHooks {
+    async fn retire_orphan(&self, _: &adxlet::RuntimeObservation) -> adx_core::Result<()> {
+        Ok(())
+    }
     async fn activate(&self, _: &EnvironmentRecord) -> adx_core::Result<()> {
         self.activations
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1875,9 +1865,6 @@ async fn public_authority_cycle_collects_sandboxd_orphan_without_local_controlle
     creator.start(&spec(), "i-1", 1, &[]).await.unwrap();
     assert!(*server.running.lock().unwrap());
     authority.cycle(&node).await.unwrap();
-    assert!(*server.running.lock().unwrap());
-    authority.registration.reconciling = true;
-    authority.cycle(&node).await.unwrap();
     assert!(!*server.running.lock().unwrap());
     assert_eq!(server.starts.lock().unwrap().len(), 1);
     assert_eq!(node.used(), Resources::default());
@@ -1913,9 +1900,6 @@ async fn public_authority_cycle_reaps_transport_lost_create_after_empty_scan() {
     authority.cycle(&node).await.unwrap();
     // The first complete inventory was empty; the failed create materializes later.
     *server.running.lock().unwrap() = true;
-    authority.cycle(&node).await.unwrap();
-    assert!(*server.running.lock().unwrap());
-    authority.registration.reconciling = true;
     authority.cycle(&node).await.unwrap();
     assert!(!*server.running.lock().unwrap());
     assert!(server
@@ -1991,51 +1975,24 @@ async fn blocked_tunnel_listeners_are_trusted_and_never_add_an_egress_exception(
 }
 
 #[tokio::test]
-async fn unknown_start_converges_after_backend_fences_empty_execution() {
+async fn unknown_start_cleanup_retries_when_backend_delete_leaves_runtime() {
     let server = Server {
-        transport_error: true,
-        fence_starts: true,
+        transport_error_after_start: true,
+        retain_after_delete: true,
         ..Default::default()
     };
     let (adapter, _server) = connect(server.clone()).await;
     assert!(adapter.start(&spec(), "i-1", 1, &[]).await.is_err());
-    adapter.remove("i-1").await.unwrap();
-    adapter.remove("i-1").await.unwrap();
+    assert!(adapter.remove("i-1").await.is_err());
+    assert!(*server.running.lock().unwrap());
     assert!(adapter.start(&spec(), "i-1", 1, &[]).await.is_err());
     assert_eq!(server.starts.lock().unwrap().len(), 1);
-    assert_eq!(server.starts.lock().unwrap()[0].start_key, "i-1");
-    assert!(server
-        .requests
-        .lock()
-        .unwrap()
-        .iter()
-        .any(|x| x == "fence:i-1"));
 }
 
 #[tokio::test]
-async fn unknown_start_requires_fence_acknowledgement_and_absence() {
-    for (ack, remains) in [(false, false), (true, true)] {
-        let server = Server {
-            transport_error: true,
-            fence_starts: true,
-            fence_ack: ack,
-            retain_after_delete: remains,
-            ..Default::default()
-        };
-        let (adapter, _server) = connect(server.clone()).await;
-        assert!(adapter.start(&spec(), "i-1", 1, &[]).await.is_err());
-        *server.running.lock().unwrap() = remains;
-        assert!(adapter.remove("i-1").await.is_err());
-        assert_eq!(server.starts.lock().unwrap().len(), 1);
-    }
-}
-
-#[tokio::test]
-async fn periodic_authority_retires_failed_controller_after_start_fence() {
+async fn periodic_authority_retires_failed_controller_and_reaps_late_runtime() {
     let server = Server {
         transport_error: true,
-        fence_starts: true,
-        fence_release: Arc::new(Semaphore::new(0)),
         ..Default::default()
     };
     let (adapter, _server) = connect(server.clone()).await;
@@ -2052,13 +2009,8 @@ async fn periodic_authority_retires_failed_controller_after_start_fence() {
     authority.cycle(&node).await.unwrap();
     let environment = node.environment(spec(), lifecycle_assignment()).unwrap();
     assert!(environment.create().await.is_err());
-    tokio::time::timeout(Duration::from_secs(3), server.fence_entered.acquire())
-        .await
-        .unwrap()
-        .unwrap()
-        .forget();
-    // The failed Environment is still waiting for backend settlement. A live
-    // authority cycle must keep admission open and allow another reservation.
+    // Empty inventory permits controller retirement; node-wide scanning remains
+    // responsible for an execution that becomes visible afterwards.
     authority.cycle(&node).await.unwrap();
     assert!(node.accepting_allocations());
     assert!(authority.registration.accepting_allocations);
@@ -2066,7 +2018,6 @@ async fn periodic_authority_retires_failed_controller_after_start_fence() {
     other.id = "other".into();
     let reservation = node.reserve_local(&other).unwrap();
     node.release_local(&other.id, &reservation).unwrap();
-    server.fence_release.add_permits(1);
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             authority.cycle(&node).await.unwrap();
@@ -2082,6 +2033,8 @@ async fn periodic_authority_retires_failed_controller_after_start_fence() {
     })
     .await
     .unwrap();
+    *server.running.lock().unwrap() = true;
+    authority.cycle(&node).await.unwrap();
     assert!(node.accepting_allocations());
     assert_eq!(node.used(), Resources::default());
     assert_eq!(server.starts.lock().unwrap().len(), 1);
@@ -2095,10 +2048,9 @@ async fn periodic_authority_retires_failed_controller_after_start_fence() {
 }
 
 #[tokio::test]
-async fn restart_inventory_reclaims_pending_start_without_previous_client_state() {
+async fn restart_inventory_reclaims_late_start_after_initial_empty_scan() {
     let server = Server {
         transport_error: true,
-        advertise_pending: true,
         ..Default::default()
     };
     let (old, harness) = connect(server.clone()).await;
@@ -2110,11 +2062,139 @@ async fn restart_inventory_reclaims_pending_start_without_previous_client_state(
     )
     .await
     .unwrap();
-    let pending = restored.inventory().await.unwrap();
-    assert_eq!(pending.len(), 1);
-    assert_eq!(pending[0].runtime_id, "i-1");
-    assert!(!pending[0].running);
-    restored.remove(&pending[0].runtime_id).await.unwrap();
-    assert!(restored.inventory().await.unwrap().is_empty());
+    let node = authority::manager(Arc::new(restored));
+    let mut authority = authority::Fixture::new().await;
+    authority.cycle(&node).await.unwrap();
+    *server.running.lock().unwrap() = true;
+    authority.cycle(&node).await.unwrap();
+    assert!(!*server.running.lock().unwrap());
+    assert!(node.accepting_allocations());
     assert_eq!(server.starts.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn main_backend_unknown_start_empty_scan_allows_later_cleanup() {
+    let server = Server {
+        transport_error: true,
+        ..Default::default()
+    };
+    let (adapter, _server) = connect(server.clone()).await;
+    assert!(adapter.start(&spec(), "i-1", 1, &[]).await.is_err());
+    adapter.remove("i-1").await.unwrap();
+    *server.running.lock().unwrap() = true;
+    adapter.remove("i-1").await.unwrap();
+    assert!(!*server.running.lock().unwrap());
+    assert!(matches!(
+        adapter.start(&spec(), "i-1", 1, &[]).await,
+        Err(adx_core::Error::Conflict)
+    ));
+    assert_eq!(server.starts.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn main_backend_lost_response_cleans_by_physical_id() {
+    let server = Server {
+        transport_error_after_start: true,
+        ..Default::default()
+    };
+    let (adapter, _server) = connect(server.clone()).await;
+    assert!(adapter.start(&spec(), "i-1", 1, &[]).await.is_err());
+    adapter.remove("i-1").await.unwrap();
+    assert!(!*server.running.lock().unwrap());
+    assert!(server
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|r| r == "delete:generated-backend-id"));
+}
+
+#[tokio::test]
+async fn periodic_inventory_failure_preserves_admission_and_retries_cleanup() {
+    use std::sync::atomic::Ordering;
+    let server = Server::default();
+    let (creator, harness) = connect(server.clone()).await;
+    let adapter = Sandboxd::connect(
+        harness._directory.path().join("rpc.sock"),
+        Config::default(),
+    )
+    .await
+    .unwrap();
+    let node = authority::manager(Arc::new(adapter));
+    let mut authority = authority::Fixture::new().await;
+    authority.cycle(&node).await.unwrap();
+    creator.start(&spec(), "i-1", 1, &[]).await.unwrap();
+    server.list_unavailable.store(true, Ordering::SeqCst);
+    assert!(authority.cycle(&node).await.is_err());
+    assert!(node.accepting_allocations());
+    assert!(authority.registration.accepting_allocations);
+    assert!(*server.running.lock().unwrap());
+    server.list_unavailable.store(false, Ordering::SeqCst);
+    authority.cycle(&node).await.unwrap();
+    assert!(!*server.running.lock().unwrap());
+}
+
+#[tokio::test]
+async fn periodic_catalog_failure_preserves_orphan_until_fresh_authority() {
+    use std::sync::atomic::Ordering;
+    let server = Server::default();
+    let (creator, harness) = connect(server.clone()).await;
+    let adapter = Sandboxd::connect(
+        harness._directory.path().join("rpc.sock"),
+        Config::default(),
+    )
+    .await
+    .unwrap();
+    let node = authority::manager(Arc::new(adapter));
+    let mut authority = authority::Fixture::new().await;
+    authority.cycle(&node).await.unwrap();
+    creator.start(&spec(), "i-1", 1, &[]).await.unwrap();
+    authority
+        .authority
+        .unavailable
+        .store(true, Ordering::SeqCst);
+    assert!(authority.cycle(&node).await.is_err());
+    assert!(node.accepting_allocations());
+    assert!(*server.running.lock().unwrap());
+    authority
+        .authority
+        .unavailable
+        .store(false, Ordering::SeqCst);
+    authority.cycle(&node).await.unwrap();
+    assert!(!*server.running.lock().unwrap());
+}
+
+#[tokio::test]
+async fn periodic_inventory_preserves_create_admitted_during_catalog_read() {
+    use std::sync::atomic::Ordering;
+    let server = Server {
+        wait_pending: true,
+        ..Default::default()
+    };
+    let (adapter, _harness) = connect(server.clone()).await;
+    let hooks = Arc::new(LifecycleHooks::default());
+    let node = lifecycle_node(adapter, &hooks);
+    let mut authority = authority::Fixture::new().await;
+    authority.cycle(&node).await.unwrap();
+    let authority_state = authority.authority.clone();
+    authority_state.block_inspect.store(true, Ordering::SeqCst);
+    let cycle_node = node.clone();
+    let cycle = tokio::spawn(async move { authority.cycle(&cycle_node).await });
+    authority_state.inspect_entered.notified().await;
+    let handle = node.environment(spec(), lifecycle_assignment()).unwrap();
+    handle.create().await.unwrap();
+    authority_state.inspect_release.notify_one();
+    cycle.await.unwrap().unwrap();
+    assert!(*server.running.lock().unwrap());
+    assert_eq!(
+        handle.sync().await.unwrap().record.state,
+        EnvironmentState::Running
+    );
+    assert!(node.accepting_allocations());
+    assert!(!server
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|r| r.starts_with("delete:")));
 }

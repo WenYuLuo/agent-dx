@@ -12,6 +12,13 @@ mod tests;
 
 pub(crate) struct ComparisonBasis {
     controllers: crate::EnvironmentDirectory,
+    inventory: Result<Vec<crate::RuntimeObservation>>,
+}
+
+enum OrphanTarget {
+    Controller(EnvironmentHandle),
+    AwaitingController,
+    Unowned,
 }
 
 pub(crate) enum ReconciliationOutcome {
@@ -25,13 +32,14 @@ impl Adxlet {
     fn start_comparison(
         &self,
         id: String,
+        runtime_id: Option<String>,
         work: impl std::future::Future<Output = Result<AuthorityResult>> + Send + 'static,
     ) {
         let mut tasks = self
             .authority_tasks
             .lock()
             .expect("shared state lock poisoned");
-        tasks.entry(id).or_insert_with(|| {
+        tasks.entry((id, runtime_id)).or_insert_with(|| {
             let progress = self.authority_progress.clone();
             let (send, receive) = tokio::sync::oneshot::channel();
             tokio::spawn(async move {
@@ -46,7 +54,7 @@ impl Adxlet {
     fn completed_comparisons(&self) -> (Option<Error>, bool) {
         let mut failure = None;
         let mut stale = false;
-        self.authority_tasks.lock().expect("shared state lock poisoned").retain(|id, task| {
+        self.authority_tasks.lock().expect("shared state lock poisoned").retain(|(id, _), task| {
             let result = match task.try_recv() {
                 Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return true,
                 Err(tokio::sync::oneshot::error::TryRecvError::Closed) => Err(Error::Unavailable("environment reconciliation task stopped".into())),
@@ -67,13 +75,25 @@ impl Adxlet {
 
     /// Capture before InspectNode. A controller admitted after this point cannot
     /// be discarded merely because it is missing from that earlier catalog.
-    pub(crate) fn comparison_basis(&self) -> ComparisonBasis {
+    pub(crate) async fn comparison_basis(&self, budget: std::time::Duration) -> ComparisonBasis {
         let controllers = self
             .environments
             .lock()
             .expect("shared state lock poisoned")
             .clone();
-        ComparisonBasis { controllers }
+        // Sample before authority: anything created after this inventory is not
+        // eligible for orphan collection from the following catalog snapshot.
+        let inventory = tokio::time::timeout(
+            budget.min(self.services.operation_timeout),
+            self.services.runtime.inventory(),
+        )
+        .await
+        .map_err(|_| Error::Unavailable("inventory timed out".into()))
+        .and_then(|result| result);
+        ComparisonBasis {
+            controllers,
+            inventory,
+        }
     }
 
     pub(crate) async fn compare_retained(
@@ -145,7 +165,7 @@ impl Adxlet {
             let references = catalog.references.clone();
             let manager = self.clone();
             let gate = _gate.clone();
-            self.start_comparison(id.clone(), async move {
+            self.start_comparison(id.clone(), None, async move {
                 let _gate = gate;
                 let result = handle
                     .check_authority(AuthorityCheck {
@@ -183,6 +203,59 @@ impl Adxlet {
                 }
                 Ok(AuthorityResult::Current)
             });
+        }
+        match basis.inventory {
+            Ok(actual) => {
+                validate_inventory(&actual, &catalog.records)?;
+                for runtime in actual {
+                    // Controllers own same-generation lifecycle decisions. An
+                    // older observation must not delete a resumed execution or
+                    // a create admitted while InspectNode was in flight.
+                    if catalog
+                        .records
+                        .get(&runtime.environment_id)
+                        .is_some_and(|record| {
+                            record.assignment.generation < runtime.generation
+                                || controller::protects_execution(record, &runtime.runtime_id)
+                        })
+                    {
+                        continue;
+                    }
+                    let retire_route = catalog
+                        .records
+                        .get(&runtime.environment_id)
+                        .is_none_or(|record| record.assignment.generation != runtime.generation);
+                    let manager = self.clone();
+                    let gate = _gate.clone();
+                    self.start_comparison(
+                        runtime.environment_id.clone(),
+                        Some(runtime.runtime_id.clone()),
+                        async move {
+                            let _gate = gate;
+                            match manager.claim_orphan(&runtime, !retire_route) {
+                                OrphanTarget::Controller(handle) => {
+                                    handle.reap_orphan(runtime).await?;
+                                    return Ok(AuthorityResult::Current);
+                                }
+                                OrphanTarget::AwaitingController => {
+                                    return Ok(AuthorityResult::Current);
+                                }
+                                OrphanTarget::Unowned => (),
+                            }
+                            tokio::time::timeout(manager.services.operation_timeout, async {
+                                if retire_route {
+                                    manager.services.routes.retire_orphan(&runtime).await?;
+                                }
+                                manager.services.runtime.remove(&runtime.runtime_id).await
+                            })
+                            .await
+                            .map_err(|_| Error::Unavailable("orphan cleanup timed out".into()))??;
+                            Ok(AuthorityResult::Current)
+                        },
+                    );
+                }
+            }
+            Err(error) => failure = Some(error),
         }
         // A long restore must not stall the next catalog/resource sample. Keep
         // one tracked task per environment; accepted work is never cancelled.
@@ -225,6 +298,52 @@ impl Adxlet {
         } else {
             ReconciliationOutcome::Complete
         })
+    }
+
+    fn claim_orphan(
+        &self,
+        runtime: &crate::RuntimeObservation,
+        same_generation_owner: bool,
+    ) -> OrphanTarget {
+        // Same lock order as environment(): protect newly admitted work and
+        // retire the observed generation atomically before asynchronous cleanup.
+        let mut retired = self
+            .retired_environments
+            .lock()
+            .expect("shared state lock poisoned");
+        let controllers = self
+            .environments
+            .lock()
+            .expect("shared state lock poisoned");
+        if let Some((_, _, handle)) = controllers.get(&runtime.environment_id) {
+            return OrphanTarget::Controller(handle.clone());
+        }
+        // Authority still owns this generation. Its Create may be in flight,
+        // or its controller may be between retirement and adoption. Let the
+        // next inventory retry through that controller rather than installing
+        // a generation tombstone that would prevent the owner from arriving.
+        if same_generation_owner {
+            return OrphanTarget::AwaitingController;
+        }
+        let now = tokio::time::Instant::now();
+        let expires_at = now
+            .checked_add(self.services.operation_timeout.saturating_mul(2))
+            .unwrap_or(now);
+        retired
+            .entry(runtime.environment_id.clone())
+            .and_modify(|entry| {
+                if runtime.generation > entry.generation {
+                    entry.generation = runtime.generation;
+                    entry.result = None;
+                }
+                entry.expires_at = entry.expires_at.max(expires_at);
+            })
+            .or_insert(crate::RetiredEnvironment {
+                generation: runtime.generation,
+                expires_at,
+                result: None,
+            });
+        OrphanTarget::Unowned
     }
 
     fn adopt_comparison_record(
