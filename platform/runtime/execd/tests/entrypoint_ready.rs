@@ -141,7 +141,9 @@ async fn inherited_long_running_process_keeps_control_responsive() {
 #[tokio::test]
 async fn explicit_workload_commands_and_user_override_the_image_defaults() {
     use std::os::unix::fs::PermissionsExt;
-    let directory = tempfile::tempdir().unwrap();
+    // The workload drops privileges, so its markers need a traversable parent
+    // even when the builder's TMPDIR is inside a private root-owned directory.
+    let directory = tempfile::tempdir_in("/tmp").unwrap();
     std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
     let marker = directory.path().join("first");
     let second = directory.path().join("second");
@@ -207,7 +209,10 @@ async fn explicit_workload_commands_and_user_override_the_image_defaults() {
         "{}",
         std::fs::read_to_string(log_path).unwrap()
     );
-    assert_eq!(std::fs::read_to_string(marker).unwrap().trim(), expected_uid);
+    assert_eq!(
+        std::fs::read_to_string(marker).unwrap().trim(),
+        expected_uid
+    );
     assert_eq!(std::fs::read_to_string(second).unwrap(), "second");
 }
 
