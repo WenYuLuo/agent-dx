@@ -194,6 +194,16 @@ impl Coordinator {
         })
     }
 
+    pub(crate) fn forget_node(&mut self, id: &str) -> Result<()> {
+        if let Some(shard) = self.node_shards.get(id).copied() {
+            self.shards[shard].forget_node(id)?;
+            self.node_shards.remove(id);
+            Arc::make_mut(&mut self.snapshot).remove_node(id);
+            self.journal.record(id);
+            self.wake_pending(None);
+        }
+        Ok(())
+    }
     pub fn register(&mut self, node: Node) -> Result<usize> {
         if node.id.trim().is_empty() {
             return Err(Error::Invalid("node id is required".into()));

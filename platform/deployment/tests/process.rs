@@ -287,7 +287,9 @@ async fn supervisor_drains_rotated_logs_on_stop() {
     // Confirm all bytes were submitted by the child, rather than waiting for
     // asynchronous archive compression to finish before exercising Stop.
     wait_for_graceful_services(root, &["adx-coordinator"]).await;
-    let stopped = supervisor::request(&state_directory, Request::Stop, Duration::from_secs(5))
+    // Stop also drains and fsyncs every rotated archive. Shared CI disks can
+    // need longer than the child termination budget; still verify every byte.
+    let stopped = supervisor::request(&state_directory, Request::Stop, Duration::from_secs(30))
         .await
         .unwrap();
     supervisor_task.await.unwrap().unwrap();

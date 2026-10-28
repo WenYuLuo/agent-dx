@@ -177,6 +177,7 @@ class _PtyConnection:
 
     async def _run(self) -> None:
         import websockets.asyncio.client as ws_client
+        from websockets.exceptions import ConnectionClosed
 
         loop = asyncio.get_running_loop()
         with self._state_lock:
@@ -195,7 +196,13 @@ class _PtyConnection:
             ) as websocket:
                 with self._state_lock:
                     self._websocket = websocket
-                await websocket.send(f"RESIZE:{self._cols}:{self._rows}")
+                try:
+                    await websocket.send(f"RESIZE:{self._cols}:{self._rows}")
+                except ConnectionClosed:
+                    # A fast child can send its terminal frame and close before
+                    # the initial resize. Drain buffered frames before deciding
+                    # whether this session completed or lost its terminal status.
+                    pass
                 async for message in websocket:
                     if isinstance(message, bytes):
                         if self._on_data is not None:

@@ -126,3 +126,8 @@ Kubernetes 同样在 Pod 内运行进程，但部署与验收应使用独立的 
 ## Failed 记录保留
 
 Coordinator 服务配置 `failed_retention_seconds` 默认600秒，必须大于零。终态 Failed 在保留期后自动清理；创建失败的资源预留立即释放。正在重启／恢复的记录不按普通终态回收，清理失败继续重试。具体契约见 [Failed Environment GC](../testing/failed-environment-gc.md)。
+
+Coordinator 的 `node_retention_seconds` 默认 1800 秒，控制已失联且无 Environment
+引用的节点注册保留期，必须大于零。优雅停止通过会话校验的 `UnregisterNode` 主动下线，
+排空节点无需等待该保留期。仍有执行/恢复引用时保留必要上下文，待对象退役后清理。
+具体边界见 [离线节点退役与主动注销](../testing/recovery-discovery.md#离线节点退役与主动注销)。

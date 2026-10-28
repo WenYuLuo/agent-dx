@@ -43,8 +43,7 @@ struct NodeMetrics {
     connect_total: AtomicU64,
     connect_errors: AtomicU64,
     completed_streams: AtomicU64,
-    bytes_up: AtomicU64,
-    bytes_down: AtomicU64,
+    traffic: Arc<crate::common::traffic::TrafficMeter>,
     route_mismatch: AtomicU64,
     forbidden_target: AtomicU64,
     overload_rejections: AtomicU64,
@@ -137,12 +136,13 @@ impl Relay {
     }
 
     pub fn metrics(&self) -> NodeMetricSnapshot {
+        let (bytes_up, bytes_down) = self.metrics.traffic.snapshot();
         NodeMetricSnapshot {
             connect_total: self.metrics.connect_total.load(Ordering::Relaxed),
             connect_errors: self.metrics.connect_errors.load(Ordering::Relaxed),
             completed_streams: self.metrics.completed_streams.load(Ordering::Relaxed),
-            bytes_up: self.metrics.bytes_up.load(Ordering::Relaxed),
-            bytes_down: self.metrics.bytes_down.load(Ordering::Relaxed),
+            bytes_up,
+            bytes_down,
             route_mismatch: self.metrics.route_mismatch.load(Ordering::Relaxed),
             forbidden_target: self.metrics.forbidden_target.load(Ordering::Relaxed),
             overload_rejections: self.metrics.overload_rejections.load(Ordering::Relaxed),
@@ -481,6 +481,7 @@ impl Relay {
         self.metrics.connect_total.fetch_add(1, Ordering::Relaxed);
         let mut route_rx = route_rx;
         let relay_stats = RelayStats::default();
+        let _traffic = relay_stats.track(&self.metrics.traffic);
         let result = tokio::select! {
             result = relay_h2_tcp_with_stats(request.into_body(), send, tcp, relay_stats.clone()) => Some(result),
             _ = connection_closed.changed() => None,
@@ -493,10 +494,6 @@ impl Relay {
             } => None,
         };
         let (bytes_up, bytes_down) = relay_stats.snapshot();
-        self.metrics.bytes_up.fetch_add(bytes_up, Ordering::Relaxed);
-        self.metrics
-            .bytes_down
-            .fetch_add(bytes_down, Ordering::Relaxed);
         if let Some(Err(error)) = result {
             tracing::debug!(
                 instance_id = %target.instance_id,

@@ -133,6 +133,13 @@ async fn mock_full_data_plane_protocol_matrix() {
     assert_websocket_upgrade(ingress_http_address, http_target.port()).await;
     assert_eq!(seen_paths.recv().await.unwrap().path, "/socket");
     assert_http_connect(ingress_http_address, echo_target.port()).await;
+    assert_live_transfer_metrics(
+        ingress_http_address,
+        ingress_health_address,
+        echo_target.port(),
+        &node,
+    )
+    .await;
     for access_kind in [
         AccessKind::Tunnel,
         AccessKind::PortForwarding,
@@ -830,4 +837,50 @@ async fn assert_half_closed_route_cancel(websocket: bool) {
     reconciler.abort();
     node_task.abort();
     backend_task.abort();
+}
+
+async fn assert_live_transfer_metrics(
+    ingress: std::net::SocketAddr,
+    health: std::net::SocketAddr,
+    port: u16,
+    node: &Relay,
+) {
+    let before = node.metrics();
+    let mut stream = open_connect(ingress, port, AccessKind::PortForwarding).await;
+    let payload = vec![b'x'; 256 * 1024 + 17];
+    stream.write_all(&payload).await.unwrap();
+    let mut echoed = vec![0; payload.len()];
+    stream.read_exact(&mut echoed).await.unwrap();
+    assert_eq!(echoed, payload);
+    // These counters must advance before the active stream closes.
+    let after = node.metrics();
+    assert!(
+        after.bytes_up >= before.bytes_up + payload.len() as u64,
+        "upstream bytes are delayed until stream close"
+    );
+    assert!(
+        after.bytes_down >= before.bytes_down + payload.len() as u64,
+        "downstream bytes are delayed until stream close"
+    );
+    let metrics = raw_http(
+        health,
+        "GET /metrics HTTP/1.1\r\nHost: health\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    for direction in ["received", "sent"] {
+        let prefix =
+            format!("data_plane_ingress_frontend_bytes_total{{direction=\"{direction}\"}} ");
+        let value: u64 = metrics
+            .lines()
+            .find_map(|line| line.strip_prefix(&prefix))
+            .expect("Ingress traffic counter missing")
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(
+            value >= payload.len() as u64,
+            "Ingress counter excludes the active transfer"
+        );
+    }
+    stream.shutdown().await.unwrap();
 }

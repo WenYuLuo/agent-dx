@@ -53,7 +53,7 @@ async fn health_response(
             (
                 StatusCode::OK,
                 format!(
-                    "data_plane_relay_ready {}\ndata_plane_relay_active_streams {}\ndata_plane_relay_max_streams {}\ndata_plane_relay_connect_total {}\ndata_plane_relay_connect_errors {}\ndata_plane_relay_completed_streams {}\ndata_plane_relay_bytes_up {}\ndata_plane_relay_bytes_down {}\ndata_plane_relay_route_mismatch_total {}\ndata_plane_relay_forbidden_target_total {}\ndata_plane_relay_overload_rejections_total {}\n",
+                    "data_plane_relay_ready {}\ndata_plane_relay_active_streams {}\ndata_plane_relay_max_streams {}\ndata_plane_relay_connect_total {}\ndata_plane_relay_connect_errors {}\ndata_plane_relay_completed_streams {}\ndata_plane_relay_bytes_up {}\ndata_plane_relay_bytes_down {}\ndata_plane_relay_route_mismatch_total {}\ndata_plane_relay_forbidden_target_total {}\ndata_plane_relay_overload_rejections_total {}\n# TYPE data_plane_relay_transfer_bytes_total counter\ndata_plane_relay_transfer_bytes_total{{direction=\"to_runtime\"}} {}\ndata_plane_relay_transfer_bytes_total{{direction=\"from_runtime\"}} {}\n",
                     usize::from(gateway.ready()),
                     gateway.active_streams(),
                     gateway.max_active_streams(),
@@ -65,6 +65,8 @@ async fn health_response(
                     metrics.route_mismatch,
                     metrics.forbidden_target,
                     metrics.overload_rejections,
+                    metrics.bytes_up,
+                    metrics.bytes_down,
                 ),
             )
         }

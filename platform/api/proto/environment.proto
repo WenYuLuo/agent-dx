@@ -18,6 +18,7 @@ service CoordinatorService {
   rpc ReserveLocalEnvironment(ClaimEnvironmentRequest) returns (ClaimEnvironmentResponse);
   rpc ClaimEnvironment(ClaimEnvironmentRequest) returns (ClaimEnvironmentResponse);
   rpc ForwardCreate(LocalEnvironmentCreateRequest) returns (EnvironmentResult);
+  rpc UnregisterNode(UnregisterNodeRequest) returns (UnregisterNodeResponse);
   rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeResponse);
   rpc InspectNode(InspectNodeRequest) returns (InspectNodeResponse);
   rpc CreateEnvironment(CreateEnvironmentRequest) returns (EnvironmentResult);
@@ -82,6 +83,10 @@ message StorageMount {
   string backend_id = 1;
   string root = 2;
 }
+
+// Planned departure is authenticated and fenced to this exact boot session.
+message UnregisterNodeRequest { string node_id = 1; string session_id = 2; }
+message UnregisterNodeResponse {}
 
 message RegisterNodeResponse { uint32 shard_id = 1; uint64 coordinator_epoch = 2; }
 

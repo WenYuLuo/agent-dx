@@ -7,6 +7,8 @@ mod common;
 mod counter_compaction;
 #[path = "storage/dormancy.rs"]
 mod dormancy;
+#[path = "storage/node_retirement.rs"]
+mod node_retirement;
 #[path = "storage/observability.rs"]
 mod observability;
 #[path = "storage/publication.rs"]

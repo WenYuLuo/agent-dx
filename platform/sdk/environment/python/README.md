@@ -559,6 +559,9 @@ request_max_attempts must be a positive integer. The gateway address
 defaults to the frontend address for reverse-tunnel and user-port routes. PTY
 uses the Ingress data-plane route when a gateway address is configured, and falls
 back to the server address for combined deployments.
+A fast PTY child may finish before the initial resize. The SDK drains queued
+terminal frames when that resize encounters an already closed connection; a
+closed connection without terminal status still raises `PtyError`.
 
 ## Build and test
 

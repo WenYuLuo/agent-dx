@@ -90,3 +90,40 @@ ADX_TEST_REDIS_SERVER=/path/to/redis-server ADX_TEST_APISERVER=/path/to/adx-apis
 | Go HTTP 进程使用 Redis 发现，与 Rust RPC／Redis 协作 | 同一 RPC 套件的 3 个用例再次通过，0 忽略 | `frontend-v5/result.json`、`frontend-http.log` |
 
 默认忽略项不计为通过；Redis／RPC 已由上面的专用入口实际执行，性能基准本阶段未重跑。`red.log` 与中间告警日志保留；`source-manifest.json` 记录验证源码及服务二进制 SHA256。
+
+## 离线节点退役与主动注销
+
+Coordinator 的 `node_retention_seconds` 默认 1800 秒，必须大于零。从首次持久确认
+心跳失效时开始计算，Coordinator 重启不重置该时间。维护循环每轮最多退役 16 个节点。
+仍被保留的 Environment 引用或尚有本地预留的节点延后退役；相关对象完成恢复、删除
+或 Failed 回收后再清理，不能为了删节点而删除用户休眠的 Environment。
+
+退役原子移除完整注册、发布 token 和 ownership 版本，折叠业务累计数，保留
+`retired-node:<id>` 中的分片、管理准入开关及旧会话/序号。容量、设备、地址不继续
+导出为当前节点指标；目录发布器执行全量刷新。旧时序仍按 Prometheus 保留策略可查。
+节点重新加入须重新对账，保留其分片和管理暂停设置。自然失联后，同一进程可以用
+更高心跳序号重新握手；重复的旧心跳不能重新激活已退役节点。
+
+`UnregisterNode` 只接受与节点身份匹配的认证调用，并校验精确 boot session。
+重复注销幂等；旧进程不能注销替代它的新进程，已主动注销的会话不能重新注册。
+已排空的节点立即退役；仍有关联 Environment 时先撤销执行归属和路由，再按现有
+恢复/回收流程处理。主动注销不增加 Worker Incidents；尚在运行的执行中断按 unknown
+原因记录，并保留“节点主动注销”的证据，避免混同心跳超时。
+
+adxlet 收到正常退出信号后关闭本地准入，通过当前 Coordinator 连接发送注销请求，
+通知最多等待 `min(rpc_timeout_seconds, 5)` 秒。通知失败记录一次 WARN，继续退出，
+由心跳失效与超时退役兜底。直接退出不等于用户删除，运行时由现有失效归属对账处理。
+`adxctl stop` 仍先通过 Drain 删除并确认本地 Environment 已发布退役，再停止进程
+并发送注销。
+
+主动注销的 boot session 另存为 `node-departed:<digest>` 最小身份记录。新会话加入及
+Coordinator 再次重启都不清除此记录，避免已注销进程的迟到注册重新激活节点。
+普通已登记会话的周期心跳仍走内存路径，不增加 Redis 写入。
+注销的所有权事务由独立任务完成；调用方断开或等待超时不会中途丢弃已经受理的退役。
+
+Coordinator shutdown closes active route and Environment-directory subscriptions
+before draining the gRPC server. Idle watch streams must not keep a stopped
+Coordinator alive until the supervisor timeout, which can otherwise restart an
+old instance and fence its replacement. The real-Redis/TCP regression
+`coordinator_shutdown_finishes_with_live_directory_subscriptions` retains both
+clients while verifying server shutdown and rejection of new subscriptions.

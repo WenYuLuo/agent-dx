@@ -22,6 +22,8 @@ struct Server {
     network_updates: Arc<Mutex<Vec<SetNetworkPolicyRequest>>>,
     unready: Arc<std::sync::atomic::AtomicUsize>,
     running: Arc<Mutex<bool>>,
+    pending: Arc<Mutex<bool>>,
+    advertise_pending: bool,
     xpu: Arc<Mutex<Vec<XpuAllocation>>>,
     entered: Arc<Semaphore>,
     release: Arc<Semaphore>,
@@ -34,6 +36,10 @@ struct Server {
     settled_error: Option<tonic::Code>,
     settled_error_after_start: bool,
     retain_after_delete: bool,
+    fence_starts: bool,
+    fence_entered: Arc<Semaphore>,
+    fence_release: Arc<Semaphore>,
+    fence_ack: bool,
     exit_message: Option<String>,
     start_timeout: Option<String>,
 }
@@ -45,6 +51,8 @@ impl Default for Server {
             network_updates: Arc::default(),
             unready: Arc::default(),
             running: Arc::default(),
+            pending: Arc::default(),
+            advertise_pending: false,
             xpu: Arc::default(),
             entered: Arc::new(Semaphore::new(0)),
             release: Arc::new(Semaphore::new(1)),
@@ -57,6 +65,10 @@ impl Default for Server {
             settled_error: None,
             settled_error_after_start: false,
             retain_after_delete: false,
+            fence_starts: false,
+            fence_entered: Arc::new(Semaphore::new(0)),
+            fence_release: Arc::new(Semaphore::new(1)),
+            fence_ack: true,
             exit_message: None,
             start_timeout: None,
         }
@@ -69,6 +81,9 @@ impl sandbox_service_server::SandboxService for Server {
         request: Request<StartRequest>,
     ) -> Result<Response<StartResponse>, Status> {
         let request = request.into_inner();
+        if self.advertise_pending {
+            *self.pending.lock().unwrap() = true;
+        }
         assert!(request.sandbox_id.is_empty());
         self.starts.lock().unwrap().push(request.clone());
         *self.labels.lock().unwrap() = request.labels.clone();
@@ -120,12 +135,35 @@ impl sandbox_service_server::SandboxService for Server {
         &self,
         request: Request<DeleteRequest>,
     ) -> Result<Response<DeleteResponse>, Status> {
+        let request = request.into_inner();
+        if !request.start_key.is_empty() {
+            if !self.fence_starts {
+                return Err(Status::unimplemented("start fencing unavailable"));
+            }
+            self.requests
+                .lock()
+                .unwrap()
+                .push(format!("fence:{}", request.start_key));
+            self.fence_entered.add_permits(1);
+            self.fence_release.acquire().await.unwrap().forget();
+            if !self.retain_after_delete {
+                *self.running.lock().unwrap() = false;
+            }
+            let mut response = Response::new(DeleteResponse::default());
+            if self.fence_ack {
+                response
+                    .metadata_mut()
+                    .insert("sandboxd-start-fenced", "true".parse().unwrap());
+            }
+            return Ok(response);
+        }
         self.requests
             .lock()
             .unwrap()
-            .push(format!("delete:{}", request.into_inner().id));
+            .push(format!("delete:{}", request.id));
         if !self.retain_after_delete {
             *self.running.lock().unwrap() = false;
+            *self.pending.lock().unwrap() = false;
         }
         Ok(Response::new(DeleteResponse::default()))
     }
@@ -136,7 +174,9 @@ impl sandbox_service_server::SandboxService for Server {
         let request = request.into_inner();
         let id = request.id;
         self.requests.lock().unwrap().push(format!("list:{id}"));
-        if (!*self.running.lock().unwrap() && self.exit_message.is_none())
+        if (!*self.running.lock().unwrap()
+            && !*self.pending.lock().unwrap()
+            && self.exit_message.is_none())
             || (!id.is_empty() && id != "generated-backend-id")
         {
             if !id.is_empty() {
@@ -158,6 +198,8 @@ impl sandbox_service_server::SandboxService for Server {
                 labels,
                 state: if *self.running.lock().unwrap() {
                     SandboxState::Running as i32
+                } else if *self.pending.lock().unwrap() {
+                    SandboxState::Unknown as i32
                 } else {
                     SandboxState::Exited as i32
                 },
@@ -1946,4 +1988,133 @@ async fn blocked_tunnel_listeners_are_trusted_and_never_add_an_egress_exception(
         .insert("EXECD_TUNNEL_WS_PORT".into(), "12345".into());
     let request = start_request(&spec, "i-1", 1, &[], &Config::default()).unwrap();
     assert!(!request.envs.contains_key("EXECD_TUNNEL_WS_PORT"));
+}
+
+#[tokio::test]
+async fn unknown_start_converges_after_backend_fences_empty_execution() {
+    let server = Server {
+        transport_error: true,
+        fence_starts: true,
+        ..Default::default()
+    };
+    let (adapter, _server) = connect(server.clone()).await;
+    assert!(adapter.start(&spec(), "i-1", 1, &[]).await.is_err());
+    adapter.remove("i-1").await.unwrap();
+    adapter.remove("i-1").await.unwrap();
+    assert!(adapter.start(&spec(), "i-1", 1, &[]).await.is_err());
+    assert_eq!(server.starts.lock().unwrap().len(), 1);
+    assert_eq!(server.starts.lock().unwrap()[0].start_key, "i-1");
+    assert!(server
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|x| x == "fence:i-1"));
+}
+
+#[tokio::test]
+async fn unknown_start_requires_fence_acknowledgement_and_absence() {
+    for (ack, remains) in [(false, false), (true, true)] {
+        let server = Server {
+            transport_error: true,
+            fence_starts: true,
+            fence_ack: ack,
+            retain_after_delete: remains,
+            ..Default::default()
+        };
+        let (adapter, _server) = connect(server.clone()).await;
+        assert!(adapter.start(&spec(), "i-1", 1, &[]).await.is_err());
+        *server.running.lock().unwrap() = remains;
+        assert!(adapter.remove("i-1").await.is_err());
+        assert_eq!(server.starts.lock().unwrap().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn periodic_authority_retires_failed_controller_after_start_fence() {
+    let server = Server {
+        transport_error: true,
+        fence_starts: true,
+        fence_release: Arc::new(Semaphore::new(0)),
+        ..Default::default()
+    };
+    let (adapter, _server) = connect(server.clone()).await;
+    let hooks = Arc::new(LifecycleHooks::default());
+    let hub = adxlet::control_stream::RuntimeControlHub::new(vec![7; 32], Duration::from_secs(1))
+        .unwrap();
+    let control = adxlet::runtime_control::RuntimeControlClient::new(50090, Duration::from_secs(1))
+        .unwrap()
+        .with_stream(hub);
+    let node = lifecycle_node(adapter, &hooks)
+        .with_runtime_control(control)
+        .unwrap();
+    let mut authority = authority::Fixture::new().await;
+    authority.cycle(&node).await.unwrap();
+    let environment = node.environment(spec(), lifecycle_assignment()).unwrap();
+    assert!(environment.create().await.is_err());
+    tokio::time::timeout(Duration::from_secs(3), server.fence_entered.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    // The failed Environment is still waiting for backend settlement. A live
+    // authority cycle must keep admission open and allow another reservation.
+    authority.cycle(&node).await.unwrap();
+    assert!(node.accepting_allocations());
+    assert!(authority.registration.accepting_allocations);
+    let mut other = spec();
+    other.id = "other".into();
+    let reservation = node.reserve_local(&other).unwrap();
+    node.release_local(&other.id, &reservation).unwrap();
+    server.fence_release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            authority.cycle(&node).await.unwrap();
+            assert!(node.accepting_allocations());
+            if matches!(
+                node.environment(spec(), lifecycle_assignment()),
+                Err(adx_core::Error::Conflict)
+            ) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(node.accepting_allocations());
+    assert_eq!(node.used(), Resources::default());
+    assert_eq!(server.starts.lock().unwrap().len(), 1);
+    assert!(!*server.running.lock().unwrap());
+    assert!(hooks
+        .records
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|r| r.state != EnvironmentState::Running));
+}
+
+#[tokio::test]
+async fn restart_inventory_reclaims_pending_start_without_previous_client_state() {
+    let server = Server {
+        transport_error: true,
+        advertise_pending: true,
+        ..Default::default()
+    };
+    let (old, harness) = connect(server.clone()).await;
+    assert!(old.start(&spec(), "i-1", 1, &[]).await.is_err());
+    drop(old);
+    let restored = Sandboxd::connect(
+        harness._directory.path().join("rpc.sock"),
+        Config::default(),
+    )
+    .await
+    .unwrap();
+    let pending = restored.inventory().await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].runtime_id, "i-1");
+    assert!(!pending[0].running);
+    restored.remove(&pending[0].runtime_id).await.unwrap();
+    assert!(restored.inventory().await.unwrap().is_empty());
+    assert_eq!(server.starts.lock().unwrap().len(), 1);
 }

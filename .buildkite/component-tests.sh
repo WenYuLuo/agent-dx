@@ -33,4 +33,9 @@ if [[ $component == platform ]]; then
   export ADX_TEST_EVIDENCE="$PWD/out/buildkite/logs/redis-counter-compaction"
   cargo test --locked --package=adx-coordinator --test storage -j "${JOBS:-4}" \
     counter_compaction -- --ignored
+  # Retirement covers durable offline recovery and authenticated normal exit.
+  # These real-Redis regressions are ignored by the ordinary component suite.
+  export ADX_TEST_EVIDENCE="$PWD/out/buildkite/logs/node-retirement"
+  cargo test --locked --package=adx-coordinator --test storage --test rpc \
+    -j "${JOBS:-4}" node_retirement -- --ignored
 fi

@@ -1,4 +1,7 @@
 import ssl
+import asyncio
+import json
+from contextlib import asynccontextmanager
 import unittest
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlparse
@@ -108,6 +111,57 @@ class PtyTests(unittest.TestCase):
         ):
             self.assertEqual(_pty_server(), "ingress:8080")
             self.assertTrue(_use_tls())
+
+
+class PtyEarlyCloseTests(unittest.IsolatedAsyncioTestCase):
+    async def exercise_peer_closed_before_resize(self, terminal):
+        import websockets.asyncio.client as ws_client
+        from websockets.asyncio.server import serve
+        from adx_environment._pty_transport import _PtyConnection
+
+        async def handler(socket):
+            await socket.send(json.dumps({
+                "version": 1, "type": "started", "session_id": "pty-fast"
+            }))
+            if terminal:
+                await socket.send(json.dumps({
+                    "version": 1, "type": "exited", "session_id": "pty-fast",
+                    "exit_code": 7,
+                }))
+            await socket.close()
+
+        connect = ws_client.connect
+
+        @asynccontextmanager
+        async def after_peer_close(*args, **kwargs):
+            async with connect(*args, **kwargs) as socket:
+                # A real close handshake completes before the SDK gets its
+                # connection. Terminal frames remain queued for recv().
+                await asyncio.wait_for(socket.wait_closed(), 2)
+                yield socket
+
+        async with serve(handler, "127.0.0.1", 0) as server:
+            port = server.sockets[0].getsockname()[1]
+            transport = _PtyConnection(
+                f"ws://127.0.0.1:{port}/pty", token="test-key",
+                ssl_context=None, rows=24, cols=80, on_data=None,
+                on_done=lambda: None,
+            )
+            with patch.object(ws_client, "connect", after_peer_close):
+                try:
+                    await asyncio.to_thread(transport.start, 5)
+                    return await asyncio.to_thread(transport.wait, 5)
+                finally:
+                    await asyncio.to_thread(transport.close)
+
+    async def test_buffered_terminal_survives_initial_resize_after_close(self):
+        exit_code = await self.exercise_peer_closed_before_resize(True)
+        self.assertEqual(exit_code, 7)
+
+    async def test_close_without_terminal_does_not_fabricate_success(self):
+        from adx_environment._pty_transport import _PtyTransportError
+        with self.assertRaises(_PtyTransportError):
+            await self.exercise_peer_closed_before_resize(False)
 
 
 if __name__ == "__main__":

@@ -33,6 +33,8 @@ struct Config {
     advertised_address: Option<String>,
     #[serde(default = "default_heartbeat")]
     heartbeat_timeout_seconds: u64,
+    #[serde(default = "default_node_retention")]
+    node_retention_seconds: u64,
     #[serde(default = "default_ttl")]
     discovery_ttl_seconds: u64,
     #[serde(default = "default_failed_retention")]
@@ -44,6 +46,9 @@ struct Config {
     rpc_timeout_seconds: u64,
     tls: TlsFiles,
     bootstrap_credentials: Vec<Bootstrap>,
+}
+fn default_node_retention() -> u64 {
+    1800
 }
 fn default_heartbeat() -> u64 {
     30
@@ -58,12 +63,13 @@ fn default_failed_retention() -> u64 {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _logging_guard = adx_observability::logging::init("adx-coordinator", false)?;
     let config: Config = read_config()?;
-    if config.heartbeat_timeout_seconds == 0
+    if config.node_retention_seconds == 0
+        || config.heartbeat_timeout_seconds == 0
         || config.discovery_ttl_seconds < 3
         || config.failed_retention_seconds == 0
     {
         return Err(
-            "positive heartbeat timeout and Failed retention, and discovery TTL >= 3 required"
+            "positive node/Failed retention and heartbeat timeout, and discovery TTL >= 3 required"
                 .into(),
         );
     }
@@ -171,6 +177,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Err(error) = maintenance_rpc.expire_nodes().await {
                 adx_observability::warn!("node health publication unavailable: {error}");
             }
+            if let Err(error) = maintenance_rpc
+                .collect_retired_nodes(Duration::from_secs(config.node_retention_seconds))
+                .await
+            {
+                adx_observability::warn!(%error, "offline node retirement deferred");
+            }
             if let Some(address) = &config.advertised_address {
                 if let Err(error) = session.advertise(&config.namespace, address, ttl).await {
                     adx_observability::warn!("Coordinator discovery renewal unavailable: {error}");
@@ -218,6 +230,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(tls) = server_tls {
         builder = builder.tls_config(tls)?;
     }
+    let closing_routes = routes.clone();
     let server = builder
         .add_service(
             pb::volume_execution_service_server::VolumeExecutionServiceServer::new(rpc.clone()),
@@ -245,7 +258,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .serve_with_incoming_shutdown(
             tokio_stream::wrappers::TcpListenerStream::new(listener),
-            shutdown(),
+            async move {
+                shutdown().await;
+                closing_routes.close_subscriptions();
+            },
         );
     tokio::select! {
         result = server => result?,

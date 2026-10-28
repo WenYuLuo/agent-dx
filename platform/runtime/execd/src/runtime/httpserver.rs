@@ -655,7 +655,12 @@ async fn handle_command_watch(
                     tokio_tungstenite::tungstenite::Message::Ping(payload) => {
                         websocket.send(tokio_tungstenite::tungstenite::Message::Pong(payload)).await?;
                     }
-                    tokio_tungstenite::tungstenite::Message::Close(_) => break,
+                    tokio_tungstenite::tungstenite::Message::Close(_) => {
+                        // Reading Close queues the reply; flush it before
+                        // returning ownership of the underlying TCP socket.
+                        websocket.flush().await?;
+                        break;
+                    }
                     _ => {}
                 }
             }
@@ -3014,6 +3019,15 @@ mod tests {
             .send(tokio_tungstenite::tungstenite::Message::Close(None))
             .await
             .unwrap();
+        let close = tokio::time::timeout(std::time::Duration::from_secs(1), websocket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            close,
+            tokio_tungstenite::tungstenite::Message::Close(_)
+        ));
         let socket = websocket.get_mut();
         let result = tokio::time::timeout(std::time::Duration::from_secs(1), async {
             let mut buffer = [0; 1024];

@@ -16,6 +16,8 @@ use tonic::{Request, Response, Status};
 
 #[derive(Clone, Default)]
 pub struct Authority {
+    pub departures: Arc<Mutex<Vec<pb::UnregisterNodeRequest>>>,
+    pub stall_unregister: Arc<AtomicBool>,
     pub reports: Arc<Mutex<Vec<pb::RegisterNodeRequest>>>,
     pub records: Arc<Mutex<Vec<pb::EnvironmentRecord>>>,
     pub unavailable: Arc<AtomicBool>,
@@ -28,6 +30,16 @@ pub struct Authority {
 }
 #[async_trait]
 impl pb::coordinator_service_server::CoordinatorService for Authority {
+    async fn unregister_node(
+        &self,
+        request: Request<pb::UnregisterNodeRequest>,
+    ) -> Result<Response<pb::UnregisterNodeResponse>, Status> {
+        self.departures.lock().unwrap().push(request.into_inner());
+        if self.stall_unregister.load(Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
+        Ok(Response::new(pb::UnregisterNodeResponse {}))
+    }
     async fn register_node(
         &self,
         request: Request<pb::RegisterNodeRequest>,

@@ -9,6 +9,7 @@ mod collection;
 mod credentials;
 mod failure;
 mod inspection;
+mod node_retirement;
 mod observability;
 use observability::CounterUpdate;
 mod recovery;
@@ -127,7 +128,14 @@ pub struct NodeSession {
     pub routable: bool,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeRetirement {
+    pub since_unix_seconds: u64,
+    pub unregistered: bool,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredNode {
+    #[serde(default)]
+    pub retirement: Option<NodeRetirement>,
     /// Incident for the current unavailable period; cleared when routable again.
     #[serde(default)]
     pub last_incident_id: Option<String>,
@@ -773,6 +781,7 @@ impl RedisStore {
             local old = redis.call('HGET',KEYS[1],ARGV[2])
             if ARGV[3] == '' then if old then return 0 end
             elseif old ~= ARGV[3] then return 0 end
+            if not old and string.sub(ARGV[2],1,5) == 'node:' and redis.call('HEXISTS',KEYS[1],'retired-node:' .. string.sub(ARGV[2],6)) ~= 0 then return 0 end
             local facts = cjson.decode(ARGV[7])
             if facts[1] ~= '' and (redis.call('HGET',KEYS[3],facts[1]) or '') ~= facts[2] then return 0 end
             redis.call('HSET',KEYS[1],ARGV[2],ARGV[4])
@@ -1062,6 +1071,8 @@ fn snapshot(raw: &BTreeMap<String, String>) -> Result<StoredSnapshot> {
             && key != "claim-fence"
             && !key.starts_with("node-session:")
             && !key.starts_with("node-ownership:")
+            && !key.starts_with("retired-node:")
+            && !key.starts_with("node-departed:")
         {
             return Err(Error::Unavailable("unknown control metadata field".into()));
         }
@@ -1326,20 +1337,24 @@ impl Session {
             {
                 return Err(Error::Conflict);
             }
-            if active.as_deref() == Some(session_id) {
+            if active.as_deref() == Some(session_id)
+                && registered.last_incident_id.is_none()
+                && registered.retirement.is_none()
+            {
                 return Ok(());
             }
-            if active.is_some() {
+            if active.as_deref().is_some_and(|s| s != session_id) {
                 return Err(Error::Conflict);
             }
             registered.last_incident_id = None;
+            registered.retirement = None;
             let mut command = redis::cmd("EVAL");
             command
                 .arg(
                     r#"
                 if redis.call('HGET',KEYS[1],'epoch') ~= ARGV[1] then return 0 end
                 if redis.call('HGET',KEYS[1],ARGV[2]) ~= ARGV[3] then return 0 end
-                if redis.call('HEXISTS',KEYS[1],ARGV[4]) ~= 0 then return 0 end
+                if (redis.call('HGET',KEYS[1],ARGV[4]) or '') ~= ARGV[7] then return 0 end
                 redis.call('HSET',KEYS[1],ARGV[2],ARGV[6],ARGV[4],ARGV[5]); return 1
             "#,
                 )
@@ -1350,7 +1365,8 @@ impl Session {
                 .arg(raw)
                 .arg(&token)
                 .arg(session_id)
-                .arg(encode(&registered)?);
+                .arg(encode(&registered)?)
+                .arg(active.as_deref().unwrap_or(""));
             if self.store.query::<u8>(command).await? == 1 {
                 return Ok(());
             }
@@ -1380,6 +1396,11 @@ impl Session {
             .get(&node.id)
             .cloned();
         if let Some(previous) = cached {
+            if previous.retirement.as_ref().is_some_and(|r| r.unregistered)
+                && previous.session.as_ref().map(|s| &s.id) == session.as_ref().map(|s| &s.id)
+            {
+                return Err(Error::Conflict);
+            }
             if self.store.connection.active_epoch.load(Ordering::Acquire) == self.epoch
                 && previous.address == address
                 && previous.proxy_address == proxy_address
@@ -1392,6 +1413,11 @@ impl Session {
                 }
                 node.available &= !previous.scheduling_paused;
                 let record = StoredNode {
+                    retirement: if session.as_ref().is_some_and(|s| s.routable) {
+                        None
+                    } else {
+                        previous.retirement.clone()
+                    },
                     last_incident_id: if session.as_ref().is_some_and(|s| s.routable) {
                         None
                     } else {
@@ -1410,14 +1436,51 @@ impl Session {
         }
         let field = format!("node:{}", node.id);
         for _ in 0..ATTEMPTS {
-            let [header_value, node_value] =
-                self.store.fields([HEADER.into(), field.clone()]).await?;
+            let retired_field = format!("retired-node:{}", node.id);
+            let departed_field = node_retirement::departure_field(
+                &node.id,
+                session.as_ref().map_or("", |s| s.id.as_str()),
+            );
+            let [header_value, node_value, retired_value, departed] = self
+                .store
+                .fields([
+                    HEADER.into(),
+                    field.clone(),
+                    retired_field.clone(),
+                    departed_field,
+                ])
+                .await?;
+            if departed.is_some() {
+                return Err(Error::Conflict);
+            }
             let header = self.header(&header_value)?;
+            if node_value.is_none() {
+                if let Some(raw) = retired_value.as_deref() {
+                    let record = self
+                        .register_retired_node(
+                            &node,
+                            &address,
+                            &proxy_address,
+                            session.as_ref(),
+                            raw,
+                        )
+                        .await?;
+                    if let Some(record) = record {
+                        return Ok(record);
+                    }
+                    continue;
+                }
+            }
             let previous = node_value
                 .as_deref()
                 .map(decode::<StoredNode>)
                 .transpose()?;
             if let Some(previous) = &previous {
+                if previous.retirement.as_ref().is_some_and(|r| r.unregistered)
+                    && previous.session.as_ref().map(|s| &s.id) == session.as_ref().map(|s| &s.id)
+                {
+                    return Err(Error::Conflict);
+                }
                 if previous.address == address
                     && previous.proxy_address == proxy_address
                     && previous.session.as_ref().map(|s| &s.id) == session.as_ref().map(|s| &s.id)
@@ -1430,6 +1493,11 @@ impl Session {
                     }
                     node.available &= !previous.scheduling_paused;
                     let record = StoredNode {
+                        retirement: if session.as_ref().is_some_and(|s| s.routable) {
+                            None
+                        } else {
+                            previous.retirement.clone()
+                        },
                         last_incident_id: if session.as_ref().is_some_and(|s| s.routable) {
                             None
                         } else {
@@ -1464,6 +1532,12 @@ impl Session {
                 node.available = false;
             }
             let record = StoredNode {
+                retirement: previous
+                    .as_ref()
+                    .filter(|n| {
+                        n.session.as_ref().map(|s| &s.id) == session.as_ref().map(|s| &s.id)
+                    })
+                    .and_then(|n| n.retirement.clone()),
                 // Reconciliation heartbeats keep the active outage. A confirmed
                 // routable registration closes it, even within the same process.
                 last_incident_id: if session.as_ref().is_some_and(|s| s.routable) {

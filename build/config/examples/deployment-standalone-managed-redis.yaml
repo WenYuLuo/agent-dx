@@ -36,6 +36,7 @@ services:
           expires_at_unix_seconds: 0
       advertised_address: https://127.0.0.1:19000
       heartbeat_timeout_seconds: 30
+      node_retention_seconds: 1800
       discovery_ttl_seconds: 15
       metrics_listen: 127.0.0.1:19090
       autoscaling_listen: 127.0.0.1:19092

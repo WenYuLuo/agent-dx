@@ -36,7 +36,7 @@
 选择其他兼容节点，排队期间可跨分片回退并保留原期限和身份。显式放置策略覆盖自动偏好，
 local-only 仍只允许来源节点。来源节点偏好不保证其本地缓存仍存在。
 
-adxlet 调用 sandboxd Start 时，RPC 失败、超时、应答丢失或成功载荷无效均判定创建 Failed，不以同一执行身份重复 Start。创建进入 Failed 即释放本机标量资源和 GPU/NPU 预留，并在清理之前提交 `resources_held=false`。资源释放不依赖后端查询、删除成功或清理超时。清理与本机尚在等待的 Start 客户端任务串行，失败则继续重试；提交不可用时按既有降级／重试契约补写集群账本。Failed 实例即使已释放资源仍会在生命周期巡检中检查并删除迟到的后端，不能转成 Running；节点重启时通过权威目录对账清理。这里的 Failed 是创建结果，不是物理后端从未启动的证明。公开 API 应答丢失仍按同一 Request ID/Environment ID 查询或重试；未成功确认的尝试可以重新分配，已确认成功不能覆盖，残留执行按目录回收；checkpoint 结果未知的保护独立保留。
+adxlet 调用 sandboxd Start 时，RPC 失败、超时、应答丢失或成功载荷无效均判定创建 Failed，不以同一执行身份重复 Start。创建进入 Failed 即释放本机标量资源和 GPU/NPU 预留，并在清理之前提交 `resources_held=false`。资源释放不依赖后端查询、删除成功或清理超时。清理与本机尚在等待的 Start 客户端任务串行，失败则继续重试；提交不可用时按既有降级／重试契约补写集群账本。Failed 实例即使已释放资源仍会在生命周期巡检中检查并删除迟到的后端，不能转成 Running；节点重启时通过权威目录对账清理。这里的 Failed 是创建结果，不是物理后端从未启动的证明。后端支持按 `start_key` 删除时，未知 Start 通过该接口取消并等待原处理器及回滚结束；后端阻止同一启动标识的迟到请求，删除可能迟到的物理实例，返回明确的 `sandboxd-start-fenced=true` 凭据。adxlet 获得凭据后仍检查库存为空，随后允许周期对账移除失败控制器；仅收到普通 Delete 成功或单次 List 为空不能解除未知状态。sandboxd List 同时暴露尚在执行的 keyed Start（UNKNOWN 状态），调用方重启丢失本地适配器后仍可通过物理 ID 触发同一取消与等待流程；回收不会仅因尚未提交库存而遗漏在途启动。公开 API 应答丢失仍按同一 Request ID/Environment ID 查询或重试；未成功确认的尝试可以重新分配，已确认成功不能覆盖，残留执行按目录回收；checkpoint 结果未知的保护独立保留。
 
 `StateSink` 返回 Published 表示 Coordinator 已提交 Redis；Journaled 表示结果只进入 SQLite 降级日志。后者不发布集群路由，API Server 不返回集群生命周期成功。Coordinator 恢复后去重补写；adxlet 重启而 Coordinator 不可用时只观察，等待权威对账。详见 [节点生命周期](node-lifecycle.md)、[暂停恢复](environment-checkpoint.md) 和 [存储](snapshot-storage.md)。
 

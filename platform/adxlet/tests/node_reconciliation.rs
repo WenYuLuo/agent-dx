@@ -312,3 +312,36 @@ async fn expired_capacity_observation_keeps_last_capacity_for_creation() {
     );
     node.reserve_local(&creating_spec()).unwrap();
 }
+
+#[tokio::test]
+async fn planned_departure_uses_exact_identity_and_bounds_unavailable_coordinator() {
+    let mut fixture = authority::Fixture::new().await;
+    adxlet::node_reconciliation::unregister_node(
+        &mut fixture.client,
+        &fixture.registration,
+        Duration::from_millis(100),
+    )
+    .await
+    .unwrap();
+    let calls = fixture.authority.departures.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].node_id, fixture.registration.node_id);
+    assert_eq!(calls[0].session_id, fixture.registration.session_id);
+    fixture
+        .authority
+        .stall_unregister
+        .store(true, Ordering::SeqCst);
+    let started = std::time::Instant::now();
+    let error = adxlet::node_reconciliation::unregister_node(
+        &mut fixture.client,
+        &fixture.registration,
+        Duration::from_millis(20),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        error.code(),
+        tonic::Code::DeadlineExceeded | tonic::Code::Cancelled
+    ));
+    assert!(started.elapsed() < Duration::from_secs(1));
+}

@@ -563,6 +563,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         result = admin => result.map_err(|error| -> Box<dyn std::error::Error> { error })?,
         _ = shutdown() => {}
     }
+    manager.set_maintenance(true);
+    if let Err(error) = adxlet::node_reconciliation::unregister_node(
+        &mut coordinator,
+        &registration,
+        timeout.min(Duration::from_secs(5)),
+    )
+    .await
+    {
+        adx_observability::warn!(%error, "planned node departure unconfirmed; heartbeat expiry remains active");
+    }
     if let Some(proxy) = embedded {
         proxy.shutdown().await?;
     }
