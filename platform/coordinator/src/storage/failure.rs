@@ -3,6 +3,21 @@ use super::*;
 
 impl Session {
     pub async fn invalidate_node(&self, id: &str, session_id: &str) -> Result<StoredSnapshot> {
+        self.invalidate_node_with_departure(id, session_id, false)
+            .await
+    }
+    pub async fn invalidate_node_with_departure(
+        &self,
+        id: &str,
+        session_id: &str,
+        unregistered: bool,
+    ) -> Result<StoredSnapshot> {
+        let observed_sequence = self
+            .get_node(id)
+            .await?
+            .session
+            .as_ref()
+            .map_or(0, |s| s.sequence);
         for _ in 0..ATTEMPTS {
             let snapshots = self.retained_snapshots().await?;
             let raw = self.store.raw().await?;
@@ -36,17 +51,37 @@ impl Session {
                 None => format!("node:{id}:{session_id}:{}", self.next_generation()?),
             };
             if node.last_incident_id.is_none() {
-                counters.value.worker_incidents = counters
-                    .value
-                    .worker_incidents
-                    .checked_add(1)
-                    .ok_or(Error::Conflict)?;
+                if !unregistered {
+                    counters.value.worker_incidents = counters
+                        .value
+                        .worker_incidents
+                        .checked_add(1)
+                        .ok_or(Error::Conflict)?;
+                }
                 node.last_incident_id = Some(incident_id.clone());
+            }
+            let since = node
+                .retirement
+                .as_ref()
+                .map_or_else(collection::now, |r| Ok(r.since_unix_seconds))?;
+            node.retirement = Some(NodeRetirement {
+                since_unix_seconds: since,
+                unregistered: unregistered
+                    || node.retirement.as_ref().is_some_and(|r| r.unregistered),
+            });
+            if let Some(session) = node.session.as_mut() {
+                session.sequence = session.sequence.max(observed_sequence);
             }
             node.node.available = false;
             node.session.as_mut().ok_or(Error::Conflict)?.routable = false;
             let mut holds = Vec::new();
             let mut writes = vec![(format!("node:{id}"), encode(node)?)];
+            if unregistered {
+                writes.push((
+                    node_retirement::departure_field(id, session_id),
+                    encode(&(id, session_id))?,
+                ));
+            }
             for (environment_id, environment) in &mut saved.environments {
                 if environment.assignment.node_id != id
                     || environment.invalidated
@@ -57,7 +92,7 @@ impl Session {
                 {
                     continue;
                 }
-                environment.observe_node_loss(&incident_id, &mut counters.value)?;
+                environment.observe_node_loss(&incident_id, unregistered, &mut counters.value)?;
                 if volumes::has_volumes(&environment.spec) {
                     catalog
                         .as_mut()

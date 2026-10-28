@@ -6,6 +6,7 @@ mod claims;
 mod cloning;
 mod collection;
 mod metrics;
+mod node_retirement;
 mod observation;
 mod recovery;
 mod resume;
@@ -102,13 +103,20 @@ impl State {
         }
     }
     async fn invalidate_node(&mut self, id: &str) -> Result<()> {
+        self.invalidate_node_with_departure(id, false).await
+    }
+    async fn invalidate_node_with_departure(&mut self, id: &str, departed: bool) -> Result<()> {
         let mut node = self.nodes.get(id).ok_or(Error::Conflict)?.clone();
         let session_id = node.session.as_ref().ok_or(Error::Conflict)?.id.clone();
         node.node.available = false;
         node.session.as_mut().ok_or(Error::Conflict)?.routable = false;
         self.scheduler.register(node.node.clone())?;
         self.nodes.insert(id.to_owned(), node);
-        let saved = match self.session.invalidate_node(id, &session_id).await {
+        let saved = match self
+            .session
+            .invalidate_node_with_departure(id, &session_id, departed)
+            .await
+        {
             Ok(saved) => saved,
             Err(error) => {
                 self.needs_recovery = true;
@@ -430,6 +438,9 @@ impl CoordinatorRpc {
                     routable: false,
                 })
                 .routable = false;
+            if node.retirement.as_ref().is_some_and(|r| r.unregistered) {
+                continue;
+            }
             *node = session
                 .register_session(
                     node.node.clone(),
@@ -465,6 +476,7 @@ impl CoordinatorRpc {
                 None
             }
         };
+        let departed_sessions = session.departed_node_sessions().await?;
         let service = Self(Arc::new(Inner {
             business: Arc::new(std::sync::RwLock::new(business)),
             business_fenced: Default::default(),
@@ -496,7 +508,7 @@ impl CoordinatorRpc {
                 collection_cursor: None,
                 live: BTreeMap::new(),
                 recovering,
-                retired_sessions: BTreeSet::new(),
+                retired_sessions: departed_sessions,
                 scheduling_deadlines: BTreeMap::new(),
                 claims_in_flight: BTreeMap::new(),
                 create_requests: BTreeMap::new(),
@@ -1899,6 +1911,18 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
         }
     }
 
+    async fn unregister_node(
+        &self,
+        request: Request<pb::UnregisterNodeRequest>,
+    ) -> std::result::Result<Response<pb::UnregisterNodeResponse>, Status> {
+        // Once accepted, complete the ownership transition even if the
+        // departing process disconnects or its bounded wait expires.
+        let service = self.clone();
+        tokio::spawn(async move { service.unregister_node_request(request).await })
+            .await
+            .map_err(|_| Status::internal("node departure task failed"))?
+    }
+
     async fn register_node(
         &self,
         request: Request<pb::RegisterNodeRequest>,
@@ -1939,6 +1963,12 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
             let mut state = service.0.state.lock().await;
             state.recover_authoritative_state().await.map_err(status)?;
             state.healthy().map_err(status)?;
+            if state.nodes.get(&r.node_id).is_some_and(|n| {
+                n.retirement.as_ref().is_some_and(|r| r.unregistered)
+                    && n.session.as_ref().is_some_and(|s| s.id == r.session_id)
+            }) {
+                return Err(Status::failed_precondition("unregistered node session"));
+            }
             if state
                 .retired_sessions
                 .contains(&(r.node_id.clone(), r.session_id.clone()))

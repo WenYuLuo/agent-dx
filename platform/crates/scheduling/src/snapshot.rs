@@ -29,6 +29,10 @@ impl Snapshot {
     pub fn node(&self, id: &str) -> Option<&Node> {
         self.nodes.get(id).map(AsRef::as_ref)
     }
+    pub fn remove_node(&mut self, id: &str) {
+        self.nodes.remove(id);
+        self.revision += 1;
+    }
     pub fn update_node(&mut self, node: Node) {
         self.nodes.insert(node.id.clone(), Arc::new(node));
         self.revision += 1;

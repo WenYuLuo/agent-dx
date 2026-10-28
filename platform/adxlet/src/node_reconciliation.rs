@@ -59,6 +59,23 @@ pub async fn pause_lifecycle_reporting(
     .await
 }
 
+/// Best-effort planned departure: bounded even when Coordinator is unavailable.
+/// This retires node ownership; it does not turn process restart into user deletion.
+pub async fn unregister_node(
+    coordinator: &mut Coordinator,
+    registration: &pb::RegisterNodeRequest,
+    timeout: Duration,
+) -> Result<(), Status> {
+    let mut request = Request::new(pb::UnregisterNodeRequest {
+        node_id: registration.node_id.clone(),
+        session_id: registration.session_id.clone(),
+    });
+    request.set_timeout(timeout);
+    bounded_rpc(timeout, coordinator.unregister_node(request))
+        .await
+        .map(|_| ())
+}
+
 async fn report(
     coordinator: &mut Coordinator,
     registration: &mut pb::RegisterNodeRequest,
