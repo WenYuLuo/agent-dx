@@ -307,6 +307,58 @@ fn spec(class: &str) -> EnvironmentSpec {
 }
 
 #[tokio::test]
+async fn inherited_workload_overrides_reach_execd_for_both_jiuwenbox_runtimes() {
+    for class in ["supervisor", "conch"] {
+        let fixture = Fixture::new();
+        let driver = fixture.driver().await;
+        let mut wanted = spec(class);
+        let process = json!({
+            "commands": [["agent-server", "--port", "18092"]],
+            "user": "1000:1000",
+            "cwd": "/workspace"
+        });
+        wanted.execution.process = Some(serde_json::from_value(process.clone()).unwrap());
+        driver
+            .start_with_deadline(
+                &wanted,
+                "tenant-agent-1",
+                1,
+                &[],
+                Instant::now() + CREATE_BUDGET,
+            )
+            .await
+            .unwrap();
+        {
+            let calls = fixture.backend.calls.lock().unwrap();
+            for request in [
+                &calls
+                    .iter()
+                    .find(|(m, p, _)| m == "POST" && p == "/api/v1/sandboxes")
+                    .unwrap()
+                    .2,
+                &calls
+                    .iter()
+                    .find(|(_, p, _)| p.ends_with("/exec_background"))
+                    .unwrap()
+                    .2,
+            ] {
+                let env = &request["env"];
+                assert_eq!(
+                    serde_json::from_str::<Value>(env["ADX_WORKLOAD_PROCESS"].as_str().unwrap())
+                        .unwrap(),
+                    process
+                );
+                assert_eq!(
+                    env["ADX_IMAGE_PROCESS_CONFIG"],
+                    "/__adx_launch/process.json"
+                );
+            }
+        }
+        driver.remove("tenant-agent-1").await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn native_runtime_response_field_keeps_reconciliation_and_deletion_available() {
     for class in ["supervisor", "conch"] {
         let fixture = Fixture::new();
