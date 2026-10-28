@@ -120,3 +120,10 @@ adxlet 收到正常退出信号后关闭本地准入，通过当前 Coordinator 
 Coordinator 再次重启都不清除此记录，避免已注销进程的迟到注册重新激活节点。
 普通已登记会话的周期心跳仍走内存路径，不增加 Redis 写入。
 注销的所有权事务由独立任务完成；调用方断开或等待超时不会中途丢弃已经受理的退役。
+
+Coordinator shutdown closes active route and Environment-directory subscriptions
+before draining the gRPC server. Idle watch streams must not keep a stopped
+Coordinator alive until the supervisor timeout, which can otherwise restart an
+old instance and fence its replacement. The real-Redis/TCP regression
+`coordinator_shutdown_finishes_with_live_directory_subscriptions` retains both
+clients while verifying server shutdown and rejection of new subscriptions.

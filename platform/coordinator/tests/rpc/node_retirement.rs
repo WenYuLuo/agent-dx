@@ -2,6 +2,99 @@ use super::*;
 use adx_protocol::control::coordinator_service_server::CoordinatorService;
 use adx_transport::rpc::RpcClient;
 
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py control-rpc"]
+async fn coordinator_shutdown_finishes_with_live_directory_subscriptions() {
+    use pb::environment_directory_service_server::EnvironmentDirectoryService;
+    use pb::route_service_server::RouteService;
+
+    let rig = common::Redis::new().await;
+    let publisher =
+        RoutePublisher::new(rig.store().await.begin(1).await.unwrap(), Peers::network());
+    publisher.refresh().await.unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let closing = publisher.clone();
+    let routes = publisher.clone();
+    let server = tokio::spawn(async move {
+        Server::builder()
+            .add_service(pb::route_service_server::RouteServiceServer::new(
+                routes.clone(),
+            ))
+            .add_service(
+                pb::environment_directory_service_server::EnvironmentDirectoryServiceServer::new(
+                    routes,
+                ),
+            )
+            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+                stopped.await.unwrap();
+                closing.close_subscriptions();
+            })
+            .await
+            .unwrap();
+    });
+    let channel = Channel::from_shared(format!("http://{address}"))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let route_request = || {
+        let mut request = Request::new(pb::WatchRoutesRequest {});
+        request
+            .metadata_mut()
+            .insert("adx-component", "ingress".parse().unwrap());
+        request
+    };
+    let directory_request = || {
+        let mut request = Request::new(pb::WatchEnvironmentsRequest {});
+        request
+            .metadata_mut()
+            .insert("adx-component", "apiserver".parse().unwrap());
+        request
+    };
+    let mut route_client = pb::route_service_client::RouteServiceClient::new(channel.clone());
+    let mut directory_client =
+        pb::environment_directory_service_client::EnvironmentDirectoryServiceClient::new(channel);
+    let mut routes = route_client
+        .watch_routes(route_request())
+        .await
+        .unwrap()
+        .into_inner();
+    let mut directory = directory_client
+        .watch_environments(directory_request())
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(routes.message().await.unwrap().unwrap().reset);
+    assert!(directory.message().await.unwrap().unwrap().reset);
+    stop.send(()).unwrap();
+    // Keep both clients alive. Shutdown must end their infinite streams instead
+    // of waiting for the deployment supervisor to kill/restart the old epoch.
+    tokio::time::timeout(Duration::from_secs(2), server)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(routes.message().await.unwrap().is_none());
+    assert!(directory.message().await.unwrap().is_none());
+    assert_eq!(
+        publisher
+            .watch_routes(route_request())
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::Unavailable
+    );
+    assert_eq!(
+        publisher
+            .watch_environments(directory_request())
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::Unavailable
+    );
+}
+
 async fn metrics(rpc: &CoordinatorRpc) -> String {
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {

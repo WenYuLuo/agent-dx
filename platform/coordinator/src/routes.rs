@@ -10,7 +10,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tokio::sync::{broadcast, mpsc, Mutex};
+use tokio::sync::{broadcast, mpsc, watch, Mutex};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 fn security(value: adx_core::execution::DataPlaneSecurityMode) -> i32 {
@@ -43,6 +43,7 @@ pub struct RoutePublisher {
     committed: Arc<Mutex<Option<broadcast::Receiver<ControlChange>>>>,
     changes: broadcast::Sender<pb::RouteFrame>,
     environment_changes: broadcast::Sender<pb::EnvironmentDirectoryFrame>,
+    closing: watch::Sender<bool>,
 }
 impl RoutePublisher {
     pub fn new(session: Session, peers: Peers) -> Self {
@@ -62,7 +63,13 @@ impl RoutePublisher {
             committed: Arc::new(Mutex::new(Some(committed))),
             changes,
             environment_changes,
+            closing: watch::channel(false).0,
         }
+    }
+    /// End long-lived directory streams before the RPC server drains. Otherwise
+    /// idle subscriptions can keep an old Coordinator alive until forced kill.
+    pub fn close_subscriptions(&self) {
+        self.closing.send_replace(true);
     }
     pub async fn refresh(&self) -> Result<()> {
         let result = self.refresh_inner().await;
@@ -507,6 +514,10 @@ impl pb::environment_directory_service_server::EnvironmentDirectoryService for R
         if self.peers.authenticate(&request)? != Principal::ApiServer {
             return Err(Status::permission_denied("API Server identity required"));
         }
+        let mut closing = self.closing.subscribe();
+        if *closing.borrow() {
+            return Err(Status::unavailable("Coordinator shutting down"));
+        }
         let view = self.view.lock().await;
         if !view.available {
             return Err(Status::unavailable("environment publication not ready"));
@@ -526,26 +537,32 @@ impl pb::environment_directory_service_server::EnvironmentDirectoryService for R
         drop(view);
         let (tx, rx) = mpsc::channel(8);
         tokio::spawn(async move {
-            if tx.send(Ok(full)).await.is_err() {
-                return;
-            }
-            loop {
-                let next = tokio::select! {_=tx.closed()=>return,next=updates.recv()=>next};
-                match next {
-                    Ok(frame) => {
-                        if tx.send(Ok(frame)).await.is_err() {
+            let forward = async {
+                if tx.send(Ok(full)).await.is_err() {
+                    return;
+                }
+                loop {
+                    let next = tokio::select! {_=tx.closed()=>return,next=updates.recv()=>next};
+                    match next {
+                        Ok(frame) => {
+                            if tx.send(Ok(frame)).await.is_err() {
+                                return;
+                            }
+                        }
+                        Err(_) => {
+                            let _ = tx
+                                .send(Err(Status::out_of_range(
+                                    "environment history lost; resubscribe for full snapshot",
+                                )))
+                                .await;
                             return;
                         }
                     }
-                    Err(_) => {
-                        let _ = tx
-                            .send(Err(Status::out_of_range(
-                                "environment history lost; resubscribe for full snapshot",
-                            )))
-                            .await;
-                        return;
-                    }
                 }
+            };
+            tokio::select! {
+                _ = closing.wait_for(|value| *value) => {},
+                _ = forward => {},
             }
         });
         Ok(Response::new(ReceiverStream::new(rx)))
@@ -563,6 +580,10 @@ impl pb::route_service_server::RouteService for RoutePublisher {
     ) -> std::result::Result<Response<Self::WatchRoutesStream>, Status> {
         if self.peers.authenticate(&request)? != Principal::Ingress {
             return Err(Status::permission_denied("Ingress identity required"));
+        }
+        let mut closing = self.closing.subscribe();
+        if *closing.borrow() {
+            return Err(Status::unavailable("Coordinator shutting down"));
         }
         let view = self.view.lock().await;
         if !view.available {
@@ -583,26 +604,32 @@ impl pb::route_service_server::RouteService for RoutePublisher {
         drop(view);
         let (tx, rx) = mpsc::channel(8);
         tokio::spawn(async move {
-            if tx.send(Ok(full)).await.is_err() {
-                return;
-            }
-            loop {
-                let next = tokio::select! {_=tx.closed()=>return,next=updates.recv()=>next};
-                match next {
-                    Ok(frame) => {
-                        if tx.send(Ok(frame)).await.is_err() {
+            let forward = async {
+                if tx.send(Ok(full)).await.is_err() {
+                    return;
+                }
+                loop {
+                    let next = tokio::select! {_=tx.closed()=>return,next=updates.recv()=>next};
+                    match next {
+                        Ok(frame) => {
+                            if tx.send(Ok(frame)).await.is_err() {
+                                return;
+                            }
+                        }
+                        Err(_) => {
+                            let _ = tx
+                                .send(Err(Status::out_of_range(
+                                    "route history lost; resubscribe for full snapshot",
+                                )))
+                                .await;
                             return;
                         }
                     }
-                    Err(_) => {
-                        let _ = tx
-                            .send(Err(Status::out_of_range(
-                                "route history lost; resubscribe for full snapshot",
-                            )))
-                            .await;
-                        return;
-                    }
                 }
+            };
+            tokio::select! {
+                _ = closing.wait_for(|value| *value) => {},
+                _ = forward => {},
             }
         });
         Ok(Response::new(ReceiverStream::new(rx)))

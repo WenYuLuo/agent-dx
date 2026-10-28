@@ -230,6 +230,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(tls) = server_tls {
         builder = builder.tls_config(tls)?;
     }
+    let closing_routes = routes.clone();
     let server = builder
         .add_service(
             pb::volume_execution_service_server::VolumeExecutionServiceServer::new(rpc.clone()),
@@ -257,7 +258,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .serve_with_incoming_shutdown(
             tokio_stream::wrappers::TcpListenerStream::new(listener),
-            shutdown(),
+            async move {
+                shutdown().await;
+                closing_routes.close_subscriptions();
+            },
         );
     tokio::select! {
         result = server => result?,
