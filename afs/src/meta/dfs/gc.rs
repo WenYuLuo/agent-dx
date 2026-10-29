@@ -157,14 +157,14 @@ fn plan_collection(
             MetaEntity::DfsCopy(copy) => reclaim.contains(&copy.chunk_id),
             MetaEntity::DfsReplicationTask(task) => reclaim.contains(&task.chunk_id),
             MetaEntity::DfsWriteLease(lease) => lease.expires_at_unix_ms <= now,
-            MetaEntity::DfsReference(reference) => reference
-                .retired_at_unix_ms
-                .is_some_and(|time| {
+            MetaEntity::DfsReference(reference) => {
+                reference.retired_at_unix_ms.is_some_and(|time| {
                     // The record must live as long as it still protects data
                     // (a configured grace can exceed the tombstone retention)
                     // and never shorter than the replay-fencing window.
                     time.saturating_add(grace.max(REFERENCE_RECORD_RETENTION_MS)) <= now
-                }),
+                })
+            }
             _ => false,
         };
         if dead {
@@ -783,15 +783,25 @@ mod tests {
             "data grace has passed but the record stays as a tombstone fencing late admissions"
         );
         assert!(
-            plan_collection(&entities, &[reference.clone()], 100 + ADMISSION_HORIZON_MS, 10)
-                .keys
-                .is_empty(),
+            plan_collection(
+                &entities,
+                &[reference.clone()],
+                100 + ADMISSION_HORIZON_MS,
+                10
+            )
+            .keys
+            .is_empty(),
             "the admission horizon alone is not enough while node clocks can skew"
         );
         assert_eq!(
-            plan_collection(&entities, &[reference], 100 + REFERENCE_RECORD_RETENTION_MS, 10)
-                .keys
-                .len(),
+            plan_collection(
+                &entities,
+                &[reference],
+                100 + REFERENCE_RECORD_RETENTION_MS,
+                10
+            )
+            .keys
+            .len(),
             1,
             "record reclaims only after horizon + skew, when the deadline gate alone provably rejects every replay"
         );
@@ -803,9 +813,14 @@ mod tests {
         let entities = vec![entity];
         let long_grace = 300_000_u64;
         assert!(
-            plan_collection(&entities, &[reference.clone()], 100 + REFERENCE_RECORD_RETENTION_MS, long_grace)
-                .keys
-                .is_empty(),
+            plan_collection(
+                &entities,
+                &[reference.clone()],
+                100 + REFERENCE_RECORD_RETENTION_MS,
+                long_grace
+            )
+            .keys
+            .is_empty(),
             "tombstone retention has elapsed but the record still protects data under the long grace"
         );
         assert_eq!(
@@ -818,39 +833,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn record_still_protecting_data_survives_consecutive_collections() {
+    async fn record_past_retention_but_still_protecting_data_survives_consecutive_collections() {
+        // Discriminating window: retirement happened 150s ago, so the 120s
+        // tombstone retention has already elapsed, but the configured 200s
+        // data grace has not. A record deleted at the fixed retention would
+        // leave the second collection blind to the still-protected data.
         let entities_ref = vec![inode("i", 1, "v2"), chunk("old"), chunk("new")];
         let mut entities = entities_ref;
         entities.extend(version("v1", "i", "old"));
         entities.extend(version("v2", "i", "new"));
         let mut reference = pin("i");
-        reference.retired_at_unix_ms = Some(now_unix_ms());
+        reference.retired_at_unix_ms = Some(now_unix_ms().saturating_sub(150_000));
         entities.push(MetaEntity::DfsReference(reference));
         let (store, _) = seeded_store(entities).await;
         let service = DfsService::new(store.clone()).with_gc_grace_ms(200_000);
-        let first = service
-            .collect_garbage("n".into(), "s".into(), 0, vec![])
-            .await
-            .unwrap();
-        assert!(
-            first.chunks.is_empty(),
-            "data under a live 200s grace must not reclaim"
-        );
-        let second = service
-            .collect_garbage("n".into(), "s".into(), first.generation, vec![])
-            .await
-            .unwrap();
-        assert!(second.chunks.is_empty());
-        let (_, snapshot) = store.read_view().await.unwrap().snapshot().unwrap();
-        assert!(
-            snapshot
-                .iter()
-                .any(|entity| matches!(entity, MetaEntity::DfsReference(value)
+        for _ in 0..2 {
+            let gc = service
+                .collect_garbage("n".into(), "s".into(), 0, vec![])
+                .await
+                .unwrap();
+            assert!(
+                gc.chunks.is_empty(),
+                "data under the unexpired 200s grace must not reclaim"
+            );
+            let (_, snapshot) = store.read_view().await.unwrap().snapshot().unwrap();
+            assert!(
+                snapshot
+                    .iter()
+                    .any(|entity| matches!(entity, MetaEntity::DfsReference(value)
                     if value.retired_at_unix_ms.is_some_and(|retired| {
                         retired.saturating_add(200_000) > now_unix_ms()
                     }))),
-            "a record still protecting data must survive consecutive collections even past the tombstone retention"
-        );
+                "past tombstone retention but inside the data grace, the record must survive every collection round"
+            );
+        }
     }
 
     #[tokio::test]
@@ -890,14 +906,24 @@ mod tests {
         let entities = vec![write_entity, read_entity];
         let references = vec![write_reference, read_reference];
         assert!(
-            plan_collection(&entities, &references, 100 + REFERENCE_RECORD_RETENTION_MS - 1, 10)
-                .keys
-                .is_empty()
+            plan_collection(
+                &entities,
+                &references,
+                100 + REFERENCE_RECORD_RETENTION_MS - 1,
+                10
+            )
+            .keys
+            .is_empty()
         );
         assert_eq!(
-            plan_collection(&entities, &references, 100 + REFERENCE_RECORD_RETENTION_MS, 10)
-                .keys
-                .len(),
+            plan_collection(
+                &entities,
+                &references,
+                100 + REFERENCE_RECORD_RETENTION_MS,
+                10
+            )
+            .keys
+            .len(),
             2,
             "write and read references retired together must be reclaimed together on the derived bound"
         );
@@ -1481,9 +1507,9 @@ mod tests {
             entities
                 .iter()
                 .any(|entity| matches!(entity, MetaEntity::DfsReference(value)
-                    if value.retired_at_unix_ms.is_some_and(|retired| {
-                        retired.saturating_add(REFERENCE_RECORD_RETENTION_MS) > now_unix_ms()
-                    }))),
+                if value.retired_at_unix_ms.is_some_and(|retired| {
+                    retired.saturating_add(REFERENCE_RECORD_RETENTION_MS) > now_unix_ms()
+                }))),
             "retired tombstones must outlive the admission window instead of converging at data grace"
         );
         let mut late = update("late-open");
