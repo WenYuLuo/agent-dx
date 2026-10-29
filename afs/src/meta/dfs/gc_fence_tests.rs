@@ -638,33 +638,6 @@ async fn tombstone_retention_still_reclaims_unprotected_data_at_short_grace() {
 }
 
 #[tokio::test]
-async fn expired_replay_after_safe_tombstone_expiry_is_rejected() {
-    let mut f = generation_fixture().await;
-    f.service = f.service.with_gc_grace_ms(0);
-    f.service
-        .update_gc_reference(generation_admission(&f, true))
-        .await
-        .unwrap();
-    let stale = crate::dfs::UpdateGcReference {
-        open_read: None,
-        close_open_read: false,
-        node_id: "writer".into(),
-        session_id: "writer-session".into(),
-        reference_id: format!("write:{}", f.commit.operation_id.0),
-        inode_id: Some(f.commit.inode_id.clone()),
-        version_id: None,
-        publication: true,
-        chunks: vec![],
-        release: false,
-        admission_deadline_unix_ms: now_unix_ms().saturating_sub(1),
-    };
-    assert!(
-        f.service.update_gc_reference(stale).await.is_err(),
-        "once the admission window has closed the deadline gate alone must reject replays"
-    );
-}
-
-#[tokio::test]
 async fn new_operation_on_same_node_admits_normally_after_tombstone_collection() {
     let mut f = generation_fixture().await;
     f.service = f.service.with_gc_grace_ms(0);
