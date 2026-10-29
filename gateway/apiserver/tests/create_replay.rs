@@ -792,7 +792,10 @@ impl pb::auth_service_server::AuthService for Service {
     ) -> Result<Response<pb::VerifyApiKeyResponse>, Status> {
         let mut identity = caller();
         identity.administrator =
-            request.get_ref().api_key == "admin-inspection-key-0000000000000000";
+            request.get_ref().api_key == "admin-detail-key-00000000000000000000";
+        if request.get_ref().api_key == "foreign-key-00000000000000000000" {
+            identity.tenant_id = "foreign".into();
+        }
         Ok(Response::new(pb::VerifyApiKeyResponse {
             caller: Some(identity),
             expires_at_unix_seconds: 0,
@@ -801,16 +804,18 @@ impl pb::auth_service_server::AuthService for Service {
 }
 
 #[tokio::test]
-async fn admin_inspection_reads_an_environment_created_through_another_api() {
-    use base64::Engine;
-
+async fn instance_details_preserve_visibility_configuration_and_read_only_lookup() {
     adx_transport::install_crypto_provider();
     let fixture = Fixture::new().await;
     let id = "other-api+agent";
     let environment_spec = adx_apiserver::contract::create_spec(
         json!({
             "namespace":"other", "name":"api+agent", "cpu":1000, "memory":1024,
-            "rootfs":{"type":"image","imageurl":"app:1","runtime":"runc"}
+            "rootfs":{"type":"image","imageurl":"app:1","runtime":"runc"},
+            "env":{"MODEL_KEY":"private-value"},
+            "inheritEntrypoint":true,
+            "mounts":[{"type":"bind","host_path":"/srv/alice","target":"/workspace","options":["rw"]}],
+            "healthcheckProbe":{"tcpSocket":{"port":8080},"failureThreshold":3}
         }),
         &caller(),
     )
@@ -873,43 +878,85 @@ async fn admin_inspection_reads_an_environment_created_through_another_api() {
         }
     });
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
-    let uri = format!("http://{address}/api/environment/v1/environments/other-api%2Bagent/inspect");
-    let denied = client
+    let uri = format!("http://{address}/api/instances?instance_id=other-api%2Bagent");
+    let foreign_uncached = client
+        .get(&uri)
+        .bearer_auth("foreign-key-00000000000000000000")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(foreign_uncached.status(), reqwest::StatusCode::FORBIDDEN);
+    assert_eq!(fixture.state.lookups.load(Ordering::SeqCst), 1);
+    let ordinary = client
         .get(&uri)
         .bearer_auth("ordinary-key-00000000000000000000")
         .send()
         .await
         .unwrap();
-    assert_eq!(denied.status(), reqwest::StatusCode::FORBIDDEN);
-    assert_eq!(fixture.state.lookups.load(Ordering::SeqCst), 0);
+    assert_eq!(ordinary.status(), reqwest::StatusCode::OK);
+    assert_eq!(ordinary.headers()["cache-control"], "no-store");
+    let ordinary: Value = serde_json::from_slice(&ordinary.bytes().await.unwrap()).unwrap();
+    assert_eq!(ordinary[0]["runtime_id"], "other-api+agent-7");
+    assert!(ordinary[0].get("execution").is_none());
+    assert!(ordinary[0].get("env_vars").is_none());
+    assert_eq!(fixture.state.lookups.load(Ordering::SeqCst), 2);
     let response = client
         .get(&uri)
-        .bearer_auth("admin-inspection-key-0000000000000000")
+        .bearer_auth("admin-detail-key-00000000000000000000")
         .send()
         .await
         .unwrap();
     assert_eq!(response.status(), reqwest::StatusCode::OK);
     assert_eq!(response.headers()["cache-control"], "no-store");
-    let envelope: Value = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
-    let value: Value = serde_json::from_slice(
-        &base64::engine::general_purpose::STANDARD
-            .decode(envelope["data"].as_str().unwrap())
-            .unwrap(),
-    )
-    .unwrap();
-    assert_eq!(value["record"]["assignment"]["generation"], 7);
-    assert_eq!(value["record"]["runtime"]["id"], "other-api+agent-7");
-    assert_eq!(fixture.state.lookups.load(Ordering::SeqCst), 1);
+    let value: Value = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
+    assert_eq!(value[0]["generation"], 7);
+    assert_eq!(value[0]["runtime_class"], "runc");
+    assert_eq!(value[0]["revision"], 9);
+    assert_eq!(value[0]["env_vars"]["MODEL_KEY"], "private-value");
+    assert_eq!(
+        value[0]["execution"]["mounts"][0]["source"]["Local"],
+        "/srv/alice"
+    );
+    assert_eq!(
+        value[0]["execution"]["healthcheck_probe"]["failure_threshold"],
+        3
+    );
+    assert!(value[0].get("record").is_none());
+    let listing = client
+        .get(format!("http://{address}/api/instances"))
+        .bearer_auth("admin-detail-key-00000000000000000000")
+        .send()
+        .await
+        .unwrap();
+    let listing: Value = serde_json::from_slice(&listing.bytes().await.unwrap()).unwrap();
+    assert_eq!(listing["items"][0]["id"], id);
+    assert!(listing["items"][0].get("env_vars").is_none());
+    assert!(listing["items"][0].get("execution").is_none());
+    let denied = client
+        .get(&uri)
+        .bearer_auth("foreign-key-00000000000000000000")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), reqwest::StatusCode::FORBIDDEN);
+    assert_eq!(fixture.state.lookups.load(Ordering::SeqCst), 2);
     let missing = client
-        .get(format!(
-            "http://{address}/api/environment/v1/environments/absent/inspect"
-        ))
-        .bearer_auth("admin-inspection-key-0000000000000000")
+        .get(format!("http://{address}/api/instances?instance_id=absent"))
+        .bearer_auth("ordinary-key-00000000000000000000")
         .send()
         .await
         .unwrap();
     assert_eq!(missing.status(), reqwest::StatusCode::NOT_FOUND);
-    assert_eq!(fixture.state.lookups.load(Ordering::SeqCst), 2);
+    assert_eq!(fixture.state.lookups.load(Ordering::SeqCst), 3);
+    let removed = client
+        .get(format!(
+            "http://{address}/api/environment/v1/environments/other-api%2Bagent/inspect"
+        ))
+        .bearer_auth("admin-detail-key-00000000000000000000")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(removed.status(), reqwest::StatusCode::NOT_FOUND);
     assert_eq!(fixture.state.starts.load(Ordering::SeqCst), 0);
     assert_eq!(fixture.state.create_calls.load(Ordering::SeqCst), 0);
     http.abort();

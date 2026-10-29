@@ -179,50 +179,6 @@ impl Api {
             v.split(',')
                 .any(|v| v.trim().starts_with("text/event-stream"))
         });
-        if method == "GET" {
-            if let Some(id) = path
-                .strip_prefix("/api/environment/v1/environments/")
-                .and_then(|rest| rest.strip_suffix("/inspect"))
-            {
-                if !caller.administrator {
-                    return error_response(
-                        Status::permission_denied("administrator required"),
-                        &request_id,
-                        None,
-                        Some(id),
-                        false,
-                    );
-                }
-                if id.is_empty() || id.contains('/') {
-                    return error_response(
-                        Status::invalid_argument("invalid environment ID"),
-                        &request_id,
-                        None,
-                        Some(id),
-                        false,
-                    );
-                }
-                let owner = match Box::pin(self.clients.owner(id, &caller, false)).await {
-                    Err(error) if matches!(error.code(), Code::NotFound | Code::Unavailable) => {
-                        // Another API may have created the Environment before
-                        // this API's directory has received its publication.
-                        // A local miss is not authoritative absence.
-                        Box::pin(self.clients.owner(id, &caller, true)).await
-                    }
-                    result => result,
-                };
-                let result = match owner {
-                    Ok(owner) => admin_environment_view(owner, &caller),
-                    Err(error) => Err(error),
-                };
-                let mut reply = response(result, &request_id, None, Some(id), false);
-                reply.headers_mut().insert(
-                    hyper::header::CACHE_CONTROL,
-                    hyper::header::HeaderValue::from_static("no-store"),
-                );
-                return reply;
-            }
-        }
         let lifecycle_id = header(&request, "x-adx-request-id")
             .unwrap_or("")
             .trim()
@@ -362,8 +318,14 @@ impl Api {
                 .get("instance_id")
                 .filter(|value| !value.trim().is_empty())
             {
-                return match Box::pin(self.clients.owner(instance_id, &caller, false)).await {
-                    Ok(owner) => match instance_view(owner) {
+                let owner = match Box::pin(self.clients.owner(instance_id, &caller, false)).await {
+                    Err(error) if matches!(error.code(), Code::NotFound | Code::Unavailable) => {
+                        Box::pin(self.clients.owner(instance_id, &caller, true)).await
+                    }
+                    result => result,
+                };
+                let mut reply = match owner {
+                    Ok(owner) => match instance_view(owner, caller.administrator) {
                         Ok(view) => plain(200, json!([view])),
                         Err(error) => {
                             error_response(error, &request_id, None, Some(instance_id), false)
@@ -373,6 +335,11 @@ impl Api {
                         error_response(error, &request_id, None, Some(instance_id), false)
                     }
                 };
+                reply.headers_mut().insert(
+                    hyper::header::CACHE_CONTROL,
+                    hyper::header::HeaderValue::from_static("no-store"),
+                );
+                return reply;
             }
             let page_size = match instance_page_size(&query) {
                 Ok(page_size) => page_size,
@@ -395,7 +362,7 @@ impl Api {
                 Ok(page) => {
                     let mut views = Vec::new();
                     for owner in page.entries {
-                        match instance_view(owner) {
+                        match instance_view(owner, false) {
                             Ok(view) => views.push(view),
                             Err(error) if error.code() == Code::NotFound => (),
                             Err(error) => {
@@ -1041,29 +1008,10 @@ fn status_code(error: &Status) -> u16 {
         _ => 500,
     }
 }
-fn admin_environment_view(
+pub(crate) fn instance_view(
     owner: pb::GetEnvironmentResponse,
-    caller: &pb::CallerContext,
+    include_configuration: bool,
 ) -> Result<Value, Status> {
-    if !caller.administrator {
-        return Err(Status::permission_denied("administrator required"));
-    }
-    let record = owner
-        .record
-        .ok_or_else(|| Status::data_loss("environment directory returned no record"))?;
-    if record.state == pb::EnvironmentState::Deleted as i32 {
-        return Err(Status::not_found("environment not found"));
-    }
-    let record = adx_core::EnvironmentRecord::try_from(record)
-        .map_err(|_| Status::data_loss("invalid environment inspection record"))?;
-    Ok(json!({
-        "record": record,
-        "node_address": owner.node_address,
-        "relay_address": owner.relay_address,
-    }))
-}
-
-pub(crate) fn instance_view(owner: pb::GetEnvironmentResponse) -> Result<Value, Status> {
     let record = owner
         .record
         .ok_or_else(|| Status::data_loss("environment directory returned no record"))?;
@@ -1086,7 +1034,7 @@ pub(crate) fn instance_view(owner: pb::GetEnvironmentResponse) -> Result<Value, 
         .map(adx_core::RuntimeFailure::try_from)
         .transpose()
         .map_err(adx_protocol::status)?;
-    Ok(json!({
+    let mut view = json!({
         "id": spec.id,
         "tenant_id": spec.tenant_id,
         "status": state(record.state),
@@ -1094,12 +1042,32 @@ pub(crate) fn instance_view(owner: pb::GetEnvironmentResponse) -> Result<Value, 
         "required_cpu": resource.cpu_millis,
         "required_mem": resource.memory_bytes / 1048576,
         "image": spec.image,
+        "runtime_class": spec.runtime_class,
+        "revision": record.revision,
+        "restart_attempts": record.restart_attempts,
+        "restart_pending": record.restart_pending,
         "runtime_id": runtime.id,
         "sandbox_ip": runtime.ip,
         "node_id": assignment.node_id,
         "generation": assignment.generation,
         "node_ip": node_ip,
-    }))
+    });
+    if include_configuration {
+        let execution = spec
+            .execution
+            .map(adx_core::execution::ExecutionOptions::try_from)
+            .transpose()
+            .map_err(adx_protocol::status)?
+            .unwrap_or_default();
+        view["execution"] = json!({
+            "mounts": execution.mounts,
+            "readiness_probe": execution.readiness_probe,
+            "healthcheck_probe": execution.healthcheck_probe,
+            "process": execution.process,
+        });
+        view["env_vars"] = json!(spec.env);
+    }
+    Ok(view)
 }
 fn state(value: i32) -> &'static str {
     match pb::EnvironmentState::try_from(value) {
@@ -1349,68 +1317,6 @@ fn scheduling_queue_view(queue: pb::GetSchedulingQueueResponse) -> Value {
 mod error_contract_tests {
     use super::*;
 
-    #[test]
-    fn admin_environment_inspection_requires_admin_and_preserves_execution_evidence() {
-        let caller = pb::CallerContext {
-            tenant_id: "acceptance".into(),
-            administrator: true,
-        };
-        let spec = crate::contract::create_spec(
-            json!({
-                "namespace":"audit", "name":"agent", "cpu":1000, "memory":1024,
-                "rootfs":{"type":"image","imageurl":"agentos-supervisor:v1","runtime":"supervisor"},
-                "env":{"TEST_MARKER":"retained"},
-                "restartPolicy":{"maxAttempts":3,"initialBackoffSeconds":1,"maxBackoffSeconds":5}
-            }),
-            &caller,
-        )
-        .unwrap();
-        let owner = pb::GetEnvironmentResponse {
-            record: Some(pb::EnvironmentRecord {
-                assignment: Some(pb::Assignment {
-                    environment_id: spec.id.clone(),
-                    node_id: "worker-a".into(),
-                    generation: 7,
-                    ..Default::default()
-                }),
-                spec: Some(spec),
-                state: pb::EnvironmentState::Running as i32,
-                runtime: Some(pb::Runtime {
-                    id: "backend-execution-7".into(),
-                    ip: "100.64.1.2".into(),
-                }),
-                revision: 19,
-                restart_attempts: 2,
-                resources_held: true,
-                ..Default::default()
-            }),
-            node_address: "172.30.58.2:27001".into(),
-            relay_address: "172.30.58.2:28444".into(),
-        };
-        let denied = admin_environment_view(
-            owner.clone(),
-            &pb::CallerContext {
-                tenant_id: "acceptance".into(),
-                administrator: false,
-            },
-        )
-        .unwrap_err();
-        assert_eq!(denied.code(), Code::PermissionDenied);
-        let detail = admin_environment_view(owner.clone(), &caller).unwrap();
-        assert_eq!(detail["record"]["assignment"]["generation"], 7);
-        assert_eq!(detail["record"]["runtime"]["id"], "backend-execution-7");
-        assert_eq!(detail["record"]["runtime"]["ip"], "100.64.1.2");
-        assert_eq!(detail["record"]["restart_attempts"], 2);
-        assert_eq!(detail["record"]["spec"]["env"]["TEST_MARKER"], "retained");
-        assert_eq!(detail["node_address"], "172.30.58.2:27001");
-        let mut deleted = owner;
-        deleted.record.as_mut().unwrap().state = pb::EnvironmentState::Deleted as i32;
-        assert_eq!(
-            admin_environment_view(deleted, &caller).unwrap_err().code(),
-            Code::NotFound
-        );
-    }
-
     async fn error_body(response: Response<Body>) -> Value {
         serde_json::from_slice(
             &response
@@ -1425,32 +1331,35 @@ mod error_contract_tests {
 
     #[test]
     fn instance_view_exposes_record_tenant_without_execution_secrets() {
-        let view = instance_view(pb::GetEnvironmentResponse {
-            record: Some(pb::EnvironmentRecord {
-                observation: None,
-                execution_artifacts: vec![],
-                snapshot_source: None,
-                spec: Some(pb::EnvironmentSpec {
-                    id: "environment-1".into(),
-                    tenant_id: "tenant-a".into(),
-                    env: HashMap::from([("EXECD_HTTP_TOKEN".into(), "private".into())]),
+        let view = instance_view(
+            pb::GetEnvironmentResponse {
+                record: Some(pb::EnvironmentRecord {
+                    observation: None,
+                    execution_artifacts: vec![],
+                    snapshot_source: None,
+                    spec: Some(pb::EnvironmentSpec {
+                        id: "environment-1".into(),
+                        tenant_id: "tenant-a".into(),
+                        env: HashMap::from([("EXECD_HTTP_TOKEN".into(), "private".into())]),
+                        ..Default::default()
+                    }),
+                    runtime: Some(pb::Runtime {
+                        id: "runtime-7".into(),
+                        ip: "100.96.1.7".into(),
+                    }),
+                    assignment: Some(pb::Assignment {
+                        node_id: "node-1".into(),
+                        generation: 7,
+                        ..Default::default()
+                    }),
+                    state: pb::EnvironmentState::Running as i32,
                     ..Default::default()
                 }),
-                runtime: Some(pb::Runtime {
-                    id: "runtime-7".into(),
-                    ip: "100.96.1.7".into(),
-                }),
-                assignment: Some(pb::Assignment {
-                    node_id: "node-1".into(),
-                    generation: 7,
-                    ..Default::default()
-                }),
-                state: pb::EnvironmentState::Running as i32,
+                node_address: "172.30.58.2:27001".into(),
                 ..Default::default()
-            }),
-            node_address: "172.30.58.2:27001".into(),
-            ..Default::default()
-        })
+            },
+            false,
+        )
         .unwrap();
         assert_eq!(view["tenant_id"], "tenant-a");
         assert_eq!(view["id"], "environment-1");

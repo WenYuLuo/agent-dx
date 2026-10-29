@@ -53,7 +53,7 @@ impl EnvironmentApplication for EnvironmentService {
         else {
             return Ok(None);
         };
-        match instance_view(owner) {
+        match instance_view(owner, false) {
             Ok(value) => Ok(Some(value)),
             Err(error) if error.code() == Code::NotFound => Ok(None),
             Err(error) => Err(map_status(error, false)),

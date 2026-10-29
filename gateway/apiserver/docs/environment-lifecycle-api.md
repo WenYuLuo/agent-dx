@@ -61,19 +61,20 @@ instead of inferring retry safety from HTTP status or message text. See the
 | Resume | `POST /api/environment/v1/environments/{environmentID}/resume` | none | `{"environmentId":"...","state":"running","routeAddress":"host:port","functionProxyId":"...","nodeId":"...","portMappings":{}}` |
 | Reload latest recovery point | `POST /api/environment/v1/environments/{environmentID}/reload` | none | `{"success":true}` after a new backend execution reaches Running and is published |
 | Replace network policy | `PUT /api/environment/v1/environments/{environmentID}/network` | complete network policy, or `{}` to clear it | `{"success":true}` after sandboxd accepts the replacement and the operation is published |
-| Administrator inspection | `GET /api/environment/v1/environments/{environmentID}/inspect` | none | `{"record":<EnvironmentRecord>,"node_address":"host:port","relay_address":"host:port"}` |
+| Instance details | `GET /api/instances?instance_id=<environmentID>` | none | one-element array of the caller-visible instance view |
 
-Administrator inspection reads published Environment metadata through the
-existing owner lookup. A missing or unsynchronized API directory triggers a
-read-only Coordinator lookup, so creation through another API is visible before
-its directory update arrives. It does not acquire a lifecycle operation lock or
-invoke the workload. It preserves
-the execution ID, assignment generation, runtime address, restart evidence,
-resources and requested configuration. It requires an administrator API key;
-ordinary tenant keys receive 403, including for their own environments. The
-record can contain environment variables and storage credentials, so diagnostic
-consumers must protect and redact its output. The ordinary `/api/instances`
-summary continues to omit execution secrets. Deleted or absent records return 404.
+Instance queries by ID read published metadata. A missing or unsynchronized API
+directory triggers a read-only Coordinator lookup; both paths enforce tenant
+ownership, while administrator keys can read all tenants. The query does not
+acquire a lifecycle operation lock or invoke the workload. Deleted or absent IDs
+return 404. Views include runtime identity, assignment generation, runtime class,
+revision, failure and restart evidence.
+
+Administrator queries by ID additionally return `execution` (native mounts,
+readiness/healthcheck probes and workload process) and `env_vars`. These selected
+configuration fields can contain credentials; diagnostic consumers must protect
+and redact their output. Ordinary tenant queries and all paginated list responses
+omit them. Queries by ID use `Cache-Control: no-store`.
 
 `snapshotId` on the normal create route creates a new environment from a reusable
 snapshot. The snapshot is reusable; creating from it does not consume it.
@@ -441,4 +442,4 @@ supporting these options is required before templates use them; this behavior ha
 
 Instance summaries include runtime_id, sandbox_ip, node_id, generation and node_ip from the current assignment and runtime. These fields describe observed placement; they do not include execution environment variables or credentials.
 
-Administrator inspection responses use `Cache-Control: no-store` because the execution record can contain environment credentials.
+Administrator queries by ID include selected configuration fields; list responses and ordinary tenant queries omit them.
