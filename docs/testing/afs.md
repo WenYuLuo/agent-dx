@@ -1197,3 +1197,31 @@ Component tests cover two modes, real certificate identity, body transfer,
 mode mismatch, open authorization reuse and progress past a slow handshake.
 Runtime qualification and performance remain separate evidence: the earlier
 peer-only 60/84 experiment is not a performance result for this unified code.
+
+## Ordinary write ownership admission
+
+Native local-owner ordinary DFS FUSE writes use bounded owned admission by default;
+there is no enable switch. Test `node::fuse::front_write`, `local_reply_tests`,
+`queue_default_tests` and the DFS `queued_write_capability` regression. Runtime
+acceptance covers overlapping writes, two handles, read-after-write, truncate,
+append, O_SYNC/O_DSYNC, fsync/close, required-replica failure and recovery,
+independent-file progress, restart/readback and POSIX-fd handoff. A fixed xattr
+probe must keep EOPNOTSUPP even when a queued body failed; sync must still observe
+that failure. Queue pressure and retained failures must not create internal
+resource deadlock. Unit/component gates and runtime evidence are reported
+separately; historical 2GiB timings do not qualify this implementation's speed.
+See [the ownership/error contract](../performance/afs-write-owned-admission.md).
+
+### File-scoped write barriers
+
+The ordinary-write frontend keeps 2GiB normal admitted bodies plus an additional
+32MiB of owned, unacknowledged ingress (2080MiB total). Full reserve/entry capacity
+returns EAGAIN before acceptance. Data copies, 4MiB objects, CRC and backend
+persistence are unchanged. File callbacks retain same-inode order across handles;
+namespace operations keep conservative barriers. Sync/flush/release use parked
+recovery continuations and do not acquire body capacity. Record Linux order, saturation, failure, close/teardown and USRBIO validation
+separately from performance. The FIFO consumer must preserve admitted cross-file
+arrival order; no round-robin scheduler is added. See
+[the contract](../performance/afs-write-owned-admission.md) and
+[the dated report](../performance/afs-write-early-reply-20261029.md) for exact
+versions, full trial endpoints and validation limits.

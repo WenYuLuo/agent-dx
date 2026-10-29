@@ -12179,6 +12179,20 @@ impl Backend for DistributedFs {
         self.write_with_options(ctx, handle, offset, data, WriteOptions::default())
     }
 
+    fn accepts_queued_writes(&self, handle: FileHandle) -> bool {
+        self.native_pipeline.is_some()
+            && self.handle_snapshot(handle).ok().is_some_and(|snapshot| {
+                snapshot.flags & libc::O_ACCMODE != libc::O_RDONLY
+                    && snapshot.flags & libc::O_APPEND == 0
+                    && snapshot.flags & libc::O_SYNC == 0
+                    && !has_o_dsync(snapshot.flags)
+                    && snapshot
+                        .write_session
+                        .as_ref()
+                        .is_some_and(|session| session.remote.is_none())
+            })
+    }
+
     fn write_admission_mode(&self, handle: FileHandle) -> WriteAdmissionMode {
         // Native admission may wait for mutation/publication or shared body
         // capacity. Keep those waits on a worker so the FUSE receiver can
@@ -13116,6 +13130,10 @@ impl Backend for DistributedFs {
             inode: self.backend_inode(&linked.inode_id)?,
             attributes: self.visible_attributes(&linked)?,
         })
+    }
+
+    fn getxattr_is_fixed_local(&self, name: &OsStr) -> bool {
+        name.as_encoded_bytes() == b"security.capability"
     }
 
     fn getxattr(&self, ctx: &RequestContext, inode: BackendInode, name: &OsStr) -> Result<Vec<u8>> {
@@ -19047,6 +19065,35 @@ mod tests {
     }
 
     #[cfg(feature = "dfs")]
+    #[test]
+    fn queued_write_capability_requires_native_local_ordinary_writable_handle() {
+        let (_temp, _meta, fs) = test_fs();
+        let created = fs
+            .create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new("queue-capability"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        assert!(fs.accepts_queued_writes(created.handle));
+        for flag in [libc::O_APPEND, libc::O_SYNC, libc::O_DSYNC, libc::O_RDONLY] {
+            let flags = if flag == libc::O_RDONLY {
+                flag
+            } else {
+                libc::O_RDWR | flag
+            };
+            let handle = fs.open(&context(), created.entry.inode, flags).unwrap();
+            assert!(!fs.accepts_queued_writes(handle), "flags {flags}");
+            fs.release(&context(), handle).unwrap();
+        }
+        assert!(!fs.accepts_queued_writes(FileHandle(u64::MAX)));
+        assert!(fs.getxattr_is_fixed_local(OsStr::new("security.capability")));
+        assert!(!fs.getxattr_is_fixed_local(OsStr::new("user.capability")));
+        fs.release(&context(), created.handle).unwrap();
+    }
+
     #[test]
     fn native_builder_vfs_short_write_does_not_extend_unaccepted_tail() {
         for sync_flag in [0, libc::O_SYNC, libc::O_DSYNC] {

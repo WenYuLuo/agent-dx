@@ -119,8 +119,10 @@ impl AfsFuse {
         let backend = self.backend.clone();
         let context = Self::context(req, 0);
         let self_metrics = self.read_work.clone();
-        self.dispatch
-            .submit_read_deferred_until(fh.0, deadline, move |admitted| {
+        self.dispatch.submit_read_deferred_until(
+            self.file_dispatch_key(ino.0, fh.0),
+            deadline,
+            move |admitted| {
                 let completion = match admitted {
                     Ok(completion) => completion,
                     Err(error) => {
@@ -181,7 +183,8 @@ impl AfsFuse {
                         error.0.finish();
                     }
                 });
-            });
+            },
+        );
         None
     }
 }
