@@ -1,10 +1,18 @@
 //! Initial success is the durable creation boundary. Both public identities are
 //! checked in the same transaction; unfinished executions remain node-owned.
 use super::*;
+use sha2::{Digest, Sha256};
+
+const CREATE_RECEIPT_TTL: Duration = Duration::from_secs(600);
 
 impl Session {
-    fn request_field(tenant: &str, request: &str) -> Result<String> {
-        encode(&(tenant, request))
+    fn receipt_key(&self, tenant: &str, request: &str) -> Result<String> {
+        let identity = encode(&(tenant, request))?;
+        Ok(format!(
+            "{}:create-receipt:{:x}",
+            self.store.key,
+            Sha256::digest(identity.as_bytes())
+        ))
     }
 
     pub async fn published_request(
@@ -17,10 +25,8 @@ impl Session {
         }
         let [header] = self.store.fields([HEADER.into()]).await?;
         self.header(&header)?;
-        let mut command = redis::cmd("HGET");
-        command
-            .arg(format!("{}:create-receipts", self.store.key))
-            .arg(Self::request_field(tenant, request)?);
+        let mut command = redis::cmd("GET");
+        command.arg(self.receipt_key(tenant, request)?);
         let Some(raw) = self.store.query::<Option<String>>(command).await? else {
             return Ok(None);
         };
@@ -85,7 +91,9 @@ impl Session {
     }
 
     /// Publish a completed initial execution, or return the previously published
-    /// identity. Callers must retire their execution when another result wins.
+    /// identity. Request receipts expire ten minutes after first publication;
+    /// replay does not refresh their deadline. Live Environment identity is retained.
+    /// Callers must retire their execution when another result wins.
     pub async fn publish_initial(
         &self,
         record: EnvironmentRecord,
@@ -139,10 +147,10 @@ impl Session {
             return Err(Error::Conflict);
         }
         let field = format!("environment:{}", record.spec.id);
-        let request_fields = requests
+        let request_keys = requests
             .iter()
             .filter(|request| !request.is_empty())
-            .map(|request| Self::request_field(&record.spec.tenant_id, request))
+            .map(|request| self.receipt_key(&record.spec.tenant_id, request))
             .collect::<Result<Vec<_>>>()?;
         let next = StoredEnvironment {
             creation_generation: record.assignment.generation,
@@ -211,19 +219,15 @@ impl Session {
             let mut command = redis::cmd("EVAL");
             command.arg(r#"
                 if redis.call('HGET',KEYS[1],'epoch') ~= ARGV[1] then return {-1,''} end
-                local requested = cjson.decode(ARGV[5])
-                local function aliases(value, field)
-                    for _,request in ipairs(requested) do
-                        if redis.call('HEXISTS',KEYS[3],request) == 0 then
-                            redis.call('HSET',KEYS[2],request,field)
-                            redis.call('HSET',KEYS[3],request,value)
-                        end
+                local function aliases(value)
+                    for i=5,#KEYS do
+                        redis.call('SET',KEYS[i],value,'NX','EX',ARGV[5])
                     end
                 end
-                for _,request in ipairs(requested) do
-                    local receipt = redis.call('HGET',KEYS[3],request)
+                for i=5,#KEYS do
+                    local receipt = redis.call('GET',KEYS[i])
                     if receipt then
-                        aliases(receipt, 'environment:' .. cjson.decode(receipt).spec.id)
+                        aliases(receipt)
                         return {2,receipt}
                     end
                 end
@@ -231,31 +235,30 @@ impl Session {
                 if ARGV[3] == '' then if old then return {0,''} end
                 elseif old ~= ARGV[3] then return {0,''} end
                 if ARGV[6] == 'published' then
-                    aliases(old, ARGV[2])
+                    aliases(old)
                     return {2,old}
                 end
                 if ARGV[6] == 'conflict' then return {-1,''} end
                 if ARGV[7] ~= '' and redis.call('HGET',KEYS[1],ARGV[8]) ~= ARGV[7] then return {-1,''} end
                 if ARGV[10] ~= '' and redis.call('HGET',KEYS[1],'header') ~= ARGV[10] then return {0,''} end
                 local facts = cjson.decode(ARGV[9])
-                if (redis.call('HGET',KEYS[5],facts[1]) or '') ~= facts[2] then return {0,''} end
-                redis.call('HSET',KEYS[5],facts[1],facts[3])
+                if (redis.call('HGET',KEYS[3],facts[1]) or '') ~= facts[2] then return {0,''} end
+                redis.call('HSET',KEYS[3],facts[1],facts[3])
                 redis.call('HSET',KEYS[1],ARGV[2],ARGV[4])
                 redis.call('HINCRBY',KEYS[1],'node-ownership:' .. string.sub(ARGV[8],14),1)
-                aliases(ARGV[4], ARGV[2])
+                aliases(ARGV[4])
                 local cursor=13
-                for _=1,tonumber(ARGV[12]) do redis.call('HSET',KEYS[6],ARGV[cursor],ARGV[cursor+1]); cursor=cursor+2 end
+                for _=1,tonumber(ARGV[12]) do redis.call('HSET',KEYS[4],ARGV[cursor],ARGV[cursor+1]); cursor=cursor+2 end
                 if ARGV[10] ~= '' then redis.call('HSET',KEYS[1],'header',ARGV[11]) end
-                for i=cursor,#ARGV,2 do redis.call('HSET',KEYS[4],ARGV[i],ARGV[i+1]) end
+                for i=cursor,#ARGV,2 do redis.call('HSET',KEYS[2],ARGV[i],ARGV[i+1]) end
                 return {1,ARGV[4]}
-            "#).arg(6).arg(&self.store.key)
-                .arg(format!("{}:create-requests", self.store.key))
-                .arg(format!("{}:create-receipts", self.store.key))
+            "#).arg(4 + request_keys.len()).arg(&self.store.key)
                 .arg(format!("{}:artifacts", self.store.key))
                 .arg(format!("{}:business", self.store.key))
                 .arg(self.volumes_key())
+                .arg(&request_keys)
                 .arg(self.epoch.to_string()).arg(&field).arg(old.as_deref().unwrap_or(""))
-                .arg(encode(&next)?).arg(encode(&request_fields)?)
+                .arg(encode(&next)?).arg(CREATE_RECEIPT_TTL.as_secs())
                 .arg(if published { "published" } else if pending_conflict { "conflict" } else { "initial" }).arg(node_session)
                 .arg(format!("node-session:{}", record.assignment.node_id))
                 .arg(counters.argument()?);

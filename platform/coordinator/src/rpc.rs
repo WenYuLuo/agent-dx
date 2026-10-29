@@ -26,7 +26,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tokio::sync::{mpsc, oneshot, Mutex, Notify};
+use tokio::sync::{mpsc, oneshot, watch, Mutex, Notify};
 use tonic::{transport::Endpoint, Request, Response, Status};
 
 struct LiveNode {
@@ -288,6 +288,7 @@ struct Inner {
     create_locks: std::sync::Mutex<BTreeMap<String, std::sync::Weak<Mutex<()>>>>,
     claim_sender: mpsc::Sender<PendingClaim>,
     changed: Notify,
+    closing: watch::Sender<bool>,
     peers: Peers,
     node_tls: RpcClient,
     timeout: Duration,
@@ -518,6 +519,7 @@ impl CoordinatorRpc {
             volume_domains: Default::default(),
             claim_sender,
             changed: Notify::new(),
+            closing: watch::channel(false).0,
             peers,
             node_tls: node_tls.into(),
             timeout,
@@ -550,6 +552,12 @@ impl CoordinatorRpc {
         service.watch_volume_changes(volume_changes);
         Ok(service)
     }
+    /// End node directory streams before the RPC server drains, including
+    /// subscribers blocked on a full response channel.
+    pub fn close_subscriptions(&self) {
+        self.0.closing.send_replace(true);
+    }
+
     pub fn with_reclaimers(self, reclaimers: adx_checkpoint_storage::reclaim::Reclaimers) -> Self {
         *self
             .0
@@ -1601,35 +1609,41 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
         if self.0.peers.authenticate(&request)? != Principal::ApiServer {
             return Err(Status::permission_denied("API Server required"));
         }
+        let mut closing = self.0.closing.subscribe();
+        if *closing.borrow() {
+            return Err(Status::unavailable("Coordinator shutting down"));
+        }
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         let service = self.clone();
         tokio::spawn(async move {
-            loop {
-                let frame = {
-                    let state = service.0.state.lock().await;
-                    state.healthy().map_err(status).map(|()| pb::NodeDirectory {
-                        epoch: state.session.epoch(),
-                        valid_for_millis: 2500,
-                        nodes: state
-                            .nodes
-                            .values()
-                            .filter(|n| {
-                                n.session.as_ref().is_some_and(|session| {
-                                    state
-                                        .live_claimant(
-                                            &n.node.id,
-                                            &session.id,
-                                            service.0.heartbeat_timeout,
-                                        )
-                                        .is_ok()
-                                })
-                            })
-                            .filter_map(|n| {
-                                let (capacity, allocatable) =
-                                    state.scheduler.node_resources(&n.node.id)?;
-                                let (capacity_devices, allocatable_devices) =
-                                    state.scheduler.node_devices(&n.node.id)?;
-                                Some(pb::NodeEndpoint {
+            let forward = async {
+                loop {
+                    let frame =
+                        {
+                            let state = service.0.state.lock().await;
+                            state.healthy().map_err(status).map(|()| pb::NodeDirectory {
+                                epoch: state.session.epoch(),
+                                valid_for_millis: 2500,
+                                nodes: state
+                                    .nodes
+                                    .values()
+                                    .filter(|n| {
+                                        n.session.as_ref().is_some_and(|session| {
+                                            state
+                                                .live_claimant(
+                                                    &n.node.id,
+                                                    &session.id,
+                                                    service.0.heartbeat_timeout,
+                                                )
+                                                .is_ok()
+                                        })
+                                    })
+                                    .filter_map(|n| {
+                                        let (capacity, allocatable) =
+                                            state.scheduler.node_resources(&n.node.id)?;
+                                        let (capacity_devices, allocatable_devices) =
+                                            state.scheduler.node_devices(&n.node.id)?;
+                                        Some(pb::NodeEndpoint {
                                     node_id: n.node.id.clone(),
                                     address: n.address.clone(),
                                     relay_address: n.proxy_address.clone(),
@@ -1652,15 +1666,20 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                                         .map(Into::into)
                                         .collect(),
                                 })
+                                    })
+                                    .collect(),
                             })
-                            .collect(),
-                    })
-                };
-                let failed = frame.is_err();
-                if tx.send(frame).await.is_err() || failed {
-                    break;
+                        };
+                    let failed = frame.is_err();
+                    if tx.send(frame).await.is_err() || failed {
+                        break;
+                    }
+                    tokio::select! { _ = tx.closed() => break, _ = tokio::time::sleep(Duration::from_secs(1)) => (), _ = service.0.changed.notified() => () }
                 }
-                tokio::select! { _ = tx.closed() => break, _ = tokio::time::sleep(Duration::from_secs(1)) => (), _ = service.0.changed.notified() => () }
+            };
+            tokio::select! {
+                _ = closing.wait_for(|value| *value) => {},
+                _ = forward => {},
             }
         });
         Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
