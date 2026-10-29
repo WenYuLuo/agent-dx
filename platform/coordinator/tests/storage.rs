@@ -15,6 +15,8 @@ mod observability;
 mod publication;
 #[path = "storage/publication_regressions.rs"]
 mod publication_regressions;
+#[path = "storage/receipt_expiry.rs"]
+mod receipt_expiry;
 use adx_coordinator::{storage::StoredNode, Coordinator, Node, Placement};
 use adx_core::{
     Assignment, EnvironmentRecord, EnvironmentSpec, EnvironmentState, Error, Resources,
