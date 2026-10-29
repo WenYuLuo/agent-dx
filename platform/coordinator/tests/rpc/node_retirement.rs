@@ -9,16 +9,20 @@ async fn coordinator_shutdown_finishes_with_live_directory_subscriptions() {
     use pb::route_service_server::RouteService;
 
     let rig = common::Redis::new().await;
-    let publisher =
-        RoutePublisher::new(rig.store().await.begin(1).await.unwrap(), Peers::network());
+    let session = rig.store().await.begin(1).await.unwrap();
+    let rpc = service(session.clone()).await;
+    let publisher = RoutePublisher::new(session, Peers::network());
     publisher.refresh().await.unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let (stop, stopped) = tokio::sync::oneshot::channel();
     let closing = publisher.clone();
     let routes = publisher.clone();
+    let nodes = rpc.clone();
+    let closing_nodes = rpc.clone();
     let server = tokio::spawn(async move {
         Server::builder()
+            .add_service(pb::coordinator_service_server::CoordinatorServiceServer::new(nodes))
             .add_service(pb::route_service_server::RouteServiceServer::new(
                 routes.clone(),
             ))
@@ -30,6 +34,7 @@ async fn coordinator_shutdown_finishes_with_live_directory_subscriptions() {
             .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
                 stopped.await.unwrap();
                 closing.close_subscriptions();
+                closing_nodes.close_subscriptions();
             })
             .await
             .unwrap();
@@ -53,6 +58,21 @@ async fn coordinator_shutdown_finishes_with_live_directory_subscriptions() {
             .insert("adx-component", "apiserver".parse().unwrap());
         request
     };
+    let node_request = || {
+        let mut request = Request::new(pb::WatchNodesRequest {});
+        request
+            .metadata_mut()
+            .insert("adx-component", "apiserver".parse().unwrap());
+        request
+    };
+    let mut node_client =
+        pb::coordinator_service_client::CoordinatorServiceClient::new(channel.clone());
+    let mut nodes = node_client
+        .watch_nodes(node_request())
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(nodes.message().await.unwrap().is_some());
     let mut route_client = pb::route_service_client::RouteServiceClient::new(channel.clone());
     let mut directory_client =
         pb::environment_directory_service_client::EnvironmentDirectoryServiceClient::new(channel);
@@ -69,14 +89,19 @@ async fn coordinator_shutdown_finishes_with_live_directory_subscriptions() {
     assert!(routes.message().await.unwrap().unwrap().reset);
     assert!(directory.message().await.unwrap().unwrap().reset);
     stop.send(()).unwrap();
-    // Keep both clients alive. Shutdown must end their infinite streams instead
+    // Keep all three clients alive. Shutdown must end their infinite streams instead
     // of waiting for the deployment supervisor to kill/restart the old epoch.
     tokio::time::timeout(Duration::from_secs(2), server)
         .await
         .unwrap()
         .unwrap();
+    assert!(nodes.message().await.unwrap().is_none());
     assert!(routes.message().await.unwrap().is_none());
     assert!(directory.message().await.unwrap().is_none());
+    assert_eq!(
+        rpc.watch_nodes(node_request()).await.unwrap_err().code(),
+        tonic::Code::Unavailable
+    );
     assert_eq!(
         publisher
             .watch_routes(route_request())
@@ -402,4 +427,27 @@ async fn unregister_node_finishes_after_its_rpc_caller_disconnects() {
         session.business_counters().await.unwrap().worker_incidents,
         0
     );
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py control-rpc"]
+async fn coordinator_shutdown_cancels_backpressured_node_directory() {
+    use tokio_stream::StreamExt;
+    let rig = common::Redis::new().await;
+    let rpc = service(rig.store().await.begin(1).await.unwrap()).await;
+    let mut request = Request::new(pb::WatchNodesRequest {});
+    request
+        .metadata_mut()
+        .insert("adx-component", "apiserver".parse().unwrap());
+    let mut stream = rpc.watch_nodes(request).await.unwrap().into_inner();
+    // Leave the capacity-one channel unread through its second publication.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    rpc.close_subscriptions();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while let Some(frame) = stream.next().await {
+            frame.unwrap();
+        }
+    })
+    .await
+    .unwrap();
 }

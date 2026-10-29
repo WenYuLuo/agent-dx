@@ -231,6 +231,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         builder = builder.tls_config(tls)?;
     }
     let closing_routes = routes.clone();
+    let closing_nodes = rpc.clone();
     let server = builder
         .add_service(
             pb::volume_execution_service_server::VolumeExecutionServiceServer::new(rpc.clone()),
@@ -261,6 +262,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             async move {
                 shutdown().await;
                 closing_routes.close_subscriptions();
+                closing_nodes.close_subscriptions();
             },
         );
     tokio::select! {
