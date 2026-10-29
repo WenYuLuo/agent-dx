@@ -202,7 +202,8 @@ pub async fn run(cfg: Config, obs: Observability) -> Result<(), BoxError> {
                     generation: backend.generation.clone(),
                 },
             ),
-        );
+        )
+        .with_gc_grace_ms(cfg.dfs_gc_grace_ms);
         if cfg.dfs {
             service.initialize_replication_config().await?;
         }

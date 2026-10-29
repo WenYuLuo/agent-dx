@@ -579,3 +579,92 @@ async fn crc32c_meta_commit_and_gc_preserve_typed_live_object() {
         .unwrap();
     assert!(!gc.chunks.contains(&item.chunk.id));
 }
+
+#[tokio::test]
+async fn late_admission_replay_after_tombstone_collection_is_rejected() {
+    let mut f = generation_fixture().await;
+    f.service = f.service.with_gc_grace_ms(0);
+    f.service
+        .update_gc_reference(generation_admission(&f, true))
+        .await
+        .unwrap();
+    f.service
+        .collect_garbage(
+            "writer".into(),
+            "writer-session".into(),
+            0,
+            vec![],
+        )
+        .await
+        .unwrap();
+    assert!(
+        f.service
+            .update_gc_reference(generation_admission(&f, false))
+            .await
+            .is_err(),
+        "a collected tombstone must not let an abandoned admission resurrect an active reference while its original deadline is still valid"
+    );
+}
+
+#[tokio::test]
+async fn tombstone_retention_still_reclaims_unprotected_data_at_short_grace() {
+    let mut f = generation_fixture().await;
+    f.service = f.service.with_gc_grace_ms(0);
+    f.service
+        .update_gc_reference(generation_admission(&f, true))
+        .await
+        .unwrap();
+    let gc = f
+        .service
+        .collect_garbage(
+            "writer".into(),
+            "writer-session".into(),
+            0,
+            vec![f.staged.chunk.clone()],
+        )
+        .await
+        .unwrap();
+    assert!(
+        gc.chunks.contains(&f.staged.chunk.id),
+        "data nobody needs must still reclaim at the short data grace while the tombstone record lingers"
+    );
+    assert!(
+        f.service
+            .update_gc_reference(generation_admission(&f, false))
+            .await
+            .is_err(),
+        "the lingering record must keep fencing the abandoned admission"
+    );
+}
+
+#[tokio::test]
+async fn new_operation_on_same_node_admits_normally_after_tombstone_collection() {
+    let mut f = generation_fixture().await;
+    f.service = f.service.with_gc_grace_ms(0);
+    f.service
+        .update_gc_reference(generation_admission(&f, true))
+        .await
+        .unwrap();
+    f.service
+        .collect_garbage("writer".into(), "writer-session".into(), 0, vec![])
+        .await
+        .unwrap();
+    f.commit.operation_id = OperationId::new(crate::meta::store::timed_request_id("next-op"));
+    let fresh = crate::dfs::UpdateGcReference {
+        open_read: None,
+        close_open_read: false,
+        node_id: "writer".into(),
+        session_id: "writer-session".into(),
+        reference_id: format!("write:{}", f.commit.operation_id.0),
+        inode_id: Some(f.commit.inode_id.clone()),
+        version_id: None,
+        publication: true,
+        chunks: vec![],
+        release: false,
+        admission_deadline_unix_ms: now_unix_ms().saturating_add(30_000),
+    };
+    assert!(
+        f.service.update_gc_reference(fresh).await.is_ok(),
+        "the tombstone must only fence its own abandoned operation, not new ones"
+    );
+}
