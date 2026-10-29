@@ -142,15 +142,9 @@ fn plan_collection(
             MetaEntity::DfsCopy(copy) => reclaim.contains(&copy.chunk_id),
             MetaEntity::DfsReplicationTask(task) => reclaim.contains(&task.chunk_id),
             MetaEntity::DfsWriteLease(lease) => lease.expires_at_unix_ms <= now,
-            MetaEntity::DfsReference(reference) => {
-                reference.retired_at_unix_ms.is_some_and(|time| {
-                    time.saturating_add(if reference.reference_id.starts_with("write:") {
-                        grace.max(120_000)
-                    } else {
-                        grace
-                    }) <= now
-                })
-            }
+            MetaEntity::DfsReference(reference) => reference
+                .retired_at_unix_ms
+                .is_some_and(|time| time.saturating_add(grace) <= now),
             _ => false,
         };
         if dead {
@@ -210,8 +204,7 @@ fn live_caller(entities: &[MetaEntity], node: &str, session: &str) -> Result<()>
     }
 }
 impl DfsService {
-    #[cfg(test)]
-    fn with_gc_grace_ms(mut self, grace: u64) -> Self {
+    pub fn with_gc_grace_ms(mut self, grace: u64) -> Self {
         self.gc_grace_ms = grace;
         self
     }
@@ -751,6 +744,49 @@ mod tests {
             "both versions become unreachable only after close and grace"
         );
     }
+
+    fn retired_reference(id: &str, retired_at: u64) -> (MetaEntity, GcReference) {
+        let mut reference = pin("mapped");
+        reference.reference_id = id.into();
+        reference.retired_at_unix_ms = Some(retired_at);
+        (MetaEntity::DfsReference(reference.clone()), reference)
+    }
+
+    #[test]
+    fn retired_write_reference_uses_common_grace_boundary() {
+        let (entity, reference) = retired_reference("write:generation-op", 100);
+        let entities = vec![entity];
+        assert!(
+            plan_collection(&entities, &[reference.clone()], 109, 10)
+                .keys
+                .is_empty(),
+            "one millisecond before grace expiry the write reference record must stay"
+        );
+        assert_eq!(
+            plan_collection(&entities, &[reference], 110, 10).keys.len(),
+            1,
+            "retired write references must die on the common grace boundary, not a hidden 120s floor"
+        );
+    }
+
+    #[test]
+    fn write_and_read_references_die_together_after_retirement() {
+        let (write_entity, write_reference) = retired_reference("write:generation-op", 100);
+        let (read_entity, read_reference) = retired_reference("open:reader-1", 100);
+        let entities = vec![write_entity, read_entity];
+        let references = vec![write_reference, read_reference];
+        assert!(
+            plan_collection(&entities, &references, 109, 10)
+                .keys
+                .is_empty()
+        );
+        assert_eq!(
+            plan_collection(&entities, &references, 110, 10).keys.len(),
+            2,
+            "write and read references retired together must be reclaimed together"
+        );
+    }
+
     fn generation_chunk(operation: &str, suffix: char) -> MetaEntity {
         let generation = blake3::hash(operation.as_bytes()).to_hex()[..32].to_string();
         let mut staged = crate::node::chunk::StagedChunk::new_crc32c(

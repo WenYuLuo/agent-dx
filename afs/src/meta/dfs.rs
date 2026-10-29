@@ -111,7 +111,7 @@ impl DfsService {
             replication,
             durability_policy,
             read_grant_key: Arc::new(read_grant_key),
-            gc_grace_ms: 60_000,
+            gc_grace_ms: 1_000,
             gc_reference_updates: Arc::new(std::array::from_fn(|_| tokio::sync::Mutex::new(()))),
         }
     }

@@ -291,6 +291,9 @@ pub struct Cli {
     /// Native Node live write-body capacity (4..=64MiB); S3 budgets are separate.
     #[arg(long)]
     pub dfs_dirty_budget_bytes: Option<u64>,
+    /// GC grace after reference retirement in milliseconds (0..=600000).
+    #[arg(long)]
+    pub dfs_gc_grace_ms: Option<u64>,
     /// Native uploaded but unpublished objects (1..=1024), within 4MiB metadata.
     #[arg(long)]
     pub dfs_unpublished_descriptors: Option<usize>,
@@ -466,6 +469,7 @@ struct FileConfig {
     dfs_outboard_work_wait_ms: Option<u64>,
     dfs_catalog_commit_queue: Option<usize>,
     dfs_dirty_budget_bytes: Option<u64>,
+    dfs_gc_grace_ms: Option<u64>,
     dfs_unpublished_descriptors: Option<usize>,
     dfs_upload_inflight_chunks: Option<usize>,
     dfs_background_commit_ms: Option<u64>,
@@ -575,6 +579,7 @@ pub struct Config {
     pub dfs_outboard_work_wait_ms: u64,
     pub dfs_catalog_commit_queue: usize,
     pub dfs_dirty_budget_bytes: u64,
+    pub dfs_gc_grace_ms: u64,
     pub dfs_unpublished_descriptors: usize,
     pub dfs_upload_inflight_chunks: usize,
     pub dfs_background_commit_ms: u64,
@@ -826,6 +831,13 @@ impl Config {
         if !(4 * 1024 * 1024..=64 * 1024 * 1024).contains(&dfs_dirty_budget_bytes) {
             return Err(invalid("DFS native dirty budget bytes must be 4..=64MiB"));
         }
+        let dfs_gc_grace_ms = cli
+            .dfs_gc_grace_ms
+            .or(file.dfs_gc_grace_ms)
+            .unwrap_or(1_000);
+        if dfs_gc_grace_ms > 600_000 {
+            return Err(invalid("DFS GC grace must be 0..=600000ms"));
+        }
         let dfs_unpublished_descriptors = cli
             .dfs_unpublished_descriptors
             .or(file.dfs_unpublished_descriptors)
@@ -1030,6 +1042,7 @@ impl Config {
             dfs_outboard_work_wait_ms,
             dfs_catalog_commit_queue,
             dfs_dirty_budget_bytes,
+            dfs_gc_grace_ms,
             dfs_unpublished_descriptors,
             dfs_upload_inflight_chunks,
             dfs_background_commit_ms,
@@ -1696,6 +1709,50 @@ dfs_read_crc_mode = "receiver"
             serde_json::json!("receiver"),
             "configured CRC read mode must survive resolution"
         );
+    }
+}
+
+#[cfg(test)]
+mod gc_grace_config_tests {
+    use super::*;
+    #[test]
+    fn gc_grace_defaults_to_one_second() {
+        let cfg = Config::resolve(
+            Role::Meta,
+            Cli::parse_from(["afs-meta", "--meta-store", "memory"]),
+        )
+        .unwrap();
+        assert_eq!(cfg.dfs_gc_grace_ms, 1_000);
+    }
+
+    #[test]
+    fn gc_grace_accepts_file_and_cli_overrides() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), "dfs_gc_grace_ms = 5000\n").unwrap();
+        let cli = Cli::parse_from([
+            "afs-meta",
+            "--meta-store",
+            "memory",
+            "--config",
+            file.path().to_str().unwrap(),
+        ]);
+        let cfg = Config::resolve(Role::Meta, cli).unwrap();
+        assert_eq!(cfg.dfs_gc_grace_ms, 5_000);
+    }
+
+    #[test]
+    fn gc_grace_rejects_values_beyond_ten_minutes() {
+        let result = Config::resolve(
+            Role::Meta,
+            Cli::parse_from([
+                "afs-meta",
+                "--meta-store",
+                "memory",
+                "--dfs-gc-grace-ms",
+                "600001",
+            ]),
+        );
+        assert!(result.is_err());
     }
 }
 
