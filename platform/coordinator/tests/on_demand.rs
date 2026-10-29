@@ -1,5 +1,6 @@
 //! Real Redis and gRPC; runtime memory and object storage are controlled fixtures.
 mod common;
+use adx_checkpoint_storage::ObjectCheckpointStore;
 use adx_coordinator::{rpc::CoordinatorRpc, storage::Session, Placement};
 use adx_core::{EnvironmentRecord, EnvironmentSpec, Resources, Result};
 use adx_protocol::{
@@ -8,7 +9,7 @@ use adx_protocol::{
 };
 use adx_transport::rpc::{RpcChannel, RpcClient};
 use adxlet::{
-    checkpoint::{CheckpointCooperation, ObjectCheckpointStore},
+    checkpoint::CheckpointCooperation,
     rpc::{CoordinatorStateSink, NodeRpc},
     Adxlet, Readiness, Routes, RuntimeDriver,
 };
@@ -28,6 +29,7 @@ use tonic::transport::{Channel, Server};
 
 fn spec() -> EnvironmentSpec {
     EnvironmentSpec {
+        envd: None,
         id: "sleep".into(),
         tenant_id: "tenant".into(),
         image: "image".into(),
@@ -50,6 +52,8 @@ fn spec() -> EnvironmentSpec {
         priority: 0,
         scheduling: Default::default(),
         execution: Default::default(),
+        run_policy: None,
+        compatibility: None,
     }
 }
 fn caller() -> Option<pb::CallerContext> {
@@ -240,8 +244,9 @@ async fn worker(
     .unwrap()
     .with_session(session.clone());
     let store = Arc::new(
-        ObjectCheckpointStore::new(
+        ObjectCheckpointStore::new_scoped(
             "obs".into(),
+            "test-shared".into(),
             remote,
             "checkpoints".into(),
             dir.path().into(),
@@ -288,6 +293,7 @@ async fn worker(
             proxy_address: format!("{id}:9002"),
             capacity: Some(spec().resources.into()),
             runtime_classes: vec!["test-runtime".into()],
+            checkpoint_scopes: vec!["test-shared".into()],
             labels: [("ADX_CHECKPOINT_STORAGE".into(), "obs".into())].into(),
             session_id: session,
             heartbeat_sequence: 1,
@@ -354,6 +360,13 @@ impl Rig {
         Self::with_ttl(timeout, 3600).await
     }
     async fn with_ttl(timeout: Duration, ttl_seconds: u64) -> Self {
+        Self::with_spec(timeout, ttl_seconds, spec()).await
+    }
+    async fn with_spec(
+        timeout: Duration,
+        ttl_seconds: u64,
+        specification: EnvironmentSpec,
+    ) -> Self {
         let redis = common::Redis::new().await;
         let session = redis.store().await.begin(1).await.unwrap();
         let rpc = CoordinatorRpc::new(
@@ -396,7 +409,7 @@ impl Rig {
         let created = client
             .create_environment(pb::CreateEnvironmentRequest {
                 request_id: String::new(),
-                spec: Some(spec().into()),
+                spec: Some(specification.into()),
                 caller: caller(),
                 schedule_timeout_seconds: 3,
                 create_timeout_seconds: 10,
@@ -414,6 +427,8 @@ impl Rig {
             assignment: record.assignment,
             caller: caller(),
             operation_id: "pause-original".into(),
+
+            node_session_id: String::new(),
             expected_revision: record.revision,
             retention: Some(adx_core::lifecycle::RetentionPolicy::Ttl { ttl_seconds }.into()),
             timeout_seconds: 10,
@@ -476,6 +491,7 @@ impl Rig {
             channel(&self.address, role).await,
         )
         .ensure_running(pb::EnsureRunningRequest {
+            run_timeout_seconds: None,
             expected_runtime_id: "sleep-1".into(),
             environment_id: "sleep".into(),
             caller: caller(),
@@ -746,6 +762,7 @@ async fn multiple_ingress_and_manual_resume_restore_once_on_original_node() {
                 .await,
             )
             .ensure_running(pb::EnsureRunningRequest {
+                run_timeout_seconds: None,
                 expected_runtime_id: "sleep-1".into(),
                 environment_id: "sleep".into(),
                 caller: caller(),
@@ -779,7 +796,7 @@ async fn multiple_ingress_and_manual_resume_restore_once_on_original_node() {
 #[tokio::test]
 #[ignore = "requires dedicated real Redis"]
 async fn definite_local_capacity_rejection_restores_same_state_on_another_node() {
-    use adxlet::checkpoint::CheckpointAccess;
+    use adx_checkpoint_storage::CheckpointAccess;
     let mut rig = Rig::new(Duration::from_secs(2)).await;
     rig.source
         .manager
@@ -1051,6 +1068,7 @@ async fn cached_background_sweep_retries_a_live_committed_wake_after_timeout() {
         .unwrap();
     let error = client
         .ensure_running(pb::EnsureRunningRequest {
+            run_timeout_seconds: None,
             expected_runtime_id: "sleep-1".into(),
             environment_id: "sleep".into(),
             caller: caller(),
@@ -1342,6 +1360,7 @@ async fn multiple_ingress_traffic(timeout_retry: bool) {
                 tenant_id: "tenant".into(),
                 administrator: false,
                 expires_at_unix_seconds: 0,
+                metadata: Default::default(),
             },
         )
         .await
@@ -1644,6 +1663,7 @@ async fn delete_serializes_with_restore_and_fences_its_late_result() {
                 channel(&address, Principal::Ingress).await,
             )
             .ensure_running(pb::EnsureRunningRequest {
+                run_timeout_seconds: None,
                 environment_id: "sleep".into(),
                 caller: caller(),
 
@@ -1659,9 +1679,11 @@ async fn delete_serializes_with_restore_and_fences_its_late_result() {
         channel(&rig.source.report.node_address, Principal::ApiServer).await,
     );
     let mut deleting = Box::pin(node.delete_environment(pb::DeleteEnvironmentRequest {
+        expected_revision: None,
         assignment: Some(paused.assignment.clone().try_into().unwrap()),
         caller: caller(),
         failed_revision: None,
+
         node_session_id: String::new(),
     }));
     assert!(futures_util::poll!(deleting.as_mut()).is_pending());
@@ -1789,7 +1811,7 @@ async fn background_resume_round_does_not_starve_later_intents() {
 #[tokio::test]
 #[ignore = "requires dedicated real Redis"]
 async fn original_checkpoint_cache_pressure_does_not_reject_resume() {
-    use adxlet::checkpoint::CheckpointAccess;
+    use adx_checkpoint_storage::CheckpointAccess;
     let rig = Rig::new(Duration::from_secs(2)).await;
     let stage = rig.source.store.begin_capture().await.unwrap();
     std::fs::write(stage.join("occupied"), vec![42; 1024]).unwrap();
@@ -1923,6 +1945,7 @@ async fn local_checkpoint_waits_for_volume_without_rejecting_its_owner_node() {
     );
     let paused = node
         .pause_environment(pb::PauseEnvironmentRequest {
+            node_session_id: String::new(),
             assignment: created.assignment,
             caller: caller(),
             operation_id: "pause-volume".into(),
@@ -1959,6 +1982,7 @@ async fn local_checkpoint_waits_for_volume_without_rejecting_its_owner_node() {
     let mut waking = tokio::spawn(async move {
         waking_client
             .ensure_running(pb::EnsureRunningRequest {
+                run_timeout_seconds: None,
                 environment_id: "sleep".into(),
                 caller: caller(),
                 timeout_seconds: 5,
@@ -1992,6 +2016,8 @@ async fn local_checkpoint_waits_for_volume_without_rejecting_its_owner_node() {
         .unwrap();
     assert_eq!(unrelated.assignment.as_ref().unwrap().node_id, "b");
     node.delete_environment(pb::DeleteEnvironmentRequest {
+        expected_revision: None,
+
         assignment: holder.assignment,
         caller: caller(),
         failed_revision: None,
@@ -2004,4 +2030,165 @@ async fn local_checkpoint_waits_for_volume_without_rejecting_its_owner_node() {
     assert_eq!(running.assignment, paused.assignment);
     assert_eq!(source.backend.restored.load(Ordering::SeqCst), 1);
     server.abort();
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis"]
+async fn resume_duration_survives_delayed_followup_on_original_and_replacement_owner() {
+    use adx_core::environment_control::{RunExpiryAction, RunPolicy};
+    for transferred in [false, true] {
+        let mut specification = spec();
+        specification.run_policy = Some(RunPolicy {
+            timeout_seconds: 1,
+            action: RunExpiryAction::Delete,
+        });
+        let rig = Rig::with_spec(Duration::from_secs(2), 3600, specification).await;
+        if transferred {
+            rig.source
+                .manager
+                .update_capacity(
+                    Resources {
+                        cpu_millis: 50,
+                        memory_bytes: 64,
+                        disk_bytes: 0,
+                    },
+                    Duration::from_secs(60),
+                )
+                .unwrap();
+        }
+        let mut client = pb::coordinator_service_client::CoordinatorServiceClient::new(
+            channel(&rig.address, Principal::ApiServer).await,
+        );
+        let request = pb::EnsureRunningRequest {
+            environment_id: "sleep".into(),
+            caller: caller(),
+            timeout_seconds: 3,
+            expected_runtime_id: "sleep-1".into(),
+            run_timeout_seconds: Some(30),
+        };
+        let running = client
+            .ensure_running(request.clone())
+            .await
+            .unwrap()
+            .into_inner()
+            .record
+            .unwrap();
+        assert_eq!(
+            running.assignment.as_ref().unwrap().node_id,
+            if transferred { "b" } else { "a" }
+        );
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        let mut controls = pb::coordinator_service_client::CoordinatorServiceClient::new(
+            channel(&rig.address, Principal::ApiServer).await,
+        );
+        let query = pb::GetEnvironmentControlRequest {
+            id: "sleep".into(),
+            caller: caller(),
+        };
+        let before = controls
+            .get_environment_control(query.clone())
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(before.expires_at_unix_ms >= before.started_at_unix_ms + 29_000);
+        let stored = rig.session.get("sleep").await.unwrap();
+        assert_eq!(
+            stored.result.as_ref().unwrap().state,
+            adx_core::EnvironmentState::Running
+        );
+        assert_eq!(stored.spec.run_policy.as_ref().unwrap().timeout_seconds, 1);
+        client.ensure_running(request).await.unwrap();
+        let after = controls
+            .get_environment_control(query)
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(
+            after.expires_at_unix_ms.abs_diff(before.expires_at_unix_ms) < 100,
+            "replayed wake must not restart the timer"
+        );
+        assert_eq!(
+            rig.source.backend.restored.load(Ordering::SeqCst)
+                + rig.target.backend.restored.load(Ordering::SeqCst),
+            1
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis"]
+async fn background_recovery_keeps_the_durable_resume_duration_after_restart() {
+    use adx_core::environment_control::{RunExpiryAction, RunPolicy};
+    let mut specification = spec();
+    specification.run_policy = Some(RunPolicy {
+        timeout_seconds: 1,
+        action: RunExpiryAction::Delete,
+    });
+    let mut rig = Rig::with_spec(Duration::from_secs(2), 3600, specification).await;
+    rig.source
+        .manager
+        .update_capacity(
+            Resources {
+                cpu_millis: 50,
+                memory_bytes: 64,
+                disk_bytes: 0,
+            },
+            Duration::from_secs(60),
+        )
+        .unwrap();
+    let pending = rig
+        .session
+        .request_resume_with_timeout("sleep", 1, Some(30))
+        .await
+        .unwrap();
+    // A coalescing caller and the background one-second wait budget cannot overwrite it.
+    let coalesced = rig
+        .session
+        .request_resume_with_timeout("sleep", 2, Some(5))
+        .await
+        .unwrap();
+    assert_eq!(coalesced.resume, pending.resume);
+    rig.session
+        .reject_local_resume(
+            &pending.assignment,
+            &pending.resume.as_ref().unwrap().operation_id,
+            2,
+        )
+        .await
+        .unwrap();
+    let moved = rig
+        .session
+        .reserve_recovery(
+            &pending.assignment,
+            adx_core::Assignment {
+                node_id: "b".into(),
+                generation: pending.assignment.generation + 1,
+                ..pending.assignment.clone()
+            },
+            3,
+        )
+        .await
+        .unwrap();
+    rig.restart_coordinator(true).await;
+    assert_eq!(rig.session.get("sleep").await.unwrap().resume, moved.resume);
+    // Exercise the independent background RecoverEnvironment sender, not drive_resume.
+    assert_eq!(rig.rpc.recover_environments().await.unwrap(), 1);
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    let mut controls = pb::coordinator_service_client::CoordinatorServiceClient::new(
+        channel(&rig.address, Principal::ApiServer).await,
+    );
+    let control = controls
+        .get_environment_control(pb::GetEnvironmentControlRequest {
+            id: "sleep".into(),
+            caller: caller(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(control.expires_at_unix_ms >= control.started_at_unix_ms + 29_000);
+    assert_eq!(
+        rig.session.get("sleep").await.unwrap().assignment.node_id,
+        "b"
+    );
+    assert_eq!(rig.target.backend.restored.load(Ordering::SeqCst), 1);
 }

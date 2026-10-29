@@ -5,11 +5,15 @@ package adx.control.v1;
 // Versioned internal Environment control. All callers authenticate with mTLS.
 import public "environment_types.proto";
 import public "snapshot.proto";
+import public "snapshot_preparation.proto";
 import public "volume.proto";
 import public "credentials.proto";
 import public "routes.proto";
 
 service CoordinatorService {
+  rpc GetEnvironmentControl(GetEnvironmentControlRequest) returns (EnvironmentControlRecord);
+  rpc BatchGetEnvironmentControl(BatchGetEnvironmentControlRequest) returns (BatchGetEnvironmentControlResponse);
+  rpc UpdateEnvironmentControl(UpdateEnvironmentControlRequest) returns (EnvironmentControlRecord);
   rpc WatchNodes(WatchNodesRequest) returns (stream NodeDirectory);
   rpc GetSchedulingQueue(GetSchedulingQueueRequest) returns (GetSchedulingQueueResponse);
   rpc SetNodeScheduling(SetNodeSchedulingRequest) returns (NodeSchedulingState);
@@ -31,7 +35,19 @@ service CoordinatorService {
   rpc CommitEnvironment(CommitEnvironmentRequest) returns (CommitEnvironmentResponse);
 }
 
+message GetEnvironmentControlRequest { string id = 1; CallerContext caller = 2; }
+message BatchGetEnvironmentControlRequest { repeated string ids = 1; CallerContext caller = 2; }
+message BatchGetEnvironmentControlResponse { repeated EnvironmentControlRecord records = 1; }
+message UpdateEnvironmentControlRequest {
+  string id = 1;
+  CallerContext caller = 2;
+  uint64 timeout_seconds = 3;
+  bool extend_only = 4;
+}
 service NodeService {
+  rpc GetEnvironmentControl(NodeGetEnvironmentControlRequest) returns (EnvironmentControlRecord);
+  rpc BatchGetEnvironmentControl(NodeBatchGetEnvironmentControlRequest) returns (BatchGetEnvironmentControlResponse);
+  rpc UpdateEnvironmentControl(NodeUpdateEnvironmentControlRequest) returns (EnvironmentControlRecord);
   rpc CreateLocalEnvironment(LocalEnvironmentCreateRequest) returns (EnvironmentResult);
   rpc RecoverEnvironment(RecoverEnvironmentRequest) returns (EnvironmentResult);
   // Coordinator verifies the process currently serving an already registered address
@@ -46,17 +62,38 @@ service NodeService {
   rpc ReloadEnvironment(ReloadEnvironmentRequest) returns (EnvironmentResult);
   rpc CreateSnapshot(CreateSnapshotRequest) returns (CreateSnapshotResponse);
   rpc CollectSnapshot(CollectSnapshotRequest) returns (CollectSnapshotResponse);
+  rpc CollectCheckpointCleanup(CollectCheckpointCleanupRequest) returns (CollectCheckpointCleanupResponse);
 }
 
-message RecoverEnvironmentRequest { EnvironmentRecord record = 1; string node_session_id = 2; }
+message NodeGetEnvironmentControlRequest {
+  Assignment assignment = 1;
+  CallerContext caller = 2;
+  string node_session_id = 3;
+}
+message NodeBatchGetEnvironmentControlRequest { repeated NodeGetEnvironmentControlRequest requests = 1; }
+message NodeUpdateEnvironmentControlRequest {
+  Assignment assignment = 1;
+  CallerContext caller = 2;
+  string node_session_id = 3;
+  uint64 timeout_seconds = 4;
+  bool extend_only = 5;
+}
+message RecoverEnvironmentRequest {
+  EnvironmentRecord record = 1; string node_session_id = 2;
+  // One-run duration from the durable resume intent; separate from the RPC budget.
+  optional uint64 run_timeout_seconds = 3;
+}
 message EnsureRunningRequest {
   string environment_id = 1; CallerContext caller = 2; reserved 3;
   uint64 timeout_seconds = 4;
   // Observed execution before demand; callers coalesce onto a later Running result.
   string expected_runtime_id = 5;
+  // Applied before the resumed execution starts its owner timer.
+  optional uint64 run_timeout_seconds = 6;
 }
 message EnsureEnvironmentRunningRequest {
   Assignment assignment = 1; string operation_id = 2; string node_session_id = 3;
+  optional uint64 run_timeout_seconds = 4;
 }
 
 message GetNodeSessionRequest {}
@@ -77,6 +114,8 @@ message RegisterNodeRequest {
   repeated string runtime_classes = 11; // Available classes reported by the configured runtime adapters.
   // Complete current mount view. Omitted domains are unavailable on this session.
   map<string, StorageMount> storage_mounts = 12;
+  // Stable non-secret identities of configured shared checkpoint backends.
+  repeated string checkpoint_scopes = 13;
 }
 
 message StorageMount {
@@ -103,11 +142,18 @@ message CreateEnvironmentRequest {
   Assignment expected_assignment = 6;
   // Stable public operation identity, preserved on every hop and retry.
   string request_id = 7;
+  reserved 8;
+  reserved "user_metadata";
 }
 
 message GetEnvironmentRequest { string environment_id = 1; CallerContext caller = 2; }
 
-message GetEnvironmentResponse { EnvironmentRecord record = 1; string node_address = 2; string relay_address = 3; }
+message GetEnvironmentResponse {
+  EnvironmentRecord record = 1;
+  string node_address = 2;
+  string relay_address = 3;
+  reserved 4;
+}
 
 message StartAssignedEnvironmentRequest {
   ReusableSnapshot snapshot = 4;
@@ -123,9 +169,34 @@ message DeleteEnvironmentRequest {
   // Coordinator GC only: the node rechecks Failed and revision in the serial lifecycle task.
   optional uint64 failed_revision = 3;
   string node_session_id = 4;
+  reserved 5;
+  // Coordinator-owned preparation cleanup: exact lifecycle revision, with session fencing.
+  optional uint64 expected_revision = 6;
 }
 
-message CommitEnvironmentRequest { EnvironmentRecord record = 1; string node_session_id = 2; repeated string stopped_runtime_ids = 3; }
+message CommitEnvironmentRequest {
+  EnvironmentRecord record = 1;
+  string node_session_id = 2;
+  repeated string stopped_runtime_ids = 3;
+  // Deleted only. Stored atomically with catalog retirement, before physical GC.
+  repeated CheckpointArtifact cleanup_artifacts = 4;
+}
+
+message CheckpointCleanup {
+  Assignment assignment = 1;
+  uint64 revision = 2;
+  repeated CheckpointArtifact artifacts = 3;
+}
+message CollectCheckpointCleanupRequest {
+  CheckpointCleanup cleanup = 1;
+  string node_session_id = 2;
+  bool delegated = 3;
+}
+message CollectCheckpointCleanupResponse {
+  string environment_id = 1;
+  uint64 generation = 2;
+  uint64 revision = 3;
+}
 
 message CommitEnvironmentResponse { EnvironmentRecord record = 1; }
 
@@ -133,7 +204,7 @@ message InspectNodeRequest { string node_id = 1; string session_id = 2; }
 
 message InspectNodeResponse { repeated EnvironmentRecord records = 1; uint64 coordinator_epoch = 2; repeated ReusableSnapshot snapshots = 3; repeated CheckpointArtifact retained_artifacts = 4; }
 
-message PauseEnvironmentRequest { Assignment assignment = 1; CallerContext caller = 2; string operation_id = 3; uint64 expected_revision = 4; reserved 5; uint64 timeout_seconds = 6; RetentionPolicy retention = 7; }
+message PauseEnvironmentRequest { Assignment assignment = 1; CallerContext caller = 2; string operation_id = 3; uint64 expected_revision = 4; reserved 5; uint64 timeout_seconds = 6; RetentionPolicy retention = 7; reserved 8; string node_session_id = 9; }
 
 message ResumeEnvironmentRequest { Assignment assignment = 1; CallerContext caller = 2; string operation_id = 3; uint64 expected_revision = 4; }
 
@@ -195,6 +266,8 @@ message ClaimEnvironmentRequest {
   repeated DeviceAllocation devices = 4;
   string request_id = 5;
   uint64 create_deadline_unix_millis = 6;
+  reserved 7;
+  reserved "user_metadata";
 }
 message ClaimEnvironmentResponse {
   oneof outcome {

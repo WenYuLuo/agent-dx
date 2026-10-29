@@ -73,43 +73,52 @@ impl CoordinatorRpc {
                     {
                         return None;
                     }
-                    Some((node.clone(), i.result.clone()?))
+                    Some((
+                        node.clone(),
+                        i.result.clone()?,
+                        i.resume
+                            .as_ref()
+                            .and_then(|intent| intent.run_timeout_seconds),
+                    ))
                 })
                 .take(16)
                 .collect();
-            state.recovery_cursor = work.last().map(|(_, record)| record.spec.id.clone());
+            state.recovery_cursor = work.last().map(|(_, record, _)| record.spec.id.clone());
             work
         };
-        let results = stream::iter(work.into_iter().map(|(node, record)| async move {
-            let endpoint = self
-                .0
-                .node_tls
-                .endpoint(&node.address)
-                .map_err(|_| Error::Conflict)?
-                .connect_timeout(self.0.timeout)
-                .timeout(self.0.timeout);
-            let channel = endpoint
-                .connect()
-                .await
-                .map_err(|_| Error::Unavailable("recovery node unavailable".into()))?;
-            let session = node.session.ok_or(Error::Conflict)?.id;
-            let response =
-                pb::node_service_client::NodeServiceClient::new(self.0.node_tls.wrap(channel))
-                    .recover_environment(pb::RecoverEnvironmentRequest {
-                        record: Some(record.try_into()?),
-                        node_session_id: session.clone(),
-                    })
+        let results = stream::iter(work.into_iter().map(|(node, record, run_timeout_seconds)| {
+            Box::pin(async move {
+                let endpoint = self
+                    .0
+                    .node_tls
+                    .endpoint(&node.address)
+                    .map_err(|_| Error::Conflict)?
+                    .connect_timeout(self.0.timeout)
+                    .timeout(self.0.timeout);
+                let channel = endpoint
+                    .connect()
                     .await
-                    .map_err(adx_protocol::dependency_status)?
-                    .into_inner();
-            if response.durability != pb::Durability::Published as i32 {
-                return Err(Error::Unavailable(
-                    "recovery result publication pending".into(),
-                ));
-            }
-            let record = response.record.ok_or(Error::Conflict)?.try_into()?;
-            self.commit(record, session).await?;
-            Ok::<_, Error>(())
+                    .map_err(|_| Error::Unavailable("recovery node unavailable".into()))?;
+                let session = node.session.ok_or(Error::Conflict)?.id;
+                let response =
+                    pb::node_service_client::NodeServiceClient::new(self.0.node_tls.wrap(channel))
+                        .recover_environment(pb::RecoverEnvironmentRequest {
+                            run_timeout_seconds,
+                            record: Some(record.try_into()?),
+                            node_session_id: session.clone(),
+                        })
+                        .await
+                        .map_err(adx_protocol::dependency_status)?
+                        .into_inner();
+                if response.durability != pb::Durability::Published as i32 {
+                    return Err(Error::Unavailable(
+                        "recovery result publication pending".into(),
+                    ));
+                }
+                let record = response.record.ok_or(Error::Conflict)?.try_into()?;
+                self.commit(record, session).await?;
+                Ok::<_, Error>(())
+            })
         }))
         .buffer_unordered(4)
         .collect::<Vec<_>>()

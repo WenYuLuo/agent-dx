@@ -12,6 +12,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "environment.proto",
         "environment_types.proto",
         "snapshot.proto",
+        "snapshot_preparation.proto",
         "volume.proto",
         "credentials.proto",
         "routes.proto",
@@ -25,6 +26,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .boxed(".adx.control.v1.EnvironmentRecord.failure")
         .boxed(".adx.control.v1.ClaimEnvironmentResponse.outcome.owned")
         .boxed(".adx.control.v1.ClaimEnvironmentResponse.outcome.existing")
+        .skip_debug(".adx.control.v1.EnvironmentCompatibility")
+        .skip_debug(".adx.control.v1.EnvdServiceConfig")
+        .skip_debug(".adx.control.v1.SandboxRouteCompatibility")
         .compile_protos(&[proto.join("environment.proto")], std::slice::from_ref(&proto))?;
     println!(
         "cargo:rerun-if-changed={}",

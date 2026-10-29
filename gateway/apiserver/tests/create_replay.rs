@@ -1,17 +1,32 @@
 //! Replay capacity is a cache budget, never a create admission limit.
-use adx_apiserver::{clients::Clients, config::Config, environment_service::EnvironmentService};
+#[path = "support/e2b_create_errors.rs"]
+mod e2b_create_errors;
+#[path = "support/http.rs"]
+mod http;
+
+use adx_apiserver::{
+    clients::Clients, config::Config, environment_service::EnvironmentService, http::Api,
+};
 use adx_protocol::control as pb;
+use hyper::service::service_fn;
+use hyper_util::rt::TokioIo;
 use serde_json::{json, Value};
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     time::Duration,
 };
-use tokio::sync::Notify;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    sync::Notify,
+};
 use tonic::{Request, Response, Status};
+
+const FAMILY_ID: &str = "550e8400-e29b-41d4-a716-446655440010";
+const BUILD_ID: &str = "550e8400-e29b-41d4-a716-446655440011";
 
 #[derive(Default)]
 struct State {
@@ -23,13 +38,90 @@ struct State {
     create_calls: AtomicUsize,
     lookups: AtomicUsize,
     response_error: AtomicUsize,
+    auth_error: AtomicUsize,
+    control_error: AtomicUsize,
+    control_read_calls: AtomicUsize,
+    batch_control_calls: AtomicUsize,
+    control_owner_unavailable: AtomicBool,
+    control_updates: Mutex<Vec<pb::UpdateEnvironmentControlRequest>>,
+    control_order: Mutex<Vec<&'static str>>,
+    resume_requests: Mutex<Vec<pb::EnsureRunningRequest>>,
     scheduling_expired: AtomicBool,
     block_response: AtomicBool,
     pending_response: AtomicBool,
     deadlines: Mutex<Vec<u64>>,
     timeout_phase: Mutex<Option<String>>,
+    snapshot: Mutex<Option<pb::ReusableSnapshot>>,
+    snapshot_calls: AtomicUsize,
+    snapshot_error: AtomicUsize,
+    snapshot_requests: Mutex<Vec<(String, String)>>,
+    preparation_calls: AtomicUsize,
+    preparation_error: AtomicUsize,
+    registered_tenant: Mutex<String>,
+    resolved_snapshot_id: Mutex<String>,
+    preparation_requests: Mutex<Vec<(String, String, bool)>>,
     release: Notify,
 }
+fn fixture_control(
+    state: &State,
+    id: &str,
+    caller: &pb::CallerContext,
+) -> Result<pb::EnvironmentControlRecord, Box<Status>> {
+    let error = tonic::Code::from_i32(state.control_error.load(Ordering::SeqCst) as i32);
+    if error != tonic::Code::Ok {
+        return Err(Box::new(Status::new(
+            error,
+            "injected control read failure",
+        )));
+    }
+    let owners = state.owners.lock().unwrap();
+    let record = owners
+        .get(id)
+        .and_then(|owner| owner.record.as_ref())
+        .ok_or_else(|| Status::not_found("environment not found"))?;
+    let spec = record
+        .spec
+        .as_ref()
+        .filter(|spec| spec.tenant_id == caller.tenant_id)
+        .ok_or_else(|| Status::not_found("environment not found"))?;
+    let policy = spec
+        .run_policy
+        .as_ref()
+        .ok_or_else(|| Status::not_found("run policy disabled"))?;
+    let initial_timeout = state
+        .resume_requests
+        .lock()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|request| request.environment_id == id)
+        .and_then(|request| request.run_timeout_seconds)
+        .unwrap_or(policy.timeout_seconds);
+    let timeout = state
+        .control_updates
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| request.id == id)
+        .fold(initial_timeout, |current, request| {
+            if request.extend_only {
+                current.max(request.timeout_seconds)
+            } else {
+                request.timeout_seconds
+            }
+        });
+    Ok(pb::EnvironmentControlRecord {
+        environment_id: id.into(),
+        expires_at_unix_ms: timeout.saturating_mul(1000).saturating_add(1),
+        started_at_unix_ms: 1,
+        revision: record.revision,
+        generation: record
+            .assignment
+            .as_ref()
+            .map_or(1, |assignment| assignment.generation),
+    })
+}
+
 #[derive(Clone)]
 struct Service(Arc<State>);
 macro_rules! service_impl {
@@ -63,7 +155,14 @@ service_impl!(pb::coordinator_service_server::CoordinatorService, {
         self.0.deadlines.lock().unwrap().push(request.get_ref().create_deadline_unix_millis);
         self.0.create_calls.fetch_add(1, Ordering::SeqCst);
         let request = request.into_inner();
-        let mut spec = request.spec.unwrap();
+        let spec = request.spec.unwrap();
+        // The coordinator validates and canonicalizes E2B Environment specs
+        // through the core model before publishing them.
+        let mut spec = if spec.compatibility.is_some() {
+            adx_core::EnvironmentSpec::try_from(spec).unwrap().into()
+        } else {
+            spec
+        };
         let identity = (spec.tenant_id.clone(), request.request_id);
         if !identity.1.is_empty() {
             if let Some(id) = self.0.receipts.lock().unwrap().get(&identity) {
@@ -79,7 +178,6 @@ service_impl!(pb::coordinator_service_server::CoordinatorService, {
         let (record, newly_created) = {
             let mut owners = self.0.owners.lock().unwrap();
             if let Some(owner) = owners.get_mut(&spec.id) {
-                assert_eq!(owner.record.as_ref().unwrap().spec.as_ref(), Some(&spec));
                 if !self.0.pending_response.load(Ordering::SeqCst) {
                     let record = owner.record.as_mut().unwrap();
                     if record.state == pb::EnvironmentState::Pending as i32 {
@@ -135,6 +233,60 @@ assignment: Some(pb::Assignment { environment_id: spec.id.clone(), node_id: self
         }
         Ok(Response::new(pb::EnvironmentResult { newly_created, record: Some(record), durability: pb::Durability::Published as i32 }))
     }
+    async fn ensure_running(&self, request: Request<pb::EnsureRunningRequest>) -> Result<Response<pb::GetEnvironmentResponse>, Status> {
+        let request = request.into_inner();
+        let caller = request.caller.clone().ok_or_else(|| Status::unauthenticated("caller required"))?;
+        self.0.control_order.lock().unwrap().push("ensure_running");
+        let mut owners = self.0.owners.lock().unwrap();
+        let owner = owners.get_mut(&request.environment_id).ok_or_else(|| Status::not_found("environment not found"))?;
+        let record = owner.record.as_mut().unwrap();
+        if record.spec.as_ref().unwrap().tenant_id != caller.tenant_id {
+            return Err(Status::permission_denied("wrong tenant"));
+        }
+        if record.state == pb::EnvironmentState::Paused as i32 {
+            self.0.resume_requests.lock().unwrap().push(request.clone());
+        }
+        record.state = pb::EnvironmentState::Running as i32;
+        record.revision += 1;
+        self.0.control_owner_unavailable.store(false, Ordering::SeqCst);
+        Ok(Response::new(owner.clone()))
+    }
+    async fn update_environment_control(&self, request: Request<pb::UpdateEnvironmentControlRequest>) -> Result<Response<pb::EnvironmentControlRecord>, Status> {
+        let request = request.into_inner();
+        self.0.control_order.lock().unwrap().push("update");
+        let running = self.0.owners.lock().unwrap().get(&request.id)
+            .and_then(|owner| owner.record.as_ref())
+            .is_some_and(|record| record.state == pb::EnvironmentState::Running as i32);
+        // Owner-memory timer updates require a live Running owner. A Paused
+        // invalidated/offline owner can only recover through EnsureRunning.
+        if !running || self.0.control_owner_unavailable.load(Ordering::SeqCst) {
+            return Err(Status::unavailable("timer owner unavailable before resume"));
+        }
+        let caller = request.caller.clone().ok_or_else(|| Status::unauthenticated("caller required"))?;
+        let _ = fixture_control(&self.0, &request.id, &caller).map_err(|error| *error)?;
+        self.0.control_updates.lock().unwrap().push(request.clone());
+        Ok(Response::new(fixture_control(&self.0, &request.id, &caller).map_err(|error| *error)?))
+    }
+    async fn get_environment_control(&self, request: Request<pb::GetEnvironmentControlRequest>) -> Result<Response<pb::EnvironmentControlRecord>, Status> {
+        self.0.control_read_calls.fetch_add(1, Ordering::SeqCst);
+        let request = request.into_inner();
+        let caller = request.caller.ok_or_else(|| Status::unauthenticated("caller required"))?;
+        Ok(Response::new(fixture_control(&self.0, &request.id, &caller).map_err(|error| *error)?))
+    }
+    async fn batch_get_environment_control(&self, request: Request<pb::BatchGetEnvironmentControlRequest>) -> Result<Response<pb::BatchGetEnvironmentControlResponse>, Status> {
+        self.0.batch_control_calls.fetch_add(1, Ordering::SeqCst);
+        let request = request.into_inner();
+        let caller = request.caller.ok_or_else(|| Status::unauthenticated("caller required"))?;
+        let mut records = Vec::new();
+        for id in request.ids {
+            match fixture_control(&self.0, &id, &caller) {
+                Ok(record) => records.push(record),
+                Err(error) if error.code() == tonic::Code::NotFound => (),
+                Err(error) => return Err(*error),
+            }
+        }
+        Ok(Response::new(pb::BatchGetEnvironmentControlResponse { records }))
+    }
 }, [
     get_scheduling_queue(GetSchedulingQueueRequest) -> GetSchedulingQueueResponse,
     set_node_scheduling(SetNodeSchedulingRequest) -> NodeSchedulingState,
@@ -146,8 +298,145 @@ assignment: Some(pb::Assignment { environment_id: spec.id.clone(), node_id: self
     register_node(RegisterNodeRequest) -> RegisterNodeResponse,
     inspect_node(InspectNodeRequest) -> InspectNodeResponse,
     commit_environment(CommitEnvironmentRequest) -> CommitEnvironmentResponse,
-    ensure_running(EnsureRunningRequest) -> GetEnvironmentResponse,
     retire_dormant(GetEnvironmentRequest) -> EnvironmentResult,
+]);
+
+#[tonic::async_trait]
+impl pb::auth_service_server::AuthService for Service {
+    async fn verify_api_key(
+        &self,
+        request: Request<pb::VerifyApiKeyRequest>,
+    ) -> Result<Response<pb::VerifyApiKeyResponse>, Status> {
+        let error = tonic::Code::from_i32(self.0.auth_error.load(Ordering::SeqCst) as i32);
+        if error != tonic::Code::Ok {
+            return Err(Status::new(error, "injected authentication failure"));
+        }
+        let api_key = request.into_inner().api_key;
+        if api_key.len() < 32 {
+            return Err(Status::unauthenticated("invalid API key"));
+        }
+        let mut identity = caller();
+        identity.administrator = api_key == "admin-detail-key-00000000000000000000";
+        if api_key.starts_with("other-") {
+            identity.tenant_id = "other-tenant".into();
+        } else if api_key == "foreign-key-00000000000000000000" {
+            identity.tenant_id = "foreign".into();
+        }
+        Ok(Response::new(pb::VerifyApiKeyResponse {
+            caller: Some(identity),
+            expires_at_unix_seconds: 0,
+        }))
+    }
+}
+
+#[tonic::async_trait]
+impl pb::snapshot_service_server::SnapshotService for Service {
+    async fn publish_snapshot(
+        &self,
+        _: Request<pb::PublishSnapshotRequest>,
+    ) -> Result<Response<pb::ReusableSnapshot>, Status> {
+        Err(Status::unimplemented("fixture only resolves snapshots"))
+    }
+
+    async fn get_snapshot(
+        &self,
+        request: Request<pb::GetSnapshotRequest>,
+    ) -> Result<Response<pb::ReusableSnapshot>, Status> {
+        self.0.snapshot_calls.fetch_add(1, Ordering::SeqCst);
+        let request = request.into_inner();
+        let tenant = request
+            .caller
+            .as_ref()
+            .map(|caller| caller.tenant_id.as_str())
+            .unwrap_or("");
+        self.0
+            .snapshot_requests
+            .lock()
+            .unwrap()
+            .push((tenant.into(), request.id.clone()));
+        let error = tonic::Code::from_i32(self.0.snapshot_error.load(Ordering::SeqCst) as i32);
+        if error != tonic::Code::Ok {
+            return Err(Status::new(error, "injected snapshot source failure"));
+        }
+        let snapshot = self
+            .0
+            .snapshot
+            .lock()
+            .unwrap()
+            .clone()
+            .filter(|snapshot| {
+                snapshot.id == request.id
+                    && snapshot
+                        .template
+                        .as_ref()
+                        .is_some_and(|spec| spec.tenant_id == tenant)
+            })
+            .ok_or_else(|| Status::not_found("snapshot not found"))?;
+        Ok(Response::new(snapshot))
+    }
+
+    async fn list_snapshots(
+        &self,
+        _: Request<pb::ListSnapshotsRequest>,
+    ) -> Result<Response<pb::ListSnapshotsResponse>, Status> {
+        Err(Status::unimplemented("fixture only resolves snapshots"))
+    }
+
+    async fn delete_snapshot(
+        &self,
+        _: Request<pb::DeleteSnapshotRequest>,
+    ) -> Result<Response<pb::ReusableSnapshot>, Status> {
+        Err(Status::unimplemented("fixture only resolves snapshots"))
+    }
+}
+service_impl!(pb::snapshot_preparation_service_server::SnapshotPreparationService, {
+    async fn resolve_snapshot_template(
+        &self,
+        request: Request<pb::ResolveSnapshotTemplateRequest>,
+    ) -> Result<Response<pb::SnapshotPreparationView>, Status> {
+        self.0.preparation_calls.fetch_add(1, Ordering::SeqCst);
+        let error = tonic::Code::from_i32(self.0.preparation_error.load(Ordering::SeqCst) as i32);
+        if error != tonic::Code::Ok {
+            return Err(Status::new(error, "injected preparation resolution failure"));
+        }
+        let request = request.into_inner();
+        let tenant = request.caller.as_ref().map(|caller| caller.tenant_id.as_str()).unwrap_or("");
+        self.0.preparation_requests.lock().unwrap().push((tenant.into(), request.reference.clone(), request.registration_only));
+        if request.reference.contains(':') {
+            return Err(Status::invalid_argument("fixture requires a family reference"));
+        }
+        let name = request.reference.as_str();
+        if (name != "base" && name != FAMILY_ID) || tenant != *self.0.registered_tenant.lock().unwrap() {
+            return Err(Status::not_found("no registered preparation"));
+        }
+        let snapshot_id = self.0.resolved_snapshot_id.lock().unwrap().clone();
+        let snapshot = self.0.snapshot.lock().unwrap().clone().filter(|snapshot| {
+            snapshot.id == snapshot_id && snapshot.state == pb::SnapshotState::Ready as i32
+                && snapshot.template.as_ref().is_some_and(|spec| spec.tenant_id == tenant)
+        });
+        if !request.registration_only && snapshot.is_none() {
+            return Err(Status::failed_precondition("registered family has no available ready snapshot"));
+        }
+        Ok(Response::new(pb::SnapshotPreparationView {
+            template_id: FAMILY_ID.into(), name: "base".into(), preparation_id: BUILD_ID.into(),
+            phase: if snapshot.is_some() { pb::SnapshotPreparationPhase::Ready } else { pb::SnapshotPreparationPhase::Registered } as i32,
+            snapshot_available: snapshot.is_some(), snapshot_id, ..Default::default()
+        }))
+    }
+    async fn delete_snapshot_template(
+        &self,
+        request: Request<pb::DeleteSnapshotTemplateRequest>,
+    ) -> Result<Response<pb::DeleteSnapshotTemplateResponse>, Status> {
+        if !request.into_inner().require_unused {
+            return Err(Status::invalid_argument("E2B deletion must protect live references"));
+        }
+        let error = tonic::Code::from_i32(self.0.preparation_error.load(Ordering::SeqCst) as i32);
+        Err(Status::new(if error == tonic::Code::Ok { tonic::Code::NotFound } else { error }, "template has live references"))
+    }
+}, [
+    register_snapshot_preparation(RegisterSnapshotPreparationRequest) -> SnapshotPreparationView,
+    start_snapshot_preparation(StartSnapshotPreparationRequest) -> SnapshotPreparationView,
+    get_snapshot_preparation(GetSnapshotPreparationRequest) -> SnapshotPreparationView,
 ]);
 #[tonic::async_trait]
 impl pb::environment_directory_service_server::EnvironmentDirectoryService for Service {
@@ -175,6 +464,7 @@ use futures_util::StreamExt;
 struct Fixture {
     service: Arc<EnvironmentService>,
     clients: Arc<Clients>,
+    api: Arc<Api>,
     state: Arc<State>,
     server: tokio::task::JoinHandle<()>,
 }
@@ -194,9 +484,12 @@ impl Fixture {
         Self::with_claim_mode(retention, local_first, None).await
     }
     async fn with_claim_mode(retention: u64, local_first: bool, persist: Option<bool>) -> Self {
+        adx_transport::install_crypto_provider();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap().to_string();
         let state = Arc::new(State::default());
+        *state.registered_tenant.lock().unwrap() = "tenant".into();
+        *state.resolved_snapshot_id.lock().unwrap() = "base-snapshot".into();
         if local_first {
             *state.entry_node.lock().unwrap() = Some(pb::NodeEndpoint {
                 node_id: "arbitrary-entry".into(),
@@ -208,6 +501,7 @@ impl Fixture {
             });
         }
         let endpoint = Service(state.clone());
+        let snapshots = endpoint.clone();
         let server = tokio::spawn(async move {
             let incoming = futures_util::stream::unfold(listener, |listener| async {
                 let socket = listener.accept().await.map(|(socket, _)| socket);
@@ -218,20 +512,35 @@ impl Fixture {
                 .add_service(pb::node_service_server::NodeServiceServer::new(endpoint.clone()))
                 .add_service(pb::coordinator_service_server::CoordinatorServiceServer::new(endpoint.clone()))
                 .add_service(pb::environment_directory_service_server::EnvironmentDirectoryServiceServer::new(endpoint))
+                .add_service(pb::snapshot_service_server::SnapshotServiceServer::new(snapshots.clone()))
+                .add_service(pb::snapshot_preparation_service_server::SnapshotPreparationServiceServer::new(snapshots))
                 .serve_with_incoming(incoming).await.unwrap();
         });
         let mut config = json!({
             "listen":"127.0.0.1:0", "coordinator_address":address, "internal_security":"network", "ingress_mode":"standalone",
             "rpc_timeout_seconds":2, "cache_entries":1, "auth_cache_ttl_seconds":1,
+            "create_unknown_retention_seconds":retention,
             "create_mode":if local_first { "local_first" } else { "central" },
-            "create_unknown_retention_seconds":retention
+            "e2b": {
+                "domain":"sandbox.test",
+                "envdVersion":"0.9.0",
+                "envdIngressSources":["10.0.0.2"],
+                "requiredNodeLabels":{"adx.runtime.profile":"e2b-v1"}
+            },
+            "runtime_profile": {
+                "rootfs":{"runtime_class":"runsc","type":"local","path":"/rootfs","readonly":true},
+                "bootstrap":{"type":"erofs","root":"/rootfs","target":"/rootfs","entrypoint":["/rootfs/init"]},
+                "env":{"ADX_ENVD_PATH":"/usr/local/bin/envd","ADX_ENVD_SHA256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","ADX_ENVD_DEFAULT_USER":"user","ADX_ENVD_DEFAULT_WORKDIR":"/workspace"}
+            }
         });
         if let Some(persist) = persist {
             config["persist_local_claim"] = json!(persist);
         }
         let config: Config = serde_json::from_value(config).unwrap();
+        *state.snapshot.lock().unwrap() = Some(snapshot_source(&config));
         let clients = Clients::new(config).unwrap();
-        let service = EnvironmentService::new(clients.clone());
+        let api = Api::new(clients.clone()).unwrap();
+        let service = api.environment_service.clone();
         tokio::time::timeout(Duration::from_secs(3), async {
             while service.inspect("tenant", "not-created").await.is_err() {
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -242,6 +551,7 @@ impl Fixture {
         Self {
             service,
             clients,
+            api,
             state,
             server,
         }
@@ -261,6 +571,103 @@ impl Fixture {
         })
         .await
         .unwrap();
+    }
+}
+
+fn snapshot_source(config: &Config) -> pb::ReusableSnapshot {
+    use adx_core::execution::{
+        NetworkAction, NetworkDirection, NetworkPeer, NetworkPolicy, NetworkProtocol, NetworkRule,
+        PortRange, TrafficMode, TrafficPolicy,
+    };
+    let mut source = adx_apiserver::contract::create_spec_with_environment(
+        json!({
+            "namespace":"e2b", "name":"base-source",
+            "image":format!("registry.example/base@sha256:{}", "a".repeat(64)),
+            "runtime":"runsc", "cpu":1250, "memory":768, "cpu_limit":1500, "mem_limit":1024,
+            "inheritEntrypoint":true, "env":{"SNAPSHOT_SOURCE":"true"}, "ports":["8080"],
+            "idleTimeoutSeconds":0, "initCallTimeoutSeconds":30,
+            "readinessProbe":{"tcpSocket":{"port":8080},"periodSeconds":3,"timeoutSeconds":2}
+        }),
+        &caller(),
+        config.runtime_profile.as_ref(),
+    )
+    .unwrap();
+    let rules = vec![
+        NetworkRule {
+            action: NetworkAction::Deny,
+            direction: NetworkDirection::Ingress,
+            protocol: NetworkProtocol::Tcp,
+            peer: NetworkPeer::default(),
+            environment_port: 0,
+            environment_port_range: Some(PortRange {
+                first: 49983,
+                last: 49983,
+            }),
+            priority: u32::MAX - 2,
+        },
+        NetworkRule {
+            action: NetworkAction::Allow,
+            direction: NetworkDirection::Ingress,
+            protocol: NetworkProtocol::Tcp,
+            peer: NetworkPeer {
+                cidr: "10.0.0.2/32".into(),
+                ..Default::default()
+            },
+            environment_port: 0,
+            environment_port_range: Some(PortRange {
+                first: 49983,
+                last: 49983,
+            }),
+            priority: u32::MAX - 1,
+        },
+    ];
+    let execution = source.execution.as_mut().unwrap();
+    execution.private_service_ports = vec![49983];
+    execution.protected_ingress = rules.iter().cloned().map(Into::into).collect();
+    execution.network = Some(
+        NetworkPolicy {
+            traffic: Some(TrafficPolicy {
+                ingress_default_action: NetworkAction::Allow,
+                egress_default_action: NetworkAction::Allow,
+                rules,
+                mode: TrafficMode::Stateful,
+            }),
+            dns: None,
+        }
+        .into(),
+    );
+    source.envd = Some(pb::EnvdServiceConfig {
+        version: "0.9.0".into(),
+        gateway_auth: true,
+        access_token: None,
+        ingress_sources: vec!["10.0.0.2".into()],
+    });
+    source.scheduling.as_mut().unwrap().labels = [
+        ("native-source".into(), "inherited".into()),
+        ("source".into(), "from-native".into()),
+    ]
+    .into();
+    source.scheduling.as_mut().unwrap().required_node = vec![pb::LabelSelector {
+        match_labels: [("adx.runtime.profile".into(), "e2b-v1".into())].into(),
+        ..Default::default()
+    }];
+    let source: pb::EnvironmentSpec = adx_core::EnvironmentSpec::try_from(source).unwrap().into();
+    pb::ReusableSnapshot {
+        id: "base-snapshot".into(),
+        source_node_id: "node".into(),
+        source_runtime_id: format!("{}-1", source.id),
+        template: Some(source),
+        artifact: Some(pb::CheckpointArtifact {
+            storage: "shared".into(),
+            scope: "fixture".into(),
+            location: "fixture/base".into(),
+            size_bytes: 1,
+        }),
+        kind: pb::SnapshotKind::Golden as i32,
+        created_at_unix_ms: 1,
+        revision: 1,
+        state: pb::SnapshotState::Ready as i32,
+        ..Default::default()
     }
 }
 
@@ -303,6 +710,7 @@ async fn snapshot_create_uses_coordinator_even_with_a_live_local_first_entry() {
 }
 fn spec(id: &str) -> pb::EnvironmentSpec {
     pb::EnvironmentSpec {
+        compatibility: None,
         id: id.into(),
         tenant_id: "tenant".into(),
         runtime_class: "runsc".into(),
@@ -601,6 +1009,1056 @@ async fn completed_cache_capacity_never_rejects_new_creates() {
     );
     assert_eq!(fixture.state.starts.load(Ordering::SeqCst), 12);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn e2b_create_through_http_listener_completes_on_default_worker_stack() {
+    let fixture = Fixture::new().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let api = fixture.api.clone();
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        hyper::server::conn::http1::Builder::new()
+            .serve_connection(
+                TokioIo::new(socket),
+                service_fn(move |request| api.clone().serve(request)),
+            )
+            .await
+            .unwrap();
+    });
+    let request = br#"{"templateID":"base","envVars":{"REQUEST_VALUE":"ok"}}"#;
+    let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+    let request = format!(
+        "POST /v2/sandboxes HTTP/1.1\r\nHost: localhost\r\nX-API-Key: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "k".repeat(32),
+        request.len(),
+        std::str::from_utf8(request).unwrap(),
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.unwrap();
+    server.await.unwrap();
+    assert!(
+        response.starts_with(b"HTTP/1.1 201"),
+        "{}",
+        String::from_utf8_lossy(&response)
+    );
+    assert_eq!(
+        *fixture.state.snapshot_requests.lock().unwrap(),
+        vec![("tenant".into(), "base-snapshot".into())]
+    );
+    let owner = fixture
+        .state
+        .owners
+        .lock()
+        .unwrap()
+        .values()
+        .next()
+        .unwrap()
+        .clone();
+    let spec = owner.record.unwrap().spec.unwrap();
+    assert_eq!(
+        spec.image,
+        format!("registry.example/base@sha256:{}", "a".repeat(64))
+    );
+    assert_eq!(spec.snapshot_id.as_deref(), Some("base-snapshot"));
+    assert_eq!(spec.compatibility.as_ref().unwrap().template_id, FAMILY_ID);
+    assert_eq!(spec.env["SNAPSHOT_SOURCE"], "true");
+    assert_eq!(spec.env["REQUEST_VALUE"], "ok");
+    assert_eq!(spec.resources.as_ref().unwrap().cpu_millis, 1250);
+    let execution = spec.execution.as_ref().unwrap();
+    assert!(execution.inherit_entrypoint);
+    assert_eq!(execution.ports, vec![8080]);
+    assert_eq!(execution.limits.as_ref().unwrap().cpu_millis, 1500);
+    assert_eq!(
+        execution.limits.as_ref().unwrap().memory_bytes,
+        1024 * 1_048_576
+    );
+    assert_eq!(execution.init_timeout_seconds, 30);
+    assert!(execution.readiness_probe.is_some());
+    assert_eq!(spec.lifecycle.as_ref().unwrap().idle_timeout_seconds, 0);
+    let policy = spec.run_policy.as_ref().unwrap();
+    assert_eq!(policy.timeout_seconds, 300);
+    assert_eq!(policy.action, pb::RunExpiryAction::Delete as i32);
+    assert_eq!(
+        spec.scheduling.unwrap().required_node[0].match_labels["adx.runtime.profile"],
+        "e2b-v1"
+    );
+    assert!(spec.runtime_profile.is_some());
+    assert!(spec.envd.as_ref().unwrap().gateway_auth);
+    assert!(spec.envd.as_ref().unwrap().access_token.is_none());
+    assert_eq!(execution.private_service_ports, vec![49983]);
+    assert_eq!(execution.protected_ingress.len(), 2);
+    assert_eq!(fixture.state.preparation_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn legacy_sandbox_create_route_reuses_snapshot_source_create() {
+    let fixture = Fixture::new().await;
+    let headers = [
+        ("X-API-Key", "k".repeat(32)),
+        ("Content-Type", "application/json".into()),
+    ];
+    let response = http::request(
+        fixture.api.clone(),
+        "POST",
+        "/sandboxes",
+        &headers,
+        r#"{"templateID":"base","secure":true}"#,
+    )
+    .await;
+    assert_eq!(response.status().as_u16(), 201);
+    assert_eq!(fixture.state.starts.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        *fixture.state.snapshot_requests.lock().unwrap(),
+        vec![("tenant".into(), "base-snapshot".into())]
+    );
+}
+
+#[tokio::test]
+async fn e2b_secure_false_rejects_before_template_or_create() {
+    let fixture = Fixture::new().await;
+    let headers = [
+        ("X-API-Key", "k".repeat(32)),
+        ("Content-Type", "application/json".into()),
+    ];
+    let response = http::request(
+        fixture.api.clone(),
+        "POST",
+        "/sandboxes",
+        &headers,
+        r#"{"templateID":"base","secure":false}"#,
+    )
+    .await;
+    assert_eq!(response.status().as_u16(), 400);
+    assert_eq!(
+        serde_json::from_slice::<Value>(response.body()).unwrap()["error_code"],
+        "capability_not_supported"
+    );
+    assert_eq!(fixture.state.snapshot_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.state.starts.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn template_alias_lookup_is_tenant_scoped_and_read_only() {
+    let fixture = Fixture::new().await;
+    let tenant = [("X-API-Key", "k".repeat(32))];
+    let other_tenant = [("X-API-Key", format!("other-{}", "k".repeat(32)))];
+    let response = http::request(
+        fixture.api.clone(),
+        "GET",
+        "/templates/aliases/base",
+        &[],
+        "",
+    )
+    .await;
+    assert_eq!(response.status().as_u16(), 401);
+    assert_eq!(fixture.state.snapshot_calls.load(Ordering::SeqCst), 0);
+    let response = http::request(
+        fixture.api.clone(),
+        "GET",
+        "/templates/aliases/base",
+        &tenant,
+        "",
+    )
+    .await;
+    assert_eq!(response.status().as_u16(), 200);
+    assert_eq!(
+        serde_json::from_slice::<Value>(response.body()).unwrap(),
+        json!({"public": false, "templateID": FAMILY_ID})
+    );
+    let response = http::request(
+        fixture.api.clone(),
+        "GET",
+        "/templates/aliases/base",
+        &other_tenant,
+        "",
+    )
+    .await;
+    assert_eq!(response.status().as_u16(), 404);
+    assert_eq!(fixture.state.snapshot_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        *fixture.state.preparation_requests.lock().unwrap(),
+        vec![
+            ("tenant".into(), "base".into(), true),
+            ("other-tenant".into(), "base".into(), true),
+        ]
+    );
+    let response = http::request(
+        fixture.api.clone(),
+        "GET",
+        "/templates/aliases/unregistered",
+        &tenant,
+        "",
+    )
+    .await;
+    assert_eq!(response.status().as_u16(), 404);
+    assert_eq!(fixture.state.starts.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn platform_alias_source_failure_is_not_reported_as_not_found() {
+    let fixture = Fixture::new().await;
+    fixture
+        .state
+        .preparation_error
+        .store(tonic::Code::Unavailable as usize, Ordering::SeqCst);
+    let response = http::request(
+        fixture.api.clone(),
+        "GET",
+        "/templates/aliases/base",
+        &[("X-API-Key", "k".repeat(32))],
+        "",
+    )
+    .await;
+    assert_eq!(response.status().as_u16(), 503);
+}
+
+#[tokio::test]
+async fn template_registration_authenticates_and_rejects_missing_name() {
+    let fixture = Fixture::new().await;
+    let response = http::request(fixture.api.clone(), "POST", "/v3/templates", &[], "{}").await;
+    assert_eq!(response.status().as_u16(), 401);
+    let response = http::request(
+        fixture.api.clone(),
+        "POST",
+        "/v3/templates",
+        &[("X-API-Key", "k".repeat(32))],
+        "{}",
+    )
+    .await;
+    assert_eq!(response.status().as_u16(), 400);
+    assert_eq!(fixture.state.starts.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn e2b_create_rejects_control_environment_overrides_before_template_lookup() {
+    let fixture = Fixture::new().await;
+    let headers = [
+        ("X-API-Key", "k".repeat(32)),
+        ("Content-Type", "application/json".into()),
+    ];
+    let response = crate::http::request(
+        fixture.api.clone(),
+        "POST",
+        "/v2/sandboxes",
+        &headers,
+        r#"{"templateID":"base","envVars":{"ADX_ENVD_PATH":"injected"}}"#,
+    )
+    .await;
+    assert_eq!(response.status().as_u16(), 400);
+    assert_eq!(fixture.state.snapshot_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn known_family_with_missing_golden_does_not_fallback_to_same_named_raw_snapshot() {
+    let fixture = Fixture::new().await;
+    // The directory still binds base to base-snapshot; a raw snapshot named base is unrelated.
+    fixture.state.snapshot.lock().unwrap().as_mut().unwrap().id = "base".into();
+    let headers = [("X-API-Key", "k".repeat(32))];
+    let response = http::request(
+        fixture.api.clone(),
+        "GET",
+        "/templates/aliases/base",
+        &headers,
+        "",
+    )
+    .await;
+    assert_eq!(response.status().as_u16(), 200);
+    assert_eq!(
+        serde_json::from_slice::<Value>(response.body()).unwrap()["templateID"],
+        FAMILY_ID
+    );
+    let response = http::request(
+        fixture.api.clone(),
+        "GET",
+        "/templates/aliases/base:default",
+        &headers,
+        "",
+    )
+    .await;
+    assert_eq!(response.status().as_u16(), 404);
+    let response = http::request(
+        fixture.api.clone(),
+        "POST",
+        "/v2/sandboxes",
+        &headers,
+        r#"{"templateID":"base"}"#,
+    )
+    .await;
+    assert_eq!(response.status().as_u16(), 409);
+    assert_eq!(fixture.state.snapshot_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.state.preparation_calls.load(Ordering::SeqCst), 3);
+    assert_eq!(fixture.state.starts.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn bare_registered_alias_exists_before_ready_while_explicit_tag_does_not() {
+    let fixture = Fixture::new().await;
+    fixture.state.resolved_snapshot_id.lock().unwrap().clear();
+    let headers = [("X-API-Key", "k".repeat(32))];
+    let response = http::request(
+        fixture.api.clone(),
+        "GET",
+        "/templates/aliases/base",
+        &headers,
+        "",
+    )
+    .await;
+    assert_eq!(response.status().as_u16(), 200);
+    assert_eq!(
+        serde_json::from_slice::<Value>(response.body()).unwrap()["templateID"],
+        FAMILY_ID
+    );
+    let response = http::request(
+        fixture.api.clone(),
+        "GET",
+        "/templates/aliases/base:default",
+        &headers,
+        "",
+    )
+    .await;
+    assert_eq!(response.status().as_u16(), 404);
+    assert_eq!(fixture.state.snapshot_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.state.starts.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn custom_template_selectors_are_explicitly_unsupported() {
+    let fixture = Fixture::new().await;
+    let headers = [("X-API-Key", "k".repeat(32))];
+    for (reference, expected) in [("base:missing", 400), ("unknown:release", 400)] {
+        let response = http::request(
+            fixture.api.clone(),
+            "POST",
+            "/v2/sandboxes",
+            &headers,
+            &json!({"templateID":reference}).to_string(),
+        )
+        .await;
+        assert_eq!(response.status().as_u16(), expected);
+    }
+    let response = http::request(
+        fixture.api.clone(),
+        "GET",
+        "/templates/aliases/base:missing",
+        &headers,
+        "",
+    )
+    .await;
+    assert_eq!(response.status().as_u16(), 400);
+    assert_eq!(fixture.state.snapshot_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.state.starts.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn default_selectors_on_family_ids_and_aliases_select_the_registered_snapshot() {
+    for reference in [format!("{FAMILY_ID}:default"), "base:default".into()] {
+        let fixture = Fixture::new().await;
+        let response = http::request(
+            fixture.api.clone(),
+            "POST",
+            "/v2/sandboxes",
+            &[("X-API-Key", "k".repeat(32))],
+            &json!({"templateID":reference}).to_string(),
+        )
+        .await;
+        assert_eq!(response.status().as_u16(), 201);
+        assert_eq!(
+            serde_json::from_slice::<Value>(response.body()).unwrap()["templateID"],
+            FAMILY_ID
+        );
+        assert_eq!(
+            *fixture.state.snapshot_requests.lock().unwrap(),
+            vec![("tenant".into(), "base-snapshot".into())]
+        );
+    }
+    let fixture = Fixture::new().await;
+    let response = http::request(
+        fixture.api.clone(),
+        "POST",
+        "/v2/sandboxes",
+        &[("X-API-Key", "k".repeat(32))],
+        &json!({"templateID":format!("base:{BUILD_ID}")}).to_string(),
+    )
+    .await;
+    assert_eq!(response.status().as_u16(), 400);
+    assert_eq!(fixture.state.preparation_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn common_family_rebinding_controls_the_next_same_name_sandbox_source() {
+    let fixture = Fixture::new().await;
+    *fixture.state.resolved_snapshot_id.lock().unwrap() = "rebuilt-golden".into();
+    fixture.state.snapshot.lock().unwrap().as_mut().unwrap().id = "rebuilt-golden".into();
+    let response = http::request(
+        fixture.api.clone(),
+        "POST",
+        "/v2/sandboxes",
+        &[("X-API-Key", "k".repeat(32))],
+        r#"{"templateID":"base"}"#,
+    )
+    .await;
+    assert_eq!(response.status().as_u16(), 201);
+    let owners = fixture.state.owners.lock().unwrap();
+    let created = owners
+        .values()
+        .next()
+        .unwrap()
+        .record
+        .as_ref()
+        .unwrap()
+        .spec
+        .as_ref()
+        .unwrap();
+    assert_eq!(created.snapshot_id.as_deref(), Some("rebuilt-golden"));
+    assert_eq!(
+        created.compatibility.as_ref().unwrap().template_id,
+        FAMILY_ID
+    );
+    assert_eq!(
+        *fixture.state.snapshot_requests.lock().unwrap(),
+        vec![("tenant".into(), "rebuilt-golden".into())]
+    );
+}
+
+#[tokio::test]
+async fn tenant_own_base_family_resolves_without_a_global_alias() {
+    let fixture = Fixture::new().await;
+    *fixture.state.registered_tenant.lock().unwrap() = "other-tenant".into();
+    fixture
+        .state
+        .snapshot
+        .lock()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .template
+        .as_mut()
+        .unwrap()
+        .tenant_id = "other-tenant".into();
+    let response = http::request(
+        fixture.api.clone(),
+        "POST",
+        "/v2/sandboxes",
+        &[("X-API-Key", format!("other-{}", "k".repeat(32)))],
+        r#"{"templateID":"base"}"#,
+    )
+    .await;
+    assert_eq!(response.status().as_u16(), 201);
+    let owners = fixture.state.owners.lock().unwrap();
+    let created = owners
+        .values()
+        .next()
+        .unwrap()
+        .record
+        .as_ref()
+        .unwrap()
+        .spec
+        .as_ref()
+        .unwrap();
+    assert_eq!(created.tenant_id, "other-tenant");
+    assert_eq!(
+        created.compatibility.as_ref().unwrap().template_id,
+        FAMILY_ID
+    );
+}
+
+#[tokio::test]
+async fn unregistered_reference_falls_back_to_snapshot_only_after_preparation_not_found() {
+    let fixture = Fixture::new().await;
+    let response = http::request(
+        fixture.api.clone(),
+        "POST",
+        "/v2/sandboxes",
+        &[("X-API-Key", "k".repeat(32))],
+        r#"{"templateID":"base-snapshot"}"#,
+    )
+    .await;
+    assert_eq!(response.status().as_u16(), 201);
+    assert_eq!(fixture.state.preparation_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.state.snapshot_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.state.starts.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn preparation_dependency_failure_does_not_fallback_to_an_existing_snapshot() {
+    let fixture = Fixture::new().await;
+    fixture
+        .state
+        .preparation_error
+        .store(tonic::Code::Unavailable as usize, Ordering::SeqCst);
+    let response = http::request(
+        fixture.api.clone(),
+        "POST",
+        "/v2/sandboxes",
+        &[("X-API-Key", "k".repeat(32))],
+        r#"{"templateID":"base-snapshot"}"#,
+    )
+    .await;
+    assert_eq!(response.status().as_u16(), 503);
+    assert_eq!(fixture.state.preparation_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.state.snapshot_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.state.starts.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn registered_family_cannot_create_for_a_different_tenant() {
+    let fixture = Fixture::new().await;
+    let response = http::request(
+        fixture.api.clone(),
+        "POST",
+        "/v2/sandboxes",
+        &[("X-API-Key", format!("other-{}", "k".repeat(32)))],
+        r#"{"templateID":"base"}"#,
+    )
+    .await;
+    assert_eq!(response.status().as_u16(), 404);
+    assert_eq!(fixture.state.starts.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn create_replay_keeps_labels_and_native_name_reuse() {
+    let fixture = Fixture::new().await;
+    let mut original = spec("metadata-replay");
+    original.scheduling = Some(pb::SchedulingPolicy {
+        labels: [("purpose".into(), "original".into())].into(),
+        ..Default::default()
+    });
+    fixture
+        .service
+        .create(
+            original.clone(),
+            json!({"name":"metadata-replay"}),
+            "metadata-request",
+            &caller(),
+        )
+        .await
+        .unwrap();
+    let mut changed = original;
+    changed
+        .scheduling
+        .as_mut()
+        .unwrap()
+        .labels
+        .insert("purpose".into(), "changed".into());
+    fixture
+        .service
+        .create(
+            changed,
+            json!({"name":"metadata-replay"}),
+            "metadata-request",
+            &caller(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture.state.owners.lock().unwrap()["metadata-replay"]
+            .record
+            .as_ref()
+            .unwrap()
+            .spec
+            .as_ref()
+            .unwrap()
+            .scheduling
+            .as_ref()
+            .unwrap()
+            .labels["purpose"],
+        "original"
+    );
+    assert_eq!(fixture.state.starts.load(Ordering::SeqCst), 1);
+
+    fixture
+        .create("native-reuse", "native-first")
+        .await
+        .unwrap();
+    let mut changed = spec("native-reuse");
+    changed.image = "different-image".into();
+    fixture
+        .service
+        .create(
+            changed,
+            json!({"name":"native-reuse"}),
+            "native-second",
+            &caller(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fixture.state.starts.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn e2b_create_rejects_oversized_metadata_before_any_create_rpc() {
+    let fixture = Fixture::new().await;
+    let metadata = (0..17)
+        .map(|index| (format!("key-{index}"), "x".repeat(4096)))
+        .collect::<BTreeMap<_, _>>();
+    let response = http::request(
+        fixture.api.clone(),
+        "POST",
+        "/v2/sandboxes",
+        &[("X-API-Key", "k".repeat(32))],
+        &json!({"templateID":"base", "metadata":metadata}).to_string(),
+    )
+    .await;
+    assert_eq!(response.status().as_u16(), 400);
+    assert_eq!(fixture.state.create_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.state.snapshot_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn paused_e2b_connect_carries_duration_through_recovery_and_only_extends_afterwards() {
+    for unavailable in [false, true] {
+        let fixture = Fixture::new().await;
+        let headers = [
+            ("X-API-Key", "k".repeat(32)),
+            ("Content-Type", "application/json".into()),
+        ];
+        let created = http::request(
+            fixture.api.clone(),
+            "POST",
+            "/v2/sandboxes",
+            &headers,
+            r#"{"templateID":"base"}"#,
+        )
+        .await;
+        assert_eq!(created.status().as_u16(), 201);
+        let created: Value = serde_json::from_slice(created.body()).unwrap();
+        let id = created["sandboxID"].as_str().unwrap();
+        fixture
+            .state
+            .owners
+            .lock()
+            .unwrap()
+            .get_mut(id)
+            .unwrap()
+            .record
+            .as_mut()
+            .unwrap()
+            .state = pb::EnvironmentState::Paused as i32;
+        fixture
+            .state
+            .control_owner_unavailable
+            .store(unavailable, Ordering::SeqCst);
+        let path = format!("/v2/sandboxes/{id}/connect");
+        let response = http::request(
+            fixture.api.clone(),
+            "POST",
+            &path,
+            &headers,
+            r#"{"timeout":73}"#,
+        )
+        .await;
+        assert_eq!(response.status().as_u16(), 201);
+        let value: Value = serde_json::from_slice(response.body()).unwrap();
+        assert_eq!(value["state"], "running");
+        assert_eq!(value["endAt"], "1970-01-01T00:01:13.001Z");
+        assert_eq!(
+            *fixture.state.control_order.lock().unwrap(),
+            ["ensure_running", "update"]
+        );
+        {
+            let updates = fixture.state.control_updates.lock().unwrap();
+            assert_eq!(updates.len(), 1);
+            assert_eq!(updates[0].id, id);
+            assert_eq!(updates[0].timeout_seconds, 73);
+            assert!(updates[0].extend_only);
+            let requests = fixture.state.resume_requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].run_timeout_seconds, Some(73));
+            assert_eq!(
+                requests[0].timeout_seconds, 300,
+                "RPC wait budget stays independent"
+            );
+        }
+        fixture.state.control_order.lock().unwrap().clear();
+        let response = http::request(
+            fixture.api.clone(),
+            "POST",
+            &path,
+            &headers,
+            r#"{"timeout":5}"#,
+        )
+        .await;
+        assert_eq!(response.status().as_u16(), 200);
+        let value: Value = serde_json::from_slice(response.body()).unwrap();
+        assert_eq!(value["endAt"], "1970-01-01T00:01:13.001Z");
+        assert_eq!(*fixture.state.control_order.lock().unwrap(), ["update"]);
+        let updates = fixture.state.control_updates.lock().unwrap();
+        assert_eq!(updates[1].timeout_seconds, 5);
+        assert!(updates[1].extend_only);
+    }
+}
+
+#[tokio::test]
+async fn e2b_list_reuses_filtered_directory_pages_and_one_batch_without_credentials() {
+    let fixture = Fixture::new().await;
+    let headers = [
+        ("X-API-Key", "k".repeat(32)),
+        ("Content-Type", "application/json".into()),
+    ];
+    for role in ["one", "two"] {
+        let response = http::request(
+            fixture.api.clone(),
+            "POST",
+            "/v2/sandboxes",
+            &headers,
+            &json!({"templateID":"base","metadata":{"team":"core","purpose":role}}).to_string(),
+        )
+        .await;
+        assert_eq!(response.status().as_u16(), 201);
+    }
+    let example = fixture
+        .state
+        .owners
+        .lock()
+        .unwrap()
+        .values()
+        .next()
+        .unwrap()
+        .clone();
+    for (id, tenant, e2b, state) in [
+        ("00-native", "tenant", false, pb::EnvironmentState::Running),
+        (
+            "01-other-tenant",
+            "other",
+            true,
+            pb::EnvironmentState::Running,
+        ),
+        ("02-paused", "tenant", true, pb::EnvironmentState::Paused),
+    ] {
+        let mut owner = example.clone();
+        let record = owner.record.as_mut().unwrap();
+        let spec = record.spec.as_mut().unwrap();
+        spec.id = id.into();
+        spec.tenant_id = tenant.into();
+        if !e2b {
+            spec.compatibility = None;
+        }
+        record.assignment.as_mut().unwrap().environment_id = id.into();
+        record.state = state as i32;
+        fixture.clients.put_owner(owner.clone()).await.unwrap();
+        fixture
+            .state
+            .owners
+            .lock()
+            .unwrap()
+            .insert(id.into(), owner);
+    }
+    fixture.state.control_read_calls.store(0, Ordering::SeqCst);
+    fixture.state.batch_control_calls.store(0, Ordering::SeqCst);
+    let first = http::request(
+        fixture.api.clone(),
+        "GET",
+        "/v2/sandboxes?metadata=team%3Dcore&limit=1",
+        &headers,
+        "",
+    )
+    .await;
+    assert_eq!(first.status().as_u16(), 200);
+    let cursor = first
+        .headers()
+        .get("x-next-token")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert!(!cursor.is_empty());
+    let first: Value = serde_json::from_slice(first.body()).unwrap();
+    assert_eq!(first.as_array().unwrap().len(), 1);
+    assert_eq!(first[0]["metadata"]["team"], "core");
+    assert_eq!(first[0]["metadata"]["native-source"], "inherited");
+    assert!(first[0].get("envdAccessToken").is_none());
+    assert!(first[0].get("trafficAccessToken").is_none());
+    assert_eq!(fixture.state.control_read_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.state.batch_control_calls.load(Ordering::SeqCst), 1);
+    let encoded: String = url::form_urlencoded::byte_serialize(cursor.as_bytes()).collect();
+    let next = http::request(
+        fixture.api.clone(),
+        "GET",
+        &format!("/v2/sandboxes?metadata=team%3Dcore&limit=1&nextToken={encoded}"),
+        &headers,
+        "",
+    )
+    .await;
+    assert_eq!(next.status().as_u16(), 200);
+    let next: Value = serde_json::from_slice(next.body()).unwrap();
+    assert_eq!(next.as_array().unwrap().len(), 1);
+    assert_ne!(first[0]["sandboxID"], next[0]["sandboxID"]);
+    let paused = http::request(
+        fixture.api.clone(),
+        "GET",
+        "/v2/sandboxes?metadata=team%3Dcore&state=paused",
+        &headers,
+        "",
+    )
+    .await;
+    assert_eq!(paused.status().as_u16(), 200);
+    let paused: Value = serde_json::from_slice(paused.body()).unwrap();
+    assert_eq!(paused[0]["sandboxID"], "02-paused");
+    assert_eq!(paused[0]["state"], "paused");
+    assert_eq!(paused[0]["endAt"], "9999-12-31T23:59:59Z");
+    for (key, filter) in [
+        ("k".repeat(32), "metadata=team%3Dother"),
+        (format!("other-{}", "k".repeat(32)), "metadata=team%3Dcore"),
+    ] {
+        let response = http::request(
+            fixture.api.clone(),
+            "GET",
+            &format!("/v2/sandboxes?{filter}&nextToken={encoded}"),
+            &[("X-API-Key", key)],
+            "",
+        )
+        .await;
+        assert_eq!(response.status().as_u16(), 400);
+    }
+}
+
+#[tokio::test]
+async fn generic_run_policy_does_not_make_a_native_environment_an_e2b_sandbox() {
+    let fixture = Fixture::new().await;
+    let mut native = spec("native-with-runtime-policy");
+    native.run_policy = Some(pb::RunPolicy {
+        timeout_seconds: 90_000,
+        action: pb::RunExpiryAction::Delete as i32,
+    });
+    fixture
+        .service
+        .create(
+            native,
+            json!({"name":"native-with-runtime-policy"}),
+            "native-runtime-policy",
+            &caller(),
+        )
+        .await
+        .unwrap();
+    // The generic control exists independently of E2B.
+    assert!(fixture
+        .clients
+        .environment_control("native-with-runtime-policy", &caller())
+        .await
+        .is_ok());
+    let headers = [
+        ("X-API-Key", "k".repeat(32)),
+        ("Content-Type", "application/json".into()),
+    ];
+    for (method, suffix, body) in [
+        ("GET", "", ""),
+        ("DELETE", "", ""),
+        ("POST", "/timeout", r#"{"timeout":60}"#),
+        ("POST", "/pause", "{}"),
+        ("POST", "/snapshots", "{}"),
+        ("PUT", "/network", "{}"),
+    ] {
+        let response = http::request(
+            fixture.api.clone(),
+            method,
+            &format!("/sandboxes/native-with-runtime-policy{suffix}"),
+            &headers,
+            body,
+        )
+        .await;
+        assert_eq!(response.status().as_u16(), 404, "{method} {suffix}");
+    }
+    let response = http::request(
+        fixture.api.clone(),
+        "POST",
+        "/v2/sandboxes/native-with-runtime-policy/connect",
+        &headers,
+        "{}",
+    )
+    .await;
+    assert_eq!(response.status().as_u16(), 404);
+    let list = http::request(fixture.api.clone(), "GET", "/v2/sandboxes", &headers, "").await;
+    assert_eq!(list.status().as_u16(), 200);
+    assert!(serde_json::from_slice::<Value>(list.body())
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert_eq!(fixture.state.starts.load(Ordering::SeqCst), 1);
+    assert!(fixture
+        .state
+        .owners
+        .lock()
+        .unwrap()
+        .contains_key("native-with-runtime-policy"));
+}
+
+#[tokio::test]
+async fn e2b_snapshot_clone_uses_the_persisted_spec_after_alias_resolution() {
+    let fixture = Fixture::new().await;
+    let headers = [
+        ("X-API-Key", "k".repeat(32)),
+        ("Content-Type", "application/json".into()),
+    ];
+    let first = http::request(
+        fixture.api.clone(),
+        "POST",
+        "/v2/sandboxes",
+        &headers,
+        r#"{"templateID":"base","metadata":{"source":"one"}}"#,
+    )
+    .await;
+    assert_eq!(first.status().as_u16(), 201);
+    let mut original = fixture
+        .state
+        .owners
+        .lock()
+        .unwrap()
+        .values()
+        .next()
+        .unwrap()
+        .record
+        .as_ref()
+        .unwrap()
+        .spec
+        .clone()
+        .unwrap();
+    // The published alias may be removed or repointed after the snapshot. Restore must consume
+    // the persisted specification and never attempt to resolve this historical identity.
+    original.compatibility.as_mut().unwrap().template_id = "deleted-alias".into();
+    original.envd.as_mut().unwrap().version = "0.9.1".into();
+    *fixture.state.snapshot.lock().unwrap() = Some(pb::ReusableSnapshot {
+        id: "snapshot-1".into(),
+        template: Some(original.clone()),
+        state: pb::SnapshotState::Ready as i32,
+        ..Default::default()
+    });
+
+    let cloned = http::request(
+        fixture.api.clone(),
+        "POST",
+        "/v2/sandboxes",
+        &headers,
+        r#"{"templateID":"snapshot-1","timeout":60,"autoPause":true,"metadata":{"clone":"two","source":"overridden"}}"#,
+    )
+    .await;
+    assert_eq!(cloned.status().as_u16(), 201);
+    assert_eq!(
+        serde_json::from_slice::<Value>(cloned.body()).unwrap()["envdVersion"],
+        "0.9.1"
+    );
+    let cloned = fixture
+        .state
+        .owners
+        .lock()
+        .unwrap()
+        .values()
+        .map(|owner| {
+            owner
+                .record
+                .as_ref()
+                .unwrap()
+                .spec
+                .as_ref()
+                .unwrap()
+                .clone()
+        })
+        .find(|spec| spec.id != original.id)
+        .unwrap();
+    assert_eq!(fixture.state.snapshot_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        *fixture.state.snapshot_requests.lock().unwrap(),
+        vec![
+            ("tenant".into(), "base-snapshot".into()),
+            ("tenant".into(), "snapshot-1".into())
+        ]
+    );
+    assert_eq!(cloned.image, original.image);
+    assert_eq!(cloned.resources, original.resources);
+    assert_eq!(cloned.env, original.env);
+    assert_eq!(cloned.runtime_profile, original.runtime_profile);
+    assert_eq!(cloned.envd, original.envd);
+    assert_eq!(cloned.execution, original.execution);
+    assert_eq!(cloned.snapshot_id.as_deref(), Some("snapshot-1"));
+    assert_eq!(original.run_policy.as_ref().unwrap().timeout_seconds, 300);
+    assert_eq!(cloned.run_policy.as_ref().unwrap().timeout_seconds, 60);
+    assert_eq!(
+        cloned.run_policy.as_ref().unwrap().action,
+        pb::RunExpiryAction::Pause as i32
+    );
+    let original_compatibility = original.compatibility.unwrap();
+    let cloned_compatibility = cloned.compatibility.unwrap();
+    assert_ne!(
+        cloned_compatibility.envd_access_token,
+        original_compatibility.envd_access_token
+    );
+    assert_ne!(
+        cloned_compatibility.traffic_access_token,
+        original_compatibility.traffic_access_token
+    );
+    assert_eq!(
+        original.scheduling.as_ref().unwrap().labels["native-source"],
+        "inherited"
+    );
+    assert_eq!(
+        cloned.scheduling.as_ref().unwrap().labels["native-source"],
+        "inherited"
+    );
+    assert_eq!(
+        original.scheduling.as_ref().unwrap().labels["source"],
+        "one"
+    );
+    assert_eq!(cloned.scheduling.as_ref().unwrap().labels["clone"], "two");
+    assert_eq!(
+        cloned.scheduling.as_ref().unwrap().labels["source"],
+        "overridden"
+    );
+}
+
+#[tokio::test]
+async fn legacy_e2b_snapshot_clone_is_rejected_before_create() {
+    let fixture = Fixture::new().await;
+    let headers = [
+        ("X-API-Key", "k".repeat(32)),
+        ("Content-Type", "application/json".into()),
+    ];
+    let first = http::request(
+        fixture.api.clone(),
+        "POST",
+        "/v2/sandboxes",
+        &headers,
+        r#"{"templateID":"base"}"#,
+    )
+    .await;
+    assert_eq!(first.status().as_u16(), 201);
+    let mut source = fixture
+        .state
+        .owners
+        .lock()
+        .unwrap()
+        .values()
+        .next()
+        .unwrap()
+        .record
+        .as_ref()
+        .unwrap()
+        .spec
+        .clone()
+        .unwrap();
+    let envd = source.envd.as_mut().unwrap();
+    envd.gateway_auth = false;
+    envd.access_token = Some("legacy-token-012345678901234567890123456789".into());
+    envd.ingress_sources.clear();
+    *fixture.state.snapshot.lock().unwrap() = Some(pb::ReusableSnapshot {
+        id: "legacy-snapshot".into(),
+        template: Some(source),
+        state: pb::SnapshotState::Ready as i32,
+        ..Default::default()
+    });
+    let starts = fixture.state.starts.load(Ordering::SeqCst);
+    let response = http::request(
+        fixture.api.clone(),
+        "POST",
+        "/v2/sandboxes",
+        &headers,
+        r#"{"templateID":"legacy-snapshot"}"#,
+    )
+    .await;
+    assert_eq!(response.status().as_u16(), 409);
+    assert_eq!(fixture.state.starts.load(Ordering::SeqCst), starts);
+}
 #[tokio::test]
 async fn unknown_results_do_not_block_new_names_and_retry_original_identity() {
     let fixture = Fixture::new().await;
@@ -819,25 +2277,6 @@ async fn pending_retry_accepts_a_reassigned_unconfirmed_generation() {
     assert_eq!(fixture.state.starts.load(Ordering::SeqCst), 1);
 }
 
-#[tonic::async_trait]
-impl pb::auth_service_server::AuthService for Service {
-    async fn verify_api_key(
-        &self,
-        request: Request<pb::VerifyApiKeyRequest>,
-    ) -> Result<Response<pb::VerifyApiKeyResponse>, Status> {
-        let mut identity = caller();
-        identity.administrator =
-            request.get_ref().api_key == "admin-detail-key-00000000000000000000";
-        if request.get_ref().api_key == "foreign-key-00000000000000000000" {
-            identity.tenant_id = "foreign".into();
-        }
-        Ok(Response::new(pb::VerifyApiKeyResponse {
-            caller: Some(identity),
-            expires_at_unix_seconds: 0,
-        }))
-    }
-}
-
 #[tokio::test]
 async fn instance_details_preserve_visibility_configuration_and_read_only_lookup() {
     adx_transport::install_crypto_provider();
@@ -1007,6 +2446,9 @@ service_impl!(pb::node_service_server::NodeService, {
         }).await
     }
 }, [
+    get_environment_control(NodeGetEnvironmentControlRequest) -> EnvironmentControlRecord,
+    batch_get_environment_control(NodeBatchGetEnvironmentControlRequest) -> BatchGetEnvironmentControlResponse,
+    update_environment_control(NodeUpdateEnvironmentControlRequest) -> EnvironmentControlRecord,
     recover_environment(RecoverEnvironmentRequest) -> EnvironmentResult,
     get_session(GetNodeSessionRequest) -> GetNodeSessionResponse,
     create_environment(StartAssignedEnvironmentRequest) -> EnvironmentResult,
@@ -1018,6 +2460,7 @@ service_impl!(pb::node_service_server::NodeService, {
     reload_environment(ReloadEnvironmentRequest) -> EnvironmentResult,
     create_snapshot(CreateSnapshotRequest) -> CreateSnapshotResponse,
     collect_snapshot(CollectSnapshotRequest) -> CollectSnapshotResponse,
+    collect_checkpoint_cleanup(CollectCheckpointCleanupRequest) -> CollectCheckpointCleanupResponse,
 ]);
 
 static TRACE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -1447,4 +2890,23 @@ async fn invalid_name_types_are_rejected_before_default_identity() {
             .unwrap(),
         fixture.service.prepare_create(input, &caller()).unwrap()
     );
+}
+
+#[tokio::test]
+async fn busy_template_delete_uses_e2b_bad_request_without_snapshot_fallback() {
+    let fixture = Fixture::new().await;
+    fixture
+        .state
+        .preparation_error
+        .store(tonic::Code::FailedPrecondition as usize, Ordering::SeqCst);
+    let response = http::request(
+        fixture.api.clone(),
+        "DELETE",
+        "/templates/family",
+        &[("X-API-Key", "k".repeat(32))],
+        "",
+    )
+    .await;
+    assert_eq!(response.status().as_u16(), 400);
+    assert_eq!(fixture.state.snapshot_calls.load(Ordering::SeqCst), 0);
 }

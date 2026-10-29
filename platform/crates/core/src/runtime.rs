@@ -1,6 +1,7 @@
 //! Shared Execd HTTP/stream control payloads; lifecycle decisions remain in Adxlet.
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeIdentity {
     pub environment_id: String,
@@ -99,6 +100,55 @@ pub struct RuntimeStatus {
     /// Changes on request/command entry and exit, including bursts between polls.
     #[serde(default)]
     pub activity_revision: u64,
+    /// Deployment-owned services required by the selected runtime profile.
+    /// An omitted map is the legacy/native profile and carries no extra
+    /// readiness requirements.
+    #[serde(default)]
+    pub required_services: BTreeMap<String, RequiredServiceStatus>,
+}
+
+impl RuntimeStatus {
+    /// Every reported mandatory service and every configured expectation must be ready.
+    /// A legacy runtime with no configured or reported services remains compatible.
+    pub fn validate_required_services<'a>(
+        &self,
+        expected: impl IntoIterator<Item = &'a str>,
+    ) -> Result<()> {
+        if self
+            .required_services
+            .values()
+            .any(|service| service.phase != RequiredServicePhase::Ready)
+            || expected
+                .into_iter()
+                .any(|name| !self.required_services.contains_key(name))
+        {
+            return Err(Error::Unavailable(
+                "required runtime service is not ready".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// State reported by a guest service which participates in runtime readiness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequiredServicePhase {
+    Disabled,
+    Starting,
+    Ready,
+    Failed,
+}
+
+/// Version and failure information for one deployment-owned guest service.
+/// The error text is diagnostic only and must never contain credentials.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequiredServiceStatus {
+    pub phase: RequiredServicePhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -161,4 +211,38 @@ pub struct FinishWorkloadCheckpoint {
     pub operation_id: String,
     /// A failure wakes the workload without asserting that a checkpoint exists.
     pub error: Option<String>,
+}
+
+#[cfg(test)]
+mod required_service_tests {
+    use super::*;
+
+    #[test]
+    fn validates_aggregate_status_and_configured_expectations() {
+        let mut status: RuntimeStatus = serde_json::from_value(serde_json::json!({
+            "identity": {"environment_id":"i", "runtime_id":"i-1", "ownership_generation":1},
+            "revision":1, "phase":"running", "checkpoint":null,
+            "active_requests":0, "active_commands":0,
+        }))
+        .unwrap();
+        assert!(status.validate_required_services([]).is_ok());
+        assert!(status.validate_required_services(["helper"]).is_err());
+        status.required_services.insert(
+            "helper".into(),
+            RequiredServiceStatus {
+                phase: RequiredServicePhase::Ready,
+                version: None,
+                error: None,
+            },
+        );
+        assert!(status.validate_required_services(["helper"]).is_ok());
+        for phase in [
+            RequiredServicePhase::Starting,
+            RequiredServicePhase::Failed,
+            RequiredServicePhase::Disabled,
+        ] {
+            status.required_services.get_mut("helper").unwrap().phase = phase;
+            assert!(status.validate_required_services([]).is_err());
+        }
+    }
 }

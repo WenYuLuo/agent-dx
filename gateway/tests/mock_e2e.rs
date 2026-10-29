@@ -45,6 +45,7 @@ async fn mock_full_data_plane_protocol_matrix() {
 
     let store = Arc::new(RouteStore::new());
     let route = RouteInfo {
+        private_service_ports: Vec::new(),
         instance_id: "instance-a".into(),
         environment_status: EnvironmentStatus {
             code: 3,
@@ -57,6 +58,7 @@ async fn mock_full_data_plane_protocol_matrix() {
         tunnel_security_mode: Default::default(),
         port_forward_security_mode: Default::default(),
         port_forward_routes: Vec::new(),
+        e2b: None,
     };
     node.activate_route(
         route.instance_id.clone(),
@@ -731,6 +733,7 @@ async fn assert_half_closed_route_cancel(websocket: bool) {
         node.activate_route(id.into(), id.into(), backend_address.ip())
             .await;
         store.put(RouteInfo {
+            private_service_ports: Vec::new(),
             instance_id: id.into(),
             environment_status: EnvironmentStatus {
                 code: 3,
@@ -743,6 +746,7 @@ async fn assert_half_closed_route_cancel(websocket: bool) {
             tunnel_security_mode: Default::default(),
             port_forward_security_mode: Default::default(),
             port_forward_routes: Vec::new(),
+            e2b: None,
         });
     }
     store.set_ready(true);

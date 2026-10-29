@@ -5,6 +5,10 @@ fn snapshot() -> Snapshot {
         "snapshot-1".into(),
         vec!["base".into()],
         EnvironmentSpec {
+            envd: None,
+            run_policy: None,
+            compatibility: None,
+
             runtime_profile: None,
             snapshot_id: None,
             id: "source".into(),
@@ -25,6 +29,8 @@ fn snapshot() -> Snapshot {
         "node1".into(),
         "source-1".into(),
         CheckpointArtifact {
+            scope: String::new(),
+
             storage: "shared".into(),
             location: "artifact-1".into(),
             size_bytes: 100,
@@ -101,12 +107,82 @@ fn snapshot_source_replay_accepts_omitted_uid_but_rejects_different_mount_identi
     reference.uid = None;
     assert!(saved.same_content(&request));
     assert!(saved.matches_template(&request.template));
+    assert!(request.template.matches_fixed_spec(&saved.template));
+    let unresolved = request.clone();
+    unresolved.validate().unwrap();
+    assert!(!unresolved.same_content(&unresolved));
+    assert!(!unresolved.matches_template(&unresolved.template));
+    assert!(!unresolved.template.matches_fixed_spec(&unresolved.template));
     let MountSource::Volume(reference) = &mut request.template.execution.mounts[0].source else {
         unreachable!()
     };
     reference.uid = Some("recreated-uid".into());
     assert!(!saved.same_content(&request));
+    assert!(!request.template.matches_fixed_spec(&saved.template));
     request.template.execution.mounts.clear();
     assert!(!saved.same_content(&request));
     assert!(!saved.matches_template(&request.template));
+}
+
+#[test]
+fn capture_identity_preserves_existing_algorithm_and_scopes_each_input() {
+    use adx_core::snapshots::snapshot_id;
+    let id = snapshot_id("tenant", "environment", "operation").unwrap();
+    assert_eq!(
+        id,
+        "snapshot-77ef1426cfeabb67ace325518d616e49ec845e50aa98938d6971b473f689c308"
+    );
+    assert_ne!(
+        id,
+        snapshot_id("other", "environment", "operation").unwrap()
+    );
+    assert_ne!(id, snapshot_id("tenant", "other", "operation").unwrap());
+    assert_ne!(id, snapshot_id("tenant", "environment", "other").unwrap());
+}
+
+#[test]
+fn snapshot_kind_and_capture_time_are_immutable_content() {
+    use adx_core::snapshots::SnapshotKind;
+    let saved = snapshot();
+    assert_eq!(saved.kind, SnapshotKind::Regular);
+    assert!(saved.created_at_unix_ms > 0);
+    let mut changed = saved.clone();
+    changed.kind = SnapshotKind::Golden;
+    assert!(!saved.same_content(&changed));
+    changed.kind = saved.kind;
+    changed.created_at_unix_ms += 1;
+    assert!(!saved.same_content(&changed));
+    let mut golden = saved.clone();
+    golden.kind = SnapshotKind::Golden;
+    let created_at = golden.created_at_unix_ms;
+    golden
+        .acquire(
+            "tenant",
+            Reference::Restore {
+                environment_id: "clone".into(),
+            },
+        )
+        .unwrap();
+    golden
+        .release(&Reference::Restore {
+            environment_id: "clone".into(),
+        })
+        .unwrap();
+    golden.delete("tenant").unwrap();
+    assert_eq!(golden.kind, SnapshotKind::Golden);
+    assert_eq!(golden.created_at_unix_ms, created_at);
+}
+
+#[test]
+fn legacy_snapshot_metadata_defaults_to_regular_with_unknown_capture_time() {
+    use adx_core::snapshots::SnapshotKind;
+    let mut raw = serde_json::to_value(snapshot()).unwrap();
+    raw.as_object_mut().unwrap().remove("kind");
+    raw.as_object_mut().unwrap().remove("created_at_unix_ms");
+    let legacy: Snapshot = serde_json::from_value(raw.clone()).unwrap();
+    assert_eq!(legacy.kind, SnapshotKind::Regular);
+    assert_eq!(legacy.created_at_unix_ms, 0);
+    legacy.validate().unwrap();
+    raw["kind"] = serde_json::json!("unknown");
+    assert!(serde_json::from_value::<Snapshot>(raw).is_err());
 }

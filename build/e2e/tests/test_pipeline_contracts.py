@@ -210,11 +210,15 @@ class PipelineContracts(unittest.TestCase):
             repo = Path(tmp)
             (repo / ".buildkite").mkdir()
             (repo / "build/e2e/tests").mkdir(parents=True)
+            (repo / "build/e2b").mkdir(parents=True)
             (repo / "build/release/tests").mkdir(parents=True)
             (repo / "build/e2e/tests/test_stub.py").write_text(
                 "import unittest\n\nclass Stub(unittest.TestCase):\n    def test_ok(self):\n        pass\n"
             )
             (repo / "build/release/tests/test_stub.py").write_text(
+                "import unittest\n\nclass Stub(unittest.TestCase):\n    def test_ok(self):\n        pass\n"
+            )
+            (repo / "build/e2b/test_stub.py").write_text(
                 "import unittest\n\nclass Stub(unittest.TestCase):\n    def test_ok(self):\n        pass\n"
             )
             (repo / ".gitignore").write_text("gate-ran\nout/\n__pycache__/\n")
@@ -226,12 +230,14 @@ class PipelineContracts(unittest.TestCase):
                 'echo "afs:$${ADX_WITH_AFS}:$${ADX_AFS_ALL_FEATURES}" >> gate-ran; fi\n'
             )
             _api_gate_stub(repo)
-            subprocess.run(["git", "init"], cwd=repo, capture_output=True, text=True, check=True)
-            subprocess.run(["git", "config", "user.email", "ci@example.invalid"], cwd=repo, check=True)
-            subprocess.run(["git", "config", "user.name", "CI"], cwd=repo, check=True)
-            subprocess.run(["git", "add", "."], cwd=repo, check=True)
-            subprocess.run(["git", "commit", "-m", "initial"], cwd=repo, capture_output=True, text=True, check=True)
-            commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+            git = _executable("git")
+            bash = _executable("bash")
+            subprocess.run([git, "init"], cwd=repo, capture_output=True, text=True, check=True)
+            subprocess.run([git, "config", "user.email", "ci@example.invalid"], cwd=repo, check=True)
+            subprocess.run([git, "config", "user.name", "CI"], cwd=repo, check=True)
+            subprocess.run([git, "add", "."], cwd=repo, check=True)
+            subprocess.run([git, "commit", "-m", "initial"], cwd=repo, capture_output=True, text=True, check=True)
+            commit = subprocess.check_output([git, "rev-parse", "HEAD"], cwd=repo, text=True).strip()
             base_env = dict(_without_afs_environment(), BUILDKITE_COMMIT=commit, PATH=os.environ["PATH"])
             for value, all_features, expected in [
                 (None, None, "rust"),
@@ -247,7 +253,7 @@ class PipelineContracts(unittest.TestCase):
                     if all_features is not None:
                         env["ADX_AFS_ALL_FEATURES"] = all_features
                     subprocess.run(
-                        ["bash", ".buildkite/source-gate.sh"],
+                        [bash, ".buildkite/source-gate.sh"],
                         cwd=repo,
                         env=env,
                         capture_output=True,
@@ -258,7 +264,7 @@ class PipelineContracts(unittest.TestCase):
                     self.assertEqual((repo / 'api-contract-ran').read_text().strip(), 'api')
             (repo / 'gate-ran').unlink()
             result = subprocess.run(
-                ['bash', '.buildkite/source-gate.sh'], cwd=repo,
+                [bash, '.buildkite/source-gate.sh'], cwd=repo,
                 env=dict(base_env, FAKE_API_CONTRACT_EXIT='7'), capture_output=True, text=True,
             )
             self.assertEqual(result.returncode, 7, result.stderr)
@@ -269,6 +275,7 @@ class PipelineContracts(unittest.TestCase):
             repo = Path(tmp)
             (repo / ".buildkite").mkdir()
             (repo / "build/e2e/tests").mkdir(parents=True)
+            (repo / "build/e2b").mkdir(parents=True)
             (repo / "build/release/tests").mkdir(parents=True)
             (repo / "build/e2e/tests/test_stub.py").write_text(
                 "import unittest\n\nclass Stub(unittest.TestCase):\n    def test_ok(self):\n        pass\n"
@@ -276,20 +283,25 @@ class PipelineContracts(unittest.TestCase):
             (repo / "build/release/tests/test_stub.py").write_text(
                 "import unittest\n\nclass Stub(unittest.TestCase):\n    def test_ok(self):\n        pass\n"
             )
+            (repo / "build/e2b/test_stub.py").write_text(
+                "import unittest\n\nclass Stub(unittest.TestCase):\n    def test_ok(self):\n        pass\n"
+            )
             (repo / ".gitignore").write_text("bootstrap-ran\nout/\n__pycache__/\n")
             (repo / ".buildkite/source-gate.sh").write_text((ROOT / ".buildkite/source-gate.sh").read_text())
             (repo / ".buildkite/bootstrap-build.sh").write_text("echo bootstrap-ran > bootstrap-ran\n")
             (repo / "Makefile").write_text("rust-check:\n\t@true\n")
-            subprocess.run(["git", "init"], cwd=repo, capture_output=True, text=True, check=True)
-            subprocess.run(["git", "config", "user.email", "ci@example.invalid"], cwd=repo, check=True)
-            subprocess.run(["git", "config", "user.name", "CI"], cwd=repo, check=True)
-            subprocess.run(["git", "add", "."], cwd=repo, check=True)
-            subprocess.run(["git", "commit", "-m", "initial"], cwd=repo, capture_output=True, text=True, check=True)
-            commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+            git = _executable("git")
+            bash = _executable("bash")
+            subprocess.run([git, "init"], cwd=repo, capture_output=True, text=True, check=True)
+            subprocess.run([git, "config", "user.email", "ci@example.invalid"], cwd=repo, check=True)
+            subprocess.run([git, "config", "user.name", "CI"], cwd=repo, check=True)
+            subprocess.run([git, "add", "."], cwd=repo, check=True)
+            subprocess.run([git, "commit", "-m", "initial"], cwd=repo, capture_output=True, text=True, check=True)
+            commit = subprocess.check_output([git, "rev-parse", "HEAD"], cwd=repo, text=True).strip()
             for key in ("ADX_WITH_AFS", "ADX_AFS_ALL_FEATURES"):
                 env = dict(_without_afs_environment(), BUILDKITE_COMMIT=commit, PATH=os.environ["PATH"], **{key: "bad"})
                 result = subprocess.run(
-                    ["bash", ".buildkite/source-gate.sh"], cwd=repo, env=env, capture_output=True, text=True
+                    [bash, ".buildkite/source-gate.sh"], cwd=repo, env=env, capture_output=True, text=True
                 )
                 self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertIn(f"{key} must be 0 or 1", result.stderr)
@@ -300,11 +312,15 @@ class PipelineContracts(unittest.TestCase):
             repo = Path(tmp)
             (repo / ".buildkite").mkdir()
             (repo / "build/e2e/tests").mkdir(parents=True)
+            (repo / "build/e2b").mkdir(parents=True)
             (repo / "build/release/tests").mkdir(parents=True)
             (repo / "build/e2e/tests/test_stub.py").write_text(
                 "import unittest\n\nclass Stub(unittest.TestCase):\n    def test_ok(self):\n        pass\n"
             )
             (repo / "build/release/tests/test_stub.py").write_text(
+                "import unittest\n\nclass Stub(unittest.TestCase):\n    def test_ok(self):\n        pass\n"
+            )
+            (repo / "build/e2b/test_stub.py").write_text(
                 "import unittest\n\nclass Stub(unittest.TestCase):\n    def test_ok(self):\n        pass\n"
             )
             (repo / ".gitignore").write_text("gate-ran\nout/\n__pycache__/\n")
@@ -314,15 +330,17 @@ class PipelineContracts(unittest.TestCase):
                 'rust-check:\n\t@echo rust >> gate-ran\n\t@if [ "$${ADX_WITH_AFS}" = "1" ]; then exit 7; fi\n'
             )
             _api_gate_stub(repo)
-            subprocess.run(["git", "init"], cwd=repo, capture_output=True, text=True, check=True)
-            subprocess.run(["git", "config", "user.email", "ci@example.invalid"], cwd=repo, check=True)
-            subprocess.run(["git", "config", "user.name", "CI"], cwd=repo, check=True)
-            subprocess.run(["git", "add", "."], cwd=repo, check=True)
-            subprocess.run(["git", "commit", "-m", "initial"], cwd=repo, capture_output=True, text=True, check=True)
-            commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+            git = _executable("git")
+            bash = _executable("bash")
+            subprocess.run([git, "init"], cwd=repo, capture_output=True, text=True, check=True)
+            subprocess.run([git, "config", "user.email", "ci@example.invalid"], cwd=repo, check=True)
+            subprocess.run([git, "config", "user.name", "CI"], cwd=repo, check=True)
+            subprocess.run([git, "add", "."], cwd=repo, check=True)
+            subprocess.run([git, "commit", "-m", "initial"], cwd=repo, capture_output=True, text=True, check=True)
+            commit = subprocess.check_output([git, "rev-parse", "HEAD"], cwd=repo, text=True).strip()
             env = dict(_without_afs_environment(), BUILDKITE_COMMIT=commit, ADX_WITH_AFS="1", PATH=os.environ["PATH"])
             result = subprocess.run(
-                ["bash", ".buildkite/source-gate.sh"],
+                [bash, ".buildkite/source-gate.sh"],
                 cwd=repo,
                 env=env,
                 capture_output=True,
@@ -345,11 +363,20 @@ class PipelineContracts(unittest.TestCase):
             for script in scripts:
                 with self.subTest(legacy=legacy, entry=script):
                     result = subprocess.run(
-                        ["bash", str(ROOT / script)], env=environment, capture_output=True, text=True
+                        [_executable("bash", environment=environment), str(ROOT / script)],
+                        env=environment,
+                        capture_output=True,
+                        text=True,
                     )
                     self.assertEqual(result.returncode, 2, result.stderr)
                     self.assertIn(legacy + " was replaced by", result.stderr)
-            result = subprocess.run(["make", "help"], cwd=ROOT, env=environment, capture_output=True, text=True)
+            result = subprocess.run(
+                [_executable("make", environment=environment), "help"],
+                cwd=ROOT,
+                env=environment,
+                capture_output=True,
+                text=True,
+            )
             self.assertNotEqual(result.returncode, 0)
             self.assertIn(legacy + " was replaced by", result.stderr)
 

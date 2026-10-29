@@ -44,6 +44,7 @@ fn inherit_template(
     snapshot.origin()?;
     let template = &snapshot.template;
     request.runtime_profile = template.runtime_profile.clone().map(Into::into);
+    inherit_service_protection(&mut request, template)?;
     if request.image.is_empty() {
         request.image = template.image.clone();
     }
@@ -120,6 +121,52 @@ fn inherit_template(
     request.try_into()
 }
 
+fn inherit_service_protection(
+    request: &mut pb::EnvironmentSpec,
+    template: &EnvironmentSpec,
+) -> Result<()> {
+    let envd = template.envd.clone().map(Into::into);
+    if request
+        .envd
+        .as_ref()
+        .is_some_and(|requested| Some(requested) != envd.as_ref())
+    {
+        return Err(Error::Invalid(
+            "snapshot envd service configuration must match its source".into(),
+        ));
+    }
+    request.envd = envd;
+    let execution = request.execution.get_or_insert_with(Default::default);
+    let protected: Vec<_> = template
+        .execution
+        .protected_ingress
+        .iter()
+        .cloned()
+        .map(Into::into)
+        .collect();
+    let private: Vec<_> = template
+        .execution
+        .private_service_ports
+        .iter()
+        .copied()
+        .map(u32::from)
+        .collect();
+    if (!execution.protected_ingress.is_empty() && execution.protected_ingress != protected)
+        || (!execution.private_service_ports.is_empty()
+            && execution.private_service_ports != private)
+    {
+        return Err(Error::Invalid(
+            "snapshot service protection must match its source".into(),
+        ));
+    }
+    execution.protected_ingress = protected;
+    execution.private_service_ports = private;
+    if !execution.protected_ingress.is_empty() && execution.network.is_none() {
+        execution.network = template.execution.network.clone().map(Into::into);
+    }
+    Ok(())
+}
+
 fn has_placement(policy: &pb::SchedulingPolicy, shared_pause: bool) -> bool {
     // The API adds Exists + NotIn(local) for shared pause storage. Retain those
     // guards, but do not mistake them for an explicit node-placement choice.
@@ -180,6 +227,7 @@ mod tests {
             "source-1".into(),
             adx_core::CheckpointArtifact {
                 storage: storage.into(),
+                scope: String::new(),
                 location: "artifact".into(),
                 size_bytes: 100,
             },
@@ -194,6 +242,72 @@ mod tests {
             snapshot_id: Some(snapshot.id.clone()),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn native_clone_inherits_common_service_protection_and_rejects_overrides() {
+        use adx_core::execution::{
+            NetworkAction, NetworkDirection, NetworkPeer, NetworkPolicy, NetworkProtocol,
+            NetworkRule, TrafficMode, TrafficPolicy,
+        };
+        let mut snapshot = source("s3");
+        snapshot.template.envd = Some(adx_core::envd::EnvdServiceConfig {
+            version: "0.9.0".into(),
+            gateway_auth: false,
+            access_token: Some("a".repeat(32)),
+            ingress_sources: Vec::new(),
+        });
+        let rules = vec![NetworkRule {
+            action: NetworkAction::Deny,
+            direction: NetworkDirection::Ingress,
+            protocol: NetworkProtocol::Tcp,
+            peer: NetworkPeer::default(),
+            environment_port: 8081,
+            environment_port_range: None,
+            priority: 10,
+        }];
+        snapshot.template.execution.protected_ingress = rules.clone();
+        snapshot.template.execution.private_service_ports = vec![49_983];
+        snapshot.template.execution.network = Some(NetworkPolicy {
+            traffic: Some(TrafficPolicy {
+                ingress_default_action: NetworkAction::Allow,
+                egress_default_action: NetworkAction::Allow,
+                rules,
+                mode: TrafficMode::Stateful,
+            }),
+            dns: None,
+        });
+        let normalized = inherit_template(clone_request(&snapshot), &snapshot, None).unwrap();
+        assert!(normalized.compatibility.is_none());
+        assert_eq!(normalized.envd, snapshot.template.envd);
+        assert_eq!(
+            normalized.execution.protected_ingress,
+            snapshot.template.execution.protected_ingress
+        );
+        assert_eq!(normalized.execution.private_service_ports, vec![49_983]);
+        let mut request = clone_request(&snapshot);
+        request.execution = Some(pb::ExecutionOptions {
+            private_service_ports: vec![8080],
+            ..Default::default()
+        });
+        assert!(inherit_template(request, &snapshot, None).is_err());
+        let mut request: pb::EnvironmentSpec = normalized.clone().into();
+        request.envd.as_mut().unwrap().access_token = Some("b".repeat(32));
+        assert!(inherit_template(request, &snapshot, None).is_err());
+        let mut request: pb::EnvironmentSpec = normalized.into();
+        request
+            .execution
+            .as_mut()
+            .unwrap()
+            .network
+            .as_mut()
+            .unwrap()
+            .traffic
+            .as_mut()
+            .unwrap()
+            .rules
+            .clear();
+        assert!(inherit_template(request, &snapshot, None).is_err());
     }
 
     #[test]

@@ -5,7 +5,8 @@ use tokio::time::Instant;
 
 impl Controller {
     pub(super) async fn tick(&mut self) -> Result<Option<crate::OperationResult>> {
-        self.tick_inner().await?;
+        // Keep lifecycle-sized state out of the caller's dispatch future.
+        Box::pin(self.tick_inner()).await?;
         Ok(self.published_delete())
     }
 
@@ -57,8 +58,12 @@ impl Controller {
             if self.workload_checkpoint().await? {
                 return Ok(());
             }
+            // Explicit mandatory services remain health dependencies even when
+            // optional idle and periodic health policies are disabled.
+            let services_require_health = self.record.spec.required_services().next().is_some();
             let runtime_activity = if self.record.spec.lifecycle.idle_timeout_seconds > 0
                 || self.services.health_failure_threshold.is_some()
+                || services_require_health
             {
                 tokio::time::timeout(
                     self.services.operation_timeout,
@@ -69,6 +74,9 @@ impl Controller {
             } else {
                 Ok((0, 0))
             };
+            if services_require_health && runtime_activity.is_err() {
+                return self.unexpected_exit().await;
+            }
             if let Some(threshold) = self.services.health_failure_threshold {
                 if runtime_activity.is_ok() {
                     self.health_failures = 0;
@@ -232,7 +240,9 @@ impl Controller {
         self.mark_interruption(source)?;
         let trace = adx_observability::trace::Trace::child("environment.unexpected_exit");
         trace.attribute("environment.id", self.record.spec.id.clone());
-        trace.run_result(self.unexpected_exit_inner()).await
+        trace
+            .run_result(Box::pin(self.unexpected_exit_inner()))
+            .await
     }
 
     async fn unexpected_exit_inner(&mut self) -> Result<()> {

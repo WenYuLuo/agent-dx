@@ -84,6 +84,9 @@ fn record() -> EnvironmentRecord {
         snapshot_source: None,
         failure: None,
         spec: EnvironmentSpec {
+            envd: None,
+            run_policy: None,
+            compatibility: None,
             id: "i".into(),
             tenant_id: "t".into(),
             runtime_profile: None,

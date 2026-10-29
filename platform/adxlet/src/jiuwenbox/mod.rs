@@ -474,6 +474,11 @@ impl Jiuwenbox {
         devices: &[DeviceAllocation],
         root: &Path,
     ) -> Result<(Value, Value)> {
+        if !spec.execution.protected_ingress.is_empty() {
+            return Err(Error::Invalid(
+                "protected ingress requires an ACL-capable runtime".into(),
+            ));
+        }
         adx_core::execution::validate_process_identity(
             spec.execution.user.as_deref(),
             spec.execution.group.as_deref(),

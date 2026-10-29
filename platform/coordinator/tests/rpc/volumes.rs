@@ -99,6 +99,7 @@ async fn volume_rpc_uses_tenant_auth_and_reuses_existing_definitions() {
                 "node".into(),
                 "source-1".into(),
                 adx_core::CheckpointArtifact {
+                    scope: Default::default(),
                     storage: "shared".into(),
                     location: "artifact".into(),
                     size_bytes: 1,
@@ -188,6 +189,7 @@ async fn inspection_reports_latest_authorized_volume_execution() {
         .await
         .unwrap();
     let report = pb::RegisterNodeRequest {
+        checkpoint_scopes: Default::default(),
         storage_mounts: Default::default(),
         node_id: "node".into(),
         node_address: "127.0.0.1:9000".into(),

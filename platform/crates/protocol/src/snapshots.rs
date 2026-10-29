@@ -1,8 +1,24 @@
 use crate::control as pb;
 use adx_core::{
-    snapshots::{Reference, Snapshot, SnapshotState},
+    snapshots::{Reference, Snapshot, SnapshotKind, SnapshotState},
     CheckpointArtifact, Error, Result,
 };
+impl From<SnapshotKind> for pb::SnapshotKind {
+    fn from(kind: SnapshotKind) -> Self {
+        match kind {
+            SnapshotKind::Regular => Self::Regular,
+            SnapshotKind::Golden => Self::Golden,
+        }
+    }
+}
+impl From<pb::SnapshotKind> for SnapshotKind {
+    fn from(kind: pb::SnapshotKind) -> Self {
+        match kind {
+            pb::SnapshotKind::Regular => Self::Regular,
+            pb::SnapshotKind::Golden => Self::Golden,
+        }
+    }
+}
 impl TryFrom<Snapshot> for pb::ReusableSnapshot {
     type Error = Error;
     fn try_from(s: Snapshot) -> Result<Self> {
@@ -10,11 +26,14 @@ impl TryFrom<Snapshot> for pb::ReusableSnapshot {
         Ok(Self {
             id: s.id,
             names: s.names,
+            kind: pb::SnapshotKind::from(s.kind) as i32,
+            created_at_unix_ms: s.created_at_unix_ms,
             template: Some(s.template.into()),
             source_node_id: s.source_node_id,
             source_runtime_id: s.source_runtime_id,
             artifact: Some(pb::CheckpointArtifact {
                 storage: s.artifact.storage,
+                scope: s.artifact.scope,
                 location: s.artifact.location,
                 size_bytes: s.artifact.size_bytes,
             }),
@@ -73,9 +92,13 @@ impl TryFrom<pb::ReusableSnapshot> for Snapshot {
                 return Err(Error::Invalid("duplicate snapshot reference".into()));
             }
         }
+        let kind = pb::SnapshotKind::try_from(s.kind)
+            .map_err(|_| Error::Invalid("invalid snapshot kind".into()))?;
         let result = Snapshot {
             id: s.id,
             names: s.names,
+            kind: kind.into(),
+            created_at_unix_ms: s.created_at_unix_ms,
             template: s
                 .template
                 .ok_or_else(|| Error::Invalid("snapshot template required".into()))?
@@ -84,6 +107,7 @@ impl TryFrom<pb::ReusableSnapshot> for Snapshot {
             source_runtime_id: s.source_runtime_id,
             artifact: CheckpointArtifact {
                 storage: artifact.storage,
+                scope: artifact.scope,
                 location: artifact.location,
                 size_bytes: artifact.size_bytes,
             },

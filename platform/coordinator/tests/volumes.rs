@@ -38,6 +38,9 @@ fn volume(id: &str, path: &str) -> VolumeSpec {
 
 fn environment(id: &str, reference: &str) -> EnvironmentSpec {
     EnvironmentSpec {
+        envd: None,
+        compatibility: None,
+        run_policy: None,
         runtime_profile: None,
         snapshot_id: None,
         lifecycle: Default::default(),
@@ -668,6 +671,7 @@ async fn node_loss_releases_reserved_and_current_authorized_volumes_with_the_fai
         expires_at_unix_seconds: None,
         source_runtime_id: first.runtime.id.clone(),
         artifact: adx_core::CheckpointArtifact {
+            scope: Default::default(),
             storage: "shared".into(),
             location: "artifact".into(),
             size_bytes: 8,
@@ -888,6 +892,7 @@ fn reusable_snapshot(id: &str, spec: EnvironmentSpec) -> adx_core::snapshots::Sn
         "node-a".into(),
         format!("{}-1", spec.id),
         adx_core::CheckpointArtifact {
+            scope: Default::default(),
             storage: "shared".into(),
             location: format!("artifact-{id}"),
             size_bytes: 1,
@@ -1705,8 +1710,25 @@ async fn volume_claim_batch_and_delete_preserve_request_identity_and_creation_su
         assert_eq!(stored.creation.unwrap().result, CreationResult::Success);
         if index == 0 {
             assert!(stored.volume_execution.is_some());
+            // One Delete must release the confirmed runtime's Volume and retain
+            // durable checkpoint cleanup authority in the same transaction.
+            record.checkpoint = Some(adx_core::RestorePoint {
+                id: "volume-cleanup".into(),
+                origin: None,
+                expires_at_unix_seconds: None,
+                source_runtime_id: runtime_id.clone(),
+                artifact: adx_core::CheckpointArtifact {
+                    storage: "local".into(),
+                    scope: String::new(),
+                    location: "volume-checkpoint".into(),
+                    size_bytes: 8,
+                },
+            });
+            record.revision += 1;
+            session.commit(record.clone()).await.unwrap();
         }
         record.runtime.ip = None;
+        record.checkpoint = None;
         record.state = EnvironmentState::Deleted;
         record.resources_held = false;
         record.revision += 1;
@@ -1718,6 +1740,9 @@ async fn volume_claim_batch_and_delete_preserve_request_identity_and_creation_su
         assert_eq!(replay.result, record);
         assert!(replay.stored.is_none());
     }
+    let cleanup = session.checkpoint_cleanups().await.unwrap();
+    assert_eq!(cleanup.len(), 1);
+    assert_eq!(cleanup[0].artifacts[0].location, "volume-checkpoint");
     let bindings: Vec<String> = redis::cmd("KEYS")
         .arg("adx:{test}:control:v1:create-receipt:*")
         .query_async(&mut redis)

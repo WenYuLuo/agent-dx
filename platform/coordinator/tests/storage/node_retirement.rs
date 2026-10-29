@@ -263,3 +263,75 @@ async fn node_retirement_new_boot_readiness_closes_the_previous_departure_durabl
         1
     );
 }
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn retired_node_rejoins_with_current_checkpoint_scopes_and_reconciliation_fence() {
+    use std::collections::BTreeSet;
+
+    for initially_routable in [false, true] {
+        let rig = common::Redis::new().await;
+        let store = rig.store().await;
+        let session = store.begin(1).await.unwrap();
+        session
+            .register_session_with_scopes(
+                node("old"),
+                "127.0.0.1:9000".into(),
+                "127.0.0.1:9001".into(),
+                Some(NodeSession {
+                    id: "boot-one".into(),
+                    sequence: 7,
+                    routable: true,
+                }),
+                BTreeSet::from(["old-storage".into()]),
+            )
+            .await
+            .unwrap();
+        let invalidated = session.invalidate_node("old", "boot-one").await.unwrap();
+        assert!(invalidated.nodes["old"].checkpoint_gc_fenced);
+        assert!(session
+            .retire_expired_node("old", "boot-one", u64::MAX, 1800)
+            .await
+            .unwrap());
+
+        let active = store.begin(1).await.unwrap();
+        let advertised = BTreeSet::from(["current-storage".into(), "second-storage".into()]);
+        let restored = active
+            .register_session_with_scopes(
+                node("old"),
+                "127.0.0.1:9000".into(),
+                "127.0.0.1:9001".into(),
+                Some(NodeSession {
+                    id: "boot-two".into(),
+                    sequence: 1,
+                    routable: initially_routable,
+                }),
+                advertised.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(restored.checkpoint_scopes, advertised);
+        assert_eq!(restored.checkpoint_gc_fenced, !initially_routable);
+        let persisted = store.begin(1).await.unwrap();
+        let saved = persisted.snapshot().await.unwrap();
+        assert_eq!(saved.nodes["old"].checkpoint_scopes, advertised);
+        assert_eq!(saved.nodes["old"].checkpoint_gc_fenced, !initially_routable);
+
+        let ready = persisted
+            .register_session_with_scopes(
+                node("old"),
+                "127.0.0.1:9000".into(),
+                "127.0.0.1:9001".into(),
+                Some(NodeSession {
+                    id: "boot-two".into(),
+                    sequence: 2,
+                    routable: true,
+                }),
+                advertised.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ready.checkpoint_scopes, advertised);
+        assert!(!ready.checkpoint_gc_fenced);
+    }
+}

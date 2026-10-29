@@ -11,6 +11,11 @@ service SnapshotService {
   rpc DeleteSnapshot(DeleteSnapshotRequest) returns (ReusableSnapshot);
 }
 
+enum SnapshotKind {
+  SNAPSHOT_KIND_REGULAR = 0;
+  SNAPSHOT_KIND_GOLDEN = 1;
+}
+
 enum SnapshotState {
   SNAPSHOT_STATE_UNSPECIFIED = 0;
   SNAPSHOT_STATE_READY = 1;
@@ -35,25 +40,29 @@ message ReusableSnapshot {
   uint64 revision = 7;
   SnapshotState state = 8;
   repeated SnapshotReference references = 9;
+  SnapshotKind kind = 10;
+  uint64 created_at_unix_ms = 11;
 }
 
 message PublishSnapshotRequest { ReusableSnapshot snapshot = 1; string node_session_id = 2; }
 
 message GetSnapshotRequest { string id = 1; CallerContext caller = 2; string node_session_id = 3; }
 
-message ListSnapshotsRequest { CallerContext caller = 1; string name = 2; string page_token = 3; uint32 page_size = 4; }
+message ListSnapshotsRequest { CallerContext caller = 1; string name = 2; string page_token = 3; uint32 page_size = 4; optional SnapshotKind kind = 5; }
 
 message ListSnapshotsResponse { repeated ReusableSnapshot snapshots = 1; string next_page_token = 2; }
 
 message DeleteSnapshotRequest { string id = 1; CallerContext caller = 2; }
 
-message CollectSnapshotRequest { ReusableSnapshot snapshot = 1; string node_session_id = 2; }
+message CollectSnapshotRequest { ReusableSnapshot snapshot = 1; string node_session_id = 2; bool delegated = 3; }
 
 message CollectSnapshotResponse { string snapshot_id = 1; uint64 revision = 2; }
 
 message CreateSnapshotRequest {
   Assignment assignment = 1; CallerContext caller = 2; string operation_id = 3;
-  uint64 expected_revision = 4; repeated string names = 5; uint64 timeout_seconds = 6;
+  uint64 expected_revision = 4; repeated string names = 5; uint64 timeout_seconds = 6; SnapshotKind kind = 7;
+  // Required for Coordinator-originated capture; binds the owner process session.
+  string node_session_id = 8;
 }
 
 message CreateSnapshotResponse { ReusableSnapshot snapshot = 1; EnvironmentResult environment = 2; }

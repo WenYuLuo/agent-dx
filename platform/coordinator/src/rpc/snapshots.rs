@@ -49,6 +49,9 @@ impl CoordinatorRpc {
                 // snapshot or Environment recovery point's bytes.
                 let same = |a: &adx_core::CheckpointArtifact| {
                     a.storage == snapshot.artifact.storage
+                        && (a.scope.is_empty()
+                            || snapshot.artifact.scope.is_empty()
+                            || a.scope == snapshot.artifact.scope)
                         && a.location == snapshot.artifact.location
                 };
                 if snapshots
@@ -68,28 +71,40 @@ impl CoordinatorRpc {
                     continue;
                 }
                 if snapshot.artifact.storage != "local" {
-                    candidates.push((snapshot.clone(), String::new(), String::new()));
+                    candidates.push((snapshot.clone(), String::new(), String::new(), false));
                     continue;
                 }
-                let Some(live) = state.live.get(&snapshot.source_node_id) else {
-                    continue;
-                };
-                if !live.inspected
-                    || live.report.reconciling
-                    || live.last_seen.elapsed() >= self.0.heartbeat_timeout
-                {
+                let source = state.nodes.get(&snapshot.source_node_id);
+                let source_live = state.live.get(&snapshot.source_node_id);
+                let source_ready = source.zip(source_live).is_some_and(|(node, live)| {
+                    node.session
+                        .as_ref()
+                        .is_some_and(|session| session.routable && session.id == live.session)
+                        && live.inspected
+                        && !live.report.reconciling
+                        && live.last_seen.elapsed() < self.0.heartbeat_timeout
+                });
+                if source_ready {
+                    let node = source.ok_or(Error::Conflict)?;
+                    let live = source_live.ok_or(Error::Conflict)?;
+                    candidates.push((
+                        snapshot.clone(),
+                        node.address.clone(),
+                        live.session.clone(),
+                        false,
+                    ));
                     continue;
                 }
-                let Some(node) = state.nodes.get(&snapshot.source_node_id) else {
-                    continue;
-                };
-                candidates.push((snapshot.clone(), node.address.clone(), live.session.clone()));
+                // Local artifacts are owned by their source node.  A shared
+                // backend is reclaimed directly above; never reinterpret a
+                // node cache release as physical deletion by delegating it to
+                // another node after the source has stopped.
             }
             (state.session.clone(), candidates)
         };
         let mut completed = 0;
         let mut error = None;
-        for (snapshot, address, node_session_id) in candidates {
+        for (snapshot, address, node_session_id, delegated) in candidates {
             let result = async {
                 // Recheck persistent authority before issuing each destructive RPC.
                 if session.get_snapshot(&snapshot.id).await? != snapshot {
@@ -129,6 +144,7 @@ impl CoordinatorRpc {
                         .collect_snapshot(pb::CollectSnapshotRequest {
                             snapshot: Some(snapshot.clone().try_into()?),
                             node_session_id,
+                            delegated,
                         })
                         .await
                         .map_err(|_| {
@@ -246,7 +262,7 @@ impl pb::snapshot_service_server::SnapshotService for CoordinatorRpc {
                 }
                 let saved = state
                     .session
-                    .publish_snapshot(snapshot)
+                    .publish_snapshot_from_source(snapshot, &source.assignment)
                     .await
                     .map_err(status)?;
                 Ok(Response::new(saved.try_into().map_err(status)?))
@@ -333,6 +349,12 @@ impl pb::snapshot_service_server::SnapshotService for CoordinatorRpc {
                 {
                     return Err(Status::invalid_argument("invalid snapshot page"));
                 }
+                let kind: Option<adx_core::snapshots::SnapshotKind> = r
+                    .kind
+                    .map(pb::SnapshotKind::try_from)
+                    .transpose()
+                    .map_err(|_| Status::invalid_argument("invalid snapshot kind"))?
+                    .map(Into::into);
                 let size = if r.page_size == 0 { 100 } else { r.page_size } as usize;
                 let state = self.0.state.lock().await;
                 state.healthy().map_err(status)?;
@@ -344,7 +366,9 @@ impl pb::snapshot_service_server::SnapshotService for CoordinatorRpc {
                 let mut page: Vec<_> = snapshots
                     .into_iter()
                     .filter(|s| {
-                        s.id > r.page_token && (r.name.is_empty() || s.names.contains(&r.name))
+                        kind.is_none_or(|kind| s.kind == kind)
+                            && s.id > r.page_token
+                            && (r.name.is_empty() || s.names.contains(&r.name))
                     })
                     .take(size + 1)
                     .collect();

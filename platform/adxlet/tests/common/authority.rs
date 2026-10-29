@@ -138,6 +138,24 @@ impl pb::coordinator_service_server::CoordinatorService for Authority {
     ) -> Result<Response<pb::GetEnvironmentResponse>, Status> {
         Err(Status::unimplemented("unused test RPC"))
     }
+    async fn get_environment_control(
+        &self,
+        _: Request<pb::GetEnvironmentControlRequest>,
+    ) -> Result<Response<pb::EnvironmentControlRecord>, Status> {
+        Err(Status::unimplemented("unused test RPC"))
+    }
+    async fn batch_get_environment_control(
+        &self,
+        _: Request<pb::BatchGetEnvironmentControlRequest>,
+    ) -> Result<Response<pb::BatchGetEnvironmentControlResponse>, Status> {
+        Err(Status::unimplemented("unused test RPC"))
+    }
+    async fn update_environment_control(
+        &self,
+        _: Request<pb::UpdateEnvironmentControlRequest>,
+    ) -> Result<Response<pb::EnvironmentControlRecord>, Status> {
+        Err(Status::unimplemented("unused test RPC"))
+    }
     async fn ensure_running(
         &self,
         _: Request<pb::EnsureRunningRequest>,

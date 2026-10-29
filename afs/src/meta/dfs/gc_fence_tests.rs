@@ -589,12 +589,7 @@ async fn late_admission_replay_after_tombstone_collection_is_rejected() {
         .await
         .unwrap();
     f.service
-        .collect_garbage(
-            "writer".into(),
-            "writer-session".into(),
-            0,
-            vec![],
-        )
+        .collect_garbage("writer".into(), "writer-session".into(), 0, vec![])
         .await
         .unwrap();
     assert!(

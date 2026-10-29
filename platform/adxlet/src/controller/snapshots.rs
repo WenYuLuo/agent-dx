@@ -1,23 +1,18 @@
 use super::*;
 use crate::checkpoint::{SnapshotRequest, SnapshotResult};
 use adx_core::{
-    snapshots::{Snapshot, SnapshotState},
+    snapshots::{snapshot_id, Snapshot, SnapshotState},
     LifecycleKind,
 };
-use sha2::{Digest, Sha256};
 use std::time::Duration;
 
 impl Controller {
     pub(super) async fn snapshot(&mut self, request: SnapshotRequest) -> Result<SnapshotResult> {
-        // The operation ID is scoped to tenant and Environment. Names are deliberately
-        // excluded so retries with changed arguments conflict instead of creating twice.
-        let key = serde_json::to_vec(&(
+        let id = snapshot_id(
             &self.record.spec.tenant_id,
             &self.record.spec.id,
             &request.operation_id,
-        ))
-        .map_err(|e| Error::Invalid(e.to_string()))?;
-        let id = format!("snapshot-{:x}", Sha256::digest(key));
+        )?;
         if self.record.state != EnvironmentState::Running
             || request.timeout_seconds == 0
             || request.timeout_seconds > 3600
@@ -37,7 +32,8 @@ impl Controller {
         // Probe before stopping the source; creating a cluster snapshot needs Coordinator.
         match catalog.get(&id).await {
             Ok(snapshot) => {
-                if snapshot.names != request.names
+                if snapshot.kind != request.kind
+                    || snapshot.names != request.names
                     || !snapshot.matches_template(&self.record.spec)
                     || snapshot.state != SnapshotState::Ready
                     || snapshot.source_node_id != self.record.assignment.node_id
@@ -65,7 +61,8 @@ impl Controller {
         )?;
 
         // Validate names before any lifecycle mutation.
-        let mut snapshot = Snapshot::new(
+        let mut snapshot = Snapshot::new_with_kind(
+            request.kind,
             id.clone(),
             request.names,
             self.record.spec.clone(),
@@ -73,6 +70,7 @@ impl Controller {
             self.record.runtime.id.clone(),
             adx_core::CheckpointArtifact {
                 storage: "pending".into(),
+                scope: String::new(),
                 location: "pending".into(),
                 size_bytes: 1,
             },

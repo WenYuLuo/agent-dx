@@ -113,6 +113,17 @@ class PackageTests(unittest.TestCase):
             self.assertEqual({p.name for p in (output / "bin").iterdir()}, shipped | {"redis-server", "redis-cli"})
             self.assertNotIn("bin/adx-data-plane-forward", manifest["files"])
             self.assertNotIn("bin/afs-meta", manifest["files"])
+            # The deployed worker consumes this packaged file, not a separate
+            # copy. Keep only the permissions required by the E2B guest.
+            oci_path = "etc/examples/e2b-runc-oci-spec.json"
+            self.assertIn(oci_path, manifest["files"])
+            oci_spec = json.loads((output / oci_path).read_text())
+            expected_capabilities = {
+                "CAP_AUDIT_WRITE", "CAP_KILL", "CAP_NET_BIND_SERVICE",
+                "CAP_SETUID", "CAP_SETGID", "CAP_CHOWN", "CAP_DAC_OVERRIDE", "CAP_FOWNER",
+            }
+            for group in ("bounding", "effective", "inheritable", "permitted"):
+                self.assertEqual(set(oci_spec["process"]["capabilities"][group]), expected_capabilities)
             pkg.verify(output)
 
     def test_afs_artifacts_are_only_shipped_when_enabled(self):
@@ -248,6 +259,47 @@ class PackageTests(unittest.TestCase):
                     "debug",
                     True,
                 )
+
+    def test_package_ships_complete_optional_envd_provenance(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            binaries = root / "bin"
+            binaries.mkdir()
+            for name in pkg.BINARIES + ("adx-execd",):
+                (binaries / name).write_bytes(b"fixture")
+            redis = root / "redis"
+            redis.write_text("#!/bin/sh\necho 'Redis server v=7.2.5 sha=fixture'\n")
+            redis.chmod(0o700)
+            redis_cli = root / "redis-cli"
+            redis_cli.write_text("#!/bin/sh\necho 'redis-cli 7.2.5'\n")
+            redis_cli.chmod(0o700)
+            wheel = root / "adx_environment-1-py3-none-any.whl"
+            wheel.write_bytes(b"fixture wheel")
+            envd = binaries / "envd"
+            envd.mkdir()
+            (envd / "LICENSE").write_text("Apache-2.0\n")
+            (envd / "manifest.json").write_text('{"sha256": "' + "a" * 64 + '"}')
+            output = root / "package"
+            manifest = pkg.assemble(
+                binaries, redis, redis_cli, wheel, output, "a" * 40, False, "fixture", "debug"
+            )
+            self.assertIn("runtime/envd/manifest.json", manifest["files"])
+            self.assertIn("runtime/envd/LICENSE", manifest["files"])
+            pkg.verify(output)
+            (output / "runtime/envd/manifest.json").write_text("tampered")
+            with self.assertRaises(ValueError):
+                pkg.verify(output)
+
+    def test_package_rejects_incomplete_envd_provenance(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            package = root / "package"
+            package.mkdir()
+            (package / "manifest.json").write_text(
+                json.dumps({"schema_version": 1, "files": {"runtime/envd/LICENSE": "a" * 64}})
+            )
+            with self.assertRaisesRegex(ValueError, "incomplete envd provenance"):
+                pkg.verify(package)
 
     def test_missing_artifact_never_creates_package(self):
         with tempfile.TemporaryDirectory() as t:

@@ -7,6 +7,7 @@ use crate::common::route::{
     DataPlaneAuthMode, DataPlaneSecurityMode, EnvironmentStatus, PortForwardRoute, RouteCache,
     RouteInfo,
 };
+use crate::ingress::e2b_route::E2bRouteConfig;
 use adx_discovery::RedisDiscovery;
 use adx_protocol::control as pb;
 use adx_transport::rpc::{RpcChannel, RpcClient};
@@ -63,14 +64,26 @@ impl RouteConsumer {
             {
                 return Err("invalid published route".into());
             }
-            if let Some(old) = self.routes.get(&r.environment_id) {
-                if (r.generation, r.environment_revision)
-                    < (old.generation, old.environment_revision)
+            if let Some(compatibility) = &r.compatibility {
+                if !valid_sha256(&compatibility.envd_token_sha256)
+                    || !valid_sha256(&compatibility.traffic_token_sha256)
                 {
+                    return Err("invalid E2B route compatibility policy".into());
+                }
+            }
+            if let Some(old) = self.routes.get(&r.environment_id) {
+                if route_version(&r) < route_version(old) {
                     return Err("route execution version regressed".into());
                 }
             }
             let route = route_info(&r)?;
+            if route
+                .e2b
+                .as_ref()
+                .is_some_and(|policy| !policy.valid_signing_material())
+            {
+                return Err("invalid E2B signing credentials".into());
+            }
             upserts.push((r, route));
         }
         let deleted = f.deleted;
@@ -112,6 +125,10 @@ impl RouteConsumer {
     }
 }
 
+fn route_version(route: &pb::PublishedRoute) -> (u64, u64) {
+    (route.generation, route.environment_revision)
+}
+
 fn route_info(r: &pb::PublishedRoute) -> Result<RouteInfo, String> {
     let tunnel_security_mode = security_mode(r.tunnel_security_mode)?;
     let port_forward_security_mode = security_mode(r.port_forward_security_mode)?;
@@ -131,6 +148,16 @@ fn route_info(r: &pb::PublishedRoute) -> Result<RouteInfo, String> {
         },
         tunnel_security_mode,
         port_forward_security_mode,
+        private_service_ports: r
+            .private_service_ports
+            .iter()
+            .map(|port| {
+                u16::try_from(*port)
+                    .ok()
+                    .filter(|port| *port > 0)
+                    .ok_or("invalid private service port")
+            })
+            .collect::<Result<_, _>>()?,
         port_forward_routes: r
             .forwarded_ports
             .iter()
@@ -144,7 +171,49 @@ fn route_info(r: &pb::PublishedRoute) -> Result<RouteInfo, String> {
                 })
             })
             .collect::<Result<_, &str>>()?,
+        e2b: r
+            .compatibility
+            .as_ref()
+            .map(|compatibility| E2bRouteConfig {
+                envd_token_sha256: compatibility.envd_token_sha256.clone(),
+                traffic_token_sha256: compatibility.traffic_token_sha256.clone(),
+                allow_public_traffic: compatibility.allow_public_traffic,
+                envd_ready: compatibility.envd_ready,
+                envd_gateway_auth: compatibility.envd_gateway_auth,
+                envd_signing_key: compatibility.envd_signing_key.clone(),
+            }),
     })
+}
+
+fn paused_e2b_config(spec: &pb::EnvironmentSpec) -> Result<Option<E2bRouteConfig>, String> {
+    let Some(compatibility) = &spec.compatibility else {
+        return Ok(None);
+    };
+    let service = spec.envd.as_ref().ok_or("E2B envd service missing")?;
+    Ok(Some(E2bRouteConfig {
+        envd_token_sha256: format!(
+            "{:x}",
+            Sha256::digest(compatibility.envd_access_token.as_bytes())
+        ),
+        traffic_token_sha256: format!(
+            "{:x}",
+            Sha256::digest(compatibility.traffic_access_token.as_bytes())
+        ),
+        allow_public_traffic: compatibility.allow_public_traffic,
+        // A metadata-only fallback must never proxy envd before the route
+        // subscription confirms that the sandbox is ready.
+        envd_ready: false,
+        envd_gateway_auth: service.gateway_auth,
+        envd_signing_key: if service.gateway_auth {
+            compatibility.envd_access_token.clone()
+        } else {
+            String::new()
+        },
+    }))
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 fn security_mode(value: i32) -> Result<DataPlaneSecurityMode, String> {
     match pb::DataPlaneSecurityMode::try_from(value) {
@@ -163,6 +232,17 @@ fn security_mode(value: i32) -> Result<DataPlaneSecurityMode, String> {
 mod route_consumer_tests {
     use super::*;
 
+    fn compatibility() -> pb::SandboxRouteCompatibility {
+        pb::SandboxRouteCompatibility {
+            envd_token_sha256: "a".repeat(64),
+            traffic_token_sha256: "b".repeat(64),
+            allow_public_traffic: false,
+            envd_ready: true,
+            envd_gateway_auth: false,
+            envd_signing_key: String::new(),
+        }
+    }
+
     fn published_route(id: &str, revision: u64) -> pb::PublishedRoute {
         pb::PublishedRoute {
             environment_id: id.into(),
@@ -175,7 +255,20 @@ mod route_consumer_tests {
             tunnel_security_mode: pb::DataPlaneSecurityMode::DataPlaneSecurityTlsToken as i32,
             port_forward_security_mode: pb::DataPlaneSecurityMode::DataPlaneSecurityTlsToken as i32,
             forwarded_ports: vec![8080],
+            private_service_ports: Vec::new(),
+            compatibility: None,
         }
+    }
+
+    #[test]
+    fn private_service_ports_survive_route_publication_and_reject_invalid_values() {
+        let mut published = published_route("native-service", 1);
+        published.private_service_ports = vec![49_983];
+        let route = route_info(&published).unwrap();
+        assert!(route.e2b.is_none());
+        assert_eq!(route.private_service_ports, vec![49_983]);
+        published.private_service_ports = vec![65_536];
+        assert!(route_info(&published).is_err());
     }
 
     #[test]
@@ -212,6 +305,105 @@ mod route_consumer_tests {
             untouched,
             "an incremental route frame must not clone untouched entries"
         );
+    }
+
+    #[test]
+    fn rejects_route_execution_revision_regression() {
+        let store = Arc::new(RouteStore::new());
+        let mut consumer = RouteConsumer::new(store);
+        consumer
+            .apply(pb::RouteFrame {
+                epoch: 1,
+                revision: 1,
+                reset: true,
+                upserts: vec![published_route("environment-a", 2)],
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            consumer
+                .apply(pb::RouteFrame {
+                    epoch: 1,
+                    base_revision: 1,
+                    revision: 2,
+                    upserts: vec![published_route("environment-a", 1)],
+                    ..Default::default()
+                })
+                .unwrap_err(),
+            "route execution version regressed"
+        );
+    }
+
+    #[test]
+    fn accepts_compatibility_route_without_a_public_lease() {
+        let store = Arc::new(RouteStore::new());
+        let mut consumer = RouteConsumer::new(store.clone());
+        let mut route = published_route("environment-a", 1);
+        route.compatibility = Some(compatibility());
+        consumer
+            .apply(pb::RouteFrame {
+                epoch: 1,
+                revision: 1,
+                reset: true,
+                upserts: vec![route],
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(store.get("environment-a").unwrap().e2b.is_some());
+    }
+
+    #[test]
+    fn accepts_native_route_without_a_lease() {
+        let store = Arc::new(RouteStore::new());
+        let mut consumer = RouteConsumer::new(store.clone());
+        consumer
+            .apply(pb::RouteFrame {
+                epoch: 1,
+                revision: 1,
+                reset: true,
+                upserts: vec![published_route("environment-a", 1)],
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            store.get("environment-a").unwrap().environment_status.code,
+            3
+        );
+    }
+
+    #[test]
+    fn paused_metadata_keeps_e2b_policy_unavailable() {
+        let spec = pb::EnvironmentSpec {
+            compatibility: Some(pb::EnvironmentCompatibility {
+                envd_access_token: "envd".into(),
+                traffic_access_token: "traffic".into(),
+                allow_public_traffic: true,
+                ..Default::default()
+            }),
+            envd: Some(pb::EnvdServiceConfig {
+                gateway_auth: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            paused_e2b_config(&spec).unwrap(),
+            Some(E2bRouteConfig {
+                envd_token_sha256: format!("{:x}", Sha256::digest(b"envd")),
+                traffic_token_sha256: format!("{:x}", Sha256::digest(b"traffic")),
+                allow_public_traffic: true,
+                envd_ready: false,
+                envd_gateway_auth: true,
+                envd_signing_key: "envd".into(),
+            })
+        );
+        assert_eq!(
+            paused_e2b_config(&pb::EnvironmentSpec::default()).unwrap(),
+            None
+        );
+        let mut missing = spec;
+        missing.envd = None;
+        assert!(paused_e2b_config(&missing).is_err());
     }
 }
 
@@ -373,6 +565,26 @@ impl super::resolver::DemandResolver for CoordinatorConnection {
             .as_ref()
             .is_some_and(|s| s.ports.contains(&u32::from(port)));
         Ok(RouteHandle {
+            e2b: paused_e2b_config(spec).map_err(ResolveError::Unavailable)?,
+            private_service_ports: spec
+                .execution
+                .as_ref()
+                .map(|execution| {
+                    execution
+                        .private_service_ports
+                        .iter()
+                        .map(|port| {
+                            u16::try_from(*port)
+                                .ok()
+                                .filter(|port| *port > 0)
+                                .ok_or_else(|| {
+                                    ResolveError::Unavailable("invalid private service port".into())
+                                })
+                        })
+                        .collect::<Result<_, _>>()
+                })
+                .transpose()?
+                .unwrap_or_default(),
             needs_resume: true,
             processing: None,
             access_kind: kind,
@@ -409,6 +621,7 @@ impl super::resolver::DemandResolver for CoordinatorConnection {
             .ok_or(ResolveError::NotReady)?;
         let deadline = route.processing.clone().unwrap_or_default();
         let mut request = tonic::Request::new(pb::EnsureRunningRequest {
+            run_timeout_seconds: None,
             expected_runtime_id: route.target.workload_id.clone(),
             environment_id: route.target.instance_id.clone(),
             caller: Some(pb::CallerContext {

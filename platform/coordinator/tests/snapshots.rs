@@ -7,6 +7,9 @@ fn snapshot() -> Snapshot {
         "snapshot-1".into(),
         vec!["base".into()],
         EnvironmentSpec {
+            envd: None,
+            run_policy: None,
+            compatibility: None,
             runtime_profile: None,
             snapshot_id: None,
             id: "source".into(),
@@ -28,6 +31,7 @@ fn snapshot() -> Snapshot {
         "source-1".into(),
         CheckpointArtifact {
             storage: "shared".into(),
+            scope: String::new(),
             location: "artifact-1".into(),
             size_bytes: 100,
         },
@@ -40,7 +44,9 @@ async fn snapshot_busy_delete_is_rejected_and_survives_coordinator_restart() {
     let mut rig = common::Redis::new().await;
     let db = rig.store().await;
     let first = db.begin(1).await.unwrap();
-    let snapshot = snapshot();
+    let mut snapshot = snapshot();
+    snapshot.kind = adx_core::snapshots::SnapshotKind::Golden;
+    let created_at = snapshot.created_at_unix_ms;
     first.publish_snapshot(snapshot.clone()).await.unwrap();
     let reference = Reference::Template {
         node_id: "node1".into(),
@@ -65,6 +71,9 @@ async fn snapshot_busy_delete_is_rejected_and_survives_coordinator_restart() {
     rig.crash();
     rig.start().await;
     let second = rig.store().await.begin(1).await.unwrap();
+    let restored = second.get_snapshot(&snapshot.id).await.unwrap();
+    assert_eq!(restored.kind, adx_core::snapshots::SnapshotKind::Golden);
+    assert_eq!(restored.created_at_unix_ms, created_at);
     assert!(first
         .release_snapshot(&snapshot.id, reference.clone())
         .await
@@ -112,6 +121,12 @@ async fn snapshot_identity_is_immutable_and_tenant_checked() {
     let first = snapshot();
     session.publish_snapshot(first.clone()).await.unwrap();
     session.publish_snapshot(first.clone()).await.unwrap();
+    let mut conflict = first.clone();
+    conflict.kind = adx_core::snapshots::SnapshotKind::Golden;
+    assert!(session.publish_snapshot(conflict).await.is_err());
+    let mut conflict = first.clone();
+    conflict.created_at_unix_ms += 1;
+    assert!(session.publish_snapshot(conflict).await.is_err());
     let mut conflict = first.clone();
     conflict.artifact.location = "different".into();
     assert!(session.publish_snapshot(conflict).await.is_err());

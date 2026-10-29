@@ -3,6 +3,7 @@ use crate::common::protocol::ConnectTarget;
 use crate::common::route::{
     DataPlaneAuthMode, DataPlaneSecurityMode, EnvironmentStatus, RouteInfo,
 };
+use crate::ingress::e2b_route::E2bRouteConfig;
 use crate::ingress::route_store::{RouteChange, RouteStore};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -92,6 +93,8 @@ pub struct RouteHandle {
     pub tenant_id: String,
     pub tunnel_security_mode: DataPlaneSecurityMode,
     pub port_forward_auth_mode: DataPlaneAuthMode,
+    pub private_service_ports: Vec<u16>,
+    pub e2b: Option<E2bRouteConfig>,
     pub target: ConnectTarget,
 }
 
@@ -238,6 +241,8 @@ impl IngressRouteResolver {
                     && route.relay_address == handle.relay_address
                     && route.environment_id == handle.target.workload_id
                     && route.environment_ip.parse().ok() == Some(handle.target.target_ip)
+                    && route.e2b == handle.e2b
+                    && route.private_service_ports == handle.private_service_ports
             })
     }
 
@@ -372,6 +377,8 @@ impl IngressRouteResolver {
             tenant_id: route.tenant_id,
             tunnel_security_mode: route.tunnel_security_mode,
             port_forward_auth_mode,
+            private_service_ports: route.private_service_ports,
+            e2b: route.e2b,
             target,
         })
     }
@@ -403,6 +410,8 @@ mod tests {
             tunnel_security_mode: DataPlaneSecurityMode::Inherit,
             port_forward_security_mode: DataPlaneSecurityMode::Inherit,
             port_forward_routes: Vec::new(),
+            private_service_ports: Vec::new(),
+            e2b: None,
         }
     }
 
@@ -434,5 +443,41 @@ mod tests {
             resolver.resolve("i", 22, AccessKind::Ssh, "req").await,
             Err(ResolveError::EnvironmentStatus { code: 5, .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn service_exposure_change_invalidates_previous_route_handles() {
+        let store = Arc::new(RouteStore::new());
+        store.put(route(3));
+        store.set_ready(true);
+        let resolver = IngressRouteResolver::new(store.clone());
+        let previous = resolver
+            .resolve("i", 8081, AccessKind::PortForwarding, "old")
+            .await
+            .unwrap();
+        let mut protected = route(3);
+        protected.private_service_ports = vec![8081];
+        store.put(protected);
+        assert!(!resolver.route_is_current(&previous));
+        let current = resolver
+            .resolve("i", 8081, AccessKind::PortForwarding, "new")
+            .await
+            .unwrap();
+        assert_eq!(current.private_service_ports, vec![8081]);
+        assert!(resolver.route_is_current(&current));
+    }
+
+    #[tokio::test]
+    async fn unchanged_route_refresh_keeps_the_previous_handle_current() {
+        let store = Arc::new(RouteStore::new());
+        store.put(route(3));
+        store.set_ready(true);
+        let resolver = IngressRouteResolver::new(store.clone());
+        let previous = resolver
+            .resolve("i", 22, AccessKind::Direct, "old")
+            .await
+            .unwrap();
+        store.put(route(3));
+        assert!(resolver.route_is_current(&previous));
     }
 }

@@ -3,6 +3,49 @@ use std::sync::Arc;
 
 #[tokio::test]
 #[ignore = "requires isolated Redis; run storage suite"]
+async fn first_publication_preserves_native_labels_and_optional_run_policy() {
+    let rig = common::Redis::new().await;
+    let session = rig.store().await.begin(1).await.unwrap();
+    register(&session, "node").await;
+    let mut spec = spec("metadata-publication");
+    spec.run_policy = Some(adx_core::environment_control::RunPolicy {
+        timeout_seconds: 60,
+        action: adx_core::environment_control::RunExpiryAction::Delete,
+    });
+    let assignment = Assignment {
+        environment_id: spec.id.clone(),
+        node_id: "node".into(),
+        shard_id: 0,
+        generation: 1,
+        devices: vec![],
+    };
+    spec.scheduling
+        .labels
+        .insert("purpose".into(), "original".into());
+    let labels = spec.scheduling.labels.clone();
+    session
+        .reserve_with_request(spec.clone(), assignment.clone(), "metadata-request")
+        .await
+        .unwrap();
+    let record = running(spec, assignment);
+    session
+        .publish_initial(record.clone(), "metadata-request", "")
+        .await
+        .unwrap();
+    let stored = session.get(&record.spec.id).await.unwrap();
+    assert_eq!(stored.spec.scheduling.labels, labels);
+    assert_eq!(stored.spec.run_policy, record.spec.run_policy);
+    assert_eq!(
+        session
+            .published_request("tenant", "metadata-request")
+            .await
+            .unwrap(),
+        Some(record)
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Redis; run storage suite"]
 async fn initial_success_is_atomic_by_environment_or_request_and_survives_restart() {
     let mut rig = common::Redis::new().await;
     let session = rig.store().await.begin(1).await.unwrap();

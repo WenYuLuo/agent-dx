@@ -64,6 +64,7 @@ async fn live_catalog_keeps_a_durable_claim_pending_until_the_create_rpc() {
     let snapshot = rig.session.snapshot().await.unwrap();
     let node = &snapshot.nodes["a"];
     let mut registration = pb::RegisterNodeRequest {
+        checkpoint_scopes: vec![],
         storage_mounts: Default::default(),
         node_id: "a".into(),
         session_id: "boot-a".into(),
@@ -147,6 +148,7 @@ struct Rig {
     rpc: CoordinatorRpc,
     coordinator: pb::coordinator_service_client::CoordinatorServiceClient<Channel>,
     nodes: Vec<pb::node_service_client::NodeServiceClient<Channel>>,
+    coordinator_nodes: Vec<pb::node_service_client::NodeServiceClient<Channel>>,
     claimants: Vec<pb::coordinator_service_client::CoordinatorServiceClient<Channel>>,
     managers: Vec<Arc<Adxlet>>,
     backends: Vec<Arc<Backend>>,
@@ -209,6 +211,7 @@ impl Rig {
                 channel(ma, "apiserver").await,
             ),
             nodes: vec![],
+            coordinator_nodes: vec![],
             claimants: vec![],
             managers: vec![],
             backends: vec![],
@@ -263,6 +266,7 @@ impl Rig {
         }));
         let mut coordinator = pb::coordinator_service_client::CoordinatorServiceClient::new(client);
         let mut register = pb::RegisterNodeRequest {
+            checkpoint_scopes: vec![],
             storage_mounts: Default::default(),
             runtime_classes: vec![
                 "runsc".into(),
@@ -302,6 +306,10 @@ impl Rig {
             .push(pb::node_service_client::NodeServiceClient::new(
                 channel(na, "apiserver").await,
             ));
+        self.coordinator_nodes
+            .push(pb::node_service_client::NodeServiceClient::new(
+                channel(na, "coordinator").await,
+            ));
     }
     async fn report_mounts(
         &mut self,
@@ -335,6 +343,8 @@ impl Rig {
             .unwrap();
         self.nodes[index]
             .delete_environment(pb::DeleteEnvironmentRequest {
+                expected_revision: None,
+
                 failed_revision: None,
                 node_session_id: String::new(),
                 assignment: Some(owner.clone()),
@@ -558,6 +568,7 @@ async fn heartbeat_expiry_wakes_only_the_volume_wait_and_allows_takeover_before_
     let b = &snapshot.nodes["b"];
     rig.claimants[1]
         .register_node(pb::RegisterNodeRequest {
+            checkpoint_scopes: vec![],
             storage_mounts: Default::default(),
             runtime_classes: b.node.runtime_classes.clone(),
             node_id: "b".into(),
@@ -605,6 +616,7 @@ async fn heartbeat_expiry_wakes_only_the_volume_wait_and_allows_takeover_before_
         .contains(&old.runtime.as_ref().unwrap().id));
     let error = rig.claimants[0]
         .commit_environment(pb::CommitEnvironmentRequest {
+            cleanup_artifacts: vec![],
             record: Some(old.clone()),
             node_session_id: "boot-a".into(),
             stopped_runtime_ids: vec![old.runtime.unwrap().id],
@@ -770,11 +782,70 @@ async fn failed_gc_cleans_node_controller_redis_and_allows_same_name() {
     rig.managers[0].pause_lifecycle().await;
     assert!(rig.rpc.collect_failed(Duration::ZERO).await.is_err());
     assert!(rig.session.get("failed-gc").await.is_ok());
+    let failed_record = failed.result.unwrap();
     rig.managers[0]
-        .reconcile(vec![failed.result.unwrap()])
+        .reconcile(vec![failed_record.clone()])
         .await
         .unwrap();
+    let collection_record = rig.session.get("failed-gc").await.unwrap().result.unwrap();
     assert_eq!(rig.rpc.collect_failed(Duration::ZERO).await.unwrap(), 1);
+    let failed_fence = collection_record.revision;
+    let assignment = pb::Assignment {
+        environment_id: collection_record.assignment.environment_id.clone(),
+        node_id: collection_record.assignment.node_id.clone(),
+        shard_id: collection_record
+            .assignment
+            .shard_id
+            .try_into()
+            .expect("test shard id fits protocol"),
+        generation: collection_record.assignment.generation,
+        devices: vec![],
+    };
+    let replay = pb::DeleteEnvironmentRequest {
+        expected_revision: None,
+        failed_revision: Some(failed_fence),
+
+        node_session_id: "boot-a".into(),
+        assignment: Some(assignment.clone()),
+        caller: None,
+    };
+    let replayed = rig.coordinator_nodes[0]
+        .delete_environment(replay.clone())
+        .await
+        .expect("Coordinator mTLS retry with the original failed fence replays deletion")
+        .into_inner();
+    assert_eq!(
+        replayed.record.unwrap().state,
+        pb::EnvironmentState::Deleted as i32
+    );
+    for invalid in [
+        pb::DeleteEnvironmentRequest {
+            failed_revision: Some(failed_fence + 1),
+            ..replay.clone()
+        },
+        pb::DeleteEnvironmentRequest {
+            failed_revision: None,
+            expected_revision: Some(failed_fence),
+            ..replay.clone()
+        },
+        {
+            let mut changed_assignment = assignment.clone();
+            changed_assignment.generation += 1;
+            pb::DeleteEnvironmentRequest {
+                assignment: Some(changed_assignment),
+                ..replay.clone()
+            }
+        },
+    ] {
+        assert_eq!(
+            rig.coordinator_nodes[0]
+                .delete_environment(invalid)
+                .await
+                .expect_err("only the original Coordinator fence may replay deletion")
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+    }
     assert_eq!(
         rig.session.get("failed-gc").await.unwrap_err(),
         adx_core::Error::NotFound
@@ -817,6 +888,7 @@ async fn failed_gc_cleans_invalidated_owner_and_fences_delayed_running() {
     );
     assert!(rig.claimants[0]
         .commit_environment(pb::CommitEnvironmentRequest {
+            cleanup_artifacts: vec![],
             stopped_runtime_ids: vec![],
             record: Some(created),
             node_session_id: "boot-a".into()
@@ -841,6 +913,7 @@ async fn redis_restart_recovers_scheduler_after_failed_node_heartbeat() {
     let stored = rig.session.snapshot().await.unwrap();
     let node = &stored.nodes["a"];
     let heartbeat = pb::RegisterNodeRequest {
+        checkpoint_scopes: vec![],
         storage_mounts: Default::default(),
         runtime_classes: vec!["runsc".into(), "runc".into()],
         node_id: "a".into(),
@@ -1199,6 +1272,7 @@ async fn environment_directory_increment_does_not_rescan_control_history() {
     let heartbeat_before = redis_command_calls(&rig._redis, "hgetall").await;
     rig.claimants[0]
         .register_node(pb::RegisterNodeRequest {
+            checkpoint_scopes: vec![],
             storage_mounts: Default::default(),
             runtime_classes: stored.node.runtime_classes,
             node_id: stored.node.id,
@@ -1708,6 +1782,7 @@ async fn prepare_http(rig: &mut Rig) {
             .bootstrap_credential(
                 &key.repeat(40),
                 &adx_coordinator::auth::Credential {
+                    metadata: None,
                     tenant_id: tenant.into(),
                     administrator: false,
                     expires_at_unix_seconds: 0,
@@ -1728,6 +1803,7 @@ async fn prepare_http(rig: &mut Rig) {
         let node = &rig.session.snapshot().await.unwrap().nodes[if i == 0 { "a" } else { "b" }];
         rig.claimants[i]
             .register_node(pb::RegisterNodeRequest {
+                checkpoint_scopes: vec![],
                 storage_mounts: Default::default(),
                 runtime_classes: vec![
                     "runsc".into(),
@@ -1946,6 +2022,8 @@ async fn existing_terminal_claim_reconciles_a_late_commit_into_scheduler_account
         Some((rig._redis.url.clone(), 500));
     assert!(rig.nodes[0]
         .delete_environment(pb::DeleteEnvironmentRequest {
+            expected_revision: None,
+
             failed_revision: None,
             node_session_id: String::new(),
             assignment: running.assignment,
@@ -1996,6 +2074,7 @@ async fn ordinary_heartbeats_do_not_write_redis() {
     for sequence in 3..23 {
         rig.claimants[0]
             .register_node(pb::RegisterNodeRequest {
+                checkpoint_scopes: vec![],
                 storage_mounts: Default::default(),
                 node_id: "a".into(),
                 session_id: "boot-a".into(),
@@ -2200,6 +2279,7 @@ async fn coordinator_restart_reclaims_unconfirmed_runtime_before_reassignment() 
         );
         let node = &saved.nodes[id];
         let mut report = pb::RegisterNodeRequest {
+            checkpoint_scopes: vec![],
             storage_mounts: Default::default(),
             node_id: id.into(),
             node_address: node.address.clone(),
@@ -2480,6 +2560,7 @@ async fn memory_local_reservation_expires_and_late_result_is_fenced() {
     assert_eq!(
         rig.claimants[0]
             .commit_environment(pb::CommitEnvironmentRequest {
+                cleanup_artifacts: vec![],
                 stopped_runtime_ids: vec![],
                 record: Some(late),
                 node_session_id: "boot-a".into()
@@ -2935,4 +3016,81 @@ async fn default_local_creation_still_claims_an_exclusive_volume() {
         .unwrap()
         .occupancy
         .is_none());
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; ADX_TEST_REDIS_SERVER"]
+async fn local_first_replay_uses_native_published_spec_with_labels() {
+    let mut rig = Rig::new().await;
+    let mut request = Rig::request("native-metadata", 0);
+    request
+        .create
+        .as_mut()
+        .unwrap()
+        .spec
+        .as_mut()
+        .unwrap()
+        .scheduling
+        .get_or_insert_with(Default::default)
+        .labels = [("note".into(), "line one\nline two".into())]
+        .into_iter()
+        .collect();
+    let created = rig.nodes[0]
+        .create_local_environment(request.clone())
+        .await
+        .unwrap()
+        .into_inner()
+        .record
+        .unwrap();
+    let stored = rig.session.get("native-metadata").await.unwrap();
+    assert!(stored.spec.compatibility.is_none());
+    assert_eq!(stored.spec.scheduling.labels["note"], "line one\nline two");
+    assert!(!stored.spec.env.contains_key("note"));
+    assert!(stored.spec.scheduling.labels.contains_key("note"));
+    request
+        .create
+        .as_mut()
+        .unwrap()
+        .spec
+        .as_mut()
+        .unwrap()
+        .scheduling
+        .get_or_insert_with(Default::default)
+        .labels
+        .clear();
+    // Native published-result replay returns its original winner, including labels.
+    let replay = rig.nodes[0]
+        .create_local_environment(request)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        replay
+            .record
+            .unwrap()
+            .spec
+            .unwrap()
+            .scheduling
+            .unwrap()
+            .labels["note"],
+        "line one\nline two"
+    );
+    assert_eq!(
+        rig.session
+            .get("native-metadata")
+            .await
+            .unwrap()
+            .spec
+            .scheduling
+            .labels,
+        stored.spec.scheduling.labels
+    );
+    assert_eq!(
+        rig.backends
+            .iter()
+            .map(|backend| backend.started.load(Ordering::SeqCst))
+            .sum::<usize>(),
+        1
+    );
+    rig.delete(&created).await;
 }

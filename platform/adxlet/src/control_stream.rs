@@ -302,7 +302,12 @@ impl RuntimeControlHub {
         {
             return Err(Error::Conflict);
         }
-        let pending = status.requested_checkpoint.is_some() || status.failure.is_some();
+        let pending = status.requested_checkpoint.is_some()
+            || status.failure.is_some()
+            || status
+                .required_services
+                .values()
+                .any(|service| service.phase == adx_core::runtime::RequiredServicePhase::Failed);
         slot.status.send_replace(Some(status));
         drop(session);
         if pending {
@@ -487,8 +492,43 @@ mod tests {
             active_requests: 0,
             active_commands: 0,
             activity_revision: 1,
+            required_services: Default::default(),
         }
     }
+    #[tokio::test]
+    async fn failed_required_service_emits_a_generic_runtime_event() {
+        let hub = RuntimeControlHub::new(vec![1; 32], Duration::from_secs(1)).unwrap();
+        let mut events = hub.take_events().unwrap();
+        hub.expect(&identity()).unwrap();
+        let slot = hub.slot(&identity()).unwrap();
+        let (commands, _receiver) = mpsc::channel(16);
+        *slot.session.lock().unwrap() = Some(Session {
+            id: 1,
+            commands,
+            pending: HashMap::new(),
+        });
+        let mut observation = status();
+        observation.required_services.insert(
+            "helper".into(),
+            adx_core::runtime::RequiredServiceStatus {
+                phase: adx_core::runtime::RequiredServicePhase::Starting,
+                version: None,
+                error: None,
+            },
+        );
+        hub.observe(&slot, 1, observation.clone(), &identity())
+            .unwrap();
+        assert!(events.try_recv().is_err());
+        observation
+            .required_services
+            .get_mut("helper")
+            .unwrap()
+            .phase = adx_core::runtime::RequiredServicePhase::Failed;
+        observation.revision += 1;
+        hub.observe(&slot, 1, observation, &identity()).unwrap();
+        assert_eq!(events.try_recv().unwrap(), identity());
+    }
+
     #[tokio::test]
     async fn cancelled_request_releases_its_pending_reply_slot() {
         let hub = RuntimeControlHub::new(vec![1; 32], Duration::from_secs(60)).unwrap();
