@@ -248,3 +248,13 @@ full TLS, including when using standard TLS-only diagnostic clients. False uses
 an AFS-specific authenticated-handshake/plaintext protocol and gives no subsequent
 cryptographic confidentiality or integrity. See
 [transport contract](../docs/testing/afs.md#unified-internal-transport-encryption).
+
+### 普通 DFS 写入的回复点
+
+本地 owner、原生 DFS 的普通显式偏移写，在挂载接住整笔正文后回复；使用共享的
+正常接纳2GiB、额外等待32MiB（合计2080MiB）的有界输入队列，不需要配置开关。队列满时背压，后台保留原 CRC、副本和 Meta 业务。
+写成功只代表内存接纳；`fsync`、`flush` 和关闭仍等待原同步语义，失败必须检查返回值。
+同步写、追加、远端 owner、内核 writeback 和 OwnerFS 保留原返回点。
+按文件收窄等待；正文保留共享FIFO和单消费者。fsync/flush/release登记恢复任务，不占正文额度。
+后台失败按文件保留并报告，不关闭整个挂载；USRBIO交接前等待此前正文处理。
+完整内存、顺序、错误及历史性能口径见[写入接纳合同](../docs/performance/afs-write-owned-admission.md)。

@@ -147,9 +147,9 @@ NodeSession 保留拒绝过期 session ID 重用所需的记录；待确认、�
 
 ## DFS 原生写正文所有权
 
-启用原生写入管线时，普通 FUSE 写入和内核页写回先取得 owned 输入，再由有界 callback
-worker 按同 fh FIFO 执行，避免上传、发布或正文背压占住接收线程。
-worker 将请求正文复制到最终 `ChunkBuilder` 分配。正文准入等待不持 inode 锁或 operation 门禁，
+原生本地 owner 的普通 FUSE 写入由前台有界正文队列接住，后台单消费线程依序执行；
+内核页写回及兼容路径仍先取得 owned 输入，由有界 callback worker 按同 fh FIFO 执行，
+避免单次上传、发布或正文等待直接占住接收线程。执行者将请求正文复制到最终 `ChunkBuilder` 分配。正文准入等待不持 inode 锁或 operation 门禁，
 重新取得短操作门禁后复核 generation、序号、位置和 builder，避免等待期间后台提交造成错接。
 顺序写优先使用4MiB容量块；满块冻结原分配并排队预上传，不触发 Meta 发布。
 提交前仍可原地覆盖可写 builder；已冻结／已提交内容的小覆盖形成普通小 Chunk，
@@ -162,7 +162,7 @@ worker 将请求正文复制到最终 `ChunkBuilder` 分配。正文准入等待
 已有布局并存份数不增加，其capacity与transport临时分配仍须另行计量，不能宣称全部Node元数据受此限制。
 空闲池默认128MiB，独立于 live，不能借作额外接纳额度。共享范围按父分配实际 capacity
 计费一次，最后一个读者、上传／复制／RDMA或冻结提交持有者释放后才退账。
-FUSE owned 输入使用独立的每 mount 32MiB 预算，复制前取得额度，后端执行结束或未准入
+兼容路径 FUSE owned 输入使用独立的每 mount 32MiB 预算，复制前取得额度，后端执行结束或未准入
 任务丢弃时释放；它不计入原生 ChunkBuilder 的64MiB live账，也不是进程RSS上限。
 额度或队列耗尽时接收端仍会背压；worker 排队消除的是单次后端等待直接占用接收线程，
 不承诺负载超过限额时仍能立即接纳。关闭时唤醒额度等待者并拒绝新任务。
@@ -176,6 +176,18 @@ pause 或恢复的总墙钟时间直接相加，也不能将 execute 全部解�
 OperationId、正文与回执，精确重放后才继续。普通 write 可以先报告已接纳；发布入口是
 fsync／fdatasync、同步写、可写 flush／close、最后写者退出、后台调度、批准的压力以及
 停止排空。原16MiB累计接纳发布阈值退出原生路径，4MiB满块不是发布入口。
+
+DFS FUSE 的本地 owner 普通显式偏移写进一步在前台整笔入有界内存队列后回复，
+不增加配置开关。每挂载正常接纳2GiB、额外等待32MiB（合计2080MiB），等待条目4096，包含执行中及失败保留正文；
+满时背压，失败保留导致额度不能恢复时返回EAGAIN，允许后续同步或关闭解除占用。
+正文由单消费线程按顺序交给原后端；跨句柄的同文件写仍保序。读、截断、元数据、
+复制、USRBIO交接和同步先等待相关文件已接纳的正文，正文为空时保持原读并发。
+同inode屏障跨句柄持有至真实完成；namespace保留全挂载屏障。fsync/flush/release
+通过独立的有界恢复接纳登记续办任务，不占正文额度；正文仍是一条FIFO、一个消费者。
+写成功不表示持久化；fsync/flush/close继续执行原同步，追加、O_SYNC/O_DSYNC、
+远端owner、内核writeback和OwnerFS保留旧返回点。失败和尾部按inode隔离，关闭仅退役
+对应句柄；固定本地答复不等待正文或清除错误。完整边界见[写入接纳合同](../performance/afs-write-owned-admission.md)。
+
 后台默认5s是调度周期，busy时延后补做，不承诺严格可见期限。成功 fsync 仍等待此前
 已接纳序号所需的持久对象回执和 Meta 确认，错误原样传播。
 
