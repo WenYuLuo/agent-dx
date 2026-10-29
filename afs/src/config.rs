@@ -291,7 +291,10 @@ pub struct Cli {
     /// Native Node live write-body capacity (4..=64MiB); S3 budgets are separate.
     #[arg(long)]
     pub dfs_dirty_budget_bytes: Option<u64>,
-    /// GC grace after reference retirement in milliseconds (0..=600000).
+    /// GC data-protection grace after a reference retires, in milliseconds
+    /// (0..=600000). Governs when retired references stop protecting inodes
+    /// and chunks. Reference *records* additionally linger as replay
+    /// tombstones for a derived admission window beyond this value.
     #[arg(long)]
     pub dfs_gc_grace_ms: Option<u64>,
     /// Native uploaded but unpublished objects (1..=1024), within 4MiB metadata.

@@ -7,6 +7,20 @@ use std::{
 };
 static GC_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 const MAX_CHUNKS: usize = 1024;
+/// Maximum admission horizon update_gc_reference accepts beyond the current
+/// time (the "60s cleanup fence"). A replay of an abandoned admission can
+/// only be accepted while its original deadline is still in this window.
+const ADMISSION_HORIZON_MS: u64 = 60_000;
+/// Clock-skew allowance between node clocks (which stamp admission deadlines
+/// and write identities) and the meta clock (which validates them). Combined
+/// with ADMISSION_HORIZON_MS it bounds when a replay can still pass the
+/// deadline gate after the tombstone's retirement.
+const ADMISSION_CLOCK_SKEW_MS: u64 = 60_000;
+/// A retired reference record stops protecting data after gc_grace_ms, but as
+/// a pure tombstone it must outlive every replay its abandoned admission can
+/// still legally send: retention = admission horizon + clock skew. Only then
+/// does the deadline/identity gate provably reject any late arrival alone.
+const REFERENCE_RECORD_RETENTION_MS: u64 = ADMISSION_HORIZON_MS + ADMISSION_CLOCK_SKEW_MS;
 #[derive(Default)]
 struct GcPlan {
     keys: Vec<MetaKey>,
@@ -144,7 +158,9 @@ fn plan_collection(
             MetaEntity::DfsWriteLease(lease) => lease.expires_at_unix_ms <= now,
             MetaEntity::DfsReference(reference) => reference
                 .retired_at_unix_ms
-                .is_some_and(|time| time.saturating_add(grace) <= now),
+                .is_some_and(|time| {
+                    time.saturating_add(REFERENCE_RECORD_RETENTION_MS) <= now
+                }),
             _ => false,
         };
         if dead {
@@ -753,37 +769,47 @@ mod tests {
     }
 
     #[test]
-    fn retired_write_reference_uses_common_grace_boundary() {
+    fn retired_write_reference_record_outlives_grace_until_admission_window_closes() {
         let (entity, reference) = retired_reference("write:generation-op", 100);
         let entities = vec![entity];
         assert!(
-            plan_collection(&entities, &[reference.clone()], 109, 10)
+            plan_collection(&entities, &[reference.clone()], 110, 10)
                 .keys
                 .is_empty(),
-            "one millisecond before grace expiry the write reference record must stay"
+            "data grace has passed but the record stays as a tombstone fencing late admissions"
+        );
+        assert!(
+            plan_collection(&entities, &[reference.clone()], 100 + ADMISSION_HORIZON_MS, 10)
+                .keys
+                .is_empty(),
+            "the admission horizon alone is not enough while node clocks can skew"
         );
         assert_eq!(
-            plan_collection(&entities, &[reference], 110, 10).keys.len(),
+            plan_collection(&entities, &[reference], 100 + REFERENCE_RECORD_RETENTION_MS, 10)
+                .keys
+                .len(),
             1,
-            "retired write references must die on the common grace boundary, not a hidden 120s floor"
+            "record reclaims only after horizon + skew, when the deadline gate alone provably rejects every replay"
         );
     }
 
     #[test]
-    fn write_and_read_references_die_together_after_retirement() {
+    fn write_and_read_reference_records_die_together_after_retirement() {
         let (write_entity, write_reference) = retired_reference("write:generation-op", 100);
         let (read_entity, read_reference) = retired_reference("open:reader-1", 100);
         let entities = vec![write_entity, read_entity];
         let references = vec![write_reference, read_reference];
         assert!(
-            plan_collection(&entities, &references, 109, 10)
+            plan_collection(&entities, &references, 100 + REFERENCE_RECORD_RETENTION_MS - 1, 10)
                 .keys
                 .is_empty()
         );
         assert_eq!(
-            plan_collection(&entities, &references, 110, 10).keys.len(),
+            plan_collection(&entities, &references, 100 + REFERENCE_RECORD_RETENTION_MS, 10)
+                .keys
+                .len(),
             2,
-            "write and read references retired together must be reclaimed together"
+            "write and read references retired together must be reclaimed together on the derived bound"
         );
     }
 
@@ -1362,16 +1388,19 @@ mod tests {
             .unwrap();
         let (_, entities) = store.read_view().await.unwrap().snapshot().unwrap();
         assert!(
-            !entities
+            entities
                 .iter()
-                .any(|entity| matches!(entity, MetaEntity::DfsReference(_))),
-            "retired tombstones must also converge"
+                .any(|entity| matches!(entity, MetaEntity::DfsReference(value)
+                    if value.retired_at_unix_ms.is_some_and(|retired| {
+                        retired.saturating_add(REFERENCE_RECORD_RETENTION_MS) > now_unix_ms()
+                    }))),
+            "retired tombstones must outlive the admission window instead of converging at data grace"
         );
         let mut late = update("late-open");
         late.admission_deadline_unix_ms = now_unix_ms().saturating_sub(1);
-        assert_eq!(
-            service.update_gc_reference(late).await.unwrap_err().code(),
-            afs_error::META_DFS_REFERENCE_ADMISSION_EXPIRED
+        assert!(
+            service.update_gc_reference(late).await.is_err(),
+            "an expired replay must stay rejected while the tombstone is retained"
         );
     }
     #[tokio::test]
