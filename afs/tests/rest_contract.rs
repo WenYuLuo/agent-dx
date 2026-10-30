@@ -121,6 +121,7 @@ async fn register_node_with_ttl(meta: &Meta, session_id: &str, ttl: Duration) {
             grpc_addr: "http://node-a:7400".into(),
             data_addr: "http://node-a:7500".into(),
             rest_addr: "http://node-a:7600".into(),
+            ownerfs_enabled: true,
             storage_devices: Vec::new(),
             lease_ttl: ttl,
         },
@@ -154,6 +155,8 @@ async fn activate_root(meta: &Meta, root_id: &str, session_id: &str) {
                 session_id: reserved.home_session_id,
                 create_intent_id: reserved.create_intent_id,
                 prepare_token: reserved.prepare_token,
+                requester_node_id: reserved.requester_node_id,
+                requester_session_id: reserved.requester_session_id,
             },
             local_prepare_id: format!("local-{root_id}"),
         })
@@ -302,6 +305,7 @@ async fn chunk_replication_reports_observed_availability_without_claiming_data_l
         grpc_addr: "http://node-a:7400".into(),
         data_addr: "http://node-a:7500".into(),
         rest_addr: "http://node-a:7600".into(),
+        ownerfs_enabled: true,
         storage_devices: vec![descriptor],
         lease_ttl: Duration::from_secs(30),
     };

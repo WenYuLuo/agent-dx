@@ -171,8 +171,9 @@ fn configure_node_tcp_server(
 }
 
 /// B-side slow-path connector. The root grant and Home location stay in the
-/// OwnerFs business layer; this adapter only turns Meta's authenticated node
-/// endpoint into a cached OwnerFiles transport client.
+/// OwnerFs business layer; this adapter turns Meta's authenticated node
+/// endpoint into a cached OwnerFiles transport client and forwards reserved
+/// workspace creation requests to Home.
 #[cfg(feature = "ownerfs")]
 struct OwnerFilesFactory {
     meta: Arc<rpc::meta::GrpcRootMeta>,
@@ -187,6 +188,31 @@ struct OwnerFilesFactory {
 
 #[cfg(feature = "ownerfs")]
 impl vfs::ownerfs::RemoteFilesFactory for OwnerFilesFactory {
+    fn prepare_root(
+        &self,
+        reservation: &vfs::ownerfs::root::RootReservation,
+        params: &vfs::ownerfs::root::RootCreateParams,
+    ) -> afs_error::Result<()> {
+        let (uri, epoch) = self.meta.lookup_node_location(&reservation.home_node_id)?;
+        self.runtime.block_on(async {
+            let channel = self
+                .peers
+                .channel(&reservation.home_node_id, epoch, &uri)
+                .await?;
+            tokio::time::timeout(
+                self.timeout,
+                rpc::ownerfs::prepare_root(channel, reservation, params),
+            )
+            .await
+            .map_err(|_| {
+                afs_error::Error::coded(
+                    afs_error::CLIENT_DEADLINE_EXCEEDED,
+                    "OwnerFs creation request timed out",
+                )
+            })?
+        })
+    }
+
     fn supports_advisory_locks(&self) -> bool {
         true
     }

@@ -421,6 +421,65 @@ fn p2_c1a_outboard_wait_defaults_and_file_cli_boundaries() {
 }
 
 #[test]
+fn node_rejects_explicit_meta_placement_switch() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("node.toml");
+    for enabled in ["false", "true"] {
+        let error = Config::resolve(
+            Role::Node,
+            Cli::parse_from(["afs-node", "--ownerfs-mkdir-load-balance", enabled]),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("only valid for afs-meta"));
+        std::fs::write(&path, format!("ownerfs_mkdir_load_balance = {enabled}\n")).unwrap();
+        let error = Config::resolve(
+            Role::Node,
+            Cli::parse_from(["afs-node", "--config", path.to_str().unwrap()]),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("only valid for afs-meta"));
+    }
+}
+
+#[test]
+fn ownerfs_mkdir_load_balance_is_opt_in() {
+    let default = Config::resolve(Role::Meta, Cli::parse_from(["afs-meta"])).unwrap();
+    let default = serde_json::to_value(default).unwrap();
+    assert_eq!(
+        default.get("ownerfs_mkdir_load_balance"),
+        Some(&serde_json::Value::Bool(false))
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("meta.toml");
+    for enabled in [false, true] {
+        std::fs::write(&path, format!("ownerfs_mkdir_load_balance = {enabled}\n")).unwrap();
+        let configured = Config::resolve(
+            Role::Meta,
+            Cli::parse_from(["afs-meta", "--config", path.to_str().unwrap()]),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(configured).unwrap()["ownerfs_mkdir_load_balance"],
+            enabled
+        );
+        let override_value = if enabled { "false" } else { "true" };
+        let overridden = Config::resolve(
+            Role::Meta,
+            Cli::parse_from([
+                "afs-meta",
+                "--config",
+                path.to_str().unwrap(),
+                "--ownerfs-mkdir-load-balance",
+                override_value,
+            ]),
+        )
+        .unwrap();
+        assert_eq!(overridden.ownerfs_mkdir_load_balance, !enabled);
+    }
+}
+
+#[test]
 fn shipped_examples_resolve_with_mutual_tls_and_node_identity_binding() {
     let examples = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
     let meta_path = examples.join("meta.toml");

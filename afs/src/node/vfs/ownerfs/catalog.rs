@@ -57,6 +57,10 @@ pub trait LockedLocalRootCatalog: Send + Sync {
     fn remove_prepared_root(&self, record: &LocalRootRecord) -> Result<()>;
 
     fn scan_roots(&self) -> Result<Vec<LocalRootRecord>>;
+
+    /// Read one canonical root record without scanning unrelated records.
+    /// Invalid durable identity or a filename/key mismatch returns an error.
+    fn lookup_root(&self, id: &RootId) -> Result<Option<LocalRootRecord>>;
 }
 
 /// 由 OwnerFs 实现的本机持久记录接口，不属于通用 Storage。
@@ -149,7 +153,14 @@ impl LockedLocalFsRootCatalog {
             .and_then(|mut file| file.read_to_end(&mut bytes))
             .map_err(Error::from)?;
         let wire: WireRootRecord = serde_json::from_slice(&bytes).map_err(catalog_decode_error)?;
-        wire.try_into_record()
+        let record = wire.try_into_record()?;
+        if Self::record_path(&record.id)? != *path {
+            return Err(Error::coded(
+                afs_error::NODE_OWNER_INVALID_GRANT,
+                "local root record filename does not match its identity",
+            ));
+        }
+        Ok(record)
     }
 
     fn write_record(&self, record: &LocalRootRecord) -> Result<()> {
@@ -196,6 +207,55 @@ impl LockedLocalFsRootCatalog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn record(name: &str) -> LocalRootRecord {
+        let id = RootId(format!("root-{}", hex(name.as_bytes())));
+        LocalRootRecord {
+            data_dir: StoragePath::new(format!("{}-e1", id.0)).unwrap(),
+            id,
+            name: OsString::from(name),
+            epoch: 1,
+            local_prepare_id: "prepare".into(),
+        }
+    }
+
+    #[test]
+    fn direct_lookup_reads_only_the_requested_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
+        let catalog = LocalFsRootCatalog::new(disk.clone());
+        let locked = catalog.lock_and_open().unwrap();
+        let record = record("agent-a");
+        disk.mkdir(&record.data_dir, 0o700).unwrap();
+        locked.persist_prepared_root(&record).unwrap();
+        std::fs::write(
+            temp.path().join(CATALOG_DIR).join("unrelated.json"),
+            b"broken",
+        )
+        .unwrap();
+        assert_eq!(locked.lookup_root(&record.id).unwrap(), Some(record));
+        assert_eq!(locked.lookup_root(&RootId("root-62".into())).unwrap(), None);
+        assert!(locked.scan_roots().is_err());
+    }
+
+    #[test]
+    fn direct_lookup_rejects_a_mismatched_record_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
+        let catalog = LocalFsRootCatalog::new(disk.clone());
+        let locked = catalog.lock_and_open().unwrap();
+        let original = record("agent-a");
+        disk.mkdir(&original.data_dir, 0o700).unwrap();
+        locked.persist_prepared_root(&original).unwrap();
+        let old = temp
+            .path()
+            .join(CATALOG_DIR)
+            .join(format!("{}.json", original.id.0));
+        let new = temp.path().join(CATALOG_DIR).join("root-62.json");
+        std::fs::rename(old, new).unwrap();
+        assert!(locked.lookup_root(&RootId("root-62".into())).is_err());
+        assert!(locked.scan_roots().is_err());
+    }
 
     #[test]
     fn long_workspace_name_does_not_expand_catalog_temp_basename() {
@@ -299,6 +359,20 @@ impl LockedLocalRootCatalog for LockedLocalFsRootCatalog {
         }
         records.sort_by(|left, right| left.id.0.cmp(&right.id.0));
         Ok(records)
+    }
+
+    fn lookup_root(&self, id: &RootId) -> Result<Option<LocalRootRecord>> {
+        let _mutation = self.mutation.lock().map_err(|_| {
+            Error::coded(
+                afs_error::NODE_OWNER_INVALID_GRANT,
+                "root catalog lock poisoned",
+            )
+        })?;
+        match self.read_record(&Self::record_path(id)?) {
+            Ok(record) => Ok(Some(record)),
+            Err(error) if error.code() == afs_error::IO_NOT_FOUND => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 }
 

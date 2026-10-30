@@ -148,6 +148,7 @@ pub struct NodeSession {
     pub grpc_addr: String,
     pub data_addr: String,
     pub rest_addr: String,
+    pub ownerfs_enabled: bool,
     #[serde(default)]
     pub storage_devices: Vec<StorageDeviceDescriptor>,
     pub lease_epoch: u64,
@@ -172,6 +173,7 @@ pub struct NodeSessionLease {
     pub grpc_addr: String,
     pub data_addr: String,
     pub rest_addr: String,
+    pub ownerfs_enabled: bool,
     pub storage_devices: Vec<StorageDeviceDescriptor>,
     pub lease_ttl: Duration,
 }
@@ -205,6 +207,8 @@ pub struct RootReservationRecord {
     pub home_session_id: String,
     pub create_intent_id: String,
     pub prepare_token: String,
+    pub requester_node_id: String,
+    pub requester_session_id: String,
     pub created_at_revision: StoreRevision,
 }
 
@@ -358,6 +362,9 @@ pub enum MetaRead {
     RootReservation {
         root_id: String,
     },
+    RootState {
+        root_id: String,
+    },
     RootGrantByHolder {
         root_id: String,
         holder_node_id: String,
@@ -434,6 +441,12 @@ pub enum TxnCondition {
     /// reservation identity rather than just "some reservation exists".
     EntityEquals(MetaEntity),
     NodeSessionCurrent {
+        node_id: String,
+        session_id: String,
+    },
+    /// Requires that the supplied process session is no longer current and
+    /// live. This lets a new reserve replace a stale caller atomically.
+    NodeSessionExpired {
         node_id: String,
         session_id: String,
     },
@@ -2664,6 +2677,10 @@ fn condition_matches(state: &State, condition: &TxnCondition) -> bool {
             node_id,
             session_id,
         } => current_session_matches(state, node_id, session_id),
+        TxnCondition::NodeSessionExpired {
+            node_id,
+            session_id,
+        } => !current_session_matches(state, node_id, session_id),
         TxnCondition::RootEpochEquals {
             root_id,
             root_epoch,
@@ -2928,6 +2945,7 @@ mod tests {
             grpc_addr: format!("http://{node_id}:7400"),
             data_addr: format!("http://{node_id}:7500"),
             rest_addr: format!("http://{node_id}:7600"),
+            ownerfs_enabled: true,
             storage_devices: Vec::new(),
             lease_epoch: 1,
             expires_at_unix_ms,
@@ -3767,6 +3785,7 @@ mod tests {
             grpc_addr: "http://node-a:7400".into(),
             data_addr: "http://node-a:7500".into(),
             rest_addr: "http://node-a:7600".into(),
+            ownerfs_enabled: true,
             storage_devices: Vec::new(),
             lease_ttl: Duration::from_secs(30),
         }
@@ -3988,6 +4007,7 @@ mod tests {
                     grpc_addr: String::new(),
                     data_addr: String::new(),
                     rest_addr: text,
+                    ownerfs_enabled: true,
                     storage_devices: devices,
                     lease_epoch: 1,
                     expires_at_unix_ms: u64::MAX,
@@ -5504,6 +5524,7 @@ mod tests {
                         grpc_addr: "g".into(),
                         data_addr: "d".into(),
                         rest_addr: "r".into(),
+                        ownerfs_enabled: true,
                         storage_devices: Vec::new(),
                         lease_ttl: Duration::from_secs(300),
                     },
@@ -5849,6 +5870,7 @@ mod tests {
                         grpc_addr: "g".into(),
                         data_addr: "d".into(),
                         rest_addr: "r".into(),
+                        ownerfs_enabled: true,
                         storage_devices: Vec::new(),
                         lease_ttl: Duration::from_secs(300),
                     },
@@ -5889,6 +5911,7 @@ mod tests {
                     grpc_addr: "g".into(),
                     data_addr: "d".into(),
                     rest_addr: "r".into(),
+                    ownerfs_enabled: true,
                     storage_devices: Vec::new(),
                     lease_ttl: Duration::from_secs(300),
                 },
@@ -7780,6 +7803,7 @@ mod grant_lifecycle_tests {
                     grpc_addr: "g".into(),
                     data_addr: "d".into(),
                     rest_addr: "r".into(),
+                    ownerfs_enabled: true,
                     storage_devices: Vec::new(),
                     lease_ttl: Duration::from_secs(300),
                 },
@@ -7819,6 +7843,8 @@ mod grant_lifecycle_tests {
                     session_id: r.home_session_id.clone(),
                     create_intent_id: r.create_intent_id.clone(),
                     prepare_token: r.prepare_token.clone(),
+                    requester_node_id: r.requester_node_id.clone(),
+                    requester_session_id: r.requester_session_id.clone(),
                 },
             })
             .await
@@ -7950,6 +7976,7 @@ mod grant_lifecycle_tests {
                     grpc_addr: "g".into(),
                     data_addr: "d".into(),
                     rest_addr: "r".into(),
+                    ownerfs_enabled: true,
                     storage_devices: vec![],
                     lease_ttl: Duration::from_secs(300),
                 },
@@ -8078,6 +8105,7 @@ mod grant_lifecycle_tests {
                     grpc_addr: "g".into(),
                     data_addr: "d".into(),
                     rest_addr: "r".into(),
+                    ownerfs_enabled: true,
                     storage_devices: vec![],
                     lease_ttl: Duration::from_secs(300),
                 },

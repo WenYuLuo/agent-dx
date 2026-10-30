@@ -177,7 +177,12 @@ pub async fn run(cfg: Config, obs: Observability) -> Result<(), BoxError> {
             Arc::new(owner_roots::MissingOwnerRootAuthority)
                 as Arc<dyn owner_roots::OwnerRootAuthority>
         },
-        |store| Arc::new(owner_roots::StoreOwnerRootAuthority::new(store.clone())),
+        |store| {
+            Arc::new(owner_roots::StoreOwnerRootAuthority::with_load_balancing(
+                store.clone(),
+                cfg.ownerfs_mkdir_load_balance,
+            ))
+        },
     );
     let dfs = if let Some(store) = store.as_ref() {
         let local_copy = match cfg.dfs_local_copy.as_str() {
@@ -537,6 +542,7 @@ mod tests {
             grpc_addr: "http://node-a:7400".into(),
             data_addr: "http://node-a:7500".into(),
             rest_addr: "http://node-a:7600".into(),
+            ownerfs_enabled: true,
             storage_devices: Vec::new(),
             lease_ttl: Duration::from_secs(60),
         }
@@ -822,6 +828,7 @@ mod tests {
                 grpc_addr: "http://node-a:7400".into(),
                 data_addr: "http://node-a:7500".into(),
                 rest_addr: "http://node-a:7600".into(),
+                ownerfs_enabled: true,
                 storage_devices: Vec::new(),
                 lease_ttl: Duration::from_nanos(1),
             },

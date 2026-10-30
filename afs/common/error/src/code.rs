@@ -83,6 +83,9 @@ catalog! {
     META_DFS_REFERENCE_ADMISSION_EXPIRED = 0x03030007 => FailedPrecondition;
     META_DFS_LEASE_RETRY = 0x03030002 => Unavailable;
     META_DFS_REPAIR_SUPERSEDED = 0x03030003 => FailedPrecondition;
+    META_OWNER_ROOT_EXISTS = 0x03040001 => AlreadyExists;
+    META_OWNER_ROOT_BUSY = 0x03040002 => FailedPrecondition;
+    META_OWNER_HOME_UNAVAILABLE = 0x03040003 => Unavailable;
     META_STORE_UNIMPLEMENTED = 0x03020001 => Unimplemented;
     CONFIG_INVALID = 0x04010001 => InvalidArgument;
     RUNTIME_INTERNAL = 0x04020001 => Internal;

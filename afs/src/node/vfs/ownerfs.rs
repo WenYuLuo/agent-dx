@@ -339,6 +339,11 @@ impl OwnerFs {
         })?;
         Ok(OwnerFsPeerExecutor { local })
     }
+
+    #[cfg(test)]
+    fn root_manager(&self) -> Result<Arc<RootManager>> {
+        Ok(self.require_local()?.roots.clone())
+    }
 }
 
 /// Home-side OwnerFs executor used by node-to-node RPC handlers.
@@ -353,6 +358,18 @@ pub struct OwnerFsPeerExecutor {
 }
 
 impl OwnerFsPeerExecutor {
+    /// Prepare and activate a reserved workspace on this Home, then request
+    /// the configured bind asynchronously. Bind failure does not fail creation.
+    pub(crate) fn prepare_owner_root(
+        &self,
+        requester_node_id: &str,
+        reservation: &root::RootReservation,
+        params: &root::RootCreateParams,
+    ) -> Result<()> {
+        self.local
+            .prepare_workspace(requester_node_id, reservation, params)
+    }
+
     pub fn authorize_transport(
         &self,
         peer_node_id: &str,
@@ -900,6 +917,19 @@ impl OwnerFsPeerExecutor {
 /// implementation. OwnerFs keeps the trait here so B-side remote dispatch does
 /// not depend on Proto/gRPC/RDMA types.
 pub trait RemoteFilesFactory: Send + Sync {
+    /// Execute a reserved creation on its selected remote Home.
+    fn prepare_root(
+        &self,
+        reservation: &root::RootReservation,
+        params: &root::RootCreateParams,
+    ) -> Result<()> {
+        let _ = (reservation, params);
+        Err(Error::coded(
+            afs_error::NODE_VFS_UNIMPLEMENTED,
+            "remote workspace creation is not configured",
+        ))
+    }
+
     fn supports_advisory_locks(&self) -> bool {
         false
     }
@@ -4518,6 +4548,25 @@ impl LocalOwnerFs {
         Ok(())
     }
 
+    // Local mkdir and remote preparation share the existing best-effort
+    // trigger. An entry node whose Home is remote must not bind that workspace.
+    fn prepare_workspace(
+        &self,
+        requester_node_id: &str,
+        reservation: &root::RootReservation,
+        params: &root::RootCreateParams,
+    ) -> Result<()> {
+        self.roots
+            .prepare_owner_root(requester_node_id, reservation, params)?;
+        if let Some(manager) = &self.mount_manager {
+            let _ = manager.request_mount(
+                reservation.id.clone(),
+                OsStr::from_bytes(&params.name).to_os_string(),
+            );
+        }
+        Ok(())
+    }
+
     fn mkdir(
         &self,
         ctx: &RequestContext,
@@ -4527,26 +4576,25 @@ impl LocalOwnerFs {
     ) -> Result<Entry> {
         self.check_inode_namespace(parent)?;
         if parent.value == OWNERFS_ROOT_INODE {
-            let root_use = self.roots.create_root(name, mode)?;
-            apply_created_path_owner_and_mode(&self.disk, root_use.data_dir(), ctx, mode)?;
-            let attributes = self.root_entry_attributes(root_use.data_dir())?;
-            let mut state = self.state.lock().map_err(|_| poisoned())?;
-            let identity = self.root_identity(root_use.data_dir())?;
-            let inode = state.insert_root(
-                name.to_os_string(),
-                root_use.root_id().clone(),
-                identity,
-                attributes.clone(),
-            );
-            // Trigger async native bind mount for multi-workspace support.
-            // Non-blocking: failures fall back to FUSE-only (D2) and only log.
-            if let Some(mm) = &self.mount_manager {
-                let _ = mm.request_mount(root_use.root_id().clone(), name.to_os_string());
+            let params = root::RootCreateParams {
+                name: name.as_bytes().to_vec(),
+                uid: ctx.uid,
+                gid: ctx.gid,
+                mode,
+            };
+            let reservation = self.roots.reserve_workspace(name)?;
+            if reservation.home_node_id == self.roots.node_id() {
+                self.prepare_workspace(self.roots.node_id(), &reservation, &params)?;
+            } else {
+                let peers = self.remote_factory.as_ref().ok_or_else(|| {
+                    Error::coded(
+                        afs_error::NODE_VFS_UNIMPLEMENTED,
+                        "OwnerFs remote dispatch is not configured",
+                    )
+                })?;
+                peers.prepare_root(&reservation, &params)?;
             }
-            return Ok(Entry {
-                inode: backend_inode(inode),
-                attributes,
-            });
+            return self.lookup_root_entry(name);
         }
         let parent_record = self.record(parent.value)?.clone();
         let child = parent_record
@@ -5436,20 +5484,6 @@ impl LocalOwnerFs {
         }
         rows.sort_by(|left, right| left.name.cmp(&right.name));
         Ok(rows)
-    }
-
-    fn root_entry_attributes(&self, data_dir: &StoragePath) -> Result<FileAttributes> {
-        self.disk
-            .metadata(data_dir)
-            .map_err(Error::from)
-            .and_then(attributes_from_metadata)
-    }
-
-    fn root_identity(&self, data_dir: &StoragePath) -> Result<files::FileIdentity> {
-        self.disk
-            .metadata(data_dir)
-            .map_err(Error::from)
-            .and_then(|metadata| identity_from_metadata(&metadata))
     }
 
     fn owner_root_attributes(&self) -> Result<FileAttributes> {
@@ -6667,14 +6701,6 @@ fn apply_created_file_owner_and_mode(
     file.chmod(mode & 0o7777).map_err(Error::from)
 }
 
-fn apply_created_path_owner(
-    disk: &LocalFs,
-    path: &StoragePath,
-    ctx: &RequestContext,
-) -> Result<()> {
-    apply_created_path_owner_with_gid(disk, path, ctx.uid, ctx.gid)
-}
-
 fn apply_created_path_owner_with_gid(
     disk: &LocalFs,
     path: &StoragePath,
@@ -6686,16 +6712,6 @@ fn apply_created_path_owner_with_gid(
         return Ok(());
     }
     disk.chown(path, Some(uid), Some(gid)).map_err(Error::from)
-}
-
-fn apply_created_path_owner_and_mode(
-    disk: &LocalFs,
-    path: &StoragePath,
-    ctx: &RequestContext,
-    mode: u32,
-) -> Result<()> {
-    apply_created_path_owner(disk, path, ctx)?;
-    disk.chmod(path, mode & 0o7777).map_err(Error::from)
 }
 
 fn apply_created_path_owner_with_gid_and_mode(
@@ -7302,7 +7318,9 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::{env, process::Command};
 
-    use crate::node::vfs::ownerfs::root::{PreparedRoot, RootGrant, RootMeta, RootReservation};
+    use crate::node::vfs::ownerfs::root::{
+        PreparedRoot, RootGrant, RootLookupState, RootMeta, RootReservation,
+    };
 
     struct NoopLockedLocalRootCatalog;
 
@@ -7318,6 +7336,10 @@ mod tests {
         fn scan_roots(&self) -> Result<Vec<catalog::LocalRootRecord>> {
             Ok(Vec::new())
         }
+
+        fn lookup_root(&self, _: &RootId) -> Result<Option<catalog::LocalRootRecord>> {
+            Ok(None)
+        }
     }
 
     struct LocalMeta {
@@ -7326,6 +7348,7 @@ mod tests {
         next_epoch: Mutex<u64>,
         recover_calls: Mutex<u64>,
         active: Mutex<HashMap<RootId, root::RootLocation>>,
+        pending: Mutex<HashMap<RootId, RootReservation>>,
         rights: Vec<RootRight>,
     }
 
@@ -7334,40 +7357,59 @@ mod tests {
             let mut next = self.next_epoch.lock().unwrap();
             let epoch = *next;
             *next += 1;
-            Ok(RootReservation {
+            let reservation = RootReservation {
                 id: id.clone(),
                 epoch,
                 home_node_id: self.node_id.clone(),
                 session_id: self.session_id.clone(),
                 create_intent_id: create_intent_id.to_owned(),
                 prepare_token: format!("prepare-{epoch}"),
-            })
+                requester_node_id: self.node_id.clone(),
+                requester_session_id: self.session_id.clone(),
+            };
+            self.pending
+                .lock()
+                .unwrap()
+                .insert(id.clone(), reservation.clone());
+            Ok(reservation)
         }
 
         fn activate_root(&self, prepared: &PreparedRoot) -> Result<RootGrant> {
+            let reservation = prepared.reservation();
+            let pending = self.pending.lock().unwrap().remove(&reservation.id);
+            if pending.as_ref() != Some(reservation) {
+                return Err(Error::coded(
+                    afs_error::NODE_OWNER_GRANT_UNAVAILABLE,
+                    "test activation does not match pending reservation",
+                ));
+            }
             self.active.lock().unwrap().insert(
-                prepared.reservation().id.clone(),
+                reservation.id.clone(),
                 root::RootLocation {
-                    id: prepared.reservation().id.clone(),
-                    epoch: prepared.reservation().epoch,
+                    id: reservation.id.clone(),
+                    epoch: reservation.epoch,
                     home_node_id: self.node_id.clone(),
                     home_session_id: self.session_id.clone(),
                 },
             );
             Ok(RootGrant {
-                id: prepared.reservation().id.clone(),
-                epoch: prepared.reservation().epoch,
+                id: reservation.id.clone(),
+                epoch: reservation.epoch,
                 home_node_id: self.node_id.clone(),
                 home_session_id: self.session_id.clone(),
                 holder_node_id: self.node_id.clone(),
                 session_id: self.session_id.clone(),
-                access_generation: prepared.reservation().epoch,
+                access_generation: reservation.epoch,
                 rights: self.rights.clone(),
-                fencing_token: format!("fence-{}", prepared.reservation().epoch),
+                fencing_token: format!("fence-{}", reservation.epoch),
             })
         }
 
-        fn abort_root(&self, _: &RootReservation) -> Result<()> {
+        fn abort_root(&self, reservation: &RootReservation) -> Result<()> {
+            let mut pending = self.pending.lock().unwrap();
+            if pending.get(&reservation.id) == Some(reservation) {
+                pending.remove(&reservation.id);
+            }
             Ok(())
         }
 
@@ -7376,14 +7418,35 @@ mod tests {
             Ok(())
         }
 
-        fn lookup_root(&self, _: &RootId) -> Result<Option<root::RootLocation>> {
-            Ok(None)
+        fn lookup_root(&self, id: &RootId) -> Result<Option<root::RootLocation>> {
+            Ok(self.active.lock().unwrap().get(id).cloned())
         }
 
-        fn list_owner_roots(&self, _: &str) -> Result<root::OwnerRootInventory> {
+        fn lookup_root_state(&self, id: &RootId) -> Result<RootLookupState> {
+            Ok(RootLookupState {
+                location: self.active.lock().unwrap().get(id).cloned(),
+                reservation: self.pending.lock().unwrap().get(id).cloned(),
+            })
+        }
+
+        fn list_owner_roots(&self, home_node_id: &str) -> Result<root::OwnerRootInventory> {
             Ok(root::OwnerRootInventory {
-                active: self.active.lock().unwrap().values().cloned().collect(),
-                pending: Vec::new(),
+                active: self
+                    .active
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .filter(|root| root.home_node_id == home_node_id)
+                    .cloned()
+                    .collect(),
+                pending: self
+                    .pending
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .filter(|reservation| reservation.home_node_id == home_node_id)
+                    .cloned()
+                    .collect(),
             })
         }
 
@@ -8377,6 +8440,7 @@ mod tests {
             next_epoch: Mutex::new(1),
             recover_calls: Mutex::new(0),
             active: Mutex::new(HashMap::new()),
+            pending: Mutex::new(HashMap::new()),
             rights,
         });
         let roots = Arc::new(RootManager::new(
@@ -8402,6 +8466,7 @@ mod tests {
             next_epoch: Mutex::new(1),
             recover_calls: Mutex::new(0),
             active: Mutex::new(HashMap::new()),
+            pending: Mutex::new(HashMap::new()),
             rights: all_local_rights(),
         });
         let roots = Arc::new(
@@ -11615,6 +11680,7 @@ mod tests {
             next_epoch: Mutex::new(1),
             recover_calls: Mutex::new(0),
             active: Mutex::new(HashMap::new()),
+            pending: Mutex::new(HashMap::new()),
             rights: all_local_rights(),
         });
         let roots = Arc::new(RootManager::new(
@@ -12180,6 +12246,7 @@ mod tests {
             next_epoch: Mutex::new(1),
             recover_calls: Mutex::new(0),
             active: Mutex::new(HashMap::new()),
+            pending: Mutex::new(HashMap::new()),
             rights: all_local_rights(),
         });
         let ctx = test_context_for_path(temp.path());

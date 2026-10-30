@@ -256,6 +256,8 @@ fn wire_reservation(reservation: RootReservationRecord) -> RootReservation {
         session_id: reservation.home_session_id,
         create_intent_id: reservation.create_intent_id,
         prepare_token: reservation.prepare_token,
+        requester_node_id: reservation.requester_node_id,
+        requester_session_id: reservation.requester_session_id,
     }
 }
 
@@ -386,6 +388,10 @@ impl MetaService for MetaRpc {
                     grpc_addr: endpoint.grpc_addr,
                     data_addr: endpoint.data_addr,
                     rest_addr: endpoint.rest_addr,
+                    ownerfs_enabled: node
+                        .capabilities
+                        .iter()
+                        .any(|capability| capability == "ownerfs"),
                     storage_devices: node
                         .storage_devices
                         .into_iter()
@@ -529,6 +535,8 @@ impl OwnerRootsService for OwnerRootsRpc {
                     session_id: reservation.session_id,
                     create_intent_id: reservation.create_intent_id,
                     prepare_token: reservation.prepare_token,
+                    requester_node_id: reservation.requester_node_id,
+                    requester_session_id: reservation.requester_session_id,
                 },
                 local_prepare_id: request.local_prepare_id,
             })
@@ -596,20 +604,40 @@ impl OwnerRootsService for OwnerRootsRpc {
         &self,
         request: Request<LookupRootRequest>,
     ) -> Result<Response<LookupRootReply>, Status> {
+        let authenticated = authenticated_node_id(&self.0, &request)?;
         let request = request.into_inner();
         require_text(&request.root_id, "root_id")?;
-        let location = self
+        let state = self
             .0
             .owner_roots
             .lookup_root(super::owner_roots::LookupRootInput {
                 root_id: request.root_id,
             })
             .await
-            .map_err(afs_transport::grpc::error_status::error_to_status)?
-            .map(wire_location);
+            .map_err(afs_transport::grpc::error_status::error_to_status)?;
+        let location = state.root.clone().map(wire_location);
+        let mut reservation = None;
+        if let Some(authenticated) = authenticated {
+            let session = self
+                .0
+                .lookup_node(&authenticated)
+                .await
+                .map_err(afs_transport::grpc::error_status::error_to_status)?;
+            if let Some(candidate) = state.reservation.as_ref() {
+                let is_home = candidate.home_node_id == authenticated;
+                let is_live_requester = candidate.requester_node_id == authenticated
+                    && session.as_ref().is_some_and(|session| {
+                        candidate.requester_session_id == session.session_id
+                    });
+                if is_home || is_live_requester {
+                    reservation = Some(wire_reservation(candidate.clone()));
+                }
+            }
+        }
         Ok(Response::new(LookupRootReply {
             found: location.is_some(),
             location,
+            reservation,
         }))
     }
 
@@ -2961,6 +2989,7 @@ mod tests {
             grpc_addr: String::new(),
             data_addr: String::new(),
             rest_addr: String::new(),
+            ownerfs_enabled: true,
             storage_devices: Vec::new(),
             lease_epoch: 7,
             expires_at_unix_ms: 60_000,
