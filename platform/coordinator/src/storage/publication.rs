@@ -285,16 +285,17 @@ impl Session {
                 .publication_write(self.epoch, vec![field.clone()])
                 .await;
             let (code, raw): (i8, String) = self.store.query(command).await?;
-            write.finish(code == 1, values);
+            write.finish_with_fields(
+                code == 1,
+                values,
+                catalog
+                    .iter()
+                    .flat_map(volumes::Catalog::change_fields)
+                    .collect(),
+            );
             match code {
                 1 | 2 => {
                     let winner: StoredEnvironment = decode(&raw)?;
-                    if code == 1 {
-                        if let Some(catalog) = &catalog {
-                            self.store
-                                .notify_committed_change(0, catalog.change_fields().collect());
-                        }
-                    }
                     if code == 2 {
                         return self.resolve_receipt(winner).await;
                     }

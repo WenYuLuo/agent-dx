@@ -453,12 +453,15 @@ impl Session {
                 )
                 .await;
             let applied = self.store.query::<u8>(command).await? == 1;
-            write.finish(applied, values);
+            write.finish_with_fields(
+                applied,
+                values,
+                catalog
+                    .iter()
+                    .flat_map(volumes::Catalog::change_fields)
+                    .collect(),
+            );
             if applied {
-                if let Some(catalog) = &catalog {
-                    self.store
-                        .notify_committed_change(0, catalog.change_fields().collect());
-                }
                 return Ok(results);
             }
         }

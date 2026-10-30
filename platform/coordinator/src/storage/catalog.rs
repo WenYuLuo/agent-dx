@@ -55,9 +55,18 @@ pub(super) struct PublicationWrite {
     completed: bool,
 }
 impl PublicationWrite {
-    pub(super) fn finish(mut self, applied: bool, values: Vec<PublicationValue>) {
+    pub(super) fn finish(self, applied: bool, values: Vec<PublicationValue>) {
+        self.finish_with_fields(applied, values, vec![]);
+    }
+    pub(super) fn finish_with_fields(
+        mut self,
+        applied: bool,
+        values: Vec<PublicationValue>,
+        fields: Vec<String>,
+    ) {
         if applied {
-            self.store.publish_values(self.epoch, values, &self.fields);
+            self.store
+                .publish_values(self.epoch, values, &self.fields, fields);
         }
         self.completed = true;
     }
@@ -163,6 +172,7 @@ impl RedisStore {
         epoch: u64,
         values: Vec<PublicationValue>,
         repaired: &[String],
+        mut fields: Vec<String>,
     ) {
         let mut catalog = self
             .connection
@@ -201,14 +211,11 @@ impl RedisStore {
         for field in repaired {
             catalog.dirty.remove(field);
         }
-        if !values.is_empty() {
-            let fields = values
-                .iter()
-                .map(|v| match v {
-                    PublicationValue::Node(id, _) => format!("node:{id}"),
-                    PublicationValue::Environment(id, _) => format!("environment:{id}"),
-                })
-                .collect();
+        if !values.is_empty() || !fields.is_empty() {
+            fields.extend(values.iter().map(|v| match v {
+                PublicationValue::Node(id, _) => format!("node:{id}"),
+                PublicationValue::Environment(id, _) => format!("environment:{id}"),
+            }));
             self.send_publication(&mut catalog, values, false, fields);
         }
     }
@@ -527,6 +534,7 @@ mod tests {
             1,
             vec![PublicationValue::Environment("unknown".into(), None)],
             &[],
+            vec![],
         );
         assert_eq!(
             session
@@ -537,5 +545,28 @@ mod tests {
             before
         );
         assert!(session.publication_snapshot().is_err());
+    }
+    #[tokio::test]
+    async fn directory_delta_and_volume_wakeup_share_one_atomic_cursor() {
+        let session = session();
+        let (before, mut receiver) = session.publication_snapshot().unwrap();
+        let write = session
+            .store
+            .publication_write(1, vec!["environment:removed".into()])
+            .await;
+        write.finish_with_fields(
+            true,
+            vec![PublicationValue::Environment("removed".into(), None)],
+            vec!["volume:shared".into()],
+        );
+        let event = receiver.recv().await.unwrap();
+        assert_eq!(event.revision, before.revision + 1);
+        assert!(event.fields.iter().any(|f| f == "volume:shared"));
+        assert!(event.fields.iter().any(|f| f == "environment:removed"));
+        assert_eq!(event.values.len(), 1);
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
     }
 }

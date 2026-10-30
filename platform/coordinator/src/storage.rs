@@ -913,7 +913,14 @@ impl RedisStore {
         if applied == 2 {
             return Err(Error::Conflict);
         }
-        write.finish(applied == 1, values);
+        write.finish_with_fields(
+            applied == 1,
+            values,
+            catalog
+                .into_iter()
+                .flat_map(volumes::Catalog::change_fields)
+                .collect(),
+        );
         Ok(applied == 1)
     }
     /// Called once per Coordinator startup, never on a Redis reconnect. A new epoch

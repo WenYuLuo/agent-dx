@@ -261,7 +261,14 @@ impl Session {
                     return Err(error);
                 }
             };
-            write.finish(applied == 1, values);
+            write.finish_with_fields(
+                applied == 1,
+                values,
+                catalog
+                    .iter()
+                    .flat_map(volumes::Catalog::change_fields)
+                    .collect(),
+            );
             if applied == 1 {
                 if let Some(inventory) = committed.as_mut() {
                     inventory.holds.extend(cached_holds);

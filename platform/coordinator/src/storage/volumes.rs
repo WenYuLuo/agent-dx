@@ -841,7 +841,7 @@ impl Session {
             .publication_write(self.epoch, fields.iter().map(|(f, _)| f.clone()).collect())
             .await;
         let applied = self.store.query::<u8>(command).await? == 1;
-        write.finish(applied, values);
+        write.finish_with_fields(applied, values, catalog.change_fields().collect());
         Ok(applied)
     }
 
