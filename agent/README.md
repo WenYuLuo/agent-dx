@@ -2,7 +2,6 @@
 
 Agent 层使用 Rust，产品 API 嵌入统一 Gateway。Activator 可独立部署，也可与 API Server 和 Ingress 共进程；多个副本使用相同产品状态命名空间。
 
-面向开发与交付的讲解见 [Agent 统一能力与 Jiuwen 交付场景串讲](../docs/development/agent-jiuwen-walkthrough.zh.md)，通过单机、多机和场景部署视图，先讲通用模型、激活与访问，再讲 digital-mate App 场景的账号、模型和共享工作区部署。
 
 | 目录 | 职责 |
 | --- | --- |
