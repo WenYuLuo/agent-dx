@@ -224,11 +224,10 @@ impl Session {
             } else {
                 command.arg("").arg("");
             }
-            let changed = writes
-                .iter()
-                .map(|(field, _)| field.clone())
-                .chain(catalog.iter().flat_map(volumes::Catalog::change_fields))
-                .collect();
+            let values = RedisStore::publication_values(
+                writes.iter().map(|(f, v)| (f.as_str(), Some(v.as_str()))),
+            )?;
+            let fields = writes.iter().map(|(f, _)| f.clone()).collect();
             for (field, value) in writes {
                 command.arg(field).arg(value);
             }
@@ -252,6 +251,7 @@ impl Session {
                 command.arg(0);
             }
             command.arg(format!("node-session:{id}"));
+            let write = self.store.publication_write(self.epoch, fields).await;
             let mut inventory = self.inspection.lock().await;
             let mut committed = inventory.take();
             let applied = match self.store.query::<u8>(command).await {
@@ -261,13 +261,13 @@ impl Session {
                     return Err(error);
                 }
             };
+            write.finish(applied == 1, values);
             if applied == 1 {
                 if let Some(inventory) = committed.as_mut() {
                     inventory.holds.extend(cached_holds);
                 }
                 *inventory = committed;
-                self.observe_node(saved.nodes[id].clone());
-                self.store.notify_committed_change(header.revision, changed);
+
                 saved.revision = self
                     .store
                     .connection

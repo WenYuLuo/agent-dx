@@ -59,7 +59,7 @@ fn default_ttl() -> u64 {
 fn default_failed_retention() -> u64 {
     600
 }
-#[tokio::main(flavor = "current_thread")]
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _logging_guard = adx_observability::logging::init("adx-coordinator", false)?;
     let config: Config = read_config()?;
