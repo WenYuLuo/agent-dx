@@ -556,7 +556,7 @@ fn next_result(old: &StoredEnvironment, r: &EnvironmentRecord) -> Result<bool> {
 
 struct Connection {
     client: redis::Client,
-    current: Mutex<Option<MultiplexedConnection>>,
+    current: Mutex<Option<Arc<MultiplexedConnection>>>,
     timeout: Duration,
     committed_changes: broadcast::Sender<ControlChange>,
     publication_sequence: AtomicU64,
@@ -645,23 +645,25 @@ impl RedisStore {
                     let config = redis::AsyncConnectionConfig::new()
                         .set_connection_timeout(None)
                         .set_response_timeout(None);
-                    *guard = Some(
+                    *guard = Some(Arc::new(
                         self.connection
                             .client
                             .get_multiplexed_async_connection_with_config(&config)
                             .await?,
-                    );
+                    ));
                 }
-                let mut conn = guard.as_ref().expect("connection initialized").clone();
+                let lease = guard.as_ref().expect("connection initialized").clone();
                 drop(guard);
+                let mut conn = lease.as_ref().clone();
                 let result = cmd.query_async(&mut conn).await;
-                if retry_read
-                    && result
-                        .as_ref()
-                        .is_err_and(|error: &redis::RedisError| error.is_connection_dropped())
-                {
+                let dropped = result
+                    .as_ref()
+                    .is_err_and(|error: &redis::RedisError| error.is_connection_dropped());
+                if dropped {
+                    self.discard_connection(&lease).await;
+                }
+                if retry_read && dropped {
                     retry_read = false;
-                    *self.connection.current.lock().await = None;
                     continue;
                 }
                 return result;
@@ -669,12 +671,9 @@ impl RedisStore {
         };
         match timeout(self.connection.timeout, operation).await {
             Ok(Ok(value)) => Ok(value),
-            result => {
-                if result.is_ok() {
-                    // A driver error closes/invalidates this transport. Reconnect
-                    // on the next operation instead of retaining a broken socket.
-                    *self.connection.current.lock().await = None;
-                }
+            _ => {
+                // A Redis command rejection does not break the transport.
+                // Only the dropped-connection path above retires its own lease.
                 // On a caller timeout retain the ordered transport: its driver
                 // may still finish the queued write. A targeted repair queued on
                 // this same connection cannot overtake that unknown mutation.
@@ -683,6 +682,18 @@ impl RedisStore {
                     "Redis operation unavailable or timed out".into(),
                 ))
             }
+        }
+    }
+
+    async fn discard_connection(&self, lease: &Arc<MultiplexedConnection>) {
+        let mut current = self.connection.current.lock().await;
+        if current
+            .as_ref()
+            .is_some_and(|conn| Arc::ptr_eq(conn, lease))
+        {
+            // An older request may report its transport failure after another
+            // request has reconnected. Never clear that replacement connection.
+            *current = None;
         }
     }
 
@@ -2077,5 +2088,59 @@ impl Session {
         Err(Error::Unavailable(
             "concurrent environment commit; retry request".into(),
         ))
+    }
+}
+
+#[cfg(test)]
+use crate::rpc::cancellation_test_redis as transport_test_redis;
+
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+
+    async fn client_id(store: &RedisStore) -> u64 {
+        let mut command = redis::cmd("CLIENT");
+        command.arg("ID");
+        store.query(command).await.unwrap()
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated Redis; set ADX_TEST_REDIS_SERVER"]
+    async fn redis_command_error_does_not_discard_ordered_transport() {
+        let redis = transport_test_redis::Redis::new().await;
+        let store = redis.store().await;
+        let before = client_id(&store).await;
+        let mut command = redis::cmd("EVAL");
+        command
+            .arg("return redis.error_reply('validation rejected')")
+            .arg(0);
+        assert!(store.query::<u8>(command).await.is_err());
+        assert_eq!(
+            client_id(&store).await,
+            before,
+            "a command rejection must preserve the transport ordering of other pending writes"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires isolated Redis; set ADX_TEST_REDIS_SERVER"]
+    async fn delayed_failure_of_old_transport_preserves_reconnected_client() {
+        let redis = transport_test_redis::Redis::new().await;
+        let store = redis.store().await;
+        let before = client_id(&store).await;
+        let old = store.connection.current.lock().await.clone().unwrap();
+        let control = RedisStore::connect(&redis.url, "control", Duration::from_secs(2))
+            .await
+            .unwrap();
+        let mut kill = redis::cmd("CLIENT");
+        kill.arg("KILL").arg("ID").arg(before);
+        assert_eq!(control.query::<u8>(kill).await.unwrap(), 1);
+        let _: String = store.query(redis::cmd("PING")).await.unwrap();
+        let replacement = client_id(&store).await;
+        assert_ne!(replacement, before);
+        // Resume the failure callback of a second request on the old transport
+        // only after a real disconnect/reconnect has installed its replacement.
+        store.discard_connection(&old).await;
+        assert_eq!(client_id(&store).await, replacement);
     }
 }
