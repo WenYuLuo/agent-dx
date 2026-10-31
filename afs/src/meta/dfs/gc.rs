@@ -7,6 +7,21 @@ use std::{
 };
 static GC_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 const MAX_CHUNKS: usize = 1024;
+/// Maximum admission horizon update_gc_reference accepts beyond the current
+/// time (the "60s cleanup fence"). A replay of an abandoned admission can
+/// only be accepted while its original deadline is still in this window.
+const ADMISSION_HORIZON_MS: u64 = 60_000;
+/// Clock-skew allowance between node clocks (which stamp admission deadlines
+/// and write identities) and the meta clock (which validates them). Combined
+/// with ADMISSION_HORIZON_MS it bounds when a replay can still pass the
+/// deadline gate after the tombstone's retirement.
+const ADMISSION_CLOCK_SKEW_MS: u64 = 60_000;
+/// Minimum time a retired reference record must linger as a replay tombstone:
+/// admission horizon + clock skew, the window in which a late arrival can
+/// still legally pass its deadline gate. Records additionally live as long
+/// as the configured data grace protects their content (plan_collection
+/// deletes them at max(grace, this value)), so a long grace is honored.
+const REFERENCE_RECORD_RETENTION_MS: u64 = ADMISSION_HORIZON_MS + ADMISSION_CLOCK_SKEW_MS;
 #[derive(Default)]
 struct GcPlan {
     keys: Vec<MetaKey>,
@@ -144,11 +159,10 @@ fn plan_collection(
             MetaEntity::DfsWriteLease(lease) => lease.expires_at_unix_ms <= now,
             MetaEntity::DfsReference(reference) => {
                 reference.retired_at_unix_ms.is_some_and(|time| {
-                    time.saturating_add(if reference.reference_id.starts_with("write:") {
-                        grace.max(120_000)
-                    } else {
-                        grace
-                    }) <= now
+                    // The record must live as long as it still protects data
+                    // (a configured grace can exceed the tombstone retention)
+                    // and never shorter than the replay-fencing window.
+                    time.saturating_add(grace.max(REFERENCE_RECORD_RETENTION_MS)) <= now
                 })
             }
             _ => false,
@@ -210,8 +224,7 @@ fn live_caller(entities: &[MetaEntity], node: &str, session: &str) -> Result<()>
     }
 }
 impl DfsService {
-    #[cfg(test)]
-    fn with_gc_grace_ms(mut self, grace: u64) -> Self {
+    pub fn with_gc_grace_ms(mut self, grace: u64) -> Self {
         self.gc_grace_ms = grace;
         self
     }
@@ -751,6 +764,171 @@ mod tests {
             "both versions become unreachable only after close and grace"
         );
     }
+
+    fn retired_reference(id: &str, retired_at: u64) -> (MetaEntity, GcReference) {
+        let mut reference = pin("mapped");
+        reference.reference_id = id.into();
+        reference.retired_at_unix_ms = Some(retired_at);
+        (MetaEntity::DfsReference(reference.clone()), reference)
+    }
+
+    #[test]
+    fn retired_write_reference_record_outlives_grace_until_admission_window_closes() {
+        let (entity, reference) = retired_reference("write:generation-op", 100);
+        let entities = vec![entity];
+        assert!(
+            plan_collection(&entities, &[reference.clone()], 110, 10)
+                .keys
+                .is_empty(),
+            "data grace has passed but the record stays as a tombstone fencing late admissions"
+        );
+        assert!(
+            plan_collection(
+                &entities,
+                &[reference.clone()],
+                100 + ADMISSION_HORIZON_MS,
+                10
+            )
+            .keys
+            .is_empty(),
+            "the admission horizon alone is not enough while node clocks can skew"
+        );
+        assert_eq!(
+            plan_collection(
+                &entities,
+                &[reference],
+                100 + REFERENCE_RECORD_RETENTION_MS,
+                10
+            )
+            .keys
+            .len(),
+            1,
+            "record reclaims only after horizon + skew, when the deadline gate alone provably rejects every replay"
+        );
+    }
+
+    #[test]
+    fn long_data_grace_extends_reference_record_life_beyond_retention() {
+        let (entity, reference) = retired_reference("open:reader-1", 100);
+        let entities = vec![entity];
+        let long_grace = 300_000_u64;
+        assert!(
+            plan_collection(
+                &entities,
+                &[reference.clone()],
+                100 + REFERENCE_RECORD_RETENTION_MS,
+                long_grace
+            )
+            .keys
+            .is_empty(),
+            "tombstone retention has elapsed but the record still protects data under the long grace"
+        );
+        assert_eq!(
+            plan_collection(&entities, &[reference], 100 + long_grace, long_grace)
+                .keys
+                .len(),
+            1,
+            "record converges only when the configured data grace also expires"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_past_retention_but_still_protecting_data_survives_consecutive_collections() {
+        // Discriminating window: retirement happened 150s ago, so the 120s
+        // tombstone retention has already elapsed, but the configured 200s
+        // data grace has not. A record deleted at the fixed retention would
+        // leave the second collection blind to the still-protected data.
+        let entities_ref = vec![inode("i", 1, "v2"), chunk("old"), chunk("new")];
+        let mut entities = entities_ref;
+        entities.extend(version("v1", "i", "old"));
+        entities.extend(version("v2", "i", "new"));
+        let mut reference = pin("i");
+        reference.retired_at_unix_ms = Some(now_unix_ms().saturating_sub(150_000));
+        entities.push(MetaEntity::DfsReference(reference));
+        let (store, _) = seeded_store(entities).await;
+        let service = DfsService::new(store.clone()).with_gc_grace_ms(200_000);
+        for _ in 0..2 {
+            let gc = service
+                .collect_garbage("n".into(), "s".into(), 0, vec![])
+                .await
+                .unwrap();
+            assert!(
+                gc.chunks.is_empty(),
+                "data under the unexpired 200s grace must not reclaim"
+            );
+            let (_, snapshot) = store.read_view().await.unwrap().snapshot().unwrap();
+            assert!(
+                snapshot
+                    .iter()
+                    .any(|entity| matches!(entity, MetaEntity::DfsReference(value)
+                    if value.retired_at_unix_ms.is_some_and(|retired| {
+                        retired.saturating_add(200_000) > now_unix_ms()
+                    }))),
+                "past tombstone retention but inside the data grace, the record must survive every collection round"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_replay_after_real_tombstone_deletion_is_rejected() {
+        let mut tombstone = pending_reference("late-open");
+        let aged = now_unix_ms().saturating_sub(1_000_000);
+        let MetaEntity::DfsReference(value) = &mut tombstone else {
+            unreachable!("pending_reference builds a DfsReference");
+        };
+        value.retired_at_unix_ms = Some(aged);
+        let (store, _) = seeded_store(vec![inode("i", 1, "v"), tombstone]).await;
+        let service = DfsService::new(store.clone()).with_gc_grace_ms(0);
+        service
+            .collect_garbage("n".into(), "s".into(), 0, vec![])
+            .await
+            .unwrap();
+        let (_, snapshot) = store.read_view().await.unwrap().snapshot().unwrap();
+        assert!(
+            !snapshot
+                .iter()
+                .any(|entity| matches!(entity, MetaEntity::DfsReference(_))),
+            "the aged tombstone must be genuinely deleted before the replay"
+        );
+        let mut late = update("late-open");
+        late.admission_deadline_unix_ms = now_unix_ms().saturating_sub(1);
+        assert_eq!(
+            service.update_gc_reference(late).await.unwrap_err().code(),
+            afs_error::META_DFS_REFERENCE_ADMISSION_EXPIRED,
+            "with the record gone the deadline gate alone must reject the replay"
+        );
+    }
+
+    #[test]
+    fn write_and_read_reference_records_die_together_after_retirement() {
+        let (write_entity, write_reference) = retired_reference("write:generation-op", 100);
+        let (read_entity, read_reference) = retired_reference("open:reader-1", 100);
+        let entities = vec![write_entity, read_entity];
+        let references = vec![write_reference, read_reference];
+        assert!(
+            plan_collection(
+                &entities,
+                &references,
+                100 + REFERENCE_RECORD_RETENTION_MS - 1,
+                10
+            )
+            .keys
+            .is_empty()
+        );
+        assert_eq!(
+            plan_collection(
+                &entities,
+                &references,
+                100 + REFERENCE_RECORD_RETENTION_MS,
+                10
+            )
+            .keys
+            .len(),
+            2,
+            "write and read references retired together must be reclaimed together on the derived bound"
+        );
+    }
+
     fn generation_chunk(operation: &str, suffix: char) -> MetaEntity {
         let generation = blake3::hash(operation.as_bytes()).to_hex()[..32].to_string();
         let mut staged = crate::node::chunk::StagedChunk::new_crc32c(
@@ -1326,16 +1504,19 @@ mod tests {
             .unwrap();
         let (_, entities) = store.read_view().await.unwrap().snapshot().unwrap();
         assert!(
-            !entities
+            entities
                 .iter()
-                .any(|entity| matches!(entity, MetaEntity::DfsReference(_))),
-            "retired tombstones must also converge"
+                .any(|entity| matches!(entity, MetaEntity::DfsReference(value)
+                if value.retired_at_unix_ms.is_some_and(|retired| {
+                    retired.saturating_add(REFERENCE_RECORD_RETENTION_MS) > now_unix_ms()
+                }))),
+            "retired tombstones must outlive the admission window instead of converging at data grace"
         );
         let mut late = update("late-open");
         late.admission_deadline_unix_ms = now_unix_ms().saturating_sub(1);
-        assert_eq!(
-            service.update_gc_reference(late).await.unwrap_err().code(),
-            afs_error::META_DFS_REFERENCE_ADMISSION_EXPIRED
+        assert!(
+            service.update_gc_reference(late).await.is_err(),
+            "an expired replay must stay rejected while the tombstone is retained"
         );
     }
     #[tokio::test]

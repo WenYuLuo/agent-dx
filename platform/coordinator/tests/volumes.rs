@@ -1639,14 +1639,13 @@ async fn volume_claim_batch_and_delete_preserve_request_identity_and_creation_su
         .unwrap();
     let client = redis::Client::open(rig.url.clone()).unwrap();
     let mut redis = client.get_multiplexed_async_connection().await.unwrap();
-    let requests_key = "adx:{test}:control:v1:create-receipts";
-    let pending: u64 = redis::cmd("HLEN")
-        .arg(requests_key)
+    let pending: Vec<String> = redis::cmd("KEYS")
+        .arg("adx:{test}:control:v1:create-receipt:*")
         .query_async(&mut redis)
         .await
         .unwrap();
-    assert_eq!(
-        pending, 0,
+    assert!(
+        pending.is_empty(),
         "an unfinished claim is not a successful creation receipt"
     );
 
@@ -1719,12 +1718,12 @@ async fn volume_claim_batch_and_delete_preserve_request_identity_and_creation_su
         assert_eq!(replay.result, record);
         assert!(replay.stored.is_none());
     }
-    let bindings: u64 = redis::cmd("HLEN")
-        .arg(requests_key)
+    let bindings: Vec<String> = redis::cmd("KEYS")
+        .arg("adx:{test}:control:v1:create-receipt:*")
         .query_async(&mut redis)
         .await
         .unwrap();
-    assert_eq!(bindings, 2);
+    assert_eq!(bindings.len(), 2);
     assert_eq!(
         session
             .published_request("tenant", "volume-request")

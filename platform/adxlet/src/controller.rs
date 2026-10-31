@@ -44,6 +44,16 @@ pub(super) fn unstarted(record: &EnvironmentRecord) -> bool {
         && !record.restart_pending
 }
 
+pub(super) fn protects_execution(record: &EnvironmentRecord, runtime_id: &str) -> bool {
+    // A failed Restore can publish Paused while retaining its attempted ID.
+    // Identity alone does not authorize an execution that materializes later.
+    record.runtime.id == runtime_id
+        && !matches!(
+            record.state,
+            EnvironmentState::Paused | EnvironmentState::Failed | EnvironmentState::Deleted
+        )
+}
+
 enum Command {
     Snapshot(
         super::checkpoint::SnapshotRequest,
@@ -76,6 +86,7 @@ enum Command {
         Box<AuthorityCheck>,
         oneshot::Sender<Result<AuthorityResult>>,
     ),
+    ReapOrphan(crate::RuntimeObservation, oneshot::Sender<Result<()>>),
     Discard(
         Option<Arc<CheckpointReferences>>,
         oneshot::Sender<Result<()>>,
@@ -97,7 +108,10 @@ impl Envelope {
     fn new(command: Command, reply: Reply) -> Self {
         let trace = (!matches!(
             command,
-            Command::Tick(_) | Command::Expire(_, _) | Command::CheckAuthority(_, _)
+            Command::Tick(_)
+                | Command::Expire(_, _)
+                | Command::CheckAuthority(_, _)
+                | Command::ReapOrphan(_, _)
         ))
         .then(|| adx_observability::trace::Trace::child("environment.queue"));
         Self {
@@ -264,6 +278,16 @@ impl EnvironmentHandle {
                 Command::CheckAuthority(Box::new(check), tx),
                 unused,
             ))
+            .await
+            .map_err(|_| Error::Unavailable("environment controller stopped".into()))?;
+        rx.await
+            .map_err(|_| Error::Unavailable("environment controller stopped".into()))?
+    }
+    pub(crate) async fn reap_orphan(&self, runtime: crate::RuntimeObservation) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        let (unused, _) = oneshot::channel();
+        self.tx
+            .send(Envelope::new(Command::ReapOrphan(runtime, tx), unused))
             .await
             .map_err(|_| Error::Unavailable("environment controller stopped".into()))?;
         rx.await
@@ -636,6 +660,11 @@ impl Controller {
                 let _ = ack.send(result);
                 return;
             }
+            Command::ReapOrphan(runtime, ack) => {
+                let result = self.reap_orphan(runtime).await;
+                let _ = ack.send(result);
+                return;
+            }
             Command::Discard(references, ack) => {
                 let result = self.discard_execution(references.as_deref()).await;
                 let _ = ack.send(result);
@@ -676,6 +705,7 @@ impl Controller {
             Command::Snapshot(_, _)
             | Command::AlignAuthority(_, _)
             | Command::CheckAuthority(_, _)
+            | Command::ReapOrphan(_, _)
             | Command::Discard(_, _)
             | Command::Expire(_, _)
             | Command::Tick(_)

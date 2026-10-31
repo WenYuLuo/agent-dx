@@ -164,7 +164,7 @@ impl Api {
                     None,
                     None,
                     false,
-                );
+                )
             }
         };
         let method = request.method().as_str().to_string();

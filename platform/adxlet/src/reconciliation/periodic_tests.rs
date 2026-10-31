@@ -14,6 +14,89 @@ fn pending_record() -> EnvironmentRecord {
 }
 
 #[tokio::test]
+async fn orphan_scan_does_not_retire_a_generation_waiting_for_its_controller() {
+    let hooks = Arc::new(Hooks::default());
+    let node = Adxlet::new(
+        "n".into(),
+        hooks.clone(),
+        hooks.clone(),
+        hooks.clone(),
+        hooks,
+    );
+    node.update_capacity(
+        Resources {
+            cpu_millis: 10,
+            memory_bytes: 10,
+            disk_bytes: 0,
+        },
+        std::time::Duration::from_secs(60),
+    )
+    .unwrap();
+    let record = pending_record();
+    for _ in 0..2 {
+        let basis = ComparisonBasis {
+            controllers: Default::default(),
+            inventory: Ok(vec![crate::RuntimeObservation {
+                environment_id: record.spec.id.clone(),
+                runtime_id: "pending-1-r2".into(),
+                generation: 1,
+                tenant_id: "t".into(),
+                running: true,
+            }]),
+        };
+        let outcome = node
+            .compare_retained(
+                basis,
+                vec![record.clone()],
+                vec![],
+                vec![],
+                std::time::Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(outcome, ReconciliationOutcome::Complete));
+        assert!(node.retired_environment("pending").is_none());
+        assert!(node.accepting_allocations());
+    }
+    // The optional Claim's Create RPC can still register its controller.
+    node.environment(record.spec, record.assignment).unwrap();
+}
+
+#[tokio::test]
+async fn orphan_claim_in_controller_replacement_gap_preserves_authority_adoption() {
+    let hooks = Arc::new(Hooks::default());
+    let node = Adxlet::new(
+        "n".into(),
+        hooks.clone(),
+        hooks.clone(),
+        hooks.clone(),
+        hooks,
+    );
+    let mut record = pending_record();
+    record.state = EnvironmentState::Running;
+    record.revision = 2;
+    record.runtime.id = "pending-1-r3".into();
+    record.runtime.ip = Some("127.0.0.1".parse().unwrap());
+    let runtime = crate::RuntimeObservation {
+        environment_id: record.spec.id.clone(),
+        runtime_id: "pending-1-r2".into(),
+        generation: 1,
+        tenant_id: "t".into(),
+        running: true,
+    };
+    assert!(matches!(
+        node.claim_orphan(&runtime, true),
+        OrphanTarget::AwaitingController
+    ));
+    assert!(node.retired_environment("pending").is_none());
+    assert!(node.adopt_comparison_record(&record).unwrap().is_some());
+    assert!(matches!(
+        node.claim_orphan(&runtime, true),
+        OrphanTarget::Controller(_)
+    ));
+}
+
+#[tokio::test]
 async fn live_catalog_defers_a_claim_before_its_create_rpc_arrives() {
     let hooks = Arc::new(Hooks::default());
     let node = Adxlet::new(

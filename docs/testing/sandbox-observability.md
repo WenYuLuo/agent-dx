@@ -134,10 +134,16 @@ RPC 服务首次读取业务统计失败时以未初始化快照继续启动，�
 日志在提交成功后输出 `environment_interrupted`、`environment_recovery_resolved`，用于关联排障；
 日志不作为完整历史影响账本。
 
-同 tenant/request ID 的成功回执位于 `:create-receipts` hash，和初次成功结果原子发布。
-Environment ID 或 Request ID 任一命中成功身份，复用已有结果；默认预留不持久化请求绑定。
+同 tenant/request ID 的成功回执位于 `:create-receipt:<身份摘要>` 独立键，和初次成功结果原子发布。
+Redis 从首次发布起保留 600 秒，读取和重试不续期，重启保留到期时间；不维护永久请求索引。
+Environment ID 或有效期内的 Request ID 任一命中成功身份，复用已有结果；默认预留不持久化请求绑定。
 未命名请求由 API 根据 tenant/request ID 生成稳定名称。可选持久化 Claim 保留候选归属，
-最终仍由成功发布确定有效结果。成功 Request ID 回执跨删除保留；删除后新建须使用新请求身份。
+最终仍由成功发布确定有效结果。成功 Request ID 回执在 600 秒窗口内跨删除保留；
+窗口内删除后新建须使用新请求身份。回执过期不删除仍存活的 Environment。
+
+从无 TTL 的回执版本升级时，停止创建写入并等待最后一次成功发布满 600 秒，
+再替换全部 Coordinator，使用 Redis `UNLINK` 清理旧的 `:create-receipts` 和 `:create-requests` 两个 hash。
+这些旧 hash 不会由新写入自动过期；不要删除控制主表或在新旧 Coordinator 混跑时清理。
 
 ### 快速恢复与正常操作竞态
 

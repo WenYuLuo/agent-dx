@@ -754,7 +754,6 @@ pub fn start_request(
             })
             .collect(),
         sandbox_id: String::new(),
-        start_key: runtime_id.into(),
         runtime: spec.runtime_class.clone(),
         rootfs: Some(if let Some(rootfs) = &options.rootfs {
             environment_rootfs(rootfs)?
@@ -1288,37 +1287,15 @@ impl RuntimeDriver for Sandboxd {
         let mut state = self.cell(runtime_id).lock_owned().await;
         let failed_start = matches!(*state, StartState::Failed | StartState::UncertainStart);
         if matches!(*state, StartState::UncertainStart) {
-            // A successful keyed Delete waits for Start's handler and rollback,
-            // fences a request that has not arrived, and removes any late sandbox.
-            // Only its explicit acknowledgement can settle an empty inventory.
-            match self
-                .client
-                .clone()
-                .delete(self.request(proto::DeleteRequest {
-                    start_key: runtime_id.into(),
-                    ..Default::default()
-                }))
-                .await
-            {
-                Ok(response)
-                    if response
-                        .metadata()
-                        .get("sandboxd-start-fenced")
-                        .is_some_and(|value| value == "true") =>
-                {
-                    *state = StartState::Failed
-                }
-                Ok(_) => return Err(unavailable("backend did not acknowledge the Start fence")),
-                // Older backends can still clean a discovered physical runtime,
-                // but an empty List alone cannot settle their unknown Start.
-                Err(error) if error.code() == Code::Unimplemented => (),
-                Err(error) => return Err(unavailable(error)),
-            }
+            // A failed create is terminal locally, not proof that backend work
+            // stopped. Remove what is visible now; periodic inventory will find
+            // late instances even after this controller or process is gone.
+            *state = StartState::Failed;
         }
-        if matches!(*state, StartState::Uncertain | StartState::UncertainStart) {
+        if matches!(*state, StartState::Uncertain) {
             if self.list_id(runtime_id).await?.is_empty() {
                 return Err(unavailable(
-                    "cannot confirm cleanup while Start outcome is unknown",
+                    "cannot confirm cleanup while checkpoint outcome is unknown",
                 ));
             }
             *state = if failed_start {
@@ -1334,7 +1311,6 @@ impl RuntimeDriver for Sandboxd {
                 .delete(self.request(proto::DeleteRequest {
                     id: physical,
                     timeout: 0,
-                    ..Default::default()
                 }))
                 .await
             {

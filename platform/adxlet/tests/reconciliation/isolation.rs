@@ -235,7 +235,7 @@ async fn recovery_cleanup_failure_keeps_admission_closed_until_retry() {
 }
 
 #[tokio::test]
-async fn recovery_cleans_all_orphan_executions_before_reopening() {
+async fn periodic_cleanup_retires_all_observed_orphan_generations() {
     let backend = Arc::new(Backend::default());
     let node = authority::manager(backend.clone());
     let mut authority = authority::Fixture::new().await;
@@ -249,11 +249,13 @@ async fn recovery_cleans_all_orphan_executions_before_reopening() {
         .unwrap()
         .extend([observed("orphan"), late]);
     authority.cycle(&node).await.unwrap();
-    assert_eq!(backend.actual.lock().unwrap().len(), 2);
-    authority.registration.reconciling = true;
-    authority.cycle(&node).await.unwrap();
     assert!(backend.actual.lock().unwrap().is_empty());
-    let candidate = record("orphan", EnvironmentState::Pending);
+    assert!(node.accepting_allocations());
+    let mut candidate = record("orphan", EnvironmentState::Pending);
+    assert!(node
+        .environment(candidate.spec.clone(), candidate.assignment.clone())
+        .is_err());
+    candidate.assignment.generation = 9;
     assert!(node
         .environment(candidate.spec, candidate.assignment)
         .is_ok());
@@ -369,3 +371,6 @@ async fn session_invalidation_still_drains_pending_environment_work_before_reope
     assert!(node.accepting_allocations());
     assert_eq!(*backend.actual.lock().unwrap(), vec![observed("busy")]);
 }
+
+#[path = "late_restore.rs"]
+mod late_restore;

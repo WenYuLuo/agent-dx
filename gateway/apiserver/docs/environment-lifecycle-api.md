@@ -375,9 +375,15 @@ Like an inherited OCI USER, a non-default `user` requires the deployment-owned s
 `user` accepts the existing image user-resolution syntax (name or numeric UID,
 optionally followed by a group). `cwd` is an absolute canonical path; it must
 already be accessible to that user. This is separate from the constructor `cwd`
-option below. `process` requires `inheritEntrypoint: true`; the Jiuwenbox backend
-does not support these overrides. Environment persistence and internal RPC retain
-the explicit fields across lifecycle operations.
+option below. `process` requires `inheritEntrypoint: true`. Jiuwenbox Supervisor
+and Conch forward explicit workload fields to Execd while keeping the runtime
+control identity separate. Environment persistence and internal RPC retain the
+explicit fields across lifecycle operations.
+
+Jiuwenbox can return HTTP 201 with `phase: error` when its sandbox daemon cannot
+start. ADX treats that explicit failure as a backend rejection and cleans up the
+failed execution; it does not reschedule it until the queue deadline. Raw backend
+output is omitted from the public error because it can contain sensitive values.
 
 ## Constructor working directory
 

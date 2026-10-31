@@ -111,11 +111,13 @@ API Server、Coordinator 和入口节点为创建错误回传预留最多 3 秒�
 已确认撤销的响应进入普通完成缓存；同一 Request ID 的重放在缓存保留期间返回
 原失败，不重新排队，也不生成运行时失败实例记录。
 
+Activator 将完整的确定取消诊断与普通 RPC 超时分开处理：保持候选 Env ID和规格，CAS推进持久化的创建尝试序号，退避后使用新的 Request ID开始下一次尝试；旧 Request ID的缓存不被清除或刷新。结果未知、仅查询不到Env或已有执行启动/重启/恢复不会授权推进序号。该行为是Agent编排层开启新的已取消尝试，不改变SDK对单次 `retry=never` 的处理。详情见[Activator重试规则](../../../agent/activator/README.md#创建排队取消与退避)。
+
 ### 创建重放缓存
 
 生命周期操作的重试身份表不以 `cache_entries` 为准入限制，不会因为保留的操作记录多而返回 429；实际节点资源或准入拒绝仍按原错误契约处理。
 
-API Server 的已完成创建响应使用 600 秒 TTL 与 `cache_entries` 容量淘汰；缓存满只淘汰旧完成项，不产生 `RESOURCE_EXHAUSTED`。正在执行和结果未知的请求保留同一租户、Request ID、Environment ID 与规格，不受完成缓存容量限制。结果未知的重试在保留窗口内查询权威归属，或以原身份进入原子创建链路；不会仅凭传输超时将 Environment 标为 Failed 或释放节点预留。未知上下文的 `create_unknown_retention_seconds` 默认 600 秒，从首次未知结果计时，不因未决重试续期；到期后周期 GC 直接回收，不查询权威状态，执行中或仍有共享身份等待的请求不回收。GC 不改变 Environment 或资源状态。完成响应过期、淘汰、未知请求 GC 或进程重启后，成功请求仍由 Coordinator 的持久回执去重：同租户的 Request ID 或 Environment ID 任一个已有成功，就复用该结果和规格。已删除结果不会复活；回执不会指向同名后续的新执行。
+API Server 的已完成创建响应使用 600 秒 TTL 与 `cache_entries` 容量淘汰；缓存满只淘汰旧完成项，不产生 `RESOURCE_EXHAUSTED`。正在执行和结果未知的请求保留同一租户、Request ID、Environment ID 与规格，不受完成缓存容量限制。结果未知的重试在保留窗口内查询权威归属，或以原身份进入原子创建链路；不会仅凭传输超时将 Environment 标为 Failed 或释放节点预留。未知上下文的 `create_unknown_retention_seconds` 默认 600 秒，从首次未知结果计时，不因未决重试续期；到期后周期 GC 直接回收，不查询权威状态，执行中或仍有共享身份等待的请求不回收。GC 不改变 Environment 或资源状态。Coordinator 的成功 Request ID 回执从首次发布起保留 600 秒，重试不续期，Redis／Coordinator 重启不重置期限。在回执有效期内，同租户 Request ID 复用原结果；已删除结果不会复活，回执不会指向同名后续的新执行。回执过期后，仍存在的 Environment ID 继续复用当前结果；原 Environment 已删除时，旧 Request ID 不再保证去重，可以产生新创建。回执到期只回收幂等记录，不删除 Environment 或释放资源。
 
 ### sandboxd Start 失败
 

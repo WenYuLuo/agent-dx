@@ -49,6 +49,12 @@ pub trait Backend: Send + Sync {
         WriteAdmissionMode::Queued
     }
 
+    /// Whether an ordinary explicit-offset write can be owned by the FUSE
+    /// admission queue. Append, synchronous and remote-owner handles opt out.
+    fn accepts_queued_writes(&self, _handle: types::FileHandle) -> bool {
+        false
+    }
+
     /// Local capability query after a successful fresh open. `None` requires
     /// discarding pages; implementations must not perform RPCs from this hook.
     fn page_cache_identity(&self, _handle: types::FileHandle) -> Option<PageCacheIdentity> {
@@ -474,6 +480,12 @@ pub trait Backend: Send + Sync {
         _name: &OsStr,
     ) -> Result<types::Entry> {
         Err(unsupported("link"))
+    }
+
+    /// A fixed local response which does not depend on queued write contents.
+    /// The actual operation must still validate inode identity and permissions.
+    fn getxattr_is_fixed_local(&self, _name: &OsStr) -> bool {
+        false
     }
 
     /// Extended attributes use raw Linux names and values. Permission and

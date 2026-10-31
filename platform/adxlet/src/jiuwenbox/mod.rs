@@ -719,6 +719,15 @@ impl Jiuwenbox {
             .client
             .request(Method::POST, "/api/v1/sandboxes", Some(body), true)
             .await?;
+        if response["phase"] == "error" {
+            // Jiuwenbox reports daemon startup failures in a successful HTTP
+            // response. Preserve that terminal rejection instead of rescheduling
+            // it until the queue deadline. Backend output can contain secrets.
+            return Err(Error::BackendFailure {
+                code: adx_core::BackendFailureCode::FailedPrecondition,
+                message: "Jiuwenbox backend create reported error".into(),
+            });
+        }
         if response["phase"] != "ready" {
             return Err(unavailable("backend create did not reach ready"));
         }

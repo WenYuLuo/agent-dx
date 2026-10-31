@@ -62,6 +62,7 @@ struct Backend {
     entered: Semaphore,
     release: Semaphore,
     reject_create: AtomicBool,
+    errored_create_phase: AtomicBool,
     reject_delete: AtomicBool,
     block_delete: AtomicBool,
     delete_entered: Semaphore,
@@ -80,6 +81,7 @@ impl Backend {
             entered: Semaphore::new(0),
             release: Semaphore::new(1),
             reject_create: AtomicBool::new(false),
+            errored_create_phase: AtomicBool::new(false),
             reject_delete: AtomicBool::new(false),
             block_delete: AtomicBool::new(false),
             delete_entered: Semaphore::new(0),
@@ -117,6 +119,13 @@ impl Backend {
             if self.reject_create.load(Ordering::SeqCst) {
                 code = StatusCode::SERVICE_UNAVAILABLE;
                 json!({})
+            } else if self.errored_create_phase.load(Ordering::SeqCst) {
+                code = StatusCode::CREATED;
+                let id = body["sandbox_id"].as_str().unwrap().to_owned();
+                let value =
+                    json!({"id":id,"phase":"error","error_message":"private backend output"});
+                self.refs.lock().unwrap().insert(id, value.clone());
+                value
             } else {
                 let id = body["sandbox_id"].as_str().unwrap().to_owned();
                 self.refs
@@ -753,11 +762,8 @@ async fn recovery_reclaims_failed_execution_without_a_retained_controller() {
             .count(),
         deletes
     );
-    // An external execution has no lifecycle controller; recovery owns cleanup.
+    // Periodic inventory can reclaim an identified execution without a controller.
     fixture.backend.reject_delete.store(false, Ordering::SeqCst);
-    authority.cycle(&node).await.unwrap();
-    assert_eq!(driver.inventory().await.unwrap().len(), 1);
-    authority.registration.reconciling = true;
     authority.cycle(&node).await.unwrap();
     assert!(node.accepting_allocations());
     assert!(driver.inventory().await.unwrap().is_empty());
@@ -1447,8 +1453,10 @@ async fn recovery_reaps_late_supervisor_and_conch_without_local_records() {
             fixture.host.supervisors.lock().unwrap().push(id);
             fixture.host.process_alive.store(true, Ordering::SeqCst);
         }
-        // Ordinary data reconciliation does not scan backend execution state.
-        authority.cycle(&node).await.unwrap();
+        // Unidentified native executions still require quiescent recovery.
+        // A live inventory failure preserves admission and the backend.
+        assert!(authority.cycle(&node).await.is_err());
+        assert!(node.accepting_allocations());
         assert!(!fixture.backend.refs.lock().unwrap().is_empty(), "{class}");
         // A new recovery handshake performs complete orphan cleanup.
         authority.registration.reconciling = true;
@@ -1657,4 +1665,56 @@ async fn identity_override_is_not_silently_ignored_by_supervisor() {
         .unwrap()
         .iter()
         .any(|(m, p, _)| m == "POST" && p == "/api/v1/sandboxes"));
+}
+
+#[tokio::test]
+async fn errored_backend_phase_is_a_terminal_failure_and_is_cleaned() {
+    for class in ["supervisor", "conch"] {
+        let fixture = Fixture::new();
+        let driver = fixture.driver().await;
+        fixture
+            .backend
+            .errored_create_phase
+            .store(true, Ordering::SeqCst);
+        let error = driver
+            .start_with_deadline(
+                &spec(class),
+                "tenant-agent-1",
+                1,
+                &[],
+                Instant::now() + CREATE_BUDGET,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                Error::BackendFailure {
+                    code: adx_core::BackendFailureCode::FailedPrecondition,
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        assert!(!error.to_string().contains("private backend output"));
+        let status = adx_protocol::status(error);
+        assert_eq!(
+            status.metadata().get("adx-backend-failure").unwrap(),
+            "true"
+        );
+        driver.remove("tenant-agent-1").await.unwrap();
+        assert!(fixture.backend.refs.lock().unwrap().is_empty());
+        assert!(fixture.native.physical.lock().unwrap().is_empty());
+        let calls = fixture.backend.calls.lock().unwrap();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|(m, p, _)| m == "POST" && p == "/api/v1/sandboxes")
+                .count(),
+            1
+        );
+        assert!(!calls
+            .iter()
+            .any(|(_, p, _)| p.ends_with("/exec_background")));
+    }
 }

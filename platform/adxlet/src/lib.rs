@@ -403,8 +403,10 @@ pub(crate) struct Services {
 }
 
 type EnvironmentDirectory = BTreeMap<String, (EnvironmentSpec, Assignment, EnvironmentHandle)>;
-type AuthorityTasks =
-    BTreeMap<String, tokio::sync::oneshot::Receiver<Result<controller::AuthorityResult>>>;
+type AuthorityTasks = BTreeMap<
+    (String, Option<String>),
+    tokio::sync::oneshot::Receiver<Result<controller::AuthorityResult>>,
+>;
 
 #[derive(Clone)]
 pub struct Adxlet {
