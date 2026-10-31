@@ -723,6 +723,57 @@ pub fn make_control_server_with_dfs_owner(
 
 #[tonic::async_trait]
 impl NodeControl for NodeControlService {
+    async fn prepare_owner_root(
+        &self,
+        request: Request<afs_protocol::node_control::PrepareOwnerRootRequest>,
+    ) -> Result<Response<afs_protocol::node_control::PrepareOwnerRootReply>, Status> {
+        #[cfg(feature = "ownerfs")]
+        {
+            let owner = self.owner_locks.clone().ok_or_else(|| {
+                coded_status(afs_error::NODE_VFS_UNIMPLEMENTED, "OwnerFs is disabled")
+            })?;
+            let authenticator = self.owner_authenticator.as_ref().ok_or_else(|| {
+                coded_status(
+                    afs_error::IO_PERMISSION_DENIED,
+                    "workspace creation requires peer authentication",
+                )
+            })?;
+            let peer = authenticate_peer(authenticator.as_ref(), &request)?;
+            let request = request.into_inner();
+            let reservation = request.reservation.ok_or_else(|| {
+                coded_status(
+                    afs_error::CLIENT_ARGUMENT_INVALID,
+                    "workspace reservation is required",
+                )
+            })?;
+            let reservation =
+                super::ownerfs::reservation_from_wire(reservation).map_err(error_to_status)?;
+            let params = crate::node::vfs::ownerfs::root::RootCreateParams {
+                name: request.name,
+                uid: request.uid,
+                gid: request.gid,
+                mode: request.mode,
+            };
+            tokio::task::spawn_blocking(move || {
+                owner.prepare_owner_root(&peer, &reservation, &params)
+            })
+            .await
+            .map_err(|error| coded_status(afs_error::IO_OTHER, error.to_string()))?
+            .map_err(error_to_status)?;
+            Ok(Response::new(
+                afs_protocol::node_control::PrepareOwnerRootReply {},
+            ))
+        }
+        #[cfg(not(feature = "ownerfs"))]
+        {
+            let _ = request;
+            Err(coded_status(
+                afs_error::NODE_VFS_UNIMPLEMENTED,
+                "OwnerFs is disabled",
+            ))
+        }
+    }
+
     #[cfg(feature = "ownerfs")]
     async fn owner_get_lock(
         &self,

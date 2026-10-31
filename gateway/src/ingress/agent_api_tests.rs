@@ -270,6 +270,13 @@ async fn embedded_registration_automatically_reconciles_aliases() {
     };
     let original = state.create_binding(scope.clone()).await.unwrap();
     let backend = Arc::new(Backend::default());
+    // The native upgrade contract waits for Platform to pause the previous run.
+    let pause = |id: &str| {
+        let mut environments = backend.0.lock().unwrap();
+        let current = environments.get_mut(&("tenant".into(), id.into())).unwrap();
+        current.phase = EnvironmentPhase::Paused;
+        current.ready = false;
+    };
     backend
         .create(&CreateEnvironment {
             id: original.current.environment_id.clone(),
@@ -280,6 +287,7 @@ async fn embedded_registration_automatically_reconciles_aliases() {
         })
         .await
         .unwrap();
+    pause(&original.current.environment_id);
     alias.versions[0].version = "2".into();
     let revision = state.put_alias(&alias, Some(&revision)).await.unwrap();
     let config = serde_json::from_value(serde_json::json!({
@@ -323,6 +331,8 @@ async fn embedded_registration_automatically_reconciles_aliases() {
                     .phase,
                 EnvironmentPhase::Deleted
             );
+            let current = state.binding(&scope).await.unwrap().unwrap();
+            pause(&current.current.environment_id);
             alias.versions[0].version = "1".into();
             state.put_alias(&alias, Some(&revision)).await.unwrap();
         }
@@ -2383,4 +2393,30 @@ async fn alias_writes_use_ingress_authentication_and_revision_in_both_modes() {
         serving.abort();
         connection.abort();
     }
+}
+
+#[tokio::test]
+async fn instance_access_preserves_http2_authority_for_shared_e2b_forwarding() {
+    let (gateway, _) = fixture().await;
+    let mut request = Request::builder()
+        .uri("https://gateway.example.test/agent/http/files?target=urn:adx:instance:api&port=49983&path=%2Ftmp%2Fdata")
+        .header("authorization", "Bearer tenant")
+        .body(())
+        .unwrap();
+    gateway
+        .prepare_agent_data(&mut request, IngressSecurity::Tls)
+        .await
+        .unwrap();
+    assert_eq!(
+        request.uri().path_and_query().unwrap().as_str(),
+        "/files?path=%2Ftmp%2Fdata"
+    );
+    assert_eq!(request.uri().scheme_str(), Some("https"));
+    assert_eq!(
+        request.uri().authority().unwrap().as_str(),
+        "gateway.example.test"
+    );
+    let target = gateway.direct_route(&request).unwrap();
+    assert_eq!(target.instance_id, "api");
+    assert_eq!(target.target_port, 49983);
 }

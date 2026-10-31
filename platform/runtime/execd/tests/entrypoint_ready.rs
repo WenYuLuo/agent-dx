@@ -139,9 +139,11 @@ async fn inherited_long_running_process_keeps_control_responsive() {
 }
 
 #[tokio::test]
-async fn explicit_workload_commands_override_the_image_defaults() {
+async fn explicit_workload_commands_and_user_override_the_image_defaults() {
     use std::os::unix::fs::PermissionsExt;
-    let directory = tempfile::tempdir().unwrap();
+    // The workload drops privileges, so its markers need a traversable parent
+    // even when the builder's TMPDIR is inside a private root-owned directory.
+    let directory = tempfile::tempdir_in("/tmp").unwrap();
     std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
     let marker = directory.path().join("first");
     let second = directory.path().join("second");
@@ -157,11 +159,19 @@ async fn explicit_workload_commands_override_the_image_defaults() {
     let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = reserved.local_addr().unwrap().port();
     drop(reserved);
+    // SAFETY: reading the effective user and group IDs has no preconditions.
+    let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+    let user = if uid == 0 && gid == 0 {
+        "65534:65534".to_string()
+    } else {
+        format!("{uid}:{gid}")
+    };
+    let expected_uid = user.split(':').next().unwrap().to_string();
     let override_spec = serde_json::json!({
         "commands":[
-            ["/bin/sh","-c","printf first > \"$1\"; exec sleep 60","first",marker],
+            ["/bin/sh","-c","id -u > \"$1\"; exec sleep 60","first",marker],
             ["/bin/sh","-c","printf second > \"$1\"; exec sleep 60","second",second]
-        ]
+        ], "user": user
     });
     let log_path = directory.path().join("execd.log");
     let log = std::fs::File::create(&log_path).unwrap();
@@ -184,7 +194,7 @@ async fn explicit_workload_commands_override_the_image_defaults() {
             .unwrap(),
     );
     let ready = tokio::time::timeout(Duration::from_secs(5), async {
-        while std::fs::read_to_string(&marker).unwrap_or_default() != "first"
+        while std::fs::read_to_string(&marker).unwrap_or_default().trim() != expected_uid
             || std::fs::read_to_string(&second).unwrap_or_default() != "second"
         {
             if child.0.try_wait().unwrap().is_some() {
@@ -199,7 +209,10 @@ async fn explicit_workload_commands_override_the_image_defaults() {
         "{}",
         std::fs::read_to_string(log_path).unwrap()
     );
-    assert_eq!(std::fs::read_to_string(marker).unwrap(), "first");
+    assert_eq!(
+        std::fs::read_to_string(marker).unwrap().trim(),
+        expected_uid
+    );
     assert_eq!(std::fs::read_to_string(second).unwrap(), "second");
 }
 

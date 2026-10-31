@@ -48,6 +48,7 @@ async fn p3_local_log_namespace_retry_watch_and_restart_are_equivalent() {
                 grpc_addr: "http://writer:7400".into(),
                 data_addr: "http://writer:7500".into(),
                 rest_addr: "http://writer:7600".into(),
+                ownerfs_enabled: true,
                 storage_devices: Vec::new(),
                 lease_ttl: Duration::from_secs(60),
             },

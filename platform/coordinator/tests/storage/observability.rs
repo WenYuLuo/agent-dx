@@ -266,6 +266,7 @@ async fn worker_incident_counts_only_running_executions_once() {
                     source_runtime_id: result.runtime.id.clone(),
                     expires_at_unix_seconds: None,
                     artifact: adx_core::CheckpointArtifact {
+                        scope: Default::default(),
                         storage: "shared".into(),
                         location: "checkpoint".into(),
                         size_bytes: 1,

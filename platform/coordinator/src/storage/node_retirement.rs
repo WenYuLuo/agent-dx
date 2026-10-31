@@ -124,6 +124,7 @@ impl Session {
         address: &str,
         proxy: &str,
         session: Option<&NodeSession>,
+        checkpoint_scopes: &BTreeSet<String>,
         expected: &str,
     ) -> Result<Option<StoredNode>> {
         let retired: RetiredNode = decode(expected)?;
@@ -143,6 +144,10 @@ impl Session {
             proxy_address: proxy.into(),
             session: session.cloned(),
             scheduling_paused: retired.scheduling_paused,
+            checkpoint_scopes: checkpoint_scopes.clone(),
+            // Retirement follows ownership invalidation. A returning node remains
+            // fenced until this authenticated process finishes reconciliation.
+            checkpoint_gc_fenced: !session.is_some_and(|session| session.routable),
         };
         let id = &record.node.id;
         let mut cmd = redis::cmd("EVAL");

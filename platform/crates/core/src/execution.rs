@@ -335,6 +335,48 @@ mod tests {
     }
 
     #[test]
+    fn protected_ingress_requires_the_exact_persisted_inbound_rules() {
+        let mut policy = policy_with_priority(10);
+        let protected = policy.traffic.as_ref().unwrap().rules.clone();
+        let options = ExecutionOptions {
+            protected_ingress: protected,
+            ..Default::default()
+        };
+        assert!(options.validate_protected_ingress(Some(&policy)).is_ok());
+        assert!(options.validate_protected_ingress(None).is_err());
+        policy.traffic.as_mut().unwrap().rules[0].peer.cidr = "10.0.0.0/8".into();
+        assert!(options.validate_protected_ingress(Some(&policy)).is_err());
+        let mut policy = policy_with_priority(10);
+        let mut added = policy.traffic.as_ref().unwrap().rules[0].clone();
+        added.priority = 20;
+        policy.traffic.as_mut().unwrap().rules.push(added);
+        assert!(options.validate_protected_ingress(Some(&policy)).is_err());
+        policy.traffic.as_mut().unwrap().rules[1].direction = NetworkDirection::Egress;
+        assert!(options.validate_protected_ingress(Some(&policy)).is_ok());
+        policy.traffic.as_mut().unwrap().rules[1].direction = NetworkDirection::Both;
+        assert!(options.validate_protected_ingress(Some(&policy)).is_err());
+        assert!(ExecutionOptions::default()
+            .validate_protected_ingress(None)
+            .is_ok());
+    }
+
+    #[test]
+    fn private_services_cannot_become_published_or_tunnel_listeners() {
+        let mut options = ExecutionOptions {
+            private_service_ports: vec![8080],
+            ..Default::default()
+        };
+        assert!(options.validate_private_service_ports().is_ok());
+        options.ports.push(8080);
+        assert!(options.validate_private_service_ports().is_err());
+        options.ports.clear();
+        options.tunnel_http_port = Some(8080);
+        assert!(options.validate_private_service_ports().is_err());
+        options.tunnel_http_port = Some(8081);
+        assert!(options.validate_private_service_ports().is_err());
+    }
+
+    #[test]
     fn network_policy_reserves_zero_and_maximum_rule_priorities() {
         assert!(policy_with_priority(1).validate().is_ok());
         assert!(policy_with_priority(u32::MAX - 1).validate().is_ok());
@@ -440,6 +482,14 @@ pub struct ExecutionOptions {
     #[serde(default)]
     pub mounts: Vec<Mount>,
     pub network: Option<NetworkPolicy>,
+    /// Immutable deployment-owned inbound rules. Live network replacement may
+    /// replace egress and DNS only while preserving these exact inbound rules.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub protected_ingress: Vec<NetworkRule>,
+    /// Guest service listeners available only through an approved HTTP service
+    /// policy, never native port forwarding or opaque tunnels.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub private_service_ports: Vec<u16>,
     #[serde(default)]
     pub data_plane: DataPlanePolicy,
     #[serde(default)]
@@ -456,6 +506,75 @@ pub struct ExecutionOptions {
 }
 
 impl ExecutionOptions {
+    /// Reject removal or replacement of persisted inbound policy. Ordinary
+    /// executions without protected ingress retain their native policy behavior.
+    pub fn validate_protected_ingress(&self, policy: Option<&NetworkPolicy>) -> Result<()> {
+        if self.protected_ingress.is_empty() {
+            return Ok(());
+        }
+        let traffic = policy
+            .and_then(|policy| policy.traffic.as_ref())
+            .ok_or_else(|| {
+                Error::Invalid("protected ingress requires an active traffic policy".into())
+            })?;
+        if self
+            .protected_ingress
+            .iter()
+            .any(|rule| rule.direction == NetworkDirection::Egress)
+            || !traffic
+                .rules
+                .iter()
+                .filter(|rule| rule.direction != NetworkDirection::Egress)
+                .eq(self.protected_ingress.iter())
+        {
+            return Err(Error::Invalid(
+                "protected ingress policy cannot be replaced".into(),
+            ));
+        }
+        // Backend-owned public and tunnel exceptions outrank caller policy.
+        // They must not reopen a port denied by the persisted protection.
+        let listener_ports = self
+            .ports
+            .iter()
+            .copied()
+            .chain(self.tunnel_http_port)
+            .chain(self.tunnel_http_port.and_then(|port| port.checked_sub(1)));
+        for port in listener_ports {
+            if self.protected_ingress.iter().any(|rule| {
+                rule.action == NetworkAction::Deny
+                    && matches!(rule.protocol, NetworkProtocol::Tcp | NetworkProtocol::Any)
+                    && match &rule.environment_port_range {
+                        Some(range) => {
+                            range.first <= u32::from(port) && u32::from(port) <= range.last
+                        }
+                        None => {
+                            rule.environment_port == 0 || rule.environment_port == u32::from(port)
+                        }
+                    }
+            }) {
+                return Err(Error::Invalid(
+                    "published listener conflicts with protected ingress".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Private service listeners cannot receive backend-owned public exceptions.
+    pub fn validate_private_service_ports(&self) -> Result<()> {
+        if self.private_service_ports.iter().any(|port| {
+            *port == 0
+                || self.ports.contains(port)
+                || self.tunnel_http_port == Some(*port)
+                || self.tunnel_http_port.and_then(|value| value.checked_sub(1)) == Some(*port)
+        }) {
+            return Err(Error::Invalid(
+                "private service port conflicts with a published listener".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn validate_tunnel_network(&self, network: Option<&NetworkPolicy>) -> Result<()> {
         if let Some(port) = self.tunnel_http_port {
             if port < 2
@@ -528,6 +647,8 @@ impl ExecutionOptions {
         if let Some(network) = &self.network {
             network.validate()?;
         }
+        self.validate_protected_ingress(self.network.as_ref())?;
+        self.validate_private_service_ports()?;
         self.validate_tunnel_network(self.network.as_ref())?;
         if self.ports.contains(&0) {
             return Err(Error::Invalid("published port must be positive".into()));

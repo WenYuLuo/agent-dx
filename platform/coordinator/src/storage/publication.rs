@@ -20,6 +20,17 @@ impl Session {
         tenant: &str,
         request: &str,
     ) -> Result<Option<EnvironmentRecord>> {
+        match self.request_receipt(tenant, request).await? {
+            Some(receipt) => self.resolve_receipt(receipt).await.map(Some),
+            None => Ok(None),
+        }
+    }
+
+    async fn request_receipt(
+        &self,
+        tenant: &str,
+        request: &str,
+    ) -> Result<Option<StoredEnvironment>> {
         if request.is_empty() {
             return Ok(None);
         }
@@ -30,7 +41,7 @@ impl Session {
         let Some(raw) = self.store.query::<Option<String>>(command).await? else {
             return Ok(None);
         };
-        self.resolve_receipt(decode(&raw)?).await.map(Some)
+        decode(&raw).map(Some)
     }
 
     async fn resolve_receipt(&self, receipt: StoredEnvironment) -> Result<EnvironmentRecord> {
@@ -170,6 +181,9 @@ impl Session {
             result: None,
         };
         let artifacts = artifacts::record_artifacts(&record);
+        let attaches_artifacts = record.checkpoint.is_some()
+            || record.snapshot_source.is_some()
+            || !record.execution_artifacts.is_empty();
         let _access = self.store.lock_artifacts(&artifacts)?;
         for _ in 0..ATTEMPTS {
             let catalog = if volumes::has_volumes(&record.spec) {
@@ -185,7 +199,7 @@ impl Session {
                 continue;
             }
             let mut counters = CounterUpdate::load(&self.store, field.clone()).await?;
-            self.header(&header)?;
+            let current_header = self.header(&header)?;
             let previous = old
                 .as_deref()
                 .map(decode::<StoredEnvironment>)
@@ -268,6 +282,13 @@ impl Session {
                     .arg(&catalog.header_value)
                     .arg(encode(&catalog.advanced_header()?)?);
                 catalog.append_writes(&mut command)?;
+            } else if attaches_artifacts {
+                let mut advanced = current_header.clone();
+                advanced.advance()?;
+                command
+                    .arg(header.as_deref().ok_or(Error::Conflict)?)
+                    .arg(encode(&advanced)?)
+                    .arg(0);
             } else {
                 command.arg("").arg("").arg(0);
             }

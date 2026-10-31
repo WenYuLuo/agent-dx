@@ -62,6 +62,7 @@ struct Backend {
     entered: Semaphore,
     release: Semaphore,
     reject_create: AtomicBool,
+    errored_create_phase: AtomicBool,
     reject_delete: AtomicBool,
     block_delete: AtomicBool,
     delete_entered: Semaphore,
@@ -80,6 +81,7 @@ impl Backend {
             entered: Semaphore::new(0),
             release: Semaphore::new(1),
             reject_create: AtomicBool::new(false),
+            errored_create_phase: AtomicBool::new(false),
             reject_delete: AtomicBool::new(false),
             block_delete: AtomicBool::new(false),
             delete_entered: Semaphore::new(0),
@@ -117,6 +119,13 @@ impl Backend {
             if self.reject_create.load(Ordering::SeqCst) {
                 code = StatusCode::SERVICE_UNAVAILABLE;
                 json!({})
+            } else if self.errored_create_phase.load(Ordering::SeqCst) {
+                code = StatusCode::CREATED;
+                let id = body["sandbox_id"].as_str().unwrap().to_owned();
+                let value =
+                    json!({"id":id,"phase":"error","error_message":"private backend output"});
+                self.refs.lock().unwrap().insert(id, value.clone());
+                value
             } else {
                 let id = body["sandbox_id"].as_str().unwrap().to_owned();
                 self.refs
@@ -304,6 +313,58 @@ impl Drop for Fixture {
 }
 fn spec(class: &str) -> EnvironmentSpec {
     serde_json::from_value(json!({"id":"tenant-agent","tenant_id":"t","image":"agent:v1","runtime_class":class,"resources":{"cpu_millis":1000,"memory_bytes":134217728,"disk_bytes":0},"priority":0,"execution":{"failover":false,"inherit_entrypoint":true,"rootfs":{"readonly":false,"source":{"Image":"agent:v1"}}}})).unwrap()
+}
+
+#[tokio::test]
+async fn inherited_workload_overrides_reach_execd_for_both_jiuwenbox_runtimes() {
+    for class in ["supervisor", "conch"] {
+        let fixture = Fixture::new();
+        let driver = fixture.driver().await;
+        let mut wanted = spec(class);
+        let process = json!({
+            "commands": [["agent-server", "--port", "18092"]],
+            "user": "1000:1000",
+            "cwd": "/workspace"
+        });
+        wanted.execution.process = Some(serde_json::from_value(process.clone()).unwrap());
+        driver
+            .start_with_deadline(
+                &wanted,
+                "tenant-agent-1",
+                1,
+                &[],
+                Instant::now() + CREATE_BUDGET,
+            )
+            .await
+            .unwrap();
+        {
+            let calls = fixture.backend.calls.lock().unwrap();
+            for request in [
+                &calls
+                    .iter()
+                    .find(|(m, p, _)| m == "POST" && p == "/api/v1/sandboxes")
+                    .unwrap()
+                    .2,
+                &calls
+                    .iter()
+                    .find(|(_, p, _)| p.ends_with("/exec_background"))
+                    .unwrap()
+                    .2,
+            ] {
+                let env = &request["env"];
+                assert_eq!(
+                    serde_json::from_str::<Value>(env["ADX_WORKLOAD_PROCESS"].as_str().unwrap())
+                        .unwrap(),
+                    process
+                );
+                assert_eq!(
+                    env["ADX_IMAGE_PROCESS_CONFIG"],
+                    "/__adx_launch/process.json"
+                );
+            }
+        }
+        driver.remove("tenant-agent-1").await.unwrap();
+    }
 }
 
 #[tokio::test]
@@ -1604,4 +1665,56 @@ async fn identity_override_is_not_silently_ignored_by_supervisor() {
         .unwrap()
         .iter()
         .any(|(m, p, _)| m == "POST" && p == "/api/v1/sandboxes"));
+}
+
+#[tokio::test]
+async fn errored_backend_phase_is_a_terminal_failure_and_is_cleaned() {
+    for class in ["supervisor", "conch"] {
+        let fixture = Fixture::new();
+        let driver = fixture.driver().await;
+        fixture
+            .backend
+            .errored_create_phase
+            .store(true, Ordering::SeqCst);
+        let error = driver
+            .start_with_deadline(
+                &spec(class),
+                "tenant-agent-1",
+                1,
+                &[],
+                Instant::now() + CREATE_BUDGET,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                Error::BackendFailure {
+                    code: adx_core::BackendFailureCode::FailedPrecondition,
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        assert!(!error.to_string().contains("private backend output"));
+        let status = adx_protocol::status(error);
+        assert_eq!(
+            status.metadata().get("adx-backend-failure").unwrap(),
+            "true"
+        );
+        driver.remove("tenant-agent-1").await.unwrap();
+        assert!(fixture.backend.refs.lock().unwrap().is_empty());
+        assert!(fixture.native.physical.lock().unwrap().is_empty());
+        let calls = fixture.backend.calls.lock().unwrap();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|(m, p, _)| m == "POST" && p == "/api/v1/sandboxes")
+                .count(),
+            1
+        );
+        assert!(!calls
+            .iter()
+            .any(|(_, p, _)| p.ends_with("/exec_background")));
+    }
 }

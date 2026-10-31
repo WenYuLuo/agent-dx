@@ -63,6 +63,7 @@ fn status() -> RuntimeStatus {
         checkpoint: None,
         requested_checkpoint: None,
         requested_checkpoint_deadline_unix_millis: None,
+        required_services: Default::default(),
         failure: None,
         active_requests: 0,
         active_commands: 0,

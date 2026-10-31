@@ -2,8 +2,10 @@
 //! atomic hash writes; JSON and u64 counters are validated in Rust, never Lua doubles.
 mod catalog;
 pub(crate) use catalog::{PublicationReset, PublicationValue};
+mod checkpoint_cleanup;
 mod claims;
 mod publication;
+mod transport;
 pub use claims::{ClaimOutcome, LocalClaim};
 mod artifacts;
 pub use artifacts::ArtifactDeletionGuard;
@@ -19,6 +21,7 @@ pub use observability::{
     BusinessCounters, CreationResult, CreationSummary, InterruptionSummary, RecoveryState,
 };
 mod resume;
+mod snapshot_preparation;
 mod snapshots;
 mod volumes;
 use crate::Node;
@@ -26,11 +29,10 @@ use adx_core::{
     scheduling::validate_device_assignment, Assignment, EnvironmentRecord, EnvironmentSpec,
     EnvironmentState, Error, Result,
 };
-use redis::{aio::MultiplexedConnection, FromRedisValue};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -76,17 +78,24 @@ if ARGV[8] ~= '' and redis.call('HGET',KEYS[1],'header') ~= ARGV[8] then return 
 local facts = cjson.decode(ARGV[7])
 if (redis.call('HGET',KEYS[3],facts[1]) or '') ~= facts[2] then return 0 end
 if (redis.call('HGET',KEYS[3],facts[4]) or '') ~= facts[5] then return 0 end
+local cleanup_cursor=13 + 2 * tonumber(ARGV[12])
+if ARGV[cleanup_cursor] ~= '' and redis.call('HEXISTS',KEYS[6],ARGV[cleanup_cursor]) ~= 0 then return 2 end
 redis.call('SET', KEYS[2], ARGV[5], 'PX', ARGV[6])
 redis.call('HSET',KEYS[3],facts[4],facts[6])
 redis.call('HDEL',KEYS[3],facts[1])
 redis.call('HDEL', KEYS[1], ARGV[3])
 if ARGV[8] ~= '' then
   redis.call('HSET',KEYS[1],'header',ARGV[9])
-  redis.call('HSET',KEYS[5],ARGV[10],ARGV[11])
+  if ARGV[10] ~= '' then redis.call('HSET',KEYS[5],ARGV[10],ARGV[11]) end
 end
-for i=13,#ARGV,2 do
-  if ARGV[i+1] == '' then redis.call('HDEL',KEYS[4],ARGV[i])
-  else redis.call('HSET',KEYS[4],ARGV[i],ARGV[i+1]) end
+local cursor=13
+for _=1,tonumber(ARGV[12]) do
+  local key=ARGV[cursor]; local value=ARGV[cursor+1]
+  if value == '' then redis.call('HDEL',KEYS[4],key) else redis.call('HSET',KEYS[4],key,value) end
+  cursor=cursor+2
+end
+if ARGV[cursor] ~= '' then
+  redis.call('HSET',KEYS[6],ARGV[cursor],ARGV[cursor+1])
 end
 return 1
 "#;
@@ -150,6 +159,13 @@ pub struct StoredNode {
     /// Administrative admission override. Heartbeats cannot clear it.
     #[serde(default)]
     pub scheduling_paused: bool,
+    /// Shared checkpoint backends declared by the current authenticated session.
+    #[serde(default)]
+    pub checkpoint_scopes: BTreeSet<String>,
+    /// Set by durable invalidation; an unfenced routable session is required
+    /// before a node can perform checkpoint collection again.
+    #[serde(default)]
+    pub checkpoint_gc_fenced: bool,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Recovery {
@@ -158,6 +174,9 @@ pub struct Recovery {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResumeIntent {
+    /// Initial duration of this wake, retained across placement and background retries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_timeout_seconds: Option<u64>,
     pub operation_id: String,
     /// A definitive local admission rejection permits a different placement.
     pub local_rejected: bool,
@@ -205,19 +224,42 @@ struct DeletedReceipt {
     environment_id: String,
     generation: u64,
     result_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cleanup_digest: Option<String>,
 }
 
 impl DeletedReceipt {
-    fn from_result(result: &EnvironmentRecord) -> Result<Self> {
+    fn from_result(
+        result: &EnvironmentRecord,
+        cleanup: &[adx_core::CheckpointArtifact],
+    ) -> Result<Self> {
         Ok(Self {
             environment_id: result.spec.id.clone(),
             generation: result.assignment.generation,
             result_digest: format!("{:x}", Sha256::digest(encode(result)?.as_bytes())),
+            cleanup_digest: Some(format!(
+                "{:x}",
+                Sha256::digest(
+                    encode(&checkpoint_cleanup::normalized_artifacts(cleanup))?.as_bytes()
+                )
+            )),
         })
     }
 
-    fn matches(&self, result: &EnvironmentRecord) -> Result<bool> {
-        Ok(self == &Self::from_result(result)?)
+    fn matches(
+        &self,
+        result: &EnvironmentRecord,
+        cleanup: &[adx_core::CheckpointArtifact],
+    ) -> Result<bool> {
+        let expected = Self::from_result(result, cleanup)?;
+        Ok(self.environment_id == expected.environment_id
+            && self.generation == expected.generation
+            && self.result_digest == expected.result_digest
+            && match self.cleanup_digest.as_ref() {
+                Some(digest) => Some(digest) == expected.cleanup_digest.as_ref(),
+                // Master receipts did not authorize a caller-supplied cleanup payload.
+                None => cleanup.is_empty(),
+            })
     }
 }
 impl StoredEnvironment {
@@ -292,6 +334,15 @@ impl StoredEnvironment {
     }
     fn validate(&self) -> Result<()> {
         self.spec.validate()?;
+        if let Some(seconds) = self
+            .resume
+            .as_ref()
+            .and_then(|intent| intent.run_timeout_seconds)
+        {
+            let mut policy = self.spec.run_policy.clone().ok_or(Error::Conflict)?;
+            policy.timeout_seconds = seconds;
+            policy.validate()?;
+        }
         if self.spec.id != self.assignment.environment_id
             || self.creation_generation == 0
             || self.creation_generation > self.assignment.generation
@@ -556,7 +607,7 @@ fn next_result(old: &StoredEnvironment, r: &EnvironmentRecord) -> Result<bool> {
 
 struct Connection {
     client: redis::Client,
-    current: Mutex<Option<Arc<MultiplexedConnection>>>,
+    current: Mutex<Option<Arc<transport::Lease>>>,
     timeout: Duration,
     committed_changes: broadcast::Sender<ControlChange>,
     publication_sequence: AtomicU64,
@@ -629,74 +680,6 @@ impl RedisStore {
         let _: String = store.query(redis::cmd("PING")).await?;
         Ok(store)
     }
-    async fn query<T: FromRedisValue>(&self, cmd: redis::Cmd) -> Result<T> {
-        let operation = async {
-            // Only side-effect-free reads may reconnect and repeat once after a
-            // closed transport. EVAL writes retain their unknown-result/CAS path.
-            let mut retry_read = matches!(
-                cmd.args_iter().next(),
-                Some(redis::Arg::Simple(
-                    b"GET" | b"HGET" | b"HMGET" | b"HGETALL" | b"HKEYS" | b"HVALS" | b"PING"
-                ))
-            );
-            loop {
-                let mut guard = self.connection.current.lock().await;
-                if guard.is_none() {
-                    let config = redis::AsyncConnectionConfig::new()
-                        .set_connection_timeout(None)
-                        .set_response_timeout(None);
-                    *guard = Some(Arc::new(
-                        self.connection
-                            .client
-                            .get_multiplexed_async_connection_with_config(&config)
-                            .await?,
-                    ));
-                }
-                let lease = guard.as_ref().expect("connection initialized").clone();
-                drop(guard);
-                let mut conn = lease.as_ref().clone();
-                let result = cmd.query_async(&mut conn).await;
-                let dropped = result
-                    .as_ref()
-                    .is_err_and(|error: &redis::RedisError| error.is_connection_dropped());
-                if dropped {
-                    self.discard_connection(&lease).await;
-                }
-                if retry_read && dropped {
-                    retry_read = false;
-                    continue;
-                }
-                return result;
-            }
-        };
-        match timeout(self.connection.timeout, operation).await {
-            Ok(Ok(value)) => Ok(value),
-            _ => {
-                // A Redis command rejection does not break the transport.
-                // Only the dropped-connection path above retires its own lease.
-                // On a caller timeout retain the ordered transport: its driver
-                // may still finish the queued write. A targeted repair queued on
-                // this same connection cannot overtake that unknown mutation.
-                // Never replay a timed-out write outside its existing CAS.
-                Err(Error::Unavailable(
-                    "Redis operation unavailable or timed out".into(),
-                ))
-            }
-        }
-    }
-
-    async fn discard_connection(&self, lease: &Arc<MultiplexedConnection>) {
-        let mut current = self.connection.current.lock().await;
-        if current
-            .as_ref()
-            .is_some_and(|conn| Arc::ptr_eq(conn, lease))
-        {
-            // An older request may report its transport failure after another
-            // request has reconnected. Never clear that replacement connection.
-            *current = None;
-        }
-    }
-
     async fn fields<const N: usize>(&self, fields: [String; N]) -> Result<[Option<String>; N]> {
         let mut cmd = redis::cmd("HMGET");
         cmd.arg(&self.key).arg(&fields);
@@ -796,6 +779,39 @@ impl RedisStore {
         } else {
             vec![]
         };
+        let attached_artifacts = if name.starts_with("environment:") {
+            let next: StoredEnvironment = decode(&next)?;
+            let previous = old.map(decode::<StoredEnvironment>).transpose()?;
+            let owned = |stored: &StoredEnvironment| {
+                stored
+                    .result
+                    .as_ref()
+                    .map(|record| {
+                        record
+                            .checkpoint
+                            .iter()
+                            .chain(record.snapshot_source.iter())
+                            .map(|point| point.artifact.clone())
+                            .chain(record.execution_artifacts.iter().cloned())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+            };
+            let previous = previous.as_ref().map(owned).unwrap_or_default();
+            owned(&next)
+                .into_iter()
+                .filter(|artifact| !previous.contains(artifact))
+                .collect::<Vec<_>>()
+        } else {
+            vec![]
+        };
+        let guarded_header = if attached_artifacts.is_empty() {
+            None
+        } else {
+            let mut next = header.clone();
+            next.advance()?;
+            Some((encode(header)?, encode(&next)?))
+        };
         let _access = self.lock_artifacts(&artifacts)?;
         let membership = if name.starts_with("environment:") {
             let environment: StoredEnvironment = decode(&next)?;
@@ -832,15 +848,19 @@ impl RedisStore {
             if not old and string.sub(ARGV[2],1,5) == 'node:' and redis.call('HEXISTS',KEYS[1],'retired-node:' .. string.sub(ARGV[2],6)) ~= 0 then return 0 end
             local facts = cjson.decode(ARGV[7])
             if facts[1] ~= '' and (redis.call('HGET',KEYS[3],facts[1]) or '') ~= facts[2] then return 0 end
+            if ARGV[8] ~= '' and redis.call('HGET',KEYS[1],'header') ~= ARGV[8] then return 0 end
             redis.call('HSET',KEYS[1],ARGV[2],ARGV[4])
+            if ARGV[8] ~= '' then redis.call('HSET',KEYS[1],'header',ARGV[9]) end
             if facts[1] ~= '' then redis.call('HSET',KEYS[3],facts[1],facts[3]) end
             if ARGV[5] ~= '' then redis.call('HSET',KEYS[1],'node-session:' .. string.sub(ARGV[2],6),ARGV[5]) end
             if ARGV[6] ~= '' then redis.call('HINCRBY',KEYS[1],ARGV[6],1) end
-            for i=8,#ARGV,2 do redis.call('HSET',KEYS[2],ARGV[i],ARGV[i+1]) end
+            for i=10,#ARGV,2 do redis.call('HSET',KEYS[2],ARGV[i],ARGV[i+1]) end
             return 1
         "#).arg(3).arg(&self.key).arg(format!("{}:artifacts", self.key)).arg(format!("{}:business", self.key))
             .arg(header.epoch.to_string()).arg(name).arg(old.unwrap_or("")).arg(next).arg(node_session).arg(membership)
-            .arg(counters.map(CounterUpdate::argument).transpose()?.unwrap_or_else(|| r#"["","",""]"#.into()));
+            .arg(counters.map(CounterUpdate::argument).transpose()?.unwrap_or_else(|| r#"["","",""]"#.into()))
+            .arg(guarded_header.as_ref().map(|pair| pair.0.as_str()).unwrap_or(""))
+            .arg(guarded_header.as_ref().map(|pair| pair.1.as_str()).unwrap_or(""));
         for artifact in artifacts {
             cmd.arg(artifacts::artifact_key(&artifact))
                 .arg(encode(&artifact)?);
@@ -882,24 +902,26 @@ impl RedisStore {
         let applied: u8 = self.query(cmd).await?;
         Ok(applied == 1)
     }
-    async fn retire_environment(
+    async fn retire_environment_with_cleanup(
         &self,
-        _expected_header: &str,
-        expected_environment: &str,
+        expected: (&str, &str),
         header: &Header,
         receipt: &DeletedReceipt,
         counters: &CounterUpdate,
         catalog: Option<&volumes::Catalog>,
+        cleanup: Option<&adx_core::CheckpointCleanup>,
     ) -> Result<bool> {
+        let (expected_header, expected_environment) = expected;
         let field = format!("environment:{}", receipt.environment_id);
         let mut cmd = redis::cmd("EVAL");
         cmd.arg(RETIRE_ENVIRONMENT)
-            .arg(5)
+            .arg(6)
             .arg(&self.key)
             .arg(self.deleted_receipt_key(&receipt.environment_id))
             .arg(format!("{}:business", self.key))
             .arg(format!("{}:volumes", self.key))
             .arg(format!("{}:volume-references", self.key))
+            .arg(format!("{}:checkpoint-cleanups", self.key))
             .arg(header.epoch.to_string())
             .arg(encode(header)?)
             .arg(&field)
@@ -914,7 +936,16 @@ impl RedisStore {
                 .arg(catalog.reference_value(&receipt.environment_id)?);
             catalog.append_writes(&mut cmd)?;
         } else {
-            cmd.arg("").arg("").arg("").arg("").arg(0);
+            cmd.arg(expected_header)
+                .arg(encode(header)?)
+                .arg("")
+                .arg("")
+                .arg(0);
+        }
+        if let Some(task) = cleanup {
+            cmd.arg(task.id()).arg(encode(task)?);
+        } else {
+            cmd.arg("").arg("");
         }
         let values = Self::publication_values([(field.as_str(), None)])?;
         let write = self
@@ -1470,10 +1501,22 @@ impl Session {
 
     pub async fn register_session(
         &self,
+        node: Node,
+        address: String,
+        proxy_address: String,
+        session: Option<NodeSession>,
+    ) -> Result<StoredNode> {
+        self.register_session_with_scopes(node, address, proxy_address, session, BTreeSet::new())
+            .await
+    }
+
+    pub async fn register_session_with_scopes(
+        &self,
         mut node: Node,
         address: String,
         proxy_address: String,
         session: Option<NodeSession>,
+        checkpoint_scopes: BTreeSet<String>,
     ) -> Result<StoredNode> {
         node.validate()?;
         if address.trim().is_empty() || proxy_address.trim().is_empty() {
@@ -1504,6 +1547,8 @@ impl Session {
                     self.restore_node_publication(&node.id, &current.id).await?;
                 }
                 node.available &= !previous.scheduling_paused;
+                let checkpoint_gc_fenced =
+                    previous.checkpoint_gc_fenced && !session.as_ref().is_some_and(|s| s.routable);
                 let record = StoredNode {
                     retirement: if session.as_ref().is_some_and(|s| s.routable) {
                         None
@@ -1521,6 +1566,8 @@ impl Session {
                     session,
                     shard_id: previous.shard_id,
                     scheduling_paused: previous.scheduling_paused,
+                    checkpoint_scopes: checkpoint_scopes.clone(),
+                    checkpoint_gc_fenced,
                 };
                 self.observe_node(record.clone());
                 return Ok(record);
@@ -1554,6 +1601,7 @@ impl Session {
                             &address,
                             &proxy_address,
                             session.as_ref(),
+                            &checkpoint_scopes,
                             raw,
                         )
                         .await?;
@@ -1584,6 +1632,8 @@ impl Session {
                         self.restore_node_publication(&node.id, &current.id).await?;
                     }
                     node.available &= !previous.scheduling_paused;
+                    let checkpoint_gc_fenced = previous.checkpoint_gc_fenced
+                        && !session.as_ref().is_some_and(|s| s.routable);
                     let record = StoredNode {
                         retirement: if session.as_ref().is_some_and(|s| s.routable) {
                             None
@@ -1601,13 +1651,20 @@ impl Session {
                         session,
                         shard_id: previous.shard_id,
                         scheduling_paused: previous.scheduling_paused,
+                        checkpoint_scopes: checkpoint_scopes.clone(),
+                        checkpoint_gc_fenced,
                     };
                     self.observe_node(record.clone());
                     return Ok(record);
                 }
             }
-            let (shard, scheduling_paused) = if let Some(previous) = &previous {
-                (previous.shard_id, previous.scheduling_paused)
+            let (shard, scheduling_paused, checkpoint_gc_fenced) = if let Some(previous) = &previous
+            {
+                (
+                    previous.shard_id,
+                    previous.scheduling_paused,
+                    previous.checkpoint_gc_fenced && !session.as_ref().is_some_and(|s| s.routable),
+                )
             } else {
                 let current = self.snapshot().await?;
                 let mut counts = vec![0usize; header.shards];
@@ -1618,7 +1675,7 @@ impl Session {
                     .map(|offset| (header.next_node_shard + offset) % header.shards)
                     .min_by_key(|shard| counts[*shard])
                     .expect("nonempty shards");
-                (shard, false)
+                (shard, false, false)
             };
             if scheduling_paused {
                 node.available = false;
@@ -1645,6 +1702,8 @@ impl Session {
                 proxy_address: proxy_address.clone(),
                 session: session.clone(),
                 scheduling_paused,
+                checkpoint_scopes: checkpoint_scopes.clone(),
+                checkpoint_gc_fenced,
             };
             let encoded = encode(&record)?;
             if node_value.as_ref() == Some(&encoded) {
@@ -1928,6 +1987,19 @@ impl Session {
         Ok(self.commit_with_state(result).await?.result)
     }
 
+    /// Retire a completed execution and its object cleanup authority atomically.
+    /// Submitted cleanup artifacts are valid only on a Deleted result.
+    pub async fn commit_with_cleanup(
+        &self,
+        result: EnvironmentRecord,
+        cleanup_artifacts: &[adx_core::CheckpointArtifact],
+    ) -> Result<EnvironmentRecord> {
+        Ok(self
+            .commit_releasing_with_cleanup_state(result, "", &[], cleanup_artifacts)
+            .await?
+            .result)
+    }
+
     /// Commit a result and return its authoritative summaries without a follow-up read.
     /// Replay returns the stored record; deletion returns only the accepted result.
     pub async fn commit_with_state(
@@ -1957,6 +2029,45 @@ impl Session {
         session: &str,
         stopped: &[String],
     ) -> Result<CommittedEnvironment> {
+        self.commit_releasing_with_cleanup_state(result, session, stopped, &[])
+            .await
+    }
+
+    pub(crate) async fn commit_releasing_with_cleanup_state(
+        &self,
+        result: EnvironmentRecord,
+        session: &str,
+        stopped: &[String],
+        cleanup_artifacts: &[adx_core::CheckpointArtifact],
+    ) -> Result<CommittedEnvironment> {
+        if !cleanup_artifacts.is_empty() && result.state != EnvironmentState::Deleted {
+            return Err(Error::Invalid("cleanup artifacts require Deleted".into()));
+        }
+        if !cleanup_artifacts.is_empty() {
+            adx_core::CheckpointCleanup {
+                assignment: result.assignment.clone(),
+                revision: result.revision,
+                artifacts: checkpoint_cleanup::normalized_artifacts(cleanup_artifacts),
+            }
+            .validate()?;
+        }
+        if let Some(checkpoint) = &result.checkpoint {
+            if let Some(origin) = checkpoint
+                .origin
+                .as_ref()
+                .filter(|origin| origin.environment_id != result.spec.id)
+            {
+                let snapshot = self
+                    .get_snapshot(result.spec.snapshot_id.as_deref().ok_or(Error::Conflict)?)
+                    .await?;
+                if snapshot.template.tenant_id != result.spec.tenant_id
+                    || snapshot.origin()? != *origin
+                    || checkpoint.artifact == snapshot.artifact
+                {
+                    return Err(Error::Conflict);
+                }
+            }
+        }
         if !stopped.is_empty()
             && (session.is_empty()
                 || stopped.len() > 1024
@@ -1993,14 +2104,16 @@ impl Session {
             let [header_value, environment_value] =
                 self.store.fields([HEADER.into(), field.clone()]).await?;
             let mut counters = CounterUpdate::load(&self.store, field.clone()).await?;
-            let header = self.header(&header_value)?;
+            let mut header = self.header(&header_value)?;
             let Some(environment_value) = environment_value.as_deref() else {
                 if result.state == EnvironmentState::Deleted {
                     return match self.store.deleted_receipt(&result.spec.id).await? {
-                        Some(receipt) if receipt.matches(&result)? => Ok(CommittedEnvironment {
-                            result,
-                            stored: None,
-                        }),
+                        Some(receipt) if receipt.matches(&result, cleanup_artifacts)? => {
+                            Ok(CommittedEnvironment {
+                                result,
+                                stored: None,
+                            })
+                        }
                         Some(_) => Err(Error::Conflict),
                         None => Err(Error::NotFound),
                     };
@@ -2036,6 +2149,15 @@ impl Session {
             } else {
                 None
             };
+            let cleanup = if result.state == EnvironmentState::Deleted {
+                self.prepare_checkpoint_cleanup(&stored_environment, &result, cleanup_artifacts)
+                    .await?
+            } else {
+                None
+            };
+            if cleanup.is_some() && catalog.is_none() {
+                header.advance()?;
+            }
             if result.state != EnvironmentState::Paused {
                 stored_environment.resume = None;
                 if let Some(recovery) = &mut stored_environment.recovery {
@@ -2053,19 +2175,19 @@ impl Session {
             stored_environment.result = Some(result.clone());
             stored_environment.track_failure(collection::now()?);
             stored_environment.validate()?;
-            let expected_header = header_value
-                .as_deref()
-                .expect("validated control header is present");
             let applied = if result.state == EnvironmentState::Deleted {
                 counters.prepare_retirement(&self.store).await?;
                 self.store
-                    .retire_environment(
-                        expected_header,
-                        environment_value,
+                    .retire_environment_with_cleanup(
+                        (
+                            header_value.as_deref().ok_or(Error::Conflict)?,
+                            environment_value,
+                        ),
                         &header,
-                        &DeletedReceipt::from_result(&result)?,
+                        &DeletedReceipt::from_result(&result, cleanup_artifacts)?,
                         &counters,
                         catalog.as_ref(),
+                        cleanup.as_ref(),
                     )
                     .await?
             } else {

@@ -44,7 +44,7 @@
 5. **释放资源**：Failed 不等于资源可用；`resources_held=true` 时恢复占用。服务层必须先确认节点清理、提交终态，再释放调度账本；不能仅以 State=Failed 释放。节点心跳失效是单独的持久化失效路径，会释放逻辑预留并关闭节点资格；物理旧执行在返回对账时清理，见 [节点失效](node-failure-takeover.md)。
 6. **节点明确拒绝分配**：确认未执行或已清理后，可以通过 `replace_rejected` 条件替换精确旧分配，新的 generation 必须更高。Running、Deleted 或仍占用资源的 Failed 不能走这个入口。旧分配之后的迟到结果会被拒绝；这不是运行中实例的跨节点接管协议。
 
-`reserve/commit/replace_rejected` 支持相同内容的重复调用。同一实例 revision 携带不同内容、旧 revision 或旧 assignment 均返回冲突。删除提交的完整结果只以摘要、ID 和 generation 形成带 TTL 的最小回执，用于应答丢失后的相同结果重试；它不会进入实例目录。删除后可用同一 ID 创建新 Environment，新 Assignment 使用更高的全局 generation；旧 generation 的迟到结果不能修改新记录。已释放的 Failed 仍保留，便于查询失败原因，后续清理由独立策略决定。
+`reserve/commit/replace_rejected` 支持相同内容的重复调用。同一实例 revision 携带不同内容、旧 revision 或旧 assignment 均返回冲突。删除提交的结果与规范化 cleanup payload 只以摘要、ID 和 generation 形成600秒最小回执，用于应答丢失后的相同结果重试；它不会进入实例目录，也不另留永久cleanup/artifact fence；未完成的本地或未登记制品由独立最小pending承担清理责任，完成后删除。删除后可用同一 ID 创建新 Environment，新 Assignment 使用更高的全局 generation；旧 generation 的迟到结果不能修改新记录。已释放的 Failed 仍保留，便于查询失败原因，后续清理由独立策略决定。
 
 每次 Coordinator 真正启动才调用 begin；Redis 连接恢复不增加 epoch。旧 Session 的写入和全量读取会被拒绝。这个机制用于排除旧 Coordinator 写者，不提供主备选举，也不证明失联节点上的旧执行已经停止。
 
@@ -52,7 +52,7 @@
 
 | 情况 | 行为 |
 |---|---|
-| Redis 不可用／超时 | 返回 Unavailable，清除失效连接；后续调用重新连接，不在传输层盲目重放写入 |
+| Redis 不可用／超时／调用取消 | 将该连接标记为失效；后续调用在自身超时预算内建立新连接，确认旧 Redis 会话已终止后才能接管，不在传输层重放写入 |
 | 写入已应用但响应丢失 | 调用方以相同实例身份和结果重试；通过读取现值与条件提交判定结果 |
 | Coordinator 重启 | 保留原 Assignment/generation 和资源占用，新分配从持久化 generation 下限继续 |
 | 旧版本已删除的 `capsule:*` / `environment:*` 记录 | 启动时校验终态和资源释放条件后原子移除；全局 header generation 保留旧写入隔离下限 |
@@ -62,6 +62,10 @@
 | 本地降级日志 | 由 adxlet 的 SQLite 降级包装实现；底层 Redis/RPC 返回 Unavailable 本身不等于 Journaled |
 
 客户端提交成功的持久性遵从 Redis 部署的 AOF 配置。库不执行 CONFIG SET，也不擅自改变已选的可配置刷盘策略。集成测试使用 `appendonly yes`、`appendfsync always` 验证进程 SIGKILL 后恢复；这不证明 everysec/no 配置下断电零丢失，也不覆盖 Redis 数据盘丢失或恢复旧备份后的代次回退。[Redis 持久化说明](https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/)
+
+连接建立时读取 `CLIENT ID` 和 `INFO SERVER` 的 `run_id`。恢复到同一 Redis 进程时，新连接先等待 `CLIENT KILL ID <old-id>` 应答，再用于读取和对象级修复：旧会话的写入要么已经执行，要么已无法迟到执行。正常命令错误保留健康连接；旧连接的迟到错误只标记它自己的 lease。Redis 进程重启后不使用旧进程的 Client ID 终止新进程的客户端。部署凭证须允许这些连接管理命令；无法确认旧会话已终止时返回 Unavailable，继续保留待修复状态。连接管理仅发生在建立和故障恢复阶段，正常提交及心跳不增加此类 Redis 往返，也不推进 Coordinator epoch。
+
+`transport_recovery` 真实 Redis 回归使用按连接隔离的 RESP 代理，覆盖既有连接无响应而新连接健康、写入已执行但应答丢失、写入在 Redis 前迟到及调用取消。后两种场景在恢复为空目录后释放旧命令，验证其不能补写；相同 Environment ID／Request ID 重试仍只发布一个有效结果。
 
 ## 本地验证入口
 

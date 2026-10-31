@@ -474,6 +474,11 @@ impl Jiuwenbox {
         devices: &[DeviceAllocation],
         root: &Path,
     ) -> Result<(Value, Value)> {
+        if !spec.execution.protected_ingress.is_empty() {
+            return Err(Error::Invalid(
+                "protected ingress requires an ACL-capable runtime".into(),
+            ));
+        }
         adx_core::execution::validate_process_identity(
             spec.execution.user.as_deref(),
             spec.execution.group.as_deref(),
@@ -499,11 +504,6 @@ impl Jiuwenbox {
             spec.execution.tunnel_http_port,
             &self.launch,
         )?;
-        if spec.execution.process.is_some() {
-            return Err(Error::Invalid(
-                "Jiuwenbox workload process overrides are unsupported".into(),
-            ));
-        }
         if !devices.is_empty()
             || !spec.execution.extra_config.is_empty()
             || spec.execution.limits.disk_bytes > 0
@@ -724,6 +724,15 @@ impl Jiuwenbox {
             .client
             .request(Method::POST, "/api/v1/sandboxes", Some(body), true)
             .await?;
+        if response["phase"] == "error" {
+            // Jiuwenbox reports daemon startup failures in a successful HTTP
+            // response. Preserve that terminal rejection instead of rescheduling
+            // it until the queue deadline. Backend output can contain secrets.
+            return Err(Error::BackendFailure {
+                code: adx_core::BackendFailureCode::FailedPrecondition,
+                message: "Jiuwenbox backend create reported error".into(),
+            });
+        }
         if response["phase"] != "ready" {
             return Err(unavailable("backend create did not reach ready"));
         }

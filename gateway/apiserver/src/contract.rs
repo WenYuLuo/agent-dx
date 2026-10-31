@@ -794,6 +794,8 @@ pub fn create_spec_with_environment(
             .map_err(|_| invalid("invalid environment extra_config"))?
     };
     let environment = adx_core::execution::ExecutionOptions {
+        protected_ingress: Vec::new(),
+        private_service_ports: Vec::new(),
         user: r.user,
         group: r.group,
         process: r.process,
@@ -934,6 +936,9 @@ pub fn create_spec_with_environment(
         None
     };
     Ok(pb::EnvironmentSpec {
+        envd: None,
+        run_policy: None,
+        compatibility: None,
         runtime_profile,
         id: format!("{}-{}", r.namespace, r.name),
         tenant_id: caller.tenant_id.clone(),

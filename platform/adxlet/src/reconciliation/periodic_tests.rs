@@ -311,3 +311,35 @@ async fn adopted_controller_requires_authority_check_before_exposing_lifecycle()
         }
     }
 }
+
+#[tokio::test]
+async fn newer_orphan_generation_does_not_inherit_a_completed_delete_fence() {
+    let hooks = Arc::new(Hooks::default());
+    let node = Adxlet::new(
+        "n".into(),
+        hooks.clone(),
+        hooks.clone(),
+        hooks.clone(),
+        hooks,
+    );
+    let record = pending_record();
+    node.remember_retired_with_fence(
+        &record.assignment,
+        None,
+        Some(crate::RetiredDeleteFence::Revision(7)),
+    );
+    let runtime = crate::RuntimeObservation {
+        environment_id: record.spec.id,
+        runtime_id: "pending-2".into(),
+        generation: 2,
+        tenant_id: "t".into(),
+        running: true,
+    };
+    assert!(matches!(
+        node.claim_orphan(&runtime, false),
+        OrphanTarget::Unowned
+    ));
+    let retired = node.retired_environment("pending").unwrap();
+    assert_eq!(retired.generation, 2);
+    assert_eq!(retired.coordinator_delete_fence, None);
+}

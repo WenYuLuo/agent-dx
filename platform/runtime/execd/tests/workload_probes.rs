@@ -46,6 +46,7 @@ struct Process {
     _temp: tempfile::TempDir,
     record: EnvironmentRecord,
     client: RuntimeControlClient,
+    port: u16,
 }
 impl Drop for Process {
     fn drop(&mut self) {
@@ -101,6 +102,9 @@ fn start(config: ProbeConfig) -> Process {
         snapshot_source: None,
         failure: None,
         spec: EnvironmentSpec {
+            envd: None,
+            run_policy: None,
+            compatibility: None,
             runtime_profile: None,
             snapshot_id: None,
             lifecycle: Default::default(),
@@ -142,6 +146,7 @@ fn start(config: ProbeConfig) -> Process {
         _temp: temp,
         record,
         client,
+        port,
     }
 }
 fn probe(action: ProbeAction) -> ProbeSpec {
@@ -249,5 +254,108 @@ async fn healthcheck_is_armed_after_readiness_resets_failures_and_preserves_idle
     assert_eq!(failed.failure.unwrap().consecutive_failures, 2);
     assert_eq!(failed.activity_revision, 1);
     assert_eq!(failed.active_commands, 0);
+    server.abort();
+}
+
+async fn probe_progress(process: &Process) -> serde_json::Value {
+    let body = r#"{"action":"runtime.probes","args":{}}"#;
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", process.port))
+        .await
+        .unwrap();
+    stream.write_all(format!("POST /invoke HTTP/1.1\r\nHost: localhost\r\nX-Auth: probe-test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+    let mut response = Vec::new();
+    loop {
+        let mut chunk = [0; 4096];
+        let count = stream.read(&mut chunk).await.unwrap();
+        assert!(count > 0, "incomplete probe response");
+        response.extend_from_slice(&chunk[..count]);
+        assert!(response.len() < 65536);
+        if let Some(end) = response.windows(4).position(|part| part == b"\r\n\r\n") {
+            let headers = std::str::from_utf8(&response[..end]).unwrap();
+            let length: usize = headers
+                .lines()
+                .filter_map(|line| line.split_once(':'))
+                .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                .unwrap()
+                .1
+                .trim()
+                .parse()
+                .unwrap();
+            if response.len() >= end + 4 + length {
+                break;
+            }
+        }
+    }
+    let response = String::from_utf8(response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap()
+}
+
+#[tokio::test]
+async fn native_probe_progress_exposes_failure_then_recovery_without_runtime_replacement() {
+    use std::sync::atomic::AtomicBool;
+    let healthy = Arc::new(AtomicBool::new(false));
+    let flag = healthy.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1024];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            let code = if flag.load(Ordering::SeqCst) {
+                200
+            } else {
+                503
+            };
+            stream
+                .write_all(format!("HTTP/1.1 {code} Test\r\nContent-Length: 0\r\n\r\n").as_bytes())
+                .await
+                .unwrap();
+        }
+    });
+    let mut healthcheck = probe(ProbeAction::HttpGet {
+        port,
+        path: "/".into(),
+    });
+    healthcheck.failure_threshold = 10;
+    let process = start(ProbeConfig {
+        readiness: None,
+        healthcheck: Some(healthcheck),
+        init_timeout_seconds: 4,
+    });
+    status(&process).await;
+    tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            let progress = probe_progress(&process).await;
+            assert_eq!(progress["runtime_id"], "probe-1");
+            assert_eq!(progress["ownership_generation"], 1);
+            if progress["healthcheck_consecutive_failures"]
+                .as_u64()
+                .is_some_and(|n| n > 0)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(status(&process).await.phase, RuntimePhase::Running);
+    healthy.store(true, Ordering::SeqCst);
+    tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            if probe_progress(&process).await["healthcheck_consecutive_failures"] == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let recovered = status(&process).await;
+    assert_eq!(recovered.phase, RuntimePhase::Running);
+    assert!(recovered.failure.is_none());
+    assert_eq!(recovered.identity.runtime_id, "probe-1");
     server.abort();
 }

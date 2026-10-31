@@ -26,6 +26,7 @@ async fn network_create_preserves_tenant_session_and_api_key_checks() {
                 tenant_id: "tenant".into(),
                 administrator: false,
                 expires_at_unix_seconds: 0,
+                metadata: None,
             },
         )
         .await
@@ -86,6 +87,7 @@ async fn network_create_preserves_tenant_session_and_api_key_checks() {
             .unwrap();
     }));
     let mut register = pb::RegisterNodeRequest {
+        checkpoint_scopes: vec![],
         storage_mounts: Default::default(),
         runtime_classes: vec![
             "runsc".into(),
@@ -274,6 +276,7 @@ async fn create_retries_ready_delivery_and_lost_response_within_original_deadlin
         accepting_allocations: false,
         labels: Default::default(),
         devices: vec![],
+        checkpoint_scopes: vec![],
     };
     worker.register_node(register.clone()).await.unwrap();
     worker
@@ -378,6 +381,7 @@ async fn create_retries_ready_delivery_and_lost_response_within_original_deadlin
         pb::node_service_client::NodeServiceClient::new(connect(na, Principal::ApiServer).await);
     node_api
         .delete_environment(pb::DeleteEnvironmentRequest {
+            expected_revision: None,
             assignment: record.assignment.clone(),
             caller: caller(),
             node_session_id: String::new(),

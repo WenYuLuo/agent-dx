@@ -6,11 +6,20 @@ behavior, with no enable/disable switch or experimental environment input.
 `write()` success means memory ownership, not persistence. A process or host crash
 can lose acknowledged writes which have not completed a successful sync.
 
-One mount owns at most 2080MiB of payload and 4096 waiting requests: 2GiB is normal admitted work, and an additional 32MiB is reserved for owned requests awaiting admission. The reserve never reduces the normal admission window. Executing
+`dfs_write_queue_bytes` (CLI `--dfs-write-queue-bytes`) controls normal admitted
+payload per DFS mount. Its default is 2147483648 (2GiB), with range
+8388608..1099511627776 (8MiB..1TiB), additionally checked to fit `usize`.
+CLI overrides TOML, which overrides the default. All files share this allowance.
+An additional reserve of min(normal/8, 32MiB) owns requests awaiting admission;
+at the default, total payload capacity is 2080MiB. At most 4096 body entries are
+retained, including executing, pending and failed retained work.
+A single FUSE write must fit the normal allowance; an oversized request returns
+E2BIG before payload allocation. Consider the negotiated FUSE request size when
+choosing a smaller allowance. The reserve never reduces the normal admission window. Executing
 requests and failed retained bodies remain charged. Normal capacity backpressures the application by retaining its owned input and withholding the reply, while returning the receive callback. Exhausting the total body/entry bound returns EAGAIN before input ownership or success; allocation failure returns ENOMEM. When failed retained bodies prevent
 capacity recovery, an unrelated admission returns EAGAIN rather than blocking the
 callback that must sync or close those bodies. Allocator metadata and downstream
-DFS buffers are additional memory. The total limit is an internal constant, not a deployment setting. Promotion retains the same Vec, with no additional payload copy. No per-file thread or 2GiB up-front allocation is introduced.
+DFS buffers are additional memory. This limit does not alter downstream dirty-body or idle-pool settings. Promotion retains the same Vec, with no additional payload copy. No per-file thread or 2GiB up-front allocation is introduced.
 
 The FIFO body consumer preserves write order, including overlapping writes and
 writes through multiple handles. It calls the existing complete DFS backend,
@@ -62,14 +71,56 @@ rather than treating one endpoint's latency as a complete throughput judgment.
 
 The package excludes zero-copy ownership redesigns, inline write shortcuts,
 region parallelism, object-size changes, O_DIRECT/huge-page experiments,
-persistence-barrier reductions and multi-host sharding. The per-mount 2GiB normal
+persistence-barrier reductions and multi-host sharding. The per-mount normal
 limit is charged on demand and is not an up-front allocation or a bound for all
 process memory. Downstream buffers, allocator metadata and concurrent mounts add
-to the memory requirement. The additional 32MiB reserve never reduces normal
-admission. No enable/disable or queue-size configuration is introduced.
+to the memory requirement. The automatically derived waiting reserve never reduces normal
+admission. There is no enable/disable switch; the normal queue size is configurable.
 
 Historical cohorts, exact validation commands and final comparison results are
 recorded in `afs-write-early-reply-20261029.md`. Historical 2GiB private-pipeline
 results and different workload definitions must not be combined into one gain.
 Local Linux/FUSE validation does not certify remote CI, all deployment modes or
 long-running failure recovery.
+
+
+## Reply scheduling and tuning
+
+Ready ordinary-write admission results execute inline, after input ownership and
+outside the body state lock. When normal quota is full, the receiver returns
+without acknowledging the retained request; its callback runs when quota is
+promoted, or reports the admission error. There is no separate reply queue or
+reply worker. Backend processing remains asynchronous and `fsync`/`close` keep
+waiting for the original completion and error barriers. Existing sync, append,
+writeback and other-backend reply points are unchanged.
+
+Size the normal allowance from available memory and the burst to absorb: if input
+arrives faster than the body consumer can accept it, the difference accumulates
+here. The body consumer releasing an input does not itself prove disk durability.
+A larger limit absorbs longer bursts; it does not improve sustained disk throughput.
+Several files share the same limit and can fill it together. It is not per-file,
+not a maximum file size and not an up-front allocation. Executing and failed
+retained bodies still count. Downstream live/idle buffers, protocols, allocator and
+kernel memory must be budgeted separately; 2GiB is not an RSS cap or a claim of
+optimal sizing. Keep headroom for those other users when tuning this parameter.
+
+
+## Measurement observer isolation
+
+Progress and trace output must stay in bounded memory during the measured region
+and be exported after the business completion timestamp. A small same-device
+progress `pwrite` can wait for inode timestamps and ext4/JBD2 journal buffer access,
+even without `fsync`; byte count alone does not bound its latency. Include the
+application and helper processes when tracing gaps before the next FUSE request.
+Record any post-timing export separately. If same-disk progress output is part of
+a real workload, name and account for that I/O explicitly rather than silently
+calling it instrumentation.
+
+The historical write cohorts included such observer I/O. Keep their raw timings,
+but do not attribute the entire difference to AFS or retrospectively subtract an
+estimated observer cost. With in-memory progress, the six-case reply comparison
+did not reproduce a stable 7.5% slowdown: direct/thread group medians were
+8.246182/8.245387 seconds, while paired changes had both signs. This does not prove
+performance equivalence or a stable thread benefit. Keep the simpler inline-ready
+path; do not import private tracing or reply-toggle environment controls into the
+product. Functional gates and byte/copy evidence remain separately reportable.

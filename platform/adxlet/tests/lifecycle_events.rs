@@ -237,6 +237,7 @@ impl Fixture {
     }
     fn status(&self) -> RuntimeStatus {
         RuntimeStatus {
+            required_services: Default::default(),
             identity: self.identity.clone(),
             revision: 1,
             phase: RuntimePhase::Running,

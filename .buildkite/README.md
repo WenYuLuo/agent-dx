@@ -39,6 +39,18 @@ fixture startup race separate from the production termination contract.
 Base builds publish verified candidates to OBS by default. PyPI publication remains opt-in.
 Set these variables on a Buildkite build or in that pipeline's environment settings.
 
+Both architecture Execd components include the pinned upstream envd in
+`adx-runtime-rootfs.img`. The Linux builder fetches the exact revision from
+`third_party/e2b/source.json` into a temporary checkout, verifies source hashes,
+and builds with its pinned Go toolchain. A fetch, checksum or build failure
+fails the component. The component and unified release retain envd LICENSE and
+manifest; the latter records the binary SHA256, revision, version and toolchain.
+`ADX_ENVD_SOURCE` optionally supplies an existing clean checkout of that same
+revision. On the macOS ARM worker, this host directory is mounted read-only at
+`/mnt/adx-envd-source` and its path is translated for the Linux container.
+Without an override, both architectures fetch inside their Linux builder.
+The standalone `build/release/build.sh` remains opt-in through `ADX_ENVD_SOURCE`.
+
 | Variable | Default | Applies to / responsibility |
 |---|---|---|
 | `ADX_OBS_UPLOAD` | base `1`, SDK `0` | `0` disables OBS upload for the selected pipeline |

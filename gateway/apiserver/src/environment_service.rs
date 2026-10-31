@@ -116,6 +116,32 @@ impl EnvironmentService {
             .await
     }
 
+    /// Resume with the duration of the newly started run, preserving Spec defaults.
+    pub async fn resume_with_run_timeout(
+        &self,
+        id: &str,
+        caller: &pb::CallerContext,
+        seconds: u64,
+    ) -> Result<Value, Status> {
+        self.operations
+            .resume_with_run_timeout(id, caller, seconds)
+            .await
+    }
+
+    /// Execute a read-merge-write operation only at the inspected revision.
+    pub async fn update_network_at_revision(
+        &self,
+        id: &str,
+        request_id: &str,
+        network: Option<adx_core::execution::NetworkPolicy>,
+        caller: &pb::CallerContext,
+        required_revision: u64,
+    ) -> Result<Value, Status> {
+        self.operations
+            .update_network_at_revision(id, request_id, network, caller, required_revision)
+            .await
+    }
+
     pub fn metrics(&self) -> String {
         self.creation_metrics.render()
     }

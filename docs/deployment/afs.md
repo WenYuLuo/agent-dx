@@ -547,6 +547,7 @@ fsync依赖原持久副本与Meta屏障。S3原有窗口、载荷／descriptor�
 
 | 原生 DFS 参数（CLI 将下划线改为连字符） | 默认 | 合法范围／含义 |
 | --- | ---: | --- |
+| `dfs_write_queue_bytes` | `2147483648` | 每DFS挂载前台普通写正常正文总额，8MiB..1TiB且须能装入usize；所有文件合计，按需使用；不是Node总内存。自动额外等待空间=min(额度/8,32MiB) |
 | `dfs_dirty_budget_bytes` | `67108864` | 4..64MiB，Node实际live正文capacity，含仍被持有的已上传正文 |
 | `dfs_unpublished_descriptors` | `1024` | 1..1024，且受固定4MiB元数据总额限制，不能靠增大计数绕过字节上限 |
 | `dfs_upload_inflight_chunks` | `8` | 1..8，整个Node的真实任务上限，共享live正文 |

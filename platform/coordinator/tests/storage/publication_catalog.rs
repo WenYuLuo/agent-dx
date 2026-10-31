@@ -207,7 +207,7 @@ async fn publication_overflow_recovers_during_continuous_writes_and_again_after_
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires isolated Redis; run storage suite"]
-async fn publication_repairs_a_timed_out_applied_write_without_losing_its_order() {
+async fn publication_resolves_a_timed_out_write_before_publishing_its_repair() {
     let mut rig = common::Redis::new().await;
     let session = rig.store().await.begin(1).await.unwrap();
     register(&session, "node").await;
@@ -226,13 +226,26 @@ async fn publication_repairs_a_timed_out_applied_write_without_losing_its_order(
         .publish_initial(record("unknown-write", 1), "unknown-request", "")
         .await;
     assert!(matches!(result, Err(Error::Unavailable(_))));
-    // Repair must not publish an empty snapshot by overtaking the paused write.
-    // It either waits behind it or remains unavailable until the same ordered
-    // connection confirms the eventual committed value.
-    if publisher.refresh().await.is_ok() {
-        assert_eq!(directory(&publisher).await.upserts.len(), 1);
-    }
+    // A fenced old client may have executed before recovery or may be removed
+    // while WRITE-paused. An authoritative empty repair must stay empty after
+    // the pause expires; an unfenced late command would violate that decision.
+    let visible_after_repair = if publisher.refresh().await.is_ok() {
+        Some(!directory(&publisher).await.upserts.is_empty())
+    } else {
+        None
+    };
     tokio::time::sleep(Duration::from_millis(900)).await;
+    if let Some(visible) = visible_after_repair {
+        assert_eq!(session.get("unknown-write").await.is_ok(), visible);
+    }
+    let expected = record("unknown-write", 1);
+    assert_eq!(
+        session
+            .publish_initial(expected.clone(), "unknown-request", "")
+            .await
+            .unwrap(),
+        expected
+    );
     publisher.refresh().await.unwrap();
     let frame = directory(&publisher).await;
     assert_eq!(frame.upserts.len(), 1);

@@ -2,7 +2,6 @@
 
 Agent 层使用 Rust，产品 API 嵌入统一 Gateway。Activator 可独立部署，也可与 API Server 和 Ingress 共进程；多个副本使用相同产品状态命名空间。
 
-
 | 目录 | 职责 |
 | --- | --- |
 | `crates/core` | 产品类型、协议、Environment 能力边界及通用校验 |

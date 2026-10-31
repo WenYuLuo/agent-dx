@@ -1,6 +1,7 @@
 use crate::clients::{authorize, Clients};
 use adx_observability::trace;
 use adx_protocol::control as pb;
+use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::{json, Value};
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::Mutex;
@@ -39,6 +40,11 @@ struct Operation {
     expected: u64,
     kind: Kind,
     body: Value,
+    network: Option<pb::NetworkPolicy>,
+}
+struct OperationInput {
+    body: Value,
+    network: Option<pb::NetworkPolicy>,
 }
 type OperationKey = (String, String, String);
 type PendingOperations = HashMap<OperationKey, Arc<Mutex<Operation>>>;
@@ -53,6 +59,77 @@ impl Operations {
             pending: Mutex::new(HashMap::new()),
         }
     }
+    /// Supply a one-run duration through the same native owner recovery path.
+    pub async fn resume_with_run_timeout(
+        &self,
+        id: &str,
+        caller: &pb::CallerContext,
+        seconds: u64,
+    ) -> Result<Value, Status> {
+        self.resume(id, caller, Some(seconds)).await
+    }
+
+    async fn resume(
+        &self,
+        id: &str,
+        caller: &pb::CallerContext,
+        run_timeout_seconds: Option<u64>,
+    ) -> Result<Value, Status> {
+        let observed = self.clients.owner(id, caller, false).await?;
+        let expected_runtime_id = observed
+            .record
+            .as_ref()
+            .and_then(|r| r.runtime.as_ref())
+            .map_or_else(String::new, |r| r.id.clone());
+        let mut coordinator = pb::coordinator_service_client::CoordinatorServiceClient::new(
+            self.clients.coordinator().await?,
+        );
+        let owner = self
+            .clients
+            .rpc_with_timeout(
+                "apiserver.ensure_running",
+                Duration::from_secs(300),
+                coordinator.ensure_running(trace::inject(pb::EnsureRunningRequest {
+                    run_timeout_seconds,
+                    expected_runtime_id,
+                    environment_id: id.into(),
+                    caller: Some(caller.clone()),
+                    timeout_seconds: 300,
+                })),
+            )
+            .await?;
+        authorize(caller, owner.record.as_ref())?;
+        if owner
+            .record
+            .as_ref()
+            .is_none_or(|r| r.state != pb::EnvironmentState::Running as i32)
+        {
+            return Err(Status::unavailable("resume has not committed Running"));
+        }
+        if owner.relay_address.is_empty()
+            || owner
+                .record
+                .as_ref()
+                .and_then(|r| r.spec.as_ref())
+                .is_none_or(|s| s.id != id)
+        {
+            return Err(Status::data_loss(
+                "invalid resume route or Environment identity",
+            ));
+        }
+        let node = owner
+            .record
+            .as_ref()
+            .and_then(|r| r.assignment.as_ref())
+            .ok_or_else(|| Status::data_loss("resume assignment missing"))?
+            .node_id
+            .clone();
+        let value = json!({"environmentId": id, "state": "running", "routeAddress": owner.relay_address,
+            "functionProxyId": node, "nodeId": node, "portMappings": {}});
+        self.clients.put_owner(owner).await?;
+        Ok(value)
+    }
+
     pub async fn execute(
         &self,
         kind: Kind,
@@ -62,59 +139,60 @@ impl Operations {
         caller: &pb::CallerContext,
     ) -> Result<Value, Status> {
         if kind == Kind::Resume {
-            let observed = self.clients.owner(id, caller, false).await?;
-            let expected_runtime_id = observed
-                .record
-                .as_ref()
-                .and_then(|r| r.runtime.as_ref())
-                .map_or_else(String::new, |r| r.id.clone());
-            let mut coordinator = pb::coordinator_service_client::CoordinatorServiceClient::new(
-                self.clients.coordinator().await?,
-            );
-            let owner = self
-                .clients
-                .rpc_with_timeout(
-                    "apiserver.ensure_running",
-                    Duration::from_secs(300),
-                    coordinator.ensure_running(trace::inject(pb::EnsureRunningRequest {
-                        expected_runtime_id,
-                        environment_id: id.into(),
-                        caller: Some(caller.clone()),
-                        timeout_seconds: 300,
-                    })),
-                )
-                .await?;
-            authorize(caller, owner.record.as_ref())?;
-            if owner
-                .record
-                .as_ref()
-                .is_none_or(|r| r.state != pb::EnvironmentState::Running as i32)
-            {
-                return Err(Status::unavailable("resume has not committed Running"));
-            }
-            if owner.relay_address.is_empty()
-                || owner
-                    .record
-                    .as_ref()
-                    .and_then(|r| r.spec.as_ref())
-                    .is_none_or(|s| s.id != id)
-            {
-                return Err(Status::data_loss(
-                    "invalid resume route or Environment identity",
-                ));
-            }
-            let node = owner
-                .record
-                .as_ref()
-                .and_then(|r| r.assignment.as_ref())
-                .ok_or_else(|| Status::data_loss("resume assignment missing"))?
-                .node_id
-                .clone();
-            let value = json!({"environmentId": id, "state": "running", "routeAddress": owner.relay_address,
-                "functionProxyId": node, "nodeId": node, "portMappings": {}});
-            self.clients.put_owner(owner).await?;
-            return Ok(value);
+            return self.resume(id, caller, None).await;
         }
+        let network = if kind == Kind::Network {
+            crate::contract::network_policy(body.clone())?.map(Into::into)
+        } else {
+            None
+        };
+        self.execute_inner(
+            kind,
+            id,
+            request_id,
+            OperationInput { body, network },
+            caller,
+            None,
+        )
+        .await
+    }
+
+    /// Update a typed policy only if a fresh lookup still has `required_revision`.
+    pub async fn update_network_at_revision(
+        &self,
+        id: &str,
+        request_id: &str,
+        network: Option<adx_core::execution::NetworkPolicy>,
+        caller: &pb::CallerContext,
+        required_revision: u64,
+    ) -> Result<Value, Status> {
+        if let Some(network) = &network {
+            network.validate().map_err(adx_protocol::status)?;
+        }
+        self.execute_inner(
+            Kind::Network,
+            id,
+            request_id,
+            OperationInput {
+                body: Value::Null,
+                network: network.map(Into::into),
+            },
+            caller,
+            Some(required_revision),
+        )
+        .await
+    }
+
+    async fn execute_inner(
+        &self,
+        kind: Kind,
+        id: &str,
+        request_id: &str,
+        input: OperationInput,
+        caller: &pb::CallerContext,
+        required_revision: Option<u64>,
+    ) -> Result<Value, Status> {
+        let OperationInput { body, network } = input;
         let seconds = number(&body, "timeoutSeconds", 300, 3600)?;
         let name = body
             .get("name")
@@ -135,7 +213,13 @@ impl Operations {
         let clients = &self.clients;
         // Workload checkpoint acknowledges publication before the directory watch
         // necessarily catches up. Reload must start from the committed revision.
-        let mut owner = clients.owner(id, caller, kind == Kind::Reload).await?;
+        let mut owner = clients
+            .owner(
+                id,
+                caller,
+                kind == Kind::Reload || required_revision.is_some(),
+            )
+            .await?;
         if kind == Kind::Delete
             && owner
                 .record
@@ -190,6 +274,9 @@ impl Operations {
         } else {
             default_retention
         };
+        if required_revision.is_some_and(|required| required != record.revision) {
+            return Err(Status::aborted("sandbox revision changed"));
+        }
         if kind == Kind::Delete
             && record.state == pb::EnvironmentState::Deleted as i32
             && !record.resources_held
@@ -216,6 +303,7 @@ impl Operations {
                     expected,
                     kind,
                     body: body.clone(),
+                    network: network.clone(),
                 }));
                 pending.insert(key.clone(), operation.clone());
                 operation
@@ -224,6 +312,7 @@ impl Operations {
         let operation = operation.lock().await;
         if operation.kind != kind
             || operation.body != body
+            || operation.network != network
             || Some(&operation.assignment)
                 != owner
                     .record
@@ -247,6 +336,7 @@ impl Operations {
                         .rpc(
                             "apiserver.delete",
                             node.delete_environment(trace::inject(pb::DeleteEnvironmentRequest {
+                                expected_revision: None,
                                 failed_revision: None,
                                 node_session_id: String::new(),
                                 assignment,
@@ -267,6 +357,7 @@ impl Operations {
                                 expected_revision: operation.expected,
                                 retention: Some(retention.into()),
                                 timeout_seconds: seconds,
+                                node_session_id: String::new(),
                             })),
                         )
                         .await
@@ -277,6 +368,7 @@ impl Operations {
                         "apiserver.snapshot",
                         clients.config.timeout() + Duration::from_secs(seconds),
                         node.create_snapshot(trace::inject(pb::CreateSnapshotRequest {
+                            node_session_id: String::new(),
                             assignment,
                             caller: caller_context,
                             operation_id: request_id.into(),
@@ -287,6 +379,7 @@ impl Operations {
                                 vec![name.into()]
                             },
                             timeout_seconds: seconds,
+                            kind: pb::SnapshotKind::Regular as i32,
                         })),
                     )
                     .await
@@ -300,8 +393,6 @@ impl Operations {
                     Err(error) => Err(error),
                 },
                 Kind::Network => {
-                    let network =
-                        crate::contract::network_policy(operation.body.clone())?.map(Into::into);
                     clients
                         .rpc(
                             "apiserver.update_network_policy",
@@ -311,7 +402,7 @@ impl Operations {
                                     caller: caller_context,
                                     operation_id: request_id.into(),
                                     expected_revision: operation.expected,
-                                    network,
+                                    network: operation.network.clone(),
                                 },
                             )),
                         )
@@ -461,6 +552,7 @@ pub fn number(value: &Value, key: &str, default: u64, max: u64) -> Result<u64, S
     }
     Ok(value)
 }
+
 pub fn snapshot_value(
     s: &pb::ReusableSnapshot,
     caller: &pb::CallerContext,
@@ -477,5 +569,89 @@ pub fn snapshot_value(
             "snapshot belongs to another tenant",
         ));
     }
-    Ok(json!({"snapshotId":s.id,"names":s.names}))
+    let kind = match pb::SnapshotKind::try_from(s.kind) {
+        Ok(pb::SnapshotKind::Regular) => "regular",
+        Ok(pb::SnapshotKind::Golden) => "golden",
+        Err(_) => return Err(Status::data_loss("invalid snapshot kind")),
+    };
+    let state = match pb::SnapshotState::try_from(s.state) {
+        Ok(pb::SnapshotState::Ready) => "ready",
+        Ok(pb::SnapshotState::Deleting) => "deleting",
+        Ok(pb::SnapshotState::Deleted) => "deleted",
+        _ => return Err(Status::data_loss("invalid snapshot state")),
+    };
+    let created_at = i64::try_from(s.created_at_unix_ms)
+        .ok()
+        .and_then(DateTime::<Utc>::from_timestamp_millis)
+        .ok_or_else(|| Status::data_loss("invalid snapshot creation time"))?;
+    Ok(json!({
+        "snapshotId": s.id, "names": s.names, "kind": kind, "state": state,
+        "createdAt": created_at.to_rfc3339_opts(SecondsFormat::Millis, true),
+        "image": spec.image, "runtime": spec.runtime_class
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_summary_exposes_metadata_without_private_capture_inputs() {
+        let caller = pb::CallerContext {
+            tenant_id: "tenant".into(),
+            ..Default::default()
+        };
+        let snapshot = pb::ReusableSnapshot {
+            id: "snapshot".into(),
+            names: vec!["base".into()],
+            kind: pb::SnapshotKind::Golden as i32,
+            state: pb::SnapshotState::Ready as i32,
+            created_at_unix_ms: 1_730_000_000_123,
+            template: Some(pb::EnvironmentSpec {
+                tenant_id: "tenant".into(),
+                image: "image".into(),
+                runtime_class: "firecracker".into(),
+                env: std::collections::HashMap::from([("TOKEN".into(), "private-env".into())]),
+                ..Default::default()
+            }),
+            artifact: Some(pb::CheckpointArtifact {
+                location: "private-artifact".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            snapshot_value(&snapshot, &caller).unwrap(),
+            json!({
+                "snapshotId":"snapshot", "names":["base"], "kind":"golden", "state":"ready",
+                "createdAt":"2024-10-27T03:33:20.123Z", "image":"image", "runtime":"firecracker"
+            })
+        );
+        let mut invalid = snapshot.clone();
+        invalid.kind = 42;
+        assert_eq!(
+            snapshot_value(&invalid, &caller).unwrap_err().code(),
+            Code::DataLoss
+        );
+        invalid = snapshot.clone();
+        invalid.state = 0;
+        assert_eq!(
+            snapshot_value(&invalid, &caller).unwrap_err().code(),
+            Code::DataLoss
+        );
+        invalid = snapshot.clone();
+        invalid.created_at_unix_ms = u64::MAX;
+        assert_eq!(
+            snapshot_value(&invalid, &caller).unwrap_err().code(),
+            Code::DataLoss
+        );
+        let foreign = pb::CallerContext {
+            tenant_id: "other".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            snapshot_value(&snapshot, &foreign).unwrap_err().code(),
+            Code::PermissionDenied
+        );
+    }
 }

@@ -559,7 +559,9 @@ fn resolve_identity(user: &str) -> Result<Option<Identity>, String> {
     }))
 }
 
-fn resolve_user(user: &str) -> Result<(libc::uid_t, libc::gid_t, Option<CString>), String> {
+pub(super) fn resolve_user(
+    user: &str,
+) -> Result<(libc::uid_t, libc::gid_t, Option<CString>), String> {
     if let Ok(uid) = user.parse::<libc::uid_t>() {
         return Ok((uid, lookup_uid_gid(uid).unwrap_or(0), None));
     }

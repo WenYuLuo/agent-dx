@@ -13,6 +13,7 @@ mod lifecycle;
 pub(super) use authority::{AuthorityCheck, AuthorityResult};
 mod monitor;
 mod observation;
+mod run_timer;
 mod snapshots;
 mod workload_checkpoint;
 use super::checkpoint::{PauseRequest, ResumeRequest};
@@ -55,13 +56,19 @@ pub(super) fn protects_execution(record: &EnvironmentRecord, runtime_id: &str) -
 }
 
 enum Command {
+    RunControl(oneshot::Sender<Result<adx_core::environment_control::EnvironmentControlRecord>>),
+    RunTimeout(
+        u64,
+        bool,
+        oneshot::Sender<Result<adx_core::environment_control::EnvironmentControlRecord>>,
+    ),
     Snapshot(
         super::checkpoint::SnapshotRequest,
         oneshot::Sender<Result<super::checkpoint::SnapshotResult>>,
     ),
     Pause(PauseRequest),
     Resume(ResumeRequest),
-    EnsureRunning(String),
+    EnsureRunning(String, Option<u64>),
     Network {
         policy: Option<adx_core::execution::NetworkPolicy>,
         operation_id: String,
@@ -78,6 +85,7 @@ enum Command {
         Option<tokio::time::Instant>,
     ),
     Delete,
+    DeleteAt(u64),
     CollectFailed(u64),
     Sync,
     Reconcile,
@@ -192,9 +200,18 @@ impl EnvironmentHandle {
         self.send(Command::Resume(request)).await
     }
     pub async fn ensure_running(&self, operation_id: String) -> Result<OperationResult> {
+        self.ensure_running_with_timeout(operation_id, None).await
+    }
+    /// Configure only a newly resumed run; a Running replay never stages a later override.
+    pub async fn ensure_running_with_timeout(
+        &self,
+        operation_id: String,
+        run_timeout_seconds: Option<u64>,
+    ) -> Result<OperationResult> {
         self.demand
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        self.send(Command::EnsureRunning(operation_id)).await
+        self.send(Command::EnsureRunning(operation_id, run_timeout_seconds))
+            .await
     }
     pub async fn update_network_policy(
         &self,
@@ -246,8 +263,45 @@ impl EnvironmentHandle {
         self.send(Command::Clone(Box::new(snapshot), Some(deadline)))
             .await
     }
+    /// Read the current owner timer estimate; returns NotFound without a run policy
+    /// and Unavailable if the owner controller has stopped.
+    pub async fn run_control(
+        &self,
+    ) -> Result<adx_core::environment_control::EnvironmentControlRecord> {
+        let (tx, rx) = oneshot::channel();
+        let (unused, _) = oneshot::channel();
+        self.tx
+            .send(Envelope::new(Command::RunControl(tx), unused))
+            .await
+            .map_err(|_| Error::Unavailable("environment controller stopped".into()))?;
+        rx.await
+            .map_err(|_| Error::Unavailable("environment controller stopped".into()))?
+    }
+    /// Update in the serial owner queue. Running Connect only extends; a paused
+    /// update supplies one next-run duration. Expired or terminal runs conflict.
+    pub async fn update_run_timeout(
+        &self,
+        seconds: u64,
+        extend_only: bool,
+    ) -> Result<adx_core::environment_control::EnvironmentControlRecord> {
+        let (tx, rx) = oneshot::channel();
+        let (unused, _) = oneshot::channel();
+        self.tx
+            .send(Envelope::new(
+                Command::RunTimeout(seconds, extend_only, tx),
+                unused,
+            ))
+            .await
+            .map_err(|_| Error::Unavailable("environment controller stopped".into()))?;
+        rx.await
+            .map_err(|_| Error::Unavailable("environment controller stopped".into()))?
+    }
     pub async fn delete(&self) -> Result<OperationResult> {
         self.send(Command::Delete).await
+    }
+    /// Revision-fenced cleanup must not delete a later replacement execution.
+    pub async fn delete_at_revision(&self, expected_revision: u64) -> Result<OperationResult> {
+        self.send(Command::DeleteAt(expected_revision)).await
     }
     /// GC must not delete an execution that moved on after the candidate was read.
     pub async fn collect_failed(&self, expected_revision: u64) -> Result<OperationResult> {
@@ -428,6 +482,9 @@ fn spawn_controller(
     let cleanup_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let metrics_registration = services.metrics.register(&record.spec.id);
     let mut controller = Controller {
+        run_timer: None,
+        timer_sequence: 0,
+        next_run_timeout: None,
         capture_preparation: None,
         intent_retry: None,
         recovery_files: None,
@@ -458,6 +515,8 @@ fn spawn_controller(
         loop {
             controller.publish_view();
             observers.refresh(&mut controller);
+            controller.reconcile_run_timer();
+            let run_deadline = controller.run_deadline();
             let deadline = controller.lifecycle_deadline();
             let record = controller.record.clone();
             let routes = controller.services.routes.clone();
@@ -471,8 +530,11 @@ fn spawn_controller(
                 Exit(Result<adx_core::RuntimeFailure>),
                 Proxy(Result<(String, u64, u64)>),
                 Deadline,
+                RunDeadline,
             }
             let wake = tokio::select! {
+                biased;
+                _ = async { match run_deadline { Some(deadline) => tokio::time::sleep_until(deadline).await, None => std::future::pending().await } } => Wake::RunDeadline,
                 command = rx.recv() => Wake::Command(command),
                 status = async {
                     let Some(changes) = observers.control.as_mut() else { return std::future::pending().await; };
@@ -524,6 +586,12 @@ fn spawn_controller(
                 }
                 Wake::Proxy(status) => {
                     controller.proxy_observed(status);
+                    continue;
+                }
+                Wake::RunDeadline => {
+                    let result = Box::pin(controller.run_timeout_due()).await;
+                    controller.trace_observation_error("run.timeout", &result);
+                    observers.arm_exit(&controller);
                     continue;
                 }
                 Wake::Deadline => {
@@ -591,6 +659,24 @@ fn spawn_controller(
 impl Controller {
     async fn dispatch(&mut self, command: Command, reply: Reply) {
         let command = match command {
+            Command::RunControl(ack) => {
+                let result = if self.retired || self.authority_fenced {
+                    Err(Error::Conflict)
+                } else {
+                    self.run_control()
+                };
+                let _ = ack.send(result);
+                return;
+            }
+            Command::RunTimeout(seconds, extend_only, ack) => {
+                let result = if self.retired || self.authority_fenced {
+                    Err(Error::Conflict)
+                } else {
+                    self.update_run_timeout(seconds, extend_only)
+                };
+                let _ = ack.send(result);
+                return;
+            }
             Command::CheckAuthority(check, ack) => {
                 self.authority_fenced = true;
                 let result = self.check_authority(*check).await;
@@ -615,7 +701,19 @@ impl Controller {
                 let result = if self.retired || self.authority_fenced {
                     Err(Error::Conflict)
                 } else {
-                    self.snapshot(request).await
+                    // Internal capture work keeps the original host deadline.
+                    // Its elapsed time counts toward this run, including any
+                    // temporary guest pause; expiry runs after this command.
+                    let suspended = self.run_timer.take();
+                    let result = self.snapshot(request).await;
+                    if let Some(mut timer) = suspended {
+                        if self.record.state == EnvironmentState::Running {
+                            timer.runtime_id = self.record.runtime.id.clone();
+                            timer.generation = self.record.assignment.generation;
+                            self.run_timer = Some(timer);
+                        }
+                    }
+                    result
                 };
                 let _ = ack.send(result);
                 return;
@@ -630,10 +728,32 @@ impl Controller {
                     Ok(())
                 } else {
                     async {
-                        if !self.runtime_probe_failure().await? {
-                            self.workload_checkpoint().await?;
+                        if self.runtime_probe_failure().await? {
+                            return Ok(());
                         }
-                        Ok(())
+                        match self.workload_checkpoint().await {
+                            // A guest checkpoint deliberately changes RuntimeStatus before
+                            // resuming. Its own checkpoint protocol owns that transition.
+                            Ok(true) => Ok(()),
+                            Err(error) => Err(error),
+                            Ok(false) => {
+                                let health = tokio::time::timeout(
+                                    self.services.operation_timeout,
+                                    self.services
+                                        .readiness
+                                        .required_service_health(&self.record),
+                                )
+                                .await
+                                .unwrap_or_else(|_| {
+                                    Err(Error::Unavailable("runtime health timed out".into()))
+                                });
+                                if health.is_err() {
+                                    self.unexpected_exit().await.map(|_| ())
+                                } else {
+                                    Ok(())
+                                }
+                            }
+                        }
                     }
                     .await
                 };
@@ -685,12 +805,13 @@ impl Controller {
         let operation = match &command {
             Command::Pause(_) => "pause",
             Command::Resume(_) => "resume",
-            Command::EnsureRunning(_) => "ensure_running",
+            Command::EnsureRunning(..) => "ensure_running",
             Command::Network { .. } => "network",
             Command::Reload { .. } => "reload",
             Command::Recover(_) => "recover",
             Command::Create(_) | Command::Clone(_, _) => "create",
             Command::Delete => "delete",
+            Command::DeleteAt(_) => "delete_expired",
             Command::CollectFailed(_) => "collect_failed",
             Command::Sync => "sync",
             Command::Reconcile => "reconcile",
@@ -702,7 +823,9 @@ impl Controller {
             self.operation_intent(adx_core::observation::OperationIntent::Policy);
         }
         let result = match command {
-            Command::Snapshot(_, _)
+            Command::RunControl(_)
+            | Command::RunTimeout(_, _, _)
+            | Command::Snapshot(_, _)
             | Command::AlignAuthority(_, _)
             | Command::CheckAuthority(_, _)
             | Command::ReapOrphan(_, _)
@@ -710,14 +833,22 @@ impl Controller {
             | Command::Expire(_, _)
             | Command::Tick(_)
             | Command::RuntimeEvent(_, _) => unreachable!(),
-            Command::Pause(request) => self.pause(request).await,
+            Command::Pause(request) => {
+                let result = self.pause(request).await;
+                if result.is_ok() && self.record.state == EnvironmentState::Paused {
+                    self.run_timer = None;
+                    self.next_run_timeout = None;
+                }
+                result
+            }
             Command::Resume(request) => self.resume(request).await,
-            Command::EnsureRunning(operation_id) => {
+            Command::EnsureRunning(operation_id, run_timeout_seconds) => {
                 self.idle = None;
                 if self.record.state == EnvironmentState::Running {
                     self.sync().await
                 } else {
                     self.resume(ResumeRequest {
+                        run_timeout_seconds,
                         operation_id,
                         expected_revision: self
                             .capture_preparation
@@ -754,6 +885,13 @@ impl Controller {
                 result
             }
             Command::Delete => self.delete().await,
+            Command::DeleteAt(revision) => {
+                if self.record.revision != revision {
+                    Err(Error::Conflict)
+                } else {
+                    self.delete().await
+                }
+            }
             Command::CollectFailed(revision) => {
                 if self.record.state != EnvironmentState::Failed
                     || self.record.restart_pending
@@ -788,6 +926,9 @@ impl Controller {
 }
 
 struct Controller {
+    run_timer: Option<run_timer::RunTimer>,
+    timer_sequence: u64,
+    next_run_timeout: Option<u64>,
     // One validated reload may retry after its intent-only state revisions.
     intent_retry: Option<adx_core::CompletedOperation>,
     stopped_runtime_ids: Vec<String>,
@@ -1076,13 +1217,26 @@ impl Controller {
         ) {
             return Err(Error::Conflict);
         }
+        let cleanup_artifacts = if self.record.state == EnvironmentState::Deleted {
+            self.obsolete_checkpoints.clone()
+        } else {
+            Vec::new()
+        };
         let durability = timeout(
             self.services.operation_timeout,
-            adx_observability::trace::Trace::child("environment.state.commit").run_result(
-                self.services
-                    .sink
-                    .commit_releasing(&self.record, &self.stopped_runtime_ids),
-            ),
+            adx_observability::trace::Trace::child("environment.state.commit").run_result(async {
+                if self.record.state == EnvironmentState::Deleted {
+                    self.services
+                        .sink
+                        .commit_deleted(&self.record, &cleanup_artifacts, &self.stopped_runtime_ids)
+                        .await
+                } else {
+                    self.services
+                        .sink
+                        .commit_releasing(&self.record, &self.stopped_runtime_ids)
+                        .await
+                }
+            }),
         )
         .await
         .map_err(|_| Error::Unavailable("state commit timed out".into()))??;
@@ -1114,6 +1268,13 @@ impl Controller {
 
     async fn clean_obsolete_checkpoints(&mut self) -> Result<()> {
         if self.durability != Some(Durability::Published) {
+            return Ok(());
+        }
+        if self.record.state == EnvironmentState::Deleted {
+            // Coordinator has atomically retained the cleanup task with the
+            // Deleted record. Shared objects stay in the existing registry;
+            // the outbox retains local or unregistered objects until collection.
+            self.obsolete_checkpoints.clear();
             return Ok(());
         }
         if let (Some(cp), Some(services)) = (&self.record.checkpoint, &self.services.checkpoint) {

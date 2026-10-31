@@ -1,5 +1,6 @@
 use adx_core::{
     Assignment, EnvironmentRecord, EnvironmentSpec, EnvironmentState, Error, Resources, Result,
+    UnsupportedCapability,
 };
 use adxlet::{
     checkpoint::{CheckpointCooperation, LocalCheckpointStore, PauseRequest, ResumeRequest},
@@ -15,6 +16,7 @@ use std::{
 
 #[derive(Default)]
 struct Backend {
+    checkpoint_cleanups: Mutex<Vec<adx_core::CheckpointCleanup>>,
     execution_admission_error: Mutex<Option<Error>>,
     sampled_runtimes: Mutex<BTreeSet<String>>,
     checkpoint_commit_failures: Mutex<usize>,
@@ -24,6 +26,7 @@ struct Backend {
     prepare_entered: tokio::sync::Notify,
     checkpoint_gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
     checkpoint_entered: tokio::sync::Notify,
+    running_checkpoint_delay: Mutex<Duration>,
     snapshots: Mutex<BTreeMap<String, adx_core::snapshots::Snapshot>>,
     committed_records: Mutex<BTreeMap<String, EnvironmentRecord>>,
     fail_snapshot_publish: Mutex<bool>,
@@ -51,6 +54,13 @@ struct Backend {
 impl Backend {
     fn event(&self, e: &str) {
         self.events.lock().unwrap().push(e.into());
+    }
+    async fn collect_deleted(&self, node: &Adxlet, artifact: &adx_core::CheckpointArtifact) {
+        let tasks = std::mem::take(&mut *self.checkpoint_cleanups.lock().unwrap());
+        assert!(tasks.iter().any(|task| task.artifacts.contains(artifact)));
+        for task in tasks {
+            node.collect_checkpoint_cleanup(&task, false).await.unwrap();
+        }
     }
 }
 #[async_trait]
@@ -120,7 +130,9 @@ impl RuntimeDriver for Backend {
     }
     async fn checkpoint_supported(&self, _: &str) -> Result<()> {
         if *self.unsupported_checkpoint.lock().unwrap() {
-            return Err(Error::Invalid("unsupported checkpoint".into()));
+            return Err(Error::UnsupportedCapability(
+                UnsupportedCapability::CheckpointRestore,
+            ));
         }
         Ok(())
     }
@@ -139,6 +151,10 @@ impl RuntimeDriver for Backend {
     }
     async fn checkpoint_running(&self, id: &str, path: &Path, timeout: Duration) -> Result<()> {
         self.event("checkpoint-running");
+        let delay = *self.running_checkpoint_delay.lock().unwrap();
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
         self.workload_checkpoint_timeouts
             .lock()
             .unwrap()
@@ -197,6 +213,7 @@ impl CheckpointCooperation for Backend {
     ) -> Result<Option<adx_core::runtime::RuntimeStatus>> {
         Ok(self.workload_request.lock().unwrap().clone().map(|id| {
             adx_core::runtime::RuntimeStatus {
+                required_services: Default::default(),
                 failure: None,
                 identity: adxlet::runtime_control::RuntimeControlClient::identity(record),
                 revision: 1,
@@ -332,6 +349,24 @@ impl StateSink for Backend {
             Ok(Durability::Published)
         }
     }
+    async fn commit_deleted(
+        &self,
+        record: &EnvironmentRecord,
+        artifacts: &[adx_core::CheckpointArtifact],
+        _: &[String],
+    ) -> Result<Durability> {
+        let durability = self.commit(record).await?;
+        if durability == Durability::Published && !artifacts.is_empty() {
+            let task = adx_core::CheckpointCleanup {
+                assignment: record.assignment.clone(),
+                revision: record.revision,
+                artifacts: artifacts.to_vec(),
+            };
+            task.validate()?;
+            self.checkpoint_cleanups.lock().unwrap().push(task);
+        }
+        Ok(durability)
+    }
 }
 fn fixture() -> (
     tempfile::TempDir,
@@ -364,6 +399,9 @@ fn fixture() -> (
     node.update_capacity(resources, Duration::from_secs(300))
         .unwrap();
     let spec = EnvironmentSpec {
+        envd: None,
+        run_policy: None,
+        compatibility: None,
         runtime_profile: None,
         snapshot_id: None,
         lifecycle: Default::default(),
@@ -396,6 +434,7 @@ fn pause(revision: u64) -> PauseRequest {
 }
 fn resume(revision: u64) -> ResumeRequest {
     ResumeRequest {
+        run_timeout_seconds: None,
         operation_id: "resume-b".into(),
         expected_revision: revision,
     }
@@ -651,6 +690,8 @@ async fn permanent_pause_survives_expiry_and_reconcile_then_resumes_and_deletes(
         .unwrap()
         .contains(&running.record.runtime.id));
     h.delete().await.unwrap();
+    assert!(Path::new(&cp.artifact.location).exists());
+    backend.collect_deleted(&node, &cp.artifact).await;
     assert!(!Path::new(&cp.artifact.location).exists());
 }
 
@@ -795,7 +836,10 @@ async fn failed_publication_restores_local_staging_and_reports_pause_failure() {
         .expect("rollback must persist its local recovery files");
     assert_eq!(local.artifact.storage, "local");
     assert!(Path::new(&local.artifact.location).exists());
+    let artifact = local.artifact.clone();
     h.delete().await.unwrap();
+    assert!(Path::new(&artifact.location).exists());
+    backend.collect_deleted(&node, &artifact).await;
     assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
 }
 
@@ -1156,22 +1200,22 @@ async fn snapshot_collection_requires_closed_references_and_is_retryable() {
         store.seal(&path).await.unwrap(),
     )
     .unwrap();
-    assert!(node.collect_snapshot(&snapshot).await.is_err());
+    assert!(node.collect_snapshot(&snapshot, false).await.is_err());
     let reference = Reference::Restore {
         environment_id: "clone".into(),
     };
     snapshot.acquire("tenant", reference.clone()).unwrap();
     assert!(snapshot.delete("tenant").is_err());
-    assert!(node.collect_snapshot(&snapshot).await.is_err());
+    assert!(node.collect_snapshot(&snapshot, false).await.is_err());
     assert!(path.exists());
     snapshot.release(&reference).unwrap();
     snapshot.delete("tenant").unwrap();
     let mut foreign = snapshot.clone();
     foreign.source_node_id = "other".into();
-    assert!(node.collect_snapshot(&foreign).await.is_err());
-    node.collect_snapshot(&snapshot).await.unwrap();
+    assert!(node.collect_snapshot(&foreign, false).await.is_err());
+    node.collect_snapshot(&snapshot, false).await.unwrap();
     assert!(!path.exists());
-    node.collect_snapshot(&snapshot).await.unwrap();
+    node.collect_snapshot(&snapshot, false).await.unwrap();
 }
 
 #[async_trait]
@@ -1220,6 +1264,7 @@ async fn reusable_snapshot_survives_source_deletion_and_retries_without_checkpoi
     let h = node.environment(spec, assignment).unwrap();
     let created = h.create().await.unwrap();
     let request = SnapshotRequest {
+        kind: adx_core::snapshots::SnapshotKind::Regular,
         operation_id: "snapshot-a".into(),
         expected_revision: created.record.revision,
         names: vec!["base".into()],
@@ -1258,6 +1303,43 @@ async fn reusable_snapshot_survives_source_deletion_and_retries_without_checkpoi
 }
 
 #[tokio::test]
+async fn golden_snapshot_capture_replays_metadata_and_rejects_kind_changes() {
+    use adx_core::snapshots::SnapshotKind;
+    use adxlet::checkpoint::SnapshotRequest;
+    let (_temp, backend, node, spec, assignment) = fixture();
+    let h = node.environment(spec, assignment).unwrap();
+    let created = h.create().await.unwrap();
+    let request = SnapshotRequest {
+        operation_id: "golden".into(),
+        expected_revision: created.record.revision,
+        names: vec!["prepared".into()],
+        kind: SnapshotKind::Golden,
+        timeout_seconds: 60,
+    };
+    let saved = h.snapshot(request.clone()).await.unwrap();
+    assert_eq!(saved.snapshot.kind, SnapshotKind::Golden);
+    assert!(saved.snapshot.created_at_unix_ms > 0);
+    assert_eq!(saved.environment.record.state, EnvironmentState::Running);
+    assert_eq!(
+        h.snapshot(request.clone()).await.unwrap().snapshot,
+        saved.snapshot
+    );
+    let mut changed = request;
+    changed.kind = SnapshotKind::Regular;
+    assert!(h.snapshot(changed).await.is_err());
+    assert_eq!(
+        backend
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.as_str() == "checkpoint-running")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn snapshot_publication_failure_attempts_to_resume_source() {
     use adxlet::checkpoint::SnapshotRequest;
     let (_temp, backend, node, spec, assignment) = fixture();
@@ -1266,6 +1348,7 @@ async fn snapshot_publication_failure_attempts_to_resume_source() {
     *backend.fail_snapshot_publish.lock().unwrap() = true;
     assert!(h
         .snapshot(SnapshotRequest {
+            kind: adx_core::snapshots::SnapshotKind::Regular,
             operation_id: "snapshot-fail".into(),
             expected_revision: created.record.revision,
             names: vec![],
@@ -1289,6 +1372,7 @@ async fn snapshot_checkpoint_commit_failure_still_attempts_source_resume() {
     *backend.unavailable_commit.lock().unwrap() = true;
     assert!(h
         .snapshot(SnapshotRequest {
+            kind: adx_core::snapshots::SnapshotKind::Regular,
             operation_id: "snapshot-outage".into(),
             expected_revision: created.record.revision,
             names: vec![],
@@ -1299,14 +1383,14 @@ async fn snapshot_checkpoint_commit_failure_still_attempts_source_resume() {
     assert_eq!(backend.running.lock().unwrap().len(), 1);
 }
 
-#[tokio::test]
-async fn clone_borrows_snapshot_and_blocks_deletion_until_it_releases_input() {
+async fn assert_snapshot_clone_lifecycle(kind: adx_core::snapshots::SnapshotKind) {
     use adx_core::snapshots::Reference;
     let (_temp, backend, node, spec, assignment) = fixture();
     let source = node.environment(spec.clone(), assignment.clone()).unwrap();
     let running = source.create().await.unwrap();
     let saved = source
         .snapshot(adxlet::checkpoint::SnapshotRequest {
+            kind,
             operation_id: "clone-source".into(),
             expected_revision: running.record.revision,
             names: vec![],
@@ -1370,9 +1454,19 @@ async fn clone_borrows_snapshot_and_blocks_deletion_until_it_releases_input() {
         })
         .unwrap();
     snapshot.delete("tenant").unwrap();
-    node.collect_snapshot(&snapshot).await.unwrap();
+    node.collect_snapshot(&snapshot, false).await.unwrap();
     assert!(!Path::new(&snapshot.artifact.location).exists());
     assert!(backend.running.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn clone_borrows_snapshot_and_blocks_deletion_until_it_releases_input() {
+    assert_snapshot_clone_lifecycle(adx_core::snapshots::SnapshotKind::Regular).await;
+}
+
+#[tokio::test]
+async fn golden_clone_uses_the_same_restore_references_and_collection() {
+    assert_snapshot_clone_lifecycle(adx_core::snapshots::SnapshotKind::Golden).await;
 }
 
 #[tokio::test]
@@ -1386,6 +1480,7 @@ async fn failed_snapshot_copy_publishes_failure_without_booting_an_image() {
         "node".into(),
         "environment-1".into(),
         adx_core::CheckpointArtifact {
+            scope: String::new(),
             storage: "local".into(),
             location: temp.path().join("missing").to_string_lossy().into(),
             size_bytes: 1,
@@ -1445,6 +1540,7 @@ async fn recovery_with_unusable_checkpoint_settles_failed_without_image_start() 
                 ownership_generation: 1,
             }),
             artifact: adx_core::CheckpointArtifact {
+                scope: String::new(),
                 storage: "missing-shared-backend".into(),
                 location: "unavailable".into(),
                 size_bytes: 8,
@@ -1551,6 +1647,7 @@ async fn recovery_retries_publication_without_repeating_backend_restore() {
         assert_eq!(
             handle
                 .resume(ResumeRequest {
+                    run_timeout_seconds: None,
                     operation_id: "recover-2".into(),
                     expected_revision: progress.revision
                 })
@@ -2210,15 +2307,69 @@ async fn unsupported_snapshot_does_not_stop_source_or_allocate_capture() {
     let h = node.environment(spec, assignment).unwrap();
     let created = h.create().await.unwrap();
     *backend.unsupported_checkpoint.lock().unwrap() = true;
-    assert!(h
-        .snapshot(adxlet::checkpoint::SnapshotRequest {
+    assert_eq!(
+        h.snapshot(adxlet::checkpoint::SnapshotRequest {
+            kind: adx_core::snapshots::SnapshotKind::Regular,
             operation_id: "snapshot-unsupported".into(),
             expected_revision: created.record.revision,
             names: vec![],
-            timeout_seconds: 30
+            timeout_seconds: 30,
         })
         .await
-        .is_err());
+        .unwrap_err(),
+        Error::UnsupportedCapability(UnsupportedCapability::CheckpointRestore),
+    );
+    assert!(backend
+        .running
+        .lock()
+        .unwrap()
+        .contains(&created.record.runtime.id));
+    assert_eq!(h.sync().await.unwrap().record, created.record);
+    assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+}
+
+#[tokio::test]
+async fn e2b_runtime_event_processes_guest_checkpoint_before_service_health() {
+    let (_temp, backend, node, mut spec, assignment) = fixture();
+    spec.compatibility = Some(adx_core::environment_control::EnvironmentCompatibility {
+        template_id: "base".into(),
+        envd_access_token: "a".repeat(32),
+        traffic_access_token: "b".repeat(32),
+        allow_public_traffic: false,
+    });
+    let handle = node.environment(spec, assignment).unwrap();
+    let created = handle.create().await.unwrap();
+    *backend.workload_request.lock().unwrap() = Some("guest-checkpoint".into());
+    node.observe_runtime_event(&adx_core::runtime::RuntimeIdentity {
+        environment_id: created.record.spec.id.clone(),
+        runtime_id: created.record.runtime.id.clone(),
+        ownership_generation: created.record.assignment.generation,
+    })
+    .await
+    .unwrap();
+
+    let record = handle.sync().await.unwrap().record;
+    assert_eq!(record.state, EnvironmentState::Running);
+    assert_eq!(record.runtime, created.record.runtime);
+    assert_eq!(record.checkpoint.as_ref().unwrap().id, "guest-checkpoint");
+    assert!(!backend
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|event| event == "retire" || event == "remove"));
+}
+
+#[tokio::test]
+async fn unsupported_pause_does_not_stop_source_or_allocate_capture() {
+    let (temp, backend, node, spec, assignment) = fixture();
+    let h = node.environment(spec, assignment).unwrap();
+    let created = h.create().await.unwrap();
+    *backend.unsupported_checkpoint.lock().unwrap() = true;
+    assert_eq!(
+        h.pause(pause(created.record.revision)).await.unwrap_err(),
+        Error::UnsupportedCapability(UnsupportedCapability::CheckpointRestore),
+    );
     assert!(backend
         .running
         .lock()
@@ -2266,6 +2417,7 @@ async fn runsc_capture_preserves_background_restore_input_without_pinning_new_ca
     assert!(running.record.execution_artifacts.contains(&input));
     let snapshot = h
         .snapshot(adxlet::checkpoint::SnapshotRequest {
+            kind: adx_core::snapshots::SnapshotKind::Regular,
             operation_id: "capture-after-background-restore".into(),
             expected_revision: running.record.revision,
             names: vec![],
@@ -2387,6 +2539,7 @@ async fn workload_retry_case(failure: WorkloadRetryFailure) {
     let (send, receive) = mpsc::channel(16);
     let mut status = RuntimeStatus {
         identity: identity.clone(),
+        required_services: Default::default(),
         revision: 1,
         phase: RuntimePhase::Running,
         failure: None,
@@ -2546,6 +2699,7 @@ async fn busy_controllers_do_not_starve_other_runtime_samples() {
             operations.push(tokio::spawn(async move {
                 handle
                     .snapshot(adxlet::checkpoint::SnapshotRequest {
+                        kind: adx_core::snapshots::SnapshotKind::Regular,
                         operation_id: format!("review-{index}"),
                         expected_revision: created.record.revision,
                         names: vec![],
@@ -2730,4 +2884,239 @@ async fn intended_removal_with_late_exit_is_not_runtime_interruption() {
         observation.intent,
         Some(adx_core::observation::OperationIntent::User)
     );
+}
+
+#[tokio::test]
+async fn explicit_pause_stops_timer_and_next_run_timeout_is_consumed_once() {
+    use adx_core::environment_control::{RunExpiryAction, RunPolicy};
+    let (_temp, _backend, node, mut spec, assignment) = fixture();
+    spec.run_policy = Some(RunPolicy {
+        timeout_seconds: 60,
+        action: RunExpiryAction::Pause,
+    });
+    let h = node.environment(spec, assignment).unwrap();
+    let created = h.create().await.unwrap();
+    h.update_run_timeout(5, false).await.unwrap();
+    let paused = h.pause(pause(created.record.revision)).await.unwrap();
+    assert_eq!(h.run_control().await.unwrap().expires_at_unix_ms, 0);
+    h.update_run_timeout(120, true).await.unwrap();
+    let resumed = h.resume(resume(paused.record.revision)).await.unwrap();
+    let current = h.run_control().await.unwrap();
+    assert!(current.expires_at_unix_ms >= current.started_at_unix_ms + 119_000);
+    let mut request = pause(resumed.record.revision);
+    request.operation_id = "pause-timer-second".into();
+    let paused = h.pause(request).await.unwrap();
+    let mut request = resume(paused.record.revision);
+    request.operation_id = "resume-timer-second".into();
+    h.resume(request).await.unwrap();
+    let current = h.run_control().await.unwrap();
+    assert!(current.expires_at_unix_ms <= current.started_at_unix_ms + 60_000);
+    h.delete().await.unwrap();
+}
+
+#[tokio::test]
+async fn snapshot_elapsed_time_counts_against_original_source_deadline() {
+    use adx_core::environment_control::{RunExpiryAction, RunPolicy};
+    use adxlet::checkpoint::SnapshotRequest;
+    let (_temp, backend, node, mut spec, assignment) = fixture();
+    spec.run_policy = Some(RunPolicy {
+        timeout_seconds: 60,
+        action: RunExpiryAction::Delete,
+    });
+    let h = node.environment(spec, assignment).unwrap();
+    let created = h.create().await.unwrap();
+    h.update_run_timeout(20, false).await.unwrap();
+    let before = h.run_control().await.unwrap();
+    *backend.running_checkpoint_delay.lock().unwrap() = Duration::from_millis(100);
+    let capture_started = tokio::time::Instant::now();
+    h.snapshot(SnapshotRequest {
+        kind: adx_core::snapshots::SnapshotKind::Regular,
+        operation_id: "snapshot-run-timer".into(),
+        expected_revision: created.record.revision,
+        names: vec![],
+        timeout_seconds: 60,
+    })
+    .await
+    .unwrap();
+    assert!(capture_started.elapsed() >= Duration::from_millis(100));
+    let after = h.run_control().await.unwrap();
+    assert_eq!(after.started_at_unix_ms, before.started_at_unix_ms);
+    assert_eq!(after.revision, before.revision);
+    // endAt is a wall-clock estimate, so allow rounding/scheduling headroom.
+    // Freezing the timer during capture would extend it by at least 100 ms.
+    assert!(after.expires_at_unix_ms <= before.expires_at_unix_ms + 50);
+    h.delete().await.unwrap();
+}
+
+#[tokio::test]
+async fn restarted_owner_uses_default_duration_instead_of_old_renewal() {
+    use adx_core::environment_control::{RunExpiryAction, RunPolicy};
+    let (temp, backend, owner, mut spec, assignment) = fixture();
+    spec.run_policy = Some(RunPolicy {
+        timeout_seconds: 60,
+        action: RunExpiryAction::Delete,
+    });
+    let h = owner.environment(spec.clone(), assignment.clone()).unwrap();
+    let created = h.create().await.unwrap();
+    let short = h.update_run_timeout(2, false).await.unwrap();
+    drop(h);
+    drop(owner);
+    tokio::task::yield_now().await;
+    let replacement = Adxlet::new(
+        "node".into(),
+        backend.clone(),
+        backend.clone(),
+        backend.clone(),
+        backend.clone(),
+    )
+    .with_checkpointing(
+        Arc::new(LocalCheckpointStore::new(temp.path().into()).unwrap()),
+        backend,
+    )
+    .unwrap();
+    replacement.reconcile(vec![created.record]).await.unwrap();
+    let h = replacement.environment(spec, assignment).unwrap();
+    let restarted = h.run_control().await.unwrap();
+    assert!(restarted.expires_at_unix_ms > short.expires_at_unix_ms + 50_000);
+    h.delete().await.unwrap();
+}
+
+#[tokio::test]
+async fn timer_that_expires_during_snapshot_runs_before_next_owner_command() {
+    use adx_core::environment_control::{RunExpiryAction, RunPolicy};
+    use adxlet::checkpoint::SnapshotRequest;
+    let (_temp, backend, node, mut spec, assignment) = fixture();
+    spec.run_policy = Some(RunPolicy {
+        timeout_seconds: 60,
+        action: RunExpiryAction::Delete,
+    });
+    let h = node.environment(spec, assignment).unwrap();
+    let created = h.create().await.unwrap();
+    h.update_run_timeout(1, false).await.unwrap();
+    *backend.running_checkpoint_delay.lock().unwrap() = Duration::from_millis(1100);
+    h.snapshot(SnapshotRequest {
+        kind: adx_core::snapshots::SnapshotKind::Regular,
+        operation_id: "snapshot-over-deadline".into(),
+        expected_revision: created.record.revision,
+        names: vec![],
+        timeout_seconds: 60,
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        h.sync().await.unwrap().record.state,
+        EnvironmentState::Deleted
+    );
+    assert!(backend.running.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn run_timeout_pause_retries_after_reservation_publication_recovers() {
+    use adx_core::environment_control::{RunExpiryAction, RunPolicy};
+    let (_temp, backend, node, mut spec, assignment) = fixture();
+    spec.run_policy = Some(RunPolicy {
+        timeout_seconds: 60,
+        action: RunExpiryAction::Pause,
+    });
+    let handle = node.environment(spec, assignment).unwrap();
+    handle.create().await.unwrap();
+    *backend.unavailable_state.lock().unwrap() = Some(EnvironmentState::Running);
+    *backend.unavailable_commit.lock().unwrap() = true;
+    handle.update_run_timeout(0, false).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if backend
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| event == "abort")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    *backend.unavailable_commit.lock().unwrap() = false;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if handle
+                .sync()
+                .await
+                .is_ok_and(|result| result.record.state == EnvironmentState::Paused)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let attempts = backend.prepare_ids.lock().unwrap();
+    assert!(attempts.len() >= 2);
+    // Execd rejects re-preparing a confirmed Aborted operation; retry must use
+    // a fresh operation only after the first pre-capture abort was confirmed.
+    assert_ne!(attempts[0], attempts[1]);
+}
+
+#[tokio::test]
+async fn resume_applies_requested_duration_before_delayed_followup_and_consumes_once() {
+    use adx_core::environment_control::{RunExpiryAction, RunPolicy};
+    let (_temp, backend, node, mut spec, assignment) = fixture();
+    spec.run_policy = Some(RunPolicy {
+        timeout_seconds: 1,
+        action: RunExpiryAction::Delete,
+    });
+    let handle = node.environment(spec, assignment).unwrap();
+    let created = handle.create().await.unwrap();
+    handle.update_run_timeout(60, false).await.unwrap();
+    let paused = handle.pause(pause(created.record.revision)).await.unwrap();
+    let mut request = resume(paused.record.revision);
+    request.run_timeout_seconds = Some(30);
+    let resumed = handle.resume(request.clone()).await.unwrap();
+    // Simulate a delayed resume response/control RPC, beyond the old Spec default.
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    let control = handle
+        .run_control()
+        .await
+        .expect("requested duration must protect the restored run");
+    assert!(control.expires_at_unix_ms >= control.started_at_unix_ms + 29_000);
+    assert_eq!(
+        backend.committed_records.lock().unwrap()[&resumed.record.spec.id].state,
+        EnvironmentState::Running
+    );
+    assert_eq!(
+        resumed
+            .record
+            .spec
+            .run_policy
+            .as_ref()
+            .unwrap()
+            .timeout_seconds,
+        1
+    );
+    let replay = handle.resume(request).await.unwrap();
+    assert_eq!(replay.record.runtime.id, resumed.record.runtime.id);
+    handle
+        .ensure_running_with_timeout("coalesced-wake".into(), Some(5))
+        .await
+        .unwrap();
+    let after_replay = handle.run_control().await.unwrap();
+    assert!(
+        after_replay
+            .expires_at_unix_ms
+            .abs_diff(control.expires_at_unix_ms)
+            < 100
+    );
+    let mut pause_request = pause(replay.record.revision);
+    pause_request.operation_id = "pause-duration-next".into();
+    let paused = handle.pause(pause_request).await.unwrap();
+    let mut next = resume(paused.record.revision);
+    next.operation_id = "resume-duration-next".into();
+    handle.resume(next).await.unwrap();
+    let next_control = handle.run_control().await.unwrap();
+    assert!(next_control.expires_at_unix_ms <= next_control.started_at_unix_ms + 1_000);
+    handle.delete().await.unwrap();
 }

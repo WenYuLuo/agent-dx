@@ -154,7 +154,7 @@ impl Clients {
                     .rpc_with_timeout(
                         "apiserver.create_local",
                         budget,
-                        client.create_local_environment(request),
+                        Box::pin(client.create_local_environment(request)),
                     )
                     .await?;
                 if let Some(owner) = local_owner(&node, &result)? {
@@ -273,8 +273,8 @@ impl Clients {
         timeout: Duration,
         future: impl Future<Output = Result<Response<T>, Status>>,
     ) -> Result<T, Status> {
-        // Keep the generated RPC future out of the nested timeout/trace state
-        // machines on the embedded Activator's HTTP polling stack.
+        // Generated RPC futures are large. Heap-own them before the nested
+        // timeout/trace state machines on the embedded Activator's HTTP stack.
         let future = Box::pin(future);
         trace::Trace::child(name)
             .run_result(async {
@@ -298,17 +298,10 @@ impl Clients {
         if let Some(c) = self.auth.lock().await.get(&digest) {
             return Ok(c);
         }
-        let mut client = pb::auth_service_client::AuthServiceClient::new(self.coordinator().await?);
-        let result = self
-            .rpc(
-                "apiserver.verify_key",
-                client.verify_api_key(trace::inject(pb::VerifyApiKeyRequest {
-                    api_key: key.into(),
-                })),
-            )
-            .await?;
+        let result = self.verify_key(key).await?;
         let caller = result
             .caller
+            .clone()
             .filter(|c| !c.tenant_id.is_empty())
             .ok_or_else(|| Status::unauthenticated("invalid identity"))?;
         let mut ttl = self.config.auth_cache_ttl_seconds;
@@ -327,6 +320,93 @@ impl Clients {
             .await
             .insert(digest, caller.clone(), Duration::from_secs(ttl));
         Ok(caller)
+    }
+
+    /// Verifies the current credential state without using the local cache.
+    /// Revocation and expiry are checked by the authoritative Coordinator.
+    pub async fn authenticate_fresh(&self, key: &str) -> Result<pb::CallerContext, Status> {
+        let result = self.verify_key(key).await?;
+        result
+            .caller
+            .filter(|caller| !caller.tenant_id.is_empty())
+            .ok_or_else(|| Status::unauthenticated("invalid identity"))
+    }
+
+    async fn verify_key(&self, key: &str) -> Result<pb::VerifyApiKeyResponse, Status> {
+        if !(32..=512).contains(&key.len()) {
+            return Err(Status::unauthenticated("invalid API key"));
+        }
+        let mut client = pb::auth_service_client::AuthServiceClient::new(self.coordinator().await?);
+        let result = self
+            .rpc(
+                "apiserver.verify_key",
+                client.verify_api_key(trace::inject(pb::VerifyApiKeyRequest {
+                    api_key: key.into(),
+                })),
+            )
+            .await?;
+        if result.expires_at_unix_seconds != 0 && result.expires_at_unix_seconds <= unix_seconds() {
+            return Err(Status::unauthenticated("expired API key"));
+        }
+        Ok(result)
+    }
+    pub async fn environment_control(
+        &self,
+        id: &str,
+        caller: &pb::CallerContext,
+    ) -> Result<pb::EnvironmentControlRecord, Status> {
+        let mut client = pb::coordinator_service_client::CoordinatorServiceClient::new(
+            self.coordinator().await?,
+        );
+        self.rpc(
+            "apiserver.get_environment_control",
+            client.get_environment_control(trace::inject(pb::GetEnvironmentControlRequest {
+                id: id.into(),
+                caller: Some(caller.clone()),
+            })),
+        )
+        .await
+    }
+    pub async fn batch_environment_control(
+        &self,
+        caller: &pb::CallerContext,
+        ids: Vec<String>,
+    ) -> Result<Vec<pb::EnvironmentControlRecord>, Status> {
+        let mut client = pb::coordinator_service_client::CoordinatorServiceClient::new(
+            self.coordinator().await?,
+        );
+        self.rpc(
+            "apiserver.batch_environment_control",
+            client.batch_get_environment_control(trace::inject(
+                pb::BatchGetEnvironmentControlRequest {
+                    ids,
+                    caller: Some(caller.clone()),
+                },
+            )),
+        )
+        .await
+        .map(|response| response.records)
+    }
+    pub async fn update_environment_control(
+        &self,
+        id: &str,
+        caller: &pb::CallerContext,
+        timeout_seconds: u64,
+        extend_only: bool,
+    ) -> Result<pb::EnvironmentControlRecord, Status> {
+        let mut client = pb::coordinator_service_client::CoordinatorServiceClient::new(
+            self.coordinator().await?,
+        );
+        self.rpc(
+            "apiserver.update_environment_control",
+            client.update_environment_control(trace::inject(pb::UpdateEnvironmentControlRequest {
+                id: id.into(),
+                caller: Some(caller.clone()),
+                timeout_seconds,
+                extend_only,
+            })),
+        )
+        .await
     }
     pub async fn owner(
         &self,
@@ -369,11 +449,33 @@ impl Clients {
         after: Option<&str>,
         limit: NonZeroUsize,
     ) -> Result<EnvironmentPage, Status> {
-        self.environments
-            .lock()
+        self.filtered_environments(caller, after, limit, |_| Ok(true))
             .await
-            .page(after, limit, |entry| is_visible(entry, caller))
     }
+    /// Apply entrypoint filters before the common directory counts a page.
+    pub(crate) async fn filtered_environments<F>(
+        &self,
+        caller: &pb::CallerContext,
+        after: Option<&str>,
+        limit: NonZeroUsize,
+        mut visible: F,
+    ) -> Result<EnvironmentPage, Status>
+    where
+        F: FnMut(&pb::EnvironmentRecord) -> Result<bool, Status> + Send,
+    {
+        self.environments.lock().await.page(after, limit, |entry| {
+            if !is_visible(entry, caller)? {
+                return Ok(false);
+            }
+            visible(
+                entry
+                    .record
+                    .as_ref()
+                    .ok_or_else(|| Status::data_loss("missing environment record"))?,
+            )
+        })
+    }
+
     pub async fn put_owner(&self, value: pb::GetEnvironmentResponse) -> Result<(), Status> {
         self.environments.lock().await.put(value)
     }
@@ -596,6 +698,7 @@ mod tests {
                 snapshot_source: None,
                 failure: None,
                 spec: Some(pb::EnvironmentSpec {
+                    compatibility: None,
                     id: id.into(),
                     tenant_id: tenant.into(),
                     ..Default::default()

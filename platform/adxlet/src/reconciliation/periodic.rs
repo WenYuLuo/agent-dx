@@ -335,6 +335,7 @@ impl Adxlet {
                 if runtime.generation > entry.generation {
                     entry.generation = runtime.generation;
                     entry.result = None;
+                    entry.coordinator_delete_fence = None;
                 }
                 entry.expires_at = entry.expires_at.max(expires_at);
             })
@@ -342,6 +343,7 @@ impl Adxlet {
                 generation: runtime.generation,
                 expires_at,
                 result: None,
+                coordinator_delete_fence: None,
             });
         OrphanTarget::Unowned
     }

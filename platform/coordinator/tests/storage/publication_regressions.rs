@@ -87,6 +87,7 @@ async fn receipt_follows_recovered_environment() {
         expires_at_unix_seconds: None,
         source_runtime_id: first.runtime.id.clone(),
         artifact: adx_core::CheckpointArtifact {
+            scope: Default::default(),
             storage: "shared".into(),
             location: "artifact".into(),
             size_bytes: 8,
@@ -173,6 +174,31 @@ async fn receipt_follows_recovered_environment() {
         Some(current.clone())
     );
     let mut deleted = current.clone();
+    // Recovery retains input objects until old nodes acknowledge reconciliation.
+    // Complete that independent cleanup contract before testing receipt/name reuse.
+    for id in ["source", "target"] {
+        let stored = session.snapshot().await.unwrap().nodes[id].clone();
+        let mut node = stored.node;
+        node.available = true;
+        session
+            .register_session(
+                node,
+                stored.address,
+                stored.proxy_address,
+                Some(NodeSession {
+                    id: "reconciled".into(),
+                    sequence: 1,
+                    routable: true,
+                }),
+            )
+            .await
+            .unwrap();
+        session
+            .release_execution_holds(id, "reconciled")
+            .await
+            .unwrap();
+    }
+    assert!(session.execution_holds().await.unwrap().is_empty());
     deleted.state = EnvironmentState::Deleted;
     deleted.resources_held = false;
     deleted.runtime.ip = None;

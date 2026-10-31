@@ -62,12 +62,20 @@ impl ExecdReadiness {
     }
     async fn probe(&self, record: &EnvironmentRecord) -> Result<()> {
         let status = self.client.probe_status(record).await?;
-        if let Some(failure) = status.failure {
-            return Err(Error::ProbeFailed(failure));
+        self.validate_status(record, &status)
+    }
+    fn validate_status(
+        &self,
+        record: &EnvironmentRecord,
+        status: &adx_core::runtime::RuntimeStatus,
+    ) -> Result<()> {
+        if let Some(failure) = &status.failure {
+            return Err(Error::ProbeFailed(failure.clone()));
         }
         if status.phase != RuntimePhase::Running {
             return Err(unavailable("runtime control is not running"));
         }
+        status.validate_required_services(record.spec.required_services())?;
         Ok(())
     }
 }
@@ -88,13 +96,29 @@ impl Readiness for ExecdReadiness {
     }
     async fn activity(&self, record: &EnvironmentRecord) -> Result<(u64, u64)> {
         let status = self.client.status(record).await?;
-        if status.phase != RuntimePhase::Running || status.activity_revision == 0 {
+        self.validate_status(record, &status)?;
+        if status.activity_revision == 0 {
             return Err(unavailable("runtime activity observation is not ready"));
         }
         // A detached background command belongs to the runtime, not to a live
         // client. Its start still advances activity_revision, but it must not
         // indefinitely prevent an otherwise idle capsule from being reaped.
         Ok((status.activity_revision, status.active_requests))
+    }
+    async fn required_service_health(&self, record: &EnvironmentRecord) -> Result<()> {
+        match self.client.status(record).await {
+            Ok(status)
+                if record.spec.required_services().next().is_some()
+                    || !status.required_services.is_empty() =>
+            {
+                self.validate_status(record, &status)
+            }
+            Ok(_) => Ok(()),
+            // No configured service means an unavailable observation alone cannot
+            // establish a mandatory-service failure for a legacy runtime.
+            Err(_) if record.spec.required_services().next().is_none() => Ok(()),
+            Err(error) => Err(error),
+        }
     }
     async fn wait_ready(&self, record: &EnvironmentRecord) -> Result<()> {
         let ready_timeout = if record.spec.execution.init_timeout_seconds > 0 {
@@ -104,7 +128,12 @@ impl Readiness for ExecdReadiness {
         };
         if self.client.uses_stream() {
             return tokio::time::timeout(ready_timeout, async {
-                self.client.wait_ready_notification(record).await?;
+                let status = self
+                    .client
+                    .wait_ready_notification(record)
+                    .await?
+                    .ok_or_else(|| unavailable("Ready notification omitted runtime status"))?;
+                self.validate_status(record, &status)?;
                 if !self.runtime.is_running(&record.runtime.id).await? {
                     return Err(unavailable("runtime exited before Ready"));
                 }

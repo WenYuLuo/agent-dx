@@ -49,6 +49,9 @@ fn record() -> EnvironmentRecord {
         restart_attempts: 0,
         restart_pending: false,
         spec: EnvironmentSpec {
+            run_policy: None,
+            envd: None,
+            compatibility: None,
             runtime_profile: None,
             snapshot_id: None,
             lifecycle: Default::default(),
@@ -91,9 +94,10 @@ impl Drop for Server {
     }
 }
 async fn serve(
-    body: &'static str,
+    body: impl Into<String>,
     stopped: Option<Arc<Runtime>>,
 ) -> (u16, Server, Arc<AtomicUsize>) {
+    let body = body.into();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let requests = Arc::new(AtomicUsize::new(0));
@@ -216,6 +220,98 @@ async fn active_client_request_still_blocks_idle_activity() {
 }
 
 #[tokio::test]
+async fn configured_service_requires_a_ready_report_without_compatibility() {
+    for (service, ready) in [
+        (serde_json::json!({}), false),
+        (
+            serde_json::json!({"envd":{"phase":"ready"}, "helper":{"phase":"failed"}}),
+            false,
+        ),
+        (
+            serde_json::json!({"envd":{"phase":"starting","version":"0.9.0"}}),
+            false,
+        ),
+        (serde_json::json!({"envd":{"phase":"ready"}}), true),
+        (
+            serde_json::json!({"envd":{"phase":"ready","version":"0.8.0"}}),
+            true,
+        ),
+        (
+            serde_json::json!({"envd":{"phase":"failed","version":"0.9.0"}}),
+            false,
+        ),
+        (
+            serde_json::json!({"envd":{"phase":"ready","version":"0.9.0"}}),
+            true,
+        ),
+    ] {
+        let mut record = record();
+        record.spec.envd = Some(adx_core::envd::EnvdServiceConfig {
+            version: "0.9.0".into(),
+            access_token: Some("a".repeat(32)),
+            gateway_auth: false,
+            ingress_sources: Vec::new(),
+        });
+        let body = serde_json::json!({
+            "identity":{"environment_id":"i","runtime_id":"i-1","ownership_generation":1},
+            "revision":1,"phase":"running","checkpoint":null,"active_requests":0,"active_commands":0,
+            "required_services":service,
+        }).to_string();
+        let (port, _server, _) = serve(body, None).await;
+        assert_eq!(
+            checker(runtime(true), port)
+                .wait_ready(&record)
+                .await
+                .is_ok(),
+            ready
+        );
+    }
+}
+
+#[tokio::test]
+async fn activity_requires_all_reported_services_to_be_ready() {
+    for (service, healthy) in [
+        (serde_json::json!({}), false),
+        (
+            serde_json::json!({"envd":{"phase":"ready"}, "helper":{"phase":"failed"}}),
+            false,
+        ),
+        (
+            serde_json::json!({"envd":{"phase":"failed","version":"0.9.0"}}),
+            false,
+        ),
+        (
+            serde_json::json!({"envd":{"phase":"ready","version":"0.8.0"}}),
+            true,
+        ),
+        (
+            serde_json::json!({"envd":{"phase":"ready","version":"0.9.0"}}),
+            true,
+        ),
+    ] {
+        let mut record = record();
+        record.spec.envd = Some(adx_core::envd::EnvdServiceConfig {
+            version: "0.9.0".into(),
+            access_token: Some("a".repeat(32)),
+            gateway_auth: false,
+            ingress_sources: Vec::new(),
+        });
+        let body = serde_json::json!({
+            "identity":{"environment_id":"i","runtime_id":"i-1","ownership_generation":1},
+            "revision":1,"phase":"running","checkpoint":null,
+            "active_requests":0,"active_commands":0,"activity_revision":1,
+            "required_services":service,
+        })
+        .to_string();
+        let (port, _server, _) = serve(body, None).await;
+        assert_eq!(
+            checker(runtime(true), port).activity(&record).await.is_ok(),
+            healthy
+        );
+    }
+}
+
+#[tokio::test]
 async fn terminal_readiness_failure_is_not_retried_as_transport_error() {
     let (port, _server, requests) = serve(r#"{"identity":{"environment_id":"i","runtime_id":"i-1","ownership_generation":1},"revision":2,"phase":"failed","failure":{"kind":"readiness_timeout","message":"HTTP 503","consecutive_failures":3},"checkpoint":null,"active_requests":0,"active_commands":0}"#, None).await;
     let result = checker(runtime(true), port)
@@ -259,4 +355,37 @@ async fn explicit_probe_can_use_http_but_stream_readiness_never_polls() {
         1,
         "stream readiness must not poll HTTP"
     );
+}
+
+#[tokio::test]
+async fn reported_mandatory_service_failure_blocks_native_readiness() {
+    let (port, _server, _) = serve(r#"{"identity":{"environment_id":"i","runtime_id":"i-1","ownership_generation":1},"revision":1,"phase":"running","checkpoint":null,"active_requests":0,"active_commands":0,"required_services":{"helper":{"phase":"failed"}}}"#, None).await;
+    assert!(checker(runtime(true), port)
+        .wait_ready(&record())
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn event_health_aggregates_reported_services_without_requiring_idle_activity() {
+    for (services, healthy) in [
+        (serde_json::json!({}), true),
+        (serde_json::json!({"helper":{"phase":"ready"}}), true),
+        (serde_json::json!({"helper":{"phase":"failed"}}), false),
+    ] {
+        let body = serde_json::json!({
+            "identity":{"environment_id":"i","runtime_id":"i-1","ownership_generation":1},
+            "revision":1,"phase":"running","checkpoint":null,
+            "active_requests":0,"active_commands":0,"required_services":services,
+        })
+        .to_string();
+        let (port, _server, _) = serve(body, None).await;
+        assert_eq!(
+            checker(runtime(true), port)
+                .required_service_health(&record())
+                .await
+                .is_ok(),
+            healthy
+        );
+    }
 }

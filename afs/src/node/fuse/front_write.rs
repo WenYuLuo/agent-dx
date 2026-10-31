@@ -11,6 +11,8 @@ use std::thread::{self, JoinHandle};
 type Job = Box<dyn FnMut() -> Result<(), i32> + Send>;
 type Admission = Box<dyn FnOnce(Result<(), i32>) + Send>;
 type RecoveryStart = Box<dyn FnOnce(CallbackGuard) + Send>;
+const MAX_WAITING_ENTRIES: usize = 4096;
+
 struct Waiter {
     inode: u64,
     through: u64,
@@ -438,6 +440,8 @@ impl FrontWriteQueue {
         make: impl FnOnce() -> Result<Job, i32>,
         admitted: impl FnOnce(Result<(), i32>) + Send + 'static,
     ) {
+        // Ready results keep the inline fast path. Quota-limited requests
+        // retain their callback until promotion. Both run outside the state lock.
         let mut callback: Option<Admission> = Some(Box::new(admitted));
         let result = (|| {
             let mut state = self.shared.state.lock().map_err(|_| EIO)?;
@@ -450,7 +454,8 @@ impl FrontWriteQueue {
             if bytes > self.shared.admitted_limit {
                 return Err(E2BIG);
             }
-            if bytes > self.shared.limit.saturating_sub(state.bytes) || state.entries.len() >= 4096
+            if bytes > self.shared.limit.saturating_sub(state.bytes)
+                || state.entries.len() >= MAX_WAITING_ENTRIES
             {
                 return Err(EAGAIN);
             }
@@ -495,7 +500,8 @@ impl FrontWriteQueue {
             if let Some(error) = state.errors.get(&inode) {
                 return Err(*error);
             }
-            if bytes <= self.shared.limit - state.bytes && state.entries.len() < 4096 {
+            if bytes <= self.shared.limit - state.bytes && state.entries.len() < MAX_WAITING_ENTRIES
+            {
                 break;
             }
             if !state.errors.is_empty() {
@@ -623,7 +629,21 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
         mpsc,
     };
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
+
+    fn assert_state_lock_available(shared: &Shared) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if shared.state.try_lock().is_ok() {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "callback retained the state lock"
+            );
+            thread::yield_now();
+        }
+    }
     fn submit(
         queue: &FrontWriteQueue,
         inode: u64,
@@ -633,6 +653,125 @@ mod tests {
     ) -> Result<(), i32> {
         queue.submit_with(inode, handle, bytes, || Ok(Box::new(job)))
     }
+    #[test]
+    fn ready_admission_reply_stays_on_caller_thread() {
+        let q = FrontWriteQueue::with_limits(8, 2).unwrap();
+        let caller = std::thread::current().id();
+        let (tx, rx) = mpsc::channel();
+        q.submit_deferred_with(
+            1,
+            11,
+            1,
+            || Ok(Box::new(|| Ok(()))),
+            move |r| {
+                tx.send((r, std::thread::current().id())).unwrap();
+            },
+        );
+        let (result, reply_thread) = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            reply_thread, caller,
+            "ready admission must keep the inline fast path"
+        );
+    }
+
+    #[test]
+    fn ready_and_rejected_replies_do_not_wait_for_body_io() {
+        let q = FrontWriteQueue::with_limits(8, 2).unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (ack_tx, ack_rx) = mpsc::channel();
+        q.submit_deferred_with(
+            1,
+            11,
+            4,
+            || {
+                Ok(Box::new(move || {
+                    started_tx.send(thread::current().id()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(())
+                }))
+            },
+            move |r| ack_tx.send((r, thread::current().id())).unwrap(),
+        );
+        let body_thread = started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let first = ack_rx.recv_timeout(Duration::from_secs(2));
+        let (next_tx, next_rx) = mpsc::channel();
+        q.submit_deferred_with(
+            2,
+            22,
+            4,
+            || Ok(Box::new(|| Ok(()))),
+            move |r| next_tx.send((r, thread::current().id())).unwrap(),
+        );
+        let next = next_rx.recv_timeout(Duration::from_secs(2));
+        let (error_tx, error_rx) = mpsc::channel();
+        q.submit_deferred_with(
+            3,
+            33,
+            9,
+            || panic!("oversize must not allocate"),
+            move |r| error_tx.send((r, thread::current().id())).unwrap(),
+        );
+        let error = error_rx.recv_timeout(Duration::from_secs(2));
+        // Release before asserting so a failure cannot strand the body worker.
+        release_tx.send(()).unwrap();
+        let (result, reply_thread) = first.unwrap();
+        assert_eq!(result, Ok(()));
+        assert_eq!(reply_thread, thread::current().id());
+        assert_ne!(reply_thread, body_thread);
+        assert_eq!(next.unwrap(), (Ok(()), reply_thread));
+        assert_eq!(error.unwrap(), (Err(E2BIG), reply_thread));
+        q.close().unwrap();
+    }
+
+    #[test]
+    fn close_settles_admission_and_rejects_new_input_inline() {
+        let q = FrontWriteQueue::with_limits(8, 2).unwrap();
+        let (tx, rx) = mpsc::channel();
+        q.submit_deferred_with(
+            1,
+            11,
+            1,
+            || Ok(Box::new(|| Ok(()))),
+            move |r| tx.send(r).unwrap(),
+        );
+        q.close().unwrap();
+        assert_eq!(rx.try_recv().unwrap(), Ok(()));
+        let (tx, rx) = mpsc::channel();
+        q.submit_deferred_with(
+            1,
+            11,
+            1,
+            || panic!("closed must not allocate"),
+            move |r| tx.send((r, thread::current().id())).unwrap(),
+        );
+        let (result, id) = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(result, Err(EIO));
+        assert_eq!(id, thread::current().id());
+    }
+
+    #[test]
+    fn ready_and_rejected_callbacks_run_outside_the_state_lock() {
+        let q = FrontWriteQueue::with_limits(8, 2).unwrap();
+        for (bytes, expected) in [(1, Ok(())), (9, Err(E2BIG))] {
+            let shared = q.shared.clone();
+            let (tx, rx) = mpsc::channel();
+            q.submit_deferred_with(
+                1,
+                11,
+                bytes,
+                || Ok(Box::new(|| Ok(()))),
+                move |result| {
+                    assert_state_lock_available(&shared);
+                    tx.send(result).unwrap();
+                },
+            );
+            assert_eq!(rx.try_recv().unwrap(), expected);
+        }
+        q.close().unwrap();
+    }
+
     #[test]
     fn admitted_bodies_keep_cross_file_fifo_without_fair_scheduling() {
         let q = FrontWriteQueue::with_limits(16, 0).unwrap();
@@ -846,12 +985,16 @@ mod tests {
         assert_eq!(ack_rx.recv_timeout(Duration::from_secs(2)).unwrap(), Ok(()));
         entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         let (pending_tx, pending_rx) = mpsc::channel();
+        let pending_shared = q.shared.clone();
         q.submit_deferred_with(
             1,
             11,
             8,
             || Ok(Box::new(|| Ok(()))),
-            move |result| pending_tx.send(result).unwrap(),
+            move |result| {
+                assert_state_lock_available(&pending_shared);
+                pending_tx.send(result).unwrap();
+            },
         );
         assert!(
             pending_rx.try_recv().is_err(),

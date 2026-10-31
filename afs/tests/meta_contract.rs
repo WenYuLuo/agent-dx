@@ -847,7 +847,7 @@ async fn node_rpc_store_local_file_recovers_committed_session_and_reply() {
                 rest_addr: "http://node-a:7600".into(),
             }),
             labels: Default::default(),
-            capabilities: Vec::new(),
+            capabilities: vec!["ownerfs".into()],
             session_id: "session-a".into(),
             storage_devices: Vec::new(),
         }),
@@ -876,6 +876,14 @@ async fn node_rpc_store_local_file_recovers_committed_session_and_reply() {
         .into_inner();
     assert!(found.found);
     assert_eq!(found.lease_epoch, 1);
+    assert!(
+        reopened
+            .lookup_node("node-a")
+            .await
+            .unwrap()
+            .unwrap()
+            .ownerfs_enabled
+    );
     let replay = rpc::MetaRpc(reopened)
         .register_node(Request::new(request))
         .await
@@ -1416,6 +1424,7 @@ fn owner_root_messages_keep_location_reservation_and_access_separate() {
     let lookup = LookupRootReply {
         location: Some(location),
         found: true,
+        reservation: None,
     };
     assert_eq!(lookup.location.unwrap().home_node_id, "node-a");
 
@@ -1426,6 +1435,8 @@ fn owner_root_messages_keep_location_reservation_and_access_separate() {
         session_id: "session-a".into(),
         create_intent_id: "intent-a".into(),
         prepare_token: "prepare-a".into(),
+        requester_node_id: "node-a".into(),
+        requester_session_id: "session-a".into(),
     };
     let reserve = ReserveRootReply {
         reservation: Some(reservation.clone()),

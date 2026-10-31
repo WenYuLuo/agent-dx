@@ -20,6 +20,17 @@ impl Session {
         next: &Snapshot,
         catalog: Option<&volumes::Catalog>,
     ) -> Result<bool> {
+        self.snapshot_cas_with_source(id, old, next, catalog, None)
+            .await
+    }
+    async fn snapshot_cas_with_source(
+        &self,
+        id: &str,
+        old: Option<&str>,
+        next: &Snapshot,
+        catalog: Option<&volumes::Catalog>,
+        source: Option<(&str, &str)>,
+    ) -> Result<bool> {
         next.validate()?;
         let _access = if next.state == SnapshotState::Ready {
             Some(
@@ -33,23 +44,35 @@ impl Session {
             Some(catalog) => Some(catalog.header_value.clone()),
             None => self.store.fields([HEADER.into()]).await?[0].clone(),
         };
-        self.header(&header_value)?;
-        let header = catalog.map(volumes::Catalog::advanced_header).transpose()?;
+        let mut current_header = self.header(&header_value)?;
+        let header = if let Some(catalog) = catalog {
+            Some(catalog.advanced_header()?)
+        } else if next.state == SnapshotState::Ready {
+            current_header.advance()?;
+            Some(current_header)
+        } else {
+            None
+        };
         let mut command = redis::cmd("EVAL");
         command
             .arg(
                 r#"
             if redis.call('HGET', KEYS[1], 'epoch') ~= ARGV[1] then return 0 end
             if ARGV[6] ~= '' and redis.call('HGET',KEYS[1],'header') ~= ARGV[6] then return 0 end
+            if ARGV[7] ~= '' and redis.call('HGET',KEYS[1],ARGV[7]) ~= ARGV[8] then return 0 end
             local old = redis.call('HGET', KEYS[2], ARGV[2])
             if ARGV[3] == '' then
                 if old then return 0 end
             elseif old ~= ARGV[3] then return 0 end
             redis.call('HSET', KEYS[2], ARGV[2], ARGV[4])
             if ARGV[5] ~= '' then redis.call('HSET', KEYS[1], 'header', ARGV[5]) end
-            for i = 8, #ARGV, 2 do
-                if ARGV[i + 1] == '' then redis.call('HDEL', KEYS[3], ARGV[i])
-                else redis.call('HSET', KEYS[3], ARGV[i], ARGV[i + 1]) end
+            local cursor = 10
+            for _ = 1, tonumber(ARGV[9]) do
+                local key = ARGV[cursor]
+                local value = ARGV[cursor + 1]
+                if value == '' then redis.call('HDEL', KEYS[3], key)
+                else redis.call('HSET', KEYS[3], key, value) end
+                cursor = cursor + 2
             end
             return 1
         "#,
@@ -63,11 +86,10 @@ impl Session {
             .arg(old.unwrap_or(""))
             .arg(encode(next)?)
             .arg(header.as_ref().map(encode).transpose()?.unwrap_or_default())
-            .arg(
-                catalog
-                    .map(|catalog| catalog.header_value.as_str())
-                    .unwrap_or(""),
-            );
+            .arg(header_value.as_deref().unwrap_or(""));
+        command
+            .arg(source.map_or("", |(field, _)| field))
+            .arg(source.map_or("", |(_, value)| value));
         if let Some(catalog) = catalog {
             catalog.append_writes(&mut command)?;
         } else {
@@ -100,6 +122,25 @@ impl Session {
         }
     }
     pub async fn publish_snapshot(&self, record: Snapshot) -> Result<Snapshot> {
+        self.publish_snapshot_checked(record, None).await
+    }
+
+    /// Node publication compares the exact source bytes in the same CAS. A
+    /// retirement that finishes outside the RPC state lock cannot be raced.
+    pub(crate) async fn publish_snapshot_from_source(
+        &self,
+        record: Snapshot,
+        assignment: &Assignment,
+    ) -> Result<Snapshot> {
+        self.publish_snapshot_checked(record, Some(assignment))
+            .await
+    }
+
+    async fn publish_snapshot_checked(
+        &self,
+        record: Snapshot,
+        assignment: Option<&Assignment>,
+    ) -> Result<Snapshot> {
         record.validate()?;
         if record.state != SnapshotState::Ready
             || record.revision != 1
@@ -119,6 +160,26 @@ impl Session {
                     Err(Error::Conflict)
                 };
             }
+            let source_field = format!("environment:{}", record.template.id);
+            let source = if let Some(assignment) = assignment {
+                let [raw] = self.store.fields([source_field.clone()]).await?;
+                let raw = raw.ok_or(Error::Conflict)?;
+                let stored: StoredEnvironment = decode(&raw)?;
+                stored.validate()?;
+                if stored.assignment != *assignment
+                    || stored.invalidated
+                    || !record.matches_template(&stored.spec)
+                    || !stored.result.as_ref().is_some_and(|result| {
+                        result.runtime.id == record.source_runtime_id
+                            && result.execution_artifacts.contains(&record.artifact)
+                    })
+                {
+                    return Err(Error::Conflict);
+                }
+                Some(raw)
+            } else {
+                None
+            };
             let mut next = record.clone();
             let catalog = if volumes::has_volumes(&next.template) {
                 let mut catalog = self.volume_catalog().await?;
@@ -128,7 +189,13 @@ impl Session {
                 None
             };
             if self
-                .snapshot_cas(&record.id, None, &next, catalog.as_ref())
+                .snapshot_cas_with_source(
+                    &record.id,
+                    None,
+                    &next,
+                    catalog.as_ref(),
+                    source.as_deref().map(|raw| (source_field.as_str(), raw)),
+                )
                 .await?
             {
                 return Ok(next);

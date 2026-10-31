@@ -21,13 +21,17 @@ API Server 仍保留原有九条 `/api/agent` 兼容转发路由，由 `agent_ad
 
 平台内部以 **Environment + Runtime** 建模。Environment 是跨节点、暂停恢复和故障接管期间保持不变的逻辑身份，持有期望规格、生命周期、归属和 checkpoint 引用；Runtime 是运行时后端在某个节点创建的一次物理执行，具有独立 `runtime_id`，重启、恢复或接管时可以替换。二者通过 `RuntimeIdentity { environment_id, runtime_id, ownership_generation }` 绑定，adxlet 只允许当前 generation 的 Runtime 对外提供服务。
 
-Coordinator 在启动或权威写入恢复时从 Redis 载入记录；正常节点对账使用提交后同步更新的缓存，只比较归属、版本及制品引用。节点启动／会话恢复执行完整运行时接管。正常生命周期由 Execd 主动控制流、Relay 活动增量、后端退出通知及每实例截止时间推进；独立资源采样默认每 15 秒采集 CPU、内存，不推进生命周期。异常断流先等待重连，再按需确认后端状态；创建结果不明确时保留带退避的定向清理重试。部署要求配置 `runtime_control`，并同步更新 rootfs 中的 Execd。
+Coordinator 在启动或权威写入恢复时从 Redis 载入记录；正常节点对账使用提交后同步更新的缓存，只比较归属、版本及制品引用。节点启动／会话恢复执行完整运行时对账；进程 crash 后，旧会话未过期且未退役、相同节点 ID 与 RPC/Relay 地址经身份校验通过时，才可接管现存 Runtime。SIGTERM 执行 planned unregister 并使旧 owner 会话失效；节点或后端计划升级先 Pause 并确认持久化恢复点，或迁移／删除实例完成排空，再退出升级和恢复。正常生命周期由 Execd 主动控制流、Relay 活动增量、后端退出通知及 owner 内存中的每实例单调时钟推进；独立资源采样默认每 15 秒采集 CPU、内存，不推进生命周期。异常断流先等待重连，再按需确认后端状态；创建结果不明确时保留带退避的定向清理重试。部署要求配置 `runtime_control`，并同步更新 rootfs 中的 Execd。
 
 Environment 自动暂停复用 idle timeout，策略为 delete/pause；匿名恢复点可按配置发布到共享对象存储。Ingress 认证首请求后与 API Server 手动 resume 共用 Coordinator `EnsureRunning`。Coordinator 持久化恢复意图、优先原节点准入，仅在明确资源不足或执行已失效时调度兼容目标；adxlet 执行恢复并提交 Running。节点失效保留 Paused，等待需求或到期/删除。Ingress 获得该执行的已发布路由后才转发业务字节。详见 [节点生命周期](../testing/node-lifecycle.md)。
 
 公开 Environment 生命周期 HTTP 契约使用 `/api/environment/v1/environments` 与 `environmentId`，Python SDK 使用 `adx_environment.Environment` 与 `environment_id`；`/api/instances` 保留为目录查询入口。内部 Rust 类型、gRPC、持久化字段与 Metrics 使用 Environment/Runtime，执行设置位于 `EnvironmentSpec.execution`。详见 [命名与抽象](naming.md)。
 
 AFS（Agent FS）是可选文件系统组件，源码、整体文档、构建、CI 和发布入口统一使用 `afs`。OwnerFs 与 DFS 是其内部平级模式；模式模块及 `ownerfs_*`／`dfs_*` 配置沿用各自名称。参见 [AFS 架构与关键时序图](afs.md)，其中包含 OwnerFs／DFS 总览、workspace bind 与远端路径、DFS 外部 S3 发布和读取流程。
+
+## 可选 E2B 兼容链路
+
+E2B 管理协议适配属于 `gateway/apiserver/src/e2b`，直接调用平台镜像准备和快照能力，不经过 Agent Template/Activator。首版支持公开 OCI 镜像的 `fromImage` 构建：平台创建 seed、生成 Golden Snapshot 并清理 seed；适配层将 E2B templateID/标签解析为 snapshotID，创建复用 EnvironmentService 的快照创建路径。准备状态与恢复归 Coordinator，Golden 通过原生 Snapshot 查询和创建入口复用；部署 RuntimeProfile 提供受信任的 bootstrap/envd 配置，Pause/Snapshot 不回查当前模板别名；可选运行期限由平台 `EnvironmentSpec.run_policy` 配置默认时长和到期动作，当前 owner adxlet 使用单调内存 timer，仅在 crash 后满足原生同节点未过期会话接管条件时按默认时长重建，不持久化动态 deadline；内部不依赖 E2B 身份，复用原生 Pause/Delete 和操作重放，当前仅 E2B 公共入口启用；E2B metadata 直接映射到 `EnvironmentSpec.scheduling.labels`，复用原生校验、调度选择、快照继承和 LabelSelector 查询；创建时覆盖同名标签，不保留独立 metadata 存储。Ingress 读取平台发布的凭据摘要、envd Ready 与当前执行身份，经 Relay 将 commands/files/PTY 请求发往 guest envd 49983。Execd 管理固定 envd 的初始化和健康，adxlet 的 Ready 同时要求 Execd 与 envd 成功；原生 ADX 沙箱不启动 envd。E2B 入口由 Ingress 校验 SDK token 和文件签名，guest envd 不配置 token，跨沙箱隔离依赖后端入站 ACL；克隆时换发独立的网关凭据。profile 只配置受信任 rootfs/bootstrap，不成为第二个生命周期状态机。接口、配置、请求图与验证入口见 [E2B 能力文档](../deployment/e2b-compatibility.md)。
 
 ## 实际目录
 
@@ -109,10 +113,10 @@ agent-dx/
 | Coordinator | `lib.rs`、`shard.rs`、`queue.rs`、`journal.rs` | Global 轮转、Shard 内存队列、预留、增量调度视图；租户间轮转，租户内优先级/FIFO |
 | Coordinator | `storage.rs`、`storage/`、`rpc.rs`、`rpc/` | Redis 条件提交、原子归属、目录、节点失效、快照克隆、共享恢复协调；不执行节点普通生命周期 |
 | Coordinator | `auth.rs`、`routes.rs`、`metrics.rs` | API Key 摘要、路由发布、集群指标 |
-| adxlet | `controller.rs`、`controller/{lifecycle,monitor,snapshots}.rs` | 每 Environment 串行任务、暂停/恢复/删除、空闲回收与重启 |
+| adxlet | `controller.rs`、`controller/{lifecycle,monitor,snapshots}.rs` | 每 Environment 串行任务、暂停/恢复/删除、空闲回收、owner 运行 timer 与重启 |
 | adxlet | `runtime_router.rs`、`sandboxd.rs`、`jiuwenbox/` | 按 runtime class 创建、按执行归属分发；Jiuwenbox 从权威目录重建内存关联，复用独立 EROFS 和原生 ACL；后端源码不变 |
 | adxlet | `runtime_control.rs`、`readiness.rs` | Execd 双向控制流／HTTP 协作与就绪 |
-| adxlet | `checkpoint.rs`、`checkpoint/` | 可扩展 CheckpointStore、本地/S3、缓存引用和远端孤儿回收 |
+| adxlet / checkpoint-storage | `platform/adxlet/src/checkpoint.rs`、`platform/crates/checkpoint-storage/` | CheckpointAccess 捕获/恢复与本地缓存；Coordinator ArtifactReclaimer 负责共享制品物理回收，registry/GC 回收已登记共享制品，Deleted outbox 仅保留本地/未登记待办 |
 | adxlet | `node_reconciliation.rs`、`reconciliation.rs`、`journal.rs` | 全后端共用启动和周期性权威对账、孤儿/晚到资源清理、准入及心跳协调；既有可选 SQLite 结果降级日志 |
 | adxlet | `resources.rs`、`routes.rs`、`activity.rs`、`proxy.rs` | 容量源/准入、绑定同步、活动采集、代理进程组合 |
 | Rust API Server | `contract.rs`、`http.rs`、`clients.rs`、`operations.rs` | HTTP 兼容字段到 Environment RPC；认证、版本化 Environment 目录订阅、入口节点轮转、直达节点、快照目录 |
@@ -174,3 +178,15 @@ adxlet 使用 `CheckpointAccess` 捕获和取得恢复目录；Coordinator 使�
 `ArtifactReclaimer` 回收 S3/AFS。匿名恢复点属于 Environment，运行时文件使用独立保护；
 可复用 Snapshot 通过引用被恢复使用，使用中删除直接返回 Sandbox 列表。
 配置、流程和故障边界见[Checkpoint 存储](../testing/snapshot-storage.md)。
+
+## E2B 兼容入口与公共平台能力
+
+E2B 入口复用 Platform Environment、可靠 fromImage → Golden Snapshot 准备和原生 Snapshot 查询，不经过 Agent Template/Activator。公共准备目录只保留单个 current preparation 与 latest-success 指针，同名准备串行；不保存多 build 历史或 tag 目录。E2B 仅接受 default tag，旧 buildID 不再是当前准备或 latest-success 时返回 404；`GET /v2/templates` 明确不支持，Golden 使用原生 Snapshot 列表。
+
+运行策略默认值保存在 EnvironmentSpec.run_policy，动态 timer 只属于当前 owner adxlet。Connect 只延长、setTimeout 替换（0 到期），由 owner 串行接受；crash 后成功接管现存 Runtime 时按默认时长重建 timer，SIGTERM 计划退役会使旧 owner 会话失效，不能视为透明滚动重启。节点计划升级先 Pause 并确认恢复点／结果持久化，或完成排空；升级后通过 Connect 恢复，恢复节点须保留匹配原 Spec 的 profile/bootstrap，必要时沿原生恢复调度重新分配。Pause 停 timer，Resume 新周期；暂停态更新仅影响下一周期一次，Snapshot 源流程保留原 deadline 并计入拍摄时间。Coordinator 转发读写到 owner，不保存动态 control、不扫描或 claim 运行到期；Gateway 只负责鉴权、执行身份和正常路由撤销，不承担运行 deadline 准入或逐流 expiry guard。`startedAt` 来自原生首次成功 Running，运行态 `endAt` 为估计，暂停态来自真实恢复点保留期限。
+
+E2B 列表沿 EnvironmentDirectory 的现有分页，在分页前过滤租户、兼容范围、状态和 labels；时间字段批量查询公共 control 摘要，专用 DTO 直接返回列表字段。目录未同步时失败，游标绑定查询条件；metadata 继续复用原生 labels。
+
+启用 E2B 即启用 Gateway envd 鉴权，不保留 gatewayEnvdAuth 配置开关；原生 envd 可继续选择 guest-token。envd ACL 构造与最终校验共享 core::envd 小函数，各原生入口仍校验保护，Ingress 私有端口检查与 backend ACL 保留各自职责。
+
+已登记共享制品由既有 registry/引用/执行 holds 与 GC 回收，不重复写入 cleanup outbox。本地及确实未登记制品的最小 pending 在 Deleted 退役时原子保留，完整 ACK 后移除；源节点永久丢失不代表清理成功。删除幂等沿用 600 秒 DeletedReceipt，并保存规范化 cleanup 摘要，不保留永久 cleanup/artifact fence。journal 重放在 fresh assignment 明确撤销后可丢弃旧记录，但不宣称原提交成功；正常 Snapshot 发布在同一 CAS 比较源记录，防止退役后的迟到发布。artifact scope 继续校验实际物理存储目标。

@@ -12,6 +12,9 @@ fn environment_identity_survives_runtime_replacement() {
         snapshot_source: None,
         failure: None,
         spec: EnvironmentSpec {
+            envd: None,
+            run_policy: None,
+            compatibility: None,
             id: "environment-a".into(),
             tenant_id: "tenant-a".into(),
             image: "image-a".into(),

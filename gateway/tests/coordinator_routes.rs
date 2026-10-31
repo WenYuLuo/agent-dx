@@ -3,6 +3,7 @@ use data_plane_gateway::ingress::{coordinator_routes::RouteConsumer, RouteStore}
 use std::sync::Arc;
 fn route(id: &str) -> PublishedRoute {
     PublishedRoute {
+        private_service_ports: Vec::new(),
         environment_id: id.into(),
         tenant_id: "t".into(),
         runtime_id: format!("{id}-1"),
@@ -15,6 +16,7 @@ fn route(id: &str) -> PublishedRoute {
         port_forward_security_mode:
             adx_protocol::control::DataPlaneSecurityMode::DataPlaneSecurityTlsToken as i32,
         forwarded_ports: vec![8080],
+        compatibility: None,
     }
 }
 #[test]

@@ -7,6 +7,21 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 impl EnvironmentSpec {
+    /// Compare with a saved spec after fixing omitted Volume UIDs to its identities.
+    pub fn matches_fixed_spec(&self, fixed: &Self) -> bool {
+        let volumes = fixed
+            .execution
+            .mounts
+            .iter()
+            .filter_map(|mount| match &mount.source {
+                MountSource::Volume(reference) => Some(reference.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let mut candidate = self.clone();
+        candidate.fix_volume_references(&volumes).is_ok() && candidate == *fixed
+    }
+
     /// Fix every Volume mount to its saved UID. Missing or mismatched identities conflict.
     pub fn fix_volume_references(&mut self, fixed: &[VolumeRef]) -> Result<()> {
         for mount in &mut self.execution.mounts {

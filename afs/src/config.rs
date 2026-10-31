@@ -213,6 +213,9 @@ pub struct Cli {
     /// Allow a node to become functionally ready with a healthy volatile Meta.
     #[arg(long)]
     pub allow_volatile_meta: Option<bool>,
+    /// Enable centralized HRW placement for new OwnerFs workspaces on Meta.
+    #[arg(long)]
+    pub ownerfs_mkdir_load_balance: Option<bool>,
     #[arg(long)]
     pub peer_endpoint: Option<String>,
     /// 对外发布的本 Node gRPC URI；监听 0.0.0.0 时必须显式指定。
@@ -288,6 +291,9 @@ pub struct Cli {
     /// Queued plus active catalog commit requests (1..=256), with a separate 1MiB control bound.
     #[arg(long)]
     pub dfs_catalog_commit_queue: Option<usize>,
+    /// Ordinary DFS FUSE front-owned payload across files (8MiB..=1TiB), not total memory.
+    #[arg(long)]
+    pub dfs_write_queue_bytes: Option<u64>,
     /// Native Node live write-body capacity (4..=64MiB); S3 budgets are separate.
     #[arg(long)]
     pub dfs_dirty_budget_bytes: Option<u64>,
@@ -437,6 +443,7 @@ struct FileConfig {
     meta_watch_bytes_max: Option<u64>,
     meta_watch_retention_ms: Option<u64>,
     allow_volatile_meta: Option<bool>,
+    ownerfs_mkdir_load_balance: Option<bool>,
     peer_endpoint: Option<String>,
     advertise_endpoint: Option<String>,
     tls_encryption_enabled: Option<bool>,
@@ -471,6 +478,7 @@ struct FileConfig {
     dfs_version_cache_bytes: Option<u64>,
     dfs_outboard_work_wait_ms: Option<u64>,
     dfs_catalog_commit_queue: Option<usize>,
+    dfs_write_queue_bytes: Option<u64>,
     dfs_dirty_budget_bytes: Option<u64>,
     dfs_gc_grace_ms: Option<u64>,
     dfs_unpublished_descriptors: Option<usize>,
@@ -547,6 +555,7 @@ pub struct Config {
     pub meta_watch_bytes_max: u64,
     pub meta_watch_retention_ms: u64,
     pub allow_volatile_meta: bool,
+    pub ownerfs_mkdir_load_balance: bool,
     pub peer_endpoint: Option<String>,
     pub advertise_endpoint: Option<String>,
     pub tls_encryption_enabled: bool,
@@ -581,6 +590,7 @@ pub struct Config {
     pub dfs_version_cache_bytes: u64,
     pub dfs_outboard_work_wait_ms: u64,
     pub dfs_catalog_commit_queue: usize,
+    pub dfs_write_queue_bytes: u64,
     pub dfs_dirty_budget_bytes: u64,
     pub dfs_gc_grace_ms: u64,
     pub dfs_unpublished_descriptors: usize,
@@ -629,6 +639,14 @@ impl Config {
             })?,
             None => FileConfig::default(),
         };
+        if role == Role::Node
+            && (cli.ownerfs_mkdir_load_balance.is_some()
+                || file.ownerfs_mkdir_load_balance.is_some())
+        {
+            return Err(invalid(
+                "ownerfs_mkdir_load_balance is only valid for afs-meta",
+            ));
+        }
         let id = cli.id.or(file.id).unwrap_or_else(|| {
             match role {
                 Role::Node => "node",
@@ -827,6 +845,17 @@ impl Config {
         if !(1..=256).contains(&dfs_catalog_commit_queue) {
             return Err(invalid("DFS catalog commit queue must be 1..=256"));
         }
+        let dfs_write_queue_bytes = cli
+            .dfs_write_queue_bytes
+            .or(file.dfs_write_queue_bytes)
+            .unwrap_or(2 * 1024 * 1024 * 1024);
+        if !(8 * 1024 * 1024..=1024 * 1024 * 1024 * 1024).contains(&dfs_write_queue_bytes)
+            || usize::try_from(dfs_write_queue_bytes).is_err()
+        {
+            return Err(invalid(
+                "DFS write queue bytes must be 8MiB..=1TiB and fit usize",
+            ));
+        }
         let dfs_dirty_budget_bytes = cli
             .dfs_dirty_budget_bytes
             .or(file.dfs_dirty_budget_bytes)
@@ -985,6 +1014,10 @@ impl Config {
                 .allow_volatile_meta
                 .or(file.allow_volatile_meta)
                 .unwrap_or(false),
+            ownerfs_mkdir_load_balance: cli
+                .ownerfs_mkdir_load_balance
+                .or(file.ownerfs_mkdir_load_balance)
+                .unwrap_or(false),
             peer_endpoint: cli.peer_endpoint.or(file.peer_endpoint),
             advertise_endpoint: cli.advertise_endpoint.or(file.advertise_endpoint),
             tls_encryption_enabled: cli
@@ -1044,6 +1077,7 @@ impl Config {
             dfs_version_cache_bytes,
             dfs_outboard_work_wait_ms,
             dfs_catalog_commit_queue,
+            dfs_write_queue_bytes,
             dfs_dirty_budget_bytes,
             dfs_gc_grace_ms,
             dfs_unpublished_descriptors,

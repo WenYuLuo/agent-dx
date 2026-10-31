@@ -179,6 +179,7 @@ fields_heap!(super::NodeSessionLease {
     grpc_addr,
     data_addr,
     rest_addr,
+    ownerfs_enabled,
     storage_devices,
     lease_ttl
 });
@@ -203,6 +204,10 @@ impl Heap for super::TxnCondition {
             }
             Self::EntityEquals(value) => c.value(value),
             Self::NodeSessionCurrent {
+                node_id,
+                session_id,
+            }
+            | Self::NodeSessionExpired {
                 node_id,
                 session_id,
             } => {
@@ -317,6 +322,7 @@ fields_heap!(super::NodeSession {
     grpc_addr,
     data_addr,
     rest_addr,
+    ownerfs_enabled,
     storage_devices,
     lease_epoch,
     expires_at_unix_ms
@@ -337,6 +343,8 @@ fields_heap!(super::RootReservationRecord {
     home_session_id,
     create_intent_id,
     prepare_token,
+    requester_node_id,
+    requester_session_id,
     created_at_revision
 });
 fields_heap!(super::RootAccessGrant {
@@ -1180,6 +1188,7 @@ mod tests {
                     grpc_addr: "g".into(),
                     data_addr: "d".into(),
                     rest_addr: "r".into(),
+                    ownerfs_enabled: true,
                     storage_devices: Vec::new(),
                     lease_ttl: Duration::from_secs(30),
                 },
@@ -1321,6 +1330,7 @@ mod tests {
                     grpc_addr: "grpc".into(),
                     data_addr: "data".into(),
                     rest_addr: "rest".into(),
+                    ownerfs_enabled: true,
                     storage_devices: Vec::new(),
                     lease_ttl: Duration::from_secs(30),
                 },
@@ -1370,6 +1380,7 @@ mod tests {
                     grpc_addr: "g".into(),
                     data_addr: "d".into(),
                     rest_addr: "r".into(),
+                    ownerfs_enabled: true,
                     storage_devices: Vec::new(),
                     lease_ttl: Duration::from_secs(30),
                 },
@@ -1422,6 +1433,7 @@ mod tests {
             grpc_addr: address,
             data_addr: "d".into(),
             rest_addr: "r".into(),
+            ownerfs_enabled: true,
             storage_devices: devices,
             lease_epoch: 1,
             expires_at_unix_ms: 100,

@@ -1,5 +1,6 @@
 import importlib.util
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -8,9 +9,48 @@ from pathlib import Path
 import yaml
 
 ROOT = Path(__file__).resolve().parents[3]
+BASH = shutil.which("bash")
 
 
 class IndependentPipelineTests(unittest.TestCase):
+    def test_arm_execd_maps_optional_host_source_into_linux_container(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            shell_env = root / "shell-env"
+            shell_env.write_text(
+                'uname() { echo arm64; }\n'
+                'git() { if [[ $1 == rev-parse ]]; then echo fixture-commit; fi; }\n'
+                'docker() { if [[ $1 == run ]]; then printf "%s\\n" "$@" > "$DOCKER_ARGS"; fi; }\n'
+            )
+            image = root / "build/images/build-environment-arm64.json"
+            image.parent.mkdir(parents=True)
+            image.write_text('{"ci_image":"fixture@sha256:abc"}')
+            source = root / "source with spaces"
+            source.mkdir()
+            arguments = root / "docker-args"
+            env = {key: value for key, value in os.environ.items() if not key.startswith(("ADX_", "BUILDKITE_"))}
+            env.update(BASH_ENV=str(shell_env), BUILDKITE_COMMIT="fixture-commit",
+                       BUILDKITE_BUILD_ID="fixture-build", DOCKER_ARGS=str(arguments))
+            for override in (None, source, root / "missing"):
+                with self.subTest(override=override):
+                    arguments.unlink(missing_ok=True)
+                    child_env = dict(env)
+                    if override is not None:
+                        child_env["ADX_ENVD_SOURCE"] = str(override)
+                    result = subprocess.run([BASH, str(ROOT / ".buildkite/build-arm-package.sh"), "build", "execd"],
+                                            cwd=root, env=child_env, capture_output=True, text=True)
+                    if override is not None and not override.exists():
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertFalse(arguments.exists())
+                        continue
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    args = arguments.read_text().splitlines()
+                    if override is None:
+                        self.assertFalse(any("ADX_ENVD_SOURCE=" in arg for arg in args))
+                    else:
+                        self.assertIn(str(source.resolve()) + ":/mnt/adx-envd-source:ro", args)
+                        self.assertIn("ADX_ENVD_SOURCE=/mnt/adx-envd-source", args)
+
     def test_product_pipelines_have_separate_configs_and_steps(self):
         package = (ROOT / ".buildkite/pipeline-package.yml").read_text()
         sdk = (ROOT / ".buildkite/pipeline-sdk.yml").read_text()
@@ -150,7 +190,7 @@ class IndependentPipelineTests(unittest.TestCase):
                     if mode is not None:
                         child_env["ADX_WITH_AFS"] = mode
                     result = subprocess.run(
-                        ["bash", str(ROOT / ".buildkite/package-e2e.sh")],
+                        [BASH, str(ROOT / ".buildkite/package-e2e.sh")],
                         cwd=root,
                         env=child_env,
                         capture_output=True,

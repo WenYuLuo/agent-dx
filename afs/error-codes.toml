@@ -418,6 +418,30 @@ subsystem = "DistributedFs"
 description = "引用准入期限过期或被非法刷新；不同于复制修复 claim 已被替换"
 
 [[error]]
+name = "META_OWNER_ROOT_EXISTS"
+value = "0x03040001"
+kind = "AlreadyExists"
+component = "Meta"
+subsystem = "OwnerFs"
+description = "OwnerFs workspace 已激活，名称不能再次预留"
+
+[[error]]
+name = "META_OWNER_ROOT_BUSY"
+value = "0x03040002"
+kind = "FailedPrecondition"
+component = "Meta"
+subsystem = "OwnerFs"
+description = "OwnerFs workspace 正由其他有效预留处理，名称暂时不可用"
+
+[[error]]
+name = "META_OWNER_HOME_UNAVAILABLE"
+value = "0x03040003"
+kind = "Unavailable"
+component = "Meta"
+subsystem = "OwnerFs"
+description = "没有可接受 OwnerFs workspace 创建的 Home 节点"
+
+[[error]]
 name = "META_STORE_UNIMPLEMENTED"
 value = "0x03020001"
 kind = "Unimplemented"

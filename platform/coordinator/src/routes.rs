@@ -132,6 +132,7 @@ impl RoutePublisher {
             next_environments.insert(
                 id.clone(),
                 pb::PublishedEnvironment {
+                    compatibility: route_compatibility(environment),
                     record: Some(record.try_into()?),
                     node_address: node.address.clone(),
                     relay_address: node.proxy_address.clone(),
@@ -446,10 +447,45 @@ fn published_environment(
     node: &StoredNode,
 ) -> Result<pb::PublishedEnvironment> {
     Ok(pb::PublishedEnvironment {
+        compatibility: route_compatibility(environment),
         record: Some(environment.effective_record().try_into()?),
         node_address: node.address.clone(),
         relay_address: node.proxy_address.clone(),
     })
+}
+
+fn route_compatibility(environment: &StoredEnvironment) -> Option<pb::SandboxRouteCompatibility> {
+    use sha2::{Digest, Sha256};
+    let envd_gateway_auth = environment
+        .spec
+        .envd
+        .as_ref()
+        .is_some_and(|service| service.gateway_auth);
+    environment
+        .spec
+        .compatibility
+        .as_ref()
+        .map(|compatibility| pb::SandboxRouteCompatibility {
+            envd_token_sha256: format!(
+                "{:x}",
+                Sha256::digest(compatibility.envd_access_token.as_bytes())
+            ),
+            traffic_token_sha256: format!(
+                "{:x}",
+                Sha256::digest(compatibility.traffic_access_token.as_bytes())
+            ),
+            allow_public_traffic: compatibility.allow_public_traffic,
+            envd_gateway_auth,
+            envd_signing_key: if envd_gateway_auth {
+                compatibility.envd_access_token.clone()
+            } else {
+                String::new()
+            },
+            envd_ready: environment.result.as_ref().is_some_and(|record| {
+                record.state == adx_core::EnvironmentState::Running
+                    && record.spec.required_services().any(|name| name == "envd")
+            }),
+        })
 }
 
 fn published_route(
@@ -469,6 +505,7 @@ fn published_route(
         return Ok(None);
     };
     Ok(Some(pb::PublishedRoute {
+        compatibility: route_compatibility(environment),
         environment_id: record.spec.id.clone(),
         tenant_id: record.spec.tenant_id.clone(),
         runtime_id: record.runtime.id.clone(),
@@ -478,6 +515,14 @@ fn published_route(
         environment_revision: record.revision,
         tunnel_security_mode: security(record.spec.execution.data_plane.tunnel),
         port_forward_security_mode: security(record.spec.execution.data_plane.port_forward),
+        private_service_ports: record
+            .spec
+            .execution
+            .private_service_ports
+            .iter()
+            .copied()
+            .map(u32::from)
+            .collect(),
         forwarded_ports: record
             .spec
             .execution
@@ -579,6 +624,7 @@ impl pb::environment_directory_service_server::EnvironmentDirectoryService for R
 fn tracing_unavailable() {
     eprintln!("Coordinator route publication awaiting authoritative storage");
 }
+
 #[tonic::async_trait]
 impl pb::route_service_server::RouteService for RoutePublisher {
     type WatchRoutesStream = ReceiverStream<std::result::Result<pb::RouteFrame, Status>>;
@@ -686,5 +732,37 @@ mod tests {
         assert!(!batch.is_empty());
         assert!(batch.len() <= 256);
         assert!(!receiver.is_empty());
+    }
+
+    #[test]
+    fn route_uses_authoritative_envd_auth_and_preserves_sdk_signing_key() {
+        let mut environment: StoredEnvironment = serde_json::from_value(serde_json::json!({
+            "creation_generation": 1,
+            "spec": {
+                "id": "e2b-test", "tenant_id": "tenant", "image": "image",
+                "runtime_class": "runtime", "priority": 0,
+                "resources": {"cpu_millis": 1000, "memory_bytes": 1024, "disk_bytes": 0},
+                "envd": {"version": "0.9.0", "gateway_auth": true,
+                    "ingress_sources": ["10.0.0.2"]},
+                "compatibility": {"template_id": "base",
+                    "envd_access_token": "sdk-signing-key", "traffic_access_token": "traffic-key",
+                    "allow_public_traffic": false}
+            },
+            "assignment": {"environment_id": "e2b-test", "node_id": "node",
+                "shard_id": 0, "generation": 1, "devices": []},
+            "result": null
+        }))
+        .unwrap();
+        let compatibility = route_compatibility(&environment).unwrap();
+        assert!(compatibility.envd_gateway_auth);
+        assert_eq!(compatibility.envd_signing_key, "sdk-signing-key");
+        assert!(!compatibility.envd_ready);
+
+        environment.spec.envd.as_mut().unwrap().gateway_auth = false;
+        let compatibility = route_compatibility(&environment).unwrap();
+        assert!(!compatibility.envd_gateway_auth);
+        assert!(compatibility.envd_signing_key.is_empty());
+        environment.spec.envd = None;
+        assert!(!route_compatibility(&environment).unwrap().envd_gateway_auth);
     }
 }

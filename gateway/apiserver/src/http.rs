@@ -41,8 +41,9 @@ pub struct Api {
 }
 impl Api {
     pub fn new(clients: Arc<Clients>) -> Result<Arc<Self>, Error> {
+        let environment_service = EnvironmentService::new(clients.clone());
         Ok(Arc::new(Self {
-            environment_service: EnvironmentService::new(clients.clone()),
+            environment_service,
             clients,
             proxy: reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
@@ -51,6 +52,16 @@ impl Api {
         }))
     }
     pub async fn serve(
+        self: Arc<Self>,
+        request: Request<Incoming>,
+    ) -> Result<Response<Body>, Infallible> {
+        // Hyper polls this public service future directly on its connection
+        // worker. Keep the full request tracing and dispatch state off that
+        // default worker frame.
+        Box::pin(self.serve_inner(request)).await
+    }
+
+    async fn serve_inner(
         self: Arc<Self>,
         request: Request<Incoming>,
     ) -> Result<Response<Body>, Infallible> {
@@ -137,15 +148,35 @@ impl Api {
             .creation_metrics
             .rejection_guard(create_route);
         let request_id = RequestContext::from_headers(request.headers()).request_id;
-        let api_key = header(&request, "authorization")
-            .and_then(|s| s.strip_prefix("Bearer "))
-            .or_else(|| header(&request, "x-auth-token"))
-            .or_else(|| header(&request, "x-auth"))
-            .unwrap_or("")
-            .trim();
-        let caller = match Box::pin(self.clients.authenticate(api_key)).await {
+        let e2b_route = crate::e2b::http::route(request.uri().path());
+        let api_key = if crate::e2b::keys::route(request.uri().path()) {
+            match crate::e2b::keys::token(request.headers()) {
+                Ok(key) => key,
+                Err(error) => return crate::e2b::http::authentication_error(error),
+            }
+        } else if e2b_route {
+            header(&request, "x-api-key").unwrap_or("").trim()
+        } else {
+            header(&request, "authorization")
+                .and_then(|s| s.strip_prefix("Bearer "))
+                .or_else(|| header(&request, "x-auth-token"))
+                .or_else(|| header(&request, "x-auth"))
+                .unwrap_or("")
+                .trim()
+        };
+        let authentication = async {
+            if e2b_route {
+                self.clients.authenticate_fresh(api_key).await
+            } else {
+                self.clients.authenticate(api_key).await
+            }
+        };
+        let caller = match Box::pin(authentication).await {
             Ok(caller) => caller,
             Err(error) => {
+                if e2b_route {
+                    return crate::e2b::http::authentication_error(error);
+                }
                 rejection.status(&error);
                 let status = if matches!(error.code(), Code::Unavailable | Code::DeadlineExceeded) {
                     Status::unavailable("authentication service unavailable")
@@ -155,6 +186,11 @@ impl Api {
                 return error_response(status, &request_id, None, None, false);
             }
         };
+        if e2b_route {
+            // Keep the opt-in adapter's RPC futures off the native request
+            // frame; both protocols share this listener on default stacks.
+            return Box::pin(crate::e2b::http::handle(self.clone(), request, caller)).await;
+        }
         let path = match percent_encoding::percent_decode_str(request.uri().path()).decode_utf8() {
             Ok(path) => path.trim_end_matches('/').to_string(),
             Err(_) => {
@@ -318,8 +354,14 @@ impl Api {
                 .get("instance_id")
                 .filter(|value| !value.trim().is_empty())
             {
-                return match Box::pin(self.clients.owner(instance_id, &caller, false)).await {
-                    Ok(owner) => match instance_view(owner) {
+                let owner = match Box::pin(self.clients.owner(instance_id, &caller, false)).await {
+                    Err(error) if matches!(error.code(), Code::NotFound | Code::Unavailable) => {
+                        Box::pin(self.clients.owner(instance_id, &caller, true)).await
+                    }
+                    result => result,
+                };
+                let mut reply = match owner {
+                    Ok(owner) => match instance_view(owner, caller.administrator) {
                         Ok(view) => plain(200, json!([view])),
                         Err(error) => {
                             error_response(error, &request_id, None, Some(instance_id), false)
@@ -329,6 +371,11 @@ impl Api {
                         error_response(error, &request_id, None, Some(instance_id), false)
                     }
                 };
+                reply.headers_mut().insert(
+                    hyper::header::CACHE_CONTROL,
+                    hyper::header::HeaderValue::from_static("no-store"),
+                );
+                return reply;
             }
             let page_size = match instance_page_size(&query) {
                 Ok(page_size) => page_size,
@@ -351,7 +398,7 @@ impl Api {
                 Ok(page) => {
                     let mut views = Vec::new();
                     for owner in page.entries {
-                        match instance_view(owner) {
+                        match instance_view(owner, false) {
                             Ok(view) => views.push(view),
                             Err(error) if error.code() == Code::NotFound => (),
                             Err(error) => {
@@ -624,6 +671,7 @@ impl Api {
                             name: query.get("name").cloned().unwrap_or_default(),
                             page_token: query.get("pageToken").cloned().unwrap_or_default(),
                             page_size: page_size(query)?,
+                            kind: snapshot_kind(query)?.map(|kind| kind as i32),
                         })),
                     )
                     .await?;
@@ -667,6 +715,7 @@ impl Api {
                             caller: Some(caller.clone()),
                             tenant_id: input.tenant_id.clone(),
                             expires_at_unix_seconds: input.expires_at_unix_seconds,
+                            name: None,
                         })),
                     )
                     .await?;
@@ -709,6 +758,8 @@ impl Api {
                         client.revoke_tenant_key(trace::inject(pb::RevokeTenantKeyRequest {
                             caller: Some(caller.clone()),
                             id: id.into(),
+                            public_id: String::new(),
+                            tenant_id: String::new(),
                         })),
                     )
                     .await?;
@@ -770,6 +821,7 @@ impl Api {
         }
     }
 }
+
 fn trace_identifiers(context: &str) -> (&str, &str) {
     let mut fields = context.split('-');
     let _version = fields.next();
@@ -808,6 +860,15 @@ fn key_value(key: &pb::TenantKey) -> Value {
         "expiresAtUnixSeconds": key.expires_at_unix_seconds,
     })
 }
+fn snapshot_kind(query: &HashMap<String, String>) -> Result<Option<pb::SnapshotKind>, Status> {
+    match query.get("kind").map(String::as_str) {
+        None => Ok(None),
+        Some("regular") => Ok(Some(pb::SnapshotKind::Regular)),
+        Some("golden") => Ok(Some(pb::SnapshotKind::Golden)),
+        Some(_) => Err(Status::invalid_argument("invalid snapshot kind")),
+    }
+}
+
 fn page_size(query: &HashMap<String, String>) -> Result<u32, Status> {
     query
         .get("pageSize")
@@ -893,7 +954,7 @@ fn create_error_event(error: &Status, request_id: &str, environment_id: &str) ->
 fn sse(name: &str, data: Value) -> Frame<Bytes> {
     Frame::data(Bytes::from(format!("event: {name}\ndata: {data}\n\n")))
 }
-async fn body(body: Incoming, limit: usize) -> Result<Value, Status> {
+pub(crate) async fn body(body: Incoming, limit: usize) -> Result<Value, Status> {
     let bytes = tokio::time::timeout(
         Duration::from_secs(10),
         http_body_util::Limited::new(body, limit).collect(),
@@ -997,7 +1058,10 @@ fn status_code(error: &Status) -> u16 {
         _ => 500,
     }
 }
-pub(crate) fn instance_view(owner: pb::GetEnvironmentResponse) -> Result<Value, Status> {
+pub(crate) fn instance_view(
+    owner: pb::GetEnvironmentResponse,
+    include_configuration: bool,
+) -> Result<Value, Status> {
     let record = owner
         .record
         .ok_or_else(|| Status::data_loss("environment directory returned no record"))?;
@@ -1008,12 +1072,19 @@ pub(crate) fn instance_view(owner: pb::GetEnvironmentResponse) -> Result<Value, 
         .spec
         .ok_or_else(|| Status::data_loss("environment record returned no spec"))?;
     let resource = spec.resources.unwrap_or_default();
+    let runtime = record.runtime.unwrap_or_default();
+    let assignment = record.assignment.unwrap_or_default();
+    let node_ip = owner
+        .node_address
+        .parse::<std::net::SocketAddr>()
+        .ok()
+        .map(|address| address.ip().to_string());
     let failure = record
         .failure
         .map(adx_core::RuntimeFailure::try_from)
         .transpose()
         .map_err(adx_protocol::status)?;
-    Ok(json!({
+    let mut view = json!({
         "id": spec.id,
         "tenant_id": spec.tenant_id,
         "status": state(record.state),
@@ -1021,7 +1092,32 @@ pub(crate) fn instance_view(owner: pb::GetEnvironmentResponse) -> Result<Value, 
         "required_cpu": resource.cpu_millis,
         "required_mem": resource.memory_bytes / 1048576,
         "image": spec.image,
-    }))
+        "runtime_class": spec.runtime_class,
+        "revision": record.revision,
+        "restart_attempts": record.restart_attempts,
+        "restart_pending": record.restart_pending,
+        "runtime_id": runtime.id,
+        "sandbox_ip": runtime.ip,
+        "node_id": assignment.node_id,
+        "generation": assignment.generation,
+        "node_ip": node_ip,
+    });
+    if include_configuration {
+        let execution = spec
+            .execution
+            .map(adx_core::execution::ExecutionOptions::try_from)
+            .transpose()
+            .map_err(adx_protocol::status)?
+            .unwrap_or_default();
+        view["execution"] = json!({
+            "mounts": execution.mounts,
+            "readiness_probe": execution.readiness_probe,
+            "healthcheck_probe": execution.healthcheck_probe,
+            "process": execution.process,
+        });
+        view["env_vars"] = json!(spec.env);
+    }
+    Ok(view)
 }
 fn state(value: i32) -> &'static str {
     match pb::EnvironmentState::try_from(value) {
@@ -1285,25 +1381,43 @@ mod error_contract_tests {
 
     #[test]
     fn instance_view_exposes_record_tenant_without_execution_secrets() {
-        let view = instance_view(pb::GetEnvironmentResponse {
-            record: Some(pb::EnvironmentRecord {
-                observation: None,
-                execution_artifacts: vec![],
-                snapshot_source: None,
-                spec: Some(pb::EnvironmentSpec {
-                    id: "environment-1".into(),
-                    tenant_id: "tenant-a".into(),
-                    env: HashMap::from([("EXECD_HTTP_TOKEN".into(), "private".into())]),
+        let view = instance_view(
+            pb::GetEnvironmentResponse {
+                record: Some(pb::EnvironmentRecord {
+                    observation: None,
+                    execution_artifacts: vec![],
+                    snapshot_source: None,
+                    spec: Some(pb::EnvironmentSpec {
+                        id: "environment-1".into(),
+                        tenant_id: "tenant-a".into(),
+                        env: HashMap::from([("EXECD_HTTP_TOKEN".into(), "private".into())]),
+                        ..Default::default()
+                    }),
+                    runtime: Some(pb::Runtime {
+                        id: "runtime-7".into(),
+                        ip: "100.96.1.7".into(),
+                    }),
+                    assignment: Some(pb::Assignment {
+                        node_id: "node-1".into(),
+                        generation: 7,
+                        ..Default::default()
+                    }),
+                    state: pb::EnvironmentState::Running as i32,
                     ..Default::default()
                 }),
-                state: pb::EnvironmentState::Running as i32,
+                node_address: "172.30.58.2:27001".into(),
                 ..Default::default()
-            }),
-            ..Default::default()
-        })
+            },
+            false,
+        )
         .unwrap();
         assert_eq!(view["tenant_id"], "tenant-a");
         assert_eq!(view["id"], "environment-1");
+        assert_eq!(view["runtime_id"], "runtime-7");
+        assert_eq!(view["sandbox_ip"], "100.96.1.7");
+        assert_eq!(view["node_ip"], "172.30.58.2");
+        assert_eq!(view["node_id"], "node-1");
+        assert_eq!(view["generation"], 7);
         assert!(view.get("env").is_none());
         assert!(!view.to_string().contains("private"));
     }
@@ -1323,6 +1437,28 @@ mod error_contract_tests {
         for invalid in ["0", "1001", "invalid"] {
             assert_eq!(
                 instance_page_size(&HashMap::from([("pageSize".into(), invalid.into())]))
+                    .unwrap_err()
+                    .code(),
+                Code::InvalidArgument
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_kind_query_defaults_to_all_and_accepts_only_known_kinds() {
+        assert_eq!(snapshot_kind(&HashMap::new()).unwrap(), None);
+        for (name, kind) in [
+            ("regular", pb::SnapshotKind::Regular),
+            ("golden", pb::SnapshotKind::Golden),
+        ] {
+            assert_eq!(
+                snapshot_kind(&HashMap::from([("kind".into(), name.into())])).unwrap(),
+                Some(kind)
+            );
+        }
+        for invalid in ["", "unknown", "Golden", "golden,regular"] {
+            assert_eq!(
+                snapshot_kind(&HashMap::from([("kind".into(), invalid.into())]))
                     .unwrap_err()
                     .code(),
                 Code::InvalidArgument
@@ -1581,6 +1717,7 @@ mod error_contract_tests {
         let value = scheduling_queue_view(pb::GetSchedulingQueueResponse {
             environments: vec![pb::PendingEnvironment {
                 spec: Some(pb::EnvironmentSpec {
+                    compatibility: None,
                     id: "environment-a".into(),
                     resources: Some(pb::Resources {
                         cpu_millis: 2000,

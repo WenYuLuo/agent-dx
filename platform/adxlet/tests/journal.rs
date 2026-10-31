@@ -1,5 +1,6 @@
 use adx_core::{
-    Assignment, EnvironmentRecord, EnvironmentSpec, EnvironmentState, Error, Resources, Result,
+    Assignment, CheckpointArtifact, EnvironmentRecord, EnvironmentSpec, EnvironmentState, Error,
+    Resources, Result,
 };
 use adxlet::{journal::JournalSink, Durability, StateSink};
 use async_trait::async_trait;
@@ -10,9 +11,37 @@ struct Coordinator {
     failure: Mutex<Option<Error>>,
     records: Mutex<Vec<EnvironmentRecord>>,
     stopped: Mutex<Vec<Vec<String>>>,
+    cleanup: Mutex<Vec<Vec<CheckpointArtifact>>>,
+    catalog: Mutex<Option<Vec<EnvironmentRecord>>>,
 }
 #[async_trait]
 impl StateSink for Coordinator {
+    async fn has_current_assignment(&self, record: &EnvironmentRecord) -> Result<bool> {
+        let catalog = self.catalog.lock().unwrap();
+        let catalog = catalog
+            .as_ref()
+            .ok_or_else(|| Error::Unavailable("authority unavailable".into()))?;
+        Ok(catalog
+            .iter()
+            .any(|current| current.assignment == record.assignment))
+    }
+
+    async fn commit_deleted(
+        &self,
+        record: &EnvironmentRecord,
+        cleanup_artifacts: &[CheckpointArtifact],
+        stopped: &[String],
+    ) -> Result<Durability> {
+        let durability = self.commit(record).await?;
+        if !stopped.is_empty() {
+            self.stopped.lock().unwrap().push(stopped.to_vec());
+        }
+        self.cleanup
+            .lock()
+            .unwrap()
+            .push(cleanup_artifacts.to_vec());
+        Ok(durability)
+    }
     async fn commit_releasing(
         &self,
         record: &EnvironmentRecord,
@@ -41,6 +70,9 @@ fn record(revision: u64) -> EnvironmentRecord {
         restart_attempts: 0,
         restart_pending: false,
         spec: EnvironmentSpec {
+            envd: None,
+            run_policy: None,
+            compatibility: None,
             runtime_profile: None,
             snapshot_id: None,
             lifecycle: Default::default(),
@@ -74,6 +106,23 @@ fn record(revision: u64) -> EnvironmentRecord {
         resources_held: true,
         checkpoint: None,
         last_operation: None,
+    }
+}
+
+fn deleted_record(revision: u64) -> EnvironmentRecord {
+    let mut record = record(revision);
+    record.state = EnvironmentState::Deleted;
+    record.resources_held = false;
+    record.runtime.ip = None;
+    record
+}
+
+fn artifact() -> CheckpointArtifact {
+    CheckpointArtifact {
+        storage: "memory".into(),
+        scope: "node".into(),
+        location: "checkpoint/obsolete".into(),
+        size_bytes: 1,
     }
 }
 
@@ -267,4 +316,150 @@ async fn direct_recovery_evidence_survives_journal_restart_and_replay() {
         .unwrap()
         .iter()
         .all(|r| r.state == EnvironmentState::Running));
+}
+
+#[tokio::test]
+async fn deleted_cleanup_survives_restart_and_replays_with_its_artifacts() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("cleanup.sqlite");
+    let coordinator = Arc::new(Coordinator::default());
+    *coordinator.failure.lock().unwrap() = Some(Error::Unavailable("offline".into()));
+    let sink = JournalSink::new(path.clone(), coordinator.clone());
+    let deleted = deleted_record(3);
+    let artifact = artifact();
+    assert_eq!(
+        sink.commit_deleted(
+            &deleted,
+            std::slice::from_ref(&artifact),
+            &["runtime-stopped".into()],
+        )
+        .await
+        .unwrap(),
+        Durability::Journaled
+    );
+    drop(sink);
+
+    *coordinator.failure.lock().unwrap() = None;
+    let sink = JournalSink::new(path, coordinator.clone());
+    sink.recover(&[record(2)]).await.unwrap();
+    assert_eq!(sink.pending().await.unwrap(), 0);
+    assert_eq!(coordinator.records.lock().unwrap().as_slice(), &[deleted]);
+    assert_eq!(
+        coordinator.cleanup.lock().unwrap().as_slice(),
+        &[vec![artifact]]
+    );
+    assert_eq!(
+        coordinator.stopped.lock().unwrap().as_slice(),
+        &[vec!["runtime-stopped".to_owned()]]
+    );
+}
+
+#[tokio::test]
+async fn cleanup_recovery_discards_a_reassigned_environment_without_blocking() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("reassigned.sqlite");
+    let coordinator = Arc::new(Coordinator::default());
+    *coordinator.failure.lock().unwrap() = Some(Error::Unavailable("offline".into()));
+    let sink = JournalSink::new(path.clone(), coordinator.clone());
+    let deleted = deleted_record(3);
+    sink.commit_deleted(&deleted, &[artifact()], &[])
+        .await
+        .unwrap();
+    drop(sink);
+
+    *coordinator.failure.lock().unwrap() = None;
+    let mut replacement = record(4);
+    replacement.assignment.generation = 2;
+    let sink = JournalSink::new(path, coordinator.clone());
+    sink.recover(&[replacement]).await.unwrap();
+    assert_eq!(sink.pending().await.unwrap(), 0);
+    assert!(coordinator.records.lock().unwrap().is_empty());
+    assert!(coordinator.cleanup.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn deleted_cleanup_recovery_discards_revoked_ownership_without_claiming_publication() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("retired.sqlite");
+    let coordinator = Arc::new(Coordinator::default());
+    *coordinator.failure.lock().unwrap() = Some(Error::Unavailable("offline".into()));
+    let sink = JournalSink::new(path.clone(), coordinator.clone());
+    sink.commit_deleted(&deleted_record(3), &[artifact()], &[])
+        .await
+        .unwrap();
+    drop(sink);
+    *coordinator.failure.lock().unwrap() = None;
+    let sink = JournalSink::new(path, coordinator.clone());
+    sink.recover(&[]).await.unwrap();
+    assert_eq!(sink.pending().await.unwrap(), 0);
+    assert!(coordinator.records.lock().unwrap().is_empty());
+    assert!(coordinator.cleanup.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn expired_deleted_receipt_requires_fresh_revoked_assignment_before_journal_ack() {
+    let root = tempfile::tempdir().unwrap();
+    let coordinator = Arc::new(Coordinator::default());
+    *coordinator.failure.lock().unwrap() = Some(Error::Unavailable("offline".into()));
+    let sink = JournalSink::new(root.path().join("expired.sqlite"), coordinator.clone());
+    let deleted = deleted_record(3);
+    sink.commit_deleted(&deleted, &[artifact()], &[])
+        .await
+        .unwrap();
+    // Coordinator's 600-second receipt has expired. NotFound alone is not proof.
+    *coordinator.failure.lock().unwrap() = Some(Error::NotFound);
+    assert!(matches!(sink.flush().await, Err(Error::Unavailable(_))));
+    assert_eq!(sink.pending().await.unwrap(), 1);
+    *coordinator.catalog.lock().unwrap() = Some(vec![record(2)]);
+    assert_eq!(sink.flush().await, Err(Error::NotFound));
+    assert_eq!(sink.pending().await.unwrap(), 1);
+    *coordinator.catalog.lock().unwrap() = Some(vec![]);
+    sink.flush().await.unwrap();
+    assert_eq!(sink.pending().await.unwrap(), 0);
+    // Discarding an obsolete journal is not a successful commit receipt.
+    assert_eq!(
+        sink.commit_deleted(&deleted, &[artifact()], &[]).await,
+        Err(Error::NotFound)
+    );
+    assert!(coordinator.records.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn conflicting_cleanup_payload_is_never_discarded_as_retired_ownership() {
+    let root = tempfile::tempdir().unwrap();
+    let coordinator = Arc::new(Coordinator::default());
+    *coordinator.failure.lock().unwrap() = Some(Error::Unavailable("offline".into()));
+    let sink = JournalSink::new(root.path().join("conflict.sqlite"), coordinator.clone());
+    sink.commit_deleted(&deleted_record(3), &[artifact()], &[])
+        .await
+        .unwrap();
+    *coordinator.failure.lock().unwrap() = Some(Error::Conflict);
+    *coordinator.catalog.lock().unwrap() = Some(vec![record(2)]);
+    assert_eq!(sink.flush().await, Err(Error::Conflict));
+    assert_eq!(sink.pending().await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn live_flush_discards_a_journal_for_the_previous_generation_of_the_same_name() {
+    let root = tempfile::tempdir().unwrap();
+    let coordinator = Arc::new(Coordinator::default());
+    *coordinator.failure.lock().unwrap() = Some(Error::Unavailable("offline".into()));
+    let sink = JournalSink::new(root.path().join("recreated.sqlite"), coordinator.clone());
+    let deleted = deleted_record(3);
+    sink.commit_deleted(&deleted, &[artifact()], &[])
+        .await
+        .unwrap();
+    *coordinator.failure.lock().unwrap() = Some(Error::Conflict);
+    let mut replacement = record(1);
+    replacement.assignment.generation = 2;
+    replacement.runtime.id = "i-2".into();
+    assert_eq!(replacement.spec.id, deleted.spec.id);
+    *coordinator.catalog.lock().unwrap() = Some(vec![replacement]);
+    sink.flush().await.unwrap();
+    assert_eq!(sink.pending().await.unwrap(), 0);
+    assert!(coordinator.records.lock().unwrap().is_empty());
+    assert_eq!(
+        sink.commit_deleted(&deleted, &[artifact()], &[]).await,
+        Err(Error::Conflict)
+    );
 }

@@ -1,0 +1,70 @@
+syntax = "proto3";
+package adx.control.v1;
+
+import "environment_types.proto";
+
+enum SnapshotPreparationPhase {
+  SNAPSHOT_PREPARATION_PHASE_UNSPECIFIED = 0;
+  SNAPSHOT_PREPARATION_PHASE_REGISTERED = 1;
+  SNAPSHOT_PREPARATION_PHASE_CREATING = 2;
+  SNAPSHOT_PREPARATION_PHASE_SNAPSHOTTING = 3;
+  SNAPSHOT_PREPARATION_PHASE_CLEANING = 4;
+  SNAPSHOT_PREPARATION_PHASE_READY = 5;
+  SNAPSHOT_PREPARATION_PHASE_FAILED = 6;
+}
+
+// Public platform preparation operations. Protocol adapters only project these records.
+service SnapshotPreparationService {
+  rpc RegisterSnapshotPreparation(RegisterSnapshotPreparationRequest) returns (SnapshotPreparationView);
+  rpc StartSnapshotPreparation(StartSnapshotPreparationRequest) returns (SnapshotPreparationView);
+  rpc GetSnapshotPreparation(GetSnapshotPreparationRequest) returns (SnapshotPreparationView);
+  rpc ResolveSnapshotTemplate(ResolveSnapshotTemplateRequest) returns (SnapshotPreparationView);
+  rpc DeleteSnapshotTemplate(DeleteSnapshotTemplateRequest) returns (DeleteSnapshotTemplateResponse);
+}
+
+message RegisterSnapshotPreparationRequest {
+  CallerContext caller = 1;
+  string name = 2;
+  Resources resources = 4;
+}
+message StartSnapshotPreparationRequest {
+  CallerContext caller = 1;
+  string template_id = 2;
+  string preparation_id = 3;
+  EnvironmentSpec spec = 4;
+}
+message GetSnapshotPreparationRequest {
+  CallerContext caller = 1;
+  string template_id = 2;
+  string preparation_id = 3;
+}
+message ResolveSnapshotTemplateRequest {
+  CallerContext caller = 1;
+  // Family ID or name only; selector syntax belongs to protocol adapters.
+  string reference = 2;
+  // Return the current registration without requiring a completed native snapshot.
+  bool registration_only = 3;
+}
+message DeleteSnapshotTemplateRequest {
+  CallerContext caller = 1;
+  string template_id = 2;
+  bool require_unused = 3;
+}
+message DeleteSnapshotTemplateResponse {}
+
+// Deliberately omits credentials, execution environment and private artifact locations.
+message SnapshotPreparationView {
+  reserved 6, 14;
+  reserved "state", "build_status";
+  string template_id = 1;
+  string name = 2;
+  string preparation_id = 3;
+  Resources resources = 5;
+  string snapshot_id = 7;
+  string error = 8;
+  uint64 created_at_unix_ms = 9;
+  string image = 10;
+  string envd_version = 11;
+  SnapshotPreparationPhase phase = 15;
+  bool snapshot_available = 17;
+}

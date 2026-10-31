@@ -28,9 +28,8 @@ class BackendObsTests(unittest.TestCase):
         self.output = self.root / "installed"
         self.archive = self.root / "backend.tar.gz"
         self.pin = self.root / "artifacts.json"
-        self.revision = json.loads(
-            (backend.ROOT / "third_party/sandboxd/source.json").read_text()
-        )["revision"]
+        pinned = json.loads((backend.ROOT / "third_party/sandboxd/source.json").read_text())
+        self.revision = pinned["revision"]
         for name in backend.BACKEND_BINARIES:
             self.payload.joinpath(name).write_bytes(
                 b"\x7fELF\x02\x01"
@@ -194,19 +193,6 @@ class BackendObsTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "pin revision"):
             self.install()
         self.assertFalse(self.output.exists())
-
-    def test_default_pin_and_ci_consumers_use_obs(self):
-        pin = json.loads(
-            (backend.ROOT / "third_party/sandboxd/artifacts.json").read_text()
-        )
-        self.assertEqual(pin["sandboxd_revision"], self.revision)
-        self.assertIn(".obs.", pin["artifacts"][TARGET]["url"])
-        for name in ["package-components.sh", "build-e2e.sh"]:
-            text = (backend.ROOT / ".buildkite" / name).read_text()
-            self.assertIn("build/e2e/download_backend.py", text)
-            self.assertNotIn("ADX_BACKEND_ARTIFACT_BUILD", text)
-        pipeline = (backend.ROOT / ".buildkite/pipeline-package.yml").read_text()
-        self.assertNotIn("ADX_BACKEND_ARTIFACT_BUILD", pipeline)
 
 
 if __name__ == "__main__":

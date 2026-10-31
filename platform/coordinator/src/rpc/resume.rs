@@ -134,54 +134,63 @@ impl CoordinatorRpc {
                 }
             }
         };
-        tokio::time::timeout(Duration::from_secs(seconds), async {
-            let _guard = lock.lock().await;
-            {
-                let mut state = self.0.state.lock().await;
-                state.recover_authoritative_state().await.map_err(status)?;
-                let stored = state
-                    .session
-                    .get(&request.environment_id)
-                    .await
-                    .map_err(status)?;
-                tenant(request.caller.as_ref(), &stored.spec.tenant_id)?;
-                if !stored.invalidated
-                    && stored.resume.is_none()
-                    && stored.result.as_ref().is_some_and(|r| {
-                        r.state == EnvironmentState::Running
-                            && !request.expected_runtime_id.is_empty()
-                            && r.runtime.id != request.expected_runtime_id
-                    })
+        // Keep the restore payload off the caller's poll frame: background
+        // recovery also drives this path on the default Tokio test/thread stack.
+        tokio::time::timeout(
+            Duration::from_secs(seconds),
+            Box::pin(async {
+                let _guard = lock.lock().await;
                 {
-                    let node = state
-                        .nodes
-                        .get(&stored.assignment.node_id)
-                        .ok_or_else(|| Status::unavailable("owner node missing"))?;
-                    return Ok(pb::GetEnvironmentResponse {
-                        record: Some(
-                            stored
-                                .result
-                                .ok_or_else(|| Status::data_loss("result missing"))?
-                                .try_into()
-                                .map_err(status)?,
-                        ),
-                        node_address: node.address.clone(),
-                        relay_address: node.proxy_address.clone(),
-                    });
+                    let mut state = self.0.state.lock().await;
+                    state.recover_authoritative_state().await.map_err(status)?;
+                    let stored = state
+                        .session
+                        .get(&request.environment_id)
+                        .await
+                        .map_err(status)?;
+                    tenant(request.caller.as_ref(), &stored.spec.tenant_id)?;
+                    if !stored.invalidated
+                        && stored.resume.is_none()
+                        && stored.result.as_ref().is_some_and(|r| {
+                            r.state == EnvironmentState::Running
+                                && !request.expected_runtime_id.is_empty()
+                                && r.runtime.id != request.expected_runtime_id
+                        })
+                    {
+                        let node = state
+                            .nodes
+                            .get(&stored.assignment.node_id)
+                            .ok_or_else(|| Status::unavailable("owner node missing"))?;
+                        return Ok(pb::GetEnvironmentResponse {
+                            record: Some(
+                                stored
+                                    .result
+                                    .ok_or_else(|| Status::data_loss("result missing"))?
+                                    .try_into()
+                                    .map_err(status)?,
+                            ),
+                            node_address: node.address.clone(),
+                            relay_address: node.proxy_address.clone(),
+                        });
+                    }
+                    // A cancelled or ambiguous CAS must reload before cached sweeps
+                    // decide that no durable wake intent remains.
+                    state.needs_recovery = true;
+                    let demanded = state
+                        .session
+                        .request_resume_with_timeout(
+                            &request.environment_id,
+                            recovery::now().map_err(status)?,
+                            request.run_timeout_seconds,
+                        )
+                        .await
+                        .map_err(status)?;
+                    state.remember_environment(demanded);
+                    state.needs_recovery = false;
                 }
-                // A cancelled or ambiguous CAS must reload before cached sweeps
-                // decide that no durable wake intent remains.
-                state.needs_recovery = true;
-                let demanded = state
-                    .session
-                    .request_resume(&request.environment_id, recovery::now().map_err(status)?)
-                    .await
-                    .map_err(status)?;
-                state.remember_environment(demanded);
-                state.needs_recovery = false;
-            }
-            self.drive_resume(&request.environment_id).await
-        })
+                self.drive_resume(&request.environment_id).await
+            }),
+        )
         .await
         .map_err(|_| {
             Status::deadline_exceeded("resume remains pending; retry the same Environment")
@@ -383,6 +392,7 @@ impl CoordinatorRpc {
             let result = if transferred {
                 client
                     .recover_environment(pb::RecoverEnvironmentRequest {
+                        run_timeout_seconds: intent.run_timeout_seconds,
                         record: Some(record.try_into().map_err(status)?),
                         node_session_id: session.clone(),
                     })
@@ -390,6 +400,7 @@ impl CoordinatorRpc {
             } else {
                 client
                     .ensure_environment_running(pb::EnsureEnvironmentRunningRequest {
+                        run_timeout_seconds: intent.run_timeout_seconds,
                         assignment: Some(stored.assignment.clone().try_into().map_err(status)?),
                         operation_id: intent.operation_id.clone(),
                         node_session_id: session.clone(),
@@ -482,6 +493,7 @@ impl CoordinatorRpc {
         let mut count = 0;
         for stored in pending {
             let request = pb::EnsureRunningRequest {
+                run_timeout_seconds: None,
                 expected_runtime_id: String::new(),
                 environment_id: stored.spec.id,
                 caller: Some(pb::CallerContext {
