@@ -27,16 +27,27 @@ pub struct ProbeSpec {
 }
 impl ProbeSpec {
     pub fn validate(&self) -> Result<()> {
-        if self.period_seconds == 0
-            || self.timeout_seconds == 0
-            || self.failure_threshold == 0
-            || self.period_seconds > 86400
-            || self.timeout_seconds > 3600
-            || self.initial_delay_seconds > 86400
-        {
-            return Err(Error::Invalid(
-                "probe timing or failure threshold is out of range".into(),
-            ));
+        for (field, value, minimum, maximum) in [
+            ("period_seconds", self.period_seconds, 1, 86400),
+            ("timeout_seconds", self.timeout_seconds, 1, 3600),
+            (
+                "initial_delay_seconds",
+                self.initial_delay_seconds,
+                0,
+                86400,
+            ),
+            (
+                "failure_threshold",
+                u64::from(self.failure_threshold),
+                1,
+                u64::from(u32::MAX),
+            ),
+        ] {
+            if value < minimum || value > maximum {
+                return Err(Error::Invalid(format!(
+                    "probe {field} must be between {minimum} and {maximum}"
+                )));
+            }
         }
         match &self.action {
             ProbeAction::HttpGet { port, path }
@@ -144,6 +155,36 @@ impl From<ProbeFailure> for crate::RuntimeFailure {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn invalid_timing_errors_identify_the_configured_field() {
+        let baseline = ProbeSpec {
+            action: ProbeAction::TcpSocket { port: 18092 },
+            initial_delay_seconds: 0,
+            period_seconds: 2,
+            timeout_seconds: 1,
+            failure_threshold: 3,
+        };
+        let mut period = baseline.clone();
+        period.period_seconds = 0;
+        let mut delay = baseline.clone();
+        delay.initial_delay_seconds = 86401;
+        let mut timeout = baseline.clone();
+        timeout.timeout_seconds = 3601;
+        let mut threshold = baseline;
+        threshold.failure_threshold = 0;
+        for (probe, field) in [
+            (period, "period"),
+            (delay, "initial"),
+            (timeout, "timeout"),
+            (threshold, "failure"),
+        ] {
+            assert!(
+                probe.validate().unwrap_err().to_string().contains(field),
+                "missing {field} context"
+            );
+        }
+    }
+
     #[test]
     fn rejects_http_request_injection_and_empty_exec() {
         let mut probe = ProbeSpec {
