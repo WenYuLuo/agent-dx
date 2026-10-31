@@ -409,6 +409,7 @@ fn run_command(
 pub(crate) fn normalize_environment_action(action: &str) -> Option<&'static str> {
     match action {
         "ping" | "noop" => Some("ping"),
+        "runtime.probes" => Some("runtime_probe_status"),
         "cmd_run" | "exec" | "process.exec" | "process.run" | "cmd.run" => Some("cmd_run"),
         "cmd_start" | "process.start" | "cmd.start" => Some("cmd_start"),
         "cmd_get" | "process.get" | "cmd.get" => Some("cmd_get"),
@@ -457,6 +458,25 @@ pub(crate) fn dispatch_runtime_action_with_trace(
 ) -> Option<rmpv::Value> {
     match method {
         "ping" => Some(codec::map_value(vec![("status", rmpv::Value::from("ok"))])),
+        "runtime_probe_status" => {
+            let result = super::control::current()
+                .ok_or_else(|| {
+                    adx_core::Error::Unavailable("runtime control is not configured".into())
+                })
+                .and_then(|controller| controller.healthcheck_progress());
+            Some(match result {
+                Ok((identity, failures)) => codec::map_value(vec![
+                    ("environment_id", identity.environment_id.into()),
+                    ("runtime_id", identity.runtime_id.into()),
+                    ("ownership_generation", identity.ownership_generation.into()),
+                    (
+                        "healthcheck_consecutive_failures",
+                        failures.map(rmpv::Value::from).unwrap_or(rmpv::Value::Nil),
+                    ),
+                ]),
+                Err(error) => codec::map_value(vec![("error", error.to_string().into())]),
+            })
+        }
         "cmd_run" => {
             let cmd = codec::kw_str(kw, "cmd")
                 .or_else(|| codec::kw_str(kw, "command"))

@@ -27,6 +27,10 @@ an explicit image or S3 source atomically replaces the source. Adxlet still
 requires the deployment-owned source, bootstrap and environment to match the
 local node when no source replacement was requested.
 
+Supervisor and Conch image bindings accept explicit workload `process`
+commands, working directory and user overrides through Execd. Fields omitted
+from `process` retain the corresponding image defaults.
+
 All ordinary responses use the API Server response envelope:
 
 ```json
@@ -57,6 +61,20 @@ instead of inferring retry safety from HTTP status or message text. See the
 | Resume | `POST /api/environment/v1/environments/{environmentID}/resume` | none | `{"environmentId":"...","state":"running","routeAddress":"host:port","functionProxyId":"...","nodeId":"...","portMappings":{}}` |
 | Reload latest recovery point | `POST /api/environment/v1/environments/{environmentID}/reload` | none | `{"success":true}` after a new backend execution reaches Running and is published |
 | Replace network policy | `PUT /api/environment/v1/environments/{environmentID}/network` | complete network policy, or `{}` to clear it | `{"success":true}` after sandboxd accepts the replacement and the operation is published |
+| Instance details | `GET /api/instances?instance_id=<environmentID>` | none | one-element array of the caller-visible instance view |
+
+Instance queries by ID read published metadata. A missing or unsynchronized API
+directory triggers a read-only Coordinator lookup; both paths enforce tenant
+ownership, while administrator keys can read all tenants. The query does not
+acquire a lifecycle operation lock or invoke the workload. Deleted or absent IDs
+return 404. Views include runtime identity, assignment generation, runtime class,
+revision, failure and restart evidence.
+
+Administrator queries by ID additionally return `execution` (native mounts,
+readiness/healthcheck probes and workload process) and `env_vars`. These selected
+configuration fields can contain credentials; diagnostic consumers must protect
+and redact their output. Ordinary tenant queries and all paginated list responses
+omit them. Queries by ID use `Cache-Control: no-store`.
 
 `snapshotId` on the normal create route creates a new environment from a reusable
 snapshot. The snapshot is reusable; creating from it does not consume it.
@@ -121,6 +139,23 @@ control-stream delivery. The committed instance view exposes `failure.reason=Pro
 `failure.probe_failure` with `kind`, `message`, `consecutive_failures`, and optional `exit_code` /
 `http_status`. Pause/resume/restore cancel checks, recheck readiness and reset
 healthcheck counts. Probes do not count as user activity.
+
+### Current healthcheck progress
+
+`POST /direct/{environment-id}/invoke` with
+`{"action":"runtime.probes","args":{}}` reads Execd's actual healthcheck
+progress. The result contains `environment_id`, `runtime_id`,
+`ownership_generation`, and `healthcheck_consecutive_failures`. The count is
+`null` until a healthcheck completes in the current running probe epoch, and
+also when healthchecks are disabled or the runtime is not Running. A failed
+check increments it; a successful check resets it to zero. Observations from
+an earlier runtime identity or probe epoch are not returned.
+
+A positive count below `failureThreshold` is an unhealthy observation while
+the Environment lifecycle remains Running. Reaching the threshold still
+follows the existing Failed/restart policy. Reading progress does not run a
+probe, reset its count, or change lifecycle state; the invoke request follows
+normal data-plane activity accounting.
 
 ## Create from a reusable snapshot
 
@@ -340,9 +375,15 @@ Like an inherited OCI USER, a non-default `user` requires the deployment-owned s
 `user` accepts the existing image user-resolution syntax (name or numeric UID,
 optionally followed by a group). `cwd` is an absolute canonical path; it must
 already be accessible to that user. This is separate from the constructor `cwd`
-option below. `process` requires `inheritEntrypoint: true`; the Jiuwenbox backend
-does not support these overrides. Environment persistence and internal RPC retain
-the explicit fields across lifecycle operations.
+option below. `process` requires `inheritEntrypoint: true`. Jiuwenbox Supervisor
+and Conch forward explicit workload fields to Execd while keeping the runtime
+control identity separate. Environment persistence and internal RPC retain the
+explicit fields across lifecycle operations.
+
+Jiuwenbox can return HTTP 201 with `phase: error` when its sandbox daemon cannot
+start. ADX treats that explicit failure as a backend rejection and cleans up the
+failed execution; it does not reschedule it until the queue deadline. Raw backend
+output is omitted from the public error because it can contain sensitive values.
 
 ## Constructor working directory
 
@@ -404,3 +445,7 @@ existing directories are never automatically repaired, removed or renamed. No
 fallback to more permissive access is applied. The shared filesystem must permit
 ownership and permission changes, with no renameat2 requirement. A node release
 supporting these options is required before templates use them; this behavior has local component coverage, not a runsc/SFS end-to-end claim.
+
+Instance summaries include runtime_id, sandbox_ip, node_id, generation and node_ip from the current assignment and runtime. These fields describe observed placement; they do not include execution environment variables or credentials.
+
+Administrator queries by ID include selected configuration fields; list responses and ordinary tenant queries omit them.

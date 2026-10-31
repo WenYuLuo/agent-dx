@@ -318,8 +318,14 @@ impl Api {
                 .get("instance_id")
                 .filter(|value| !value.trim().is_empty())
             {
-                return match Box::pin(self.clients.owner(instance_id, &caller, false)).await {
-                    Ok(owner) => match instance_view(owner) {
+                let owner = match Box::pin(self.clients.owner(instance_id, &caller, false)).await {
+                    Err(error) if matches!(error.code(), Code::NotFound | Code::Unavailable) => {
+                        Box::pin(self.clients.owner(instance_id, &caller, true)).await
+                    }
+                    result => result,
+                };
+                let mut reply = match owner {
+                    Ok(owner) => match instance_view(owner, caller.administrator) {
                         Ok(view) => plain(200, json!([view])),
                         Err(error) => {
                             error_response(error, &request_id, None, Some(instance_id), false)
@@ -329,6 +335,11 @@ impl Api {
                         error_response(error, &request_id, None, Some(instance_id), false)
                     }
                 };
+                reply.headers_mut().insert(
+                    hyper::header::CACHE_CONTROL,
+                    hyper::header::HeaderValue::from_static("no-store"),
+                );
+                return reply;
             }
             let page_size = match instance_page_size(&query) {
                 Ok(page_size) => page_size,
@@ -351,7 +362,7 @@ impl Api {
                 Ok(page) => {
                     let mut views = Vec::new();
                     for owner in page.entries {
-                        match instance_view(owner) {
+                        match instance_view(owner, false) {
                             Ok(view) => views.push(view),
                             Err(error) if error.code() == Code::NotFound => (),
                             Err(error) => {
@@ -997,7 +1008,10 @@ fn status_code(error: &Status) -> u16 {
         _ => 500,
     }
 }
-pub(crate) fn instance_view(owner: pb::GetEnvironmentResponse) -> Result<Value, Status> {
+pub(crate) fn instance_view(
+    owner: pb::GetEnvironmentResponse,
+    include_configuration: bool,
+) -> Result<Value, Status> {
     let record = owner
         .record
         .ok_or_else(|| Status::data_loss("environment directory returned no record"))?;
@@ -1008,12 +1022,19 @@ pub(crate) fn instance_view(owner: pb::GetEnvironmentResponse) -> Result<Value, 
         .spec
         .ok_or_else(|| Status::data_loss("environment record returned no spec"))?;
     let resource = spec.resources.unwrap_or_default();
+    let runtime = record.runtime.unwrap_or_default();
+    let assignment = record.assignment.unwrap_or_default();
+    let node_ip = owner
+        .node_address
+        .parse::<std::net::SocketAddr>()
+        .ok()
+        .map(|address| address.ip().to_string());
     let failure = record
         .failure
         .map(adx_core::RuntimeFailure::try_from)
         .transpose()
         .map_err(adx_protocol::status)?;
-    Ok(json!({
+    let mut view = json!({
         "id": spec.id,
         "tenant_id": spec.tenant_id,
         "status": state(record.state),
@@ -1021,7 +1042,32 @@ pub(crate) fn instance_view(owner: pb::GetEnvironmentResponse) -> Result<Value, 
         "required_cpu": resource.cpu_millis,
         "required_mem": resource.memory_bytes / 1048576,
         "image": spec.image,
-    }))
+        "runtime_class": spec.runtime_class,
+        "revision": record.revision,
+        "restart_attempts": record.restart_attempts,
+        "restart_pending": record.restart_pending,
+        "runtime_id": runtime.id,
+        "sandbox_ip": runtime.ip,
+        "node_id": assignment.node_id,
+        "generation": assignment.generation,
+        "node_ip": node_ip,
+    });
+    if include_configuration {
+        let execution = spec
+            .execution
+            .map(adx_core::execution::ExecutionOptions::try_from)
+            .transpose()
+            .map_err(adx_protocol::status)?
+            .unwrap_or_default();
+        view["execution"] = json!({
+            "mounts": execution.mounts,
+            "readiness_probe": execution.readiness_probe,
+            "healthcheck_probe": execution.healthcheck_probe,
+            "process": execution.process,
+        });
+        view["env_vars"] = json!(spec.env);
+    }
+    Ok(view)
 }
 fn state(value: i32) -> &'static str {
     match pb::EnvironmentState::try_from(value) {
@@ -1285,25 +1331,43 @@ mod error_contract_tests {
 
     #[test]
     fn instance_view_exposes_record_tenant_without_execution_secrets() {
-        let view = instance_view(pb::GetEnvironmentResponse {
-            record: Some(pb::EnvironmentRecord {
-                observation: None,
-                execution_artifacts: vec![],
-                snapshot_source: None,
-                spec: Some(pb::EnvironmentSpec {
-                    id: "environment-1".into(),
-                    tenant_id: "tenant-a".into(),
-                    env: HashMap::from([("EXECD_HTTP_TOKEN".into(), "private".into())]),
+        let view = instance_view(
+            pb::GetEnvironmentResponse {
+                record: Some(pb::EnvironmentRecord {
+                    observation: None,
+                    execution_artifacts: vec![],
+                    snapshot_source: None,
+                    spec: Some(pb::EnvironmentSpec {
+                        id: "environment-1".into(),
+                        tenant_id: "tenant-a".into(),
+                        env: HashMap::from([("EXECD_HTTP_TOKEN".into(), "private".into())]),
+                        ..Default::default()
+                    }),
+                    runtime: Some(pb::Runtime {
+                        id: "runtime-7".into(),
+                        ip: "100.96.1.7".into(),
+                    }),
+                    assignment: Some(pb::Assignment {
+                        node_id: "node-1".into(),
+                        generation: 7,
+                        ..Default::default()
+                    }),
+                    state: pb::EnvironmentState::Running as i32,
                     ..Default::default()
                 }),
-                state: pb::EnvironmentState::Running as i32,
+                node_address: "172.30.58.2:27001".into(),
                 ..Default::default()
-            }),
-            ..Default::default()
-        })
+            },
+            false,
+        )
         .unwrap();
         assert_eq!(view["tenant_id"], "tenant-a");
         assert_eq!(view["id"], "environment-1");
+        assert_eq!(view["runtime_id"], "runtime-7");
+        assert_eq!(view["sandbox_ip"], "100.96.1.7");
+        assert_eq!(view["node_ip"], "172.30.58.2");
+        assert_eq!(view["node_id"], "node-1");
+        assert_eq!(view["generation"], 7);
         assert!(view.get("env").is_none());
         assert!(!view.to_string().contains("private"));
     }
