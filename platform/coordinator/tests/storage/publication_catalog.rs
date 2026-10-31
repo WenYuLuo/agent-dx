@@ -108,7 +108,12 @@ async fn publication_overflow_recovers_during_continuous_writes_and_again_after_
         Arc,
     };
     let mut rig = common::Redis::new().await;
-    let store = rig.store().await;
+    // This test checks catalog recovery under sustained durable writes, not a
+    // subsecond Redis deadline. AOF fsync shares the CI worker's busy disk.
+    let store =
+        adx_coordinator::storage::RedisStore::connect(&rig.url, "test", Duration::from_secs(2))
+            .await
+            .unwrap();
     let session = store.begin(1).await.unwrap();
     register(&session, "node").await;
     let publisher = RoutePublisher::new(session.clone(), Peers::network());

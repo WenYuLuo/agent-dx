@@ -58,10 +58,16 @@ def build(source, output, jobs=4):
         source = Path(directory)
         run_git([git, 'init', str(source)], timeout=30)
         run_git([git, '-C', str(source), 'remote', 'add', 'origin', pin['repository']], timeout=30)
+        # Git 2.17 requires an explicit partial-clone repository before fetch
+        # accepts --filter. Keep checkout patterns compatible with pre-2.25 Git.
+        for key, value in (('core.repositoryformatversion', '1'), ('extensions.partialClone', 'origin'),
+                           ('core.partialCloneFilter', 'blob:none'), ('remote.origin.promisor', 'true'),
+                           ('remote.origin.partialCloneFilter', 'blob:none'), ('core.sparseCheckout', 'true')):
+            run_git([git, '-C', str(source), 'config', key, value], timeout=30)
+        (source / '.git/info/sparse-checkout').write_text('/*\n!/*/\n/packages/\n!/packages/*/\n'
+                                                       '/packages/envd/\n/packages/shared/\n')
         run_git([git, '-C', str(source), 'fetch', '--depth=1', '--filter=blob:none', 'origin', pin['revision']],
                 timeout=300)
-        run_git([git, '-C', str(source), 'sparse-checkout', 'init', '--cone'], timeout=30)
-        run_git([git, '-C', str(source), 'sparse-checkout', 'set', 'packages/envd', 'packages/shared'], timeout=30)
         run_git([git, '-C', str(source), 'checkout', '--detach', 'FETCH_HEAD'], timeout=60)
         return _build(source, output, jobs)
 
