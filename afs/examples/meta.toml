@@ -20,6 +20,8 @@ meta_request_bytes_max = 268435456
 meta_watch_events_max = 1000000
 meta_watch_bytes_max = 67108864
 meta_watch_retention_ms = 3600000
+# Default: create OwnerFs workspaces on the requesting node. Set true for HRW placement.
+ownerfs_mkdir_load_balance = false
 data_dir = "/opt/adx/data/afs/meta"
 # DFS replication is a filesystem initialization contract. These R1 defaults
 # must remain unchanged on later starts unless the filesystem is reinitialized.

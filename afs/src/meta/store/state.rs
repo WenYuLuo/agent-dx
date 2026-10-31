@@ -636,7 +636,7 @@ impl State {
                     node_id: node_id.clone(),
                 })
             }
-            MetaRead::CurrentNodeSessions => None,
+            MetaRead::CurrentNodeSessions | MetaRead::RootState { .. } => None,
             MetaRead::Root { root_id } => state.entities.get(&MetaKey::Root {
                 root_id: root_id.clone(),
             }),
@@ -711,6 +711,21 @@ impl State {
             _ => None,
         };
         let (revision, entities) = match &read {
+            MetaRead::RootState { root_id } => {
+                let entities = [
+                    MetaKey::Root {
+                        root_id: root_id.clone(),
+                    },
+                    MetaKey::RootReservation {
+                        root_id: root_id.clone(),
+                    },
+                ]
+                .iter()
+                .filter_map(|key| state.entities.get(key).map(|v| v.entity.clone()))
+                .collect();
+                (state.revision, entities)
+            }
+
             MetaRead::DfsDirectory {
                 namespace_id,
                 parent_inode_id,
@@ -1088,6 +1103,7 @@ impl State {
             grpc_addr: lease.grpc_addr,
             data_addr: lease.data_addr,
             rest_addr: lease.rest_addr,
+            ownerfs_enabled: lease.ownerfs_enabled,
             storage_devices: lease.storage_devices,
             lease_epoch,
             expires_at_unix_ms: now_ms.saturating_add(ttl_ms),
@@ -2071,6 +2087,7 @@ mod completion_tests {
             grpc_addr: "grpc".into(),
             data_addr: "data".into(),
             rest_addr: "rest".into(),
+            ownerfs_enabled: true,
             storage_devices: Vec::new(),
             lease_ttl: std::time::Duration::from_secs(60),
         }
@@ -2414,6 +2431,7 @@ mod grant_lifecycle_gc_tests {
             grpc_addr: "g".into(),
             data_addr: "d".into(),
             rest_addr: "r".into(),
+            ownerfs_enabled: true,
             storage_devices: vec![],
             lease_epoch: 1,
             expires_at_unix_ms: 0,
@@ -2534,6 +2552,7 @@ mod grant_lifecycle_gc_tests {
             grpc_addr: "g".into(),
             data_addr: "d".into(),
             rest_addr: "r".into(),
+            ownerfs_enabled: true,
             storage_devices: vec![],
             lease_epoch: 1,
             expires_at_unix_ms: 100,
@@ -2623,6 +2642,8 @@ mod grant_lifecycle_gc_tests {
                     request,
                     operation: StoreOperation::ReserveRoot,
                     result: OperationResult::RootReservation(super::super::RootReservationRecord {
+                        requester_node_id: String::new(),
+                        requester_session_id: String::new(),
                         root_id: "retired".into(),
                         root_epoch: 40,
                         home_node_id: "home".into(),

@@ -1132,6 +1132,7 @@ async fn service_smoke(store: Arc<Store>) -> BenchResult<Value> {
                 grpc_addr: "127.0.0.1:1".into(),
                 data_addr: "127.0.0.1:2".into(),
                 rest_addr: "127.0.0.1:3".into(),
+                ownerfs_enabled: true,
                 storage_devices: vec![],
                 lease_ttl: Duration::from_secs(60),
             },

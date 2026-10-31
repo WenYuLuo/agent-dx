@@ -4,11 +4,13 @@
 //! 这是 Node 的内部控制 caller，不是对外的本机高性能 client/ SDK。
 //! 示例每次显式 ping 建连；未来节点注册/watch 的连接复用由相应业务模块管理。
 #[cfg(feature = "ownerfs")]
+use super::ownerfs::{reservation_from_wire, reservation_wire};
+#[cfg(feature = "ownerfs")]
 use crate::node::vfs::ownerfs::{
     catalog::LocalRootRecord,
     root::{
         OwnerRootInventory, PreparedRoot, PresentedRootAccess, RootGrant, RootId, RootLocation,
-        RootMeta, RootReservation, RootRight,
+        RootLookupState, RootMeta, RootReservation, RootRight,
     },
 };
 #[cfg(any(feature = "ownerfs", feature = "dfs"))]
@@ -690,18 +692,6 @@ fn grant_from_wire(value: afs_protocol::meta::RootAccess) -> Result<RootGrant> {
 }
 
 #[cfg(feature = "ownerfs")]
-fn reservation_wire(value: &RootReservation) -> afs_protocol::meta::RootReservation {
-    afs_protocol::meta::RootReservation {
-        root_id: value.id.0.clone(),
-        root_epoch: value.epoch,
-        home_node_id: value.home_node_id.clone(),
-        session_id: value.session_id.clone(),
-        create_intent_id: value.create_intent_id.clone(),
-        prepare_token: value.prepare_token.clone(),
-    }
-}
-
-#[cfg(feature = "ownerfs")]
 impl RootMeta for GrpcRootMeta {
     fn lookup_node_endpoint(&self, node_id: &str) -> Result<String> {
         GrpcRootMeta::lookup_node_endpoint(self, node_id)
@@ -728,14 +718,31 @@ impl RootMeta for GrpcRootMeta {
         };
         let mut client = self.client();
         let reply = self.run(client.reserve_root(request))?.into_inner();
-        let value = required(reply.reservation, "ReserveRoot.reservation")?;
-        Ok(RootReservation {
-            id: RootId(value.root_id),
-            epoch: value.root_epoch,
-            home_node_id: value.home_node_id,
-            session_id: value.session_id,
-            create_intent_id: value.create_intent_id,
-            prepare_token: value.prepare_token,
+        reservation_from_wire(required(reply.reservation, "ReserveRoot.reservation")?)
+    }
+
+    fn lookup_root_state(&self, id: &RootId) -> Result<RootLookupState> {
+        let mut client = self.client();
+        let reply = self
+            .run(client.lookup_root(LookupRootRequest {
+                request_id: self.request_id(),
+                root_id: id.0.clone(),
+            }))?
+            .into_inner();
+        let location = if reply.found {
+            let value = required(reply.location, "LookupRoot.location")?;
+            Some(RootLocation {
+                id: RootId(value.root_id),
+                epoch: value.root_epoch,
+                home_node_id: value.home_node_id,
+                home_session_id: value.home_session_id,
+            })
+        } else {
+            None
+        };
+        Ok(RootLookupState {
+            location,
+            reservation: reply.reservation.map(reservation_from_wire).transpose()?,
         })
     }
 
@@ -828,15 +835,8 @@ impl RootMeta for GrpcRootMeta {
             pending: reply
                 .pending_reservations
                 .into_iter()
-                .map(|value| RootReservation {
-                    id: RootId(value.root_id),
-                    epoch: value.root_epoch,
-                    home_node_id: value.home_node_id,
-                    session_id: value.session_id,
-                    create_intent_id: value.create_intent_id,
-                    prepare_token: value.prepare_token,
-                })
-                .collect(),
+                .map(reservation_from_wire)
+                .collect::<Result<Vec<_>>>()?,
         })
     }
 

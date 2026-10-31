@@ -9,10 +9,10 @@ use std::sync::Arc;
 use afs_error::{Error, Result};
 
 use super::store::{
-    MetaEntity, MetaFuture, MetaKey, MetaRead, MetaStore, MetaTxn, OperationResult, RecoveryCursor,
-    RequestKey, RootAccessGrant, RootCommandAck, RootCommandRecord, RootCommandType, RootRecord,
-    RootReservationRecord, RootRight, StoreOperation, StoreRevision, TxnCondition, TxnMutation,
-    TxnOutcome, WatchBatch, WatchChange, unavailable_meta_store,
+    MetaEntity, MetaFuture, MetaKey, MetaRead, MetaStore, MetaTxn, NodeSession, OperationResult,
+    RecoveryCursor, RequestKey, RootAccessGrant, RootCommandAck, RootCommandRecord,
+    RootCommandType, RootRecord, RootReservationRecord, RootRight, StoreOperation, StoreRevision,
+    TxnCondition, TxnMutation, TxnOutcome, WatchBatch, WatchChange, unavailable_meta_store,
 };
 
 pub trait OwnerRootAuthority: Send + Sync {
@@ -20,7 +20,7 @@ pub trait OwnerRootAuthority: Send + Sync {
     fn activate_root(&self, input: ActivateRootInput) -> MetaFuture<'_, RootAccessGrant>;
     fn abort_root(&self, input: AbortRootInput) -> MetaFuture<'_, ()>;
     fn deactivate_root(&self, input: DeactivateRootInput) -> MetaFuture<'_, ()>;
-    fn lookup_root(&self, input: LookupRootInput) -> MetaFuture<'_, Option<RootRecord>>;
+    fn lookup_root(&self, input: LookupRootInput) -> MetaFuture<'_, RootLookupState>;
     fn list_owner_roots(&self, input: ListOwnerRootsInput) -> MetaFuture<'_, ListOwnerRootsOutput>;
     fn acquire_root(&self, input: AcquireRootInput) -> MetaFuture<'_, RootAccessGrant>;
     fn validate_root_access(
@@ -58,7 +58,7 @@ impl OwnerRootAuthority for MissingOwnerRootAuthority {
         Box::pin(async { Err(unavailable_meta_store()) })
     }
 
-    fn lookup_root(&self, _input: LookupRootInput) -> MetaFuture<'_, Option<RootRecord>> {
+    fn lookup_root(&self, _input: LookupRootInput) -> MetaFuture<'_, RootLookupState> {
         Box::pin(async { Err(unavailable_meta_store()) })
     }
 
@@ -109,11 +109,22 @@ impl OwnerRootAuthority for MissingOwnerRootAuthority {
 
 pub struct StoreOwnerRootAuthority {
     store: Arc<dyn MetaStore>,
+    load_balancing: bool,
 }
 
 impl StoreOwnerRootAuthority {
     pub fn new(store: Arc<dyn MetaStore>) -> Self {
-        Self { store }
+        Self {
+            store,
+            load_balancing: false,
+        }
+    }
+
+    pub fn with_load_balancing(store: Arc<dyn MetaStore>, load_balancing: bool) -> Self {
+        Self {
+            store,
+            load_balancing,
+        }
     }
 
     // Commands and the resume cursor come from the same pinned authority view.
@@ -146,29 +157,122 @@ impl StoreOwnerRootAuthority {
 impl OwnerRootAuthority for StoreOwnerRootAuthority {
     fn reserve_root(&self, input: ReserveRootInput) -> MetaFuture<'_, ReserveRootOutput> {
         Box::pin(async move {
+            if input.root_id.is_empty()
+                || input.preferred_home_node_id.is_empty()
+                || input.session_id.is_empty()
+                || input.create_intent_id.is_empty()
+            {
+                return Err(invalid("root and requester identity are required"));
+            }
+            let requester_node_id = input.preferred_home_node_id.clone();
+            let requester_session_id = input.session_id.clone();
             let key = request_key(
-                format!("{}/{}", input.preferred_home_node_id, input.session_id),
+                format!("{requester_node_id}/{requester_session_id}"),
                 input.request_id.clone(),
             );
+            if let Some(outcome) = self
+                .store
+                .read(MetaRead::RequestOutcome(key.clone()))
+                .await?
+                .request_outcome
+            {
+                require_current_live_session(
+                    self.store.as_ref(),
+                    &requester_node_id,
+                    &requester_session_id,
+                )
+                .await?;
+                if outcome.operation != StoreOperation::ReserveRoot {
+                    return Err(invalid(
+                        "request_id was already used for a different Meta operation",
+                    ));
+                }
+                let reservation = take_reserve_result(outcome.result, &input)?;
+                return Ok(ReserveRootOutput {
+                    reservation,
+                    already_reserved_by_same_intent: true,
+                });
+            }
             // Allocation shares the existing writer. A different Root reserving
             // concurrently may advance its floor; retry only that CAS conflict.
             for _ in 0..32 {
-                let existing = self
+                let root = self
+                    .store
+                    .read(MetaRead::Root {
+                        root_id: input.root_id.clone(),
+                    })
+                    .await?;
+                if root.entity.is_some() {
+                    return Err(root_exists("root already exists"));
+                }
+                let snapshot = self
                     .store
                     .read(MetaRead::RootReservation {
                         root_id: input.root_id.clone(),
                     })
                     .await?;
-                if let Some(MetaEntity::RootReservation(reservation)) = existing.entity
-                    && reservation.home_node_id == input.preferred_home_node_id
-                    && reservation.home_session_id == input.session_id
-                    && reservation.create_intent_id == input.create_intent_id
-                {
-                    return Ok(ReserveRootOutput {
-                        reservation,
-                        already_reserved_by_same_intent: true,
-                    });
+                let existing = match snapshot.entity {
+                    Some(MetaEntity::RootReservation(reservation)) => Some(reservation),
+                    Some(_) => {
+                        return Err(invalid("root reservation lookup returned wrong entity"));
+                    }
+                    None => None,
+                };
+                if let Some(existing) = &existing {
+                    let same_intent = existing.create_intent_id == input.create_intent_id
+                        && existing.requester_node_id == requester_node_id
+                        && existing.requester_session_id == requester_session_id;
+                    if same_intent {
+                        let mut txn = MetaTxn::new(key.clone(), StoreOperation::ReserveRoot);
+                        txn.conditions.extend([
+                            TxnCondition::RequestAbsent(key.clone()),
+                            TxnCondition::NodeSessionCurrent {
+                                node_id: requester_node_id.clone(),
+                                session_id: requester_session_id.clone(),
+                            },
+                            TxnCondition::Missing(MetaKey::Root {
+                                root_id: input.root_id.clone(),
+                            }),
+                            TxnCondition::EntityEquals(MetaEntity::RootReservation(
+                                existing.clone(),
+                            )),
+                        ]);
+                        txn.mutations.push(TxnMutation::RecordRequestOutcome(
+                            super::store::RequestOutcome {
+                                request: txn.request.clone(),
+                                operation: txn.operation,
+                                result: OperationResult::RootReservation(existing.clone()),
+                            },
+                        ));
+                        let outcome = self.store.compare_and_commit(txn).await?;
+                        let reservation = take_reserve_result(
+                            classify_reserve_outcome(
+                                self.store.as_ref(),
+                                outcome,
+                                &input.root_id,
+                                Some(existing),
+                            )
+                            .await?,
+                            &input,
+                        )?;
+                        return Ok(ReserveRootOutput {
+                            reservation,
+                            already_reserved_by_same_intent: true,
+                        });
+                    }
+
+                    if reservation_requester_is_live(self.store.as_ref(), existing).await? {
+                        return Err(root_busy("root is reserved by another live request"));
+                    }
                 }
+                let home = select_home(
+                    self.store.as_ref(),
+                    self.load_balancing,
+                    &input.root_id,
+                    &requester_node_id,
+                    &requester_session_id,
+                )
+                .await?;
                 let floor = self.store.read(MetaRead::RootEpochWatermark).await?;
                 let Some(MetaEntity::RootEpochWatermark(previous)) = floor.entity else {
                     return Err(invalid("root epoch allocation floor is unavailable"));
@@ -179,73 +283,75 @@ impl OwnerRootAuthority for StoreOwnerRootAuthority {
                 if input.expected_root_epoch > root_epoch {
                     return Err(invalid("expected root epoch exceeds next allocated epoch"));
                 }
-                let reservation = RootReservationRecord {
-                    root_id: input.root_id.clone(),
-                    root_epoch,
-                    home_node_id: input.preferred_home_node_id.clone(),
-                    home_session_id: input.session_id.clone(),
-                    create_intent_id: input.create_intent_id.clone(),
-                    prepare_token: format!(
-                        "prepare:{}:{}:{}:{}",
-                        input.root_id, input.session_id, input.create_intent_id, input.request_id
-                    ),
-                    created_at_revision: StoreRevision::ZERO,
-                };
+                let reservation = reservation_record(&input, home, root_epoch);
                 let mut txn = MetaTxn::new(key.clone(), StoreOperation::ReserveRoot);
                 txn.conditions.extend([
                     TxnCondition::RequestAbsent(key.clone()),
                     TxnCondition::RootEpochWatermarkEquals(previous),
                     TxnCondition::NodeSessionCurrent {
-                        node_id: input.preferred_home_node_id.clone(),
-                        session_id: input.session_id.clone(),
+                        node_id: requester_node_id.clone(),
+                        session_id: requester_session_id.clone(),
                     },
                     TxnCondition::Missing(MetaKey::Root {
                         root_id: input.root_id.clone(),
                     }),
-                    TxnCondition::Missing(MetaKey::RootReservation {
-                        root_id: input.root_id.clone(),
-                    }),
+                    TxnCondition::NodeSessionCurrent {
+                        node_id: reservation.home_node_id.clone(),
+                        session_id: reservation.home_session_id.clone(),
+                    },
                 ]);
+                match &existing {
+                    Some(existing) => txn.conditions.extend([
+                        TxnCondition::EntityEquals(MetaEntity::RootReservation(existing.clone())),
+                        TxnCondition::NodeSessionExpired {
+                            node_id: existing.requester_node_id.clone(),
+                            session_id: existing.requester_session_id.clone(),
+                        },
+                    ]),
+                    None => txn
+                        .conditions
+                        .push(TxnCondition::Missing(MetaKey::RootReservation {
+                            root_id: input.root_id.clone(),
+                        })),
+                }
                 txn.mutations.extend([
                     TxnMutation::Put(MetaEntity::RootEpochWatermark(root_epoch)),
                     TxnMutation::Put(MetaEntity::RootReservation(reservation.clone())),
                     TxnMutation::RecordRequestOutcome(super::store::RequestOutcome {
-                        request: key.clone(),
+                        request: txn.request.clone(),
                         operation: txn.operation,
                         result: OperationResult::RootReservation(reservation),
                     }),
                 ]);
-                let outcome = match self.store.compare_and_commit(txn).await? {
-                    TxnOutcome::Committed { outcome, .. } => Some(outcome),
+                let outcome = self.store.compare_and_commit(txn).await?;
+                if matches!(
+                    &outcome,
                     TxnOutcome::ConditionFailed {
-                        existing_outcome: Some(outcome),
+                        existing_outcome: None,
                         ..
-                    } => Some(outcome),
-                    TxnOutcome::ConditionFailed { .. } => None,
-                };
-                if let Some(outcome) = outcome {
-                    if outcome.operation != StoreOperation::ReserveRoot {
-                        return Err(invalid(
-                            "request_id was already used for a different Meta operation",
-                        ));
                     }
-                    let OperationResult::RootReservation(reservation) = outcome.result else {
-                        return Err(invalid("reserve replay returned wrong result type"));
-                    };
-                    return Ok(ReserveRootOutput {
-                        reservation,
-                        already_reserved_by_same_intent: false,
-                    });
+                ) {
+                    let refreshed = self.store.read(MetaRead::RootEpochWatermark).await?;
+                    if refreshed.entity != Some(MetaEntity::RootEpochWatermark(previous)) {
+                        continue;
+                    }
                 }
-                let refreshed = self.store.read(MetaRead::RootEpochWatermark).await?;
-                if refreshed.entity == Some(MetaEntity::RootEpochWatermark(previous)) {
-                    return Err(invalid(
-                        "Meta reservation conditions failed; caller must refresh authority state",
-                    ));
-                }
+                let reservation = take_reserve_result(
+                    classify_reserve_outcome(
+                        self.store.as_ref(),
+                        outcome,
+                        &input.root_id,
+                        existing.as_ref(),
+                    )
+                    .await?,
+                    &input,
+                )?;
+                return Ok(ReserveRootOutput {
+                    reservation,
+                    already_reserved_by_same_intent: false,
+                });
             }
-            Err(Error::coded(
-                afs_error::IO_UNAVAILABLE,
+            Err(home_unavailable(
                 "root epoch allocation contention; retry the same request",
             ))
         })
@@ -253,6 +359,9 @@ impl OwnerRootAuthority for StoreOwnerRootAuthority {
 
     fn activate_root(&self, input: ActivateRootInput) -> MetaFuture<'_, RootAccessGrant> {
         Box::pin(async move {
+            if input.local_prepare_id.is_empty() {
+                return Err(invalid("local_prepare_id is required"));
+            }
             let key = request_key(
                 format!(
                     "{}/{}",
@@ -260,6 +369,48 @@ impl OwnerRootAuthority for StoreOwnerRootAuthority {
                 ),
                 input.request_id,
             );
+            if let Some(outcome) = self
+                .store
+                .read(MetaRead::RequestOutcome(key.clone()))
+                .await?
+                .request_outcome
+            {
+                require_current_live_session(
+                    self.store.as_ref(),
+                    &input.reservation.home_node_id,
+                    &input.reservation.session_id,
+                )
+                .await?;
+                if outcome.operation != StoreOperation::ActivateRoot {
+                    return Err(invalid(
+                        "request_id was already used for a different Meta operation",
+                    ));
+                }
+                let OperationResult::RootGrant(grant) = outcome.result else {
+                    return Err(invalid("activate replay returned wrong result type"));
+                };
+                if grant.root_id != input.reservation.root_id
+                    || grant.root_epoch != input.reservation.root_epoch
+                    || grant.home_node_id != input.reservation.home_node_id
+                    || grant.home_session_id != input.reservation.session_id
+                {
+                    return Err(invalid("activate replay parameters do not match"));
+                }
+                let root = self
+                    .store
+                    .read(MetaRead::Root {
+                        root_id: input.reservation.root_id.clone(),
+                    })
+                    .await?;
+                if !matches!(
+                    root.entity,
+                    Some(MetaEntity::Root(root))
+                        if root.local_prepare_id == input.local_prepare_id
+                ) {
+                    return Err(invalid("activate replay parameters do not match"));
+                }
+                return Ok(grant);
+            }
             let snapshot = self
                 .store
                 .read(MetaRead::RootReservation {
@@ -274,6 +425,8 @@ impl OwnerRootAuthority for StoreOwnerRootAuthority {
                 || record.home_session_id != input.reservation.session_id
                 || record.create_intent_id != input.reservation.create_intent_id
                 || record.prepare_token != input.reservation.prepare_token
+                || record.requester_node_id != input.reservation.requester_node_id
+                || record.requester_session_id != input.reservation.requester_session_id
             {
                 return Err(invalid("reservation does not match durable reserve record"));
             }
@@ -282,7 +435,7 @@ impl OwnerRootAuthority for StoreOwnerRootAuthority {
                 root_epoch: record.root_epoch,
                 home_node_id: record.home_node_id.clone(),
                 home_session_id: record.home_session_id.clone(),
-                local_prepare_id: input.local_prepare_id,
+                local_prepare_id: input.local_prepare_id.clone(),
                 created_at_revision: StoreRevision::ZERO,
                 updated_at_revision: StoreRevision::ZERO,
             };
@@ -466,18 +619,28 @@ impl OwnerRootAuthority for StoreOwnerRootAuthority {
         })
     }
 
-    fn lookup_root(&self, input: LookupRootInput) -> MetaFuture<'_, Option<RootRecord>> {
+    fn lookup_root(&self, input: LookupRootInput) -> MetaFuture<'_, RootLookupState> {
         Box::pin(async move {
             let snapshot = self
                 .store
-                .read(MetaRead::Root {
+                .read(MetaRead::RootState {
                     root_id: input.root_id,
                 })
                 .await?;
-            Ok(match snapshot.entity {
-                Some(MetaEntity::Root(root)) => Some(root),
-                _ => None,
-            })
+            let mut state = RootLookupState {
+                root: None,
+                reservation: None,
+            };
+            for entity in snapshot.entities {
+                match entity {
+                    MetaEntity::Root(root) => state.root = Some(root),
+                    MetaEntity::RootReservation(reservation) => {
+                        state.reservation = Some(reservation)
+                    }
+                    _ => return Err(invalid("root state read returned wrong entity type")),
+                }
+            }
+            Ok(state)
         })
     }
 
@@ -858,9 +1021,120 @@ impl OwnerRootAuthority for StoreOwnerRootAuthority {
     }
 }
 
+fn reservation_record(
+    input: &ReserveRootInput,
+    home: NodeSession,
+    root_epoch: u64,
+) -> RootReservationRecord {
+    RootReservationRecord {
+        root_id: input.root_id.clone(),
+        root_epoch,
+        home_node_id: home.node_id,
+        home_session_id: home.session_id,
+        create_intent_id: input.create_intent_id.clone(),
+        prepare_token: format!(
+            "prepare:{}:{}:{}:{}",
+            input.root_id, input.session_id, input.create_intent_id, input.request_id
+        ),
+        requester_node_id: input.preferred_home_node_id.clone(),
+        requester_session_id: input.session_id.clone(),
+        created_at_revision: StoreRevision::ZERO,
+    }
+}
+
+async fn reservation_requester_is_live(
+    store: &dyn MetaStore,
+    reservation: &RootReservationRecord,
+) -> Result<bool> {
+    let snapshot = store
+        .read(MetaRead::CurrentNodeSession {
+            node_id: reservation.requester_node_id.clone(),
+        })
+        .await?;
+    Ok(matches!(
+        snapshot.entity,
+        Some(MetaEntity::NodeSession(session))
+            if session.session_id == reservation.requester_session_id
+                && session.is_live_at_unix_ms(now_unix_ms())
+    ))
+}
+
+async fn select_home(
+    store: &dyn MetaStore,
+    load_balancing: bool,
+    root_id: &str,
+    requester_node_id: &str,
+    requester_session_id: &str,
+) -> Result<NodeSession> {
+    if !load_balancing {
+        return require_current_live_session(store, requester_node_id, requester_session_id).await;
+    }
+    let snapshot = store.read(MetaRead::CurrentNodeSessions).await?;
+    let sessions = snapshot
+        .entities
+        .into_iter()
+        .filter_map(|entity| match entity {
+            MetaEntity::NodeSession(session)
+                if session.ownerfs_enabled && session.is_live_at_unix_ms(now_unix_ms()) =>
+            {
+                Some(session)
+            }
+            _ => None,
+        });
+    let mut selected: Option<(blake3::Hash, NodeSession)> = None;
+    for session in sessions {
+        let score = placement_score(root_id, &session.node_id);
+        let replace = selected
+            .as_ref()
+            .is_none_or(|(selected_score, selected_session)| {
+                placement_is_preferred(
+                    &score,
+                    &session.node_id,
+                    selected_score,
+                    &selected_session.node_id,
+                )
+            });
+        if replace {
+            selected = Some((score, session));
+        }
+    }
+    selected
+        .map(|(_, session)| session)
+        .ok_or_else(|| home_unavailable("no live node is available for workspace creation"))
+}
+
+fn placement_is_preferred(
+    score: &blake3::Hash,
+    node_id: &str,
+    selected_score: &blake3::Hash,
+    selected_node_id: &str,
+) -> bool {
+    score.as_bytes().cmp(selected_score.as_bytes()).is_gt()
+        || (score == selected_score && node_id < selected_node_id)
+}
+
+fn placement_score(root_id: &str, node_id: &str) -> blake3::Hash {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"afs-ownerfs-placement-v1");
+    hasher.update(
+        &u64::try_from(root_id.len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    hasher.update(root_id.as_bytes());
+    hasher.update(
+        &u64::try_from(node_id.len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    hasher.update(node_id.as_bytes());
+    hasher.finalize()
+}
+
 pub struct ReserveRootInput {
     pub request_id: String,
     pub root_id: String,
+    /// Entry node identity; Meta selects the actual Home.
     pub preferred_home_node_id: String,
     pub session_id: String,
     pub rights: Vec<RootRight>,
@@ -888,6 +1162,8 @@ pub struct WireRootReservation {
     pub session_id: String,
     pub create_intent_id: String,
     pub prepare_token: String,
+    pub requester_node_id: String,
+    pub requester_session_id: String,
 }
 
 pub struct AbortRootInput {
@@ -912,6 +1188,12 @@ pub struct DeactivateRootInput {
 
 pub struct LookupRootInput {
     pub root_id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RootLookupState {
+    pub root: Option<RootRecord>,
+    pub reservation: Option<RootReservationRecord>,
 }
 
 pub struct ListOwnerRootsInput {
@@ -1017,11 +1299,81 @@ async fn commit_or_replay(store: &dyn MetaStore, txn: MetaTxn) -> Result<Operati
     }
 }
 
+fn take_reserve_result(
+    result: OperationResult,
+    input: &ReserveRootInput,
+) -> Result<RootReservationRecord> {
+    let OperationResult::RootReservation(reservation) = result else {
+        return Err(invalid("reserve replay returned wrong result type"));
+    };
+    if reservation.root_id != input.root_id
+        || reservation.root_epoch == 0
+        || reservation.root_epoch < input.expected_root_epoch
+        || reservation.create_intent_id != input.create_intent_id
+        || reservation.requester_node_id != input.preferred_home_node_id
+        || reservation.requester_session_id != input.session_id
+    {
+        return Err(invalid("reserve replay parameters do not match"));
+    }
+    Ok(reservation)
+}
+
+async fn classify_reserve_outcome(
+    store: &dyn MetaStore,
+    outcome: TxnOutcome,
+    root_id: &str,
+    previous_reservation: Option<&RootReservationRecord>,
+) -> Result<OperationResult> {
+    match outcome {
+        TxnOutcome::Committed { outcome, .. } => Ok(outcome.result),
+        TxnOutcome::ConditionFailed {
+            existing_outcome: Some(outcome),
+            ..
+        } if outcome.operation == StoreOperation::ReserveRoot => Ok(outcome.result),
+        TxnOutcome::ConditionFailed {
+            existing_outcome: Some(_),
+            ..
+        } => Err(invalid(
+            "request_id was already used for a different Meta operation",
+        )),
+        TxnOutcome::ConditionFailed {
+            existing_outcome: None,
+            ..
+        } => {
+            let state = store
+                .read(MetaRead::RootState {
+                    root_id: root_id.to_owned(),
+                })
+                .await?;
+            if state
+                .entities
+                .iter()
+                .any(|entity| matches!(entity, MetaEntity::Root(_)))
+            {
+                return Err(root_exists("root was activated while reserving"));
+            }
+            if let Some(reservation) = state.entities.iter().find_map(|entity| match entity {
+                MetaEntity::RootReservation(reservation) => Some(reservation),
+                _ => None,
+            }) && Some(reservation) != previous_reservation
+            {
+                return Err(root_busy("root is reserved by another request"));
+            }
+            // The old reservation can remain when requester/Home authority
+            // changed before commit. Its unchanged identity is not evidence
+            // that another request won the name.
+            Err(home_unavailable(
+                "node authority changed while reserving; caller must refresh authority state",
+            ))
+        }
+    }
+}
+
 async fn require_current_live_session(
     store: &dyn MetaStore,
     node_id: &str,
     session_id: &str,
-) -> Result<()> {
+) -> Result<NodeSession> {
     let snapshot = store
         .read(MetaRead::CurrentNodeSession {
             node_id: node_id.to_owned(),
@@ -1031,7 +1383,7 @@ async fn require_current_live_session(
         Some(MetaEntity::NodeSession(session))
             if session.session_id == session_id && session.is_live_at_unix_ms(now_unix_ms()) =>
         {
-            Ok(())
+            Ok(session)
         }
         _ => Err(invalid("node session is not current")),
     }
@@ -1100,6 +1452,18 @@ fn invalid(message: impl Into<String>) -> Error {
     Error::coded(afs_error::META_CATALOG_INVALID_REQUEST, message)
 }
 
+fn root_exists(message: impl Into<String>) -> Error {
+    Error::coded(afs_error::META_OWNER_ROOT_EXISTS, message)
+}
+
+fn root_busy(message: impl Into<String>) -> Error {
+    Error::coded(afs_error::META_OWNER_ROOT_BUSY, message)
+}
+
+fn home_unavailable(message: impl Into<String>) -> Error {
+    Error::coded(afs_error::META_OWNER_HOME_UNAVAILABLE, message)
+}
+
 fn permission_denied(message: impl Into<String>) -> Error {
     Error::coded(afs_error::CLIENT_PERMISSION_DENIED, message)
 }
@@ -1139,6 +1503,7 @@ mod retention_tests {
                     grpc_addr: "http://n:1".into(),
                     data_addr: "http://n:2".into(),
                     rest_addr: "http://n:3".into(),
+                    ownerfs_enabled: true,
                     storage_devices: vec![],
                     lease_ttl: std::time::Duration::from_secs(30),
                 },
@@ -1206,6 +1571,7 @@ mod retention_tests {
                         grpc_addr: "http://other:1".into(),
                         data_addr: "http://other:2".into(),
                         rest_addr: "http://other:3".into(),
+                        ownerfs_enabled: true,
                         storage_devices: vec![],
                         lease_ttl: std::time::Duration::from_secs(30),
                     },
@@ -1263,5 +1629,266 @@ mod retention_tests {
     fn uuid_id() -> u64 {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::meta::store::journal::MemoryLog;
+    use crate::meta::store::{NodeSessionLease, Store};
+    use std::time::Duration;
+
+    fn wire_reservation(reservation: &RootReservationRecord) -> WireRootReservation {
+        WireRootReservation {
+            root_id: reservation.root_id.clone(),
+            root_epoch: reservation.root_epoch,
+            home_node_id: reservation.home_node_id.clone(),
+            session_id: reservation.home_session_id.clone(),
+            create_intent_id: reservation.create_intent_id.clone(),
+            prepare_token: reservation.prepare_token.clone(),
+            requester_node_id: reservation.requester_node_id.clone(),
+            requester_session_id: reservation.requester_session_id.clone(),
+        }
+    }
+
+    async fn register_node(store: &Store, node_id: &str, session_id: &str) {
+        register_node_with_ttl(store, node_id, session_id, Duration::from_secs(60)).await;
+    }
+
+    async fn register_node_with_ttl(
+        store: &Store,
+        node_id: &str,
+        session_id: &str,
+        lease_ttl: Duration,
+    ) {
+        store
+            .register_node_session(
+                RequestKey::new(
+                    node_id,
+                    format!("register-{session_id}-{}", lease_ttl.as_nanos()),
+                ),
+                NodeSessionLease {
+                    node_id: node_id.into(),
+                    session_id: session_id.into(),
+                    grpc_addr: format!("http://{node_id}:7400"),
+                    data_addr: format!("http://{node_id}:7500"),
+                    rest_addr: format!("http://{node_id}:7600"),
+                    ownerfs_enabled: true,
+                    storage_devices: Vec::new(),
+                    lease_ttl,
+                },
+            )
+            .await
+            .expect("register test node");
+    }
+
+    async fn open_store() -> Arc<Store> {
+        Arc::new(
+            Store::open_log(Arc::new(MemoryLog::new(Default::default()).unwrap()))
+                .await
+                .expect("open memory store"),
+        )
+    }
+
+    fn reserve_input(
+        requester_node_id: &str,
+        requester_session_id: &str,
+        request_id: &str,
+        create_intent_id: &str,
+    ) -> ReserveRootInput {
+        ReserveRootInput {
+            request_id: request_id.into(),
+            root_id: "root-6167656e742d61".into(),
+            rights: vec![RootRight::Lookup],
+            expected_root_epoch: 0,
+            create_intent_id: create_intent_id.into(),
+            preferred_home_node_id: requester_node_id.into(),
+            session_id: requester_session_id.into(),
+        }
+    }
+
+    #[test]
+    fn equal_placement_scores_prefer_the_smallest_node_id() {
+        let tied = blake3::Hash::from_bytes([0x80; 32]);
+        assert!(placement_is_preferred(&tied, "node-a", &tied, "node-b"));
+        assert!(!placement_is_preferred(&tied, "node-b", &tied, "node-a"));
+        assert!(!placement_is_preferred(&tied, "node-a", &tied, "node-a"));
+        let smaller = blake3::Hash::from_bytes([0x7f; 32]);
+        assert!(placement_is_preferred(&tied, "node-z", &smaller, "node-a"));
+        assert!(!placement_is_preferred(&smaller, "node-a", &tied, "node-z"));
+    }
+
+    #[test]
+    fn placement_scores_match_independent_blake3_vectors() {
+        // Computed independently with Python blake3 from the documented byte
+        // layout; these constants pin domain, lengths, order and digest bytes.
+        for (root_id, node_id, expected) in [
+            (
+                "root-6167656e742d61",
+                "node-a",
+                "ed8e0b31e0c45cf6ed45eb3391531a6e78039ee7b62850de0e0fa398c5d3b350",
+            ),
+            (
+                "root-6167656e742d61",
+                "node-b",
+                "ef11aee7c1e2f56af8279c5df511cae7fda66d2606e82cec1e1406b7e208243f",
+            ),
+            (
+                "root-ff80",
+                "node-a",
+                "3269e57524da2f1ede6a434ff7c4150a6e505a027365b7b2e9fa3977c3b4f19d",
+            ),
+        ] {
+            assert_eq!(
+                placement_score(root_id, node_id).to_hex().as_str(),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn load_balancing_selects_current_live_home_and_persists_requester() {
+        let store = open_store().await;
+        register_node(&store, "node-a", "session-a").await;
+        register_node(&store, "node-b", "old-session-b").await;
+        register_node(&store, "node-b", "session-b").await;
+        let authority = StoreOwnerRootAuthority::with_load_balancing(store.clone(), true);
+        let input = reserve_input("node-a", "session-a", "reserve-1", "intent-1");
+        let output = authority.reserve_root(input).await.expect("reserve root");
+        assert_eq!(output.reservation.home_node_id, "node-b");
+        assert_eq!(output.reservation.home_session_id, "session-b");
+        assert_eq!(output.reservation.requester_node_id, "node-a");
+        assert_eq!(output.reservation.requester_session_id, "session-a");
+
+        register_node_with_ttl(&store, "node-b", "session-b", Duration::from_millis(5)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let selected = select_home(
+            store.as_ref(),
+            true,
+            "root-6167656e742d61",
+            "node-a",
+            "session-a",
+        )
+        .await
+        .expect("expired higher-scoring candidate must be excluded");
+        assert_eq!(selected.node_id, "node-a");
+    }
+
+    #[tokio::test]
+    async fn activate_replay_rejects_a_different_prepare_identity() {
+        let store = open_store().await;
+        register_node(store.as_ref(), "node-a", "session-a").await;
+        let authority = StoreOwnerRootAuthority::new(store);
+        let reservation = authority
+            .reserve_root(ReserveRootInput {
+                request_id: "reserve-1".into(),
+                root_id: "root-6167656e742d61".into(),
+                rights: vec![RootRight::Lookup],
+                expected_root_epoch: 0,
+                create_intent_id: "node-a:session-a:agent-a".into(),
+                preferred_home_node_id: "node-a".into(),
+                session_id: "session-a".into(),
+            })
+            .await
+            .expect("reserve root")
+            .reservation;
+
+        authority
+            .activate_root(ActivateRootInput {
+                request_id: "activate-1".into(),
+                reservation: wire_reservation(&reservation),
+                local_prepare_id: "local-prepare-1".into(),
+            })
+            .await
+            .expect("activate root");
+
+        let replay = authority
+            .activate_root(ActivateRootInput {
+                request_id: "activate-1".into(),
+                reservation: wire_reservation(&reservation),
+                local_prepare_id: "local-prepare-2".into(),
+            })
+            .await
+            .expect_err("changed prepare identity must not replay the grant");
+        assert_eq!(replay.code(), afs_error::META_CATALOG_INVALID_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn disabled_load_balancing_keeps_requester_as_home() {
+        let store = open_store().await;
+        register_node(store.as_ref(), "node-a", "session-a").await;
+        register_node(store.as_ref(), "node-b", "session-b").await;
+        let output = StoreOwnerRootAuthority::new(store)
+            .reserve_root(reserve_input(
+                "node-a",
+                "session-a",
+                "reserve-1",
+                "node-a:session-a:agent-a",
+            ))
+            .await
+            .expect("reserve root with local fallback");
+        assert_eq!(output.reservation.home_node_id, "node-a");
+    }
+
+    #[tokio::test]
+    async fn dfs_only_node_is_not_a_workspace_home() {
+        let store = open_store().await;
+        store
+            .register_node_session(
+                RequestKey::new("node-b", "register-dfs"),
+                NodeSessionLease {
+                    node_id: "node-b".into(),
+                    session_id: "session-b".into(),
+                    grpc_addr: "http://node-b:7400".into(),
+                    data_addr: "http://node-b:7500".into(),
+                    rest_addr: "http://node-b:7600".into(),
+                    ownerfs_enabled: false,
+                    storage_devices: Vec::new(),
+                    lease_ttl: Duration::from_secs(60),
+                },
+            )
+            .await
+            .unwrap();
+        let error = select_home(
+            store.as_ref(),
+            true,
+            "root-6167656e742d61",
+            "node-b",
+            "session-b",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), afs_error::META_OWNER_HOME_UNAVAILABLE);
+        register_node(&store, "node-a", "session-a").await;
+        // node-b has the higher HRW score for this name, but cannot create OwnerFs roots.
+        let home = select_home(
+            store.as_ref(),
+            true,
+            "root-6167656e742d61",
+            "node-a",
+            "session-a",
+        )
+        .await
+        .unwrap();
+        assert_eq!(home.node_id, "node-a");
+    }
+
+    #[tokio::test]
+    async fn no_live_candidate_returns_structured_unavailable() {
+        let store = open_store().await;
+        let error = match StoreOwnerRootAuthority::with_load_balancing(store, true)
+            .reserve_root(reserve_input(
+                "node-a",
+                "session-a",
+                "reserve-1",
+                "node-a:session-a:agent-a",
+            ))
+            .await
+        {
+            Ok(_) => panic!("no live candidate must fail"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), afs_error::META_OWNER_HOME_UNAVAILABLE);
     }
 }

@@ -29,8 +29,8 @@ use afs::node::{
             catalog::LocalRootRecord,
             remote::RemoteFiles,
             root::{
-                PreparedRoot, RootGrant, RootId, RootLocation, RootManager, RootMeta,
-                RootReservation, RootRight, root_id_from_name,
+                PreparedRoot, RootGrant, RootId, RootLocation, RootLookupState, RootManager,
+                RootMeta, RootReservation, RootRight, root_id_from_name,
             },
         },
         types::{BackendInode, RenameFlags, RequestContext},
@@ -185,6 +185,7 @@ zNEGIq4pivkTMT3xJGFmgGqs
 #[derive(Default)]
 struct ContractMeta {
     active: Mutex<Option<RootGrant>>,
+    pending: Mutex<Option<RootReservation>>,
     validate_calls: Mutex<usize>,
     block_on_validation: bool,
 }
@@ -225,20 +226,32 @@ impl RootMeta for ContractMeta {
         id: &RootId,
         create_intent_id: &str,
     ) -> afs_error::Result<RootReservation> {
-        Ok(RootReservation {
+        let reservation = RootReservation {
             id: id.clone(),
             epoch: 1,
             home_node_id: "node-a".to_owned(),
             session_id: "session-a".to_owned(),
             create_intent_id: create_intent_id.to_owned(),
             prepare_token: "prepare-token".to_owned(),
-        })
+            requester_node_id: "node-a".into(),
+            requester_session_id: "session-a".into(),
+        };
+        *self.pending.lock().unwrap() = Some(reservation.clone());
+        Ok(reservation)
     }
 
     fn activate_root(&self, prepared: &PreparedRoot) -> afs_error::Result<RootGrant> {
+        let reservation = prepared.reservation();
+        let pending = self.pending.lock().unwrap().take();
+        if pending.as_ref() != Some(reservation) {
+            return Err(afs_error::Error::coded(
+                afs_error::NODE_OWNER_GRANT_UNAVAILABLE,
+                "test activation does not match pending reservation",
+            ));
+        }
         let grant = RootGrant {
-            id: prepared.reservation().id().clone(),
-            epoch: prepared.reservation().epoch,
+            id: reservation.id().clone(),
+            epoch: reservation.epoch,
             home_node_id: "node-a".to_owned(),
             home_session_id: "session-a".to_owned(),
             holder_node_id: "node-a".to_owned(),
@@ -251,7 +264,11 @@ impl RootMeta for ContractMeta {
         Ok(grant)
     }
 
-    fn abort_root(&self, _reservation: &RootReservation) -> afs_error::Result<()> {
+    fn abort_root(&self, reservation: &RootReservation) -> afs_error::Result<()> {
+        let mut pending = self.pending.lock().unwrap();
+        if pending.as_ref() == Some(reservation) {
+            *pending = None;
+        }
         Ok(())
     }
 
@@ -281,6 +298,23 @@ impl RootMeta for ContractMeta {
             }))
     }
 
+    fn lookup_root_state(&self, id: &RootId) -> afs_error::Result<RootLookupState> {
+        let active = self.active.lock().unwrap().clone();
+        let pending = self.pending.lock().unwrap().clone();
+        Ok(RootLookupState {
+            location: active
+                .as_ref()
+                .filter(|grant| &grant.id == id)
+                .map(|grant| RootLocation {
+                    id: grant.id.clone(),
+                    epoch: grant.epoch,
+                    home_node_id: grant.home_node_id.clone(),
+                    home_session_id: grant.home_session_id.clone(),
+                }),
+            reservation: pending.filter(|reservation| &reservation.id == id),
+        })
+    }
+
     fn list_owner_roots(
         &self,
         home_node_id: &str,
@@ -300,7 +334,14 @@ impl RootMeta for ContractMeta {
                 })
                 .into_iter()
                 .collect(),
-            pending: Vec::new(),
+            pending: self
+                .pending
+                .lock()
+                .unwrap()
+                .clone()
+                .filter(|reservation| reservation.home_node_id == home_node_id)
+                .into_iter()
+                .collect(),
         })
     }
 

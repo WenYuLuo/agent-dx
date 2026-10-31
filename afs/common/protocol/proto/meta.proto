@@ -159,6 +159,8 @@ message RootReservation {
   string session_id = 4;
   string create_intent_id = 5;
   string prepare_token = 6;
+  string requester_node_id = 7;
+  string requester_session_id = 8;
 }
 
 message ReserveRootRequest {
@@ -225,6 +227,7 @@ message LookupRootRequest {
 message LookupRootReply {
   RootLocation location = 1;
   bool found = 2;
+  RootReservation reservation = 3;
 }
 
 message ListOwnerRootsRequest {

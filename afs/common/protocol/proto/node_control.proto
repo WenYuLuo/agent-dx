@@ -2,6 +2,7 @@ syntax = "proto3";
 package afs.node.control.v1;
 
 import "node_data.proto";
+import "meta.proto";
 
 // 会话协商/close 是传输资源控制，不是目录读写授权。
 // 就绪通过 RDMA SEND_WITH_IMM 探测确认，不再提供 ReadyData RPC。
@@ -13,6 +14,8 @@ import "node_data.proto";
 // 不承载文件内容。
 
 service NodeControl {
+  // Prepare and activate a durable workspace reservation on its Home.
+  rpc PrepareOwnerRoot(PrepareOwnerRootRequest) returns (PrepareOwnerRootReply);
   // Home owns advisory lock authority; no file payload travels here.
   rpc OwnerGetLock(OwnerGetLockRequest) returns (OwnerGetLockReply);
   rpc OwnerSetLock(OwnerSetLockRequest) returns (OwnerSetLockReply);
@@ -40,6 +43,16 @@ service NodeControl {
   rpc DfsOwnerReleaseLockSession(DfsOwnerReleaseLockSessionRequest) returns (DfsOwnerReleaseLockSessionReply);
   rpc DfsOwnerRelease(DfsOwnerReleaseRequest) returns (DfsOwnerReleaseReply);
 }
+
+message PrepareOwnerRootRequest {
+  afs.meta.v1.RootReservation reservation = 1;
+  bytes name = 2;
+  uint32 uid = 3;
+  uint32 gid = 4;
+  uint32 mode = 5;
+}
+
+message PrepareOwnerRootReply {}
 
 message NegotiateDataRequest {
   bytes client_info = 1;

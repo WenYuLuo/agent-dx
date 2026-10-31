@@ -1,8 +1,9 @@
 //! OwnerFs 的根目录身份、授权缓存与创建合同。
 //!
 //! `mkdir /ownerfs/job-42` 与根内的 `open job-42/a.txt` 是两条不同的路径：
-//! 前者先向 Meta 预留根，再准备本地目录并激活；后者应凭已缓存的有效
-//! 根授权直接访问本地普通文件。这里不保存逐文件的 inode 或数据。
+//! 前者先向 Meta 预留根，再由选定的 Home（本机或远端）准备目录并激活；
+//! 后者应凭已缓存的有效根授权直接访问本地普通文件。这里不保存逐文件的
+//! inode 或数据。
 //!
 //! 启动必须先核对 Meta 的 pending/active 状态、本机 catalog 与物理目录，
 //! 才能把根放进热路径。目录存在或预留成功都不构成访问授权。
@@ -10,9 +11,12 @@
 use std::{
     collections::{HashMap, HashSet},
     ffi::{OsStr, OsString},
-    os::unix::ffi::OsStrExt,
+    os::unix::{
+        ffi::{OsStrExt, OsStringExt},
+        fs::MetadataExt,
+    },
     sync::{
-        Arc, Condvar, Mutex, RwLock,
+        Arc, Condvar, Mutex, RwLock, Weak,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -22,7 +26,7 @@ use afs_error::{Error, Result};
 use super::catalog::{
     LocalFsRootCatalog, LocalRootCatalog, LocalRootRecord, LockedLocalRootCatalog,
 };
-use crate::node::storage::{FileStore, LocalFs, StoragePath};
+use crate::node::storage::{DirectoryHandle, FileStore, LocalFs, StoragePath};
 
 /// Meta 使用的稳定根身份；与 FUSE inode、磁盘目录名均不同。
 ///
@@ -58,6 +62,25 @@ pub struct RootReservation {
     pub session_id: String,
     pub create_intent_id: String,
     pub prepare_token: String,
+    pub requester_node_id: String,
+    pub requester_session_id: String,
+}
+
+/// Transient parameters supplied by the mkdir caller, never persisted in Meta.
+#[derive(Clone, Debug)]
+pub struct RootCreateParams {
+    pub name: Vec<u8>,
+    pub uid: u32,
+    pub gid: u32,
+    /// Directory permissions after applying the caller's umask (0o7777 bits).
+    pub mode: u32,
+}
+
+/// One consistent Meta observation of an active root or a pending creation.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RootLookupState {
+    pub location: Option<RootLocation>,
+    pub reservation: Option<RootReservation>,
 }
 
 /// One linearizable Meta view for startup. Reading active and pending in two
@@ -178,6 +201,7 @@ pub(crate) struct HomeRootRevocation {
 /// 只发生于创建、未命中和恢复等慢路径；适配器不得在 Tokio worker
 /// 上直接阻塞，也不得让调用方持有根状态锁等待网络。
 pub trait RootMeta: Send + Sync {
+    /// Reserve a root for this entry session; Meta determines its Home.
     fn reserve_root(&self, id: &RootId, create_intent_id: &str) -> Result<RootReservation>;
     fn activate_root(&self, prepared: &PreparedRoot) -> Result<RootGrant>;
     fn abort_root(&self, reservation: &RootReservation) -> Result<()>;
@@ -193,6 +217,14 @@ pub trait RootMeta: Send + Sync {
         session_id: &str,
     ) -> Result<()>;
     fn lookup_root(&self, id: &RootId) -> Result<Option<RootLocation>>;
+    /// Return active and pending state in one linearizable observation.
+    fn lookup_root_state(&self, id: &RootId) -> Result<RootLookupState> {
+        let _ = id;
+        Err(Error::coded(
+            afs_error::META_STORE_UNIMPLEMENTED,
+            "RootMeta root state lookup is not wired",
+        ))
+    }
     /// Linearizable Home inventory, including prior process sessions. An
     /// active root without catalog must prevent mount; a pending root must be
     /// canceled or reconciled before access is enabled.
@@ -448,9 +480,15 @@ pub struct RootManager {
     catalog: Box<dyn LockedLocalRootCatalog>,
     control_valid: AtomicBool,
     roots: RwLock<HashMap<RootId, Arc<LocalRoot>>>,
+    workspace_locks: Mutex<HashMap<RootId, Weak<Mutex<()>>>>,
 }
 
 impl RootManager {
+    #[must_use]
+    pub fn node_id(&self) -> &str {
+        &self.local_node_id
+    }
+
     /// Open the production root manager, hold the local catalog lock for the
     /// process lifetime, and recover all durable local roots through Meta before
     /// the VFS is mounted. Any invalid durable root fails closed by returning an
@@ -481,6 +519,7 @@ impl RootManager {
             catalog,
             control_valid: AtomicBool::new(true),
             roots: RwLock::new(HashMap::new()),
+            workspace_locks: Mutex::new(HashMap::new()),
         };
         manager.reconcile_on_startup()?;
         Ok(manager)
@@ -500,76 +539,228 @@ impl RootManager {
             .expect("OwnerFs root catalog must open before mounting")
     }
 
-    /// Create a first-level OwnerFs root on the local node.
-    ///
-    /// This is the slow path behind `mkdir /ownerfs/<root>`. It reserves coarse
-    /// authority in Meta, creates a local ordinary directory, syncs the parent,
-    /// activates the root, then returns a normal hot-path grant. File operations
-    /// below the root do not come back here or touch Meta per write.
-    pub fn create_root(&self, name: &OsStr, mode: u32) -> Result<RootUse> {
+    fn workspace_lock(&self, id: &RootId) -> Result<Arc<Mutex<()>>> {
+        let mut locks = self
+            .workspace_locks
+            .lock()
+            .map_err(|_| invalid_grant("workspace lock map poisoned"))?;
+        locks.retain(|_, lock| lock.upgrade().is_some());
+        if let Some(lock) = locks.get(id).and_then(Weak::upgrade) {
+            return Ok(lock);
+        }
+        let lock = Arc::new(Mutex::new(()));
+        locks.insert(id.clone(), Arc::downgrade(&lock));
+        Ok(lock)
+    }
+
+    /// Reserve a first-level workspace for this entry session.
+    /// Same-session retries reuse a pending Home reservation.
+    pub fn reserve_workspace(&self, name: &OsStr) -> Result<RootReservation> {
         let id = root_id_from_name(name)?;
         let create_intent_id = format!("{}:{}:{}", self.local_node_id, self.session_id, id.0);
         let reservation = self.meta.reserve_root(&id, &create_intent_id)?;
         if reservation.id != id
-            || reservation.home_node_id != self.local_node_id
-            || reservation.session_id != self.session_id
+            || reservation.create_intent_id != create_intent_id
+            || reservation.requester_node_id != self.local_node_id
+            || reservation.requester_session_id != self.session_id
             || reservation.epoch == 0
+            || reservation.home_node_id.is_empty()
+            || reservation.session_id.is_empty()
             || reservation.prepare_token.is_empty()
         {
-            return Err(invalid_grant("reserved root does not match this Node"));
+            return Err(invalid_grant(
+                "reserved workspace does not match this entry session",
+            ));
         }
+        Ok(reservation)
+    }
 
-        let data_dir = root_data_dir(name, reservation.epoch)?;
-        let local_prepare_id = format!("{}:{}", reservation.prepare_token, self.session_id);
-        match self.disk.mkdir(&data_dir, mode) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                if !self.disk.metadata(&data_dir).map_err(Error::from)?.is_dir() {
-                    let _ = self.meta.abort_root(&reservation);
-                    return Err(invalid_grant(
-                        "reserved root path exists but is not a directory",
-                    ));
-                }
-                let old = self
-                    .catalog
-                    .scan_roots()?
-                    .into_iter()
-                    .find(|record| record.id == id);
-                if old.is_none() {
-                    // A crash may leave an empty directory after the Meta
-                    // reservation was canceled. Never silently reuse its
-                    // contents as a new root with the same epoch.
-                    self.disk.remove_dir(&data_dir).map_err(Error::from)?;
-                    self.disk.sync_root().map_err(Error::from)?;
-                    self.disk.mkdir(&data_dir, mode).map_err(Error::from)?;
-                }
-            }
+    /// Prepare a reserved workspace on this node when it is the selected Home.
+    /// Reusing a prepared directory with different uid, gid or mode returns
+    /// IO_INVALID without cancelling the pending reservation.
+    /// The workspace lock covers the Meta identity check, local directory
+    /// preparation, catalog publication and activation, preventing duplicate notifications from interleaving with the create.
+    pub fn prepare_owner_root(
+        &self,
+        requester_node_id: &str,
+        reservation: &RootReservation,
+        params: &RootCreateParams,
+    ) -> Result<()> {
+        let lock = self.workspace_lock(&reservation.id)?;
+        let _guard = lock
+            .lock()
+            .map_err(|_| invalid_grant("workspace lock poisoned"))?;
+        self.validate_home_reservation(requester_node_id, reservation, params)?;
+        let state = self.meta.lookup_root_state(&reservation.id)?;
+        if state.location.is_some() {
+            return Err(Error::coded(
+                afs_error::IO_ALREADY_EXISTS,
+                "workspace is already active",
+            ));
+        }
+        if state.reservation.as_ref() != Some(reservation) {
+            return Err(invalid_grant(
+                "workspace reservation changed before Home preparation",
+            ));
+        }
+        let prepared = match self.prepare_local_root(reservation, params) {
+            Ok(prepared) => prepared,
             Err(error) => {
-                let _ = self.meta.abort_root(&reservation);
-                return Err(Error::from(error));
+                if let Err(abort_error) = self.meta.abort_root(reservation) {
+                    afs_logging::warn!("ownerfs.prepare_abort_unconfirmed";
+                        "root_id" => reservation.id.0.clone(),
+                        "home_node_id" => self.local_node_id.clone(),
+                        "create_intent_id" => reservation.create_intent_id.clone(),
+                        "prepare_error" => error.to_string(),
+                        "abort_error" => abort_error.to_string());
+                }
+                return Err(error);
             }
-        }
-        if let Err(error) = self.disk.sync_root() {
-            let _ = self.meta.abort_root(&reservation);
-            return Err(Error::from(error));
-        }
-        let record = LocalRootRecord {
-            id: reservation.id.clone(),
-            name: name.to_os_string(),
-            epoch: reservation.epoch,
-            data_dir: data_dir.clone(),
-            local_prepare_id: local_prepare_id.clone(),
         };
-        if let Err(error) = self.catalog.persist_prepared_root(&record) {
-            let _ = self.meta.abort_root(&reservation);
-            return Err(error);
+        let metadata = self.disk.metadata(prepared.data_dir())?;
+        if metadata.uid() != params.uid
+            || metadata.gid() != params.gid
+            || metadata.mode() & 0o7777 != params.mode
+        {
+            return Err(Error::coded(
+                afs_error::IO_INVALID,
+                "workspace creation parameters differ from the prepared directory",
+            ));
         }
-        let prepared = PreparedRoot::new(reservation, data_dir, local_prepare_id, 1);
-        // Activate may have committed even if the RPC reply was lost. Keep the
-        // synced catalog record on *any* error; startup can then distinguish an
-        // active root from a pending reservation and recover or abort safely.
-        self.activate_prepared(name.to_os_string(), &prepared)?;
-        self.enter_root(prepared.reservation().id(), RootRight::Write)
+        // Activation may commit before a reply is lost. Keep the durable catalog
+        // on any activation error; startup recovery resolves the current state.
+        self.activate_prepared(OsString::from_vec(params.name.clone()), &prepared)
+    }
+
+    fn validate_home_reservation(
+        &self,
+        requester_node_id: &str,
+        reservation: &RootReservation,
+        params: &RootCreateParams,
+    ) -> Result<()> {
+        if !self.control_valid.load(Ordering::Acquire) {
+            return Err(unavailable_grant("Meta control session is invalid"));
+        }
+        if requester_node_id.is_empty()
+            || reservation.epoch == 0
+            || reservation.home_node_id != self.local_node_id
+            || reservation.session_id != self.session_id
+            || reservation.prepare_token.is_empty()
+            || reservation.requester_node_id != requester_node_id
+            || reservation.requester_session_id.is_empty()
+        {
+            return Err(invalid_grant(
+                "workspace reservation identity is incomplete",
+            ));
+        }
+        if root_id_from_name(OsStr::from_bytes(&params.name))? != reservation.id
+            || params.mode & !0o7777 != 0
+        {
+            return Err(invalid_grant("workspace name or permissions are invalid"));
+        }
+        let expected = format!(
+            "{}:{}:{}",
+            reservation.requester_node_id, reservation.requester_session_id, reservation.id.0
+        );
+        if reservation.create_intent_id != expected {
+            return Err(invalid_grant("workspace create intent id is not canonical"));
+        }
+        Ok(())
+    }
+
+    /// Prepare durable local evidence while the caller holds the workspace lock.
+    /// Errors here precede activation and can safely cancel this reservation.
+    fn prepare_local_root(
+        &self,
+        reservation: &RootReservation,
+        params: &RootCreateParams,
+    ) -> Result<PreparedRoot> {
+        let name = OsString::from_vec(params.name.clone());
+        let data_dir = root_data_dir(&name, reservation.epoch)?;
+        let local_prepare_id = format!("{}:{}", reservation.prepare_token, self.session_id);
+        let mut local_record = self.catalog.lookup_root(&reservation.id)?;
+        if let Some(record) = &local_record
+            && record.epoch < reservation.epoch
+        {
+            // The current reservation was verified under the workspace lock.
+            // Remove only an obsolete, canonical directory without a local runtime.
+            if record.epoch == 0
+                || record.name != name
+                || root_id_from_name(&record.name)? != record.id
+                || root_data_dir(&record.name, record.epoch)? != record.data_dir
+                || record.local_prepare_id.is_empty()
+                || self
+                    .roots
+                    .read()
+                    .map_err(|_| invalid_grant("root cache lock poisoned"))?
+                    .contains_key(&record.id)
+            {
+                return Err(invalid_grant(
+                    "conflicting local catalog record already exists",
+                ));
+            }
+            self.remove_abandoned_dir(&record.data_dir)?;
+            self.catalog.remove_prepared_root(record)?;
+            local_record = None;
+        }
+        if let Some(record) = local_record {
+            if record.name != name
+                || record.epoch != reservation.epoch
+                || record.data_dir != data_dir
+                || record.local_prepare_id != local_prepare_id
+            {
+                return Err(invalid_grant(
+                    "conflicting local catalog record already exists",
+                ));
+            }
+            if !self.disk.metadata(&data_dir)?.is_dir() {
+                return Err(invalid_grant(
+                    "local catalog points to a missing workspace directory",
+                ));
+            }
+        } else {
+            // Keep the directory owner-readable while opening the durability
+            // handle. The requested final mode may be 000, and LocalFs opens
+            // directories with O_RDONLY.
+            let temporary_mode = params.mode | 0o700;
+            match self.disk.mkdir(&data_dir, temporary_mode) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if !self.disk.metadata(&data_dir)?.is_dir() {
+                        return Err(invalid_grant(
+                            "reserved workspace path exists but is not a directory",
+                        ));
+                    }
+                    self.disk.remove_dir(&data_dir)?;
+                    self.disk.sync_root()?;
+                    self.disk.mkdir(&data_dir, temporary_mode)?;
+                }
+                Err(error) => return Err(Error::from(error)),
+            }
+            // A daemon umask may have removed the temporary owner bits from
+            // mkdir; chmod before open makes the handle acquisition reliable.
+            self.disk.chmod(&data_dir, temporary_mode)?;
+            let directory = self.disk.open_dir(&data_dir)?;
+            self.disk
+                .chown(&data_dir, Some(params.uid), Some(params.gid))?;
+            self.disk.chmod(&data_dir, params.mode)?;
+            directory.sync_all()?;
+            self.disk.sync_root()?;
+            let record = LocalRootRecord {
+                id: reservation.id.clone(),
+                name,
+                epoch: reservation.epoch,
+                data_dir: data_dir.clone(),
+                local_prepare_id: local_prepare_id.clone(),
+            };
+            self.catalog.persist_prepared_root(&record)?;
+        }
+        Ok(PreparedRoot::new(
+            reservation.clone(),
+            data_dir,
+            local_prepare_id,
+            1,
+        ))
     }
 
     /// B-side slow path: locate a root without granting file access.
@@ -1058,6 +1249,10 @@ impl RootManager {
     /// 执行步骤见 [`RootManager::delete_root`] 文档；每步成功后记录 info，
     /// 任一步失败时提前返回，统一由外层 `delete_root` 记录失败日志。
     fn delete_root_inner(&self, id: &RootId) -> Result<()> {
+        let lock = self.workspace_lock(id)?;
+        let _guard = lock
+            .lock()
+            .map_err(|_| invalid_grant("workspace lock poisoned"))?;
         // 1. revoke — 阻止新的 enter_root。
         self.revoke_root(id);
 
@@ -1189,9 +1384,13 @@ impl RootManager {
                 let expected_dir = root_data_dir(&record.name, reservation.epoch)?;
                 let expected_prepare_id =
                     format!("{}:{}", reservation.prepare_token, reservation.session_id);
-                if record.epoch != reservation.epoch
-                    || record.data_dir != expected_dir
-                    || record.local_prepare_id != expected_prepare_id
+                // A newer reservation fences older local preparation. The
+                // same epoch still requires its exact durable prepare identity.
+                if record.epoch > reservation.epoch
+                    || record.local_prepare_id.is_empty()
+                    || (record.epoch == reservation.epoch
+                        && (record.data_dir != expected_dir
+                            || record.local_prepare_id != expected_prepare_id))
                 {
                     return Err(invalid_grant(
                         "pending reservation does not match local durable root",
@@ -1202,6 +1401,9 @@ impl RootManager {
             self.meta.abort_root(&reservation)?;
             self.remove_abandoned_dir(&data_dir)?;
             if let Some(record) = records.remove(&reservation.id) {
+                if record.epoch < reservation.epoch {
+                    self.remove_abandoned_dir(&record.data_dir)?;
+                }
                 self.catalog.remove_prepared_root(&record)?;
             }
         }
@@ -1567,6 +1769,7 @@ fn hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::node::storage::FileStore;
+    use std::os::unix::fs::MetadataExt;
 
     struct FixedMeta {
         activate: RootGrant,
@@ -1647,6 +1850,8 @@ mod tests {
                 session_id: "session-a".into(),
                 create_intent_id: "intent-a".into(),
                 prepare_token: "prepare-a".into(),
+                requester_node_id: String::new(),
+                requester_session_id: String::new(),
             },
             data_dir,
             local_prepare_id: "local-a".into(),
@@ -1711,6 +1916,8 @@ mod tests {
                 session_id: "session-a".into(),
                 create_intent_id: "intent-a".into(),
                 prepare_token: "prepare-a".into(),
+                requester_node_id: String::new(),
+                requester_session_id: String::new(),
             },
             data_dir,
             local_prepare_id: "local-a".into(),
@@ -2001,6 +2208,8 @@ mod tests {
                 session_id: "session-a".into(),
                 create_intent_id: "intent-a".into(),
                 prepare_token: "prepare-a".into(),
+                requester_node_id: String::new(),
+                requester_session_id: String::new(),
             },
             data_dir,
             local_prepare_id: "local-a".into(),
@@ -2211,6 +2420,8 @@ mod tests {
                 session_id: "session-a".into(),
                 create_intent_id: "intent-a".into(),
                 prepare_token: "prepare-a".into(),
+                requester_node_id: String::new(),
+                requester_session_id: String::new(),
             },
             data_dir,
             local_prepare_id: "local-a".into(),
@@ -2302,6 +2513,8 @@ mod tests {
                 session_id: "old-session".into(),
                 create_intent_id: intent.into(),
                 prepare_token: "prepare-1".into(),
+                requester_node_id: "node-a".into(),
+                requester_session_id: "old-session".into(),
             };
             state.pending = Some(reservation.clone());
             Ok(reservation)
@@ -2354,6 +2567,14 @@ mod tests {
                 .active
                 .clone()
                 .filter(|root| &root.id == id))
+        }
+
+        fn lookup_root_state(&self, id: &RootId) -> Result<RootLookupState> {
+            let state = self.0.lock().unwrap();
+            Ok(RootLookupState {
+                location: state.active.clone().filter(|root| &root.id == id),
+                reservation: state.pending.clone().filter(|root| &root.id == id),
+            })
         }
 
         fn list_owner_roots(&self, home: &str) -> Result<OwnerRootInventory> {
@@ -2472,7 +2693,18 @@ mod tests {
             disk.clone(),
         )
         .unwrap();
-        assert!(manager.create_root(OsStr::new("job"), 0o700).is_err());
+        let owner = std::fs::metadata(temp.path()).unwrap();
+        let params = RootCreateParams {
+            name: b"job".to_vec(),
+            uid: owner.uid(),
+            gid: owner.gid(),
+            mode: 0o700,
+        };
+        let reservation = manager.reserve_workspace(OsStr::new("job")).unwrap();
+        let error = manager
+            .prepare_owner_root("node-a", &reservation, &params)
+            .unwrap_err();
+        assert_eq!(error.message(), "injected lost Activate reply");
         assert!(
             manager
                 .enter_root(
@@ -2741,3 +2973,7 @@ mod tests {
         assert!(locked.scan_roots().unwrap().is_empty());
     }
 }
+
+#[cfg(test)]
+#[path = "root/creation_tests.rs"]
+mod creation_tests;

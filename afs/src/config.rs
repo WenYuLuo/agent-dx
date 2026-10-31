@@ -213,6 +213,9 @@ pub struct Cli {
     /// Allow a node to become functionally ready with a healthy volatile Meta.
     #[arg(long)]
     pub allow_volatile_meta: Option<bool>,
+    /// Enable centralized HRW placement for new OwnerFs workspaces on Meta.
+    #[arg(long)]
+    pub ownerfs_mkdir_load_balance: Option<bool>,
     #[arg(long)]
     pub peer_endpoint: Option<String>,
     /// 对外发布的本 Node gRPC URI；监听 0.0.0.0 时必须显式指定。
@@ -437,6 +440,7 @@ struct FileConfig {
     meta_watch_bytes_max: Option<u64>,
     meta_watch_retention_ms: Option<u64>,
     allow_volatile_meta: Option<bool>,
+    ownerfs_mkdir_load_balance: Option<bool>,
     peer_endpoint: Option<String>,
     advertise_endpoint: Option<String>,
     tls_encryption_enabled: Option<bool>,
@@ -547,6 +551,7 @@ pub struct Config {
     pub meta_watch_bytes_max: u64,
     pub meta_watch_retention_ms: u64,
     pub allow_volatile_meta: bool,
+    pub ownerfs_mkdir_load_balance: bool,
     pub peer_endpoint: Option<String>,
     pub advertise_endpoint: Option<String>,
     pub tls_encryption_enabled: bool,
@@ -629,6 +634,14 @@ impl Config {
             })?,
             None => FileConfig::default(),
         };
+        if role == Role::Node
+            && (cli.ownerfs_mkdir_load_balance.is_some()
+                || file.ownerfs_mkdir_load_balance.is_some())
+        {
+            return Err(invalid(
+                "ownerfs_mkdir_load_balance is only valid for afs-meta",
+            ));
+        }
         let id = cli.id.or(file.id).unwrap_or_else(|| {
             match role {
                 Role::Node => "node",
@@ -984,6 +997,10 @@ impl Config {
             allow_volatile_meta: cli
                 .allow_volatile_meta
                 .or(file.allow_volatile_meta)
+                .unwrap_or(false),
+            ownerfs_mkdir_load_balance: cli
+                .ownerfs_mkdir_load_balance
+                .or(file.ownerfs_mkdir_load_balance)
                 .unwrap_or(false),
             peer_endpoint: cli.peer_endpoint.or(file.peer_endpoint),
             advertise_endpoint: cli.advertise_endpoint.or(file.advertise_endpoint),

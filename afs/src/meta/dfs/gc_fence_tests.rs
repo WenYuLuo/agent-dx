@@ -268,6 +268,7 @@ async fn fixture() -> Fixture {
                 grpc_addr: "http://127.0.0.1:1".into(),
                 data_addr: "http://127.0.0.1:2".into(),
                 rest_addr: "http://127.0.0.1:3".into(),
+                ownerfs_enabled: false,
                 storage_devices: vec![local.device_descriptor().unwrap()],
                 lease_ttl: std::time::Duration::from_secs(60),
             },

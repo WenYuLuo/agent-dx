@@ -3,7 +3,8 @@ use std::os::{fd::AsRawFd, unix::fs::MetadataExt};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::node::vfs::ownerfs::root::{
-    OwnerRootInventory, PresentedRootAccess, RootLocation, RootMeta, RootReservation,
+    OwnerRootInventory, PresentedRootAccess, RootLocation, RootLookupState, RootMeta,
+    RootReservation,
 };
 
 struct RejectRemoteFactory;
@@ -23,6 +24,7 @@ struct NativeHomeMeta {
     next_epoch: AtomicU64,
     active: Mutex<HashMap<RootId, RootLocation>>,
     fail_deactivate: AtomicBool,
+    pending: Mutex<HashMap<RootId, RootReservation>>,
 }
 
 impl NativeHomeMeta {
@@ -33,6 +35,7 @@ impl NativeHomeMeta {
             next_epoch: AtomicU64::new(1),
             active: Mutex::new(HashMap::new()),
             fail_deactivate: AtomicBool::new(false),
+            pending: Mutex::new(HashMap::new()),
         }
     }
 
@@ -45,40 +48,59 @@ impl NativeHomeMeta {
 impl RootMeta for NativeHomeMeta {
     fn reserve_root(&self, id: &RootId, create_intent_id: &str) -> Result<RootReservation> {
         let epoch = self.next_epoch.fetch_add(1, Ordering::SeqCst);
-        Ok(RootReservation {
+        let reservation = RootReservation {
             id: id.clone(),
             epoch,
             home_node_id: self.node_id.clone(),
             session_id: self.session_id.clone(),
             create_intent_id: create_intent_id.to_owned(),
             prepare_token: format!("prepare-{epoch}"),
-        })
+            requester_node_id: self.node_id.clone(),
+            requester_session_id: self.session_id.clone(),
+        };
+        self.pending
+            .lock()
+            .unwrap()
+            .insert(id.clone(), reservation.clone());
+        Ok(reservation)
     }
 
     fn activate_root(&self, prepared: &root::PreparedRoot) -> Result<RootGrant> {
+        let reservation = prepared.reservation();
+        let pending = self.pending.lock().unwrap().remove(&reservation.id);
+        if pending.as_ref() != Some(reservation) {
+            return Err(Error::coded(
+                afs_error::NODE_OWNER_GRANT_UNAVAILABLE,
+                "native home test activation does not match pending reservation",
+            ));
+        }
         self.active.lock().unwrap().insert(
-            prepared.reservation().id.clone(),
+            reservation.id.clone(),
             RootLocation {
-                id: prepared.reservation().id.clone(),
-                epoch: prepared.reservation().epoch,
+                id: reservation.id.clone(),
+                epoch: reservation.epoch,
                 home_node_id: self.node_id.clone(),
                 home_session_id: self.session_id.clone(),
             },
         );
         Ok(RootGrant {
-            id: prepared.reservation().id.clone(),
-            epoch: prepared.reservation().epoch,
+            id: reservation.id.clone(),
+            epoch: reservation.epoch,
             home_node_id: self.node_id.clone(),
             home_session_id: self.session_id.clone(),
             holder_node_id: self.node_id.clone(),
             session_id: self.session_id.clone(),
-            access_generation: prepared.reservation().epoch,
+            access_generation: reservation.epoch,
             rights: vec![RootRight::Lookup, RootRight::Read, RootRight::Write],
-            fencing_token: format!("fence-{}", prepared.reservation().epoch),
+            fencing_token: format!("fence-{}", reservation.epoch),
         })
     }
 
-    fn abort_root(&self, _: &RootReservation) -> Result<()> {
+    fn abort_root(&self, reservation: &RootReservation) -> Result<()> {
+        let mut pending = self.pending.lock().unwrap();
+        if pending.get(&reservation.id) == Some(reservation) {
+            pending.remove(&reservation.id);
+        }
         Ok(())
     }
 
@@ -97,10 +119,31 @@ impl RootMeta for NativeHomeMeta {
         Ok(self.active.lock().unwrap().get(id).cloned())
     }
 
-    fn list_owner_roots(&self, _: &str) -> Result<OwnerRootInventory> {
+    fn lookup_root_state(&self, id: &RootId) -> Result<RootLookupState> {
+        Ok(RootLookupState {
+            location: self.active.lock().unwrap().get(id).cloned(),
+            reservation: self.pending.lock().unwrap().get(id).cloned(),
+        })
+    }
+
+    fn list_owner_roots(&self, home_node_id: &str) -> Result<OwnerRootInventory> {
         Ok(OwnerRootInventory {
-            active: self.active.lock().unwrap().values().cloned().collect(),
-            pending: Vec::new(),
+            active: self
+                .active
+                .lock()
+                .unwrap()
+                .values()
+                .filter(|root| root.home_node_id == home_node_id)
+                .cloned()
+                .collect(),
+            pending: self
+                .pending
+                .lock()
+                .unwrap()
+                .values()
+                .filter(|reservation| reservation.home_node_id == home_node_id)
+                .cloned()
+                .collect(),
         })
     }
 
@@ -1049,3 +1092,175 @@ fn e2e_real_fuse_rmdir_triggers_egress_detach_and_clean_session_join() {
 }
 
 include!("native_home_fuse_fixture.rs");
+
+// Exercise the Home control RPC without a FUSE mkdir on that Home. The test
+// authenticator supplies only transport identity; normal reservation validation
+// and local preparation still run through the production handler.
+struct RemoteCreatePeer;
+
+impl crate::node::rpc::data::PeerAuthenticator for RemoteCreatePeer {
+    fn authenticate(
+        &self,
+        _: &tonic::metadata::MetadataMap,
+        _: Option<std::net::SocketAddr>,
+        _: Option<&[u8]>,
+    ) -> Result<String> {
+        Ok("node-b".into())
+    }
+}
+
+struct RemoteCreateFixture {
+    _temp: tempfile::TempDir,
+    owner: Arc<OwnerFs>,
+    ctx: RequestContext,
+    service: crate::node::rpc::control::NodeControlService,
+    request: afs_protocol::node_control::PrepareOwnerRootRequest,
+}
+
+impl RemoteCreateFixture {
+    fn new(egress_root: Option<PathBuf>) -> Self {
+        let (temp, base, ctx, disk, meta) = fixture_with_meta(true);
+        let owner = Arc::new(match egress_root {
+            Some(path) => OwnerFs::new_local_with_mount_manager(
+                base.root_manager().unwrap(),
+                disk,
+                Arc::new(RejectRemoteFactory),
+                path,
+            ),
+            None => base,
+        });
+        if let Some(manager) = owner.mount_manager() {
+            manager.attach_owner(&owner);
+        }
+        let id = root::root_id_from_name(OsStr::new("agent-a")).unwrap();
+        let mut reservation = meta
+            .reserve_root(&id, &format!("node-b:session-b:{}", id.0))
+            .unwrap();
+        reservation.requester_node_id = "node-b".into();
+        reservation.requester_session_id = "session-b".into();
+        meta.pending
+            .lock()
+            .unwrap()
+            .insert(id.clone(), reservation.clone());
+        let wire = afs_protocol::meta::RootReservation {
+            root_id: id.0,
+            root_epoch: reservation.epoch,
+            home_node_id: reservation.home_node_id,
+            session_id: reservation.session_id,
+            create_intent_id: reservation.create_intent_id,
+            prepare_token: reservation.prepare_token,
+            requester_node_id: reservation.requester_node_id,
+            requester_session_id: reservation.requester_session_id,
+        };
+        let service = crate::node::rpc::control::NodeControlService::new(
+            crate::node::rpc::control::RdmaSessionRegistry::new(None),
+        )
+        .with_owner_locks(owner.peer_executor().unwrap(), Arc::new(RemoteCreatePeer));
+        Self {
+            _temp: temp,
+            owner,
+            ctx: ctx.clone(),
+            service,
+            request: afs_protocol::node_control::PrepareOwnerRootRequest {
+                reservation: Some(wire),
+                name: b"agent-a".to_vec(),
+                uid: ctx.uid,
+                gid: ctx.gid,
+                mode: 0o750,
+            },
+        }
+    }
+
+    async fn prepare(&self) {
+        use afs_protocol::node_control::node_control_server::NodeControl;
+        self.service
+            .prepare_owner_root(tonic::Request::new(self.request.clone()))
+            .await
+            .expect("creation must not depend on bind completion");
+    }
+    async fn reject_duplicate(&self) {
+        use afs_protocol::node_control::node_control_server::NodeControl;
+        let error = self
+            .service
+            .prepare_owner_root(tonic::Request::new(self.request.clone()))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::AlreadyExists);
+    }
+}
+
+impl Drop for RemoteCreateFixture {
+    fn drop(&mut self) {
+        self.owner.mount_manager_shutdown();
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires root Linux mount privileges; run explicitly"]
+async fn e2e_remote_prepare_automatically_binds_home_and_deduplicates() {
+    let egress = tempfile::tempdir().unwrap();
+    let fixture = RemoteCreateFixture::new(Some(egress.path().to_path_buf()));
+    let target = egress.path().join("agent-a");
+    fixture.prepare().await;
+    wait_for_egress_bind(&target);
+    let inode = std::fs::metadata(&target).unwrap().ino();
+    std::fs::write(target.join("proof"), b"remote-home").unwrap();
+    let root = lookup_root(&fixture.owner, &fixture.ctx, "agent-a").unwrap();
+    let file = Backend::lookup(
+        &*fixture.owner,
+        &fixture.ctx,
+        root.inode,
+        OsStr::new("proof"),
+    )
+    .unwrap();
+    let handle = Backend::open(&*fixture.owner, &fixture.ctx, file.inode, libc::O_RDONLY).unwrap();
+    let mut bytes = [0; 11];
+    Backend::read(&*fixture.owner, &fixture.ctx, handle, 0, &mut bytes).unwrap();
+    Backend::release(&*fixture.owner, &fixture.ctx, handle).unwrap();
+    assert_eq!(&bytes, b"remote-home");
+
+    fixture.reject_duplicate().await;
+    assert_eq!(std::fs::metadata(&target).unwrap().ino(), inode);
+    let count = std::fs::read_to_string("/proc/self/mountinfo")
+        .unwrap()
+        .lines()
+        .filter(|line| line.split_whitespace().nth(4) == target.to_str())
+        .count();
+    assert_eq!(count, 1, "duplicate notification must not stack binds");
+
+    fixture
+        .owner
+        .mount_manager()
+        .unwrap()
+        .request_unmount(&root::root_id_from_name(OsStr::new("agent-a")).unwrap())
+        .unwrap();
+    assert!(!target.exists());
+}
+
+#[tokio::test]
+async fn remote_prepare_bind_disabled_or_failed_keeps_workspace_usable() {
+    for bind_enabled in [false, true] {
+        let egress = tempfile::tempdir().unwrap();
+        let missing = egress.path().join("missing");
+        let fixture = RemoteCreateFixture::new(bind_enabled.then(|| missing.clone()));
+        fixture.prepare().await;
+        let root = lookup_root(&fixture.owner, &fixture.ctx, "agent-a").unwrap();
+        let child = Backend::mkdir(
+            &*fixture.owner,
+            &fixture.ctx,
+            root.inode,
+            OsStr::new("data"),
+            0o700,
+        )
+        .unwrap();
+        let found = Backend::lookup(
+            &*fixture.owner,
+            &fixture.ctx,
+            root.inode,
+            OsStr::new("data"),
+        )
+        .unwrap();
+        assert_eq!(found.inode, child.inode);
+        assert!(!missing.exists());
+    }
+}
