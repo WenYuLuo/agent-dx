@@ -137,7 +137,7 @@ async fn session(controller: Arc<Controller>, config: ControlStreamConfig) -> Re
                     Ok(ControlOperation::Quiesce { identity, activity_revision }) => controller.quiesce_idle(&identity, activity_revision),
                     Ok(ControlOperation::ReopenIdle { identity }) => controller.reopen_idle(&identity),
                     Ok(ControlOperation::Prepare(request)) => controller.prepare(request).await,
-                    Ok(ControlOperation::Abort(request)) => controller.abort_unstarted(&request.operation_id, &request.identity, request.expected_revision),
+                    Ok(ControlOperation::Abort(request)) => controller.abort_unstarted(&request.operation_id, &request.identity, request.expected_revision).await,
                     Ok(ControlOperation::Finish(request)) => controller.finish_checkpoint(request),
                     Err(_) => Err(Error::Invalid("invalid runtime control operation".into())),
                 };

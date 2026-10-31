@@ -84,6 +84,11 @@ route takes precedence over management and configured proxy paths. Unrelated
 Hosts retain the existing path routing. Deployments serving this form to
 browsers need wildcard DNS and a TLS certificate covering the subdomains; the
 Ingress still applies the same route publication and authentication checks.
+When E2B routing is enabled, a Host valid in both the native `<instance-id>-<port>`
+and E2B `<port>-<sandbox-id>` forms defaults to the native target. To select the
+E2B target instead, supply both `E2b-Sandbox-Id` and `E2b-Sandbox-Port` matching
+its E2B Host interpretation. The selected target retains its published access
+policy; an unavailable or unauthorized native target does not fall back to E2B.
 Frontend is not a data-plane hop. Ingress removes credentials before opening Node
 streams, so user API Keys never reach Node or the workload.
 

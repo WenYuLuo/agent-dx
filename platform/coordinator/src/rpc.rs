@@ -2,14 +2,17 @@
 use adx_transport::rpc::RpcClient;
 mod artifacts;
 mod autoscaling;
+mod checkpoint_cleanup;
 mod claims;
 mod cloning;
 mod collection;
+mod environment_control;
 mod metrics;
 mod node_retirement;
 mod observation;
 mod recovery;
 mod resume;
+mod snapshot_preparation;
 mod snapshots;
 mod volumes;
 use crate::{
@@ -49,6 +52,7 @@ struct State {
     recovery_cursor: Option<String>,
     resume_cursor: Option<String>,
     collection_cursor: Option<String>,
+    checkpoint_cleanup_cursor: Option<String>,
     live: BTreeMap<String, LiveNode>,
     recovering: BTreeMap<String, tokio::time::Instant>,
     retired_sessions: BTreeSet<(String, String)>,
@@ -413,6 +417,25 @@ impl CoordinatorRpc {
         timeout: Duration,
         heartbeat_timeout: Duration,
     ) -> Result<Self> {
+        Box::pin(Self::with_heartbeat_timeout_inner(
+            session,
+            placement,
+            peers,
+            node_tls.into(),
+            timeout,
+            heartbeat_timeout,
+        ))
+        .await
+    }
+
+    async fn with_heartbeat_timeout_inner(
+        session: Session,
+        placement: Placement,
+        peers: Peers,
+        node_tls: RpcClient,
+        timeout: Duration,
+        heartbeat_timeout: Duration,
+    ) -> Result<Self> {
         if timeout.is_zero() || heartbeat_timeout.is_zero() {
             return Err(Error::Invalid("RPC timeout must be positive".into()));
         }
@@ -443,11 +466,12 @@ impl CoordinatorRpc {
                 continue;
             }
             *node = session
-                .register_session(
+                .register_session_with_scopes(
                     node.node.clone(),
                     node.address.clone(),
                     node.proxy_address.clone(),
                     node.session.clone(),
+                    node.checkpoint_scopes.clone(),
                 )
                 .await?;
         }
@@ -507,6 +531,7 @@ impl CoordinatorRpc {
                 recovery_cursor: None,
                 resume_cursor: None,
                 collection_cursor: None,
+                checkpoint_cleanup_cursor: None,
                 live: BTreeMap::new(),
                 recovering,
                 retired_sessions: departed_sessions,
@@ -521,7 +546,7 @@ impl CoordinatorRpc {
             changed: Notify::new(),
             closing: watch::channel(false).0,
             peers,
-            node_tls: node_tls.into(),
+            node_tls,
             timeout,
             heartbeat_timeout,
         }));
@@ -675,24 +700,24 @@ impl CoordinatorRpc {
         (actual.node_id == r.node_id && actual.session_id == r.session_id).then_some(predecessor)
     }
 
-    async fn create_guard(&self, key: String) -> tokio::sync::OwnedMutexGuard<()> {
-        let lock = {
-            let mut locks = self
-                .0
-                .create_locks
-                .lock()
-                .expect("create lock registry poisoned");
-            locks.retain(|_, lock| lock.strong_count() > 0);
-            match locks.get(&key).and_then(std::sync::Weak::upgrade) {
-                Some(lock) => lock,
-                None => {
-                    let lock = Arc::new(Mutex::new(()));
-                    locks.insert(key, Arc::downgrade(&lock));
-                    lock
-                }
+    fn create_lock(&self, key: String) -> Arc<Mutex<()>> {
+        let mut locks = self
+            .0
+            .create_locks
+            .lock()
+            .expect("create lock registry poisoned");
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        match locks.get(&key).and_then(std::sync::Weak::upgrade) {
+            Some(lock) => lock,
+            None => {
+                let lock = Arc::new(Mutex::new(()));
+                locks.insert(key, Arc::downgrade(&lock));
+                lock
             }
-        };
-        lock.lock_owned().await
+        }
+    }
+    async fn create_guard(&self, key: String) -> tokio::sync::OwnedMutexGuard<()> {
+        self.create_lock(key).lock_owned().await
     }
     async fn create_from_request(
         &self,
@@ -760,22 +785,23 @@ impl CoordinatorRpc {
             Err(error) => return Err(status(error)),
         };
         let service = self.clone();
-        tokio::spawn(
-            adx_observability::trace::Trace::child("coordinator.create").run(async move {
-                service
-                    .create(
-                        spec,
-                        schedule_timeout,
-                        deadline,
-                        expected_assignment,
-                        request_id,
-                    )
-                    .await
-                    .map(Response::new)
-            }),
-        )
-        .await
-        .map_err(|_| Status::internal("creation task failed"))?
+        // Keep the large creation future behind a pointer before adding trace wrappers.
+        // The task remains detached from cancellation of the RPC response wait.
+        let creation = Box::pin(async move {
+            service
+                .create(
+                    spec,
+                    schedule_timeout,
+                    deadline,
+                    expected_assignment,
+                    request_id,
+                )
+                .await
+                .map(Response::new)
+        });
+        tokio::spawn(adx_observability::trace::Trace::child("coordinator.create").run(creation))
+            .await
+            .map_err(|_| Status::internal("creation task failed"))?
     }
 
     async fn create(
@@ -809,7 +835,12 @@ impl CoordinatorRpc {
         .map_err(|_| Status::deadline_exceeded("create deadline waiting for environment"))?;
         let outcome = match tokio::time::timeout_at(
             create_deadline.instant() + adx_transport::deadline::CREATE_RESPONSE_GRACE,
-            self.create_attempt(spec.clone(), schedule_timeout, create_deadline, request_id),
+            Box::pin(self.create_attempt(
+                spec.clone(),
+                schedule_timeout,
+                create_deadline,
+                request_id,
+            )),
         )
         .await
         {
@@ -911,8 +942,7 @@ impl CoordinatorRpc {
                     .result
                     .ok_or_else(|| Status::internal("confirmed environment result missing"))?;
                 let record = if record.state == EnvironmentState::Running {
-                    session
-                        .publish_existing(record, &request_id)
+                    Box::pin(session.publish_existing(record, &request_id))
                         .await
                         .map_err(status)?
                 } else {
@@ -1323,7 +1353,7 @@ impl CoordinatorRpc {
         record: EnvironmentRecord,
         session_id: String,
     ) -> Result<EnvironmentRecord> {
-        self.commit_releasing(record, session_id, vec![]).await
+        Box::pin(self.commit_releasing(record, session_id, vec![], &[])).await
     }
 
     async fn commit_releasing(
@@ -1331,6 +1361,7 @@ impl CoordinatorRpc {
         record: EnvironmentRecord,
         session_id: String,
         stopped_runtime_ids: Vec<String>,
+        cleanup_artifacts: &[adx_core::CheckpointArtifact],
     ) -> Result<EnvironmentRecord> {
         let _publication = self
             .create_guard(format!("publication:{}", record.spec.id))
@@ -1424,7 +1455,12 @@ impl CoordinatorRpc {
             return Ok(record);
         } else {
             let committed = session
-                .commit_releasing_with_state(record, &session_id, &stopped_runtime_ids)
+                .commit_releasing_with_cleanup_state(
+                    record,
+                    &session_id,
+                    &stopped_runtime_ids,
+                    cleanup_artifacts,
+                )
                 .await?;
             authoritative = committed.stored;
             committed.result
@@ -1599,6 +1635,24 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
         })
         .await
         .map_err(|_| Status::internal("resume task failed"))?
+    }
+    async fn get_environment_control(
+        &self,
+        request: Request<pb::GetEnvironmentControlRequest>,
+    ) -> std::result::Result<Response<pb::EnvironmentControlRecord>, Status> {
+        self.get_environment_control_rpc(request).await
+    }
+    async fn batch_get_environment_control(
+        &self,
+        request: Request<pb::BatchGetEnvironmentControlRequest>,
+    ) -> std::result::Result<Response<pb::BatchGetEnvironmentControlResponse>, Status> {
+        self.batch_get_environment_control_rpc(request).await
+    }
+    async fn update_environment_control(
+        &self,
+        request: Request<pb::UpdateEnvironmentControlRequest>,
+    ) -> std::result::Result<Response<pb::EnvironmentControlRecord>, Status> {
+        self.update_environment_control_rpc(request).await
     }
     type WatchNodesStream =
         tokio_stream::wrappers::ReceiverStream<std::result::Result<pb::NodeDirectory, Status>>;
@@ -1776,12 +1830,12 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
         };
         let service = self.clone();
         let request = request.into_inner();
-        tokio::spawn(trace.run(async move {
+        tokio::spawn(trace.run(Box::pin(async move {
             service
                 .claim_local(node, request, false)
                 .await
                 .map(Response::new)
-        }))
+        })))
         .await
         .map_err(|_| Status::internal("local reservation task failed"))?
     }
@@ -1795,12 +1849,12 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
         };
         let service = self.clone();
         let request = request.into_inner();
-        tokio::spawn(trace.run(async move {
+        tokio::spawn(trace.run(Box::pin(async move {
             service
                 .claim_local(node, request, true)
                 .await
                 .map(Response::new)
-        }))
+        })))
         .await
         .map_err(|_| Status::internal("claim task failed"))?
     }
@@ -1824,9 +1878,11 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
             .create
             .ok_or_else(|| Status::invalid_argument("create required"))?;
         let service = self.clone();
-        tokio::spawn(trace.run(async move { service.create_from_request(create).await }))
-            .await
-            .map_err(|_| Status::internal("forwarded creation task failed"))?
+        tokio::spawn(trace.run(Box::pin(async move {
+            service.create_from_request(create).await
+        })))
+        .await
+        .map_err(|_| Status::internal("forwarded creation task failed"))?
     }
 
     async fn inspect_node(
@@ -2035,7 +2091,7 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
             }
             let saved = match state
                 .session
-                .register_session(
+                .register_session_with_scopes(
                     node.clone(),
                     r.node_address.clone(),
                     r.proxy_address.clone(),
@@ -2044,6 +2100,7 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                         sequence: r.heartbeat_sequence,
                         routable: !r.reconciling,
                     }),
+                    r.checkpoint_scopes.iter().cloned().collect(),
                 )
                 .await
             {
@@ -2131,7 +2188,7 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                 if self.0.peers.authenticate(&request)? != Principal::ApiServer {
                     return Err(Status::permission_denied("Frontend caller required"));
                 }
-                self.create_from_request(request.into_inner()).await
+                Box::pin(self.create_from_request(request.into_inner())).await
             })
             .await
     }
@@ -2199,17 +2256,30 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                 if principal != Principal::Node(record.assignment.node_id.clone()) {
                     return Err(Status::permission_denied("only owning node may commit"));
                 }
+                let cleanup_artifacts = r
+                    .cleanup_artifacts
+                    .into_iter()
+                    .map(TryInto::try_into)
+                    .collect::<Result<Vec<adx_core::CheckpointArtifact>>>()
+                    .map_err(status)?;
                 let service = self.clone();
                 tokio::spawn(
-                    adx_observability::trace::Trace::child("coordinator.commit").run(async move {
-                        let record = service
-                            .commit_releasing(record, r.node_session_id, r.stopped_runtime_ids)
-                            .await
-                            .map_err(status)?;
-                        Ok(Response::new(pb::CommitEnvironmentResponse {
-                            record: Some(record.try_into().map_err(status)?),
-                        }))
-                    }),
+                    adx_observability::trace::Trace::child("coordinator.commit").run(Box::pin(
+                        async move {
+                            let record = service
+                                .commit_releasing(
+                                    record,
+                                    r.node_session_id,
+                                    r.stopped_runtime_ids,
+                                    &cleanup_artifacts,
+                                )
+                                .await
+                                .map_err(status)?;
+                            Ok(Response::new(pb::CommitEnvironmentResponse {
+                                record: Some(record.try_into().map_err(status)?),
+                            }))
+                        },
+                    )),
                 )
                 .await
                 .map_err(|_| Status::internal("commit task failed"))?
@@ -2221,6 +2291,21 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
 #[cfg(test)]
 mod timeout_tests {
     use super::*;
+
+    #[test]
+    fn deleting_a_queued_recovery_retires_it_before_clearing_the_fence() {
+        let spec: EnvironmentSpec = serde_json::from_value(serde_json::json!({
+            "id": "queued-recovery", "tenant_id": "tenant", "image": "image",
+            "runtime_class": "runsc", "priority": 0,
+            "resources": {"cpu_millis": 100, "memory_bytes": 128, "disk_bytes": 0}
+        }))
+        .unwrap();
+        let mut scheduler = Coordinator::new(1, Placement::Pack).unwrap();
+        scheduler.submit_recovery(spec.clone()).unwrap();
+        scheduler.forget_deleted(&spec.id).unwrap();
+        assert_eq!(scheduler.pending(0).unwrap(), 0);
+        assert!(scheduler.submit(spec).is_ok());
+    }
 
     #[test]
     fn central_queue_timeout_has_a_bounded_default() {

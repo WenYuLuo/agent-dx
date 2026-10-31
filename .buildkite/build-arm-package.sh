@@ -54,6 +54,11 @@ env_args=()
 for key in BUILDKITE_COMMIT BUILDKITE_BUILD_ID JOBS ADX_ARM_TESTS ADX_WITH_AFS; do
   if [[ -n ${!key:-} ]]; then env_args+=(-e "$key"); fi
 done
+if [[ $component == execd && -n ${ADX_ENVD_SOURCE:-} ]]; then
+  [[ -d $ADX_ENVD_SOURCE ]] || { echo 'ADX_ENVD_SOURCE must be an existing checkout directory' >&2; exit 2; }
+  envd_source=$(cd "$ADX_ENVD_SOURCE" && pwd -P)
+  env_args+=(-v "$envd_source:/mnt/adx-envd-source:ro" -e ADX_ENVD_SOURCE=/mnt/adx-envd-source)
+fi
 # Publication runs on the existing Kubernetes worker with its OBS Secret.
 docker run --rm --platform linux/arm64 \
   -v "$PWD:/workspace" -w /workspace \

@@ -26,6 +26,7 @@ async fn failed_restore() -> (
     backend.fail_start.store(true, Ordering::SeqCst);
     assert!(handle
         .resume(adxlet::checkpoint::ResumeRequest {
+            run_timeout_seconds: None,
             operation_id: "unknown-restore".into(),
             expected_revision: paused.revision,
         })

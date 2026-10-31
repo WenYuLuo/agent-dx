@@ -1,5 +1,9 @@
 use super::auth::IngressAuthenticator;
 use super::connector::{DataPlaneL4Connector, H2ConnectStream};
+use super::e2b_route::{
+    is_management_path as is_e2b_management_path, parse_target as parse_e2b_target,
+    E2bAuthorizationError, E2bTarget,
+};
 use super::http_pool::{
     BackendHttpPool, BackendHttpPoolConfig, BackendHttpPoolError, BackendHttpPoolKey,
 };
@@ -17,7 +21,7 @@ use http::{header, Request, Response, StatusCode};
 use http_body_util::{combinators::UnsyncBoxBody, BodyExt, Empty, Full};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -350,6 +354,7 @@ pub struct Ingress {
     default_direct_port: u16,
     default_tunnel_port: u16,
     port_host_domain: Option<String>,
+    e2b_enabled: bool,
     frontend_address: String,
     reverse_proxy: ReverseProxy,
     proxy_routes: Arc<Vec<ProxyRoute>>,
@@ -390,6 +395,7 @@ impl Ingress {
             default_direct_port,
             default_tunnel_port,
             port_host_domain: None,
+            e2b_enabled: false,
             frontend_address: frontend_address.into(),
             reverse_proxy: ReverseProxy::new(ReverseProxyConfig::default()),
             proxy_routes: Arc::new(Vec::new()),
@@ -445,6 +451,11 @@ impl Ingress {
 
     pub fn with_port_host_domain(mut self, domain: Option<String>) -> Self {
         self.port_host_domain = domain;
+        self
+    }
+
+    pub fn with_e2b_enabled(mut self, enabled: bool) -> Self {
+        self.e2b_enabled = enabled;
         self
     }
 
@@ -541,6 +552,12 @@ impl Ingress {
         self.authorize(&ready, tenant_id)?;
         if ready.tunnel_security_mode != route.tunnel_security_mode
             || ready.port_forward_auth_mode != route.port_forward_auth_mode
+            || ready.private_service_ports != route.private_service_ports
+            || !match (&route.e2b, &ready.e2b) {
+                (None, None) => true,
+                (Some(previous), Some(current)) => e2b_session_policy_unchanged(previous, current),
+                _ => false,
+            }
         {
             return Err(IngressOpenError::Forbidden);
         }
@@ -551,6 +568,21 @@ impl Ingress {
         &self,
         route: RouteHandle,
     ) -> io::Result<IngressStream> {
+        if route
+            .private_service_ports
+            .contains(&route.target.target_port)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "private service requires an approved HTTP policy",
+            ));
+        }
+        self.open_authorized_stream_with_activity(route, false)
+            .await
+    }
+
+    // Called only after the HTTP service policy has authorized this request.
+    async fn open_service_http_stream(&self, route: RouteHandle) -> io::Result<IngressStream> {
         self.open_authorized_stream_with_activity(route, false)
             .await
     }
@@ -603,6 +635,8 @@ impl Ingress {
         if replacement.tenant_id != route.tenant_id
             || replacement.tunnel_security_mode != route.tunnel_security_mode
             || replacement.port_forward_auth_mode != route.port_forward_auth_mode
+            || replacement.private_service_ports != route.private_service_ports
+            || replacement.e2b != route.e2b
         {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -657,6 +691,7 @@ impl Ingress {
                 workload_id: route.target.workload_id.clone(),
                 relay_address: route.relay_address.clone(),
                 target_ip: route.target.target_ip,
+                route: route.clone(),
                 cancel,
             },
         );
@@ -694,6 +729,9 @@ impl Ingress {
         let route = self
             .resolve_route(instance_id, target_port, access_kind, request_id.clone())
             .await?;
+        if route.e2b.is_some() {
+            return Err(IngressOpenError::Forbidden);
+        }
         let tenant_id = self
             .authenticator
             .authenticate_token_with_policy(
@@ -730,9 +768,9 @@ impl Ingress {
 
     fn apply_route_change(&self, change: super::route_store::RouteChange) {
         {
-            let sessions = self.sessions.lock().unwrap();
+            let mut sessions = self.sessions.lock().unwrap();
             for session in sessions
-                .values()
+                .values_mut()
                 .filter(|session| session.instance_id == change.instance_id)
             {
                 let still_current = change.current.as_ref().is_some_and(|route| {
@@ -740,6 +778,7 @@ impl Ingress {
                         && route.environment_id == session.workload_id
                         && route.relay_address == session.relay_address
                         && route.environment_ip.parse().ok() == Some(session.target_ip)
+                        && session_can_continue(session, route)
                 });
                 if !still_current && !*session.cancel.borrow() {
                     self.forced_close_total.fetch_add(1, Ordering::Relaxed);
@@ -765,6 +804,17 @@ impl Ingress {
         route: &RouteHandle,
         tenant_id: &str,
     ) -> Result<(), IngressOpenError> {
+        // Only a protocol-aware HTTP service handler may admit a private guest
+        // listener. Native forwarding and opaque streams never open these ports.
+        if route
+            .private_service_ports
+            .contains(&route.target.target_port)
+        {
+            return Err(IngressOpenError::Forbidden);
+        }
+        if route.e2b.is_some() && native_execd_route(route) && tenant_id.is_empty() {
+            return Err(IngressOpenError::Forbidden);
+        }
         if tenant_id.is_empty() {
             return Ok(());
         }
@@ -852,12 +902,25 @@ impl Ingress {
         let gateway = self;
         let service =
             service_fn(move |request| gateway.clone().handle_http(request, ingress_security, peer));
-        if let Err(error) = hyper::server::conn::http1::Builder::new()
-            .serve_connection(TokioIo::new(stream), service)
-            .with_upgrades()
-            .await
-        {
-            tracing::debug!(%peer, %error, "Ingress HTTP connection closed");
+        match ingress_security {
+            IngressSecurity::Tls => {
+                if let Err(error) =
+                    hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
+                        .serve_connection_with_upgrades(TokioIo::new(stream), service)
+                        .await
+                {
+                    tracing::debug!(%peer, %error, "Ingress HTTP connection closed");
+                }
+            }
+            IngressSecurity::Plaintext => {
+                if let Err(error) = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .with_upgrades()
+                    .await
+                {
+                    tracing::debug!(%peer, %error, "Ingress HTTP connection closed");
+                }
+            }
         }
     }
 
@@ -1014,6 +1077,11 @@ impl Ingress {
         let agent_forward = false;
         let response = if let Some(response) = agent_data_error {
             response
+        } else if let Some(target) = match self.e2b_target(&request) {
+            Ok(target) => target,
+            Err(_) => return Ok(plain(StatusCode::BAD_REQUEST, "invalid E2B sandbox target")),
+        } {
+            self.proxy_e2b(request, ingress_security, target).await
         } else if host_route || agent_forward {
             // A selected Environment is already a data-plane target. Its ID must never
             // be interpreted again as a public management or configured proxy path.
@@ -1173,7 +1241,8 @@ impl Ingress {
                     stripped_path: access.backend_uri.path().into(),
                     access_kind: AccessKind::PortForwarding,
                 }));
-            *request.uri_mut() = access.backend_uri;
+            replace_request_path(request, &access.backend_uri.to_string())
+                .map_err(|_| response_text(StatusCode::BAD_REQUEST, "invalid backend URI"))?;
             return Ok(());
         }
         let api = self
@@ -1239,6 +1308,25 @@ impl Ingress {
         parse_port_host_route(host, request.uri().path(), domain)
     }
 
+    fn e2b_target<B>(&self, request: &Request<B>) -> Result<Option<E2bTarget>, ()> {
+        if !self.e2b_enabled || request.method() == http::Method::CONNECT {
+            return Ok(None);
+        }
+        // The native <id>-<port> grammar overlaps E2B's <port>-<id> form.
+        // Preserve native Host routing unless an explicit E2B selector is present;
+        // parsing below still requires both headers and agreement with the Host.
+        if self.port_host_route(request).is_some()
+            && !request.headers().contains_key("e2b-sandbox-id")
+            && !request.headers().contains_key("e2b-sandbox-port")
+        {
+            return Ok(None);
+        }
+        let Some(domain) = self.port_host_domain.as_deref() else {
+            return Ok(None);
+        };
+        parse_e2b_target(request, domain).map_err(|_| ())
+    }
+
     fn direct_route<B>(&self, request: &Request<B>) -> Option<ParsedDirectPath> {
         #[cfg(feature = "agent-api")]
         if let Some(access) = request
@@ -1260,6 +1348,7 @@ impl Ingress {
         self.control_plane_routes
             .iter()
             .any(|route| route.matches(path))
+            || (self.e2b_enabled && is_e2b_management_path(path))
     }
 
     async fn proxy_control_plane(
@@ -1620,6 +1709,12 @@ impl Ingress {
             Err(error) => return error_response(error),
         };
         route.processing = request.extensions().get::<ProcessingDeadline>().cloned();
+        if route.e2b.is_some() && !native_execd_route(&route) {
+            return plain(
+                StatusCode::FORBIDDEN,
+                "use the HTTP service entrypoint for this sandbox",
+            );
+        }
         let auth_required = self.auth_required(access_kind, &route);
         if ingress_security == IngressSecurity::Plaintext && auth_required {
             return tls_required();
@@ -1817,6 +1912,21 @@ impl Ingress {
             }
         };
         route.processing = request.extensions().get::<ProcessingDeadline>().cloned();
+        if route.e2b.is_some() && !native_execd_route(&route) {
+            let query = request
+                .uri()
+                .query()
+                .map(|value| format!("?{value}"))
+                .unwrap_or_default();
+            if replace_request_path(&mut request, &format!("{}{query}", parsed.stripped_path))
+                .is_err()
+            {
+                return Ok(plain(StatusCode::BAD_REQUEST, "invalid service path"));
+            }
+            return Ok(self
+                .proxy_service_route(request, ingress_security, route)
+                .await);
+        }
         let auth_required = self.auth_required(parsed.access_kind, &route);
         if ingress_security == IngressSecurity::Plaintext && auth_required {
             return Ok(tls_required());
@@ -1854,6 +1964,9 @@ impl Ingress {
             request.headers_mut().remove(H_TARGET_PORT);
             request.headers_mut().remove("x-auth");
             request.headers_mut().remove(header::AUTHORIZATION);
+        }
+        if route.e2b.is_some() {
+            strip_service_credentials(&mut request, route.target.target_port);
         }
         #[cfg(feature = "agent-api")]
         if parsed.access_kind == AccessKind::Direct {
@@ -1939,6 +2052,163 @@ impl Ingress {
             Err((error, None)) => Ok(backend_pool_error_response(error)),
         }
     }
+
+    async fn proxy_e2b(
+        &self,
+        request: Request<Incoming>,
+        ingress_security: IngressSecurity,
+        target: E2bTarget,
+    ) -> Response<ProxyBody> {
+        if ingress_security == IngressSecurity::Plaintext {
+            return tls_required();
+        }
+        let request_id = header_string(&request, "x-request-id");
+        let route = match self
+            .resolve_route(
+                &target.sandbox_id,
+                target.port,
+                AccessKind::PortForwarding,
+                request_id,
+            )
+            .await
+        {
+            Ok(route) => route,
+            Err(error) => return error_response(error),
+        };
+        self.proxy_service_route(request, ingress_security, route)
+            .await
+    }
+
+    async fn proxy_service_route(
+        &self,
+        mut request: Request<Incoming>,
+        ingress_security: IngressSecurity,
+        route: RouteHandle,
+    ) -> Response<ProxyBody> {
+        if ingress_security == IngressSecurity::Plaintext {
+            return tls_required();
+        }
+        // An opaque tunnel could carry unchecked envd control requests. Execd
+        // is available only through its separately authenticated native entry.
+        if request.method() == http::Method::CONNECT {
+            return e2b_policy_error(E2bAuthorizationError::Forbidden);
+        }
+        let target = E2bTarget {
+            sandbox_id: route.target.instance_id.clone(),
+            port: route.target.target_port,
+        };
+        let Some(policy) = route.e2b.as_ref() else {
+            return plain(
+                StatusCode::NOT_FOUND,
+                "E2B routing is not enabled for this sandbox",
+            );
+        };
+        if let Err(error) = policy.authorize(&request, &target) {
+            return e2b_policy_error(error);
+        }
+        if !self.resolver.route_is_current(&route) {
+            return error_response(IngressOpenError::RouteChanged);
+        }
+        strip_service_credentials(&mut request, target.port);
+        if policy.envd_gateway_auth
+            && target.port == super::e2b_route::ENVD_PORT
+            && strip_gateway_envd_credentials(&mut request).is_err()
+        {
+            return plain(StatusCode::BAD_REQUEST, "invalid envd file URL");
+        }
+        let upgrade_requested = request.headers().contains_key(header::UPGRADE);
+        if upgrade_requested {
+            let stream = match self.open_service_http_stream(route).await {
+                Ok(stream) => stream,
+                Err(error) => return error_response(IngressOpenError::Connect(error)),
+            };
+            let cancelled = stream.cancelled.clone();
+            return proxy_http(request, stream, "envd-or-application", Some(cancelled)).await;
+        }
+        strip_hop_by_hop_headers(request.headers_mut());
+        let key = BackendHttpPoolKey {
+            relay_address: route.relay_address.clone(),
+            instance_id: route.target.instance_id.clone(),
+            workload_id: route.target.workload_id.clone(),
+            target_ip: route.target.target_ip,
+            target_port: route.target.target_port,
+        };
+        match self
+            .http_pool
+            .send_recoverable(key, request, || self.open_service_http_stream(route))
+            .await
+        {
+            Ok(mut response) => {
+                strip_hop_by_hop_headers(response.headers_mut());
+                response.map(|body| {
+                    body.map_err(|error| -> BoxError { Box::new(error) })
+                        .boxed_unsync()
+                })
+            }
+            Err((error, _)) => backend_pool_error_response(error),
+        }
+    }
+}
+
+fn strip_service_credentials<B>(request: &mut Request<B>, port: u16) {
+    // All selectors are consumed at the ingress trust boundary. The traffic
+    // credential never reaches the guest; X-Access-Token reaches only envd.
+    for name in [
+        H_INSTANCE_ID,
+        H_WORKLOAD_ID,
+        H_TARGET_IP,
+        H_TARGET_PORT,
+        H_ACCESS_KIND,
+        "e2b-sandbox-id",
+        "e2b-sandbox-port",
+        "e2b-traffic-access-token",
+    ] {
+        request.headers_mut().remove(name);
+    }
+    if port != super::e2b_route::ENVD_PORT {
+        request.headers_mut().remove("x-access-token");
+    }
+}
+
+fn e2b_policy_error(error: E2bAuthorizationError) -> Response<ProxyBody> {
+    let message = match error {
+        E2bAuthorizationError::Unavailable => "E2B sandbox route is unavailable",
+        E2bAuthorizationError::Forbidden => "E2B route is forbidden",
+        E2bAuthorizationError::Unauthorized => "E2B token is invalid or missing",
+    };
+    plain(error.status(), message)
+}
+
+fn strip_gateway_envd_credentials<B>(request: &mut Request<B>) -> Result<(), http::Error> {
+    request.headers_mut().remove("x-access-token");
+    if request.uri().path() == "/files" {
+        if let Some(query) = request.uri().query() {
+            let pairs: Vec<_> = url::form_urlencoded::parse(query.as_bytes())
+                .filter(|(name, _)| !matches!(name.as_ref(), "signature" | "signature_expiration"))
+                .collect();
+            let mut remaining = url::form_urlencoded::Serializer::new(String::new());
+            for (name, value) in pairs {
+                remaining.append_pair(&name, &value);
+            }
+            let remaining = remaining.finish();
+            let path_and_query = if remaining.is_empty() {
+                "/files".to_owned()
+            } else {
+                format!("/files?{remaining}")
+            };
+            replace_request_path(request, &path_and_query)?;
+        }
+    }
+    Ok(())
+}
+
+fn replace_request_path<B>(request: &mut Request<B>, path: &str) -> Result<(), http::Error> {
+    // HTTP/2 carries Host in :authority. Path and credential rewrites must
+    // preserve the original scheme and authority before shared forwarding.
+    let mut parts = request.uri().clone().into_parts();
+    parts.path_and_query = Some(path.parse()?);
+    *request.uri_mut() = http::Uri::from_parts(parts)?;
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -2496,7 +2766,38 @@ struct ActiveSession {
     workload_id: String,
     relay_address: String,
     target_ip: std::net::IpAddr,
+    route: RouteHandle,
     cancel: watch::Sender<bool>,
+}
+
+fn session_can_continue(session: &ActiveSession, route: &crate::common::route::RouteInfo) -> bool {
+    route.environment_status.code == 3
+        && route.environment_id == session.workload_id
+        && route.relay_address == session.relay_address
+        && route.environment_ip.parse().ok() == Some(session.target_ip)
+        && session.route.private_service_ports == route.private_service_ports
+        && match (&session.route.e2b, &route.e2b) {
+            (None, None) => true,
+            (Some(previous), Some(current)) => e2b_session_policy_unchanged(previous, current),
+            _ => false,
+        }
+}
+
+fn native_execd_route(route: &RouteHandle) -> bool {
+    route.access_kind == AccessKind::Direct
+        && route.target.target_port == super::e2b_route::EXECD_PORT
+}
+
+fn e2b_session_policy_unchanged(
+    previous: &super::e2b_route::E2bRouteConfig,
+    current: &super::e2b_route::E2bRouteConfig,
+) -> bool {
+    current.envd_ready
+        && previous.envd_token_sha256 == current.envd_token_sha256
+        && previous.envd_gateway_auth == current.envd_gateway_auth
+        && previous.envd_signing_key == current.envd_signing_key
+        && previous.traffic_token_sha256 == current.traffic_token_sha256
+        && previous.allow_public_traffic == current.allow_public_traffic
 }
 
 struct SessionGuard {
@@ -2740,6 +3041,7 @@ mod tests {
     use super::*;
     use crate::common::protocol::ConnectTarget;
     use crate::common::route::{DataPlaneAuthMode, DataPlaneSecurityMode};
+    use crate::ingress::{H2PoolConfig, RouteStore};
 
     #[tokio::test]
     async fn preforward_route_change_is_retryable_but_other_connection_errors_are_not() {
@@ -2826,12 +3128,12 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        TlsAcceptor::from(Arc::new(
-            rustls::ServerConfig::builder()
-                .with_no_client_auth()
-                .with_single_cert(certs, key)
-                .unwrap(),
-        ))
+        let mut config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .unwrap();
+        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        TlsAcceptor::from(Arc::new(config))
     }
 
     async fn ingress_test_pair() -> (TcpStream, TcpStream, std::net::SocketAddr) {
@@ -3049,6 +3351,8 @@ mod tests {
             tenant_id: "tenant-a".into(),
             tunnel_security_mode: tunnel,
             port_forward_auth_mode: port_forward,
+            private_service_ports: Vec::new(),
+            e2b: None,
             target: ConnectTarget {
                 instance_id: "instance-a".into(),
                 workload_id: "environment-a".into(),
@@ -3113,6 +3417,53 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn e2b_route_config() -> super::super::e2b_route::E2bRouteConfig {
+        super::super::e2b_route::E2bRouteConfig {
+            envd_token_sha256: "a".repeat(64),
+            traffic_token_sha256: "b".repeat(64),
+            allow_public_traffic: false,
+            envd_ready: true,
+            envd_gateway_auth: false,
+            envd_signing_key: String::new(),
+        }
+    }
+
+    #[test]
+    fn e2b_lease_renewal_keeps_session_policy_but_revocation_does_not() {
+        let current = e2b_route_config();
+        let renewed = current.clone();
+        assert!(e2b_session_policy_unchanged(&current, &renewed));
+
+        let mut revoked = renewed.clone();
+        revoked.traffic_token_sha256 = "c".repeat(64);
+        assert!(!e2b_session_policy_unchanged(&renewed, &revoked));
+
+        let mut unavailable = renewed;
+        unavailable.envd_ready = false;
+        assert!(!e2b_session_policy_unchanged(&current, &unavailable));
+    }
+
+    #[test]
+    fn e2b_management_paths_require_a_configured_domain() {
+        let store = Arc::new(RouteStore::new());
+        let ingress = Ingress::new(
+            Arc::new(IngressRouteResolver::new(store)),
+            DataPlaneL4Connector::new(H2PoolConfig::default()),
+            IngressAuthenticator::disabled(),
+            EXECD_COMMAND_PORT,
+            8765,
+            "127.0.0.1:8080",
+            Vec::new(),
+        );
+        assert!(!ingress.is_control_plane_path("/v2/sandboxes"));
+        let ingress = ingress.with_port_host_domain(Some("sandbox.example.test".into()));
+        assert!(!ingress.is_control_plane_path("/v2/sandboxes"));
+        let ingress = ingress.with_e2b_enabled(true);
+        assert!(ingress.is_control_plane_path("/v2/sandboxes"));
+        assert!(ingress.is_control_plane_path("/templates/snapshot-a"));
+        assert!(!ingress.is_control_plane_path("/snapshots-old"));
     }
 
     #[test]
@@ -3315,6 +3666,9 @@ mod agent_api_tests;
 
 #[cfg(test)]
 mod processing_tests;
+
+#[cfg(test)]
+mod access_policy_tests;
 
 #[cfg(test)]
 mod watch_close_contract_tests {

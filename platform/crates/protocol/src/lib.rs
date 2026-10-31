@@ -1,5 +1,8 @@
 //! Generated transport contracts and validated conversions, without services.
 mod admission;
+mod checkpoint_cleanup;
+mod envd;
+mod environment_control;
 pub use admission::{scheduling_deadline, scheduling_failure};
 mod runtime_profile;
 mod snapshots;
@@ -15,6 +18,9 @@ mod observation;
 mod probes;
 pub use observation::create_status;
 mod scheduling;
+
+/// gRPC metadata key for a typed runtime capability rejection.
+const UNSUPPORTED_CAPABILITY_METADATA: &str = "adx-unsupported-capability";
 
 impl From<adx_core::Resources> for control::Resources {
     fn from(value: adx_core::Resources) -> Self {
@@ -33,6 +39,9 @@ impl TryFrom<control::EnvironmentSpec> for adx_core::EnvironmentSpec {
             .resources
             .ok_or_else(|| Error::Invalid("resources are required".into()))?;
         let spec = Self {
+            run_policy: value.run_policy.map(TryInto::try_into).transpose()?,
+            envd: value.envd.map(Into::into),
+            compatibility: value.compatibility.map(Into::into),
             runtime_profile: value.runtime_profile.map(TryInto::try_into).transpose()?,
             snapshot_id: value.snapshot_id,
             lifecycle: value
@@ -70,6 +79,9 @@ impl TryFrom<control::EnvironmentSpec> for adx_core::EnvironmentSpec {
 impl From<adx_core::EnvironmentSpec> for control::EnvironmentSpec {
     fn from(value: adx_core::EnvironmentSpec) -> Self {
         Self {
+            run_policy: value.run_policy.map(Into::into),
+            envd: value.envd.map(Into::into),
+            compatibility: value.compatibility.map(Into::into),
             runtime_profile: value.runtime_profile.map(Into::into),
             snapshot_id: value.snapshot_id,
             lifecycle: Some(value.lifecycle.into()),
@@ -142,6 +154,22 @@ mod tests {
     #[test]
     fn environment_spec_round_trip_preserves_units_and_priority() {
         let value = adx_core::EnvironmentSpec {
+            run_policy: Some(adx_core::environment_control::RunPolicy {
+                timeout_seconds: 90_000,
+                action: adx_core::environment_control::RunExpiryAction::Pause,
+            }),
+            envd: Some(adx_core::envd::EnvdServiceConfig {
+                version: "0.9.0".into(),
+                gateway_auth: false,
+                access_token: Some("a".repeat(32)),
+                ingress_sources: Vec::new(),
+            }),
+            compatibility: Some(adx_core::environment_control::EnvironmentCompatibility {
+                template_id: "template-id".into(),
+                envd_access_token: "a".repeat(32),
+                traffic_access_token: "b".repeat(32),
+                allow_public_traffic: false,
+            }),
             runtime_profile: None,
             snapshot_id: None,
             lifecycle: Default::default(),
@@ -162,6 +190,63 @@ mod tests {
         let bytes = control::EnvironmentSpec::from(value.clone()).encode_to_vec();
         let decoded = control::EnvironmentSpec::decode(bytes.as_slice()).unwrap();
         assert_eq!(adx_core::EnvironmentSpec::try_from(decoded).unwrap(), value);
+    }
+
+    #[test]
+    fn run_policy_rejects_unspecified_action() {
+        assert!(
+            adx_core::environment_control::RunPolicy::try_from(control::RunPolicy {
+                timeout_seconds: 60,
+                action: 0,
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn unsupported_capability_round_trips_through_grpc_status() {
+        let node_status = status(adx_core::Error::UnsupportedCapability(
+            adx_core::UnsupportedCapability::CheckpointRestore,
+        ));
+
+        assert_eq!(node_status.code(), tonic::Code::InvalidArgument);
+        assert_eq!(
+            node_status
+                .metadata()
+                .get(UNSUPPORTED_CAPABILITY_METADATA)
+                .unwrap(),
+            "checkpoint_restore",
+        );
+        let coordinator_status = status(dependency_status(node_status));
+        assert_eq!(
+            unsupported_capability(&coordinator_status),
+            Some(adx_core::UnsupportedCapability::CheckpointRestore),
+        );
+    }
+
+    #[test]
+    fn capability_metadata_requires_a_known_capability_and_invalid_argument() {
+        let mut unknown = tonic::Status::invalid_argument("unsupported capability");
+        unknown.metadata_mut().insert(
+            UNSUPPORTED_CAPABILITY_METADATA,
+            tonic::metadata::MetadataValue::from_static("unknown"),
+        );
+        assert_eq!(unsupported_capability(&unknown), None);
+        assert_eq!(
+            dependency_status(unknown),
+            adx_core::Error::Invalid("remote request rejected".into()),
+        );
+
+        let mut unavailable = tonic::Status::unavailable("backend unavailable");
+        unavailable.metadata_mut().insert(
+            UNSUPPORTED_CAPABILITY_METADATA,
+            tonic::metadata::MetadataValue::from_static("checkpoint_restore"),
+        );
+        assert_eq!(unsupported_capability(&unavailable), None);
+        assert_eq!(
+            dependency_status(unavailable),
+            adx_core::Error::Unavailable("control RPC unavailable".into()),
+        );
     }
 }
 
@@ -270,21 +355,23 @@ impl TryFrom<adx_core::EnvironmentRecord> for control::EnvironmentRecord {
             resources_held: v.resources_held,
             snapshot_source: v.snapshot_source.map(Into::into),
             checkpoint: v.checkpoint.map(Into::into),
-            execution_artifacts: v
-                .execution_artifacts
-                .into_iter()
-                .map(|a| control::CheckpointArtifact {
-                    storage: a.storage,
-                    location: a.location,
-                    size_bytes: a.size_bytes,
-                })
-                .collect(),
+            execution_artifacts: v.execution_artifacts.into_iter().map(Into::into).collect(),
             last_operation: v.last_operation.map(Into::into),
         })
     }
 }
 pub fn status(error: adx_core::Error) -> tonic::Status {
     match error {
+        Error::UnsupportedCapability(capability) => {
+            let mut status = tonic::Status::invalid_argument(format!(
+                "capability not supported: {capability}"
+            ));
+            status.metadata_mut().insert(
+                UNSUPPORTED_CAPABILITY_METADATA,
+                tonic::metadata::MetadataValue::from_static(capability.wire_name()),
+            );
+            status
+        }
         adx_core::Error::SnapshotInUse { sandbox_ids, template_ids } => tonic::Status::with_details(
             tonic::Code::FailedPrecondition, "snapshot is in use",
             serde_json::json!({"code":"SNAPSHOT_IN_USE", "sandbox_ids":sandbox_ids, "template_ids":template_ids}).to_string().into_bytes().into(),
@@ -334,6 +421,9 @@ pub fn status(error: adx_core::Error) -> tonic::Status {
     }
 }
 pub fn dependency_status(status: tonic::Status) -> Error {
+    if let Some(capability) = unsupported_capability(&status) {
+        return Error::UnsupportedCapability(capability);
+    }
     if status.code() == tonic::Code::ResourceExhausted {
         if let Ok(value) = serde_json::from_slice::<serde_json::Value>(status.details()) {
             if value["code"] == "WAITING_FOR_VOLUME" {
@@ -364,6 +454,18 @@ pub fn dependency_status(status: tonic::Status) -> Error {
     }
 }
 
+/// Return the typed capability rejection encoded in a control-plane status.
+pub fn unsupported_capability(status: &tonic::Status) -> Option<adx_core::UnsupportedCapability> {
+    if status.code() != tonic::Code::InvalidArgument {
+        return None;
+    }
+    status
+        .metadata()
+        .get(UNSUPPORTED_CAPABILITY_METADATA)
+        .and_then(|value| value.to_str().ok())
+        .and_then(adx_core::UnsupportedCapability::from_wire_name)
+}
+
 /// A node-confirmed failed create, distinct from a transport wait expiring.
 pub fn deadline_failure(status: &tonic::Status) -> Option<adx_core::RuntimeFailure> {
     if status.code() != tonic::Code::DeadlineExceeded {
@@ -383,6 +485,7 @@ impl From<adx_core::RestorePoint> for control::RestorePoint {
             source_runtime_id: v.source_runtime_id,
             artifact: Some(control::CheckpointArtifact {
                 storage: v.artifact.storage,
+                scope: v.artifact.scope,
                 location: v.artifact.location,
                 size_bytes: v.artifact.size_bytes,
             }),
@@ -411,6 +514,7 @@ impl TryFrom<control::RestorePoint> for adx_core::RestorePoint {
             source_runtime_id: v.source_runtime_id,
             artifact: adx_core::CheckpointArtifact {
                 storage: a.storage,
+                scope: a.scope,
                 location: a.location,
                 size_bytes: a.size_bytes,
             },
@@ -692,6 +796,7 @@ impl TryFrom<control::CheckpointArtifact> for adx_core::CheckpointArtifact {
         }
         Ok(Self {
             storage: a.storage,
+            scope: a.scope,
             location: a.location,
             size_bytes: a.size_bytes,
         })
@@ -701,6 +806,7 @@ impl From<adx_core::CheckpointArtifact> for control::CheckpointArtifact {
     fn from(a: adx_core::CheckpointArtifact) -> Self {
         Self {
             storage: a.storage,
+            scope: a.scope,
             location: a.location,
             size_bytes: a.size_bytes,
         }

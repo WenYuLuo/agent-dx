@@ -21,6 +21,7 @@ struct Dependencies {
     actual: std::sync::atomic::AtomicBool,
     fail_cleanup: std::sync::atomic::AtomicBool,
     failure: Mutex<Option<adx_core::RuntimeFailure>>,
+    compatibility_ready: std::sync::atomic::AtomicBool,
 }
 
 impl Dependencies {
@@ -39,6 +40,7 @@ impl Dependencies {
             actual: std::sync::atomic::AtomicBool::new(false),
             fail_cleanup: std::sync::atomic::AtomicBool::new(false),
             failure: Mutex::default(),
+            compatibility_ready: std::sync::atomic::AtomicBool::new(true),
         })
     }
     fn event(&self, name: &str) -> Result<()> {
@@ -107,6 +109,16 @@ impl RuntimeDriver for Dependencies {
 }
 #[async_trait]
 impl Readiness for Dependencies {
+    async fn activity(&self, _record: &EnvironmentRecord) -> Result<(u64, u64)> {
+        if self
+            .compatibility_ready
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            Ok((1, 0))
+        } else {
+            Err(Error::Unavailable("envd is not ready".into()))
+        }
+    }
     async fn probe_failure(
         &self,
         _: &EnvironmentRecord,
@@ -162,6 +174,9 @@ fn resources() -> Resources {
 }
 fn spec(id: &str) -> EnvironmentSpec {
     EnvironmentSpec {
+        run_policy: None,
+        envd: None,
+        compatibility: None,
         runtime_profile: None,
         snapshot_id: None,
         lifecycle: Default::default(),
@@ -174,6 +189,22 @@ fn spec(id: &str) -> EnvironmentSpec {
         resources: resources(),
         priority: 0,
         execution: Default::default(),
+    }
+}
+fn envd_service() -> adx_core::envd::EnvdServiceConfig {
+    adx_core::envd::EnvdServiceConfig {
+        version: "0.9.0".into(),
+        gateway_auth: false,
+        access_token: Some("a".repeat(32)),
+        ingress_sources: Vec::new(),
+    }
+}
+fn e2b_compatibility() -> adx_core::environment_control::EnvironmentCompatibility {
+    adx_core::environment_control::EnvironmentCompatibility {
+        template_id: "base".into(),
+        envd_access_token: "a".repeat(32),
+        traffic_access_token: "b".repeat(32),
+        allow_public_traffic: false,
     }
 }
 fn assignment(id: &str) -> Assignment {
@@ -253,6 +284,86 @@ async fn create_publishes_only_after_runtime_readiness_and_route_binding() {
     environment.delete().await.unwrap();
     assert_eq!(deps.events.lock().unwrap().len(), 8);
     assert_eq!(environment.create().await.unwrap_err(), Error::Conflict);
+}
+
+#[tokio::test]
+async fn configured_service_failure_on_tick_retires_route_and_releases_resources() {
+    let deps = Dependencies::new(false);
+    let node = node(&deps);
+    let mut value = spec("e2b-tick");
+    value.envd = Some(envd_service());
+    let environment = node.environment(value, assignment("e2b-tick")).unwrap();
+    environment.create().await.unwrap();
+
+    deps.compatibility_ready
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    environment.tick().await.unwrap();
+
+    let failed = environment.sync().await.unwrap().record;
+    assert_eq!(failed.state, EnvironmentState::Failed);
+    assert!(!failed.resources_held);
+    assert_eq!(node.used(), Resources::default());
+    assert_eq!(
+        &deps.events.lock().unwrap()[4..7],
+        ["retire", "remove", "commit:Failed"]
+    );
+}
+
+#[tokio::test]
+async fn configured_service_failure_event_retires_route_without_waiting_for_monitor_policy() {
+    let deps = Dependencies::new(false);
+    let node = node(&deps);
+    let mut value = spec("e2b-event");
+    value.envd = Some(envd_service());
+    let environment = node.environment(value, assignment("e2b-event")).unwrap();
+    environment.create().await.unwrap();
+
+    deps.compatibility_ready
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    node.observe_runtime_event(&adx_core::runtime::RuntimeIdentity {
+        environment_id: "e2b-event".into(),
+        runtime_id: "e2b-event-1".into(),
+        ownership_generation: 1,
+    })
+    .await
+    .unwrap();
+
+    let failed = environment.sync().await.unwrap().record;
+    assert_eq!(failed.state, EnvironmentState::Failed);
+    assert!(!failed.resources_held);
+    assert_eq!(node.used(), Resources::default());
+    assert_eq!(
+        &deps.events.lock().unwrap()[4..7],
+        ["retire", "remove", "commit:Failed"]
+    );
+}
+
+#[tokio::test]
+async fn compatibility_identity_does_not_enable_optional_service_health() {
+    let deps = Dependencies::new(false);
+    let node = node(&deps);
+    let mut value = spec("native");
+    value.compatibility = Some(e2b_compatibility());
+    let environment = node.environment(value, assignment("native")).unwrap();
+    environment.create().await.unwrap();
+
+    deps.compatibility_ready
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    environment.tick().await.unwrap();
+
+    node.observe_runtime_event(&adx_core::runtime::RuntimeIdentity {
+        environment_id: "native".into(),
+        runtime_id: "native-1".into(),
+        ownership_generation: 1,
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        environment.sync().await.unwrap().record.state,
+        EnvironmentState::Running
+    );
+    assert_eq!(node.used(), resources());
 }
 
 #[tokio::test]
@@ -378,6 +489,107 @@ async fn network_policy_replacement_is_serialized_and_published_idempotently() {
         events
             .iter()
             .filter(|event| *event == "network:clear")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn gateway_envd_network_replacement_requires_the_persisted_guard_before_backend_update() {
+    use adx_core::execution::{
+        NetworkAction, NetworkDirection, NetworkPeer, NetworkPolicy, NetworkProtocol, NetworkRule,
+        PortRange, TrafficMode, TrafficPolicy,
+    };
+    let guarded_policy = || NetworkPolicy {
+        traffic: Some(TrafficPolicy {
+            ingress_default_action: NetworkAction::Allow,
+            egress_default_action: NetworkAction::Allow,
+            rules: vec![
+                NetworkRule {
+                    action: NetworkAction::Deny,
+                    direction: NetworkDirection::Ingress,
+                    protocol: NetworkProtocol::Tcp,
+                    peer: NetworkPeer::default(),
+                    environment_port: 0,
+                    environment_port_range: Some(PortRange {
+                        first: 49_983,
+                        last: 49_983,
+                    }),
+                    priority: u32::MAX - 2,
+                },
+                NetworkRule {
+                    action: NetworkAction::Allow,
+                    direction: NetworkDirection::Ingress,
+                    protocol: NetworkProtocol::Tcp,
+                    peer: NetworkPeer {
+                        cidr: "10.0.0.2/32".into(),
+                        ..Default::default()
+                    },
+                    environment_port: 0,
+                    environment_port_range: Some(PortRange {
+                        first: 49_983,
+                        last: 49_983,
+                    }),
+                    priority: u32::MAX - 1,
+                },
+            ],
+            mode: TrafficMode::Stateful,
+        }),
+        dns: None,
+    };
+    let deps = Dependencies::new(false);
+    let node = node(&deps);
+    let mut value = spec("gateway-network");
+    value.runtime_class = "runsc".into();
+    value.execution.ports = vec![8080];
+    let compatibility = e2b_compatibility();
+    value.envd = Some(adx_core::envd::EnvdServiceConfig {
+        version: "0.9.0".into(),
+        gateway_auth: true,
+        access_token: None,
+        ingress_sources: vec!["10.0.0.2".into()],
+    });
+    value.compatibility = Some(compatibility);
+    value.execution.network = Some(guarded_policy());
+    value.execution.protected_ingress = guarded_policy().traffic.unwrap().rules;
+    value.execution.private_service_ports = vec![49_983];
+    let environment = node
+        .environment(value, assignment("gateway-network"))
+        .unwrap();
+    let created = environment.create().await.unwrap();
+    deps.events.lock().unwrap().clear();
+
+    assert!(matches!(
+        environment
+            .update_network_policy(
+                None,
+                "gateway-network-missing".into(),
+                created.record.revision
+            )
+            .await,
+        Err(Error::Invalid(_))
+    ));
+    assert!(deps.events.lock().unwrap().is_empty());
+    assert_eq!(environment.sync().await.unwrap().record, created.record);
+
+    let updated = environment
+        .update_network_policy(
+            Some(guarded_policy()),
+            "gateway-network-valid".into(),
+            created.record.revision,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        updated.record.spec.execution.network,
+        Some(guarded_policy())
+    );
+    assert_eq!(
+        deps.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| *event == "network:set")
             .count(),
         1
     );
@@ -1180,6 +1392,15 @@ async fn losing_attempt_releases_only_its_token_and_partial_device_reservation_i
     let mut other = spec("a");
     other.tenant_id = "other".into();
     assert_eq!(manager.reserve_local(&other).unwrap_err(), Error::Conflict);
+    let mut relabeled = spec("a");
+    relabeled
+        .scheduling
+        .labels
+        .insert("team".into(), "changed".into());
+    assert_eq!(
+        manager.reserve_local(&relabeled).unwrap_err(),
+        Error::Conflict
+    );
     assert_eq!(manager.used(), resources());
     manager.release_local("a", &b).unwrap();
     assert_eq!(manager.used(), Resources::default());
@@ -1494,4 +1715,56 @@ async fn delete_publishes_execution_intent_before_cleanup_and_aborts_if_unconfir
         intent.observation.as_ref().unwrap().intent,
         Some(adx_core::observation::OperationIntent::User)
     );
+}
+
+#[tokio::test]
+async fn optional_run_timer_renews_in_owner_and_zero_deletes_without_tick() {
+    use adx_core::environment_control::{RunExpiryAction, RunPolicy};
+    let deps = Dependencies::new(false);
+    let owner = node(&deps);
+    let mut configured = spec("run-timer");
+    configured.run_policy = Some(RunPolicy {
+        timeout_seconds: 60,
+        action: RunExpiryAction::Delete,
+    });
+    let environment = owner
+        .environment(configured, assignment("run-timer"))
+        .unwrap();
+    environment.create().await.unwrap();
+    let original = environment.run_control().await.unwrap();
+    let shorter = environment.update_run_timeout(5, true).await.unwrap();
+    assert_eq!(shorter.revision, original.revision);
+    let extended = environment.update_run_timeout(120, true).await.unwrap();
+    assert!(extended.expires_at_unix_ms > original.expires_at_unix_ms);
+    let replaced = environment.update_run_timeout(10, false).await.unwrap();
+    assert!(replaced.expires_at_unix_ms < extended.expires_at_unix_ms);
+    environment.update_run_timeout(0, false).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while deps.actual.load(std::sync::atomic::Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("owner timer deletes without polling");
+    assert!(environment.update_run_timeout(60, true).await.is_err());
+}
+
+#[tokio::test]
+async fn environments_without_run_policy_have_no_timer() {
+    let deps = Dependencies::new(false);
+    let owner = node(&deps);
+    let environment = owner
+        .environment(spec("untimed"), assignment("untimed"))
+        .unwrap();
+    environment.create().await.unwrap();
+    assert_eq!(
+        environment.run_control().await.unwrap_err(),
+        Error::NotFound
+    );
+    assert_eq!(
+        environment.update_run_timeout(0, false).await.unwrap_err(),
+        Error::NotFound
+    );
+    assert!(deps.actual.load(std::sync::atomic::Ordering::SeqCst));
+    environment.delete().await.unwrap();
 }

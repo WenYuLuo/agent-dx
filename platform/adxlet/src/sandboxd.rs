@@ -2,7 +2,7 @@
 //! cannot race its client task. Failed starts are terminal; ambiguous outcomes
 //! retain targeted cleanup retries until their backend can be removed.
 use crate::RuntimeDriver;
-use adx_core::{EnvironmentSpec, Error, Result};
+use adx_core::{EnvironmentSpec, Error, Result, UnsupportedCapability};
 use async_trait::async_trait;
 use hyper_util::rt::TokioIo;
 use std::collections::{BTreeMap, HashMap};
@@ -601,6 +601,7 @@ pub fn start_request(
             "environment runtime environment differs from this node deployment".into(),
         ));
     }
+    validate_protected_ingress(spec)?;
     let environment = spec.runtime_profile.as_ref();
     let mut envs: HashMap<String, String> = spec.env.clone().into_iter().collect();
     if let Some(e) = environment {
@@ -612,6 +613,45 @@ pub fn start_request(
     envs.remove("ADX_RUNTIME_CONTROL_ADDRESS");
     envs.remove("ADX_RUNTIME_CONTROL_TOKEN");
     envs.remove("ADX_RUNTIME_CONTROL_SECRET");
+    // Privileged bootstrap settings come only from the trusted node profile;
+    // the optional common service config owns enabling and instance credentials.
+    const ENVD_CONFIGURATION_KEYS: [&str; 6] = [
+        "ADX_ENVD_PATH",
+        "ADX_ENVD_SHA256",
+        "ADX_ENVD_ARGS",
+        "ADX_ENVD_DEFAULT_USER",
+        "ADX_ENVD_DEFAULT_WORKDIR",
+        "ADX_ENVD_FREEZE_ON_CHECKPOINT",
+    ];
+    for key in ENVD_CONFIGURATION_KEYS.into_iter().chain([
+        "ADX_ENVD_ACCESS_TOKEN",
+        "ADX_ENVD_GATEWAY_AUTH",
+        "ADX_ENVD_VERSION",
+    ]) {
+        envs.remove(key);
+    }
+    if let Some(service) = &spec.envd {
+        service.validate()?;
+        let profile = config.runtime_profile.as_ref().ok_or_else(|| {
+            Error::Invalid("envd service requires a trusted runtime profile".into())
+        })?;
+        for key in ENVD_CONFIGURATION_KEYS {
+            if let Some(value) = profile.env.get(key) {
+                envs.insert(key.into(), value.clone());
+            }
+        }
+        if envs.get("ADX_ENVD_PATH").is_none_or(|path| path.is_empty()) {
+            return Err(Error::Invalid(
+                "envd service requires a trusted artifact path".into(),
+            ));
+        }
+        envs.insert("ADX_ENVD_VERSION".into(), service.version.clone());
+        if service.gateway_auth {
+            envs.insert("ADX_ENVD_GATEWAY_AUTH".into(), "true".into());
+        } else if let Some(token) = &service.access_token {
+            envs.insert("ADX_ENVD_ACCESS_TOKEN".into(), token.clone());
+        }
+    }
     if let (Some(address), Some(secret)) = (
         config.env.get("ADX_RUNTIME_CONTROL_ADDRESS"),
         config.env.get("ADX_RUNTIME_CONTROL_SECRET"),
@@ -822,6 +862,23 @@ pub fn start_request(
         },
         ..Default::default()
     })
+}
+
+pub(crate) fn validate_protected_ingress(spec: &EnvironmentSpec) -> Result<()> {
+    spec.execution
+        .validate_protected_ingress(spec.execution.network.as_ref())?;
+    spec.execution.validate_private_service_ports()?;
+    if !spec.execution.protected_ingress.is_empty()
+        && !matches!(
+            spec.runtime_class.as_str(),
+            "runsc" | "firecracker" | "firecracker-pvm"
+        )
+    {
+        return Err(Error::Invalid(
+            "protected ingress requires an ACL-capable runtime".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn deployment_environment_accepts(
@@ -1111,8 +1168,8 @@ impl RuntimeDriver for Sandboxd {
             {
                 Ok(())
             }
-            _ => Err(Error::Invalid(
-                "runtime does not provide checkpoint/restore handoff".into(),
+            _ => Err(Error::UnsupportedCapability(
+                UnsupportedCapability::CheckpointRestore,
             )),
         }
     }
@@ -1444,8 +1501,123 @@ mod tests {
     }
 
     #[test]
+    fn deployment_envd_payload_is_enabled_without_compatibility_identity() {
+        let profile: adx_core::runtime_profile::RuntimeProfile = serde_json::from_value(serde_json::json!({
+            "rootfs":{"runtime_class":"runc","type":"local","path":"/opt/adx/runtime.img","readonly":false},
+            "bootstrap":{"type":"erofs","root":"/opt/adx/runtime.img","target":"/__adx","entrypoint":["/__adx/usr/local/bin/adx-execd"]},
+            "env":{"ADX_ENVD_PATH":"/usr/local/bin/envd","ADX_ENVD_SHA256":"a".repeat(64),"ADX_ENVD_DEFAULT_USER":"user","ADX_ENVD_DEFAULT_WORKDIR":"/home/user","ADX_ENVD_FREEZE_ON_CHECKPOINT":"false"}
+        })).unwrap();
+        let mut spec = EnvironmentSpec {
+            run_policy: None,
+            envd: None,
+            compatibility: None,
+            runtime_profile: Some(profile.clone()),
+            snapshot_id: None,
+            lifecycle: Default::default(),
+            env: [
+                ("ADX_ENVD_FREEZE_ON_CHECKPOINT".into(), "true".into()),
+                ("ADX_ENVD_PATH".into(), "/untrusted/envd".into()),
+                ("ADX_ENVD_VERSION".into(), "untrusted".into()),
+                ("ADX_ENVD_ACCESS_TOKEN".into(), "untrusted".into()),
+            ]
+            .into(),
+            scheduling: Default::default(),
+            id: "compat-switch".into(),
+            tenant_id: "tenant".into(),
+            image: String::new(),
+            runtime_class: "runc".into(),
+            resources: adx_core::Resources {
+                cpu_millis: 1000,
+                memory_bytes: 512 * 1024 * 1024,
+                disk_bytes: 0,
+            },
+            priority: 0,
+            execution: Default::default(),
+        };
+        let config = Config {
+            runtime_profile: Some(profile),
+            ..Config::default()
+        };
+        let native = start_request(&spec, "compat-switch-1", 1, &[], &config).unwrap();
+        assert!(!native.envs.contains_key("ADX_ENVD_PATH"));
+        assert!(!native.envs.contains_key("ADX_ENVD_ACCESS_TOKEN"));
+        assert!(!native.envs.contains_key("ADX_ENVD_FREEZE_ON_CHECKPOINT"));
+        assert!(!native.envs.contains_key("ADX_ENVD_VERSION"));
+        spec.envd = Some(adx_core::envd::EnvdServiceConfig {
+            version: "0.9.0".into(),
+            access_token: Some("t".repeat(32)),
+            gateway_auth: false,
+            ingress_sources: Vec::new(),
+        });
+        let compatible = start_request(&spec, "compat-switch-2", 2, &[], &config).unwrap();
+        assert_eq!(compatible.envs["ADX_ENVD_PATH"], "/usr/local/bin/envd");
+        assert_eq!(compatible.envs["ADX_ENVD_VERSION"], "0.9.0");
+        assert!(spec.compatibility.is_none());
+        assert_eq!(compatible.envs["ADX_ENVD_ACCESS_TOKEN"], "t".repeat(32));
+        assert_eq!(compatible.envs["ADX_ENVD_FREEZE_ON_CHECKPOINT"], "false");
+        assert!(!compatible.envs.contains_key("ADX_ENVD_GATEWAY_AUTH"));
+        spec.runtime_profile = None;
+        assert!(start_request(&spec, "missing-profile-1", 1, &[], &Config::default()).is_err());
+    }
+
+    #[test]
+    fn protected_ingress_is_generic_and_cannot_be_overridden_by_published_ports() {
+        use adx_core::execution::{
+            NetworkAction, NetworkDirection, NetworkPeer, NetworkPolicy, NetworkProtocol,
+            NetworkRule, TrafficMode, TrafficPolicy,
+        };
+        let protected = vec![NetworkRule {
+            action: NetworkAction::Deny,
+            direction: NetworkDirection::Ingress,
+            protocol: NetworkProtocol::Tcp,
+            peer: NetworkPeer::default(),
+            environment_port: 8081,
+            environment_port_range: None,
+            priority: 10,
+        }];
+        let mut spec: EnvironmentSpec = serde_json::from_value(serde_json::json!({
+            "id":"private-service", "tenant_id":"tenant", "runtime_class":"runsc",
+            "image":"image", "priority":0,
+            "resources":{"cpu_millis":1000,"memory_bytes":1024,"disk_bytes":0},
+        }))
+        .unwrap();
+        spec.execution.protected_ingress = protected.clone();
+        spec.execution.network = Some(NetworkPolicy {
+            traffic: Some(TrafficPolicy {
+                ingress_default_action: NetworkAction::Allow,
+                egress_default_action: NetworkAction::Allow,
+                rules: protected,
+                mode: TrafficMode::Stateful,
+            }),
+            dns: None,
+        });
+        assert!(validate_protected_ingress(&spec).is_ok());
+        spec.execution.ports.push(8081);
+        assert!(validate_protected_ingress(&spec).is_err());
+        spec.execution.ports.clear();
+        spec.runtime_class = "runc".into();
+        assert!(validate_protected_ingress(&spec).is_err());
+        spec.runtime_class = "runsc".into();
+        spec.execution
+            .network
+            .as_mut()
+            .unwrap()
+            .traffic
+            .as_mut()
+            .unwrap()
+            .rules[0]
+            .action = NetworkAction::Allow;
+        assert!(validate_protected_ingress(&spec).is_err());
+        spec.execution.network = None;
+        assert!(validate_protected_ingress(&spec).is_err());
+    }
+
+    #[test]
     fn request_preserves_execution_identity_image_and_resource_units() {
         let spec = EnvironmentSpec {
+            run_policy: None,
+            envd: None,
+            compatibility: None,
             runtime_profile: None,
             snapshot_id: None,
             lifecycle: Default::default(),
@@ -1504,6 +1676,9 @@ mod tests {
     #[test]
     fn runtime_control_credentials_are_scoped_and_host_secret_is_not_injected() {
         let mut spec = EnvironmentSpec {
+            run_policy: None,
+            envd: None,
+            compatibility: None,
             id: "i".into(),
             tenant_id: "t".into(),
             image: "image".into(),
@@ -1565,6 +1740,9 @@ mod tests {
     #[test]
     fn workload_probe_configuration_is_node_owned_and_preserves_init_budget() {
         let workload = EnvironmentSpec {
+            run_policy: None,
+            envd: None,
+            compatibility: None,
             execution: adx_core::execution::ExecutionOptions {
                 inherit_entrypoint: true,
                 rootfs: Some(adx_core::execution::Rootfs {

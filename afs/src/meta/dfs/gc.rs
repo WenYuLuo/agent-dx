@@ -777,7 +777,7 @@ mod tests {
         let (entity, reference) = retired_reference("write:generation-op", 100);
         let entities = vec![entity];
         assert!(
-            plan_collection(&entities, &[reference.clone()], 110, 10)
+            plan_collection(&entities, std::slice::from_ref(&reference), 110, 10)
                 .keys
                 .is_empty(),
             "data grace has passed but the record stays as a tombstone fencing late admissions"
@@ -785,7 +785,7 @@ mod tests {
         assert!(
             plan_collection(
                 &entities,
-                &[reference.clone()],
+                std::slice::from_ref(&reference),
                 100 + ADMISSION_HORIZON_MS,
                 10
             )
@@ -815,7 +815,7 @@ mod tests {
         assert!(
             plan_collection(
                 &entities,
-                &[reference.clone()],
+                std::slice::from_ref(&reference),
                 100 + REFERENCE_RECORD_RETENTION_MS,
                 long_grace
             )

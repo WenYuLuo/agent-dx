@@ -21,6 +21,11 @@ maintained control-plane copy of the backend API.
 The archive contains sandboxd, sbox, runc, runc-shim, sandbox-logger, redis-cli
 and their backend manifest. It contains no ADX platform or Execd binaries.
 
+The current AMD64 executables require glibc 2.34 or newer. Firecracker uses
+`mount_setattr` for recursive virtiofs export protection, requiring Linux 5.12
+or a kernel with that feature backported. An available `/dev/kvm` alone does
+not establish host compatibility.
+
 `build/e2e/download_backend.py` checks the archive byte count and SHA256, then
 validates the pinned sandboxd revision, declared target, complete file set,
 per-file SHA256 and each executable's ELF machine. It rejects unsafe or duplicate

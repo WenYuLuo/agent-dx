@@ -60,6 +60,9 @@ service_impl!(pb::coordinator_service_server::CoordinatorService, {
         Ok(Response::new(state.owner.clone()))
     }
 }, [
+    get_environment_control(GetEnvironmentControlRequest) -> EnvironmentControlRecord,
+    batch_get_environment_control(BatchGetEnvironmentControlRequest) -> BatchGetEnvironmentControlResponse,
+    update_environment_control(UpdateEnvironmentControlRequest) -> EnvironmentControlRecord,
     get_scheduling_queue(GetSchedulingQueueRequest) -> GetSchedulingQueueResponse,
     set_node_scheduling(SetNodeSchedulingRequest) -> NodeSchedulingState,
     prepare_create(LocalEnvironmentCreateRequest) -> PreparedEnvironment,
@@ -122,6 +125,9 @@ service_impl!(pb::node_service_server::NodeService, {
         }))
     }
 }, [
+    get_environment_control(NodeGetEnvironmentControlRequest) -> EnvironmentControlRecord,
+    batch_get_environment_control(NodeBatchGetEnvironmentControlRequest) -> BatchGetEnvironmentControlResponse,
+    update_environment_control(NodeUpdateEnvironmentControlRequest) -> EnvironmentControlRecord,
     create_local_environment(LocalEnvironmentCreateRequest) -> EnvironmentResult,
     recover_environment(RecoverEnvironmentRequest) -> EnvironmentResult,
     get_session(GetNodeSessionRequest) -> GetNodeSessionResponse,
@@ -132,6 +138,7 @@ service_impl!(pb::node_service_server::NodeService, {
     update_network_policy(UpdateNetworkPolicyRequest) -> EnvironmentResult,
     create_snapshot(CreateSnapshotRequest) -> CreateSnapshotResponse,
     collect_snapshot(CollectSnapshotRequest) -> CollectSnapshotResponse,
+    collect_checkpoint_cleanup(CollectCheckpointCleanupRequest) -> CollectCheckpointCleanupResponse,
 ]);
 
 struct Fixture {
@@ -156,6 +163,7 @@ impl Fixture {
                 snapshot_source: None,
                 failure: None,
                 spec: Some(pb::EnvironmentSpec {
+                    compatibility: None,
                     id: "environment".into(),
                     tenant_id: "tenant".into(),
                     ..Default::default()

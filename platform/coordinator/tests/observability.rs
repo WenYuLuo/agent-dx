@@ -14,6 +14,9 @@ use std::time::Duration;
 
 fn spec(id: &str) -> EnvironmentSpec {
     EnvironmentSpec {
+        envd: None,
+        compatibility: None,
+        run_policy: None,
         id: id.into(),
         tenant_id: "tenant".into(),
         image: "image".into(),

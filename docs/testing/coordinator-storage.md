@@ -44,7 +44,7 @@
 5. **释放资源**：Failed 不等于资源可用；`resources_held=true` 时恢复占用。服务层必须先确认节点清理、提交终态，再释放调度账本；不能仅以 State=Failed 释放。节点心跳失效是单独的持久化失效路径，会释放逻辑预留并关闭节点资格；物理旧执行在返回对账时清理，见 [节点失效](node-failure-takeover.md)。
 6. **节点明确拒绝分配**：确认未执行或已清理后，可以通过 `replace_rejected` 条件替换精确旧分配，新的 generation 必须更高。Running、Deleted 或仍占用资源的 Failed 不能走这个入口。旧分配之后的迟到结果会被拒绝；这不是运行中实例的跨节点接管协议。
 
-`reserve/commit/replace_rejected` 支持相同内容的重复调用。同一实例 revision 携带不同内容、旧 revision 或旧 assignment 均返回冲突。删除提交的完整结果只以摘要、ID 和 generation 形成带 TTL 的最小回执，用于应答丢失后的相同结果重试；它不会进入实例目录。删除后可用同一 ID 创建新 Environment，新 Assignment 使用更高的全局 generation；旧 generation 的迟到结果不能修改新记录。已释放的 Failed 仍保留，便于查询失败原因，后续清理由独立策略决定。
+`reserve/commit/replace_rejected` 支持相同内容的重复调用。同一实例 revision 携带不同内容、旧 revision 或旧 assignment 均返回冲突。删除提交的结果与规范化 cleanup payload 只以摘要、ID 和 generation 形成600秒最小回执，用于应答丢失后的相同结果重试；它不会进入实例目录，也不另留永久cleanup/artifact fence；未完成的本地或未登记制品由独立最小pending承担清理责任，完成后删除。删除后可用同一 ID 创建新 Environment，新 Assignment 使用更高的全局 generation；旧 generation 的迟到结果不能修改新记录。已释放的 Failed 仍保留，便于查询失败原因，后续清理由独立策略决定。
 
 每次 Coordinator 真正启动才调用 begin；Redis 连接恢复不增加 epoch。旧 Session 的写入和全量读取会被拒绝。这个机制用于排除旧 Coordinator 写者，不提供主备选举，也不证明失联节点上的旧执行已经停止。
 

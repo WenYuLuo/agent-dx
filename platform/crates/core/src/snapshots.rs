@@ -1,7 +1,28 @@
 //! Reusable snapshot metadata. References are durable identities, not counters.
 use crate::{CheckpointArtifact, EnvironmentSpec, Error, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use sha2::{Digest, Sha256};
+use std::{
+    collections::BTreeSet,
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+/// Stable capture identity scoped to tenant, Environment and operation.
+/// Names are excluded so retries with changed arguments conflict instead of duplicating captures.
+pub fn snapshot_id(tenant: &str, environment: &str, operation: &str) -> Result<String> {
+    let identity = serde_json::to_vec(&(tenant, environment, operation))
+        .map_err(|_| Error::Invalid("invalid snapshot capture identity".into()))?;
+    Ok(format!("snapshot-{:x}", Sha256::digest(identity)))
+}
+
+/// Reusable captures share storage and restore semantics regardless of preparation.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotKind {
+    #[default]
+    Regular,
+    Golden,
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SnapshotState {
     Ready,
@@ -39,6 +60,11 @@ fn valid_id(id: &str) -> bool {
 pub struct Snapshot {
     pub id: String,
     pub names: Vec<String>,
+    #[serde(default)]
+    pub kind: SnapshotKind,
+    /// Capture creation time, or zero when reading metadata written before it was recorded.
+    #[serde(default)]
+    pub created_at_unix_ms: u64,
     pub template: EnvironmentSpec,
     pub source_node_id: String,
     pub source_runtime_id: String,
@@ -56,9 +82,39 @@ impl Snapshot {
         source_runtime_id: String,
         artifact: CheckpointArtifact,
     ) -> Result<Self> {
+        Self::new_with_kind(
+            SnapshotKind::Regular,
+            id,
+            names,
+            template,
+            source_node_id,
+            source_runtime_id,
+            artifact,
+        )
+    }
+
+    /// Create a reusable capture with its trusted preparation kind and fixed creation time.
+    /// Returns an invalid-input error for invalid metadata, or unavailable if the clock
+    /// cannot be represented as UNIX milliseconds.
+    pub fn new_with_kind(
+        kind: SnapshotKind,
+        id: String,
+        names: Vec<String>,
+        template: EnvironmentSpec,
+        source_node_id: String,
+        source_runtime_id: String,
+        artifact: CheckpointArtifact,
+    ) -> Result<Self> {
+        let created_at_unix_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+            .ok_or_else(|| Error::Unavailable("snapshot capture clock unavailable".into()))?;
         let s = Self {
             id,
             names,
+            kind,
+            created_at_unix_ms,
             template,
             source_node_id,
             source_runtime_id,
@@ -190,6 +246,8 @@ impl Snapshot {
     pub fn same_content(&self, other: &Self) -> bool {
         self.id == other.id
             && self.names == other.names
+            && self.kind == other.kind
+            && self.created_at_unix_ms == other.created_at_unix_ms
             && self.matches_template(&other.template)
             && self.source_node_id == other.source_node_id
             && self.source_runtime_id == other.source_runtime_id
@@ -198,21 +256,6 @@ impl Snapshot {
 
     /// Match the source spec after normalizing omitted UIDs to this snapshot's fixed identities.
     pub fn matches_template(&self, spec: &EnvironmentSpec) -> bool {
-        let fixed: Vec<_> = self
-            .template
-            .execution
-            .mounts
-            .iter()
-            .filter_map(|mount| match &mount.source {
-                crate::execution::MountSource::Volume(reference) => Some(reference.clone()),
-                _ => None,
-            })
-            .collect();
-        let mut spec = spec.clone();
-        // Before publication both templates may still contain unresolved references.
-        if spec == self.template {
-            return true;
-        }
-        spec.fix_volume_references(&fixed).is_ok() && spec == self.template
+        spec.matches_fixed_spec(&self.template)
     }
 }

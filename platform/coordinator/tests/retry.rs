@@ -2,6 +2,9 @@ use adx_coordinator::{Coordinator, Node, Placement};
 use adx_core::{EnvironmentSpec, Error, Resources};
 fn spec() -> EnvironmentSpec {
     EnvironmentSpec {
+        envd: None,
+        run_policy: None,
+        compatibility: None,
         runtime_profile: None,
         snapshot_id: None,
         lifecycle: Default::default(),

@@ -381,6 +381,16 @@ impl From<core::ExecutionOptions> for pb::ExecutionOptions {
             rootfs: value.rootfs.map(Into::into),
             mounts: value.mounts.into_iter().map(Into::into).collect(),
             network: value.network.map(Into::into),
+            protected_ingress: value
+                .protected_ingress
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+            private_service_ports: value
+                .private_service_ports
+                .into_iter()
+                .map(u32::from)
+                .collect(),
             data_plane: Some(pb::DataPlanePolicy {
                 tunnel: security_pb(value.data_plane.tunnel),
                 port_forward: security_pb(value.data_plane.port_forward),
@@ -421,6 +431,16 @@ impl TryFrom<pb::ExecutionOptions> for core::ExecutionOptions {
                 .map(TryInto::try_into)
                 .collect::<Result<_>>()?,
             network: value.network.map(TryInto::try_into).transpose()?,
+            protected_ingress: value
+                .protected_ingress
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<_>>()?,
+            private_service_ports: value
+                .private_service_ports
+                .into_iter()
+                .map(|port| u16::try_from(port).map_err(|_| invalid("private service port")))
+                .collect::<Result<_>>()?,
             data_plane: core::DataPlanePolicy {
                 tunnel: security(data_plane.tunnel)?,
                 port_forward: security(data_plane.port_forward)?,

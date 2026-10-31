@@ -24,12 +24,29 @@ impl Session {
         self.commit(deleted).await
     }
     pub async fn request_resume(&self, id: &str, now: u64) -> Result<StoredEnvironment> {
+        self.request_resume_with_timeout(id, now, None).await
+    }
+
+    /// The first accepted wake fixes this run's duration; retries retain that intent.
+    pub async fn request_resume_with_timeout(
+        &self,
+        id: &str,
+        now: u64,
+        run_timeout_seconds: Option<u64>,
+    ) -> Result<StoredEnvironment> {
         let field = format!("environment:{id}");
         for _ in 0..ATTEMPTS {
             let [header_value, value] = self.store.fields([HEADER.into(), field.clone()]).await?;
             let header = self.header(&header_value)?;
             let mut stored: StoredEnvironment = decode(value.as_deref().ok_or(Error::NotFound)?)?;
             stored.validate()?;
+            if let Some(seconds) = run_timeout_seconds {
+                let mut policy = stored.spec.run_policy.clone().ok_or_else(|| {
+                    Error::Invalid("run policy required for resume duration".into())
+                })?;
+                policy.timeout_seconds = seconds;
+                policy.validate()?;
+            }
             let record = stored.result.as_ref().ok_or(Error::Conflict)?;
             if !matches!(
                 record.state,
@@ -56,6 +73,7 @@ impl Session {
                 intent.retry_after_unix_seconds = 0;
             } else {
                 stored.resume = Some(ResumeIntent {
+                    run_timeout_seconds,
                     operation_id: format!("wake-{}", uuid::Uuid::new_v4()),
                     local_rejected: false,
                     rejected_nodes: Default::default(),

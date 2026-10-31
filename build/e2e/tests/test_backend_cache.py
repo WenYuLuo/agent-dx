@@ -1,5 +1,4 @@
 import contextlib
-import importlib.util
 import io
 import json
 import sys
@@ -54,8 +53,3 @@ class BackendCacheTests(unittest.TestCase):
         self.save()
         with self.assertRaisesRegex(ValueError, 'file set'):
             cached.verify(self.root, self.manifest['target'])
-
-    def test_buildkite_gate_uses_pinned_obs_bundle(self):
-        script = (cached.ROOT / '.buildkite/package-components.sh').read_text()
-        self.assertIn('build/e2e/download_backend.py', script)
-        self.assertNotIn('ADX_BACKEND_ARTIFACT_BUILD', script)

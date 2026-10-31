@@ -11,12 +11,15 @@ pub struct PauseRequest {
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResumeRequest {
+    /// Override only the runtime started by this resume; does not change Spec defaults.
+    pub run_timeout_seconds: Option<u64>,
     pub operation_id: String,
     pub expected_revision: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotRequest {
+    pub kind: adx_core::snapshots::SnapshotKind,
     pub operation_id: String,
     pub expected_revision: u64,
     pub names: Vec<String>,

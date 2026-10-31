@@ -41,8 +41,9 @@ pub struct Api {
 }
 impl Api {
     pub fn new(clients: Arc<Clients>) -> Result<Arc<Self>, Error> {
+        let environment_service = EnvironmentService::new(clients.clone());
         Ok(Arc::new(Self {
-            environment_service: EnvironmentService::new(clients.clone()),
+            environment_service,
             clients,
             proxy: reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
@@ -51,6 +52,16 @@ impl Api {
         }))
     }
     pub async fn serve(
+        self: Arc<Self>,
+        request: Request<Incoming>,
+    ) -> Result<Response<Body>, Infallible> {
+        // Hyper polls this public service future directly on its connection
+        // worker. Keep the full request tracing and dispatch state off that
+        // default worker frame.
+        Box::pin(self.serve_inner(request)).await
+    }
+
+    async fn serve_inner(
         self: Arc<Self>,
         request: Request<Incoming>,
     ) -> Result<Response<Body>, Infallible> {
@@ -137,15 +148,35 @@ impl Api {
             .creation_metrics
             .rejection_guard(create_route);
         let request_id = RequestContext::from_headers(request.headers()).request_id;
-        let api_key = header(&request, "authorization")
-            .and_then(|s| s.strip_prefix("Bearer "))
-            .or_else(|| header(&request, "x-auth-token"))
-            .or_else(|| header(&request, "x-auth"))
-            .unwrap_or("")
-            .trim();
-        let caller = match Box::pin(self.clients.authenticate(api_key)).await {
+        let e2b_route = crate::e2b::http::route(request.uri().path());
+        let api_key = if crate::e2b::keys::route(request.uri().path()) {
+            match crate::e2b::keys::token(request.headers()) {
+                Ok(key) => key,
+                Err(error) => return crate::e2b::http::authentication_error(error),
+            }
+        } else if e2b_route {
+            header(&request, "x-api-key").unwrap_or("").trim()
+        } else {
+            header(&request, "authorization")
+                .and_then(|s| s.strip_prefix("Bearer "))
+                .or_else(|| header(&request, "x-auth-token"))
+                .or_else(|| header(&request, "x-auth"))
+                .unwrap_or("")
+                .trim()
+        };
+        let authentication = async {
+            if e2b_route {
+                self.clients.authenticate_fresh(api_key).await
+            } else {
+                self.clients.authenticate(api_key).await
+            }
+        };
+        let caller = match Box::pin(authentication).await {
             Ok(caller) => caller,
             Err(error) => {
+                if e2b_route {
+                    return crate::e2b::http::authentication_error(error);
+                }
                 rejection.status(&error);
                 let status = if matches!(error.code(), Code::Unavailable | Code::DeadlineExceeded) {
                     Status::unavailable("authentication service unavailable")
@@ -155,6 +186,11 @@ impl Api {
                 return error_response(status, &request_id, None, None, false);
             }
         };
+        if e2b_route {
+            // Keep the opt-in adapter's RPC futures off the native request
+            // frame; both protocols share this listener on default stacks.
+            return Box::pin(crate::e2b::http::handle(self.clone(), request, caller)).await;
+        }
         let path = match percent_encoding::percent_decode_str(request.uri().path()).decode_utf8() {
             Ok(path) => path.trim_end_matches('/').to_string(),
             Err(_) => {
@@ -635,6 +671,7 @@ impl Api {
                             name: query.get("name").cloned().unwrap_or_default(),
                             page_token: query.get("pageToken").cloned().unwrap_or_default(),
                             page_size: page_size(query)?,
+                            kind: snapshot_kind(query)?.map(|kind| kind as i32),
                         })),
                     )
                     .await?;
@@ -678,6 +715,7 @@ impl Api {
                             caller: Some(caller.clone()),
                             tenant_id: input.tenant_id.clone(),
                             expires_at_unix_seconds: input.expires_at_unix_seconds,
+                            name: None,
                         })),
                     )
                     .await?;
@@ -720,6 +758,8 @@ impl Api {
                         client.revoke_tenant_key(trace::inject(pb::RevokeTenantKeyRequest {
                             caller: Some(caller.clone()),
                             id: id.into(),
+                            public_id: String::new(),
+                            tenant_id: String::new(),
                         })),
                     )
                     .await?;
@@ -781,6 +821,7 @@ impl Api {
         }
     }
 }
+
 fn trace_identifiers(context: &str) -> (&str, &str) {
     let mut fields = context.split('-');
     let _version = fields.next();
@@ -819,6 +860,15 @@ fn key_value(key: &pb::TenantKey) -> Value {
         "expiresAtUnixSeconds": key.expires_at_unix_seconds,
     })
 }
+fn snapshot_kind(query: &HashMap<String, String>) -> Result<Option<pb::SnapshotKind>, Status> {
+    match query.get("kind").map(String::as_str) {
+        None => Ok(None),
+        Some("regular") => Ok(Some(pb::SnapshotKind::Regular)),
+        Some("golden") => Ok(Some(pb::SnapshotKind::Golden)),
+        Some(_) => Err(Status::invalid_argument("invalid snapshot kind")),
+    }
+}
+
 fn page_size(query: &HashMap<String, String>) -> Result<u32, Status> {
     query
         .get("pageSize")
@@ -904,7 +954,7 @@ fn create_error_event(error: &Status, request_id: &str, environment_id: &str) ->
 fn sse(name: &str, data: Value) -> Frame<Bytes> {
     Frame::data(Bytes::from(format!("event: {name}\ndata: {data}\n\n")))
 }
-async fn body(body: Incoming, limit: usize) -> Result<Value, Status> {
+pub(crate) async fn body(body: Incoming, limit: usize) -> Result<Value, Status> {
     let bytes = tokio::time::timeout(
         Duration::from_secs(10),
         http_body_util::Limited::new(body, limit).collect(),
@@ -1395,6 +1445,28 @@ mod error_contract_tests {
     }
 
     #[test]
+    fn snapshot_kind_query_defaults_to_all_and_accepts_only_known_kinds() {
+        assert_eq!(snapshot_kind(&HashMap::new()).unwrap(), None);
+        for (name, kind) in [
+            ("regular", pb::SnapshotKind::Regular),
+            ("golden", pb::SnapshotKind::Golden),
+        ] {
+            assert_eq!(
+                snapshot_kind(&HashMap::from([("kind".into(), name.into())])).unwrap(),
+                Some(kind)
+            );
+        }
+        for invalid in ["", "unknown", "Golden", "golden,regular"] {
+            assert_eq!(
+                snapshot_kind(&HashMap::from([("kind".into(), invalid.into())]))
+                    .unwrap_err()
+                    .code(),
+                Code::InvalidArgument
+            );
+        }
+    }
+
+    #[test]
     fn instance_page_token_is_bound_to_the_authenticated_scope() {
         let tenant = pb::CallerContext {
             tenant_id: "tenant-a".into(),
@@ -1645,6 +1717,7 @@ mod error_contract_tests {
         let value = scheduling_queue_view(pb::GetSchedulingQueueResponse {
             environments: vec![pb::PendingEnvironment {
                 spec: Some(pb::EnvironmentSpec {
+                    compatibility: None,
                     id: "environment-a".into(),
                     resources: Some(pb::Resources {
                         cpu_millis: 2000,

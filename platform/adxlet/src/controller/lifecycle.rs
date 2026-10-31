@@ -117,6 +117,9 @@ impl Controller {
             .spec
             .execution
             .validate_tunnel_network(policy.as_ref())?;
+        let mut proposed = self.record.spec.clone();
+        proposed.execution.network = policy.clone();
+        crate::sandboxd::validate_protected_ingress(&proposed)?;
         self.services
             .runtime
             .set_network_policy(
@@ -238,12 +241,21 @@ impl Controller {
             kind,
         });
     }
-    pub(super) async fn pause(&mut self, request: PauseRequest) -> Result<OperationResult> {
-        let intent = if self.auto_pause_guard.is_some() {
+    fn pause_intent(&self) -> adx_core::observation::OperationIntent {
+        if self
+            .run_timer
+            .as_ref()
+            .is_some_and(|timer| timer.deadline <= tokio::time::Instant::now())
+        {
+            adx_core::observation::OperationIntent::Policy
+        } else if self.auto_pause_guard.is_some() {
             adx_core::observation::OperationIntent::Idle
         } else {
             adx_core::observation::OperationIntent::User
-        };
+        }
+    }
+    pub(super) async fn pause(&mut self, request: PauseRequest) -> Result<OperationResult> {
+        let intent = self.pause_intent();
         let services = self.services.clone();
         let mut attempt = services.metrics.operation_attempt("pause", intent);
         let result = self.pause_inner(request).await;
@@ -376,11 +388,7 @@ impl Controller {
                 self.record.execution_artifacts.push(reference);
             }
         }
-        self.operation_intent(if self.auto_pause_guard.is_some() {
-            adx_core::observation::OperationIntent::Idle
-        } else {
-            adx_core::observation::OperationIntent::User
-        });
+        self.operation_intent(self.pause_intent());
         self.record.revision = self.record.revision.checked_add(1).ok_or(Error::Conflict)?;
         match self.sync().await {
             Ok(result) if result.durability == Durability::Published => {}
@@ -694,6 +702,14 @@ impl Controller {
         if self.record.state != EnvironmentState::Paused {
             return Err(Error::Conflict);
         }
+        if let Some(seconds) = request.run_timeout_seconds {
+            let mut policy =
+                self.record.spec.run_policy.clone().ok_or_else(|| {
+                    Error::Invalid("run policy required for resume duration".into())
+                })?;
+            policy.timeout_seconds = seconds;
+            policy.validate()?;
+        }
         let cp = self
             .record
             .checkpoint
@@ -756,6 +772,11 @@ impl Controller {
                 )));
             }
             return Err(error);
+        }
+        // Install after successful restore, before Running can establish its timer.
+        // Replays and failed admissions must not stage a duration for a later run.
+        if let Some(seconds) = request.run_timeout_seconds {
+            self.next_run_timeout = Some(seconds);
         }
         if !already_held
             && !self

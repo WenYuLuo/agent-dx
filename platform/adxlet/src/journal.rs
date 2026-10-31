@@ -1,7 +1,7 @@
 //! SQLite contains only results awaiting cluster publication. It is never a
 //! replacement for the authoritative node catalog or the Ingress routing stream.
 use crate::{Durability, StateSink};
-use adx_core::{EnvironmentRecord, Error, Result};
+use adx_core::{CheckpointArtifact, EnvironmentRecord, Error, Result};
 use async_trait::async_trait;
 use rusqlite::{params, Connection};
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
@@ -13,6 +13,8 @@ struct Pending {
     record: EnvironmentRecord,
     #[serde(default)]
     stopped_runtime_ids: Vec<String>,
+    #[serde(default)]
+    cleanup_artifacts: Vec<CheckpointArtifact>,
 }
 impl std::ops::Deref for Pending {
     type Target = EnvironmentRecord;
@@ -120,10 +122,12 @@ impl JournalSink {
         &self,
         record: &EnvironmentRecord,
         stopped_runtime_ids: &[String],
+        cleanup_artifacts: &[CheckpointArtifact],
     ) -> Result<Durability> {
         let record = Pending {
             record: record.clone(),
             stopped_runtime_ids: stopped_runtime_ids.to_vec(),
+            cleanup_artifacts: cleanup_artifacts.to_vec(),
         };
         self.database(true, move |connection| {
             let mut connection = connection.ok_or_else(|| unavailable("missing database"))?;
@@ -158,15 +162,38 @@ impl JournalSink {
         Ok(Durability::Journaled)
     }
 
+    async fn publish_entry(&self, pending: &Pending) -> Result<Durability> {
+        if pending.cleanup_artifacts.is_empty() {
+            self.upstream
+                .commit_releasing(&pending.record, &pending.stopped_runtime_ids)
+                .await
+        } else {
+            self.upstream
+                .commit_deleted(
+                    &pending.record,
+                    &pending.cleanup_artifacts,
+                    &pending.stopped_runtime_ids,
+                )
+                .await
+        }
+    }
+
     async fn publish(&self, entries: Vec<Entry>) -> Result<()> {
         for (sequence, record) in entries {
-            if self
-                .upstream
-                .commit_releasing(&record.record, &record.stopped_runtime_ids)
-                .await?
-                != Durability::Published
-            {
-                return Err(unavailable("upstream did not publish result"));
+            match self.publish_entry(&record).await {
+                Ok(Durability::Published) => (),
+                Err(error @ (Error::NotFound | Error::Conflict)) => {
+                    // A bounded receipt may expire or the name may be recreated.
+                    // Only a fresh authoritative catalog can revoke this entry;
+                    // discarding it does not assert that its commit succeeded.
+                    if self.upstream.has_current_assignment(&record.record).await? {
+                        return Err(error);
+                    }
+                }
+                Ok(Durability::Journaled) => {
+                    return Err(unavailable("upstream did not publish result"));
+                }
+                Err(error) => return Err(error),
             }
             self.acknowledge(sequence).await?;
         }
@@ -202,11 +229,7 @@ impl JournalSink {
                     if (current.revision < record.revision
                         || current.revision == record.revision
                             && !record.stopped_runtime_ids.is_empty())
-                        && self
-                            .upstream
-                            .commit_releasing(&record.record, &record.stopped_runtime_ids)
-                            .await?
-                            != Durability::Published
+                        && self.publish_entry(&record).await? != Durability::Published
                     {
                         return Err(unavailable("recovery result is not published"));
                     }
@@ -233,6 +256,16 @@ impl JournalSink {
 impl StateSink for JournalSink {
     async fn commit(&self, record: &EnvironmentRecord) -> Result<Durability> {
         self.commit_releasing(record, &[]).await
+    }
+
+    async fn commit_deleted(
+        &self,
+        record: &EnvironmentRecord,
+        cleanup_artifacts: &[CheckpointArtifact],
+        stopped_runtime_ids: &[String],
+    ) -> Result<Durability> {
+        self.commit_with_details(record, stopped_runtime_ids, cleanup_artifacts)
+            .await
     }
 
     async fn prepare_execution(
@@ -273,6 +306,18 @@ impl StateSink for JournalSink {
         record: &EnvironmentRecord,
         stopped_runtime_ids: &[String],
     ) -> Result<Durability> {
+        self.commit_with_details(record, stopped_runtime_ids, &[])
+            .await
+    }
+}
+
+impl JournalSink {
+    async fn commit_with_details(
+        &self,
+        record: &EnvironmentRecord,
+        stopped_runtime_ids: &[String],
+        cleanup_artifacts: &[CheckpointArtifact],
+    ) -> Result<Durability> {
         let ready = self.ready.read().await;
         if !*ready {
             return Err(unavailable("authoritative recovery required"));
@@ -287,7 +332,9 @@ impl StateSink for JournalSink {
         let _serial = serial.lock().await;
         let pending = self.entries(Some(record.spec.id.clone())).await?;
         if let Some((_, latest)) = pending.last() {
-            if &latest.record != record
+            if (&latest.record != record
+                || latest.stopped_runtime_ids != stopped_runtime_ids
+                || latest.cleanup_artifacts != cleanup_artifacts)
                 && (latest.assignment != record.assignment
                     || latest.spec != record.spec
                     || latest.revision >= record.revision)
@@ -298,17 +345,24 @@ impl StateSink for JournalSink {
         let result = self.publish(pending).await;
         match result {
             Ok(()) => match self
-                .upstream
-                .commit_releasing(record, stopped_runtime_ids)
+                .publish_entry(&Pending {
+                    record: record.clone(),
+                    stopped_runtime_ids: stopped_runtime_ids.to_vec(),
+                    cleanup_artifacts: cleanup_artifacts.to_vec(),
+                })
                 .await
             {
                 Ok(Durability::Published) => Ok(Durability::Published),
                 Err(Error::Unavailable(_)) | Ok(Durability::Journaled) => {
-                    self.append(record, stopped_runtime_ids).await
+                    self.append(record, stopped_runtime_ids, cleanup_artifacts)
+                        .await
                 }
                 Err(error) => Err(error),
             },
-            Err(Error::Unavailable(_)) => self.append(record, stopped_runtime_ids).await,
+            Err(Error::Unavailable(_)) => {
+                self.append(record, stopped_runtime_ids, cleanup_artifacts)
+                    .await
+            }
             Err(error) => Err(error),
         }
     }

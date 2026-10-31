@@ -3,10 +3,14 @@
 pub mod checkpoint;
 pub mod lifecycle;
 pub mod runtime_profile;
+pub mod snapshot_preparation;
 pub mod snapshots;
 pub use checkpoint::{
-    valid_runtime_id, CheckpointArtifact, CompletedOperation, LifecycleKind, RestorePoint,
+    valid_runtime_id, CheckpointArtifact, CheckpointCleanup, CompletedOperation, LifecycleKind,
+    RestorePoint,
 };
+pub mod envd;
+pub mod environment_control;
 pub mod execution;
 pub mod observation;
 pub mod probes;
@@ -21,6 +25,8 @@ use std::collections::BTreeMap;
 pub enum Error {
     #[error("invalid request: {0}")]
     Invalid(String),
+    #[error("capability not supported: {0}")]
+    UnsupportedCapability(UnsupportedCapability),
     #[error("request conflicts with existing state")]
     Conflict,
     #[error("snapshot is in use by sandboxes {sandbox_ids:?} or templates {template_ids:?}")]
@@ -70,6 +76,35 @@ pub enum BackendFailureCode {
     Unauthenticated,
 }
 
+/// Runtime capability that a lifecycle operation requires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnsupportedCapability {
+    CheckpointRestore,
+}
+
+impl UnsupportedCapability {
+    /// Stable identifier carried in control-plane status metadata.
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::CheckpointRestore => "checkpoint_restore",
+        }
+    }
+
+    /// Decode a status-metadata capability identifier.
+    pub fn from_wire_name(value: &str) -> Option<Self> {
+        match value {
+            "checkpoint_restore" => Some(Self::CheckpointRestore),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for UnsupportedCapability {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.wire_name())
+    }
+}
+
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -114,6 +149,12 @@ impl Resources {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnvironmentSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub envd: Option<envd::EnvdServiceConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_policy: Option<environment_control::RunPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compatibility: Option<environment_control::EnvironmentCompatibility>,
     #[serde(default)]
     pub runtime_profile: Option<runtime_profile::RuntimeProfile>,
     #[serde(default)]
@@ -135,7 +176,23 @@ pub struct EnvironmentSpec {
 }
 
 impl EnvironmentSpec {
+    /// Required guest services configured for this execution. Service-specific
+    /// readiness and version checks belong to the runtime service owner.
+    pub fn required_services(&self) -> impl Iterator<Item = &'static str> + '_ {
+        self.envd.iter().map(|_| "envd")
+    }
+
     pub fn validate(&self) -> Result<()> {
+        if let Some(envd) = &self.envd {
+            envd.validate()?;
+            envd.validate_execution(&self.execution)?;
+        }
+        if let Some(compatibility) = &self.compatibility {
+            compatibility.validate()?;
+        }
+        if let Some(run_policy) = &self.run_policy {
+            run_policy.validate()?;
+        }
         for (name, value) in [
             ("id", &self.id),
             ("tenant", &self.tenant_id),

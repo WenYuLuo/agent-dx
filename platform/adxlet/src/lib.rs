@@ -51,10 +51,17 @@ pub struct OperationResult {
     pub durability: Durability,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RetiredDeleteFence {
+    Failed(u64),
+    Revision(u64),
+}
+
 #[derive(Clone)]
 struct RetiredEnvironment {
     generation: u64,
     result: Option<OperationResult>,
+    coordinator_delete_fence: Option<RetiredDeleteFence>,
     expires_at: Instant,
 }
 
@@ -257,6 +264,15 @@ pub trait Readiness: Send + Sync {
     async fn activity(&self, _record: &EnvironmentRecord) -> Result<(u64, u64)> {
         Err(Error::Unavailable("runtime activity is unavailable".into()))
     }
+    /// Check mandatory service health without requiring idle activity support.
+    /// Implementations with runtime status also aggregate reported guest services.
+    async fn required_service_health(&self, record: &EnvironmentRecord) -> Result<()> {
+        if record.spec.required_services().next().is_some() {
+            self.activity(record).await.map(|_| ())
+        } else {
+            Ok(())
+        }
+    }
     /// Runtime execution and the platform runtime service must both be ready.
     async fn wait_ready(&self, record: &EnvironmentRecord) -> Result<()>;
 }
@@ -310,6 +326,14 @@ pub trait Routes: Send + Sync {
 
 #[async_trait]
 pub trait StateSink: Send + Sync {
+    /// Check a fresh authoritative catalog before discarding a result whose
+    /// bounded receipt is gone. Offline/custom sinks cannot revoke ownership.
+    async fn has_current_assignment(&self, _record: &EnvironmentRecord) -> Result<bool> {
+        Err(Error::Unavailable(
+            "authoritative assignment lookup unavailable".into(),
+        ))
+    }
+
     /// Resolve managed mounts only after Coordinator grants this concrete attempt.
     /// Custom/offline sinks cannot authorize a referenced Volume.
     async fn prepare_execution(
@@ -344,6 +368,21 @@ pub trait StateSink: Send + Sync {
     /// after a durable local append. Reject stale assignment generations and
     /// revisions. Repeated commits of an identical record are idempotent.
     async fn commit(&self, record: &EnvironmentRecord) -> Result<Durability>;
+
+    /// Commit a deleted record together with checkpoint artifacts that may be
+    /// removed only after Coordinator durably accepts this transition.
+    ///
+    /// The default preserves existing sinks that do not own checkpoint
+    /// cleanup. Production sinks override this to carry the artifacts through
+    /// the Coordinator commit.
+    async fn commit_deleted(
+        &self,
+        record: &EnvironmentRecord,
+        _cleanup_artifacts: &[adx_core::CheckpointArtifact],
+        stopped_runtime_ids: &[String],
+    ) -> Result<Durability> {
+        self.commit_releasing(record, stopped_runtime_ids).await
+    }
 }
 
 pub(crate) struct Admission {
@@ -658,6 +697,15 @@ impl Adxlet {
     }
 
     fn remember_retired(&self, assignment: &Assignment, result: Option<OperationResult>) {
+        self.remember_retired_with_fence(assignment, result, None);
+    }
+
+    fn remember_retired_with_fence(
+        &self,
+        assignment: &Assignment,
+        result: Option<OperationResult>,
+        coordinator_delete_fence: Option<RetiredDeleteFence>,
+    ) {
         let now = Instant::now();
         let expires_at = now
             .checked_add(self.services.operation_timeout.saturating_mul(2))
@@ -670,19 +718,32 @@ impl Adxlet {
                 if assignment.generation > retired.generation {
                     retired.generation = assignment.generation;
                     retired.result = result.clone();
+                    retired.coordinator_delete_fence = coordinator_delete_fence;
                 } else if assignment.generation == retired.generation && result.is_some() {
                     retired.result = result.clone();
+                    if coordinator_delete_fence.is_some() {
+                        retired.coordinator_delete_fence = coordinator_delete_fence;
+                    }
                 }
                 retired.expires_at = retired.expires_at.max(expires_at);
             })
             .or_insert(RetiredEnvironment {
                 generation: assignment.generation,
                 result,
+                coordinator_delete_fence,
                 expires_at,
             });
     }
 
     fn release_published_controller(&self, result: &OperationResult) {
+        self.release_published_controller_with_fence(result, None);
+    }
+
+    pub(crate) fn release_published_controller_with_fence(
+        &self,
+        result: &OperationResult,
+        coordinator_delete_fence: Option<RetiredDeleteFence>,
+    ) {
         if result.record.state != adx_core::EnvironmentState::Deleted
             || result.record.resources_held
             || result.durability != Durability::Published
@@ -690,7 +751,11 @@ impl Adxlet {
             return;
         }
         let assignment = &result.record.assignment;
-        self.remember_retired(assignment, Some(result.clone()));
+        self.remember_retired_with_fence(
+            assignment,
+            Some(result.clone()),
+            coordinator_delete_fence,
+        );
         let mut environments = self
             .environments
             .lock()
@@ -714,6 +779,9 @@ impl Adxlet {
         spec.validate()?;
         if spec.lifecycle.idle_action == adx_core::lifecycle::IdleAction::Pause
             || spec.lifecycle.pause.is_some()
+            || spec.run_policy.as_ref().is_some_and(|policy| {
+                policy.action == adx_core::environment_control::RunExpiryAction::Pause
+            })
         {
             let checkpoint =
                 self.services.checkpoint.as_ref().ok_or_else(|| {
