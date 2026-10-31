@@ -58,8 +58,6 @@ const PAGE_CACHE_IDENTITIES: usize = 65_536;
 const PAGE_CACHE_VERSION_BYTES: usize = 1024 * 1024;
 const PAGE_CACHE_INODE_GATES: usize = 64;
 const MAX_OWNED_WRITE_INPUT_BYTES: usize = 32 * 1024 * 1024;
-// Normal admission per DFS mount; FrontWriteQueue adds bounded waiting space.
-const FRONT_WRITE_QUEUE_BYTES: usize = 2 * 1024 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FrontOrdering {
@@ -95,6 +93,8 @@ pub struct FuseMountOptions {
     pub dfs_fuse_entry_ttl_ms: u32,
     pub dfs_fuse_attr_ttl_ms: u32,
     pub fuse_max_readahead_bytes: u32,
+    /// Front-owned normal ordinary-write payload; downstream buffers are separate.
+    pub dfs_write_queue_bytes: u64,
 }
 
 impl Default for FuseMountOptions {
@@ -109,6 +109,7 @@ impl Default for FuseMountOptions {
             dfs_fuse_entry_ttl_ms: 0,
             dfs_fuse_attr_ttl_ms: 0,
             fuse_max_readahead_bytes: 16 * 1024 * 1024,
+            dfs_write_queue_bytes: 2 * 1024 * 1024 * 1024,
         }
     }
 }
@@ -125,6 +126,7 @@ impl From<&crate::config::Config> for FuseMountOptions {
             dfs_fuse_entry_ttl_ms: config.dfs_fuse_entry_ttl_ms,
             dfs_fuse_attr_ttl_ms: config.dfs_fuse_attr_ttl_ms,
             fuse_max_readahead_bytes: config.fuse_max_readahead_bytes,
+            dfs_write_queue_bytes: config.dfs_write_queue_bytes,
         }
     }
 }
@@ -145,6 +147,8 @@ impl FuseMountOptions {
             || self.dfs_fuse_entry_ttl_ms > 60_000
             || self.dfs_fuse_attr_ttl_ms > 60_000
             || self.fuse_max_readahead_bytes > 16 * 1024 * 1024
+            || !(8 * 1024 * 1024..=1024 * 1024 * 1024 * 1024).contains(&self.dfs_write_queue_bytes)
+            || usize::try_from(self.dfs_write_queue_bytes).is_err()
         {
             return Err(Error::coded(
                 afs_error::CONFIG_INVALID,
@@ -1736,9 +1740,10 @@ impl AfsFuse {
     }
 
     fn enable_write_queue(&mut self) -> io::Result<()> {
+        let bytes = usize::try_from(self.mount_options.dfs_write_queue_bytes)
+            .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
         self.front_write = Some(Arc::new(
-            front_write::FrontWriteQueue::new(FRONT_WRITE_QUEUE_BYTES)
-                .map_err(io::Error::from_raw_os_error)?,
+            front_write::FrontWriteQueue::new(bytes).map_err(io::Error::from_raw_os_error)?,
         ));
         Ok(())
     }
@@ -6248,11 +6253,46 @@ mod queue_default_tests {
         ));
     }
     #[test]
+    fn configured_front_write_limit_reaches_the_mount_queue() {
+        let options = FuseMountOptions {
+            dfs_write_queue_bytes: 64 * 1024 * 1024,
+            ..Default::default()
+        };
+        options.validate().unwrap();
+        let mut fs = AfsFuse::with_mount_options(Arc::new(EmptyBackend), options);
+        fs.enable_write_queue().unwrap();
+        let q = fs.front_write.as_ref().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        q.submit_deferred_with(
+            1,
+            11,
+            64 * 1024 * 1024 + 1,
+            || panic!("configured limit must reject before allocation"),
+            move |r| tx.send(r).unwrap(),
+        );
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap(),
+            Err(libc::E2BIG)
+        );
+        assert!(
+            FuseMountOptions {
+                dfs_write_queue_bytes: 0,
+                ..Default::default()
+            }
+            .validate()
+            .is_err()
+        );
+    }
+
+    #[test]
     fn normal_dfs_setup_enables_owned_write_admission_without_an_option() {
         let mut fs = AfsFuse::new(Arc::new(EmptyBackend));
         fs.enable_write_queue().unwrap();
         assert!(fs.front_write.is_some());
-        assert_eq!(FRONT_WRITE_QUEUE_BYTES, 2 * 1024 * 1024 * 1024);
+        assert_eq!(
+            fs.mount_options.dfs_write_queue_bytes,
+            2 * 1024 * 1024 * 1024
+        );
         assert!(
             !fs.backend
                 .accepts_queued_writes(crate::node::vfs::types::FileHandle(1))
