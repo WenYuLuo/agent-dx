@@ -252,7 +252,9 @@ cryptographic confidentiality or integrity. See
 ### 普通 DFS 写入的回复点
 
 本地 owner、原生 DFS 的普通显式偏移写，在挂载接住整笔正文后回复；使用共享的
-正常接纳2GiB、额外等待32MiB（合计2080MiB）的有界输入队列，不需要配置开关。队列满时背压，后台保留原 CRC、副本和 Meta 业务。
+有界输入队列，`dfs_write_queue_bytes`默认2GiB，所有文件合计，另自动留出至多32MiB等待空间。
+有额度时接住正文后直接写reply；没有额度时保留正文并暂不回复，接收回调先返回，
+待额度恢复后回复。不额外经过独立回复队列或线程。队列满时背压，后台保留原 CRC、副本和 Meta 业务。
 写成功只代表内存接纳；`fsync`、`flush` 和关闭仍等待原同步语义，失败必须检查返回值。
 同步写、追加、远端 owner、内核 writeback 和 OwnerFS 保留原返回点。
 按文件收窄等待；正文保留共享FIFO和单消费者。fsync/flush/release登记恢复任务，不占正文额度。

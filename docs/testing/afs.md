@@ -1214,9 +1214,13 @@ See [the ownership/error contract](../performance/afs-write-owned-admission.md).
 
 ### File-scoped write barriers
 
-The ordinary-write frontend keeps 2GiB normal admitted bodies plus an additional
-32MiB of owned, unacknowledged ingress (2080MiB total). Full reserve/entry capacity
-returns EAGAIN before acceptance. Data copies, 4MiB objects, CRC and backend
+The ordinary-write frontend defaults to 2GiB normal admitted bodies (`dfs_write_queue_bytes`,
+8MiB..1TiB, CLI overrides TOML) plus an automatically derived waiting reserve
+(minimum of normal/8 and 32MiB). Full reserve/entry capacity
+returns EAGAIN before acceptance. Test ready and rejected admissions inline,
+pending quota admission without occupying the receiver, callbacks outside the
+body state lock, blocked body work, allocation failure and close/recovery. No
+independent reply worker is required. Data copies, 4MiB objects, CRC and backend
 persistence are unchanged. File callbacks retain same-inode order across handles;
 namespace operations keep conservative barriers. Sync/flush/release use parked
 recovery continuations and do not acquire body capacity. Record Linux order, saturation, failure, close/teardown and USRBIO validation
@@ -1225,3 +1229,18 @@ arrival order; no round-robin scheduler is added. See
 [the contract](../performance/afs-write-owned-admission.md) and
 [the dated report](../performance/afs-write-early-reply-20261029.md) for exact
 versions, full trial endpoints and validation limits.
+
+
+### Isolate observation I/O in write benchmarks
+
+Use bounded in-memory progress/trace records during timing and export them only
+after the complete business timer stops. Report export time separately. Even an
+8-byte progress `pwrite` on the payload device can block in inode timestamp and
+ext4/JBD2 journal buffer access, with no explicit `fsync`. Trace the application
+and helper as well as AFS, including small writes; distinguish time before the
+next application write from time handling a submitted request. Check observer
+perturbation before attributing scheduler or persistence differences. A real
+workload that writes progress to the same device must declare that extra I/O.
+Retain historical raw cohorts with this caveat; do not silently rewrite them,
+subtract an estimated cost, or claim all previous differences came from it.
+See [the measurement boundary](../performance/afs-write-owned-admission.md#measurement-observer-isolation).
