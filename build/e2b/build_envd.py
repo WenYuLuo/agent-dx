@@ -35,13 +35,13 @@ def run_git(command, *, timeout):
     process = subprocess.Popen(command, env=environment, start_new_session=True)
     try:
         code = process.wait(timeout=timeout)
-    except (subprocess.TimeoutExpired, KeyboardInterrupt, SystemExit):
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        process.wait()
-        raise
+    finally:
+        if process.poll() is None:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
     if code:
         raise subprocess.CalledProcessError(code, command)
 
